@@ -152,6 +152,8 @@ pub struct SharedWorkerExecution {
     /// This worker is a voting member of its shard's running committee
     /// session whose materialized frame trails the session's committed tip.
     lagging_voter: Arc<AtomicBool>,
+    /// This worker's seat departs, and its recovery is more than a gap fill.
+    departing: Arc<AtomicBool>,
     /// The queue place of this worker's last replay, kept while it ended
     /// behind its target: `(filter, ticket)`.
     replay_ticket: Arc<Mutex<Option<(Vec<u8>, u64)>>>,
@@ -244,6 +246,20 @@ impl SharedWorkerExecution {
     /// turn queue each time it grants a turn.
     pub(crate) fn lagging_voter_flag(&self) -> Arc<AtomicBool> {
         self.lagging_voter.clone()
+    }
+
+    /// Whether this worker's seat departs (GLOBAL confirmed its leave, or
+    /// the seat ended) while its recovery needs more than a gap fill of
+    /// [`crate::recovery_turns::DEPARTING_GAP_FILL_FRAMES`]: its claims
+    /// wait while any seat the node keeps waits.
+    pub(crate) fn set_departing(&self, departing: bool) {
+        self.departing.store(departing, Ordering::Relaxed);
+    }
+
+    /// The flag behind [`Self::set_departing`], read by the recovery turn
+    /// queue each time it grants a turn.
+    pub(crate) fn departing_flag(&self) -> Arc<AtomicBool> {
+        self.departing.clone()
     }
 
     /// A replay of `filter` ended its turn behind its target: its next

@@ -6,10 +6,12 @@
 //! successor session cannot start until its recovery lands, whose shard
 //! owes a re-anchor, or that votes in its running session while it trails
 //! the session's committed tip (a lagging voter), goes first: these reorder
-//! the queue and add no concurrent recovery. A blocked successor or lagging
-//! voter also keeps its turn for further replay batches, for at most
-//! [`BLOCKED_TURN_BUDGET`]. A replay whose turn ends behind its target
-//! queues again in its first place. No recovery keeps a turn
+//! the queue and add no concurrent recovery. A worker whose seat departs
+//! (GLOBAL confirmed its leave) waits while any seat the node keeps waits,
+//! unless it fills a short gap ([`DEPARTING_GAP_FILL_FRAMES`]). A blocked
+//! successor or lagging voter also keeps its turn for further replay
+//! batches, for at most [`BLOCKED_TURN_BUDGET`]. A replay whose turn ends
+//! behind its target queues again in its first place. No recovery keeps a turn
 //! much past [`MAX_TURN_HOLD`]: a tree install hands it back at its next
 //! chunk boundary and queues again in its first place, resuming from the
 //! leaves it installed, and the engine's own installation of a checkpoint
@@ -50,6 +52,16 @@ pub(crate) const BLOCKED_TURN_BUDGET: Duration = Duration::from_secs(5 * 60);
 /// started. A handed-back turn goes to the next waiter: archive reads stay
 /// at [`RECOVERY_TURNS`] at once.
 pub(crate) const MAX_TURN_HOLD: Duration = Duration::from_secs(10 * 60);
+
+/// The most frames a worker whose seat departs may trail its known
+/// committed tip by and still queue as the seats the node keeps do
+/// (`SharedWorkerExecution::set_departing`): about one replay batch,
+/// cheap, and it keeps the seat's vote alive until it departs, which its
+/// committee's quorum may need. A longer catch-up or a checkpoint install
+/// waits while any kept seat waits: on an operator's node every turn for
+/// 2.5 hours went to departing seats installing 0.2 to 2.5 million leaves
+/// while the one seat it kept waited.
+pub(crate) const DEPARTING_GAP_FILL_FRAMES: u64 = 32;
 
 /// How long a worker waits for a turn before the queue counts as saturated.
 const SATURATED_AFTER: Duration = Duration::from_secs(60);
@@ -122,6 +134,10 @@ struct Priority {
     /// committed tip (`SharedWorkerExecution::set_lagging_voter`): it goes
     /// as a blocked successor does.
     lagging: Arc<AtomicBool>,
+    /// Its seat departs and its recovery is more than a gap fill
+    /// (`SharedWorkerExecution::set_departing`): it waits while any seat
+    /// the node keeps waits.
+    departing: Arc<AtomicBool>,
     /// It holds frames of its shard, so its turn replays at most a few
     /// batches onto them (or re-anchors at a fence) rather than installing a
     /// checkpoint, about half an hour per million leaves.
@@ -159,6 +175,12 @@ impl<T> Waiter<T> {
             (false, true) => 2,
             (false, false) => 3,
         }
+    }
+
+    /// Its seat departs and it needs more than a gap fill
+    /// ([`DEPARTING_GAP_FILL_FRAMES`]): it waits while any other waits.
+    fn departing(&self) -> bool {
+        self.priority.departing.load(Ordering::Relaxed)
     }
 }
 
@@ -245,6 +267,11 @@ impl<T> TurnQueue<T> {
     /// A turn ended: the waiter it goes to, or none (the turn is free). The
     /// first waiter of the lowest [`Waiter::rank`] goes first, unless
     /// [`PRIORITY_RUN`] turns in a row already went past the longest waiter.
+    /// A departing seat's waiter ([`Waiter::departing`]) goes only once no
+    /// other waits, whatever its rank, and the longest waiter is that of
+    /// the seats the node keeps: a departing seat still votes until it
+    /// departs, but a full install of its shard serves no seat the node
+    /// keeps, and starves those that need one.
     ///
     /// A resumed waiter keeps its place, so a long install that handed its
     /// turn back is soon granted another, but after a turn went to a resumed
@@ -259,8 +286,11 @@ impl<T> TurnQueue<T> {
             self.free += 1;
             return None;
         }
-        let skip_resumed = self.after_resumed && self.waiters.iter().any(|w| !w.resumed);
-        let eligible = |w: &Waiter<T>| !(skip_resumed && w.resumed);
+        let keeps = self.waiters.iter().any(|w| !w.departing());
+        let candidate = |w: &Waiter<T>| !(keeps && w.departing());
+        let skip_resumed =
+            self.after_resumed && self.waiters.iter().any(|w| candidate(w) && !w.resumed);
+        let eligible = |w: &Waiter<T>| candidate(w) && !(skip_resumed && w.resumed);
         let first = self.waiters.iter().position(eligible).unwrap_or(0);
         let pick = if self.bypassed < PRIORITY_RUN {
             self.waiters
@@ -287,8 +317,8 @@ impl<T> TurnQueue<T> {
         true
     }
 
-    /// Waiting workers, of them blocked successors and replays, the longest
-    /// wait and whose it is.
+    /// Waiting workers, of them blocked successors, replays and departing
+    /// seats, the longest wait and whose it is.
     fn load(&self, now: Instant) -> QueueLoad {
         QueueLoad {
             waiting: self.waiters.len(),
@@ -298,6 +328,7 @@ impl<T> TurnQueue<T> {
                 .filter(|w| w.priority.blocked.load(Ordering::Relaxed))
                 .count(),
             replays: self.waiters.iter().filter(|w| w.priority.replay).count(),
+            departing: self.waiters.iter().filter(|w| w.departing()).count(),
             longest_wait: self
                 .waiters
                 .iter()
@@ -314,6 +345,8 @@ struct QueueLoad {
     waiting: usize,
     blocked_successors: usize,
     replays: usize,
+    /// Waiters whose seat departs ([`Waiter::departing`]).
+    departing: usize,
     longest_wait: Duration,
     /// The core of the longest waiter.
     front_core: Option<u32>,
@@ -597,6 +630,7 @@ impl RecoveryTurns {
             blocked: claim.execution.successor_blocked_flag(),
             reanchor: claim.execution.reanchor_armed_flag(),
             lagging: claim.execution.lagging_voter_flag(),
+            departing: claim.execution.departing_flag(),
             replay: claim.kind == RecoveryKind::Replay,
         };
         let (grant, granted) = oneshot::channel();
@@ -690,7 +724,7 @@ impl RecoveryTurns {
         match logged.saturation {
             Some((SaturationLog::Saturated { duration }, load, holders)) => tracing::warn!(
                 waiting_workers = load.waiting, blocked_successors_waiting = load.blocked_successors,
-                replays_waiting = load.replays,
+                replays_waiting = load.replays, departing_waiting = load.departing,
                 longest_wait_secs = load.longest_wait.as_secs(),
                 longest_waiting_core = %load.front_core.map_or_else(|| "none".to_string(), |core| core.to_string()),
                 permits = self.turns, saturated_secs = duration.as_secs(),
@@ -698,7 +732,8 @@ impl RecoveryTurns {
                 scope = "this node",
                 action = "this node recovers at most this many shards from archives at once to bound their load; \
                     workers wait their turn, frame replays before checkpoint installs and owed re-anchors, blocked \
-                    successor sessions and voting members trailing their committee first, and no recovery holds a \
+                    successor sessions and voting members trailing their committee first, seats whose leave GLOBAL \
+                    confirmed after every other unless they fill a gap of at most 32 frames, and no recovery holds a \
                     turn much past 10 minutes; holders names what the turns do now; with 'archive recovery \
                     failing' warnings check those first, otherwise it ends as the queue drains",
                 "archive recovery turns saturated"),
@@ -723,6 +758,7 @@ mod tests {
             blocked: Arc::new(AtomicBool::new(blocked)),
             reanchor: Arc::default(),
             lagging: Arc::default(),
+            departing: Arc::default(),
             replay,
         }
     }
@@ -1053,6 +1089,47 @@ mod tests {
         assert_eq!(queue.next(), None);
     }
 
+    /// A worker whose seat departs waits while any seat the node keeps
+    /// waits, whatever its rank and however long it waited: every third
+    /// turn goes to the longest waiting kept seat. Once none waits, the
+    /// departing seats take turns in their usual order.
+    #[test]
+    fn departing_seats_wait_for_every_kept_seat() {
+        let now = Instant::now();
+        let mut queue = TurnQueue::new(0);
+        let departing = |blocked, replay| Priority {
+            departing: Arc::new(AtomicBool::new(true)),
+            ..waiter(blocked, replay)
+        };
+        queue
+            .take_or_queue(departing(true, true), 1, now, "departing blocked replay")
+            .unwrap_err();
+        queue
+            .take_or_queue(departing(false, false), 2, now, "departing install")
+            .unwrap_err();
+        for (core, name) in [(3, "install 1"), (4, "install 2"), (5, "install 3")] {
+            queue
+                .take_or_queue(waiter(false, false), core, now, name)
+                .unwrap_err();
+        }
+        queue
+            .take_or_queue(waiter(false, true), 6, now, "replay")
+            .unwrap_err();
+        assert_eq!(queue.load(now).departing, 2);
+        let order: Vec<_> = std::iter::from_fn(|| queue.next()).collect();
+        assert_eq!(
+            order,
+            [
+                "replay",
+                "install 1",
+                "install 2",
+                "install 3",
+                "departing blocked replay",
+                "departing install"
+            ]
+        );
+    }
+
     #[test]
     fn a_withdrawn_waiter_leaves_the_queue() {
         let now = Instant::now();
@@ -1072,6 +1149,7 @@ mod tests {
                 waiting: 2,
                 blocked_successors: 1,
                 replays: 0,
+                departing: 0,
                 longest_wait: MINUTE * 2,
                 front_core: Some(2),
             }
@@ -1090,6 +1168,7 @@ mod tests {
             waiting,
             blocked_successors: 0,
             replays: 0,
+            departing: 0,
             longest_wait,
             front_core: None,
         };

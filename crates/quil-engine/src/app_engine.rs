@@ -5453,7 +5453,10 @@ impl AppConsensusEngine {
     /// session's quorum. An unseated worker still recovers, in arrival
     /// order, so seated members' recoveries go before its (an operator's
     /// node: a worker whose allocation was leaving queued its checkpoint
-    /// install as a blocked successor).
+    /// install as a blocked successor). A seat whose leave is confirmed
+    /// still queues behind every kept seat's recovery, whatever this
+    /// returns, unless it only fills a short gap
+    /// (`SharedWorkerExecution::set_departing`).
     fn successor_priority(&self) -> bool {
         let _probe = probe::section(probe::Section::SuccessorPriority);
         if self.start_context.not_seated.is_some() {
@@ -6901,7 +6904,8 @@ impl AppConsensusEngine {
     /// it trails (`recovery_turns`). On an operator's node such a member of
     /// an 11-seat committee waited up to 5 hours per turn for 32 to 64
     /// frames, and abstained for 12 hours while its committee stood one
-    /// vote short of its quorum.
+    /// vote short of its quorum. Also publishes whether its seat departs
+    /// ([`Self::publish_departing`]), which ranks its recoveries last.
     fn publish_lagging_voter(&mut self, now: std::time::Instant) {
         let seated = self.cw_session.is_some()
             && self.own_votes.member().is_some()
@@ -6930,6 +6934,7 @@ impl AppConsensusEngine {
         let logged = self.lagging_voter.observe(gap, now);
         self.execution
             .set_lagging_voter(self.lagging_voter.lagging());
+        self.publish_departing(materialized);
         let or_none =
             |value: Option<u64>| value.map_or_else(|| "none".to_string(), |n| n.to_string());
         match logged {
@@ -6948,6 +6953,56 @@ impl AppConsensusEngine {
                 outcome = if seated { "caught up" } else { "no longer votes in a running session" },
                 "voting member no longer trails its committee: its archive replays queue as others do"),
             None => {}
+        }
+    }
+
+    /// Publish whether this worker's archive recoveries wait while any seat
+    /// this node keeps waits (`SharedWorkerExecution::set_departing`): its
+    /// seat departs at the latest GLOBAL frame ([`seat_departs`]), and it
+    /// trails its known committed tip by more than
+    /// `recovery_turns::DEPARTING_GAP_FILL_FRAMES`, or knows none, as a
+    /// worker without the shard's state does. The seat still votes until it
+    /// departs, and a gap that short is about one replay batch that keeps
+    /// the vote alive; a longer catch-up or a checkpoint install takes
+    /// turns for hours that the seats this node keeps wait for. Logged when
+    /// the seat starts or stops departing.
+    fn publish_departing(&mut self, materialized: u64) {
+        use crate::recovery_turns::DEPARTING_GAP_FILL_FRAMES;
+        let global_frame = self
+            .global_anchor_store
+            .get_latest_global_clock_frame()
+            .ok()
+            .and_then(|f| f.header.map(|h| h.frame_number))
+            .unwrap_or(0);
+        // An unreadable registry keeps the last answer.
+        let Ok(prover) = self
+            .prover_registry
+            .get_prover_info(&self.local_prover_address)
+        else {
+            return;
+        };
+        let allocations = prover.map(|p| p.allocations).unwrap_or_default();
+        let seat = seat_departs(&allocations, &self.filter, global_frame);
+        let gap = self
+            .lagging_voter
+            .known_tip
+            .map(|tip| tip.saturating_sub(materialized));
+        let full = gap.is_none_or(|gap| gap > DEPARTING_GAP_FILL_FRAMES);
+        self.execution.set_departing(seat && full);
+        if seat == self.lagging_voter.departing {
+            return;
+        }
+        self.lagging_voter.departing = seat;
+        if seat {
+            info!(core_id = self.core_id, filter = %hex::encode(&self.filter), global_frame,
+                gap_fill_frames = DEPARTING_GAP_FILL_FRAMES, scope = "this node",
+                action = "none: it votes until it departs; a replay of at most gap_fill_frames frames still \
+                    queues as the other seats' do",
+                "this worker's seat departs: its archive recoveries wait while any seat this node keeps \
+                 waits");
+        } else {
+            info!(core_id = self.core_id, filter = %hex::encode(&self.filter), global_frame,
+                "this worker's seat no longer departs: its archive recoveries queue as the other seats' do");
         }
     }
 
@@ -11408,6 +11463,33 @@ fn lagging_tip(
         .filter(|&tip| seated && tip > materialized)
 }
 
+/// Whether this prover's seat on `filter` departs at GLOBAL `frame`, by its
+/// `allocations`: it holds one on the shard, and the leave of each is
+/// confirmed, its notice served until its departure boundary
+/// (`AllocationPhase::Departing`), or the allocation ended (left, kicked,
+/// rejected, its join expired). The worker stays only to vote until the
+/// seat departs. A seat joining, activating, active, paused, leaving
+/// unconfirmed, lapsed or reassigned does not depart.
+fn seat_departs(
+    allocations: &[quil_types::consensus::ProverAllocationInfo],
+    filter: &[u8],
+    frame: u64,
+) -> bool {
+    use quil_types::consensus::AllocationPhase;
+    let mut held = false;
+    for allocation in allocations {
+        if allocation.confirmation_filter != filter {
+            continue;
+        }
+        let ended = allocation.effective_status(frame).is_terminal();
+        if !ended && allocation.phase(frame) != Some(AllocationPhase::Departing) {
+            return false;
+        }
+        held = true;
+    }
+    held
+}
+
 /// The fewest frames a voting member trails its committed tip by to count
 /// as lagging: certified frames wait briefly to materialize, so a healthy
 /// member trails by one now and then.
@@ -11452,6 +11534,8 @@ struct LaggingVoter {
     /// The committed tip last known: GLOBAL's of the running session, or a
     /// higher certified frame held.
     known_tip: Option<u64>,
+    /// This member's seat departs ([`seat_departs`]), as last logged.
+    departing: bool,
 }
 
 impl LaggingVoter {
@@ -16609,6 +16693,135 @@ mod tests {
             !successor_flag.load(Ordering::Relaxed),
             "a started session no longer goes first"
         );
+    }
+
+    /// A worker whose seat departs, its leave confirmed by GLOBAL (it stays
+    /// only to vote until its departure boundary), takes no recovery turn
+    /// for a checkpoint install while a seat this node keeps waits, though
+    /// it queued first: on an operator's node every turn for 2.5 hours went
+    /// to such seats installing 0.2 to 2.5 million leaves, while the one
+    /// seat it kept waited.
+    #[tokio::test]
+    async fn reproduces_a_departing_seat_taking_a_turn_before_a_kept_seat() {
+        use quil_types::consensus::ProverStatus;
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, handle, _events) = test_engine(registry.clone());
+        let mut departing = local_prover(ProverStatus::Leaving);
+        departing.allocations[0].leave_frame_number = 1;
+        departing.allocations[0].leave_confirm_frame_number =
+            quil_types::consensus::epoch_length_frames() + 1;
+        registry.set_prover(departing);
+        let turns: &'static crate::recovery_turns::RecoveryTurns =
+            Box::leak(Box::new(crate::recovery_turns::RecoveryTurns::new(1)));
+        let claim = |core: u32, execution: crate::worker_execution::SharedWorkerExecution| {
+            crate::recovery_turns::Claim {
+                core,
+                filter: vec![core as u8; 32],
+                kind: crate::recovery_turns::RecoveryKind::Install,
+                execution,
+                ticket: None,
+            }
+        };
+        let held = turns.acquire(claim(9, Default::default())).await;
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let run = |name: &'static str,
+                   core: u32,
+                   execution: crate::worker_execution::SharedWorkerExecution| {
+            let order = order.clone();
+            tokio::spawn(async move {
+                let _turn = turns.acquire(claim(core, execution)).await;
+                order.lock().unwrap().push(name);
+            })
+        };
+        let leaving = run("departing", 1, handle.execution_record().clone());
+        tokio::task::yield_now().await;
+        let kept = run("kept", 2, Default::default());
+        tokio::task::yield_now().await;
+        engine.publish_lagging_voter(std::time::Instant::now());
+        drop(held);
+        leaving.await.unwrap();
+        kept.await.unwrap();
+        assert_eq!(*order.lock().unwrap(), ["kept", "departing"]);
+    }
+
+    /// This node's prover (`test_engine`'s) whose seat on the engine's
+    /// shard departs: its leave confirmed, its notice not served yet.
+    fn departing_prover() -> quil_types::consensus::ProverInfo {
+        let mut prover = local_prover(quil_types::consensus::ProverStatus::Leaving);
+        prover.allocations[0].leave_frame_number = 1;
+        prover.allocations[0].leave_confirm_frame_number =
+            quil_types::consensus::epoch_length_frames() + 1;
+        prover
+    }
+
+    /// A seat departs once GLOBAL confirmed the leave of each of its
+    /// allocations of the shard, or they ended; not while one joins again,
+    /// serves, or leaves unconfirmed, nor without one.
+    #[test]
+    fn a_seat_departs_once_its_leave_is_confirmed_or_it_ended() {
+        use quil_types::consensus::ProverStatus;
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let of = |status| local_prover(status).allocations;
+        let unconfirmed = {
+            let mut allocations = departing_prover().allocations;
+            allocations[0].leave_confirm_frame_number = 0;
+            allocations
+        };
+        let departing = departing_prover().allocations;
+        assert!(seat_departs(&departing, &filter, 0));
+        assert!(seat_departs(&of(ProverStatus::Kicked), &filter, 0));
+        assert!(!seat_departs(&unconfirmed, &filter, 0), "unconfirmed");
+        assert!(!seat_departs(&of(ProverStatus::Active), &filter, 0));
+        assert!(!seat_departs(&of(ProverStatus::Joining), &filter, 0));
+        assert!(!seat_departs(&[], &filter, 0), "no seat");
+        assert!(!seat_departs(&departing, &[7; 32], 0), "another shard");
+        let mut rejoined = departing.clone();
+        rejoined.extend(of(ProverStatus::Joining));
+        assert!(!seat_departs(&rejoined, &filter, 0), "joining again");
+    }
+
+    /// A departing seat's recoveries wait for the seats this node keeps
+    /// unless it trails its known committed tip by at most
+    /// `DEPARTING_GAP_FILL_FRAMES`; a seat that no longer departs queues
+    /// as the others do.
+    #[tokio::test]
+    async fn a_departing_seat_queues_with_kept_seats_only_to_fill_a_short_gap() {
+        use crate::recovery_turns::DEPARTING_GAP_FILL_FRAMES;
+        use quil_types::consensus::ProverStatus;
+        use std::sync::atomic::Ordering;
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, handle, _events) = test_engine(registry.clone());
+        let flag = handle.execution_record().departing_flag();
+        let certified = |number: u64| quil_types::proto::global::AppShardFrame {
+            header: Some(quil_types::proto::global::FrameHeader {
+                frame_number: number,
+                public_key_signature_bls48581: Some(
+                    quil_types::proto::keys::Bls48581AggregateSignature {
+                        signature: vec![1],
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let publish = |engine: &mut AppConsensusEngine| {
+            engine.publish_lagging_voter(std::time::Instant::now());
+            flag.load(Ordering::Relaxed)
+        };
+        registry.set_prover(departing_prover());
+        assert!(publish(&mut engine), "no tip known: an install");
+        let gap_fill = DEPARTING_GAP_FILL_FRAMES;
+        engine
+            .received_full_frames
+            .insert(gap_fill, certified(gap_fill));
+        assert!(!publish(&mut engine), "a gap fill");
+        engine
+            .received_full_frames
+            .insert(gap_fill + 1, certified(gap_fill + 1));
+        assert!(publish(&mut engine), "a longer catch-up");
+        registry.set_prover(local_prover(ProverStatus::Active));
+        assert!(!publish(&mut engine), "a seat this node keeps");
     }
 
     /// A worker its session does not seat, whose active, current allocation
