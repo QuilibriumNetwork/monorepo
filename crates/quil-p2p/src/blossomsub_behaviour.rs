@@ -1472,6 +1472,94 @@ mod propagation_tests {
             "both leaves must receive the hub's published message (published={published}, a={a_got}, b={b_got})"
         );
     }
+
+    /// A message on a bitmask without a validator of its own gets the
+    /// fallback validator's verdict on the receive path, and the validator
+    /// sees its bitmask: a message it rejects is not delivered, one it
+    /// accepts is.
+    #[tokio::test]
+    async fn received_messages_on_unregistered_bitmasks_get_the_fallback_verdict() {
+        let bitmask = vec![0x01u8; 33];
+        let seen: Arc<std::sync::Mutex<Vec<(Vec<u8>, Vec<u8>)>>> = Default::default();
+
+        let mut hub = build_swarm();
+        let mut leaf = build_swarm();
+        let leaf_id = *leaf.local_peer_id();
+        let validated = seen.clone();
+        let fallback = move |_: &PeerId, bitmask: &[u8], data: &[u8]| {
+            validated
+                .lock()
+                .unwrap()
+                .push((bitmask.to_vec(), data.to_vec()));
+            if data == b"accepted" {
+                ValidationResult::Accept
+            } else {
+                ValidationResult::Reject
+            }
+        };
+        leaf.behaviour_mut().register_fallback_validator(fallback);
+        hub.behaviour_mut().subscribe(bitmask.clone());
+        leaf.behaviour_mut().subscribe(bitmask.clone());
+
+        hub.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .expect("listen");
+        let hub_addr: Multiaddr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = hub.select_next_some().await {
+                break address;
+            }
+        };
+        leaf.dial(hub_addr).expect("leaf dial");
+
+        let mut published = false;
+        let mut delivered = Vec::new();
+        let ok = tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                tokio::select! {
+                    _ = hub.select_next_some() => {}
+                    ev = leaf.select_next_some() => {
+                        if let SwarmEvent::Behaviour(BlossomSubEvent::Message { message, .. }) = ev {
+                            delivered.push(message.data);
+                        }
+                    }
+                }
+                if !published && hub.behaviour().peer_subscribed_to(&leaf_id, &bitmask) {
+                    for data in [b"rejected".to_vec(), b"accepted".to_vec()] {
+                        hub.behaviour_mut()
+                            .publish(bitmask.clone(), data)
+                            .expect("publish");
+                    }
+                    published = true;
+                }
+                let accepted = delivered.iter().any(|data| data == b"accepted");
+                if accepted && seen.lock().unwrap().len() >= 2 {
+                    return true;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            ok,
+            "the fallback must see both and the accepted one arrive ({delivered:?}, {seen:?})"
+        );
+        assert_eq!(
+            delivered,
+            vec![b"accepted".to_vec()],
+            "a message the fallback validator rejected was delivered"
+        );
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                (bitmask.clone(), b"accepted".to_vec()),
+                (bitmask, b"rejected".to_vec()),
+            ],
+            "the fallback validator sees each message with its bitmask"
+        );
+    }
+
     /// IDONTWANT received, from gossipsub's own counter in `swarm`'s registry.
     fn idontwants_received(swarm: &Swarm<BlossomSubBehaviour>) -> u64 {
         crate::metrics::render(&swarm.behaviour().metrics_registry())
