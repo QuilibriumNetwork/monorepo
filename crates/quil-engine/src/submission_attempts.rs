@@ -89,6 +89,31 @@ impl SubmissionAttempts {
         })
     }
 
+    /// Release the published joins of each `(filter, frames)` whose attempt
+    /// frame lies in `frames`, returning them with that frame. A join still
+    /// in flight keeps its filter.
+    pub(crate) fn release_published_joins(
+        &self,
+        joins: &[(Vec<u8>, std::ops::Range<u64>)],
+    ) -> Vec<(Vec<u8>, u64)> {
+        let Ok(mut attempts) = self.0.lock() else {
+            return Vec::new();
+        };
+        let mut released = Vec::new();
+        attempts.retain(|(_, filter, kind), attempt| {
+            let release = *kind == OpKind::Join
+                && !attempt.in_flight
+                && joins
+                    .iter()
+                    .any(|(held, frames)| held == filter && frames.contains(&attempt.frame));
+            if release {
+                released.push((filter.clone(), attempt.frame));
+            }
+            !release
+        });
+        released
+    }
+
     pub(crate) fn begin(
         self: &Arc<Self>,
         filters: &[Vec<u8>],
@@ -407,5 +432,49 @@ mod tests {
         confirm.published(20);
         assert!(attempts.confirming(&[1], 49));
         assert!(!attempts.confirming(&[1], 50), "the fence ends it");
+    }
+
+    /// Releasing published joins frees only fenced joins whose frame lies in
+    /// the given window: a join in flight, one outside the window and other
+    /// kinds keep their filters.
+    #[test]
+    fn released_joins_no_longer_hold_off_a_confirm() {
+        let attempts = Arc::new(SubmissionAttempts::default());
+        attempts
+            .begin(&[vec![1]], 130, OpKind::Join)
+            .unwrap()
+            .published(130);
+        assert!(
+            attempts.begin(&[vec![1]], 131, OpKind::Confirm).is_none(),
+            "the join's retry fence holds a confirm off"
+        );
+        let running = attempts.begin(&[vec![2]], 130, OpKind::Join).unwrap();
+        attempts
+            .begin(&[vec![3]], 120, OpKind::Join)
+            .unwrap()
+            .published(120);
+        attempts
+            .begin(&[vec![4]], 130, OpKind::Leave)
+            .unwrap()
+            .published(130);
+        let window = |filter: u8| (vec![filter], 121u64..841);
+        assert_eq!(
+            attempts.release_published_joins(&[window(1), window(2), window(3), window(4)]),
+            vec![(vec![1], 130)]
+        );
+        assert!(attempts.begin(&[vec![1]], 131, OpKind::Confirm).is_some());
+        assert!(
+            attempts.owned(&[2], 131, OpKind::Confirm),
+            "a join in flight keeps its filter"
+        );
+        assert!(
+            attempts.owned(&[3], 131, OpKind::Confirm),
+            "so does one outside the window"
+        );
+        assert!(
+            attempts.owned(&[4], 131, OpKind::Confirm),
+            "and an operation of another kind"
+        );
+        drop(running);
     }
 }

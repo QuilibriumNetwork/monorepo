@@ -74,8 +74,12 @@ pub const SCORE_LEAVE_MIN_HOLD_FRAMES: u64 = DEFAULT_CONFIRM_WINDOW_FRAMES;
 /// 5 overlapping ProposeJoin cycles for the same ~13
 /// halt-risk filters within 45 frames produced 22 unique Joining
 /// allocs against 13 available worker slots, leaving ~9 orphans).
-/// 30 frames ≈ 15 minutes on mainnet, well past the worst-case
-/// archive materialize + prover-tree sync round-trip we've seen.
+/// This is the shortest hold. It lasts longer while the registry may
+/// still lack the join (`ProverLifecycle::join_hold_ended`): a regular
+/// node's registry shows its own join only with the next prover-tree sync
+/// begun after the join's inclusion, which can end well past 30 frames
+/// (a five-minute pull is about 25 frames on mainnet, after the wait for
+/// the next sync to begin).
 pub const JOIN_FILTER_COOLDOWN_FRAMES: u64 = 30;
 
 /// Backoff before re-proposing a join to a shard that *rejected* our
@@ -89,6 +93,15 @@ pub const JOIN_FILTER_COOLDOWN_FRAMES: u64 = 30;
 /// shards instead of fighting for the same one. Matches one confirm
 /// window. Tunable.
 pub const JOIN_REJECT_BACKOFF_FRAMES: u64 = DEFAULT_CONFIRM_WINDOW_FRAMES;
+
+/// Why a proposed join stopped keeping its filter from new joins
+/// (`ProverLifecycle::join_hold_ended`).
+enum JoinHoldEnd {
+    /// The registry shows the join.
+    Shown,
+    /// The registry does not show it, for the reason given.
+    NotShown(&'static str),
+}
 
 /// Result of evaluating the current frame for prover lifecycle actions.
 pub enum LifecycleAction {
@@ -639,8 +652,9 @@ pub struct ProverLifecycle {
     /// Joining allocs than we have workers for, and the excess
     /// becomes orphans (alloc Joining, no worker bound). This map
     /// gates `plan_and_allocate` candidate selection so a filter
-    /// with a recent in-flight bundle isn't re-picked until the
-    /// cooldown elapses. Pruned lazily on read.
+    /// with an in-flight bundle isn't re-picked until the registry
+    /// shows the join or shows it lost (`join_hold_ended`). Pruned
+    /// lazily on read.
     last_join_attempt: RwLock<HashMap<Vec<u8>, u64>>,
     /// Set to true after the first successful `GetAppShards` refresh
     /// (`set_remote_shard_sizes`). Gates `ProposeJoin` and `ProposeLeave`:
@@ -1104,21 +1118,121 @@ impl ProverLifecycle {
     }
 
     /// Build a set of filters with an in-flight Join proposal — i.e.,
-    /// any filter we stamped in `last_join_attempt` within the last
-    /// `JOIN_FILTER_COOLDOWN_FRAMES`. Used by the propose path to
+    /// any filter we stamped in `last_join_attempt` whose join may still
+    /// land (`join_hold_ended`). Used by the propose path to
     /// exclude these filters from the candidate set passed to
     /// `plan_and_allocate`, preventing the orphan-Joining failure
     /// mode where overlapping cycles propose the same filter via
     /// different workers and both bundles eventually materialize.
-    /// Also opportunistically prunes expired entries so the map
-    /// can't grow unbounded.
-    fn filters_with_inflight_join(&self, frame_number: u64) -> std::collections::HashSet<Vec<u8>> {
+    /// Also prunes ended entries so the map can't grow unbounded.
+    fn filters_with_inflight_join(
+        &self,
+        frame_number: u64,
+        allocations: &[quil_types::consensus::ProverAllocationInfo],
+    ) -> std::collections::HashSet<Vec<u8>> {
         let Ok(mut guard) = self.last_join_attempt.write() else {
             return std::collections::HashSet::new();
         };
-        // Lazy prune.
-        guard.retain(|_, last| frame_number.saturating_sub(*last) < JOIN_FILTER_COOLDOWN_FRAMES);
+        guard.retain(|filter, proposed| {
+            let ended = self.join_hold_ended(filter, *proposed, frame_number, allocations);
+            if let Some(JoinHoldEnd::NotShown(reason)) = ended {
+                info!(
+                    filter = %hex::encode(filter),
+                    frame = frame_number,
+                    proposed_frame = *proposed,
+                    reason,
+                    "lifecycle: a join this node proposed is not in its registry; \
+                     the shard is a join candidate again"
+                );
+            }
+            ended.is_none()
+        });
         guard.keys().cloned().collect()
+    }
+
+    /// Why a join this node proposed for `filter` at `proposed` no longer
+    /// keeps the filter from new joins at `frame_number`, or `None` while it
+    /// may still land.
+    ///
+    /// The registry shows it once an allocation of ours on the filter
+    /// carries a join frame at or after `proposed`, whatever its status:
+    /// from then on the allocation keeps the filter from new joins while the
+    /// chain refuses a re-join, and a rejection or expiry frees it as usual.
+    /// The registry may lack it for `JOIN_FILTER_COOLDOWN_FRAMES`, and on a
+    /// node whose registry shows a landed join only after a prover-tree
+    /// sync, until a sync begun after the join's inclusion has refreshed it.
+    /// Proposing the filter again before then puts a second worker on it,
+    /// and GLOBAL refuses that join (`existing allocation still active`).
+    /// The hold never outlasts the chain's re-join window: a join that had
+    /// landed would no longer hold the filter by then.
+    fn join_hold_ended(
+        &self,
+        filter: &[u8],
+        proposed: u64,
+        frame_number: u64,
+        allocations: &[quil_types::consensus::ProverAllocationInfo],
+    ) -> Option<JoinHoldEnd> {
+        if allocations
+            .iter()
+            .any(|a| a.confirmation_filter == filter && a.join_frame_number >= proposed)
+        {
+            return Some(JoinHoldEnd::Shown);
+        }
+        let window = quil_execution::global_intrinsic::verify::REJOIN_WINDOW_FRAMES;
+        if frame_number >= proposed.saturating_add(window) {
+            return Some(JoinHoldEnd::NotShown("its re-join window ended"));
+        }
+        if frame_number < proposed.saturating_add(JOIN_FILTER_COOLDOWN_FRAMES)
+            || self.allocator.registry_may_lack_join(proposed)
+        {
+            return None;
+        }
+        Some(JoinHoldEnd::NotShown(
+            "a registry refreshed since its inclusion lacks it",
+        ))
+    }
+
+    /// Release the published joins GLOBAL refuses, so their retry fences do
+    /// not hold the allocation already on their filter off its confirm or
+    /// leave. GLOBAL refuses a join of a filter while this prover's
+    /// allocation there, in any status but Rejected or Historic, is within
+    /// `REJOIN_WINDOW_FRAMES` of its join frame (`existing allocation still
+    /// active`); a join published in that window cannot land. A regular node
+    /// does not see the refusal itself, only that allocation in its registry.
+    fn release_refused_joins(
+        &self,
+        allocations: &[quil_types::consensus::ProverAllocationInfo],
+        frame_number: u64,
+    ) {
+        let window = quil_execution::global_intrinsic::verify::REJOIN_WINDOW_FRAMES;
+        let refusing: Vec<(Vec<u8>, std::ops::Range<u64>)> = allocations
+            .iter()
+            .filter(|a| {
+                !matches!(
+                    a.status,
+                    ProverStatus::Unknown | ProverStatus::Rejected | ProverStatus::Historic
+                )
+            })
+            .map(|a| {
+                let joined = a.join_frame_number;
+                (
+                    a.confirmation_filter.clone(),
+                    joined..joined.saturating_add(window),
+                )
+            })
+            .collect();
+        if refusing.is_empty() {
+            return;
+        }
+        for (filter, published) in self.submission_attempts.release_published_joins(&refusing) {
+            info!(
+                filter = %hex::encode(&filter),
+                frame = frame_number,
+                published_frame = published,
+                "lifecycle: GLOBAL refuses a join this node published for a shard it already \
+                 holds; the join no longer holds off that allocation's confirm or leave"
+            );
+        }
     }
 
     /// Stamp the per-filter Join cooldown map. Called immediately
@@ -1607,6 +1721,11 @@ impl ProverLifecycle {
         let active_filters = buckets.active;
         let leaving_filters = buckets.leaving;
         let all_our_filters = buckets.all_ours;
+        let own_allocations: &[quil_types::consensus::ProverAllocationInfo] = prover_info
+            .as_ref()
+            .map(|p| p.allocations.as_slice())
+            .unwrap_or_default();
+        self.release_refused_joins(own_allocations, frame_number);
         // Cloned because the re-confirm path below consumes the original and
         // the orphan-leave sweep needs it again: an ExpiredEpoch allocation is
         // still on-chain Active, so it is a valid Leave target when nothing is
@@ -2565,9 +2684,9 @@ impl ProverLifecycle {
             );
 
             if can_propose {
-                // Per-filter Join cooldown: exclude any filter we've
-                // already proposed Join for within the last
-                // `JOIN_FILTER_COOLDOWN_FRAMES`. Closes the orphan-
+                // Per-filter Join hold: exclude any filter we've
+                // already proposed Join for while that join may still
+                // land (`join_hold_ended`). Closes the orphan-
                 // Joining gap where the worker-level
                 // `PROPOSAL_TIMEOUT_FRAMES` (10) frees a worker for
                 // re-use after 10 frames but the prior bundle is still
@@ -2575,7 +2694,8 @@ impl ProverLifecycle {
                 // the registry ends up with more Joining allocs than
                 // worker slots. See `JOIN_FILTER_COOLDOWN_FRAMES`
                 // docstring for the production trace.
-                let inflight_filters = self.filters_with_inflight_join(frame_number);
+                let inflight_filters =
+                    self.filters_with_inflight_join(frame_number, own_allocations);
                 let pre_cooldown_candidates = proposal_descriptors.len();
                 let proposal_descriptors_filtered: Vec<proposer::ShardDescriptor> =
                     proposal_descriptors
@@ -2818,7 +2938,7 @@ impl ProverLifecycle {
 
         // A worker or recent submission already reserves its destination even
         // before the allocation appears in the registry. It cannot fund a leave.
-        let mut inflight = self.filters_with_inflight_join(frame_number);
+        let mut inflight = self.filters_with_inflight_join(frame_number, own_allocations);
         for action in &actions {
             if let LifecycleAction::ProposeJoin { filters, .. } = action {
                 inflight.extend(filters.iter().cloned());
@@ -7669,6 +7789,217 @@ mod proposal_loop_tests {
             !joins.is_empty(),
             "expected Join to be proposed again after JOIN_FILTER_COOLDOWN_FRAMES elapsed; got {:?}",
             actions,
+        );
+    }
+
+    /// A regular node with two idle workers and one joinable shard, whose
+    /// join of the shard was proposed and published at `PROPOSED`. The
+    /// prover-tree sync running then has ended without the join.
+    struct LaggingJoin {
+        lifecycle: Arc<ProverLifecycle>,
+        wm: Arc<ConfigurableWorkerManager>,
+        reg: Arc<ConfigurableRegistry>,
+        shard: Vec<u8>,
+        /// The worker the join was proposed for.
+        core: u32,
+    }
+
+    impl LaggingJoin {
+        const ADDRESS: [u8; 32] = [0xCD; 32];
+        const PROPOSED: u64 = 100;
+
+        fn new() -> Self {
+            let shard = filter_bytes(0xC0);
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            let reg = Arc::new(ConfigurableRegistry::new());
+            wm.add(idle_worker(1));
+            wm.add(idle_worker(2));
+            reg.set_prover(prover(Self::ADDRESS.to_vec(), vec![]));
+            reg.set_summaries(vec![ProverShardSummary {
+                filter: shard.clone(),
+                status_counts: HashMap::from([(ProverStatus::Active, 1)]),
+                total_size: 10_000_000,
+            }]);
+            let lifecycle = make_lifecycle(
+                Self::ADDRESS.to_vec(),
+                wm.clone() as Arc<dyn WorkerManager>,
+                reg.clone() as Arc<dyn ProverRegistry>,
+            );
+            lifecycle.hold_gone_shard_leaves_for_sync();
+            lifecycle.set_prover_root_verified_frame(Self::PROPOSED);
+            let actions = lifecycle
+                .evaluate(Self::PROPOSED, 1, reg.as_ref(), wm.as_ref())
+                .unwrap();
+            let core = actions
+                .iter()
+                .find_map(|a| match a {
+                    LifecycleAction::ProposeJoin {
+                        filters,
+                        worker_ids,
+                        ..
+                    } => filters
+                        .iter()
+                        .position(|f| *f == shard)
+                        .map(|i| worker_ids[i]),
+                    _ => None,
+                })
+                .expect("the shard's join is proposed");
+            // Published: the pipeline marks the join's worker.
+            lifecycle.record_join_attempt(Self::PROPOSED);
+            wm.set_pending_filter_frame(core, Self::PROPOSED).unwrap();
+            lifecycle.current_frame.observe(Self::PROPOSED + 1);
+            let before = lifecycle.begin_registry_sync();
+            lifecycle.note_registry_synced(before);
+            Self {
+                lifecycle,
+                wm,
+                reg,
+                shard,
+                core,
+            }
+        }
+
+        /// Whether an evaluation at `frame` proposes a join of the shard.
+        fn proposes_shard(&self, frame: u64) -> bool {
+            self.lifecycle.set_prover_root_verified_frame(frame);
+            let actions = self
+                .lifecycle
+                .evaluate(frame, 1, self.reg.as_ref(), self.wm.as_ref())
+                .unwrap();
+            proposed_join_filters(&actions).contains(&self.shard)
+        }
+    }
+
+    /// A regular node's registry shows its own join only after a prover-tree
+    /// sync begun after the join's inclusion, and such a sync can end more
+    /// than `JOIN_FILTER_COOLDOWN_FRAMES` after the proposal. A free worker
+    /// was then proposed for the same shard: GLOBAL refused that join
+    /// (`existing allocation still active`), and its retry fence held the
+    /// first join's confirm off the shard.
+    #[test]
+    fn reproduces_a_second_join_of_a_shard_the_registry_lags_on() {
+        let node = LaggingJoin::new();
+        // The next sync began after the join's inclusion and is still pulling.
+        node.lifecycle
+            .current_frame
+            .observe(LaggingJoin::PROPOSED + 25);
+        let _pulling = node.lifecycle.begin_registry_sync();
+        let lagging = LaggingJoin::PROPOSED + JOIN_FILTER_COOLDOWN_FRAMES;
+        node.lifecycle.allocator.on_new_frame(lagging).unwrap();
+        let reserved = node
+            .wm
+            .range_workers()
+            .unwrap()
+            .into_iter()
+            .find(|w| w.core_id == node.core)
+            .map(|w| w.pending_filter_frame);
+        assert_eq!(
+            reserved,
+            Some(LaggingJoin::PROPOSED),
+            "the join's worker waits for the sync"
+        );
+        assert!(
+            !node.proposes_shard(lagging),
+            "a second worker is proposed for the shard whose join the registry lags on"
+        );
+    }
+
+    /// The registry showing the join ends the hold, whatever it shows: the
+    /// allocation then keeps the shard from new joins, and a rejection frees
+    /// it after the usual backoff, not at the end of the join's window.
+    #[test]
+    fn a_join_the_registry_shows_hands_its_shard_to_the_allocation() {
+        let node = LaggingJoin::new();
+        let joined = LaggingJoin::PROPOSED + 1;
+        let lagging = LaggingJoin::PROPOSED + JOIN_FILTER_COOLDOWN_FRAMES;
+        node.reg.set_prover(prover(
+            LaggingJoin::ADDRESS.to_vec(),
+            vec![alloc(node.shard.clone(), ProverStatus::Joining, joined)],
+        ));
+        assert!(
+            !node.proposes_shard(lagging),
+            "the allocation holds the shard"
+        );
+        assert!(
+            node.lifecycle.last_join_attempt.read().unwrap().is_empty(),
+            "the join's hold has ended"
+        );
+
+        let mut rejected = alloc(node.shard.clone(), ProverStatus::Rejected, joined);
+        rejected.join_reject_frame_number = joined + 1;
+        node.reg
+            .set_prover(prover(LaggingJoin::ADDRESS.to_vec(), vec![rejected]));
+        let backoff_over = joined + 1 + JOIN_REJECT_BACKOFF_FRAMES;
+        assert!(
+            backoff_over
+                < LaggingJoin::PROPOSED
+                    + quil_execution::global_intrinsic::verify::REJOIN_WINDOW_FRAMES,
+            "fixture must end the backoff inside the join's window"
+        );
+        assert!(
+            node.proposes_shard(backoff_over),
+            "a rejected join's shard is joinable again after the backoff"
+        );
+    }
+
+    /// A join the registry never shows frees its shard once a sync begun
+    /// after its inclusion has refreshed the registry without it, and at the
+    /// latest when the chain's re-join window ends.
+    #[test]
+    fn a_join_the_registry_never_shows_frees_its_shard() {
+        let lagging = LaggingJoin::PROPOSED + JOIN_FILTER_COOLDOWN_FRAMES;
+        let synced = LaggingJoin::new();
+        synced
+            .lifecycle
+            .current_frame
+            .observe(LaggingJoin::PROPOSED + 25);
+        let since = synced.lifecycle.begin_registry_sync();
+        assert!(!synced.proposes_shard(lagging), "the sync is still pulling");
+        synced.lifecycle.note_registry_synced(since);
+        assert!(
+            synced.proposes_shard(lagging + 1),
+            "a sync begun since the join's inclusion does not show it"
+        );
+
+        let window = quil_execution::global_intrinsic::verify::REJOIN_WINDOW_FRAMES;
+        let unsynced = LaggingJoin::new();
+        assert!(
+            !unsynced.proposes_shard(LaggingJoin::PROPOSED + window - 1),
+            "no sync since: the join may still land"
+        );
+        assert!(
+            unsynced.proposes_shard(LaggingJoin::PROPOSED + window),
+            "until its window ends"
+        );
+    }
+
+    /// GLOBAL refuses a join of a shard while this prover's allocation there
+    /// is inside its re-join window. Such a join, published before the
+    /// registry showed the allocation, must not hold the allocation's own
+    /// confirm off the shard.
+    #[test]
+    fn a_join_global_refuses_does_not_hold_off_the_confirm() {
+        use crate::submission_attempts::OpKind;
+        let node = LaggingJoin::new();
+        let duplicate = LaggingJoin::PROPOSED + JOIN_FILTER_COOLDOWN_FRAMES;
+        let attempts = &node.lifecycle.submission_attempts;
+        attempts
+            .begin(&[node.shard.clone()], duplicate, OpKind::Join)
+            .unwrap()
+            .published(duplicate);
+        assert!(attempts.owned(&node.shard, duplicate + 1, OpKind::Confirm));
+        node.reg.set_prover(prover(
+            LaggingJoin::ADDRESS.to_vec(),
+            vec![alloc(
+                node.shard.clone(),
+                ProverStatus::Joining,
+                LaggingJoin::PROPOSED + 1,
+            )],
+        ));
+        assert!(!node.proposes_shard(duplicate + 1));
+        assert!(
+            !attempts.owned(&node.shard, duplicate + 1, OpKind::Confirm),
+            "the refused join no longer owns the shard"
         );
     }
 
