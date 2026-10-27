@@ -41,6 +41,7 @@ pub mod global_view_refresh;
 mod gossip_frames;
 pub mod halt_state;
 pub mod historical_committee;
+pub mod inclusion_summary;
 pub mod leader_provider;
 pub mod message_collector;
 pub mod message_router;

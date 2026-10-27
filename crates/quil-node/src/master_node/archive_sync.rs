@@ -1769,55 +1769,62 @@ fn sequenced_ingest_hook(
 /// Which shard headers a GLOBAL proposal may carry: those whose application
 /// frame bodies this archive's ingest holds
 /// (`ArchiveAppShardIngest::holds_bodies_through`), the bodies sequenced
-/// ingest waits for before the GLOBAL frame executes. Sequenced execution
-/// holds the ingest while it materializes; a proposal waits for it at most
-/// `LOCK_WAIT` and otherwise carries no shard header this time.
+/// ingest waits for before the GLOBAL frame executes, with the application
+/// frames executing each makes archives materialize. Read from what the
+/// ingest publishes (`HeldBodies`), never by waiting for the ingest: a
+/// proposal holds the GLOBAL execution lease, and it used to wait up to 2 s
+/// for the ingest, which sequenced execution holds while it materializes, and
+/// then carry no shard header at all (2026-10-27: most proposals of every
+/// archive). Headers the ingest has not published bodies for are left to it,
+/// which asks for the frames they lack on its next retry pass.
+///
+/// On a test network (`network` other than 0), while the file
+/// `QUIL_DEVNET_HOLD_SHARD_HEADERS_FILE` names exists, no shard header is
+/// reported held: a devnet holds shard inclusion back with it, to check that
+/// shards whose headers were held back past the frame buffer recover.
 fn shard_body_availability(
     cell: AppIngestCell,
+    network: u8,
 ) -> quil_engine::leader_provider::ShardBodyAvailability {
+    use quil_engine::archive_ingest::HeldBodies;
     use quil_engine::leader_provider::ShardBodyNeed;
     use std::sync::TryLockError;
-    const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
-    const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
+    let held: std::sync::OnceLock<HeldBodies> = std::sync::OnceLock::new();
+    let hold_file = (network != 0)
+        .then(|| std::env::var_os("QUIL_DEVNET_HOLD_SHARD_HEADERS_FILE"))
+        .flatten()
+        .map(std::path::PathBuf::from);
     Arc::new(move |needs: &[ShardBodyNeed]| {
         if needs.is_empty() {
             return Vec::new();
         }
         let Some(ingest) = cell.get() else {
-            return vec![false; needs.len()]; // not built yet: nothing executes
+            return vec![None; needs.len()]; // not built yet: nothing executes
         };
-        let started = std::time::Instant::now();
-        let mut ingest = loop {
-            match ingest.try_lock() {
-                Ok(guard) => break guard,
-                Err(TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
-                Err(TryLockError::WouldBlock) if started.elapsed() < LOCK_WAIT => {
-                    std::thread::sleep(LOCK_RETRY)
+        if hold_file.as_ref().is_some_and(|file| file.exists()) {
+            debug!(
+                shard_headers = needs.len(),
+                "devnet: shard headers held back while QUIL_DEVNET_HOLD_SHARD_HEADERS_FILE exists"
+            );
+            return vec![None; needs.len()];
+        }
+        // The handle, once: never wait for the ingest under the lease.
+        let held = match held.get() {
+            Some(held) => held,
+            None => match ingest.try_lock() {
+                Ok(guard) => held.get_or_init(|| guard.held_bodies()),
+                Err(TryLockError::Poisoned(poisoned)) => {
+                    held.get_or_init(|| poisoned.into_inner().held_bodies())
                 }
                 Err(TryLockError::WouldBlock) => {
-                    warn!(
-                        shard_headers = needs.len(),
-                        waited_ms = started.elapsed().as_millis() as u64,
-                        "GLOBAL proposal carries no shard headers: the application frame ingest stayed busy"
-                    );
-                    return vec![false; needs.len()];
+                    quil_engine::inclusion_summary::note_gate_unavailable(needs.len());
+                    return vec![None; needs.len()];
                 }
-            }
+            },
         };
         needs
             .iter()
-            .map(|need| {
-                ingest
-                    .holds_bodies_through(&need.address, need.frame_number, need.empty)
-                    .unwrap_or_else(|error| {
-                        debug!(
-                            %error,
-                            address = %hex::encode(&need.address),
-                            "shard body check unavailable; its header is held back"
-                        );
-                        false
-                    })
-            })
+            .map(|need| held.frames_held(&need.address, need.frame_number, need.empty))
             .collect()
     })
 }
@@ -1917,7 +1924,8 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
     });
     // A GLOBAL prover proposes a shard's header only once it holds the bodies
     // that sequenced ingest waits for.
-    let body_availability = archive_mode.then(|| shard_body_availability(app_ingest.clone()));
+    let body_availability =
+        archive_mode.then(|| shard_body_availability(app_ingest.clone(), network));
 
     // The archive-sync transport identity is the FALCON network key (all
     // outbound :8340 dials below use it). `mtls_seed` (Ed448) presence still

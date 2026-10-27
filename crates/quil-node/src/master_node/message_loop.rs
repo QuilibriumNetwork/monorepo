@@ -231,6 +231,11 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         activation_waits: activation_waits_for_recv,
     } = args;
     let archive_ingest_for_recv = archive_app_shard_ingest;
+    // Gossiped application frames are verified without holding the ingest,
+    // which GLOBAL execution waits for.
+    let archive_verifier_for_recv = archive_ingest_for_recv
+        .as_ref()
+        .map(|ingest| ingest.lock().unwrap_or_else(|p| p.into_inner()).verifier());
     // GLOBAL_FRAME admission state shared with the gossip gate: a frame this
     // loop accepted is neither forwarded nor checked again, and a header whose
     // certificate and VDF verified skips both checks on later copies.
@@ -1942,8 +1947,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                     }
                                 }
                                 if !routed {
-                                    let ingest = archive_ingest_for_recv.as_ref().map(|ingest| {
-                                        move |data: &[u8]| ingest.lock().unwrap_or_else(|p| p.into_inner()).ingest(data)
+                                    let ingest = archive_ingest_for_recv.as_ref().zip(archive_verifier_for_recv.as_ref()).map(|(ingest, verifier)| {
+                                        move |data: &[u8]| quil_engine::archive_ingest::ingest_gossiped(ingest, verifier, data)
                                     });
                                     unrouted_shard_message(
                                         bm,

@@ -113,12 +113,26 @@ impl Admission {
         }
     }
 }
+/// A lease hold long enough to cost a view (35 s on mainnet) is logged on its
+/// own; shorter ones are counted into the inclusion summary
+/// ([`crate::inclusion_summary`]). Logged from one second up, they ran to
+/// about 126 lines an hour on every archive (2026-10-27).
+const LONG_LEASE_HOLD: std::time::Duration = std::time::Duration::from_secs(20);
+
 impl Drop for Admission {
     fn drop(&mut self) {
         self.active.store(false, Ordering::Release);
         let held = self.since.elapsed();
-        if held >= crate::stage_clock::SLOW_EXECUTION {
+        crate::inclusion_summary::note_lease(held);
+        if held >= LONG_LEASE_HOLD {
             tracing::warn!(
+                holder = self.holder,
+                frame = self.frame,
+                held_ms = held.as_millis() as u64,
+                "GLOBAL execution lease held long: votes defer and a leader waits while it is held"
+            );
+        } else if held >= crate::stage_clock::SLOW_EXECUTION {
+            tracing::debug!(
                 holder = self.holder,
                 frame = self.frame,
                 held_ms = held.as_millis() as u64,
