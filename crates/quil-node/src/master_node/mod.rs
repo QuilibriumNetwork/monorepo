@@ -592,22 +592,15 @@ pub(crate) async fn start(
     // shard RPCs each counted all of them per frame.
     let committed_shard_sizes =
         std::sync::Arc::new(quil_engine::shard_info::CommittedShardSizes::default());
-    {
-        let crdt_inv = crdt.clone();
-        let shards_inv = shards_store.clone();
-        let reg_inv =
-            prover_registry.clone() as std::sync::Arc<dyn quil_types::consensus::ProverRegistry>;
-        let sizes_inv = committed_shard_sizes.clone();
-        coverage_monitor.set_shard_inventory_provider(std::sync::Arc::new(move |frame: u64| {
-            quil_engine::coverage::build_shard_inventory(
-                crdt_inv.clone(),
-                shards_inv.clone(),
-                reg_inv.as_ref(),
-                frame,
-                &sizes_inv,
-            )
-        }));
-    }
+    // A regular node sizes its frozen genesis grid by its own data only; see
+    // `shard_inventory_provider`.
+    coverage_monitor.set_shard_inventory_provider(quil_engine::coverage::shard_inventory_provider(
+        crdt.clone(),
+        shards_store.clone(),
+        prover_registry.clone() as std::sync::Arc<dyn quil_types::consensus::ProverRegistry>,
+        committed_shard_sizes.clone(),
+        archive_mode,
+    ));
 
     // Lazy cell holding the prover-message transport. The transport
     // itself is constructed later (it depends on the archive pool and

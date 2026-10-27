@@ -461,10 +461,30 @@ pub fn local_app_shard_get_sizes(
     shards_store: std::sync::Arc<dyn ShardsStore>,
     sizes: std::sync::Arc<CommittedShardSizes>,
 ) -> impl Fn(&[u8], &ShardInfo) -> Result<Vec<ShardSizeEntry>> + Send + Sync {
+    app_shard_sizes(crdt, shards_store, Some(sizes))
+}
+
+/// [`local_app_shard_get_sizes`] without committed deliveries: each
+/// sub-shard's size as measured in the local hypergraph CRDT only.
+pub fn local_app_shard_measured_sizes(
+    crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+    shards_store: std::sync::Arc<dyn ShardsStore>,
+) -> impl Fn(&[u8], &ShardInfo) -> Result<Vec<ShardSizeEntry>> + Send + Sync {
+    app_shard_sizes(crdt, shards_store, None)
+}
+
+fn app_shard_sizes(
+    crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+    shards_store: std::sync::Arc<dyn ShardsStore>,
+    sizes: Option<std::sync::Arc<CommittedShardSizes>>,
+) -> impl Fn(&[u8], &ShardInfo) -> Result<Vec<ShardSizeEntry>> + Send + Sync {
     move |shard_key: &[u8], shard_info: &ShardInfo| -> Result<Vec<ShardSizeEntry>> {
-        let committed = crdt
-            .read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
-            .unwrap_or(0);
+        let committed = sizes.as_ref().map(|sizes| {
+            let frame = crdt
+                .read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+                .unwrap_or(0);
+            (sizes, frame)
+        });
         let mut sub_shards = shards_store.get_app_shards(shard_key, &[])?;
         if sub_shards.is_empty() {
             sub_shards = vec![shard_info.clone()];
@@ -473,9 +493,15 @@ pub fn local_app_shard_get_sizes(
         let mut out = Vec::with_capacity(sub_shards.len());
         for sub in &sub_shards {
             if let Some(meta) = crate::app_shard_metadata::get_app_shard_metadata(&crdt, sub) {
+                let size = match committed {
+                    Some((sizes, frame)) => {
+                        sizes.size(&crdt, shard_key, &sub.prefix, meta.size, frame)
+                    }
+                    None => meta.size,
+                };
                 out.push(ShardSizeEntry {
                     prefix: sub.prefix.clone(),
-                    size: sizes.size(&crdt, shard_key, &sub.prefix, meta.size, committed),
+                    size,
                     data_shards: meta.data_shards,
                     materialized_frame: 0,
                     latest_frame: 0,
