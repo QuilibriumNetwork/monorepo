@@ -2380,6 +2380,35 @@ pub enum FetchedFrames {
     AwaitsExecution { anchor: u64, executed: u64 },
 }
 
+/// Whether the gap fetch asks its next source for a frame after the copy one
+/// source served (this archive's store included) was refused, given the
+/// error preparing that copy returned, if any. Only a copy that cannot be
+/// verified yet ends the round: its storage registrations, certified
+/// descendant or GLOBAL anchor were unavailable, which any other copy waits
+/// for too, and the ingest asks again later. A copy that verification
+/// refused says nothing about the others.
+///
+/// Three archives had stored frame 16207 of shard …091000 as certified by
+/// generation 46, before that session ended at 16206. Generation 47's
+/// frame 16207, which GLOBAL executed, verified, but each retry refused the
+/// stored copy as outside its session's terminal checkpoint and ended the
+/// round there, never asking the endpoints serving the other copy; GLOBAL
+/// halted at 944,910 (2026-10-27).
+pub fn gap_fetch_asks_next_source(prepare_error: Option<&quil_types::error::QuilError>) -> bool {
+    use quil_types::error::QuilError;
+    prepare_error.is_none_or(|error| {
+        !matches!(
+            error,
+            QuilError::ExecutionUnavailable(_)
+                | QuilError::NotFound(_)
+                | QuilError::Store(_)
+                | QuilError::Io(_)
+                | QuilError::P2p(_)
+                | QuilError::Internal(_)
+        )
+    })
+}
+
 /// Check the frames a gap fetch recovered from one endpoint (the frame asked
 /// for first, then the run up to its certified descendant) and admit them to
 /// `ingest`, which is held only to admit.
