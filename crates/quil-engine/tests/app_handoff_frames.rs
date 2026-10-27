@@ -1408,3 +1408,163 @@ fn production_validators_reject_namespace_downgrades_and_unauthorized_coordinate
         assert!(intrinsic.invoke_step(3, &wire, &fixture.state).is_err());
     }
 }
+
+/// An archive stored frame 3 as its session certified it at view 10, before
+/// GLOBAL sealed the session at frame 3's copy of view 9 (three archives
+/// held generation 46's frame 16207 of …091000 after that session ended at
+/// 16206, and GLOBAL halted at 944,910, 2026-10-27). After a restart the
+/// stored copy is the first the gap fetch tries, and verification refuses it
+/// as outside the terminal checkpoint. That refusal must not end the round:
+/// the copy an endpoint serves, the one GLOBAL executed, is admitted and
+/// replaces the stored one. A copy that cannot be verified yet still ends it.
+#[test]
+fn a_refused_stored_copy_does_not_end_the_gap_fetch_before_the_valid_one() {
+    use quil_engine::archive_ingest::{admit_fetched, gap_fetch_asks_next_source, FetchedFrames};
+    use quil_types::store::ClockStore as _;
+    let keys = keys();
+    let source = session(&keys, vec![0x68; 32]);
+    let fixture = Fixture::new(&source);
+    let intrinsic = fixture.intrinsic();
+    handoff::set_presence_report_frame_for_thread(Some(0));
+    handoff::initialize(&fixture.state, 2, &source).unwrap();
+    commit(&fixture.state, 2);
+
+    // Frames 1–3 at views 5, 7, 9, and another frame 3 at view 10, both
+    // extending frame 2.
+    let extend = |previous: &AppShardFrame, number: u64, view: u64, parent_view: u64| {
+        let previous = previous.header.as_ref().unwrap();
+        let mut header = FrameHeader {
+            address: source.filter.clone(),
+            frame_number: number,
+            rank: view,
+            difficulty: 1,
+            parent_selector: quil_crypto::poseidon::hash_bytes_to_32(&previous.output)
+                .unwrap()
+                .to_vec(),
+            requests_root: vec![0; 32],
+            state_roots: vec![vec![0; 32]; 4],
+            ..Default::default()
+        };
+        certify(&mut header, &source, &keys, parent_view);
+        AppShardFrame {
+            header: Some(header),
+            ..Default::default()
+        }
+    };
+    let mut frames = vec![first_frame(&source, &keys)];
+    frames.push(extend(&frames[0], 2, 7, 5));
+    frames.push(extend(&frames[1], 3, 9, 7));
+    let other = extend(&frames[1], 3, 10, 7);
+    let output = |frame: &AppShardFrame| frame.header.as_ref().unwrap().output.clone();
+    let stored = |fixture: &Fixture| {
+        fixture
+            .clock
+            .get_shard_clock_frame(&source.filter, 3, false)
+            .unwrap()
+    };
+
+    // Before the seal the other frame 3 verifies, and the archive stores it.
+    let archive = fixture.archive();
+    let verifier = archive.verifier();
+    let ingest = std::sync::Mutex::new(archive);
+    assert_eq!(
+        admit_fetched(&ingest, &verifier, &source.filter, vec![other.clone()]),
+        FetchedFrames::Admitted
+    );
+    assert_eq!(output(&stored(&fixture)), output(&other));
+    drop(ingest);
+
+    // GLOBAL executes frame 1, then the seal at frame 3 of view 9 drains
+    // frames 2 and 3.
+    let wire = |frame: &AppShardFrame| canonical(frame).to_canonical_bytes().unwrap();
+    intrinsic
+        .invoke_step(3, &wire(&frames[0]), &fixture.state)
+        .unwrap();
+    commit(&fixture.state, 3);
+    let request = handoff::schedule(
+        &fixture.state,
+        4,
+        vec![source.filter.clone()],
+        vec![DesiredCommittee {
+            filter: source.filter.clone(),
+            members: session(&self::keys(), source.filter.clone()).members,
+        }],
+    )
+    .unwrap();
+    commit(&fixture.state, 4);
+    let seal = Seal {
+        request: request.id().unwrap(),
+        session: source.id().unwrap(),
+        view: 11,
+        checkpoint: Checkpoint {
+            frame: 3,
+            view: 9,
+            digest: quil_crypto::poseidon::hash_bytes_to_32(&output(&frames[2])).unwrap(),
+            state_roots: [[0; 32]; 4],
+            history_root: [0x66; 32],
+        },
+    };
+    let submission = CertificateSubmission {
+        certificate: sign(&source, &keys, 11, 9, seal.digest()),
+        seal,
+    };
+    let drain = handoff::SealSubmission {
+        submission,
+        drain: frames.iter().map(wire).collect(),
+    }
+    .to_canonical_bytes()
+    .unwrap();
+    handoff::set_seal_drain_frame_for_thread(Some(6));
+    intrinsic.invoke_step(6, &drain, &fixture.state).unwrap();
+    commit(&fixture.state, 6);
+    handoff::set_seal_drain_frame_for_thread(None);
+    handoff::set_presence_report_frame_for_thread(None);
+    assert_eq!(
+        handoff::head(&fixture.state, &source.filter)
+            .unwrap()
+            .unwrap()
+            .generation,
+        2,
+        "the seal authorized the successor"
+    );
+
+    // After a restart the gap fetch tries the stored copy first: refused.
+    let archive = fixture.archive();
+    let verifier = archive.verifier();
+    let ingest = std::sync::Mutex::new(archive);
+    assert_eq!(
+        admit_fetched(&ingest, &verifier, &source.filter, vec![stored(&fixture)]),
+        FetchedFrames::Refused
+    );
+    let refusal = fixture.validator().validate(&stored(&fixture)).unwrap_err();
+    assert!(
+        refusal
+            .to_string()
+            .contains("data frame is outside the terminal checkpoint"),
+        "{refusal}"
+    );
+    assert!(
+        gap_fetch_asks_next_source(Some(&refusal)),
+        "the stored copy's refusal ({refusal}) ended the gap fetch's round: \
+         the copy GLOBAL executed was never asked for"
+    );
+    // Nothing else could verify yet either: the round ends, and the ingest
+    // asks again later.
+    assert!(!gap_fetch_asks_next_source(Some(
+        &quil_types::error::QuilError::ExecutionUnavailable(
+            "peer lacks historical storage registration".into()
+        )
+    )));
+    assert!(gap_fetch_asks_next_source(None));
+
+    // The endpoints' copies are admitted, and frame 3 GLOBAL executed
+    // replaces the stored one.
+    for frame in &frames {
+        assert_eq!(
+            admit_fetched(&ingest, &verifier, &source.filter, vec![frame.clone()]),
+            FetchedFrames::Admitted
+        );
+    }
+    assert_eq!(fixture.cursor(&source.filter), 3);
+    assert_eq!(output(&stored(&fixture)), output(&frames[2]));
+}

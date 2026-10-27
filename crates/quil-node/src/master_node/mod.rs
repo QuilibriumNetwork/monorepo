@@ -1544,10 +1544,13 @@ pub(crate) async fn start(
                         }
                     }
                     // A frame that fails verification (a copy without its
-                    // storage attestation, say) does not end the round: the
-                    // next endpoint is asked, as when one lacks the frame,
-                    // unless the frame's registrations were unavailable.
+                    // storage attestation, or one this archive stored from a
+                    // session that later ended below it) does not end the
+                    // round: the next endpoint is asked, as when one lacks
+                    // the frame, unless the copy cannot be verified yet
+                    // (`gap_fetch_asks_next_source`).
                     let mut failures = Vec::new();
+                    let mut noted_refusal = false;
                     let mut awaiting_execution = 0usize;
                     let mut recovered = None;
                     // A frame above the cursor this archive stored before a
@@ -1585,7 +1588,7 @@ pub(crate) async fn start(
                         // here, off the ingest lock. A frame without a
                         // certificate comes with the run up to its
                         // certified descendant, the source asked first.
-                        let mut prepared_ok = true;
+                        let mut prepare_error = None;
                         let frames = match validator.as_ref() {
                             Some(validator) if anchored => {
                                 let fetch = |number: u64| {
@@ -1614,9 +1617,11 @@ pub(crate) async fn start(
                                 };
                                 let (frames, prepared) = quil_engine::archive_ingest::prepare_gap_fetched(validator, frame, fetch).await;
                                 if let Err(error) = prepared {
-                                    prepared_ok = false;
-                                    tracing::info!(filter = %hex::encode(&filter), frame = frame_number, %error,
-                                        "app-shard gap fetch: historical storage registrations unavailable");
+                                    if !quil_engine::archive_ingest::gap_fetch_asks_next_source(Some(&error)) {
+                                        tracing::info!(filter = %hex::encode(&filter), frame = frame_number, %error,
+                                            "app-shard gap fetch: historical storage registrations unavailable");
+                                    }
+                                    prepare_error = Some(error);
                                 }
                                 frames
                             }
@@ -1636,10 +1641,18 @@ pub(crate) async fn start(
                                     Ok(FetchedFrames::Admitted) => {}
                                     Ok(FetchedFrames::Refused) => {
                                         failures.push(format!("{source}: served a frame that failed verification"));
-                                        if prepared_ok {
-                                            continue;
+                                        if !quil_engine::archive_ingest::gap_fetch_asks_next_source(prepare_error.as_ref()) {
+                                            break;
                                         }
-                                        break;
+                                        if !noted_refusal {
+                                            noted_refusal = true;
+                                            let reason = prepare_error.as_ref()
+                                                .map_or_else(|| "failed verification".to_string(), ToString::to_string);
+                                            tracing::info!(filter = %hex::encode(&filter), frame = frame_number, %source, %reason,
+                                                "app-shard gap fetch: a copy of the frame failed verification; asking the other endpoints \
+                                                 for one that verifies");
+                                        }
+                                        continue;
                                     }
                                     // Not recovered from this endpoint: a forged copy
                                     // must not keep the others from being asked.
