@@ -21566,6 +21566,111 @@ mod tests {
         handoff::set_seal_recovery_frame_for_thread(None);
         handoff::set_seal_drain_frame_for_thread(None);
     }
+
+    /// The resubmission timer counts from the last publish or view move,
+    /// whichever is later, and the members after the head of the line
+    /// publish in their turns. When the view moves, the head publishes at
+    /// once and the others hold, though their last copies are past the
+    /// timer; 20 s after the move the second member's turn comes. A member
+    /// whose view stays on the part it published falls back to the timer,
+    /// counted from that publish, while members whose view moved within the
+    /// timer still hold.
+    #[tokio::test]
+    async fn a_view_move_holds_the_timer_and_the_next_member_publishes_in_its_turn() {
+        use quil_execution::global_intrinsic::handoff;
+        use std::time::{Duration, Instant};
+        handoff::set_seal_drain_frame_for_thread(Some(0));
+        handoff::set_seal_recovery_frame_for_thread(Some(0));
+        let members = 4;
+        let (global, id, mut engines) = sealed_drain_committee(members);
+        let logs = crate::outage::test_logs::CapturedLogs::default();
+        let _guard = logs.install();
+        let counts = |engines: &[SealMember]| {
+            engines
+                .iter()
+                .map(|(_, sent)| sent.lock().unwrap().len())
+                .collect::<Vec<_>>()
+        };
+        let triggered = |trigger: &str| {
+            logs.lines_with("closing certificate waits for GLOBAL")
+                .iter()
+                .filter(|line| {
+                    line.contains(&format!("trigger=\"{trigger}\""))
+                        || line.contains(&format!("trigger={trigger}"))
+                })
+                .count()
+        };
+        for (engine, _) in engines.iter_mut() {
+            engine.maintain_committee_session().await;
+        }
+        let mut expected = vec![1; members];
+        assert_eq!(
+            counts(&engines),
+            expected,
+            "every member publishes the first part"
+        );
+        let timer_copies = triggered("timer");
+        assert_eq!(timer_copies, members);
+        // Every member's copy is past the resubmission timer (60-89 s) when
+        // GLOBAL executes frames 1-8.
+        let long_ago = Instant::now() - Duration::from_secs(120);
+        for (engine, _) in engines.iter_mut() {
+            engine.seal_published_at = Some(long_ago);
+        }
+        execute_drain_part(&global, &id, 8, 2);
+        for (engine, _) in engines.iter_mut() {
+            engine.maintain_committee_session().await;
+        }
+        let head = (8 / handoff::MAX_DRAIN_HEADERS) % members;
+        let second = (head + 1) % members;
+        expected[head] += 1;
+        assert_eq!(
+            counts(&engines),
+            expected,
+            "the head of the line publishes at once; the view move holds the others' timers"
+        );
+        assert_eq!(triggered("view_moved"), 1);
+        assert_eq!(triggered("timer"), timer_copies);
+        // 20 s after the move: the second member's turn. The third (40 s)
+        // and the fourth (60 s) wait, and so do their timers.
+        for (engine, _) in engines.iter_mut() {
+            engine.seal_follow.backdate(crate::seal_follow::FOLLOW_STEP);
+        }
+        for (engine, _) in engines.iter_mut() {
+            engine.maintain_committee_session().await;
+        }
+        expected[second] += 1;
+        assert_eq!(
+            counts(&engines),
+            expected,
+            "member {second}'s turn came 20 s after the move, and only its"
+        );
+        assert_eq!(triggered("view_moved"), 2);
+        let last = engines[second].1.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(drained_frames(&last), (9..=16).collect::<Vec<_>>());
+        // 100 s after every member's last publish and 30 s after the move:
+        // the two members whose view stays on the part they published
+        // republish on the timer; the two whose view moved 30 s ago hold.
+        let long_ago = Instant::now() - Duration::from_secs(100);
+        for (engine, _) in engines.iter_mut() {
+            engine.seal_published_at = Some(long_ago);
+            engine.seal_follow.backdate(Duration::from_secs(10));
+        }
+        for (engine, _) in engines.iter_mut() {
+            engine.maintain_committee_session().await;
+        }
+        expected[head] += 1;
+        expected[second] += 1;
+        assert_eq!(
+            counts(&engines),
+            expected,
+            "the timer counts from the last publish or view move, whichever is later"
+        );
+        assert_eq!(triggered("timer"), timer_copies + 2);
+        assert_eq!(triggered("view_moved"), 2);
+        handoff::set_seal_recovery_frame_for_thread(None);
+        handoff::set_seal_drain_frame_for_thread(None);
+    }
 }
 
 /// Frames peers publish on the shard's frame topic: queued apart, prepared

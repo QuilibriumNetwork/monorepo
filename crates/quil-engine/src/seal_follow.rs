@@ -92,6 +92,15 @@ impl SealFollow {
         };
         now.saturating_duration_since(since) >= turn(tip, rank, members)
     }
+
+    /// Move the recorded view move `by` into the past, as if the view had
+    /// moved that much earlier.
+    #[cfg(test)]
+    pub(crate) fn backdate(&mut self, by: Duration) {
+        if let Some((_, at)) = self.moved.as_mut() {
+            *at = at.checked_sub(by).expect("an instant that far back");
+        }
+    }
 }
 
 /// How long the member at `rank` of `members` waits, after its view shows
