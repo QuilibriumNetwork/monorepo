@@ -61,6 +61,15 @@ fn format_claimable_rewards(result: anyhow::Result<Option<(u128, u64)>>) -> Stri
 /// `(total, unshielded, shielded)`, or `None` without an Ed448 identity.
 pub(super) fn format_legacy_coins(result: anyhow::Result<Option<(u128, usize, usize)>>) -> String {
     match result {
+        // The listing answered with nothing: distinct from no answer.
+        Ok(Some((_, 0, 0))) => {
+            "Unshielded legacy coins: none (the listing has no coin under this identity's key or \
+             peer-id owner)"
+                .into()
+        }
+        Ok(Some((_, 0, shielded))) => {
+            format!("Unshielded legacy coins: none left ({shielded} already shielded)")
+        }
         Ok(Some((total, unshielded, shielded))) => format!(
             "Unshielded legacy coins: {} QUIL ({total} base units) across {unshielded} coins ({shielded} already shielded)",
             quil_amount(total)

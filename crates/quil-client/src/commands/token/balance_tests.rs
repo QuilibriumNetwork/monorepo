@@ -197,6 +197,16 @@ fn balance_lines_show_a_missing_root_as_no_coins_and_failures_with_their_reason(
         format_legacy_coins(Ok(None)),
         "Unshielded legacy coins: none (this node has no Ed448 identity)"
     );
+    // An empty listing is an answer, apart from "unavailable".
+    assert_eq!(
+        format_legacy_coins(Ok(Some((0, 0, 0)))),
+        "Unshielded legacy coins: none (the listing has no coin under this identity's key or \
+         peer-id owner)"
+    );
+    assert_eq!(
+        format_legacy_coins(Ok(Some((0, 0, 3)))),
+        "Unshielded legacy coins: none left (3 already shielded)"
+    );
     assert_eq!(
         format_legacy_coins(Err(anyhow::anyhow!(
             "legacy coins: no archive answered for legacy coins"

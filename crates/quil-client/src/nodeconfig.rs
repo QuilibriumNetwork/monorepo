@@ -61,25 +61,90 @@ pub fn default_node_config_dir(network_override: Option<&str>) -> anyhow::Result
 /// - `"default"` or empty → resolve via `default_node_config_dir`
 /// - an explicit path → loaded directly
 ///
-/// Port of `LoadNodeConfig` / `LoadDefaultNodeConfig`.
+/// Port of `LoadNodeConfig` / `LoadDefaultNodeConfig`, except that a
+/// directory without `config.yml` is refused rather than given a fresh
+/// config: that config would carry a new identity, and a client command
+/// reading it would report on that identity instead of the node's. Only
+/// `node config create` and the node itself create configs.
 pub fn load_node_config(
     config_directory: &str,
     network_override: Option<&str>,
 ) -> anyhow::Result<(Config, PathBuf)> {
-    let dir = if config_directory.is_empty() || config_directory == "default" {
-        default_node_config_dir(network_override)?
-    } else {
+    let explicit = !(config_directory.is_empty() || config_directory == "default");
+    let dir = if explicit {
         PathBuf::from(config_directory)
+    } else {
+        default_node_config_dir(network_override)?
     };
-    let cfg = quil_config::load_config(&dir)
-        .map_err(|e| anyhow::anyhow!("load node config {}: {}", dir.display(), e))?;
+    let cfg = load_existing_node_config(&dir, explicit)?;
     Ok((cfg, dir))
+}
+
+/// The node config in `dir`, which must already hold `config.yml`: nothing
+/// is created. `explicit` says whether the operator named `dir` (`--config`)
+/// or it was resolved by default, for the refusal's advice.
+pub fn load_existing_node_config(dir: &Path, explicit: bool) -> anyhow::Result<Config> {
+    if !dir.join("config.yml").is_file() {
+        if explicit {
+            anyhow::bail!(
+                "{} holds no config.yml: pass the node's config directory, the one holding \
+                 config.yml (usually .config in the node directory). qclient creates no config \
+                 here: a new config would carry a new identity",
+                dir.display()
+            );
+        }
+        anyhow::bail!(
+            "the default node config directory {} holds no config.yml: start the node once, \
+             run `qclient node config create`, or pass --config with the node's config directory",
+            dir.display()
+        );
+    }
+    quil_config::load_config(dir)
+        .map_err(|e| anyhow::anyhow!("load node config {}: {}", dir.display(), e))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    /// A directory without config.yml is refused, and nothing is created in
+    /// it or for it: a fresh config would carry a new identity.
+    #[test]
+    fn a_config_directory_without_config_yml_is_refused_and_left_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = tmp.path().join("node").join(".config");
+        let error = load_node_config(absent.to_str().unwrap(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("holds no config.yml"), "{error}");
+        assert!(!absent.exists(), "the missing directory was created");
+        assert!(!tmp.path().join("node").exists());
+
+        let empty = tmp.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        assert!(load_node_config(empty.to_str().unwrap(), None).is_err());
+        assert_eq!(
+            fs::read_dir(&empty).unwrap().count(),
+            0,
+            "files were created"
+        );
+        let error = load_existing_node_config(&empty, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("default node config directory"), "{error}");
+
+        // An existing config still loads.
+        fs::write(
+            empty.join("config.yml"),
+            "listenGrpcMultiaddr: /ip4/127.0.0.1/tcp/8888\n",
+        )
+        .unwrap();
+        let (config, dir) = load_node_config(empty.to_str().unwrap(), None).unwrap();
+        assert_eq!(dir, empty);
+        assert_eq!(config.listen_grpc_multiaddr, "/ip4/127.0.0.1/tcp/8888");
+        assert_eq!(fs::read_dir(&empty).unwrap().count(), 1);
+    }
 
     #[test]
     fn has_node_config_files_requires_both() {
