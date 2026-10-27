@@ -1378,18 +1378,26 @@ impl WorkerAllocator {
     }
 
     /// Whether a join proposed at `pending_frame` (included at the next
-    /// frame) may still appear with the next registry sync. A sync anchors
-    /// at the frame before its begin frame.
+    /// frame) may still appear with the next registry sync, holding its
+    /// worker for at most `PROPOSAL_SYNC_CEILING_FRAMES`.
     fn join_awaits_registry_sync(&self, pending_frame: u64, frame_number: u64) -> bool {
         pending_frame > 0
-            && self
-                .pending_joins_await_sync
-                .load(std::sync::atomic::Ordering::SeqCst)
             && frame_number <= pending_frame + PROPOSAL_SYNC_CEILING_FRAMES
+            && self.registry_may_lack_join(pending_frame)
+    }
+
+    /// Whether the registry may still lack a join proposed at
+    /// `proposed_frame` (included at the next frame): on a node whose
+    /// registry shows a landed join only after a prover-tree sync, no sync
+    /// begun after the inclusion has refreshed it yet. A sync anchors at the
+    /// frame before its begin frame.
+    pub(crate) fn registry_may_lack_join(&self, proposed_frame: u64) -> bool {
+        self.pending_joins_await_sync
+            .load(std::sync::atomic::Ordering::SeqCst)
             && self
                 .registry_synced_from_frame
                 .load(std::sync::atomic::Ordering::SeqCst)
-                <= pending_frame + 1
+                <= proposed_frame + 1
     }
 
     /// Clear the pending-join marker of a worker still idle after the bind
