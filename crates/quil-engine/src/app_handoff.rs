@@ -169,7 +169,15 @@ pub fn still_current(global: &Arc<HypergraphCrdt>, session: &Session) -> Result<
 /// allocation is already Leaving, Kicked or reassigned is still part of the
 /// quorum that must finalize frames and, eventually, the seal. (Otherwise a
 /// shard can lose its whole closing committee to voluntary leaves.)
-pub fn retains_worker(global: &Arc<HypergraphCrdt>, filter: &[u8], member: &[u8]) -> bool {
+///
+/// `None` while a GLOBAL state sync withholds the committed view between its
+/// chunks (every few minutes, for seconds): the wait says nothing about the
+/// session, so whether it retains the worker is unknown, not "no".
+pub fn worker_retention(
+    global: &Arc<HypergraphCrdt>,
+    filter: &[u8],
+    member: &[u8],
+) -> Option<bool> {
     let check = || -> Result<bool> {
         let view = CommittedView::capture(global)?;
         let Some(session) = handoff::head(&view, filter)? else {
@@ -185,13 +193,11 @@ pub fn retains_worker(global: &Arc<HypergraphCrdt>, filter: &[u8], member: &[u8]
         })
     };
     match check() {
-        Ok(retain) => retain,
-        // A GLOBAL state sync between chunks withholds the view for a while;
-        // it says nothing about the session, so keep a possibly hosting member.
-        Err(error) if handoff::global_sync_in_progress(&error) => true,
+        Ok(retain) => Some(retain),
+        Err(error) if handoff::global_sync_in_progress(&error) => None,
         // No authenticated GLOBAL state yet: this node cannot be running a
         // session host (startup needs the same snapshot), so nothing is closing.
-        Err(QuilError::ExecutionUnavailable(_)) => false,
+        Err(QuilError::ExecutionUnavailable(_)) => Some(false),
         // A store or decoding failure says nothing about the session: do not
         // release a possibly closing member on it.
         // Once a minute at most: the reconcile asks every frame, and the
@@ -216,9 +222,16 @@ pub fn retains_worker(global: &Arc<HypergraphCrdt>, filter: &[u8], member: &[u8]
                 tracing::warn!(filter = hex::encode(filter), %error,
                     "committee authorization unreadable; retaining the worker (repeats at most once a minute)");
             }
-            true
+            Some(true)
         }
     }
+}
+
+/// [`worker_retention`] for a caller that only withholds a release or a
+/// removal: while a GLOBAL state sync withholds the view, a possibly hosting
+/// member is kept.
+pub fn retains_worker(global: &Arc<HypergraphCrdt>, filter: &[u8], member: &[u8]) -> bool {
+    worker_retention(global, filter, member).unwrap_or(true)
 }
 
 /// Of `filters`, those whose head session counts `member` and is not closed:
@@ -2985,6 +2998,11 @@ mod successor_tests {
             retains_worker(&global, &filter, &member),
             "the member keeps its worker while the sync installs"
         );
+        assert_eq!(
+            worker_retention(&global, &filter, &member),
+            None,
+            "whether the session retains it is unknown meanwhile"
+        );
 
         let rest: Vec<_> = plan.remaining().iter().map(blob).collect();
         global.apply_sync_chunk(&mut plan, &rest).unwrap();
@@ -2992,6 +3010,7 @@ mod successor_tests {
         let view = CommittedView::capture(&global).unwrap();
         assert!(handoff::head(&view, &filter).unwrap().is_none());
         assert!(!retains_worker(&global, &filter, &member));
+        assert_eq!(worker_retention(&global, &filter, &member), Some(false));
     }
 
     /// A member whose cursor is at its predecessor's sealed checkpoint, with

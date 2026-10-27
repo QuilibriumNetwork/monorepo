@@ -1751,16 +1751,27 @@ impl WorkerAllocator {
             .clone();
         let local_public_key = prover_info.as_ref().map(|p| p.public_key.clone());
         for worker in &workers {
-            // Retention only withholds a RELEASE below. Everything else in this
-            // pass (notably starting the engine once the allocation is Active)
-            // must still run for a retained worker.
-            let retained = match (session_authority.as_ref(), local_public_key.as_ref()) {
+            // Whether the worker's committee session retains it: unknown while
+            // a GLOBAL state sync withholds the committed view.
+            let retention = match (session_authority.as_ref(), local_public_key.as_ref()) {
                 (Some(global), Some(member)) if !worker.filter.is_empty() => {
-                    crate::app_handoff::retains_worker(global, &worker.filter, member)
+                    crate::app_handoff::worker_retention(global, &worker.filter, member)
                 }
-                _ => false,
-            } || (!worker.filter.is_empty()
-                && self.owes_storage_settlement(&worker.filter, frame_number));
+                _ => Some(false),
+            };
+            let settling = !worker.filter.is_empty()
+                && self.owes_storage_settlement(&worker.filter, frame_number);
+            // Retention only withholds a RELEASE below, and so does an unknown
+            // view. Everything else in this pass (notably starting the engine
+            // once the allocation is Active) must still run for a retained
+            // worker.
+            let retained = retention.unwrap_or(true) || settling;
+            // A retained worker runs consensus. An unknown view neither starts
+            // nor stops its engine: it keeps the worker's current state. Read
+            // as retained, it started the engine of a worker whose allocation
+            // was still Joining at every sync and stopped it after, and each
+            // restart withdrew the engine's queued recovery claim.
+            let runs_consensus = retention.unwrap_or(worker.allocated) || settling;
             if worker.filter.is_empty() {
                 // Idle worker: an expired pending-join marker is swept after
                 // the bind pass below (`expire_unlanded_join_markers`), so a
@@ -1851,7 +1862,7 @@ impl WorkerAllocator {
                     // A retained worker runs consensus whatever its allocation
                     // says: after a restart its engine must start again even
                     // though the allocation is Leaving or terminal.
-                    let mut desired_allocated = retained
+                    let mut desired_allocated = runs_consensus
                         || matches!(
                             alloc.status,
                             ProverStatus::Active | ProverStatus::Paused | ProverStatus::Leaving
@@ -1935,22 +1946,23 @@ impl WorkerAllocator {
                             // explicitly asked to leave, forever.
                             if alloc.effective_status(frame_number)
                                 == quil_types::consensus::EffectiveStatus::ExpiredLeaving
-                                && !retained
                             {
-                                desired_allocated = false;
-                                info!(
-                                    core_id = worker.core_id,
-                                    filter = hex::encode(&worker.filter),
-                                    leave_frame = alloc.leave_frame_number,
-                                    "leave expired after 720 frames, clearing worker"
-                                );
-                                self.release_worker(worker, retained)?;
+                                desired_allocated = runs_consensus;
+                                if !retained {
+                                    info!(
+                                        core_id = worker.core_id,
+                                        filter = hex::encode(&worker.filter),
+                                        leave_frame = alloc.leave_frame_number,
+                                        "leave expired after 720 frames, clearing worker"
+                                    );
+                                    self.release_worker(worker, retained)?;
+                                }
                             }
                         }
                         _ => {}
                     }
 
-                    let desired_allocated = desired_allocated || retained;
+                    let desired_allocated = desired_allocated || runs_consensus;
                     // Plumb desired_allocated → WorkerInfo.allocated.
                     // The lifecycle layer reads this for
                     // unallocatedWorkerCount → decide_joins
@@ -3834,6 +3846,220 @@ mod tests {
         }
         assert_eq!(wm.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(wm.range_workers().unwrap()[0].allocated);
+    }
+
+    /// The shared mock, recording engine starts and allocated marks, and
+    /// keeping the mark as the production managers do.
+    #[derive(Default)]
+    struct StartRecordingWorkers {
+        inner: MockWorkerManager,
+        starts: std::sync::Mutex<Vec<u32>>,
+        marked: std::sync::Mutex<Vec<u32>>,
+    }
+
+    impl WorkerManager for StartRecordingWorkers {
+        fn set_worker_filter(
+            &self,
+            core_id: u32,
+            filter: &[u8],
+            start_consensus: bool,
+        ) -> Result<()> {
+            if start_consensus && !filter.is_empty() {
+                self.starts.lock().unwrap().push(core_id);
+            }
+            self.inner
+                .set_worker_filter(core_id, filter, start_consensus)
+        }
+        fn deallocate_worker(&self, core_id: u32) -> Result<()> {
+            self.inner.deallocate_worker(core_id)
+        }
+        fn check_workers_connected(&self) -> Result<Vec<u32>> {
+            self.inner.check_workers_connected()
+        }
+        fn range_workers(&self) -> Result<Vec<crate::worker::WorkerInfo>> {
+            self.inner.range_workers()
+        }
+        fn respawn_worker(&self, core_id: u32, filter: &[u8]) -> Result<()> {
+            self.inner.respawn_worker(core_id, filter)
+        }
+        fn set_pending_filter_frame(&self, core_id: u32, frame: u64) -> Result<()> {
+            self.inner.set_pending_filter_frame(core_id, frame)
+        }
+        fn set_allocated(&self, core_id: u32, allocated: bool) -> Result<()> {
+            if allocated {
+                self.marked.lock().unwrap().push(core_id);
+            }
+            let workers = self.inner.range_workers()?;
+            if let Some(worker) = workers.into_iter().find(|w| w.core_id == core_id) {
+                self.inner.add(crate::worker::WorkerInfo {
+                    allocated,
+                    ..worker
+                });
+            }
+            Ok(())
+        }
+    }
+
+    /// While an archive state sync of GLOBAL installs its chunks (every few
+    /// minutes, for seconds), the committed view is withheld, and whether a
+    /// committee session retains a worker is unknown. The reconcile read
+    /// that as retained: it marked the worker of a pending join allocated
+    /// and started its engine, stopped it once the sync was in, and started
+    /// it again at the next sync; each restart withdrew the engine's queued
+    /// recovery claim. An unknown view starts no engine and releases no
+    /// worker; once the view is back, seats nothing retains are released.
+    #[test]
+    fn reproduces_joining_worker_started_during_global_sync() {
+        use quil_execution::global_intrinsic::handoff::{global_sync_in_progress, CommittedView};
+        use quil_execution::hypergraph_state::HypergraphState;
+
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        global.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
+        let state = HypergraphState::new(global.clone());
+        state.commit().unwrap();
+        state.abort();
+        let cursor = quil_store::encoding::global_materialized_cursor_key();
+        global.commit_with_global_cursor(1, &cursor).unwrap();
+
+        let frame = epoch_length_frames() + 100;
+        let (joining, kicked, left) = (vec![0x01; 32], vec![0x02; 32], vec![0x03; 32]);
+        // A join proposed in this epoch, a seat that ended and a leave that
+        // departed at the boundary.
+        let pending = ProverAllocationInfo {
+            status: ProverStatus::Joining,
+            join_frame_number: frame - 1,
+            join_confirm_frame_number: 0,
+            ..make_alloc(joining.clone())
+        };
+        let ended = ProverAllocationInfo {
+            status: ProverStatus::Kicked,
+            ..make_alloc(kicked.clone())
+        };
+        let departed = ProverAllocationInfo {
+            status: ProverStatus::Leaving,
+            leave_frame_number: 1,
+            leave_confirm_frame_number: 1,
+            ..make_alloc(left.clone())
+        };
+        let wm = Arc::new(StartRecordingWorkers::default());
+        // The pending join's worker is bound without an engine; the ended
+        // seat's engine runs, the departed seat's does not.
+        wm.inner.set_worker_filter(1, &joining, false).unwrap();
+        wm.inner.set_worker_filter(2, &kicked, true).unwrap();
+        wm.inner.set_worker_filter(3, &left, false).unwrap();
+        let prover = ProverInfo {
+            public_key: vec![0xBB; 74],
+            address: vec![0xAA; 32],
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: vec![pending, ended, departed],
+            available_storage: 0,
+            seniority: 0,
+            delegate_address: vec![],
+        };
+        let alloc = WorkerAllocator::new(
+            wm.clone(),
+            Arc::new(TestProverRegistry::with_prover(prover)),
+            vec![0xAA; 32],
+        );
+        alloc.set_session_authority(global.clone());
+        let workers = |wm: &StartRecordingWorkers| -> Vec<(u32, Vec<u8>, bool)> {
+            wm.range_workers()
+                .unwrap()
+                .into_iter()
+                .map(|w| (w.core_id, w.filter, w.allocated))
+                .collect()
+        };
+
+        // An archive state sync of GLOBAL has installed its first chunk only.
+        let address = [0xff; 32];
+        let archive = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        for byte in 1..=3u8 {
+            let location = quil_hypergraph::Location {
+                app_address: address,
+                data_address: [byte; 32],
+            };
+            archive.add_vertex(&location, &[byte; 48]).unwrap();
+        }
+        archive.commit(1).unwrap();
+        let (version, root) = archive.serve_forest_head(&address, 0).unwrap();
+        let reader = quil_hypergraph::testing::CrdtTreeReader {
+            source: archive,
+            shard_id: address.to_vec(),
+            phase: 0,
+        };
+        let mut plan = global
+            .prepare_phase_sync(
+                &reader,
+                version,
+                &address,
+                0,
+                &[],
+                Some(quil_forest::SubtreeSyncAnchor::AppRoot(root)),
+            )
+            .unwrap();
+        let blob = |(key, leaf): &([u8; 32], Option<Vec<u8>>)| {
+            if leaf.is_some() {
+                vec![key[0]; 48]
+            } else {
+                Vec::new()
+            }
+        };
+        let first = vec![blob(&plan.remaining()[0])];
+        global.apply_sync_chunk(&mut plan, &first).unwrap();
+        assert!(!plan.remaining().is_empty());
+        let error = CommittedView::capture(&global)
+            .err()
+            .expect("no committed view between a sync's chunks");
+        assert!(global_sync_in_progress(&error), "{error}");
+
+        for at in [frame, frame + 1] {
+            alloc.on_new_frame(at).unwrap();
+        }
+        assert_eq!(
+            *wm.starts.lock().unwrap(),
+            Vec::<u32>::new(),
+            "no engine starts while the sync withholds the view"
+        );
+        assert_eq!(
+            *wm.marked.lock().unwrap(),
+            Vec::<u32>::new(),
+            "no worker is marked allocated while the sync withholds the view"
+        );
+        assert_eq!(
+            workers(&wm),
+            vec![
+                (1, joining.clone(), false),
+                (2, kicked.clone(), true),
+                (3, left.clone(), false),
+            ],
+            "the view withheld, every worker keeps its binding and engine state"
+        );
+
+        // The sync is in: nothing retains the ended seats any more.
+        let rest: Vec<_> = plan.remaining().iter().map(blob).collect();
+        global.apply_sync_chunk(&mut plan, &rest).unwrap();
+        assert_eq!(global.finish_phase_sync(&plan).unwrap(), root);
+        alloc.on_new_frame(frame + 2).unwrap();
+        assert_eq!(*wm.starts.lock().unwrap(), Vec::<u32>::new());
+        assert_eq!(
+            workers(&wm),
+            vec![
+                (1, joining, false),
+                (2, Vec::new(), false),
+                (3, Vec::new(), false),
+            ]
+        );
     }
 
     #[test]
