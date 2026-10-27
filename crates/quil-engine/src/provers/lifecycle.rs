@@ -10448,6 +10448,112 @@ mod proposal_loop_tests {
         assert_eq!(count_confirms(&actions).len(), 1, "{actions:?}");
     }
 
+    /// A pending join is confirmed or rejected in the epoch after it was
+    /// proposed, and confirmations are capped at the workers not allocated.
+    /// While an archive state sync of GLOBAL withheld the committed view, the
+    /// allocator marked the worker bound to a pending join allocated, so the
+    /// cap left no worker for the join and the node rejected its own join.
+    #[test]
+    fn reproduces_own_join_rejected_during_global_sync() {
+        use quil_execution::global_intrinsic::handoff::{global_sync_in_progress, CommittedView};
+        use quil_execution::hypergraph_state::HypergraphState;
+
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        global.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
+        let state = HypergraphState::new(global.clone());
+        state.commit().unwrap();
+        state.abort();
+        let cursor = quil_store::encoding::global_materialized_cursor_key();
+        global.commit_with_global_cursor(1, &cursor).unwrap();
+
+        let address = vec![0xCDu8; 32];
+        let joining = filter_bytes(0xA1);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(WorkerInfo {
+            filter: joining.clone(),
+            ..idle_worker(1)
+        });
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(
+            address.clone(),
+            vec![alloc(joining.clone(), ProverStatus::Joining, 50)],
+        ));
+        reg.set_summaries(vec![shard_summary(joining.clone(), 1)]);
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.allocator.set_session_authority(global.clone());
+        lifecycle.set_prover_root_verified_frame(800);
+
+        // An archive state sync of GLOBAL has installed its first chunk only.
+        let archive_address = [0xff; 32];
+        let archive = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        for byte in 1..=3u8 {
+            let location = quil_hypergraph::Location {
+                app_address: archive_address,
+                data_address: [byte; 32],
+            };
+            archive.add_vertex(&location, &[byte; 48]).unwrap();
+        }
+        archive.commit(1).unwrap();
+        let (version, root) = archive.serve_forest_head(&archive_address, 0).unwrap();
+        let reader = quil_hypergraph::testing::CrdtTreeReader {
+            source: archive,
+            shard_id: archive_address.to_vec(),
+            phase: 0,
+        };
+        let mut plan = global
+            .prepare_phase_sync(
+                &reader,
+                version,
+                &archive_address,
+                0,
+                &[],
+                Some(quil_forest::SubtreeSyncAnchor::AppRoot(root)),
+            )
+            .unwrap();
+        let (key, leaf) = plan.remaining()[0].clone();
+        global
+            .apply_sync_chunk(
+                &mut plan,
+                &[if leaf.is_some() {
+                    vec![key[0]; 48]
+                } else {
+                    Vec::new()
+                }],
+            )
+            .unwrap();
+        assert!(!plan.remaining().is_empty());
+        let error = CommittedView::capture(&global)
+            .err()
+            .expect("the view is withheld");
+        assert!(global_sync_in_progress(&error), "{error}");
+
+        // Epoch 1: the epoch-0 join is in its confirm slot.
+        lifecycle.allocator.on_new_frame(800).unwrap();
+        let actions = lifecycle
+            .evaluate(800, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        assert!(
+            !count_reject_filters(&actions).contains(&joining),
+            "the node must not reject its own join for want of the worker bound to it: {actions:?}"
+        );
+        assert!(count_confirms(&actions).contains(&joining), "{actions:?}");
+        assert!(!wm.range_workers().unwrap()[0].allocated);
+    }
+
     /// After the worker count is lowered, the surplus leave the node proposes
     /// is confirmed even with no better shard to go to. Without a reduction
     /// the same leave still goes through the score rule and is rejected.
