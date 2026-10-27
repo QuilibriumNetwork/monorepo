@@ -15,6 +15,12 @@
 //! leaves it installed, and the engine's own installation of a checkpoint
 //! runs after the turn is released. A recovery that handed its turn back
 //! takes at most every other turn while others wait ([`TurnQueue::next`]).
+//! A claim withdrawn while it waits because its worker's engine stopped
+//! leaves its place to the same core's next claim of the same shard, which
+//! queues there rather than behind every claim that arrived meanwhile: an
+//! engine restarts on its seat at its activation, around a GLOBAL sync or
+//! at an operator's action. The place serves one claim, and lapses
+//! [`place_kept_for`] after its first withdrawal since its last turn.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,6 +65,18 @@ const SATURATED_REPEAT: Duration = Duration::from_secs(10 * 60);
 
 /// How often a waiting worker re-evaluates saturation while no turn moves.
 const SATURATION_TICK: Duration = Duration::from_secs(60);
+
+/// How long a withdrawn claim's place waits for its worker's next claim of
+/// the shard ([`State::keep_place`]): an epoch of wall time from its first
+/// withdrawal since the place last got a turn. An engine restarts within
+/// seconds to minutes; on an operator's node the engine of a seat it kept
+/// restarted seven times in 81 minutes while its recovery waited.
+fn place_kept_for() -> Duration {
+    Duration::from_millis(
+        quil_types::consensus::epoch_length_frames()
+            .saturating_mul(crate::difficulty::IDEAL_FRAME_TIME.unsigned_abs()),
+    )
+}
 
 pub(crate) static SHARD_RECOVERY_TURNS: RecoveryTurns = RecoveryTurns::new(RECOVERY_TURNS);
 
@@ -451,14 +469,75 @@ struct Logged {
     overruns: Vec<(HolderView, usize)>,
 }
 
+/// The place of a claim withdrawn while it waited ([`Queued`]), kept for
+/// its core's next claim of the shard.
+#[derive(Debug)]
+struct KeptPlace {
+    core: u32,
+    filter: Vec<u8>,
+    ticket: u64,
+    /// Its first withdrawal since it last got a turn.
+    since: Instant,
+}
+
 struct State {
     queue: TurnQueue<oneshot::Sender<()>>,
     saturation: Saturation,
     holders: Vec<Holder>,
     next_holder: u64,
+    /// Places of withdrawn claims, at most one per core and shard.
+    kept: Vec<KeptPlace>,
 }
 
 impl State {
+    /// Keep `ticket`, the place of `core`'s withdrawn claim of `filter`,
+    /// first withdrawn at `since`, for the core's next claim of the shard
+    /// ([`Self::take_place`]), unless [`place_kept_for`] has passed since
+    /// then. Of two places of one core and shard, the earlier stays.
+    fn keep_place(&mut self, core: u32, filter: &[u8], ticket: u64, since: Instant, now: Instant) {
+        let lasts = place_kept_for();
+        self.kept
+            .retain(|kept| now.saturating_duration_since(kept.since) < lasts);
+        if now.saturating_duration_since(since) >= lasts {
+            return;
+        }
+        match self
+            .kept
+            .iter_mut()
+            .find(|kept| kept.core == core && kept.filter == filter)
+        {
+            Some(kept) => {
+                kept.ticket = kept.ticket.min(ticket);
+                kept.since = kept.since.min(since);
+            }
+            None => self.kept.push(KeptPlace {
+                core,
+                filter: filter.to_vec(),
+                ticket,
+                since,
+            }),
+        }
+    }
+
+    /// The place kept for `core`'s claim of `filter`, with its first
+    /// withdrawal; it serves this claim only. A place the core kept for
+    /// another shard lapses: its worker serves this one now.
+    fn take_place(&mut self, core: u32, filter: &[u8], now: Instant) -> Option<(u64, Instant)> {
+        let lasts = place_kept_for();
+        let mut taken = None;
+        self.kept.retain(|kept| {
+            let current = now.saturating_duration_since(kept.since) < lasts;
+            if kept.core != core {
+                return current;
+            }
+            if current && kept.filter == filter {
+                taken = Some((kept.ticket, kept.since));
+            }
+            false
+        });
+        taken
+    }
+
     /// Re-evaluate saturation and the holders after a queue change or a tick
     /// at `now`. A turn held past [`overdue_after`] is warned about once,
     /// while workers wait for it.
@@ -540,13 +619,20 @@ impl Drop for Turn<'_> {
 }
 
 /// A queued request for a turn; dropped unanswered, it leaves the queue,
-/// and dropped answered, it passes the turn on.
+/// its place kept for its core's next claim of the shard, and dropped
+/// answered, it passes the turn on.
 struct Queued<'a> {
     turns: &'a RecoveryTurns,
     id: u64,
     granted: oneshot::Receiver<()>,
     /// The turn was received and is now held by a [`Turn`].
     taken: bool,
+    core: u32,
+    filter: Vec<u8>,
+    ticket: u64,
+    /// The first withdrawal of the place it took back, if it did
+    /// ([`State::take_place`]).
+    kept_since: Option<Instant>,
 }
 
 impl Drop for Queued<'_> {
@@ -556,8 +642,13 @@ impl Drop for Queued<'_> {
         }
         let (withdrawn, logged) = {
             let mut state = self.turns.lock();
+            let now = Instant::now();
             let withdrawn = state.queue.withdraw(self.id);
-            (withdrawn, state.observe(Instant::now()))
+            if withdrawn {
+                let since = self.kept_since.unwrap_or(now);
+                state.keep_place(self.core, &self.filter, self.ticket, since, now);
+            }
+            (withdrawn, state.observe(now))
         };
         self.turns.log(logged);
         if !withdrawn && self.granted.try_recv().is_ok() {
@@ -575,6 +666,7 @@ impl RecoveryTurns {
                 saturation: Saturation::new(),
                 holders: Vec::new(),
                 next_holder: 0,
+                kept: Vec::new(),
             }),
         }
     }
@@ -591,7 +683,9 @@ impl RecoveryTurns {
 
     /// Wait for a turn. Replays go before checkpoint installs, and a worker
     /// whose successor-blocked, re-anchor or lagging-voter flag is set when
-    /// a turn frees up before others of its kind ([`Waiter::rank`]).
+    /// a turn frees up before others of its kind ([`Waiter::rank`]). A new
+    /// arrival takes the place its core's withdrawn claim of the shard left,
+    /// if one is kept ([`State::take_place`]).
     pub(crate) async fn acquire(&self, claim: Claim) -> Turn<'_> {
         let priority = Priority {
             blocked: claim.execution.successor_blocked_flag(),
@@ -600,26 +694,43 @@ impl RecoveryTurns {
             replay: claim.kind == RecoveryKind::Replay,
         };
         let (grant, granted) = oneshot::channel();
-        let (mut queued, logged, ticket) = {
+        let (core, filter) = (claim.core, claim.filter.clone());
+        let (mut queued, logged, ticket, kept) = {
             let mut state = self.lock();
             let now = Instant::now();
+            let kept = match claim.ticket {
+                Some(_) => None,
+                None => state.take_place(core, &filter, now),
+            };
+            let place = claim.ticket.or(kept.map(|(ticket, _)| ticket));
             match state
                 .queue
-                .take_or_requeue(priority, claim.core, claim.ticket, now, grant)
+                .take_or_requeue(priority, core, place, now, grant)
             {
-                (ticket, Ok(())) => return self.hold(&mut state, claim, ticket, now),
+                (ticket, Ok(())) => {
+                    let turn = self.hold(&mut state, claim, ticket, now);
+                    drop(state);
+                    log_kept_place(core, &filter, kept);
+                    return turn;
+                }
                 (ticket, Err(id)) => (
                     Queued {
                         turns: self,
                         id,
                         granted,
                         taken: false,
+                        core,
+                        filter: filter.clone(),
+                        ticket,
+                        kept_since: kept.map(|(_, since)| since),
                     },
                     state.observe(now),
                     ticket,
+                    kept,
                 ),
             }
         };
+        log_kept_place(core, &filter, kept);
         self.log(logged);
         // The sender is dropped only after it granted the turn.
         while tokio::time::timeout(SATURATION_TICK, &mut queued.granted)
@@ -659,6 +770,14 @@ impl RecoveryTurns {
             id,
             ticket,
         }
+    }
+
+    /// Keep `ticket`, the place of `core`'s recovery of `filter` that handed
+    /// its turn back and whose engine then stopped, for the core's next claim
+    /// of the shard, as a withdrawn claim's is ([`State::keep_place`]).
+    pub(crate) fn keep_place(&self, core: u32, filter: &[u8], ticket: u64) {
+        let now = Instant::now();
+        self.lock().keep_place(core, filter, ticket, now, now);
     }
 
     fn release(&self) {
@@ -709,6 +828,17 @@ impl RecoveryTurns {
             ),
             None => {}
         }
+    }
+}
+
+/// Name a claim that took back the place its core's withdrawn claim of the
+/// shard left ([`State::take_place`]), with that place's first withdrawal.
+fn log_kept_place(core: u32, filter: &[u8], kept: Option<(u64, Instant)>) {
+    if let Some((_, since)) = kept {
+        tracing::info!(core, filter = %hex::encode(filter),
+            withdrawn_secs = since.elapsed().as_secs(), scope = "this node's worker",
+            "archive recovery queues again in the place its stopped engine's request held: \
+            the shard engine restarted on this core");
     }
 }
 
@@ -1209,6 +1339,72 @@ mod tests {
         assert_eq!(*ran.lock().unwrap(), ["second"]);
         let state = turns.lock();
         assert_eq!((state.queue.free, state.queue.waiters.len()), (1, 0));
+    }
+
+    /// A claim withdrawn as its worker's engine stopped leaves its place to
+    /// the same core's next claim of the same shard, once, and to no other
+    /// core's or shard's claim; the place lapses an epoch of wall time after
+    /// its first withdrawal, though the claims that took it were withdrawn
+    /// in turn, and once the core claims another shard.
+    #[tokio::test(start_paused = true)]
+    async fn a_withdrawn_place_serves_its_own_seat_once_within_an_epoch() {
+        let lasts = place_kept_for();
+        let turns: &'static RecoveryTurns = Box::leak(Box::new(RecoveryTurns::new(1)));
+        let _held = turns.acquire(claim(9, false)).await;
+        let queue = |core: u32, shard: u8| {
+            let mut seat = claim(core, false);
+            seat.filter = vec![shard; 32];
+            tokio::spawn(async move { drop(turns.acquire(seat).await) })
+        };
+        let places = || -> Vec<(u32, u64)> {
+            let state = turns.lock();
+            let waiters = state.queue.waiters.iter();
+            waiters.map(|w| (w.core, w.ticket)).collect()
+        };
+        let withdraw = |task: tokio::task::JoinHandle<()>| async move {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        };
+        let first = queue(1, 1);
+        tokio::task::yield_now().await;
+        assert_eq!(places(), [(1, 1)]);
+        withdraw(first).await;
+        let _other_core = queue(2, 1);
+        tokio::task::yield_now().await;
+        let again = queue(1, 1);
+        tokio::task::yield_now().await;
+        let twice = queue(1, 1);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            places(),
+            [(1, 1), (2, 2), (1, 3)],
+            "taken back once, by its own seat"
+        );
+        // Withdrawn again half an epoch on, it keeps its first withdrawal.
+        tokio::time::advance(lasts / 2).await;
+        withdraw(twice).await;
+        withdraw(again).await;
+        let third = queue(1, 1);
+        tokio::task::yield_now().await;
+        assert_eq!(places(), [(1, 1), (2, 2)]);
+        tokio::time::advance(lasts / 2).await;
+        withdraw(third).await;
+        let fourth = queue(1, 1);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            places(),
+            [(2, 2), (1, 4)],
+            "lapsed an epoch after its first withdrawal"
+        );
+        // The core claims another shard: the place it kept lapses.
+        withdraw(fourth).await;
+        let moved = queue(1, 2);
+        tokio::task::yield_now().await;
+        withdraw(moved).await;
+        let _back = queue(1, 1);
+        tokio::task::yield_now().await;
+        assert_eq!(places(), [(2, 2), (1, 6)]);
+        assert!(turns.lock().kept.is_empty());
     }
 
     /// A turn held past its overdue time while workers wait is warned about once,
