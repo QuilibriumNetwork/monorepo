@@ -3140,9 +3140,7 @@ impl GlobalIntrinsic {
                     "a partial drain carries exactly the most headers a submission may",
                 ));
             }
-            _ if drained == 0 => {
-                return Err(invalid("a partial drain's headers are already executed"))
-            }
+            _ if drained == 0 => return Err(invalid(handoff::superseded::PARTIAL_DRAIN_EXECUTED)),
             _ => false,
         };
         if execute && drained > 0 {
@@ -4086,6 +4084,9 @@ impl GlobalIntrinsic {
         self.sweep_storage_expiries(frame_number, state)?;
         self.reconcile_committee_sessions(frame_number, state)?;
         self.log_local_shard_grid_once_per_epoch(frame_number, state);
+        // Logging only: the stale seal-drain copy summary is written once its
+        // interval ends, also when no further copy arrives.
+        super::handoff::superseded::flush_due(frame_number);
         state.stage_records([quil_types::store::RecordMutation {
             key: DUE_FRAME_KEY.to_vec(),
             value: Some(frame_number.to_be_bytes().to_vec()),

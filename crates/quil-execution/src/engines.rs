@@ -338,6 +338,7 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
                         "seal drain headers need the global intrinsic".into(),
                     )),
                 };
+                handoff::superseded::flush_due(frame_number);
                 if let Err(error) = &verified {
                     if matches!(error, QuilError::InvalidArgument(_)) {
                         let executed =

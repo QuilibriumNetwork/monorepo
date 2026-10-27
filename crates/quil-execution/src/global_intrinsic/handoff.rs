@@ -383,7 +383,8 @@ impl SealSubmission {
 /// Log a seal submission GLOBAL refused, once per seal until its reason
 /// changes or five minutes pass: every closing member resubmits about once a
 /// minute, and the refusal was otherwise invisible (#699). `executed` is the
-/// source frame GLOBAL has executed through.
+/// source frame GLOBAL has executed through. A stale copy of a partial drain
+/// is no failure: it is counted in a summary instead ([`superseded`]).
 pub fn note_refused_seal(
     frame: u64,
     sealed: &SealSubmission,
@@ -397,6 +398,23 @@ pub fn note_refused_seal(
     static LOGGED: LazyLock<Mutex<Logged>> = LazyLock::new(|| Mutex::new(HashMap::new()));
     const QUIET: Duration = Duration::from_secs(300);
     let seal = &sealed.submission.seal;
+    // A stale copy of a partial drain is counted, not logged per seal.
+    if superseded::is_superseded_copy(error) {
+        let last = sealed
+            .drain
+            .last()
+            .and_then(|bytes| super::frame_header::FrameHeader::from_canonical_bytes(bytes).ok());
+        if let (Some(last), Some(executed)) = (last, executed) {
+            superseded::note(
+                frame,
+                &last.address,
+                seal.session,
+                executed,
+                last.frame_number,
+            );
+            return;
+        }
+    }
     let reason = error.to_string();
     let now = Instant::now();
     {
@@ -1945,6 +1963,9 @@ pub mod presence;
 
 #[path = "handoff_exclusion.rs"]
 pub mod exclusion;
+
+#[path = "handoff_superseded.rs"]
+pub mod superseded;
 
 #[cfg(test)]
 #[path = "handoff_tests.rs"]
