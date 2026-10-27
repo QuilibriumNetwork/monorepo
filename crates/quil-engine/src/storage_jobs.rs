@@ -97,6 +97,21 @@ fn run_lane(lane: Vec<u8>, first: Job) {
     }
 }
 
+/// Wait until `lane` has no job running or queued, at most `timeout`: a test
+/// whose job reads its store must not exit while the job runs, or process
+/// exit tears the store down under it.
+#[cfg(test)]
+pub(crate) fn wait_lane_idle(lane: &[u8], timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while lanes().contains_key(lane) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    true
+}
+
 /// Reserve `bytes` for a job's work: waits, behind the reservations asked
 /// for before it, until it fits beside the ones held.
 pub fn reserve(bytes: u64) -> Reservation {
