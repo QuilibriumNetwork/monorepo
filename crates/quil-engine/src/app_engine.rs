@@ -18608,6 +18608,36 @@ mod fence_reanchor_tests {
         (engine, received)
     }
 
+    /// Labels kept for an epoch that has begun go at the next GLOBAL frame
+    /// an engine sees, whether or not its member labels ahead again: a seat
+    /// lost before its registration was sealed leaves none on disk.
+    #[tokio::test]
+    async fn labels_of_an_epoch_that_has_begun_go_without_a_seat() {
+        use quil_types::consensus::{epoch_for_frame, epoch_length_frames};
+        crate::storage_labels::install_with_space(
+            std::env::temp_dir().join(format!("quil-labels-tests-{}", std::process::id())),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let (member, leaf) = ([0x4Du8; 32], b"never sealed".as_slice());
+        let params = quil_crypto::sdr::SdrParams::default();
+        // Labelled for epoch 2; the seat was lost and the registration never
+        // sealed, so no precompute runs for the shard again.
+        let ahead = crate::storage_labels::Stage::Ahead;
+        let admitted = store.admit(2, &member, leaf, 64, ahead).unwrap();
+        admitted.label(&params).unwrap();
+        assert!(store.find(2, &member, leaf, |_| true).is_some());
+        let (engine, _events) = engine();
+        let frame = 3 * epoch_length_frames() + 1;
+        assert_eq!(epoch_for_frame(frame), 3);
+        engine.label_storage_ahead(frame);
+        assert!(
+            store.find(2, &member, leaf, |_| true).is_none(),
+            "labels of epoch 2 are still on disk in epoch 3: only a later \
+             precompute for a seat this member holds evicts them"
+        );
+    }
+
     /// While a re-anchor is owed the 10 s data-bootstrap re-request stays
     /// quiet: the re-anchor requests its own attempts.
     #[tokio::test]

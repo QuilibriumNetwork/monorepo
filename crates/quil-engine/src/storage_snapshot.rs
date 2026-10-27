@@ -841,7 +841,11 @@ fn report_long_leaves() {
 /// otherwise it is labelled now, going on from the whole layers kept on disk
 /// at a count its data may register (labelled ahead, or by this snapshot
 /// before a restart), its labels kept for its seal when their filesystem has
-/// room for them.
+/// room for them. Labels kept that do not match their column commitment are
+/// labelled again rather than encoded from
+/// (`crate::storage_labels::Kept::verified_last_layer`), and a leaf whose
+/// labels cannot be written is encoded as by a process that keeps none, its
+/// seal labelling it again.
 pub fn encode_member(captured: &Captured, member: &[u8], replicas: &ReplicaStore) -> Result<()> {
     encode_member_with(
         captured,
@@ -928,10 +932,43 @@ fn encode_member_until(
         };
         let data = captured.leaf_data(prefix)?;
         let exact = data_node_count(data.len() as u64);
+        // Labels kept that are not whole are labelled again rather than
+        // encoded from: a registration from them could never be sealed.
         let ahead = store.and_then(|store| {
-            store.find(captured.epoch, member, &leaf_id, |n| {
+            let kept = store.find(captured.epoch, member, &leaf_id, |n| {
                 padded_nodes_allowed(exact, n)
-            })
+            })?;
+            let checking = std::time::Instant::now();
+            let last = kept.verified_last_layer();
+            let took = checking.elapsed();
+            match last {
+                Some(last) => {
+                    if took >= LEAF_LOGGED_FROM {
+                        info!(epoch = captured.epoch, filter = %hex::encode(&captured.filter),
+                            leaf = %hex::encode(&leaf_id), nodes = kept.n,
+                            verify_seconds = took.as_secs_f64(), scope = "local",
+                            "storage labels kept for a leaf took long to check against their \
+                             column commitment before its snapshot encodes from them: check this \
+                             node's disk and CPU load if this recurs");
+                    }
+                    Some((kept, last))
+                }
+                None => {
+                    warn!(epoch = captured.epoch, filter = %hex::encode(&captured.filter),
+                        leaf = %hex::encode(&leaf_id), nodes = kept.n,
+                        verify_seconds = took.as_secs_f64(), scope = "local",
+                        action = "check this node's disk and its kernel log for I/O errors if \
+                                  this recurs",
+                        "storage labels kept for a leaf do not match their column commitment, as \
+                         a torn or damaged file on this node's disk leaves them; they are removed \
+                         and the leaf is labelled again for its snapshot (about an hour per GiB \
+                         on a core)");
+                    let n = kept.n;
+                    drop(kept);
+                    store.discard_damaged(captured.epoch, member, &leaf_id, n);
+                    None
+                }
+            }
         });
         // Else the leaf is labelled at the count its data may register
         // with the most whole layers kept on disk, or at its own.
@@ -943,7 +980,7 @@ fn encode_member_until(
                 .unwrap_or((exact, 0)),
             _ => (exact, 0),
         };
-        let nodes = ahead.as_ref().map_or(count, |kept| kept.n);
+        let nodes = ahead.as_ref().map_or(count, |(labels, _)| labels.n);
         memory.resize(encoding_bytes(nodes));
         // A leaf to label now that cannot end by the renewal's grace frame
         // would hold its memory for nothing: its seat renews without it.
@@ -963,9 +1000,7 @@ fn encode_member_until(
                 LeafWork::LabellingNow
             },
         );
-        let from_kept = ahead.and_then(|kept| {
-            use quil_crypto::storage_proof::LabelSource as _;
-            let last = kept.last_layer()?;
+        let from_kept = ahead.and_then(|(kept, last)| {
             quil_crypto::storage_proof::encode_with_labels(&data, kept.n, &last, kept.comm_c).ok()
         });
         let ahead = from_kept.is_some();
@@ -974,9 +1009,11 @@ fn encode_member_until(
             // `crate::storage_jobs::AHEAD_JOBS_BESIDE_DUE` of it.
             memory.labelling_now();
         }
-        // Labelled now and kept when there is room; otherwise encoded as by a
-        // process that keeps no labels, and its seal labels it again.
-        let mut resumed = 0;
+        // Labelled now and kept when there is room; otherwise, or when its
+        // labels cannot be written, encoded as by a process that keeps no
+        // labels, and its seal labels it again: a failed write does not fail
+        // the snapshot, whose retry would label every leaf again.
+        let (mut resumed, mut unkept) = (0, None);
         let labelled = match (&from_kept, store) {
             (None, Some(store)) => {
                 match store.admit(captured.epoch, member, &leaf_id, count, Stage::Snapshot) {
@@ -997,15 +1034,15 @@ fn encode_member_until(
                         }
                         progress.layers(admitted.resumes_from(), layers);
                         let labelling = admitted
-                            .label_kept(&params, stop, &|done| progress.layers(done, layers))?;
+                            .label_kept(&params, stop, &|done| progress.layers(done, layers));
                         match labelling {
-                            Labelling::Labelled(labelled) => Some((count, labelled)),
-                            Labelling::Refused => {
+                            Ok(Labelling::Labelled(labelled)) => Some((count, labelled)),
+                            Ok(Labelling::Refused) => {
                                 return Err(QuilError::Internal(
                                     "storage labels: a snapshot's labelling refused room".into(),
                                 ))
                             }
-                            Labelling::Stopped { .. } => {
+                            Ok(Labelling::Stopped { .. }) => {
                                 // Kept for the next attempt unless the seat
                                 // renews without them.
                                 if grace_passed(member, captured.epoch)
@@ -1015,6 +1052,10 @@ fn encode_member_until(
                                 }
                                 progress.end(stop_outcome());
                                 return Err(stopped());
+                            }
+                            Err(error) => {
+                                unkept = Some(error);
+                                None
                             }
                         }
                     }
@@ -1063,13 +1104,22 @@ fn encode_member_until(
             &encoded.registration_root(),
         )?;
         progress.end(LeafOutcome::Completed);
-        Ok((encoded.n, ahead, resumed))
+        Ok((encoded.n, ahead, resumed, unkept))
     })?;
     info!(epoch = captured.epoch, filter = %hex::encode(&captured.filter), leaves = encoded.len(),
-        labelled_ahead = encoded.iter().filter(|(_, ahead, _)| *ahead).count(),
-        layers_resumed = encoded.iter().map(|(.., resumed)| resumed).sum::<usize>(),
+        labelled_ahead = encoded.iter().filter(|(_, ahead, ..)| *ahead).count(),
+        layers_resumed = encoded.iter().map(|(_, _, resumed, _)| resumed).sum::<usize>(),
         nodes = encoded.iter().map(|(n, ..)| n).sum::<u64>(), seconds = started.elapsed().as_secs(),
         "storage snapshot leaves encoded");
+    let mut unkept = encoded.iter().filter_map(|(.., unkept)| unkept.as_ref());
+    if let Some(error) = unkept.next() {
+        warn!(epoch = captured.epoch, filter = %hex::encode(&captured.filter),
+            leaves = encoded.len(), unkept = 1 + unkept.count(), %error, scope = "local",
+            "storage labels not kept at the snapshot: writing them failed on this node's \
+             disk; the leaves are registered without them, and their seal labels them again \
+             (about an hour per GiB on a core): check free space and health of the \
+             storage-labels disk");
+    }
     let nodes: Vec<u64> = encoded.iter().map(|(n, ..)| *n).collect();
     let plan = quil_execution::global_intrinsic::storage_snapshot::encode_plan(&[(
         captured.filter.clone(),
@@ -1781,10 +1831,43 @@ pub fn prepare_member_seat(
 /// Seconds a failed snapshot waits before it is tried again.
 const SNAPSHOT_RETRY_SECS: u64 = 60;
 
+/// Times a job failing on a local disk error (`QuilError::Io`, as a label
+/// write to a full disk) doubles its wait before it is tried again: from
+/// [`SNAPSHOT_RETRY_SECS`] to 32 minutes, about a fifth of an epoch.
+const IO_RETRY_DOUBLINGS: u32 = 5;
+
+/// A snapshot job's record ([`request`]).
+#[derive(Default)]
+struct JobState {
+    /// When it last failed, and how long it waits since; `None` while it is
+    /// queued or running.
+    failed: Option<(std::time::Instant, std::time::Duration)>,
+    /// Its failures in a row on a local disk error.
+    io_failures: u32,
+}
+
+impl JobState {
+    /// Record a failure with `error`: how long the job waits before it is
+    /// tried again. A local disk error waits twice as long as the one before
+    /// it, up to [`IO_RETRY_DOUBLINGS`] times; any other waits
+    /// [`SNAPSHOT_RETRY_SECS`].
+    fn failed_with(&mut self, error: &QuilError) -> std::time::Duration {
+        self.io_failures = match error {
+            QuilError::Io(_) => self.io_failures.saturating_add(1),
+            _ => 0,
+        };
+        let doublings = self.io_failures.saturating_sub(1).min(IO_RETRY_DOUBLINGS);
+        let wait = std::time::Duration::from_secs(SNAPSHOT_RETRY_SECS << doublings);
+        self.failed = Some((std::time::Instant::now(), wait));
+        wait
+    }
+}
+
 /// Run the snapshot job for `key` in `lane` (`crate::storage_jobs::spawn`)
-/// unless one is queued or running, or the last failed less than
-/// [`SNAPSHOT_RETRY_SECS`] ago. A job that succeeds leaves its record behind,
-/// so its caller stops asking.
+/// unless one is queued or running, or the last failed less than its wait
+/// ago ([`JobState::failed_with`]): [`SNAPSHOT_RETRY_SECS`], or longer while
+/// it fails on a local disk error. A job that succeeds leaves its record
+/// behind, so its caller stops asking.
 pub fn request(
     lane: &[u8],
     key: Vec<u8>,
@@ -1792,19 +1875,29 @@ pub fn request(
     job: impl FnOnce() -> Result<()> + Send + 'static,
 ) {
     use std::collections::HashMap;
-    use std::time::{Duration, Instant};
-    static STATE: std::sync::OnceLock<std::sync::Mutex<HashMap<Vec<u8>, Option<Instant>>>> =
+    use std::time::Duration;
+    static STATE: std::sync::OnceLock<std::sync::Mutex<HashMap<Vec<u8>, JobState>>> =
         std::sync::OnceLock::new();
+    // A failed job no caller asked for again within twice the longest wait
+    // is forgotten.
+    let forget = Duration::from_secs(2 * (SNAPSHOT_RETRY_SECS << IO_RETRY_DOUBLINGS));
     let state = STATE.get_or_init(Default::default);
     {
         let Ok(mut jobs) = state.lock() else { return };
-        jobs.retain(|_, failed| {
-            failed.is_none_or(|at| at.elapsed() < Duration::from_secs(SNAPSHOT_RETRY_SECS))
-        });
-        if jobs.contains_key(&key) {
-            return;
+        jobs.retain(|_, job| job.failed.is_none_or(|(at, _)| at.elapsed() < forget));
+        match jobs.get(&key).map(|job| job.failed) {
+            // Queued or running, or waiting after a failure.
+            Some(None) => return,
+            Some(Some((at, wait))) if at.elapsed() < wait => return,
+            Some(Some(_)) => {
+                if let Some(job) = jobs.get_mut(&key) {
+                    job.failed = None;
+                }
+            }
+            None => {
+                jobs.insert(key.clone(), JobState::default());
+            }
         }
-        jobs.insert(key.clone(), None);
     }
     crate::storage_jobs::spawn(lane, label, move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
@@ -1814,8 +1907,16 @@ pub fn request(
                 Ok(()) => {
                     jobs.remove(&key);
                 }
-                Err(_) => {
-                    jobs.insert(key, Some(Instant::now()));
+                Err(error) => {
+                    let job = jobs.entry(key).or_default();
+                    let wait = job.failed_with(error);
+                    if job.io_failures == 1 {
+                        warn!(label, %error, retry_seconds = wait.as_secs(),
+                            max_retry_seconds = SNAPSHOT_RETRY_SECS << IO_RETRY_DOUBLINGS,
+                            "storage snapshot job failed on this node's disk; while it keeps \
+                             failing it is tried again at doubling intervals rather than every \
+                             minute: check free space and health of the node's disk");
+                    }
                 }
             }
         }
@@ -3924,5 +4025,163 @@ pub(crate) mod tests {
         assert_eq!(files_under(&dir), Vec::<std::path::PathBuf>::new());
         let _ = std::fs::remove_dir_all(&dir);
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// A job failing on a local disk error waits twice as long at each
+    /// failure, up to 32 minutes; any other failure, or one after it, waits
+    /// a minute.
+    #[test]
+    fn a_job_failing_on_the_disk_is_retried_at_doubling_intervals() {
+        let mut job = JobState::default();
+        let disk = || QuilError::Io(std::io::Error::other("no space left"));
+        let waits: Vec<u64> = (0..7).map(|_| job.failed_with(&disk()).as_secs()).collect();
+        assert_eq!(waits, [60, 120, 240, 480, 960, 1920, 1920]);
+        let other = QuilError::ExecutionUnavailable("no source".into());
+        assert_eq!(job.failed_with(&other).as_secs(), 60);
+        assert_eq!(job.failed_with(&disk()).as_secs(), 60);
+    }
+
+    /// Labels kept for a leaf whose layers file was torn, its length
+    /// unchanged (here the second half of its last layer zeroed, as two
+    /// workers writing it at once can leave it), are not encoded from: the
+    /// registration is the leaf's own encoding, which its seal can open.
+    #[test]
+    fn a_torn_kept_label_file_is_not_encoded_from() {
+        use crate::storage_labels::{ample_space, files_under, LabelStore, Stage};
+        use quil_crypto::storage_proof::{data_node_count, NODE_BYTES};
+        use std::os::unix::fs::FileExt;
+        let dir = std::env::temp_dir().join(format!("quil-labels-torn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let crdt = test_crdt();
+        let app = [0x7Eu8; 32];
+        for d in 0..30u8 {
+            crdt.add_vertex(
+                &Location {
+                    app_address: app,
+                    data_address: address(d.wrapping_mul(5), d),
+                },
+                &vec![d; 300],
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let epoch = 7;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let member = [0x63u8; 32];
+        let captured =
+            capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
+        assert_eq!(captured.prefixes.len(), 1);
+        let prefix = captured.prefixes[0].clone();
+        let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&app, &prefix);
+        let data = captured.leaf_data(&prefix).unwrap();
+        let exact = data_node_count(data.len() as u64);
+        let params = quil_crypto::sdr::SdrParams::default();
+        let admitted = store
+            .admit(epoch, &member, &leaf_id, exact, Stage::Ahead)
+            .unwrap();
+        assert!(admitted.label(&params).unwrap().kept);
+        // Tear the kept layers file.
+        let layers = files_under(&dir)
+            .into_iter()
+            .find(|file| file.extension().is_some_and(|kind| kind == "layers"))
+            .expect("the kept layers");
+        let half = exact / 2;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&layers)
+            .unwrap()
+            .write_all_at(
+                &vec![0u8; ((exact - half) * NODE_BYTES as u64) as usize],
+                ((params.layers as u64 - 1) * exact + half) * NODE_BYTES as u64,
+            )
+            .unwrap();
+        assert!(store
+            .find(epoch, &member, &leaf_id, |n| n == exact)
+            .is_some());
+
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        encode_member_with(&captured, &member, &replicas, Some(&store)).unwrap();
+        let stored = replicas.get_hash(epoch, &leaf_id).unwrap().unwrap();
+        let whole = quil_crypto::storage_proof::encode_leaf_at(
+            &data,
+            &quil_crypto::sdr::replica_key(&member, &leaf_id, epoch),
+            &params,
+            exact,
+            &mut |_, _| {},
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert!(
+            stored.registration_root == whole.registration_root(),
+            "a torn kept label file was encoded from: the registration commits to a \
+             replica that is not the leaf's encoding, so its seal can never be proven"
+        );
+    }
+
+    /// A leaf whose labels cannot be written (here its label directory's
+    /// path is taken by a file) is encoded as by a process that keeps no
+    /// labels: the snapshot succeeds with the leaf's own encoding, rather
+    /// than failing and labelling every leaf again at each retry.
+    #[test]
+    fn a_failed_label_write_does_not_fail_the_snapshot() {
+        use crate::storage_labels::{ample_space, LabelStore};
+        use sha3::Digest as _;
+        let dir =
+            std::env::temp_dir().join(format!("quil-labels-unwritable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let crdt = test_crdt();
+        let app = [0x7Du8; 32];
+        for d in 0..30u8 {
+            crdt.add_vertex(
+                &Location {
+                    app_address: app,
+                    data_address: address(d.wrapping_mul(5), d),
+                },
+                &vec![d; 300],
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let epoch = 8;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let member = [0x64u8; 32];
+        let captured =
+            capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
+        assert!(!captured.prefixes.is_empty());
+        // Each leaf's label directory, `<epoch>/<member and leaf>` below the
+        // store's before the stable replica key epoch, is taken by a file.
+        for prefix in &captured.prefixes {
+            let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&app, prefix);
+            let mut h = sha3::Sha3_256::new();
+            h.update((member.len() as u32).to_be_bytes());
+            h.update(member);
+            h.update(&leaf_id);
+            let path = dir.join(epoch.to_string()).join(hex::encode(h.finalize()));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"").unwrap();
+        }
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let result = encode_member_with(&captured, &member, &replicas, Some(&store));
+        let _ = std::fs::remove_dir_all(&dir);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert!(
+            result.is_ok(),
+            "a failed label write failed the snapshot, whose job is then retried every \
+             minute, labelling every leaf again: {result:?}"
+        );
+        let params = quil_crypto::sdr::SdrParams::default();
+        for prefix in &captured.prefixes {
+            let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&app, prefix);
+            let data = captured.leaf_data(prefix).unwrap();
+            let own = quil_crypto::storage_proof::encode_leaf(
+                &data,
+                &quil_crypto::sdr::replica_key(&member, &leaf_id, epoch),
+                &params,
+            );
+            let stored = replicas.get_hash(epoch, &leaf_id).unwrap().unwrap();
+            assert!(stored.registration_root == own.registration_root());
+        }
     }
 }
