@@ -368,6 +368,29 @@ pub struct ReportedAppProgress {
     pub stalled: bool,
 }
 
+/// A committed app head (GlobalHead) trailing the shard's app head by more
+/// than this many frames is reported as behind.
+pub const GLOBAL_APP_LAG_FRAMES: u64 = 100;
+
+/// Progress of GLOBAL's committed app head of one shard, inferred only from
+/// newly returned shard snapshots, against the shard's app head: the higher
+/// of the peer-reported head and this node's materialized frame.
+#[derive(Debug, Clone)]
+pub struct CommittedAppProgress {
+    pub frame: u64,
+    pub generation: u64,
+    /// The GLOBAL frame and app head when `frame` last changed.
+    pub global_frame: u64,
+    pub head: u64,
+    pub last_change: std::time::Instant,
+    pub last_seen: std::time::Instant,
+    pub observations: u32,
+    /// Unchanged while GLOBAL and the app head both advanced.
+    pub stalled: bool,
+    /// More than [`GLOBAL_APP_LAG_FRAMES`] behind the app head.
+    pub behind: bool,
+}
+
 // ── Model ────────────────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -492,6 +515,14 @@ pub struct Model {
     pub app_stall_time: Option<std::time::SystemTime>,
     pub reported_app_progress: HashMap<Vec<u8>, ReportedAppProgress>,
     pub reported_app_stall_time: Option<std::time::SystemTime>,
+    pub committed_app_progress: HashMap<Vec<u8>, CommittedAppProgress>,
+    /// Allocations (filter keys) whose local materialized frame is unchanged
+    /// for 60s, and the staffed earning allocations with fresh observations.
+    pub local_stalled_rows: HashSet<String>,
+    pub local_stalled_count: usize,
+    pub local_app_rows: usize,
+    /// When each current condition notice was first observed, by its key.
+    pub notice_since: HashMap<&'static str, std::time::SystemTime>,
     pub status_msg: String,
     pub status_message_key: String,
     pub status_message_seen: Option<std::time::Instant>,
@@ -907,6 +938,97 @@ impl Model {
             .collect();
         let stalled = known.iter().filter(|p| p.stalled).count();
         (stalled > 0).then_some((stalled, known.len()))
+    }
+
+    /// Record GLOBAL's committed app heads once per fresh shard RPC, never on
+    /// cache reuse. Unstaffed shards and shards without a committed head or
+    /// an app head cannot establish a stall or a lag.
+    pub fn observe_committed_app_heads(
+        &mut self,
+        shards: &GetShardInfoResponse,
+        now: std::time::Instant,
+    ) {
+        let budget = std::time::Duration::from_secs(self.refresh_seconds * 2 + 30);
+        let window = std::time::Duration::from_secs(60.max(self.refresh_seconds * 3));
+        let mut local: HashMap<Vec<u8>, u64> = HashMap::new();
+        for a in &self.allocations {
+            if let Some(frame) = a.execution.as_ref().and_then(|e| e.materialized_frame) {
+                let entry = local.entry(a.filter.clone()).or_default();
+                *entry = (*entry).max(frame);
+            }
+        }
+        let mut known = HashSet::new();
+        for shard in &shards.shards {
+            let Some(committed) = shard.global_head.as_ref() else {
+                continue;
+            };
+            let head = shard
+                .latest_frame
+                .max(local.get(&shard.filter).copied().unwrap_or(0));
+            if shard.active_provers == 0 || head == 0 || !known.insert(shard.filter.clone()) {
+                continue;
+            }
+            let fresh = CommittedAppProgress {
+                frame: committed.frame,
+                generation: committed.generation,
+                global_frame: committed.global_frame,
+                head,
+                last_change: now,
+                last_seen: now,
+                observations: 0,
+                stalled: false,
+                behind: false,
+            };
+            let progress = self
+                .committed_app_progress
+                .entry(shard.filter.clone())
+                .or_insert_with(|| fresh.clone());
+            if progress.frame != committed.frame
+                || progress.generation != committed.generation
+                || now.saturating_duration_since(progress.last_seen) > budget
+            {
+                *progress = fresh;
+            }
+            progress.last_seen = now;
+            progress.observations = progress.observations.saturating_add(1);
+            progress.behind = head.saturating_sub(committed.frame) > GLOBAL_APP_LAG_FRAMES;
+            if progress.observations >= 3
+                && now.saturating_duration_since(progress.last_change) >= window
+                && committed.global_frame > progress.global_frame
+                && head > progress.head
+            {
+                progress.stalled = true;
+            }
+        }
+        self.committed_app_progress
+            .retain(|filter, _| known.contains(filter));
+    }
+
+    /// The shard's GlobalHead is stalled or behind in a fresh snapshot.
+    pub fn committed_app_flagged(&self, filter: &[u8]) -> bool {
+        if self.shard_error.is_some() {
+            return false;
+        }
+        self.committed_app_progress.get(filter).is_some_and(|p| {
+            (p.stalled || p.behind)
+                && p.last_seen.elapsed().as_secs() <= self.refresh_seconds * 2 + 30
+        })
+    }
+
+    /// Stalled and behind shards, and the tracked shards with fresh snapshots.
+    pub fn committed_app_counts(&self, now: std::time::Instant) -> Option<(usize, usize, usize)> {
+        if self.shard_error.is_some() {
+            return None;
+        }
+        let budget = std::time::Duration::from_secs(self.refresh_seconds * 2 + 30);
+        let known: Vec<_> = self
+            .committed_app_progress
+            .values()
+            .filter(|p| now.saturating_duration_since(p.last_seen) <= budget)
+            .collect();
+        let stalled = known.iter().filter(|p| p.stalled).count();
+        let behind = known.iter().filter(|p| p.behind).count();
+        (stalled + behind > 0).then_some((stalled, behind, known.len()))
     }
 
     // ── Data refresh ─────────────────────────────────────────────────────

@@ -64,6 +64,7 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
                 Ok(shards) => {
                     m.observe_app_intervals(&shards, Instant::now());
                     m.observe_reported_app_heads(&shards, Instant::now());
+                    m.observe_committed_app_heads(&shards, Instant::now());
                     m.shard_error = None;
                     m.shard_last_success = Some(Instant::now());
                     m.shard_last_duration = elapsed;
@@ -96,6 +97,7 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
             if let Some(shards) = &shard_info {
                 m.observe_app_intervals(shards, Instant::now());
                 m.observe_reported_app_heads(shards, Instant::now());
+                m.observe_committed_app_heads(shards, Instant::now());
             }
             m.last_fetch_success = Some(Instant::now());
             if m.consecutive_failures > 0 && m.status_msg.starts_with("Refresh failed: ") {

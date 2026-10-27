@@ -2,8 +2,7 @@
 //! and its panel/help/join-picker renderers, expressed with ratatui.
 
 use super::super::local_execution::{
-    advance_age, execution_label, local_execution_state, recovery, recovery_summary, seal_summary,
-    sealed,
+    advance_age, execution_label, recovery, recovery_summary, seal_summary, sealed,
 };
 
 use super::super::epoch::EffectiveStatus;
@@ -1333,11 +1332,17 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
             if local_warning(m, a) {
                 "0!".into()
             } else {
-                a.execution
+                let height = a
+                    .execution
                     .as_ref()
                     .and_then(|s| s.materialized_frame)
                     .map(|h| h.to_string())
-                    .unwrap_or_else(|| "-".into())
+                    .unwrap_or_else(|| "-".into());
+                if m.local_stalled_rows.contains(&a.filter_key) {
+                    height + "!"
+                } else {
+                    height
+                }
             }
         }
         7 => {
@@ -1355,7 +1360,7 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
                 )
             }
         }
-        8 => fmt_global_head(a.global_head.as_ref()),
+        8 => committed_head_cell(m, a.global_head.as_ref(), &a.filter),
         9 => m.allocation_execution_state(a).into(),
         10 => {
             if a.ring == UNKNOWN_REWARD_RING {
@@ -1414,7 +1419,7 @@ pub(super) fn allocation_status_text(m: &Model, a: &AllocationRow) -> String {
 
 fn alloc_display_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
     let text = alloc_cell(m, a, col, fw);
-    if matches!(col, 6 | 7 | 12 | ALLOC_PROVER_PHASES_COL) {
+    if matches!(col, 6 | 7 | 8 | 12 | ALLOC_PROVER_PHASES_COL) {
         warning_slot(&text, m.color_coding)
     } else {
         text
@@ -1423,7 +1428,7 @@ fn alloc_display_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> St
 
 fn avail_display_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
     let text = avail_cell(m, s, col, fw);
-    if matches!(col, 9 | AVAIL_PROVER_PHASES_COL) {
+    if matches!(col, 8 | 9 | AVAIL_PROVER_PHASES_COL) {
         warning_slot(&text, m.color_coding)
     } else {
         text
@@ -1748,7 +1753,9 @@ fn local_warning(m: &Model, a: &AllocationRow) -> bool {
 
 fn local_color(m: &Model, a: &AllocationRow) -> Color {
     let state = m.execution_state(a.execution.as_ref());
-    if matches!(state, "running" | "serving") && local_warning(m, a) {
+    if matches!(state, "running" | "serving")
+        && (local_warning(m, a) || m.local_stalled_rows.contains(&a.filter_key))
+    {
         Color::Yellow
     } else {
         execution_color(state)
@@ -1772,6 +1779,21 @@ const EXECUTION_STATES: [&str; 12] = [
 fn fmt_global_head(head: Option<&quil_types::proto::node::GlobalAppFrameHead>) -> String {
     head.map(|h| format!("{}@g{}", h.frame, h.generation))
         .unwrap_or_else(|| "-".into())
+}
+
+/// The GlobalHead cell; a trailing `!` marks a stalled or trailing committed
+/// head for `warning_slot`.
+fn committed_head_cell(
+    m: &Model,
+    head: Option<&quil_types::proto::node::GlobalAppFrameHead>,
+    filter: &[u8],
+) -> String {
+    let text = fmt_global_head(head);
+    if head.is_some() && m.committed_app_flagged(filter) {
+        text + "!"
+    } else {
+        text
+    }
 }
 
 fn snapshot_suffix<'a>(
@@ -2014,6 +2036,8 @@ fn render_alloc_panel(
                     local_color(m, a)
                 } else if ci == 7 && m.color_coding && m.reported_app_stalled(&a.filter) {
                     WARNING
+                } else if ci == 8 && m.color_coding && m.committed_app_flagged(&a.filter) {
+                    WARNING
                 } else if ci == ALLOC_PROVER_PHASES_COL
                     && m.color_coding
                     && prover_halt_risk(a.prover_counts.as_ref(), &a.shard_size)
@@ -2062,6 +2086,9 @@ fn render_alloc_panel(
                         Span::styled(cell.clone(), Style::new().fg(local_color(m, a)))
                     }
                     7 if m.color_coding && m.reported_app_stalled(&a.filter) => {
+                        Span::styled(cell.clone(), Style::new().fg(WARNING))
+                    }
+                    8 if m.color_coding && m.committed_app_flagged(&a.filter) => {
                         Span::styled(cell.clone(), Style::new().fg(WARNING))
                     }
                     7 | 8 if m.color_coding => Span::styled(cell.clone(), Style::new().fg(HELP)),
@@ -2129,7 +2156,7 @@ fn avail_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
                 s.latest_frame.to_string()
             }
         }
-        8 => fmt_global_head(s.global_head.as_ref()),
+        8 => committed_head_cell(m, s.global_head.as_ref(), &s.filter),
         9 if m.reported_app_stalled(&s.filter) => "stalled!".into(),
         9 => {
             let state = materialization_state(s.materialized_frame, s.latest_frame);
@@ -2504,6 +2531,8 @@ fn render_avail_panel(
                 let color =
                     if m.color_coding && matches!(c, 7 | 9) && m.reported_app_stalled(&s.filter) {
                         WARNING
+                    } else if m.color_coding && c == 8 && m.committed_app_flagged(&s.filter) {
+                        WARNING
                     } else if m.color_coding && matches!(c, 6 | 9) {
                         materialization_state_color(materialization_state(
                             s.materialized_frame,
@@ -2556,6 +2585,9 @@ fn render_avail_panel(
                 spans.push(match c {
                     3 if m.color_coding => Span::styled(cell, Style::new().fg(ring_color(s.ring))),
                     7 | 9 if m.color_coding && m.reported_app_stalled(&s.filter) => {
+                        Span::styled(cell, Style::new().fg(WARNING))
+                    }
+                    8 if m.color_coding && m.committed_app_flagged(&s.filter) => {
                         Span::styled(cell, Style::new().fg(WARNING))
                     }
                     7 | 8 if m.color_coding => Span::styled(cell, Style::new().fg(HELP)),
@@ -2711,6 +2743,16 @@ fn update_message_lifetime(m: &mut Model) {
     } else {
         m.reported_app_stall_time = None;
     }
+    let active: Vec<&'static str> = condition_notices(m)
+        .into_iter()
+        .map(|(key, ..)| key)
+        .collect();
+    m.notice_since.retain(|key, _| active.contains(key));
+    for key in active {
+        m.notice_since
+            .entry(key)
+            .or_insert_with(std::time::SystemTime::now);
+    }
     if m.status_message_key != m.status_msg {
         m.status_message_key = m.status_msg.clone();
         m.status_message_seen = Some(std::time::Instant::now());
@@ -2838,11 +2880,10 @@ fn wrap_message(message: Line<'static>, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-/// Require fresh observations for every staffed earning allocation: missing data
-/// must not be reported as a demonstrated stall. Peer metadata is independent.
-fn update_app_progress_warning(m: &mut Model) {
-    let rows: Vec<_> = m
-        .allocations
+/// Staffed earning allocations past their activation waits; local progress
+/// and execution notices judge only these.
+fn earning_allocations(m: &Model) -> Vec<&AllocationRow> {
+    m.allocations
         .iter()
         .filter(|a| {
             matches!(
@@ -2856,47 +2897,237 @@ fn update_app_progress_warning(m: &mut Model) {
                 "waiting" | "syncing" | "closing" | "handoff"
             )
         })
-        .collect();
-    let known = m.reachable
-        && !rows.is_empty()
-        && rows.iter().all(|a| {
-            a.execution.as_ref().is_some_and(|e| {
-                e.materialized_frame.is_some()
+        .collect()
+}
+
+/// Judge each staffed earning allocation with a fresh observation on its own:
+/// missing or old data is excluded rather than reported as a stall, and one
+/// advancing allocation does not hide another that stopped.
+fn update_app_progress_warning(m: &mut Model) {
+    let rows: Vec<(String, u64)> = if m.reachable {
+        earning_allocations(m)
+            .into_iter()
+            .filter_map(|a| {
+                let e = a.execution.as_ref()?;
+                (e.materialized_frame.is_some()
                     && matches!(
-                        local_execution_state(Some(e)),
+                        m.execution_state(Some(e)),
                         "starting" | "running" | "serving" | "blocked" | "stopped"
-                    )
+                    ))
+                .then(|| (a.filter_key.clone(), e.last_advance_unix_ms))
             })
-        });
-    if !known {
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if rows.is_empty() {
         m.app_progress_observed_since = None;
         m.app_stall_time = None;
+        m.local_stalled_rows.clear();
+        m.local_stalled_count = 0;
+        m.local_app_rows = 0;
         return;
     }
-    let observed = m
+    let observed = *m
         .app_progress_observed_since
         .get_or_insert_with(std::time::Instant::now);
-    let last = rows
-        .iter()
-        .filter_map(|a| a.execution.as_ref())
-        .map(|e| e.last_advance_unix_ms)
-        .max()
-        .unwrap_or(0);
     let now = std::time::SystemTime::now();
     let now_ms = now
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let stalled = if last == 0 {
-        observed.elapsed().as_secs() >= 60
-    } else {
-        now_ms.saturating_sub(last) >= 60_000
-    };
-    if stalled {
-        m.app_stall_time.get_or_insert(now);
-    } else {
+    m.local_app_rows = rows.len();
+    let stalled: Vec<String> = rows
+        .into_iter()
+        .filter(|(_, last)| {
+            if *last == 0 {
+                observed.elapsed().as_secs() >= 60
+            } else {
+                now_ms.saturating_sub(*last) >= 60_000
+            }
+        })
+        .map(|(key, _)| key)
+        .collect();
+    m.local_stalled_count = stalled.len();
+    m.local_stalled_rows = stalled.into_iter().collect();
+    if m.local_stalled_count == 0 {
         m.app_stall_time = None;
+    } else {
+        m.app_stall_time.get_or_insert(now);
     }
+}
+
+/// Current active + leaving forecasts in the 60m and 24h windows when the
+/// 60m one is below half the 24h one. Only rows whose shard has 30 min of
+/// 60m and 2h of 24h coverage count; both windows price frames alike.
+fn reward_drop(m: &Model) -> Option<(BigInt, BigInt)> {
+    let (mut hour, mut day, mut rows) = (BigInt::from(0), BigInt::from(0), 0);
+    for a in &m.allocations {
+        if a.ring == UNKNOWN_REWARD_RING
+            || !matches!(
+                a.reward_status(m.epoch_frame(), m.epoch_length),
+                Some(EffectiveStatus::Active | EffectiveStatus::Leaving)
+            )
+        {
+            continue;
+        }
+        let Some(cadence) = m.node_app_cadence.get(&a.filter) else {
+            continue;
+        };
+        let covered = |w: Option<&quil_types::proto::node::FrameWindow>, seconds: u64| {
+            w.is_some_and(|w| w.observed_seconds >= seconds)
+        };
+        if !covered(cadence.hour.as_ref(), 1800) || !covered(cadence.day.as_ref(), 7200) {
+            continue;
+        }
+        let (Some(h), Some(d)) = (
+            m.daily_reward(&a.estimated_reward, &a.filter, 0),
+            m.daily_reward(&a.estimated_reward, &a.filter, 1),
+        ) else {
+            continue;
+        };
+        hour += h;
+        day += d;
+        rows += 1;
+    }
+    (rows > 0 && day.sign() == num_bigint::Sign::Plus && BigInt::from(2) * &hour < day)
+        .then_some((hour, day))
+}
+
+/// Conditions that need attention besides the progress stalls: key, severity
+/// and text without its timestamp. Each needs fresh node status; missing or
+/// old data establishes none. Definitions belong in help.
+fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
+    let mut notices = Vec::new();
+    if !rpc_status_is_fresh(m) {
+        return notices;
+    }
+    if let Some((stalled, behind, known)) = m.committed_app_counts(std::time::Instant::now()) {
+        if stalled > 0 {
+            notices.push((
+                "global-app-unchanged",
+                NoticeSeverity::Warning,
+                format!(
+                    "{}: {stalled}/{known} tracked shards.",
+                    progress_stall_text("Global app frames", 60.max(m.refresh_seconds * 3))
+                ),
+            ));
+        }
+        if behind > 0 {
+            notices.push((
+                "global-app-behind",
+                NoticeSeverity::Warning,
+                format!(
+                    "Global app frames >{GLOBAL_APP_LAG_FRAMES} behind app heads: \
+                     {behind}/{known} tracked shards."
+                ),
+            ));
+        }
+    }
+    if let Some((hour, day)) = reward_drop(m) {
+        notices.push((
+            "reward-drop",
+            NoticeSeverity::Warning,
+            format!(
+                "Reward now 60m {} vs 24h {} Q/d.",
+                super::super::format_quil_daily_units(&hour),
+                super::super::format_quil_daily_units(&day)
+            ),
+        ));
+    }
+    let worker_fresh = m
+        .worker_snapshot_received
+        .is_some_and(|(t, _)| t.elapsed().as_secs() <= m.refresh_seconds * 2 + 30);
+    let allocations: Vec<_> = m.allocations.iter().filter(|a| a.status != 0).collect();
+    let due: Vec<_> = allocations
+        .iter()
+        .filter(|a| {
+            matches!(
+                a.status_name.as_str(),
+                "active" | "leaving" | "departing" | "re-confirm!"
+            )
+        })
+        .collect();
+    let workerless = due.iter().filter(|a| a.worker_id < 0).count();
+    if worker_fresh && workerless > 0 {
+        notices.push((
+            "allocation-workerless",
+            NoticeSeverity::Error,
+            format!("Allocations without a worker: {workerless}/{}.", due.len()),
+        ));
+    }
+    let observed: Vec<_> = earning_allocations(m)
+        .into_iter()
+        .filter(|a| {
+            matches!(
+                m.execution_state(a.execution.as_ref()),
+                "starting" | "running" | "serving" | "blocked" | "stopped"
+            )
+        })
+        .collect();
+    let failed = observed
+        .iter()
+        .filter(|a| {
+            matches!(
+                m.execution_state(a.execution.as_ref()),
+                "blocked" | "stopped"
+            )
+        })
+        .count();
+    if failed > 0 {
+        notices.push((
+            "local-execution-failed",
+            NoticeSeverity::Error,
+            format!(
+                "Local execution blocked or stopped: {failed}/{} allocations.",
+                observed.len()
+            ),
+        ));
+    }
+    let stale = allocations
+        .iter()
+        .filter(|a| a.status_name == "re-confirm!")
+        .count();
+    if stale > 0 {
+        notices.push((
+            "allocation-epoch-stale",
+            NoticeSeverity::Warning,
+            format!(
+                "Allocation epoch stale (re-confirm!): {stale}/{} allocations.",
+                allocations.len()
+            ),
+        ));
+    }
+    let workers: Vec<_> = m
+        .allocations
+        .iter()
+        .filter(|a| {
+            !matches!(
+                m.execution_state(a.execution.as_ref()),
+                "unknown" | "stale" | "cached"
+            )
+        })
+        .collect();
+    let recovery_failed = workers
+        .iter()
+        .filter(|a| {
+            a.execution
+                .as_ref()
+                .and_then(|e| e.recovery.as_ref())
+                .is_some_and(|r| r.last_error_unix_ms > r.last_outcome_unix_ms)
+        })
+        .count();
+    if recovery_failed > 0 {
+        notices.push((
+            "recovery-failed",
+            NoticeSeverity::Warning,
+            format!(
+                "Last recovery attempt failed: {recovery_failed}/{} workers.",
+                workers.len()
+            ),
+        ));
+    }
+    notices
 }
 
 /// Shared progress-notice convention; tracker definitions belong in help.
@@ -2961,11 +3192,31 @@ fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'sta
             lines.extend(wrap_message(
                 Line::from(Span::styled(
                     format!(
-                        "{}{}.",
+                        "{}{}: {}/{} allocations.",
                         message_timestamp(Some(time)),
-                        progress_stall_text("Local app frames", 60)
+                        progress_stall_text("Local app frames", 60),
+                        m.local_stalled_count,
+                        m.local_app_rows
                     ),
                     Style::new().fg(Color::Yellow),
+                )),
+                width,
+            ));
+        }
+    }
+    for (key, severity, text) in condition_notices(m) {
+        if severity >= m.notice_minimum {
+            lines.extend(wrap_message(
+                Line::from(Span::styled(
+                    format!(
+                        "{}{text}",
+                        message_timestamp(m.notice_since.get(key).copied())
+                    ),
+                    Style::new().fg(if severity == NoticeSeverity::Error {
+                        ERROR
+                    } else {
+                        WARNING
+                    }),
                 )),
                 width,
             ));
@@ -3747,11 +3998,13 @@ fn help_items() -> Vec<HelpItem> {
         kv("LocalMat", "Local materialized height:"),
         item("`-`: unknown"),
         item("`0!`: no materialized frames, with colors off; colors show a `yellow` `0`"),
+        item("`yellow` (or `!` with colors off): unchanged for 60s; see Local app notice"),
         kv("PeerMat", "Peer-reported materialized height; compared with PeerHead"),
         kv("PeerHead", "Peer-reported shard head; remote metadata, not the local cursor. `yellow` (or `!` with colors off) marks unchanged fresh reports for max(60s, 3 polls)"),
         kv("GlobalHead", "Committed app head@generation, independent of LocalMat and peer metadata; absent on older servers:"),
         item("`-`: unavailable"),
         item("`0@gN`: a known genesis head"),
+        item("`yellow` (or `!` with colors off): unchanged or trailing; see Global app notice"),
         kv("Execution", "Local phase of the allocation's worker, not proof of frame progress or quorum; local progress notices exclude sync, close, handoff and activation waits:"),
         item("`start`: host starting"),
         item("`sync`: staging shard data"),
@@ -3795,9 +4048,19 @@ fn help_items() -> Vec<HelpItem> {
         kv("Freshness", "Age of the worker state shown; poll delays do not age the received state, and startup restoration is not an advance:"),
         item("`stale`: node observation already >30s old at receipt"),
         item("`cached`: no worker result for >2 polls +30s; not proof of ongoing execution"),
-        kv("Local app notice", "No local materialized frame advanced for 60s across staffed earning allocations; any local advance clears it"),
+        kv("Local app notice", "`Local app frames unchanged >60s`: staffed earning allocations whose LocalMat has not advanced for 60s, of those with fresh observations; sync, close, handoff and activation waits are excluded. Their LocalMat cells are `yellow`, or marked `!` with colors off"),
         kv("Reported app heads", "No peer-reported app frames advanced on the stated subset of tracked shards. Counts include allocated and unallocated shards. Affected PeerHead / PeerState cells are `yellow`, or marked `!` with colors off. Requires 3+ fresh snapshots over max(60s, 3 polls); missing/unstaffed rows are excluded. Does not prove a network halt"),
         kv("Global notice", "After max(60s, 3 polls) without received-head advance; timestamp survives refresh changes. Clears on advance or stale RPC"),
+        kv("Global app notice", "Committed GLOBAL state: each tracked shard's GlobalHead against its app head, the higher of PeerHead and LocalMat. Counts include allocated and unallocated shards with provers, a GlobalHead and an app head. Affected GlobalHead cells are `yellow`, or marked `!` with colors off:"),
+        item("`Global app frames unchanged >Ns`: GlobalHead kept its frame over 3+ fresh snapshots spanning max(60s, 3 polls) while the GLOBAL snapshot and the app head both advanced"),
+        item("`Global app frames >100 behind app heads`: GlobalHead trails the app head by more than 100 frames"),
+        item("Either way GLOBAL has not applied the newer shard frames, so their shard state and rewards are not credited yet. On most tracked shards it is network-wide: GLOBAL frames are not carrying shard frames; report it with the GLOBAL frame and shard filters. On a few shards, check those shards' committees"),
+        kv("Reward notice", "`Reward now 60m … vs 24h … Q/d`: the active + leaving forecast over the last 60m is below half its 24h value. Counts rows whose shard has 30 min of 60m and 2h of 24h coverage. Both windows apply the current per-frame reward, so the drop is in committed app frames, not in pricing; see Global app notice"),
+        kv("Allocation notices", "Allocations or workers with a condition, out of those it applies to:"),
+        item("`Allocations without a worker`: active, leaving, departing or `re-confirm!` allocations with Worker `-1`; they do no work and earn nothing until a worker is bound"),
+        item("`Local execution blocked or stopped`: staffed earning allocations whose Execution is `blocked` or `stopped`, of those with fresh observations; the row footer names the blocker"),
+        item("`Allocation epoch stale (re-confirm!)`: allocations whose epoch is older than the current one. The node reconfirms each allocation during every epoch, so its reconfirm has not been recorded; check the node's prover confirmation log lines"),
+        item("`Last recovery attempt failed`: workers whose latest archive recovery attempt failed, of workers with fresh observations; the Recovery footer gives the error and the failure streak"),
         kv("Command legends", "Compact mode shows applicable UI/worker commands only; expanded mode also shows disabled commands. Usable commands share one highlight; labels show colors on/off and relative/absolute thresholds. `filter*` means a column filter is active"),
         kv("Scroll hints", "Bottom border counts hidden rows `↑`/`↓` and columns `←`/`→`"),
         kv("Colors", "What the main view's colors mean:"),
@@ -3815,7 +4078,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("‹b›", "Visibility picker (b: blocks): ‹tab› moves focus between Columns, Top header and every panel header group; ‹↑/↓› selects, ‹space› toggles, ‹a› restores the focused group, ‹enter›/‹esc› closes. Interval, reward and Global field options nest beneath their KPI. Panel names and identity columns stay visible"),
         kv("Columns group", "In the picker, visibility shared by both panels; ‹Shift+↑/↓› reorders focused table columns with their sub-items, ‹r› restores order, ‹c› hides Provers/Size/Shards and ‹a› restores all columns. Select/Filter stay pinned; settings last for the TUI session"),
         kv("‹t›", "Cycle refresh (t: timer) 5/15/30/60s (default 15); startup and post-action fetches are immediate"),
-        kv("‹c›", "Toggle color-coding of Ring, Mat/Lag/State, ProverPhases, Worker, Status and Mode; values quoted in this help follow it"),
+        kv("‹c›", "Toggle color-coding of Ring, Mat/Lag/State, GlobalHead, ProverPhases, Worker, Status and Mode; values quoted in this help follow it"),
         kv("‹e›", "Show Next/Default Action thresholds relative to the received GLOBAL frame (`in Nf`, default) or as absolute frames (`@f…`)"),
         kv("‹h›", "Open this help (‹↑/↓› or ‹Pg↑/↓› scroll; ‹h› or ‹esc› closes)"),
         kv("‹q› / ‹Ctrl+C›", "Quit"),
@@ -4735,13 +4998,14 @@ mod tests {
     }
 
     #[test]
-    fn app_stall_warning_respects_severity_and_clears_on_progress_or_missing_data() {
+    fn app_stall_warning_counts_each_allocation_and_clears_on_progress_or_missing_data() {
         use quil_types::proto::node::WorkerExecution;
         use std::time::{SystemTime, UNIX_EPOCH};
         let mut m = Model::new();
         m.frame_number = 2160;
         m.epoch_length = 720;
         m.reachable = true;
+        m.color_coding = false;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -4750,36 +5014,414 @@ mod tests {
         worker.status = 2;
         worker.epoch = 3;
         worker.execution = Some(WorkerExecution {
-            state: "blocked".into(),
+            state: "serving".into(),
             materialized_frame: Some(744),
             observed_unix_ms: now,
             last_advance_unix_ms: now - 120_000,
             ..Default::default()
         });
-        m.allocations = vec![worker.clone(), worker];
+        let mut other = worker.clone();
+        other.filter_key = "bb".into();
+        other.filter_hex = "bb".into();
+        other.worker_id = 8;
+        m.allocations = vec![worker, other];
         update_app_progress_warning(&mut m);
         let timestamp = m.app_stall_time.expect("known stalled workers warn");
         update_app_progress_warning(&mut m);
         assert_eq!(m.app_stall_time, Some(timestamp));
+        let notices = |m: &Model| {
+            message_lines(m, Line::default(), 240)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         m.notice_minimum = NoticeSeverity::Warning;
-        assert!(message_lines(&m, Line::default(), 240)
-            .iter()
-            .any(|l| l.to_string().contains("Local app frames unchanged")));
+        assert!(notices(&m).contains(&format!(
+            "{}Local app frames unchanged >60s: 2/2 allocations.",
+            message_timestamp(Some(timestamp))
+        )));
         m.notice_minimum = NoticeSeverity::Error;
-        assert!(!message_lines(&m, Line::default(), 240)
-            .iter()
-            .any(|l| l.to_string().contains("Local app frames unchanged")));
+        assert!(!notices(&m).contains("Local app frames unchanged"));
+        m.notice_minimum = NoticeSeverity::Warning;
+        // One advancing allocation no longer hides another that stopped.
         m.allocations[1]
             .execution
             .as_mut()
             .unwrap()
             .last_advance_unix_ms = now;
         update_app_progress_warning(&mut m);
+        assert_eq!(m.app_stall_time, Some(timestamp));
+        assert!(notices(&m).contains("Local app frames unchanged >60s: 1/2 allocations."));
+        assert_eq!(alloc_display_cell(&m, &m.allocations[0], 6, 0), "744!");
+        assert_eq!(alloc_display_cell(&m, &m.allocations[1], 6, 0), "744 ");
+        assert_eq!(local_color(&m, &m.allocations[0]), Color::Yellow);
+        assert_eq!(local_color(&m, &m.allocations[1]), SUCCESS);
+        // Missing data leaves the count rather than counting as a stall.
+        m.allocations[0].execution = None;
+        update_app_progress_warning(&mut m);
         assert!(m.app_stall_time.is_none());
+        assert!(!notices(&m).contains("Local app frames unchanged"));
         m.allocations[1].execution = None;
         update_app_progress_warning(&mut m);
         assert!(m.app_stall_time.is_none());
         assert!(m.app_progress_observed_since.is_none());
+    }
+
+    #[test]
+    fn global_app_notice_reports_unchanged_and_trailing_committed_heads() {
+        use quil_types::proto::node::{GetShardInfoResponse, GlobalAppFrameHead, ShardRewardInfo};
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let mut m = Model::new();
+        m.last_fetch_success = Some(now);
+        let shard_info =
+            |filter: u8, provers: u32, latest: u64, head: Option<(u64, u64)>| ShardRewardInfo {
+                filter: vec![filter],
+                active_provers: provers,
+                latest_frame: latest,
+                global_head: head.map(|(frame, global_frame)| GlobalAppFrameHead {
+                    frame,
+                    global_frame,
+                    generation: 1,
+                }),
+                ..Default::default()
+            };
+        for step in 0..3u64 {
+            let snapshot = GetShardInfoResponse {
+                shards: vec![
+                    // GLOBAL and the shard advance; the committed head does not.
+                    shard_info(1, 4, 1000 + step * 6, Some((995, 500 + step * 3))),
+                    // The committed head advances but trails by more than the bound.
+                    shard_info(2, 4, 1300 + step, Some((1000 + step, 500 + step * 3))),
+                    // Healthy: the committed head follows the shard.
+                    shard_info(
+                        3,
+                        4,
+                        1000 + step * 6,
+                        Some((995 + step * 6, 500 + step * 3)),
+                    ),
+                    // GLOBAL did not advance: the Global head notice covers it.
+                    shard_info(4, 4, 1000 + step * 6, Some((995, 500))),
+                    // The shard produced nothing new for GLOBAL to commit.
+                    shard_info(5, 4, 1000, Some((995, 500 + step * 3))),
+                    // Unstaffed, or without a committed head: not tracked.
+                    shard_info(6, 0, 1000 + step * 6, Some((995, 500 + step * 3))),
+                    shard_info(7, 4, 1000 + step * 6, None),
+                ],
+                ..Default::default()
+            };
+            m.observe_committed_app_heads(&snapshot, now - Duration::from_secs(60 - step * 30));
+        }
+        assert_eq!(m.committed_app_counts(now), Some((1, 1, 5)));
+        update_message_lifetime(&mut m);
+        let unchanged = m.notice_since["global-app-unchanged"];
+        let behind = m.notice_since["global-app-behind"];
+        let text = message_lines(&m, Line::default(), 300)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        for notice in [
+            format!(
+                "{}Global app frames unchanged >60s: 1/5 tracked shards.",
+                message_timestamp(Some(unchanged))
+            ),
+            format!(
+                "{}Global app frames >100 behind app heads: 1/5 tracked shards.",
+                message_timestamp(Some(behind))
+            ),
+        ] {
+            assert!(text.contains(&notice), "{notice} missing from {text:?}");
+            assert!(notice.chars().count() <= 80, "routine notices fit one row");
+        }
+        let committed = |filter: u8, frame: u64| {
+            let mut s = shard("01", 1, 1);
+            s.filter = vec![filter];
+            s.global_head = Some(GlobalAppFrameHead {
+                frame,
+                global_frame: 506,
+                generation: 1,
+            });
+            s
+        };
+        let (stalled, trailing, healthy) =
+            (committed(1, 995), committed(2, 1002), committed(3, 1007));
+        assert_eq!(avail_cell(&m, &stalled, 8, 0), "995@g1!");
+        assert_eq!(avail_cell(&m, &trailing, 8, 0), "1002@g1!");
+        assert_eq!(avail_cell(&m, &healthy, 8, 0), "1007@g1");
+        let mut allocation = row("02", 1, 1, 7, "", "");
+        allocation.filter = vec![2];
+        allocation.global_head = trailing.global_head.clone();
+        assert_eq!(alloc_cell(&m, &allocation, 8, 0), "1002@g1!");
+        assert_eq!(alloc_display_cell(&m, &allocation, 8, 0), "1002@g1 ");
+        let lines = render_avail_panel(
+            &mut m,
+            &[healthy.clone(), stalled.clone()],
+            Rect::new(0, 0, 300, 4),
+            None,
+        );
+        let fg = |content: &str| {
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.trim() == content)
+                .and_then(|span| span.style.fg)
+        };
+        assert_eq!(fg("995@g1"), Some(WARNING));
+        assert_ne!(fg("1007@g1"), Some(WARNING));
+        m.color_coding = false;
+        assert_eq!(avail_display_cell(&m, &stalled, 8, 0), "995@g1!");
+        assert_eq!(avail_display_cell(&m, &healthy, 8, 0), "1007@g1 ");
+        m.notice_minimum = NoticeSeverity::Error;
+        assert!(!message_lines(&m, Line::default(), 300)
+            .iter()
+            .any(|l| l.to_string().contains("Global app frames")));
+        m.notice_minimum = NoticeSeverity::Warning;
+        // Stale status cannot keep a claim alive, nor can a failed shard fetch.
+        m.last_fetch_success = Some(now - Duration::from_secs(60));
+        assert!(!message_lines(&m, Line::default(), 300)
+            .iter()
+            .any(|l| l.to_string().contains("Global app frames")));
+        m.last_fetch_success = Some(now);
+        m.shard_error = Some("fetch failed".into());
+        update_message_lifetime(&mut m);
+        assert!(m.committed_app_counts(now).is_none());
+        assert!(!m.committed_app_flagged(&[1]));
+        assert!(m.notice_since.is_empty());
+        assert_eq!(avail_cell(&m, &stalled, 8, 0), "995@g1");
+    }
+
+    #[test]
+    fn global_app_lag_needs_one_snapshot_and_uses_the_higher_local_or_peer_head() {
+        use quil_types::proto::node::{
+            GetShardInfoResponse, GlobalAppFrameHead, ShardRewardInfo, WorkerExecution,
+        };
+        let now = std::time::Instant::now();
+        let mut m = Model::new();
+        m.last_fetch_success = Some(now);
+        let mut allocation = row("09", 1, 1, 3, "", "");
+        allocation.filter = vec![9];
+        allocation.execution = Some(WorkerExecution {
+            materialized_frame: Some(1151),
+            ..Default::default()
+        });
+        m.allocations = vec![allocation];
+        let snapshot = |committed| GetShardInfoResponse {
+            shards: vec![ShardRewardInfo {
+                filter: vec![9],
+                active_provers: 4,
+                latest_frame: 1000,
+                global_head: Some(GlobalAppFrameHead {
+                    frame: committed,
+                    global_frame: 500,
+                    generation: 2,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        m.observe_committed_app_heads(&snapshot(1051), now);
+        assert_eq!(
+            m.committed_app_counts(now),
+            None,
+            "the bound itself is not behind"
+        );
+        m.observe_committed_app_heads(&snapshot(1050), now);
+        assert_eq!(m.committed_app_counts(now), Some((0, 1, 1)));
+        assert!(m.committed_app_flagged(&[9]));
+        m.allocations.clear();
+        m.observe_committed_app_heads(&snapshot(1050), now);
+        assert_eq!(
+            m.committed_app_counts(now),
+            None,
+            "the peer head alone is within the bound"
+        );
+    }
+
+    #[test]
+    fn reward_notice_compares_the_60m_forecast_with_its_24h_window() {
+        use quil_types::proto::node::{FrameCadence, FrameWindow};
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+        let mut m = Model::new();
+        m.frame_number = 2160;
+        m.epoch_length = 720;
+        m.last_fetch_success = Some(Instant::now());
+        let mut allocation = row("aa", 1, 1, 7, "", "");
+        allocation.filter = vec![0xaa];
+        allocation.status = 2;
+        allocation.epoch = 3;
+        allocation.estimated_reward = BigInt::from(5_000_000);
+        m.allocations = vec![allocation];
+        let seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let cadence = |hour_seconds, hour_frames| FrameCadence {
+            last_observed_unix_seconds: seconds,
+            hour: Some(FrameWindow {
+                window_seconds: 3600,
+                observed_seconds: hour_seconds,
+                advanced_frames: hour_frames,
+            }),
+            day: Some(FrameWindow {
+                window_seconds: 86_400,
+                observed_seconds: 86_400,
+                advanced_frames: 4800,
+            }),
+        };
+        let notices = |m: &Model| {
+            message_lines(m, Line::default(), 300)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        m.node_app_cadence.insert(vec![0xaa], cadence(3600, 20));
+        update_message_lifetime(&mut m);
+        let since = m.notice_since["reward-drop"];
+        assert!(notices(&m).contains(&format!(
+            "{}Reward now 60m ~0.3 vs 24h ~3.0 Q/d.",
+            message_timestamp(Some(since))
+        )));
+        // The notice quotes the same forecasts as the Reward KPI.
+        assert!(reward_total(&m, &m.allocations, 0).starts_with("0.3/3.0/"));
+        m.notice_minimum = NoticeSeverity::Error;
+        assert!(!notices(&m).contains("Reward now"));
+        m.notice_minimum = NoticeSeverity::Warning;
+        m.last_fetch_success = Some(Instant::now() - Duration::from_secs(60));
+        assert!(!notices(&m).contains("Reward now"));
+        m.last_fetch_success = Some(Instant::now());
+        // Half of the 24h rate or more is not a drop.
+        m.node_app_cadence.insert(vec![0xaa], cadence(3600, 100));
+        update_message_lifetime(&mut m);
+        assert!(!m.notice_since.contains_key("reward-drop"));
+        // Short 60m coverage cannot establish a drop.
+        m.node_app_cadence.insert(vec![0xaa], cadence(600, 0));
+        update_message_lifetime(&mut m);
+        assert!(!m.notice_since.contains_key("reward-drop"));
+        // Unassigned allocations take no part.
+        m.node_app_cadence.insert(vec![0xaa], cadence(3600, 20));
+        m.allocations[0].worker_id = -1;
+        assert!(reward_drop(&m).is_none());
+    }
+
+    #[test]
+    fn allocation_notices_count_workerless_failed_stale_and_recovering_rows() {
+        use quil_types::proto::node::{ShardRecovery, WorkerExecution};
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+        let mut m = Model::new();
+        m.frame_number = 2160;
+        m.epoch_length = 720;
+        m.reachable = true;
+        m.last_fetch_success = Some(Instant::now());
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        m.worker_snapshot_received = Some((Instant::now(), now_ms));
+        let execution = |state: &str| {
+            Some(WorkerExecution {
+                state: state.into(),
+                materialized_frame: Some(744),
+                observed_unix_ms: now_ms,
+                last_advance_unix_ms: now_ms,
+                ..Default::default()
+            })
+        };
+        let allocation =
+            |filter: u8, worker: i64, epoch: u64, status: &str, state: Option<&str>| {
+                let mut a = row(&format!("{filter:02x}"), 1, 1, worker, "", "");
+                a.filter = vec![filter];
+                a.status = 2;
+                a.epoch = epoch;
+                a.status_name = status.into();
+                a.execution = state.and_then(|state| execution(state));
+                a
+            };
+        m.allocations = vec![
+            allocation(1, 3, 3, "active", Some("serving")),
+            allocation(2, -1, 3, "active", None),
+            allocation(3, 4, 1, "re-confirm!", Some("serving")),
+            allocation(4, 5, 3, "active", Some("blocked")),
+        ];
+        m.allocations[0].execution.as_mut().unwrap().recovery = Some(ShardRecovery {
+            last_error_unix_ms: now_ms,
+            last_outcome_unix_ms: now_ms - 1000,
+            consecutive_failures: 1,
+            ..Default::default()
+        });
+        // A bound worker's stopped engine is a lifecycle wait, not an allocation's failure.
+        let mut bound = row("w9", 1, 1, 9, "", "");
+        bound.status = 0;
+        bound.status_name = "bound".into();
+        bound.execution = execution("stopped");
+        m.allocations.push(bound);
+        update_message_lifetime(&mut m);
+        let lines = message_lines(&m, Line::default(), 300);
+        let find = |text: &str| {
+            lines
+                .iter()
+                .find(|l| l.to_string().contains(text))
+                .unwrap_or_else(|| panic!("`{text}` missing"))
+        };
+        for (key, text, color) in [
+            (
+                "allocation-workerless",
+                "Allocations without a worker: 1/4.",
+                ERROR,
+            ),
+            (
+                "local-execution-failed",
+                "Local execution blocked or stopped: 1/2 allocations.",
+                ERROR,
+            ),
+            (
+                "allocation-epoch-stale",
+                "Allocation epoch stale (re-confirm!): 1/4 allocations.",
+                WARNING,
+            ),
+            (
+                "recovery-failed",
+                "Last recovery attempt failed: 1/4 workers.",
+                WARNING,
+            ),
+        ] {
+            let line = find(text);
+            assert!(line
+                .to_string()
+                .starts_with(&message_timestamp(Some(m.notice_since[key]))));
+            assert_eq!(line.spans[0].style.fg, Some(color), "{text}");
+            assert!(line.to_string().chars().count() <= 80, "{text}");
+        }
+        m.notice_minimum = NoticeSeverity::Error;
+        let errors = message_lines(&m, Line::default(), 300)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(errors.contains("Allocations without a worker"));
+        assert!(!errors.contains("Last recovery attempt failed"));
+        // Old worker data cannot establish a worker, execution or recovery claim.
+        m.worker_snapshot_received = Some((Instant::now() - Duration::from_secs(120), now_ms));
+        update_message_lifetime(&mut m);
+        assert_eq!(
+            m.notice_since.keys().copied().collect::<Vec<_>>(),
+            vec!["allocation-epoch-stale"]
+        );
+        m.worker_snapshot_received = Some((Instant::now(), now_ms));
+        m.allocations[0].execution.as_mut().unwrap().recovery = Some(ShardRecovery {
+            last_error_unix_ms: now_ms - 1000,
+            last_outcome_unix_ms: now_ms,
+            ..Default::default()
+        });
+        m.allocations[1].worker_id = 6;
+        m.allocations[1].execution = execution("serving");
+        m.allocations[2].epoch = 3;
+        m.allocations[2].status_name = "active".into();
+        m.allocations[3].execution = execution("serving");
+        assert!(condition_notices(&m).is_empty());
+        update_message_lifetime(&mut m);
+        assert!(m.notice_since.is_empty());
     }
 
     #[test]
@@ -6823,6 +7465,9 @@ mod tests {
             "Local app notice",
             "Reported app heads",
             "Global notice",
+            "Global app notice",
+            "Reward notice",
+            "Allocation notices",
             "Command legends",
             "Scroll hints",
             "Colors",
