@@ -35,6 +35,16 @@ fn has_nonzero_remote_shard_size(shards: &RemoteAppShardMap) -> bool {
         .any(|info| info.size.iter().any(|b| *b != 0))
 }
 
+/// Whether `GetShardInfo` must take shard sizes from the archives rather than
+/// from the local view. Only an archive materializes app shards. A regular
+/// node's master store holds no app data and need not hold the committed
+/// grid, so its only nonzero local sizes are the nominal sizes of shards GLOBAL
+/// has committed outputs into: a view of a few KB that must never stand for
+/// the network.
+fn local_shard_info_incomplete(basis: &num_bigint::BigInt, archive_mode: bool) -> bool {
+    !archive_mode || basis.sign() == num_bigint::Sign::NoSign
+}
+
 async fn fetch_remote_app_shards(
     client: &mut quil_rpc::ArchiveClient,
     shard_keys: &[Vec<u8>],
@@ -2695,7 +2705,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         sizes: Arc<quil_engine::shard_info::CommittedShardSizes>,
         /// The configured worker count, for a leave's inferred reason.
         worker_capacity: Arc<std::sync::atomic::AtomicU32>,
+        /// Last source of the served shard sizes, so a change is logged once.
+        size_source: std::sync::atomic::AtomicU8,
     }
+    const SIZES_LOCAL: u8 = 1;
+    const SIZES_ARCHIVE: u8 = 2;
+    const SIZES_FALLBACK_FAILED: u8 = 3;
     impl quil_types::consensus::ShardInfoProvider for LocalShardInfoProvider {
         fn allocation_scoring_strategy(&self) -> &'static str {
             self.allocation_scoring_strategy
@@ -2742,6 +2757,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         }
     }
     impl LocalShardInfoProvider {
+        /// Whether the served sizes changed source since the last call.
+        fn size_source_changed(&self, source: u8) -> bool {
+            self.size_source
+                .swap(source, std::sync::atomic::Ordering::Relaxed)
+                != source
+        }
+
         fn get_shard_info_inner(
             &self,
             include_all: bool,
@@ -2780,23 +2802,10 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                 self.registry.as_ref(),
                 &local_get_sizes,
             );
-            let expected_shards: usize = self
-                .shards_store
-                .range_app_shards()
-                .map(|v| {
-                    let mut keys: std::collections::HashSet<Vec<u8>> =
-                        std::collections::HashSet::new();
-                    for s in v {
-                        keys.insert(s.shard_key);
-                    }
-                    keys.len()
-                })
-                .unwrap_or(0);
+            let local_rows = local_result.as_ref().map_or(0, |result| result.0.len());
             let local_incomplete = match &local_result {
-                Ok((details, _diff, basis, _frame, _world)) => {
-                    let entries_below_shards =
-                        !self.archive_mode && details.len() < expected_shards;
-                    basis.sign() == num_bigint::Sign::NoSign || entries_below_shards
+                Ok((_details, _diff, basis, _frame, _world)) => {
+                    local_shard_info_incomplete(basis, self.archive_mode)
                 }
                 Err(_) => true,
             };
@@ -2807,6 +2816,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                 (details, diff, basis, frame, world)
             });
             if !local_incomplete {
+                if self.size_source_changed(SIZES_LOCAL) {
+                    info!(local_rows, "shard info: serving local shard sizes");
+                }
                 return local_result;
             }
             // The :8340 transport decodes a FALCON signing key on both ends, so the
@@ -2820,6 +2832,14 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                 .clone()
                 .or_else(|| self.ed448_seed.map(|s| s.to_vec()))
             else {
+                if self.size_source_changed(SIZES_FALLBACK_FAILED) {
+                    warn!(
+                        local_rows,
+                        reason = "no transport identity for the archive dial",
+                        action = "check the node's q-prover-key; shard sizes, world size and live-shard counts stay incomplete until the archive fallback succeeds",
+                        "shard info: archive fallback unavailable; serving the incomplete local view"
+                    );
+                }
                 return local_result;
             };
 
@@ -2871,10 +2891,25 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
             let prefetched = match prefetched {
                 Ok(map) => map,
                 Err(e) => {
-                    tracing::debug!(error = %e, "remote shard info fallback failed; returning local result");
+                    if self.size_source_changed(SIZES_FALLBACK_FAILED) {
+                        warn!(
+                            error = %e,
+                            local_rows,
+                            scope = "archives",
+                            action = "expected while the archives are unreachable or restarting; retried on every shard-info request, and a later success is logged",
+                            "shard info: archive fallback failed; serving the incomplete local view"
+                        );
+                    }
                     return local_result;
                 }
             };
+            if self.size_source_changed(SIZES_ARCHIVE) {
+                info!(
+                    local_rows,
+                    archive_shard_keys = prefetched.len(),
+                    "shard info: serving archive shard sizes"
+                );
+            }
             let prefetched = std::sync::Arc::new(prefetched);
             let remote_get_sizes = {
                 let prefetched = prefetched.clone();
@@ -3103,6 +3138,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
             ed448_seed: mtls_seed,
             archive_mode,
             archive_pool: archive_pool.clone(),
+            size_source: std::sync::atomic::AtomicU8::new(0),
         }));
     // Sample without clients, archive requests or changes to consensus/reward policy.
     let mut cadence_scope = vec![network];
@@ -5068,5 +5104,30 @@ mod rpc_bound_tests {
                 since_previous: Some(SUBMIT_REFUSAL_REPORT_INTERVAL),
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod shard_info_completeness_tests {
+    use super::local_shard_info_incomplete;
+    use num_bigint::BigInt;
+
+    /// On 2026-10-27 GLOBAL committed outputs into two genesis-grid shards
+    /// of a regular node's local view (4 KB each). With a nonzero basis and
+    /// one L2 key, the release served that view: world 8 KB, two rows with
+    /// no provers, none of the node's allocations, and no live shard for
+    /// shield-all. Every genesis shard can gain such commits, so no local
+    /// row count makes a regular node's view complete.
+    #[test]
+    fn a_regular_node_takes_archive_sizes() {
+        for basis in [BigInt::from(1), BigInt::from(2_965_820_800_757_861u64)] {
+            assert!(local_shard_info_incomplete(&basis, false));
+        }
+    }
+
+    #[test]
+    fn an_archive_serves_its_local_view() {
+        assert!(!local_shard_info_incomplete(&BigInt::from(1), true));
+        assert!(local_shard_info_incomplete(&BigInt::from(0), true));
     }
 }
