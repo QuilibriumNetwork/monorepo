@@ -2957,6 +2957,9 @@ pub struct AppConsensusEngine {
     /// since, to publish the next part when the view moves
     /// ([`crate::seal_follow`]).
     seal_follow: crate::seal_follow::SealFollow,
+    /// Whether this member's seal drain moves, to warn when it stops
+    /// ([`crate::seal_follow::DrainProgress`]).
+    seal_drain_progress: crate::seal_follow::DrainProgress,
     /// Whether the running session's committed status is unreadable.
     session_status_outage: crate::outage::Outage,
     /// Whether the GLOBAL view the running session is judged by trails the
@@ -3144,6 +3147,7 @@ impl AppConsensusEngine {
             sealed_session: None,
             seal_published_at: None,
             seal_follow: Default::default(),
+            seal_drain_progress: Default::default(),
             // Checked every 10 s: three unreadable checks in a row.
             session_status_outage: crate::outage::Outage::begin_after(3),
             session_view_lag: Default::default(),
@@ -6885,18 +6889,88 @@ impl AppConsensusEngine {
                 self.execution
                     .seal_submitted(drained.executed, drained.reason, drained.attached);
                 self.seal_follow.published(drained.reason, drained.executed);
+                let stall = self.seal_drain_progress.published(
+                    drained.reason,
+                    drained.executed,
+                    drained.checkpoint,
+                    std::time::Instant::now(),
+                );
+                self.log_seal_drain_stall(stall, None);
                 publish(drained.bytes);
             }
             Some(Err(error)) => {
                 warn!(core_id = self.core_id, error = %error, "seal drain headers unavailable; submitting the seal alone");
                 self.execution.seal_submitted(0, "unavailable", 0);
                 self.seal_follow.published("unavailable", 0);
+                let stall = self.seal_drain_progress.clear(std::time::Instant::now());
+                self.log_seal_drain_stall(stall, None);
                 publish(base.to_vec());
             }
             None => {
                 self.seal_follow.clear();
+                let stall = self.seal_drain_progress.clear(std::time::Instant::now());
+                self.log_seal_drain_stall(stall, None);
                 publish(base.to_vec());
             }
+        }
+    }
+
+    /// Log a seal drain's stall transitions
+    /// ([`crate::seal_follow::DrainProgress`]), with whose problem the stall
+    /// is from this member's committed view of GLOBAL at `committed_frame`
+    /// ([`crate::seal_follow::stall_scope`]).
+    fn log_seal_drain_stall(
+        &self,
+        stall: Option<crate::seal_follow::DrainStall>,
+        committed_frame: Option<u64>,
+    ) {
+        use crate::seal_follow::DrainStall;
+        let Some(stall) = stall else {
+            return;
+        };
+        let filter = hex::encode(&self.filter);
+        let session = self
+            .sealed_session
+            .as_ref()
+            .map(|(id, _)| hex::encode(id))
+            .unwrap_or_default();
+        let (state, began) = match stall {
+            DrainStall::Ended { state, outcome } => {
+                info!(core_id = self.core_id, filter = %filter, session = %session,
+                    global_executed = state.executed, checkpoint = state.checkpoint,
+                    parts_drained = state.parts_drained, parts_total = state.parts_total,
+                    stalled_secs = state.stalled_secs, outcome,
+                    "closing session's seal drain stall ended");
+                return;
+            }
+            DrainStall::Began(state) => (state, true),
+            DrainStall::Continues(state) => (state, false),
+        };
+        let latest_global_frame = self
+            .global_anchor_store
+            .get_latest_global_clock_frame()
+            .ok()
+            .and_then(|frame| frame.header.as_ref().map(|header| header.frame_number));
+        let (scope, action, waits_on) = crate::seal_follow::stall_scope(
+            state.global_frames,
+            committed_frame,
+            latest_global_frame,
+        );
+        if began {
+            warn!(core_id = self.core_id, filter = %filter, session = %session, committed_frame,
+                latest_global_frame, global_frames = state.global_frames,
+                global_executed = state.executed, checkpoint = state.checkpoint,
+                parts_drained = state.parts_drained, parts_total = state.parts_total,
+                stalled_secs = state.stalled_secs, scope, action, waits_on,
+                "closing session's seal drain stalled: this worker's GLOBAL view has shown no part \
+                 executed for over 5 min");
+        } else {
+            warn!(core_id = self.core_id, filter = %filter, session = %session, committed_frame,
+                latest_global_frame, global_frames = state.global_frames,
+                global_executed = state.executed, checkpoint = state.checkpoint,
+                parts_drained = state.parts_drained, parts_total = state.parts_total,
+                stalled_secs = state.stalled_secs, scope, action, waits_on,
+                "closing session's seal drain still stalled");
         }
     }
 
@@ -7477,23 +7551,37 @@ impl AppConsensusEngine {
             60 + u64::from(self.local_bls_pubkey.last().copied().unwrap_or(0) % 30),
         );
         let following = self.seal_follow.following();
+        let draining = self.seal_drain_progress.draining();
         let timer_due = |follow: &crate::seal_follow::SealFollow,
                          published: Option<std::time::Instant>| {
             published
                 .max(follow.moved_at())
                 .is_none_or(|at| now.saturating_duration_since(at) >= resubmit_after)
         };
-        if !following && !timer_due(&self.seal_follow, self.seal_published_at) {
+        if !following && !draining && !timer_due(&self.seal_follow, self.seal_published_at) {
             return;
         }
         let view = handoff::CommittedView::capture(global);
         let mut trigger = "timer";
-        if following {
-            let executed = view.as_ref().ok().and_then(|view| {
+        // The sealed session's executed frame in this member's view, while
+        // its drain is followed or tracked.
+        let executed = view
+            .as_ref()
+            .ok()
+            .filter(|_| following || draining)
+            .and_then(|view| {
                 handoff::session_tip(view, &id)
                     .ok()
                     .map(|tip| tip.map_or(session.base_frame, |tip| tip.frame))
             });
+        if draining {
+            let committed_frame = view.as_ref().ok().map(handoff::CommittedView::frame);
+            let stall = self
+                .seal_drain_progress
+                .observe(executed, committed_frame, now);
+            self.log_seal_drain_stall(stall, committed_frame);
+        }
+        if following {
             let rank = session
                 .members
                 .iter()
@@ -7507,13 +7595,19 @@ impl AppConsensusEngine {
             } else if !timer_due(&self.seal_follow, self.seal_published_at) {
                 return;
             }
+        } else if !timer_due(&self.seal_follow, self.seal_published_at) {
+            return;
         }
         match view.and_then(|view| handoff::schedule::seal_submitted(&view, session)) {
             Ok(false) => {
                 self.publish_seal(&submission, trigger);
                 self.seal_published_at = Some(now);
             }
-            Ok(true) => self.execution.seal_recorded(),
+            Ok(true) => {
+                self.execution.seal_recorded();
+                let stall = self.seal_drain_progress.clear(now);
+                self.log_seal_drain_stall(stall, None);
+            }
             Err(_) => {}
         }
     }
@@ -7541,6 +7635,8 @@ impl AppConsensusEngine {
             .as_ref()
             .is_some_and(|(id, _)| session.id().ok() != Some(*id))
         {
+            let stall = self.seal_drain_progress.clear(std::time::Instant::now());
+            self.log_seal_drain_stall(stall, None);
             self.sealed_session = None;
             self.seal_published_at = None;
             self.seal_follow.clear();
@@ -21668,6 +21764,71 @@ mod tests {
         );
         assert_eq!(triggered("timer"), timer_copies + 2);
         assert_eq!(triggered("view_moved"), 2);
+        handoff::set_seal_recovery_frame_for_thread(None);
+        handoff::set_seal_drain_frame_for_thread(None);
+    }
+
+    /// A drain whose member's view shows no part executed for
+    /// `seal_follow::DRAIN_STALL_AFTER` is reported once with its progress
+    /// and scope, not again within the repeat interval, and its end is
+    /// logged when the next part executes.
+    #[tokio::test]
+    async fn a_seal_drain_without_a_part_executed_is_reported_until_it_moves() {
+        use quil_execution::global_intrinsic::handoff;
+        handoff::set_seal_drain_frame_for_thread(Some(0));
+        handoff::set_seal_recovery_frame_for_thread(Some(0));
+        let (global, id, mut engines) = sealed_drain_committee(1);
+        let logs = crate::outage::test_logs::CapturedLogs::default();
+        let _guard = logs.install();
+        let (engine, sent) = &mut engines[0];
+        engine.maintain_committee_session().await;
+        engine.maintain_committee_session().await;
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert!(
+            logs.lines_with("seal drain st").is_empty(),
+            "within the bound"
+        );
+        engine
+            .seal_drain_progress
+            .backdate(crate::seal_follow::DRAIN_STALL_AFTER);
+        engine.maintain_committee_session().await;
+        engine.maintain_committee_session().await;
+        let stalled = logs.lines_with("seal drain stalled");
+        assert_eq!(stalled.len(), 1, "{stalled:?}");
+        let session = hex::encode(id);
+        for field in [
+            "WARN",
+            "parts_drained=0",
+            "parts_total=5",
+            "global_executed=0",
+            "checkpoint=40",
+            "stalled_secs=30",
+            "committed_frame=1",
+            "network",
+            session.as_str(),
+        ] {
+            assert!(stalled[0].contains(field), "{field}: {}", stalled[0]);
+        }
+        assert!(
+            logs.lines_with("still stalled").is_empty(),
+            "no repeat within ten minutes"
+        );
+        execute_drain_part(&global, &id, 8, 2);
+        engine.maintain_committee_session().await;
+        let ended = logs.lines_with("seal drain stall ended");
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        for field in [
+            "INFO",
+            "parts_drained=1",
+            "parts_total=5",
+            "global_executed=8",
+            "part_executed",
+        ] {
+            assert!(ended[0].contains(field), "{field}: {}", ended[0]);
+        }
+        assert_eq!(sent.lock().unwrap().len(), 2, "the next part went out");
+        engine.maintain_committee_session().await;
+        assert_eq!(logs.lines_with("seal drain st").len(), 2, "nothing more");
         handoff::set_seal_recovery_frame_for_thread(None);
         handoff::set_seal_drain_frame_for_thread(None);
     }
