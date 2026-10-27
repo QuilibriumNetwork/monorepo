@@ -113,18 +113,38 @@ start_node() { # dir-name [--archive] ; delay applies when DELAY_NOW is set
 }
 # Every process of node $1: its master and any cluster workers.
 node_pids() { pgrep -f -- "--config $NET_DIR/$1 "; }
-stop_node() { pkill -f -- "--config $NET_DIR/$1 " 2>/dev/null; return 0; }
+STOPPED_PIDS=""
+stop_node() {
+  STOPPED_PIDS="$STOPPED_PIDS $(node_pids "$1" | tr '\n' ' ')"
+  pkill -f -- "--config $NET_DIR/$1 " 2>/dev/null; return 0
+}
+# A stopped process holds its store's lock until it is gone or a zombie: the
+# command line pgrep matches disappears earlier, while the kernel tears down
+# its memory and its files are still open, and a node restarted then finds
+# its store locked and stays down.
+exiting() {
+  local p s
+  for p in $STOPPED_PIDS; do
+    s=$(ps -o stat= -p "$p" 2>/dev/null)
+    [[ -n "$s" && "$s" != Z* ]] && return 0
+  done
+  return 1
+}
 wait_gone() { # names...
   local n i alive
   for (( i=0; i<STOP_GRACE; i+=2 )); do
-    alive=0; for n in "$@"; do [[ -n "$(node_pids "$n")" ]] && alive=1; done
-    (( alive == 0 )) && return 0; sleep 2
+    alive=0; exiting && alive=1
+    for n in "$@"; do [[ -n "$(node_pids "$n")" ]] && alive=1; done
+    (( alive == 0 )) && { STOPPED_PIDS=""; return 0; }; sleep 2
   done
   for n in "$@"; do
     [[ -n "$(node_pids "$n")" ]] || continue
     log "$n did not stop within ${STOP_GRACE}s; killing it"
     pkill -9 -f -- "--config $NET_DIR/$n " 2>/dev/null
   done
+  # shellcheck disable=SC2086 # one PID per word
+  exiting && kill -9 $STOPPED_PIDS 2>/dev/null
+  STOPPED_PIDS=""
   sleep 2
 }
 
