@@ -126,8 +126,36 @@ pub struct ShardBodyNeed {
 
 /// Whether this GLOBAL prover holds the application frame bodies each need
 /// requires, one answer per need
-/// ([`GlobalLeaderProvider::with_body_availability`]).
-pub type ShardBodyAvailability = Arc<dyn Fn(&[ShardBodyNeed]) -> Vec<bool> + Send + Sync>;
+/// ([`GlobalLeaderProvider::with_body_availability`]): `Some` with the
+/// application frames archives materialize executing the header (those above
+/// the shard's cursor through it), `None` when a body is not held.
+pub type ShardBodyAvailability = Arc<dyn Fn(&[ShardBodyNeed]) -> Vec<Option<u64>> + Send + Sync>;
+
+/// Application frames the shard headers one GLOBAL proposal carries make
+/// archives materialize, at most, beyond the one smallest header that does
+/// not fit ([`hold_back_unavailable_shard_proofs`]).
+///
+/// Every archive materializes them, holding its application frame ingest,
+/// before it publishes the GLOBAL frame, and GLOBAL waits for the slowest.
+/// Before 2026-10-27 archives materialized about 4,000–6,000 application
+/// frames per 10 minutes while GLOBAL made about 38 frames, so about 130 per
+/// GLOBAL frame, executed within the frame cadence. Twice that keeps a frame
+/// that catches shards up within about three times a routine frame's
+/// materialization, while about 100 shards 300–600 frames behind are carried
+/// again within about 100 GLOBAL frames. `QUIL_PROPOSAL_APP_FRAME_BUDGET`
+/// overrides it. Leader policy only: which headers a proposal carries is the
+/// leader's choice, and verification and execution are unchanged.
+const PROPOSAL_APP_FRAME_BUDGET: u64 = 256;
+
+fn proposal_app_frame_budget() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("QUIL_PROPOSAL_APP_FRAME_BUDGET")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(PROPOSAL_APP_FRAME_BUDGET)
+    })
+}
 
 /// The bodies the shard headers a proof bundle carries need.
 pub(crate) fn shard_body_needs(raw: &[u8]) -> Vec<ShardBodyNeed> {
@@ -151,31 +179,89 @@ pub(crate) fn shard_body_needs(raw: &[u8]) -> Vec<ShardBodyNeed> {
         .collect()
 }
 
+/// The shard proofs a GLOBAL proposal carries
+/// ([`hold_back_unavailable_shard_proofs`]).
+#[derive(Debug, Default)]
+pub(crate) struct ShardProofSelection {
+    /// The proofs that ride, in the order given.
+    pub ready: Vec<Vec<u8>>,
+    /// The needs whose bodies are not held.
+    pub missing: Vec<ShardBodyNeed>,
+    /// Application frames the proofs that ride make archives materialize.
+    pub frames: u64,
+    /// Proofs whose bodies are held, left for a later proposal by the budget.
+    pub deferred: usize,
+    /// Application frames those would have added, and the most one would.
+    pub deferred_frames: u64,
+    pub largest_deferred: u64,
+}
+
 /// Split shard proofs into those whose headers' bodies `available` reports
 /// held, which may ride this proposal, and the needs it does not report
 /// held. A proof with any such need stays in the mempool, for a later
 /// proposal within its anchor window once the bodies arrive.
+///
+/// Of the proofs whose bodies are held, those making archives materialize
+/// the fewest application frames ride first, within `budget` frames, and the
+/// smallest one that does not fit rides too, so a shard further behind than
+/// the budget is still carried. The rest stay in the mempool and ride a
+/// later proposal, with the shard's newer header. Carried all at once after
+/// headers were held back for long, about 100 shards 300–600 frames behind
+/// would make every archive materialize some 45,000 frames before executing
+/// one GLOBAL frame.
 pub(crate) fn hold_back_unavailable_shard_proofs(
     proofs: Vec<Vec<u8>>,
-    available: &dyn Fn(&[ShardBodyNeed]) -> Vec<bool>,
-) -> (Vec<Vec<u8>>, Vec<ShardBodyNeed>) {
+    available: &dyn Fn(&[ShardBodyNeed]) -> Vec<Option<u64>>,
+    budget: u64,
+) -> ShardProofSelection {
     let needs: Vec<Vec<ShardBodyNeed>> = proofs.iter().map(|raw| shard_body_needs(raw)).collect();
     let all: Vec<ShardBodyNeed> = needs.iter().flatten().cloned().collect();
     let mut answers = available(all.as_slice()).into_iter();
-    let mut ready = Vec::with_capacity(proofs.len());
-    let mut missing = Vec::new();
+    let mut selection = ShardProofSelection::default();
+    // (proof, the frames it makes archives materialize)
+    let mut held: Vec<(Vec<u8>, u64)> = Vec::with_capacity(proofs.len());
     for (raw, needs) in proofs.into_iter().zip(needs) {
-        let before = missing.len();
+        let before = selection.missing.len();
+        // A shard materializes once, through its highest header.
+        let mut frames: std::collections::HashMap<Vec<u8>, u64> = std::collections::HashMap::new();
         for need in needs {
-            if !answers.next().unwrap_or(false) {
-                missing.push(need);
+            match answers.next().flatten() {
+                Some(count) => {
+                    let shard = frames.entry(need.address).or_insert(0);
+                    *shard = (*shard).max(count);
+                }
+                None => selection.missing.push(need),
             }
         }
-        if missing.len() == before {
-            ready.push(raw);
+        if selection.missing.len() == before {
+            held.push((
+                raw,
+                frames.values().fold(0, |sum, &n| sum.saturating_add(n)),
+            ));
         }
     }
-    (ready, missing)
+    let mut order: Vec<usize> = (0..held.len()).collect();
+    order.sort_by_key(|&index| (held[index].1, index));
+    let mut rides = vec![false; held.len()];
+    let mut overflowed = false;
+    for index in order {
+        let frames = held[index].1;
+        if selection.frames.saturating_add(frames) <= budget || !overflowed {
+            overflowed |= selection.frames.saturating_add(frames) > budget;
+            selection.frames = selection.frames.saturating_add(frames);
+            rides[index] = true;
+        } else {
+            selection.deferred += 1;
+            selection.deferred_frames = selection.deferred_frames.saturating_add(frames);
+            selection.largest_deferred = selection.largest_deferred.max(frames);
+        }
+    }
+    selection.ready = held
+        .into_iter()
+        .zip(rides)
+        .filter_map(|((raw, _), rides)| rides.then_some(raw))
+        .collect();
+    selection
 }
 
 /// Global chain leader provider. Selects leaders based on the prover
@@ -1183,17 +1269,38 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 // later frame within their anchor window.
                 if let Some(available) = self.body_availability.as_ref() {
                     let kept = std::mem::take(&mut tips.kept);
-                    let (ready, missing) = hold_back_unavailable_shard_proofs(kept, &**available);
-                    tips.kept = ready;
-                    if let Some(first) = missing.first() {
-                        tracing::info!(
-                            frame = frame_number,
-                            held_back = missing.len(),
-                            first_shard = %hex::encode(&first.address),
-                            first_frame = first.frame_number,
-                            "shard headers held back from this GLOBAL proposal: this archive lacks application frame bodies their execution needs; each rides a later frame once its bodies arrive"
-                        );
-                    }
+                    let offered = kept.len();
+                    let budget = proposal_app_frame_budget();
+                    let selection = hold_back_unavailable_shard_proofs(kept, &**available, budget);
+                    tips.kept = selection.ready;
+                    let held_back = offered - tips.kept.len() - selection.deferred;
+                    let first = selection.missing.first();
+                    // Counted into one summary line per interval
+                    // ([`crate::inclusion_summary`]), not logged per proposal.
+                    crate::inclusion_summary::note_proposal(
+                        frame_number,
+                        offered,
+                        tips.kept.len(),
+                        held_back,
+                        first.map(|need| (need.address.as_slice(), need.frame_number)),
+                        selection.deferred,
+                        selection.largest_deferred,
+                    );
+                    tracing::debug!(
+                        frame = frame_number,
+                        offered,
+                        carried = tips.kept.len(),
+                        carried_app_frames = selection.frames,
+                        held_back,
+                        first_held_back_shard = %first.map_or(String::new(), |need| hex::encode(&need.address)),
+                        first_held_back_frame = first.map_or(0, |need| need.frame_number),
+                        deferred = selection.deferred,
+                        deferred_app_frames = selection.deferred_frames,
+                        largest_deferred_gap = selection.largest_deferred,
+                        budget,
+                        "shard tips selected for this GLOBAL proposal: those whose application frame bodies this \
+                         archive holds, smallest gap first within the application frame budget"
+                    );
                 }
                 let coalesced = tips.superseded.len();
                 valid.extend(tips.kept);
@@ -2253,10 +2360,10 @@ mod tests {
             empty: false,
         };
         // Shard 0x22's frame 9 body was never released.
-        let available = |needs: &[ShardBodyNeed]| -> Vec<bool> {
+        let available = |needs: &[ShardBodyNeed]| -> Vec<Option<u64>> {
             needs
                 .iter()
-                .map(|n| n.address != vec![0x22u8; 32] || n.frame_number < 9)
+                .map(|n| (n.address != vec![0x22u8; 32] || n.frame_number < 9).then_some(1))
                 .collect()
         };
         let held = make_shard_frame(0x11, 7);
@@ -2271,7 +2378,9 @@ mod tests {
             junk.clone(),
         ]);
         assert_eq!(superseded.len(), 1);
-        let (mut ready, missing) = hold_back_unavailable_shard_proofs(kept, &available);
+        let ShardProofSelection {
+            mut ready, missing, ..
+        } = hold_back_unavailable_shard_proofs(kept, &available, u64::MAX);
         ready.sort();
         let mut want = vec![held, junk];
         want.sort();
@@ -2294,10 +2403,73 @@ mod tests {
             ]
         );
         // Nothing held: every proof with a shard header stays back.
-        let none_held = |needs: &[ShardBodyNeed]| vec![false; needs.len()];
-        let (ready, missing) = hold_back_unavailable_shard_proofs(vec![withheld], &none_held);
+        let none_held = |needs: &[ShardBodyNeed]| vec![None; needs.len()];
+        let ShardProofSelection { ready, missing, .. } =
+            hold_back_unavailable_shard_proofs(vec![withheld], &none_held, u64::MAX);
         assert!(ready.is_empty());
         assert_eq!(missing, vec![need(0x22, 9)]);
+    }
+
+    /// Shard headers whose bodies are held ride smallest gap first within the
+    /// application frame budget, plus the smallest that does not fit, so a
+    /// shard further behind than the budget is still carried; the rest wait
+    /// for a later proposal, and a header whose body is not held never rides,
+    /// however small.
+    #[test]
+    fn shard_tips_ride_smallest_gap_first_within_the_app_frame_budget() {
+        // Shard `addr` is `addr` frames behind; 0x05's bodies are not held.
+        let available = |needs: &[ShardBodyNeed]| -> Vec<Option<u64>> {
+            needs
+                .iter()
+                .map(|n| (n.address[0] != 0x05).then_some(n.address[0] as u64 * 10))
+                .collect()
+        };
+        let gaps = [0x30u8, 0x01, 0x14, 0x05, 0x02, 0x40, 0x03];
+        let proofs: Vec<Vec<u8>> = gaps.iter().map(|&a| make_shard_frame(a, 7)).collect();
+        let junk = b"not a bundle".to_vec();
+        let mut with_junk = proofs.clone();
+        with_junk.push(junk.clone());
+
+        // Budget 100: 10 + 20 + 30 = 60 fit, 200 does not and rides as the
+        // smallest overflow; 480 and 640 wait. 0x05 is held back for its body.
+        let selection = hold_back_unavailable_shard_proofs(with_junk, &available, 100);
+        assert_eq!(
+            selection.ready,
+            vec![
+                proofs[1].clone(),
+                proofs[2].clone(),
+                proofs[4].clone(),
+                proofs[6].clone(),
+                junk.clone(),
+            ],
+            "the smallest gaps, the first overflow and the proof without headers ride, in the order given"
+        );
+        assert_eq!(selection.frames, 260);
+        assert_eq!(selection.deferred, 2);
+        assert_eq!(selection.deferred_frames, 480 + 640);
+        assert_eq!(selection.largest_deferred, 640);
+        assert_eq!(
+            selection.missing,
+            vec![ShardBodyNeed {
+                address: vec![0x05; 32],
+                frame_number: 7,
+                empty: false,
+            }]
+        );
+
+        // A shard further behind than the whole budget still rides alone.
+        let selection = hold_back_unavailable_shard_proofs(
+            vec![proofs[5].clone(), proofs[0].clone()],
+            &available,
+            100,
+        );
+        assert_eq!(selection.ready, vec![proofs[0].clone()]);
+        assert_eq!((selection.deferred, selection.largest_deferred), (1, 640));
+
+        // Within the budget everything rides and nothing is deferred.
+        let selection = hold_back_unavailable_shard_proofs(proofs.clone(), &available, u64::MAX);
+        assert_eq!(selection.ready.len(), proofs.len() - 1);
+        assert_eq!(selection.deferred, 0);
     }
 
     fn make_shard_frame(addr: u8, local_frame: u64) -> Vec<u8> {

@@ -1550,10 +1550,21 @@ pub(crate) async fn start(
                     let mut failures = Vec::new();
                     let mut awaiting_execution = 0usize;
                     let mut recovered = None;
-                    let mut attempts = futures::stream::iter(endpoints.iter().cloned().map(|addr| {
+                    // A frame above the cursor this archive stored before a
+                    // restart is checked from its own store first: it
+                    // remembers such bodies in memory only, and asking the
+                    // network for hundreds of frames per shard it holds
+                    // delayed every shard header behind them.
+                    const LOCAL: &str = "this archive's store";
+                    let local = |number: u64| ingest.as_ref()
+                        .and_then(|(_, verifier)| verifier.stored_above_cursor(&filter, number));
+                    type Attempt = Result<Result<Option<quil_types::proto::global::AppShardFrame>, String>,
+                        tokio::time::error::Elapsed>;
+                    let stored = local(frame_number).map(|frame| (LOCAL.to_string(), Attempt::Ok(Ok(Some(frame)))));
+                    let mut attempts = futures::stream::iter(stored).chain(futures::stream::iter(endpoints.iter().cloned().map(|addr| {
                         let attempt = fetch_from(addr.clone(), frame_number);
                         async move { (addr, attempt.await) }
-                    })).buffer_unordered(CONCURRENT);
+                    })).buffer_unordered(CONCURRENT));
                     while let Some((source, attempt)) = attempts.next().await {
                         let frame = match attempt {
                             Ok(Ok(Some(frame))) if frame.header.as_ref().is_some_and(|h|
@@ -1583,8 +1594,15 @@ pub(crate) async fn start(
                                         .collect();
                                     let filter = filter.clone();
                                     let fetch_from = &fetch_from;
+                                    let local = &local;
                                     async move {
                                         for addr in order {
+                                            if addr == LOCAL {
+                                                if let Some(frame) = local(number) {
+                                                    return Some(frame);
+                                                }
+                                                continue;
+                                            }
                                             if let Ok(Ok(Some(frame))) = fetch_from(addr, number).await {
                                                 if frame.header.as_ref().is_some_and(|h| h.address == filter && h.frame_number == number) {
                                                     return Some(frame);
@@ -1645,6 +1663,9 @@ pub(crate) async fn start(
                     }
                     drop(attempts);
                     match recovered {
+                        // Read back after a restart, up to hundreds per shard.
+                        Some((source, through)) if source == LOCAL => tracing::debug!(filter = %hex::encode(&filter),
+                            frame = frame_number, through, "app-shard gap fetch admitted a frame from this archive's store"),
                         Some((source, through)) => tracing::info!(filter = %hex::encode(&filter), frame = frame_number,
                             through, %source, endpoints_failed = failures.len(),
                             "app-shard gap fetch recovered a missing frame"),

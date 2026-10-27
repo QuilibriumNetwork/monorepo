@@ -51,6 +51,17 @@ pub struct ArchiveAppShardIngest {
     /// Out-of-order verified frames, buffered until the gap fills:
     /// address → (frame_number → frame).
     buffered: HashMap<Vec<u8>, HashMap<u64, AppShardFrame>>,
+    /// Frames above the cursor that were admitted and stored for serving, per
+    /// address: frame → digest of the stored encoding ([`body_digest`]). A
+    /// frame the buffer bound evicted is read back from the store, and
+    /// materialized when the stored copy still has this digest, so it counts
+    /// as held as a buffered frame does. Kept in memory only: after a restart
+    /// such frames are admitted again, from this archive's store first
+    /// ([`ArchiveFrameVerifier::stored_above_cursor`]).
+    stored: HashMap<Vec<u8>, BTreeMap<u64, [u8; 32]>>,
+    /// What [`Self::holds_bodies_through`] answers, per shard, readable
+    /// without this ingest.
+    held_bodies: HeldBodies,
     /// Validated frames without a certificate, waiting for a certified
     /// descendant to link to them: address → ((frame, identity) → frame).
     held: HashMap<Vec<u8>, std::collections::BTreeMap<(u64, [u8; 32]), AppShardFrame>>,
@@ -118,6 +129,17 @@ const GAP_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// execution is stalled for as long as it is missing.
 const GLOBAL_WAIT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_BUFFERED_FRAMES_PER_SHARD: usize = 128;
+/// Frames above a shard's cursor whose stored bodies are remembered
+/// ([`ArchiveAppShardIngest::stored`]), 32 bytes each. The buffer holds at most
+/// [`MAX_BUFFERED_FRAMES_PER_SHARD`] frames, and GLOBAL can carry only a recent
+/// header, so a shard whose head ran further ahead than the buffer could never
+/// have a header proposed again: from 03:20Z on 2026-10-27 about 100 shards
+/// sat 270–600 frames behind, growing about 5 a minute, and GLOBAL frames
+/// carried almost no shard headers. This bound is about a day of such growth.
+const MAX_STORED_BODIES_PER_SHARD: usize = 8192;
+/// Headers proposals could not carry that wait for the ingest to look into
+/// them ([`HeldBodies::frames_held`]), one per shard.
+const MAX_WANTED_SHARDS: usize = 4096;
 /// Frames of one shard asked for at once while a GLOBAL frame waits on it.
 /// Asked one at a time, each only once the one before it arrived, an archive
 /// behind by thousands of frames per shard recovered about one frame a second:
@@ -258,6 +280,8 @@ impl ArchiveAppShardIngest {
             hypergraph,
             last_materialized: HashMap::new(),
             buffered: HashMap::new(),
+            stored: HashMap::new(),
+            held_bodies: HeldBodies::default(),
             held: HashMap::new(),
             gap_requests: None,
             prefetch_requests: None,
@@ -362,12 +386,32 @@ impl ArchiveAppShardIngest {
     /// ingest ([`Self::admit_verified`]).
     pub fn verifier(&self) -> ArchiveFrameVerifier {
         ArchiveFrameVerifier {
+            held_bodies: self.held_bodies.clone(),
             validator: self.validator.clone(),
             execution_manager: self.execution_manager.clone(),
             inclusion_prover: self.inclusion_prover.clone(),
             has_forest: self.hypergraph.has_forest(),
             clock_store: self.clock_store.clone(),
             hypergraph: self.hypergraph.clone(),
+        }
+    }
+
+    /// The bodies this ingest holds per shard, as last published, to read
+    /// without holding the ingest: a GLOBAL proposal checks the headers it
+    /// may carry against them ([`HeldBodies::frames_held`]).
+    pub fn held_bodies(&self) -> HeldBodies {
+        self.held_bodies.clone()
+    }
+
+    /// Look into the headers proposals could not carry
+    /// ([`HeldBodies::frames_held`]): publish what is held of each shard and
+    /// ask for the first frame it lacks ([`Self::holds_bodies_through`]).
+    pub fn look_into_wanted(&mut self) {
+        for (address, (through, empty)) in self.held_bodies.take_wanted() {
+            if let Err(error) = self.holds_bodies_through(&address, through, empty) {
+                debug!(%error, address = %hex::encode(&address),
+                    "shard body check unavailable; its header is held back");
+            }
         }
     }
 
@@ -479,6 +523,12 @@ impl ArchiveAppShardIngest {
     /// Publish in memory only after state and cursor have committed together.
     fn set_materialized_height(&mut self, address: &[u8], frame: u64) {
         self.last_materialized.insert(address.to_vec(), frame);
+        if let Some(stored) = self.stored.get_mut(address) {
+            *stored = stored.split_off(&(frame + 1));
+            if stored.is_empty() {
+                self.stored.remove(address);
+            }
+        }
         if let Some(requested) = self.requested.get_mut(address) {
             *requested = requested.split_off(&(frame + 1));
             if requested.is_empty() {
@@ -530,6 +580,8 @@ impl ArchiveAppShardIngest {
         self.clock_store.discard_app_frame_history(global_frame)?;
         self.last_materialized.clear();
         self.buffered.clear();
+        self.stored.clear();
+        self.held_bodies.clear();
         self.held.clear();
         self.requested.clear();
         self.owed_bodies.clear();
@@ -550,6 +602,7 @@ impl ArchiveAppShardIngest {
         self.take_missing_frame_reports();
         self.request_owed_bodies();
         self.note_execution();
+        self.look_into_wanted();
         if self.sequenced {
             return;
         }
@@ -664,6 +717,11 @@ impl ArchiveAppShardIngest {
     /// of its own. Refusing such a parent leaves archives waiting for it
     /// forever and halts GLOBAL's sequenced ingest.
     fn admit(&mut self, address: &[u8], frame: AppShardFrame, certified: bool) {
+        self.admit_frames(address, frame, certified);
+        self.publish_held(address);
+    }
+
+    fn admit_frames(&mut self, address: &[u8], frame: AppShardFrame, certified: bool) {
         use crate::frame_validator::app_frame_links_to_child;
         let Some(header) = frame.header.clone() else {
             return;
@@ -711,18 +769,110 @@ impl ArchiveAppShardIngest {
             }
         }
         for (number, frame) in authenticated {
-            self.store_for_serving(&frame);
+            match self.store_body(&frame) {
+                Some(digest) => self.remember_stored(address, number, digest),
+                None => self.forget_stored(address, number),
+            }
             self.buffered
                 .entry(address.to_vec())
                 .or_default()
                 .insert(number, frame);
         }
+        // The farthest frame leaves the buffer; stored, it is still held
+        // ([`Self::read_back_stored`]).
         let buffered = self.buffered.entry(address.to_vec()).or_default();
         if buffered.len() > MAX_BUFFERED_FRAMES_PER_SHARD {
             if let Some(farthest) = buffered.keys().max().copied() {
                 buffered.remove(&farthest);
             }
         }
+    }
+
+    /// Remember that the body of frame `number` of `address`, above the
+    /// cursor, is stored with `digest`, within [`MAX_STORED_BODIES_PER_SHARD`]:
+    /// past it the farthest is forgotten, and asked for again once needed.
+    fn remember_stored(&mut self, address: &[u8], number: u64, digest: [u8; 32]) {
+        if self
+            .last_materialized
+            .get(address)
+            .is_some_and(|&cursor| number <= cursor)
+        {
+            return;
+        }
+        let stored = self.stored.entry(address.to_vec()).or_default();
+        stored.insert(number, digest);
+        if stored.len() > MAX_STORED_BODIES_PER_SHARD {
+            let farthest = stored.pop_last().map_or(number, |(farthest, _)| farthest);
+            let cursor = self.last_materialized.get(address).copied().unwrap_or(0);
+            self.held_bodies
+                .note_beyond_bound(address, cursor, farthest);
+        }
+    }
+
+    fn forget_stored(&mut self, address: &[u8], number: u64) {
+        if let Some(stored) = self.stored.get_mut(address) {
+            stored.remove(&number);
+            if stored.is_empty() {
+                self.stored.remove(address);
+            }
+        }
+    }
+
+    /// Whether the body of frame `number` of `address` is buffered, or stored
+    /// with its digest remembered.
+    fn body_held(&self, address: &[u8], number: u64) -> bool {
+        self.buffered
+            .get(address)
+            .is_some_and(|frames| frames.contains_key(&number))
+            || self
+                .stored
+                .get(address)
+                .is_some_and(|stored| stored.contains_key(&number))
+    }
+
+    /// Frame `number` of `address` read back from the store, when its body was
+    /// admitted and stored above the cursor and the stored copy is still that
+    /// body ([`Self::stored`]); a copy since replaced or lost is forgotten, so
+    /// the frame is asked for again.
+    fn read_back_stored(&mut self, address: &[u8], number: u64) -> Option<AppShardFrame> {
+        let digest = *self.stored.get(address)?.get(&number)?;
+        let frame = self
+            .clock_store
+            .get_shard_clock_frame(address, number, false)
+            .ok()
+            .filter(|frame| body_digest(frame) == digest);
+        if frame.is_none() {
+            self.forget_stored(address, number);
+            warn!(address = %hex::encode(address), frame = number,
+                "archive ingest: a shard frame body stored above the cursor is no longer the one admitted; \
+                 it is asked for again");
+        }
+        frame
+    }
+
+    /// The highest frame of `address` through which every body above
+    /// `cursor` is held: buffered, stored ([`Self::body_held`]) or held as the
+    /// frame GLOBAL committed at that height ([`Self::committed_held`]).
+    fn held_through(&self, address: &[u8], cursor: u64) -> u64 {
+        let bound = cursor
+            .saturating_add((MAX_STORED_BODIES_PER_SHARD + MAX_BUFFERED_FRAMES_PER_SHARD) as u64);
+        let mut through = cursor;
+        while through < bound
+            && (self.body_held(address, through + 1)
+                || self.committed_held(address, through + 1).is_some())
+        {
+            through += 1;
+        }
+        through
+    }
+
+    /// Publish what this ingest holds of `address` ([`HeldBodies`]).
+    fn publish_held(&mut self, address: &[u8]) {
+        let Ok(cursor) = self.materialized_height(address) else {
+            return;
+        };
+        let through = self.held_through(address, cursor);
+        self.held_bodies.publish(address, cursor, through);
     }
 
     /// Serve the frame held without a certificate at `address`'s committed
@@ -880,6 +1030,14 @@ impl ArchiveAppShardIngest {
     /// GLOBAL frame carries fills and no certificate binds, is stored empty.
     /// Returns whether the frame was stored.
     fn store_for_serving(&self, frame: &AppShardFrame) -> bool {
+        self.store_body(frame).is_some()
+    }
+
+    /// [`Self::store_for_serving`], returning the digest of what was stored
+    /// ([`body_digest`]). Materializing reads a frame's requests and its
+    /// header's other fields, never the cleared `storage_attestation`, so the
+    /// stored copy materializes as the one received.
+    fn store_body(&self, frame: &AppShardFrame) -> Option<[u8; 32]> {
         if frame
             .header
             .as_ref()
@@ -889,14 +1047,10 @@ impl ArchiveAppShardIngest {
             if let Some(header) = cleared.header.as_mut() {
                 header.storage_attestation.clear();
             }
-            return self.store_for_serving(&cleared);
+            return self.store_body(&cleared);
         }
-        let Some(header) = frame.header.as_ref() else {
-            return false;
-        };
-        let Ok(selector) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else {
-            return false;
-        };
+        let header = frame.header.as_ref()?;
+        let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output).ok()?;
         // Outside every GLOBAL execution footprint, so it does not make a
         // concurrent atomic execution stale.
         if let Err(error) = self
@@ -906,9 +1060,9 @@ impl ArchiveAppShardIngest {
             warn!(frame = header.frame_number, %error,
                 address = %hex::encode(&header.address),
                 "archive ingest: storing a verified shard frame for serving failed");
-            return false;
+            return None;
         }
-        true
+        Some(body_digest(frame))
     }
 
     /// Whether this archive owes the body of frame `number` of `address`.
@@ -1338,8 +1492,13 @@ impl ArchiveAppShardIngest {
                 break true;
             };
             // `rebuilt`: rebuilt from its header, and whether whole.
-            let (frame, rebuilt) = match self.buffered.get(address).and_then(|m| m.get(&next)) {
-                Some(f) => (f.clone(), None),
+            let buffered = self
+                .buffered
+                .get(address)
+                .and_then(|m| m.get(&next))
+                .cloned();
+            let (frame, rebuilt) = match buffered.or_else(|| self.read_back_stored(address, next)) {
+                Some(f) => (f, None),
                 None => match self.committed_held(address, next) {
                     Some(frame) => {
                         self.store_for_serving(&frame);
@@ -1423,11 +1582,19 @@ impl ArchiveAppShardIngest {
         let ahead = self
             .buffered
             .get(address)
-            .map_or(0, |m| m.keys().filter(|&&f| f > next_needed).count());
-        let missing = !self
-            .buffered
-            .get(address)
-            .is_some_and(|m| m.contains_key(&next_needed));
+            .map_or(0, |m| m.keys().filter(|&&f| f > next_needed).count())
+            + self.stored.get(address).map_or(0, |stored| {
+                stored
+                    .range(next_needed + 1..)
+                    .filter(|(f, _)| {
+                        !self
+                            .buffered
+                            .get(address)
+                            .is_some_and(|m| m.contains_key(*f))
+                    })
+                    .count()
+            });
+        let missing = !self.body_held(address, next_needed);
         let waiting = !reached && through != u64::MAX;
         if missing && (ahead > 0 || waiting) {
             // A frame already held without a certificate needs its certified
@@ -1448,7 +1615,10 @@ impl ArchiveAppShardIngest {
             };
             let requested = self.request_frames(address, wanted..=upto, true, waiting, interval);
             if requested > 0 {
-                warn!(
+                // Counted into the inclusion summary; a GLOBAL frame waiting on
+                // the gap has a warning of its own.
+                crate::inclusion_summary::note_gap(address, next_needed, requested);
+                debug!(
                     address = %hex::encode(address),
                     missing_from = next_needed,
                     requested,
@@ -1472,6 +1642,7 @@ impl ArchiveAppShardIngest {
                 self.buffered.remove(address);
             }
         }
+        self.publish_held(address);
         Ok(reached)
     }
 
@@ -1498,14 +1669,20 @@ impl ArchiveAppShardIngest {
 
     /// Whether this archive holds every frame of `address` that
     /// materializing it through `through` needs: each frame above its cursor
-    /// buffered, or held as the frame GLOBAL committed at that height (a
-    /// sealed session's last frame); `through` itself may instead be provably
-    /// empty (`empty`: its certified header's `requests_root` is all zero),
-    /// which [`Self::empty_frame_from_header`] rebuilds from that header. The
-    /// first frame it lacks is asked for, with those above it to the
-    /// prefetch depth, for a shard it already holds frames of: a header
+    /// buffered, stored with its digest remembered ([`Self::stored`]: frames
+    /// the buffer bound evicted), or held as the frame GLOBAL committed at that
+    /// height (a sealed session's last frame); `through` itself may instead be
+    /// provably empty (`empty`: its certified header's `requests_root` is all
+    /// zero), which [`Self::empty_frame_from_header`] rebuilds from that
+    /// header. The first frame it lacks is asked for, with those above it to
+    /// the prefetch depth, for a shard it already holds frames of: a header
     /// naming any other address may be forged (a bundle carrying several
-    /// shards' headers rides without verification).
+    /// shards' headers rides without verification). What is held is
+    /// published for proposals ([`Self::held_bodies`]).
+    ///
+    /// Buffered frames alone, a shard whose head ran more than the buffer
+    /// bound past its cursor could never be held through a header GLOBAL can
+    /// still carry, and its headers were held back for good.
     ///
     /// A GLOBAL prover proposes a shard's certified header only while this
     /// holds. Execution on every archive waits for the body of each frame a
@@ -1519,29 +1696,19 @@ impl ArchiveAppShardIngest {
         empty: bool,
     ) -> quil_types::error::Result<bool> {
         let last = self.materialized_height(address)?;
-        if through <= last {
+        let held = self.held_through(address, last);
+        self.held_bodies.publish(address, last, held);
+        if through <= held || (empty && through == held + 1) {
             return Ok(true);
         }
-        for number in last + 1..=through {
-            let buffered = self
-                .buffered
-                .get(address)
-                .is_some_and(|frames| frames.contains_key(&number));
-            if buffered
-                || (empty && number == through)
-                || self.committed_held(address, number).is_some()
-            {
-                continue;
-            }
-            let known = last > 0 || self.buffered.contains_key(address);
-            if known || self.held.contains_key(address) {
-                let reach = last.saturating_add(PREFETCH_DEPTH);
-                let upto = through.min(reach).max(number);
-                self.request_frames(address, number..=upto, false, false, GAP_RETRY_INTERVAL);
-            }
-            return Ok(false);
+        let number = held + 1;
+        let known =
+            last > 0 || self.buffered.contains_key(address) || self.stored.contains_key(address);
+        if known || self.held.contains_key(address) {
+            let upto = through.min(number.saturating_add(PREFETCH_DEPTH));
+            self.request_frames(address, number..=upto, false, false, GAP_RETRY_INTERVAL);
         }
-        Ok(true)
+        Ok(false)
     }
 
     /// Ask for each frame of `frames` neither buffered nor held, unless it was
@@ -1568,12 +1735,7 @@ impl ArchiveAppShardIngest {
         let mut stored: HashMap<u64, bool> = HashMap::new();
         let mut executed: Option<Option<u64>> = None;
         for number in frames {
-            if self
-                .buffered
-                .get(address)
-                .is_some_and(|buffered| buffered.contains_key(&number))
-                || self.is_held(address, number)
-            {
+            if self.body_held(address, number) || self.is_held(address, number) {
                 continue;
             }
             if let Some(anchor) = self
@@ -1796,6 +1958,9 @@ impl ArchiveAppShardIngest {
 /// admits it, apart from the ingest, so they can run without holding it.
 #[derive(Clone)]
 pub struct ArchiveFrameVerifier {
+    /// What the ingest holds per shard, whose cursors tell a frame above the
+    /// cursor ([`Self::stored_above_cursor`]).
+    held_bodies: HeldBodies,
     validator: Arc<BlsAppFrameValidator>,
     execution_manager: Arc<quil_execution::ExecutionEngineManager>,
     inclusion_prover: Arc<dyn InclusionProver>,
@@ -1822,6 +1987,27 @@ pub enum FrameCheck {
 }
 
 impl ArchiveFrameVerifier {
+    /// Frame `number` of `address` as this archive's store holds it, when it
+    /// is above the shard's cursor as the ingest last published it
+    /// ([`HeldBodies`]); unverified, like a frame any endpoint serves. Bodies
+    /// stored above the cursor are remembered in memory only, so after a
+    /// restart an archive whose shards ran far ahead of their cursors admits
+    /// them again from here before it asks the network.
+    pub fn stored_above_cursor(&self, address: &[u8], number: u64) -> Option<AppShardFrame> {
+        let cursor = self.held_bodies.cursor(address)?;
+        if number <= cursor {
+            return None;
+        }
+        self.clock_store
+            .get_shard_clock_frame(address, number, false)
+            .ok()
+            .filter(|frame| {
+                frame.header.as_ref().is_some_and(|header| {
+                    header.address == address && header.frame_number == number
+                })
+            })
+    }
+
     /// The GLOBAL frame `frame` is anchored to, when this archive has not
     /// stored it. Validation derives the frame's output from that GLOBAL
     /// frame, so it cannot pass before the GLOBAL frame is stored.
@@ -1966,6 +2152,217 @@ impl ArchiveFrameVerifier {
         }
 
         FrameCheck::Admit { certified }
+    }
+}
+
+/// The digest of a frame's encoding as it is stored, with its header's
+/// `storage_attestation` cleared, which a body read back from the store must
+/// match ([`ArchiveAppShardIngest::stored`]).
+fn body_digest(frame: &AppShardFrame) -> [u8; 32] {
+    use sha2::Digest as _;
+    if frame
+        .header
+        .as_ref()
+        .is_some_and(|header| !header.storage_attestation.is_empty())
+    {
+        let mut cleared = frame.clone();
+        if let Some(header) = cleared.header.as_mut() {
+            header.storage_attestation.clear();
+        }
+        return body_digest(&cleared);
+    }
+    sha2::Sha256::digest(prost::Message::encode_to_vec(frame)).into()
+}
+
+/// Per shard, the run of frames above its cursor whose bodies an archive's
+/// ingest holds, published by the ingest
+/// ([`ArchiveAppShardIngest::holds_bodies_through`]) and read without it.
+///
+/// A GLOBAL proposal checks the headers it may carry against it. It used to
+/// wait up to 2 s for the ingest itself, which sequenced execution holds while
+/// it materializes and the receive loop held while it verified each gossiped
+/// frame, and to carry no shard header at all when the wait ran out: on
+/// 2026-10-27 most proposals of every archive did.
+#[derive(Clone, Default)]
+pub struct HeldBodies {
+    inner: Arc<std::sync::Mutex<HeldBodiesInner>>,
+}
+
+#[derive(Default)]
+struct HeldBodiesInner {
+    runs: HashMap<Vec<u8>, HeldRun>,
+    /// Shards whose frames ran further above the cursor than the ingest
+    /// tracks ([`MAX_STORED_BODIES_PER_SHARD`]), since when.
+    beyond_bound: HashMap<Vec<u8>, Instant>,
+    /// Headers a proposal could not carry, per shard: (frame, empty).
+    wanted: HashMap<Vec<u8>, (u64, bool)>,
+}
+
+/// A shard's cursor, the highest frame through which every body above it is
+/// held, and whether a header past the frame buffer was refused since one
+/// was last proposable.
+#[derive(Clone, Copy, Debug)]
+struct HeldRun {
+    cursor: u64,
+    through: u64,
+    refused: bool,
+}
+
+impl HeldBodies {
+    /// The record, also after a holder panicked.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HeldBodiesInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The application frames materializing `address` through `through`
+    /// executes, when every body it needs is held, as
+    /// [`ArchiveAppShardIngest::holds_bodies_through`] last found; `None`
+    /// otherwise, and the header is left for the ingest to look into
+    /// ([`ArchiveAppShardIngest::look_into_wanted`]).
+    pub fn frames_held(&self, address: &[u8], through: u64, empty: bool) -> Option<u64> {
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        if let Some(run) = inner.runs.get_mut(address) {
+            if through <= run.through || (empty && through == run.through + 1) {
+                let frames = through.saturating_sub(run.cursor);
+                if std::mem::take(&mut run.refused) {
+                    // Held past the frame buffer: read back from the store.
+                    crate::inclusion_summary::note_caught_up(address, frames);
+                }
+                if let Some(since) = inner.beyond_bound.remove(address) {
+                    info!(scope = "this archive", address = %hex::encode(address), through, frames,
+                        beyond_secs = since.elapsed().as_secs(),
+                        "archive holds a shard's application frame bodies again from its cursor through a header \
+                         GLOBAL can carry, after the shard ran further ahead than this archive tracks; its \
+                         headers can be proposed again");
+                }
+                return Some(frames);
+            }
+            let gap = through.saturating_sub(run.cursor);
+            if gap > MAX_BUFFERED_FRAMES_PER_SHARD as u64 {
+                run.refused = true;
+                crate::inclusion_summary::note_behind(address, gap);
+            }
+        }
+        if inner.wanted.len() < MAX_WANTED_SHARDS || inner.wanted.contains_key(address) {
+            let wanted = inner
+                .wanted
+                .entry(address.to_vec())
+                .or_insert((through, empty));
+            if through > wanted.0 {
+                *wanted = (through, empty);
+            }
+        }
+        None
+    }
+
+    /// `address`'s frames ran past [`MAX_STORED_BODIES_PER_SHARD`] above its
+    /// `cursor`, to `farthest`: warned once, until its headers can be
+    /// proposed again ([`Self::frames_held`]).
+    fn note_beyond_bound(&self, address: &[u8], cursor: u64, farthest: u64) {
+        let mut inner = self.lock();
+        if inner.beyond_bound.contains_key(address) {
+            return;
+        }
+        inner.beyond_bound.insert(address.to_vec(), Instant::now());
+        warn!(scope = "this archive", address = %hex::encode(address), cursor, farthest,
+            bound = MAX_STORED_BODIES_PER_SHARD,
+            "archive ingest: a shard's frames run further above its cursor than this archive tracks, so its \
+             newest headers cannot be proposed until frames below are executed; frames past the bound are asked \
+             for again once needed. A defect to report with this line; a line follows when it recovers");
+    }
+
+    /// `address`'s cursor as last published.
+    pub fn cursor(&self, address: &[u8]) -> Option<u64> {
+        self.lock().runs.get(address).map(|run| run.cursor)
+    }
+
+    fn publish(&self, address: &[u8], cursor: u64, through: u64) {
+        let mut inner = self.lock();
+        match inner.runs.get_mut(address) {
+            Some(run) => {
+                run.cursor = cursor;
+                run.through = through;
+            }
+            None => {
+                inner.runs.insert(
+                    address.to_vec(),
+                    HeldRun {
+                        cursor,
+                        through,
+                        refused: false,
+                    },
+                );
+            }
+        }
+    }
+
+    fn take_wanted(&self) -> HashMap<Vec<u8>, (u64, bool)> {
+        std::mem::take(&mut self.lock().wanted)
+    }
+
+    fn clear(&self) {
+        let mut inner = self.lock();
+        inner.runs.clear();
+        inner.wanted.clear();
+        inner.beyond_bound.clear();
+    }
+}
+
+/// Ingest a gossiped full `AppShardFrame` (prost bytes) as
+/// [`ArchiveAppShardIngest::ingest`] does, verifying it without holding
+/// `ingest`, which is held only to read the cursor and to admit.
+///
+/// The receive loop used to verify every gossiped frame of every shard while
+/// it held the ingest, which GLOBAL execution and proposals wait for.
+pub fn ingest_gossiped(
+    ingest: &std::sync::Mutex<ArchiveAppShardIngest>,
+    verifier: &ArchiveFrameVerifier,
+    data: &[u8],
+) {
+    let lock = || ingest.lock().unwrap_or_else(|p| p.into_inner());
+    let frame = match <AppShardFrame as prost::Message>::decode(data) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let (address, frame_number) = match frame.header.as_ref() {
+        Some(h) if !h.address.is_empty() => (h.address.clone(), h.frame_number),
+        _ => {
+            debug!("archive ingest: shard frame missing header or empty address — dropping");
+            return;
+        }
+    };
+    {
+        let mut guard = lock();
+        let held = match guard.materialized_height(&address) {
+            Ok(height) => height,
+            Err(error) => {
+                warn!(error = %error, "archive ingest deferred: materialized cursor unavailable");
+                return;
+            }
+        };
+        debug!(
+            frame = frame_number,
+            held,
+            address = %hex::encode(&address),
+            "archive ingest: received a full app-shard frame"
+        );
+        // Already materialized (or older): ignore, unless this archive owes
+        // the frame's body, which is then checked and served, never executed.
+        if frame_number <= held && !guard.wants_owed_body(&address, &frame) {
+            return;
+        }
+    }
+    if let Some(anchor) = verifier.missing_anchor(&frame) {
+        lock().await_anchor(&address, frame_number, anchor);
+        return;
+    }
+    match verifier.check(&frame) {
+        FrameCheck::Admit { certified } => lock().admit_verified(frame, certified),
+        FrameCheck::AwaitExecution { anchor, executed } => {
+            lock().await_execution(&address, frame_number, anchor, executed);
+        }
+        FrameCheck::Refused => {}
     }
 }
 
@@ -2781,6 +3178,150 @@ mod tests {
             ingest.holds_bodies_through(&filter, 2, false).unwrap(),
             "behind the cursor is already there"
         );
+    }
+
+    /// A shard whose head ran more than the frame buffer past its cursor
+    /// holds every body it received: those the buffer bound evicted were
+    /// stored for serving, and are read back from the store, so the shard's
+    /// header can be proposed and executed. Buffered frames alone, such a
+    /// shard's headers were held back for good: from 03:20Z on 2026-10-27
+    /// about 100 shards sat 270–600 frames behind and GLOBAL frames carried
+    /// almost no shard headers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shard_further_ahead_than_the_frame_buffer_holds_the_bodies_it_received() {
+        use quil_types::store::ClockStore as _;
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let frames = chain(&filter, 201);
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (ingest, _) = fixture_with_clock(Some(clock.clone()));
+        let mut ingest = ingest.sequenced();
+        ingest.admit(&filter, frames[0].clone(), true);
+        assert!(ingest.materialize_through(&filter, 1).unwrap());
+        for frame in &frames[1..] {
+            ingest.admit(&filter, frame.clone(), true);
+        }
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 1);
+        assert!(
+            (2..=201).all(|number| clock.get_shard_clock_frame(&filter, number, false).is_ok()),
+            "every frame received is stored for serving"
+        );
+        assert!(
+            ingest.buffered[&filter].len() < 200,
+            "the buffer is full: frames past its bound were evicted"
+        );
+        assert!(
+            ingest.holds_bodies_through(&filter, 201, false).unwrap(),
+            "shard latched: all 200 frames above its cursor were received and stored, yet the header 200 \
+             frames ahead is held back from every GLOBAL proposal"
+        );
+        assert!(ingest.materialize_through(&filter, 201).unwrap());
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 201);
+    }
+
+    /// A body read back from the store counts as held only when this ingest
+    /// admitted it: a frame that never arrived holds every header above it
+    /// back and is asked for, though another copy sits in the store, and
+    /// nothing past it is executed; a stored copy that is no longer the body
+    /// admitted is not executed, and is asked for again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_bodies_this_archive_admitted_are_read_back_from_the_store() {
+        use quil_types::store::ClockStore as _;
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let frames = chain(&filter, 201);
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (ingest, _) = fixture_with_clock(Some(clock.clone()));
+        let (prefetch_tx, mut prefetch_rx) = tokio::sync::mpsc::channel(256);
+        let mut ingest = ingest.with_prefetch(prefetch_tx).sequenced();
+        ingest.admit(&filter, frames[0].clone(), true);
+        assert!(ingest.materialize_through(&filter, 1).unwrap());
+        // Frame 150 never arrives; a copy that does not link to frame 151 is
+        // stored anyway, as a writer this ingest does not check could.
+        for frame in &frames[1..] {
+            if frame.header.as_ref().unwrap().frame_number != 150 {
+                ingest.admit(&filter, frame.clone(), true);
+            }
+        }
+        let mut forged = frames[149].clone();
+        forged.header.as_mut().unwrap().output = vec![0xee; 32];
+        clock
+            .store_shard_clock_frame_for_serving(&[0xee; 32], &forged)
+            .unwrap();
+        assert!(ingest.holds_bodies_through(&filter, 149, false).unwrap());
+        assert!(
+            !ingest.holds_bodies_through(&filter, 201, false).unwrap(),
+            "frame 150 was never received"
+        );
+        assert_eq!(
+            prefetch_rx.try_recv().unwrap(),
+            (filter.clone(), 150),
+            "and is asked for, not the frames above it this archive holds"
+        );
+        assert!(prefetch_rx.try_recv().is_err());
+        let held = ingest.held_bodies();
+        assert_eq!(held.frames_held(&filter, 201, false), None);
+        assert_eq!(held.frames_held(&filter, 149, false), Some(148));
+        assert!(!ingest.materialize_through(&filter, 201).unwrap());
+        assert_eq!(
+            ingest.materialized_height(&filter).unwrap(),
+            149,
+            "nothing past the missing frame is executed"
+        );
+        let verifier = ingest.verifier();
+        assert_eq!(verifier.stored_above_cursor(&filter, 149), None);
+        assert_eq!(
+            verifier.stored_above_cursor(&filter, 151),
+            Some(frames[150].clone()),
+            "a frame stored above the cursor can be admitted again from the store"
+        );
+
+        // Frame 180's stored copy is replaced by another body after it was
+        // admitted: execution stops below it, and it is asked for again.
+        let mut replaced = frames[179].clone();
+        replaced.header.as_mut().unwrap().fee_multiplier_vote = 9;
+        clock
+            .store_shard_clock_frame_for_serving(&[0xdd; 32], &replaced)
+            .unwrap();
+        ingest.admit(&filter, frames[149].clone(), true);
+        assert!(ingest.holds_bodies_through(&filter, 201, false).unwrap());
+        assert!(!ingest.materialize_through(&filter, 201).unwrap());
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 179);
+        assert!(!ingest.holds_bodies_through(&filter, 201, false).unwrap());
+        assert_eq!(prefetch_rx.try_recv().unwrap(), (filter.clone(), 180));
+
+        ingest.admit(&filter, frames[179].clone(), true);
+        assert!(ingest.holds_bodies_through(&filter, 201, false).unwrap());
+        assert!(ingest.materialize_through(&filter, 201).unwrap());
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 201);
+    }
+
+    /// What the ingest holds is read without it, so a proposal does not wait
+    /// for execution or intake holding the ingest. A header it has published
+    /// nothing for is left to the ingest, which publishes the shard on its
+    /// next retry pass.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn held_bodies_answer_while_the_ingest_is_held() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let unknown = vec![0x42; 32];
+        let (ingest, _) = fixture();
+        let mut ingest = ingest.sequenced();
+        for frame in chain(&filter, 3) {
+            ingest.admit(&filter, frame, true);
+        }
+        let held = ingest.held_bodies();
+        let ingest = std::sync::Mutex::new(ingest);
+        let execution = ingest.lock().unwrap();
+        assert_eq!(held.frames_held(&filter, 3, false), Some(3));
+        assert_eq!(
+            held.frames_held(&filter, 4, true),
+            Some(4),
+            "a provably empty header stands in for its own body"
+        );
+        assert_eq!(held.frames_held(&filter, 5, true), None);
+        assert_eq!(held.frames_held(&unknown, 1, true), None);
+        drop(execution);
+        ingest.lock().unwrap().retry_pending();
+        assert_eq!(held.frames_held(&unknown, 1, true), Some(1));
+        assert_eq!(held.frames_held(&unknown, 1, false), None);
     }
 
     /// Archives that hold different bodies execute the same GLOBAL frame
