@@ -393,11 +393,27 @@ pub(crate) fn leaf_read_bytes(size: u128) -> u64 {
 /// epoch's leaves ready for the renewal to register. The leaves encode side by
 /// side, each once the memory it takes is free (`crate::storage_jobs`), from
 /// the labels kept ahead for it when they fit its data (`crate::storage_labels`):
-/// otherwise it is labelled now, its labels kept for its seal.
+/// otherwise it is labelled now, its labels kept for its seal when their
+/// filesystem has room for them.
 pub fn encode_member(captured: &Captured, member: &[u8], replicas: &ReplicaStore) -> Result<()> {
+    encode_member_with(
+        captured,
+        member,
+        replicas,
+        crate::storage_labels::installed(),
+    )
+}
+
+/// [`encode_member`] with the labels of `store`.
+fn encode_member_with(
+    captured: &Captured,
+    member: &[u8],
+    replicas: &ReplicaStore,
+    store: Option<&crate::storage_labels::LabelStore>,
+) -> Result<()> {
+    use crate::storage_labels::Stage;
     use quil_crypto::storage_proof::{data_node_count, padded_nodes_allowed};
     let params = quil_crypto::sdr::SdrParams::default();
-    let store = crate::storage_labels::installed();
     let encoded = crate::storage_jobs::for_each_parallel(&captured.prefixes, |prefix| {
         let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&captured.filter, prefix);
         let mut memory = crate::storage_jobs::reserve(encoding_bytes(data_node_count(
@@ -417,14 +433,24 @@ pub fn encode_member(captured: &Captured, member: &[u8], replicas: &ReplicaStore
             quil_crypto::storage_proof::encode_with_labels(&data, kept.n, &last, kept.comm_c).ok()
         });
         let ahead = from_kept.is_some();
-        let encoded = match (from_kept, store) {
+        // Labelled now and kept when there is room; otherwise encoded as by a
+        // process that keeps no labels, and its seal labels it again.
+        let labelled = match (&from_kept, store) {
+            (None, Some(store)) => store
+                .admit(captured.epoch, member, &leaf_id, exact, Stage::Snapshot)
+                .map(|admitted| admitted.label(&params))
+                .transpose()?,
+            _ => None,
+        };
+        let encoded = match (from_kept, labelled) {
             (Some(encoded), _) => encoded,
-            (None, Some(store)) => {
-                let (comm_c, last) =
-                    store.label(captured.epoch, member, &leaf_id, exact, &params)?;
-                quil_crypto::storage_proof::encode_with_labels(&data, exact, &last, comm_c)
-                    .map_err(QuilError::Internal)?
-            }
+            (None, Some(labelled)) => quil_crypto::storage_proof::encode_with_labels(
+                &data,
+                exact,
+                &labelled.last,
+                labelled.comm_c,
+            )
+            .map_err(QuilError::Internal)?,
             (None, None) => quil_crypto::storage_proof::encode_leaf(
                 &data,
                 &quil_crypto::sdr::replica_key(member, &leaf_id, captured.epoch),
@@ -1624,8 +1650,9 @@ mod tests {
         use quil_execution::global_intrinsic::storage_epoch_proof::{
             EpochClaim, StorageEpochProof,
         };
-        crate::storage_labels::install(
+        crate::storage_labels::install_with_space(
             std::env::temp_dir().join(format!("quil-labels-tests-{}", std::process::id())),
+            crate::storage_labels::ample_space(),
         );
         let store = crate::storage_labels::installed().unwrap();
         let crdt = test_crdt();
@@ -1756,6 +1783,68 @@ mod tests {
         assert!(store
             .find(epoch, &other, &leaf_id, |n| n == exact)
             .is_some());
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// A leaf whose labels' filesystem has no room for them
+    /// (`crate::storage_labels::LabelStore::admit`) is not labelled ahead,
+    /// and is encoded at its snapshot as by a process that keeps no labels:
+    /// the same replica, and no labels left on disk.
+    #[test]
+    fn a_leaf_without_room_for_its_labels_encodes_as_without_them() {
+        use crate::storage_labels::{files_under, precompute, precomputed, LabelStore};
+        let crdt = test_crdt();
+        let app = [0x7Cu8; 32];
+        for d in 0..30u8 {
+            crdt.add_vertex(
+                &Location {
+                    app_address: app,
+                    data_address: address(d.wrapping_mul(5), d),
+                },
+                &vec![d; 300],
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let epoch = 6;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let dir = std::env::temp_dir().join(format!("quil-labels-full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // 9 GiB free of 100: below the 10 GiB floor.
+        let full = LabelStore::with_space(
+            dir.clone(),
+            Box::new(|_| {
+                Some(quil_forest::storage_health::FsUsage {
+                    total_bytes: 100 << 30,
+                    free_bytes: 9 << 30,
+                    ..Default::default()
+                })
+            }),
+        );
+        let member = [0x61u8; 32];
+        precompute(&full, &crdt, &member, &app, epoch).unwrap();
+        assert!(
+            precomputed(&member, &app, epoch),
+            "asked again only after a while"
+        );
+        let captured =
+            capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
+        assert!(!captured.prefixes.is_empty());
+        let replicas =
+            || ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let (refused, without) = (replicas(), replicas());
+        encode_member_with(&captured, &member, &refused, Some(&full)).unwrap();
+        encode_member_with(&captured, &member, &without, None).unwrap();
+        for prefix in &captured.prefixes {
+            let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&app, prefix);
+            assert!(full.find(epoch, &member, &leaf_id, |_| true).is_none());
+            assert_eq!(
+                refused.get_hash(epoch, &leaf_id).unwrap(),
+                without.get_hash(epoch, &leaf_id).unwrap()
+            );
+        }
+        assert_eq!(files_under(&dir), Vec::<std::path::PathBuf>::new());
+        let _ = std::fs::remove_dir_all(&dir);
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 }

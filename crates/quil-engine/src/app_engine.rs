@@ -3218,6 +3218,10 @@ impl AppConsensusEngine {
             return;
         };
         let current = epoch_for_frame(global_frame_number);
+        // Remove the labels of epochs that have begun, as a crash, a restart
+        // or a lost seat may have left them, whether this member labels
+        // ahead again or not.
+        store.sweep(current);
         let epoch = if global_frame_number < storage_snapshot_frame(current + 1) {
             current + 1
         } else {
