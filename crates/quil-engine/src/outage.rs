@@ -42,6 +42,7 @@ struct Failing {
 #[derive(Debug)]
 pub struct Outage {
     begin_after: u64,
+    log_every: Duration,
     failing: Option<Failing>,
 }
 
@@ -55,8 +56,15 @@ impl Default for Outage {
 impl Outage {
     /// An outage that begins after `failures` consecutive failed attempts.
     pub fn begin_after(failures: u64) -> Self {
+        Self::begin_after_repeating(failures, OUTAGE_LOG_EVERY)
+    }
+
+    /// An outage that begins after `failures` consecutive failed attempts and
+    /// repeats every `every` instead of [`OUTAGE_LOG_EVERY`].
+    pub fn begin_after_repeating(failures: u64, every: Duration) -> Self {
         Self {
             begin_after: failures.max(1),
+            log_every: every,
             failing: None,
         }
     }
@@ -85,7 +93,7 @@ impl Outage {
             }
             false => None,
             true => {
-                if now.duration_since(f.logged) < OUTAGE_LOG_EVERY {
+                if now.duration_since(f.logged) < self.log_every {
                     return None;
                 }
                 f.logged = now;
