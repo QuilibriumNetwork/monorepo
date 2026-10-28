@@ -891,6 +891,7 @@ pub(crate) fn init(
             db_arc
                 .inner()
                 .register_store(quil_forest::StoreRole::Worker(core_id));
+            quil_store::large_vertex_index::start(&db_arc.inner(), format!("worker {core_id}"));
             let clock_store: Arc<dyn quil_types::store::ClockStore> =
                 Arc::new(quil_store::RocksClockStore::new(db_arc.inner()));
             let hg_store_concrete = Arc::new(quil_store::RocksHypergraphStore::new(db_arc.inner()));

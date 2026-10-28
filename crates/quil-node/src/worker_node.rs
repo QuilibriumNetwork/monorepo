@@ -60,6 +60,7 @@ pub(crate) async fn start(
     let db = quil_store::RocksDb::open(&db_path)?;
     db.inner()
         .register_store(quil_forest::StoreRole::Worker(core_id));
+    quil_store::large_vertex_index::start(&db.inner(), format!("worker {core_id}"));
     crate::storage_watch::start(&config.db);
     // This process's store, once it stops writing, is reopened by a restart
     // of the process once its disk has room again.

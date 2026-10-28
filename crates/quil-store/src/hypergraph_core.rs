@@ -146,12 +146,40 @@ macro_rules! impl_hypergraph_storage {
                 bytes: &[u8],
             ) -> Result<()> {
                 let key = hypergraph_vertex_data_key(set_type, phase_type, shard_key, vertex_key);
-                <$txn>::for_store(txn, &self.db)?
-                    .batch
-                    .lock()
-                    .unwrap()
-                    .put(&key, bytes);
+                let records =
+                    self.large_vertex_records(set_type, phase_type, vertex_key, bytes.len());
+                let staged = <$txn>::for_store(txn, &self.db)?;
+                let mut batch = staged.batch.lock().unwrap();
+                batch.put(&key, bytes);
+                for (key, value) in records {
+                    batch.put(&key, &value);
+                }
                 Ok(())
+            }
+
+            /// The index entry of a large row, staged beside it in the same
+            /// batch, and the index's completion mark for a store that opened
+            /// empty.
+            fn large_vertex_records(
+                &self,
+                set_type: &str,
+                phase_type: &str,
+                vertex_key: &[u8],
+                len: usize,
+            ) -> Vec<(Vec<u8>, Vec<u8>)> {
+                if set_type != "vertex" || phase_type != "adds" {
+                    return Vec::new();
+                }
+                let mut records = Vec::new();
+                if let Some(entry) =
+                    crate::large_vertex_index::live_entry(set_type, phase_type, vertex_key, len)
+                {
+                    records.push((entry, Vec::new()));
+                }
+                if let Some((key, value)) = self.index_complete_mark_backend() {
+                    records.push((key.to_vec(), value));
+                }
+                records
             }
 
             /// Load one vertex's `underlying_data`, or `Ok(None)` if absent.
@@ -638,11 +666,14 @@ macro_rules! impl_hypergraph_storage {
                 let key = crate::encoding::hypergraph_vertex_data_v2_key(
                     set_type, phase_type, shard_key, vertex_key, version,
                 );
-                <$txn>::for_store(txn, &self.db)?
-                    .batch
-                    .lock()
-                    .unwrap()
-                    .put(&key, data);
+                let records =
+                    self.large_vertex_records(set_type, phase_type, vertex_key, data.len());
+                let staged = <$txn>::for_store(txn, &self.db)?;
+                let mut batch = staged.batch.lock().unwrap();
+                batch.put(&key, data);
+                for (key, value) in records {
+                    batch.put(&key, &value);
+                }
                 Ok(())
             }
 

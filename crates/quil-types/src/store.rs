@@ -949,6 +949,30 @@ pub struct VertexDataPage {
     pub has_more: bool,
 }
 
+/// A page of the large-vertex index ([`SnapshotReadable::page_large_vertices_skipping`]).
+pub struct IndexedVertexPage {
+    /// Address and latest blob, in ascending address order, for one domain.
+    pub entries: Vec<([u8; 32], Vec<u8>)>,
+    /// The last address examined, returned or not: a page can hold no entry
+    /// and still move the scan on.
+    pub cursor: Option<[u8; 32]>,
+    /// Index entries examined, including passed-over and stale ones.
+    pub examined: usize,
+    pub has_more: bool,
+}
+
+/// Whether a store's index of its large vertex rows can answer a scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LargeVertexIndexState {
+    /// The backend keeps no such index; scans walk the whole keyspace.
+    Unsupported,
+    /// The rows the store held before it kept the index are still being
+    /// walked: `rows_walked` so far.
+    Building { rows_walked: u64 },
+    /// Every large row has an entry.
+    Complete,
+}
+
 pub trait HypergraphStore: Send + Sync {
     /// Clear legacy and versioned underlying rows in all four phases of one
     /// shard. Forest maintenance is separate and must share the same barrier.
@@ -1448,6 +1472,31 @@ pub trait SnapshotReadable: Send + Sync {
     ) -> Result<VertexDataPage> {
         Err(QuilError::Store(
             "fixed vertex snapshot paging is unsupported by this backend".into(),
+        ))
+    }
+
+    /// Whether [`Self::page_large_vertices_skipping`] lists every large row.
+    fn large_vertex_index_state(&self) -> Result<LargeVertexIndexState> {
+        Ok(LargeVertexIndexState::Unsupported)
+    }
+
+    /// [`Self::page_vertex_underlying_fixed_skipping`] over only the rows the
+    /// large-vertex index names (at least `LARGE_VERTEX_MIN_BYTES`), so a scan
+    /// for large records passes over the small ones without reading them.
+    /// Index entries whose row is gone are passed over. Valid only while
+    /// [`Self::large_vertex_index_state`] is `Complete`.
+    fn page_large_vertices_skipping(
+        &self,
+        _set_type: &str,
+        _phase_type: &str,
+        _shard: &ShardKey,
+        _domain: &[u8; 32],
+        _after: Option<&[u8; 32]>,
+        _limits: VertexPageLimits,
+        _skip: &dyn Fn(&[u8; 32]) -> bool,
+    ) -> Result<IndexedVertexPage> {
+        Err(QuilError::Store(
+            "large vertex index paging is unsupported by this backend".into(),
         ))
     }
 
