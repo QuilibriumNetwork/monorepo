@@ -9,7 +9,9 @@ use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
 use quil_lattice_ct::confidential::{coin_tree::RootRecord, transfer::parameter_context};
 use quil_types::{
     error::{QuilError, Result},
-    store::{SnapshotReadable, VertexPageLimits},
+    store::{
+        IndexedVertexPage, LargeVertexIndexState, ShardKey, SnapshotReadable, VertexPageLimits,
+    },
 };
 
 pub struct CoinPage {
@@ -260,25 +262,13 @@ fn scan_coins(
     });
     let mut key = [0; 64];
     key[..32].copy_from_slice(application);
-    // The accumulator's own records share this keyspace and are never coins.
-    // They are passed over unread: the root history (up to 128 root ids) and
-    // the block summary (one root per non-empty block) outgrow a page, and
-    // would then fail every wallet's scan.
-    let page = snapshot.page_vertex_underlying_fixed_skipping(
-        "vertex",
-        "adds",
-        &shard,
-        application,
-        after,
-        limits,
-        &super::state::is_accumulator_record,
-    )?;
+    let started = std::time::Instant::now();
+    let page = page_records(snapshot, &shard, application, after, limits)?;
     let mut cursor = after.copied();
     let mut bytes = 0usize;
     let mut coins = Vec::new();
-    if page.entries.len() > limits.max_entries || (page.has_more && page.entries.is_empty()) {
-        return Err(QuilError::Store("coin scan: invalid backend page".into()));
-    }
+    check_backend_page(&page, after, limits)?;
+    let examined = page.examined;
     for (address, blob) in page.entries {
         bytes = bytes
             .checked_add(64)
@@ -295,7 +285,135 @@ fn scan_coins(
         }
         cursor = Some(address);
     }
+    let cursor = page.cursor.max(cursor);
+    report_slow_page(
+        snapshot,
+        application,
+        examined,
+        coins.len(),
+        started.elapsed(),
+    );
     Ok((coins, cursor, page.has_more))
+}
+
+/// One backend page of the application's records. Through the store's index
+/// of its large rows when it keeps one, so the transparent coins that share
+/// the keyspace (about 122 million in QUIL) are never read: each page then
+/// costs its own records, not the walk to them. The accumulator's own records
+/// are passed over unread: the root history (up to 128 root ids) and the block
+/// summary (one root per non-empty block) outgrow a page, and would then fail
+/// every wallet's scan.
+fn page_records(
+    snapshot: &dyn SnapshotReadable,
+    shard: &ShardKey,
+    application: &[u8; 32],
+    after: Option<&[u8; 32]>,
+    limits: VertexPageLimits,
+) -> Result<IndexedVertexPage> {
+    let skip = &super::state::is_accumulator_record;
+    match snapshot.large_vertex_index_state()? {
+        LargeVertexIndexState::Complete => snapshot.page_large_vertices_skipping(
+            "vertex",
+            "adds",
+            shard,
+            application,
+            after,
+            limits,
+            skip,
+        ),
+        LargeVertexIndexState::Building { rows_walked } => Err(index_building_error(rows_walked)),
+        LargeVertexIndexState::Unsupported => {
+            let page = snapshot.page_vertex_underlying_fixed_skipping(
+                "vertex",
+                "adds",
+                shard,
+                application,
+                after,
+                limits,
+                skip,
+            )?;
+            Ok(IndexedVertexPage {
+                // Rows passed over move no cursor here: a page of none
+                // continues from where the last one ended.
+                cursor: page
+                    .entries
+                    .last()
+                    .map(|(address, _)| *address)
+                    .or(after.copied()),
+                examined: page.entries.len(),
+                entries: page.entries,
+                has_more: page.has_more,
+            })
+        }
+    }
+}
+
+/// The answer to a scan while the store still walks the rows it held before
+/// it indexed its large ones.
+fn index_building_error(rows_walked: u64) -> QuilError {
+    QuilError::ExecutionUnavailable(format!(
+        "coin scan: this node is still indexing its stored records once after an upgrade \
+         ({rows_walked} walked so far); coins and escrows can be listed when it finishes, \
+         retry in a few minutes"
+    ))
+}
+
+fn check_backend_page(
+    page: &IndexedVertexPage,
+    after: Option<&[u8; 32]>,
+    limits: VertexPageLimits,
+) -> Result<()> {
+    let last = page.entries.last().map(|(address, _)| *address);
+    if page.entries.len() > limits.max_entries
+        || page.cursor < last
+        || page.cursor < after.copied()
+        || (page.has_more && page.cursor <= after.copied())
+    {
+        return Err(QuilError::Store("coin scan: invalid backend page".into()));
+    }
+    Ok(())
+}
+
+/// A page slower than this is reported (at most once a minute).
+const SLOW_PAGE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// One line, at most once a minute, for scan pages that run long: a store
+/// whose index cannot answer them, or a disk that cannot keep up.
+fn report_slow_page(
+    snapshot: &dyn SnapshotReadable,
+    application: &[u8; 32],
+    examined: usize,
+    coins: usize,
+    elapsed: std::time::Duration,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SLOW: AtomicU64 = AtomicU64::new(0);
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    if elapsed < SLOW_PAGE {
+        return;
+    }
+    let slow = SLOW.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last.saturating_add(60)
+        || LAST
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    SLOW.store(0, Ordering::Relaxed);
+    tracing::warn!(
+        store = snapshot.store_name().as_deref().unwrap_or("unnamed"),
+        application = %hex::encode(application),
+        records_examined = examined,
+        coins_returned = coins,
+        elapsed_ms = elapsed.as_millis() as u64,
+        slow_pages_since_last_report = slow,
+        "coin scan page slow: this node's store answered a wallet page in over a second; wallets may run out of time or pages"
+    );
 }
 
 /// Public encrypted escrows from one retained snapshot; no ownership or
@@ -324,21 +442,11 @@ pub fn scan_escrow_page(
         data_address: [0; 32],
     });
     // Passed over unread, as in the coin scan.
-    let page = snapshot.page_vertex_underlying_fixed_skipping(
-        "vertex",
-        "adds",
-        &shard,
-        application,
-        after,
-        limits,
-        &super::state::is_accumulator_record,
-    )?;
+    let page = page_records(snapshot, &shard, application, after, limits)?;
     let mut cursor = after.copied();
     let mut bytes = 0usize;
     let mut escrows = Vec::new();
-    if page.entries.len() > limits.max_entries || (page.has_more && page.entries.is_empty()) {
-        return Err(QuilError::Store("coin scan: invalid backend page".into()));
-    }
+    check_backend_page(&page, after, limits)?;
     for (address, blob) in page.entries {
         bytes = bytes
             .checked_add(64)
@@ -378,7 +486,7 @@ pub fn scan_escrow_page(
     }
     Ok(EscrowPage {
         escrows,
-        cursor,
+        cursor: page.cursor.max(cursor),
         has_more: page.has_more,
     })
 }
@@ -1015,5 +1123,404 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    /// A wallet scan of an application whose keyspace is mostly migrated
+    /// transparent coins (QUIL holds about 122 million) must still list its
+    /// confidential coins within the client's default budget: 128 pages of
+    /// 8 records (`qclient token coins --max-pages`). Paging every record of
+    /// the keyspace ran out of pages long before the coins (mainnet,
+    /// 2026-10-28: `scan ended or page budget exhausted`).
+    #[test]
+    fn a_wallet_scan_finds_coins_behind_thousands_of_transparent_coins_within_the_client_budget() {
+        use crate::token_intrinsic::legacy_migration::{
+            create_transparent_coin_tree, transparent_type_hash, TransparentCoin,
+        };
+        const TRANSPARENT: usize = 5_000;
+        const CLIENT_PAGES: usize = 128;
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let state = HypergraphState::new(Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            store.clone(),
+            Arc::new(NoopInclusionProver),
+        )));
+        let network = [1; 32];
+        let application = [2; 32];
+        let context = parameter_context(&network, &application);
+        let disc = vertex_adds_discriminator().unwrap();
+        let snapshot_limits = SnapshotLimits {
+            max_coins: 2,
+            max_depth: 32,
+            max_nodes: 1 << 16,
+        };
+        // The two of 64 confidential coins with the highest addresses, so
+        // most transparent coins sort before them.
+        let output = |seed: u8| Output {
+            owner: [seed; IDENTITY_BYTES],
+            commitment: CommitmentKey::derive(&context)
+                .commit(5, &AmountOpening::from_seed(&context, &[seed; 32])),
+            memo: [seed; 1115],
+        };
+        let mut seeds: Vec<(u8, [u8; 32])> = (1..=64u8)
+            .map(|seed| {
+                let (address, _) =
+                    crate::token_intrinsic::state::coin_identity(&context, 7, &output(seed))
+                        .unwrap();
+                (seed, address)
+            })
+            .collect();
+        seeds.sort_by_key(|(_, address)| *address);
+        let mut staged = std::collections::BTreeMap::new();
+        let mut confidential = Vec::new();
+        for (seed, _) in &seeds[seeds.len() - 2..] {
+            let (address, tree) = roots::stage_coin(
+                &state,
+                &network,
+                &application,
+                &context,
+                7,
+                &output(*seed),
+                &mut staged,
+                snapshot_limits,
+            )
+            .unwrap();
+            state
+                .set(
+                    &application,
+                    &address,
+                    &disc,
+                    0,
+                    quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+                )
+                .unwrap();
+            confidential.push(address);
+        }
+        confidential.sort();
+        roots::refresh_root(&state, &network, &application, snapshot_limits).unwrap();
+        // Transparent coins as the migration wrote them, all before the coins.
+        let type_hash = transparent_type_hash(&application).unwrap();
+        let mut transparent = 0;
+        let mut origin = 0u32;
+        while transparent < TRANSPARENT {
+            origin += 1;
+            let mut origin_bytes = [0u8; 32];
+            origin_bytes[..4].copy_from_slice(&origin.to_le_bytes());
+            let tree = create_transparent_coin_tree(
+                &TransparentCoin {
+                    owner_address: [0x11; 32],
+                    amount: 1_000,
+                },
+                &type_hash,
+                &origin_bytes,
+            )
+            .unwrap();
+            let address = crate::token_intrinsic::materialize::coin_content_address(&tree).unwrap();
+            if address >= confidential[0] {
+                continue;
+            }
+            state
+                .set(
+                    &application,
+                    &address,
+                    &disc,
+                    0,
+                    quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+                )
+                .unwrap();
+            transparent += 1;
+        }
+        state.commit().unwrap();
+        state.abort();
+        state.crdt().commit(1).unwrap();
+        let snapshot = store.capture_snapshot().unwrap();
+        // Driven as the client drives the node: pages of at most 8 records
+        // and 240 KiB, continued from each page's cursor, 128 pages at most.
+        let limits = VertexPageLimits {
+            max_entries: 8,
+            max_bytes: 240 * 1024,
+        };
+        let mut after = None;
+        let mut found = Vec::new();
+        let mut pages = 0;
+        loop {
+            assert!(
+                pages < CLIENT_PAGES,
+                "scan ended or page budget exhausted: {pages} pages listed {} of 2 coins behind {TRANSPARENT} transparent coins",
+                found.len()
+            );
+            let page = match scan_wallet_page(
+                snapshot.as_ref(),
+                &network,
+                &application,
+                after.as_ref(),
+                limits,
+            )
+            .unwrap()
+            {
+                WalletPage::Page(page) => page,
+                _ => panic!("the application has a root and coins"),
+            };
+            pages += 1;
+            found.extend(page.coins.into_iter().map(|(address, _)| address));
+            if !page.has_more {
+                break;
+            }
+            assert!(page.cursor > after, "each page moves the scan on");
+            after = page.cursor;
+        }
+        assert_eq!(found, confidential);
+    }
+
+    /// A store with `transparent` migrated transparent coins and two
+    /// confidential coins under a root, committed: its directory, database
+    /// and the coins' addresses in order.
+    fn wallet_store(
+        transparent: u32,
+    ) -> (
+        tempfile::TempDir,
+        quil_store::RocksDb,
+        Arc<quil_store::RocksHypergraphStore>,
+        Vec<[u8; 32]>,
+    ) {
+        use crate::token_intrinsic::legacy_migration::{
+            create_transparent_coin_tree, transparent_type_hash, TransparentCoin,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let state = HypergraphState::new(Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            store.clone(),
+            Arc::new(NoopInclusionProver),
+        )));
+        let (network, application) = ([1; 32], [2; 32]);
+        let context = parameter_context(&network, &application);
+        let disc = vertex_adds_discriminator().unwrap();
+        let limits = SnapshotLimits {
+            max_coins: 2,
+            max_depth: 32,
+            max_nodes: 1 << 16,
+        };
+        let mut staged = std::collections::BTreeMap::new();
+        let mut coins = Vec::new();
+        for seed in 1..=2u8 {
+            let output = Output {
+                owner: [seed; IDENTITY_BYTES],
+                commitment: CommitmentKey::derive(&context)
+                    .commit(5, &AmountOpening::from_seed(&context, &[seed; 32])),
+                memo: [seed; 1115],
+            };
+            let (address, tree) = roots::stage_coin(
+                &state,
+                &network,
+                &application,
+                &context,
+                7,
+                &output,
+                &mut staged,
+                limits,
+            )
+            .unwrap();
+            let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+            assert!(blob.len() >= quil_store::large_vertex_index::LARGE_VERTEX_MIN_BYTES);
+            state.set(&application, &address, &disc, 0, blob).unwrap();
+            coins.push(address);
+        }
+        coins.sort();
+        roots::refresh_root(&state, &network, &application, limits).unwrap();
+        let type_hash = transparent_type_hash(&application).unwrap();
+        for origin in 0..transparent {
+            let mut origin_bytes = [0u8; 32];
+            origin_bytes[..4].copy_from_slice(&origin.to_le_bytes());
+            let tree = create_transparent_coin_tree(
+                &TransparentCoin {
+                    owner_address: [0x11; 32],
+                    amount: 1_000,
+                },
+                &type_hash,
+                &origin_bytes,
+            )
+            .unwrap();
+            let address = crate::token_intrinsic::materialize::coin_content_address(&tree).unwrap();
+            let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+            assert!(blob.len() < quil_store::large_vertex_index::LARGE_VERTEX_MIN_BYTES);
+            state.set(&application, &address, &disc, 0, blob).unwrap();
+        }
+        state.commit().unwrap();
+        state.abort();
+        state.crdt().commit(1).unwrap();
+        (dir, db, store, coins)
+    }
+
+    fn scan_wallet(snapshot: &dyn SnapshotReadable) -> Result<Vec<[u8; 32]>> {
+        let limits = VertexPageLimits {
+            max_entries: 8,
+            max_bytes: 240 * 1024,
+        };
+        let mut after = None;
+        let mut found = Vec::new();
+        for _ in 0..128 {
+            let WalletPage::Page(page) =
+                scan_wallet_page(snapshot, &[1; 32], &[2; 32], after.as_ref(), limits)?
+            else {
+                panic!("the application has a root and coins");
+            };
+            found.extend(page.coins.into_iter().map(|(address, _)| address));
+            if !page.has_more {
+                return Ok(found);
+            }
+            after = page.cursor;
+        }
+        panic!("scan ended or page budget exhausted");
+    }
+
+    /// A store upgraded from a binary that kept no index answers wallet scans
+    /// unavailable, naming the walk and its progress, until the walk of its
+    /// rows ends; the walk resumes after a restart from its saved cursor.
+    #[test]
+    fn scans_answer_unavailable_until_the_upgrade_walk_ends() {
+        let (dir, db, store, coins) = wallet_store(400);
+        // As written by a binary without the index.
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete_range([0x37u8].as_slice(), [0x38u8].as_slice());
+        db.inner().write(batch).unwrap();
+        let refused = scan_wallet(store.capture_snapshot().unwrap().as_ref()).unwrap_err();
+        assert!(
+            matches!(&refused, QuilError::ExecutionUnavailable(m) if m.contains("still indexing") && m.contains("0 walked")),
+            "{refused}"
+        );
+        let progress = quil_store::large_vertex_index::walk_step(
+            &db.inner(),
+            100,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(!progress.complete);
+        let refused = scan_wallet(store.capture_snapshot().unwrap().as_ref()).unwrap_err();
+        assert!(refused.to_string().contains("100 walked"), "{refused}");
+        drop(store);
+        drop(db);
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let store = quil_store::RocksHypergraphStore::new(db.inner());
+        assert!(scan_wallet(store.capture_snapshot().unwrap().as_ref()).is_err());
+        let mut steps = 0;
+        while !quil_store::large_vertex_index::walk_step(
+            &db.inner(),
+            100,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap()
+        .complete
+        {
+            steps += 1;
+            assert!(steps < 100);
+        }
+        assert_eq!(
+            scan_wallet(store.capture_snapshot().unwrap().as_ref()).unwrap(),
+            coins
+        );
+    }
+
+    /// A delivery whose placement fails is rolled back with its index entry:
+    /// the committed store indexes the placed coin and not the refused one.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn a_rolled_back_placement_leaves_no_index_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let state = HypergraphState::new(Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            store.clone(),
+            Arc::new(NoopInclusionProver),
+        )));
+        let (network, application) = ([1u8; 32], [2u8; 32]);
+        let context = parameter_context(&network, &application);
+        // A cap of one coin refuses the second placement after its vertex
+        // was staged, which rolls the placement back.
+        let limits = SnapshotLimits {
+            max_coins: 1,
+            max_depth: 32,
+            max_nodes: 1 << 14,
+        };
+        let coin = |seed: u8| {
+            let output = Output {
+                owner: [seed; IDENTITY_BYTES],
+                commitment: CommitmentKey::derive(&context).commit(
+                    u128::from(seed),
+                    &AmountOpening::from_seed(&context, &[seed; 32]),
+                ),
+                memo: [seed; 1115],
+            };
+            crate::token_intrinsic::state::coin_identity(&context, 5, &output).unwrap()
+        };
+        let place = |seed: u8| {
+            let (address, tree) = coin(seed);
+            let block =
+                crate::token_intrinsic::coin_blocks::block_for_address(7, &address).unwrap();
+            let seq = roots::block_count(&state, &network, &application, block, limits).unwrap();
+            crate::token_intrinsic::delivery::place_committed(
+                &state,
+                5,
+                &network,
+                &application,
+                &address,
+                tree,
+                block,
+                seq,
+                limits,
+            )
+            .map(|()| address)
+        };
+        let placed = place(3).unwrap();
+        let before = state.changeset_len();
+        assert!(place(4).is_err());
+        assert_eq!(
+            state.changeset_len(),
+            before,
+            "the refused placement left nothing staged"
+        );
+        let refused = coin(4).0;
+        state.commit().unwrap();
+        state.abort();
+        state.crdt().commit(1).unwrap();
+        let snapshot = store.capture_snapshot().unwrap();
+        let shard = shard_key_for_location(&Location {
+            app_address: application,
+            data_address: [0; 32],
+        });
+        let page = snapshot
+            .page_large_vertices_skipping(
+                "vertex",
+                "adds",
+                &shard,
+                &application,
+                None,
+                VertexPageLimits {
+                    max_entries: 8,
+                    max_bytes: 240 * 1024,
+                },
+                &super::super::state::is_accumulator_record,
+            )
+            .unwrap();
+        let listed: Vec<_> = page.entries.iter().map(|(address, _)| *address).collect();
+        assert_eq!(listed, vec![placed]);
+        // The index itself, read raw: the live entries of this application.
+        let mut prefix = vec![0x37u8, 0x01];
+        prefix.extend_from_slice(&application);
+        let entries: Vec<[u8; 32]> = db
+            .inner()
+            .iterator(rocksdb::IteratorMode::From(
+                &prefix,
+                rocksdb::Direction::Forward,
+            ))
+            .map(|entry| entry.unwrap().0)
+            .take_while(|key| key.starts_with(&prefix))
+            .map(|key| key[prefix.len()..].try_into().unwrap())
+            .filter(|address| !super::super::state::is_accumulator_record(address))
+            .collect();
+        assert!(
+            entries.contains(&placed) && !entries.contains(&refused),
+            "{entries:?}"
+        );
     }
 }

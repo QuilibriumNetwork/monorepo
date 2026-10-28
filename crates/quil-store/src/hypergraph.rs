@@ -19,6 +19,9 @@ use crate::encoding::{
 /// RocksDB-backed hypergraph tree storage.
 pub struct RocksHypergraphStore {
     db: quil_forest::CoordinatedDb,
+    /// The store opened without rows or a large-vertex index state: its
+    /// writes mark the index complete until that mark is stored.
+    index_opened_empty: std::sync::atomic::AtomicBool,
     #[cfg(any(test, feature = "test-utils"))]
     fail_commit: std::sync::atomic::AtomicBool,
 }
@@ -36,6 +39,10 @@ struct OverlayHypergraphSnapshot {
 impl OverlayHypergraphSnapshot {
     fn scan_point_backend(&self) -> Option<quil_types::store::ScanPoint> {
         self.snapshot.scan_point()
+    }
+
+    fn store_name_backend(&self) -> Option<String> {
+        None
     }
 }
 
@@ -71,6 +78,11 @@ impl OverlayHypergraphStore {
         Err(QuilError::Store(
             "external database import is unavailable during tentative execution".into(),
         ))
+    }
+
+    /// Execution branches never mark the index: their base store does.
+    fn index_complete_mark_backend(&self) -> Option<([u8; 2], Vec<u8>)> {
+        None
     }
 }
 
@@ -138,6 +150,9 @@ impl RocksHypergraphStore {
 
     pub fn new(db: quil_forest::CoordinatedDb) -> Self {
         Self {
+            index_opened_empty: std::sync::atomic::AtomicBool::new(
+                crate::large_vertex_index::opens_empty(&db),
+            ),
             db,
             #[cfg(any(test, feature = "test-utils"))]
             fail_commit: std::sync::atomic::AtomicBool::new(false),
@@ -293,8 +308,15 @@ impl RocksHypergraphStore {
         bytes: &[u8],
     ) -> Result<()> {
         let key = hypergraph_vertex_data_key(set_type, phase_type, shard_key, vertex_key);
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(&key, bytes);
+        if let Some(entry) =
+            crate::large_vertex_index::live_entry(set_type, phase_type, vertex_key, bytes.len())
+        {
+            batch.put(&entry, b"");
+        }
         self.db
-            .put(&key, bytes)
+            .write(batch)
             .map_err(|e| QuilError::Store(e.to_string()))
     }
 
@@ -352,6 +374,14 @@ impl RocksHypergraphStore {
                         } => {
                             let key = hypergraph_vertex_data_key(set, phase, shard, vertex_key);
                             batch.put(&key, blob);
+                            if let Some(entry) = crate::large_vertex_index::live_entry(
+                                set,
+                                phase,
+                                vertex_key,
+                                blob.len(),
+                            ) {
+                                batch.put(&entry, b"");
+                            }
                         }
                         VertexWrite::Delete {
                             set,
@@ -409,8 +439,15 @@ impl RocksHypergraphStore {
         bytes: &[u8],
     ) -> Result<()> {
         let key = hypergraph_vertex_data_key(set_type, phase_type, shard_key, vertex_key);
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(&key, bytes);
+        if let Some(entry) =
+            crate::large_vertex_index::live_entry(set_type, phase_type, vertex_key, bytes.len())
+        {
+            batch.put(&entry, b"");
+        }
         self.db
-            .put(&key, bytes)
+            .write(batch)
             .map_err(|e| QuilError::Store(e.to_string()))
     }
 
@@ -670,6 +707,14 @@ impl RocksHypergraphStore {
                         } => {
                             let key = hypergraph_vertex_data_key(set, phase, shard, vertex_key);
                             batch.put(&key, blob);
+                            if let Some(entry) = crate::large_vertex_index::live_entry(
+                                set,
+                                phase,
+                                vertex_key,
+                                blob.len(),
+                            ) {
+                                batch.put(&entry, b"");
+                            }
                         }
                         VertexWrite::Delete {
                             set,
@@ -793,6 +838,10 @@ impl RocksHypergraphSnapshot {
 
     fn scan_point_backend(&self) -> Option<quil_types::store::ScanPoint> {
         Some(self.scan)
+    }
+
+    fn store_name_backend(&self) -> Option<String> {
+        crate::large_vertex_index::store_name(&self._db)
     }
 }
 
@@ -1067,6 +1116,44 @@ macro_rules! impl_hypergraph_snapshot {
                 )
             }
 
+            fn store_name(&self) -> Option<String> {
+                self.store_name_backend()
+            }
+
+            fn large_vertex_index_state(&self) -> Result<quil_types::store::LargeVertexIndexState> {
+                let state = self
+                    .snapshot
+                    .get(crate::large_vertex_index::state_key())
+                    .map_err(|e| QuilError::Store(e.to_string()))?;
+                crate::large_vertex_index::state_at(&self.snapshot, state.as_deref())
+            }
+
+            fn page_large_vertices_skipping(
+                &self,
+                set_type: &str,
+                phase_type: &str,
+                shard: &ShardKey,
+                domain: &[u8; 32],
+                after: Option<&[u8; 32]>,
+                limits: quil_types::store::VertexPageLimits,
+                skip: &dyn Fn(&[u8; 32]) -> bool,
+            ) -> Result<quil_types::store::IndexedVertexPage> {
+                if set_type != "vertex" || phase_type != "adds" {
+                    return Err(QuilError::InvalidArgument(
+                        "the large vertex index holds vertex adds only".into(),
+                    ));
+                }
+                let legacy = |key: &[u8]| {
+                    self.snapshot
+                        .get(key)
+                        .map_err(|e| QuilError::Store(e.to_string()))
+                };
+                let load = |vertex_key: &[u8]| {
+                    crate::large_vertex_index::load_row(&self.snapshot, &legacy, shard, vertex_key)
+                };
+                crate::large_vertex_index::page(&self.snapshot, &load, domain, after, limits, skip)
+            }
+
             fn load_tree_blob(
                 &self,
                 set_type: &str,
@@ -1290,6 +1377,24 @@ impl RocksTxn {
 }
 
 impl RocksHypergraphStore {
+    /// The record that marks the large-vertex index complete, for a write of a
+    /// store that opened empty, until it is stored: its rows were all written
+    /// with their entries.
+    fn index_complete_mark_backend(&self) -> Option<([u8; 2], Vec<u8>)> {
+        use std::sync::atomic::Ordering;
+        if !self.index_opened_empty.load(Ordering::Relaxed) {
+            return None;
+        }
+        if matches!(
+            self.db.get(crate::large_vertex_index::state_key()),
+            Ok(Some(_))
+        ) {
+            self.index_opened_empty.store(false, Ordering::Relaxed);
+            return None;
+        }
+        Some(crate::large_vertex_index::complete_record())
+    }
+
     fn new_transaction_backend(&self, _indexed: bool) -> Result<Box<dyn Transaction>> {
         Ok(Box::new(RocksTxn {
             batch: std::sync::Mutex::new(rocksdb::WriteBatch::default()),
@@ -1339,7 +1444,15 @@ impl RocksHypergraphStore {
                     return Err(QuilError::Store(format!("apply snapshot: iter: {}", e)));
                 }
             };
+            // The copied rows' index entries; another store's walk state
+            // does not describe this one's rows.
+            if crate::large_vertex_index::is_walk_record(&k) {
+                continue;
+            }
             batch.put(&k, &v);
+            if let Some(entry) = crate::large_vertex_index::live_entry_for_row(&k, v.len()) {
+                batch.put(&entry, b"");
+            }
             count += 1;
             if count % CHUNK == 0 {
                 let to_commit = std::mem::take(&mut batch);
@@ -1376,7 +1489,7 @@ impl RocksHypergraphStore {
 /// such as an absent one, stepped over every record below it that a payload
 /// eviction had range-deleted while older snapshots still pinned them,
 /// blocking a mainnet worker's sweeps for 35-52 s each.
-fn vertex_version_at(
+pub(crate) fn vertex_version_at(
     source: &impl BoundedCursorSource,
     set_type: &str,
     phase_type: &str,

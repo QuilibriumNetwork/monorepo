@@ -7,6 +7,7 @@ pub mod encoding;
 mod hypergraph;
 pub mod import;
 mod key;
+pub mod large_vertex_index;
 pub mod migration;
 mod overlay;
 pub mod replica_store;

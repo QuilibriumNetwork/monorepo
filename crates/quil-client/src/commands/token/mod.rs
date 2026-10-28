@@ -227,8 +227,9 @@ pub struct TokenArgs {
     /// Application identifier in hexadecimal (default: QUIL).
     #[arg(long, global = true)]
     pub application: Option<String>,
-    /// Maximum discovery pages; exhaustion fails rather than returning a partial balance.
-    #[arg(long, global = true, default_value_t = 128)]
+    /// Maximum discovery pages (up to 8 confidential coins or escrows each);
+    /// exhaustion fails rather than returning a partial balance.
+    #[arg(long, global = true, default_value_t = 2048)]
     pub max_pages: usize,
     /// Maximum recovered unspent coins retained during discovery.
     #[arg(long, global = true, default_value_t = 1024)]

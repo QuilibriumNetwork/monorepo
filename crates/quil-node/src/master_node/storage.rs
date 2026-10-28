@@ -80,6 +80,7 @@ pub(crate) fn init(
     db_arc
         .inner()
         .register_store(quil_forest::StoreRole::Master);
+    quil_store::large_vertex_index::start(&db_arc.inner(), "master".into());
     info!(
         path = %db_path.display(),
         block_cache_mb = db_arc.health().block_cache_capacity / (1024 * 1024),
