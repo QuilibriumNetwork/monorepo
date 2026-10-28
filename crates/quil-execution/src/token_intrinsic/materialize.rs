@@ -103,10 +103,13 @@ pub fn create_lattice_coin_vertex_tree(
 /// Compute the coin type hash for a domain.
 /// `poseidon(domain || "coin:Coin")` → 32 bytes.
 pub fn coin_type_hash(domain: &[u8]) -> Result<[u8; 32]> {
-    let mut preimage = Vec::with_capacity(domain.len() + 9);
-    preimage.extend_from_slice(domain);
-    preimage.extend_from_slice(b"coin:Coin");
-    quil_crypto::poseidon::hash_bytes_to_32(&preimage)
+    static MARKERS: super::MarkerCache = super::MarkerCache::new();
+    MARKERS.get(domain, || {
+        let mut preimage = Vec::with_capacity(domain.len() + 9);
+        preimage.extend_from_slice(domain);
+        preimage.extend_from_slice(b"coin:Coin");
+        preimage
+    })
 }
 
 /// Create a spent marker tree for an input's verification key.

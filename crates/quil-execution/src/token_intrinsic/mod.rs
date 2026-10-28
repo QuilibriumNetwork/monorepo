@@ -119,3 +119,86 @@ pub fn global_commit_tx_id(operation: &[u8]) -> [u8; 32] {
     use sha3::Digest;
     sha3::Sha3_256::digest(operation).into()
 }
+
+/// Poseidon type markers of one family, by the 32-byte context or domain each
+/// binds. A marker costs about 0.66 ms and depends on nothing else, and a coin
+/// scan decodes every vertex of an application: rehashing one marker for each
+/// of an archive's QUIL vertices held GLOBAL 945,000 for hours (2026-10-28).
+/// Only successful results are kept, as for the state discriminators.
+pub(crate) struct MarkerCache(std::sync::Mutex<Vec<([u8; 32], [u8; 32])>>);
+
+/// Contexts one family keeps: one per network and application in use.
+const MARKER_CONTEXTS: usize = 64;
+
+impl MarkerCache {
+    pub(crate) const fn new() -> Self {
+        Self(std::sync::Mutex::new(Vec::new()))
+    }
+
+    /// `poseidon(preimage())`, the marker of `context`: computed once per
+    /// 32-byte context, and every time for any other length.
+    pub(crate) fn get(
+        &self,
+        context: &[u8],
+        preimage: impl FnOnce() -> Vec<u8>,
+    ) -> quil_types::error::Result<[u8; 32]> {
+        let Ok(key) = <[u8; 32]>::try_from(context) else {
+            return quil_crypto::poseidon::hash_bytes_to_32(&preimage());
+        };
+        if let Some((_, marker)) = self.entries().iter().find(|(held, _)| *held == key) {
+            return Ok(*marker);
+        }
+        let marker = quil_crypto::poseidon::hash_bytes_to_32(&preimage())?;
+        let mut entries = self.entries();
+        if !entries.iter().any(|(held, _)| *held == key) {
+            if entries.len() >= MARKER_CONTEXTS {
+                entries.remove(0);
+            }
+            entries.push((key, marker));
+        }
+        Ok(marker)
+    }
+
+    fn entries(&self) -> std::sync::MutexGuard<'_, Vec<([u8; 32], [u8; 32])>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MarkerCache;
+
+    /// A cached marker is the Poseidon hash of its preimage, per context, for
+    /// contexts of other lengths and after older contexts are dropped.
+    #[test]
+    fn a_cached_marker_is_its_hash() {
+        static MARKERS: MarkerCache = MarkerCache::new();
+        let preimage = |context: &[u8]| {
+            let mut bytes = b"marker\0".to_vec();
+            bytes.extend_from_slice(context);
+            bytes
+        };
+        let direct =
+            |context: &[u8]| quil_crypto::poseidon::hash_bytes_to_32(&preimage(context)).unwrap();
+        let contexts: Vec<[u8; 32]> = (0..=super::MARKER_CONTEXTS as u8)
+            .map(|i| [i; 32])
+            .collect();
+        for _ in 0..2 {
+            for context in &contexts {
+                assert_eq!(
+                    MARKERS.get(context, || preimage(context)).unwrap(),
+                    direct(context)
+                );
+            }
+        }
+        assert_ne!(direct(&contexts[0]), direct(&contexts[1]));
+        let short = [5u8; 7];
+        assert_eq!(
+            MARKERS.get(&short, || preimage(&short)).unwrap(),
+            direct(&short)
+        );
+        assert!(MARKERS.entries().len() <= super::MARKER_CONTEXTS);
+    }
+}

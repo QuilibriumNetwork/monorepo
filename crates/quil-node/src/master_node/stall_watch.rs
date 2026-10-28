@@ -23,6 +23,13 @@ pub(crate) const MESSAGE_LOOP_STALL_AFTER: Duration = Duration::from_secs(60);
 /// A poller fetch times out after 30 s and is retried once on a fresh
 /// connection; a pass longer than that is blocked.
 pub(crate) const POLLER_STALL_AFTER: Duration = Duration::from_secs(90);
+/// A GLOBAL materializer pass beats for each frame. A frame executes in
+/// seconds and an epoch's first in about 30 s, and on an archive the
+/// application frames one GLOBAL frame sequences can add minutes after a gap.
+pub(crate) const MATERIALIZER_STALL_AFTER: Duration = Duration::from_secs(120);
+/// The archive ingest waits for the ingest the materializer holds while it
+/// sequences application frames, so it can be held as long.
+pub(crate) const ARCHIVE_INGEST_STALL_AFTER: Duration = MATERIALIZER_STALL_AFTER;
 /// How often a continuing block warns again.
 const REPEAT: Duration = Duration::from_secs(60);
 /// How often the watchdog looks.
@@ -34,6 +41,10 @@ pub(crate) const MESSAGE_LOOP_IMPACT: &str =
     "inbound gossip (GLOBAL frames, peer info, consensus messages) waits and 'node status' lines stop while it lasts";
 pub(crate) const POLLER_IMPACT: &str =
     "this node fetches and executes no GLOBAL frame from archives while it lasts";
+pub(crate) const MATERIALIZER_IMPACT: &str =
+    "this node executes and publishes no GLOBAL frame while it lasts";
+pub(crate) const ARCHIVE_INGEST_IMPACT: &str =
+    "gossiped application frames queue on this archive; those that do not fit are dropped and fetched again when a GLOBAL frame needs them";
 
 /// Where a blocked task was seen: the step it last entered and its
 /// innermost and outermost synchronous sections.

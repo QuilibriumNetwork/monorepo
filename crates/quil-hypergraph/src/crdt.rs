@@ -1642,11 +1642,21 @@ impl HypergraphCrdt {
             .for_each_vertex_underlying_matching("vertex", "adds", &shard, matches, cb)
     }
 
-    /// Collect vertex-adds blobs including writes staged since the last forest
-    /// commit. Execution uses this to derive state from earlier messages in the
-    /// same frame. Callers must serialize mutations while deriving that state;
-    /// this is not a committed snapshot for external readers.
-    pub fn collect_live_vertex_adds(&self, domain: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    /// Visit vertex-adds blobs including writes staged since the last forest
+    /// commit: each committed blob no staged write replaces, then the staged
+    /// blobs, so not in key order. Execution uses this to derive state from
+    /// earlier messages in the same frame. Callers must serialize mutations
+    /// while deriving that state; this is not a committed snapshot for
+    /// external readers.
+    ///
+    /// One at a time: collected whole, the QUIL application's blobs (88 GB on
+    /// an archive) were held at once while a coin root bootstrap kept a few of
+    /// them, and GLOBAL halted at 945,000 for hours (2026-10-28).
+    pub fn for_each_live_vertex_add(
+        &self,
+        domain: &[u8],
+        visit: &mut dyn FnMut(Vec<u8>, Vec<u8>),
+    ) -> Result<()> {
         let app_address: [u8; 32] = domain.try_into().map_err(|_| {
             QuilError::InvalidArgument("vertex-adds domain must be 32 bytes".into())
         })?;
@@ -1654,7 +1664,25 @@ impl HypergraphCrdt {
             app_address,
             data_address: [0; 32],
         });
-        self.collect_phase_leaves(&shard, 0, &[])
+        let (set, phase) = PHASE_STR[0];
+        let staged: PhaseBlobs = self
+            .pending_blobs
+            .read()
+            .unwrap()
+            .get(&(shard.clone(), 0))
+            .cloned()
+            .unwrap_or_default();
+        self.store.for_each_vertex_underlying_matching(
+            set,
+            phase,
+            &shard,
+            &|key| !staged.contains_key(key),
+            visit,
+        )?;
+        for (key, blob) in staged {
+            visit(key, blob);
+        }
+        Ok(())
     }
 
     /// Enumerate committed `(vertex_key, blob)` for an EXPLICIT shard/phase —

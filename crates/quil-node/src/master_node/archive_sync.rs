@@ -3366,6 +3366,14 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         let registry_for_merge = sync_pr.clone();
                         let finalization_for_worker = sync_finalization.clone();
                         let ingest_for_worker = sync_ingest.clone();
+                        // Each pass runs on the blocking pool and beats per
+                        // frame; between passes it waits with no deadline.
+                        let materializer_probe = super::stall_watch::watch(
+                            ProbeSection::GlobalMaterializer,
+                            super::stall_watch::MATERIALIZER_IMPACT,
+                            super::stall_watch::MATERIALIZER_STALL_AFTER,
+                        );
+                        materializer_probe.idle();
                         spawner.detach("global-materializer", async move {
                             // Highest signaled target. Atomic finalization
                             // also retries on a timer without a new signal.
@@ -3405,7 +3413,18 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 let shards_store_for_merge = shards_store_for_merge.clone();
                                 let registry_for_merge = registry_for_merge.clone();
                                 let catch_up = catch_up.clone();
+                                let pass_probe = materializer_probe.clone();
                                 let outcome = tokio::task::spawn_blocking(move || {
+                                    let _installed = probe::install(pass_probe);
+                                    probe::beat();
+                                    /// Ends the pass's watch: the next one waits for a signal.
+                                    struct PassEnd;
+                                    impl Drop for PassEnd {
+                                        fn drop(&mut self) {
+                                            probe::idle();
+                                        }
+                                    }
+                                    let _pass_end = PassEnd;
                                     let mut catch_up = catch_up.lock().unwrap_or_else(|p| p.into_inner());
                                     // The freshest GLOBAL frame this node has evidence of.
                                     // An inflated head only starts a catch-up early:
@@ -3474,6 +3493,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     // the pipeline is consulted at every missing
                                     // height and `target` does not bound the pass.
                                     loop {
+                                        probe::beat();
                                         let next = m.last_materialized_frame() + 1;
                                         catch_up.observe_and_log(
                                             std::time::Instant::now(),

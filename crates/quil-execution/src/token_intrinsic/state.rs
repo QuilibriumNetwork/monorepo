@@ -36,10 +36,13 @@ impl StoredCoin {
 }
 
 fn type_hash(context: &[u8; 32]) -> Result<[u8; 32]> {
-    // v2: records carry their accumulator position (leaf index).
-    let mut bytes = Vec::from(b"quil/coin/QCT3/v4\0".as_slice());
-    bytes.extend_from_slice(context);
-    quil_crypto::poseidon::hash_bytes_to_32(&bytes)
+    static MARKERS: super::MarkerCache = super::MarkerCache::new();
+    MARKERS.get(context, || {
+        // v2: records carry their accumulator position (leaf index).
+        let mut bytes = Vec::from(b"quil/coin/QCT3/v4\0".as_slice());
+        bytes.extend_from_slice(context);
+        bytes
+    })
 }
 
 /// Prepare a vertex and its content address for the caller's state transaction.

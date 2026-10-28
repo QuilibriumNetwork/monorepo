@@ -113,17 +113,15 @@ fn submission_engines<'a, H>(bitmask: &[u8], entries: &'a [(Vec<u8>, H)]) -> Vec
         .collect()
 }
 
-/// A shard-frame message no local engine takes.
-///
-/// ARCHIVE (no local shard engines): the app-shard ingest decodes and verifies
-/// it as a full AppShardFrame (non-frame messages fail decode and are
-/// ignored), stores it for serving once admitted, and materializes the
-/// shard's state. Nothing is stored before that check: an unverified store
-/// let one forged far-future frame pin the head the archive serves.
+/// A shard-frame message no local engine takes, on a node without an archive
+/// ingest. (An archive queues it for its ingest thread
+/// (`archive_ingest_queue`), which verifies it before anything is stored: an
+/// unverified store let one forged far-future frame pin the head the archive
+/// serves.)
 ///
 /// CLUSTER MASTER: a full app-shard frame the master received via
 /// `shard_frame_bitmask` gossip for a filter its REMOTE workers cover — no
-/// local engine handle and no archive ingest. Mirror it into the master clock
+/// local engine handle. Mirror it into the master clock
 /// store so the store-backed `AppShardService::get_app_shard_frame` serves it;
 /// without this, cluster reads hit an empty master store (thread-mode/local
 /// frames are mirrored by the worker drain). The filter is the frame header's
@@ -134,12 +132,7 @@ fn unrouted_shard_message(
     bitmask: &[u8],
     data: &[u8],
     clock_store: &dyn quil_types::store::ClockStore,
-    archive_ingest: Option<&dyn Fn(&[u8])>,
 ) {
-    if let Some(ingest) = archive_ingest {
-        ingest(data);
-        return;
-    }
     if let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(data) {
         if let Some(addr) = frame.header.as_ref().map(|h| h.address.clone()) {
             if !addr.is_empty()
@@ -230,12 +223,31 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         global_finalization: global_finalization_for_recv,
         activation_waits: activation_waits_for_recv,
     } = args;
-    let archive_ingest_for_recv = archive_app_shard_ingest;
-    // Gossiped application frames are verified without holding the ingest,
-    // which GLOBAL execution waits for.
-    let archive_verifier_for_recv = archive_ingest_for_recv
-        .as_ref()
-        .map(|ingest| ingest.lock().unwrap_or_else(|p| p.into_inner()).verifier());
+    // Gossiped application frames and the ingest's retry pass run on their
+    // own thread: GLOBAL execution holds the ingest while it sequences
+    // application frames, and this loop must never wait for it.
+    let archive_ingest_queue = archive_app_shard_ingest.map(|ingest| {
+        // Verified without holding the ingest, which is held only to admit.
+        let verifier = ingest.lock().unwrap_or_else(|p| p.into_inner()).verifier();
+        let retrying = ingest.clone();
+        super::archive_ingest_queue::ArchiveIngestQueue::spawn(
+            super::archive_ingest_queue::QUEUE_FRAMES,
+            super::archive_ingest_queue::QUEUE_BYTES,
+            super::archive_ingest_queue::RETRY_EVERY,
+            Some(super::stall_watch::watch(
+                ProbeSection::ArchiveIngest,
+                super::stall_watch::ARCHIVE_INGEST_IMPACT,
+                super::stall_watch::ARCHIVE_INGEST_STALL_AFTER,
+            )),
+            move |data| quil_engine::archive_ingest::ingest_gossiped(&ingest, &verifier, data),
+            move || {
+                retrying
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .retry_pending()
+            },
+        )
+    });
     // GLOBAL_FRAME admission state shared with the gossip gate: a frame this
     // loop accepted is neither forwarded nor checked again, and a header whose
     // certificate and VDF verified skips both checks on later copies.
@@ -550,8 +562,17 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                 }
                 _ = status_timer.tick() => {
                     probe::step(ProbeSection::LoopStatus);
-                    if let Some(ingest) = archive_ingest_for_recv.as_ref() {
-                        ingest.lock().unwrap_or_else(|p| p.into_inner()).retry_pending();
+                    if let Some((frames, bytes)) = archive_ingest_queue
+                        .as_ref()
+                        .map(|queue| queue.take_dropped())
+                        .filter(|(frames, _)| *frames > 0)
+                    {
+                        warn!(frames, bytes, interval_secs = 30, scope = "this archive",
+                            action = "none if it passes: the application frame ingest is held, usually by GLOBAL \
+                                      execution sequencing application frames, and the gap fetch asks for a dropped \
+                                      frame again when a GLOBAL frame needs it; if it repeats, look for 'master task \
+                                      blocked' lines naming the GLOBAL frame materializer",
+                            "archive dropped gossiped application frames: its ingest queue was full");
                     }
                     // Periodic allocation status snapshot.
                     let peer_count = p2p_for_recv.peer_count();
@@ -1953,15 +1974,18 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                     }
                                 }
                                 if !routed {
-                                    let ingest = archive_ingest_for_recv.as_ref().zip(archive_verifier_for_recv.as_ref()).map(|(ingest, verifier)| {
-                                        move |data: &[u8]| quil_engine::archive_ingest::ingest_gossiped(ingest, verifier, data)
-                                    });
-                                    unrouted_shard_message(
-                                        bm,
-                                        &received.data,
-                                        clock_store_recv.as_ref(),
-                                        ingest.as_ref().map(|ingest| ingest as &dyn Fn(&[u8])),
-                                    );
+                                    match archive_ingest_queue.as_ref() {
+                                        Some(queue) => {
+                                            if super::archive_ingest_queue::may_carry_shard_frame(bm) {
+                                                queue.offer(std::mem::take(&mut received.data));
+                                            }
+                                        }
+                                        None => unrouted_shard_message(
+                                            bm,
+                                            &received.data,
+                                            clock_store_recv.as_ref(),
+                                        ),
+                                    }
                                 }
                             }
                             }
@@ -2018,9 +2042,8 @@ mod tests {
 
     /// A cluster master (no archive ingest) mirrors a frame on its shard's
     /// frame topic for serving, and not a message on another topic. An archive
-    /// hands the frame to its ingest, which stores only what it verifies, and
-    /// stores nothing before that; a frame it fetched to fill a gap arrives
-    /// under the frame's own topic.
+    /// queues the frame for its ingest instead; a frame it fetched to fill a
+    /// gap arrives under the frame's own topic, which the queue takes.
     #[test]
     fn only_a_cluster_master_mirrors_a_frame_unverified() {
         use quil_types::store::ClockStore as _;
@@ -2038,12 +2061,7 @@ mod tests {
             ..Default::default()
         };
         let topic = quil_engine::bitmasks::shard_frame_bitmask(&filter);
-        unrouted_shard_message(
-            &topic,
-            &prost::Message::encode_to_vec(&frame(7)),
-            &clock,
-            None,
-        );
+        unrouted_shard_message(&topic, &prost::Message::encode_to_vec(&frame(7)), &clock);
         assert_eq!(
             clock.get_shard_clock_frame(&filter, 7, false).unwrap(),
             frame(7)
@@ -2052,27 +2070,16 @@ mod tests {
             clock.get_latest_shard_clock_frame(&filter).unwrap(),
             frame(7)
         );
-        unrouted_shard_message(&[], &prost::Message::encode_to_vec(&frame(8)), &clock, None);
+        unrouted_shard_message(&[], &prost::Message::encode_to_vec(&frame(8)), &clock);
         assert!(
             clock.get_shard_clock_frame(&filter, 8, false).is_err(),
             "not a shard-frame message"
         );
 
-        let handed = std::cell::RefCell::new(Vec::new());
-        let ingest = |data: &[u8]| handed.borrow_mut().push(data.to_vec());
-        let forged = prost::Message::encode_to_vec(&frame(u64::MAX / 2));
-        unrouted_shard_message(&topic, &forged, &clock, Some(&ingest));
-        assert_eq!(*handed.borrow(), vec![forged.clone()]);
-        assert!(
-            clock
-                .get_shard_clock_frame(&filter, u64::MAX / 2, false)
-                .is_err(),
-            "not stored before verification"
-        );
-        assert_eq!(
-            clock.get_latest_shard_clock_frame(&filter).unwrap(),
-            frame(7)
-        );
-        assert_eq!(gap_fetched_frame_message(&filter, forged).bitmask, topic);
+        let fetched = gap_fetched_frame_message(&filter, prost::Message::encode_to_vec(&frame(9)));
+        assert_eq!(fetched.bitmask, topic);
+        assert!(super::super::archive_ingest_queue::may_carry_shard_frame(
+            &fetched.bitmask
+        ));
     }
 }

@@ -184,6 +184,8 @@ impl GlobalFinalizationPipeline {
         let Some(ingest) = self.sequenced_ingest.as_ref() else {
             return true;
         };
+        let _section =
+            quil_types::thread_probe::section(quil_types::thread_probe::Section::SequencedIngest);
         match ingest(frame) {
             Ok(ready) => ready,
             Err(error) => {

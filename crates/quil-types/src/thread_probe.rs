@@ -88,6 +88,11 @@ sections! {
     // Master tasks.
     MessageLoop => "message loop",
     ArchivePoller => "archive frame poller",
+    ArchiveIngest => "archive application frame ingest",
+    GlobalMaterializer => "GLOBAL frame materializer",
+    // Steps of the archive application frame ingest.
+    IngestFrame => "gossiped application frame",
+    IngestRetry => "ingest retry pass",
     // Steps of the master's message loop.
     LoopRemoteDirect => "remote worker topic tick",
     LoopCommitteePeers => "committee peer tick",
@@ -111,6 +116,7 @@ sections! {
     GlobalFrameRequestsRoot => "GLOBAL frame requests root check",
     GlobalFrameStore => "GLOBAL frame store",
     GlobalFrameExecution => "GLOBAL frame execution",
+    SequencedIngest => "application frames a GLOBAL frame sequences",
     PollerFrameCallback => "poller frame callback",
     ProverRegistryRefresh => "prover registry refresh",
     AllocationReconcile => "worker allocation reconcile",

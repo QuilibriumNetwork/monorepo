@@ -132,10 +132,13 @@ pub fn decode_legacy_verenc_coin(tree: &VectorCommitmentTree) -> Result<Option<T
 /// Type hash for a transparent legacy coin vertex: `poseidon(domain ‖
 /// "transparent:LegacyCoin")`.
 pub fn transparent_type_hash(domain: &[u8]) -> Result<[u8; 32]> {
-    let mut p = Vec::with_capacity(domain.len() + 22);
-    p.extend_from_slice(domain);
-    p.extend_from_slice(b"transparent:LegacyCoin");
-    quil_crypto::poseidon::hash_bytes_to_32(&p)
+    static MARKERS: super::MarkerCache = super::MarkerCache::new();
+    MARKERS.get(domain, || {
+        let mut p = Vec::with_capacity(domain.len() + 22);
+        p.extend_from_slice(domain);
+        p.extend_from_slice(b"transparent:LegacyCoin");
+        p
+    })
 }
 
 /// Build the compact transparent-coin vertex tree: `[0x00]` owner (32 B),

@@ -564,6 +564,11 @@ mod tests {
             max_path_data_bytes: 1 << 20,
         };
         let disc = vertex_adds_discriminator().unwrap();
+        // No root retained yet.
+        assert!(matches!(
+            committed_witnesses(&state, &network, &application, &[[7; 32]], limits),
+            Err(QuilError::NotFound(_))
+        ));
         let mut addresses = Vec::new();
         let mut outputs = Vec::new();
         let mut staged = std::collections::BTreeMap::new();
@@ -597,14 +602,11 @@ mod tests {
             addresses.push(address);
             outputs.push(output);
         }
+        // Published in the coins' own changeset, as every placement does.
+        let root = roots::refresh_root(&state, &network, &application, limits.snapshot).unwrap();
         state.commit().unwrap();
         state.abort();
         state.crdt().commit(1).unwrap();
-        assert!(matches!(
-            committed_witnesses(&state, &network, &application, &addresses, limits),
-            Err(QuilError::NotFound(_))
-        ));
-        let root = roots::refresh_root(&state, &network, &application, limits.snapshot).unwrap();
         addresses.push([0; 32]);
         let response =
             committed_witnesses(&state, &network, &application, &addresses, limits).unwrap();

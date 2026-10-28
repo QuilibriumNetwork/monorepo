@@ -63,9 +63,12 @@ pub fn decode_escrow_blob(
 }
 
 fn type_hash(context: &[u8; 32]) -> Result<[u8; 32]> {
-    let mut bytes = Vec::from(b"quil/escrow/QCT3/v3\0".as_slice());
-    bytes.extend_from_slice(context);
-    quil_crypto::poseidon::hash_bytes_to_32(&bytes)
+    static MARKERS: super::MarkerCache = super::MarkerCache::new();
+    MARKERS.get(context, || {
+        let mut bytes = Vec::from(b"quil/escrow/QCT3/v3\0".as_slice());
+        bytes.extend_from_slice(context);
+        bytes
+    })
 }
 
 /// Prepare a content-addressed vertex for an admitted operation's changeset.
