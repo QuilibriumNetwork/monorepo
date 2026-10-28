@@ -10,7 +10,9 @@
 //! threads of a multi-thread runtime, carries its own probe instead
 //! ([`task_probed`]) and [`beat`]s it each time its loop comes round.
 //! Every mark is a few atomic stores, and on threads without a probe
-//! (tests, untracked tasks) a no-op.
+//! (tests, untracked tasks) a no-op. A [`detail`] names what a section
+//! works on (a frame, a shard): it takes the probe's uncontended detail
+//! lock twice, so it marks units of work, not loop iterations.
 use std::cell::RefCell;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -109,6 +111,11 @@ sections! {
     PollerFillFrame => "archive catch-up frame processing",
     PollerReconnect => "archive reconnect",
     PollerRefetch => "archive fetch on a fresh connection",
+    // Steps of the GLOBAL materializer.
+    MaterializerFinalization => "GLOBAL finalization step",
+    MaterializerIngest => "application-frame ingest before GLOBAL execution",
+    MaterializerAtomic => "canonical GLOBAL frame atomic execution",
+    MaterializerExecute => "GLOBAL frame execution in place",
     // Synchronous sections of master tasks.
     LatestGlobalFrameRead => "latest GLOBAL frame read",
     ProverInfoRead => "own prover info read",
@@ -122,6 +129,13 @@ sections! {
     AllocationReconcile => "worker allocation reconcile",
     ShardSizeRead => "local shard size read",
     LifecycleEvaluate => "prover lifecycle evaluation",
+    // Archive application-frame ingest.
+    ArchiveIngestLockWait => "archive ingest lock wait",
+    SequencedPreverify => "sequenced proof pre-verification (does not hold the ingest lock)",
+    AppFramePreverify => "app-shard frame proof pre-verification",
+    AppFramePricing => "app-shard frame bundle pricing",
+    AppFrameProcess => "app-shard frame bundle execution",
+    AppFrameCommit => "app-shard frame commit",
     // Clock store lock waits, marked only when the lock is contended.
     ClockCacheWait => "GLOBAL frame cache lock wait",
     ClockWriterWait => "GLOBAL frame writer lock wait",
@@ -202,6 +216,7 @@ pub struct ThreadProbe {
     section: AtomicU64,
     outer: AtomicU64,
     filter: Mutex<Vec<u8>>,
+    detail: Mutex<String>,
 }
 
 impl ThreadProbe {
@@ -213,6 +228,7 @@ impl ThreadProbe {
             section: AtomicU64::new(0),
             outer: AtomicU64::new(0),
             filter: Mutex::new(Vec::new()),
+            detail: Mutex::new(String::new()),
         })
     }
 
@@ -240,6 +256,14 @@ impl ThreadProbe {
 
     pub fn filter(&self) -> Vec<u8> {
         self.filter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// What the marked work is about ([`detail`]), empty when unnamed.
+    pub fn detail(&self) -> String {
+        self.detail
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -330,6 +354,46 @@ impl Drop for SectionGuard {
             if previous == 0 {
                 probe.outer.store(0, Ordering::Relaxed);
             }
+        }
+    }
+}
+
+/// Name what the current work is about (a frame, a shard) until the guard
+/// drops; nested details are joined with `: `. Formatted only when a probe
+/// is installed. Not `Send`, as [`section`].
+pub fn detail(args: std::fmt::Arguments<'_>) -> DetailGuard {
+    let Some(probe) = current() else {
+        return DetailGuard {
+            entered: None,
+            _thread: PhantomData,
+        };
+    };
+    let mut held = probe.detail.lock().unwrap_or_else(|e| e.into_inner());
+    let previous = held.len();
+    if previous > 0 {
+        held.push_str(": ");
+    }
+    let _ = std::fmt::Write::write_fmt(&mut *held, args);
+    drop(held);
+    DetailGuard {
+        entered: Some((probe, previous)),
+        _thread: PhantomData,
+    }
+}
+
+pub struct DetailGuard {
+    entered: Option<(Arc<ThreadProbe>, usize)>,
+    _thread: PhantomData<*const ()>,
+}
+
+impl Drop for DetailGuard {
+    fn drop(&mut self) {
+        if let Some((probe, previous)) = self.entered.take() {
+            probe
+                .detail
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .truncate(previous);
         }
     }
 }
@@ -512,6 +576,28 @@ mod tests {
         assert_eq!(seen.section, None);
         assert_eq!(seen.step.map(|m| m.section), Some(Section::PollerHeadFetch));
         assert!(!seen.idle());
+    }
+
+    #[test]
+    fn details_nest_restore_and_cost_nothing_without_a_probe() {
+        drop(detail(format_args!("unprobed")));
+        let probe = ThreadProbe::new();
+        let installed = install(probe.clone());
+        {
+            let _global = detail(format_args!("GLOBAL frame {}", 945_000));
+            {
+                let _shard = detail(format_args!("shard {} frame {}", "ab01", 16_210));
+                assert_eq!(
+                    probe.detail(),
+                    "GLOBAL frame 945000: shard ab01 frame 16210"
+                );
+            }
+            assert_eq!(probe.detail(), "GLOBAL frame 945000");
+        }
+        assert_eq!(probe.detail(), "");
+        drop(installed);
+        drop(detail(format_args!("unprobed")));
+        assert_eq!(probe.detail(), "");
     }
 
     #[test]

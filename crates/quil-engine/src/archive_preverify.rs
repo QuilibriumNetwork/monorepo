@@ -432,7 +432,7 @@ pub fn preverify_through_within(
         truncated: false,
     };
     let (planned, verify, clock) = {
-        let mut guard = ingest.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = crate::archive_ingest::lock_ingest(ingest);
         let mut planned = Vec::new();
         for (address, through) in targets {
             let bodies = guard.plan_bodies(address, *through, &mut budget);

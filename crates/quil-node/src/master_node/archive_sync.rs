@@ -1657,10 +1657,7 @@ fn sequenced_ingest_hook(
         let frame_number = frame.header.as_ref().map_or(0, |h| h.frame_number);
         // The flag day's discard precedes the first GLOBAL frame from
         // activation, so no session frame it sequences is ever discarded.
-        ingest
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .discard_legacy_history_at(frame_number)?;
+        quil_engine::archive_ingest::lock_ingest(ingest).discard_legacy_history_at(frame_number)?;
         let state = quil_execution::hypergraph_state::HypergraphState::new(crdt.clone());
         let bls = quil_crypto::FalconKeyConstructor;
         // Per shard: the certified headers this frame carries, by frame number.
@@ -1709,6 +1706,8 @@ fn sequenced_ingest_hook(
         // locked pass below then finds their verdicts cached, and verifies
         // itself whatever this left.
         let _pass = quil_engine::archive_preverify::SequencedPass::begin();
+        // Marked for the watchdog: this does not hold the ingest lock.
+        let preverify = probe::section(ProbeSection::SequencedPreverify);
         let targets: Vec<(Vec<u8>, u64)> = vouched
             .iter()
             .filter_map(|(address, headers)| {
@@ -1719,15 +1718,16 @@ fn sequenced_ingest_hook(
             })
             .collect();
         quil_engine::archive_preverify::preverify_through(ingest, frame_number, &targets);
-        let mut ingest = ingest
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        drop(preverify);
+        let mut ingest = quil_engine::archive_ingest::lock_ingest(ingest);
+        // Marked for the watchdog: gossip ingest waits for the lock this holds.
+        let sequenced = probe::section(ProbeSection::SequencedIngest);
         let mut missing = Vec::new();
         for (address, headers) in vouched {
             let Some(&through) = headers.keys().max() else {
                 continue;
             };
-            if !ingest.materialize_through_vouched(&address, through, &headers)? {
+            if !ingest.materialize_through_vouched(&address, through, &headers, frame_number)? {
                 let held = ingest.materialized_height(&address).unwrap_or(0);
                 missing.push(format!(
                     "{}: frame {} of {through}",
@@ -1736,6 +1736,7 @@ fn sequenced_ingest_hook(
                 ));
             }
         }
+        drop(sequenced);
         if missing.is_empty() {
             return Ok(true);
         }
@@ -1750,11 +1751,8 @@ fn sequenced_ingest_hook(
             *lookahead = Some((frame_number, std::time::Instant::now(), targets));
         }
         if let Some((_, _, targets)) = lookahead.as_ref() {
-            let mut ingest = cell
-                .get()
-                .expect("checked above")
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut ingest =
+                quil_engine::archive_ingest::lock_ingest(cell.get().expect("checked above"));
             for (address, &through) in targets {
                 if let Err(error) = ingest.prefetch_through(address, through) {
                     tracing::debug!(%error, address = %hex::encode(address), "application frame prefetch skipped");
@@ -3384,10 +3382,16 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         let finalization_for_worker = sync_finalization.clone();
                         let ingest_for_worker = sync_ingest.clone();
                         // Each pass runs on the blocking pool and beats per
-                        // frame; between passes it waits with no deadline.
+                        // frame; between passes it waits with no deadline. On
+                        // an archive a pass holds the ingest while it
+                        // sequences application frames.
                         let materializer_probe = super::stall_watch::watch(
                             ProbeSection::GlobalMaterializer,
-                            super::stall_watch::MATERIALIZER_IMPACT,
+                            if ingest_for_worker.is_some() {
+                                super::stall_watch::ARCHIVE_MATERIALIZER_IMPACT
+                            } else {
+                                super::stall_watch::MATERIALIZER_IMPACT
+                            },
                             super::stall_watch::MATERIALIZER_STALL_AFTER,
                         );
                         materializer_probe.idle();
@@ -3512,6 +3516,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     loop {
                                         probe::beat();
                                         let next = m.last_materialized_frame() + 1;
+                                        let _on = probe::detail(format_args!("GLOBAL frame {next}"));
                                         catch_up.observe_and_log(
                                             std::time::Instant::now(),
                                             next - 1,
@@ -3553,6 +3558,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 m.set_coverage_halt_durations(cov.check(next));
                                                 use quil_engine::global_finalization::FinalizationStep;
                                                 let attempts = catch_up.atomic_attempts();
+                                                probe::step(ProbeSection::MaterializerFinalization);
                                                 match pipeline.step_within(next, attempts) {
                                                     FinalizationStep::Published { frame, result } => {
                                                         // Consumed bundles leave the mempool
@@ -3595,6 +3601,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         // The application frames this frame rewards
                                         // must be ingested first, on every path.
                                         if let Some(ingest) = ingest.as_ref() {
+                                            probe::step(ProbeSection::MaterializerIngest);
                                             let ready = ingest(&frame);
                                             catch_up.note_ingest(std::time::Instant::now(), matches!(ready, Ok(true)));
                                             match ready {
@@ -3624,6 +3631,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                             } else {
                                                 catch_up.atomic_attempts()
                                             };
+                                            probe::step(ProbeSection::MaterializerAtomic);
                                             match canonical_atomic_attempts(&m, &frame, attempts) {
                                                 Some(CanonicalAttempt::Published(result)) => {
                                                     if !result.consumed_bundles.is_empty() {
@@ -3658,6 +3666,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 None => {}
                                             }
                                         }
+                                        probe::step(ProbeSection::MaterializerExecute);
                                         match m.materialize(&frame) {
                                             Ok(result) => {
                                                 // Consume the finalized frame's

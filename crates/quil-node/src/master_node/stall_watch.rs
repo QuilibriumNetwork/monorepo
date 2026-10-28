@@ -1,6 +1,12 @@
 //! Names what blocks a master task. The message loop and the archive frame
 //! poller each run as one task: a call in either that does not return holds
-//! every message or GLOBAL frame behind it, and nothing else logs it.
+//! every message or GLOBAL frame behind it, and nothing else logs it. The
+//! GLOBAL materializer runs its passes on a blocking thread under a probe of
+//! its own: on an archive it holds the ingest while it materializes the
+//! application frames a GLOBAL frame carries, so one shard frame that does
+//! not finish halts GLOBAL execution and holds gossiped application frames
+//! behind it (2026-10-27: every archive hung on GLOBAL frame 945,000, and the
+//! warning could only name the message loop's inbound message).
 //!
 //! Each watched task runs under
 //! [`task_probed`](quil_types::thread_probe::task_probed) with its own
@@ -8,8 +14,9 @@
 //! and synchronous sections it enters mark where it is. One watchdog
 //! thread, outside the async runtime so that it runs while the runtime is
 //! wedged, warns when a task has not beaten within its threshold, naming
-//! the task, step and section, repeats while the block lasts, and logs its
-//! end.
+//! the task, step and section and what the section works on (its
+//! [`detail`](quil_types::thread_probe::detail)), repeats while the block
+//! lasts, and logs its end.
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -43,6 +50,8 @@ pub(crate) const POLLER_IMPACT: &str =
     "this node fetches and executes no GLOBAL frame from archives while it lasts";
 pub(crate) const MATERIALIZER_IMPACT: &str =
     "this node executes and publishes no GLOBAL frame while it lasts";
+pub(crate) const ARCHIVE_MATERIALIZER_IMPACT: &str =
+    "this archive executes and publishes no GLOBAL frame while it lasts, and while it sequences application frames it holds the ingest, so gossiped application frames queue behind it (those that do not fit are dropped and fetched again when a GLOBAL frame needs them); if every archive shows it at once, GLOBAL halts network-wide";
 pub(crate) const ARCHIVE_INGEST_IMPACT: &str =
     "gossiped application frames queue on this archive; those that do not fit are dropped and fetched again when a GLOBAL frame needs them";
 
@@ -98,6 +107,8 @@ pub(crate) enum StallReport {
         impact: &'static str,
         blocked: Duration,
         place: Place,
+        /// What the marked section works on, empty when unnamed.
+        detail: String,
         at_ms: u64,
         repeat: bool,
     },
@@ -117,8 +128,13 @@ struct Stall {
 }
 
 impl Stall {
-    fn see(&mut self, place: &Place) {
-        let described = place.describe();
+    fn see(&mut self, place: &Place, detail: &str) {
+        let mut described = place.describe();
+        if !detail.is_empty() {
+            described.push_str(" (");
+            described.push_str(detail);
+            described.push(')');
+        }
         if self.seen.len() < MAX_SEEN && !self.seen.contains(&described) {
             self.seen.push(described);
         }
@@ -200,7 +216,8 @@ impl StallWatch {
                     });
                 } else {
                     let place = Place::of(&snapshot);
-                    stall.see(&place);
+                    let detail = probe.detail();
+                    stall.see(&place, &detail);
                     if now_ms.saturating_sub(stall.reported_ms) >= repeat_ms {
                         stall.reported_ms = now_ms;
                         reports.push(StallReport::Blocked {
@@ -210,6 +227,7 @@ impl StallWatch {
                                 now_ms.saturating_sub(stall.last_beat_ms),
                             ),
                             place,
+                            detail,
                             at_ms: now_ms,
                             repeat: true,
                         });
@@ -219,18 +237,20 @@ impl StallWatch {
                 && now_ms.saturating_sub(snapshot.last_beat_ms) >= watched.stall_after_ms
             {
                 let place = Place::of(&snapshot);
+                let detail = probe.detail();
                 let mut stall = Stall {
                     last_beat_ms: snapshot.last_beat_ms,
                     reported_ms: now_ms,
                     seen: Vec::new(),
                 };
-                stall.see(&place);
+                stall.see(&place, &detail);
                 watched.stall = Some(stall);
                 reports.push(StallReport::Blocked {
                     task: watched.task,
                     impact: watched.impact,
                     blocked: Duration::from_millis(now_ms.saturating_sub(snapshot.last_beat_ms)),
                     place,
+                    detail,
                     at_ms: now_ms,
                     repeat: false,
                 });
@@ -274,6 +294,53 @@ pub(crate) fn watch(
     probe
 }
 
+/// The line a report logs.
+fn headline(report: &StallReport) -> String {
+    match report {
+        StallReport::Blocked {
+            task,
+            blocked,
+            place,
+            detail,
+            repeat,
+            ..
+        } => {
+            let message = if *repeat {
+                "master task still blocked"
+            } else {
+                "master task blocked"
+            };
+            let mut line = format!(
+                "{message}: {} / {} has not returned for {}s",
+                task.label(),
+                place.describe(),
+                blocked.as_secs()
+            );
+            if !detail.is_empty() {
+                line.push_str(", on ");
+                line.push_str(detail);
+            }
+            line
+        }
+        StallReport::Unblocked { task, blocked, .. } => format!(
+            "master task unblocked after {}s: {}",
+            blocked.as_secs(),
+            task.label()
+        ),
+    }
+}
+
+/// What a blocked task's warning asks the operator to do.
+fn action(impact: &str, pid: u32) -> String {
+    format!(
+        "this node's master process, not the network: {impact}. One warning after a slow epoch step \
+         (prover registry refresh, epoch-boundary execution) is expected; if this warning repeats, \
+         take a thread dump before restarting (gdb -p {pid} -batch -ex 'thread apply all bt', or \
+         eu-stack -p {pid}) and report it with these lines; a dump can contain file paths, so share \
+         it privately"
+    )
+}
+
 fn log(report: &StallReport) {
     let secs = |mark: Option<Mark>, now: u64| {
         mark.map_or(0, |mark| now.saturating_sub(mark.since_ms) / 1000)
@@ -286,27 +353,17 @@ fn log(report: &StallReport) {
             impact,
             blocked,
             place,
+            detail,
             at_ms,
-            repeat,
+            ..
         } => {
-            let message = if *repeat {
-                "master task still blocked"
-            } else {
-                "master task blocked"
-            };
-            let action = format!(
-                "this node's master process, not the network: {impact}. One warning after a slow epoch step \
-                 (prover registry refresh, epoch-boundary execution) is expected; if this warning repeats, \
-                 take a thread dump before restarting (gdb -p {pid} -batch -ex 'thread apply all bt', or \
-                 eu-stack -p {pid}) and report it with these lines; a dump can contain file paths, so share \
-                 it privately"
-            );
+            let action = action(impact, pid);
             warn!(task = task.label(), blocked_secs = blocked.as_secs(),
                 step = label(place.step), step_secs = secs(place.step, *at_ms),
                 section = label(place.section), section_secs = secs(place.section, *at_ms),
                 within = label(place.outer), within_secs = secs(place.outer, *at_ms),
-                pid, scope = "this node's master process", action = %action,
-                "{message}: {} / {} has not returned for {}s", task.label(), place.describe(), blocked.as_secs());
+                detail = %detail, pid, scope = "this node's master process", action = %action,
+                "{}", headline(report));
         }
         StallReport::Unblocked {
             task,
@@ -315,8 +372,7 @@ fn log(report: &StallReport) {
             exited,
         } => {
             info!(task = task.label(), blocked_secs = blocked.as_secs(), seen = %seen.join("; "), exited,
-                scope = "this node's master process",
-                "master task unblocked after {}s: {}", blocked.as_secs(), task.label());
+                scope = "this node's master process", "{}", headline(report));
         }
     }
 }
@@ -478,5 +534,84 @@ mod tests {
         probe.beat_at(t0 + 3_600_000);
         assert_eq!(watch.poll(t0 + 3_689_999), Vec::new());
         assert_eq!(blocked(&watch.poll(t0 + 3_690_000)).len(), 1);
+    }
+
+    /// The materializer's warning names the GLOBAL frame, the shard and its
+    /// frame that it materializes and the step it is in, says that it holds
+    /// the ingest, asks for a thread dump, and its end names them too.
+    #[test]
+    fn a_blocked_materializer_names_the_shard_frame_it_is_on_and_logs_its_end() {
+        use quil_types::thread_probe::{detail, idle};
+        let probe = ThreadProbe::new();
+        let t0 = now_ms();
+        probe.beat_at(t0);
+        let mut watch = StallWatch::new(REPEAT);
+        watch.add(
+            Section::GlobalMaterializer,
+            ARCHIVE_MATERIALIZER_IMPACT,
+            MATERIALIZER_STALL_AFTER,
+            &probe,
+        );
+        let shard = "00".repeat(29) + "091000";
+        let on = format!(
+            "GLOBAL frame 945000: shard {shard} frame 16210, 3 bundles, 5 requests \
+             (coin_delivery 1, transfer 4): bundle 2 of 3 (coin_delivery 1)"
+        );
+        let place = "application-frame ingest before GLOBAL execution / app-shard frame bundle \
+                     execution within application frames a GLOBAL frame sequences";
+        {
+            let installed = install(probe.clone());
+            probe.beat_at(t0);
+            step(Section::MaterializerIngest);
+            let sequenced = section(Section::SequencedIngest);
+            let global = detail(format_args!("GLOBAL frame {}", 945_000));
+            let frame = detail(format_args!(
+                "shard {shard} frame {}, {} bundles, {} requests ({})",
+                16_210, 3, 5, "coin_delivery 1, transfer 4"
+            ));
+            let bundle = detail(format_args!(
+                "bundle {} of {} ({})",
+                2, 3, "coin_delivery 1"
+            ));
+            let process = section(Section::AppFrameProcess);
+            assert_eq!(watch.poll(t0 + 119_999), Vec::new());
+            let reports = watch.poll(t0 + 120_000);
+            assert_eq!(
+                blocked(&reports),
+                vec![(Section::GlobalMaterializer, 120, place.to_string(), false)]
+            );
+            assert_eq!(
+                headline(&reports[0]),
+                format!(
+                    "master task blocked: GLOBAL frame materializer / {place} has not returned for 120s, on {on}"
+                )
+            );
+            let StallReport::Blocked { impact, .. } = &reports[0] else {
+                unreachable!()
+            };
+            let action = action(impact, 7);
+            assert!(action.contains("it holds the ingest"), "{action}");
+            assert!(action.contains("eu-stack -p 7"), "{action}");
+            drop((process, bundle, frame, global, sequenced));
+            // The pass ends: the materializer waits for its next signal.
+            idle();
+            drop(installed);
+        }
+        assert!(probe.snapshot().idle());
+        let reports = watch.poll(t0 + 125_000);
+        assert_eq!(
+            reports,
+            vec![StallReport::Unblocked {
+                task: Section::GlobalMaterializer,
+                blocked: Duration::from_secs(125),
+                seen: vec![format!("{place} ({on})")],
+                exited: false,
+            }]
+        );
+        assert_eq!(
+            headline(&reports[0]),
+            "master task unblocked after 125s: GLOBAL frame materializer"
+        );
+        assert_eq!(probe.detail(), "");
     }
 }
