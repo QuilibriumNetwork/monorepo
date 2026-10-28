@@ -6,16 +6,19 @@
 //! seat's shard, whose jobs run one at a time as a standalone worker runs its
 //! own, or the node's epoch proofs ([`EPOCH_PROOF_LANE`]). Lanes run side by
 //! side, bounded by memory and cores: before its heavy work a job reserves
-//! what it holds at its peak ([`reserve`]), and reservations are granted in
-//! the order asked, each once it fits in the jobs' share of the memory
+//! what it holds at its peak ([`reserve`]), and reservations are granted
+//! smallest first, each once it fits in the jobs' share of the memory
 //! available to the node ([`MEMORY_SHARE_PERCENT`]) and a core is free of
 //! them. A node with the memory encodes every seat at once; one without
 //! encodes as many as fit, then the next as each finishes. A job alone runs
 //! whatever its size.
 //!
-//! Labelling a leaf is one chain of hashes, a core's work for about an hour
-//! per GiB. With one job at a time for the whole node, a node's later seats
-//! missed their renewal's grace.
+//! Labelling a leaf is one chain of hashes, a core's work for about 80
+//! minutes per GiB. With one job at a time for the whole node, a node's
+//! later seats missed their renewal's grace. Taken in the order asked, one
+//! large leaf held a node's only free core past every other seat's grace
+//! (2026-10-28: a leaf of 30 million nodes labelled for 75 minutes of a
+//! 54-minute grace); smallest first, the seats with small leaves register.
 //!
 //! Work done ahead of when it is needed ([`reserve_ahead`]) gives its memory
 //! back while work due now waits for memory ([`Reservation::yield_requested`],
@@ -259,8 +262,9 @@ pub(crate) fn wait_lane_idle(lane: &[u8], timeout: Duration) -> bool {
     true
 }
 
-/// Reserve `bytes` for a job's work: waits, behind the reservations asked
-/// for before it, until it fits beside the ones held.
+/// Reserve `bytes` for a job's work: waits, behind the smaller reservations
+/// and those of its size asked for before it, until it fits beside the ones
+/// held.
 pub fn reserve(bytes: u64) -> Reservation {
     admission().reserve(bytes)
 }
@@ -411,8 +415,9 @@ impl Drop for Reservation {
     }
 }
 
-/// Grants the jobs' reservations ([`reserve`]): in the order asked, each
-/// once it fits.
+/// Grants the jobs' reservations ([`reserve`]): those for work due now
+/// smallest first, then those for work ahead in the order asked, each once
+/// it fits.
 pub struct Admission {
     state: Mutex<State>,
     changed: Condvar,
@@ -426,9 +431,10 @@ struct State {
     reserved: u64,
     /// Reservations held.
     holders: usize,
-    /// Tickets of the reservations waiting, in the order granted: those due
-    /// now in the order asked, then those ahead in the order asked.
-    waiting: VecDeque<(u64, Urgency)>,
+    /// Tickets of the reservations waiting, with their urgency and bytes, in
+    /// the order granted: those due now smallest first, then in the order
+    /// asked, then those ahead in the order asked.
+    waiting: VecDeque<(u64, Urgency, u64)>,
     next_ticket: u64,
     /// Memory available when the last reservation granted to no others was.
     idle_available: Option<u64>,
@@ -468,19 +474,20 @@ impl Admission {
         let mut state = self.state();
         let ticket = state.next_ticket;
         state.next_ticket += 1;
-        // Work due now goes before every reservation for work ahead.
+        // Work due now goes before every reservation for work ahead, and
+        // before larger ones for work due now: the shortest ends first.
         let position = match urgency {
             Urgency::Due => state
                 .waiting
                 .iter()
-                .position(|&(_, waiting)| waiting == Urgency::Ahead)
+                .position(|&(_, waiting, asked)| waiting == Urgency::Ahead || asked > bytes)
                 .unwrap_or(state.waiting.len()),
             Urgency::Ahead => state.waiting.len(),
         };
-        state.waiting.insert(position, (ticket, urgency));
+        state.waiting.insert(position, (ticket, urgency, bytes));
         let started = Instant::now();
         let mut waited = false;
-        while state.waiting.front().map(|&(front, _)| front) != Some(ticket)
+        while state.waiting.front().map(|&(front, _, _)| front) != Some(ticket)
             || !self.fits(&mut state, bytes)
         {
             if !waited {
@@ -495,7 +502,7 @@ impl Admission {
                     ahead = state
                         .waiting
                         .iter()
-                        .position(|&(waiting, _)| waiting == ticket)
+                        .position(|&(waiting, _, _)| waiting == ticket)
                         .unwrap_or(0),
                     due = urgency == Urgency::Due,
                     "storage job waits for memory"
@@ -681,7 +688,7 @@ mod tests {
                 .state()
                 .waiting
                 .iter()
-                .map(|&(_, urgency)| urgency)
+                .map(|&(_, urgency, _)| urgency)
                 .collect::<Vec<_>>(),
             vec![Urgency::Due, Urgency::Ahead, Urgency::Ahead],
             "the due reservation waits first in line"
@@ -775,22 +782,62 @@ mod tests {
         assert!(granted(&small));
     }
 
+    /// Reservations for work due now are granted smallest first, those of
+    /// one size in the order asked (2026-10-28: a node's one free core
+    /// labelled a large leaf past every other seat's renewal's grace).
     #[test]
-    fn a_waiting_reservation_holds_later_ones_back() {
-        let (admission, _) = admission(8, 40 * GIB);
-        let first = hold(admission, 20 * GIB);
+    fn a_smaller_reservation_due_now_goes_before_a_larger_one_waiting() {
+        let (admission, _) = admission(1, 40 * GIB);
+        let first = hold(admission, GIB);
         assert!(granted(&first));
-        let large = hold(admission, 20 * GIB);
+        let large = hold(admission, 4 * GIB);
         until_waiting(admission, 1);
         let small = hold(admission, GIB);
         until_waiting(admission, 2);
+        let same = hold(admission, GIB);
+        until_waiting(admission, 3);
+        drop(first.release);
         assert!(
-            still_waiting(&small),
-            "it would fit, but waits its turn behind the larger one"
+            granted(&small),
+            "a 1 GiB reservation asked for after a 4 GiB one is granted first"
+        );
+        assert!(still_waiting(&large));
+        drop(small.release);
+        assert!(granted(&same), "then the one of its size asked after it");
+        assert!(still_waiting(&large));
+        drop(same.release);
+        assert!(granted(&large));
+    }
+
+    /// Work ahead stays behind all work due now, however small, and keeps
+    /// the order asked whatever its size.
+    #[test]
+    fn work_ahead_waits_behind_larger_work_due_now_in_the_order_asked() {
+        let (admission, _) = admission(1, 40 * GIB);
+        let first = hold(admission, GIB);
+        assert!(granted(&first));
+        let ahead_large = hold_with(admission, 4 * GIB, Urgency::Ahead);
+        until_waiting(admission, 1);
+        let ahead_small = hold_with(admission, GIB, Urgency::Ahead);
+        until_waiting(admission, 2);
+        let due = hold(admission, 8 * GIB);
+        until_waiting(admission, 3);
+        assert_eq!(
+            admission
+                .state()
+                .waiting
+                .iter()
+                .map(|&(_, urgency, bytes)| (urgency, bytes / GIB))
+                .collect::<Vec<_>>(),
+            vec![(Urgency::Due, 8), (Urgency::Ahead, 4), (Urgency::Ahead, 1)]
         );
         drop(first.release);
-        assert!(granted(&large));
-        assert!(granted(&small), "then it fits beside it");
+        assert!(granted(&due));
+        drop(due.release);
+        assert!(granted(&ahead_large));
+        assert!(still_waiting(&ahead_small));
+        drop(ahead_large.release);
+        assert!(granted(&ahead_small));
     }
 
     #[test]

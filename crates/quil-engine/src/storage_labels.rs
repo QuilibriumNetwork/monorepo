@@ -25,6 +25,10 @@
 //! labelled is given up, and labelled again from its start once that work is
 //! done (`crate::storage_jobs::wait_for_due_work`), unless its snapshot has
 //! labelled it meanwhile.
+//!
+//! Labelling ahead for an epoch gives up once GLOBAL reaches the epoch's
+//! snapshot frame ([`expired`]): the snapshot labels what is left itself, and
+//! past the renewal's grace its seat renews without it.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -643,6 +647,35 @@ pub fn precomputed(member: &[u8], filter: &[u8], epoch: u64) -> bool {
         .is_some_and(|refused| refused.is_none_or(|at| at.elapsed() < REFUSED_RETRY))
 }
 
+/// The epoch whose leaves a member labels ahead at GLOBAL frame `frame`
+/// ([`precompute`]): the epoch after next, from the first frame of the
+/// current one, an epoch and 16 frames before its snapshot frame
+/// (`quil_types::consensus::storage_snapshot_frame`). In an epoch's first 16
+/// frames the next epoch's snapshot frame is too close to label a leaf of any
+/// size by, and labelling ahead gives up at it ([`expired`]).
+pub fn ahead_epoch(frame: u64) -> u64 {
+    quil_types::consensus::epoch_for_frame(frame) + 2
+}
+
+/// Whether labelling ahead for `epoch` is of no use any more: GLOBAL reached
+/// the epoch's snapshot frame (`crate::storage_snapshot::note_global_frame`),
+/// from which the snapshot labels its leaves itself.
+fn expired(epoch: u64) -> bool {
+    crate::storage_snapshot::global_frame()
+        .is_some_and(|frame| frame >= quil_types::consensus::storage_snapshot_frame(epoch))
+}
+
+/// Log that labelling `leaf_id` of shard `filter` ahead for `epoch` gave up
+/// `at` a step of its work: GLOBAL reached the epoch's snapshot frame
+/// ([`expired`]).
+fn log_expired(epoch: u64, filter: &[u8], leaf_id: &[u8], at: &'static str) {
+    info!(epoch, filter = %hex::encode(filter), leaf = %hex::encode(leaf_id), at,
+        snapshot_frame = quil_types::consensus::storage_snapshot_frame(epoch),
+        global_frame = crate::storage_snapshot::global_frame().unwrap_or(0), scope = "local",
+        "storage labels computed ahead given up: GLOBAL reached the epoch's snapshot frame, from \
+         which the snapshot labels this leaf itself; an expected skip");
+}
+
 /// Label ahead the leaves `member` will register for `epoch` on shard
 /// `filter`: the leaves of the shard's data in `crdt` now, each at
 /// `precompute_nodes` of its node count, side by side
@@ -650,7 +683,9 @@ pub fn precomputed(member: &[u8], filter: &[u8], epoch: u64) -> bool {
 /// its data allows is left, and one its filesystem has no room for is not
 /// labelled ([`LabelStore::admit`]). A leaf whose memory work due now waits
 /// for is given up and labelled again once that work is done
-/// ([`label_leaf_ahead`]). Removes the labels of epochs that have begun.
+/// ([`label_leaf_ahead`]). Nothing is labelled once GLOBAL reached the
+/// epoch's snapshot frame ([`expired`]). Removes the labels of epochs that
+/// have begun.
 pub fn precompute(
     store: &LabelStore,
     crdt: &Arc<HypergraphCrdt>,
@@ -660,12 +695,24 @@ pub fn precompute(
 ) -> Result<()> {
     use quil_crypto::storage_proof::{data_node_count, padded_nodes_allowed, precompute_nodes};
     store.evict_before(epoch.saturating_sub(1));
+    if expired(epoch) {
+        info!(epoch, filter = %hex::encode(filter),
+            snapshot_frame = quil_types::consensus::storage_snapshot_frame(epoch),
+            global_frame = crate::storage_snapshot::global_frame().unwrap_or(0), scope = "local",
+            "storage labels not computed ahead: GLOBAL already reached the epoch's snapshot \
+             frame, from which the snapshot labels the leaves itself; an expected skip");
+        return Ok(());
+    }
     let source = crate::storage_snapshot::current_source(crdt, filter, epoch);
     let captured = crate::storage_snapshot::capture_at(crdt, filter, epoch, &[source])?;
     let params = SdrParams::default();
     let started = std::time::Instant::now();
     let labelled = crate::storage_jobs::for_each_parallel(&captured.prefixes, |prefix| {
         let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(filter, prefix);
+        // Past the epoch's snapshot frame, leaves not started yet are skipped.
+        if expired(epoch) {
+            return Ok(Some(0));
+        }
         let size = captured.leaf_size(prefix)?;
         // A leaf's data is at least its values (`leaf_size`): one whose
         // labels at that count have no room is refused before its read,
@@ -679,6 +726,15 @@ pub fn precompute(
         let exact = {
             let _memory =
                 crate::storage_jobs::reserve_ahead(crate::storage_snapshot::leaf_read_bytes(size));
+            if expired(epoch) {
+                log_expired(
+                    epoch,
+                    filter,
+                    &leaf_id,
+                    "waiting for memory to read the leaf",
+                );
+                return Ok(Some(0));
+            }
             #[cfg(test)]
             store.leaves_read.fetch_add(1, Ordering::SeqCst);
             data_node_count(captured.leaf_data(prefix)?.len() as u64)
@@ -692,6 +748,11 @@ pub fn precompute(
         label_leaf_ahead(store, member, filter, &leaf_id, epoch, exact, &params)
     })?;
     let refused = labelled.iter().filter(|n| n.is_none()).count();
+    let outcome = if expired(epoch) {
+        "stopped at the epoch's snapshot frame: its snapshot labels the leaves not labelled by then"
+    } else {
+        "completed"
+    };
     {
         let mut done = precomputed_set();
         done.retain(|(_, _, e), _| e.saturating_add(2) >= epoch);
@@ -703,18 +764,21 @@ pub fn precompute(
     info!(epoch, filter = %hex::encode(filter), leaves = labelled.len(),
         labelled = labelled.iter().filter(|n| n.is_some_and(|n| n > 0)).count(), refused,
         nodes = labelled.iter().flatten().sum::<u64>(), seconds = started.elapsed().as_secs_f64(),
-        "storage labels computed ahead of the epoch's snapshot");
+        outcome, "storage labels computed ahead of the epoch's snapshot");
     Ok(())
 }
 
 /// Label `member`'s leaf `leaf_id` of shard `filter`, whose data takes
 /// `exact` nodes, ahead for `epoch` ([`precompute`]): `Some` of the count it
-/// was labelled and kept at (0 when it was labelled meanwhile), `None` when
-/// refused room. While work due now waits for memory
+/// was labelled and kept at (0 when it was labelled meanwhile, or given up),
+/// `None` when refused room. While work due now waits for memory
 /// (`crate::storage_jobs::Reservation::yield_requested`) the labelling gives
 /// up the leaf and its memory, waits until that work is done
 /// (`crate::storage_jobs::wait_for_due_work`), and labels it again from its
 /// start, unless the epoch's snapshot of the shard labelled it meanwhile.
+/// Once GLOBAL reaches the epoch's snapshot frame ([`expired`]), looked at
+/// once the leaf has its memory, while it is labelled and once work due now
+/// is done, the leaf is given up.
 fn label_leaf_ahead(
     store: &LabelStore,
     member: &[u8],
@@ -724,6 +788,7 @@ fn label_leaf_ahead(
     exact: u64,
     params: &SdrParams,
 ) -> Result<Option<u64>> {
+    use crate::storage_snapshot::LeafOutcome;
     use quil_crypto::storage_proof::{padded_nodes_allowed, precompute_nodes};
     let stopping = || QuilError::ExecutionUnavailable("the node is stopping".into());
     let n = precompute_nodes(exact);
@@ -732,6 +797,15 @@ fn label_leaf_ahead(
             return Ok(None);
         };
         let memory = crate::storage_jobs::reserve_ahead(crate::storage_snapshot::encoding_bytes(n));
+        if expired(epoch) {
+            log_expired(
+                epoch,
+                filter,
+                leaf_id,
+                "waiting for memory to label the leaf",
+            );
+            return Ok(Some(0));
+        }
         let progress = crate::storage_snapshot::leaf_started(
             epoch,
             filter,
@@ -741,24 +815,36 @@ fn label_leaf_ahead(
         );
         let started = Instant::now();
         let labelled = admitted.label_until(params, &|| {
-            memory.yield_requested() || crate::storage_jobs::stopping()
+            memory.yield_requested() || crate::storage_jobs::stopping() || expired(epoch)
         })?;
         if let Some(labelled) = labelled {
+            progress.end(LeafOutcome::Completed);
             return Ok(labelled.kept.then_some(n));
         }
         drop(memory);
         if crate::storage_jobs::stopping() {
+            progress.end(LeafOutcome::Stopping);
             return Err(stopping());
+        }
+        if expired(epoch) {
+            log_expired(epoch, filter, leaf_id, "labelling the leaf");
+            progress.end(LeafOutcome::Expired);
+            return Ok(Some(0));
         }
         info!(epoch, filter = %hex::encode(filter), leaf = %hex::encode(leaf_id), nodes = n,
             seconds = started.elapsed().as_secs(), scope = "local",
             "storage labels computed ahead give their memory back to work due now (a renewal's \
              snapshot or an epoch proof) waiting for it; this leaf is labelled ahead again from its \
-             start once that work is done: an expected wait");
-        drop(progress);
+             start once that work is done, unless GLOBAL reaches the epoch's snapshot frame first: \
+             an expected wait");
+        progress.end(LeafOutcome::Yielded);
         let yielded = Instant::now();
         if !crate::storage_jobs::wait_for_due_work() {
             return Err(stopping());
+        }
+        if expired(epoch) {
+            log_expired(epoch, filter, leaf_id, "waiting for work due now to end");
+            return Ok(Some(0));
         }
         let done = store
             .find(epoch, member, leaf_id, |n| padded_nodes_allowed(exact, n))
@@ -986,6 +1072,29 @@ mod tests {
             "labelled again from its start"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Labelling ahead targets the epoch after next from an epoch's first
+    /// frame: in its first 16 frames, the next epoch's snapshot frame is at
+    /// most 16 frames away, too close to label a leaf by.
+    #[test]
+    fn labelling_ahead_targets_the_epoch_after_next() {
+        use quil_types::consensus::{storage_snapshot_frame, STORAGE_SNAPSHOT_OFFSET};
+        // Mainnet epoch 1315 begins at frame 946,800, and its frame 16
+        // snapshots the leaves registered for epoch 1316.
+        assert_eq!(storage_snapshot_frame(1316), 946_816);
+        for frame in 946_800..=946_815 {
+            assert_eq!(ahead_epoch(frame), 1317, "frame {frame}");
+        }
+        assert_eq!(ahead_epoch(946_816), 1317, "the snapshot frame");
+        assert_eq!(ahead_epoch(946_799), 1316, "the epoch before's last frame");
+        for frame in 946_080..948_240 {
+            let lead = storage_snapshot_frame(ahead_epoch(frame)) - frame;
+            assert!(
+                lead > STORAGE_SNAPSHOT_OFFSET,
+                "frame {frame}: labelling ahead {lead} frames before the snapshot frame"
+            );
+        }
     }
 
     /// The labels of epochs before the current one go at its first sweep,

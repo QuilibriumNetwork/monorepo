@@ -3218,11 +3218,12 @@ impl AppConsensusEngine {
     /// (`crate::storage_labels`), so the snapshot only adds the data. A lane
     /// of its own (`crate::storage_jobs`): labelling the epoch after next must
     /// never hold up the seat's encode of the next. A snapshot already
-    /// encoded needs none.
+    /// encoded needs none. Notes the GLOBAL frame, past an epoch's snapshot
+    /// frame labelling ahead for it gives up
+    /// (`crate::storage_snapshot::note_global_frame`).
     fn label_storage_ahead(&self, global_frame_number: u64) {
-        use quil_types::consensus::{
-            epoch_for_frame, hash_storage_proofs_at, storage_snapshot_frame,
-        };
+        use quil_types::consensus::{epoch_for_frame, hash_storage_proofs_at};
+        crate::storage_snapshot::note_global_frame(global_frame_number);
         let Some(store) = crate::storage_labels::installed() else {
             return;
         };
@@ -3231,11 +3232,7 @@ impl AppConsensusEngine {
         // or a lost seat may have left them, whether this member labels
         // ahead again or not.
         store.sweep(current);
-        let epoch = if global_frame_number < storage_snapshot_frame(current + 1) {
-            current + 1
-        } else {
-            current + 2
-        };
+        let epoch = crate::storage_labels::ahead_epoch(global_frame_number);
         if !hash_storage_proofs_at(epoch) {
             return;
         }
