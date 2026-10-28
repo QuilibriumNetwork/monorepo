@@ -768,7 +768,7 @@ mod tests {
         )
         .unwrap();
         // The frame's end folds the coin into its block.
-        roots::fold_placed(&state, &network, &application, limits).unwrap();
+        roots::fold_placed(&state, 5, &network, &application, limits).unwrap();
 
         let path = coin_blocks::block_path(narrow);
         let holder: Vec<bool> = path.iter().copied().chain([false]).collect();
@@ -951,13 +951,13 @@ mod tests {
         );
 
         let end = mem_state(&crdt);
-        let published = roots::fold_placed(&end, &network, &application, limits)
+        let published = roots::fold_placed(&end, 5, &network, &application, limits)
             .unwrap()
             .expect("the frame placed coins");
         end.commit().unwrap();
         end.abort();
         assert!(
-            roots::fold_placed(&end, &network, &application, limits)
+            roots::fold_placed(&end, 5, &network, &application, limits)
                 .unwrap()
                 .is_none(),
             "a frame's coins are folded once"
@@ -1040,7 +1040,7 @@ mod tests {
         };
         place(&frame[0]).1.unwrap();
         let end = mem_state(&crdt);
-        roots::fold_placed(&end, &network, &application, limits)
+        roots::fold_placed(&end, 5, &network, &application, limits)
             .unwrap()
             .unwrap();
         end.commit().unwrap();
@@ -1057,7 +1057,7 @@ mod tests {
             2
         );
         assert_eq!(
-            roots::fold_placed(&end, &network, &application, limits)
+            roots::fold_placed(&end, 5, &network, &application, limits)
                 .unwrap()
                 .unwrap()
                 .coins,

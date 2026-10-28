@@ -637,17 +637,49 @@ pub(crate) fn add_placed(
 
 /// Fold the coins placed since the last fold into their blocks and publish
 /// the root: once per application frame, before its report reads the blocks.
-/// `None`, and nothing written, when none were placed.
+/// `None`, and nothing written, when none were placed. `frame` only names the
+/// fold in its log line.
 pub fn fold_placed(
     state: &HypergraphState,
+    frame: u64,
     network: &[u8; 32],
     application: &[u8; 32],
     limits: SnapshotLimits,
 ) -> Result<Option<RootRecord>> {
-    if read_placed(state, application)?.is_empty() {
+    let coins = read_placed(state, application)?.len();
+    if coins == 0 {
         return Ok(None);
     }
-    refresh_root(state, network, application, limits).map(Some)
+    let started = std::time::Instant::now();
+    let root = refresh_root(state, network, application, limits)?;
+    note_fold(application, frame, coins, started.elapsed(), FOLD_SLOW);
+    Ok(Some(root))
+}
+
+/// A fold taking this long logs a warning. The frame's commit waits for its
+/// fold, and on an archive so does the sequenced ingest.
+const FOLD_SLOW: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn note_fold(
+    application: &[u8; 32],
+    frame: u64,
+    coins: usize,
+    elapsed: std::time::Duration,
+    slow: std::time::Duration,
+) {
+    if elapsed < slow {
+        return;
+    }
+    tracing::warn!(
+        application = %hex::encode(application),
+        frame,
+        coins,
+        duration_ms = elapsed.as_millis() as u64,
+        scope = "this node",
+        action = "report this line to the maintainers: the frame's commit waited for this \
+                  fold of its placed coins into the coin root",
+        "coin root fold slow"
+    );
 }
 
 /// The coin cap bounds the APPLICATION, not one block: blocks are an internal
@@ -788,13 +820,42 @@ fn prepare<'a>(
     // the block records have not changed in between (decided 2026-10-28).
     if super::summary_tree::top(state, application)?.is_none() {
         let disc = vertex_adds_discriminator()?;
+        let started = std::time::Instant::now();
+        let mut reads = 0u64;
+        let mut next_progress = REBUILD_PROGRESS_EVERY;
         let summary = block_summary_from_records(context, &[], |address| {
+            reads += 1;
+            if reads % 1024 == 0 && started.elapsed() >= next_progress {
+                tracing::warn!(
+                    application = %hex::encode(application),
+                    blocks_read = reads / 2,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    scope = "this node",
+                    action = "none: a one-time rebuild reads two records for each of the \
+                              application's blocks; it ends with 'coin root summary rebuilt'",
+                    "coin root summary rebuild still reading block records"
+                );
+                next_progress = started.elapsed() + REBUILD_PROGRESS_EVERY;
+            }
             state.get(application, address, &disc)
         })?;
         tree.replace(&summary.blocks)?;
+        tracing::info!(
+            application = %hex::encode(application),
+            blocks = summary.blocks.len(),
+            coins = summary.coins(),
+            duration_ms = started.elapsed().as_millis() as u64,
+            scope = "this node",
+            "coin root summary rebuilt from block records: on a node without its private \
+             copies (the application's first coins, or the application taken by sync)"
+        );
     }
     Ok(tree)
 }
+
+/// A summary rebuild still reading block records after this long logs its
+/// progress, at most this often.
+const REBUILD_PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Fold new coins into their blocks and stage each touched block's frontier
 /// and root, the summary tree and the bounded root history. New coins are
@@ -1968,6 +2029,190 @@ mod tests {
                 .unwrap()
                 .coins,
             (before.len() + 4) as u64
+        );
+    }
+
+    /// `LEVEL field=value ...` of each event logged while `run` runs.
+    fn logged(run: impl FnOnce()) -> Vec<String> {
+        use std::sync::{Arc, Mutex};
+        struct Recorder(Arc<Mutex<Vec<String>>>);
+        impl tracing::Subscriber for Recorder {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Fields(String);
+                impl tracing::field::Visit for Fields {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!(" {}={:?}", field.name(), value));
+                    }
+                }
+                let mut fields = Fields(event.metadata().level().to_string());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Recorder(lines.clone()), run);
+        let lines = lines.lock().unwrap().clone();
+        lines
+    }
+
+    /// A node without the private copies rebuilds the summary from the block
+    /// records, and says so with its counts: in the frame placing the
+    /// application's first coins (an application with no blocks yet has no
+    /// summary top, so that frame's fold rebuilds its empty summary again),
+    /// and once on a node that took the application by sync. Frames after
+    /// that rebuild nothing and log nothing.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn a_summary_rebuild_logs_once_per_application() {
+        use super::super::{coin_blocks, delivery::place_committed, state::coin_identity};
+        use quil_lattice_ct::confidential::{
+            transfer::{Output, MEMO_BYTES},
+            AmountOpening, CommitmentKey,
+        };
+        let (network, application) = ([61u8; 32], [62u8; 32]);
+        let context = parameter_context(&network, &application);
+        let key = CommitmentKey::derive(&context);
+        let limits = SnapshotLimits {
+            max_coins: 64,
+            max_depth: 32,
+            max_nodes: 1 << 14,
+        };
+        let mut seqs = BTreeMap::<u64, u64>::new();
+        let mut place = |state: &HypergraphState, seed: u8| {
+            let output = Output {
+                owner: [seed; IDENTITY_BYTES],
+                commitment: key.commit(9, &AmountOpening::from_seed(&context, &[seed; 32])),
+                memo: [seed; MEMO_BYTES],
+            };
+            let (address, tree) = coin_identity(&context, 5, &output).unwrap();
+            let block =
+                coin_blocks::block_for_address(coin_blocks::INITIAL_BLOCK_BITS, &address).unwrap();
+            let seq = seqs.entry(block).or_default();
+            place_committed(
+                state,
+                5,
+                &network,
+                &application,
+                &address,
+                tree,
+                block,
+                *seq,
+                limits,
+            )
+            .unwrap();
+            *seq += 1;
+            state.commit().unwrap();
+            state.abort();
+        };
+        let fold = |state: &HypergraphState, frame: u64| {
+            let end = HypergraphState::new(state.crdt().clone());
+            fold_placed(&end, frame, &network, &application, limits)
+                .unwrap()
+                .expect("the frame placed coins");
+            end.commit().unwrap();
+            end.abort();
+            end.crdt().commit(frame).unwrap();
+        };
+        let rebuilt = |lines: &[String]| -> Vec<String> {
+            lines
+                .iter()
+                .filter(|line| line.contains("coin root summary rebuilt"))
+                .cloned()
+                .collect()
+        };
+
+        // The first frame: three deliveries, one message each, then the fold.
+        let state = mem_state();
+        let lines = logged(|| {
+            for seed in 1..=3 {
+                place(&state, seed);
+            }
+            fold(&state, 1);
+        });
+        let lines = rebuilt(&lines);
+        assert!((1..=2).contains(&lines.len()), "{lines:?}");
+        for line in &lines {
+            assert!(line.starts_with("INFO"), "{line}");
+            assert!(
+                line.contains(&format!("application={}", hex::encode(application))),
+                "{line}"
+            );
+            assert!(line.contains(" blocks=0 coins=0 duration_ms="), "{line}");
+        }
+
+        // The next frame holds the copies.
+        let lines = logged(|| {
+            place(&state, 4);
+            fold(&state, 2);
+        });
+        assert_eq!(rebuilt(&lines), Vec::<String>::new());
+
+        // A node that took the application by sync holds the block records
+        // but not the copies: it rebuilds once, from the four coins' blocks.
+        let synced = mem_state();
+        let disc = vertex_adds_discriminator().unwrap();
+        let mut vertices = Vec::new();
+        state
+            .crdt()
+            .for_each_live_vertex_add(&application, &mut |key, blob| vertices.push((key, blob)))
+            .unwrap();
+        for (key, blob) in vertices {
+            let address: [u8; 32] = key[32..].try_into().unwrap();
+            synced.set(&application, &address, &disc, 2, blob).unwrap();
+        }
+        synced.commit().unwrap();
+        synced.abort();
+        synced.crdt().commit(2).unwrap();
+        let lines = logged(|| {
+            place(&synced, 5);
+            fold(&synced, 3);
+        });
+        let lines = rebuilt(&lines);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        for line in &lines {
+            assert!(line.contains(" coins=4 duration_ms="), "{line}");
+            assert!(!line.contains(" blocks=0 "), "{line}");
+        }
+    }
+
+    /// A fold at its bound warns once with its frame, coins and duration;
+    /// one under it logs nothing.
+    #[test]
+    fn a_slow_fold_warns_at_its_bound() {
+        let application = [63u8; 32];
+        let slow = std::time::Duration::from_millis(50);
+        let under = logged(|| {
+            note_fold(
+                &application,
+                7,
+                3,
+                slow - std::time::Duration::from_millis(1),
+                slow,
+            )
+        });
+        assert_eq!(under, Vec::<String>::new());
+        let at = logged(|| note_fold(&application, 7, 3, slow, slow));
+        assert_eq!(at.len(), 1, "{at:?}");
+        assert!(at[0].starts_with("WARN"), "{}", at[0]);
+        assert!(at[0].contains(" message=coin root fold slow"), "{}", at[0]);
+        assert!(
+            at[0].contains(" frame=7 coins=3 duration_ms=50 "),
+            "{}",
+            at[0]
         );
     }
 }

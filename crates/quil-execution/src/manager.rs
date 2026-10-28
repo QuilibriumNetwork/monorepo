@@ -752,7 +752,7 @@ impl ExecutionEngineManager {
 
         let settlements = settlement_record::encode_entries(settlements)?;
         let spends = spend_relay::encode_frame_entries(spends)?;
-        self.fold_placed_coins(filter)?;
+        self.fold_placed_coins(frame_number, filter)?;
         // HypergraphState includes this frame's staged blobs. Computing after
         // commit would leave a cursor with no report if construction failed.
         let report = self.shard_accumulator_report(filter, anchor)?;
@@ -794,10 +794,10 @@ impl ExecutionEngineManager {
     /// Fold the coins this application frame's deliveries placed into their
     /// blocks and the root, once, before its report reads them. Refreshing the
     /// root for each delivery redid the summary and root history per coin.
-    fn fold_placed_coins(&self, filter: &[u8]) -> Result<()> {
+    fn fold_placed_coins(&self, frame_number: u64, filter: &[u8]) -> Result<()> {
         #[cfg(not(feature = "native-proof"))]
         {
-            let _ = filter;
+            let _ = (frame_number, filter);
             Ok(())
         }
         #[cfg(feature = "native-proof")]
@@ -813,7 +813,7 @@ impl ExecutionEngineManager {
                 quil_lattice_ct::confidential::transfer::network_identifier(self.pricing_network());
             let limits = TokenPolicy::for_network(self.pricing_network()).snapshots;
             let state = crate::hypergraph_state::HypergraphState::new(self.crdt());
-            if roots::fold_placed(&state, &network, &application, limits)?.is_some() {
+            if roots::fold_placed(&state, frame_number, &network, &application, limits)?.is_some() {
                 state.commit()?;
             }
             Ok(())

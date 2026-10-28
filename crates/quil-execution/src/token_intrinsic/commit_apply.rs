@@ -83,7 +83,7 @@ pub fn commit_and_place(
     }
     // Once per operation, not per frame: the canonical root it publishes below
     // is GLOBAL state, and has to take this operation's coins.
-    super::roots::fold_placed(state, network, application, limits)?;
+    super::roots::fold_placed(state, frame, network, application, limits)?;
     // No shard delivers to a globally executed application, so its escrow
     // records are written here, where a delivery would have written them.
     if let Some(placement) = escrow {
