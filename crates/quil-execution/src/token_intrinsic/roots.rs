@@ -781,9 +781,12 @@ fn prepare<'a>(
     // an application without them holds none. Folding every live coin instead
     // read each of an archive's QUIL vertices, for the first coin QUIL ever
     // held, while GLOBAL waited at frame 945,000 (2026-10-28).
-    if read_local(state, application, &ROOT_ADDRESS)?.is_none()
-        || super::summary_tree::top(state, application)?.is_none()
-    {
+    //
+    // The tree's top alone decides: the root history is published only by the
+    // fold, so on a node's first frame for an application it is still absent
+    // when the fold prepares again after `add_placed` rebuilt the copies, and
+    // the block records have not changed in between (decided 2026-10-28).
+    if super::summary_tree::top(state, application)?.is_none() {
         let disc = vertex_adds_discriminator()?;
         let summary = block_summary_from_records(context, &[], |address| {
             state.get(application, address, &disc)
