@@ -585,7 +585,10 @@ pub fn request_storage_snapshots(
     let Some(seat) = filters.first() else {
         return Ok(());
     };
-    if !quil_types::consensus::hash_storage_proofs_at(epoch) {
+    // Past the renewal's grace a seat renews without the snapshot.
+    if !quil_types::consensus::hash_storage_proofs_at(epoch)
+        || crate::storage_snapshot::grace_passed(member, epoch)
+    {
         return Ok(());
     }
     for filter in filters {
@@ -631,6 +634,12 @@ fn snapshot_storage_confirm(
         ConfirmLeafRoots, LeafRootEntry,
     };
     let unavailable = |what: String| quil_types::error::QuilError::ExecutionUnavailable(what);
+    let grace_frame =
+        quil_types::consensus::storage_snapshot_frame(epoch) + storage_snapshot_grace();
+    if frame_number >= grace_frame {
+        // Encodes still running are stopped, their memory free for others.
+        crate::storage_snapshot::note_grace_passed(member, epoch);
+    }
     request_storage_snapshots(crdt, replica_store, filters, member, epoch, snapshots)?;
     let mut all = Vec::with_capacity(filters.len());
     for (index, filter) in filters.iter().enumerate() {
@@ -639,11 +648,7 @@ fn snapshot_storage_confirm(
             // recorded change creates from it waits only while its sources are
             // known, rather than hold the renewal up for one never recorded.
             let sources = snapshots.iter().any(|(shard, _)| shard == filter);
-            if (index == 0 || sources)
-                && frame_number
-                    < quil_types::consensus::storage_snapshot_frame(epoch)
-                        + storage_snapshot_grace()
-            {
+            if (index == 0 || sources) && frame_number < grace_frame {
                 return Err(quil_types::error::QuilError::StorageSnapshotPending(
                     format!(
                         "leaf snapshot of {} for epoch {epoch} not encoded yet",

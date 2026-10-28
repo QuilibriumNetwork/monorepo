@@ -652,15 +652,34 @@ fn encode_member_with(
     replicas: &ReplicaStore,
     store: Option<&crate::storage_labels::LabelStore>,
 ) -> Result<()> {
+    encode_member_until(captured, member, replicas, store, &|| false)
+}
+
+/// [`encode_member_with`], given up once `stop` says so: looked at before
+/// each leaf, once it has its memory, and while it is labelled.
+fn encode_member_until(
+    captured: &Captured,
+    member: &[u8],
+    replicas: &ReplicaStore,
+    store: Option<&crate::storage_labels::LabelStore>,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Result<()> {
     use crate::storage_labels::Stage;
     use quil_crypto::storage_proof::{data_node_count, padded_nodes_allowed};
     let params = quil_crypto::sdr::SdrParams::default();
     let started = std::time::Instant::now();
+    let stopped = || unavailable("the storage snapshot's encode was stopped".into());
     let encoded = crate::storage_jobs::for_each_parallel(&captured.prefixes, |prefix| {
         let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&captured.filter, prefix);
+        if stop() {
+            return Err(stopped());
+        }
         let mut memory = crate::storage_jobs::reserve(encoding_bytes(data_node_count(
             estimated_leaf_bytes(captured.leaf_size(prefix)?),
         )));
+        if stop() {
+            return Err(stopped());
+        }
         let data = captured.leaf_data(prefix)?;
         let exact = data_node_count(data.len() as u64);
         let ahead = store.and_then(|store| {
@@ -689,26 +708,40 @@ fn encode_member_with(
         // Labelled now and kept when there is room; otherwise encoded as by a
         // process that keeps no labels, and its seal labels it again.
         let labelled = match (&from_kept, store) {
-            (None, Some(store)) => store
-                .admit(captured.epoch, member, &leaf_id, exact, Stage::Snapshot)
-                .map(|admitted| admitted.label(&params))
-                .transpose()?,
+            (None, Some(store)) => {
+                match store.admit(captured.epoch, member, &leaf_id, exact, Stage::Snapshot) {
+                    Some(admitted) => {
+                        Some(admitted.label_until(&params, stop)?.ok_or_else(stopped)?)
+                    }
+                    None => None,
+                }
+            }
             _ => None,
         };
-        let encoded = match (from_kept, labelled) {
-            (Some(encoded), _) => encoded,
-            (None, Some(labelled)) => quil_crypto::storage_proof::encode_with_labels(
-                &data,
-                exact,
-                &labelled.last,
-                labelled.comm_c,
-            )
-            .map_err(QuilError::Internal)?,
-            (None, None) => quil_crypto::storage_proof::encode_leaf(
-                &data,
-                &quil_crypto::sdr::replica_key(member, &leaf_id, captured.epoch),
-                &params,
-            ),
+        let encoded = match from_kept {
+            Some(encoded) => encoded,
+            None => {
+                let (last, comm_c) = match labelled {
+                    Some(labelled) => (labelled.last, labelled.comm_c),
+                    None => {
+                        // As by a process that keeps no labels
+                        // (`quil_crypto::storage_proof::encode_leaf`).
+                        let (last, columns) = quil_crypto::storage_proof::label_leaf_until(
+                            exact,
+                            &quil_crypto::sdr::replica_key(member, &leaf_id, captured.epoch),
+                            &params,
+                            &mut |_, _| {},
+                            stop,
+                        )
+                        .ok_or_else(stopped)?;
+                        let comm_c = quil_crypto::storage_proof::MerkleTree::from_digests(columns)
+                            .commitment(quil_crypto::storage_proof::Tree::Column);
+                        (last, comm_c)
+                    }
+                };
+                quil_crypto::storage_proof::encode_with_labels(&data, exact, &last, comm_c)
+                    .map_err(QuilError::Internal)?
+            }
         };
         drop(data);
         replicas.put_hash(
@@ -741,6 +774,45 @@ fn kept() -> &'static std::sync::Mutex<std::collections::HashMap<(Vec<u8>, u64),
         std::sync::Mutex<std::collections::HashMap<(Vec<u8>, u64), Arc<Captured>>>,
     > = std::sync::OnceLock::new();
     KEPT.get_or_init(Default::default)
+}
+
+/// Whether this process encoded `filter`'s snapshot for `epoch` (kept for
+/// its seal): labels computed ahead for that epoch would come too late.
+pub(crate) fn snapshot_encoded(filter: &[u8], epoch: u64) -> bool {
+    kept()
+        .lock()
+        .is_ok_and(|kept| kept.contains_key(&(filter.to_vec(), epoch)))
+}
+
+/// Members and epochs whose renewal's grace frame passed
+/// ([`note_grace_passed`]).
+fn graces_passed() -> std::sync::MutexGuard<'static, std::collections::HashSet<(Vec<u8>, u64)>> {
+    static PASSED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(Vec<u8>, u64)>>,
+    > = std::sync::OnceLock::new();
+    PASSED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Record that `member`'s confirm for `epoch` reached its renewal's grace
+/// frame (`crate::app_shard_metadata::storage_snapshot_grace`): a seat whose
+/// snapshot is not encoded by then renews without a storage registration,
+/// so its encode is not started, and one running stops ([`request_member`]).
+pub fn note_grace_passed(member: &[u8], epoch: u64) {
+    let mut passed = graces_passed();
+    if passed.contains(&(member.to_vec(), epoch)) {
+        return;
+    }
+    passed.retain(|(_, e)| e.saturating_add(2) >= epoch);
+    passed.insert((member.to_vec(), epoch));
+}
+
+/// Whether `member`'s renewal's grace frame for `epoch` passed
+/// ([`note_grace_passed`]).
+pub fn grace_passed(member: &[u8], epoch: u64) -> bool {
+    graces_passed().contains(&(member.to_vec(), epoch))
 }
 
 fn keep(captured: Arc<Captured>) {
@@ -805,10 +877,30 @@ pub fn request_member(
 ) {
     let key = [b"member".as_slice(), &member, &filter, &epoch.to_be_bytes()].concat();
     request(seat, key, "member", move || {
+        let past_grace = || {
+            info!(epoch, filter = %hex::encode(&filter), scope = "local",
+                "storage snapshot not encoded: the renewal's grace frame passed, so this seat renews \
+                 without a storage registration and earns no storage share on its shard that epoch; \
+                 its memory goes to other storage work");
+            Ok(())
+        };
+        if grace_passed(&member, epoch) {
+            return past_grace();
+        }
         let captured = capture_at(&crdt, &filter, epoch, &sources)?;
         info!(epoch, leaves = captured.prefixes.len(), filter = %hex::encode(&filter),
             "storage snapshot taken for the epoch's registration");
-        encode_member(&captured, &member, &replicas)?;
+        let stop = || grace_passed(&member, epoch) || crate::storage_jobs::stopping();
+        match encode_member_until(
+            &captured,
+            &member,
+            &replicas,
+            crate::storage_labels::installed(),
+            &stop,
+        ) {
+            Err(_) if grace_passed(&member, epoch) => return past_grace(),
+            result => result?,
+        }
         keep(Arc::new(captured));
         Ok(())
     });
@@ -2037,6 +2129,148 @@ mod tests {
         assert!(store
             .find(epoch, &other, &leaf_id, |n| n == exact)
             .is_some());
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// An encode whose renewal's grace frame passed stops, leaving the
+    /// seat's snapshot unencoded, and one not started is not started; the
+    /// labelling of a leaf as by a process that keeps no labels stops too
+    /// and is otherwise unchanged.
+    #[test]
+    fn an_encode_past_its_renewals_grace_stops() {
+        let crdt = test_crdt();
+        let app = [0x7Du8; 32];
+        for d in 0..30u8 {
+            crdt.add_vertex(
+                &Location {
+                    app_address: app,
+                    data_address: address(d.wrapping_mul(5), d),
+                },
+                &vec![d; 300],
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let epoch = 6;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let captured =
+            capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
+        let replicas =
+            || ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let (stopped, whole, unchanged) = (replicas(), replicas(), replicas());
+        let looks = std::sync::atomic::AtomicUsize::new(0);
+        let late = || looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 3;
+        assert!(encode_member_until(&captured, &[0x62; 32], &stopped, None, &late).is_err());
+        assert_eq!(stopped.get_partition(epoch, &app).unwrap(), None);
+        encode_member_until(&captured, &[0x62; 32], &unchanged, None, &|| false).unwrap();
+        encode_member_with(&captured, &[0x62; 32], &whole, None).unwrap();
+        for prefix in &captured.prefixes {
+            let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&app, prefix);
+            let expected = quil_crypto::storage_proof::encode_leaf(
+                &captured.leaf_data(prefix).unwrap(),
+                &quil_crypto::sdr::replica_key(&[0x62; 32], &leaf_id, epoch),
+                &quil_crypto::sdr::SdrParams::default(),
+            );
+            let stored = unchanged.get_hash(epoch, &leaf_id).unwrap().unwrap();
+            assert_eq!(stored.registration_root, expected.registration_root());
+            assert_eq!(stored, whole.get_hash(epoch, &leaf_id).unwrap().unwrap());
+        }
+
+        // The background job: not started past the grace.
+        let member = vec![0x63u8; 32];
+        note_grace_passed(&member, epoch);
+        assert!(grace_passed(&member, epoch) && !grace_passed(&[0x62; 32], epoch));
+        let target = replicas();
+        let lane = b"test lane: past grace".to_vec();
+        request_member(
+            crdt.clone(),
+            target.clone(),
+            member,
+            &lane,
+            app.to_vec(),
+            epoch,
+            vec![current_source(&crdt, &app, epoch)],
+        );
+        assert!(crate::storage_jobs::wait_lane_idle(
+            &lane,
+            std::time::Duration::from_secs(30)
+        ));
+        assert_eq!(target.get_partition(epoch, &app).unwrap(), None);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// Work due now (a renewal's snapshot) asked for while a leaf is
+    /// labelled ahead waits no longer than a short bound for its memory,
+    /// and the labelling ahead still completes once that work is done
+    /// (2026-10-28: a node's snapshots waited 40 minutes behind one leaf
+    /// labelled ahead, past their renewal's grace).
+    #[test]
+    fn work_due_now_waits_briefly_behind_a_leaf_labelled_ahead() {
+        use crate::storage_labels::{ample_space, precompute, precomputed, LabelStore};
+        use std::time::{Duration, Instant};
+        const BOUND: Duration = Duration::from_secs(2);
+        let crdt = test_crdt();
+        let app = [0x7Eu8; 32];
+        for d in 0..12u8 {
+            crdt.add_vertex(
+                &Location {
+                    app_address: app,
+                    data_address: address(d.wrapping_mul(3), d),
+                },
+                &vec![d; 16 << 10],
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let epoch = 6;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let captured =
+            capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
+        assert_eq!(captured.prefixes.len(), 1);
+        let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&app, &captured.prefixes[0]);
+        let dir = std::env::temp_dir().join(format!("quil-labels-yield-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store: &'static LabelStore =
+            Box::leak(Box::new(LabelStore::with_space(dir.clone(), ample_space())));
+        let member = [0x64u8; 32];
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let labelling = crdt.clone();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+            let result = precompute(store, &labelling, &member, &app, epoch);
+            done_tx.send(result).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !running_leaves()
+            .leaves
+            .values()
+            .any(|leaf| leaf.work == LeafWork::LabellingAhead)
+        {
+            assert!(Instant::now() < deadline, "the leaf is labelled ahead");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let asked = Instant::now();
+        let due = crate::storage_jobs::reserve(u64::MAX / 4);
+        let waited = asked.elapsed();
+        let finished = store.find(epoch, &member, &leaf_id, |_| true).is_some();
+        assert!(
+            waited < BOUND && !finished,
+            "work due now waited {waited:?} for its memory behind a leaf labelled ahead \
+             (the labelling ran to its end first: {finished}; it started {:?} before)",
+            asked.duration_since(started)
+        );
+        drop(due);
+        let result = done
+            .recv_timeout(Duration::from_secs(300))
+            .expect("the labelling ahead completes once the work due now is done");
+        result.unwrap();
+        assert!(precomputed(&member, &app, epoch));
+        assert!(
+            store.find(epoch, &member, &leaf_id, |_| true).is_some(),
+            "the leaf is labelled ahead after all"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 

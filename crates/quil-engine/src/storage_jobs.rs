@@ -17,6 +17,13 @@
 //! per GiB. With one job at a time for the whole node, a node's later seats
 //! missed their renewal's grace.
 //!
+//! Work done ahead of when it is needed ([`reserve_ahead`]) gives its memory
+//! back while work due now waits for memory ([`Reservation::yield_requested`],
+//! looked at every few milliseconds of its labelling), and starts again once
+//! no work due now has waited or held memory for a while
+//! ([`wait_for_due_work`]): a renewal's snapshot waited 40 minutes behind one
+//! leaf labelled ahead (2026-10-28).
+//!
 //! A stopping node stops its jobs ([`shut_down`]) before it exits: they use
 //! its stores, which exit tears down under a thread still using them.
 
@@ -38,6 +45,15 @@ pub const MEMORY_SHARE_PERCENT: u64 = 75;
 /// How often a reservation that does not fit looks at the memory again,
 /// besides whenever another one changes.
 const RECHECK: Duration = Duration::from_secs(5);
+
+/// How long work due now must have neither waited for memory nor held any
+/// before work ahead that yielded to it starts again ([`wait_for_due_work`]):
+/// a gap between one seat's encode and the next's does not end it.
+const DUE_QUIET: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(60)
+};
 
 type Job = Box<dyn FnOnce() + Send>;
 
@@ -77,6 +93,12 @@ pub fn spawn(lane: &[u8], label: &'static str, job: impl FnOnce() -> Result<()> 
 /// Returns the labels of the jobs still running, one per lane.
 pub fn shut_down(grace: Duration) -> Vec<&'static str> {
     jobs().shut_down(grace)
+}
+
+/// Whether the node is stopping its jobs ([`shut_down`]): long work looks
+/// at it to end early.
+pub fn stopping() -> bool {
+    jobs().stopping()
 }
 
 /// Exit the process with `code` at once, skipping the exit handlers and
@@ -245,10 +267,20 @@ pub fn reserve(bytes: u64) -> Reservation {
 
 /// Reserve `bytes` for work done ahead of when it is needed (labelling a
 /// later epoch's leaves, `crate::storage_labels`): like [`reserve`], behind
-/// every reservation asked for work due now, whenever asked, so a renewal's
-/// snapshot never waits for it.
+/// every reservation asked for work due now, whenever asked. Once granted,
+/// the work gives the memory back while work due now waits for memory
+/// ([`Reservation::yield_requested`]), so a renewal's snapshot never waits
+/// for it for long.
 pub fn reserve_ahead(bytes: u64) -> Reservation {
     admission().reserve_with(bytes, Urgency::Ahead)
+}
+
+/// Wait until no work due now has waited for memory or held any for
+/// [`DUE_QUIET`]: when work ahead that gave its memory back to it
+/// ([`Reservation::yield_requested`]) starts again. False, without waiting
+/// further, once the node is stopping ([`shut_down`]).
+pub fn wait_for_due_work() -> bool {
+    admission().wait_due_quiet(DUE_QUIET, &stopping)
 }
 
 fn admission() -> &'static Admission {
@@ -339,6 +371,7 @@ fn available_memory() -> Option<u64> {
 pub struct Reservation {
     admission: &'static Admission,
     bytes: u64,
+    urgency: Urgency,
 }
 
 impl Reservation {
@@ -354,6 +387,14 @@ impl Reservation {
         drop(state);
         self.admission.changed.notify_all();
     }
+
+    /// Whether work ahead holding this reservation ([`reserve_ahead`])
+    /// should give it back, dropping it, and start again once work due now
+    /// is done ([`wait_for_due_work`]): a reservation for work due now waits
+    /// for memory. Never for work due now.
+    pub fn yield_requested(&self) -> bool {
+        self.urgency == Urgency::Ahead && self.admission.state().due_waiting > 0
+    }
 }
 
 impl Drop for Reservation {
@@ -361,6 +402,10 @@ impl Drop for Reservation {
         let mut state = self.admission.state();
         state.reserved = state.reserved.saturating_sub(self.bytes);
         state.holders = state.holders.saturating_sub(1);
+        if self.urgency == Urgency::Due {
+            state.due_held = state.due_held.saturating_sub(1);
+            state.due_last = Some(Instant::now());
+        }
         drop(state);
         self.admission.changed.notify_all();
     }
@@ -387,6 +432,14 @@ struct State {
     next_ticket: u64,
     /// Memory available when the last reservation granted to no others was.
     idle_available: Option<u64>,
+    /// Reservations held for work due now.
+    due_held: usize,
+    /// Reservations for work due now waiting, once they found they do not
+    /// fit or are not first in line: what work ahead gives its memory back
+    /// for ([`Reservation::yield_requested`]).
+    due_waiting: usize,
+    /// When a reservation for work due now last was granted or given back.
+    due_last: Option<Instant>,
 }
 
 impl Admission {
@@ -432,6 +485,9 @@ impl Admission {
         {
             if !waited {
                 waited = true;
+                if urgency == Urgency::Due {
+                    state.due_waiting += 1;
+                }
                 info!(
                     bytes,
                     reserved = state.reserved,
@@ -454,6 +510,13 @@ impl Admission {
         state.waiting.pop_front();
         state.reserved = state.reserved.saturating_add(bytes);
         state.holders += 1;
+        if urgency == Urgency::Due {
+            if waited {
+                state.due_waiting = state.due_waiting.saturating_sub(1);
+            }
+            state.due_held += 1;
+            state.due_last = Some(Instant::now());
+        }
         let jobs = state.holders;
         drop(state);
         if waited {
@@ -469,6 +532,32 @@ impl Admission {
         Reservation {
             admission: self,
             bytes,
+            urgency,
+        }
+    }
+
+    /// Wait until no reservation for work due now has waited or been held
+    /// for `quiet` ([`wait_for_due_work`]); false, at once, when `stop` says
+    /// so.
+    pub fn wait_due_quiet(&self, quiet: Duration, stop: &dyn Fn() -> bool) -> bool {
+        let mut state = self.state();
+        loop {
+            if stop() {
+                return false;
+            }
+            let busy = state.due_held > 0 || state.due_waiting > 0;
+            let left = state
+                .due_last
+                .map_or(Duration::ZERO, |at| quiet.saturating_sub(at.elapsed()));
+            if !busy && left.is_zero() {
+                return true;
+            }
+            let wait = if busy { RECHECK } else { left.min(RECHECK) };
+            state = self
+                .changed
+                .wait_timeout(state, wait)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
     }
 
@@ -604,6 +693,75 @@ mod tests {
         drop(due.release);
         assert!(granted(&ahead));
         assert!(granted(&later_ahead), "work ahead keeps its own order");
+    }
+
+    /// Work ahead holding memory is asked to give it back once work due now
+    /// waits for memory, and not before; work due now is never asked.
+    #[test]
+    fn work_ahead_is_asked_to_yield_while_work_due_now_waits() {
+        let (admission, _) = admission(8, 8 * GIB);
+        let ahead = admission.reserve_with(4 * GIB, Urgency::Ahead);
+        assert!(!ahead.yield_requested(), "nothing waits");
+        let small = hold(admission, GIB);
+        assert!(granted(&small), "it fits beside the work ahead");
+        assert!(
+            !ahead.yield_requested(),
+            "work due now that fits waits for nothing"
+        );
+        let due = hold(admission, 4 * GIB);
+        until_waiting(admission, 1);
+        assert!(ahead.yield_requested(), "work due now waits for memory");
+        drop(ahead);
+        assert!(
+            granted(&due),
+            "it runs once the work ahead gives its memory back"
+        );
+        let now = admission.reserve(GIB);
+        assert!(!now.yield_requested(), "never work due now");
+        drop(now);
+        let next = admission.reserve_with(GIB, Urgency::Ahead);
+        assert!(!next.yield_requested(), "nothing due waits any more");
+        drop(small.release);
+        drop(due.release);
+    }
+
+    /// Work ahead that yielded starts again only once no work due now has
+    /// waited or held memory for the quiet time, and at once when stopping.
+    #[test]
+    fn work_ahead_waits_for_work_due_now_to_be_done() {
+        let (admission, _) = admission(8, 8 * GIB);
+        let quiet = Duration::from_millis(300);
+        assert!(
+            admission.wait_due_quiet(quiet, &|| false),
+            "no work due now"
+        );
+        let due = hold(admission, GIB);
+        assert!(granted(&due));
+        let (resumed_tx, resumed) = mpsc::channel();
+        std::thread::spawn(move || {
+            resumed_tx
+                .send((admission.wait_due_quiet(quiet, &|| false), Instant::now()))
+                .unwrap();
+        });
+        assert!(
+            resumed.recv_timeout(NOT_YET).is_err(),
+            "not while work due now holds memory"
+        );
+        let released = Instant::now();
+        drop(due.release);
+        let (done, at) = resumed.recv_timeout(SOON).unwrap();
+        assert!(done);
+        assert!(
+            at.duration_since(released) >= quiet,
+            "only after the quiet time"
+        );
+        let held = hold(admission, GIB);
+        assert!(granted(&held));
+        assert!(
+            !admission.wait_due_quiet(quiet, &|| true),
+            "a stopping node does not wait"
+        );
+        drop(held.release);
     }
 
     #[test]

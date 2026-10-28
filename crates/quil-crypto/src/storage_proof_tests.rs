@@ -743,3 +743,38 @@ fn a_count_labelled_ahead_stays_registrable_while_the_data_changes_a_little() {
     assert!(padded_nodes_allowed(800, 800 + 100 + PAD_FLOOR_NODES));
     assert!(!padded_nodes_allowed(800, 800 + 101 + PAD_FLOOR_NODES));
 }
+
+/// Labelling given up when told to stop hands on no further layer and
+/// returns nothing; one never told to stop is [`label_leaf`]'s.
+#[test]
+fn labelling_stops_when_told_and_is_unchanged_otherwise() {
+    use std::cell::Cell;
+    let n = STOP_CHECK_NODES as u64 + 7;
+    let key = b"stop-key";
+    let whole = label_leaf(n, key, &params(), &mut |_, _| {});
+    assert_eq!(
+        label_leaf_until(n, key, &params(), &mut |_, _| {}, &|| false),
+        Some(whole)
+    );
+    // Stopped within the second layer: one layer handed on, then none.
+    let looks = Cell::new(0usize);
+    let checks_per_layer = (n as usize).div_ceil(STOP_CHECK_NODES);
+    let mut layers = Vec::new();
+    let stopped = label_leaf_until(
+        n,
+        key,
+        &params(),
+        &mut |index, _| layers.push(index),
+        &|| {
+            looks.set(looks.get() + 1);
+            looks.get() > checks_per_layer + 1
+        },
+    );
+    assert_eq!(stopped, None);
+    assert_eq!(layers, vec![0], "no layer after the stop");
+    assert_eq!(
+        looks.get(),
+        checks_per_layer + 2,
+        "it stops at the first look that says so"
+    );
+}

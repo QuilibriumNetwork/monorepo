@@ -19,6 +19,12 @@
 //! to write, checked before a leaf starts and before each of its writes. A
 //! leaf refused room is labelled where it is needed instead, as by a process
 //! that keeps no labels, and leaves nothing on disk.
+//!
+//! Labelling ahead gives its memory back while work due now waits for memory
+//! (`crate::storage_jobs::Reservation::yield_requested`): the leaf being
+//! labelled is given up, and labelled again from its start once that work is
+//! done (`crate::storage_jobs::wait_for_due_work`), unless its snapshot has
+//! labelled it meanwhile.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -440,15 +446,28 @@ impl Admitted<'_> {
         *pending = pending.saturating_sub(bytes);
     }
 
+    /// [`Self::label_until`], never given up.
+    #[cfg(test)]
+    pub(crate) fn label(self, params: &SdrParams) -> Result<Labelled> {
+        self.label_until(params, &|| false)?
+            .ok_or_else(|| QuilError::Internal("labelling that never stops stopped".into()))
+    }
+
     /// Label the leaf at its count and keep its layers while the filesystem
     /// has room for them, checked before each layer and the columns are
     /// written. A leaf that runs out of room is labelled to the end but not
     /// kept: its files are removed and the refusal logged as
-    /// [`LabelStore::admit`] logs one.
-    pub fn label(mut self, params: &SdrParams) -> Result<Labelled> {
+    /// [`LabelStore::admit`] logs one. Given up once `stop` says so
+    /// (`quil_crypto::storage_proof::label_leaf_until`): `None`, and none of
+    /// its files remain.
+    pub fn label_until(
+        mut self,
+        params: &SdrParams,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Option<Labelled>> {
         let paths = paths(&self.dir, self.n);
-        let result = self.write(params, &paths);
-        if !matches!(result, Ok(Labelled { kept: true, .. })) {
+        let result = self.write(params, &paths, stop);
+        if !matches!(result, Ok(Some(Labelled { kept: true, .. }))) {
             let [layers, columns, _] = &paths;
             let _ = fs::remove_file(layers);
             let _ = fs::remove_file(columns);
@@ -457,15 +476,23 @@ impl Admitted<'_> {
         result
     }
 
-    fn write(&mut self, params: &SdrParams, paths: &[PathBuf; 3]) -> Result<Labelled> {
+    fn write(
+        &mut self,
+        params: &SdrParams,
+        paths: &[PathBuf; 3],
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Option<Labelled>> {
         let [layers_path, columns_path, ready_path] = paths;
         fs::create_dir_all(&self.dir).map_err(|e| io("create", &self.dir, e))?;
         let file = File::create(layers_path).map_err(|e| io("create", layers_path, e))?;
         let mut writer = Some(BufWriter::with_capacity(1 << 22, file));
         let (mut failure, mut shortfall) = (None, None);
         let key = quil_crypto::sdr::replica_key(&self.member, &self.leaf_id, self.epoch);
-        let (last, columns) =
-            quil_crypto::storage_proof::label_leaf(self.n, &key, params, &mut |_, layer| {
+        let labelled = quil_crypto::storage_proof::label_leaf_until(
+            self.n,
+            &key,
+            params,
+            &mut |_, layer| {
                 if writer.is_none() {
                     return;
                 }
@@ -483,10 +510,15 @@ impl Admitted<'_> {
                     }
                     None => {}
                 }
-            });
+            },
+            stop,
+        );
         if let Some(error) = failure {
             return Err(io("write", layers_path, error));
         }
+        let Some((last, columns)) = labelled else {
+            return Ok(None);
+        };
         let commitment = |columns: Vec<Digest>| {
             quil_crypto::storage_proof::MerkleTree::from_digests(columns)
                 .commitment(quil_crypto::storage_proof::Tree::Column)
@@ -503,11 +535,11 @@ impl Admitted<'_> {
             let (epoch, n, stage) = (self.epoch, self.n, self.stage);
             self.store
                 .refuse(epoch, &self.dir, &self.leaf_id, n, stage, shortfall);
-            return Ok(Labelled {
+            return Ok(Some(Labelled {
                 comm_c: commitment(columns),
                 last,
                 kept: false,
-            });
+            }));
         }
         let mut writer = BufWriter::with_capacity(
             1 << 22,
@@ -524,11 +556,11 @@ impl Admitted<'_> {
         let staged = self.dir.join(format!("{}.ready.tmp", self.n));
         fs::write(&staged, comm_c).map_err(|e| io("write", &staged, e))?;
         fs::rename(&staged, ready_path).map_err(|e| io("rename", ready_path, e))?;
-        Ok(Labelled {
+        Ok(Some(Labelled {
             comm_c,
             last,
             kept: true,
-        })
+        }))
     }
 }
 
@@ -616,8 +648,9 @@ pub fn precomputed(member: &[u8], filter: &[u8], epoch: u64) -> bool {
 /// `precompute_nodes` of its node count, side by side
 /// (`storage_jobs::for_each_parallel`). A leaf already labelled at a count
 /// its data allows is left, and one its filesystem has no room for is not
-/// labelled ([`LabelStore::admit`]). Removes the labels of epochs that have
-/// begun.
+/// labelled ([`LabelStore::admit`]). A leaf whose memory work due now waits
+/// for is given up and labelled again once that work is done
+/// ([`label_leaf_ahead`]). Removes the labels of epochs that have begun.
 pub fn precompute(
     store: &LabelStore,
     crdt: &Arc<HypergraphCrdt>,
@@ -656,20 +689,7 @@ pub fn precompute(
         {
             return Ok(Some(0));
         }
-        let n = precompute_nodes(exact);
-        let Some(admitted) = store.admit(epoch, member, &leaf_id, n, Stage::Ahead) else {
-            return Ok(None);
-        };
-        let _memory =
-            crate::storage_jobs::reserve_ahead(crate::storage_snapshot::encoding_bytes(n));
-        let _progress = crate::storage_snapshot::leaf_started(
-            epoch,
-            filter,
-            &leaf_id,
-            n,
-            crate::storage_snapshot::LeafWork::LabellingAhead,
-        );
-        Ok(admitted.label(&params)?.kept.then_some(n))
+        label_leaf_ahead(store, member, filter, &leaf_id, epoch, exact, &params)
     })?;
     let refused = labelled.iter().filter(|n| n.is_none()).count();
     {
@@ -685,6 +705,72 @@ pub fn precompute(
         nodes = labelled.iter().flatten().sum::<u64>(), seconds = started.elapsed().as_secs_f64(),
         "storage labels computed ahead of the epoch's snapshot");
     Ok(())
+}
+
+/// Label `member`'s leaf `leaf_id` of shard `filter`, whose data takes
+/// `exact` nodes, ahead for `epoch` ([`precompute`]): `Some` of the count it
+/// was labelled and kept at (0 when it was labelled meanwhile), `None` when
+/// refused room. While work due now waits for memory
+/// (`crate::storage_jobs::Reservation::yield_requested`) the labelling gives
+/// up the leaf and its memory, waits until that work is done
+/// (`crate::storage_jobs::wait_for_due_work`), and labels it again from its
+/// start, unless the epoch's snapshot of the shard labelled it meanwhile.
+fn label_leaf_ahead(
+    store: &LabelStore,
+    member: &[u8],
+    filter: &[u8],
+    leaf_id: &[u8],
+    epoch: u64,
+    exact: u64,
+    params: &SdrParams,
+) -> Result<Option<u64>> {
+    use quil_crypto::storage_proof::{padded_nodes_allowed, precompute_nodes};
+    let stopping = || QuilError::ExecutionUnavailable("the node is stopping".into());
+    let n = precompute_nodes(exact);
+    loop {
+        let Some(admitted) = store.admit(epoch, member, leaf_id, n, Stage::Ahead) else {
+            return Ok(None);
+        };
+        let memory = crate::storage_jobs::reserve_ahead(crate::storage_snapshot::encoding_bytes(n));
+        let progress = crate::storage_snapshot::leaf_started(
+            epoch,
+            filter,
+            leaf_id,
+            n,
+            crate::storage_snapshot::LeafWork::LabellingAhead,
+        );
+        let started = Instant::now();
+        let labelled = admitted.label_until(params, &|| {
+            memory.yield_requested() || crate::storage_jobs::stopping()
+        })?;
+        if let Some(labelled) = labelled {
+            return Ok(labelled.kept.then_some(n));
+        }
+        drop(memory);
+        if crate::storage_jobs::stopping() {
+            return Err(stopping());
+        }
+        info!(epoch, filter = %hex::encode(filter), leaf = %hex::encode(leaf_id), nodes = n,
+            seconds = started.elapsed().as_secs(), scope = "local",
+            "storage labels computed ahead give their memory back to work due now (a renewal's \
+             snapshot or an epoch proof) waiting for it; this leaf is labelled ahead again from its \
+             start once that work is done: an expected wait");
+        drop(progress);
+        let yielded = Instant::now();
+        if !crate::storage_jobs::wait_for_due_work() {
+            return Err(stopping());
+        }
+        let done = store
+            .find(epoch, member, leaf_id, |n| padded_nodes_allowed(exact, n))
+            .is_some()
+            || crate::storage_snapshot::snapshot_encoded(filter, epoch);
+        info!(epoch, filter = %hex::encode(filter), leaf = %hex::encode(leaf_id), nodes = n,
+            waited_seconds = yielded.elapsed().as_secs(), labelled_meanwhile = done, scope = "local",
+            "storage labels computed ahead resume: no work due now waits for memory");
+        if done {
+            return Ok(Some(0));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -871,6 +957,34 @@ mod tests {
         assert!(store.find(9, &member, leaf, |_| true).is_none());
         assert_eq!(*store.pending(), 0);
         assert_eq!(store.refused.lock().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A leaf whose labelling is given up midway leaves none of its files,
+    /// and what it had still to write counts against the room no more.
+    #[test]
+    fn a_leaf_given_up_midway_leaves_no_files() {
+        use std::sync::atomic::AtomicUsize;
+        let dir = temp_dir("given-up");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let (member, leaf, n) = ([7u8; 32], b"leaf".as_slice(), 1_500u64);
+        let admitted = store.admit(9, &member, leaf, n, Stage::Ahead).unwrap();
+        let looks = AtomicUsize::new(0);
+        // Past the first layer, written to disk, then stopped.
+        let per_layer = (n as usize).div_ceil(quil_crypto::storage_proof::STOP_CHECK_NODES);
+        let stopped = admitted
+            .label_until(&SdrParams::default(), &|| {
+                looks.fetch_add(1, Ordering::SeqCst) > per_layer
+            })
+            .unwrap();
+        assert!(stopped.is_none());
+        assert_eq!(files_under(&dir), Vec::<PathBuf>::new());
+        assert_eq!(*store.pending(), 0);
+        assert!(store.find(9, &member, leaf, |_| true).is_none());
+        assert!(
+            keep(&store, 9, &member, leaf, n).kept,
+            "labelled again from its start"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

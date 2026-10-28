@@ -353,6 +353,10 @@ fn label(
     absorber.finish()
 }
 
+/// Nodes [`label_leaf_until`] labels between looks at whether to stop: a
+/// few milliseconds of a core's work.
+pub const STOP_CHECK_NODES: usize = 1024;
+
 /// Every node's labels, layer by layer, handing each finished layer to
 /// `on_layer`; returns the last. Two layers resident at a time, plus the
 /// parent table of [`sdr::graph_parents`]. Labelling is sequential within a
@@ -363,12 +367,28 @@ fn label_layers(
     params: &SdrParams,
     on_layer: &mut dyn FnMut(usize, &[Digest]),
 ) -> Vec<Digest> {
+    label_layers_until(n, key, params, on_layer, &|| false)
+        .expect("labelling that never stops ends")
+}
+
+/// [`label_layers`], given up (`None`) once `stop` says so, looked at every
+/// [`STOP_CHECK_NODES`] nodes.
+fn label_layers_until(
+    n: usize,
+    key: &Digest,
+    params: &SdrParams,
+    on_layer: &mut dyn FnMut(usize, &[Digest]),
+    stop: &dyn Fn() -> bool,
+) -> Option<Vec<Digest>> {
     let (parents, drg, width) =
         sdr::graph_parents(n, params).expect("a leaf's node indices fit in u32");
     let mut prev = vec![hash::ZERO; n];
     let mut cur = vec![hash::ZERO; n];
     for layer in 0..params.layers {
         for v in 0..n {
+            if v % STOP_CHECK_NODES == 0 && stop() {
+                return None;
+            }
             let row = &parents[v * width..(v + 1) * width];
             let (dpar, epar) = row.split_at(drg);
             let lbl = label(
@@ -384,7 +404,7 @@ fn label_layers(
         on_layer(layer, &cur);
         std::mem::swap(&mut prev, &mut cur);
     }
-    prev // after the final swap, `prev` holds layer L-1
+    Some(prev) // after the final swap, `prev` holds layer L-1
 }
 
 fn column_step(previous: &Digest, label: &Digest) -> Digest {
@@ -528,6 +548,19 @@ pub fn label_leaf(
     params: &SdrParams,
     on_layer: &mut dyn FnMut(usize, &[Digest]),
 ) -> (Vec<Digest>, Vec<Digest>) {
+    label_leaf_until(n, key, params, on_layer, &|| false).expect("labelling that never stops ends")
+}
+
+/// [`label_leaf`], given up (`None`, the layers handed to `on_layer` so far
+/// partial) once `stop` says so, looked at every [`STOP_CHECK_NODES`] nodes:
+/// for work that must give its memory back to other work.
+pub fn label_leaf_until(
+    n: u64,
+    key: &[u8],
+    params: &SdrParams,
+    on_layer: &mut dyn FnMut(usize, &[Digest]),
+    stop: &dyn Fn() -> bool,
+) -> Option<(Vec<Digest>, Vec<Digest>)> {
     check_params(params);
     assert!(
         (MIN_NODES as u64..MAX_NODES).contains(&n),
@@ -535,11 +568,17 @@ pub fn label_leaf(
     );
     let n = n as usize;
     let mut columns = vec![hash::ZERO; n];
-    let last = label_layers(n, &hash::key_digest(key), params, &mut |index, layer| {
-        fold_layer(&mut columns, layer);
-        on_layer(index, layer);
-    });
-    (last, columns)
+    let last = label_layers_until(
+        n,
+        &hash::key_digest(key),
+        params,
+        &mut |index, layer| {
+            fold_layer(&mut columns, layer);
+            on_layer(index, layer);
+        },
+        stop,
+    )?;
+    Some((last, columns))
 }
 
 /// [`encode_leaf_at`] from the leaf's labels at `n` nodes ([`label_leaf`],
