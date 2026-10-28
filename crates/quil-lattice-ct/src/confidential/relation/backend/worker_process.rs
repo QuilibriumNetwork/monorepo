@@ -4,6 +4,7 @@
 use std::{
     io::Write,
     process::{Child, Command, Stdio},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -82,6 +83,109 @@ pub fn resident_bytes(pid: u32) -> Option<u64> {
     }
 }
 
+/// CPU counts of a worker started from a thread pinned to fewer CPUs than
+/// the process may use, passed once per process to [`set_cpu_report`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpawnCpus {
+    /// CPUs the child may run on: the process's set, or the spawning
+    /// thread's when widening to it failed.
+    pub child: usize,
+    /// CPUs the spawning thread is pinned to.
+    pub spawning_thread: usize,
+}
+
+static CPU_REPORT: OnceLock<fn(SpawnCpus)> = OnceLock::new();
+
+/// Install the reporter for [`SpawnCpus`]; the first call wins. It runs once
+/// per process, at the first worker spawned from a narrower-pinned thread.
+pub fn set_cpu_report(report: fn(SpawnCpus)) {
+    let _ = CPU_REPORT.set(report);
+}
+
+/// Record this process's CPU set for the workers it starts. Call it at
+/// startup, before any thread pins itself (the node pins each data worker
+/// thread to one core); the first call wins. Without it, the first
+/// [`crate::confidential::relation::backend::worker_client::WorkerVerifier`]
+/// or spawn records its own thread's set.
+pub fn remember_process_cpus() {
+    #[cfg(target_os = "linux")]
+    cpus::process();
+}
+
+#[cfg(target_os = "linux")]
+mod cpus {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        OnceLock,
+    };
+
+    static PROCESS: OnceLock<Option<libc::cpu_set_t>> = OnceLock::new();
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn process() -> Option<libc::cpu_set_t> {
+        *PROCESS.get_or_init(current)
+    }
+
+    /// The calling thread's CPU set; `None` beyond `CPU_SETSIZE` CPUs.
+    pub(super) fn current() -> Option<libc::cpu_set_t> {
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::cpu_set_t>();
+        (unsafe { libc::sched_getaffinity(0, size, &mut set) } == 0).then_some(set)
+    }
+
+    /// Set the calling thread's CPU set; `false` when the kernel refuses.
+    pub(super) fn set_current(set: &libc::cpu_set_t) -> bool {
+        let size = std::mem::size_of::<libc::cpu_set_t>();
+        unsafe { libc::sched_setaffinity(0, size, set) == 0 }
+    }
+
+    pub(super) fn count(set: &libc::cpu_set_t) -> usize {
+        unsafe { libc::CPU_COUNT(set) as usize }
+    }
+
+    pub(super) fn equal(a: &libc::cpu_set_t, b: &libc::cpu_set_t) -> bool {
+        unsafe { libc::CPU_EQUAL(a, b) }
+    }
+
+    pub(super) fn report_once(cpus: super::SpawnCpus) {
+        if let Some(report) = super::CPU_REPORT.get() {
+            if !REPORTED.swap(true, Ordering::AcqRel) {
+                report(cpus);
+            }
+        }
+    }
+}
+
+/// Start `command` on the process's CPU set rather than the calling thread's.
+/// A child inherits its spawning thread's affinity, and the node pins each
+/// data worker thread, and every thread it starts, to one core; a verifier
+/// child would run all its native threads on that core. The thread widens
+/// its own set for the spawn and restores it after; unlike a `pre_exec` hook
+/// this keeps `posix_spawn`, so the node's address space is not forked.
+fn spawn_with_process_cpus(command: &mut Command) -> std::io::Result<Child> {
+    #[cfg(target_os = "linux")]
+    if let (Some(process), Some(thread)) = (cpus::process(), cpus::current()) {
+        if !cpus::equal(&process, &thread) {
+            let widened = cpus::set_current(&process);
+            let child_cpus = if widened { cpus::current() } else { None };
+            let child = command.spawn();
+            // Narrowing back to a subset of its own set does not fail; were
+            // it refused, the thread would merely stay unpinned.
+            if widened {
+                cpus::set_current(&thread);
+            }
+            if child.is_ok() {
+                cpus::report_once(SpawnCpus {
+                    child: cpus::count(child_cpus.as_ref().unwrap_or(&thread)),
+                    spawning_thread: cpus::count(&thread),
+                });
+            }
+            return child;
+        }
+    }
+    command.spawn()
+}
+
 /// [`run_worker`] with a resident-memory cap enforced by this (parent)
 /// process: the worker is sampled every 50 ms and killed once it exceeds
 /// `max_resident_bytes`. This is a portable policy, unlike `RLIMIT_AS`, but
@@ -111,12 +215,13 @@ pub fn run_worker_capped(
         .try_reserve_exact(request.len())
         .map_err(|_| WorkerError::Allocation)?;
     input.extend_from_slice(request);
-    let child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(WorkerError::Io)?;
+    let child = spawn_with_process_cpus(
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .map_err(WorkerError::Io)?;
     let mut child = ChildGuard(child);
     let mut stdin = child.0.stdin.take().expect("piped worker stdin");
     // A non-reading worker must not block the deadline monitor on pipe writes.
@@ -566,5 +671,85 @@ mod tests {
         )
         .unwrap());
         assert_eq!(process_limits(), before);
+    }
+
+    /// The node pins each data worker thread to one core. A verifier child
+    /// it starts must still get the process's CPUs, not that core.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_worker_started_from_a_pinned_thread_gets_the_process_cpus() {
+        use std::sync::Mutex;
+        static REPORTED: Mutex<Option<SpawnCpus>> = Mutex::new(None);
+        fn record(cpus: SpawnCpus) {
+            *REPORTED.lock().unwrap() = Some(cpus);
+        }
+        fn listed(list: &str) -> Vec<usize> {
+            list.trim()
+                .split(',')
+                .filter(|range| !range.is_empty())
+                .flat_map(|range| {
+                    let (low, high) = range.split_once('-').unwrap_or((range, range));
+                    low.parse::<usize>().unwrap()..=high.parse::<usize>().unwrap()
+                })
+                .collect()
+        }
+        // As the node does at startup, before its workers pin themselves.
+        remember_process_cpus();
+        set_cpu_report(record);
+        let process = super::cpus::process().expect("process CPU set");
+        let expected: Vec<usize> = (0..libc::CPU_SETSIZE as usize)
+            .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &process) })
+            .collect();
+        if expected.len() < 2 {
+            eprintln!("skipped: this process may use only one CPU");
+            return;
+        }
+        let pinned = *expected.last().unwrap();
+        let out = std::env::temp_dir().join(format!("quil-worker-cpus-{}", std::process::id()));
+        let path = out.clone();
+        let (verdict, thread_after) = std::thread::spawn(move || {
+            let mut one: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+            unsafe { libc::CPU_SET(pinned, &mut one) };
+            assert!(super::cpus::set_current(&one), "pin the test thread");
+            let mut command = Command::new("/bin/sh");
+            command.args([
+                "-c",
+                "cat >/dev/null; grep Cpus_allowed_list /proc/self/status >\"$1\"; exit 80",
+                "sh",
+            ]);
+            command.arg(&path);
+            let verdict = run_worker(command, b"public test request", Duration::from_secs(10));
+            (verdict, super::cpus::current())
+        })
+        .join()
+        .unwrap();
+        let status = std::fs::read_to_string(&out);
+        let _ = std::fs::remove_file(&out);
+        assert!(matches!(verdict, Ok(true)), "{verdict:?}");
+        let child = listed(
+            status
+                .unwrap()
+                .strip_prefix("Cpus_allowed_list:")
+                .expect("Cpus_allowed_list line"),
+        );
+        assert_eq!(
+            child, expected,
+            "the child ran on CPUs {child:?}, its spawning thread's pin {pinned}, \
+             instead of the process's"
+        );
+        let thread_after = thread_after.expect("thread CPU set");
+        assert_eq!(
+            super::cpus::count(&thread_after),
+            1,
+            "spawning thread pin restored"
+        );
+        assert!(unsafe { libc::CPU_ISSET(pinned, &thread_after) });
+        assert_eq!(
+            *REPORTED.lock().unwrap(),
+            Some(SpawnCpus {
+                child: expected.len(),
+                spawning_thread: 1
+            })
+        );
     }
 }

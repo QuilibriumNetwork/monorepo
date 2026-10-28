@@ -6,7 +6,10 @@ use std::{path::PathBuf, time::Duration};
 
 use quil_config::ProofWorkerConfig;
 use quil_execution::{token_intrinsic::dispatch::TokenPolicy, ExecutionEngineManager};
-use quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier;
+use quil_lattice_ct::confidential::relation::backend::{
+    worker_client::WorkerVerifier,
+    worker_process::{set_cpu_report, SpawnCpus},
+};
 
 static NEXT_LANE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
@@ -91,6 +94,7 @@ pub(crate) fn build_worker(config: &ProofWorkerConfig) -> anyhow::Result<Option<
     quil_execution::token_intrinsic::dispatch::set_verification_budget_secs(
         config.verify_budget_secs,
     );
+    set_cpu_report(report_child_cpus);
     worker.check_ready().map_err(|e| {
         anyhow::anyhow!(
             "token proof worker at {} failed startup/ABI check: {e:?}",
@@ -109,6 +113,24 @@ pub(crate) fn build_worker(config: &ProofWorkerConfig) -> anyhow::Result<Option<
         "token proof worker configured"
     );
     Ok(Some(worker))
+}
+
+/// Once per process, at the first verifier child started from a data worker
+/// thread pinned to fewer CPUs than the node may use.
+fn report_child_cpus(cpus: SpawnCpus) {
+    if cpus.child > cpus.spawning_thread {
+        tracing::info!(
+            child_cpus = cpus.child,
+            worker_cpus = cpus.spawning_thread,
+            "token proof worker child runs on the node's CPUs, not its data worker's pinned core"
+        );
+    } else {
+        tracing::warn!(
+            child_cpus = cpus.child,
+            worker_cpus = cpus.spawning_thread,
+            "token proof worker child kept its data worker's core pin; verifications share that core"
+        );
+    }
 }
 
 /// All processes of one node use its base DB directory for verifier admission,
