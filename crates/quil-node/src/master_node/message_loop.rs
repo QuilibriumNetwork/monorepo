@@ -240,12 +240,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                 super::stall_watch::ARCHIVE_INGEST_STALL_AFTER,
             )),
             move |data| quil_engine::archive_ingest::ingest_gossiped(&ingest, &verifier, data),
-            move || {
-                retrying
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .retry_pending()
-            },
+            move || quil_engine::archive_ingest::lock_ingest(&retrying).retry_pending(),
         )
     });
     // GLOBAL_FRAME admission state shared with the gossip gate: a frame this

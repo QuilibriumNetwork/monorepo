@@ -12508,6 +12508,47 @@ pub(crate) struct MaterializedAppFrame {
     settlements: Vec<quil_execution::token_intrinsic::settlement_record::SettlementEntry>,
     spends: Vec<Vec<u8>>,
     accumulator_report: Vec<u8>,
+    pub(crate) steps: MaterializeSteps,
+}
+
+/// The requests of `bundles` counted by operation
+/// ([`quil_execution::token_engine::request_operation_label`]), shown as
+/// `batch_shield 2, coin_delivery 1` (labels in name order, `none` when
+/// there are none). Counted only when shown, so a probe detail naming it
+/// costs nothing on a thread without a probe.
+pub(crate) struct Operations<'a>(pub(crate) &'a [quil_types::proto::global::MessageBundle]);
+
+impl std::fmt::Display for Operations<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut counts = std::collections::BTreeMap::<&'static str, usize>::new();
+        for request in self.0.iter().flat_map(|bundle| &bundle.requests) {
+            *counts
+                .entry(quil_execution::token_engine::request_operation_label(
+                    request,
+                ))
+                .or_default() += 1;
+        }
+        if counts.is_empty() {
+            return f.write_str("none");
+        }
+        for (index, (label, count)) in counts.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{label} {count}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Time a frame's materialization spent in each step.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MaterializeSteps {
+    pub(crate) preverify: std::time::Duration,
+    /// Per-bundle caps and fee pricing.
+    pub(crate) pricing: std::time::Duration,
+    pub(crate) process: std::time::Duration,
+    pub(crate) commit: std::time::Duration,
 }
 
 pub(crate) fn materialize_app_shard_requests(
@@ -12539,8 +12580,12 @@ pub(crate) fn materialize_app_shard_requests(
         .filter_map(|bundle| crate::consensus_wire::app_bundle_to_canonical_bytes(bundle).ok())
         .map(|bytes| (addr.to_vec(), bytes))
         .collect();
+    let mut steps = MaterializeSteps::default();
     let preverify_start = std::time::Instant::now();
-    execution_manager.preverify_bundles(&canonical);
+    {
+        let _step = StepTimer::start(&mut steps.preverify, probe::Section::AppFramePreverify);
+        execution_manager.preverify_bundles(&canonical);
+    }
     if preverify_start.elapsed() > std::time::Duration::from_secs(1) {
         info!(
             frame = frame_number,
@@ -12563,7 +12608,15 @@ pub(crate) fn materialize_app_shard_requests(
     // Spend entries of the confidential operations this frame verified, for
     // the global commit. Capped per frame before execution, like settlements.
     let mut spends: Vec<Vec<u8>> = Vec::new();
-    for bundle in requests {
+    for (index, bundle) in requests.iter().enumerate() {
+        // Named while it is priced and executed: the watchdog of a frame
+        // that does not finish names the bundle and its operations.
+        let _bundle = probe::detail(format_args!(
+            "bundle {} of {} ({})",
+            index + 1,
+            requests.len(),
+            Operations(std::slice::from_ref(bundle))
+        ));
         let bundle_bytes = match crate::consensus_wire::app_bundle_to_canonical_bytes(bundle) {
             // Re-encode too short / un-encodable are DETERMINISTIC (a pure
             // function of the bundle bytes, which are part of the finalized
@@ -12586,6 +12639,7 @@ pub(crate) fn materialize_app_shard_requests(
             }
         };
 
+        let pricing = StepTimer::start(&mut steps.pricing, probe::Section::AppFramePricing);
         // Settlements beyond the per-frame relay cap are skipped before
         // execution: a pure function of the finalized body, identical on
         // every replica. A malformed settlement fails admission below anyway.
@@ -12650,8 +12704,10 @@ pub(crate) fn materialize_app_shard_requests(
                 continue;
             }
         };
+        drop(pricing);
 
-        match execution_manager.process_message_with_context(
+        let process = StepTimer::start(&mut steps.process, probe::Section::AppFrameProcess);
+        let outcome = execution_manager.process_message_with_context(
             quil_types::execution::FrameExecutionContext {
                 frame_number,
                 finalized_global_frame: (global_frame_number != 0).then_some(global_frame_number),
@@ -12663,7 +12719,9 @@ pub(crate) fn materialize_app_shard_requests(
             &fee,
             addr,
             &bundle_bytes,
-        ) {
+        );
+        drop(process);
+        match outcome {
             Ok(_) => {
                 processed += 1;
                 fee_total = fee_total.saturating_add(
@@ -12714,6 +12772,7 @@ pub(crate) fn materialize_app_shard_requests(
     }
 
     settlements.sort();
+    let commit = StepTimer::start(&mut steps.commit, probe::Section::AppFrameCommit);
     let accumulator_report = execution_manager.commit_frame_with_app_history(
         frame_number,
         app_address,
@@ -12722,6 +12781,7 @@ pub(crate) fn materialize_app_shard_requests(
         &spends,
         global_frame_number,
     )?;
+    drop(commit);
     Ok(MaterializedAppFrame {
         processed,
         skipped,
@@ -12730,7 +12790,32 @@ pub(crate) fn materialize_app_shard_requests(
         settlements,
         spends,
         accumulator_report,
+        steps,
     })
+}
+
+/// A materialization step: marked on this thread's probe, and its time
+/// added to `into`, until it drops.
+struct StepTimer<'a> {
+    into: &'a mut std::time::Duration,
+    started: std::time::Instant,
+    _section: probe::SectionGuard,
+}
+
+impl<'a> StepTimer<'a> {
+    fn start(into: &'a mut std::time::Duration, section: probe::Section) -> Self {
+        Self {
+            into,
+            started: std::time::Instant::now(),
+            _section: probe::section(section),
+        }
+    }
+}
+
+impl Drop for StepTimer<'_> {
+    fn drop(&mut self) {
+        *self.into += self.started.elapsed();
+    }
 }
 
 /// The data-address bit path of the shard a filter names: empty for a bare

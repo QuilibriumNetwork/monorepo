@@ -97,6 +97,9 @@ pub struct ArchiveAppShardIngest {
     /// How long a provably empty frame's body is sought before the frame is
     /// materialized from its certified header ([`EMPTY_FRAME_BODY_GRACE`]).
     empty_body_grace: Duration,
+    /// How long one frame's materialization takes before it is logged with
+    /// its steps ([`SLOW_MATERIALIZATION`]).
+    slow_materialization: Duration,
     /// The shards allocated provers serve, whose committed GLOBAL tips
     /// [`Self::request_committed_tips`] compares with what this archive serves.
     prover_registry: Arc<dyn ProverRegistryTrait>,
@@ -471,6 +474,7 @@ impl ArchiveAppShardIngest {
             sequenced: false,
             missing_since: HashMap::new(),
             empty_body_grace: EMPTY_FRAME_BODY_GRACE,
+            slow_materialization: SLOW_MATERIALIZATION,
             #[cfg(test)]
             skip_header_authentication: false,
         }
@@ -2083,7 +2087,7 @@ impl ArchiveAppShardIngest {
     }
 
     fn try_materialize(&mut self, address: &[u8]) {
-        if let Err(error) = self.materialize_in_order(address, u64::MAX, &HashMap::new()) {
+        if let Err(error) = self.materialize_in_order(address, u64::MAX, &HashMap::new(), None) {
             warn!(error = %error, "archive materialize deferred");
         }
     }
@@ -2102,28 +2106,32 @@ impl ArchiveAppShardIngest {
         address: &[u8],
         through: u64,
     ) -> quil_types::error::Result<bool> {
-        self.materialize_in_order(address, through, &HashMap::new())
+        self.materialize_in_order(address, through, &HashMap::new(), None)
     }
 
-    /// [`Self::materialize_through`] for a GLOBAL frame that carries the
-    /// certified `headers` (by frame number) of this shard. A frame among them
-    /// whose body no endpoint serves is materialized from its header once
-    /// the header proves the frame carried no requests
+    /// [`Self::materialize_through`] for GLOBAL frame `global_frame`, which
+    /// carries the certified `headers` (by frame number) of this shard. A
+    /// frame among them whose body no endpoint serves is materialized from
+    /// its header once the header proves the frame carried no requests
     /// ([`Self::empty_frame_from_header`]).
     pub fn materialize_through_vouched(
         &mut self,
         address: &[u8],
         through: u64,
         headers: &HashMap<u64, quil_types::proto::global::FrameHeader>,
+        global_frame: u64,
     ) -> quil_types::error::Result<bool> {
-        self.materialize_in_order(address, through, headers)
+        self.materialize_in_order(address, through, headers, Some(global_frame))
     }
 
+    /// `global_frame`: the GLOBAL frame whose execution sequences these
+    /// frames, if any; named by the slow-frame line.
     fn materialize_in_order(
         &mut self,
         address: &[u8],
         through: u64,
         vouched: &HashMap<u64, quil_types::proto::global::FrameHeader>,
+        global_frame: Option<u64>,
     ) -> quil_types::error::Result<bool> {
         let reached = loop {
             let last = self.materialized_height(address)?;
@@ -2154,6 +2162,16 @@ impl ArchiveAppShardIngest {
                     },
                 },
             };
+            // Named while it materializes: a frame that does not finish
+            // holds the ingest, and the watchdog names it.
+            let bundles = frame.requests.len();
+            let requests: usize = frame.requests.iter().map(|b| b.requests.len()).sum();
+            let operations = crate::app_engine::Operations(&frame.requests);
+            let _on = quil_types::thread_probe::detail(format_args!(
+                "shard {} frame {next}, {bundles} bundles, {requests} requests ({operations})",
+                hex::encode(address)
+            ));
+            let started = Instant::now();
             let fee_multiplier_vote = frame
                 .header
                 .as_ref()
@@ -2214,6 +2232,32 @@ impl ArchiveAppShardIngest {
                 address = %hex::encode(address),
                 "archive materialized shard frame"
             );
+            let took = started.elapsed();
+            if took >= self.slow_materialization {
+                let steps = &materialized.steps;
+                // `global_frame` 0: materialized as gossip arrived, not
+                // sequenced by a GLOBAL frame.
+                info!(
+                    global_frame = global_frame.unwrap_or(0),
+                    address = %hex::encode(address),
+                    frame = next,
+                    bundles,
+                    requests,
+                    %operations,
+                    total_ms = took.as_millis() as u64,
+                    preverify_ms = steps.preverify.as_millis() as u64,
+                    pricing_ms = steps.pricing.as_millis() as u64,
+                    process_ms = steps.process.as_millis() as u64,
+                    commit_ms = steps.commit.as_millis() as u64,
+                    scope = "this archive's application-frame ingest",
+                    action = "gossiped application frames waited for the ingest lock, and the \
+                              GLOBAL frame named in global_frame (0: none) could not finish before \
+                              it; an occasional slow frame (many proofs) is expected; if most \
+                              frames take this long, report these lines",
+                    "archive shard frame materialization took {}s, holding the ingest lock",
+                    took.as_secs()
+                );
+            }
         };
         // Gap detection: the next-needed frame is missing while frames are
         // buffered ahead of it, or while a GLOBAL frame needs it. Ask for it
@@ -2951,6 +2995,30 @@ impl HeldBodies {
     }
 }
 
+/// Lock `ingest`, marking the wait on this thread's probe when another
+/// holds it: GLOBAL execution holds it while it materializes the application
+/// frames a GLOBAL frame carries, and the gossip ingest thread waits behind
+/// it.
+pub fn lock_ingest(
+    ingest: &std::sync::Mutex<ArchiveAppShardIngest>,
+) -> std::sync::MutexGuard<'_, ArchiveAppShardIngest> {
+    match ingest.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let _wait = quil_types::thread_probe::section(
+                quil_types::thread_probe::Section::ArchiveIngestLockWait,
+            );
+            ingest.lock().unwrap_or_else(|p| p.into_inner())
+        }
+    }
+}
+
+/// One shard frame's materialization this long is logged with its steps.
+/// Each such frame takes at least this long, so the line is bounded to one
+/// per this interval.
+const SLOW_MATERIALIZATION: Duration = Duration::from_secs(5);
+
 /// Ingest a gossiped full `AppShardFrame` (prost bytes) as
 /// [`ArchiveAppShardIngest::ingest`] does, verifying it without holding
 /// `ingest`, which is held only to read the cursor and to admit.
@@ -2962,7 +3030,7 @@ pub fn ingest_gossiped(
     verifier: &ArchiveFrameVerifier,
     data: &[u8],
 ) {
-    let lock = || ingest.lock().unwrap_or_else(|p| p.into_inner());
+    let lock = || lock_ingest(ingest);
     let frame = match <AppShardFrame as prost::Message>::decode(data) {
         Ok(f) => f,
         Err(_) => return,
@@ -3060,7 +3128,7 @@ pub fn admit_fetched(
     address: &[u8],
     frames: Vec<AppShardFrame>,
 ) -> FetchedFrames {
-    let lock = || ingest.lock().unwrap_or_else(|p| p.into_inner());
+    let lock = || lock_ingest(ingest);
     let mut outcome = FetchedFrames::Admitted;
     for (index, frame) in frames.into_iter().enumerate() {
         let number = frame.header.as_ref().map_or(0, |h| h.frame_number);
@@ -4813,7 +4881,7 @@ mod tests {
         let empty = vouched(header(2, vec![0; 32]));
         assert!(
             !ingest
-                .materialize_through_vouched(&filter, 2, &empty)
+                .materialize_through_vouched(&filter, 2, &empty, 0)
                 .unwrap(),
             "the body is sought first"
         );
@@ -4824,14 +4892,14 @@ mod tests {
             "only a header the GLOBAL frame carries"
         );
         assert!(ingest
-            .materialize_through_vouched(&filter, 2, &empty)
+            .materialize_through_vouched(&filter, 2, &empty, 0)
             .unwrap());
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 2);
         assert!(ingest.missing_since.is_empty());
 
         let with_requests = vouched(header(3, vec![7; 32]));
         assert!(!ingest
-            .materialize_through_vouched(&filter, 3, &with_requests)
+            .materialize_through_vouched(&filter, 3, &with_requests, 0)
             .unwrap());
         assert!(
             ingest.missing_since.is_empty(),
@@ -4839,7 +4907,7 @@ mod tests {
         );
         let legacy_empty = vouched(header(3, vec![0; 64]));
         assert!(!ingest
-            .materialize_through_vouched(&filter, 3, &legacy_empty)
+            .materialize_through_vouched(&filter, 3, &legacy_empty, 0)
             .unwrap());
         ingest.missing_since.get_mut(&filter).unwrap().1 = Instant::now() - EMPTY_FRAME_BODY_GRACE;
         let elsewhere = HashMap::from([(
@@ -4851,12 +4919,12 @@ mod tests {
         )]);
         assert!(
             !ingest
-                .materialize_through_vouched(&filter, 3, &elsewhere)
+                .materialize_through_vouched(&filter, 3, &elsewhere, 0)
                 .unwrap(),
             "another shard's header"
         );
         assert!(ingest
-            .materialize_through_vouched(&filter, 3, &legacy_empty)
+            .materialize_through_vouched(&filter, 3, &legacy_empty, 0)
             .unwrap());
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 3);
     }
@@ -4892,12 +4960,12 @@ mod tests {
         let vouched = HashMap::from([(2, body.header.clone().unwrap())]);
         assert!(
             !ingest
-                .materialize_through_vouched(&filter, 2, &vouched)
+                .materialize_through_vouched(&filter, 2, &vouched, 0)
                 .unwrap(),
             "the body is sought first"
         );
         assert!(ingest
-            .materialize_through_vouched(&filter, 2, &vouched)
+            .materialize_through_vouched(&filter, 2, &vouched, 0)
             .unwrap());
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 2);
         assert_eq!(
@@ -4972,10 +5040,10 @@ mod tests {
         whole.header.as_mut().unwrap().requests_root = vec![0; 32];
         let vouched = HashMap::from([(3, whole.header.clone().unwrap())]);
         assert!(!ingest
-            .materialize_through_vouched(&filter, 3, &vouched)
+            .materialize_through_vouched(&filter, 3, &vouched, 0)
             .unwrap());
         assert!(ingest
-            .materialize_through_vouched(&filter, 3, &vouched)
+            .materialize_through_vouched(&filter, 3, &vouched, 0)
             .unwrap());
         assert_eq!(
             served(3),
@@ -5419,5 +5487,199 @@ mod tests {
             .unwrap()
             .materialize_through(&filter, 1)
             .unwrap());
+    }
+
+    /// While a shard frame materializes, this thread's probe names the
+    /// shard, the frame and its size after the GLOBAL frame it is sequenced
+    /// by, so the watchdog of a materializer that does not return can name
+    /// the frame it is on (2026-10-27: every archive hung on GLOBAL frame
+    /// 945,000 and its warning named only the message loop). The name goes
+    /// once the frame is done.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_materializing_shard_frame_is_named_on_the_thread_probe() {
+        use quil_types::thread_probe::{self as probe, ThreadProbe};
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let (ingest, _) = fixture();
+        let mut ingest = ingest.sequenced();
+        for number in 1..=2 {
+            ingest
+                .buffered
+                .entry(filter.clone())
+                .or_default()
+                .insert(number, verified_frame(&filter, number));
+        }
+        let thread_probe = ThreadProbe::new();
+        let installed = probe::install(thread_probe.clone());
+        // What the probe names whenever this thread logs.
+        let named = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let logs = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_writer({
+                    let (thread_probe, named) = (thread_probe.clone(), named.clone());
+                    move || {
+                        named.lock().unwrap().push(thread_probe.detail());
+                        std::io::sink()
+                    }
+                })
+                .finish(),
+        );
+        {
+            let _global = probe::detail(format_args!("GLOBAL frame {}", 945_000));
+            assert!(ingest
+                .materialize_through_vouched(&filter, 2, &HashMap::new(), 945_000)
+                .unwrap());
+            assert_eq!(thread_probe.detail(), "GLOBAL frame 945000");
+        }
+        drop(logs);
+        drop(installed);
+        let shard = hex::encode(&filter);
+        let named = named.lock().unwrap().clone();
+        for number in 1..=2 {
+            let expected = format!(
+                "GLOBAL frame 945000: shard {shard} frame {number}, 0 bundles, 0 requests (none)"
+            );
+            assert!(named.contains(&expected), "{expected:?} not in {named:?}");
+        }
+        assert_eq!(thread_probe.detail(), "");
+    }
+
+    /// A thread that waits for the ingest another holds is marked as waiting
+    /// for it, so a blocked ingest thread names the wait.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_contended_ingest_lock_wait_is_marked_on_the_thread_probe() {
+        use quil_types::thread_probe::{self as probe, Section, ThreadProbe};
+        let ingest = Arc::new(std::sync::Mutex::new(fixture().0));
+        let held = ingest.lock().unwrap();
+        let thread_probe = ThreadProbe::new();
+        let waiter = std::thread::spawn({
+            let (ingest, thread_probe) = (ingest.clone(), thread_probe.clone());
+            move || {
+                let _installed = probe::install(thread_probe);
+                drop(lock_ingest(&ingest));
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while thread_probe.snapshot().section.map(|mark| mark.section)
+            != Some(Section::ArchiveIngestLockWait)
+        {
+            assert!(Instant::now() < deadline, "the wait was never marked");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(held);
+        waiter.join().unwrap();
+        assert_eq!(thread_probe.snapshot().section, None);
+    }
+
+    /// While a shard frame materializes, the probe names its requests by
+    /// operation, and each bundle by its place and operations while it is
+    /// priced and executed, so a frame that does not finish names what it
+    /// executes (2026-10-27: the shard frame GLOBAL frame 945,000 hung on
+    /// carried a coin delivery). A slow frame's line counts them too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_materializing_frame_names_its_operations_by_type() {
+        use quil_execution::token_intrinsic::constants::{TYPE_COIN_DELIVERY, TYPE_LATTICE_SHIELD};
+        use quil_types::proto::global::{message_request::Request, MessageBundle, MessageRequest};
+        use quil_types::thread_probe::{self as probe, ThreadProbe};
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let (ingest, _) = fixture();
+        let mut ingest = ingest.sequenced();
+        ingest.slow_materialization = Duration::ZERO;
+        let tagged = |prefix: u32, version: &[u8]| {
+            let mut canonical_bytes = prefix.to_be_bytes().to_vec();
+            canonical_bytes.extend_from_slice(version);
+            MessageRequest {
+                timestamp: 0,
+                request: Some(Request::TokenOperation(
+                    quil_types::proto::token::TokenOperation { canonical_bytes },
+                )),
+            }
+        };
+        // Not encodable: each bundle is skipped, and logged, while named.
+        let unencodable = || MessageRequest {
+            timestamp: 0,
+            request: Some(Request::PresenceReport(vec![0xff])),
+        };
+        let mut frame = verified_frame(&filter, 1);
+        frame.requests = vec![
+            MessageBundle {
+                requests: vec![
+                    tagged(TYPE_LATTICE_SHIELD, b"QCT3SH\0\x03"),
+                    tagged(TYPE_COIN_DELIVERY, b"QCT3DL\0\x01"),
+                    unencodable(),
+                ],
+                timestamp: 1,
+            },
+            MessageBundle {
+                requests: vec![unencodable()],
+                timestamp: 2,
+            },
+        ];
+        ingest
+            .buffered
+            .entry(filter.clone())
+            .or_default()
+            .insert(1, frame);
+        let thread_probe = ThreadProbe::new();
+        let installed = probe::install(thread_probe.clone());
+        // What the probe names whenever this thread logs, and the lines.
+        let named = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let written = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .with_writer({
+                    let (thread_probe, named, written) =
+                        (thread_probe.clone(), named.clone(), written.clone());
+                    move || {
+                        named.lock().unwrap().push(thread_probe.detail());
+                        Capture(written.clone())
+                    }
+                })
+                .finish(),
+        );
+        {
+            let _global = probe::detail(format_args!("GLOBAL frame {}", 945_000));
+            assert!(ingest
+                .materialize_through_vouched(&filter, 1, &HashMap::new(), 945_000)
+                .unwrap());
+        }
+        drop(logs);
+        drop(installed);
+        let shard = hex::encode(&filter);
+        let named = named.lock().unwrap().clone();
+        let on = format!(
+            "GLOBAL frame 945000: shard {shard} frame 1, 2 bundles, 4 requests \
+             (batch_shield 1, coin_delivery 1, other 2)"
+        );
+        for expected in [
+            on.clone(),
+            format!("{on}: bundle 1 of 2 (batch_shield 1, coin_delivery 1, other 1)"),
+            format!("{on}: bundle 2 of 2 (other 1)"),
+        ] {
+            assert!(named.contains(&expected), "{expected:?} not in {named:?}");
+        }
+        let written = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        let slow = written
+            .lines()
+            .find(|line| line.contains("archive shard frame materialization took"))
+            .unwrap_or_else(|| panic!("no slow-frame line in {written}"));
+        assert!(
+            slow.contains("operations=batch_shield 1, coin_delivery 1, other 2"),
+            "{slow}"
+        );
+        assert!(slow.contains("global_frame=945000"), "{slow}");
+        assert_eq!(thread_probe.detail(), "");
     }
 }

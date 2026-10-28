@@ -133,6 +133,12 @@ pub fn source_address(bytes: &[u8]) -> Option<[u8; 32]> {
     None
 }
 
+/// Whether `bytes` encode a batch shield (many legacy coins), read from its
+/// type and version tags alone; it validates nothing.
+pub fn is_batch(bytes: &[u8]) -> bool {
+    bytes.get(..4) == Some(&PREFIX[..]) && bytes.get(4..12) == Some(&BATCH_VERSION[..])
+}
+
 /// One legacy coin a batch shield consumes, with its public amount.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShieldSource {
@@ -557,6 +563,7 @@ mod tests {
             .validate_local_witness());
         assert!(shield.statement.public_relation(1).is_err());
         let bytes = shield.encode().unwrap();
+        assert!(!is_batch(&bytes));
         assert_eq!(bytes.len(), 180507); // Includes signatures, memos and proof framing.
         assert!(bytes.len() < super::super::transfer::TARGET_TRANSACTION_BYTES);
         assert_eq!(
@@ -644,6 +651,7 @@ mod tests {
             (0..96u128).map(|i| 1_000 + i).sum::<u128>()
         );
         let bytes = shield.encode().unwrap();
+        assert!(is_batch(&bytes) && !is_batch(&bytes[..11]));
         assert_eq!(
             BatchShield::decode(&bytes, &[1; 32], &[2; 32]).unwrap(),
             shield

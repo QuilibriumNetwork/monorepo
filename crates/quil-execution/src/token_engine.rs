@@ -171,6 +171,54 @@ pub fn token_kind_for_request(request: &MessageRequest) -> Option<MessageKindTok
     }
 }
 
+/// A short name for what `request` does, for operator logs: a token
+/// operation by its kind (a batch shield apart from a single one, a coin
+/// delivery), a prover operation, a shard header, else `other`. Reads only
+/// the type and version tags; it validates nothing.
+pub fn request_operation_label(request: &MessageRequest) -> &'static str {
+    let Some(inner) = request.request.as_ref() else {
+        return "empty";
+    };
+    match inner {
+        MessageRequestInner::TokenOperation(op) => token_operation_label(&op.canonical_bytes),
+        MessageRequestInner::TokenDeploy(_) => MessageKindToken::TokenDeploy.label(),
+        MessageRequestInner::TokenUpdate(_) => MessageKindToken::TokenUpdate.label(),
+        MessageRequestInner::Join(_)
+        | MessageRequestInner::Leave(_)
+        | MessageRequestInner::Pause(_)
+        | MessageRequestInner::Resume(_)
+        | MessageRequestInner::Confirm(_)
+        | MessageRequestInner::Reject(_)
+        | MessageRequestInner::Kick(_)
+        | MessageRequestInner::Update(_)
+        | MessageRequestInner::SeniorityMerge(_) => "prover",
+        MessageRequestInner::Shard(_) => "shard_header",
+        _ => "other",
+    }
+}
+
+fn token_operation_label(bytes: &[u8]) -> &'static str {
+    let delivery = crate::token_intrinsic::constants::TYPE_COIN_DELIVERY.to_be_bytes();
+    if bytes.get(..4) == Some(&delivery[..]) {
+        return "coin_delivery";
+    }
+    match peek_token_message_kind(bytes) {
+        Ok(MessageKindToken::Shield) if is_batch_shield(bytes) => "batch_shield",
+        Ok(kind) => kind.label(),
+        Err(_) => "token_other",
+    }
+}
+
+#[cfg(feature = "confidential-tokens")]
+fn is_batch_shield(bytes: &[u8]) -> bool {
+    quil_lattice_ct::confidential::shield::is_batch(bytes)
+}
+
+#[cfg(not(feature = "confidential-tokens"))]
+fn is_batch_shield(_bytes: &[u8]) -> bool {
+    false
+}
+
 // =====================================================================
 // Cost dispatch
 // =====================================================================
@@ -294,6 +342,64 @@ mod tests {
             let bytes = kind.type_prefix().to_be_bytes();
             assert_eq!(peek_token_message_kind(&bytes).unwrap(), kind);
         }
+    }
+
+    /// Operator logs name a request by what it does: a token operation by
+    /// its kind, a batch shield and a coin delivery apart, else its class.
+    #[test]
+    fn requests_are_labelled_by_operation() {
+        let token = |bytes: Vec<u8>| MessageRequest {
+            timestamp: 0,
+            request: Some(MessageRequestInner::TokenOperation(
+                token_pb::TokenOperation {
+                    canonical_bytes: bytes,
+                },
+            )),
+        };
+        let tagged = |prefix: u32, version: &[u8]| {
+            let mut bytes = prefix.to_be_bytes().to_vec();
+            bytes.extend_from_slice(version);
+            token(bytes)
+        };
+        assert_eq!(
+            request_operation_label(&tagged(TYPE_LATTICE_SHIELD, b"QCT3SH\0\x02")),
+            "shield"
+        );
+        #[cfg(feature = "confidential-tokens")]
+        assert_eq!(
+            request_operation_label(&tagged(TYPE_LATTICE_SHIELD, b"QCT3SH\0\x03")),
+            "batch_shield"
+        );
+        assert_eq!(
+            request_operation_label(&tagged(
+                crate::token_intrinsic::constants::TYPE_COIN_DELIVERY,
+                b"QCT3DL\0\x01"
+            )),
+            "coin_delivery"
+        );
+        assert_eq!(
+            request_operation_label(&tagged(TYPE_LATTICE_TRANSACTION, &[])),
+            "transfer"
+        );
+        assert_eq!(request_operation_label(&token(vec![0; 2])), "token_other");
+        assert_eq!(
+            request_operation_label(&make_token_deploy()),
+            "token_deploy"
+        );
+        assert_eq!(
+            request_operation_label(&MessageRequest {
+                timestamp: 0,
+                request: Some(MessageRequestInner::PresenceReport(vec![1])),
+            }),
+            "other"
+        );
+        assert_eq!(
+            request_operation_label(&MessageRequest {
+                timestamp: 0,
+                request: None,
+            }),
+            "empty"
+        );
     }
 
     #[test]

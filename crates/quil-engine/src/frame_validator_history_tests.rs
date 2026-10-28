@@ -778,12 +778,12 @@ async fn an_archive_serves_an_empty_frame_it_rebuilt_whole_from_its_carried_head
         let vouched = std::collections::HashMap::from([(95, header)]);
         assert!(
             !ingest
-                .materialize_through_vouched(&filter, 95, &vouched)
+                .materialize_through_vouched(&filter, 95, &vouched, 0)
                 .unwrap(),
             "the body is sought first"
         );
         assert!(ingest
-            .materialize_through_vouched(&filter, 95, &vouched)
+            .materialize_through_vouched(&filter, 95, &vouched, 0)
             .unwrap());
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 95);
         let served = clock.get_shard_clock_frame(&filter, 95, false).ok();
