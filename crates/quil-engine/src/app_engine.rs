@@ -2953,6 +2953,10 @@ pub struct AppConsensusEngine {
     sealed_session: Option<([u8; 32], Vec<u8>)>,
     /// When this member last published its closing certificate.
     seal_published_at: Option<std::time::Instant>,
+    /// The partial drain this member last published and the view moves
+    /// since, to publish the next part when the view moves
+    /// ([`crate::seal_follow`]).
+    seal_follow: crate::seal_follow::SealFollow,
     /// Whether the running session's committed status is unreadable.
     session_status_outage: crate::outage::Outage,
     /// Whether the GLOBAL view the running session is judged by trails the
@@ -3139,6 +3143,7 @@ impl AppConsensusEngine {
             private_parents: None,
             sealed_session: None,
             seal_published_at: None,
+            seal_follow: Default::default(),
             // Checked every 10 s: three unreadable checks in a row.
             session_status_outage: crate::outage::Outage::begin_after(3),
             session_view_lag: Default::default(),
@@ -6839,7 +6844,7 @@ impl AppConsensusEngine {
             "app committee session sealed; submitting closing certificate"
         );
         self.execution.sealed(session.generation, checkpoint, view);
-        self.publish_seal(&submission.1);
+        self.publish_seal(&submission.1, "sealed");
         self.sealed_session = Some(submission);
         self.seal_published_at = Some(std::time::Instant::now());
         self.execution.state("handoff", "awaiting successor");
@@ -6854,8 +6859,10 @@ impl AppConsensusEngine {
     /// (`app_handoff::drained_seal`, #699): GLOBAL accepts the seal only once
     /// it has executed the sealed checkpoint frame. Says how far GLOBAL has
     /// executed the session, so a seal that keeps waiting shows why.
-    fn publish_seal(&self, base: &[u8]) {
-        let Some(publish) = self.coverage_publish.as_ref() else {
+    /// `trigger` says why this copy goes out: `sealed`, `timer` or
+    /// `view_moved` ([`crate::seal_follow`]).
+    fn publish_seal(&mut self, base: &[u8], trigger: &'static str) {
+        let Some(publish) = self.coverage_publish.clone() else {
             return;
         };
         let drained = self.global_hypergraph.as_ref().map(|global| {
@@ -6866,7 +6873,7 @@ impl AppConsensusEngine {
                 if drained.executed < drained.checkpoint {
                     info!(core_id = self.core_id, filter = hex::encode(&self.filter),
                         global_executed = drained.executed, checkpoint = drained.checkpoint,
-                        drain_headers = drained.attached, drain = drained.reason,
+                        drain_headers = drained.attached, drain = drained.reason, trigger,
                         "closing certificate waits for GLOBAL to execute the session through its checkpoint");
                 }
                 if drained.reason == "too_many" {
@@ -6877,14 +6884,19 @@ impl AppConsensusEngine {
                 }
                 self.execution
                     .seal_submitted(drained.executed, drained.reason, drained.attached);
+                self.seal_follow.published(drained.reason, drained.executed);
                 publish(drained.bytes);
             }
             Some(Err(error)) => {
                 warn!(core_id = self.core_id, error = %error, "seal drain headers unavailable; submitting the seal alone");
                 self.execution.seal_submitted(0, "unavailable", 0);
+                self.seal_follow.published("unavailable", 0);
                 publish(base.to_vec());
             }
-            None => publish(base.to_vec()),
+            None => {
+                self.seal_follow.clear();
+                publish(base.to_vec());
+            }
         }
     }
 
@@ -7440,6 +7452,72 @@ impl AppConsensusEngine {
             "app session below voting quorum: members never voted");
     }
 
+    /// Republish this member's unrecorded closing certificate when due.
+    ///
+    /// Every member of the closing committee submits the seal; a copy
+    /// already in flight needs no repeat until it has had time to land.
+    /// Resubmissions are spaced a minute apart, staggered per member, so a
+    /// committee's members do not flood GLOBAL in step while their views of
+    /// it lag. While GLOBAL drains the session in parts, the next part goes
+    /// out once this member's view shows the last one executed, in the
+    /// member's turn ([`crate::seal_follow`]), and the minute counts from
+    /// that move: at most one copy per member per executed part, and about
+    /// one per committee while the drain moves.
+    fn republish_seal_if_due(
+        &mut self,
+        global: &Arc<quil_hypergraph::HypergraphCrdt>,
+        session: &quil_cw_consensus::handoff::Session,
+    ) {
+        use quil_execution::global_intrinsic::handoff;
+        let Some((id, submission)) = self.sealed_session.clone() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let resubmit_after = std::time::Duration::from_secs(
+            60 + u64::from(self.local_bls_pubkey.last().copied().unwrap_or(0) % 30),
+        );
+        let following = self.seal_follow.following();
+        let timer_due = |follow: &crate::seal_follow::SealFollow,
+                         published: Option<std::time::Instant>| {
+            published
+                .max(follow.moved_at())
+                .is_none_or(|at| now.saturating_duration_since(at) >= resubmit_after)
+        };
+        if !following && !timer_due(&self.seal_follow, self.seal_published_at) {
+            return;
+        }
+        let view = handoff::CommittedView::capture(global);
+        let mut trigger = "timer";
+        if following {
+            let executed = view.as_ref().ok().and_then(|view| {
+                handoff::session_tip(view, &id)
+                    .ok()
+                    .map(|tip| tip.map_or(session.base_frame, |tip| tip.frame))
+            });
+            let rank = session
+                .members
+                .iter()
+                .position(|member| *member == self.local_bls_pubkey)
+                .unwrap_or_else(|| usize::from(self.local_bls_pubkey.last().copied().unwrap_or(0)));
+            if self
+                .seal_follow
+                .due(executed, rank, session.members.len(), now)
+            {
+                trigger = "view_moved";
+            } else if !timer_due(&self.seal_follow, self.seal_published_at) {
+                return;
+            }
+        }
+        match view.and_then(|view| handoff::schedule::seal_submitted(&view, session)) {
+            Ok(false) => {
+                self.publish_seal(&submission, trigger);
+                self.seal_published_at = Some(now);
+            }
+            Ok(true) => self.execution.seal_recorded(),
+            Err(_) => {}
+        }
+    }
+
     /// Timer-driven session upkeep: republish an unrecorded closing certificate,
     /// and stop a host whose session was retired or superseded so the retry
     /// path resolves the successor.
@@ -7465,34 +7543,10 @@ impl AppConsensusEngine {
         {
             self.sealed_session = None;
             self.seal_published_at = None;
+            self.seal_follow.clear();
             self.execution.clear_seal();
         }
-        // Every member of the closing committee submits the seal; a copy
-        // already in flight needs no repeat until it has had time to land.
-        // Resubmissions are spaced a minute apart, staggered per member, so a
-        // committee's members do not flood GLOBAL in step while their views of
-        // it lag.
-        let resubmit_after = std::time::Duration::from_secs(
-            60 + u64::from(self.local_bls_pubkey.last().copied().unwrap_or(0) % 30),
-        );
-        let due = self
-            .seal_published_at
-            .is_none_or(|at| at.elapsed() >= resubmit_after);
-        if let (Some((_, submission)), true) = (self.sealed_session.as_ref(), due) {
-            let view = quil_execution::global_intrinsic::handoff::CommittedView::capture(&global);
-            let recorded = view.and_then(|view| {
-                quil_execution::global_intrinsic::handoff::schedule::seal_submitted(&view, &session)
-            });
-            match recorded {
-                Ok(false) => {
-                    let submission = submission.clone();
-                    self.publish_seal(&submission);
-                    self.seal_published_at = Some(std::time::Instant::now());
-                }
-                Ok(true) => self.execution.seal_recorded(),
-                Err(_) => {}
-            }
-        }
+        self.republish_seal_if_due(&global, &session);
         let status = crate::app_handoff::still_current(&global, &session);
         let now = std::time::Instant::now();
         let filter = hex::encode(&self.filter);
@@ -21219,6 +21273,298 @@ mod tests {
     fn app_shard_proposal_too_short() {
         let data = [0u8; 2];
         assert!(AppShardProposal::from_canonical_bytes(&data).is_err());
+    }
+
+    /// A member's engine and the seal copies it published.
+    type SealMember = (AppConsensusEngine, Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+    /// Members of a closing committee whose session GLOBAL has executed none
+    /// of: the session's frames 1..=40 stored, sealed at 40, and one engine
+    /// per member with that seal to publish and its published copies.
+    fn sealed_drain_committee(
+        members: usize,
+    ) -> (
+        Arc<quil_hypergraph::HypergraphCrdt>,
+        [u8; 32],
+        Vec<SealMember>,
+    ) {
+        use quil_execution::global_intrinsic::handoff;
+        use quil_types::crypto::Signer as _;
+        use quil_types::store::ClockStore as _;
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        global.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
+        let mut keys: Vec<Vec<u8>> = (0..members)
+            .map(|_| quil_crypto::FalconSigner::generate().public_key().to_vec())
+            .collect();
+        keys.sort();
+        let filter = vec![0x61; 32];
+        let session = quil_cw_consensus::handoff::Session {
+            chain_id: [7; 32],
+            filter: filter.clone(),
+            generation: 1,
+            genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
+            base_frame: 0,
+            authorization: [0; 32],
+            members: keys.clone(),
+        };
+        let id = session.id().unwrap();
+        let state = quil_execution::hypergraph_state::HypergraphState::new(global.clone());
+        handoff::initialize(&state, 1, &session).unwrap();
+        state.commit().unwrap();
+        state.abort();
+        global
+            .commit_with_global_cursor(1, &quil_store::encoding::global_materialized_cursor_key())
+            .unwrap();
+        for number in 1..=40u64 {
+            let header = quil_types::proto::global::FrameHeader {
+                address: filter.clone(),
+                frame_number: number,
+                rank: number,
+                output: vec![number as u8; 516],
+                ..Default::default()
+            };
+            let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap();
+            let frame = quil_types::proto::global::AppShardFrame {
+                header: Some(header),
+                ..Default::default()
+            };
+            let txn = clock.new_transaction(false).unwrap();
+            clock
+                .stage_shard_clock_frame(&selector, &frame, txn.as_ref())
+                .unwrap();
+            clock
+                .commit_shard_clock_frame(&filter, number, &selector, txn.as_ref(), false)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let seal = quil_cw_consensus::handoff::Seal {
+            request: [9; 32],
+            session: id,
+            view: 50,
+            checkpoint: quil_cw_consensus::handoff::Checkpoint {
+                frame: 40,
+                view: 49,
+                digest: [0; 32],
+                state_roots: [[0; 32]; 4],
+                history_root: [0; 32],
+            },
+        };
+        let base = crate::app_handoff::submission(&seal.encode(), vec![1; 16]).unwrap();
+        let engines = keys
+            .iter()
+            .map(|key| {
+                let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let publish = sent.clone();
+                let (events, _received) = mpsc::unbounded_channel();
+                let private = [7; 57];
+                let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
+                let deps = AppEngineDeps {
+                    delivery_frame_source: None,
+                    clock_store: clock.clone(),
+                    global_anchor_store: None,
+                    global_hypergraph: Some(global.clone()),
+                    prover_registry: Arc::new(crate::test_support::TestProverRegistry::new()),
+                    frame_prover: Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+                    message_collector: Arc::new(MessageCollector::new()),
+                    fee_manager: Arc::new(crate::fees::InMemoryDynamicFeeManager::new(10)),
+                    local_prover_address: vec![1; 32],
+                    local_bls_pubkey: key.clone(),
+                    bls_signer: Box::new(
+                        quil_crypto::Ed448Signer::from_bytes(&private, &public).unwrap(),
+                    ),
+                    reward_greedy: false,
+                    min_active_provers_for_propose: 1,
+                    coverage_publish: Some(Arc::new(move |bytes: Vec<u8>| {
+                        publish.lock().unwrap().push(bytes)
+                    })),
+                    hypergraph: None,
+                    storage_source_hypergraph: None,
+                    topology: None,
+                    execution_engine: None,
+                    inclusion_prover: None,
+                    kv_db: None,
+                    app_consensus_cw: false,
+                    db_config: Default::default(),
+                    unified_cutover_hook: None,
+                };
+                let (mut engine, _handle) = AppConsensusEngine::new(
+                    1,
+                    quil_execution::domains::QUIL_TOKEN.to_vec(),
+                    deps,
+                    events,
+                );
+                engine.cw_session = Some(session.clone());
+                engine.sealed_session = Some((id, base.clone()));
+                (engine, sent)
+            })
+            .collect();
+        (global, id, engines)
+    }
+
+    /// GLOBAL executes a part of `id`'s drain: its tip moves to `frame`, in
+    /// GLOBAL frame `global_frame`.
+    fn execute_drain_part(
+        global: &Arc<quil_hypergraph::HypergraphCrdt>,
+        id: &[u8; 32],
+        frame: u64,
+        global_frame: u64,
+    ) {
+        use quil_execution::global_intrinsic::handoff;
+        let state = quil_execution::hypergraph_state::HypergraphState::new(global.clone());
+        let tip = quil_cw_consensus::handoff::Checkpoint {
+            frame,
+            view: frame,
+            digest: [0; 32],
+            state_roots: [[0; 32]; 4],
+            history_root: [0; 32],
+        };
+        handoff::record_session_tip(&state, global_frame, id, &tip).unwrap();
+        state.commit().unwrap();
+        state.abort();
+        global
+            .commit_with_global_cursor(
+                global_frame,
+                &quil_store::encoding::global_materialized_cursor_key(),
+            )
+            .unwrap();
+    }
+
+    /// The source frames a published seal copy drains.
+    fn drained_frames(bytes: &[u8]) -> Vec<u64> {
+        use quil_execution::global_intrinsic::{frame_header::FrameHeader, handoff};
+        handoff::SealSubmission::from_canonical_bytes(bytes)
+            .unwrap()
+            .drain
+            .iter()
+            .map(|header| {
+                FrameHeader::from_canonical_bytes(header)
+                    .unwrap()
+                    .frame_number
+            })
+            .collect()
+    }
+
+    /// A sealed session GLOBAL lacks 40 frames of drains in parts of eight.
+    /// Once a member's view shows a part executed, the next part goes out at
+    /// the next tick, not when the 60-89 s resubmission timer runs out: on
+    /// the timer alone a drain moved about five frames a minute. A tick whose view
+    /// has not moved sends nothing.
+    #[tokio::test]
+    async fn a_partial_seal_drain_is_republished_once_the_view_moves() {
+        use quil_execution::global_intrinsic::handoff;
+        handoff::set_seal_drain_frame_for_thread(Some(0));
+        handoff::set_seal_recovery_frame_for_thread(Some(0));
+        let (global, id, mut engines) = sealed_drain_committee(4);
+        let sent = |engines: &[SealMember]| {
+            engines
+                .iter()
+                .map(|(_, sent)| {
+                    sent.lock()
+                        .unwrap()
+                        .iter()
+                        .map(|bytes| drained_frames(bytes))
+                        .collect()
+                })
+                .collect::<Vec<Vec<Vec<u64>>>>()
+        };
+        for (engine, _) in engines.iter_mut() {
+            engine.maintain_committee_session().await;
+        }
+        let first: Vec<u64> = (1..=8).collect();
+        assert!(
+            sent(&engines)
+                .iter()
+                .all(|copies| *copies == vec![first.clone()]),
+            "every member publishes the first part: {:?}",
+            sent(&engines)
+        );
+        for (engine, _) in engines.iter_mut() {
+            engine.maintain_committee_session().await;
+        }
+        assert!(
+            sent(&engines).iter().all(|copies| copies.len() == 1),
+            "an unmoved view sends nothing before the timer"
+        );
+        // GLOBAL executes one member's copy.
+        execute_drain_part(&global, &id, 8, 2);
+        for (engine, _) in engines.iter_mut() {
+            engine.maintain_committee_session().await;
+        }
+        let next: Vec<u64> = (9..=16).collect();
+        let republished = sent(&engines)
+            .iter()
+            .filter(|copies| copies.len() == 2 && copies[1] == next)
+            .count();
+        assert!(
+            republished >= 1,
+            "no member republished the next part (frames 9-16) once its view showed frames 1-8 \
+             executed; the resubmission timer (60-89 s) had not run out: {:?}",
+            sent(&engines)
+        );
+        handoff::set_seal_recovery_frame_for_thread(None);
+        handoff::set_seal_drain_frame_for_thread(None);
+    }
+
+    /// The next part goes out from one member per view move: the head of
+    /// the line for the new tip (`seal_follow::turn`), which rotates part by
+    /// part. The others' turns come 20 s apart and lapse when the view moves
+    /// again first; the timer, counted from the move, stays the fallback.
+    /// The part that reaches the checkpoint is not followed.
+    #[tokio::test]
+    async fn one_member_per_view_move_republishes_a_partial_seal_drain() {
+        use quil_execution::global_intrinsic::handoff;
+        handoff::set_seal_drain_frame_for_thread(Some(0));
+        handoff::set_seal_recovery_frame_for_thread(Some(0));
+        let members = 4;
+        let (global, id, mut engines) = sealed_drain_committee(members);
+        let counts = |engines: &[SealMember]| {
+            engines
+                .iter()
+                .map(|(_, sent)| sent.lock().unwrap().len())
+                .collect::<Vec<_>>()
+        };
+        for (engine, _) in engines.iter_mut() {
+            engine.maintain_committee_session().await;
+        }
+        let mut expected = vec![1; members];
+        assert_eq!(counts(&engines), expected);
+        for (part, tip) in [8u64, 16, 24, 32].into_iter().enumerate() {
+            execute_drain_part(&global, &id, tip, 2 + part as u64);
+            for _ in 0..3 {
+                for (engine, _) in engines.iter_mut() {
+                    engine.maintain_committee_session().await;
+                }
+            }
+            let head = (tip / 8) as usize % members;
+            expected[head] += 1;
+            assert_eq!(
+                counts(&engines),
+                expected,
+                "tip {tip}: only member {head}, the head of the line, republished, once"
+            );
+            let last = engines[head].1.lock().unwrap().last().cloned().unwrap();
+            assert_eq!(
+                drained_frames(&last),
+                (tip + 1..=(tip + 8).min(40)).collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            !engines[0].0.seal_follow.following(),
+            "frames 33-40 reach the checkpoint: the timer alone republishes them"
+        );
+        assert!(engines[1..]
+            .iter()
+            .all(|(engine, _)| engine.seal_follow.following()));
+        handoff::set_seal_recovery_frame_for_thread(None);
+        handoff::set_seal_drain_frame_for_thread(None);
     }
 }
 
