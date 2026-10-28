@@ -34,7 +34,7 @@ use quil_hypergraph::HypergraphCrdt;
 use quil_store::replica_store::ReplicaStore;
 use quil_types::error::{QuilError, Result};
 use quil_types::store::ClockStore;
-use tracing::info;
+use tracing::{info, warn};
 
 use quil_execution::global_intrinsic::storage_binding::{
     self as binding, Entry, LeafBinding, LeafClaim,
@@ -388,6 +388,247 @@ pub(crate) fn leaf_read_bytes(size: u128) -> u64 {
     estimated_leaf_bytes(size).saturating_mul(5) / 2
 }
 
+/// How long a leaf's labelling or encode runs before it is reported as
+/// running long, and how often again while it runs, at most once a seat.
+const LEAF_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How often the running leaves are looked at for [`LEAF_PROGRESS_INTERVAL`].
+const LEAF_PROGRESS_CHECK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A leaf whose labelling is estimated at least this long logs its start and
+/// its end: shorter ones only the seat's summary.
+const LEAF_LOGGED_FROM: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Seconds labelling a GiB of a leaf's nodes takes on one core.
+const LABEL_SECONDS_PER_GIB: u64 = 3600;
+
+/// What a running leaf does ([`leaf_started`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LeafWork {
+    /// Its snapshot encodes it from the labels kept ahead for it.
+    FromLabelsAhead,
+    /// Its snapshot labels it now: none were kept ahead that fit it.
+    LabellingNow,
+    /// It is labelled ahead of a later epoch's snapshot
+    /// (`crate::storage_labels::precompute`); nothing waits for it yet.
+    LabellingAhead,
+}
+
+impl LeafWork {
+    fn name(self) -> &'static str {
+        match self {
+            Self::FromLabelsAhead => "encoding from labels kept ahead",
+            Self::LabellingNow => "labelling now",
+            Self::LabellingAhead => "labelling ahead",
+        }
+    }
+}
+
+/// About how long labelling a leaf of `nodes` nodes takes on one core.
+pub fn label_estimate(nodes: u64) -> std::time::Duration {
+    let bytes = u128::from(nodes) * quil_crypto::storage_proof::NODE_BYTES as u128;
+    let seconds = bytes * u128::from(LABEL_SECONDS_PER_GIB) / (1u128 << 30);
+    std::time::Duration::from_secs(u64::try_from(seconds).unwrap_or(u64::MAX))
+}
+
+/// A leaf being labelled or encoded.
+struct RunningLeaf {
+    epoch: u64,
+    filter: Vec<u8>,
+    nodes: u64,
+    work: LeafWork,
+    started: std::time::Instant,
+    /// Its labelling's estimate; none when its labels were kept ahead.
+    estimate: Option<std::time::Duration>,
+    /// Whether its start was logged, or it was reported running long: its
+    /// end is logged then.
+    logged: bool,
+}
+
+#[derive(Default)]
+struct RunningLeaves {
+    next: u64,
+    leaves: std::collections::HashMap<u64, RunningLeaf>,
+    /// When each seat's (epoch, shard, work) long leaves were last reported.
+    reported: std::collections::HashMap<(u64, Vec<u8>, LeafWork), std::time::Instant>,
+}
+
+fn running_leaves() -> std::sync::MutexGuard<'static, RunningLeaves> {
+    static RUNNING: std::sync::OnceLock<std::sync::Mutex<RunningLeaves>> =
+        std::sync::OnceLock::new();
+    RUNNING
+        .get_or_init(|| {
+            if let Err(error) = std::thread::Builder::new()
+                .name("storage-progress".into())
+                .spawn(report_long_leaves)
+            {
+                warn!(%error, "storage leaf progress thread not started; long leaves are not reported while they run");
+            }
+            Default::default()
+        })
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A leaf's work in progress ([`leaf_started`]); its end is logged when it
+/// drops, if its start was or it ran long.
+#[must_use = "the leaf's work ends when this drops"]
+pub struct LeafProgress {
+    id: u64,
+}
+
+/// Track `member`'s leaf `leaf_id` of shard `filter` for `epoch`, of `nodes`
+/// nodes, while its `work` runs: its start and end are logged when its
+/// labelling is estimated at [`LEAF_LOGGED_FROM`] or more, and every
+/// [`LEAF_PROGRESS_INTERVAL`] it runs a line reports its seat's long leaves.
+pub fn leaf_started(
+    epoch: u64,
+    filter: &[u8],
+    leaf_id: &[u8],
+    nodes: u64,
+    work: LeafWork,
+) -> LeafProgress {
+    let estimate = (work != LeafWork::FromLabelsAhead).then(|| label_estimate(nodes));
+    let logged = estimate.is_some_and(|estimate| estimate >= LEAF_LOGGED_FROM);
+    if logged {
+        info!(epoch, filter = %hex::encode(filter), leaf = %hex::encode(leaf_id), nodes,
+            work = work.name(), estimated_minutes = estimate.map_or(0, |e| e.as_secs() / 60),
+            scope = "local", "storage leaf work started");
+    }
+    let mut running = running_leaves();
+    let id = running.next;
+    running.next += 1;
+    running.leaves.insert(
+        id,
+        RunningLeaf {
+            epoch,
+            filter: filter.to_vec(),
+            nodes,
+            work,
+            started: std::time::Instant::now(),
+            estimate,
+            logged,
+        },
+    );
+    LeafProgress { id }
+}
+
+impl Drop for LeafProgress {
+    fn drop(&mut self) {
+        let Some(leaf) = running_leaves().leaves.remove(&self.id) else {
+            return;
+        };
+        if leaf.logged {
+            info!(epoch = leaf.epoch, filter = %hex::encode(&leaf.filter), nodes = leaf.nodes,
+                work = leaf.work.name(), seconds = leaf.started.elapsed().as_secs(),
+                scope = "local", "storage leaf work ended");
+        }
+    }
+}
+
+/// The leaves of a seat's snapshot still running: how many, and at least how
+/// long the longest has left by its estimate, and whether any labels now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SnapshotProgress {
+    pub leaves: usize,
+    pub remaining: std::time::Duration,
+    pub labelling_now: bool,
+}
+
+/// [`SnapshotProgress`] of the snapshot leaves of `filters` for `epoch`
+/// running now; `None` when none is (queued, waiting for memory, or done).
+pub fn snapshot_progress(filters: &[Vec<u8>], epoch: u64) -> Option<SnapshotProgress> {
+    let running = running_leaves();
+    let mut progress = SnapshotProgress::default();
+    for leaf in running.leaves.values().filter(|leaf| {
+        leaf.epoch == epoch
+            && leaf.work != LeafWork::LabellingAhead
+            && filters.contains(&leaf.filter)
+    }) {
+        progress.leaves += 1;
+        progress.labelling_now |= leaf.work == LeafWork::LabellingNow;
+        if let Some(estimate) = leaf.estimate {
+            progress.remaining = progress
+                .remaining
+                .max(estimate.saturating_sub(leaf.started.elapsed()));
+        }
+    }
+    (progress.leaves > 0).then_some(progress)
+}
+
+/// Report, every [`LEAF_PROGRESS_INTERVAL`] at most once a seat, the leaves
+/// running longer than it: a renewal waits for a snapshot's.
+fn report_long_leaves() {
+    loop {
+        std::thread::sleep(LEAF_PROGRESS_CHECK);
+        #[derive(Default)]
+        struct Seat {
+            leaves: usize,
+            nodes: u64,
+            longest: std::time::Duration,
+            estimate: Option<std::time::Duration>,
+        }
+        let mut seats: std::collections::BTreeMap<(u64, Vec<u8>, LeafWork), Seat> =
+            Default::default();
+        {
+            let mut running = running_leaves();
+            let RunningLeaves {
+                leaves, reported, ..
+            } = &mut *running;
+            for leaf in leaves.values_mut() {
+                let elapsed = leaf.started.elapsed();
+                if elapsed < LEAF_PROGRESS_INTERVAL {
+                    continue;
+                }
+                let key = (leaf.epoch, leaf.filter.clone(), leaf.work);
+                if reported
+                    .get(&key)
+                    .is_some_and(|at| at.elapsed() < LEAF_PROGRESS_INTERVAL)
+                {
+                    continue;
+                }
+                leaf.logged = true;
+                let seat = seats.entry(key).or_default();
+                seat.leaves += 1;
+                seat.nodes += leaf.nodes;
+                if elapsed >= seat.longest {
+                    seat.longest = elapsed;
+                    seat.estimate = leaf.estimate;
+                }
+            }
+            let now = std::time::Instant::now();
+            reported.retain(|_, at| at.elapsed() < LEAF_PROGRESS_INTERVAL * 2);
+            for key in seats.keys() {
+                reported.insert(key.clone(), now);
+            }
+        }
+        for ((epoch, filter, work), seat) in seats {
+            let estimated = seat
+                .estimate
+                .map_or_else(|| "unknown".to_string(), |e| (e.as_secs() / 60).to_string());
+            let (longest, filter) = (seat.longest.as_secs() / 60, hex::encode(&filter));
+            let overrun = seat.estimate.is_some_and(|e| seat.longest > e);
+            match work {
+                LeafWork::LabellingAhead if !overrun => info!(epoch, filter = %filter,
+                    leaves = seat.leaves, nodes = seat.nodes, longest_minutes = longest,
+                    estimated_minutes = %estimated, work = work.name(), scope = "local",
+                    "storage labels for a later epoch's snapshot still being computed ahead; \
+                     nothing waits for them yet"),
+                LeafWork::LabellingAhead => warn!(epoch, filter = %filter,
+                    leaves = seat.leaves, nodes = seat.nodes, longest_minutes = longest,
+                    estimated_minutes = %estimated, work = work.name(), scope = "local",
+                    action = "check this node's CPU load: the labelling runs past its estimate",
+                    "storage labels for a later epoch's snapshot still being computed ahead, past their estimate"),
+                _ => warn!(epoch, filter = %filter, leaves = seat.leaves, nodes = seat.nodes,
+                    longest_minutes = longest, estimated_minutes = %estimated,
+                    work = work.name(), scope = "local",
+                    "storage snapshot leaves still encoding: this seat's renewal registers its storage once \
+                     they end, and renews without a storage registration if they have not by the grace frame"),
+            }
+        }
+    }
+}
+
 /// A member's sink: encode each leaf into its replica for `member` and store it
 /// with its cap and registration root, then the partition, which marks the
 /// epoch's leaves ready for the renewal to register. The leaves encode side by
@@ -414,6 +655,7 @@ fn encode_member_with(
     use crate::storage_labels::Stage;
     use quil_crypto::storage_proof::{data_node_count, padded_nodes_allowed};
     let params = quil_crypto::sdr::SdrParams::default();
+    let started = std::time::Instant::now();
     let encoded = crate::storage_jobs::for_each_parallel(&captured.prefixes, |prefix| {
         let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&captured.filter, prefix);
         let mut memory = crate::storage_jobs::reserve(encoding_bytes(data_node_count(
@@ -427,6 +669,17 @@ fn encode_member_with(
             })
         });
         memory.resize(encoding_bytes(ahead.as_ref().map_or(exact, |kept| kept.n)));
+        let _progress = leaf_started(
+            captured.epoch,
+            &captured.filter,
+            &leaf_id,
+            ahead.as_ref().map_or(exact, |kept| kept.n),
+            if ahead.is_some() {
+                LeafWork::FromLabelsAhead
+            } else {
+                LeafWork::LabellingNow
+            },
+        );
         let from_kept = ahead.and_then(|kept| {
             use quil_crypto::storage_proof::LabelSource as _;
             let last = kept.last_layer()?;
@@ -469,7 +722,8 @@ fn encode_member_with(
     })?;
     info!(epoch = captured.epoch, filter = %hex::encode(&captured.filter), leaves = encoded.len(),
         labelled_ahead = encoded.iter().filter(|(_, ahead)| *ahead).count(),
-        nodes = encoded.iter().map(|(n, _)| n).sum::<u64>(), "storage snapshot leaves encoded");
+        nodes = encoded.iter().map(|(n, _)| n).sum::<u64>(), seconds = started.elapsed().as_secs(),
+        "storage snapshot leaves encoded");
     let nodes: Vec<u64> = encoded.iter().map(|(n, _)| *n).collect();
     let plan = quil_execution::global_intrinsic::storage_snapshot::encode_plan(&[(
         captured.filter.clone(),
@@ -1826,6 +2080,11 @@ mod tests {
         assert!(
             precomputed(&member, &app, epoch),
             "asked again only after a while"
+        );
+        assert_eq!(
+            full.leaves_read(),
+            0,
+            "a leaf refused room is refused before its data is read into memory"
         );
         let captured =
             capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
