@@ -6,6 +6,7 @@ pub mod app_shard_cache;
 pub mod app_shard_metadata;
 pub mod app_types;
 pub mod archive_ingest;
+pub mod archive_preverify;
 mod bounded_warn;
 mod closing_certificate;
 pub mod committee;

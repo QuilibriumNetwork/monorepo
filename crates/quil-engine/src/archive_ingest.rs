@@ -120,6 +120,12 @@ pub struct ArchiveAppShardIngest {
     /// Reported frames found not to be owed, and since when: such a report
     /// is not looked into again for [`NOT_OWED_TTL`]; at most [`MAX_NOT_OWED`].
     not_owed: HashMap<(Vec<u8>, u64), Instant>,
+    /// Verifies confidential proofs ahead of materialization, filling the
+    /// process-wide verdict cache ([`crate::archive_preverify`]).
+    proof_verifier: Arc<crate::archive_preverify::ProofVerifier>,
+    /// Verifies the proofs of admitted frames in the background before GLOBAL
+    /// sequences them; set by [`Self::sequenced`].
+    prewarm: Option<crate::archive_preverify::ProofPrewarm>,
     #[cfg(test)]
     skip_header_authentication: bool,
 }
@@ -275,6 +281,16 @@ impl ArchiveAppShardIngest {
                     .with_handoff_authority(hypergraph.clone()),
             ),
             clock_store,
+            proof_verifier: {
+                let execution_manager = execution_manager.clone();
+                Arc::new(
+                    move |bundles: &[(Vec<u8>, Vec<u8>)],
+                          pacing: &quil_execution::manager::PreverifyPacing<'_>| {
+                        execution_manager.preverify_bundles_paced(bundles, pacing)
+                    },
+                )
+            },
+            prewarm: None,
             execution_manager,
             inclusion_prover,
             hypergraph,
@@ -306,9 +322,102 @@ impl ArchiveAppShardIngest {
     /// diverging their prover roots. Arrival-time ingest also
     /// shared the CRDT's staging with an in-place GLOBAL execution, so either
     /// commit could publish the other's partial mutations.
+    ///
+    /// A sequenced ingest also verifies the confidential proofs of the frames
+    /// it admits in the background ([`crate::archive_preverify::ProofPrewarm`]):
+    /// they are materialized only once a GLOBAL frame carries their headers,
+    /// and verified then, under this ingest, a backlog held it for hours.
     pub fn sequenced(mut self) -> Self {
         self.sequenced = true;
+        self.prewarm = Some(crate::archive_preverify::ProofPrewarm::new(
+            self.proof_verifier.clone(),
+        ));
         self
+    }
+
+    /// Verify proofs with `verifier` instead of the execution manager.
+    #[cfg(test)]
+    pub(crate) fn with_proof_verifier(
+        mut self,
+        verifier: Arc<crate::archive_preverify::ProofVerifier>,
+    ) -> Self {
+        self.proof_verifier = verifier.clone();
+        if self.prewarm.is_some() {
+            self.prewarm = Some(crate::archive_preverify::ProofPrewarm::new(verifier));
+        }
+        self
+    }
+
+    /// The background pre-verification of admitted frames, if sequenced.
+    pub fn proof_prewarm(&self) -> Option<&crate::archive_preverify::ProofPrewarm> {
+        self.prewarm.as_ref()
+    }
+
+    /// What [`crate::archive_preverify::preverify_through`] verifies with and
+    /// reads stored bodies from, outside this ingest.
+    pub(crate) fn preverify_sources(
+        &self,
+    ) -> (
+        Arc<crate::archive_preverify::ProofVerifier>,
+        Arc<dyn quil_types::store::ClockStore>,
+    ) {
+        (self.proof_verifier.clone(), self.clock_store.clone())
+    }
+
+    /// The bodies of `address` above the cursor through `through` that this
+    /// ingest holds, in order, up to the first it lacks and within `budget`
+    /// (marked truncated when that cut them short): held ones cloned,
+    /// stored ones by number, to be read without this ingest. Nothing changes.
+    pub(crate) fn plan_bodies(
+        &mut self,
+        address: &[u8],
+        through: u64,
+        budget: &mut crate::archive_preverify::PlanBudget,
+    ) -> Vec<crate::archive_preverify::PlannedBody> {
+        use crate::archive_preverify::{PlanBudget, PlannedBody};
+        let mut bodies = Vec::new();
+        let Ok(cursor) = self.materialized_height(address) else {
+            return bodies;
+        };
+        let mut next = cursor.saturating_add(1);
+        while next <= through {
+            let held = self
+                .buffered
+                .get(address)
+                .and_then(|frames| frames.get(&next))
+                .map(|frame| frame.requests.as_slice());
+            let body = match held {
+                Some(requests) => {
+                    if !budget.take(PlanBudget::bundle_bytes(requests)) {
+                        break;
+                    }
+                    PlannedBody::Held(requests.to_vec())
+                }
+                None if self
+                    .stored
+                    .get(address)
+                    .is_some_and(|stored| stored.contains_key(&next)) =>
+                {
+                    // Its bytes are counted once read, without this ingest.
+                    if !budget.take(0) {
+                        break;
+                    }
+                    PlannedBody::Stored(next)
+                }
+                None => match self.committed_held(address, next) {
+                    Some(frame) => {
+                        if !budget.take(PlanBudget::bundle_bytes(&frame.requests)) {
+                            break;
+                        }
+                        PlannedBody::Held(frame.requests)
+                    }
+                    None => break,
+                },
+            };
+            bodies.push(body);
+            next += 1;
+        }
+        bodies
     }
 
     /// For tests elsewhere in the crate: `address` materialized through
@@ -700,7 +809,15 @@ impl ArchiveAppShardIngest {
                 return;
             }
         }
+        let prewarm = self
+            .prewarm
+            .as_ref()
+            .filter(|_| !frame.requests.is_empty())
+            .map(|_| frame.requests.clone());
         self.admit(&address, frame, certified);
+        if let (Some(prewarm), Some(requests)) = (self.prewarm.as_ref(), prewarm) {
+            prewarm.offer(&address, &requests);
+        }
         if !self.sequenced {
             self.try_materialize(&address);
         }
@@ -4169,5 +4286,181 @@ mod tests {
         store.fail_commit_setup(false, false);
         ingest.retry_pending();
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 1);
+    }
+
+    /// A certified frame of `filter` carrying `bundles` empty bundles.
+    fn frame_with_bundles(filter: &[u8], number: u64, bundles: usize) -> AppShardFrame {
+        let mut frame = verified_frame(filter, number);
+        frame.requests = (0..bundles)
+            .map(|index| quil_types::proto::global::MessageBundle {
+                requests: Vec::new(),
+                timestamp: (number * 100 + index as u64) as i64,
+            })
+            .collect();
+        frame
+    }
+
+    type Seen = Arc<std::sync::Mutex<Vec<usize>>>;
+
+    /// A verifier recording how many bundles each call got, and whether
+    /// `ingest` (once set) was free while it ran.
+    fn recording_verifier(
+        seen: Seen,
+        ingest: Arc<std::sync::OnceLock<Arc<std::sync::Mutex<ArchiveAppShardIngest>>>>,
+        free: Arc<std::sync::Mutex<Vec<bool>>>,
+        busy: bool,
+    ) -> Arc<crate::archive_preverify::ProofVerifier> {
+        Arc::new(
+            move |pairs: &[(Vec<u8>, Vec<u8>)],
+                  _: &quil_execution::manager::PreverifyPacing<'_>| {
+                seen.lock().unwrap().push(pairs.len());
+                if let Some(ingest) = ingest.get() {
+                    free.lock().unwrap().push(ingest.try_lock().is_ok());
+                }
+                quil_execution::manager::PreverifyCounts {
+                    operations: pairs.len(),
+                    verified: if busy { 0 } else { pairs.len() },
+                    busy: if busy { pairs.len() } else { 0 },
+                    ..Default::default()
+                }
+            },
+        )
+    }
+
+    /// A sequenced (archive) ingest verifies the proofs of a frame it admits
+    /// in the background, before any GLOBAL frame sequences it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_admitted_frame_has_its_proofs_verified_in_the_background() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let seen: Seen = Default::default();
+        let (ingest, _) = fixture();
+        let mut ingest = ingest.sequenced().with_proof_verifier(recording_verifier(
+            seen.clone(),
+            Default::default(),
+            Default::default(),
+            false,
+        ));
+        ingest.admit_verified(frame_with_bundles(&filter, 1, 2), true);
+        // A frame without bundles has nothing to verify.
+        ingest.admit_verified(frame_with_bundles(&filter, 2, 0), true);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen.lock().unwrap().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the admitted frame was never verified"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(*seen.lock().unwrap(), vec![2]);
+        let (pending, stats) = ingest.proof_prewarm().unwrap().stats();
+        assert_eq!((pending, stats.queued), (0, 1));
+        assert_eq!(
+            ingest.materialized_height(&filter).unwrap(),
+            0,
+            "nothing materialized"
+        );
+    }
+
+    /// The GLOBAL hook's pre-verification verifies every frame it is about to
+    /// materialize while the ingest is free; within its frame bound, and the
+    /// locked pass then materializes them all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_global_pre_verification_runs_without_the_ingest_and_within_its_bound() {
+        use crate::archive_preverify::{preverify_through_within, PrepassLimits};
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let seen: Seen = Default::default();
+        let free: Arc<std::sync::Mutex<Vec<bool>>> = Default::default();
+        let cell: Arc<std::sync::OnceLock<Arc<std::sync::Mutex<ArchiveAppShardIngest>>>> =
+            Default::default();
+        let (ingest, _) = fixture();
+        // Not sequenced: no background verification to race with.
+        let mut ingest = ingest.with_proof_verifier(recording_verifier(
+            seen.clone(),
+            cell.clone(),
+            free.clone(),
+            false,
+        ));
+        ingest.sequenced = true;
+        for number in 1..=3 {
+            ingest.admit_verified(frame_with_bundles(&filter, number, 1), true);
+        }
+        let ingest = Arc::new(std::sync::Mutex::new(ingest));
+        let _ = cell.set(ingest.clone());
+        // The byte bound: room for one frame's bundles.
+        let one = crate::archive_preverify::PlanBudget::bundle_bytes(
+            &frame_with_bundles(&filter, 1, 1).requests,
+        );
+        let limits = PrepassLimits {
+            max_bytes: one,
+            ..Default::default()
+        };
+        let report = preverify_through_within(&ingest, 7, &[(filter.clone(), 3)], limits);
+        assert!(report.truncated);
+        assert_eq!((report.frames, report.counts.verified), (1, 1));
+        // The frame bound.
+        let limits = PrepassLimits {
+            max_frames: 2,
+            ..Default::default()
+        };
+        let report = preverify_through_within(&ingest, 7, &[(filter.clone(), 3)], limits);
+        assert!(report.truncated);
+        assert_eq!(
+            (report.shards, report.frames, report.counts.verified),
+            (1, 2, 2)
+        );
+        assert_eq!(*seen.lock().unwrap(), vec![1, 2]);
+        assert_eq!(
+            *free.lock().unwrap(),
+            vec![true, true],
+            "verified while the ingest was free"
+        );
+        // The frame past the bound is left to the locked pass, which
+        // materializes all three.
+        assert!(ingest
+            .lock()
+            .unwrap()
+            .materialize_through(&filter, 3)
+            .unwrap());
+        assert_eq!(
+            ingest.lock().unwrap().materialized_height(&filter).unwrap(),
+            3
+        );
+        // Nothing above the cursor is left to verify.
+        let report = preverify_through_within(&ingest, 8, &[(filter.clone(), 3)], limits);
+        assert_eq!(report.frames, 0);
+    }
+
+    /// Proofs that found no worker slot are retried for the busy window,
+    /// then left to the locked pass.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_global_pre_verification_gives_up_on_busy_workers_after_its_window() {
+        use crate::archive_preverify::{preverify_through_within, PrepassLimits};
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let seen: Seen = Default::default();
+        let (ingest, _) = fixture();
+        let mut ingest = ingest.with_proof_verifier(recording_verifier(
+            seen.clone(),
+            Default::default(),
+            Default::default(),
+            true,
+        ));
+        ingest.sequenced = true;
+        ingest.admit_verified(frame_with_bundles(&filter, 1, 1), true);
+        let ingest = std::sync::Mutex::new(ingest);
+        let limits = PrepassLimits {
+            busy_window: Duration::from_millis(300),
+            busy_pause: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let report = preverify_through_within(&ingest, 7, &[(filter.clone(), 1)], limits);
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(report.rounds > 1, "busy proofs are retried");
+        assert_eq!(report.counts.busy, 1);
+        assert!(ingest
+            .lock()
+            .unwrap()
+            .materialize_through(&filter, 1)
+            .unwrap());
     }
 }

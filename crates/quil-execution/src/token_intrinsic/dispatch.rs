@@ -3,7 +3,8 @@
 use super::{custom_mint, state::SnapshotLimits};
 use crate::{domains, hypergraph_state::HypergraphState, token_engine::*};
 use quil_lattice_ct::confidential::relation::backend::{
-    worker_client::WorkerVerifier, worker_request::WorkerRequest,
+    worker_client::{ClientError, WorkerVerifier},
+    worker_request::WorkerRequest,
 };
 #[cfg(test)]
 use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
@@ -830,25 +831,49 @@ pub(crate) fn verify_in_worker(
 ) -> Result<()> {
     let key = verdict_key(network, application, bytes, limits, budget);
     let accepted = verdict_once(key, || {
-        let start = std::time::Instant::now();
-        let accepted = worker
-            .verify(&WorkerRequest {
-                network: *network,
-                application: *application,
-                limits,
-                submission_bytes: budget.max_native_bytes,
-                transaction: bytes,
-            })
-            .map_err(|error| {
-                QuilError::ExecutionUnavailable(format!("token proof worker: {error:?}"))
-            })?;
-        record_duration(start.elapsed());
-        Ok::<bool, QuilError>(accepted)
-    })?;
+        worker_verdict(worker, network, application, bytes, limits, budget)
+    })
+    .map_err(|error| QuilError::ExecutionUnavailable(format!("token proof worker: {error:?}")))?;
     if !accepted {
         return Err(invalid("invalid amount proof"));
     }
     Ok(())
+}
+
+/// One worker verification, its wall time recorded.
+fn worker_verdict(
+    worker: &WorkerVerifier,
+    network: &[u8; 32],
+    application: &[u8; 32],
+    bytes: &[u8],
+    limits: CompileLimits,
+    budget: NativeBudget,
+) -> std::result::Result<bool, ClientError> {
+    let start = std::time::Instant::now();
+    let accepted = worker.verify(&WorkerRequest {
+        network: *network,
+        application: *application,
+        limits,
+        submission_bytes: budget.max_native_bytes,
+        transaction: bytes,
+    })?;
+    record_duration(start.elapsed());
+    Ok(accepted)
+}
+
+/// What [`TokenPolicy::preverify`] made of one operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Preverified {
+    /// Its verdict was cached already.
+    Cached,
+    /// Verified now (or by a concurrent caller it waited for); cached.
+    Verified,
+    /// No worker slot within the admission wait; nothing cached.
+    Busy,
+    /// The worker failed (timeout, crash, resource cap); nothing cached.
+    Unavailable,
+    /// No worker proof to verify (mint claims, unknown types).
+    NotApplicable,
 }
 
 impl TokenPolicy {
@@ -886,18 +911,42 @@ impl TokenPolicy {
     }
 
     /// Verify one confidential operation ahead of materialization so the
-    /// verdict is cached. Outcomes are deliberately ignored: busy workers,
-    /// invalid proofs and unknown types are all re-handled by `dispatch`.
-    pub fn preverify(&self, worker: &WorkerVerifier, address: &[u8], bytes: &[u8], tp: u32) {
-        if let Some((application, limits)) = self.worker_request_shape(address, tp) {
-            let _ = verify_in_worker(
+    /// verdict is cached. The outcome only reports what happened: busy
+    /// workers, invalid proofs and unknown types are all re-handled by
+    /// `dispatch`.
+    pub fn preverify(
+        &self,
+        worker: &WorkerVerifier,
+        address: &[u8],
+        bytes: &[u8],
+        tp: u32,
+    ) -> Preverified {
+        let Some((application, limits)) = self.worker_request_shape(address, tp) else {
+            return Preverified::NotApplicable;
+        };
+        let key = verdict_key(
+            &self.network,
+            &application,
+            bytes,
+            limits,
+            self.native_budget,
+        );
+        if cached_verdict(&key).is_some() {
+            return Preverified::Cached;
+        }
+        match verdict_once(key, || {
+            worker_verdict(
                 worker,
                 &self.network,
                 &application,
                 bytes,
                 limits,
                 self.native_budget,
-            );
+            )
+        }) {
+            Ok(_) => Preverified::Verified,
+            Err(ClientError::Busy) => Preverified::Busy,
+            Err(_) => Preverified::Unavailable,
         }
     }
 }

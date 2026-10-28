@@ -668,27 +668,92 @@ impl TokenExecutionEngine {
     /// worker's admission slots) so the sequential materialization loop finds
     /// their verdicts cached. Never holds the execution lock; never fails.
     #[cfg(feature = "native-proof")]
-    pub fn preverify_bundles(&self, bundles: &[(Vec<u8>, Vec<u8>)]) {
-        let (Some(policy), Some(worker)) = (self.token_policy, self.token_worker.as_ref()) else {
-            return;
-        };
-        let operations = Self::confidential_operations(bundles);
-        if operations.is_empty() {
-            return;
+    pub fn preverify_bundles(
+        &self,
+        bundles: &[(Vec<u8>, Vec<u8>)],
+    ) -> crate::manager::PreverifyCounts {
+        match self.token_verifier() {
+            Some((policy, worker)) => Self::preverify_with(
+                policy,
+                &worker,
+                bundles,
+                &crate::manager::PreverifyPacing::default(),
+            ),
+            None => Default::default(),
         }
-        let parallelism = worker.concurrency().clamp(1, operations.len());
-        let next = std::sync::atomic::AtomicUsize::new(0);
+    }
+
+    /// The token policy and a clone of its worker client (sharing its
+    /// admission slots), so a caller verifies without holding this engine.
+    #[cfg(feature = "native-proof")]
+    pub fn token_verifier(
+        &self,
+    ) -> Option<(
+        crate::token_intrinsic::dispatch::TokenPolicy,
+        quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier,
+    )> {
+        Some((self.token_policy?, self.token_worker.clone()?))
+    }
+
+    /// [`Self::preverify_bundles`] with `policy` and `worker`, paced by
+    /// `pacing`: at most its parallelism at once, each operation counted
+    /// into its progress, and none started while its pause holds.
+    #[cfg(feature = "native-proof")]
+    pub fn preverify_with(
+        policy: crate::token_intrinsic::dispatch::TokenPolicy,
+        worker: &quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier,
+        bundles: &[(Vec<u8>, Vec<u8>)],
+        pacing: &crate::manager::PreverifyPacing<'_>,
+    ) -> crate::manager::PreverifyCounts {
+        use crate::token_intrinsic::dispatch::Preverified;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let operations = Self::confidential_operations(bundles);
+        let mut counts = crate::manager::PreverifyCounts {
+            operations: operations.len(),
+            ..Default::default()
+        };
+        if operations.is_empty() {
+            return counts;
+        }
+        let parallelism = pacing
+            .parallelism
+            .unwrap_or_else(|| worker.concurrency())
+            .clamp(1, operations.len());
+        let next = AtomicUsize::new(0);
+        let tallies: [AtomicUsize; 4] = Default::default();
         std::thread::scope(|scope| {
             for _ in 0..parallelism {
                 scope.spawn(|| loop {
-                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(pause) = pacing.pause {
+                        while pause() {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
                     let Some((address, bytes, tp)) = operations.get(index) else {
                         break;
                     };
-                    policy.preverify(worker, address, bytes, *tp);
+                    let tally = match policy.preverify(worker, address, bytes, *tp) {
+                        Preverified::Cached => Some(0),
+                        Preverified::Verified => Some(1),
+                        Preverified::Busy => Some(2),
+                        Preverified::Unavailable => Some(3),
+                        Preverified::NotApplicable => None,
+                    };
+                    if let Some(tally) = tally {
+                        tallies[tally].fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some(done) = pacing.done {
+                        done.fetch_add(1, Ordering::Relaxed);
+                    }
                 });
             }
         });
+        counts.cached = tallies[0].load(Ordering::Relaxed);
+        counts.verified = tallies[1].load(Ordering::Relaxed);
+        counts.busy = tallies[2].load(Ordering::Relaxed);
+        counts.unavailable = tallies[3].load(Ordering::Relaxed);
+        counts
     }
 
     /// Confidential operations a proposal may schedule under the verification
