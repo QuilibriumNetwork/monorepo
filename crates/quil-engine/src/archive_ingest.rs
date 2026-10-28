@@ -104,6 +104,17 @@ pub struct ArchiveAppShardIngest {
     last_tip_scan: Option<Instant>,
     /// Shards whose committed GLOBAL tip this archive does not serve.
     missing_tips: HashMap<Vec<u8>, MissingTip>,
+    /// Per shard whose committed GLOBAL tip is above this archive's cursor,
+    /// which frames between the two it serves and which it asks for
+    /// ([`Self::request_committed_ranges`]).
+    committed_ranges: HashMap<Vec<u8>, CommittedRange>,
+    /// What [`Self::request_committed_ranges`] did since its last summary.
+    range_window: RangeWindow,
+    /// Scans of committed ranges so far, which rotate the order shards are
+    /// read in, so a shard far behind does not use every scan's reads.
+    range_scans: usize,
+    /// How long a scan of committed ranges reads the store ([`RANGE_SCAN_TIME`]).
+    range_scan_time: Duration,
     /// Frames at or below the cursor whose bodies this archive does not serve,
     /// per address: those materialized from certified headers that carried
     /// no verifiable storage attestation ([`Self::empty_frame_from_header`])
@@ -175,6 +186,31 @@ const COMMITTED_TIP_SCAN: Duration = Duration::from_secs(60);
 const COMMITTED_TIP_ASK: Duration = Duration::from_secs(300);
 /// How long that frame stays missing before a warning, and between warnings.
 const COMMITTED_TIP_WARN: Duration = Duration::from_secs(3600);
+/// Frames above shards' cursors read back from the store per scan of
+/// committed ranges, across shards
+/// ([`ArchiveAppShardIngest::request_committed_ranges`]). The scan holds the
+/// ingest, which GLOBAL execution waits for, so an archive that restarted
+/// with thousands of such frames confirms them over a few scans.
+const RANGE_STORE_READS_PER_SCAN: usize = 2048;
+/// The longest a scan of committed ranges reads the store, past its first
+/// read: frames carrying many requests are large, and the scan holds the
+/// ingest.
+const RANGE_SCAN_TIME: Duration = Duration::from_millis(250);
+/// Frames of committed ranges asked for per scan, across shards, lowest of
+/// each shard first. The gap fetch recovers several hundred frames a minute
+/// when endpoints hold them; no scan takes more than half the prefetch queue,
+/// which proposals' body checks and owed bodies share.
+const RANGE_ASKS_PER_SCAN: usize = 256;
+/// Unserved frames of one shard's committed range tracked and asked for at
+/// once, its lowest; the store is read further once they are served.
+const RANGE_ASKS_PER_SHARD: usize = 64;
+/// Asks, one every [`COMMITTED_TIP_ASK`], before a frame of a committed range
+/// no member or archive served is warned about: an hour. It is asked for
+/// hourly from then on, and again every [`COMMITTED_TIP_ASK`] while peers
+/// report it missing.
+const RANGE_ASKS_BEFORE_WARN: u32 = 12;
+/// How often the committed range summary is logged.
+const RANGE_SUMMARY_INTERVAL: Duration = Duration::from_secs(600);
 
 /// A shard's committed GLOBAL tip this archive does not serve, since when,
 /// and when it was last asked for and warned about.
@@ -185,6 +221,128 @@ struct MissingTip {
     asked: Option<Instant>,
     asks: u32,
     warned: Option<Instant>,
+}
+
+/// A shard's frames above this archive's cursor through `tip`, the highest
+/// frame GLOBAL committed of it: every frame through `scanned_through` was
+/// read back, and of those only the `unserved` ones (its lowest, at most
+/// [`RANGE_ASKS_PER_SHARD`]) are not served. Frames a seal's drain executed
+/// sit here until GLOBAL sequences the successor's first header.
+struct CommittedRange {
+    cursor: u64,
+    tip: u64,
+    scanned_through: u64,
+    unserved: BTreeMap<u64, UnservedFrame>,
+    /// Frames asked for since the range was last served whole, and since
+    /// when one was first missing.
+    asked_frames: u32,
+    since: Option<Instant>,
+    /// When its lowest unserved frame was last warned about.
+    warned: Option<Instant>,
+}
+
+impl CommittedRange {
+    fn new(cursor: u64, tip: u64) -> Self {
+        Self {
+            cursor,
+            tip,
+            scanned_through: cursor,
+            unserved: BTreeMap::new(),
+            asked_frames: 0,
+            since: None,
+            warned: None,
+        }
+    }
+
+    /// The range after the cursor moved to `cursor` or the tip to `tip`.
+    fn retarget(&mut self, cursor: u64, tip: u64) {
+        self.unserved
+            .retain(|&number, _| number > cursor && number <= tip);
+        self.scanned_through = self.scanned_through.clamp(cursor, tip);
+        self.cursor = cursor;
+        self.tip = tip;
+    }
+
+    /// The highest frame through which every frame above the cursor is served.
+    fn served_through(&self) -> u64 {
+        self.unserved
+            .keys()
+            .next()
+            .map_or(self.scanned_through, |&lowest| {
+                (lowest - 1).min(self.scanned_through)
+            })
+    }
+
+    fn served_whole(&self) -> bool {
+        self.unserved.is_empty() && self.scanned_through >= self.tip
+    }
+}
+
+/// A frame of a committed range this archive does not serve: since when,
+/// when it was last asked for and how often, and whether a peer reported it
+/// missing since.
+struct UnservedFrame {
+    since: Instant,
+    asked: Option<Instant>,
+    asks: u32,
+    demanded: bool,
+}
+
+impl UnservedFrame {
+    fn new(now: Instant) -> Self {
+        Self {
+            since: now,
+            asked: None,
+            asks: 0,
+            demanded: false,
+        }
+    }
+
+    /// Whether it is asked for again at `now`: every [`COMMITTED_TIP_ASK`]
+    /// for its first [`RANGE_ASKS_BEFORE_WARN`] asks and while peers report
+    /// it, hourly otherwise.
+    fn due(&self, now: Instant) -> bool {
+        let interval = if self.demanded || self.asks < RANGE_ASKS_BEFORE_WARN {
+            COMMITTED_TIP_ASK
+        } else {
+            COMMITTED_TIP_WARN
+        };
+        self.asked
+            .is_none_or(|at| now.saturating_duration_since(at) >= interval)
+    }
+}
+
+/// What the committed range scans did since the last summary line.
+#[derive(Default)]
+struct RangeWindow {
+    since: Option<Instant>,
+    asked: u64,
+    recovered: u64,
+    reported: u64,
+    completed: u64,
+    store_reads: u64,
+    scans: u64,
+    scan_max_ms: u64,
+}
+
+/// What a scan of committed ranges may still read from the store: at most
+/// [`RANGE_STORE_READS_PER_SCAN`] frames, and none past `until` but its first.
+struct ReadBudget {
+    reads: usize,
+    until: Instant,
+}
+
+impl ReadBudget {
+    /// Whether one more read fits, which it then takes.
+    fn take(&mut self) -> bool {
+        if self.reads == 0
+            || (self.reads < RANGE_STORE_READS_PER_SCAN && Instant::now() >= self.until)
+        {
+            return false;
+        }
+        self.reads -= 1;
+        true
+    }
 }
 
 /// Bodies owed at once, across shards. A frame found missing beyond this is
@@ -265,6 +423,10 @@ impl ArchiveAppShardIngest {
             prover_registry: prover_registry.clone(),
             last_tip_scan: None,
             missing_tips: HashMap::new(),
+            committed_ranges: HashMap::new(),
+            range_window: RangeWindow::default(),
+            range_scans: 0,
+            range_scan_time: RANGE_SCAN_TIME,
             owed_bodies: HashMap::new(),
             owed_warned: None,
             missing_frame_reports: None,
@@ -340,7 +502,9 @@ impl ArchiveAppShardIngest {
     /// executed it, from its body or its certified header, but the body was
     /// never stored, so every node replaying the shard from archives stops
     /// there. Such a frame is owed and asked for ([`Self::request_owed_bodies`])
-    /// when the stored frame after it names its output.
+    /// when the stored frame after it names its output. One above the cursor
+    /// that GLOBAL committed, through a seal's drain, is asked for at once
+    /// ([`Self::request_committed_ranges`]).
     pub fn with_missing_frame_reports(
         mut self,
         reports: tokio::sync::mpsc::Receiver<(Vec<u8>, u64)>,
@@ -553,6 +717,14 @@ impl ArchiveAppShardIngest {
                 self.awaiting_execution.remove(address);
             }
         }
+        if let Some(range) = self.committed_ranges.get_mut(address) {
+            if frame >= range.tip {
+                self.committed_ranges.remove(address);
+            } else {
+                let tip = range.tip;
+                range.retarget(frame, tip);
+            }
+        }
         self.missing_since.remove(address);
     }
 
@@ -585,6 +757,7 @@ impl ArchiveAppShardIngest {
         self.held.clear();
         self.requested.clear();
         self.owed_bodies.clear();
+        self.committed_ranges.clear();
         crate::app_engine::forget_legacy_relay_boundaries();
         tracing::info!(
             global_frame,
@@ -598,11 +771,12 @@ impl ArchiveAppShardIngest {
         for address in holding {
             self.serve_committed_held(&address);
         }
-        self.request_committed_tips();
         self.take_missing_frame_reports();
         self.request_owed_bodies();
         self.note_execution();
         self.look_into_wanted();
+        // Last, so the frames proposals' body checks ask for queue first.
+        self.request_committed_tips();
         if self.sequenced {
             return;
         }
@@ -934,7 +1108,9 @@ impl ArchiveAppShardIngest {
     /// 2026-10-20). A fetched frame is admitted as any fetched frame is, and
     /// served only under the digest GLOBAL committed. Each shard is asked at
     /// most every [`COMMITTED_TIP_ASK`]; a frame still missing after
-    /// [`COMMITTED_TIP_WARN`] is warned about once per that interval.
+    /// [`COMMITTED_TIP_WARN`] is warned about once per that interval. The
+    /// frames between each shard's cursor and its committed tip are then
+    /// looked into ([`Self::request_committed_ranges`]).
     fn request_committed_tips(&mut self) {
         let Some(sender) = self.gap_requests.clone() else {
             return;
@@ -966,6 +1142,7 @@ impl ArchiveAppShardIngest {
         let Ok(tips) = crate::app_handoff::committed_tips(&self.hypergraph, &filters) else {
             return;
         };
+        let ranges = tips.clone();
         let mut missing = HashMap::new();
         for (filter, tip) in tips {
             let tracked = self.missing_tips.remove(&filter);
@@ -1018,6 +1195,343 @@ impl ArchiveAppShardIngest {
             missing.insert(filter, entry);
         }
         self.missing_tips = missing;
+        self.request_committed_ranges(Instant::now(), ranges);
+    }
+
+    /// Ask for every frame between each shard's cursor and its committed
+    /// GLOBAL tip (`tips`) this archive does not serve, on the prefetch queue,
+    /// which the gap fetch serves behind frames GLOBAL execution waits on:
+    /// the shard's members first, then archives. A fetched frame is admitted
+    /// above the cursor and stored for serving, as a gossiped one is; nothing
+    /// is materialized before GLOBAL sequences it, so GLOBAL state is the
+    /// same whether or not an archive found it.
+    ///
+    /// GLOBAL commits frames above an archive's cursor through a seal's
+    /// drain, which executes up to 8 of a sealed session's certified headers
+    /// without sequencing their frames here. Archives stored most of them
+    /// when they were gossiped, but asked for none they missed: only frames
+    /// GLOBAL execution or a proposal waits on, just above the cursor, and
+    /// the frame at the committed tip were ever asked for. Every
+    /// successor member replaying such a shard from archives stopped at the
+    /// first hole for good: on 2026-10-27, 147 seats on 12 nodes retried
+    /// "archive replay is missing shard frame" for hours.
+    ///
+    /// Each scan reads at most [`RANGE_STORE_READS_PER_SCAN`] frames back from
+    /// the store, for at most [`RANGE_SCAN_TIME`], across shards in an order
+    /// that rotates, from where the last scan stopped; a body remembered
+    /// stored costs none. It tracks at most
+    /// [`RANGE_ASKS_PER_SHARD`] unserved frames per shard, its lowest, and
+    /// asks for at most [`RANGE_ASKS_PER_SCAN`] (lowest of each shard first,
+    /// frames peers reported missing before all) while the prefetch queue is
+    /// less than half full. Each frame is asked for every
+    /// [`COMMITTED_TIP_ASK`]; after [`RANGE_ASKS_BEFORE_WARN`] asks, hourly,
+    /// with a warning per shard, unless peers keep reporting it missing.
+    fn request_committed_ranges(&mut self, now: Instant, mut tips: Vec<(Vec<u8>, u64)>) {
+        let Some(sender) = self.prefetch_requests.clone() else {
+            return;
+        };
+        let started = Instant::now();
+        tips.sort();
+        if !tips.is_empty() {
+            let turn = self.range_scans % tips.len();
+            tips.rotate_left(turn);
+        }
+        self.range_scans = self.range_scans.wrapping_add(1);
+        let mut reads = ReadBudget {
+            reads: RANGE_STORE_READS_PER_SCAN,
+            until: started + self.range_scan_time,
+        };
+        let mut ranges = HashMap::new();
+        for (filter, tip) in tips {
+            let Ok(cursor) = self.materialized_height(&filter) else {
+                continue;
+            };
+            let through = self.committed_range_end(&filter, tip);
+            // A shard this archive holds no frames of is left to its prefetch.
+            if cursor == 0 || through <= cursor {
+                continue;
+            }
+            let mut range = self
+                .committed_ranges
+                .remove(&filter)
+                .unwrap_or_else(|| CommittedRange::new(cursor, through));
+            range.retarget(cursor, through);
+            let known: Vec<u64> = range.unserved.keys().copied().collect();
+            for number in known {
+                match self.serves_frame(&filter, number, &mut reads) {
+                    Some(true) => {
+                        range.unserved.remove(&number);
+                        self.range_window.recovered += 1;
+                    }
+                    Some(false) => {}
+                    None => break,
+                }
+            }
+            while range.scanned_through < through && range.unserved.len() < RANGE_ASKS_PER_SHARD {
+                let number = range.scanned_through + 1;
+                match self.serves_frame(&filter, number, &mut reads) {
+                    Some(true) => {}
+                    Some(false) => {
+                        range
+                            .unserved
+                            .entry(number)
+                            .or_insert_with(|| UnservedFrame::new(now));
+                        if range.since.is_none() {
+                            range.since = Some(now);
+                        }
+                    }
+                    None => break,
+                }
+                range.scanned_through = number;
+            }
+            if range.served_whole() && range.asked_frames > 0 {
+                info!(filter = %hex::encode(&filter), cursor, committed_tip = through,
+                    frames = through - cursor, asked_frames = range.asked_frames,
+                    missing_secs = range.since.map_or(0, |since| now.saturating_duration_since(since).as_secs()),
+                    "archive serves every frame GLOBAL committed above its cursor of a shard again, after asking \
+                     the shard's members and archives for those it lacked; members replaying the shard through \
+                     them can fetch them now");
+                self.range_window.completed += 1;
+                range.asked_frames = 0;
+                range.since = None;
+                range.warned = None;
+            }
+            if range.served_whole() {
+                range.since = None;
+            }
+            ranges.insert(filter, range);
+        }
+        self.committed_ranges = ranges;
+        let used = RANGE_STORE_READS_PER_SCAN - reads.reads;
+
+        // Lowest of each shard first, across shards in turn; reported first.
+        let mut due: Vec<(bool, usize, Vec<u8>, u64)> = Vec::new();
+        for (filter, range) in &self.committed_ranges {
+            for (rank, (&number, frame)) in range.unserved.iter().enumerate() {
+                if frame.due(now) {
+                    due.push((!frame.demanded, rank, filter.clone(), number));
+                }
+            }
+        }
+        due.sort();
+        let room = sender
+            .capacity()
+            .saturating_sub(sender.max_capacity() / 2)
+            .min(RANGE_ASKS_PER_SCAN);
+        let mut sent = 0;
+        for (_, _, filter, number) in due {
+            if sent >= room || sender.capacity() == 0 {
+                break;
+            }
+            sent += self.ask_committed_frame(&filter, number, now);
+        }
+
+        self.warn_unserved_committed(now);
+        self.range_window.store_reads += used as u64;
+        self.range_window.scans += 1;
+        self.range_window.scan_max_ms = self
+            .range_window
+            .scan_max_ms
+            .max(started.elapsed().as_millis() as u64);
+        self.log_committed_ranges(now);
+    }
+
+    /// The last frame of `address`'s committed range under committed tip
+    /// `tip`: the tip, unless [`Self::request_committed_tips`] asks for the
+    /// frame there because this archive serves nothing that high.
+    fn committed_range_end(&self, address: &[u8], tip: u64) -> u64 {
+        if self
+            .missing_tips
+            .get(address)
+            .is_some_and(|missing| missing.tip == tip)
+        {
+            tip.saturating_sub(1)
+        } else {
+            tip
+        }
+    }
+
+    /// Whether this archive serves frame `number` of `address`: its body is
+    /// remembered stored ([`Self::stored`]), or the store holds it, read
+    /// within `reads`; `None` once that is used up.
+    fn serves_frame(&self, address: &[u8], number: u64, reads: &mut ReadBudget) -> Option<bool> {
+        if self
+            .stored
+            .get(address)
+            .is_some_and(|stored| stored.contains_key(&number))
+        {
+            return Some(true);
+        }
+        if !reads.take() {
+            return None;
+        }
+        Some(
+            self.clock_store
+                .get_shard_clock_frame(address, number, false)
+                .is_ok_and(|frame| {
+                    frame.header.as_ref().is_some_and(|header| {
+                        header.address == address && header.frame_number == number
+                    })
+                }),
+        )
+    }
+
+    /// Ask for unserved frame `number` of `address`'s committed range on the
+    /// prefetch queue; its own record says when it is due
+    /// ([`UnservedFrame::due`]). Returns how many requests went out: none for
+    /// a frame parked until its GLOBAL anchor is stored or execution reaches
+    /// it ([`Self::request_frames`]), or while the queue is full.
+    fn ask_committed_frame(&mut self, address: &[u8], number: u64, now: Instant) -> usize {
+        let sent = self.request_frames(address, number..=number, false, false, Duration::ZERO);
+        if sent == 0 {
+            return 0;
+        }
+        if let Some(range) = self.committed_ranges.get_mut(address) {
+            if let Some(frame) = range.unserved.get_mut(&number) {
+                if frame.asks == 0 {
+                    range.asked_frames += 1;
+                }
+                frame.asked = Some(now);
+                frame.asks += 1;
+                frame.demanded = false;
+            }
+        }
+        self.range_window.asked += sent as u64;
+        sent
+    }
+
+    /// Frame `number` of `address`, above its cursor `cursor`, which a peer
+    /// asked for and this archive does not serve: when GLOBAL committed it,
+    /// it is tracked in the shard's committed range and asked for at once,
+    /// at most every [`COMMITTED_TIP_ASK`], ahead of the frames scans find.
+    fn demand_committed_frame(&mut self, address: &[u8], number: u64, cursor: u64, now: Instant) {
+        if cursor == 0 {
+            return;
+        }
+        let Ok(Some(tip)) = crate::app_handoff::committed_tip(&self.hypergraph, address) else {
+            return;
+        };
+        let through = self.committed_range_end(address, tip);
+        if number > through {
+            return;
+        }
+        self.range_window.reported += 1;
+        let range = self
+            .committed_ranges
+            .entry(address.to_vec())
+            .or_insert_with(|| CommittedRange::new(cursor, through));
+        range.retarget(cursor, through);
+        range
+            .unserved
+            .entry(number)
+            .or_insert_with(|| UnservedFrame::new(now))
+            .demanded = true;
+        if range.since.is_none() {
+            range.since = Some(now);
+        }
+        // Within the shard's bound: the farthest other frame is found again
+        // by a later scan.
+        while range.unserved.len() > RANGE_ASKS_PER_SHARD {
+            let Some(farthest) = range.unserved.keys().rev().find(|&&n| n != number).copied()
+            else {
+                break;
+            };
+            range.unserved.remove(&farthest);
+            range.scanned_through = range.scanned_through.min(farthest - 1);
+        }
+        if range
+            .unserved
+            .get(&number)
+            .is_some_and(|frame| frame.due(now))
+        {
+            self.ask_committed_frame(address, number, now);
+        }
+    }
+
+    /// Warn, at most hourly per shard, about the lowest frame of a committed
+    /// range asked for [`RANGE_ASKS_BEFORE_WARN`] times and still unserved.
+    fn warn_unserved_committed(&mut self, now: Instant) {
+        for (filter, range) in self.committed_ranges.iter_mut() {
+            let Some((&frame, unserved)) = range
+                .unserved
+                .iter()
+                .find(|(_, frame)| frame.asks >= RANGE_ASKS_BEFORE_WARN)
+            else {
+                continue;
+            };
+            if range
+                .warned
+                .is_some_and(|at| now.saturating_duration_since(at) < COMMITTED_TIP_WARN)
+            {
+                continue;
+            }
+            range.warned = Some(now);
+            warn!(filter = %hex::encode(filter), frame, committed_tip = range.tip, cursor = range.cursor,
+                asks = unserved.asks, missing_secs = now.saturating_duration_since(unserved.since).as_secs(),
+                unserved_frames = range.unserved.len(),
+                "archive cannot find a shard frame GLOBAL committed above its cursor (executed through a seal's \
+                 drain): no member or archive the gap fetch asked holds it (the gap fetch's line for this frame \
+                 names each answer); members replaying the shard through it stay blocked until one serves it. A \
+                 defect to report with this line; repeated hourly while it lasts");
+        }
+    }
+
+    /// One line every [`RANGE_SUMMARY_INTERVAL`] while any shard's committed
+    /// tip is above this archive's cursor or a frame was asked for, reported
+    /// or recovered.
+    fn log_committed_ranges(&mut self, now: Instant) {
+        let since = *self.range_window.since.get_or_insert(now);
+        let interval = now.saturating_duration_since(since);
+        if interval < RANGE_SUMMARY_INTERVAL {
+            return;
+        }
+        let window = std::mem::replace(
+            &mut self.range_window,
+            RangeWindow {
+                since: Some(now),
+                ..RangeWindow::default()
+            },
+        );
+        let ranges = &self.committed_ranges;
+        if ranges.is_empty() && window.asked == 0 && window.recovered == 0 && window.reported == 0 {
+            return;
+        }
+        let frames_above_cursor: u64 = ranges.values().map(|r| r.tip - r.cursor).sum();
+        let frames_served: u64 = ranges.values().map(|r| r.served_through() - r.cursor).sum();
+        let frames_unread: u64 = ranges.values().map(|r| r.tip - r.scanned_through).sum();
+        let frames_unserved: usize = ranges.values().map(|r| r.unserved.len()).sum();
+        let shards_unserved = ranges.values().filter(|r| !r.unserved.is_empty()).count();
+        let oldest = ranges
+            .iter()
+            .flat_map(|(filter, range)| {
+                range
+                    .unserved
+                    .iter()
+                    .map(move |(&number, frame)| (frame.since, filter, number, frame.asks))
+            })
+            .min_by_key(|(since, _, number, _)| (*since, *number));
+        let (oldest_filter, oldest_frame, oldest_secs, oldest_asks) =
+            oldest.map_or((String::new(), 0, 0, 0), |(since, filter, number, asks)| {
+                (
+                    hex::encode(filter),
+                    number,
+                    now.saturating_duration_since(since).as_secs(),
+                    asks,
+                )
+            });
+        info!(scope = "this archive", interval_secs = interval.as_secs(),
+            shards_above_cursor = ranges.len(), frames_above_cursor, frames_served, frames_unread,
+            shards_unserved, frames_unserved, frames_asked = window.asked,
+            frames_reported = window.reported, frames_recovered = window.recovered,
+            shards_served_whole = window.completed, oldest_unserved_shard = %oldest_filter,
+            oldest_unserved_frame = oldest_frame, oldest_unserved_secs = oldest_secs,
+            oldest_unserved_asks = oldest_asks, scans = window.scans, store_reads = window.store_reads,
+            scan_max_ms = window.scan_max_ms,
+            "committed range summary: frames GLOBAL committed above this archive's cursors (a seal's drain \
+             executes them before GLOBAL sequences them here), how many it serves, has not read back yet or \
+             lacks (unserved, its lowest per shard); lacking frames are asked of the shard's members and \
+             archives, peers' reports first, and members replaying a shard stop at the first one until it \
+             is recovered");
     }
 
     /// Store an authenticated frame where this archive serves shard frames
@@ -1281,7 +1795,9 @@ impl ArchiveAppShardIngest {
     /// time a node replaying the shard asks for it. Only a hole whose next
     /// frame is stored gets that far: of consecutive holes, all but the last
     /// are owed only under a digest GLOBAL committed. A report found not to be
-    /// owed is not looked into again for [`NOT_OWED_TTL`]. At most
+    /// owed is not looked into again for [`NOT_OWED_TTL`]. A frame above the
+    /// cursor that GLOBAL committed is asked for at once instead
+    /// ([`Self::demand_committed_frame`]). At most
     /// [`MISSING_FRAME_REPORTS_PER_PASS`] reports a pass; the rest wait.
     fn take_missing_frame_reports(&mut self) {
         let mut reports = Vec::new();
@@ -1303,6 +1819,15 @@ impl ArchiveAppShardIngest {
                     .is_ok()
             {
                 continue;
+            }
+            // Above the cursor: a frame GLOBAL committed there, which every
+            // node replaying the shard stops at, is asked for at once. Only a
+            // shard whose cursor is cached gets that far.
+            if let Some(&cursor) = self.last_materialized.get(&address) {
+                if number > cursor {
+                    self.demand_committed_frame(&address, number, cursor, Instant::now());
+                    continue;
+                }
             }
             // Read before the cursor, which is cached per address: only a
             // shard this archive stores frames of gets that far.
@@ -2797,9 +3322,10 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), (filter.clone(), 4));
     }
 
-    /// An admitted frame is stored where the archive serves shard frames from.
-    /// A frame without a certificate is stored only once a certified frame
-    /// links to it, and an impostor at its height never is.
+    /// An admitted frame is stored where the archive serves shard frames from,
+    /// whether gossiped or recovered by the gap fetch. A frame without a
+    /// certificate is stored only once a certified frame links to it, and an
+    /// impostor at its height never is.
     #[tokio::test(flavor = "multi_thread")]
     async fn admitted_frames_are_stored_for_serving() {
         use quil_types::store::ClockStore as _;
@@ -2822,6 +3348,22 @@ mod tests {
             clock.get_latest_shard_clock_frame(&filter).unwrap(),
             frames[2]
         );
+
+        // The gap fetch admits what it recovered above the cursor, a frame of
+        // a committed range say, through `admit_verified`: stored for
+        // serving, one without a certificate once its certified descendant
+        // follows, and materialized only when GLOBAL sequences it.
+        let frames = chain(&filter, 6);
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (ingest, _) = fixture_with_clock(Some(clock.clone()));
+        let mut ingest = ingest.sequenced().rebuilding_at_once_from(&filter, 3);
+        let served = |number| clock.get_shard_clock_frame(&filter, number, false).ok();
+        ingest.admit_verified(frames[4].clone(), false);
+        assert_eq!(served(5), None, "held until a certified frame links to it");
+        ingest.admit_verified(frames[5].clone(), true);
+        assert_eq!(served(5), Some(frames[4].clone()));
+        assert_eq!(served(6), Some(frames[5].clone()));
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 3);
     }
 
     /// A sealed session's last frame has no certificate of its own and no
@@ -2982,6 +3524,421 @@ mod tests {
         ingest.retry_pending();
         assert!(rx.try_recv().is_err());
         assert!(ingest.missing_tips.is_empty());
+    }
+
+    /// GLOBAL commits frames above an archive's cursor through a seal's
+    /// drain, without sequencing them here. One this archive missed was never
+    /// asked for, neither when the committed tip was compared with what it
+    /// serves nor when a peer reported it missing, so every successor member
+    /// replaying the shard from archives stopped there for good ("archive
+    /// replay is missing shard frame", 147 seats, 2026-10-27). It is asked
+    /// for on the prefetch queue by the committed tip scan, and at once when
+    /// a peer reports it missing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_frame_global_executed_above_the_cursor_is_asked_for() {
+        type Requests = tokio::sync::mpsc::Receiver<(Vec<u8>, u64)>;
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let frames = chain(&filter, 8);
+        let sealed =
+            quil_crypto::poseidon::hash_bytes_to_32(&frames[7].header.as_ref().unwrap().output)
+                .unwrap();
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        registry.set_summaries(vec![quil_types::consensus::ProverShardSummary {
+            filter: filter.clone(),
+            status_counts: HashMap::new(),
+            total_size: 1,
+        }]);
+        // Materialized through frame 1; GLOBAL drained the session through
+        // its seal at frame 8, and gossip brought every frame but frame 4.
+        let drained = |reports: Requests| {
+            let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+            let (gap, gaps) = tokio::sync::mpsc::channel(64);
+            let (prefetch, prefetches) = tokio::sync::mpsc::channel(64);
+            let mut ingest = fixture_with_registry(
+                sealed_global(&filter, 8, sealed),
+                Some(clock),
+                registry.clone(),
+            )
+            .with_gap_fetch(gap)
+            .with_prefetch(prefetch)
+            .with_missing_frame_reports(reports)
+            .sequenced()
+            .rebuilding_at_once_from(&filter, 1);
+            for index in [1, 2, 4, 5, 6, 7] {
+                ingest.admit(&filter, frames[index].clone(), true);
+            }
+            (ingest, gaps, prefetches)
+        };
+        let asked = |requests: &mut Requests| {
+            let mut asked = Vec::new();
+            while let Ok(request) = requests.try_recv() {
+                asked.push(request);
+            }
+            asked
+        };
+
+        let (_report, reports) = tokio::sync::mpsc::channel(8);
+        let (mut ingest, mut gaps, mut prefetches) = drained(reports);
+        ingest.retry_pending();
+        assert!(asked(&mut gaps).is_empty(), "the committed tip is served");
+        assert_eq!(
+            asked(&mut prefetches),
+            vec![(filter.clone(), 4)],
+            "the frame GLOBAL executed above the cursor that this archive does not serve is asked for"
+        );
+
+        // Between scans, a node replaying the shard asks for it.
+        let (report, reports) = tokio::sync::mpsc::channel(8);
+        let (mut ingest, _gaps, mut prefetches) = drained(reports);
+        ingest.last_tip_scan = Some(Instant::now());
+        report.try_send((filter.clone(), 4)).unwrap();
+        ingest.retry_pending();
+        assert_eq!(
+            asked(&mut prefetches),
+            vec![(filter.clone(), 4)],
+            "a reported frame GLOBAL executed above the cursor is asked for at once"
+        );
+    }
+
+    type Requests = tokio::sync::mpsc::Receiver<(Vec<u8>, u64)>;
+
+    fn take_requests(requests: &mut Requests) -> Vec<(Vec<u8>, u64)> {
+        let mut taken = Vec::new();
+        while let Ok(request) = requests.try_recv() {
+            taken.push(request);
+        }
+        taken
+    }
+
+    /// Frame `number` of `filter` with an output of its own, to store.
+    fn frame_with_output(filter: &[u8], number: u64) -> AppShardFrame {
+        let mut frame = verified_frame(filter, number);
+        frame.header.as_mut().unwrap().output = number.to_be_bytes().repeat(4);
+        frame
+    }
+
+    /// Log lines written while `run` runs, at info and above.
+    fn logged(run: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let lines = Lines::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let bytes = lines.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// A scan asks for at most [`RANGE_ASKS_PER_SCAN`] frames across shards
+    /// and [`RANGE_ASKS_PER_SHARD`] per shard, the lowest of each first and
+    /// shards in turn; each frame at most every [`COMMITTED_TIP_ASK`]; none
+    /// while the prefetch queue is half full. Frames found served are not
+    /// asked for again, and the shard's next unserved frames are.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn committed_range_asks_are_bounded_per_scan_per_shard_and_in_time() {
+        let filters: Vec<Vec<u8>> = (1..=5u8).map(|byte| vec![byte; 32]).collect();
+        let (prefetch, mut prefetches) = tokio::sync::mpsc::channel(1024);
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (ingest, _) = fixture_with_clock(Some(clock));
+        let mut ingest = ingest.with_prefetch(prefetch.clone()).sequenced();
+        // Read budget only: no scan of this test runs out of time.
+        ingest.range_scan_time = Duration::from_secs(3600);
+        for filter in &filters {
+            ingest.last_materialized.insert(filter.clone(), 100);
+        }
+        // 300 frames above each cursor committed, none served.
+        let tips: Vec<(Vec<u8>, u64)> =
+            filters.iter().map(|filter| (filter.clone(), 400)).collect();
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let of = |asked: &[(Vec<u8>, u64)], filter: &Vec<u8>| -> Vec<u64> {
+            asked
+                .iter()
+                .filter(|(asked, _)| asked == filter)
+                .map(|(_, number)| *number)
+                .collect()
+        };
+
+        ingest.request_committed_ranges(at(0), tips.clone());
+        let first = take_requests(&mut prefetches);
+        assert_eq!(first.len(), RANGE_ASKS_PER_SCAN);
+        for filter in &filters {
+            let asked = of(&first, filter);
+            assert!(asked.len() <= RANGE_ASKS_PER_SHARD);
+            assert!(
+                asked.len() >= RANGE_ASKS_PER_SCAN / filters.len(),
+                "shards in turn"
+            );
+            assert_eq!(
+                asked,
+                (101..101 + asked.len() as u64).collect::<Vec<_>>(),
+                "lowest first"
+            );
+            assert_eq!(
+                ingest.committed_ranges[filter].unserved.len(),
+                RANGE_ASKS_PER_SHARD
+            );
+        }
+        // The rest of the tracked frames, then none within the interval.
+        ingest.request_committed_ranges(at(60), tips.clone());
+        let second = take_requests(&mut prefetches);
+        assert_eq!(
+            second.len(),
+            filters.len() * RANGE_ASKS_PER_SHARD - RANGE_ASKS_PER_SCAN
+        );
+        ingest.request_committed_ranges(at(120), tips.clone());
+        assert!(
+            take_requests(&mut prefetches).is_empty(),
+            "asked at most every interval"
+        );
+        ingest.request_committed_ranges(at(360), tips.clone());
+        assert_eq!(
+            take_requests(&mut prefetches).len(),
+            RANGE_ASKS_PER_SCAN,
+            "asked again after it"
+        );
+
+        // A prefetch queue half full or more takes none, until it drains.
+        for _ in 0..512 {
+            prefetch.try_send((vec![0; 32], 0)).unwrap();
+        }
+        ingest.request_committed_ranges(at(720), tips.clone());
+        assert_eq!(
+            take_requests(&mut prefetches).len(),
+            512,
+            "none asked while the queue is half full"
+        );
+        ingest.request_committed_ranges(at(780), tips.clone());
+        assert_eq!(take_requests(&mut prefetches).len(), RANGE_ASKS_PER_SCAN);
+
+        // Served now, the first shard's tracked frames are not asked for
+        // again; its next unserved ones are.
+        let shard = &filters[0];
+        for number in 101..=164 {
+            assert!(ingest.store_for_serving(&frame_with_output(shard, number)));
+        }
+        ingest.request_committed_ranges(at(1200), tips.clone());
+        let asked = of(&take_requests(&mut prefetches), shard);
+        assert!(
+            asked.len() >= RANGE_ASKS_PER_SCAN / filters.len(),
+            "{asked:?}"
+        );
+        assert_eq!(asked, (165..165 + asked.len() as u64).collect::<Vec<_>>());
+        assert_eq!(ingest.committed_ranges[shard].served_through(), 164);
+    }
+
+    /// An archive that restarted remembers no stored bodies above its
+    /// cursors: it reads them back, [`RANGE_STORE_READS_PER_SCAN`] a scan,
+    /// and asks the network for none it serves.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restarted_archive_reads_its_committed_ranges_back_within_the_read_budget() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (ingest, _) = fixture_with_clock(Some(clock));
+        let (prefetch, mut prefetches) = tokio::sync::mpsc::channel(1024);
+        let mut ingest = ingest.with_prefetch(prefetch).sequenced();
+        for number in 2..=5001 {
+            assert!(ingest.store_for_serving(&frame_with_output(&filter, number)));
+        }
+        ingest.last_materialized.insert(filter.clone(), 1);
+        ingest.range_scan_time = Duration::from_secs(3600);
+        assert!(ingest.stored.is_empty());
+        let tips = vec![(filter.clone(), 5001)];
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let read_through = |ingest: &ArchiveAppShardIngest| {
+            let range = &ingest.committed_ranges[&filter];
+            (
+                range.scanned_through,
+                range.served_through(),
+                range.served_whole(),
+            )
+        };
+
+        ingest.request_committed_ranges(at(0), tips.clone());
+        assert_eq!(read_through(&ingest), (2049, 2049, false));
+        ingest.request_committed_ranges(at(60), tips.clone());
+        assert_eq!(read_through(&ingest), (4097, 4097, false));
+        ingest.request_committed_ranges(at(120), tips.clone());
+        assert_eq!(read_through(&ingest), (5001, 5001, true));
+        assert_eq!(ingest.range_window.store_reads, 5000);
+        ingest.request_committed_ranges(at(180), tips.clone());
+        assert_eq!(
+            ingest.range_window.store_reads, 5000,
+            "a range served whole is not read again"
+        );
+        assert!(
+            take_requests(&mut prefetches).is_empty(),
+            "nothing it serves is asked for"
+        );
+    }
+
+    /// A scan reads the store for at most [`RANGE_SCAN_TIME`], past its first
+    /// read, so every scan makes progress; the next scan goes on from there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_committed_range_scan_reads_the_store_within_its_time_budget() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (ingest, _) = fixture_with_clock(Some(clock));
+        let (prefetch, mut prefetches) = tokio::sync::mpsc::channel(64);
+        let mut ingest = ingest.with_prefetch(prefetch).sequenced();
+        for number in 2..=11 {
+            assert!(ingest.store_for_serving(&frame_with_output(&filter, number)));
+        }
+        ingest.last_materialized.insert(filter.clone(), 1);
+        ingest.range_scan_time = Duration::ZERO;
+        let tips = vec![(filter.clone(), 11)];
+        let start = Instant::now();
+        for (scan, through) in [(0, 2), (1, 3), (2, 4)] {
+            ingest.request_committed_ranges(start + Duration::from_secs(60 * scan), tips.clone());
+            assert_eq!(ingest.committed_ranges[&filter].scanned_through, through);
+        }
+        ingest.range_scan_time = RANGE_SCAN_TIME;
+        ingest.request_committed_ranges(start + Duration::from_secs(180), tips);
+        assert!(ingest.committed_ranges[&filter].served_whole());
+        assert!(take_requests(&mut prefetches).is_empty());
+    }
+
+    /// The cursor passing frames of a committed range forgets them, and the
+    /// range once it reaches the committed tip.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn committed_range_state_is_cleared_as_the_cursor_passes() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (ingest, _) = fixture_with_clock(Some(clock));
+        let (prefetch, mut prefetches) = tokio::sync::mpsc::channel(1024);
+        let mut ingest = ingest.with_prefetch(prefetch).sequenced();
+        ingest.last_materialized.insert(filter.clone(), 100);
+        let tips = vec![(filter.clone(), 400)];
+        let start = Instant::now();
+        ingest.request_committed_ranges(start, tips.clone());
+        assert_eq!(take_requests(&mut prefetches).len(), RANGE_ASKS_PER_SHARD);
+        ingest.set_materialized_height(&filter, 150);
+        let range = &ingest.committed_ranges[&filter];
+        assert_eq!(range.unserved.keys().next(), Some(&151));
+        assert_eq!((range.cursor, range.served_through()), (150, 150));
+        ingest.set_materialized_height(&filter, 400);
+        assert!(ingest.committed_ranges.is_empty());
+        ingest.request_committed_ranges(start + COMMITTED_TIP_ASK, tips);
+        assert!(ingest.committed_ranges.is_empty());
+        assert!(take_requests(&mut prefetches).is_empty());
+    }
+
+    /// A frame of a committed range no member or archive serves is asked for
+    /// every [`COMMITTED_TIP_ASK`] for [`RANGE_ASKS_BEFORE_WARN`] asks, then
+    /// warned about and asked for hourly, at once when a peer reports it
+    /// missing; once it is served it is asked for no more, and a line says
+    /// the range is served whole.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unserved_committed_frame_is_warned_about_hourly_and_asked_for_on_demand() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let frames = chain(&filter, 8);
+        let sealed =
+            quil_crypto::poseidon::hash_bytes_to_32(&frames[7].header.as_ref().unwrap().output)
+                .unwrap();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (prefetch, mut prefetches) = tokio::sync::mpsc::channel(64);
+        let mut ingest = fixture_over(sealed_global(&filter, 8, sealed), Some(clock))
+            .with_prefetch(prefetch)
+            .sequenced()
+            .rebuilding_at_once_from(&filter, 1);
+        for index in [1, 2, 4, 5, 6, 7] {
+            ingest.admit(&filter, frames[index].clone(), true);
+        }
+        let tips = vec![(filter.clone(), 8)];
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let unserved = "archive cannot find a shard frame GLOBAL committed above its cursor";
+        let mut log = String::new();
+        macro_rules! scan {
+            ($secs:expr) => {{
+                log += &logged(|| ingest.request_committed_ranges(at($secs), tips.clone()));
+                take_requests(&mut prefetches)
+            }};
+        }
+        let once = vec![(filter.clone(), 4)];
+        for ask in 0..RANGE_ASKS_BEFORE_WARN as u64 {
+            assert_eq!(scan!(ask * 300), once);
+            assert!(scan!(ask * 300 + 60).is_empty());
+        }
+        // Asked twelve times by 3300 s: warned, then asked hourly.
+        assert_eq!(log.matches(unserved).count(), 1, "{log}");
+        assert!(
+            log.contains("frame=4 committed_tip=8 cursor=1 asks=12"),
+            "{log}"
+        );
+        assert!(scan!(3600).is_empty());
+        // A peer reports it missing: asked at once.
+        ingest.demand_committed_frame(&filter, 4, 1, at(3700));
+        assert_eq!(take_requests(&mut prefetches), once);
+        assert!(scan!(4000).is_empty());
+        assert!(scan!(6900).is_empty());
+        assert_eq!(
+            log.matches(unserved).count(),
+            2,
+            "warned again an hour later"
+        );
+        assert_eq!(scan!(7300), once, "asked hourly");
+        // Recovered: served, asked for no more, warned about no more.
+        ingest.admit_verified(frames[3].clone(), true);
+        assert!(scan!(7400).is_empty());
+        assert!(ingest.committed_ranges[&filter].served_whole());
+        assert!(scan!(11000).is_empty());
+        assert_eq!(log.matches(unserved).count(), 2);
+        assert_eq!(
+            log.matches("archive serves every frame GLOBAL committed above its cursor")
+                .count(),
+            1,
+            "{log}"
+        );
+        assert!(log.contains("committed range summary"), "{log}");
+        assert!(log.contains("frames_recovered=1"), "{log}");
+    }
+
+    /// A frame a peer reports missing is tracked within the shard's bound of
+    /// [`RANGE_ASKS_PER_SHARD`] frames, ahead of the farthest one a scan
+    /// found, which the scan finds again; one above the committed tip is not
+    /// asked for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reported_frame_is_tracked_within_the_shard_bound() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (prefetch, mut prefetches) = tokio::sync::mpsc::channel(1024);
+        let mut ingest = fixture_over(sealed_global(&filter, 400, [4; 32]), Some(clock))
+            .with_prefetch(prefetch)
+            .sequenced()
+            .rebuilding_at_once_from(&filter, 100);
+        ingest.range_scan_time = Duration::from_secs(3600);
+        let start = Instant::now();
+        ingest.request_committed_ranges(start, vec![(filter.clone(), 400)]);
+        assert_eq!(take_requests(&mut prefetches).len(), RANGE_ASKS_PER_SHARD);
+        ingest.demand_committed_frame(&filter, 300, 100, start);
+        assert_eq!(take_requests(&mut prefetches), vec![(filter.clone(), 300)]);
+        let range = &ingest.committed_ranges[&filter];
+        assert_eq!(range.unserved.len(), RANGE_ASKS_PER_SHARD);
+        assert!(range.unserved.contains_key(&300) && !range.unserved.contains_key(&164));
+        assert_eq!(range.scanned_through, 163);
+        ingest.demand_committed_frame(&filter, 401, 100, start);
+        assert!(take_requests(&mut prefetches).is_empty(), "not committed");
+        assert!(!ingest.committed_ranges[&filter].unserved.contains_key(&401));
+        // Served, the tracked frames make room for the one evicted.
+        for number in 101..=163 {
+            assert!(ingest.store_for_serving(&frame_with_output(&filter, number)));
+        }
+        ingest.request_committed_ranges(start + COMMITTED_TIP_ASK, vec![(filter.clone(), 400)]);
+        let asked = take_requests(&mut prefetches);
+        assert_eq!(asked.first(), Some(&(filter.clone(), 164)));
     }
 
     /// A gap-fetched frame without a certificate of its own is prepared
