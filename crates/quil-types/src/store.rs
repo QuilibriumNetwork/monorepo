@@ -1475,6 +1475,11 @@ pub trait SnapshotReadable: Send + Sync {
         ))
     }
 
+    /// The store this snapshot reads (`master`, `worker N`), for log lines.
+    fn store_name(&self) -> Option<String> {
+        None
+    }
+
     /// Whether [`Self::page_large_vertices_skipping`] lists every large row.
     fn large_vertex_index_state(&self) -> Result<LargeVertexIndexState> {
         Ok(LargeVertexIndexState::Unsupported)

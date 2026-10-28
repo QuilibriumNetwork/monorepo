@@ -471,6 +471,8 @@ impl crate::storage_watch::WorkerControl for ThreadWorkerStores {
         let Some(stores) = self.by_core.write().remove(&core) else {
             return;
         };
+        // Its index walk lets go of the store before the reopen.
+        quil_store::large_vertex_index::stop(&stores.db.inner());
         self.by_filter
             .write()
             .retain(|_, state| !Arc::ptr_eq(&state.db, &stores.db));

@@ -1392,6 +1392,9 @@ fn stop_detached_work() {
 /// node never writes without the write-ahead log) nor syncs the log when it
 /// closes a store, so the next start replays the same log either way.
 fn exit_node(result: &anyhow::Result<ExitCode>) -> ! {
+    // The stores' last writes: a store whose index is not sealed walks its
+    // rows again at the next start.
+    quil_store::large_vertex_index::seal_all();
     logging::shutdown_logging();
     // Every successful return of a node mode is SUCCESS.
     let code = match result {

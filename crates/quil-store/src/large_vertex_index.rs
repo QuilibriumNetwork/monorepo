@@ -15,11 +15,14 @@
 //! wrote, and cannot fail its publication. An entry outlives its row when a
 //! rewind, eviction or wipe drops the row; readers pass over such entries.
 //!
-//! A binary without this index writes rows without entries: a store that ran
-//! one after its walk completed needs the walk again (delete the state key).
+//! A binary without this index writes rows without entries. A clean close
+//! seals the index with the store's sequence number; an open that finds no
+//! seal, or a store written past it (an older binary, a crash), walks again.
+//! A crash costs a walk, never a missed coin.
 
-use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use quil_types::error::{QuilError, Result};
@@ -37,6 +40,8 @@ const STATE: u8 = 0x00;
 const LIVE: u8 = 0x01;
 const WALKED: u8 = 0x02;
 const STATE_KEY: [u8; 2] = [INDEX, STATE];
+/// The store's sequence number when a clean close sealed the index.
+const SEAL_KEY: [u8; 3] = [INDEX, STATE, 0x01];
 /// The prefixes the background walk writes.
 static WALK_PREFIXES: [[u8; 2]; 2] = [[INDEX, STATE], [INDEX, WALKED]];
 
@@ -52,7 +57,8 @@ const VERTEX_KEY: usize = 64;
 /// Rows one walk step reads at most, and how long it reads before it writes.
 const WALK_STEP_ROWS: usize = 200_000;
 const WALK_STEP_TIME: Duration = Duration::from_millis(250);
-/// Pause after each step, so the walk leaves the disk to the node's own work.
+/// Pause after each step, at least as long as the step took, so the walk
+/// leaves the disk to the node's own work at least half of the time.
 const WALK_YIELD: Duration = Duration::from_millis(50);
 const WALK_REPORT_EVERY: Duration = Duration::from_secs(300);
 const WALK_RETRY_MAX: Duration = Duration::from_secs(300);
@@ -105,6 +111,12 @@ pub(crate) fn complete_record() -> ([u8; 2], Vec<u8>) {
 
 pub(crate) fn state_key() -> &'static [u8] {
     &STATE_KEY
+}
+
+/// Whether `key` is one of the walk's own records (its state or seal), which
+/// describe one store and are never copied to another.
+pub(crate) fn is_walk_record(key: &[u8]) -> bool {
+    key.starts_with(&STATE_KEY)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -336,10 +348,15 @@ pub struct WalkProgress {
     pub complete: bool,
 }
 
-/// One step of the walk [`start`] runs: at most `max_rows` rows (and
-/// [`WALK_STEP_TIME`]) from the saved cursor, their entries and the new
-/// cursor written in one batch.
-pub fn walk_step(db: &quil_forest::CoordinatedDb, max_rows: usize) -> Result<WalkProgress> {
+/// One step of the walk [`start`] runs: at most `max_rows` rows and, after
+/// the first, `max_time` from the saved cursor, their entries and the new
+/// cursor written in one batch. A step always reads a row when one is left,
+/// so a seek that alone outlasts `max_time` cannot stall the walk.
+pub fn walk_step(
+    db: &quil_forest::CoordinatedDb,
+    max_rows: usize,
+    max_time: Duration,
+) -> Result<WalkProgress> {
     let (mut rows, mut indexed, mut cursor) = match read_state(db)? {
         Some(WalkState::Complete { rows }) => {
             return Ok(WalkProgress {
@@ -383,7 +400,7 @@ pub fn walk_step(db: &quil_forest::CoordinatedDb, max_rows: usize) -> Result<Wal
             _ => iterator.seek(range),
         }
         while iterator.valid() {
-            if read == max_rows || started.elapsed() >= WALK_STEP_TIME {
+            if read > 0 && (read >= max_rows || started.elapsed() >= max_time) {
                 finished = false;
                 break 'ranges;
             }
@@ -423,56 +440,243 @@ pub fn walk_step(db: &quil_forest::CoordinatedDb, max_rows: usize) -> Result<Wal
     })
 }
 
-static WALKING: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
-
-/// Make the index of `db` complete: at once for a store without rows, else by
-/// a background walk of the rows it holds, resumed from its cursor. Returns
-/// at once; a walk already running on `db` is not started twice. `store` names
-/// the store in the walk's log lines.
-pub fn start(db: &quil_forest::CoordinatedDb, store: String) {
-    match read_state(db) {
-        Ok(Some(WalkState::Complete { .. })) => return,
-        Ok(None) if matches!(has_rows(db), Ok(false)) => {
-            let (key, value) = complete_record();
-            let mut batch = quil_forest::DisjointBatch::new(&WALK_PREFIXES);
-            if batch.put(key, value).is_ok()
-                && db
-                    .write_disjoint(batch, &rocksdb::WriteOptions::default())
-                    .is_ok()
-            {
-                return;
-            }
-        }
-        _ => {}
-    }
-    if !WALKING.lock().unwrap().insert(db.instance()) {
-        return;
-    }
-    let instance = db.instance();
-    let weak = db.downgrade();
-    let spawned = std::thread::Builder::new()
-        .name("vertex-index".into())
-        .spawn(move || {
-            walk(weak, &store);
-            WALKING.lock().unwrap().remove(&instance);
-        });
-    if let Err(error) = spawned {
-        WALKING.lock().unwrap().remove(&instance);
-        tracing::warn!(%error, "large vertex index: cannot start its walk; coin and escrow scans of this store stay unavailable until a restart");
+fn fresh_walk() -> WalkState {
+    WalkState::Walking {
+        rows: 0,
+        indexed: 0,
+        cursor: Vec::new(),
     }
 }
 
-fn walk(weak: quil_forest::WeakCoordinatedDb, store: &str) {
+fn read_seal(db: &quil_forest::CoordinatedDb) -> Result<Option<u64>> {
+    match db.get(SEAL_KEY).map_err(store_error)? {
+        None => Ok(None),
+        Some(bytes) => bytes
+            .try_into()
+            .map(|bytes: [u8; 8]| Some(u64::from_be_bytes(bytes)))
+            .map_err(|_| store_error("malformed seal")),
+    }
+}
+
+/// What an opened store's index needs.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OpenCheck {
+    /// Complete, and nothing wrote the store since its index was sealed.
+    Complete,
+    /// A walk a clean close interrupted, resumed from its cursor.
+    Resume,
+    /// A walk from the first row, for the reason given.
+    Rewalk(&'static str),
+}
+
+/// Decide, before anything else writes an opened store, whether its index can
+/// be trusted, and record the decision. The seal is consumed, so an unclean
+/// stop before the next seal is detected at the next open.
+pub fn reconcile(db: &quil_forest::CoordinatedDb) -> Result<OpenCheck> {
+    let state = read_state(db)?;
+    let seal = read_seal(db)?;
+    let sealed = seal == Some(db.latest_sequence_number());
+    let mut batch = quil_forest::DisjointBatch::new(&WALK_PREFIXES);
+    if seal.is_some() {
+        batch.delete(SEAL_KEY).map_err(store_error)?;
+    }
+    let check = match state {
+        None if !has_rows(db)? => {
+            batch
+                .put(STATE_KEY, WalkState::Complete { rows: 0 }.encode())
+                .map_err(store_error)?;
+            OpenCheck::Complete
+        }
+        Some(WalkState::Complete { .. }) if sealed => OpenCheck::Complete,
+        Some(WalkState::Walking { .. }) if sealed => OpenCheck::Resume,
+        None => OpenCheck::Rewalk("the store holds rows written before it kept the index"),
+        Some(_) if seal.is_none() => OpenCheck::Rewalk(
+            "the store was not closed cleanly, or a binary without the index ran it",
+        ),
+        Some(_) => OpenCheck::Rewalk("the store was written after its index was sealed"),
+    };
+    if matches!(check, OpenCheck::Rewalk(_)) {
+        batch
+            .put(STATE_KEY, fresh_walk().encode())
+            .map_err(store_error)?;
+    }
+    if !batch.is_empty() {
+        db.write_disjoint(batch, &rocksdb::WriteOptions::default())
+            .map_err(store_error)?;
+    }
+    Ok(check)
+}
+
+/// Seal the index of a store being closed with the sequence number the seal
+/// write itself ends at. False when a write landed in between or the store has
+/// no walk state: the next open then walks again.
+pub fn seal(db: &quil_forest::CoordinatedDb) -> Result<bool> {
+    if read_state(db)?.is_none() {
+        return Ok(false);
+    }
+    let sealed_at = db.latest_sequence_number() + 1;
+    let mut batch = quil_forest::DisjointBatch::new(&WALK_PREFIXES);
+    batch
+        .put(SEAL_KEY, sealed_at.to_be_bytes())
+        .map_err(store_error)?;
+    db.write_disjoint(batch, &rocksdb::WriteOptions::default())
+        .map_err(store_error)?;
+    Ok(db.latest_sequence_number() == sealed_at)
+}
+
+/// A store [`start`] was called for: sealed at close, named in log lines.
+struct Registered {
+    db: quil_forest::WeakCoordinatedDb,
+    name: String,
+    cancel: Arc<AtomicBool>,
+    walk: Option<std::thread::JoinHandle<()>>,
+}
+
+static STORES: Mutex<BTreeMap<u64, Registered>> = Mutex::new(BTreeMap::new());
+/// One walk at a time per process: each reads a whole store.
+static WALK_GATE: Mutex<()> = Mutex::new(());
+
+fn stores() -> std::sync::MutexGuard<'static, BTreeMap<u64, Registered>> {
+    STORES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Check the index of an opened store before anything else writes it, and
+/// make it complete: at once for a store without rows or with a sealed index,
+/// else by a background walk of its rows. `store` names the store in log
+/// lines. Pair with [`stop`] when the store is released, and [`seal_all`] at
+/// exit.
+pub fn start(db: &quil_forest::CoordinatedDb, store: String) {
+    let instance = db.instance();
+    let mut stores = stores();
+    if stores.contains_key(&instance) {
+        return;
+    }
+    let check = reconcile(db);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let restart = match &check {
+        Ok(OpenCheck::Complete) => None,
+        Ok(OpenCheck::Resume) => Some(false),
+        Ok(OpenCheck::Rewalk(reason)) => {
+            tracing::info!(
+                store,
+                reason,
+                "large vertex index: walking this store's rows again"
+            );
+            Some(false)
+        }
+        Err(error) => {
+            tracing::warn!(store, %error, "large vertex index: cannot check this store's index; walking it again");
+            Some(true)
+        }
+    };
+    let walk = restart.and_then(|restart| {
+        let (weak, name, cancel) = (db.downgrade(), store.clone(), cancel.clone());
+        std::thread::Builder::new()
+            .name("vertex-index".into())
+            .spawn(move || walk(weak, &name, &cancel, restart))
+            .map_err(|error| {
+                tracing::warn!(store, %error, "large vertex index: cannot start its walk; coin and escrow scans of this store stay unavailable until a restart");
+            })
+            .ok()
+    });
+    stores.insert(
+        instance,
+        Registered {
+            db: db.downgrade(),
+            name: store,
+            cancel,
+            walk,
+        },
+    );
+}
+
+/// The name [`start`] gave the store `db`, for log lines.
+pub fn store_name(db: &quil_forest::CoordinatedDb) -> Option<String> {
+    stores().get(&db.instance()).map(|store| store.name.clone())
+}
+
+fn close(store: Registered) {
+    store.cancel.store(true, Ordering::Relaxed);
+    if let Some(walk) = store.walk {
+        let _ = walk.join();
+    }
+    if let Some(db) = store.db.upgrade() {
+        match seal(&db) {
+            Ok(true) => {}
+            Ok(false) => tracing::info!(store = store.name, "large vertex index: not sealed (a write landed during the seal); the next open walks again"),
+            Err(error) => tracing::info!(store = store.name, %error, "large vertex index: not sealed; the next open walks again"),
+        }
+    }
+}
+
+/// Stop the walk of a store being released, waiting for it, and seal its
+/// index, so the store can be reopened at once.
+pub fn stop(db: &quil_forest::CoordinatedDb) {
+    let store = stores().remove(&db.instance());
+    if let Some(store) = store {
+        close(store);
+    }
+}
+
+/// Stop every walk and seal every store's index: the last writes at exit.
+pub fn seal_all() {
+    let all = std::mem::take(&mut *stores());
+    for (_, store) in all {
+        close(store);
+    }
+}
+
+/// Sleep `duration` unless cancelled first; true when cancelled.
+fn pause(cancel: &AtomicBool, duration: Duration) -> bool {
+    let until = Instant::now() + duration;
+    while !cancel.load(Ordering::Relaxed) {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(100)));
+    }
+    true
+}
+
+fn walk(weak: quil_forest::WeakCoordinatedDb, store: &str, cancel: &AtomicBool, restart: bool) {
+    // One walk at a time: wait for another store's to end.
+    let _gate = loop {
+        match WALK_GATE.try_lock() {
+            Ok(gate) => break gate,
+            Err(std::sync::TryLockError::Poisoned(gate)) => break gate.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if pause(cancel, Duration::from_secs(1)) {
+                    return;
+                }
+            }
+        }
+    };
     let started = Instant::now();
     let mut reported = Instant::now();
     let mut retry = Duration::from_secs(1);
+    let mut restart = restart;
     let mut first = true;
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         // Stop once the store's other owners have closed it.
         let Some(db) = weak.upgrade() else {
             return;
         };
-        if first {
+        if restart {
+            let mut batch = quil_forest::DisjointBatch::new(&WALK_PREFIXES);
+            let reset = batch
+                .put(STATE_KEY, fresh_walk().encode())
+                .map_err(store_error)
+                .and_then(|()| {
+                    db.write_disjoint(batch, &rocksdb::WriteOptions::default())
+                        .map_err(store_error)
+                });
+            restart = reset.is_err();
+        }
+        if first && !restart {
             first = false;
             let resumed = match read_state(&db) {
                 Ok(Some(WalkState::Walking { rows, .. })) => rows,
@@ -484,11 +688,19 @@ fn walk(weak: quil_forest::WeakCoordinatedDb, store: &str) {
                 "large vertex index: walking this store's vertex rows once, so coin and escrow scans read only large rows; scans of it answer unavailable until the walk ends"
             );
         }
-        match walk_step(&db, WALK_STEP_ROWS) {
+        let step = Instant::now();
+        let result = if restart {
+            Err(store_error("cannot reset the walk"))
+        } else {
+            walk_step(&db, WALK_STEP_ROWS, WALK_STEP_TIME)
+        };
+        drop(db);
+        match result {
             Ok(progress) if progress.complete => {
                 tracing::info!(
                     store,
                     rows_walked = progress.rows,
+                    large_rows_indexed = progress.indexed,
                     elapsed_secs = started.elapsed().as_secs(),
                     "large vertex index: walk complete; coin and escrow scans of this store are served"
                 );
@@ -498,17 +710,17 @@ fn walk(weak: quil_forest::WeakCoordinatedDb, store: &str) {
                 retry = Duration::from_secs(1);
                 if reported.elapsed() >= WALK_REPORT_EVERY {
                     reported = Instant::now();
-                    let secs = started.elapsed().as_secs().max(1);
                     tracing::info!(
                         store,
                         rows_walked = progress.rows,
                         large_rows_indexed = progress.indexed,
-                        elapsed_secs = secs,
+                        elapsed_secs = started.elapsed().as_secs(),
                         "large vertex index: walk in progress; coin and escrow scans of this store answer unavailable until it ends"
                     );
                 }
-                drop(db);
-                std::thread::sleep(WALK_YIELD);
+                if pause(cancel, step.elapsed().max(WALK_YIELD)) {
+                    return;
+                }
             }
             Err(error) => {
                 tracing::warn!(
@@ -517,8 +729,9 @@ fn walk(weak: quil_forest::WeakCoordinatedDb, store: &str) {
                     retry_secs = retry.as_secs(),
                     "large vertex index: walk step failed; it resumes from its saved cursor"
                 );
-                drop(db);
-                std::thread::sleep(retry);
+                if pause(cancel, retry) {
+                    return;
+                }
                 retry = (retry * 2).min(WALK_RETRY_MAX);
             }
         }
@@ -767,7 +980,7 @@ mod tests {
                 state().unwrap(),
                 LargeVertexIndexState::Building { rows_walked: 0 }
             );
-            let progress = walk_step(&db.inner(), 300).unwrap();
+            let progress = walk_step(&db.inner(), 300, WALK_STEP_TIME).unwrap();
             assert_eq!(
                 progress,
                 WalkProgress {
@@ -784,12 +997,15 @@ mod tests {
         let db = RocksDb::open(dir.path()).unwrap();
         let store = RocksHypergraphStore::new(db.inner());
         let mut steps = 0;
-        while !walk_step(&db.inner(), 300).unwrap().complete {
+        while !walk_step(&db.inner(), 300, WALK_STEP_TIME)
+            .unwrap()
+            .complete
+        {
             steps += 1;
             assert!(steps < 10);
         }
         assert_eq!(
-            walk_step(&db.inner(), 300).unwrap(),
+            walk_step(&db.inner(), 300, WALK_STEP_TIME).unwrap(),
             WalkProgress {
                 rows: u64::from(rows),
                 indexed: 0,
@@ -804,6 +1020,130 @@ mod tests {
                 .map(address)
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Rows written raw, as a store holds them before it keeps the index.
+    fn seed_raw(db: &RocksDb, rows: std::ops::Range<u32>) {
+        for n in rows {
+            let len = if n % 100 == 0 {
+                LARGE_VERTEX_MIN_BYTES
+            } else {
+                200
+            };
+            db.inner()
+                .put(
+                    crate::encoding::hypergraph_vertex_data_v2_key(
+                        "vertex",
+                        "adds",
+                        &shard(),
+                        &vertex_key(n),
+                        1,
+                    ),
+                    vec![1u8; len],
+                )
+                .unwrap();
+        }
+    }
+
+    /// A step whose seek alone outlasts its time still reads a row, so the
+    /// walk always advances and ends.
+    #[test]
+    fn a_step_whose_seek_overruns_its_time_still_advances() {
+        let db = RocksDb::open_in_memory().unwrap();
+        seed_raw(&db, 0..5);
+        let mut walked = Vec::new();
+        loop {
+            let progress = walk_step(&db.inner(), WALK_STEP_ROWS, Duration::ZERO).unwrap();
+            if progress.complete {
+                break;
+            }
+            walked.push(progress.rows);
+            assert!(walked.len() <= 5, "the walk stalled at {walked:?}");
+        }
+        assert_eq!(walked, vec![1, 2, 3, 4], "one row per step, then the end");
+    }
+
+    /// An index is trusted at open only when a clean close sealed it and
+    /// nothing wrote the store since: a store reopened without a seal, or
+    /// written past it by a binary without the index, is walked again and its
+    /// new rows found.
+    #[test]
+    fn only_a_sealed_untouched_index_is_trusted_at_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let open = || RocksDb::open(dir.path()).unwrap();
+        let walk_all = |db: &RocksDb| {
+            while !walk_step(&db.inner(), WALK_STEP_ROWS, WALK_STEP_TIME)
+                .unwrap()
+                .complete
+            {}
+        };
+        {
+            let db = open();
+            seed_raw(&db, 0..300);
+            assert!(matches!(
+                reconcile(&db.inner()).unwrap(),
+                OpenCheck::Rewalk(_)
+            ));
+            walk_all(&db);
+            assert!(seal(&db.inner()).unwrap());
+        }
+        {
+            // Reopened as the node opens it: nothing wrote since the seal.
+            let db = open();
+            assert_eq!(reconcile(&db.inner()).unwrap(), OpenCheck::Complete);
+        }
+        {
+            // The last run ended without a seal (a crash).
+            let db = open();
+            assert_eq!(
+                reconcile(&db.inner()).unwrap(),
+                OpenCheck::Rewalk(
+                    "the store was not closed cleanly, or a binary without the index ran it"
+                )
+            );
+            walk_all(&db);
+            assert!(seal(&db.inner()).unwrap());
+            // A binary without the index writes after the seal.
+            seed_raw(&db, 300..301);
+        }
+        let db = open();
+        assert_eq!(
+            reconcile(&db.inner()).unwrap(),
+            OpenCheck::Rewalk("the store was written after its index was sealed")
+        );
+        let store = RocksHypergraphStore::new(db.inner());
+        assert_eq!(
+            store
+                .capture_snapshot()
+                .unwrap()
+                .large_vertex_index_state()
+                .unwrap(),
+            LargeVertexIndexState::Building { rows_walked: 0 }
+        );
+        walk_all(&db);
+        assert_eq!(
+            page_all(&store).0,
+            (0..=300).step_by(100).map(address).collect::<Vec<_>>()
+        );
+    }
+
+    /// A walk stopped for a store's release lets go of it and seals it, so
+    /// the store reopens at once and resumes rather than walks again.
+    #[test]
+    fn a_stopped_walk_releases_the_store_and_resumes_after_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let db = RocksDb::open(dir.path()).unwrap();
+            seed_raw(&db, 0..2_000);
+            start(&db.inner(), "worker 9001".into());
+            stop(&db.inner());
+            assert!(store_name(&db.inner()).is_none());
+        }
+        let db = RocksDb::open(dir.path()).unwrap();
+        assert!(matches!(
+            reconcile(&db.inner()).unwrap(),
+            OpenCheck::Resume | OpenCheck::Complete
+        ));
     }
 
     /// A content-address-like spread of `n`.
@@ -867,7 +1207,7 @@ mod tests {
         let mut steps = 0;
         let progress = loop {
             steps += 1;
-            let progress = walk_step(&db.inner(), WALK_STEP_ROWS).unwrap();
+            let progress = walk_step(&db.inner(), WALK_STEP_ROWS, WALK_STEP_TIME).unwrap();
             if progress.complete {
                 break progress;
             }

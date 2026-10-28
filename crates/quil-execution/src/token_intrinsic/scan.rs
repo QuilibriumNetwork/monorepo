@@ -286,7 +286,13 @@ fn scan_coins(
         cursor = Some(address);
     }
     let cursor = page.cursor.max(cursor);
-    report_slow_page(application, examined, coins.len(), started.elapsed());
+    report_slow_page(
+        snapshot,
+        application,
+        examined,
+        coins.len(),
+        started.elapsed(),
+    );
     Ok((coins, cursor, page.has_more))
 }
 
@@ -374,6 +380,7 @@ const SLOW_PAGE: std::time::Duration = std::time::Duration::from_secs(1);
 /// One line, at most once a minute, for scan pages that run long: a store
 /// whose index cannot answer them, or a disk that cannot keep up.
 fn report_slow_page(
+    snapshot: &dyn SnapshotReadable,
     application: &[u8; 32],
     examined: usize,
     coins: usize,
@@ -399,6 +406,7 @@ fn report_slow_page(
     }
     SLOW.store(0, Ordering::Relaxed);
     tracing::warn!(
+        store = snapshot.store_name().as_deref().unwrap_or("unnamed"),
         application = %hex::encode(application),
         records_examined = examined,
         coins_returned = coins,
@@ -1381,7 +1389,12 @@ mod tests {
             matches!(&refused, QuilError::ExecutionUnavailable(m) if m.contains("still indexing") && m.contains("0 walked")),
             "{refused}"
         );
-        let progress = quil_store::large_vertex_index::walk_step(&db.inner(), 100).unwrap();
+        let progress = quil_store::large_vertex_index::walk_step(
+            &db.inner(),
+            100,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
         assert!(!progress.complete);
         let refused = scan_wallet(store.capture_snapshot().unwrap().as_ref()).unwrap_err();
         assert!(refused.to_string().contains("100 walked"), "{refused}");
@@ -1391,9 +1404,13 @@ mod tests {
         let store = quil_store::RocksHypergraphStore::new(db.inner());
         assert!(scan_wallet(store.capture_snapshot().unwrap().as_ref()).is_err());
         let mut steps = 0;
-        while !quil_store::large_vertex_index::walk_step(&db.inner(), 100)
-            .unwrap()
-            .complete
+        while !quil_store::large_vertex_index::walk_step(
+            &db.inner(),
+            100,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap()
+        .complete
         {
             steps += 1;
             assert!(steps < 100);

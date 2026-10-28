@@ -40,6 +40,10 @@ impl OverlayHypergraphSnapshot {
     fn scan_point_backend(&self) -> Option<quil_types::store::ScanPoint> {
         self.snapshot.scan_point()
     }
+
+    fn store_name_backend(&self) -> Option<String> {
+        None
+    }
 }
 
 impl OverlayHypergraphStore {
@@ -835,6 +839,10 @@ impl RocksHypergraphSnapshot {
     fn scan_point_backend(&self) -> Option<quil_types::store::ScanPoint> {
         Some(self.scan)
     }
+
+    fn store_name_backend(&self) -> Option<String> {
+        crate::large_vertex_index::store_name(&self._db)
+    }
 }
 
 fn page_fixed_vertices_at_snapshot(
@@ -1106,6 +1114,10 @@ macro_rules! impl_hypergraph_snapshot {
                     limits,
                     skip,
                 )
+            }
+
+            fn store_name(&self) -> Option<String> {
+                self.store_name_backend()
             }
 
             fn large_vertex_index_state(&self) -> Result<quil_types::store::LargeVertexIndexState> {
@@ -1434,7 +1446,7 @@ impl RocksHypergraphStore {
             };
             // The copied rows' index entries; another store's walk state
             // does not describe this one's rows.
-            if &*k == crate::large_vertex_index::state_key() {
+            if crate::large_vertex_index::is_walk_record(&k) {
                 continue;
             }
             batch.put(&k, &v);
