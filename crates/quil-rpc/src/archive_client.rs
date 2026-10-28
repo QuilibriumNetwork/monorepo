@@ -759,13 +759,15 @@ impl ArchiveClient {
     }
 
     /// Peer coin scan over the same authenticated :8340 channel: ask a node
-    /// that covers `domain` for one page. `Unavailable` means that peer does
+    /// that covers `domain` for one page of up to `max_coins` coins (a peer
+    /// without the field answers eight). `Unavailable` means that peer does
     /// not serve the application — try the next one, not an empty answer.
     pub async fn list_shard_coins(
         &mut self,
         domain: Vec<u8>,
         snapshot_id: Vec<u8>,
         after: Vec<u8>,
+        max_coins: u32,
     ) -> Result<quil_types::proto::global::ListShardCoinsResponse, ArchiveClientError> {
         Ok(self
             .app_shard
@@ -773,6 +775,7 @@ impl ArchiveClient {
                 domain,
                 snapshot_id,
                 after,
+                max_coins,
             })
             .await?
             .into_inner())
@@ -800,6 +803,7 @@ impl ArchiveClient {
         domain: Vec<u8>,
         snapshot_id: Vec<u8>,
         after: Vec<u8>,
+        max_escrows: u32,
     ) -> Result<quil_types::proto::global::ListShardEscrowsResponse, ArchiveClientError> {
         Ok(self
             .app_shard
@@ -807,6 +811,7 @@ impl ArchiveClient {
                 domain,
                 snapshot_id,
                 after,
+                max_coins: max_escrows,
             })
             .await?
             .into_inner())

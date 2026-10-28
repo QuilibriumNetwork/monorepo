@@ -8,7 +8,9 @@ use quil_store::{RocksDb, RocksHypergraphStore};
 use quil_types::proto::global::app_shard_service_server::AppShardService;
 use quil_types::proto::node::node_service_server::NodeService;
 use quil_types::proto::{global, node};
-use quil_types::store::{CoinWitnessProvider, EscrowPageData, HypergraphStore, ShardKey};
+use quil_types::store::{
+    CoinData, CoinPageData, CoinWitnessProvider, EscrowPageData, HypergraphStore, ShardKey,
+};
 use tonic::{Code, Request, Status};
 
 const DOMAIN: [u8; 32] = [7; 32];
@@ -47,6 +49,54 @@ impl CoinWitnessProvider for Escrows {
             },
             cursor: Some([9; 32]),
             has_more: after.is_none(),
+        }))
+    }
+}
+
+/// The sizes the wallet-facing scan checks a coin page against.
+const ROOT_RECORD_BYTES: usize = 8 + 32 + 1 + 8 + 4 * 1216;
+const IDENTITY_BYTES: usize = 3648;
+
+fn coin_address(i: u8) -> [u8; 32] {
+    let mut address = [0; 32];
+    address[31] = i;
+    address
+}
+
+/// Coins at addresses 1..=100, eight a page, as a node's store answers.
+struct Coins;
+
+impl CoinWitnessProvider for Coins {
+    fn coin_page(
+        &self,
+        domain: &[u8; 32],
+        id: Option<&[u8; 32]>,
+        after: Option<&[u8; 32]>,
+    ) -> quil_types::error::Result<Option<CoinPageData>> {
+        assert_eq!(domain, &DOMAIN);
+        assert!(id.is_none() || id == Some(&[8; 32]));
+        let next = after.map_or(1, |address| address[31] + 1);
+        let listed: Vec<u8> = (next..=100).take(8).collect();
+        let mut root_record = vec![0; ROOT_RECORD_BYTES];
+        root_record[..8].copy_from_slice(b"QCT3RT\0\x02");
+        root_record[40] = 1;
+        Ok(Some(CoinPageData {
+            network: [11; 32],
+            snapshot_id: [8; 32],
+            root_record,
+            coins: listed
+                .iter()
+                .map(|&i| CoinData {
+                    address: coin_address(i),
+                    frame_number: 1,
+                    position: 0,
+                    owner: vec![0; IDENTITY_BYTES],
+                    commitment: vec![0; 10368],
+                    memo: vec![0; 1115],
+                })
+                .collect(),
+            cursor: listed.last().map(|&i| coin_address(i)).or(after.copied()),
+            has_more: listed.last().is_some_and(|&i| i < 100),
         }))
     }
 }
@@ -114,7 +164,7 @@ async fn forwarded_escrow_scan_preserves_pages_and_rejects_changed_snapshot() {
     let peer = Arc::new(peer(true));
     let wallet = NodeRpcServer::new()
         .with_application_coverage(Arc::new(|_| false))
-        .with_remote_escrow_page(Arc::new(move |domain, id, after| {
+        .with_remote_escrow_page(Arc::new(move |domain, id, after, max_coins| {
             let peer = peer.clone();
             Box::pin(async move {
                 let page = peer
@@ -122,6 +172,7 @@ async fn forwarded_escrow_scan_preserves_pages_and_rejects_changed_snapshot() {
                         domain: domain.to_vec(),
                         snapshot_id: id.map(Vec::from).unwrap_or_default(),
                         after: after.map(Vec::from).unwrap_or_default(),
+                        max_coins,
                     }))
                     .await
                     .ok()?
@@ -155,6 +206,7 @@ async fn forwarded_escrow_scan_preserves_pages_and_rejects_changed_snapshot() {
             domain: DOMAIN.to_vec(),
             snapshot_id: first.snapshot_id,
             after: first.cursor,
+            max_coins: 0,
         }))
         .await
         .unwrap()
@@ -164,7 +216,7 @@ async fn forwarded_escrow_scan_preserves_pages_and_rejects_changed_snapshot() {
 
     let changed = NodeRpcServer::new()
         .with_application_coverage(Arc::new(|_| false))
-        .with_remote_escrow_page(Arc::new(|_, _, after| {
+        .with_remote_escrow_page(Arc::new(|_, _, after, _| {
             Box::pin(async move {
                 Some(EscrowPageData {
                     network: [11; 32],
@@ -181,6 +233,7 @@ async fn forwarded_escrow_scan_preserves_pages_and_rejects_changed_snapshot() {
                 domain: DOMAIN.to_vec(),
                 snapshot_id: vec![8; 32],
                 after: vec![9; 32],
+                max_coins: 0,
             }))
             .await
             .unwrap_err()
@@ -276,4 +329,93 @@ async fn forwarded_vertex_reads_find_worker_data_and_preserve_tree_entries() {
             .code(),
         Code::Unavailable
     );
+}
+
+/// A wallet's page size reaches the peer that serves its forwarded scan, so
+/// the peer gathers the larger page beside its store; a wallet that does not
+/// ask gets the page of eight it always got, and a larger ask is clamped
+/// before it is passed on.
+#[tokio::test]
+async fn a_forwarded_coin_scan_asks_the_peer_for_the_wallets_page_size() {
+    let peer = Arc::new(
+        AppShardRpcServer::with_provider(Arc::new(NoFrames))
+            .with_coin_scan(Arc::new(Coins), Arc::new(|app| app == DOMAIN)),
+    );
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let wallet = NodeRpcServer::new()
+        .with_application_coverage(Arc::new(|_| false))
+        .with_remote_coin_page({
+            let asked = asked.clone();
+            Arc::new(move |domain, id, after, max_coins| {
+                asked.lock().unwrap().push(max_coins);
+                let peer = peer.clone();
+                Box::pin(async move {
+                    let page = peer
+                        .list_shard_coins(Request::new(global::ListShardCoinsRequest {
+                            domain: domain.to_vec(),
+                            snapshot_id: id.map(Vec::from).unwrap_or_default(),
+                            after: after.map(Vec::from).unwrap_or_default(),
+                            max_coins,
+                        }))
+                        .await
+                        .map_err(|status| status.message().to_string())?
+                        .into_inner();
+                    Ok::<_, String>(CoinPageData {
+                        network: page.network.try_into().unwrap(),
+                        snapshot_id: page.snapshot_id.try_into().unwrap(),
+                        root_record: page.root_record,
+                        coins: page
+                            .coins
+                            .into_iter()
+                            .map(|coin| CoinData {
+                                address: coin.address.try_into().unwrap(),
+                                frame_number: coin.frame_number,
+                                position: coin.position,
+                                owner: coin.owner,
+                                commitment: coin.commitment,
+                                memo: coin.memo,
+                            })
+                            .collect(),
+                        cursor: page.cursor.try_into().ok(),
+                        has_more: page.has_more,
+                    })
+                })
+            })
+        });
+    let request = |max_coins, snapshot_id: Vec<u8>, after: Vec<u8>| {
+        Request::new(node::ListCoinsRequest {
+            domain: DOMAIN.to_vec(),
+            snapshot_id,
+            after,
+            max_coins,
+        })
+    };
+    let first = wallet
+        .list_coins(request(64, vec![], vec![]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.coins.len(), 64);
+    assert!(first.has_more);
+    let rest = wallet
+        .list_coins(request(64, first.snapshot_id, first.cursor))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(rest.coins.len(), 36);
+    assert!(!rest.has_more);
+    assert_eq!(rest.coins[35].address, coin_address(100).to_vec());
+    let old = wallet
+        .list_coins(request(0, vec![], vec![]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(old.coins.len(), 8);
+    let capped = wallet
+        .list_coins(request(1_000, vec![], vec![]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(capped.coins.len(), 64);
+    assert_eq!(*asked.lock().unwrap(), vec![64, 64, 8, 64]);
 }

@@ -1028,6 +1028,9 @@ message ListShardCoinsRequest {
   bytes domain = 1;
   bytes snapshot_id = 2;
   bytes after = 3;
+  // As node.pb ListCoinsRequest.max_coins: a node forwarding a wallet's scan
+  // passes on the page size it serves the wallet.
+  uint32 max_coins = 4;
 }
 
 // Mirrors node.pb ConfidentialCoin; node.proto imports global.proto, so the

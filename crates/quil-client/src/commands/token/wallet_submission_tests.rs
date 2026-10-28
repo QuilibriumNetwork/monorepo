@@ -199,7 +199,10 @@ async fn wallet_scans_owned_unspent_coins_over_rpc() {
     let mut amounts: Vec<_> = unspent.iter().map(|coin| *coin.amount).collect();
     amounts.sort();
     assert_eq!(amounts, [11, 17]);
-    assert!(wallet.clone().scan_unspent(&client, 1, 2).await.is_err());
+    // One page carries every coin: the node gathers the provider's pages of
+    // one coin into the page of up to 64 the wallet asks for.
+    let one_page = wallet.clone().scan_unspent(&client, 1, 2).await.unwrap();
+    assert_eq!(one_page.len(), 2);
     assert!(wallet.clone().scan_unspent(&client, 4, 1).await.is_err());
     provider
         .fail_continuation
@@ -369,11 +372,14 @@ async fn wallet_fetches_content_bound_escrow_over_rpc() {
         .await
         .unwrap()
         .is_empty());
-    assert!(wallet
+    // One page carries the empty first page and the escrow behind it: the
+    // node gathers both into the page of up to 64 the wallet asks for.
+    let one_page = wallet
         .clone()
         .scan_escrows(&client, vec![22; 897], 1, 1)
         .await
-        .is_err());
+        .unwrap();
+    assert_eq!(one_page.len(), 1);
     // Consumption is the global commit's: the GLOBAL escrow record flips.
     let mut consumed_vertex = global.to_vec();
     consumed_vertex
@@ -748,4 +754,216 @@ async fn automatic_quil_fee_is_quoted_by_the_configured_node_and_bounded() {
     stop_read.send(()).unwrap();
     configured_serving.await.unwrap();
     read_serving.await.unwrap();
+}
+
+/// A/B reproducer: a wallet scan lists every confidential coin the application
+/// ever placed, spent or not (a spend reveals a key image, never which coin
+/// it spent), so a wallet must find its own coin behind all of them within
+/// its page budget. At eight coins a page the default budget (2,048 pages)
+/// reached 16,384 coins, and every default `token balance` and `token coins`
+/// failed once the application held one more. A wallet checks and
+/// trial-decrypts every coin it scans, about 0.1 s each in the test profile,
+/// so the test keeps the wallet's own page size, which is what changed, and
+/// scales the budget down to 16 pages, with one coin more behind them than
+/// they reach at eight coins a page.
+#[tokio::test]
+async fn a_default_wallet_scan_finds_its_coin_behind_the_old_page_budget() {
+    use clap::Parser;
+    use quil_execution::token_intrinsic::{coin_blocks, state};
+    use quil_lattice_ct::confidential::{coin_tree::CoinRecord, memo::create_output};
+    use quil_types::store::*;
+
+    /// The application's coins in address order, eight a page as a node's
+    /// store answers them.
+    struct Coins {
+        network: [u8; 32],
+        root: Vec<u8>,
+        /// `(address, frame, position, the wallet's own)`.
+        coins: Vec<([u8; 32], u64, u64, bool)>,
+        /// `(owner, commitment, memo)` of the others' output, then the
+        /// wallet's.
+        outputs: [(Vec<u8>, Vec<u8>, Vec<u8>); 2],
+    }
+    impl CoinWitnessProvider for Coins {
+        fn coin_page(
+            &self,
+            _: &[u8; 32],
+            _: Option<&[u8; 32]>,
+            after: Option<&[u8; 32]>,
+        ) -> quil_types::error::Result<Option<CoinPageData>> {
+            let start = self
+                .coins
+                .partition_point(|(address, ..)| after.is_some_and(|after| address <= after));
+            let page = &self.coins[start..self.coins.len().min(start + 8)];
+            Ok(Some(CoinPageData {
+                network: self.network,
+                snapshot_id: [33; 32],
+                root_record: self.root.clone(),
+                coins: page
+                    .iter()
+                    .map(|&(address, frame_number, position, mine)| {
+                        let (owner, commitment, memo) = &self.outputs[usize::from(mine)];
+                        CoinData {
+                            address,
+                            frame_number,
+                            position,
+                            owner: owner.clone(),
+                            commitment: commitment.clone(),
+                            memo: memo.clone(),
+                        }
+                    })
+                    .collect(),
+                cursor: page.last().map(|coin| coin.0).or(after.copied()),
+                has_more: start + page.len() < self.coins.len(),
+            }))
+        }
+    }
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        token: super::super::TokenArgs,
+    }
+    let defaults = Cli::try_parse_from(["qclient", "balance"]).unwrap().token;
+    // One coin more than pages of eight reach within the budget.
+    let pages = 16;
+    let others = pages * 8;
+
+    let network = [31; 32];
+    let application = quil_execution::domains::QUIL_TOKEN;
+    let make_wallet = || {
+        let keys = sntrup761::Sntrup761KeyPair::generate();
+        Arc::new(
+            RecipientWallet::from_keys(
+                &network,
+                &application,
+                &keys.public,
+                Zeroizing::new(keys.secret),
+            )
+            .unwrap(),
+        )
+    };
+    let wallet = make_wallet();
+    let other = make_wallet();
+    let mine = create_output(&wallet.context, wallet.address(), 5)
+        .unwrap()
+        .output;
+    let theirs = create_output(&wallet.context, other.address(), 7)
+        .unwrap()
+        .output;
+    let identity = |output: &Output, frame: u64| {
+        state::coin_identity(&wallet.context, frame, output)
+            .unwrap()
+            .0
+    };
+    // The wallet's coin sorts after every other coin, so the scan reaches it
+    // last: it takes the highest address of a few frames, and the others are
+    // drawn below it. (An address encodes a field element, so its top byte
+    // never reaches 0xff.)
+    let (my_address, my_frame) = (1..=16)
+        .map(|frame| (identity(&mine, frame), frame))
+        .max()
+        .unwrap();
+    let mut placed = vec![(my_address, my_frame, true)];
+    let mut frame = 0;
+    while placed.len() <= others {
+        frame += 1;
+        let address = identity(&theirs, frame);
+        if address < my_address {
+            placed.push((address, frame, false));
+        }
+    }
+    placed.sort();
+    // Each coin sits in the block its address selects, at that block's next
+    // free index, as the wallet checks.
+    let width = coin_blocks::INITIAL_BLOCK_BITS;
+    let mut next_local = std::collections::BTreeMap::<u64, u64>::new();
+    let coins: Vec<_> = placed
+        .into_iter()
+        .map(|(address, frame, mine)| {
+            let block = coin_blocks::block_for_address(width, &address).unwrap();
+            let local = next_local.entry(block).or_default();
+            let position = coin_blocks::position(width, block, *local).unwrap();
+            *local += 1;
+            (address, frame, position, mine)
+        })
+        .collect();
+    let my_position = coins.last().unwrap().2;
+    let tree = quil_lattice_ct::confidential::sharded_tree::ShardedCoinTree::build(
+        &wallet.context,
+        quil_lattice_ct::confidential::sharded_tree::Shape {
+            shard_bits: coin_blocks::BLOCK_INDEX_BITS,
+            subtree_bits: coin_blocks::SUBTREE_BITS,
+        },
+        &[CoinRecord {
+            address: my_address,
+            owner: mine.owner,
+            commitment: mine.commitment.clone(),
+            position: my_position,
+        }],
+    )
+    .unwrap();
+    let root = tree
+        .root_at_depth(tree.current_depth())
+        .unwrap()
+        .encode()
+        .unwrap()
+        .to_vec();
+    let bytes = |output: &Output| {
+        (
+            output.owner.to_vec(),
+            output.commitment.to_bytes().to_vec(),
+            output.memo.to_vec(),
+        )
+    };
+    let provider = Arc::new(Coins {
+        network,
+        root,
+        coins,
+        outputs: [bytes(&theirs), bytes(&mine)],
+    });
+    let server = quil_rpc::node_service::NodeRpcServer::new()
+        .with_hypergraph_store(Arc::new(quil_hypergraph::testing::MemStore::new()))
+        .with_coin_witness_provider(provider);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let incoming = futures::stream::unfold(listener, |listener| async {
+        let result = listener.accept().await.map(|(socket, _)| socket);
+        Some((result, listener))
+    });
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(async {
+        tonic::transport::Server::builder()
+            .add_service(
+                quil_types::proto::node::node_service_server::NodeServiceServer::new(server),
+            )
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    let channel = tonic::transport::Endpoint::from_shared(endpoint)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let client = quil_types::proto::node::node_service_client::NodeServiceClient::new(channel);
+    let unspent = wallet
+        .clone()
+        .scan_unspent(&client, pages, defaults.max_coins)
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "a scan of {pages} pages must reach the wallet's coin behind {others} \
+                 others, as a default scan ({} pages) must behind {}: {error}",
+                defaults.max_pages,
+                defaults.max_pages * 8
+            )
+        });
+    assert_eq!(unspent.len(), 1);
+    assert_eq!(unspent[0].address, my_address);
+    assert_eq!(*unspent[0].amount, 5);
+    stop.send(()).unwrap();
+    serving.await.unwrap();
 }

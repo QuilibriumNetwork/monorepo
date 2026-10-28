@@ -149,6 +149,11 @@ fn select_coins(
     anyhow::bail!("insufficient node-reported unspent funds")
 }
 
+/// Coins or escrows a scan page asks for: the most a node serves, so the
+/// page budget covers eight times the coins it did. A node without
+/// `max_coins` answers pages of eight, which the page checks accept too.
+const SCAN_PAGE_ENTRIES: usize = quil_types::store::MAX_SCAN_PAGE_ENTRIES;
+
 /// Bounded scan state. A failed page leaves it unchanged; an expired snapshot
 /// requires a fresh scan, never an implicit jump to a new database generation.
 pub(super) struct CoinScan {
@@ -1861,11 +1866,12 @@ impl RecipientWallet {
         );
         let response = client
             .clone()
-            .max_decoding_message_size(256 * 1024)
+            .max_decoding_message_size(quil_types::store::scan_page_bytes(SCAN_PAGE_ENTRIES))
             .list_coins(quil_types::proto::node::ListCoinsRequest {
                 domain: self.application.to_vec(),
                 snapshot_id: scan.snapshot_id.map(|id| id.to_vec()).unwrap_or_default(),
                 after: scan.after.map(|id| id.to_vec()).unwrap_or_default(),
+                max_coins: SCAN_PAGE_ENTRIES as u32,
             })
             .await?
             .into_inner();
@@ -1959,7 +1965,8 @@ impl RecipientWallet {
             "scan ended or page budget exhausted"
         );
         anyhow::ensure!(
-            prost::Message::encoded_len(&response) <= 256 * 1024,
+            prost::Message::encoded_len(&response)
+                <= quil_types::store::scan_page_bytes(SCAN_PAGE_ENTRIES),
             "escrow page exceeds size limit"
         );
         anyhow::ensure!(
@@ -1983,7 +1990,7 @@ impl RecipientWallet {
             )
         };
         anyhow::ensure!(
-            response.escrows.len() <= 8
+            response.escrows.len() <= SCAN_PAGE_ENTRIES
                 && cursor >= scan.after
                 && (!response.has_more || (cursor.is_some() && cursor > scan.after)),
             "invalid scan progress"
@@ -2036,11 +2043,12 @@ impl RecipientWallet {
             );
             let response = client
                 .clone()
-                .max_decoding_message_size(256 * 1024)
+                .max_decoding_message_size(quil_types::store::scan_page_bytes(SCAN_PAGE_ENTRIES))
                 .list_escrows(quil_types::proto::node::ListCoinsRequest {
                     domain: self.application.to_vec(),
                     snapshot_id: scan.snapshot_id.map(|id| id.to_vec()).unwrap_or_default(),
                     after: scan.after.map(|id| id.to_vec()).unwrap_or_default(),
+                    max_coins: SCAN_PAGE_ENTRIES as u32,
                 })
                 .await?
                 .into_inner();
@@ -2124,7 +2132,8 @@ impl RecipientWallet {
             "scan ended or page budget exhausted"
         );
         anyhow::ensure!(
-            prost::Message::encoded_len(&response) <= 256 * 1024,
+            prost::Message::encoded_len(&response)
+                <= quil_types::store::scan_page_bytes(SCAN_PAGE_ENTRIES),
             "scan response exceeds size limit"
         );
         anyhow::ensure!(
@@ -2173,7 +2182,7 @@ impl RecipientWallet {
             )
         };
         anyhow::ensure!(
-            response.coins.len() <= 8
+            response.coins.len() <= SCAN_PAGE_ENTRIES
                 && cursor >= scan.after
                 && (!response.has_more || (cursor.is_some() && cursor > scan.after)),
             "invalid scan progress"

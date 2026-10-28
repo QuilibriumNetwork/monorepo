@@ -2290,9 +2290,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         node_rpc_builder = node_rpc_builder
             .with_remote_coin_page({
                 let reader = reader.clone();
-                Arc::new(move |domain, snapshot, after| {
+                Arc::new(move |domain, snapshot, after, max_coins| {
                     let reader = reader.clone();
-                    Box::pin(async move { reader.coin_page(domain, snapshot, after).await })
+                    Box::pin(
+                        async move { reader.coin_page(domain, snapshot, after, max_coins).await },
+                    )
                 })
             })
             .with_remote_legacy_coins({
@@ -2304,9 +2306,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
             })
             .with_remote_escrow_page({
                 let reader = reader.clone();
-                Arc::new(move |domain, snapshot, after| {
+                Arc::new(move |domain, snapshot, after, max_escrows| {
                     let reader = reader.clone();
-                    Box::pin(async move { reader.escrow_page(domain, snapshot, after).await })
+                    Box::pin(async move {
+                        reader
+                            .escrow_page(domain, snapshot, after, max_escrows)
+                            .await
+                    })
                 })
             })
             .with_remote_vertex({

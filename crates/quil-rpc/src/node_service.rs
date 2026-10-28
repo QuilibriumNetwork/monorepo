@@ -136,6 +136,111 @@ async fn coin_read_permit(
     }
 }
 
+/// One page of a wallet scan as a provider answers it.
+trait ScanPage: Sized {
+    fn entries(&self) -> usize;
+    fn has_more(&self) -> bool;
+    fn snapshot_id(&self) -> [u8; 32];
+    fn cursor(&self) -> Option<[u8; 32]>;
+    /// Append `next`, the page read after this one's cursor, when it
+    /// continues the same scan; `false` leaves this page as it was.
+    fn append(&mut self, next: Self) -> bool;
+}
+
+impl ScanPage for quil_types::store::CoinPageData {
+    fn entries(&self) -> usize {
+        self.coins.len()
+    }
+    fn has_more(&self) -> bool {
+        self.has_more
+    }
+    fn snapshot_id(&self) -> [u8; 32] {
+        self.snapshot_id
+    }
+    fn cursor(&self) -> Option<[u8; 32]> {
+        self.cursor
+    }
+    fn append(&mut self, next: Self) -> bool {
+        if next.network != self.network
+            || next.snapshot_id != self.snapshot_id
+            || next.root_record != self.root_record
+            || next.cursor < self.cursor
+        {
+            return false;
+        }
+        self.coins.extend(next.coins);
+        self.cursor = next.cursor;
+        self.has_more = next.has_more;
+        true
+    }
+}
+
+impl ScanPage for quil_types::store::EscrowPageData {
+    fn entries(&self) -> usize {
+        self.escrows.len()
+    }
+    fn has_more(&self) -> bool {
+        self.has_more
+    }
+    fn snapshot_id(&self) -> [u8; 32] {
+        self.snapshot_id
+    }
+    fn cursor(&self) -> Option<[u8; 32]> {
+        self.cursor
+    }
+    fn append(&mut self, next: Self) -> bool {
+        if next.network != self.network
+            || next.snapshot_id != self.snapshot_id
+            || next.cursor < self.cursor
+        {
+            return false;
+        }
+        self.escrows.extend(next.escrows);
+        self.cursor = next.cursor;
+        self.has_more = next.has_more;
+        true
+    }
+}
+
+/// A scan page of up to `entries` coins or escrows, read through `read`,
+/// which answers provider pages of at most
+/// [`quil_types::store::DEFAULT_SCAN_PAGE_ENTRIES`] from one retained
+/// snapshot. The page continues while another provider page surely fits,
+/// with at most `entries / DEFAULT_SCAN_PAGE_ENTRIES` provider pages in all,
+/// so a larger page costs the node no more per entry than the default one,
+/// and the default page is exactly one provider page. A continuation that
+/// fails ends the page early: the wallet's next request meets the failure.
+fn gather_scan_page<P, F>(
+    entries: usize,
+    snapshot_id: Option<[u8; 32]>,
+    after: Option<[u8; 32]>,
+    mut read: F,
+) -> quil_types::error::Result<Option<P>>
+where
+    P: ScanPage,
+    F: FnMut(Option<&[u8; 32]>, Option<&[u8; 32]>) -> quil_types::error::Result<Option<P>>,
+{
+    use quil_types::store::DEFAULT_SCAN_PAGE_ENTRIES;
+    let Some(mut page) = read(snapshot_id.as_ref(), after.as_ref())? else {
+        return Ok(None);
+    };
+    for _ in 1..entries / DEFAULT_SCAN_PAGE_ENTRIES {
+        if !page.has_more() || page.entries() + DEFAULT_SCAN_PAGE_ENTRIES > entries {
+            break;
+        }
+        let (id, Some(cursor)) = (page.snapshot_id(), page.cursor()) else {
+            break;
+        };
+        let Ok(Some(next)) = read(Some(&id), Some(&cursor)) else {
+            break;
+        };
+        if !page.append(next) {
+            break;
+        }
+    }
+    Ok(Some(page))
+}
+
 /// Handler installed by the caller to route a Go-CLI `submit_message`
 /// into the same message-collection pipeline used by
 /// `GlobalService::submit_global_message`. Returns an error string
@@ -201,13 +306,15 @@ pub type RemoteVertex = Arc<
         + Sync,
 >;
 
-/// Forwards one coin-scan page to a node holding the application. `Err`
+/// Forwards one coin-scan page to a node holding the application, asking
+/// for pages of up to the given number of coins (`max_coins`). `Err`
 /// carries the asked peers' reasons for declining, for the wallet's status.
 pub type RemoteCoinPage = Arc<
     dyn Fn(
             [u8; 32],
             Option<[u8; 32]>,
             Option<[u8; 32]>,
+            u32,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<Output = Result<quil_types::store::CoinPageData, String>>
@@ -232,11 +339,13 @@ pub type RemoteLegacyCoins = Arc<
         + Sync,
 >;
 
+/// Forwards one escrow-scan page, as [`RemoteCoinPage`] does a coin page.
 pub type RemoteEscrowPage = Arc<
     dyn Fn(
             [u8; 32],
             Option<[u8; 32]>,
             Option<[u8; 32]>,
+            u32,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Option<quil_types::store::EscrowPageData>> + Send>,
         > + Send
@@ -953,6 +1062,7 @@ impl NodeService for NodeRpcServer {
                 "continuation requires snapshot identity",
             ));
         }
+        let entries = quil_types::store::scan_page_entries(req.max_coins);
         let page = if self.serves_application(&domain) {
             let provider = self
                 .coin_witness_provider
@@ -962,7 +1072,9 @@ impl NodeService for NodeRpcServer {
             let permit = coin_read_permit(&COIN_SCAN_WORKERS, "coin scan").await?;
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                provider.escrow_page(&domain, snapshot_id.as_ref(), after.as_ref())
+                gather_scan_page(entries, snapshot_id, after, |id, after| {
+                    provider.escrow_page(&domain, id, after)
+                })
             })
             .await
             .map_err(|e| Status::internal(format!("escrow scan task: {e}")))?
@@ -973,15 +1085,18 @@ impl NodeService for NodeRpcServer {
                 .remote_escrow_page
                 .as_ref()
                 .ok_or_else(|| self.coverage_error(&domain))?;
-            remote(domain, snapshot_id, after).await.ok_or_else(|| {
-                Status::unavailable(format!(
-                    "no node serving application {} answered this node",
-                    hex::encode(domain)
-                ))
-            })?
+            // The clamped size: a peer allowing more would fail validation.
+            remote(domain, snapshot_id, after, entries as u32)
+                .await
+                .ok_or_else(|| {
+                    Status::unavailable(format!(
+                        "no node serving application {} answered this node",
+                        hex::encode(domain)
+                    ))
+                })?
         };
         if snapshot_id.is_some_and(|id| id != page.snapshot_id)
-            || page.escrows.len() > 8
+            || page.escrows.len() > entries
             || (page.has_more && (page.cursor.is_none() || page.cursor <= after))
             || page.cursor < after
         {
@@ -1015,7 +1130,7 @@ impl NodeService for NodeRpcServer {
                 .unwrap_or_default(),
             has_more: page.has_more,
         };
-        if prost::Message::encoded_len(&response) > 256 * 1024 {
+        if prost::Message::encoded_len(&response) > quil_types::store::scan_page_bytes(entries) {
             return Err(Status::resource_exhausted(
                 "coin scan response exceeds size limit",
             ));
@@ -1048,6 +1163,7 @@ impl NodeService for NodeRpcServer {
                 "continuation requires snapshot identity",
             ));
         }
+        let entries = quil_types::store::scan_page_entries(req.max_coins);
         // Local when this node covers the application; otherwise a node that
         // does. Either way the page is validated below before it is returned.
         let page = if self.serves_application(&domain) {
@@ -1059,7 +1175,9 @@ impl NodeService for NodeRpcServer {
             let permit = coin_read_permit(&COIN_SCAN_WORKERS, "coin scan").await?;
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                provider.coin_page(&domain, snapshot_id.as_ref(), after.as_ref())
+                gather_scan_page(entries, snapshot_id, after, |id, after| {
+                    provider.coin_page(&domain, id, after)
+                })
             })
             .await
             .map_err(|e| Status::internal(format!("coin scan task: {e}")))?
@@ -1071,8 +1189,9 @@ impl NodeService for NodeRpcServer {
                 .as_ref()
                 .ok_or_else(|| self.coverage_error(&domain))?;
             // The peers' own reasons travel with the refusal, so the wallet
-            // learns why its node could not read the application.
-            remote(domain, snapshot_id, after)
+            // learns why its node could not read the application. The peer is
+            // asked for the clamped size: one allowing more would fail below.
+            remote(domain, snapshot_id, after, entries as u32)
                 .await
                 .map_err(|reasons| {
                     Status::unavailable(format!(
@@ -1099,7 +1218,7 @@ impl NodeService for NodeRpcServer {
         };
         if snapshot_id.is_some_and(|id| id != page.snapshot_id)
             || !root_valid
-            || page.coins.len() > 8
+            || page.coins.len() > entries
             || (page.has_more && (page.cursor.is_none() || page.cursor <= after))
             || page.cursor < after
         {
@@ -1139,7 +1258,7 @@ impl NodeService for NodeRpcServer {
                 .unwrap_or_default(),
             has_more: page.has_more,
         };
-        if prost::Message::encoded_len(&response) > 256 * 1024 {
+        if prost::Message::encoded_len(&response) > quil_types::store::scan_page_bytes(entries) {
             return Err(Status::resource_exhausted(
                 "coin scan response exceeds size limit",
             ));
@@ -2154,6 +2273,7 @@ mod witness_tests {
                 domain: vec![0; 32],
                 snapshot_id: id,
                 after,
+                max_coins: 0,
             })
         };
         let server = |enabled, bad_path, bad_root| {
@@ -2226,6 +2346,7 @@ mod witness_tests {
                 domain: vec![1; 32],
                 snapshot_id,
                 after,
+                max_coins: 0,
             })
         };
         let empty = NodeRpcServer::new();
@@ -2334,6 +2455,7 @@ mod witness_tests {
                 domain: vec![1; 32],
                 snapshot_id,
                 after,
+                max_coins: 0,
             })
         };
         let server = |coins, has_more| {
@@ -2379,20 +2501,208 @@ mod witness_tests {
     async fn a_forwarded_scan_refusal_names_the_peers_reasons() {
         let reasons = "4 peers declined: 4x Unavailable: coin scan: no root in snapshot";
         let remote: RemoteCoinPage =
-            Arc::new(move |_, _, _| Box::pin(async move { Err(reasons.to_string()) }));
+            Arc::new(move |_, _, _, _| Box::pin(async move { Err(reasons.to_string()) }));
         let server = NodeRpcServer::new()
             .with_application_coverage(Arc::new(|_: &[u8]| false))
             .with_remote_coin_page(remote);
         let status = server
             .list_coins(Request::new(node::ListCoinsRequest {
                 domain: vec![1; 32],
-                snapshot_id: Vec::new(),
-                after: Vec::new(),
+                ..Default::default()
             }))
             .await
             .unwrap_err();
         assert_eq!(status.code(), tonic::Code::Unavailable);
         assert!(status.message().ends_with(reasons), "{}", status.message());
+    }
+
+    /// Serves `count` coins or escrows at addresses 1..=count, eight a page
+    /// as every provider does; `sparse` pages list none and pass over one
+    /// address each, as a run of stale index entries does.
+    struct Paged {
+        count: u16,
+        sparse: bool,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    fn paged_address(i: u16) -> [u8; 32] {
+        let mut address = [0; 32];
+        address[..2].copy_from_slice(&i.to_be_bytes());
+        address
+    }
+
+    impl Paged {
+        /// The addresses a page after `after` lists, its cursor and whether
+        /// the scan continues.
+        fn page(
+            &self,
+            id: Option<&[u8; 32]>,
+            after: Option<&[u8; 32]>,
+        ) -> (Vec<[u8; 32]>, Option<[u8; 32]>, bool) {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(id.is_none() || id == Some(&[7; 32]));
+            let next = after.map_or(1, |a| u16::from_be_bytes([a[0], a[1]]) + 1);
+            if self.sparse {
+                return (Vec::new(), Some(paged_address(next)), next < self.count);
+            }
+            let listed: Vec<_> = (next..=self.count).take(8).collect();
+            let last = listed.last().copied();
+            (
+                listed.into_iter().map(paged_address).collect(),
+                last.map(paged_address).or(after.copied()),
+                last.is_some_and(|last| last < self.count),
+            )
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl CoinWitnessProvider for Paged {
+        fn coin_page(
+            &self,
+            _: &[u8; 32],
+            id: Option<&[u8; 32]>,
+            after: Option<&[u8; 32]>,
+        ) -> quil_types::error::Result<Option<CoinPageData>> {
+            let (addresses, cursor, has_more) = self.page(id, after);
+            let mut root_record = vec![0; ROOT_RECORD_BYTES];
+            root_record[..8].copy_from_slice(b"QCT3RT\0\x02");
+            root_record[40] = 1;
+            Ok(Some(CoinPageData {
+                network: [0; 32],
+                snapshot_id: [7; 32],
+                root_record,
+                coins: addresses
+                    .into_iter()
+                    .map(|address| CoinData {
+                        address,
+                        frame_number: 1,
+                        position: 0,
+                        owner: vec![0; IDENTITY_BYTES],
+                        commitment: vec![0; 10368],
+                        memo: vec![0; 1115],
+                    })
+                    .collect(),
+                cursor,
+                has_more,
+            }))
+        }
+
+        fn escrow_page(
+            &self,
+            _: &[u8; 32],
+            id: Option<&[u8; 32]>,
+            after: Option<&[u8; 32]>,
+        ) -> quil_types::error::Result<Option<EscrowPageData>> {
+            let (addresses, cursor, has_more) = self.page(id, after);
+            Ok(Some(EscrowPageData {
+                network: [0; 32],
+                snapshot_id: [7; 32],
+                escrows: addresses
+                    .into_iter()
+                    .map(|address| (address, vec![1; 64]))
+                    .collect(),
+                cursor,
+                has_more,
+            }))
+        }
+    }
+
+    /// A wallet asking for pages of up to 64 coins gets the provider's pages
+    /// of eight gathered from one snapshot, in order; a request without
+    /// `max_coins` gets one provider page, as before. A run of pages that
+    /// list nothing costs at most as many provider pages as a full page.
+    #[tokio::test]
+    async fn a_scan_page_gathers_provider_pages_up_to_the_requested_size() {
+        let server = |count, sparse| {
+            let provider = Arc::new(Paged {
+                count,
+                sparse,
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            });
+            (
+                NodeRpcServer::new().with_coin_witness_provider(provider.clone()),
+                provider,
+            )
+        };
+        let request = |max_coins, snapshot_id: Vec<u8>, after: Vec<u8>| {
+            Request::new(node::ListCoinsRequest {
+                domain: vec![1; 32],
+                snapshot_id,
+                after,
+                max_coins,
+            })
+        };
+
+        let (old, provider) = server(100, false);
+        let page = old
+            .list_coins(request(0, vec![], vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((page.coins.len(), provider.reads()), (8, 1));
+        assert!(prost::Message::encoded_len(&page) <= 256 * 1024);
+
+        let (wide, provider) = server(100, false);
+        let first = wide
+            .list_coins(request(64, vec![], vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((first.coins.len(), provider.reads()), (64, 8));
+        assert!(first.has_more);
+        assert_eq!(first.cursor, paged_address(64).to_vec());
+        assert!(prost::Message::encoded_len(&first) <= scan_page_bytes(64));
+        let rest = wide
+            .list_coins(request(64, first.snapshot_id.clone(), first.cursor.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(rest.coins.len(), 36);
+        assert!(!rest.has_more);
+        let listed: Vec<_> = first
+            .coins
+            .iter()
+            .chain(&rest.coins)
+            .map(|coin| coin.address.clone())
+            .collect();
+        let expected: Vec<_> = (1..=100).map(|i| paged_address(i).to_vec()).collect();
+        assert_eq!(listed, expected);
+
+        let (capped, _) = server(1000, false);
+        let page = capped
+            .list_coins(request(u32::MAX, vec![], vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(page.coins.len(), MAX_SCAN_PAGE_ENTRIES);
+
+        let (sparse, provider) = server(1000, true);
+        let page = sparse
+            .list_coins(request(64, vec![], vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(page.coins.is_empty() && page.has_more);
+        assert_eq!(provider.reads(), 8);
+        assert_eq!(page.cursor, paged_address(8).to_vec());
+
+        let (escrows, provider) = server(100, false);
+        let page = escrows
+            .list_escrows(request(64, vec![], vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((page.escrows.len(), provider.reads()), (64, 8));
+        let (escrows, provider) = server(100, false);
+        let page = escrows
+            .list_escrows(request(0, vec![], vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((page.escrows.len(), provider.reads()), (8, 1));
     }
 
     fn request(addresses: Vec<Vec<u8>>) -> Request<node::GetCoinWitnessesRequest> {

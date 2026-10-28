@@ -848,6 +848,11 @@ message ListCoinsRequest {
   bytes domain = 1;
   bytes snapshot_id = 2;
   bytes after = 3;
+  // The most coins a page may carry (escrows, for ListEscrows). Unset, zero
+  // and values below eight ask for pages of eight, the page every node and
+  // wallet used before this field; a node clamps larger values to its own
+  // maximum (64). A node without the field always answers pages of eight.
+  uint32 max_coins = 4;
 }
 message ConfidentialCoin {
   bytes address = 1;
