@@ -2,13 +2,16 @@
 //! serialize changeset mutation exactly as for coins.
 //!
 //! The accumulator is append-only: every staged coin carries its leaf
-//! `position`, and a persisted [`Frontier`] at `FRONTIER_ADDRESS` lets each
-//! operation extend the root in O(depth) per new coin instead of decoding and
-//! rehashing the whole coin set. A node without its private copies rebuilds
-//! them from the blocks' records (see [`refresh_root`]); `full_rebuild_root`,
-//! which reconstructs from every live coin, remains as a cross-check.
+//! `position`, and each block's persisted [`Frontier`] lets a fold extend the
+//! root in O(depth) per new coin instead of decoding and rehashing the whole
+//! coin set. A placed coin is counted at once ([`add_placed`]) and folded
+//! with the frame's others ([`fold_placed`]). A node without its private
+//! copies rebuilds them from the blocks' records (see [`refresh_root`]);
+//! `full_rebuild_root`, which reconstructs from every live coin, remains as a
+//! cross-check.
 use super::state::{
-    decode_snapshot_coin, read_local, write_local, SnapshotLimits, FRONTIER_ADDRESS, ROOT_ADDRESS,
+    decode_snapshot_coin, read_local, remove_local, write_local, SnapshotLimits, FRONTIER_ADDRESS,
+    PLACED_ADDRESS, ROOT_ADDRESS,
 };
 use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
 use quil_lattice_ct::confidential::relation::membership::{IDENTITY_BYTES, NODE_BYTES};
@@ -547,7 +550,8 @@ fn load_block_frontier(
         .transpose()
 }
 
-/// Coins already appended to `block`.
+/// Coins already appended to `block`: those its frontier holds and those
+/// placed since the last fold.
 pub fn block_count(
     state: &HypergraphState,
     network: &[u8; 32],
@@ -556,11 +560,108 @@ pub fn block_count(
     limits: SnapshotLimits,
 ) -> Result<u64> {
     let context = parameter_context(network, application);
-    Ok(
-        load_block_frontier(state, &context, application, block, limits)?
-            .map(|frontier| frontier.count())
-            .unwrap_or(0),
-    )
+    let folded = load_block_frontier(state, &context, application, block, limits)?
+        .map(|frontier| frontier.count())
+        .unwrap_or(0);
+    let placed = read_placed(state, application)?
+        .iter()
+        .filter(|(placed, _)| *placed == block)
+        .count() as u64;
+    Ok(folded + placed)
+}
+
+/// [`PLACED_ADDRESS`]: `(block, address)` of each coin placed since the last
+/// fold, in placement order.
+const PLACED_VERSION: &[u8; 8] = b"QCT3PC\0\x01";
+const PLACED_ENTRY: usize = 8 + 32;
+
+fn read_placed(state: &HypergraphState, application: &[u8; 32]) -> Result<Vec<(u64, [u8; 32])>> {
+    // Never in the tree, so never read from it (`read_local` falls back to a
+    // copy there): a vertex at that address would set the blocks' counts.
+    let key = super::state::local_record_key(application, &PLACED_ADDRESS);
+    let Some(bytes) = state.get_record(&key)? else {
+        return Ok(Vec::new());
+    };
+    // Node-local: another replica holds its own, so a malformed one stops
+    // this node rather than refusing what the others accept.
+    let entries = bytes
+        .strip_prefix(PLACED_VERSION.as_slice())
+        .filter(|entries| entries.len() % PLACED_ENTRY == 0)
+        .ok_or_else(|| {
+            QuilError::ExecutionUnavailable("coin root: malformed placed-coin record".into())
+        })?;
+    Ok(entries
+        .chunks_exact(PLACED_ENTRY)
+        .map(|entry| {
+            (
+                u64::from_be_bytes(entry[..8].try_into().unwrap()),
+                entry[8..].try_into().unwrap(),
+            )
+        })
+        .collect())
+}
+
+fn write_placed(state: &HypergraphState, application: &[u8; 32], placed: &[(u64, [u8; 32])]) {
+    let mut bytes = Vec::with_capacity(PLACED_VERSION.len() + placed.len() * PLACED_ENTRY);
+    bytes.extend_from_slice(PLACED_VERSION);
+    for (block, address) in placed {
+        bytes.extend_from_slice(&block.to_be_bytes());
+        bytes.extend_from_slice(address);
+    }
+    write_local(state, application, &PLACED_ADDRESS, bytes);
+}
+
+/// Count a coin written at the next index of `block`, to be folded with the
+/// frame's others by [`fold_placed`]. Refuses it past the application's coin
+/// cap, as its fold would have.
+pub(crate) fn add_placed(
+    state: &HypergraphState,
+    network: &[u8; 32],
+    application: &[u8; 32],
+    block: u64,
+    address: &[u8; 32],
+    limits: SnapshotLimits,
+) -> Result<()> {
+    let context = parameter_context(network, application);
+    let mut placed = read_placed(state, application)?;
+    if placed.is_empty() {
+        // The private summary the cap counts from, ready as the fold needs it.
+        prepare(state, &context, application, limits)?;
+    }
+    let held = super::summary_tree::top(state, application)?.map_or(0, |top| top.coins);
+    check_coin_cap(held, placed.len() + 1, limits)?;
+    placed.push((block, *address));
+    write_placed(state, application, &placed);
+    Ok(())
+}
+
+/// Fold the coins placed since the last fold into their blocks and publish
+/// the root: once per application frame, before its report reads the blocks.
+/// `None`, and nothing written, when none were placed.
+pub fn fold_placed(
+    state: &HypergraphState,
+    network: &[u8; 32],
+    application: &[u8; 32],
+    limits: SnapshotLimits,
+) -> Result<Option<RootRecord>> {
+    if read_placed(state, application)?.is_empty() {
+        return Ok(None);
+    }
+    refresh_root(state, network, application, limits).map(Some)
+}
+
+/// The coin cap bounds the APPLICATION, not one block: blocks are an internal
+/// partition, so a limit that counted per block would let an application grow
+/// without bound by spreading across them.
+fn check_coin_cap(held: u64, incoming: usize, limits: SnapshotLimits) -> Result<()> {
+    if usize::try_from(held)
+        .ok()
+        .and_then(|held| held.checked_add(incoming))
+        .is_none_or(|total| total > limits.max_coins)
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 /// Leaf index for the next coin staged into `block`: the block's own count,
@@ -653,66 +754,93 @@ pub fn full_rebuild_root(
     tree.root_at_depth(shape.depth()).map_err(|_| invalid())
 }
 
-/// Stage the root, frontier and bounded history alongside coins in the same
-/// changeset. New coins are those in the pending changeset whose position is at
-/// or beyond the persisted frontier; they must be consecutive from there.
-/// Does not commit state. Callers serialize mutations and own rollback on error.
+/// What a fold reads first: valid limits, the width's shape, and the private
+/// summary tree, ready to update.
+fn prepare<'a>(
+    state: &'a HypergraphState,
+    context: &[u8; 32],
+    application: &'a [u8; 32],
+    limits: SnapshotLimits,
+) -> Result<super::summary_tree::SummaryTree<'a>> {
+    if !(1..=32).contains(&limits.max_depth) {
+        return Err(invalid());
+    }
+    super::coin_blocks::shape(block_width(state, application)?)?;
+    // The summary tree carries each block's state, and a publication only
+    // rewrites the blocks its coins went into, with their ancestors. A flat
+    // summary left from before the tree is converted first, here, inside the
+    // frame's changeset.
+    let tree = super::summary_tree::SummaryTree::new(state, context, application);
+    tree.upgrade()?;
+    // A node without those private copies (one that took the application by
+    // sync, which imports the blocks' records and not the copies, or that has
+    // not published for it) rebuilds them from the blocks' records, as
+    // `rebuild_block_summary` does. Every coin is placed through
+    // `delivery::place_committed` and folded into its block's records before
+    // its frame commits, so the records account for every committed coin, and
+    // an application without them holds none. Folding every live coin instead
+    // read each of an archive's QUIL vertices, for the first coin QUIL ever
+    // held, while GLOBAL waited at frame 945,000 (2026-10-28).
+    if read_local(state, application, &ROOT_ADDRESS)?.is_none()
+        || super::summary_tree::top(state, application)?.is_none()
+    {
+        let disc = vertex_adds_discriminator()?;
+        let summary = block_summary_from_records(context, &[], |address| {
+            state.get(application, address, &disc)
+        })?;
+        tree.replace(&summary.blocks)?;
+    }
+    Ok(tree)
+}
+
+/// Fold new coins into their blocks and stage each touched block's frontier
+/// and root, the summary tree and the bounded root history. New coins are
+/// those placed since the last fold ([`add_placed`]) and those in the pending
+/// changeset, at or beyond their block's frontier; each block's must be
+/// consecutive from there. Does not commit state. Callers serialize mutations
+/// and own rollback on error.
 pub fn refresh_root(
     state: &HypergraphState,
     network: &[u8; 32],
     application: &[u8; 32],
     limits: SnapshotLimits,
 ) -> Result<RootRecord> {
-    if !(1..=32).contains(&limits.max_depth) {
-        return Err(invalid());
-    }
     let context = parameter_context(network, application);
     let disc = vertex_adds_discriminator()?;
-    let width = block_width(state, application)?;
-    super::coin_blocks::shape(width)?;
     let subtree = usize::from(super::coin_blocks::SUBTREE_BITS);
+    let tree = prepare(state, &context, application, limits)?;
 
-    // The summary tree carries each block's state, and a publication only
-    // rewrites the blocks its changeset added to, with their ancestors. A flat
-    // summary left from before the tree is converted first, here, inside the
-    // frame's changeset.
-    let tree = super::summary_tree::SummaryTree::new(state, &context, application);
-    tree.upgrade()?;
-    // A node without those private copies (one that took the application by
-    // sync, which imports the blocks' records and not the copies, or that has
-    // not published for it) rebuilds them from the blocks' records, as
-    // `rebuild_block_summary` does. Every coin is placed with its block's
-    // records in one changeset (`delivery::place_committed`), so the records
-    // account for every committed coin, and an application without them holds
-    // none. Folding every live coin instead read each of an archive's QUIL
-    // vertices, for the first coin QUIL ever held, while GLOBAL waited at frame
-    // 945,000 (2026-10-28).
-    if read_local(state, application, &ROOT_ADDRESS)?.is_none()
-        || super::summary_tree::top(state, application)?.is_none()
-    {
-        let summary = block_summary_from_records(&context, &[], |address| {
-            state.get(application, address, &disc)
-        })?;
-        tree.replace(&summary.blocks)?;
-    }
-
-    // Group the coins this publication folds by the block their position
-    // names: a transaction touches only the blocks it writes into, so the
-    // work is proportional to what changed rather than to the size of the
-    // application.
-    let mut records = Vec::new();
+    // The coins this fold may take, once each: the placed ones are already
+    // committed to the frame's staging, and anything else a caller staged is
+    // still in the changeset.
+    let mut records: BTreeMap<[u8; 32], CoinRecord> = BTreeMap::new();
+    let key = |address: &[u8; 32]| [application.as_slice(), address].concat();
     for (address, blob) in state.pending_vertex_adds(application)? {
-        if address.len() != 32 {
-            return Err(invalid());
-        }
-        let mut key = application.to_vec();
-        key.extend_from_slice(&address);
-        if let Some(record) = decode_snapshot_coin(&context, application, &key, &blob)? {
-            records.push(record);
+        let address: [u8; 32] = address.as_slice().try_into().map_err(|_| invalid())?;
+        if let Some(record) = decode_snapshot_coin(&context, application, &key(&address), &blob)? {
+            records.insert(address, record);
         }
     }
+    let placed = read_placed(state, application)?;
+    for (_, address) in &placed {
+        if records.contains_key(address) {
+            continue;
+        }
+        let record = match state.get(application, address, &disc)? {
+            Some(blob) => decode_snapshot_coin(&context, application, &key(address), &blob)?,
+            None => None,
+        }
+        .ok_or_else(|| {
+            QuilError::ExecutionUnavailable("coin root: a placed coin is not stored".into())
+        })?;
+        records.insert(*address, record);
+    }
+
+    // Group them by the block their position names: a frame touches only the
+    // blocks it writes into, so the work is proportional to what changed
+    // rather than to the size of the application.
     let mut by_block: BTreeMap<u64, Vec<CoinRecord>> = BTreeMap::new();
-    for record in records {
+    for record in records.into_values() {
         let (block, _) = super::coin_blocks::locate(record.position);
         // Bounded by the widest block, not the stored width record: a coin
         // delivered into a block wider than six bits is valid (see
@@ -740,16 +868,7 @@ pub fn refresh_root(
         incoming += records.len();
         touched.push((block, frontier, records));
     }
-    // The coin cap bounds the APPLICATION, not one block: blocks are an
-    // internal partition, so a limit that counted per block would let an
-    // application grow without bound by spreading across them.
-    if usize::try_from(held)
-        .ok()
-        .and_then(|held| held.checked_add(incoming))
-        .is_none_or(|total| total > limits.max_coins)
-    {
-        return Err(invalid());
-    }
+    check_coin_cap(held, incoming, limits)?;
     let mut leaves = Vec::with_capacity(touched.len());
     for (block, mut frontier, fresh) in touched {
         // Each new coin must continue its block's sequence exactly, so a gap
@@ -779,6 +898,9 @@ pub fn refresh_root(
         leaves.push((block, frontier.count(), root.root));
     }
     tree.update(&leaves)?;
+    if !placed.is_empty() {
+        remove_local(state, application, &PLACED_ADDRESS);
+    }
     let coins = super::summary_tree::top(state, application)?.map_or(0, |top| top.coins);
     publish_root(state, network, application, tree.root()?, coins)
 }

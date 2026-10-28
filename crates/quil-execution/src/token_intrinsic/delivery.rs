@@ -331,8 +331,11 @@ pub fn verify_and_apply(
 }
 
 /// Write a committed output at its committed position `(block, seq)` and
-/// extend the block: the shared last step of a delivery and of a globally
-/// executed application's inline commit.
+/// count it in the block: the shared last step of a delivery and of a globally
+/// executed application's inline commit. The block's records and the root
+/// take it when the placed coins are folded (`roots::fold_placed`): once per
+/// application frame, and once per operation a globally executed application
+/// commits.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn place_committed(
     state: &HypergraphState,
@@ -372,7 +375,7 @@ pub(crate) fn place_committed(
         let blob = quil_tries::serialize_go_tree(tree.root.as_ref())
             .map_err(|e| QuilError::Internal(format!("coin encoding: {e}")))?;
         state.set(application, address, &disc, frame, blob)?;
-        roots::refresh_root(state, network, application, limits)?;
+        roots::add_placed(state, network, application, block, address, limits)?;
         Ok(())
     };
     if let Err(error) = apply() {
@@ -764,6 +767,8 @@ mod tests {
             limits,
         )
         .unwrap();
+        // The frame's end folds the coin into its block.
+        roots::fold_placed(&state, &network, &application, limits).unwrap();
 
         let path = coin_blocks::block_path(narrow);
         let holder: Vec<bool> = path.iter().copied().chain([false]).collect();
@@ -830,5 +835,233 @@ mod tests {
             limits,
         )
         .unwrap();
+    }
+
+    fn mem_state(crdt: &std::sync::Arc<quil_hypergraph::HypergraphCrdt>) -> HypergraphState {
+        HypergraphState::new(crdt.clone())
+    }
+
+    fn mem_crdt() -> std::sync::Arc<quil_hypergraph::HypergraphCrdt> {
+        std::sync::Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            std::sync::Arc::new(quil_hypergraph::testing::MemStore::new()),
+            std::sync::Arc::new(quil_types::crypto::NoopInclusionProver),
+        ))
+    }
+
+    /// Seeds of coins in two six-bit blocks, three in the first and one in the
+    /// second, placed interleaved: `(seed, block, seq)`.
+    fn frame_of_coins(
+        coin: impl Fn(u8) -> ([u8; 32], quil_tries::VectorCommitmentTree),
+    ) -> Vec<(u8, u64, u64)> {
+        let mut by_block = std::collections::BTreeMap::<u64, Vec<u8>>::new();
+        for seed in 1..=u8::MAX {
+            let (address, _) = coin(seed);
+            let block =
+                coin_blocks::block_for_address(coin_blocks::INITIAL_BLOCK_BITS, &address).unwrap();
+            by_block.entry(block).or_default().push(seed);
+            let Some((&shared, seeds)) = by_block.iter().find(|(_, seeds)| seeds.len() == 3) else {
+                continue;
+            };
+            let Some((&single, other)) = by_block.iter().find(|(block, _)| **block != shared)
+            else {
+                continue;
+            };
+            return vec![
+                (seeds[0], shared, 0),
+                (other[0], single, 0),
+                (seeds[1], shared, 1),
+                (seeds[2], shared, 2),
+            ];
+        }
+        unreachable!("three coins share a block among 255");
+    }
+
+    /// The coins a frame's deliveries place are counted as each lands and
+    /// folded once, at the frame's end: the blocks' records, the root and the
+    /// report are what refreshing the root after every delivery gave.
+    #[test]
+    fn a_frames_coins_fold_once_into_what_refreshing_each_gave() {
+        use super::super::state::{block_record_address, BLOCK_FRONTIER_TAG, BLOCK_ROOT_TAG};
+        let (network, application) = ([1u8; 32], [2u8; 32]);
+        let context = parameter_context(&network, &application);
+        let key = CommitmentKey::derive(&context);
+        let limits = SnapshotLimits {
+            max_coins: 64,
+            max_depth: 32,
+            max_nodes: 1 << 14,
+        };
+        let coin = |seed: u8| {
+            let output = Output {
+                owner: [seed; IDENTITY_BYTES],
+                commitment: key.commit(
+                    u128::from(seed),
+                    &AmountOpening::from_seed(&context, &[seed; 32]),
+                ),
+                memo: [seed; MEMO_BYTES],
+            };
+            coin_identity(&context, 5, &output).unwrap()
+        };
+        let frame = frame_of_coins(coin);
+        let place = |state: &HypergraphState, seed: u8, block: u64, seq: u64| {
+            let (address, tree) = coin(seed);
+            place_committed(
+                state,
+                5,
+                &network,
+                &application,
+                &address,
+                tree,
+                block,
+                seq,
+                limits,
+            )
+        };
+
+        // Each delivery its own message, refreshing the root as it placed.
+        let refreshed = mem_state(&mem_crdt());
+        for &(seed, block, seq) in &frame {
+            place(&refreshed, seed, block, seq).unwrap();
+            roots::refresh_root(&refreshed, &network, &application, limits).unwrap();
+            refreshed.commit().unwrap();
+            refreshed.abort();
+        }
+
+        let crdt = mem_crdt();
+        let messages = mem_state(&crdt);
+        for &(seed, block, seq) in &frame {
+            place(&messages, seed, block, seq).unwrap();
+            messages.commit().unwrap();
+            messages.abort();
+        }
+        let (shared, single) = (frame[0].1, frame[1].1);
+        assert_eq!(
+            roots::block_count(&messages, &network, &application, shared, limits).unwrap(),
+            3,
+            "a placed coin is counted at once"
+        );
+        assert!(
+            roots::block_root(&messages, &application, shared)
+                .unwrap()
+                .is_none(),
+            "the blocks take the coins when they are folded"
+        );
+        assert!(
+            place(&messages, frame[0].0, shared, 3).is_err(),
+            "a coin placed this frame is present"
+        );
+
+        let end = mem_state(&crdt);
+        let published = roots::fold_placed(&end, &network, &application, limits)
+            .unwrap()
+            .expect("the frame placed coins");
+        end.commit().unwrap();
+        end.abort();
+        assert!(
+            roots::fold_placed(&end, &network, &application, limits)
+                .unwrap()
+                .is_none(),
+            "a frame's coins are folded once"
+        );
+
+        let disc = vertex_adds_discriminator().unwrap();
+        for block in [shared, single] {
+            for tag in [BLOCK_FRONTIER_TAG, BLOCK_ROOT_TAG] {
+                let address = block_record_address(tag, block);
+                let record = end.get(&application, &address, &disc).unwrap();
+                assert!(record.is_some());
+                assert_eq!(
+                    record,
+                    refreshed.get(&application, &address, &disc).unwrap()
+                );
+            }
+            assert_eq!(
+                roots::block_count(&end, &network, &application, block, limits).unwrap(),
+                roots::block_count(&refreshed, &network, &application, block, limits).unwrap()
+            );
+        }
+        assert_eq!(
+            Some(published.clone()),
+            roots::read_current(&refreshed, &network, &application).unwrap()
+        );
+        assert_eq!(
+            published,
+            roots::full_rebuild_root(&end, &network, &application, limits).unwrap()
+        );
+        assert_eq!(published.coins, 4);
+        let report = |state: &HypergraphState| {
+            super::super::shard_accumulator::shard_report(state, &network, &application, &[], true)
+                .unwrap()
+        };
+        assert_eq!(report(&end), report(&refreshed));
+    }
+
+    /// The coin cap refuses the placement that would pass it, as the fold of
+    /// that placement did, counting the coins folded and those placed since.
+    #[test]
+    fn the_coin_cap_refuses_a_placement_before_its_fold() {
+        let (network, application) = ([1u8; 32], [2u8; 32]);
+        let context = parameter_context(&network, &application);
+        let key = CommitmentKey::derive(&context);
+        let limits = SnapshotLimits {
+            max_coins: 3,
+            max_depth: 32,
+            max_nodes: 1 << 14,
+        };
+        let coin = |seed: u8| {
+            let output = Output {
+                owner: [seed; IDENTITY_BYTES],
+                commitment: key.commit(
+                    u128::from(seed),
+                    &AmountOpening::from_seed(&context, &[seed; 32]),
+                ),
+                memo: [seed; MEMO_BYTES],
+            };
+            coin_identity(&context, 5, &output).unwrap()
+        };
+        let frame = frame_of_coins(coin);
+        let crdt = mem_crdt();
+        let state = mem_state(&crdt);
+        let place = |&(seed, block, seq): &(u8, u64, u64)| {
+            let (address, tree) = coin(seed);
+            let placed = place_committed(
+                &state,
+                5,
+                &network,
+                &application,
+                &address,
+                tree,
+                block,
+                seq,
+                limits,
+            );
+            state.commit().unwrap();
+            state.abort();
+            (address, placed)
+        };
+        place(&frame[0]).1.unwrap();
+        let end = mem_state(&crdt);
+        roots::fold_placed(&end, &network, &application, limits)
+            .unwrap()
+            .unwrap();
+        end.commit().unwrap();
+        end.abort();
+        place(&frame[1]).1.unwrap();
+        place(&frame[2]).1.unwrap();
+
+        let (refused, placed) = place(&frame[3]);
+        assert!(placed.is_err(), "a fourth coin passes the cap of three");
+        let disc = vertex_adds_discriminator().unwrap();
+        assert!(state.get(&application, &refused, &disc).unwrap().is_none());
+        assert_eq!(
+            roots::block_count(&state, &network, &application, frame[3].1, limits).unwrap(),
+            2
+        );
+        assert_eq!(
+            roots::fold_placed(&end, &network, &application, limits)
+                .unwrap()
+                .unwrap()
+                .coins,
+            3
+        );
     }
 }

@@ -752,6 +752,7 @@ impl ExecutionEngineManager {
 
         let settlements = settlement_record::encode_entries(settlements)?;
         let spends = spend_relay::encode_frame_entries(spends)?;
+        self.fold_placed_coins(filter)?;
         // HypergraphState includes this frame's staged blobs. Computing after
         // commit would leave a cursor with no report if construction failed.
         let report = self.shard_accumulator_report(filter, anchor)?;
@@ -788,6 +789,35 @@ impl ExecutionEngineManager {
         crate::metrics::observe_execution_duration("crdt", "commit", start.elapsed().as_secs_f64());
         result?;
         Ok(report)
+    }
+
+    /// Fold the coins this application frame's deliveries placed into their
+    /// blocks and the root, once, before its report reads them. Refreshing the
+    /// root for each delivery redid the summary and root history per coin.
+    fn fold_placed_coins(&self, filter: &[u8]) -> Result<()> {
+        #[cfg(not(feature = "native-proof"))]
+        {
+            let _ = filter;
+            Ok(())
+        }
+        #[cfg(feature = "native-proof")]
+        {
+            use crate::token_intrinsic::{dispatch::TokenPolicy, roots};
+            // A filter naming no shard is refused by the report.
+            let Some(application) = quil_forest::decode_shard_filter_or_root(filter, 32)
+                .and_then(|(application, _)| <[u8; 32]>::try_from(application.as_slice()).ok())
+            else {
+                return Ok(());
+            };
+            let network =
+                quil_lattice_ct::confidential::transfer::network_identifier(self.pricing_network());
+            let limits = TokenPolicy::for_network(self.pricing_network()).snapshots;
+            let state = crate::hypergraph_state::HypergraphState::new(self.crdt());
+            if roots::fold_placed(&state, &network, &application, limits)?.is_some() {
+                state.commit()?;
+            }
+            Ok(())
+        }
     }
 
     /// Checkpoint completed shard sync without flushing unrelated pending state.

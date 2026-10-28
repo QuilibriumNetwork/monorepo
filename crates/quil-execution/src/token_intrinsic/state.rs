@@ -184,9 +184,17 @@ pub const SHAPE_ADDRESS: [u8; 32] = {
     address
 };
 
+/// Coins placed and not yet folded into their blocks (see `roots`). Only ever
+/// a local record, and read only as one.
+pub const PLACED_ADDRESS: [u8; 32] = {
+    let mut address = [0xff; 32];
+    address[31] = 0xf8;
+    address
+};
+
 /// Node-local copies of the application-wide accumulator records: the local
-/// root history ([`ROOT_ADDRESS`]), the frontier, the width, the flat summary
-/// and the summary tree. Keyed
+/// root history ([`ROOT_ADDRESS`]), the frontier, the width, the flat summary,
+/// the summary tree and the coins placed since the last fold. Keyed
 /// `LOCAL_RECORD_PREFIX ‖ application ‖ address` among the execution records:
 /// staged with a frame's changeset and committed with it, but outside the
 /// application tree, so no shard root, shard size or world size includes them.
@@ -235,6 +243,13 @@ pub(crate) fn write_local(
     state.stage_records([quil_types::store::RecordMutation {
         key: local_record_key(application, address),
         value: Some(value),
+    }]);
+}
+
+pub(crate) fn remove_local(state: &HypergraphState, application: &[u8; 32], address: &[u8; 32]) {
+    state.stage_records([quil_types::store::RecordMutation {
+        key: local_record_key(application, address),
+        value: None,
     }]);
 }
 
