@@ -8,10 +8,12 @@
 //!   (default 600), delete GLOBAL candidates `QUIL_PRUNE_CANDIDATE_MARGIN`
 //!   (default two epochs) or more below both the canonical head and the
 //!   executed cursor, at heights holding a canonical record.
-//! - `QUIL_PRUNE_GLOBAL_REQUESTS`: on a regular (non-archive) node, every
-//!   `QUIL_PRUNE_INTERVAL_SECS`, delete the request bodies of global frames
-//!   more than `QUIL_PRUNE_GLOBAL_REQUESTS_KEEP` (default and minimum two
-//!   days of frames) below the head. Headers are kept.
+//! - `QUIL_PRUNE_GLOBAL_REQUESTS`: on a regular (non-archive) node and on
+//!   every standalone worker, every `QUIL_PRUNE_INTERVAL_SECS`, delete the
+//!   request bodies of global frames more than
+//!   `QUIL_PRUNE_GLOBAL_REQUESTS_KEEP` (default and minimum two days of
+//!   frames) below the head. Headers are kept. A worker's first pass waits
+//!   an extra minute per core (repeating after an hour of cores).
 //! - `QUIL_SNAPSHOT_PINNED_MAX=<n>`: keep store snapshots only on the newest
 //!   `n` (default 64, at least 16; `off` also disables it) published
 //!   generations.
@@ -32,6 +34,12 @@ const MIN_CANDIDATE_MARGIN: u64 = 64;
 /// Request bodies a regular node keeps: its gap backfill window
 /// (two days of frames), which also covers the frame cache and gossip drain.
 const MIN_REQUEST_KEEP: u64 = 2 * 1440;
+/// Workers' first request prunes start this far apart, by core id: the first
+/// pass of a store that kept every body deletes and compacts gigabytes, and a
+/// host runs dozens of workers on the same disks.
+const WORKER_FIRST_PRUNE_STEP: Duration = Duration::from_secs(60);
+/// Core slots before the first-pass offsets repeat (an hour of steps).
+const WORKER_FIRST_PRUNE_SLOTS: u32 = 60;
 
 fn setting(name: &str) -> Option<u64> {
     std::env::var(name).ok().and_then(|v| v.parse().ok())
@@ -109,6 +117,24 @@ pub(crate) fn spawn_candidate_pruner(clock: &Arc<quil_store::RocksClockStore>, l
 /// GLOBAL frames nor serves their history, prune old request bodies every
 /// interval until the store is dropped. The caller decides that role.
 pub(crate) fn spawn_request_pruner(clock: &Arc<quil_store::RocksClockStore>, label: String) {
+    spawn_request_pruner_for_core(clock, label, 0);
+}
+
+/// When the first request prune of core `core_id`'s store runs: one interval
+/// after start for the master (core 0), and a slot of
+/// [`WORKER_FIRST_PRUNE_STEP`] later per worker core, so the workers of one
+/// host do not all delete and compact their backlog at once.
+fn first_request_prune(interval: Duration, core_id: u32) -> Duration {
+    interval + WORKER_FIRST_PRUNE_STEP * (core_id % WORKER_FIRST_PRUNE_SLOTS)
+}
+
+/// [`spawn_request_pruner`] for the store of core `core_id`, whose first pass
+/// waits for [`first_request_prune`].
+pub(crate) fn spawn_request_pruner_for_core(
+    clock: &Arc<quil_store::RocksClockStore>,
+    label: String,
+    core_id: u32,
+) {
     if !enabled("QUIL_PRUNE_GLOBAL_REQUESTS") {
         return;
     }
@@ -117,10 +143,14 @@ pub(crate) fn spawn_request_pruner(clock: &Arc<quil_store::RocksClockStore>, lab
         .unwrap_or(MIN_REQUEST_KEEP)
         .max(MIN_REQUEST_KEEP);
     let interval = Duration::from_secs(setting("QUIL_PRUNE_INTERVAL_SECS").unwrap_or(600).max(10));
+    let first = first_request_prune(interval, core_id);
     let spawned = std::thread::Builder::new().name(format!("request-prune-{label}")).spawn(move || {
-        info!(store = %label, keep, "GLOBAL request body pruning enabled");
+        info!(store = %label, keep, first_pass_secs = first.as_secs(),
+            "GLOBAL request body pruning enabled");
+        let mut wait = first;
         loop {
-            std::thread::sleep(interval);
+            std::thread::sleep(wait);
+            wait = interval;
             let Some(store) = clock.upgrade() else { return };
             let started = std::time::Instant::now();
             match store.prune_global_frame_requests(keep) {
@@ -193,7 +223,29 @@ fn prune_candidates(store: &quil_store::RocksClockStore, margin: u64, label: &st
 
 #[cfg(test)]
 mod tests {
-    use super::default_on;
+    use super::{default_on, first_request_prune};
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    /// The master's first request prune keeps its one-interval wait; the
+    /// workers of a host start theirs a minute apart, each in its own slot.
+    #[test]
+    fn worker_first_request_prunes_are_staggered_by_core() {
+        let interval = Duration::from_secs(600);
+        let first = |core: u32| first_request_prune(interval, core).as_secs();
+        assert_eq!(first(0), 600, "the master");
+        assert_eq!(first(1), 660);
+        assert_eq!(first(32), 600 + 32 * 60);
+        assert_eq!(first(60), 600, "slots repeat after an hour");
+        let starts: BTreeSet<u64> = (1..=32).map(first).collect();
+        assert_eq!(starts.len(), 32, "a minute of its own per worker");
+        assert!(starts.iter().all(|&start| start < 600 + 3600));
+        assert_eq!(
+            first_request_prune(Duration::from_secs(10), 3).as_secs(),
+            190,
+            "a slot does not shrink with the interval"
+        );
+    }
 
     /// Every cleanup is on unless its setting is `0`.
     #[test]
