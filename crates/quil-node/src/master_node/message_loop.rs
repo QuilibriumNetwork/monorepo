@@ -557,17 +557,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                 }
                 _ = status_timer.tick() => {
                     probe::step(ProbeSection::LoopStatus);
-                    if let Some((frames, bytes)) = archive_ingest_queue
-                        .as_ref()
-                        .map(|queue| queue.take_dropped())
-                        .filter(|(frames, _)| *frames > 0)
-                    {
-                        warn!(frames, bytes, interval_secs = 30, scope = "this archive",
-                            action = "none if it passes: the application frame ingest is held, usually by GLOBAL \
-                                      execution sequencing application frames, and the gap fetch asks for a dropped \
-                                      frame again when a GLOBAL frame needs it; if it repeats, look for 'master task \
-                                      blocked' lines naming the GLOBAL frame materializer",
-                            "archive dropped gossiped application frames: its ingest queue was full");
+                    if let Some(queue) = archive_ingest_queue.as_ref() {
+                        queue.report_dropped(30);
                     }
                     // Periodic allocation status snapshot.
                     let peer_count = p2p_for_recv.peer_count();
