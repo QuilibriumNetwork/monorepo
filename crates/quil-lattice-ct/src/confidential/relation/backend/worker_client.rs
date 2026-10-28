@@ -171,6 +171,8 @@ impl WorkerVerifier {
         {
             return Err(ClientError::Configuration);
         }
+        // Normally recorded at startup already; see the function.
+        super::worker_process::remember_process_cpus();
         Ok(Self {
             executable,
             cpu_seconds,

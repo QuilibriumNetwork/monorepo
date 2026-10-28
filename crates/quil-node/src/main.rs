@@ -395,6 +395,10 @@ fn main() -> anyhow::Result<ExitCode> {
             quil_lattice_ct::confidential::relation::backend::worker_request::run_worker(&args),
         );
     }
+    // Before any data worker pins its thread to a core: verifier children
+    // get this CPU set rather than their spawning worker's core.
+    #[cfg(feature = "native-proof")]
+    quil_lattice_ct::confidential::relation::backend::worker_process::remember_process_cpus();
     let result = node_main();
     if NODE_STARTED.load(Ordering::Acquire) {
         exit_node(&result);
