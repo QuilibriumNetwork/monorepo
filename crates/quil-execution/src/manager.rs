@@ -70,6 +70,39 @@ fn executing_filter(application: &[u8; 32], shard: &[bool]) -> Vec<u8> {
     quil_forest::encode_shard_bit_path(application, shard)
 }
 
+/// What a proof pre-verification pass ([`ExecutionEngineManager::preverify_bundles`])
+/// found: confidential operations, and of them how many had a cached verdict,
+/// were verified (and cached), found no worker slot, or failed in the worker.
+/// Operations without a worker proof count in `operations` only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PreverifyCounts {
+    pub operations: usize,
+    pub cached: usize,
+    pub verified: usize,
+    pub busy: usize,
+    pub unavailable: usize,
+}
+
+impl PreverifyCounts {
+    pub fn add(&mut self, other: PreverifyCounts) {
+        self.operations += other.operations;
+        self.cached += other.cached;
+        self.verified += other.verified;
+        self.busy += other.busy;
+        self.unavailable += other.unavailable;
+    }
+}
+
+/// How a pre-verification pass runs: at most `parallelism` operations at once
+/// (default: the worker's slots), each finished one counted into `done`, and
+/// none started while `pause` returns true.
+#[derive(Default)]
+pub struct PreverifyPacing<'a> {
+    pub parallelism: Option<usize>,
+    pub done: Option<&'a std::sync::atomic::AtomicUsize>,
+    pub pause: Option<&'a (dyn Fn() -> bool + Sync)>,
+}
+
 impl ExecutionEngineManager {
     /// Reconstruct all engines against the supplied state, preserving configured
     /// modes, cryptographic providers, worker admission and pricing policy.
@@ -277,7 +310,19 @@ impl ExecutionEngineManager {
     /// Pre-verify confidential token operations of the given `(address,
     /// canonical bundle bytes)` pairs concurrently, filling the verdict cache.
     /// Bundles routed to other engines are ignored. Never fails.
-    pub fn preverify_bundles(&self, bundles: &[(Vec<u8>, Vec<u8>)]) {
+    pub fn preverify_bundles(&self, bundles: &[(Vec<u8>, Vec<u8>)]) -> PreverifyCounts {
+        self.preverify_bundles_paced(bundles, &PreverifyPacing::default())
+    }
+
+    /// [`Self::preverify_bundles`] paced by `pacing`. The engines are read
+    /// only to take the token policy and worker client: a verification runs
+    /// for minutes, and a held read guard would keep every engine writer,
+    /// and the readers queued behind it, waiting that long.
+    pub fn preverify_bundles_paced(
+        &self,
+        bundles: &[(Vec<u8>, Vec<u8>)],
+        pacing: &PreverifyPacing<'_>,
+    ) -> PreverifyCounts {
         #[cfg(feature = "native-proof")]
         {
             let routed: Vec<(Vec<u8>, Vec<u8>)> = bundles
@@ -290,22 +335,28 @@ impl ExecutionEngineManager {
                 .cloned()
                 .collect();
             if routed.is_empty() {
-                return;
+                return PreverifyCounts::default();
             }
-            let engines = match self.engines.read() {
-                Ok(engines) => engines,
-                Err(_) => return,
+            let verifier = match self.engines.read() {
+                Ok(engines) => engines
+                    .get("token")
+                    .and_then(|e| e.as_any())
+                    .and_then(|e| e.downcast_ref::<TokenExecutionEngine>())
+                    .and_then(TokenExecutionEngine::token_verifier),
+                Err(_) => None,
             };
-            if let Some(token) = engines
-                .get("token")
-                .and_then(|e| e.as_any())
-                .and_then(|e| e.downcast_ref::<TokenExecutionEngine>())
-            {
-                token.preverify_bundles(&routed);
+            match verifier {
+                Some((policy, worker)) => {
+                    TokenExecutionEngine::preverify_with(policy, &worker, &routed, pacing)
+                }
+                None => PreverifyCounts::default(),
             }
         }
         #[cfg(not(feature = "native-proof"))]
-        let _ = bundles;
+        {
+            let _ = (bundles, pacing);
+            PreverifyCounts::default()
+        }
     }
 
     /// Confidential operations a proposal may schedule per frame under the

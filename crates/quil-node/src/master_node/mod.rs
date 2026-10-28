@@ -1,5 +1,7 @@
 mod activation_wait;
 mod archive_ingest_queue;
+#[cfg(test)]
+mod archive_verify_tests;
 mod frame_observations;
 mod peer_info_bounds;
 mod peer_info_file;

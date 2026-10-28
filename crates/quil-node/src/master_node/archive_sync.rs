@@ -1702,6 +1702,23 @@ fn sequenced_ingest_hook(
                 .or_default()
                 .insert(op.frame_number, header.clone());
         }
+        // Verify the frames' confidential proofs before taking the ingest:
+        // a batch shield takes about two minutes, and while a backlog of
+        // them verified under it, gossip ingest, its retry pass and the gap
+        // fetch's admission waited too (2026-10-28, from 945,000). The
+        // locked pass below then finds their verdicts cached, and verifies
+        // itself whatever this left.
+        let _pass = quil_engine::archive_preverify::SequencedPass::begin();
+        let targets: Vec<(Vec<u8>, u64)> = vouched
+            .iter()
+            .filter_map(|(address, headers)| {
+                headers
+                    .keys()
+                    .max()
+                    .map(|&through| (address.clone(), through))
+            })
+            .collect();
+        quil_engine::archive_preverify::preverify_through(ingest, frame_number, &targets);
         let mut ingest = ingest
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
