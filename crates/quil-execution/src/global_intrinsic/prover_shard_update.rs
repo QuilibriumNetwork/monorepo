@@ -959,7 +959,10 @@ pub fn materialize_prover_shard_update(
 ///
 /// `storage` marks a frame anchored in a hash-proof epoch: each participant's
 /// issuance share is held in its storage seat instead of paid
-/// ([`hold_storage_shares`]); fees are still paid at once.
+/// ([`hold_storage_shares`]); fees are still paid at once. From the unsealed
+/// issuance epoch (`quil_types::consensus::unsealed_issuance_active`) a
+/// participant without a sealed registration for the shard and epoch is paid
+/// its share at once instead of nothing.
 ///
 /// `issuance` prices the frame's issuance and says whether it is credited at
 /// all ([`HeaderIssuance`]); a frame not credited only resolves its rings.
@@ -1096,6 +1099,9 @@ pub fn materialize_prover_shard_update_with_fees(
     };
 
     // Hash-proof epochs: issuance shares are held per seat, fees paid below.
+    // From the unsealed issuance epoch a participant without a sealed
+    // registration is paid its share at once, as before the hash epoch.
+    let pay_unsealed = quil_types::consensus::unsealed_issuance_active(current_frame_number);
     let held = match storage {
         Some(storage) => Some(hold_storage_shares(
             frame_header,
@@ -1111,14 +1117,19 @@ pub fn materialize_prover_shard_update_with_fees(
     // Apply per-participant rewards + activity updates.
     let mut credited_provers = 0usize;
     let mut total_reward = BigInt::from(0);
+    let mut unsealed_paid = 0usize;
     for (ring, participants) in &ctx.participants_by_ring {
         let share = rewards_per_ring.get(ring);
         for &idx in participants {
             let prover = &ctx.active_provers[idx];
 
+            let issued = share.cloned().unwrap_or_else(|| BigInt::from(0));
+            let sealed = matches!(&held, Some(held) if held.sealed.contains(&idx));
+            let unsealed = pay_unsealed && held.is_some() && !sealed;
+            let unsealed_share = unsealed && issued.sign() != num_bigint::Sign::NoSign;
             let mut amount = match &held {
-                Some(_) => BigInt::from(0),
-                None => share.cloned().unwrap_or_else(|| BigInt::from(0)),
+                Some(_) if !unsealed => BigInt::from(0),
+                _ => issued,
             };
             amount += &fee_share;
             if remainder_receiver == Some(idx) {
@@ -1135,6 +1146,9 @@ pub fn materialize_prover_shard_update_with_fees(
             {
                 credited_provers += 1;
                 total_reward += &amount;
+                if unsealed_share {
+                    unsealed_paid += 1;
+                }
             }
 
             update_allocation_activity(state, current_frame_number, prover, &frame_header.address)?;
@@ -1161,7 +1175,11 @@ pub fn materialize_prover_shard_update_with_fees(
     // visible per frame instead of silent. `participants` is the committee size
     // that was eligible, so `credited < participants` flags a partial payout.
     let participants: usize = ctx.participants_by_ring.values().map(|p| p.len()).sum();
-    let (held_provers, held_total) = held.unwrap_or_default();
+    let HeldShares {
+        provers: held_provers,
+        total: held_total,
+        ..
+    } = held.unwrap_or_default();
     tracing::info!(
         shard = %hex::encode(&frame_header.address),
         frame = current_frame_number,
@@ -1171,6 +1189,7 @@ pub fn materialize_prover_shard_update_with_fees(
         fee_total = %fee_total,
         held_provers,
         held_total = %held_total,
+        unsealed_paid,
         "shard reward distribution",
     );
 
@@ -1186,7 +1205,8 @@ pub fn materialize_prover_shard_update_with_fees(
 /// queues it for the epoch's expiry sweep. Each seat touched first closes an
 /// epoch whose settlement window ended; one that closes with committed roots
 /// never proved kicks its member (`storage.kicks`). Returns how many
-/// participants had shares held, and their total.
+/// participants had shares held, their total, and which participants hold a
+/// sealed registration ([`HeldShares`]).
 fn hold_storage_shares(
     frame_header: &FrameHeader,
     current_frame_number: u64,
@@ -1194,7 +1214,7 @@ fn hold_storage_shares(
     ctx: &ShardUpdateContext,
     rewards_per_ring: &HashMap<u8, BigInt>,
     storage: &mut StorageFrame,
-) -> Result<(usize, BigInt)> {
+) -> Result<HeldShares> {
     use super::storage_seat;
     let filter = &frame_header.address;
     let epoch = storage.epoch;
@@ -1241,14 +1261,15 @@ fn hold_storage_shares(
     }
 
     let committee = ctx.active_provers.len();
-    let mut held = 0usize;
-    let mut total = BigInt::from(0);
+    let mut held = HeldShares::default();
     let none = BigInt::from(0);
     for (ring, participants) in &ctx.participants_by_ring {
         let share = rewards_per_ring.get(ring).unwrap_or(&none);
         for &idx in participants {
             let prover = &ctx.active_provers[idx];
+            let mut sealed = false;
             if touch(&prover.address, storage, &mut |seat| {
+                sealed = seat.sealed_for(epoch);
                 seat.hold(
                     epoch,
                     current_frame_number,
@@ -1257,12 +1278,28 @@ fn hold_storage_shares(
                     committee,
                 )
             })? {
-                held += 1;
-                total += share;
+                held.provers += 1;
+                held.total += share;
+            }
+            if sealed {
+                held.sealed.insert(idx);
             }
         }
     }
-    Ok((held, total))
+    Ok(held)
+}
+
+/// What [`hold_storage_shares`] held of a hash-proof frame's issuance.
+#[derive(Debug, Default)]
+struct HeldShares {
+    /// Participants whose shares were held in this call.
+    provers: usize,
+    /// Their total.
+    total: BigInt,
+    /// Participants, by committee index, with a sealed registration for the
+    /// shard and epoch: their share is held in the seat, never paid at once,
+    /// even when this call held nothing for them (a frame applied again).
+    sealed: std::collections::HashSet<usize>,
 }
 
 /// Pay a storage seat's held rewards to `member` when its epoch proof
@@ -3242,6 +3279,187 @@ mod tests {
             "the same frame applied again"
         );
         assert_eq!(slot(&provers[1]), committed);
+    }
+
+    /// Distribute `header` to all of `provers` as an app frame anchored in
+    /// hash-proof epoch `epoch` and executed in GLOBAL frame `frame`, with an
+    /// issuance share of 1,000 per participant and no openings root.
+    fn distribute_hash_epoch_frame(
+        state: &HypergraphState,
+        provers: &[ProverInfo],
+        header: &FrameHeader,
+        frame: u64,
+        epoch: u64,
+    ) {
+        let reward_issuance: Arc<dyn RewardIssuance> = Arc::new(StubReward(BigInt::from(8_000)));
+        let participants: Vec<usize> = (0..provers.len()).collect();
+        let mut storage = StorageFrame {
+            epoch,
+            commitment: None,
+            kicks: Vec::new(),
+        };
+        materialize_prover_shard_update_with_fees(
+            header,
+            frame,
+            state,
+            &noop_registry(),
+            &noop_frame_prover(),
+            &reward_issuance,
+            4096,
+            provers.to_vec(),
+            &participants,
+            ShardMetadata {
+                state_size: 1024,
+                shard_count: 1,
+            },
+            0,
+            None,
+            Some(&mut storage),
+            HeaderIssuance::claimed(header),
+        )
+        .unwrap();
+    }
+
+    /// Give `p` a seat on `filter` registered for `epoch`, sealed or not.
+    fn give_seat(state: &HypergraphState, p: &ProverInfo, filter: &[u8], epoch: u64, seal: bool) {
+        use super::super::storage_seat::{self, Seat};
+        let member = <[u8; 32]>::try_from(p.address.as_slice()).unwrap();
+        let mut seat = Seat::new(member, filter.to_vec());
+        seat.register(epoch, &[vec![]], 10);
+        if seal {
+            assert!(seat.seal(epoch, 11));
+        }
+        storage_seat::write(state, 11, &seat).unwrap();
+    }
+
+    /// What `p`'s seat on `filter` holds for `epoch`; `None` without a seat.
+    fn held_share(
+        state: &HypergraphState,
+        p: &ProverInfo,
+        filter: &[u8],
+        epoch: u64,
+    ) -> Option<BigInt> {
+        let member = <[u8; 32]>::try_from(p.address.as_slice()).unwrap();
+        super::super::storage_seat::read(state, &member, filter)
+            .unwrap()
+            .and_then(|seat| seat.slot(epoch).map(|slot| slot.pending_amount()))
+    }
+
+    /// Start (or stop) the unsealed issuance rule from epoch 0 on this thread.
+    fn pay_unsealed_issuance(on: bool) {
+        quil_types::consensus::set_unsealed_issuance_epoch_for_thread(on.then_some(0));
+    }
+
+    /// Hash-proof epochs under the unsealed issuance rule: a participant
+    /// without a sealed registration for the shard and epoch (no seat, or a
+    /// registration its labelling never sealed) is paid its issuance share
+    /// at once with its fees, while a sealed member's share is still held in
+    /// its seat. Without the rule the former earned fees only, which is what
+    /// almost every mainnet participant earned from epoch 1314.
+    #[test]
+    fn an_unsealed_participant_is_paid_its_hash_epoch_issuance_share() {
+        pay_unsealed_issuance(true);
+        let state = make_state();
+        let filter = vec![0xA7u8; 32];
+        let provers: Vec<ProverInfo> = (1u8..=3)
+            .map(|s| fake_prover(s, s as u64, 0, &filter))
+            .collect();
+        for p in &provers {
+            seed_alloc_blob(&state, p, &filter);
+        }
+        let epoch = 7;
+        give_seat(&state, &provers[0], &filter, epoch, true);
+        give_seat(&state, &provers[2], &filter, epoch, false);
+        let mut header = fake_header(filter.clone(), 10);
+        header.fee_total = super::super::frame_header::fee_total_to_bytes(300);
+        header.prover = provers[0].address.clone();
+
+        distribute_hash_epoch_frame(&state, &provers, &header, 100, epoch);
+
+        for p in &provers[1..] {
+            assert_eq!(
+                reward_balance(&state, p),
+                BigInt::from(1_000 + 100),
+                "a participant without a sealed registration must earn its issuance share \
+                 with its fees, not its fees only"
+            );
+        }
+        assert_eq!(
+            reward_balance(&state, &provers[0]),
+            BigInt::from(100),
+            "a sealed member is paid its fees at once"
+        );
+        assert_eq!(
+            held_share(&state, &provers[0], &filter, epoch),
+            Some(BigInt::from(1_000)),
+            "and its share is held in its seat"
+        );
+        assert_eq!(
+            held_share(&state, &provers[2], &filter, epoch),
+            Some(BigInt::from(0)),
+            "an unsealed registration holds nothing"
+        );
+        pay_unsealed_issuance(false);
+    }
+
+    /// The unsealed issuance rule starts at its epoch, by the GLOBAL frame
+    /// executing the header: before it an unsealed participant earns nothing
+    /// of a hash-proof frame's issuance. Under it a sealed member's share is
+    /// still only held, never also paid, and a frame applied again in the
+    /// same GLOBAL frame pays no one twice.
+    #[test]
+    fn unsealed_issuance_starts_at_its_epoch_and_leaves_sealed_seats_held() {
+        let length = quil_types::consensus::epoch_length_frames();
+        quil_types::consensus::set_unsealed_issuance_epoch_for_thread(Some(1));
+        let state = make_state();
+        let filter = vec![0xA8u8; 32];
+        let provers: Vec<ProverInfo> = (1u8..=2)
+            .map(|s| fake_prover(s, s as u64, 0, &filter))
+            .collect();
+        for p in &provers {
+            seed_alloc_blob(&state, p, &filter);
+        }
+        let epoch = 7;
+        give_seat(&state, &provers[0], &filter, epoch, true);
+        let (sealed, unsealed) = (&provers[0], &provers[1]);
+
+        let header = fake_header(filter.clone(), 10);
+        distribute_hash_epoch_frame(&state, &provers, &header, length - 1, epoch);
+        assert_eq!(
+            reward_balance(&state, unsealed),
+            BigInt::from(0),
+            "before the rule's epoch"
+        );
+        assert_eq!(
+            held_share(&state, sealed, &filter, epoch),
+            Some(BigInt::from(1_000))
+        );
+
+        let header = fake_header(filter.clone(), 11);
+        distribute_hash_epoch_frame(&state, &provers, &header, length, epoch);
+        assert_eq!(reward_balance(&state, unsealed), BigInt::from(1_000));
+        assert_eq!(
+            reward_balance(&state, sealed),
+            BigInt::from(0),
+            "a sealed member's share is never paid at once"
+        );
+        assert_eq!(
+            held_share(&state, sealed, &filter, epoch),
+            Some(BigInt::from(2_000))
+        );
+
+        distribute_hash_epoch_frame(&state, &provers, &header, length, epoch);
+        assert_eq!(
+            reward_balance(&state, unsealed),
+            BigInt::from(1_000),
+            "the same frame applied again pays nothing again"
+        );
+        assert_eq!(reward_balance(&state, sealed), BigInt::from(0));
+        assert_eq!(
+            held_share(&state, sealed, &filter, epoch),
+            Some(BigInt::from(2_000))
+        );
+        quil_types::consensus::set_unsealed_issuance_epoch_for_thread(None);
     }
 
     /// Global-venue fees go to the global frame's prover under the global
