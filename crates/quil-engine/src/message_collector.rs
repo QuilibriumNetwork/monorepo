@@ -504,9 +504,95 @@ pub struct MessageCollector {
     /// bundle, is a duplicate: GLOBAL credits a shard frame per frame that
     /// carries it, so carrying it again would credit it again.
     included_frames: std::sync::Mutex<HashMap<Vec<u8>, BTreeSet<u64>>>,
+    /// Set while submits are refused for a full rank buffer, so an accepted
+    /// submit takes `rank_full` only to end the stretch.
+    rank_full_active: std::sync::atomic::AtomicBool,
+    /// The log of submits refused for a full rank buffer.
+    rank_full: std::sync::Mutex<RankFullLog>,
+}
+
+/// How often submits refused for a full rank buffer are logged while they
+/// continue: every submit path (peer messages, gRPC, the node's own ops)
+/// reaches the collector, and a stalled rank refuses thousands per minute
+/// (2026-10-27: ~40,000 lines per archive in 2.75 h).
+const RANK_FULL_LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// A stretch of refusals for a full rank buffer, for [`RankFullLog::refuse`].
+struct RankFullLog {
+    outage: crate::outage::Outage,
+    /// Refusals since the last line.
+    unreported: u64,
+}
+
+impl RankFullLog {
+    fn new() -> Self {
+        Self {
+            outage: crate::outage::Outage::begin_after_repeating(1, RANK_FULL_LOG_EVERY),
+            unreported: 0,
+        }
+    }
+}
+
+/// The buffer a refusal found full, for its log line.
+struct RankFullState {
+    rank: u64,
+    pending: usize,
+    pending_bytes: usize,
+    ranks_held: usize,
 }
 
 impl MessageCollector {
+    /// Count a submit refused for a full rank buffer; log the first of a
+    /// stretch and then one line per [`RANK_FULL_LOG_EVERY`] with the count.
+    fn note_rank_full(&self, now: Instant, state: RankFullState) {
+        use crate::outage::OutageEvent;
+        self.rank_full_active
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut log = self.rank_full.lock().unwrap();
+        log.unreported += 1;
+        let (secs, refused) = match log.outage.observe(now, false) {
+            Some(OutageEvent::Began) => (0, log.unreported),
+            Some(OutageEvent::Continues { secs, .. }) => (secs, log.unreported),
+            _ => return,
+        };
+        log.unreported = 0;
+        tracing::warn!(
+            scope = "local",
+            action = "wait",
+            rank = state.rank,
+            refused,
+            for_secs = secs,
+            pending = state.pending,
+            pending_bytes = state.pending_bytes,
+            max_messages = MAX_MESSAGES_PER_RANK,
+            max_bytes = MAX_BYTES_PER_RANK,
+            ranks_held = state.ranks_held,
+            "message collector: refusing submits, rank buffer full (per-rank count/byte cap reached); `refused` counts refusals since the previous line; ends when the rank advances or the buffer is pruned"
+        );
+    }
+
+    /// Log the end of a stretch of refusals, if one is open.
+    fn note_rank_accepting(&self, now: Instant, rank: u64) {
+        use crate::outage::OutageEvent;
+        if !self
+            .rank_full_active
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let mut log = self.rank_full.lock().unwrap();
+        let unreported = std::mem::take(&mut log.unreported);
+        if let Some(OutageEvent::Ended { secs, failures }) = log.outage.observe(now, true) {
+            tracing::info!(
+                rank,
+                refused_total = failures,
+                refused_since_last_line = unreported,
+                lasted_secs = secs,
+                "message collector: accepting submits again after a full rank buffer"
+            );
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             buffers: RwLock::new(HashMap::new()),
@@ -524,6 +610,8 @@ impl MessageCollector {
             included: std::sync::Mutex::new(HashMap::new()),
             finalizations: std::sync::atomic::AtomicU64::new(0),
             included_frames: std::sync::Mutex::new(HashMap::new()),
+            rank_full_active: std::sync::atomic::AtomicBool::new(false),
+            rank_full: std::sync::Mutex::new(RankFullLog::new()),
         }
     }
 
@@ -973,6 +1061,7 @@ impl MessageCollector {
         let buffer = buffers.entry(rank).or_insert_with(RankBuffer::new);
         match buffer.add(message) {
             AddOutcome::Added => {
+                self.note_rank_accepting(Instant::now(), rank);
                 if verified && !keys.is_empty() {
                     self.supersede(&mut buffers, &keys, hash);
                 }
@@ -980,14 +1069,14 @@ impl MessageCollector {
             }
             AddOutcome::Duplicate => SubmitOutcome::Duplicate,
             AddOutcome::Full => {
-                tracing::warn!(
-                    rank,
-                    pending = buffer.len(),
-                    pending_bytes = buffer.bytes,
-                    max_messages = MAX_MESSAGES_PER_RANK,
-                    max_bytes = MAX_BYTES_PER_RANK,
-                    ranks_held,
-                    "message collector: submit rejected — rank buffer full (per-rank count/byte cap reached)"
+                self.note_rank_full(
+                    Instant::now(),
+                    RankFullState {
+                        rank,
+                        pending: buffer.len(),
+                        pending_bytes: buffer.bytes,
+                        ranks_held,
+                    },
                 );
                 SubmitOutcome::Filtered(Refusal::RankFull)
             }
@@ -2819,5 +2908,69 @@ mod tests {
             mc.collect_for_rank(1),
             vec![b"join".to_vec(), shard_bundle(0x11, 6, 0, 0)]
         );
+    }
+
+    /// A rank that stays full refuses thousands of submits: the log shows the
+    /// first, one line per interval with the count, and the end.
+    #[test]
+    fn full_rank_refusals_log_a_bounded_summary() {
+        use crate::outage::test_logs::CapturedLogs;
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        let mc = MessageCollector::new();
+        for i in 0..MAX_MESSAGES_PER_RANK as u64 {
+            assert_eq!(
+                mc.add_message_outcome(1, i.to_be_bytes().to_vec()),
+                SubmitOutcome::Accepted
+            );
+        }
+        assert!(logs.lines_with("rank buffer full").is_empty());
+        for i in 0..1_000u64 {
+            let data = (MAX_MESSAGES_PER_RANK as u64 + i).to_be_bytes().to_vec();
+            assert_eq!(
+                mc.add_message_outcome(1, data),
+                SubmitOutcome::Filtered(Refusal::RankFull)
+            );
+        }
+        let first = logs.lines_with("refusing submits");
+        assert_eq!(first.len(), 1, "{first:?}");
+        for field in [
+            "WARN",
+            "rank=1",
+            "refused=1 ",
+            "pending=65536",
+            "ranks_held=1",
+        ] {
+            assert!(first[0].contains(field), "{field}: {}", first[0]);
+        }
+        // Within the interval nothing more; after it, one line with the count.
+        let state = || RankFullState {
+            rank: 1,
+            pending: MAX_MESSAGES_PER_RANK,
+            pending_bytes: 0,
+            ranks_held: 1,
+        };
+        let now = Instant::now();
+        mc.note_rank_full(now + RANK_FULL_LOG_EVERY / 2, state());
+        assert_eq!(logs.lines_with("refusing submits").len(), 1);
+        mc.note_rank_full(now + RANK_FULL_LOG_EVERY + Duration::from_secs(1), state());
+        let lines = logs.lines_with("refusing submits");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].contains("refused=1001 "), "{}", lines[1]);
+        // The rank advances: submits are accepted and the end is logged once.
+        assert_eq!(
+            mc.add_message_outcome(2, b"next".to_vec()),
+            SubmitOutcome::Accepted
+        );
+        assert_eq!(
+            mc.add_message_outcome(2, b"after".to_vec()),
+            SubmitOutcome::Accepted
+        );
+        let ended = logs.lines_with("accepting submits again");
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        for field in ["INFO", "rank=2", "refused_total=1002"] {
+            assert!(ended[0].contains(field), "{field}: {}", ended[0]);
+        }
+        assert_eq!(logs.lines_with("rank buffer full").len(), 2);
     }
 }
