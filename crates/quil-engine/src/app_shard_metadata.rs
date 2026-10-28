@@ -644,10 +644,12 @@ fn snapshot_storage_confirm(
                     < quil_types::consensus::storage_snapshot_frame(epoch)
                         + storage_snapshot_grace()
             {
-                return Err(unavailable(format!(
-                    "leaf snapshot of {} for epoch {epoch} not encoded yet",
-                    hex::encode(filter)
-                )));
+                return Err(quil_types::error::QuilError::StorageSnapshotPending(
+                    format!(
+                        "leaf snapshot of {} for epoch {epoch} not encoded yet",
+                        hex::encode(filter)
+                    ),
+                ));
             }
             tracing::warn!(frame = frame_number, epoch, filter = %hex::encode(filter),
                 "no leaf snapshot for the epoch: renewing without a storage registration; this seat's frames carry \

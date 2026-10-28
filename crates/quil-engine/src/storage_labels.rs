@@ -138,6 +138,9 @@ pub struct LabelStore {
     refused: Mutex<HashSet<(u64, PathBuf, Stage)>>,
     /// The epoch before which labels were last removed ([`Self::sweep`]).
     swept: AtomicU64,
+    /// Leaves whose data [`precompute`] read, for tests.
+    #[cfg(test)]
+    leaves_read: AtomicU64,
 }
 
 /// Room a leaf's labels were refused: the free bytes they needed, beside
@@ -162,6 +165,39 @@ impl LabelStore {
             pending: Mutex::new(0),
             refused: Mutex::new(HashSet::new()),
             swept: AtomicU64::new(0),
+            #[cfg(test)]
+            leaves_read: AtomicU64::new(0),
+        }
+    }
+
+    /// Leaves whose data [`precompute`] read with this store.
+    #[cfg(test)]
+    pub(crate) fn leaves_read(&self) -> u64 {
+        self.leaves_read.load(Ordering::SeqCst)
+    }
+
+    /// Whether [`Self::admit`] could admit `member`'s leaf `leaf_id` for
+    /// `epoch` at `least` nodes or more: false when its filesystem has no
+    /// room for the labels of `least` nodes, logged as [`Self::admit`] logs a
+    /// refusal. Checked before the leaf's data is read for its exact count,
+    /// so a leaf refused room holds no memory for its read.
+    pub fn may_admit(
+        &self,
+        epoch: u64,
+        member: &[u8],
+        leaf_id: &[u8],
+        least: u64,
+        stage: Stage,
+    ) -> bool {
+        let pending = self.pending();
+        match self.room(*pending, label_bytes(least).saturating_mul(DISK_MARGIN)) {
+            Ok(()) => true,
+            Err(shortfall) => {
+                drop(pending);
+                let dir = self.leaf_dir(epoch, member, leaf_id);
+                self.refuse(epoch, &dir, leaf_id, least, stage, shortfall);
+                false
+            }
         }
     }
 
@@ -597,10 +633,21 @@ pub fn precompute(
     let started = std::time::Instant::now();
     let labelled = crate::storage_jobs::for_each_parallel(&captured.prefixes, |prefix| {
         let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(filter, prefix);
+        let size = captured.leaf_size(prefix)?;
+        // A leaf's data is at least its values (`leaf_size`): one whose
+        // labels at that count have no room is refused before its read,
+        // which would hold memory the epoch's snapshots wait for.
+        let least = precompute_nodes(data_node_count(u64::try_from(size).unwrap_or(u64::MAX)));
+        if store.find(epoch, member, &leaf_id, |_| true).is_none()
+            && !store.may_admit(epoch, member, &leaf_id, least, Stage::Ahead)
+        {
+            return Ok(None);
+        }
         let exact = {
-            let _memory = crate::storage_jobs::reserve(crate::storage_snapshot::leaf_read_bytes(
-                captured.leaf_size(prefix)?,
-            ));
+            let _memory =
+                crate::storage_jobs::reserve_ahead(crate::storage_snapshot::leaf_read_bytes(size));
+            #[cfg(test)]
+            store.leaves_read.fetch_add(1, Ordering::SeqCst);
             data_node_count(captured.leaf_data(prefix)?.len() as u64)
         };
         if store
@@ -613,7 +660,15 @@ pub fn precompute(
         let Some(admitted) = store.admit(epoch, member, &leaf_id, n, Stage::Ahead) else {
             return Ok(None);
         };
-        let _memory = crate::storage_jobs::reserve(crate::storage_snapshot::encoding_bytes(n));
+        let _memory =
+            crate::storage_jobs::reserve_ahead(crate::storage_snapshot::encoding_bytes(n));
+        let _progress = crate::storage_snapshot::leaf_started(
+            epoch,
+            filter,
+            &leaf_id,
+            n,
+            crate::storage_snapshot::LeafWork::LabellingAhead,
+        );
         Ok(admitted.label(&params)?.kept.then_some(n))
     })?;
     let refused = labelled.iter().filter(|n| n.is_none()).count();

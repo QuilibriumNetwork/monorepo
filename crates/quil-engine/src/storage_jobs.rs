@@ -240,10 +240,28 @@ pub(crate) fn wait_lane_idle(lane: &[u8], timeout: Duration) -> bool {
 /// Reserve `bytes` for a job's work: waits, behind the reservations asked
 /// for before it, until it fits beside the ones held.
 pub fn reserve(bytes: u64) -> Reservation {
+    admission().reserve(bytes)
+}
+
+/// Reserve `bytes` for work done ahead of when it is needed (labelling a
+/// later epoch's leaves, `crate::storage_labels`): like [`reserve`], behind
+/// every reservation asked for work due now, whenever asked, so a renewal's
+/// snapshot never waits for it.
+pub fn reserve_ahead(bytes: u64) -> Reservation {
+    admission().reserve_with(bytes, Urgency::Ahead)
+}
+
+fn admission() -> &'static Admission {
     static ADMISSION: OnceLock<Admission> = OnceLock::new();
-    ADMISSION
-        .get_or_init(|| Admission::new(job_slots(), Box::new(available_memory)))
-        .reserve(bytes)
+    ADMISSION.get_or_init(|| Admission::new(job_slots(), Box::new(available_memory)))
+}
+
+/// Whether a reservation's work is due now (a snapshot a renewal waits for,
+/// an epoch proof) or done ahead of when it is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Urgency {
+    Due,
+    Ahead,
 }
 
 /// Jobs that may hold memory at once: one per core, less the master's.
@@ -363,8 +381,9 @@ struct State {
     reserved: u64,
     /// Reservations held.
     holders: usize,
-    /// Tickets of the reservations waiting, in the order asked.
-    waiting: VecDeque<u64>,
+    /// Tickets of the reservations waiting, in the order granted: those due
+    /// now in the order asked, then those ahead in the order asked.
+    waiting: VecDeque<(u64, Urgency)>,
     next_ticket: u64,
     /// Memory available when the last reservation granted to no others was.
     idle_available: Option<u64>,
@@ -388,20 +407,41 @@ impl Admission {
 
     /// Reserve `bytes` ([`reserve`]).
     pub fn reserve(&'static self, bytes: u64) -> Reservation {
+        self.reserve_with(bytes, Urgency::Due)
+    }
+
+    /// Reserve `bytes` for work of `urgency` ([`reserve`], [`reserve_ahead`]).
+    pub fn reserve_with(&'static self, bytes: u64, urgency: Urgency) -> Reservation {
         let mut state = self.state();
         let ticket = state.next_ticket;
         state.next_ticket += 1;
-        state.waiting.push_back(ticket);
+        // Work due now goes before every reservation for work ahead.
+        let position = match urgency {
+            Urgency::Due => state
+                .waiting
+                .iter()
+                .position(|&(_, waiting)| waiting == Urgency::Ahead)
+                .unwrap_or(state.waiting.len()),
+            Urgency::Ahead => state.waiting.len(),
+        };
+        state.waiting.insert(position, (ticket, urgency));
         let started = Instant::now();
         let mut waited = false;
-        while state.waiting.front() != Some(&ticket) || !self.fits(&mut state, bytes) {
+        while state.waiting.front().map(|&(front, _)| front) != Some(ticket)
+            || !self.fits(&mut state, bytes)
+        {
             if !waited {
                 waited = true;
                 info!(
                     bytes,
                     reserved = state.reserved,
                     jobs = state.holders,
-                    ahead = state.waiting.len() - 1,
+                    ahead = state
+                        .waiting
+                        .iter()
+                        .position(|&(waiting, _)| waiting == ticket)
+                        .unwrap_or(0),
+                    due = urgency == Urgency::Due,
                     "storage job waits for memory"
                 );
             }
@@ -484,10 +524,14 @@ mod tests {
     }
 
     fn hold(admission: &'static Admission, bytes: u64) -> Held {
+        hold_with(admission, bytes, Urgency::Due)
+    }
+
+    fn hold_with(admission: &'static Admission, bytes: u64, urgency: Urgency) -> Held {
         let (granted_tx, granted) = mpsc::channel();
         let (release, released) = mpsc::channel::<()>();
         std::thread::spawn(move || {
-            let _reservation = admission.reserve(bytes);
+            let _reservation = admission.reserve_with(bytes, urgency);
             granted_tx.send(()).unwrap();
             let _ = released.recv();
         });
@@ -528,6 +572,38 @@ mod tests {
         assert!(still_waiting(&fourth), "40 GiB do not");
         drop(first.release);
         assert!(granted(&fourth), "it runs once one finishes");
+    }
+
+    /// A reservation for work due now (a renewal's snapshot) goes before
+    /// those for work ahead (labelling a later epoch) asked for before it.
+    #[test]
+    fn work_due_now_is_granted_before_work_ahead_asked_earlier() {
+        let (admission, _) = admission(8, 40 * GIB);
+        let first = hold(admission, 20 * GIB);
+        assert!(granted(&first));
+        let ahead = hold_with(admission, 20 * GIB, Urgency::Ahead);
+        until_waiting(admission, 1);
+        let later_ahead = hold_with(admission, GIB, Urgency::Ahead);
+        until_waiting(admission, 2);
+        let due = hold(admission, 20 * GIB);
+        until_waiting(admission, 3);
+        assert_eq!(
+            admission
+                .state()
+                .waiting
+                .iter()
+                .map(|&(_, urgency)| urgency)
+                .collect::<Vec<_>>(),
+            vec![Urgency::Due, Urgency::Ahead, Urgency::Ahead],
+            "the due reservation waits first in line"
+        );
+        drop(first.release);
+        assert!(granted(&due), "the work due now runs first");
+        assert!(still_waiting(&ahead), "the work ahead waits behind it");
+        assert!(still_waiting(&later_ahead));
+        drop(due.release);
+        assert!(granted(&ahead));
+        assert!(granted(&later_ahead), "work ahead keeps its own order");
     }
 
     #[test]

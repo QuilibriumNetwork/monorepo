@@ -238,6 +238,10 @@ enum LeftOutCause {
     /// Its thread worker is stopped while the node reopens the worker's
     /// store (`stopped_store_filters`); the master's stores lack the shard.
     StoreStopped,
+    /// Its leaf snapshot for the epoch is not encoded yet
+    /// (`QuilError::StorageSnapshotPending`): retried on the next cycle,
+    /// until the renewal's grace lets it renew without a registration.
+    SnapshotPending,
 }
 
 impl LeftOutCause {
@@ -251,6 +255,7 @@ impl LeftOutCause {
             Self::OverLimit => "over decode limit",
             Self::Refused => "refused",
             Self::StoreStopped => "worker store stopped",
+            Self::SnapshotPending => "storage snapshot not encoded yet",
         }
     }
 }
@@ -351,6 +356,110 @@ fn stopped_mid_encode(
     }
 }
 
+/// How often the seats a confirm leaves out pending their storage snapshot
+/// are reported while the same ones stay pending.
+const PENDING_SNAPSHOT_REPORT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The GLOBAL frame a seat whose snapshot leaves have `remaining` to run by
+/// their estimate is projected to be encoded by, at the ideal frame time.
+fn projected_snapshot_frame(frame_number: u64, remaining: std::time::Duration) -> u64 {
+    let frame_seconds = (crate::difficulty::IDEAL_FRAME_TIME as u64 / 1000).max(1);
+    frame_number.saturating_add(remaining.as_secs().div_ceil(frame_seconds))
+}
+
+/// Report the seats a confirm leaves out because their storage snapshot is
+/// not encoded yet: one line when the pending seats change, and again every
+/// [`PENDING_SNAPSHOT_REPORT`] while they stay, with the seats ready and the
+/// grace frame; and, once a seat per epoch, a warning when its running
+/// leaves are projected to end past that frame.
+fn report_pending_snapshots(frame_number: u64, prepared: &PreparedConfirm) {
+    const LISTED: usize = 16;
+    let pending: Vec<&LeftOutSeat> = prepared
+        .left_out
+        .iter()
+        .filter(|seat| seat.cause == LeftOutCause::SnapshotPending)
+        .collect();
+    if pending.is_empty() {
+        return;
+    }
+    // A confirm in epoch E registers the snapshot for E + 1.
+    let epoch = quil_types::consensus::epoch_for_frame(frame_number) + 1;
+    let grace_frame = quil_types::consensus::storage_snapshot_frame(epoch)
+        + crate::app_shard_metadata::storage_snapshot_grace();
+    let mut filters: Vec<Vec<u8>> = pending.iter().map(|seat| seat.filter.clone()).collect();
+    filters.sort();
+    let mut encoding = 0usize;
+    let mut late: Vec<(Vec<u8>, u64, bool)> = Vec::new();
+    for seat in &pending {
+        let shards: Vec<Vec<u8>> = std::iter::once(seat.filter.clone())
+            .chain(seat.targets.iter().cloned())
+            .collect();
+        let Some(progress) = crate::storage_snapshot::snapshot_progress(&shards, epoch) else {
+            continue;
+        };
+        encoding += 1;
+        let projected = projected_snapshot_frame(frame_number, progress.remaining);
+        if projected > grace_frame {
+            late.push((seat.filter.clone(), projected, progress.labelling_now));
+        }
+    }
+    {
+        static LAST: Mutex<Option<(u64, Vec<Vec<u8>>, std::time::Instant)>> = Mutex::new(None);
+        let mut last = LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let due = last.as_ref().is_none_or(|(seen, seats, at)| {
+            *seen != epoch || *seats != filters || at.elapsed() >= PENDING_SNAPSHOT_REPORT
+        });
+        if due {
+            *last = Some((epoch, filters.clone(), std::time::Instant::now()));
+            drop(last);
+            let listed = filters
+                .iter()
+                .take(LISTED)
+                .map(hex::encode)
+                .collect::<Vec<_>>()
+                .join(",");
+            info!(frame = frame_number, epoch, ready = prepared.filters.len(), pending = filters.len(),
+                encoding, not_started = filters.len() - encoding, grace_frame,
+                frames_to_grace = grace_frame.saturating_sub(frame_number), pending_filters = %listed,
+                more_pending = filters.len().saturating_sub(LISTED), scope = "local",
+                "confirmation submits the seats whose storage snapshot is encoded and retries the pending \
+                 ones each cycle: an expected wait while their snapshots encode; a seat still pending at the \
+                 grace frame renews without a storage registration and earns no storage share on its shard \
+                 that epoch");
+        }
+    }
+    static WARNED: Mutex<Option<(u64, std::collections::HashSet<Vec<u8>>)>> = Mutex::new(None);
+    for (filter, projected, labelling_now) in late {
+        {
+            let mut warned = WARNED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if warned.as_ref().is_none_or(|(seen, _)| *seen != epoch) {
+                *warned = Some((epoch, Default::default()));
+            }
+            if let Some((_, seats)) = warned.as_mut() {
+                if !seats.insert(filter.clone()) {
+                    continue;
+                }
+            }
+        }
+        let action = if labelling_now {
+            "its leaves are labelled at the snapshot because labels could not be computed ahead (see \
+             'storage labels not computed ahead' lines): free disk space on the filesystem holding the \
+             node's store so later epochs' labels are computed ahead"
+        } else {
+            "its leaves encode from labels computed ahead and still overrun: a defect to report with this line"
+        };
+        warn!(frame = frame_number, epoch, filter = %hex::encode(&filter), projected_frame = projected,
+            grace_frame, scope = "local", action,
+            "storage snapshot of a seat is projected to finish after its renewal's grace frame: past it the \
+             seat renews without a storage registration and earns no storage share on its shard that epoch \
+             (reported once a seat per epoch)");
+    }
+}
+
 /// Why no node would decode a confirm carrying this seat, if none would: its
 /// filter or its leaf-root groups exceed the decoders' limits. Such a seat is
 /// left out, so the seats sharing its message still go out.
@@ -369,9 +478,13 @@ fn seat_over_limit(filter: &[u8], roots: &LeafRoots) -> Option<QuilError> {
 /// A seat whose filter or leaf roots exceed what every node decodes is left
 /// out too (`seat_over_limit`), so it does not take its message-mates down,
 /// as is one `refused` finds GLOBAL would no longer accept a confirm for,
-/// once every seat is prepared. When no seat is left and none is over those
-/// limits or refused, the first worker error aborts the confirm, as does any
-/// other preparation error.
+/// once every seat is prepared. A seat whose storage snapshot is not encoded
+/// yet is left out too (`LeftOutCause::SnapshotPending`): GLOBAL renews each
+/// seat's allocation on its own, so the seats already encoded renew now and
+/// the pending one by a later confirm of the same epoch. When no seat is
+/// left and none is over those limits, refused or pending its snapshot, the
+/// first worker error aborts the confirm, as does any other preparation
+/// error.
 fn prepare_confirm<F, R>(
     filters: &[Vec<u8>],
     changes: &[quil_types::store::PendingShardChange],
@@ -386,7 +499,13 @@ where
     let mut prepared: Vec<(Vec<u8>, Vec<Vec<u8>>, LeafRoots)> = Vec::with_capacity(filters.len());
     let mut left_out: Vec<LeftOutSeat> = Vec::new();
     for (filter, targets) in confirm_encoding_plan(filters, changes, epoch) {
-        match prepare(&filter, &targets)? {
+        let prepared_seat = match prepare(&filter, &targets) {
+            Err(error @ QuilError::StorageSnapshotPending(_)) => {
+                Prepared::Unanswered(LeftOutCause::SnapshotPending, error)
+            }
+            other => other?,
+        };
+        match prepared_seat {
             Prepared::Roots(roots) => match seat_over_limit(&filter, &roots) {
                 None => prepared.push((filter, targets, roots)),
                 Some(error) => left_out.push(LeftOutSeat {
@@ -449,12 +568,16 @@ where
         });
     }
     // A seat over the decode limits or refused is settled rather than
-    // failed, so it is not prepared again every frame.
+    // failed, so it is not prepared again every frame; one pending its
+    // snapshot is reported with the seats ready (`report_pending_snapshots`).
     if prepared.is_empty()
         && !left_out.is_empty()
-        && left_out
-            .iter()
-            .all(|seat| !matches!(seat.cause, LeftOutCause::OverLimit | LeftOutCause::Refused))
+        && left_out.iter().all(|seat| {
+            !matches!(
+                seat.cause,
+                LeftOutCause::OverLimit | LeftOutCause::Refused | LeftOutCause::SnapshotPending
+            )
+        })
     {
         return Err(left_out.remove(0).error);
     }
@@ -1357,11 +1480,18 @@ impl ProverPipeline {
     /// `report_over_limit`).
     fn report_left_out_seats(&self, frame_number: u64, prepared: &PreparedConfirm) {
         const LISTED: usize = 16;
-        // Refused seats are reported as they are found (`confirm_refusal`).
+        report_pending_snapshots(frame_number, prepared);
+        // Refused seats are reported as they are found (`confirm_refusal`),
+        // seats pending their snapshot apart (`report_pending_snapshots`).
         let (over_limit, unprepared): (Vec<&LeftOutSeat>, Vec<&LeftOutSeat>) = prepared
             .left_out
             .iter()
-            .filter(|seat| seat.cause != LeftOutCause::Refused)
+            .filter(|seat| {
+                !matches!(
+                    seat.cause,
+                    LeftOutCause::Refused | LeftOutCause::SnapshotPending
+                )
+            })
             .partition(|seat| seat.cause == LeftOutCause::OverLimit);
         if !over_limit.is_empty() {
             let seats: Vec<(Vec<u8>, String)> = over_limit
@@ -2046,8 +2176,9 @@ impl ProverPipeline {
             None => HashMap::new(),
         };
         // Ask for the snapshot of every seat this node encodes before
-        // preparing any: the confirm stops at the first seat not encoded yet,
-        // and the seats encode side by side (`crate::storage_jobs`).
+        // preparing any: the seats encode side by side
+        // (`crate::storage_jobs`), and the confirm leaves out each seat not
+        // encoded yet, to renew it by a later one (`prepare_confirm`).
         if quil_types::consensus::hash_storage_proofs_at(epoch) {
             for (filter, targets) in confirm_encoding_plan(filters, &changes, epoch) {
                 if stopped.contains(&filter) || answers.contains_key(&filter) {
@@ -3975,6 +4106,175 @@ mod tests {
         assert!(
             reports.due(&consumed_by(&SEEDS[0], "join merge", OWN), 6),
             "a changed marker is reported at once"
+        );
+    }
+
+    /// A/B: a renewal of two seats, one whose leaf snapshot for the epoch is
+    /// encoded and one whose snapshot is not yet, confirms the encoded seat
+    /// now and leaves the other out to retry on the next cycle; once its
+    /// snapshot is encoded a later confirm of the same epoch registers it.
+    /// Before, the pending seat failed the whole confirm, every cycle, until
+    /// the grace frame, and the encoded seat waited with it.
+    #[test]
+    fn a_confirm_renews_encoded_seats_while_another_seat_snapshot_encodes() {
+        use quil_hypergraph::Location;
+        use std::sync::Arc;
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE.to_vec(),
+        ));
+        crdt.set_unified_tree(true);
+        let (ready, pending) = (vec![0x55u8; 32], vec![0x66u8; 32]);
+        for app in [0x55u8, 0x66] {
+            for d in 0u8..3 {
+                crdt.add_vertex(
+                    &Location {
+                        app_address: [app; 32],
+                        data_address: [d; 32],
+                    },
+                    &vec![d.wrapping_add(app); 256],
+                )
+                .unwrap();
+            }
+        }
+        crdt.commit(1).unwrap();
+        let replicas = quil_store::replica_store::ReplicaStore::new(Arc::new(
+            quil_store::RocksDb::open_in_memory().unwrap(),
+        ));
+        let member = vec![0xC2u8; 32];
+        let epoch = 7u64;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch));
+        // Within the grace: a seat not encoded yet waits for its snapshot.
+        let frame = quil_types::consensus::storage_snapshot_frame(epoch) + 30;
+        let encode = |filter: &Vec<u8>| {
+            let source = crate::storage_snapshot::current_source(&crdt, filter, epoch);
+            let captured = crate::storage_snapshot::capture_at(
+                &crdt,
+                filter,
+                epoch,
+                std::slice::from_ref(&source),
+            )
+            .unwrap();
+            crate::storage_snapshot::encode_member(&captured, &member, &replicas).unwrap();
+        };
+        encode(&ready);
+        let params = quil_crypto::sdr::SdrParams::default();
+        let prepare_at = |filters: &[Vec<u8>], frame: u64| {
+            super::prepare_confirm(
+                filters,
+                &[],
+                epoch,
+                |filter, _| {
+                    crate::app_shard_metadata::compute_storage_confirm(
+                        &crdt,
+                        &replicas,
+                        &[filter.to_vec()],
+                        &member,
+                        epoch,
+                        64,
+                        &params,
+                        frame,
+                        &[],
+                    )
+                    .map(super::Prepared::Roots)
+                },
+                |_| None,
+            )
+        };
+        let prepare = |filters: &[Vec<u8>]| prepare_at(filters, frame);
+        let attempts = Arc::new(crate::submission_attempts::SubmissionAttempts::default());
+        let both = vec![ready.clone(), pending.clone()];
+        let mut attempt = attempts.begin(&both, FRAME, OpKind::Confirm).unwrap();
+        let prepared = prepare(&both)
+            .expect("the seat whose snapshot is encoded is confirmed while the other's encodes");
+        assert_eq!(
+            prepared.filters,
+            vec![ready.clone()],
+            "only the encoded seat"
+        );
+        assert_eq!(prepared.roots.len(), 1);
+        assert_eq!(prepared.roots[0].filter, ready);
+        assert!(
+            !prepared.roots[0].entries.is_empty(),
+            "it registers its encoded leaves"
+        );
+        assert_eq!(left_out_filters(&prepared), vec![pending.clone()]);
+        prepared.settle_left_out(&mut attempt, FRAME);
+        assert!(
+            attempts
+                .begin(&[pending.clone()], FRAME, OpKind::Confirm)
+                .is_some(),
+            "the pending seat is retried on the next cycle"
+        );
+        attempt.published(FRAME);
+        // At the grace frame the seat still pending renews without a
+        // registration, and the encoded one keeps its leaves.
+        let grace = prepare_at(
+            &both,
+            quil_types::consensus::storage_snapshot_frame(epoch)
+                + crate::app_shard_metadata::storage_snapshot_grace(),
+        )
+        .expect("at the grace frame every seat renews");
+        assert_eq!(grace.filters, both);
+        assert_eq!(
+            grace.roots[0], prepared.roots[0],
+            "the encoded seat registers"
+        );
+        assert!(
+            grace.roots[1].entries.is_empty(),
+            "the pending seat renews without a registration"
+        );
+        encode(&pending);
+        let later = prepare(std::slice::from_ref(&pending))
+            .expect("once encoded, a later confirm of the epoch registers it");
+        assert_eq!(later.filters, vec![pending.clone()]);
+        assert!(!later.roots[0].entries.is_empty());
+        assert!(later.left_out.is_empty());
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// A confirm whose every seat awaits its snapshot submits none and
+    /// leaves them all for the next cycle, reported as pending rather than as
+    /// a failed preparation; any other error still aborts the confirm.
+    #[test]
+    fn a_confirm_whose_seats_all_await_their_snapshot_submits_none_and_retries_them() {
+        let pending = || {
+            quil_types::error::QuilError::StorageSnapshotPending(
+                "leaf snapshot not encoded yet".into(),
+            )
+        };
+        let filters = vec![vec![1], vec![2]];
+        let prepared = super::prepare_confirm(&filters, &[], 2, |_, _| Err(pending()), |_| None)
+            .expect("seats pending their snapshot are left out, not failed");
+        assert!(prepared.filters.is_empty() && prepared.roots.is_empty());
+        assert_eq!(left_out_filters(&prepared), filters);
+        assert!(prepared
+            .left_out
+            .iter()
+            .all(|seat| seat.cause == super::LeftOutCause::SnapshotPending));
+        let failed = super::prepare_confirm(
+            &filters,
+            &[],
+            2,
+            |filter, _| match filter {
+                [1] => Err(pending()),
+                _ => Err(unanswered()),
+            },
+            |_| None,
+        );
+        assert!(
+            failed.is_err(),
+            "another preparation error aborts the confirm"
+        );
+        assert_eq!(
+            super::projected_snapshot_frame(100, std::time::Duration::from_secs(25)),
+            103,
+            "a seat's remaining encode in frames, rounded up"
         );
     }
 }
