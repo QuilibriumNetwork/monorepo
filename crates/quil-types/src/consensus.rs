@@ -1006,6 +1006,72 @@ pub fn set_storage_attestation_pause_for_thread(pause: Option<(u64, u64)>) {
     STORAGE_ATTESTATION_PAUSE_OVERRIDE.with(|cell| cell.set(pause));
 }
 
+/// The epoch from which GLOBAL pays a participant's issuance share of a
+/// hash-proof frame at once when the participant holds no sealed
+/// registration for the shard and the frame's epoch, as before the hash
+/// epoch, instead of issuing nothing. A member with a sealed registration
+/// keeps its share held in its seat and settled by its epoch proof. From
+/// [`MAINNET_HASH_STORAGE_PROOF_EPOCH`] almost no member seals: labelling a
+/// seat's leaves takes far longer than an epoch on a regular node, so every
+/// other participant's issuance went unissued. Read from the GLOBAL frame
+/// executing the header. Consensus-affecting (reward state): every node that
+/// executes GLOBAL frames must run a build carrying the epoch before it.
+/// `None` on mainnet until it is decided; `QUIL_UNSEALED_ISSUANCE_EPOCH`
+/// elsewhere, never by default.
+pub const MAINNET_UNSEALED_ISSUANCE_EPOCH: Option<u64> = None;
+
+static UNSEALED_ISSUANCE_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static UNSEALED_ISSUANCE_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn unsealed_issuance_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_UNSEALED_ISSUANCE_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's unsealed issuance epoch from its network, and return
+/// it. Called at startup before any frame is processed; the first call
+/// decides.
+pub fn init_unsealed_issuance_epoch(network: u8) -> u64 {
+    *UNSEALED_ISSUANCE_EPOCH.get_or_init(|| {
+        unsealed_issuance_epoch_for(
+            network,
+            std::env::var("QUIL_UNSEALED_ISSUANCE_EPOCH")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The epoch fixed by [`init_unsealed_issuance_epoch`]; the mainnet epoch in
+/// a process that never called it, so the setting cannot reach mainnet.
+/// `u64::MAX` when the network has none.
+pub fn unsealed_issuance_epoch() -> u64 {
+    if let Some(epoch) = UNSEALED_ISSUANCE_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *UNSEALED_ISSUANCE_EPOCH.get_or_init(|| unsealed_issuance_epoch_for(0, None))
+}
+
+/// Whether GLOBAL frame `frame` pays the issuance share of a participant
+/// without a sealed registration at once
+/// ([`MAINNET_UNSEALED_ISSUANCE_EPOCH`]).
+pub fn unsealed_issuance_active(frame: u64) -> bool {
+    epoch_for_frame(frame) >= unsealed_issuance_epoch()
+}
+
+/// Set the unsealed issuance epoch for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_unsealed_issuance_epoch_for_thread(epoch: Option<u64>) {
+    UNSEALED_ISSUANCE_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
 /// The epoch from which a vertex membership proof authenticates a field only
 /// when the field's leaf commitment binds its value. A leaf carrying a
 /// `hash_target` commits that target instead of its value, so its value is
@@ -2789,6 +2855,21 @@ mod hash_storage_proof_epoch_tests {
             u64::MAX
         );
         assert_eq!(super::hash_storage_proof_epoch_for(1, None), u64::MAX);
+    }
+
+    /// The unsealed issuance rule never starts on mainnet by a setting, and
+    /// a test network starts it only when told to.
+    #[test]
+    fn only_a_test_network_reads_the_unsealed_issuance_setting() {
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(
+                super::unsealed_issuance_epoch_for(0, setting),
+                super::MAINNET_UNSEALED_ISSUANCE_EPOCH.unwrap_or(u64::MAX)
+            );
+        }
+        assert_eq!(super::unsealed_issuance_epoch_for(1, Some("4")), 4);
+        assert_eq!(super::unsealed_issuance_epoch_for(1, Some("bad")), u64::MAX);
+        assert_eq!(super::unsealed_issuance_epoch_for(1, None), u64::MAX);
     }
 
     /// Mainnet's first hash-proof epoch begins at GLOBAL frame 946,080, and
