@@ -2960,6 +2960,9 @@ pub struct AppConsensusEngine {
     /// Whether this member's seal drain moves, to warn when it stops
     /// ([`crate::seal_follow::DrainProgress`]).
     seal_drain_progress: crate::seal_follow::DrainProgress,
+    /// Whether this member's seal without a drain gets recorded, to warn
+    /// when it does not ([`crate::seal_follow::SealRecord`]).
+    seal_record: crate::seal_follow::SealRecord,
     /// The latest GLOBAL frame this node held a header of when this member
     /// last published its seal: the copy lands by
     /// [`crate::seal_follow::SEAL_LANDS_WITHIN`] frames later.
@@ -3152,6 +3155,7 @@ impl AppConsensusEngine {
             seal_published_at: None,
             seal_follow: Default::default(),
             seal_drain_progress: Default::default(),
+            seal_record: Default::default(),
             seal_published_head: None,
             // Checked every 10 s: three unreadable checks in a row.
             session_status_outage: crate::outage::Outage::begin_after(3),
@@ -6899,20 +6903,40 @@ impl AppConsensusEngine {
                     std::time::Instant::now(),
                 );
                 self.log_seal_drain_stall(stall, None);
+                let now = std::time::Instant::now();
+                let record = if matches!(drained.reason, "partial" | "attached") {
+                    self.seal_record.clear("drain", now)
+                } else {
+                    self.seal_record.published(
+                        drained.reason,
+                        drained.executed,
+                        drained.checkpoint,
+                        self.seal_published_head,
+                        now,
+                    );
+                    None
+                };
+                self.log_seal_record_stall(record, None);
                 publish(drained.bytes);
             }
             Some(Err(error)) => {
                 warn!(core_id = self.core_id, error = %error, "seal drain headers unavailable; submitting the seal alone");
                 self.execution.seal_submitted(0, "unavailable", 0);
                 self.seal_follow.published("unavailable", 0);
-                let stall = self.seal_drain_progress.clear(std::time::Instant::now());
+                let now = std::time::Instant::now();
+                let stall = self.seal_drain_progress.clear(now);
                 self.log_seal_drain_stall(stall, None);
+                self.seal_record
+                    .published("unavailable", 0, 0, self.seal_published_head, now);
                 publish(base.to_vec());
             }
             None => {
                 self.seal_follow.clear();
-                let stall = self.seal_drain_progress.clear(std::time::Instant::now());
+                let now = std::time::Instant::now();
+                let stall = self.seal_drain_progress.clear(now);
                 self.log_seal_drain_stall(stall, None);
+                let record = self.seal_record.clear("cleared", now);
+                self.log_seal_record_stall(record, None);
                 publish(base.to_vec());
             }
         }
@@ -6924,6 +6948,55 @@ impl AppConsensusEngine {
             .get_latest_global_clock_frame()
             .ok()
             .and_then(|frame| frame.header.as_ref().map(|header| header.frame_number))
+    }
+
+    /// Log the transitions of a published seal without a drain waiting to
+    /// be recorded ([`crate::seal_follow::SealRecord`]), from this member's
+    /// committed view of GLOBAL at `committed_frame`.
+    fn log_seal_record_stall(
+        &self,
+        stall: Option<crate::seal_follow::RecordStall>,
+        committed_frame: Option<u64>,
+    ) {
+        use crate::seal_follow::RecordStall;
+        let Some(stall) = stall else {
+            return;
+        };
+        let filter = hex::encode(&self.filter);
+        let session = self
+            .sealed_session
+            .as_ref()
+            .map(|(id, _)| hex::encode(id))
+            .unwrap_or_default();
+        let (state, began) = match stall {
+            RecordStall::Ended { state, outcome } => {
+                info!(core_id = self.core_id, filter = %filter, session = %session,
+                    global_executed = state.executed, checkpoint = state.checkpoint,
+                    copies = state.copies, waited_secs = state.waited_secs, outcome,
+                    "closing session's seal record stall ended");
+                return;
+            }
+            RecordStall::Began(state) => (state, true),
+            RecordStall::Continues(state) => (state, false),
+        };
+        let latest_global_frame = self.latest_global_header_frame();
+        let waits_on = crate::seal_follow::SEAL_UNRECORDED_WAITS_ON;
+        if began {
+            warn!(core_id = self.core_id, filter = %filter, session = %session, committed_frame,
+                latest_global_frame, published_global_frame = state.published_head,
+                global_executed = state.executed, checkpoint = state.checkpoint, drain = state.reason,
+                copies = state.copies, waited_secs = state.waited_secs, scope = "network",
+                action = "report", waits_on,
+                "closing session's seal not recorded: this worker's GLOBAL view passed the frame \
+                 its copy lands by and has not shown the seal recorded for over 5 min");
+        } else {
+            warn!(core_id = self.core_id, filter = %filter, session = %session, committed_frame,
+                latest_global_frame, published_global_frame = state.published_head,
+                global_executed = state.executed, checkpoint = state.checkpoint, drain = state.reason,
+                copies = state.copies, waited_secs = state.waited_secs, scope = "network",
+                action = "report", waits_on,
+                "closing session's seal still not recorded");
+        }
     }
 
     /// Log a seal drain's stall transitions
@@ -7563,13 +7636,18 @@ impl AppConsensusEngine {
         );
         let following = self.seal_follow.following();
         let draining = self.seal_drain_progress.draining();
+        let recording = self.seal_record.waiting();
         let timer_due = |follow: &crate::seal_follow::SealFollow,
                          published: Option<std::time::Instant>| {
             published
                 .max(follow.moved_at())
                 .is_none_or(|at| now.saturating_duration_since(at) >= resubmit_after)
         };
-        if !following && !draining && !timer_due(&self.seal_follow, self.seal_published_at) {
+        if !following
+            && !draining
+            && !recording
+            && !timer_due(&self.seal_follow, self.seal_published_at)
+        {
             return;
         }
         let view = handoff::CommittedView::capture(global);
@@ -7591,6 +7669,11 @@ impl AppConsensusEngine {
                 .seal_drain_progress
                 .observe(executed, committed_frame, now);
             self.log_seal_drain_stall(stall, committed_frame);
+        }
+        if recording {
+            let committed_frame = view.as_ref().ok().map(handoff::CommittedView::frame);
+            let stall = self.seal_record.observe(committed_frame, now);
+            self.log_seal_record_stall(stall, committed_frame);
         }
         if following {
             let rank = session
@@ -7618,6 +7701,8 @@ impl AppConsensusEngine {
                 self.execution.seal_recorded();
                 let stall = self.seal_drain_progress.clear(now);
                 self.log_seal_drain_stall(stall, None);
+                let record = self.seal_record.clear("recorded", now);
+                self.log_seal_record_stall(record, None);
             }
             Err(_) => {}
         }
@@ -7646,8 +7731,11 @@ impl AppConsensusEngine {
             .as_ref()
             .is_some_and(|(id, _)| session.id().ok() != Some(*id))
         {
-            let stall = self.seal_drain_progress.clear(std::time::Instant::now());
+            let now = std::time::Instant::now();
+            let stall = self.seal_drain_progress.clear(now);
             self.log_seal_drain_stall(stall, None);
+            let record = self.seal_record.clear("cleared", now);
+            self.log_seal_record_stall(record, None);
             self.sealed_session = None;
             self.seal_published_at = None;
             self.seal_published_head = None;
@@ -21936,6 +22024,69 @@ mod tests {
         );
         assert_eq!(triggered("timer"), timer_copies + 2);
         assert_eq!(triggered("view_moved"), 2);
+        handoff::set_seal_recovery_frame_for_thread(None);
+        handoff::set_seal_drain_frame_for_thread(None);
+    }
+
+    /// A seal GLOBAL executed the session through, so carrying no drain, left
+    /// unrecorded for `seal_follow::SEAL_UNRECORDED_AFTER` is reported with
+    /// its scope, not again within the repeat interval, and its end once a
+    /// successor runs.
+    #[tokio::test]
+    async fn a_seal_without_a_drain_left_unrecorded_is_reported_until_cleared() {
+        use quil_execution::global_intrinsic::handoff;
+        handoff::set_seal_drain_frame_for_thread(Some(0));
+        handoff::set_seal_recovery_frame_for_thread(Some(0));
+        let (global, id, mut engines) = sealed_drain_committee(1);
+        execute_drain_part(&global, &id, 40, 2);
+        let logs = crate::outage::test_logs::CapturedLogs::default();
+        let _guard = logs.install();
+        let (engine, sent) = &mut engines[0];
+        engine.maintain_committee_session().await;
+        engine.maintain_committee_session().await;
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert!(engine.seal_record.waiting(), "the copy carried no drain");
+        assert!(
+            logs.lines_with("seal not recorded").is_empty(),
+            "within the bound"
+        );
+        engine
+            .seal_record
+            .backdate(crate::seal_follow::SEAL_UNRECORDED_AFTER);
+        engine.maintain_committee_session().await;
+        engine.maintain_committee_session().await;
+        let stalled = logs.lines_with("seal not recorded");
+        assert_eq!(stalled.len(), 1, "{stalled:?}");
+        let session = hex::encode(id);
+        for field in [
+            "WARN",
+            "global_executed=40",
+            "checkpoint=40",
+            "copies=1",
+            "waited_secs=300",
+            "committed_frame=2",
+            "drain=\"executed\"",
+            "network",
+            "report",
+            session.as_str(),
+        ] {
+            assert!(stalled[0].contains(field), "{field}: {}", stalled[0]);
+        }
+        assert!(
+            logs.lines_with("seal still not recorded").is_empty(),
+            "no repeat within ten minutes"
+        );
+        // A successor runs.
+        let mut successor = engine.cw_session.clone().unwrap();
+        successor.generation += 1;
+        engine.cw_session = Some(successor);
+        engine.maintain_committee_session().await;
+        let ended = logs.lines_with("seal record stall ended");
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        for field in ["INFO", "cleared", "copies=1", session.as_str()] {
+            assert!(ended[0].contains(field), "{field}: {}", ended[0]);
+        }
+        assert!(!engine.seal_record.waiting());
         handoff::set_seal_recovery_frame_for_thread(None);
         handoff::set_seal_drain_frame_for_thread(None);
     }

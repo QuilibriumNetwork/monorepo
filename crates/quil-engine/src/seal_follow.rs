@@ -357,6 +357,178 @@ pub(crate) fn successor_pull_through(head: u64, published_head: Option<u64>) -> 
     })
 }
 
+/// How long a published seal that carries no drain may stay unrecorded in
+/// this member's committed view of GLOBAL, once that view has passed the
+/// frame its first copy lands by, before it is reported: as long as a
+/// drain may go without a part executed ([`DRAIN_STALL_AFTER`]).
+pub(crate) const SEAL_UNRECORDED_AFTER: Duration = DRAIN_STALL_AFTER;
+
+/// What an unrecorded seal ([`SealRecord`]) waits on, for its stall lines.
+pub(crate) const SEAL_UNRECORDED_WAITS_ON: &str =
+    "GLOBAL to record the seal: this worker's view shows GLOBAL frames past the one its \
+     copy lands by without it, so GLOBAL refuses or never includes the committee's copies \
+     (an archive logs why it refuses a seal submission); GLOBAL fences the session at its \
+     executed tip once its closing request is old enough; report this line";
+
+/// Whether this member's published seal gets recorded while its copies
+/// carry no drain (GLOBAL executed the session through its checkpoint, or
+/// drains are not active): from the first such copy until the view shows
+/// the seal recorded, a copy carries a drain again ([`DrainProgress`]
+/// follows that), or the seal is cleared. A seal unrecorded for
+/// [`SEAL_UNRECORDED_AFTER`] once the view has passed the frame its first
+/// copy lands by is logged at its start, at most every
+/// [`OUTAGE_LOG_EVERY`](crate::outage::OUTAGE_LOG_EVERY) while it lasts,
+/// and at its end. Before that frame the view cannot show the seal; a view
+/// that stays behind it is reported as the session's view lag.
+#[derive(Debug, Default)]
+pub(crate) struct SealRecord {
+    waiting: Option<RecordWait>,
+    stall: Outage,
+}
+
+/// A published seal waiting to be recorded.
+#[derive(Debug)]
+struct RecordWait {
+    since: Instant,
+    /// The latest GLOBAL frame this node held a header of when the first
+    /// copy went out; `None` when unknown.
+    published_head: Option<u64>,
+    copies: u64,
+    /// The latest copy's `app_handoff::DrainedSeal` `reason`, `executed`
+    /// and `checkpoint`.
+    reason: &'static str,
+    executed: u64,
+    checkpoint: u64,
+}
+
+impl RecordWait {
+    fn state(&self, now: Instant) -> RecordState {
+        RecordState {
+            waited_secs: now.saturating_duration_since(self.since).as_secs(),
+            copies: self.copies,
+            published_head: self.published_head,
+            reason: self.reason,
+            executed: self.executed,
+            checkpoint: self.checkpoint,
+        }
+    }
+}
+
+/// A published seal's wait to be recorded, for its stall lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecordState {
+    /// Seconds since the first copy without a drain went out.
+    pub(crate) waited_secs: u64,
+    /// Copies without a drain published since.
+    pub(crate) copies: u64,
+    /// The latest GLOBAL frame this node held a header of then.
+    pub(crate) published_head: Option<u64>,
+    /// Why the latest copy carried no drain (`app_handoff::DrainedSeal`).
+    pub(crate) reason: &'static str,
+    /// The session frame GLOBAL has executed and the sealed checkpoint, in
+    /// this member's view when the latest copy was built.
+    pub(crate) executed: u64,
+    pub(crate) checkpoint: u64,
+}
+
+/// A transition of an unrecorded seal worth logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordStall {
+    /// Unrecorded for [`SEAL_UNRECORDED_AFTER`] past the landing frame.
+    Began(RecordState),
+    /// Still, at most every
+    /// [`OUTAGE_LOG_EVERY`](crate::outage::OUTAGE_LOG_EVERY).
+    Continues(RecordState),
+    /// The wait ended: `recorded` when the view shows the seal, `drain`
+    /// when a copy carries a drain again, `cleared` when there is no seal
+    /// to publish any more (a successor runs, or no GLOBAL view).
+    Ended {
+        state: RecordState,
+        outcome: &'static str,
+    },
+}
+
+impl SealRecord {
+    /// A copy without a drain went out (`app_handoff::DrainedSeal`
+    /// `reason`, `executed`, `checkpoint`), while `head` was the latest
+    /// GLOBAL frame this node held a header of.
+    pub(crate) fn published(
+        &mut self,
+        reason: &'static str,
+        executed: u64,
+        checkpoint: u64,
+        head: Option<u64>,
+        now: Instant,
+    ) {
+        let wait = self.waiting.get_or_insert(RecordWait {
+            since: now,
+            published_head: head,
+            copies: 0,
+            reason,
+            executed,
+            checkpoint,
+        });
+        wait.copies += 1;
+        wait.reason = reason;
+        wait.executed = executed;
+        wait.checkpoint = checkpoint;
+    }
+
+    /// Whether a published seal without a drain waits to be recorded, so
+    /// the view is worth reading.
+    pub(crate) fn waiting(&self) -> bool {
+        self.waiting.is_some()
+    }
+
+    /// Observe the seal still unrecorded in this member's committed view of
+    /// GLOBAL at `committed_frame` (`None` when unreadable: no report).
+    pub(crate) fn observe(
+        &mut self,
+        committed_frame: Option<u64>,
+        now: Instant,
+    ) -> Option<RecordStall> {
+        let wait = self.waiting.as_ref()?;
+        if now.saturating_duration_since(wait.since) < SEAL_UNRECORDED_AFTER {
+            return None;
+        }
+        let landed = match (wait.published_head, committed_frame) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(head), Some(frame)) => frame >= head.saturating_add(SEAL_LANDS_WITHIN),
+        };
+        if !landed {
+            return None;
+        }
+        let state = wait.state(now);
+        match self.stall.observe(now, false)? {
+            OutageEvent::Began => Some(RecordStall::Began(state)),
+            OutageEvent::Continues { .. } => Some(RecordStall::Continues(state)),
+            OutageEvent::Ended { .. } => None,
+        }
+    }
+
+    /// The seal no longer waits unrecorded without a drain, for `outcome`
+    /// ([`RecordStall::Ended`]): stop tracking it, ending a stall.
+    pub(crate) fn clear(&mut self, outcome: &'static str, now: Instant) -> Option<RecordStall> {
+        let wait = self.waiting.take()?;
+        let state = wait.state(now);
+        self.stall
+            .observe(now, true)
+            .map(|_| RecordStall::Ended { state, outcome })
+    }
+
+    /// Move the first copy `by` into the past.
+    #[cfg(test)]
+    pub(crate) fn backdate(&mut self, by: Duration) {
+        if let Some(wait) = self.waiting.as_mut() {
+            wait.since = wait
+                .since
+                .checked_sub(by)
+                .expect("an instant that far back");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,5 +804,71 @@ mod tests {
             }),
             "once a header binds the frame the copy lands by"
         );
+    }
+
+    /// A seal without a drain left unrecorded is reported once its view has
+    /// passed the frame its first copy lands by, for over the bound, then at
+    /// most every repeat interval, and its end once recorded.
+    #[test]
+    fn an_unrecorded_seal_is_reported_once_its_view_passed_the_landing_frame() {
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let mut record = SealRecord::default();
+        assert_eq!(record.observe(Some(500), at(0)), None, "nothing published");
+        record.published("executed", 40, 40, Some(100), at(0));
+        assert!(record.waiting());
+        assert_eq!(record.observe(Some(105), at(299)), None, "within the bound");
+        assert_eq!(
+            record.observe(Some(101), at(400)),
+            None,
+            "the view has not reached frame 102, by which the copy lands"
+        );
+        assert_eq!(record.observe(None, at(400)), None, "unreadable view");
+        let began = record.observe(Some(102), at(400));
+        assert_eq!(
+            began,
+            Some(RecordStall::Began(RecordState {
+                waited_secs: 400,
+                copies: 1,
+                published_head: Some(100),
+                reason: "executed",
+                executed: 40,
+                checkpoint: 40,
+            }))
+        );
+        assert_eq!(
+            record.observe(Some(110), at(900)),
+            None,
+            "no repeat within ten minutes"
+        );
+        record.published("executed", 40, 40, Some(160), at(950));
+        let Some(RecordStall::Continues(state)) = record.observe(Some(170), at(1000)) else {
+            panic!("a repeat after ten minutes");
+        };
+        assert_eq!(
+            (state.waited_secs, state.copies, state.published_head),
+            (1000, 2, Some(100))
+        );
+        let Some(RecordStall::Ended { state, outcome }) = record.clear("recorded", at(1100)) else {
+            panic!("its end is logged");
+        };
+        assert_eq!((state.waited_secs, outcome), (1100, "recorded"));
+        assert!(!record.waiting());
+        assert_eq!(record.clear("recorded", at(1200)), None);
+    }
+
+    /// A seal recorded, or carrying a drain again, within the bound ends
+    /// quietly.
+    #[test]
+    fn a_seal_recorded_within_the_bound_ends_quietly() {
+        let start = Instant::now();
+        let mut record = SealRecord::default();
+        record.published("executed", 40, 40, Some(100), start);
+        assert_eq!(
+            record.observe(Some(200), start + Duration::from_secs(60)),
+            None
+        );
+        assert_eq!(record.clear("drain", start + Duration::from_secs(70)), None);
+        assert!(!record.waiting());
     }
 }
