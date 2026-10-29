@@ -361,6 +361,8 @@ struct BusyVerifier {
     busy_for: std::sync::atomic::AtomicU32,
     answer: bool,
     asked: std::sync::atomic::AtomicU32,
+    /// What [`GlobalProposer::verify_patience_ran_out`] was told, per call.
+    ran_out: std::sync::Mutex<Vec<Duration>>,
 }
 impl GlobalProposer for BusyVerifier {
     fn propose(&self, _view: u64, _parent: Sha256Digest) -> Option<(Sha256Digest, Vec<u8>)> {
@@ -388,9 +390,19 @@ impl GlobalProposer for BusyVerifier {
         }
         Ok(self.answer)
     }
+    fn verify_patience_ran_out(
+        &self,
+        context: quil_cw_consensus::adapters::ProposalContext,
+        waited: Duration,
+    ) {
+        assert_eq!(context.view, 5);
+        self.ran_out.lock().unwrap().push(waited);
+    }
 }
 
-fn busy_verify(busy_for: u32, answer: bool) -> (Option<bool>, u32) {
+/// The verdict, how often the verifier was asked, and what each
+/// [`GlobalProposer::verify_patience_ran_out`] call was told.
+fn busy_verify(busy_for: u32, answer: bool) -> (Option<bool>, u32, Vec<Duration>) {
     use commonware_consensus::{simplex::types::Context, Automaton as _};
     let leader = FalconPrivateKey::random(commonware_utils::test_rng()).public_key();
     deterministic::Runner::timed(Duration::from_secs(120)).start(|context| async move {
@@ -398,6 +410,7 @@ fn busy_verify(busy_for: u32, answer: bool) -> (Option<bool>, u32) {
             busy_for: busy_for.into(),
             answer,
             asked: 0.into(),
+            ran_out: Default::default(),
         });
         let store = BlockStore::new();
         let payload = Sha256Digest([9; 32]);
@@ -419,9 +432,11 @@ fn busy_verify(busy_for: u32, answer: bool) -> (Option<bool>, u32) {
             )
             .await;
         let verdict = pending.await.ok();
+        let ran_out = verifier.ran_out.lock().unwrap().clone();
         (
             verdict,
             verifier.asked.load(std::sync::atomic::Ordering::Acquire),
+            ran_out,
         )
     })
 }
@@ -430,16 +445,16 @@ fn busy_verify(busy_for: u32, answer: bool) -> (Option<bool>, u32) {
 fn a_busy_voter_answers_once_free_instead_of_nullifying() {
     assert_eq!(
         busy_verify(5, true),
-        (Some(true), 6),
+        (Some(true), 6, vec![]),
         "deferred checks are asked again"
     );
     assert_eq!(
         busy_verify(0, false),
-        (Some(false), 1),
+        (Some(false), 1, vec![]),
         "a rejection is final"
     );
-    assert_eq!(busy_verify(3, false), (Some(false), 4));
-    let (verdict, asked) = busy_verify(u32::MAX, true);
+    assert_eq!(busy_verify(3, false), (Some(false), 4, vec![]));
+    let (verdict, asked, ran_out) = busy_verify(u32::MAX, true);
     assert_eq!(
         verdict,
         Some(false),
@@ -448,5 +463,10 @@ fn a_busy_voter_answers_once_free_instead_of_nullifying() {
     assert!(
         asked > 50 && asked < 200,
         "bounded by patience, asked {asked} times"
+    );
+    assert_eq!(
+        ran_out,
+        vec![quil_cw_consensus::adapters::VERIFY_PATIENCE],
+        "told once, not per deferral, how long it waited"
     );
 }

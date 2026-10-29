@@ -644,6 +644,10 @@ impl GlobalProposer for HandoffProposer {
         self.inner.verify_delay(context, bytes)
     }
 
+    fn verify_patience_ran_out(&self, context: ProposalContext, waited: std::time::Duration) {
+        self.inner.verify_patience_ran_out(context, waited)
+    }
+
     fn verify_with_context(
         &self,
         context: ProposalContext,

@@ -14,7 +14,10 @@ use crate::engines::*;
 
 #[path = "execution_branch.rs"]
 mod execution_branch;
-pub use execution_branch::{ExecutionBranch, ExecutionBranchLimits, ExecutionPublicationGuard};
+pub use execution_branch::{
+    busy_unavailable, lock_unavailable, source_busy, ExecutionBranch, ExecutionBranchLimits,
+    ExecutionPublicationGuard,
+};
 
 /// State-dependent providers for a separate execution manager. The caller must
 /// construct them over the same committed checkpoint and serialize capture
@@ -694,6 +697,28 @@ impl ExecutionEngineManager {
     /// which applies pulled state into this same CRDT (coordinated versions).
     pub fn crdt(&self) -> Arc<quil_hypergraph::HypergraphCrdt> {
         self.crdt.clone()
+    }
+
+    /// Reads the engines until the returned guard drops, as a gossip
+    /// validation or an RPC cost query does.
+    #[cfg(any(test, feature = "testing-stubs"))]
+    pub fn hold_engines_for_test(&self) -> impl Sized + '_ {
+        self.engines.read().unwrap()
+    }
+
+    /// Poisons the engine lock: a thread panics while it writes them.
+    #[cfg(any(test, feature = "testing-stubs"))]
+    pub fn poison_engines_for_test(&self) {
+        std::thread::scope(|scope| {
+            let panicked = scope
+                .spawn(|| {
+                    let _engines = self.engines.write().unwrap();
+                    panic!("a test panics while it writes the execution engines");
+                })
+                .join();
+            assert!(panicked.is_err());
+        });
+        assert!(self.engines.is_poisoned());
     }
 
     /// Shard metadata bound to this manager's execution state.

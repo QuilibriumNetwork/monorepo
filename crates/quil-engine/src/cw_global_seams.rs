@@ -129,11 +129,72 @@ pub struct GlobalSeamProposer {
     /// when ([`Self::yield_to_publication`]), and how long it may.
     publication_wait: Mutex<Option<(u64, std::time::Instant)>>,
     publication_priority: std::time::Duration,
+    /// Why this node's votes on recent views waited ([`Self::defer_vote`]).
+    vote_waits: Mutex<std::collections::BTreeMap<u64, VoteWait>>,
+    /// Proposal retries that found an execution source in use
+    /// ([`Self::note_proposal_prepare`]).
+    proposal_busy: Mutex<ProposalBusy>,
 }
 
 /// Longest a proposal or vote waits per view for this node to publish its
 /// finalized parent rather than execute it privately.
 const PUBLICATION_PRIORITY: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// How long a vote this node cannot check yet waits before it asks again.
+const VOTE_DEFER: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Recent views whose vote waits are remembered; an older view's vote was
+/// decided long ago.
+const VOTE_WAIT_VIEWS: u64 = 16;
+
+/// How often a proposal that keeps finding a source in use is logged again.
+/// A view's proposal retries each second for up to 20 s.
+const PROPOSAL_BUSY_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What a vote waited for last in one view.
+struct VoteWait {
+    cause: String,
+    /// What the operator checks if the vote is declined for it.
+    check: &'static str,
+    /// The view's first deferral on a source in use is logged; later ones
+    /// are not.
+    source_logged: bool,
+}
+
+/// Why a vote is deferred.
+enum Deferral<'a> {
+    /// This node's own GLOBAL execution holds the lease or frame lock.
+    OwnExecution,
+    /// The finalized parent is publishing ([`GlobalSeamProposer::yield_to_publication`]).
+    Publication,
+    /// The capture found a source in use ([`quil_execution::source_busy`]).
+    BusySource {
+        parent: u64,
+        error: &'a quil_types::error::QuilError,
+    },
+}
+
+/// A proposal whose retries keep finding an execution source in use, as one
+/// outage per view: its start, a repeat at most every
+/// [`PROPOSAL_BUSY_LOG_EVERY`], and its end, instead of a warn per retry.
+struct ProposalBusy {
+    outage: crate::outage::Outage,
+    view: u64,
+    parent: u64,
+    /// The latest busy retry, while the outage lasts.
+    last: Option<std::time::Instant>,
+}
+
+impl Default for ProposalBusy {
+    fn default() -> Self {
+        Self {
+            outage: crate::outage::Outage::begin_after_repeating(1, PROPOSAL_BUSY_LOG_EVERY),
+            view: 0,
+            parent: 0,
+            last: None,
+        }
+    }
+}
 
 impl GlobalSeamProposer {
     pub fn new(
@@ -154,6 +215,106 @@ impl GlobalSeamProposer {
             on_prover_fork,
             publication_wait: Mutex::new(None),
             publication_priority: PUBLICATION_PRIORITY,
+            vote_waits: Mutex::default(),
+            proposal_busy: Mutex::default(),
+        }
+    }
+
+    /// Defer `view`'s vote for `why`, remembering it for
+    /// [`GlobalProposer::verify_patience_ran_out`]. The view's first deferral
+    /// on a source in use is logged; the adapter asks again every
+    /// [`VOTE_DEFER`], and those repeats are not.
+    fn defer_vote(&self, view: u64, why: Deferral<'_>) -> std::time::Duration {
+        let Ok(mut waits) = self.vote_waits.lock() else {
+            return VOTE_DEFER;
+        };
+        let floor = view.saturating_sub(VOTE_WAIT_VIEWS);
+        waits.retain(|waited, _| *waited > floor);
+        let wait = waits.entry(view).or_insert_with(|| VoteWait {
+            cause: String::new(),
+            check: "",
+            source_logged: false,
+        });
+        match why {
+            Deferral::OwnExecution => {
+                wait.cause = "this node's own GLOBAL execution (lease or frame lock)".into();
+                wait.check = "this node's execution outlasted the patience; check its slow execution and publication lines";
+            }
+            Deferral::Publication => {
+                wait.cause = "publication of the finalized parent".into();
+                wait.check = "this node's parent publication outlasted the patience; check its publication lines";
+            }
+            Deferral::BusySource { parent, error } => {
+                wait.cause = error.to_string();
+                wait.check = "another holder (a gossip validation, an RPC query or this node's own execution) kept the source past the patience; check this node's RPC and gossip load";
+                if !wait.source_logged {
+                    wait.source_logged = true;
+                    tracing::info!(
+                        view,
+                        parent,
+                        lock = %wait.cause,
+                        waits_up_to_s = quil_cw_consensus::adapters::VERIFY_PATIENCE.as_secs(),
+                        "GLOBAL vote deferred: an execution source is in use elsewhere; the vote waits up to waits_up_to_s for it, then declines"
+                    );
+                }
+            }
+        }
+        VOTE_DEFER
+    }
+
+    /// Record one proposal attempt at `now` on `view`'s parent `parent`:
+    /// `busy` is its prepare error if that only found a source in use. Logs
+    /// the busy outage's start, bounded repeats and end; a new view ends the
+    /// last view's outage at its last busy retry.
+    pub(crate) fn note_proposal_prepare(
+        &self,
+        view: u64,
+        parent: u64,
+        busy: Option<&quil_types::error::QuilError>,
+        now: std::time::Instant,
+    ) {
+        use crate::outage::OutageEvent;
+        let Ok(mut state) = self.proposal_busy.lock() else {
+            return;
+        };
+        let state = &mut *state;
+        if state.view != view {
+            if let Some(last) = state.last.take() {
+                if let Some(OutageEvent::Ended { secs, failures }) =
+                    state.outage.observe(last, true)
+                {
+                    tracing::info!(view = state.view, parent = state.parent, busy_s = secs, retries = failures,
+                        "GLOBAL proposal stopped waiting for a busy execution source: its view ended");
+                }
+            }
+            state.view = view;
+        }
+        state.parent = parent;
+        let Some(error) = busy else {
+            if state.last.take().is_some() {
+                if let Some(OutageEvent::Ended { secs, failures }) = state.outage.observe(now, true)
+                {
+                    tracing::info!(
+                        view,
+                        parent,
+                        busy_s = secs,
+                        retries = failures,
+                        "GLOBAL proposal no longer waits for a busy execution source"
+                    );
+                }
+            }
+            return;
+        };
+        state.last = Some(now);
+        match state.outage.observe(now, false) {
+            Some(OutageEvent::Began) => tracing::info!(view, parent, lock = %error,
+                retry_every_s = 1,
+                "GLOBAL proposal waits for an execution source in use elsewhere; it retries while the view lasts"),
+            Some(OutageEvent::Continues { secs, failures }) => tracing::warn!(view, parent,
+                lock = %error, busy_s = secs, retries = failures, scope = "local", action = "check",
+                check = "another holder (a gossip validation, an RPC query or this node's own execution) keeps the source; check this node's RPC and gossip load",
+                "GLOBAL proposal still waits for an execution source in use elsewhere"),
+            _ => {}
         }
     }
 
@@ -443,14 +604,21 @@ impl GlobalProposer for GlobalSeamProposer {
         if self.yield_to_publication(executor, context.view, number) {
             return None; // retried by `propose_retry`
         }
-        let prepared = match executor.prepare(
+        let prepared = executor.prepare(
             context,
             number,
             self.block_store.as_ref()?,
             &self.verifier,
             true,
-        ) {
+        );
+        let busy = prepared
+            .as_ref()
+            .err()
+            .filter(|error| quil_execution::source_busy(error));
+        self.note_proposal_prepare(context.view, number, busy, std::time::Instant::now());
+        let prepared = match prepared {
             Ok(prepared) => prepared,
+            Err(error) if quil_execution::source_busy(&error) => return None, // retried by `propose_retry`
             Err(error) => {
                 tracing::warn!(view = context.view, parent = number, %error, "selected GLOBAL parent execution unavailable");
                 return None;
@@ -510,15 +678,16 @@ impl GlobalProposer for GlobalSeamProposer {
     }
 
     /// Defers only while this node's own execution is busy (publishing the
-    /// previous frame, proposing, or checking another proposal). Answering then
-    /// nullified valid proposals at once, and a view needs 4 of 5 votes.
+    /// previous frame, proposing, or checking another proposal) or a source
+    /// its capture takes is in use by a reader. Answering then nullified valid
+    /// proposals at once, and a view needs 4 of 5 votes. A source poisoned by
+    /// a panic is refused at once.
     fn verify_or_defer(
         &self,
         context: ProposalContext,
         digest: Digest,
         bytes: Option<Vec<u8>>,
     ) -> Result<bool, std::time::Duration> {
-        const DEFER: std::time::Duration = std::time::Duration::from_millis(200);
         let Some(executor) = self.selected_execution.as_ref() else {
             return Ok(self.verify(context.view, context.parent, digest, bytes));
         };
@@ -526,7 +695,7 @@ impl GlobalProposer for GlobalSeamProposer {
             return Ok(false);
         }
         if executor.busy() {
-            return Err(DEFER);
+            return Err(self.defer_vote(context.view, Deferral::OwnExecution));
         }
         let Some(bytes) = bytes.filter(|b| b.len() <= executor.max_frame_bytes()) else {
             return Ok(false);
@@ -551,14 +720,29 @@ impl GlobalProposer for GlobalSeamProposer {
             return Ok(false);
         };
         if self.yield_to_publication(executor, context.view, number) {
-            return Err(DEFER);
+            return Err(self.defer_vote(context.view, Deferral::Publication));
         }
         let Some(blocks) = self.block_store.as_ref() else {
             return Ok(false);
         };
         let prepared = match executor.prepare(context, number, blocks, &self.verifier, false) {
             Ok(prepared) => prepared,
-            Err(_) if executor.busy() => return Err(DEFER),
+            // A gossip validation or RPC cost query can hold a source (the
+            // engines) after `busy()` read false. Like the lease, it clears
+            // without anything from the network; the adapter's patience
+            // bounds the wait.
+            Err(error) if quil_execution::source_busy(&error) => {
+                return Err(self.defer_vote(
+                    context.view,
+                    Deferral::BusySource {
+                        parent: number,
+                        error: &error,
+                    },
+                ))
+            }
+            Err(_) if executor.busy() => {
+                return Err(self.defer_vote(context.view, Deferral::OwnExecution))
+            }
             Err(error) => {
                 tracing::warn!(view = context.view, parent = number, %error, "selected GLOBAL verification parent unavailable");
                 return Ok(false);
@@ -595,6 +779,31 @@ impl GlobalProposer for GlobalSeamProposer {
         }
         self.note_frame(digest, header.frame_number);
         Ok(true)
+    }
+
+    /// One warn per declined vote, with what it waited for.
+    fn verify_patience_ran_out(&self, context: ProposalContext, waited: std::time::Duration) {
+        let wait = self.vote_waits.lock().ok().and_then(|waits| {
+            waits
+                .get(&context.view)
+                .map(|wait| (wait.cause.clone(), wait.check))
+        });
+        let (cause, check) = wait.map_or(
+            (
+                "unrecorded".to_string(),
+                "no deferral was recorded for this view; report this line",
+            ),
+            |wait| wait,
+        );
+        tracing::warn!(
+            view = context.view,
+            waited_s = waited.as_secs(),
+            cause = %cause,
+            scope = "local",
+            action = "check",
+            check,
+            "GLOBAL vote declined: still deferred when the verify patience ran out"
+        );
     }
 
     fn propose_retry(&self) -> Option<std::time::Duration> {
