@@ -807,6 +807,14 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         fenced_successor_eligibility_frame = %if fenced_successor_eligibility_from == u64::MAX { "never".to_string() } else { fenced_successor_eligibility_from.to_string() },
         "committee handoff fenced membership successors from current eligibility"
     );
+    let seal_successor_eligibility_from =
+        quil_execution::global_intrinsic::handoff::init_seal_successor_eligibility_frame(
+            args.network,
+        );
+    info!(
+        seal_successor_eligibility_frame = %if seal_successor_eligibility_from == u64::MAX { "never".to_string() } else { seal_successor_eligibility_from.to_string() },
+        "committee handoff sealed membership successors from current eligibility"
+    );
     let presence_report_from =
         quil_execution::global_intrinsic::handoff::init_presence_report_frame(args.network);
     info!(

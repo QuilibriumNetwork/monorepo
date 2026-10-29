@@ -2857,6 +2857,135 @@ fn fenced_successor_eligibility_activates_only_at_a_scheduled_frame() {
     assert_eq!(fenced_successor_eligibility_frame_for(1, None), u64::MAX);
 }
 
+/// From the seal successor eligibility frame a membership request's seal
+/// leaves its successor to the next session pass, which seats the shard's
+/// eligible provers then, not the committee the request fixed when it was
+/// scheduled (2026-10-29: a successor seated at a seal eight hours after
+/// its request had four of twelve members expired or rejected, one short of
+/// quorum, and its shard halted until the fence). The pass authorizes it
+/// once; a resubmitted seal changes nothing; a fence leaves the sealed
+/// source alone. Before the frame the seal seats the request's committee at
+/// once, as before; with nobody eligible, or with the request's committee
+/// still eligible, the request's committee stands.
+#[test]
+fn a_sealed_membership_successor_takes_the_eligible_committee() {
+    let filter = vec![0x6e; 32];
+    let filters = vec![filter.clone()];
+    let (old, requested, eligible_now) = (keys(), keys(), keys());
+    let (sealed_at, pass) = (5, 8);
+    let seal = |activation: u64, eligible_at_pass: &[FalconPrivateKey]| {
+        set_seal_successor_eligibility_frame_for_thread(Some(activation));
+        let directory = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(directory.path()).unwrap();
+        let (_store, state) = make_state(&db);
+        commit(&state, 1);
+        assert_eq!(
+            schedule::reconcile_membership(
+                &state,
+                2,
+                &policy(),
+                &filters,
+                &scan_of(&[(&filter, &old)])
+            )
+            .unwrap(),
+            1
+        );
+        commit(&state, 2);
+        assert_eq!(
+            schedule::reconcile_membership(
+                &state,
+                4,
+                &policy(),
+                &filters,
+                &scan_of(&[(&filter, &requested)])
+            )
+            .unwrap(),
+            1
+        );
+        commit(&state, 4);
+        let source = head(&state, &filter).unwrap().unwrap();
+        let Status::Sealing(request_id) = status(&state, &source.id().unwrap()).unwrap() else {
+            panic!("the source is closing");
+        };
+        let request = request(&state, &request_id).unwrap().unwrap();
+        let submission = submission(&request, 0, &old, 6);
+        let at_seal = apply_submission(&state, sealed_at, &submission).unwrap();
+        commit(&state, sealed_at);
+        let seated_at_seal = head(&state, &filter).unwrap().unwrap().generation == 2;
+        // A resubmitted seal is accepted and changes nothing.
+        assert!(!super::apply_submission(&state, sealed_at + 1, &submission).unwrap());
+        assert_eq!(
+            schedule::fence_stalled_sources(&state, 4 + fence_timeout(), &filters, None).unwrap(),
+            0,
+            "a sealed source is never fenced"
+        );
+        let scan = scan_of(&[(&filter, eligible_at_pass)]);
+        let mut eligible = |filter: &[u8]| -> Result<Vec<Vec<u8>>> {
+            Ok(schedule::desired_members(&scan, filter, pass))
+        };
+        let at_pass =
+            schedule::activate_sealed_successors(&state, pass, &filters, &mut eligible).unwrap();
+        assert_eq!(
+            schedule::activate_sealed_successors(&state, pass + 8, &filters, &mut eligible)
+                .unwrap(),
+            0,
+            "authorized once"
+        );
+        let rescheduled =
+            schedule::reconcile_membership(&state, pass, &policy(), &filters, &scan).unwrap();
+        commit(&state, pass);
+        let successor = head(&state, &filter).unwrap().unwrap();
+        assert_eq!(successor.generation, 2);
+        assert!(schedule::activated(&state, &request_id).unwrap());
+        let closing = matches!(
+            status(&state, &successor.id().unwrap()).unwrap(),
+            Status::Sealing(_)
+        );
+        set_seal_successor_eligibility_frame_for_thread(None);
+        (
+            (at_seal, seated_at_seal, at_pass),
+            successor.members,
+            closing,
+            rescheduled,
+        )
+    };
+    assert_eq!(
+        seal(u64::MAX, &eligible_now),
+        ((true, true, 0), members(&requested), true, 1),
+        "before activation: the request's committee at the seal, asked at once to close"
+    );
+    assert_eq!(
+        seal(sealed_at, &eligible_now),
+        ((false, false, 1), members(&eligible_now), false, 0)
+    );
+    assert_eq!(
+        seal(sealed_at, &[]),
+        ((false, false, 1), members(&requested), false, 0),
+        "nobody eligible"
+    );
+    assert_eq!(
+        seal(sealed_at, &requested),
+        ((false, false, 1), members(&requested), false, 0),
+        "still eligible"
+    );
+}
+
+/// Sealed membership successors from current eligibility are GLOBAL
+/// consensus: not scheduled on mainnet, whatever the environment says;
+/// other networks only when set.
+#[test]
+fn seal_successor_eligibility_is_not_scheduled_by_default() {
+    assert_eq!(MAINNET_SEAL_SUCCESSOR_ELIGIBILITY_FRAME, None);
+    assert_eq!(seal_successor_eligibility_frame_for(0, None), u64::MAX);
+    assert_eq!(seal_successor_eligibility_frame_for(0, Some("7")), u64::MAX);
+    assert_eq!(seal_successor_eligibility_frame_for(1, Some("7")), 7);
+    assert_eq!(
+        seal_successor_eligibility_frame_for(1, Some("soon")),
+        u64::MAX
+    );
+    assert_eq!(seal_successor_eligibility_frame_for(1, None), u64::MAX);
+}
+
 /// From the early fence frame GLOBAL fences a closing session that has not
 /// sealed one epoch after its request, and not before: stale seats stay
 /// eligible until the next epoch boundary (GLOBAL frame 907,920: six app

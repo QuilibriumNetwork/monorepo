@@ -896,6 +896,109 @@ pub fn fence_stalled_sources(
     Ok(fenced)
 }
 
+/// From [`super::seal_successor_eligibility_frame`], authorize the successor
+/// of each membership request among `filters`' head sessions whose source
+/// has sealed: [`super::apply_submission`] records such a seal and leaves
+/// the successor to this pass. Like a fence's ([`fenced_committee`]), it
+/// takes `eligible`'s committee for its shard when that is valid and unlike
+/// the request's, which the request fixed when it was scheduled, up to
+/// [`fence_after_epochs`] epochs earlier; else the request's. A refused
+/// activation (an `InvalidArgument` error) is undone alone, logged and
+/// tried again at the next pass; any other error (a store failure) fails
+/// the whole frame, on every node alike. Returns how many successors it
+/// authorized.
+pub fn activate_sealed_successors(
+    state: &HypergraphState,
+    frame: u64,
+    filters: &[Vec<u8>],
+    eligible: &mut dyn FnMut(&[u8]) -> Result<Vec<Vec<u8>>>,
+) -> Result<usize> {
+    if frame < super::seal_successor_eligibility_frame() {
+        return Ok(0);
+    }
+    let mut activated = 0;
+    for filter in filters {
+        let Some(session) = head(state, filter)? else {
+            continue;
+        };
+        let id = session.id()?;
+        let Status::Sealing(request_id) = status(state, &id)? else {
+            continue;
+        };
+        if read(state, b"seal", &seal_key(&request_id, &id))?.is_none() {
+            continue;
+        }
+        let pending = request(state, &request_id)?
+            .ok_or_else(|| QuilError::Store("sealed session's request is absent".into()))?;
+        if !membership_request(&pending, filter) {
+            continue;
+        }
+        let mut current = Vec::new();
+        let members = fenced_committee(&pending, &mut |filter: &[u8]| -> Result<Vec<Vec<u8>>> {
+            current = eligible(filter)?;
+            Ok(current.clone())
+        })?;
+        let checkpoint = state.changeset_len();
+        match activate_with(state, frame, &pending, members.clone()) {
+            Ok(true) => activated += 1,
+            Ok(false) => continue,
+            Err(error) if matches!(error, QuilError::InvalidArgument(_)) => {
+                state.rollback_to(checkpoint);
+                tracing::error!(frame, filter = hex::encode(filter), generation = session.generation,
+                    request = hex::encode(request_id), %error,
+                    "committee handoff: sealed session's successor was refused; tried again at the next session pass");
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+        let target = &pending.targets[0];
+        let requested = &target.committee.members;
+        let seated = members.as_ref().unwrap_or(requested);
+        let eligible_of = |committee: &[Vec<u8>]| {
+            committee
+                .iter()
+                .filter(|member| current.contains(member))
+                .count()
+        };
+        let quorum = super::exclusion::quorum(seated.len());
+        let seated_eligible = eligible_of(seated);
+        tracing::info!(
+            frame,
+            filter = hex::encode(filter),
+            generation = target.generation,
+            request = hex::encode(request_id),
+            requested_at = pending.frame,
+            committee = if members.is_some() {
+                "eligible provers"
+            } else {
+                "request's"
+            },
+            requested = requested.len(),
+            requested_eligible = eligible_of(requested),
+            requested_quorum = super::exclusion::quorum(requested.len()),
+            members = seated.len(),
+            eligible = seated_eligible,
+            quorum,
+            "committee handoff: successor authorized from a sealed source"
+        );
+        if seated_eligible < quorum {
+            tracing::warn!(
+                frame,
+                filter = hex::encode(filter),
+                generation = target.generation,
+                request = hex::encode(request_id),
+                members = seated.len(),
+                eligible = seated_eligible,
+                quorum,
+                eligible_now = current.len(),
+                "committee handoff: sealed source's successor seated below its quorum of eligible members; \
+                 it cannot produce until enough of them are eligible again, or GLOBAL fences it after its next request"
+            );
+        }
+    }
+    Ok(activated)
+}
+
 /// Record GLOBAL's fence of `session` (ID `id`) of `filter`, closing for
 /// request `request_id`, and return its checkpoint: the session's executed
 /// tip, or its base without one ([`fence_stalled_sources`]).
@@ -1119,6 +1222,8 @@ fn fence_absent_session(
 /// mostly moved on, so it could not reach quorum; and the same pass's
 /// reconciliation found it unlike current eligibility and asked it to close
 /// at once (decided 2026-10-16).
+/// A sealed source's membership successor takes it too
+/// ([`activate_sealed_successors`]).
 /// `None` keeps the request's committee: a split's or merge's, one whose
 /// shard has no valid eligible committee now, or one that still matches.
 fn fenced_committee(
