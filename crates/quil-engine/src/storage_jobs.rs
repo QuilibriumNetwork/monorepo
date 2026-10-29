@@ -175,7 +175,10 @@ impl Jobs {
         let owned = lane.to_vec();
         if let Err(error) = std::thread::Builder::new()
             .name("storage-jobs".into())
-            .spawn(move || self.run_lane(owned, job))
+            .spawn(move || {
+                on_process_cpus();
+                self.run_lane(owned, job)
+            })
         {
             self.lanes().remove(lane);
             self.idle.notify_all();
@@ -300,9 +303,56 @@ pub enum Urgency {
     Ahead,
 }
 
-/// Jobs that may hold memory at once: one per core, less the master's.
+/// Jobs that may hold memory at once: one per core the process may use,
+/// less the master's. Counted once, on a thread of the process's CPUs: the
+/// thread asking is often a data worker's, pinned to one core, and counting
+/// its CPUs ran every node's jobs one at a time (2026-10-29).
 pub fn job_slots() -> usize {
-    std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).max(1))
+    static SLOTS: OnceLock<usize> = OnceLock::new();
+    *SLOTS.get_or_init(|| {
+        let counted = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("storage-slots".into())
+                .spawn_scoped(scope, || {
+                    let process = on_process_cpus();
+                    (std::thread::available_parallelism().ok(), process)
+                })
+                .ok()
+                .and_then(|thread| thread.join().ok())
+        });
+        let (cpus, source) = match counted {
+            Some((Some(cpus), true)) => (cpus.get(), "process CPUs"),
+            Some((Some(cpus), false)) => (cpus.get(), "the asking thread's CPUs"),
+            _ => (1, "unknown"),
+        };
+        let slots = cpus.saturating_sub(1).max(1);
+        info!(
+            slots,
+            cpus,
+            source,
+            "storage job slots counted: up to this many jobs hold memory at once, one per CPU \
+             the node may use less the master's; each also waits until its memory fits"
+        );
+        slots
+    })
+}
+
+/// Move the calling storage job thread onto the process's CPUs: it inherits
+/// the set of the thread that started it, often a data worker's single core,
+/// where the jobs side by side would share that core. False when it stays on
+/// its own set, which is logged once.
+fn on_process_cpus() -> bool {
+    use quil_lattice_ct::confidential::relation::backend::worker_process::use_process_cpus;
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let moved = use_process_cpus();
+    if !moved && !WARNED.swap(true, Ordering::Relaxed) {
+        warn!(
+            "storage job thread stays on the CPUs of the thread that started it, a data \
+             worker's core perhaps: the process's CPU set is unknown or was refused; \
+             storage jobs side by side may share one core and take longer"
+        );
+    }
+    moved
 }
 
 /// Run `work` on each of `items`, on as many threads as jobs may hold
@@ -321,16 +371,19 @@ pub fn for_each_parallel<T: Sync, R: Send>(
         Mutex::new((0..items.len()).map(|_| None).collect());
     std::thread::scope(|scope| {
         for _ in 0..job_slots().min(items.len()) {
-            scope.spawn(|| loop {
-                let index = next.fetch_add(1, Ordering::Relaxed);
-                if index >= items.len() || failed.load(Ordering::Relaxed) || jobs().stopping() {
-                    break;
+            scope.spawn(|| {
+                on_process_cpus();
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= items.len() || failed.load(Ordering::Relaxed) || jobs().stopping() {
+                        break;
+                    }
+                    let result = work(&items[index]);
+                    if result.is_err() {
+                        failed.store(true, Ordering::Relaxed);
+                    }
+                    results.lock().unwrap_or_else(PoisonError::into_inner)[index] = Some(result);
                 }
-                let result = work(&items[index]);
-                if result.is_err() {
-                    failed.store(true, Ordering::Relaxed);
-                }
-                results.lock().unwrap_or_else(PoisonError::into_inner)[index] = Some(result);
             });
         }
     });
@@ -1011,5 +1064,77 @@ mod tests {
         );
         drop(open);
         assert!(jobs.shut_down(SOON).is_empty(), "the job ends once let go");
+    }
+
+    /// CPUs the calling thread may run on, as `job_slots` counted them.
+    #[cfg(target_os = "linux")]
+    fn cpus() -> usize {
+        std::thread::available_parallelism().map_or(0, |n| n.get())
+    }
+
+    /// Run `f` on a thread pinned to one core, as each data worker's is,
+    /// once the process's CPU set is recorded, as the node does at startup.
+    #[cfg(target_os = "linux")]
+    fn on_a_pinned_thread<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
+        quil_lattice_ct::confidential::relation::backend::worker_process::remember_process_cpus();
+        let core = core_affinity::get_core_ids()
+            .and_then(|cores| cores.last().copied())
+            .expect("a core to pin to");
+        std::thread::spawn(move || {
+            assert!(core_affinity::set_for_current(core), "pin the test thread");
+            assert_eq!(cpus(), 1, "the thread runs on one core");
+            f()
+        })
+        .join()
+        .unwrap()
+    }
+
+    /// Storage jobs are asked for from a data worker's thread, pinned to one
+    /// core: they still get a slot per core the process may use, less one,
+    /// not one in all (2026-10-29: every node ran one at a time).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn job_slots_asked_from_a_pinned_thread_count_the_process_cpus() {
+        let process = cpus();
+        if process < 3 {
+            eprintln!("skipped: this process may use {process} CPUs, so one slot is right");
+            return;
+        }
+        let slots = on_a_pinned_thread(job_slots);
+        assert_eq!(
+            slots,
+            process - 1,
+            "a thread pinned to one core counted {slots} slot(s) for a process of {process} CPUs"
+        );
+    }
+
+    /// A lane started from a pinned thread, and the threads a seat's leaves
+    /// run on, run on every CPU the process may use, not that one core.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn jobs_started_from_a_pinned_thread_run_on_the_process_cpus() {
+        let process = cpus();
+        if process < 2 {
+            eprintln!("skipped: this process may use one CPU");
+            return;
+        }
+        let (lane, leaves) = on_a_pinned_thread(|| {
+            let (tx, rx) = mpsc::channel();
+            own_jobs().spawn(b"test lane", "cpus", move || {
+                tx.send(cpus()).unwrap();
+                Ok(())
+            });
+            let lane = rx.recv_timeout(SOON).expect("the lane's job ran");
+            let leaves = for_each_parallel(&[(); 4], |_| Ok(cpus())).unwrap();
+            (lane, leaves)
+        });
+        assert_eq!(
+            lane, process,
+            "the lane's thread runs on {lane} of {process} CPUs"
+        );
+        assert!(
+            leaves.iter().all(|&cpus| cpus == process),
+            "the leaves' threads run on {leaves:?} of {process} CPUs"
+        );
     }
 }
