@@ -58,6 +58,152 @@ impl TokenPolicy {
 mod tests {
     use super::*;
 
+    /// A materialization put off for background verification reads as
+    /// `PROOF_VERIFICATION_PENDING`, distinct from a busy worker.
+    #[test]
+    fn a_deferred_materialization_is_recognizably_pending() {
+        let pending =
+            QuilError::ExecutionUnavailable(super::super::PROOF_VERIFICATION_PENDING.into());
+        assert!(super::super::is_proof_verification_pending(&pending));
+        assert!(!super::super::is_proof_worker_busy(&pending));
+        let busy = QuilError::ExecutionUnavailable(super::super::PROOF_WORKER_BUSY.into());
+        assert!(!super::super::is_proof_verification_pending(&busy));
+        assert!(!super::super::is_proof_verification_pending(
+            &QuilError::InvalidArgument(super::super::PROOF_VERIFICATION_PENDING.into())
+        ));
+    }
+
+    /// Each size class is estimated from its own measurements, so a slow
+    /// batch shield does not price a transfer like itself, and a class not
+    /// measured yet takes the mean of all.
+    #[test]
+    fn verification_is_estimated_per_size_class() {
+        // A 96-source shield and a transfer fall in different classes.
+        assert_ne!(verify_class(600 * 1024), verify_class(40 * 1024));
+        assert_eq!(verify_class(0), 0);
+        assert_eq!(verify_class(2048), 1);
+        assert_eq!(verify_class(usize::MAX), VERIFY_CLASSES - 1);
+        // A class's first measurement is its estimate, then a 1/4-weighted
+        // mean; an unmeasured class takes the overall mean.
+        let first = ewma_next(0, 300_000_000);
+        assert_eq!(estimate_from(first, 8.0), 300.0);
+        assert_eq!(estimate_from(ewma_next(first, 100_000_000), 8.0), 250.0);
+        assert_eq!(estimate_from(0, 8.0), 8.0);
+    }
+
+    /// `LEVEL message field=value ...` of each event logged while `run` runs.
+    fn logged(run: impl FnOnce()) -> Vec<String> {
+        use std::sync::{Arc, Mutex};
+        struct Recorder(Arc<Mutex<Vec<String>>>);
+        impl tracing::Subscriber for Recorder {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Fields(String);
+                impl tracing::field::Visit for Fields {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!(" {}={:?}", field.name(), value));
+                    }
+                }
+                let mut fields = Fields(event.metadata().level().to_string());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Recorder(lines.clone()), run);
+        let lines = lines.lock().unwrap().clone();
+        lines
+    }
+
+    /// A long verification logs once that it runs long, warns once when it
+    /// overruns, and logs its end; a short one logs nothing. Its result is
+    /// returned as is.
+    #[test]
+    fn a_long_verification_reports_its_progress_and_end() {
+        let long = std::time::Duration::from_millis(100);
+        let application = [5u8; 32];
+        let count = |lines: &[String], level: &str, text: &str| {
+            lines
+                .iter()
+                .filter(|line| line.starts_with(level) && line.contains(text))
+                .count()
+        };
+        let lines = logged(|| {
+            let result = watched_verification_every(long, long * 2, &application, 2048, || {
+                std::thread::sleep(long * 4);
+                7u32
+            });
+            assert_eq!(result, 7);
+        });
+        assert_eq!(count(&lines, "INFO", "running long"), 1, "{lines:?}");
+        assert_eq!(
+            count(&lines, "WARN", "overran twice its estimate"),
+            1,
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("WARN")).count(),
+            1,
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("INFO")
+                && line.contains("confidential proof verification finished")
+                && line.contains("operation_bytes=2048")),
+            "{lines:?}"
+        );
+        // Long but within its estimate: no warning.
+        let within = logged(|| {
+            watched_verification_every(long, long * 10, &application, 2048, || {
+                std::thread::sleep(long * 2)
+            });
+        });
+        assert_eq!(
+            within.iter().filter(|l| l.starts_with("WARN")).count(),
+            0,
+            "{within:?}"
+        );
+        assert_eq!(count(&within, "INFO", "running long"), 1, "{within:?}");
+        let quick = logged(|| {
+            assert!(watched_verification_every(
+                long,
+                long * 2,
+                &application,
+                2048,
+                || true
+            ));
+        });
+        assert!(quick.is_empty(), "{quick:?}");
+    }
+
+    /// The overrun warning comes at twice the estimate, never before the
+    /// floor; an operation is known to fit a budget only once its size class
+    /// is measured.
+    #[test]
+    fn overruns_and_fits_follow_the_measured_estimate() {
+        assert_eq!(overrun_after(8.0), VERIFY_OVERRUN_FLOOR);
+        assert_eq!(overrun_after(600.0), std::time::Duration::from_secs(1200));
+        assert!(
+            !known_to_fit(0, 12.0),
+            "an unmeasured class is not known to fit"
+        );
+        assert!(known_to_fit(8_000_000, 12.0));
+        assert!(!known_to_fit(300_000_000, 12.0));
+    }
+
     /// A refused admission reads as `PROOF_WORKER_BUSY`, which callers tell
     /// apart from other worker failures.
     #[test]
@@ -181,7 +327,7 @@ mod tests {
         assert_eq!(frame_verification_capacity(4), 8);
         VERIFY_EWMA_MICROS.store(60_000_000, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(frame_verification_capacity(1), 1);
-        record_duration(std::time::Duration::from_secs(20));
+        record_duration(1, std::time::Duration::from_secs(20));
         assert!(verification_ewma_secs() < 60.0 && verification_ewma_secs() > 20.0);
         VERIFY_EWMA_MICROS.store(8_000_000, std::sync::atomic::Ordering::Relaxed);
         // Request shapes mirror dispatch: transfers use the policy limits,
@@ -724,6 +870,75 @@ pub fn frame_verification_capacity(concurrency: usize) -> usize {
     ((concurrency.max(1) as f64 * budget / per_op).floor() as usize).max(1)
 }
 
+/// Proof-verification seconds a shard proposal may schedule per frame.
+pub fn verification_budget_secs() -> f64 {
+    VERIFY_BUDGET_SECS.load(std::sync::atomic::Ordering::Relaxed) as f64
+}
+
+/// Size classes of the per-operation estimate: an operation's bytes in powers
+/// of two from 1 KiB. A 96-source batch shield verifies for minutes and a
+/// transfer for seconds; one mean over both priced the shield as a transfer
+/// and the transfers as shields.
+const VERIFY_CLASSES: usize = 16;
+/// Exponentially weighted wall time of one worker verification per size
+/// class, in microseconds; 0 until a verification of that class is measured.
+static VERIFY_CLASS_EWMA_MICROS: [std::sync::atomic::AtomicU64; VERIFY_CLASSES] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; VERIFY_CLASSES];
+
+fn verify_class(operation_bytes: usize) -> usize {
+    ((operation_bytes / 1024).max(1).ilog2() as usize).min(VERIFY_CLASSES - 1)
+}
+
+/// Estimated wall time of verifying one confidential operation of
+/// `operation_bytes` bytes: the measured mean of its size class, or the mean
+/// of all classes until one of its class is measured.
+pub fn estimated_verify_secs(operation_bytes: usize) -> f64 {
+    estimate_from(
+        VERIFY_CLASS_EWMA_MICROS[verify_class(operation_bytes)]
+            .load(std::sync::atomic::Ordering::Relaxed),
+        verification_ewma_secs(),
+    )
+}
+
+/// A class's estimate: its measured mean (`class_micros`), or `mean_secs`
+/// until it has one.
+fn estimate_from(class_micros: u64, mean_secs: f64) -> f64 {
+    if class_micros > 0 {
+        class_micros as f64 / 1e6
+    } else {
+        mean_secs
+    }
+}
+
+/// Whether verifying one confidential operation of `operation_bytes` bytes
+/// is known to take at most `budget_secs`: its size class was measured on
+/// this node and its estimate fits. A class not measured yet is not known
+/// to fit: the first 96-source batch shield a node saw was estimated at the
+/// 8 s mean of transfers and verified for minutes (devnet, 2026-10-29).
+pub fn verification_known_to_fit(operation_bytes: usize, budget_secs: f64) -> bool {
+    known_to_fit(
+        VERIFY_CLASS_EWMA_MICROS[verify_class(operation_bytes)]
+            .load(std::sync::atomic::Ordering::Relaxed),
+        budget_secs,
+    )
+}
+
+/// [`verification_known_to_fit`] of a class whose measured mean is
+/// `class_micros` (0: not measured).
+fn known_to_fit(class_micros: u64, budget_secs: f64) -> bool {
+    class_micros > 0 && class_micros as f64 / 1e6 <= budget_secs
+}
+
+/// The next exponentially weighted mean after `micros`, 1/4 weight on the
+/// newest; the first measurement (`previous` 0) is taken as is.
+fn ewma_next(previous: u64, micros: u64) -> u64 {
+    if previous == 0 {
+        micros.max(1)
+    } else {
+        (previous - previous / 4 + micros / 4).max(1)
+    }
+}
+
 fn verdict_key(
     network: &[u8; 32],
     application: &[u8; 32],
@@ -811,12 +1026,131 @@ fn verdict_once<E>(
     Ok(accepted)
 }
 
-fn record_duration(elapsed: std::time::Duration) {
+fn record_duration(operation_bytes: usize, elapsed: std::time::Duration) {
     let micros = elapsed.as_micros().min(u64::MAX as u128) as u64;
     let previous = VERIFY_EWMA_MICROS.load(std::sync::atomic::Ordering::Relaxed);
     // 1/4 weight on the newest observation.
     let next = previous - previous / 4 + micros / 4;
     VERIFY_EWMA_MICROS.store(next.max(1), std::sync::atomic::Ordering::Relaxed);
+    let class = &VERIFY_CLASS_EWMA_MICROS[verify_class(operation_bytes)];
+    let previous = class.load(std::sync::atomic::Ordering::Relaxed);
+    class.store(
+        ewma_next(previous, micros),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// A verification running this long logs that it is running, once.
+const LONG_VERIFY: std::time::Duration = std::time::Duration::from_secs(60);
+/// A long verification warns once when it has run twice its estimate, and
+/// at least this long: a 96-source batch shield verifies for 5-8 min on a
+/// loaded node, longer while the node verifies another (devnet,
+/// 2026-10-29).
+const VERIFY_OVERRUN_FLOOR: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// When a verification estimated at `estimate_secs` has overrun.
+fn overrun_after(estimate_secs: f64) -> std::time::Duration {
+    std::time::Duration::from_secs_f64((2.0 * estimate_secs).max(0.0)).max(VERIFY_OVERRUN_FLOOR)
+}
+
+/// Watch one verification while `verify` runs it: an info line once it has
+/// run [`LONG_VERIFY`], one warning if it overruns ([`overrun_after`]), and
+/// an info line with its duration when a long one ends.
+fn watched_verification<T: Send>(
+    application: &[u8; 32],
+    operation_bytes: usize,
+    verify: impl FnOnce() -> T + Send,
+) -> T {
+    let estimate = estimated_verify_secs(operation_bytes);
+    watched_verification_every(
+        LONG_VERIFY,
+        overrun_after(estimate),
+        application,
+        operation_bytes,
+        verify,
+    )
+}
+
+/// [`watched_verification`] reporting a long verification at `long` and an
+/// overrun at `overrun`. The verification runs on a scoped thread and the
+/// reports come from the calling thread, so they carry its span and
+/// subscriber.
+fn watched_verification_every<T: Send>(
+    long: std::time::Duration,
+    overrun: std::time::Duration,
+    application: &[u8; 32],
+    operation_bytes: usize,
+    verify: impl FnOnce() -> T + Send,
+) -> T {
+    let start = std::time::Instant::now();
+    let estimate = estimated_verify_secs(operation_bytes);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let result = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let _ = sender.send(verify());
+        });
+        let (mut reported_long, mut warned) = (false, false);
+        loop {
+            let next_report = match (reported_long, warned) {
+                (false, _) => Some(long),
+                (true, false) => Some(overrun.max(long)),
+                (true, true) => None,
+            };
+            let received = match next_report {
+                Some(at) => receiver.recv_timeout(at.saturating_sub(start.elapsed())),
+                None => receiver
+                    .recv()
+                    .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+            };
+            match received {
+                Ok(result) => break Some(result),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let elapsed = start.elapsed();
+                    if !reported_long {
+                        reported_long = true;
+                        tracing::info!(
+                            scope = "this node's proof worker",
+                            application = %hex::encode(&application[..8]),
+                            operation_bytes,
+                            secs = elapsed.as_secs(),
+                            estimate_secs = estimate.round() as u64,
+                            overrun_warn_secs = overrun.as_secs(),
+                            "confidential proof verification running long; it logs its end"
+                        );
+                    } else {
+                        warned = true;
+                        tracing::warn!(
+                            scope = "this node's proof worker",
+                            application = %hex::encode(&application[..8]),
+                            operation_bytes,
+                            secs = elapsed.as_secs(),
+                            estimate_secs = estimate.round() as u64,
+                            action = "a proposal leaves the operation out until it verifies, and a frame \
+                                      carrying it waits for it; if this repeats for every operation, check \
+                                      this node's CPU and proofWorker settings",
+                            "confidential proof verification overran twice its estimate"
+                        );
+                    }
+                }
+                // The verifying thread panicked: the scope re-raises it.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break None,
+            }
+        }
+    });
+    let result =
+        result.expect("a scope whose thread panicked re-raises the panic before returning");
+    let elapsed = start.elapsed();
+    if elapsed >= long {
+        tracing::info!(
+            scope = "this node's proof worker",
+            application = %hex::encode(&application[..8]),
+            operation_bytes,
+            secs = elapsed.as_secs(),
+            estimate_secs = estimate.round() as u64,
+            "confidential proof verification finished"
+        );
+    }
+    result
 }
 
 /// The trusted client reconstructs the amount relation inside its child. Local
@@ -850,14 +1184,16 @@ fn worker_verdict(
     budget: NativeBudget,
 ) -> std::result::Result<bool, ClientError> {
     let start = std::time::Instant::now();
-    let accepted = worker.verify(&WorkerRequest {
-        network: *network,
-        application: *application,
-        limits,
-        submission_bytes: budget.max_native_bytes,
-        transaction: bytes,
+    let accepted = watched_verification(application, bytes.len(), || {
+        worker.verify(&WorkerRequest {
+            network: *network,
+            application: *application,
+            limits,
+            submission_bytes: budget.max_native_bytes,
+            transaction: bytes,
+        })
     })?;
-    record_duration(start.elapsed());
+    record_duration(bytes.len(), start.elapsed());
     Ok(accepted)
 }
 
@@ -908,6 +1244,23 @@ impl TokenPolicy {
             _ => return None,
         };
         Some((application, limits))
+    }
+
+    /// Whether one confidential operation needs no worker verification
+    /// before it executes: its verdict is cached, or it carries no worker
+    /// proof (mint claims, unknown types).
+    pub fn verdict_cached(&self, address: &[u8], bytes: &[u8], tp: u32) -> bool {
+        let Some((application, limits)) = self.worker_request_shape(address, tp) else {
+            return true;
+        };
+        cached_verdict(&verdict_key(
+            &self.network,
+            &application,
+            bytes,
+            limits,
+            self.native_budget,
+        ))
+        .is_some()
     }
 
     /// Verify one confidential operation ahead of materialization so the

@@ -1,3 +1,4 @@
+pub mod admission_verify;
 pub mod app_engine;
 pub mod app_glue;
 pub mod app_handoff;

@@ -114,6 +114,17 @@ pub fn is_proof_worker_busy(error: &quil_types::error::QuilError) -> bool {
     matches!(error, quil_types::error::QuilError::ExecutionUnavailable(message) if message == PROOF_WORKER_BUSY)
 }
 
+/// The error of a materialization put off while its frame's confidential
+/// proofs verify on a background thread: the frame is fine, the engine keeps
+/// running, and the materialization is retried once the verdicts are cached.
+pub const PROOF_VERIFICATION_PENDING: &str =
+    "token proofs of this frame are verifying in the background";
+
+/// Whether `error` is [`PROOF_VERIFICATION_PENDING`].
+pub fn is_proof_verification_pending(error: &quil_types::error::QuilError) -> bool {
+    matches!(error, quil_types::error::QuilError::ExecutionUnavailable(message) if message == PROOF_VERIFICATION_PENDING)
+}
+
 /// SHA3-256 of an operation's bytes: the id the global commit decides it by.
 pub fn global_commit_tx_id(operation: &[u8]) -> [u8; 32] {
     use sha3::Digest;
