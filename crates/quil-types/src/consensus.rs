@@ -1016,9 +1016,9 @@ pub fn set_storage_attestation_pause_for_thread(pause: Option<(u64, u64)>) {
 /// other participant's issuance went unissued. Read from the GLOBAL frame
 /// executing the header. Consensus-affecting (reward state): every node that
 /// executes GLOBAL frames must run a build carrying the epoch before it.
-/// `None` on mainnet until it is decided; `QUIL_UNSEALED_ISSUANCE_EPOCH`
-/// elsewhere, never by default.
-pub const MAINNET_UNSEALED_ISSUANCE_EPOCH: Option<u64> = None;
+/// Mainnet epoch 1321 (GLOBAL frame 951,120; decided 2026-10-28);
+/// `QUIL_UNSEALED_ISSUANCE_EPOCH` elsewhere, never by default.
+pub const MAINNET_UNSEALED_ISSUANCE_EPOCH: Option<u64> = Some(1321);
 
 static UNSEALED_ISSUANCE_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -2870,6 +2870,16 @@ mod hash_storage_proof_epoch_tests {
         assert_eq!(super::unsealed_issuance_epoch_for(1, Some("4")), 4);
         assert_eq!(super::unsealed_issuance_epoch_for(1, Some("bad")), u64::MAX);
         assert_eq!(super::unsealed_issuance_epoch_for(1, None), u64::MAX);
+    }
+
+    /// Mainnet pays unsealed participants their issuance at once from GLOBAL
+    /// frame 951,120, seven epochs after the first hash-proof epoch.
+    #[test]
+    fn mainnet_unsealed_issuance_begins_at_frame_951120() {
+        let epoch = super::MAINNET_UNSEALED_ISSUANCE_EPOCH.unwrap();
+        assert_eq!(epoch * super::EPOCH_LENGTH_FRAMES, 951_120);
+        assert!(epoch > super::MAINNET_HASH_STORAGE_PROOF_EPOCH.unwrap());
+        assert_eq!(super::unsealed_issuance_epoch_for(0, None), epoch);
     }
 
     /// Mainnet's first hash-proof epoch begins at GLOBAL frame 946,080, and
