@@ -139,6 +139,7 @@ impl PreparedSnapshotPublication<'_> {
                 self.inner.generations.pop_back();
             }
             self.inner.release_old_pins();
+            self.inner.expire_scans();
         }
     }
 }
@@ -183,6 +184,18 @@ impl SnapshotManagerInner {
 pub const MAX_SCAN_GENERATIONS: usize = 64;
 /// A scan snapshot nobody has paged for this long is released.
 pub const SCAN_IDLE: Duration = Duration::from_secs(300);
+/// A scan snapshot is released this long after its capture, however often it
+/// is paged, and continuing it then reports the scan expired, so the client
+/// starts a fresh scan. Paging alone must not keep a snapshot: each one pins
+/// every key version deleted or overwritten after it, so a client paging
+/// within [`SCAN_IDLE`] could otherwise stop compaction for good and grow
+/// the store toward disk fill.
+///
+/// A release-build regular node scanned 3,247 coins in 35.9 s (~90 coins/s,
+/// 64-coin pages, Oct 2026). At that rate a scan of 200,000 coins takes ~37
+/// minutes, so an hour covers it with ~1.6x margin (~320,000 coins), while
+/// bounding the data a scan can hold back to one hour of churn.
+pub const SCAN_MAX_AGE: Duration = Duration::from_secs(3600);
 
 /// A scan-only generation and its use.
 struct ScanGeneration {
@@ -190,9 +203,13 @@ struct ScanGeneration {
     /// The owner's commit count when captured: while unchanged, this is the
     /// current state and new scans share it ([`SnapshotManager::current_scan`]).
     commits: Option<u64>,
+    /// Capture time, against [`SCAN_MAX_AGE`].
+    created: Instant,
     used: Instant,
     /// [`SnapshotManagerInner::scan_ticks`] at the last use.
     tick: u64,
+    /// Continuations and shares served, for the expiry log.
+    pages: u64,
 }
 
 impl SnapshotManagerInner {
@@ -201,7 +218,35 @@ impl SnapshotManagerInner {
         let (tick, scan) = (self.scan_ticks, &mut self.scans[index]);
         scan.used = Instant::now();
         scan.tick = tick;
+        scan.pages += 1;
         scan.handle.clone()
+    }
+
+    /// Release scan generations idle past [`SCAN_IDLE`] or captured more than
+    /// [`SCAN_MAX_AGE`] ago. Runs on every scan request and publication, so
+    /// an expired scan neither continues nor outlives the next commit.
+    fn expire_scans(&mut self) {
+        let (mut aged, mut oldest, mut pages) = (0usize, Duration::ZERO, 0u64);
+        self.scans.retain(|s| {
+            let age = s.created.elapsed();
+            if age >= SCAN_MAX_AGE {
+                aged += 1;
+                oldest = oldest.max(age);
+                pages += s.pages;
+                return false;
+            }
+            s.used.elapsed() < SCAN_IDLE
+        });
+        if aged > 0 {
+            tracing::info!(
+                released = aged,
+                oldest_age_secs = oldest.as_secs(),
+                pages_served = pages,
+                max_age_secs = SCAN_MAX_AGE.as_secs(),
+                "wallet scan snapshots released at their maximum age; a client still \
+                 paging one is told the scan expired and must restart it"
+            );
+        }
     }
 }
 
@@ -332,6 +377,7 @@ impl SnapshotManager {
             g.generations.pop_back();
         }
         g.release_old_pins();
+        g.expire_scans();
     }
 
     /// Look up a generation by `expected_root`. Mirrors Go
@@ -373,6 +419,7 @@ impl SnapshotManager {
         {
             return Some(root.clone());
         }
+        g.expire_scans();
         let index = g
             .scans
             .iter()
@@ -389,6 +436,7 @@ impl SnapshotManager {
         if g.closed {
             return None;
         }
+        g.expire_scans();
         let current = g
             .scans
             .front()
@@ -409,9 +457,9 @@ impl SnapshotManager {
 
     /// Register a scan-only generation over `snapshot` and return it. `None`
     /// when closed or OS entropy for the scan identity is unavailable.
-    /// Generations idle past [`SCAN_IDLE`] are released, and beyond
-    /// [`MAX_SCAN_GENERATIONS`] the least recently paged goes first, so a
-    /// long scan still paging outlives newer ones abandoned.
+    /// Generations idle past [`SCAN_IDLE`] or older than [`SCAN_MAX_AGE`] are
+    /// released, and beyond [`MAX_SCAN_GENERATIONS`] the least recently paged
+    /// goes first, so a long scan still paging outlives newer ones abandoned.
     pub fn publish_scan_only(
         &self,
         frame_number: u64,
@@ -438,7 +486,7 @@ impl SnapshotManager {
             frame_number,
             db_snapshot: Some(snapshot),
         };
-        g.scans.retain(|s| s.used.elapsed() < SCAN_IDLE);
+        g.expire_scans();
         while g.scans.len() >= MAX_SCAN_GENERATIONS {
             let Some(oldest) = g
                 .scans
@@ -456,8 +504,10 @@ impl SnapshotManager {
         g.scans.push_front(ScanGeneration {
             handle: handle.clone(),
             commits,
+            created: now,
             used: now,
             tick,
+            pages: 0,
         });
         Some(handle)
     }
@@ -823,6 +873,114 @@ mod tests {
             );
         }
         assert_eq!(m.inner.read().unwrap().scans.len(), MAX_SCAN_GENERATIONS);
+    }
+
+    /// Advance every retained scan's clock by `by`, as if `by` had passed.
+    fn elapse_scans(m: &SnapshotManager, by: Duration) {
+        for scan in m.inner.write().unwrap().scans.iter_mut() {
+            scan.used -= by;
+            scan.created -= by;
+        }
+    }
+
+    /// A client paging a scan more often than [`SCAN_IDLE`] must not keep its
+    /// store snapshot pinned for good: each held snapshot keeps every key
+    /// version deleted or overwritten after it on disk.
+    #[test]
+    fn a_scan_paged_within_the_idle_window_does_not_pin_its_snapshot_forever() {
+        let counter = Arc::new(Mutex::new(0usize));
+        let m = SnapshotManager::new();
+        let snapshot: Arc<dyn SnapshotReadable> = Arc::new(CountingSnapshot {
+            counter: counter.clone(),
+        });
+        let id = m.publish_scan_only(1, snapshot).unwrap().scan_id.unwrap();
+        let page_every = SCAN_IDLE - Duration::from_secs(1);
+        let pages = 24 * 3600 / page_every.as_secs();
+        let mut served = 0;
+        for _ in 0..pages {
+            elapse_scans(&m, page_every);
+            if m.acquire_scan(Some(&id)).is_none() {
+                break;
+            }
+            served += 1;
+        }
+        // Another wallet's scan runs the publication sweep too.
+        m.publish_scan_only(2, snap_with("vertex", "adds", shard(1), vec![1]))
+            .unwrap();
+        let released = *counter.lock().unwrap();
+        assert_eq!(
+            released,
+            1,
+            "scan snapshot still pinned after {served} pages, one every {}s for {}s",
+            page_every.as_secs(),
+            served * page_every.as_secs()
+        );
+        assert!(
+            m.acquire_scan(Some(&id)).is_none(),
+            "continuing a released scan reports it expired"
+        );
+    }
+
+    /// A scan paged within the idle window lives until [`SCAN_MAX_AGE`] and no
+    /// longer; an expired current scan is not shared with a new scan; and a
+    /// commit releases an expired scan without any scan request.
+    #[test]
+    fn scan_max_age_bounds_paging_sharing_and_commits() {
+        let page_every = SCAN_IDLE - Duration::from_secs(1);
+        let m = SnapshotManager::new();
+        let id = m
+            .publish_scan_only(1, snap_with("vertex", "adds", shard(1), vec![1]))
+            .unwrap()
+            .scan_id
+            .unwrap();
+        let mut paged = Duration::ZERO;
+        while paged + page_every < SCAN_MAX_AGE {
+            elapse_scans(&m, page_every);
+            paged += page_every;
+            assert!(
+                m.acquire_scan(Some(&id)).is_some(),
+                "paged for {paged:?}, under the maximum age"
+            );
+        }
+        elapse_scans(&m, page_every);
+        assert!(
+            m.acquire_scan(Some(&id)).is_none(),
+            "expired at the maximum age"
+        );
+
+        let m = SnapshotManager::new();
+        m.publish_current_scan(1, snap_with("vertex", "adds", shard(1), vec![1]), 4)
+            .unwrap();
+        let mut shared = Duration::ZERO;
+        while shared + page_every < SCAN_MAX_AGE {
+            elapse_scans(&m, page_every);
+            shared += page_every;
+            assert!(m.current_scan(4).is_some(), "shared for {shared:?}");
+        }
+        elapse_scans(&m, page_every);
+        assert!(m.current_scan(4).is_none(), "an expired scan is not shared");
+
+        // Both commit paths release a scan past its maximum age, even one
+        // paged a moment ago.
+        for prepared in [false, true] {
+            let counter = Arc::new(Mutex::new(0usize));
+            let m = SnapshotManager::new();
+            let snapshot: Arc<dyn SnapshotReadable> = Arc::new(CountingSnapshot {
+                counter: counter.clone(),
+            });
+            m.publish_scan_only(1, snapshot).unwrap();
+            elapse_scans(&m, SCAN_MAX_AGE);
+            m.inner.write().unwrap().scans[0].used = Instant::now();
+            if prepared {
+                m.prepare_publication(vec![2; 32], 2)
+                    .unwrap()
+                    .adopt(snap_with("vertex", "adds", shard(1), vec![2]));
+            } else {
+                m.publish(vec![2; 32], 2);
+            }
+            let released = *counter.lock().unwrap();
+            assert_eq!(released, 1, "prepared publication: {prepared}");
+        }
     }
 
     #[test]
