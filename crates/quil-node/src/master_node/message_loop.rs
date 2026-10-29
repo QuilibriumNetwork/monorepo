@@ -229,8 +229,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
     let archive_ingest_queue = archive_app_shard_ingest.map(|ingest| {
         // Verified without holding the ingest, which is held only to admit.
         let verifier = ingest.lock().unwrap_or_else(|p| p.into_inner()).verifier();
+        // Frames naming no shard the archive tracks never take queue room.
+        let admits = verifier.clone();
         let retrying = ingest.clone();
-        super::archive_ingest_queue::ArchiveIngestQueue::spawn(
+        let queue = super::archive_ingest_queue::ArchiveIngestQueue::spawn(
             super::archive_ingest_queue::QUEUE_FRAMES,
             super::archive_ingest_queue::QUEUE_BYTES,
             super::archive_ingest_queue::RETRY_EVERY,
@@ -241,7 +243,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
             )),
             move |data| quil_engine::archive_ingest::ingest_gossiped(&ingest, &verifier, data),
             move || quil_engine::archive_ingest::lock_ingest(&retrying).retry_pending(),
-        )
+        );
+        (queue, admits)
     });
     // GLOBAL_FRAME admission state shared with the gossip gate: a frame this
     // loop accepted is neither forwarded nor checked again, and a header whose
@@ -557,7 +560,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                 }
                 _ = status_timer.tick() => {
                     probe::step(ProbeSection::LoopStatus);
-                    if let Some(queue) = archive_ingest_queue.as_ref() {
+                    if let Some((queue, _)) = archive_ingest_queue.as_ref() {
                         queue.report_dropped(30);
                     }
                     // Periodic allocation status snapshot.
@@ -1961,8 +1964,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 }
                                 if !routed {
                                     match archive_ingest_queue.as_ref() {
-                                        Some(queue) => {
-                                            if super::archive_ingest_queue::may_carry_shard_frame(bm) {
+                                        Some((queue, admits)) => {
+                                            if super::archive_ingest_queue::may_carry_shard_frame(bm)
+                                                && admits.may_queue(&received.data)
+                                            {
                                                 queue.offer(std::mem::take(&mut received.data));
                                             }
                                         }

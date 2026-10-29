@@ -22,8 +22,9 @@
 //! certified frame), is also stored in the archive's clock store, from which
 //! it serves shard frames to peers.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::RangeInclusive;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -77,10 +78,16 @@ pub struct ArchiveAppShardIngest {
     /// gap that persists across many inbound frames or passes asks once.
     requested: HashMap<Vec<u8>, BTreeMap<u64, (Instant, bool)>>,
     /// Frames received whose anchoring GLOBAL frame is not stored here, per
-    /// address: frame → that GLOBAL frame. Not asked for again until it is.
-    awaiting_anchor: HashMap<Vec<u8>, BTreeMap<u64, u64>>,
-    /// The GLOBAL frames [`Self::awaiting_anchor`] has logged waiting on.
+    /// address: frame → (that GLOBAL frame, since when). Not asked for again
+    /// until it is, within the bounds [`Self::await_anchor`] keeps.
+    awaiting_anchor: HashMap<Vec<u8>, BTreeMap<u64, (u64, Instant)>>,
+    /// The GLOBAL frames [`Self::awaiting_anchor`] waits on.
     anchors_noted: std::collections::BTreeSet<u64>,
+    /// When a line last said frames wait for a GLOBAL frame, and how many
+    /// GLOBAL frames were noted since without one.
+    anchor_line: Option<(Instant, u64)>,
+    /// The shards whose gossiped frames this archive ingests.
+    tracked: TrackedShards,
     /// Frames received whose session generation executed GLOBAL state has not
     /// authorized, anchored past it, per address: frame → (that anchor, since
     /// when). Not asked for again until execution reaches the anchor
@@ -187,6 +194,29 @@ const MAX_AWAITING_EXECUTION: usize = 4096;
 /// The longest a frame waits for GLOBAL execution to reach its anchor before
 /// it may be asked for, and verified, again.
 const AWAIT_EXECUTION_TTL: Duration = Duration::from_secs(30 * 60);
+/// Frames of one shard parked until the GLOBAL frame they are anchored to is
+/// stored ([`ArchiveAppShardIngest::await_anchor`]). Past it the farthest
+/// frame is forgotten: it is asked for like any missing frame once a GLOBAL
+/// frame needs it.
+const MAX_AWAITING_ANCHOR_PER_SHARD: usize = MAX_BUFFERED_FRAMES_PER_SHARD;
+/// Frames of all shards parked until their GLOBAL anchor is stored. Past it a
+/// frame is not parked: it is asked for like any missing frame.
+const MAX_AWAITING_ANCHOR: usize = 4096;
+/// The longest a frame stays parked for its GLOBAL anchor before it may be
+/// asked for again. Gossip carries frames before they are verified, so a
+/// parked copy may be forged, or anchored to a GLOBAL frame this archive never
+/// stores; it holds back no other copy of the frame for longer.
+const AWAIT_ANCHOR_TTL: Duration = Duration::from_secs(10 * 60);
+/// The least time between two lines saying frames wait for a GLOBAL frame
+/// this archive has not stored.
+const AWAIT_ANCHOR_LINE_INTERVAL: Duration = Duration::from_secs(60);
+/// The least time between two reads of the shards the prover registry holds
+/// allocations of, when a gossiped frame names a shard outside them
+/// ([`TrackedShards`]).
+const TRACKED_SHARDS_REFRESH: Duration = Duration::from_secs(10);
+/// How often gossiped frames ignored for naming no tracked shard are
+/// summarized, while there are any.
+const IGNORED_FRAMES_SUMMARY_INTERVAL: Duration = Duration::from_secs(600);
 /// How often an archive compares each shard's committed GLOBAL tip with the
 /// frame it serves ([`ArchiveAppShardIngest::request_committed_tips`]).
 const COMMITTED_TIP_SCAN: Duration = Duration::from_secs(60);
@@ -430,6 +460,7 @@ impl ArchiveAppShardIngest {
             // archive rejects every post-genesis app frame at ingest, so it
             // never materializes app-shard state.
             prover_registry: prover_registry.clone(),
+            tracked: TrackedShards::new(prover_registry.clone(), hypergraph.clone()),
             last_tip_scan: None,
             missing_tips: HashMap::new(),
             committed_ranges: HashMap::new(),
@@ -469,6 +500,7 @@ impl ArchiveAppShardIngest {
             requested: HashMap::new(),
             awaiting_anchor: HashMap::new(),
             anchors_noted: std::collections::BTreeSet::new(),
+            anchor_line: None,
             awaiting_execution: HashMap::new(),
             execution_deferrals: crate::execution_deferral::DeferralLog::new("archive ingest"),
             sequenced: false,
@@ -664,6 +696,7 @@ impl ArchiveAppShardIngest {
     pub fn verifier(&self) -> ArchiveFrameVerifier {
         ArchiveFrameVerifier {
             held_bodies: self.held_bodies.clone(),
+            tracked: self.tracked.clone(),
             validator: self.validator.clone(),
             execution_manager: self.execution_manager.clone(),
             inclusion_prover: self.inclusion_prover.clone(),
@@ -699,6 +732,15 @@ impl ArchiveAppShardIngest {
     /// Every such frame fails validation, so asking for it again only loads
     /// the shard's members: an archive missing GLOBAL frames 907,473–907,511
     /// fetched and refused about 200 frames a second (2026-10-20).
+    ///
+    /// The frame is not verified yet, so its anchor may be forged. At most
+    /// [`MAX_AWAITING_ANCHOR_PER_SHARD`] frames of a shard wait, its lowest,
+    /// and [`MAX_AWAITING_ANCHOR`] in all; the first copy's anchor and time
+    /// stand. A parked frame is asked for again once its anchor is stored,
+    /// once [`AWAIT_ANCHOR_TTL`] passed, or at once when a GLOBAL frame at or
+    /// below its anchor waits for it, since that GLOBAL frame sequences only
+    /// a copy anchored before it ([`Self::request_frames`]). A frame not
+    /// parked is asked for like any missing frame.
     pub fn await_anchor(&mut self, address: &[u8], number: u64, anchor: u64) {
         if self
             .materialized_height(address)
@@ -706,14 +748,75 @@ impl ArchiveAppShardIngest {
         {
             return;
         }
-        self.awaiting_anchor
-            .entry(address.to_vec())
-            .or_default()
-            .insert(number, anchor);
-        if self.anchors_noted.insert(anchor) {
-            info!(anchor, frame = number, address = %hex::encode(address),
-                "archive app-shard frames wait for a GLOBAL frame this archive has not stored; \
-                 they are asked for again once it is");
+        if self
+            .awaiting_anchor
+            .get(address)
+            .is_some_and(|waiting| waiting.contains_key(&number))
+        {
+            return;
+        }
+        let parked: usize = self.awaiting_anchor.values().map(BTreeMap::len).sum();
+        if parked >= MAX_AWAITING_ANCHOR {
+            return;
+        }
+        let waiting = self.awaiting_anchor.entry(address.to_vec()).or_default();
+        waiting.insert(number, (anchor, Instant::now()));
+        let mut evicted = false;
+        while waiting.len() > MAX_AWAITING_ANCHOR_PER_SHARD {
+            waiting.pop_last();
+            evicted = true;
+        }
+        let parked_here = waiting.contains_key(&number);
+        if evicted {
+            self.forget_unawaited_anchors();
+        }
+        if parked_here && self.anchors_noted.insert(anchor) {
+            self.note_anchor_wait(address, number, anchor);
+        }
+    }
+
+    /// Say that frames wait for a GLOBAL frame this archive has not stored, at
+    /// most every [`AWAIT_ANCHOR_LINE_INTERVAL`]: anchors are not verified
+    /// before frames park, so a line per anchor would log as fast as gossip
+    /// carries made-up ones.
+    fn note_anchor_wait(&mut self, address: &[u8], number: u64, anchor: u64) {
+        if let Some((at, unlogged)) = self.anchor_line.as_mut() {
+            if at.elapsed() < AWAIT_ANCHOR_LINE_INTERVAL {
+                *unlogged += 1;
+                return;
+            }
+        }
+        let unlogged = self.anchor_line.map_or(0, |(_, unlogged)| unlogged);
+        self.anchor_line = Some((Instant::now(), 0));
+        let parked: usize = self.awaiting_anchor.values().map(BTreeMap::len).sum();
+        info!(anchor, frame = number, address = %log_address(address), parked,
+            anchors = self.anchors_noted.len(), unlogged_anchors = unlogged,
+            "archive app-shard frames wait for a GLOBAL frame this archive has not stored; \
+             they are asked for again once it is, or once a GLOBAL frame needs them");
+    }
+
+    /// Keep only the GLOBAL frames parked frames still wait on.
+    fn forget_unawaited_anchors(&mut self) {
+        let awaited: HashSet<u64> = self
+            .awaiting_anchor
+            .values()
+            .flat_map(|waiting| waiting.values().map(|&(anchor, _)| anchor))
+            .collect();
+        self.anchors_noted.retain(|anchor| awaited.contains(anchor));
+    }
+
+    /// Forget frames parked for their GLOBAL anchor longer than
+    /// [`AWAIT_ANCHOR_TTL`]: each is asked for like any missing frame.
+    fn expire_anchor_waits(&mut self) {
+        let mut expired = false;
+        self.awaiting_anchor.retain(|_, waiting| {
+            let before = waiting.len();
+            waiting.retain(|_, (_, since)| since.elapsed() < AWAIT_ANCHOR_TTL);
+            expired |= waiting.len() < before;
+            !waiting.is_empty()
+        });
+        if expired {
+            self.forget_unawaited_anchors();
         }
     }
 
@@ -817,12 +920,7 @@ impl ArchiveAppShardIngest {
             if waiting.is_empty() {
                 self.awaiting_anchor.remove(address);
             }
-            let awaiting = &self.awaiting_anchor;
-            self.anchors_noted.retain(|anchor| {
-                awaiting
-                    .values()
-                    .any(|waiting| waiting.values().any(|a| a == anchor))
-            });
+            self.forget_unawaited_anchors();
         }
         if let Some(waiting) = self.awaiting_execution.get_mut(address) {
             *waiting = waiting.split_off(&(frame + 1));
@@ -880,6 +978,9 @@ impl ArchiveAppShardIngest {
     }
 
     pub fn retry_pending(&mut self) {
+        self.tracked.refresh_if_due();
+        self.tracked.report_ignored();
+        self.expire_anchor_waits();
         let holding: Vec<_> = self.held.keys().cloned().collect();
         for address in holding {
             self.serve_committed_held(&address);
@@ -1503,7 +1604,8 @@ impl ArchiveAppShardIngest {
     /// a frame parked until its GLOBAL anchor is stored or execution reaches
     /// it ([`Self::request_frames`]), or while the queue is full.
     fn ask_committed_frame(&mut self, address: &[u8], number: u64, now: Instant) -> usize {
-        let sent = self.request_frames(address, number..=number, false, false, Duration::ZERO);
+        let sent =
+            self.request_frames(address, number..=number, false, false, None, Duration::ZERO);
         if sent == 0 {
             return 0;
         }
@@ -2299,7 +2401,15 @@ impl ArchiveAppShardIngest {
             } else {
                 (wanted, GAP_RETRY_INTERVAL)
             };
-            let requested = self.request_frames(address, wanted..=upto, true, waiting, interval);
+            let waiting_global = global_frame.filter(|_| waiting);
+            let requested = self.request_frames(
+                address,
+                wanted..=upto,
+                true,
+                waiting,
+                waiting_global,
+                interval,
+            );
             if requested > 0 {
                 // Counted into the inclusion summary; a GLOBAL frame waiting on
                 // the gap has a warning of its own.
@@ -2350,7 +2460,14 @@ impl ArchiveAppShardIngest {
         if last == 0 || upto <= last {
             return Ok(0);
         }
-        Ok(self.request_frames(address, last + 1..=upto, false, false, GAP_RETRY_INTERVAL))
+        Ok(self.request_frames(
+            address,
+            last + 1..=upto,
+            false,
+            false,
+            None,
+            GAP_RETRY_INTERVAL,
+        ))
     }
 
     /// Whether this archive holds every frame of `address` that
@@ -2392,7 +2509,14 @@ impl ArchiveAppShardIngest {
             last > 0 || self.buffered.contains_key(address) || self.stored.contains_key(address);
         if known || self.held.contains_key(address) {
             let upto = through.min(number.saturating_add(PREFETCH_DEPTH));
-            self.request_frames(address, number..=upto, false, false, GAP_RETRY_INTERVAL);
+            self.request_frames(
+                address,
+                number..=upto,
+                false,
+                false,
+                None,
+                GAP_RETRY_INTERVAL,
+            );
         }
         Ok(false)
     }
@@ -2403,12 +2527,15 @@ impl ArchiveAppShardIngest {
     /// leaves the rest for the next pass.
     /// `global_waits`: a GLOBAL frame waits for these frames, so one parked
     /// until execution reaches its anchor is asked for at once.
+    /// `waiting_global`: the GLOBAL frame that waits for these frames, when
+    /// one does and it is known.
     fn request_frames(
         &mut self,
         address: &[u8],
         frames: RangeInclusive<u64>,
         urgent: bool,
         global_waits: bool,
+        waiting_global: Option<u64>,
         interval: Duration,
     ) -> usize {
         let sender = if urgent {
@@ -2420,31 +2547,40 @@ impl ArchiveAppShardIngest {
         let mut sent = 0;
         let mut stored: HashMap<u64, bool> = HashMap::new();
         let mut executed: Option<Option<u64>> = None;
+        let mut unparked = false;
         for number in frames {
             if self.body_held(address, number) || self.is_held(address, number) {
                 continue;
             }
-            if let Some(anchor) = self
+            if let Some((anchor, since)) = self
                 .awaiting_anchor
                 .get(address)
                 .and_then(|waiting| waiting.get(&number))
                 .copied()
             {
+                // A GLOBAL frame carries only frames anchored before it, so
+                // the parked copy is not the one a GLOBAL frame at or below
+                // its anchor waits for; and no copy holds the others back
+                // past its time.
+                let not_needed = waiting_global.is_some_and(|global| anchor >= global)
+                    || since.elapsed() >= AWAIT_ANCHOR_TTL;
                 let clock = &self.clock_store;
-                if !*stored
-                    .entry(anchor)
-                    .or_insert_with(|| clock.get_global_clock_frame_header(anchor).is_ok())
+                if !not_needed
+                    && !*stored
+                        .entry(anchor)
+                        .or_insert_with(|| clock.get_global_clock_frame_header(anchor).is_ok())
                 {
                     continue;
                 }
-                // The anchor arrived: the frame can validate now, so ask at once.
+                // The anchor arrived, so the frame can validate now, or
+                // another copy is needed: ask at once.
                 if let Some(waiting) = self.awaiting_anchor.get_mut(address) {
                     waiting.remove(&number);
                     if waiting.is_empty() {
                         self.awaiting_anchor.remove(address);
                     }
                 }
-                self.anchors_noted.remove(&anchor);
+                unparked = true;
                 if let Some(requested) = self.requested.get_mut(address) {
                     requested.remove(&number);
                 }
@@ -2500,6 +2636,9 @@ impl ArchiveAppShardIngest {
         }
         if let Some(Some(executed)) = executed {
             self.execution_deferrals.executed(executed);
+        }
+        if unparked {
+            self.forget_unawaited_anchors();
         }
         sent
     }
@@ -2647,6 +2786,8 @@ pub struct ArchiveFrameVerifier {
     /// What the ingest holds per shard, whose cursors tell a frame above the
     /// cursor ([`Self::stored_above_cursor`]).
     held_bodies: HeldBodies,
+    /// The shards whose gossiped frames the ingest takes ([`ingest_gossiped`]).
+    tracked: TrackedShards,
     validator: Arc<BlsAppFrameValidator>,
     execution_manager: Arc<quil_execution::ExecutionEngineManager>,
     inclusion_prover: Arc<dyn InclusionProver>,
@@ -2673,6 +2814,32 @@ pub enum FrameCheck {
 }
 
 impl ArchiveFrameVerifier {
+    /// Whether the message loop queues gossiped `data` for [`ingest_gossiped`]:
+    /// its header, decoded alone, names a shard this archive tracks as last
+    /// read ([`TrackedShards`]). Never waits: while the shards are read, or
+    /// before they were first read, a frame is queued, and checked again
+    /// there. A frame not queued is counted and summarized, and asked for when
+    /// a GLOBAL frame needs it, like a frame the full queue dropped.
+    pub fn may_queue(&self, data: &[u8]) -> bool {
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct HeaderOnly {
+            #[prost(message, optional, tag = "1")]
+            header: Option<quil_types::proto::global::FrameHeader>,
+        }
+        let queued = match <HeaderOnly as prost::Message>::decode(data) {
+            Ok(HeaderOnly {
+                header: Some(header),
+            }) if !header.address.is_empty() => {
+                self.tracked.tracks_now(&header.address, &self.held_bodies)
+            }
+            _ => false,
+        };
+        if !queued {
+            self.tracked.ignore(data.len());
+        }
+        queued
+    }
+
     /// Frame `number` of `address` as this archive's store holds it, when it
     /// is above the shard's cursor as the ingest last published it
     /// ([`HeldBodies`]); unverified, like a frame any endpoint serves. Bodies
@@ -2995,6 +3162,179 @@ impl HeldBodies {
     }
 }
 
+/// The shards whose gossiped frames an archive ingests: those the prover
+/// registry holds allocations of, as last read, and those the ingest holds
+/// frames of ([`HeldBodies`]). Gossip carries frames naming any address, and
+/// the ingest remembered every address and anchor a frame named before it
+/// verified the frame, logging each anchor with the address: frames naming
+/// made-up shards grew the ingest's memory and log without bound. Frames of
+/// other shards are ignored before the ingest is taken, counted and summarized
+/// every [`IGNORED_FRAMES_SUMMARY_INTERVAL`]. GLOBAL carries no frame of a shard
+/// without allocated provers; a frame of a shard that gained provers since the
+/// registry was read is asked for once a GLOBAL frame needs it, and the
+/// registry is read again within [`TRACKED_SHARDS_REFRESH`].
+#[derive(Clone)]
+pub struct TrackedShards {
+    inner: Arc<TrackedShardsInner>,
+}
+
+struct TrackedShardsInner {
+    registry: Arc<dyn ProverRegistryTrait>,
+    /// GLOBAL state, whose executed frame the registry is read at.
+    hypergraph: Arc<quil_hypergraph::HypergraphCrdt>,
+    known: std::sync::Mutex<KnownShards>,
+    ignored_frames: AtomicU64,
+    ignored_bytes: AtomicU64,
+}
+
+#[derive(Default)]
+struct KnownShards {
+    filters: HashSet<Vec<u8>>,
+    /// When the registry was last read; `None` before it was.
+    read: Option<Instant>,
+    /// When ignored frames were last summarized.
+    reported: Option<Instant>,
+}
+
+impl TrackedShards {
+    fn new(
+        registry: Arc<dyn ProverRegistryTrait>,
+        hypergraph: Arc<quil_hypergraph::HypergraphCrdt>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(TrackedShardsInner {
+                registry,
+                hypergraph,
+                known: std::sync::Mutex::new(KnownShards::default()),
+                ignored_frames: AtomicU64::new(0),
+                ignored_bytes: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    fn known(&self) -> std::sync::MutexGuard<'_, KnownShards> {
+        self.inner.known.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Whether frames of `address` are ingested. Reads the registry again
+    /// when it was last read [`TRACKED_SHARDS_REFRESH`] ago or more and
+    /// `address` is neither held nor known.
+    fn tracks(&self, address: &[u8], held: &HeldBodies) -> bool {
+        if held.cursor(address).is_some() {
+            return true;
+        }
+        let mut known = self.known();
+        if known.filters.contains(address) {
+            return true;
+        }
+        if known
+            .read
+            .is_some_and(|at| at.elapsed() < TRACKED_SHARDS_REFRESH)
+        {
+            return false;
+        }
+        self.read_registry(&mut known);
+        known.filters.contains(address)
+    }
+
+    /// [`Self::tracks`] without reading the registry or waiting for another
+    /// reader: true while the registry is read or before it was first read.
+    fn tracks_now(&self, address: &[u8], held: &HeldBodies) -> bool {
+        let known = match self.inner.known.try_lock() {
+            Ok(known) => known,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return true,
+        };
+        if known.read.is_none() || known.filters.contains(address) {
+            return true;
+        }
+        drop(known);
+        held.cursor(address).is_some()
+    }
+
+    /// Read the registry when it was last read [`TRACKED_SHARDS_REFRESH`] ago
+    /// or more, so shards that gained provers are known before their frames
+    /// arrive.
+    fn refresh_if_due(&self) {
+        let mut known = self.known();
+        if known
+            .read
+            .is_none_or(|at| at.elapsed() >= TRACKED_SHARDS_REFRESH)
+        {
+            self.read_registry(&mut known);
+        }
+    }
+
+    fn read_registry(&self, known: &mut KnownShards) {
+        known.read = Some(Instant::now());
+        let executed = self
+            .inner
+            .hypergraph
+            .read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+            .unwrap_or(0);
+        match self.inner.registry.get_prover_shard_summaries(executed) {
+            Ok(summaries) => {
+                known.filters = summaries
+                    .into_iter()
+                    .map(|summary| summary.filter)
+                    .filter(|filter| !filter.is_empty())
+                    .collect();
+            }
+            Err(error) => {
+                debug!(%error, "archive ingest: prover registry unreadable; the shards last read stand");
+            }
+        }
+    }
+
+    /// Count a gossiped frame of `bytes` ignored.
+    fn ignore(&self, bytes: usize) {
+        self.inner.ignored_frames.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .ignored_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Summarize the gossiped frames ignored since the last summary, at most
+    /// every [`IGNORED_FRAMES_SUMMARY_INTERVAL`].
+    fn report_ignored(&self) {
+        let mut known = self.known();
+        if known
+            .reported
+            .is_some_and(|at| at.elapsed() < IGNORED_FRAMES_SUMMARY_INTERVAL)
+        {
+            return;
+        }
+        let frames = self.inner.ignored_frames.swap(0, Ordering::Relaxed);
+        let bytes = self.inner.ignored_bytes.swap(0, Ordering::Relaxed);
+        if frames == 0 {
+            return;
+        }
+        let interval_secs = known.reported.map_or(0, |at| at.elapsed().as_secs());
+        known.reported = Some(Instant::now());
+        info!(frames, bytes, interval_secs, tracked_shards = known.filters.len(),
+            scope = "gossip from remote peers",
+            action = "none: GLOBAL carries no frame of a shard without allocated provers, and a frame \
+                      of a shard that gained provers is asked for when a GLOBAL frame needs it; if \
+                      most frames are ignored, report this line",
+            "archive ignored gossiped application frames that name no shard it tracks or do not decode");
+    }
+}
+
+/// `address` in hex for a log line, at most its first 64 bytes: a frame
+/// names any address before it is verified.
+fn log_address(address: &[u8]) -> String {
+    const SHOWN: usize = 64;
+    if address.len() <= SHOWN {
+        hex::encode(address)
+    } else {
+        format!(
+            "{}… ({} bytes)",
+            hex::encode(&address[..SHOWN]),
+            address.len()
+        )
+    }
+}
+
 /// Lock `ingest`, marking the wait on this thread's probe when another
 /// holds it: GLOBAL execution holds it while it materializes the application
 /// frames a GLOBAL frame carries, and the gossip ingest thread waits behind
@@ -3025,6 +3365,8 @@ const SLOW_MATERIALIZATION: Duration = Duration::from_secs(5);
 ///
 /// The receive loop used to verify every gossiped frame of every shard while
 /// it held the ingest, which GLOBAL execution and proposals wait for.
+///
+/// Only frames of a shard this archive tracks are taken ([`TrackedShards`]).
 pub fn ingest_gossiped(
     ingest: &std::sync::Mutex<ArchiveAppShardIngest>,
     verifier: &ArchiveFrameVerifier,
@@ -3042,6 +3384,11 @@ pub fn ingest_gossiped(
             return;
         }
     };
+    // Before anything is remembered of it, or the ingest is taken.
+    if !verifier.tracked.tracks(&address, &verifier.held_bodies) {
+        verifier.tracked.ignore(data.len());
+        return;
+    }
     {
         let mut guard = lock();
         let held = match guard.materialized_height(&address) {
@@ -4762,7 +5109,14 @@ mod tests {
             {
                 request.0 = Instant::now() - GAP_RETRY_INTERVAL;
             }
-            ingest.request_frames(&filter, 2..=4, urgent, waits, GLOBAL_WAIT_RETRY_INTERVAL);
+            ingest.request_frames(
+                &filter,
+                2..=4,
+                urgent,
+                waits,
+                None,
+                GLOBAL_WAIT_RETRY_INTERVAL,
+            );
             let rx = if urgent {
                 &mut urgent_rx
             } else {
@@ -5681,5 +6035,287 @@ mod tests {
         );
         assert!(slow.contains("global_frame=945000"), "{slow}");
         assert_eq!(thread_probe.detail(), "");
+    }
+
+    /// Gossiped frames naming made-up shards, each anchored to a GLOBAL frame
+    /// this archive has not stored, leave nothing behind before they are
+    /// verified: no cursor, no parked frame, no anchor and no line per frame.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reproduces_unregistered_address_frames_growing_archive_ingest_maps() {
+        const FRAMES: u64 = 1000;
+        const BOUND: usize = 16;
+        let (ingest, _) = fixture();
+        let ingest = std::sync::Mutex::new(ingest);
+        let verifier = ingest.lock().unwrap().verifier();
+        let lines = logged(|| {
+            for i in 0..FRAMES {
+                let mut address = vec![0xa5; 1024];
+                address[..8].copy_from_slice(&i.to_be_bytes());
+                let mut frame = verified_frame(&address, 1 + i);
+                frame.header.as_mut().unwrap().global_frame_number = u64::MAX - i;
+                ingest_gossiped(&ingest, &verifier, &prost::Message::encode_to_vec(&frame));
+            }
+        });
+        let ingest = ingest.lock().unwrap();
+        let cursors = ingest.last_materialized.len();
+        let parked: usize = ingest.awaiting_anchor.values().map(BTreeMap::len).sum();
+        let anchors = ingest.anchors_noted.len();
+        let wait_lines = lines.matches("wait for a GLOBAL frame").count();
+        assert!(
+            cursors <= BOUND && parked <= BOUND && anchors <= BOUND && wait_lines <= BOUND,
+            "{FRAMES} unverified gossiped frames naming made-up 1 KiB shard addresses grew the \
+             archive ingest without bound: {cursors} cursors, {parked} parked frames and \
+             {anchors} anchors remembered, {wait_lines} wait lines and {} bytes logged",
+            lines.len()
+        );
+    }
+
+    /// An ingest over a RocksDB clock store (kept open by the returned
+    /// database) whose prover registry holds allocations of `filters`, asking
+    /// for missing frames on the returned receiver.
+    fn tracking_fixture(
+        filters: &[Vec<u8>],
+    ) -> (
+        ArchiveAppShardIngest,
+        quil_store::RocksDb,
+        Arc<crate::test_support::TestProverRegistry>,
+        Requests,
+    ) {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock: Arc<dyn quil_types::store::ClockStore> =
+            Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        registry.set_summaries(
+            filters
+                .iter()
+                .map(|filter| quil_types::consensus::ProverShardSummary {
+                    filter: filter.clone(),
+                    status_counts: HashMap::new(),
+                    total_size: 1,
+                })
+                .collect(),
+        );
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        let (tx, rx) = tokio::sync::mpsc::channel(1024);
+        let ingest = fixture_with_registry(crdt, Some(clock), registry.clone())
+            .with_gap_fetch(tx)
+            .sequenced();
+        (ingest, db, registry, rx)
+    }
+
+    fn frame_numbers(requests: &mut Requests) -> Vec<u64> {
+        take_requests(requests)
+            .into_iter()
+            .map(|(_, number)| number)
+            .collect()
+    }
+
+    fn parked_frames(ingest: &ArchiveAppShardIngest) -> usize {
+        ingest.awaiting_anchor.values().map(BTreeMap::len).sum()
+    }
+
+    /// Frames of a shard outside the prover registry are ignored before the
+    /// ingest is taken, and before the message loop queues them, and
+    /// summarized; once the shard enters the registry, its frames are taken
+    /// after the next read of it. A shard this archive holds frames of is
+    /// taken whether or not the registry names it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gossiped_frames_are_taken_only_for_tracked_shards() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let (ingest, _db, registry, _requests) = tracking_fixture(&[]);
+        let ingest = std::sync::Mutex::new(ingest);
+        let verifier = ingest.lock().unwrap().verifier();
+        let anchored = |number: u64| {
+            let mut frame = verified_frame(&filter, number);
+            frame.header.as_mut().unwrap().global_frame_number = 77;
+            prost::Message::encode_to_vec(&frame)
+        };
+        assert!(
+            verifier.may_queue(&anchored(1)),
+            "queued before the registry is first read"
+        );
+
+        ingest_gossiped(&ingest, &verifier, &anchored(1));
+        {
+            let ingest = ingest.lock().unwrap();
+            assert!(ingest.last_materialized.is_empty() && ingest.awaiting_anchor.is_empty());
+        }
+        assert!(!verifier.may_queue(&anchored(1)));
+        assert!(!verifier.may_queue(b"not a frame"));
+        let summary = logged(|| ingest.lock().unwrap().tracked.report_ignored());
+        assert!(
+            summary.contains("name no shard it tracks") && summary.contains("frames=3"),
+            "{summary}"
+        );
+        assert!(
+            logged(|| ingest.lock().unwrap().tracked.report_ignored()).is_empty(),
+            "summarized once, while there is something to say"
+        );
+
+        registry.set_summaries(vec![quil_types::consensus::ProverShardSummary {
+            filter: filter.clone(),
+            status_counts: HashMap::new(),
+            total_size: 1,
+        }]);
+        ingest_gossiped(&ingest, &verifier, &anchored(1));
+        assert!(
+            ingest.lock().unwrap().awaiting_anchor.is_empty(),
+            "the registry is read at most every {TRACKED_SHARDS_REFRESH:?}"
+        );
+        verifier.tracked.known().read = Some(Instant::now() - TRACKED_SHARDS_REFRESH);
+        ingest_gossiped(&ingest, &verifier, &anchored(1));
+        assert_eq!(
+            ingest.lock().unwrap().awaiting_anchor[&filter]
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1],
+            "taken once the shard is in the registry"
+        );
+        assert!(verifier.may_queue(&anchored(2)));
+
+        let held = vec![0x42; 32];
+        let mut frame = verified_frame(&held, 1);
+        frame.header.as_mut().unwrap().global_frame_number = 77;
+        let bytes = prost::Message::encode_to_vec(&frame);
+        assert!(!verifier.may_queue(&bytes));
+        ingest
+            .lock()
+            .unwrap()
+            .admit_verified(verified_frame(&held, 2), true);
+        assert!(
+            verifier.may_queue(&bytes),
+            "a shard this archive holds frames of"
+        );
+        ingest_gossiped(&ingest, &verifier, &bytes);
+        assert!(ingest.lock().unwrap().awaiting_anchor.contains_key(&held));
+    }
+
+    /// Forged frames of a tracked shard park at most
+    /// [`MAX_AWAITING_ANCHOR_PER_SHARD`] frames, the shard's lowest, and log
+    /// one line; a GLOBAL frame waiting for a parked frame anchored at or
+    /// after it asks for the frame at once, and its fetched copy is admitted
+    /// and materialized.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forged_anchors_of_a_tracked_shard_are_parked_within_the_shard_bound() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let (ingest, _db, _registry, mut requests) = tracking_fixture(&[filter.clone()]);
+        let ingest = std::sync::Mutex::new(ingest);
+        let verifier = ingest.lock().unwrap().verifier();
+        let lines = logged(|| {
+            for i in 0..1000u64 {
+                let mut frame = verified_frame(&filter, 1 + i);
+                frame.header.as_mut().unwrap().global_frame_number = u64::MAX - i;
+                ingest_gossiped(&ingest, &verifier, &prost::Message::encode_to_vec(&frame));
+            }
+        });
+        let mut ingest = ingest.into_inner().unwrap();
+        assert_eq!(parked_frames(&ingest), MAX_AWAITING_ANCHOR_PER_SHARD);
+        assert_eq!(
+            ingest.awaiting_anchor[&filter].keys().next_back(),
+            Some(&(MAX_AWAITING_ANCHOR_PER_SHARD as u64)),
+            "the lowest frames stay"
+        );
+        assert_eq!(ingest.anchors_noted.len(), MAX_AWAITING_ANCHOR_PER_SHARD);
+        assert_eq!(
+            lines.matches("wait for a GLOBAL frame").count(),
+            1,
+            "{lines}"
+        );
+
+        ingest.await_anchor(&filter, 1, 950);
+        assert_eq!(
+            ingest.awaiting_anchor[&filter][&1u64].0,
+            u64::MAX,
+            "the first copy's anchor stands"
+        );
+
+        assert!(!ingest
+            .materialize_through_vouched(&filter, 3, &HashMap::new(), 1000)
+            .unwrap());
+        assert_eq!(
+            frame_numbers(&mut requests),
+            vec![1, 2, 3],
+            "a GLOBAL frame sequences no copy anchored at or after it"
+        );
+        assert!(!ingest.awaiting_anchor[&filter].contains_key(&1u64));
+        assert_eq!(
+            ingest.anchors_noted.len(),
+            MAX_AWAITING_ANCHOR_PER_SHARD - 3
+        );
+
+        for number in 1..=3 {
+            ingest.admit_verified(verified_frame(&filter, number), true);
+        }
+        assert!(ingest
+            .materialize_through_vouched(&filter, 3, &HashMap::new(), 1000)
+            .unwrap());
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 3);
+    }
+
+    /// At most [`MAX_AWAITING_ANCHOR`] frames park in all: past it a frame is
+    /// not parked, and a GLOBAL frame waiting for it asks for it and
+    /// materializes the copy fetched. A frame parked on an anchor never stored
+    /// below the waiting GLOBAL frame is asked for once
+    /// [`AWAIT_ANCHOR_TTL`] passed; the retry pass forgets the others then.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parked_frames_are_bounded_in_all_and_in_time() {
+        let shards = MAX_AWAITING_ANCHOR / MAX_AWAITING_ANCHOR_PER_SHARD;
+        let filters: Vec<Vec<u8>> = (0..=shards)
+            .map(|shard| vec![shard as u8 + 1; 32])
+            .collect();
+        let (mut ingest, _db, _registry, mut requests) = tracking_fixture(&filters);
+        for filter in &filters[..shards] {
+            for number in 1..=MAX_AWAITING_ANCHOR_PER_SHARD as u64 {
+                ingest.await_anchor(filter, number, 100);
+            }
+        }
+        assert_eq!(parked_frames(&ingest), MAX_AWAITING_ANCHOR);
+        let last = &filters[shards];
+        ingest.await_anchor(last, 1, 900);
+        assert!(!ingest.awaiting_anchor.contains_key(last), "past the bound");
+        assert!(!ingest
+            .materialize_through_vouched(last, 1, &HashMap::new(), 1000)
+            .unwrap());
+        assert_eq!(frame_numbers(&mut requests), vec![1]);
+        ingest.admit_verified(verified_frame(last, 1), true);
+        assert!(ingest
+            .materialize_through_vouched(last, 1, &HashMap::new(), 1000)
+            .unwrap());
+
+        let first = &filters[0];
+        assert!(!ingest
+            .materialize_through_vouched(first, 3, &HashMap::new(), 1000)
+            .unwrap());
+        assert_eq!(
+            frame_numbers(&mut requests),
+            Vec::<u64>::new(),
+            "anchored before the waiting GLOBAL frame, to a frame not stored yet"
+        );
+        for parked in ingest.awaiting_anchor.get_mut(first).unwrap().values_mut() {
+            parked.1 = Instant::now() - AWAIT_ANCHOR_TTL;
+        }
+        assert!(!ingest
+            .materialize_through_vouched(first, 3, &HashMap::new(), 1000)
+            .unwrap());
+        assert_eq!(frame_numbers(&mut requests), vec![1, 2, 3], "past its time");
+        assert_eq!(
+            ingest.awaiting_anchor[first].len(),
+            MAX_AWAITING_ANCHOR_PER_SHARD - 3,
+            "the rest wait for the retry pass"
+        );
+        ingest.expire_anchor_waits();
+        assert!(!ingest.awaiting_anchor.contains_key(first));
+        assert_eq!(
+            parked_frames(&ingest),
+            MAX_AWAITING_ANCHOR - MAX_AWAITING_ANCHOR_PER_SHARD
+        );
+        assert_eq!(
+            ingest.anchors_noted.iter().copied().collect::<Vec<_>>(),
+            vec![100]
+        );
     }
 }
