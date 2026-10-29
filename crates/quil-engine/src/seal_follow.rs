@@ -338,6 +338,25 @@ pub(crate) fn stall_scope(
     }
 }
 
+/// GLOBAL frames after the latest one this node holds a header of within
+/// which a seal copy published then lands: the next or the one after
+/// ([`FOLLOW_STEP`]).
+pub(crate) const SEAL_LANDS_WITHIN: u64 = 2;
+
+/// The GLOBAL frame an early pull for a sealed session awaiting its
+/// successor must reach (`crate::global_view_refresh`): the frame below the
+/// latest header `head`, whose prover root binds the state before it, but
+/// no earlier than the frame the last seal copy lands by, published while
+/// `published_head` was the latest. A pull reaching an earlier frame can
+/// show neither the seal nor the drain part it carried, and the next
+/// request waits a minute behind it.
+pub(crate) fn successor_pull_through(head: u64, published_head: Option<u64>) -> u64 {
+    let reach = head.saturating_sub(1);
+    published_head.map_or(reach, |published| {
+        reach.max(published.saturating_add(SEAL_LANDS_WITHIN))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,5 +599,38 @@ mod tests {
         assert_eq!(stall_scope(None, Some(10), Some(40)).1, "check");
         assert_eq!(stall_scope(Some(0), Some(10), Some(10)).1, "wait");
         assert_eq!(stall_scope(Some(0), Some(10), None).1, "wait");
+    }
+
+    /// A sealed member's early pull reaches no GLOBAL frame before the one
+    /// its last seal copy lands by: such a pull shows neither the seal nor
+    /// the drain part it carried.
+    #[test]
+    fn a_successor_pull_reaches_no_frame_before_the_seal_copy_lands() {
+        use crate::global_view_refresh::{Decision, EarlyPull, Reason, ViewRefresh};
+        assert_eq!(successor_pull_through(1001, None), 1000);
+        assert_eq!(successor_pull_through(1001, Some(1000)), 1002);
+        assert_eq!(successor_pull_through(1010, Some(1000)), 1009);
+        let refresh = ViewRefresh::default();
+        refresh.enable(720);
+        let now = Instant::now();
+        // Asked just after the copy went out with header 1000 the latest.
+        refresh.request(
+            Reason::SealedSessionAwaitsSuccessor,
+            successor_pull_through(1001, Some(1000)),
+            now,
+        );
+        assert_eq!(
+            refresh.decide(Some(990), Some(1001), now),
+            Decision::Idle,
+            "a pull now reaches frame 1000, before the copy can have executed"
+        );
+        assert_eq!(
+            refresh.decide(Some(990), Some(1003), now),
+            Decision::Pull(EarlyPull {
+                reason: Reason::SealedSessionAwaitsSuccessor,
+                through: 1002,
+            }),
+            "once a header binds the frame the copy lands by"
+        );
     }
 }

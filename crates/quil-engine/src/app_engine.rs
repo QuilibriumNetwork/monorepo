@@ -2960,6 +2960,10 @@ pub struct AppConsensusEngine {
     /// Whether this member's seal drain moves, to warn when it stops
     /// ([`crate::seal_follow::DrainProgress`]).
     seal_drain_progress: crate::seal_follow::DrainProgress,
+    /// The latest GLOBAL frame this node held a header of when this member
+    /// last published its seal: the copy lands by
+    /// [`crate::seal_follow::SEAL_LANDS_WITHIN`] frames later.
+    seal_published_head: Option<u64>,
     /// Whether the running session's committed status is unreadable.
     session_status_outage: crate::outage::Outage,
     /// Whether the GLOBAL view the running session is judged by trails the
@@ -3148,6 +3152,7 @@ impl AppConsensusEngine {
             seal_published_at: None,
             seal_follow: Default::default(),
             seal_drain_progress: Default::default(),
+            seal_published_head: None,
             // Checked every 10 s: three unreadable checks in a row.
             session_status_outage: crate::outage::Outage::begin_after(3),
             session_view_lag: Default::default(),
@@ -6866,6 +6871,7 @@ impl AppConsensusEngine {
         let Some(publish) = self.coverage_publish.clone() else {
             return;
         };
+        self.seal_published_head = self.latest_global_header_frame();
         let drained = self.global_hypergraph.as_ref().map(|global| {
             crate::app_handoff::drained_seal(global, self.clock_store.as_ref(), base)
         });
@@ -6910,6 +6916,14 @@ impl AppConsensusEngine {
                 publish(base.to_vec());
             }
         }
+    }
+
+    /// The latest GLOBAL frame this node holds a header of.
+    fn latest_global_header_frame(&self) -> Option<u64> {
+        self.global_anchor_store
+            .get_latest_global_clock_frame()
+            .ok()
+            .and_then(|frame| frame.header.as_ref().map(|header| header.frame_number))
     }
 
     /// Log a seal drain's stall transitions
@@ -7636,6 +7650,7 @@ impl AppConsensusEngine {
             self.log_seal_drain_stall(stall, None);
             self.sealed_session = None;
             self.seal_published_at = None;
+            self.seal_published_head = None;
             self.seal_follow.clear();
             self.execution.clear_seal();
         }
@@ -8206,9 +8221,11 @@ impl AppConsensusEngine {
                     .and_then(|frame| frame.header)
                     .map(|header| header.frame_number)
                 {
+                    // No earlier than the frame its last copy lands by:
+                    // a view before it cannot show the seal or its part.
                     crate::global_view_refresh::shared().request(
                         crate::global_view_refresh::Reason::SealedSessionAwaitsSuccessor,
-                        head.saturating_sub(1),
+                        crate::seal_follow::successor_pull_through(head, self.seal_published_head),
                         std::time::Instant::now(),
                     );
                 }
