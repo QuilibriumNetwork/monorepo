@@ -1726,6 +1726,7 @@ impl ProverLifecycle {
             .map(|p| p.allocations.as_slice())
             .unwrap_or_default();
         self.release_refused_joins(own_allocations, frame_number);
+        crate::storage_registration_landed::log_observed(own_allocations, frame_number);
         // Cloned because the re-confirm path below consumes the original and
         // the orphan-leave sweep needs it again: an ExpiredEpoch allocation is
         // still on-chain Active, so it is a valid Leave target when nothing is
