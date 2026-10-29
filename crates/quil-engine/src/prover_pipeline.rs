@@ -2040,7 +2040,13 @@ impl ProverPipeline {
                 std::time::Instant::now(),
             );
         }
-        self.publish_prover_message(bytes, frame_number).await
+        self.publish_prover_message(bytes, frame_number).await?;
+        crate::storage_registration_landed::note_submitted(
+            &confirm.leaf_roots,
+            &filters,
+            frame_number,
+        );
+        Ok(())
     }
 
     /// Each of `filters`' storage snapshot sources for `epoch` that GLOBAL has
