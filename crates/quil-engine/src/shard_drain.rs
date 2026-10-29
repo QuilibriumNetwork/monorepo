@@ -91,10 +91,11 @@ pub enum DrainRole {
 /// drains a shard its node's frozen grid names retired, and proposes its
 /// requests and coin deliveries. A member that still refuses such a proposal
 /// does not vote for it, so the frame must follow the upgrade of the voters
-/// (see [`DrainRole::Voter`]) by enough members of every committee. Unset on
-/// mainnet until that frame is chosen; `QUIL_SESSION_LEADER_NO_DRAIN_FRAME`
-/// elsewhere, never by default.
-pub const MAINNET_SESSION_LEADER_NO_DRAIN_FRAME: Option<u64> = None;
+/// (see [`DrainRole::Voter`]) by enough members of every committee. Mainnet
+/// takes the first frame of epoch 1317, after the voter bypass (#823) rolled
+/// out; other networks read `QUIL_SESSION_LEADER_NO_DRAIN_FRAME`, never by
+/// default.
+pub const MAINNET_SESSION_LEADER_NO_DRAIN_FRAME: Option<u64> = Some(948_240);
 
 static SESSION_LEADER_NO_DRAIN_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -483,8 +484,8 @@ mod tests {
         set_session_leader_no_drain_frame_for_thread(None);
     }
 
-    /// Mainnet waits for its frame to be chosen; other networks take theirs
-    /// from the environment, and none by default.
+    /// Mainnet fixes its frame; other networks take theirs from the
+    /// environment, and none by default.
     #[test]
     fn the_session_leader_no_drain_frame_is_fixed_on_mainnet_and_configured_elsewhere() {
         assert_eq!(
@@ -492,8 +493,9 @@ mod tests {
             MAINNET_SESSION_LEADER_NO_DRAIN_FRAME.unwrap_or(u64::MAX)
         );
         assert_eq!(
-            MAINNET_SESSION_LEADER_NO_DRAIN_FRAME, None,
-            "chosen once the voters have upgraded"
+            session_leader_no_drain_frame_for(0, None),
+            948_240,
+            "mainnet leaders stop draining from the first frame of epoch 1317"
         );
         assert_eq!(session_leader_no_drain_frame_for(1, Some("5")), 5);
         assert_eq!(session_leader_no_drain_frame_for(1, None), u64::MAX);
