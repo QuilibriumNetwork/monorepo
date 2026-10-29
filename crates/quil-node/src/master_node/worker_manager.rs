@@ -450,6 +450,27 @@ pub(crate) type WorkerStoresByCore =
 pub(crate) type WorkerAppStates =
     Arc<parking_lot::RwLock<std::collections::HashMap<Vec<u8>, WorkerAppState>>>;
 
+/// Stops the large vertex index of a store the worker builder opened, unless
+/// the builder registered the store: the index holds its store open until it
+/// is stopped, so a build that fails or panics after starting it must stop it
+/// for the store to close and reopen at the next restart.
+struct StopIndexUnlessRegistered(Option<quil_forest::CoordinatedDb>);
+
+impl StopIndexUnlessRegistered {
+    /// The store is registered: its release stops the index.
+    fn registered(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for StopIndexUnlessRegistered {
+    fn drop(&mut self) {
+        if let Some(db) = self.0.take() {
+            quil_store::large_vertex_index::stop(&db);
+        }
+    }
+}
+
 /// How the recovery of a thread worker's stopped store stops and restarts
 /// the worker ([`crate::storage_watch::WorkerControl`]).
 struct ThreadWorkerStores {
@@ -894,6 +915,7 @@ pub(crate) fn init(
                 .inner()
                 .register_store(quil_forest::StoreRole::Worker(core_id));
             quil_store::large_vertex_index::start(&db_arc.inner(), format!("worker {core_id}"));
+            let index = StopIndexUnlessRegistered(Some(db_arc.inner()));
             let clock_store: Arc<dyn quil_types::store::ClockStore> =
                 Arc::new(quil_store::RocksClockStore::new(db_arc.inner()));
             let hg_store_concrete = Arc::new(quil_store::RocksHypergraphStore::new(db_arc.inner()));
@@ -1015,6 +1037,7 @@ pub(crate) fn init(
                     witness_index: Default::default(),
                 },
             );
+            index.registered();
             // Outputs committed to this worker's shard were often executed
             // on another: their bytes live in that shard's certified frame,
             // which only an archive holds. Pull them on the engine's own
@@ -1674,6 +1697,24 @@ mod tests {
         );
         drop(reopen(dir.path()));
         drop(supervisor);
+    }
+
+    /// A worker build that fails after starting its store's large vertex index
+    /// stops the index, which lets go of the store, so a restart reopens it.
+    #[test]
+    fn a_failed_worker_build_lets_its_store_close() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = quil_store::RocksDb::open(dir.path()).unwrap();
+            quil_store::large_vertex_index::start(&db.inner(), "worker 8402".into());
+            let _index = StopIndexUnlessRegistered(Some(db.inner()));
+            // The build fails here, dropping its handles.
+        }
+        let db = quil_store::RocksDb::open(dir.path()).expect("the store reopens");
+        assert_eq!(
+            quil_store::large_vertex_index::reconcile(&db.inner()).unwrap(),
+            quil_store::large_vertex_index::OpenCheck::Complete
+        );
     }
 
     /// A reopened worker store serves its shard only once the builder

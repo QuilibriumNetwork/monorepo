@@ -80,7 +80,12 @@ fn hold_guard(guard: tracing_appender::non_blocking::WorkerGuard) {
 /// sitting in the non-blocking writer's channel.
 pub fn shutdown_logging() {
     if let Some(guards) = LOG_GUARDS.get() {
-        guards.lock().unwrap().clear();
+        // Never a panic here: the shutdown watchdog calls this before it
+        // forces the exit.
+        guards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 }
 

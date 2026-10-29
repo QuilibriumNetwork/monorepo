@@ -399,7 +399,16 @@ fn main() -> anyhow::Result<ExitCode> {
     // get this CPU set rather than their spawning worker's core.
     #[cfg(feature = "native-proof")]
     quil_lattice_ct::confidential::relation::backend::worker_process::remember_process_cpus();
-    let result = node_main();
+    let result = match std::panic::catch_unwind(node_main) {
+        Ok(result) => result,
+        // A node mode's stores stay open until `exit_node` seals them, so a
+        // panic out of the node ends there too rather than in the process's
+        // teardown with its stores open.
+        Err(_) if NODE_STARTED.load(Ordering::Acquire) => {
+            Err(anyhow::anyhow!("the node panicked (see the panic above)"))
+        }
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
     if NODE_STARTED.load(Ordering::Acquire) {
         exit_node(&result);
     }
@@ -1294,6 +1303,8 @@ async fn node_main() -> anyhow::Result<ExitCode> {
                     SHUTDOWN_GRACE.as_secs(),
                     code,
                 );
+                // Drain the file logs, as `exit_node` would have.
+                logging::shutdown_logging();
                 // Skipping the teardown that aborts under a thread still
                 // using a store (`storage_jobs::exit_now`).
                 quil_engine::storage_jobs::exit_now(code);
@@ -1330,11 +1341,10 @@ async fn node_main() -> anyhow::Result<ExitCode> {
 
     stop_detached_work();
 
-    // Drop the file appender guards, blocking until their writer threads
-    // drain. Without this the error! lines above — the only record of WHY
-    // the node died — race process exit and routinely lose.
-    logging::shutdown_logging();
-
+    // The file logs stay up for the stores' seals: `exit_node` drains them
+    // (the error! lines above, the only record of WHY the node died,
+    // included) after the seals, and the shutdown watchdog before it forces
+    // the exit.
     result
 }
 
