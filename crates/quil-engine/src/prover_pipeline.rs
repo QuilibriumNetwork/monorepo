@@ -361,10 +361,14 @@ fn stopped_mid_encode(
 const PENDING_SNAPSHOT_REPORT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The GLOBAL frame a seat whose snapshot leaves have `remaining` to run by
-/// their estimate is projected to be encoded by, at the ideal frame time.
+/// their estimate is projected to be encoded by, at the ideal frame time
+/// (the interval at `frame_number` throughout, even when a localnet
+/// schedule changes it within the span).
 fn projected_snapshot_frame(frame_number: u64, remaining: std::time::Duration) -> u64 {
-    let frame_seconds = (crate::difficulty::IDEAL_FRAME_TIME as u64 / 1000).max(1);
-    frame_number.saturating_add(remaining.as_secs().div_ceil(frame_seconds))
+    let frame_millis =
+        u128::from(quil_types::consensus::ideal_frame_time_ms_at(frame_number).max(1));
+    let frames = remaining.as_millis().div_ceil(frame_millis);
+    frame_number.saturating_add(u64::try_from(frames).unwrap_or(u64::MAX))
 }
 
 /// Report the seats a confirm leaves out because their storage snapshot is
@@ -876,16 +880,18 @@ const REMOTE_PREPARATION_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// frame and lapses at the next boundary. Without a deadline each worker that
 /// never answers held the round for its whole timeout, eight at a time, while
 /// the round kept an encoder permit: 40 such workers held it for 50 minutes
-/// of a two-hour mainnet epoch (720 frames of `IDEAL_FRAME_TIME`). A sixth of
+/// of a two-hour mainnet epoch (720 frames of ten seconds). A sixth of
 /// an epoch, 20 minutes on mainnet, still gives a worker asked in the round's
 /// first half its full timeout, and leaves five more rounds in the epoch for
 /// the seats a round leaves out.
 const REMOTE_ROUND_EPOCH_SHARE: u64 = 6;
 
-/// When a round of standalone-worker preparations starting now must end.
-fn remote_round_deadline() -> std::time::Instant {
+/// When a round of standalone-worker preparations starting now, at GLOBAL
+/// frame `frame_number`, must end: an epoch converted at that frame's
+/// interval throughout.
+fn remote_round_deadline(frame_number: u64) -> std::time::Instant {
     let epoch_ms = quil_types::consensus::epoch_length_frames()
-        .saturating_mul(crate::difficulty::IDEAL_FRAME_TIME as u64);
+        .saturating_mul(quil_types::consensus::ideal_frame_time_ms_at(frame_number));
     std::time::Instant::now()
         + std::time::Duration::from_millis(epoch_ms / REMOTE_ROUND_EPOCH_SHARE)
 }
@@ -2164,7 +2170,7 @@ impl ProverPipeline {
                 let answers = query_remote_workers(
                     &requests,
                     REMOTE_PREPARATIONS,
-                    remote_round_deadline(),
+                    remote_round_deadline(frame_number),
                     |filter, targets, timeout| {
                         let (_, snapshots) = sources(filter, targets);
                         remote(filter, targets, frame_number, timeout, &snapshots)

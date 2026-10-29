@@ -185,14 +185,12 @@ impl DynamicFeeManager for InMemoryDynamicFeeManager {
 // Fee traffic adjustment — matches Go's adjustFeeForTraffic()
 // =====================================================================
 
-/// Target frame production time in milliseconds (10 seconds).
-const TARGET_FRAME_TIME_MS: i64 = 10_000;
-
 /// Maximum percentage adjustment per frame (capped at 10%).
 const MAX_ADJUSTMENT_PERCENT: i64 = 10;
 
 /// Adjust the base fee multiplier based on actual frame production
-/// timing vs the 10-second target.
+/// timing vs the GLOBAL frame interval at this process's latest GLOBAL frame
+/// ([`quil_types::consensus::ideal_frame_time_ms`], 10 seconds on mainnet).
 ///
 /// If frames are produced faster than target, the fee decreases
 /// (incentivizing more transactions). If slower, the fee increases
@@ -224,19 +222,21 @@ pub fn adjust_fee_for_traffic(
     }
 
     let time_diff = current_timestamp_ms - previous_timestamp_ms;
+    let target_frame_time_ms =
+        i64::try_from(quil_types::consensus::ideal_frame_time_ms()).unwrap_or(i64::MAX);
 
-    if time_diff < TARGET_FRAME_TIME_MS {
+    if time_diff < target_frame_time_ms {
         // Frames are faster than target → decrease fee
-        let mut percent_faster = (TARGET_FRAME_TIME_MS - time_diff) * 100 / TARGET_FRAME_TIME_MS;
+        let mut percent_faster = (target_frame_time_ms - time_diff) * 100 / target_frame_time_ms;
         if percent_faster > MAX_ADJUSTMENT_PERCENT {
             percent_faster = MAX_ADJUSTMENT_PERCENT;
         }
         let adjustment = base_fee * percent_faster as u64 / 100;
         let adjusted = base_fee.saturating_sub(adjustment);
         adjusted.max(1) // minimum fee is 1
-    } else if time_diff > TARGET_FRAME_TIME_MS {
+    } else if time_diff > target_frame_time_ms {
         // Frames are slower than target → increase fee
-        let mut percent_slower = (time_diff - TARGET_FRAME_TIME_MS) * 100 / TARGET_FRAME_TIME_MS;
+        let mut percent_slower = (time_diff - target_frame_time_ms) * 100 / target_frame_time_ms;
         if percent_slower > MAX_ADJUSTMENT_PERCENT {
             percent_slower = MAX_ADJUSTMENT_PERCENT;
         }

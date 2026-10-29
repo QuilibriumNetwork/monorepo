@@ -46,14 +46,35 @@ pub(crate) fn message_kinds(raw: &[u8]) -> String {
     }
 }
 
-/// How long a leader waits at `now_ms` before producing on a parent recorded
-/// at `parent_timestamp_ms`: a header's timestamp is its production instant
-/// plus one `IDEAL_FRAME_TIME`, so waiting until it spaces production one
-/// interval apart. Capped at one interval; a parent in the past needs none.
-pub fn proposal_pacing_wait(parent_timestamp_ms: i64, now_ms: i64) -> std::time::Duration {
+/// How long a leader waits at `now_ms` before producing frame `frame_number`
+/// on a parent recorded at `parent_timestamp_ms`: a header's timestamp is its
+/// production instant plus its frame's GLOBAL frame interval
+/// ([`quil_types::consensus::ideal_frame_time_ms_at`]), so waiting until it
+/// spaces production one interval apart. Capped at the interval of the frame
+/// being proposed, so a localnet schedule that shortens the interval takes
+/// effect at its start frame; a parent in the past needs none.
+pub fn proposal_pacing_wait(
+    frame_number: u64,
+    parent_timestamp_ms: i64,
+    now_ms: i64,
+) -> std::time::Duration {
+    pacing_wait_within(
+        parent_timestamp_ms,
+        now_ms,
+        quil_types::consensus::ideal_frame_time_ms_at(frame_number),
+    )
+}
+
+/// [`proposal_pacing_wait`] for a frame interval of `interval_ms`.
+fn pacing_wait_within(
+    parent_timestamp_ms: i64,
+    now_ms: i64,
+    interval_ms: u64,
+) -> std::time::Duration {
+    let interval_ms = i64::try_from(interval_ms).unwrap_or(i64::MAX);
     let wait = parent_timestamp_ms
         .saturating_sub(now_ms)
-        .clamp(0, crate::difficulty::IDEAL_FRAME_TIME);
+        .clamp(0, interval_ms);
     std::time::Duration::from_millis(wait as u64)
 }
 
@@ -968,16 +989,17 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // finalizes, and immediately opens the next view as fast as the
         // network + VDF prove allow. With the VDF difficulty pinned near
         // the floor that round is ~3s, so frames land at the testnet rate
-        // regardless of `IDEAL_FRAME_TIME`. The VDF is NOT the pace-setter
+        // regardless of the frame interval. The VDF is NOT the pace-setter
         // under CW — the proposer is. So gate proposal production here.
         //
-        // Each header's `timestamp` is set to `production_now + IDEAL`
-        // (step 6 below), so the parent's timestamp is 1 interval ahead of
-        // the instant the parent was produced. Sleeping until
-        // `now >= prior_header.timestamp` therefore spaces our production
-        // instant exactly one `IDEAL_FRAME_TIME` after the parent's — a
-        // clean 10s cadence in both wall-clock and recorded timestamps —
-        // without any dependence on VDF difficulty.
+        // Each header's `timestamp` is set to `production_now + interval`
+        // (step 6 below; `ideal_frame_time_ms`, 10s on mainnet), so the
+        // parent's timestamp is 1 interval ahead of the instant the parent
+        // was produced. Sleeping until `now >= prior_header.timestamp`
+        // therefore spaces our production instant exactly one interval
+        // after the parent's — a clean 10s mainnet cadence in both
+        // wall-clock and recorded timestamps — without any dependence on
+        // VDF difficulty.
         //
         // Capped at one interval so a parent timestamp far in the future
         // (cross-leader clock skew, or a misbehaving prior leader) can
@@ -994,7 +1016,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as i64;
-            let wait = proposal_pacing_wait(prior_header.timestamp, now_ms);
+            let wait = proposal_pacing_wait(frame_number, prior_header.timestamp, now_ms);
             if !wait.is_zero() {
                 tracing::debug!(
                     frame = frame_number,
@@ -1386,12 +1408,17 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // 6. Compute difficulty
         // ------------------------------------------------------------------
         // Go adds 10 seconds to the timestamp for the difficulty
-        // calculation, matching the expected block interval.
+        // calculation, matching the expected block interval. A localnet that
+        // sets `QUIL_FRAME_TIME_MS` adds its shorter interval instead, which
+        // step 2b's pacing then waits out.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        let timestamp = now_ms + 10_000; // +10s, matching Go
+        let frame_time_ms =
+            i64::try_from(quil_types::consensus::ideal_frame_time_ms_at(frame_number))
+                .unwrap_or(i64::MAX);
+        let timestamp = now_ms.saturating_add(frame_time_ms); // +10s on mainnet, matching Go
         let difficulty = self
             .difficulty_adjuster
             .get_next_difficulty(rank, timestamp);
@@ -1688,6 +1715,33 @@ pub(crate) fn reduce_handoff_bundles(
 
 #[cfg(test)]
 mod tests {
+    /// A localnet's shorter frame interval caps the pacing wait at that
+    /// interval, and a parent in the past still needs none; the default
+    /// keeps the ten-second cap.
+    #[test]
+    fn proposal_pacing_clamps_to_the_frame_interval_override() {
+        use std::time::Duration;
+        let now = 1_800_000_000_000;
+        assert_eq!(
+            super::pacing_wait_within(now + 60_000, now, 2_000),
+            Duration::from_millis(2_000),
+            "one shortened interval at most"
+        );
+        assert_eq!(
+            super::pacing_wait_within(now + 1_500, now, 2_000),
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(
+            super::pacing_wait_within(now - 1_000, now, 2_000),
+            Duration::ZERO
+        );
+        assert_eq!(
+            super::proposal_pacing_wait(1, now + 60_000, now),
+            Duration::from_millis(10_000),
+            "the default interval when no override is set"
+        );
+    }
+
     /// Every member of a closing committee submits the same seal, in bundles
     /// that differ only by timestamp: one rides a proposal, the rest wait.
     #[test]

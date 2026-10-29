@@ -43,6 +43,16 @@
 #   TARGET_DIR=path   cargo target directory holding the binaries (default
 #                     <repo>/target), so a fixture can run a build other than
 #                     the one another running fixture uses; pass it on `resume` too
+#   QUIL_FRAME_TIME_MS=ms  GLOBAL frame interval (default 10000). The VDF at the
+#                     difficulty floor takes ~3 s, so 2000-3000 runs frames at its
+#                     pace: QUIL_FRAME_TIME_MS=2500 cuts a 240-frame run from ~45
+#                     to ~10 min. A schedule keyed by GLOBAL frame changes pace
+#                     within one run, e.g. 2500,10000@240 (2.5 s from genesis, real
+#                     10 s frames from frame 240 on); entries ascend, the first
+#                     has no @ or @0, each interval is at least 500. Nodes on
+#                     network 0 (mainnet) ignore it; an invalid value warns and
+#                     keeps 10000. Saved with the fixture; a caller value on
+#                     `resume` replaces it.
 #
 set -euo pipefail
 
@@ -69,7 +79,16 @@ RUNTIME_KEYS=(QUIL_EPOCH_LENGTH_FRAMES QUIL_PROVER_TREE_SYNC_SECS
   QUIL_SPLIT_MAX_PROVERS QUIL_SPLIT_ROOT_ONLY QUIL_MIN_PROVERS
   QUIL_UNIFIED_TREE_CUTOVER_FRAME QUIL_GRID_RESET_V2_FRAME
   QUIL_PROVER_RESET_V3_FRAME QUIL_PROVER_RESET_V4_FRAME QUIL_PROVER_RESET_V5_FRAME
-  QUIL_ORPHAN_REPLACE_FRAME)
+  QUIL_ORPHAN_REPLACE_FRAME QUIL_FRAME_TIME_MS)
+# Settings a fixture saved before they existed may lack: they only pace the
+# network, so a resume without one runs at the default.
+OPTIONAL_RUNTIME_KEYS=" QUIL_FRAME_TIME_MS "
+# A runtime value is a number, or for QUIL_FRAME_TIME_MS a schedule of
+# intervals keyed by start frame (2500,10000@240).
+runtime_value_valid() {
+  [[ -z "$2" || "$2" =~ ^[0-9]+$ ]] && return 0
+  [[ "$1" == QUIL_FRAME_TIME_MS && "$2" =~ ^[0-9]+(@[0-9]+)?(,[0-9]+@[0-9]+)*$ ]]
+}
 runtime_key_known() {
   [[ "$1" == NETWORK ]] && return 0
   local key
@@ -79,7 +98,7 @@ runtime_key_known() {
 load_runtime_settings() {
   local key value caller_value seen=" "
   while IFS='=' read -r key value; do
-    runtime_key_known "$key" && [[ -z "$value" || "$value" =~ ^[0-9]+$ ]] \
+    runtime_key_known "$key" && runtime_value_valid "$key" "$value" \
       || { echo "invalid setting in $NET_DIR/runtime.env: $key" >&2; return 1; }
     [[ "$seen" != *" $key "* ]] \
       || { echo "duplicate runtime setting: $key" >&2; return 1; }
@@ -105,7 +124,7 @@ load_runtime_settings() {
     fi
   done < "$NET_DIR/runtime.env"
   for key in NETWORK "${RUNTIME_KEYS[@]}"; do
-    [[ "$seen" == *" $key "* ]] \
+    [[ "$seen" == *" $key "* || "$OPTIONAL_RUNTIME_KEYS" == *" $key "* ]] \
       || { echo "incomplete runtime.env: missing $key" >&2; return 1; }
   done
 }
@@ -236,8 +255,8 @@ show_runtime_settings() {
   printf 'NETWORK=%s\n' "$NETWORK"
   for key in "${RUNTIME_KEYS[@]}"; do
     value=$(printenv "$key") || value=""
-    [[ -z "$value" || "$value" =~ ^[0-9]+$ ]] \
-      || { echo "invalid numeric runtime setting: $key" >&2; return 1; }
+    runtime_value_valid "$key" "$value" \
+      || { echo "invalid runtime setting: $key" >&2; return 1; }
     printf '%s=%s\n' "$key" "$value"
   done
 }

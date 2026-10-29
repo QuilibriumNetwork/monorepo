@@ -232,6 +232,72 @@ pub fn epoch_length_frames() -> u64 {
     }
 }
 
+/// The GLOBAL frame interval in milliseconds: a leader stamps each header
+/// this far past its production instant and paces the next proposal to it.
+pub const IDEAL_FRAME_TIME_MS: u64 = 10_000;
+
+/// Local-network schedule of GLOBAL frame intervals: `(first frame,
+/// interval ms)` entries in ascending frame order, the first from frame 0.
+/// Empty = the `IDEAL_FRAME_TIME_MS` mainnet default throughout. The node
+/// sets it once at startup from `QUIL_FRAME_TIME_MS` on networks other than
+/// mainnet, so a localnet can run frames at the pace of its VDF instead of
+/// every ten seconds, and change pace between phases of one run. Keyed by
+/// frame so every node gives the same frame the same interval.
+static FRAME_TIME_SCHEDULE: std::sync::RwLock<Vec<(u64, u64)>> = std::sync::RwLock::new(Vec::new());
+
+/// Whether [`FRAME_TIME_SCHEDULE`] holds entries: mainnet reads the default
+/// without taking the lock.
+static FRAME_TIME_SCHEDULED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The latest GLOBAL frame this process noted ([`note_frame_time_head`]),
+/// for the interval of callers with no frame at hand.
+static FRAME_TIME_HEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set the GLOBAL frame-interval schedule of a local network: `(first frame,
+/// interval ms)` entries, ascending, the first from frame 0. An empty
+/// schedule restores the mainnet `IDEAL_FRAME_TIME_MS` default. Only call
+/// this in node startup or tests, never with entries on mainnet.
+pub fn set_frame_time_schedule(schedule: Vec<(u64, u64)>) {
+    let scheduled = !schedule.is_empty();
+    *FRAME_TIME_SCHEDULE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = schedule;
+    FRAME_TIME_SCHEDULED.store(scheduled, std::sync::atomic::Ordering::Release);
+}
+
+/// The GLOBAL frame interval in milliseconds for frame `frame`: the last
+/// schedule entry starting at or before it, else the mainnet default. The
+/// ASERT difficulty adjuster keeps its own constant.
+pub fn ideal_frame_time_ms_at(frame: u64) -> u64 {
+    if !FRAME_TIME_SCHEDULED.load(std::sync::atomic::Ordering::Acquire) {
+        return IDEAL_FRAME_TIME_MS;
+    }
+    FRAME_TIME_SCHEDULE
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .take_while(|(from, _)| *from <= frame)
+        .last()
+        .map_or(IDEAL_FRAME_TIME_MS, |(_, millis)| *millis)
+}
+
+/// Note that this process saw GLOBAL frame `frame` (the GLOBAL materializer
+/// and every app shard's engine do); [`ideal_frame_time_ms`] reads the
+/// interval at the latest noted frame.
+pub fn note_frame_time_head(frame: u64) {
+    FRAME_TIME_HEAD.fetch_max(frame, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The GLOBAL frame interval in milliseconds at the latest GLOBAL frame this
+/// process noted ([`note_frame_time_head`]); before it noted one, the
+/// interval at frame 0. For callers with no frame at hand; a span converted
+/// with it takes the interval at its start throughout, even when a schedule
+/// changes pace inside it.
+pub fn ideal_frame_time_ms() -> u64 {
+    ideal_frame_time_ms_at(FRAME_TIME_HEAD.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Epoch length for testnet/devnet (`network != 0`): a short epoch so the
 /// epoch-aligned join→confirm(E+1)→activate(E+2) lifecycle plays out in
 /// minutes instead of hours. The whole pipeline (`epoch_for_frame`,
@@ -2786,6 +2852,29 @@ pub(crate) mod epoch_tests {
         set_epoch_length_frames(0);
         assert_eq!(epoch_length_frames(), EPOCH_LENGTH_FRAMES);
         assert_eq!(epoch_for_frame(720), 1);
+    }
+
+    /// A frame-interval schedule gives each frame the interval of the last
+    /// entry starting at or before it, and an empty schedule restores the
+    /// ten-second default. Serialized on the epoch-length mutex, which every
+    /// test reading process-global consensus timing takes.
+    #[test]
+    fn frame_time_schedule_applies_by_frame_and_restores() {
+        let _guard = epoch_length_guard();
+        assert_eq!(ideal_frame_time_ms_at(0), IDEAL_FRAME_TIME_MS);
+        set_frame_time_schedule(vec![(0, 2_500), (240, 10_000), (500, 3_000)]);
+        assert_eq!(ideal_frame_time_ms_at(0), 2_500);
+        assert_eq!(ideal_frame_time_ms_at(239), 2_500);
+        assert_eq!(ideal_frame_time_ms_at(240), 10_000);
+        assert_eq!(ideal_frame_time_ms_at(241), 10_000);
+        assert_eq!(ideal_frame_time_ms_at(499), 10_000);
+        assert_eq!(ideal_frame_time_ms_at(500), 3_000);
+        assert_eq!(ideal_frame_time_ms_at(u64::MAX), 3_000);
+        set_frame_time_schedule(vec![(0, 2_000)]);
+        assert_eq!(ideal_frame_time_ms(), 2_000, "one interval throughout");
+        set_frame_time_schedule(Vec::new());
+        assert_eq!(ideal_frame_time_ms_at(240), 10_000);
+        assert_eq!(ideal_frame_time_ms(), 10_000);
     }
 
     /// Members are counted by effective status: a confirmed join is

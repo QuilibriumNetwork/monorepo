@@ -616,7 +616,9 @@ impl GlobalProposer for GlobalSeamProposer {
             .unwrap_or_default()
             .as_millis() as i64;
         Some(crate::leader_provider::proposal_pacing_wait(
-            timestamp, now_ms,
+            number.saturating_add(1),
+            timestamp,
+            now_ms,
         ))
         .filter(|wait| !wait.is_zero())
     }
