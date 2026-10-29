@@ -78,6 +78,7 @@ pub mod worker_consensus_storage;
 pub mod worker_execution;
 pub mod worker_node;
 pub mod worker_payload_eviction;
+mod worker_pinning;
 pub mod worker_stall;
 
 /// Test support mocks (TestProverRegistry, TestWorkerManager).
