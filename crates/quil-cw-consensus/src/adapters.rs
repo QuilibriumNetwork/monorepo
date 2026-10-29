@@ -639,7 +639,7 @@ impl BlockStore {
 const PROPOSE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Longest a voter keeps asking to check a proposal it could not check yet.
-const VERIFY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
+pub const VERIFY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
 
 pub trait GlobalProposer: Send + Sync + 'static {
     /// Build the next frame on parent `parent_digest` for consensus `view`.
@@ -726,6 +726,12 @@ pub trait GlobalProposer: Send + Sync + 'static {
         }
         Ok(self.verify_with_context(context, digest, bytes))
     }
+
+    /// The adapter declined `context`'s proposal because it was still
+    /// deferred, `waited` in all, when [`VERIFY_PATIENCE`] ran out. Called
+    /// once per check, so a proposer can report why without a line per
+    /// deferral.
+    fn verify_patience_ran_out(&self, _context: ProposalContext, _waited: std::time::Duration) {}
 }
 
 /// Ships frame bytes to peers — the `Relay` behind consensus. In the node this
@@ -898,7 +904,12 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton for Falc
                         ctx.sleep(delay).await;
                         deferred += delay;
                     }
-                    Err(_) => break false,
+                    Err(_) => {
+                        if deferred >= VERIFY_PATIENCE {
+                            proposer.verify_patience_ran_out(proposal_context, deferred);
+                        }
+                        break false;
+                    }
                 }
             };
             if let Some(liveness) = liveness.as_ref() {

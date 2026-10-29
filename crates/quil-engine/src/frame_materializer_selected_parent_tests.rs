@@ -578,6 +578,272 @@ fn a_busy_voter_defers_and_then_votes_on_the_same_proposal() {
     assert!(!rig.executor.busy(), "a vote releases the lease");
 }
 
+/// A reader of the engines (a gossip validation or an RPC cost query) can
+/// overlap a vote's capture with no lease or frame lock held, so `busy()`
+/// reads false. The voter defers instead of refusing, then votes on the same
+/// proposal once the reader lets go.
+#[test]
+fn a_voter_whose_engines_are_in_use_defers_instead_of_refusing() {
+    let rig = Rig::new();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let expected = Fixture::new(Some(rig.signer.public_key()));
+    expected.source.materialize(&parent).unwrap();
+    let context = rig.context(&parent);
+    let child = state_frame(&expected.source, 2, context.view, context.parent);
+    let encoded = crate::consensus_wire::encode_global_frame(&child).unwrap();
+    let seam = rig.seam(&parent);
+
+    let reader = rig.source.execution_manager.hold_engines_for_test();
+    assert!(!rig.executor.busy(), "neither the lease nor the frame lock");
+    let error = rig
+        .executor
+        .prepare(context, 1, &rig.blocks, &rig.verifier, false)
+        .err()
+        .expect("the capture cannot take the engines");
+    assert!(quil_execution::source_busy(&error), "{error}");
+    assert!(seam
+        .verify_or_defer(context, id(&child), Some(encoded.clone()))
+        .is_err());
+    assert!(!rig.executor.busy(), "deferring holds nothing");
+    drop(reader);
+
+    assert_eq!(
+        seam.verify_or_defer(context, id(&child), Some(encoded)),
+        Ok(true)
+    );
+}
+
+/// The busy defer is bounded: a reader that keeps the engines past the
+/// adapter's patience (20 s) costs this voter its vote on that view and no
+/// more. Every check returns at once, since a capture never waits for the
+/// engines, and the adapter declines when its patience runs out. A reader
+/// that lets go within it gets the vote.
+#[test]
+fn a_voter_whose_engines_stay_in_use_declines_once_its_patience_runs_out() {
+    use crate::outage::test_logs::CapturedLogs;
+    use quil_cw_consensus::_consensus::simplex::types::Context;
+    use quil_cw_consensus::_consensus::types::{Epoch, Round, View};
+    use quil_cw_consensus::_consensus::Automaton as _;
+    use quil_cw_consensus::_runtime::{deterministic, Clock as _, Runner as _, Supervisor as _};
+    use std::time::Duration;
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    let rig = Rig::new();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let expected = Fixture::new(Some(rig.signer.public_key()));
+    expected.source.materialize(&parent).unwrap();
+    let context = rig.context(&parent);
+    let child = state_frame(&expected.source, 2, context.view, context.parent);
+    let digest = id(&child);
+    let store = BlockStore::new();
+    store.put(
+        digest,
+        crate::consensus_wire::encode_global_frame(&child).unwrap(),
+    );
+    let seam = Arc::new(rig.seam(&parent));
+    let leader =
+        quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(rig.signer.public_key())
+            .unwrap();
+    // The reader holds the engines until `released_after`, or until the
+    // adapter answers. Returns the answer and when it came.
+    let verify = |released_after: Option<Duration>| {
+        let (rig, seam, store, leader) = (&rig, &seam, &store, &leader);
+        deterministic::Runner::timed(Duration::from_secs(120)).start(|runtime| async move {
+            let mut automaton = quil_cw_consensus::adapters::FalconAutomaton::new(
+                runtime.child("automaton"),
+                seam.clone(),
+                store.clone(),
+            );
+            let reader = rig.source.execution_manager.hold_engines_for_test();
+            let started = runtime.current();
+            let pending = automaton
+                .verify(
+                    Context {
+                        round: Round::new(Epoch::new(context.epoch), View::new(context.view)),
+                        leader: leader.clone(),
+                        parent: (View::new(context.parent_view), context.parent),
+                    },
+                    digest,
+                )
+                .await;
+            if let Some(after) = released_after {
+                runtime.sleep(after).await;
+                drop(reader);
+                let verdict = pending.await.ok();
+                (verdict, runtime.current().duration_since(started).unwrap())
+            } else {
+                let verdict = pending.await.ok();
+                let answered = runtime.current().duration_since(started).unwrap();
+                drop(reader);
+                (verdict, answered)
+            }
+        })
+    };
+
+    let (verdict, answered) = verify(None);
+    assert_eq!(verdict, Some(false), "a reader past its patience: no vote");
+    assert!(
+        answered >= Duration::from_secs(20) && answered < Duration::from_secs(21),
+        "declined when its patience ran out, not later: {answered:?}"
+    );
+    assert!(!rig.executor.busy(), "the refusal leaves nothing held");
+
+    let (verdict, answered) = verify(Some(Duration::from_secs(2)));
+    assert_eq!(verdict, Some(true), "a reader within its patience: a vote");
+    assert!(answered < Duration::from_secs(3), "{answered:?}");
+
+    // About 110 deferrals over two checks of one view: one line says the
+    // vote waits and for what, and one says it was declined.
+    let deferred = logs.lines_with("GLOBAL vote deferred");
+    assert_eq!(deferred.len(), 1, "one line per view: {deferred:?}");
+    assert!(
+        deferred[0].contains("execution branch engines: busy elsewhere")
+            && deferred[0].contains("view=73")
+            && deferred[0].contains("waits_up_to_s=20"),
+        "{}",
+        deferred[0]
+    );
+    let declined = logs.lines_with("GLOBAL vote declined");
+    assert_eq!(
+        declined.len(),
+        1,
+        "one line per declined vote: {declined:?}"
+    );
+    assert!(
+        declined[0].contains("WARN")
+            && declined[0].contains("view=73")
+            && declined[0].contains("waited_s=20")
+            && declined[0].contains("execution branch engines: busy elsewhere")
+            && declined[0].contains("check this node's RPC and gossip load"),
+        "{}",
+        declined[0]
+    );
+}
+
+/// A leader whose proposal finds the engines in use retries each second
+/// while the view lasts. The retries log as one outage, not a warn each.
+#[test]
+fn a_proposal_that_finds_the_engines_in_use_logs_one_outage_not_a_warn_per_retry() {
+    use crate::outage::test_logs::CapturedLogs;
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    let rig = Rig::new();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let context = rig.context(&parent);
+    let seam = rig.seam(&parent);
+
+    let reader = rig.source.execution_manager.hold_engines_for_test();
+    for _ in 0..3 {
+        assert!(seam.propose_with_context(context).is_none());
+    }
+    drop(reader);
+    assert!(seam.propose_with_context(context).is_some());
+
+    assert!(logs
+        .lines_with("selected GLOBAL parent execution unavailable")
+        .is_empty());
+    let began = logs.lines_with("GLOBAL proposal waits for an execution source");
+    assert_eq!(began.len(), 1, "{began:?}");
+    assert!(
+        began[0].contains("execution branch engines: busy elsewhere"),
+        "{}",
+        began[0]
+    );
+    let ended = logs.lines_with("GLOBAL proposal no longer waits");
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert!(ended[0].contains("retries=3"), "{}", ended[0]);
+}
+
+/// A busy proposal outage repeats at most every 10 s with its duration and
+/// retry count, and a new view ends the last view's at its last busy retry.
+#[test]
+fn a_busy_proposal_outage_repeats_boundedly_and_ends_with_its_view() {
+    use crate::outage::test_logs::CapturedLogs;
+    use std::time::{Duration, Instant};
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    let rig = Rig::new();
+    let parent = rig.deploy();
+    let seam = rig.seam(&parent);
+    let busy = quil_execution::busy_unavailable("execution branch engines");
+    let start = Instant::now();
+    let at = |secs: u64| start + Duration::from_secs(secs);
+
+    // View 73's proposal retries each second for 20 s, all busy.
+    for secs in 0..20 {
+        seam.note_proposal_prepare(73, 1, Some(&busy), at(secs));
+    }
+    // View 74's first retry is busy, its second is not.
+    seam.note_proposal_prepare(74, 1, Some(&busy), at(30));
+    seam.note_proposal_prepare(74, 1, None, at(32));
+    // Nothing was busy for view 75.
+    seam.note_proposal_prepare(75, 1, None, at(40));
+
+    let began = logs.lines_with("GLOBAL proposal waits for an execution source");
+    assert_eq!(began.len(), 2, "one per view: {began:?}");
+    let repeated = logs.lines_with("GLOBAL proposal still waits");
+    assert_eq!(repeated.len(), 1, "every 10 s at most: {repeated:?}");
+    assert!(
+        repeated[0].contains("WARN")
+            && repeated[0].contains("view=73")
+            && repeated[0].contains("busy_s=10")
+            && repeated[0].contains("retries=11"),
+        "{}",
+        repeated[0]
+    );
+    let view_ended = logs.lines_with("its view ended");
+    assert_eq!(view_ended.len(), 1, "{view_ended:?}");
+    assert!(
+        view_ended[0].contains("view=73")
+            && view_ended[0].contains("busy_s=19")
+            && view_ended[0].contains("retries=20"),
+        "{}",
+        view_ended[0]
+    );
+    let cleared = logs.lines_with("GLOBAL proposal no longer waits");
+    assert_eq!(cleared.len(), 1, "{cleared:?}");
+    assert!(
+        cleared[0].contains("view=74")
+            && cleared[0].contains("busy_s=2")
+            && cleared[0].contains("retries=1"),
+        "{}",
+        cleared[0]
+    );
+}
+
+/// A source poisoned by an earlier panic does not clear by waiting: the
+/// voter refuses at once and its warn says to restart the node.
+#[test]
+fn a_voter_whose_engines_are_poisoned_refuses_at_once() {
+    let rig = Rig::new();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let expected = Fixture::new(Some(rig.signer.public_key()));
+    expected.source.materialize(&parent).unwrap();
+    let context = rig.context(&parent);
+    let child = state_frame(&expected.source, 2, context.view, context.parent);
+    let encoded = crate::consensus_wire::encode_global_frame(&child).unwrap();
+    let seam = rig.seam(&parent);
+
+    rig.source.execution_manager.poison_engines_for_test();
+    let error = rig
+        .executor
+        .prepare(context, 1, &rig.blocks, &rig.verifier, false)
+        .err()
+        .expect("the capture cannot take the engines");
+    assert!(error.to_string().contains("poisoned"), "{error}");
+    assert!(error.to_string().contains("restart the node"), "{error}");
+    assert!(!quil_execution::source_busy(&error), "{error}");
+    assert!(!rig.executor.busy());
+    assert_eq!(
+        seam.verify_or_defer(context, id(&child), Some(encoded)),
+        Ok(false)
+    );
+}
+
 /// A finalized parent this node has not published yet is published first:
 /// executing it privately for the proposal executes it twice, one after the
 /// other on the single execution lease. The wait is bounded per view: past it

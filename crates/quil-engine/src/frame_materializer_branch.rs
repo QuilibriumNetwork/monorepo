@@ -278,7 +278,7 @@ impl FrameMaterializer {
         let _frame = self
             .frame_execution
             .try_lock()
-            .map_err(|_| unavailable("materializer is busy or poisoned"))?;
+            .map_err(|error| quil_execution::lock_unavailable("materializer frame lock", error))?;
         self.capture_execution_branch_with(limits, |registry| {
             self.execution_manager
                 .capture_execution_branch_seeded(limits.execution, registry)

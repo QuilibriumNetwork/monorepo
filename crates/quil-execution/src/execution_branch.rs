@@ -179,9 +179,10 @@ impl ExecutionEngineManager {
         let capture = self.crdt.lock_execution_capture()?;
         // An executor may hold this lock while acquiring the CRDT commit lock.
         // Never wait on it with the capture barrier held.
-        let engines = self.engines.try_write().map_err(|_| {
-            QuilError::ExecutionUnavailable("execution branch engines are busy or poisoned".into())
-        })?;
+        let engines = self
+            .engines
+            .try_write()
+            .map_err(|error| lock_unavailable("execution branch engines", error))?;
         for required in ["token", "compute", "hypergraph"] {
             if !engines.contains_key(required) {
                 return Err(QuilError::ExecutionUnavailable(format!(
@@ -274,21 +275,18 @@ impl ExecutionEngineManager {
         };
         // These publishers need not take the engine lock. Acquire them without
         // waiting under the CRDT barrier, and reject a change during capture.
-        let global_quil_fee = self.global_quil_fee.try_write().map_err(|_| {
-            QuilError::ExecutionUnavailable(
-                "execution source fee snapshot is busy or poisoned".into(),
-            )
-        })?;
-        let global_venue_fee = self.global_venue_fee.try_write().map_err(|_| {
-            QuilError::ExecutionUnavailable(
-                "execution source venue fee snapshot is busy or poisoned".into(),
-            )
-        })?;
-        let summary_rebuilds = self.summary_rebuilds.try_write().map_err(|_| {
-            QuilError::ExecutionUnavailable(
-                "execution source summary metadata is busy or poisoned".into(),
-            )
-        })?;
+        let global_quil_fee = self
+            .global_quil_fee
+            .try_write()
+            .map_err(|error| lock_unavailable("execution source fee snapshot", error))?;
+        let global_venue_fee = self
+            .global_venue_fee
+            .try_write()
+            .map_err(|error| lock_unavailable("execution source venue fee snapshot", error))?;
+        let summary_rebuilds = self
+            .summary_rebuilds
+            .try_write()
+            .map_err(|error| lock_unavailable("execution source summary metadata", error))?;
         if *global_quil_fee
             != *branch
                 .manager
@@ -518,4 +516,34 @@ impl Drop for PublicationSteps {
 
 fn unavailable_engine(name: &str) -> QuilError {
     QuilError::ExecutionUnavailable(format!("unsupported execution capture engine {name}"))
+}
+
+/// Ends the message of a [`QuilError::ExecutionUnavailable`] whose source was
+/// only in use: another thread held it for a moment (a gossip validation or an
+/// RPC cost query reads the engines), and the same request succeeds once it
+/// lets go.
+const SOURCE_BUSY: &str = ": busy elsewhere; retry shortly";
+
+/// `what` could not be taken without waiting. A capture never waits for its
+/// sources while it holds the CRDT barrier, since their holders may wait on
+/// that barrier. Held is transient ([`source_busy`]); poisoned stays so until
+/// the node restarts.
+pub fn lock_unavailable<G>(what: &str, error: std::sync::TryLockError<G>) -> QuilError {
+    match error {
+        std::sync::TryLockError::WouldBlock => busy_unavailable(what),
+        std::sync::TryLockError::Poisoned(_) => QuilError::ExecutionUnavailable(format!(
+            "{what}: poisoned by an earlier panic; restart the node"
+        )),
+    }
+}
+
+/// `what` is in use by another holder; see [`source_busy`].
+pub fn busy_unavailable(what: &str) -> QuilError {
+    QuilError::ExecutionUnavailable(format!("{what}{SOURCE_BUSY}"))
+}
+
+/// Whether `error` only reports a source another holder was using, so the
+/// same request may succeed if asked again shortly.
+pub fn source_busy(error: &QuilError) -> bool {
+    matches!(error, QuilError::ExecutionUnavailable(message) if message.ends_with(SOURCE_BUSY))
 }

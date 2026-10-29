@@ -698,14 +698,16 @@ impl GlobalParentExecutor {
         Ok(published)
     }
 
-    /// This node's own GLOBAL execution is in use: a proposal, verification or
-    /// publication holds the lease, or the canonical materializer holds the
-    /// frame lock. Either clears without anything from the network.
     #[cfg(test)]
     pub(crate) fn forget_authenticated_ancestors(&self) {
         *self.authenticated.lock().unwrap() = AuthenticatedAncestors::default();
     }
 
+    /// This node's own GLOBAL execution is in use: a proposal, verification or
+    /// publication holds the lease, or the canonical materializer holds the
+    /// frame lock. Either clears without anything from the network. A sample:
+    /// a capture can still find a source in use after it reads false
+    /// ([`quil_execution::source_busy`]).
     pub(crate) fn busy(&self) -> bool {
         self.active.load(Ordering::Acquire) || self.source.frame_execution_busy()
     }
@@ -805,7 +807,7 @@ impl GlobalParentExecutor {
         }
         self.active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| unavailable("selected GLOBAL execution is busy"))?;
+            .map_err(|_| quil_execution::busy_unavailable("selected GLOBAL execution"))?;
         let admission = Admission::new(
             self.active.clone(),
             if for_proposal {
