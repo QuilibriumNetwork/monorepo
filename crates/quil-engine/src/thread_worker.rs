@@ -2,8 +2,9 @@
 //!
 //! Each worker thread runs its own single-threaded tokio runtime and
 //! communicates with the master via `tokio::sync::mpsc` channels. Core
-//! affinity is set via the `core_affinity` crate; `new_current_thread`
-//! gives each worker its own isolated runtime.
+//! affinity is set via the `core_affinity` crate, spreading workers over
+//! NUMA nodes (`worker_pinning`); `new_current_thread` gives each
+//! worker its own isolated runtime.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -284,8 +285,8 @@ fn recovery_withheld(
     seat.is_some()
 }
 
-/// Thread-based worker manager. Core 0 is reserved for the master;
-/// workers use cores 1..N.
+/// Thread-based worker manager. Worker N is pinned to slot N of the
+/// pinning layout; slot 0 is left to the master.
 pub struct ThreadWorkerManager {
     workers: Mutex<HashMap<u32, WorkerState>>,
     /// Channel for workers to send events back to master.
@@ -293,6 +294,8 @@ pub struct ThreadWorkerManager {
     master_tx: mpsc::Sender<WorkerToMaster>,
     /// Configured worker count, or available CPUs less the master's (at least one).
     num_cores: u32,
+    /// The core each worker is pinned to, read once at startup.
+    layout: crate::worker_pinning::PinLayout,
     /// Shared consensus dependencies — set after construction.
     consensus_deps: Mutex<Option<Arc<WorkerConsensusDeps>>>,
     /// What workers ask before they recover a shard from an archive; set
@@ -378,7 +381,7 @@ impl ThreadWorkerManager {
     ///
     /// This count is also the node's allocation capacity.
     pub fn new_with_count(configured: i32) -> Self {
-        let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+        let layout = crate::worker_pinning::PinLayout::detect();
         let cpu_default = std::thread::available_parallelism()
             .map(|n| n.get() as u32)
             .unwrap_or(4)
@@ -392,10 +395,16 @@ impl ThreadWorkerManager {
 
         let (master_tx, master_rx) = mpsc::channel(256);
 
+        let (cores_per_node, workers_per_node) = layout.per_node(num_cores);
         info!(
-            available_cores = core_ids.len(),
+            available_cores = layout.len(),
             configured_worker_count = configured,
             worker_cores = num_cores,
+            pinning = layout.order(),
+            numa_nodes = cores_per_node.len(),
+            cores_per_node = %crate::worker_pinning::node_counts(&cores_per_node),
+            workers_per_node = %crate::worker_pinning::node_counts(&workers_per_node),
+            unpinned_workers = layout.unpinned(num_cores),
             "thread worker manager initialized"
         );
 
@@ -404,6 +413,7 @@ impl ThreadWorkerManager {
             master_rx: Mutex::new(Some(master_rx)),
             master_tx,
             num_cores,
+            layout,
             consensus_deps: Mutex::new(None),
             recovery_gate: Arc::default(),
             worker_store: Mutex::new(None),
@@ -598,16 +608,18 @@ impl ThreadWorkerManager {
         let execution_handle = Arc::new(Mutex::new(None::<crate::app_engine::AppEngineHandle>));
         let execution_slot = execution_handle.clone();
         let shard_data = self.shard_data.clone();
+        let core = self.layout.core(core_id);
+        let numa_node = self.layout.node(core_id);
 
         let handle = std::thread::Builder::new()
             .name(format!("worker-{}", core_id))
             .spawn(move || {
-                // Pin to the requested core
-                let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+                // Pin before the worker allocates: its memory goes to the
+                // NUMA node of the core that first touches it.
                 let mut cpu = None;
-                if (core_id as usize) < core_ids.len() {
-                    if core_affinity::set_for_current(core_ids[core_id as usize]) {
-                        cpu = Some(core_ids[core_id as usize].id);
+                if let Some(core) = core {
+                    if core_affinity::set_for_current(core) {
+                        cpu = Some(core.id);
                     } else {
                         warn!(core_id, "failed to pin thread to core");
                     }
@@ -627,7 +639,7 @@ impl ThreadWorkerManager {
                 // `worker-<core_id>.log`. If the file stays empty
                 // after spawn, the routing is broken (thread-local
                 // tag missing, file registry not populated, etc).
-                info!(core_id, "worker thread up");
+                info!(core_id, cpu, numa_node, "worker thread up");
 
                 let worker_owned: Option<WorkerOwnedDeps> =
                     consensus_deps
