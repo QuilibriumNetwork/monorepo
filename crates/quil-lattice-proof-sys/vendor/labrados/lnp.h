@@ -130,7 +130,8 @@ void lnp_comkey_init(const lnp_params pp);
 
 void lnp_proof_init(lnp_proof pi, const lnp_params pp);
 void lnp_proof_free(lnp_proof pi);
-/* Returns 0 on success; nonzero aborts proving without a usable proof. */
+/* Returns 0 on success; nonzero aborts proving without a usable proof.
+ * 2: the input witness failed its check; a fresh attempt may succeed. */
 int lnp_prove(lnp_proof pi, statement ost, witness owt, const statement ist, const witness iwt, const lnp_params pp);
 int lnp_reduce (statement ost, const statement ist, const lnp_proof pi,  const lnp_params pp);
 

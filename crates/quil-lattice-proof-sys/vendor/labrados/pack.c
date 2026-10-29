@@ -376,6 +376,7 @@ int pack_prove(
 )
 {
   size_t i, j, limit;
+  int status;
   statement tst[2];
   witness twt[2];
   timing time;
@@ -407,10 +408,12 @@ int pack_prove(
   if(pp->zkp != NULL){
     timing_start(&time,"LNP Prover");
     quil_resource_trace("lnp_prove_begin");
-    if(lnp_prove(pi->zkp[0], tst[j^1], twt[j^1], tst[j], twt[j], pp->zkp[0])) {
+    // Quilibrium: pass the LNP status through (2 = input witness check failed).
+    status = lnp_prove(pi->zkp[0], tst[j^1], twt[j^1], tst[j], twt[j], pp->zkp[0]);
+    if(status) {
       statement_free(tst[0]);statement_free(tst[1]);
       witness_free(twt[0]);witness_free(twt[1]);
-      return 1;
+      return status;
     }
     quil_resource_trace("lnp_prove_end");
     timing_end(&time);

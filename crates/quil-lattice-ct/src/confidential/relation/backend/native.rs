@@ -14,6 +14,20 @@ pub enum NativeError {
     AllocationBudget,
     NativeFailure(i32),
     Poisoned,
+    /// All 8 native attempts, each with fresh randomness, failed the LNP
+    /// input-witness check. Rare and not caused by the inputs: prove again.
+    ProofAttemptsExhausted,
+}
+
+/// Native prover status: every bounded retry failed the witness check.
+const PROVE_ATTEMPTS_EXHAUSTED: i32 = 8;
+
+fn prove_status(status: i32) -> Result<(), NativeError> {
+    match status {
+        0 => Ok(()),
+        PROVE_ATTEMPTS_EXHAUSTED => Err(NativeError::ProofAttemptsExhausted),
+        status => Err(NativeError::NativeFailure(status)),
+    }
 }
 
 /// Prepare the native scalar row directly in its final flat buffer. Retain
@@ -79,9 +93,7 @@ pub fn prove(
             &mut written,
         )
     };
-    if status != 0 {
-        return Err(NativeError::NativeFailure(status));
-    }
+    prove_status(status)?;
     if written == 0 || written >= MAX_PROOF_BYTES {
         return Err(NativeError::InvalidRelation);
     }
@@ -720,6 +732,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exhausted_proof_attempts_map_to_their_own_error() {
+        assert_eq!(prove_status(0), Ok(()));
+        assert_eq!(prove_status(8), Err(NativeError::ProofAttemptsExhausted));
+        assert_eq!(prove_status(7), Err(NativeError::NativeFailure(7)));
+    }
+
+    #[test]
     fn sparse_scalar_preparation_matches_dense_reference_and_overflow_rules() {
         fn reference(row: &ScalarRow<'_>) -> Result<(Vec<usize>, Vec<i64>), NativeError> {
             if row.terms.is_empty() {
@@ -1024,5 +1043,208 @@ mod tests {
         )
         .unwrap();
         assert!(c.pointer.is_none());
+    }
+
+    /// A small raw relation under a native context (global lock and registered
+    /// samplers held): `pairs` pairs of equal binary polynomials, each pair
+    /// tied by one ring row (a - b = 0). Public contexts only hold domains.
+    fn pair_context(pairs: usize, public: bool) -> Context {
+        let budget = NativeBudget {
+            max_native_bytes: 1 << 30,
+        };
+        let mut context = Context::new(public, budget).unwrap();
+        let pointer = unsafe {
+            if public {
+                ffi::quil_fixture_new_public(2 * pairs, pairs, 0)
+            } else {
+                ffi::quil_fixture_new(2 * pairs, pairs, 0)
+            }
+        };
+        context.pointer = Some(NonNull::new(pointer).unwrap());
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..pairs {
+            let mut values = [0i64; 256];
+            for value in values.iter_mut() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *value = (state & 1) as i64;
+            }
+            for _ in 0..2 {
+                let status = unsafe {
+                    if public {
+                        ffi::quil_fixture_binary_domain(pointer)
+                    } else {
+                        ffi::quil_fixture_binary(pointer, values.as_ptr())
+                    }
+                };
+                assert_eq!(status, 0);
+            }
+        }
+        for pair in 0..pairs {
+            let indices = [2 * pair, 2 * pair + 1];
+            let mut coefficients = [0i64; 512];
+            coefficients[0] = 1;
+            coefficients[256] = -1;
+            let mut rhs = [0i64; 256];
+            let status = unsafe {
+                ffi::quil_fixture_linear(
+                    pointer,
+                    2,
+                    indices.as_ptr(),
+                    coefficients.as_mut_ptr(),
+                    rhs.as_mut_ptr(),
+                    1,
+                )
+            };
+            assert_eq!(status, 0);
+        }
+        context.finished = true;
+        context
+    }
+
+    fn verify_pair_proof(pairs: usize, proof: &[u8]) -> bool {
+        let public = pair_context(pairs, true);
+        let valid = unsafe {
+            ffi::quil_fixture_verify_encoded(public.ready().unwrap(), proof.as_ptr(), proof.len())
+        };
+        valid == 1
+    }
+
+    const PAIRS: usize = 1;
+    const ATTEMPTS: usize = 96;
+
+    /// Explicit A/B reproducer, about 2 s per attempt. The LNP stage's
+    /// input-witness check fails naturally on roughly one attempt in ten for
+    /// this relation. With the private Gaussian sampler unregistered, an
+    /// attempt that passes the check stops at LNP's first mask draw
+    /// (status 7). Every call must end there; none may abort the process.
+    #[test]
+    #[ignore = "A/B reproducer, minutes of CPU; run explicitly on both sides"]
+    fn repeated_attempts_survive_natural_witness_check_failures() {
+        for attempt in 1..=ATTEMPTS {
+            let context = pair_context(PAIRS, false);
+            unsafe { ffi::quil_set_private_gaussian_sampler(None) };
+            let mut proof = vec![0u8; MAX_PROOF_BYTES];
+            let mut written = usize::MAX;
+            let status = unsafe {
+                ffi::quil_fixture_prove_encoded(
+                    context.ready().unwrap(),
+                    proof.as_mut_ptr(),
+                    proof.len(),
+                    &mut written,
+                )
+            };
+            assert_eq!(status, 7, "attempt {attempt}/{ATTEMPTS}");
+            assert_eq!(written, 0);
+        }
+    }
+
+    /// Run `f` with file descriptor 2 sent to a file; return its result and
+    /// the native retry lines written there.
+    fn retry_lines<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        use std::os::fd::AsRawFd;
+        let path = std::env::temp_dir().join(format!(
+            "quil-witness-faults-{}-{:?}.log",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let file = std::fs::File::create(&path).unwrap();
+        let saved = unsafe { libc::dup(2) };
+        assert!(saved >= 0);
+        assert!(unsafe { libc::dup2(file.as_raw_fd(), 2) } >= 0);
+        let result = f();
+        unsafe {
+            libc::dup2(saved, 2);
+            libc::close(saved);
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let lines = text
+            .lines()
+            .filter(|l| l.starts_with("quil_native_prove attempt="))
+            .map(str::to_owned)
+            .collect();
+        (result, lines)
+    }
+
+    /// Prove with the next `faults` input-witness checks forced to fail. With
+    /// `full` false the private Gaussian sampler is unregistered, so an
+    /// attempt that passes the check stops at LNP's first mask draw
+    /// (status 7) in about a second instead of completing the proof.
+    fn prove_with_witness_faults(faults: u32, full: bool) -> (i32, u32, Vec<u8>, Vec<String>) {
+        let context = pair_context(PAIRS, false);
+        if !full {
+            unsafe { ffi::quil_set_private_gaussian_sampler(None) };
+        }
+        let mut proof = vec![0u8; MAX_PROOF_BYTES];
+        let (mut left, mut written) = (u32::MAX, usize::MAX);
+        let pointer = context.ready().unwrap();
+        let (status, lines) = retry_lines(|| unsafe {
+            ffi::quil_fixture_test_witness_faults(
+                pointer,
+                faults,
+                &mut left,
+                proof.as_mut_ptr(),
+                proof.len(),
+                &mut written,
+            )
+        });
+        // A failed attempt leaves the submitted statement and witness intact.
+        assert_eq!(unsafe { ffi::quil_fixture_check(pointer) }, 1);
+        drop(context);
+        proof.truncate(written);
+        (status, left, proof, lines)
+    }
+
+    #[test]
+    fn failed_witness_checks_retry_eight_times_then_report_status_8() {
+        // Nine forced failures: exactly eight attempts consume one each.
+        let (status, left, proof, lines) = prove_with_witness_faults(9, false);
+        assert_eq!(status, 8, "{lines:?}");
+        assert_eq!(left, 1, "attempts made: {}", 9 - left);
+        assert!(proof.is_empty());
+        assert_eq!(lines.len(), 8, "{lines:?}");
+        for (attempt, line) in (1..=8).zip(&lines) {
+            let prefix =
+                format!("quil_native_prove attempt={attempt}/8 failed: LNP input-witness check; ");
+            assert!(line.starts_with(&prefix), "{line}");
+        }
+        assert!(lines[6].ends_with("retrying with fresh randomness"));
+        assert!(lines[7].ends_with("giving up (status 8)"));
+        assert_eq!(
+            prove_status(status),
+            Err(NativeError::ProofAttemptsExhausted)
+        );
+    }
+
+    /// The attempt after a failed check runs on to LNP's masking (status 7
+    /// here, as the sampler is unregistered); natural failures in between
+    /// are retried too.
+    #[test]
+    fn a_failed_witness_check_is_retried() {
+        let (status, left, proof, lines) = prove_with_witness_faults(1, false);
+        assert_eq!(status, 7, "{lines:?}");
+        assert_eq!(left, 0);
+        assert!(proof.is_empty());
+        assert!(lines[0].starts_with("quil_native_prove attempt=1/8 failed: "));
+        assert!(lines.len() < 8, "{lines:?}");
+        for line in &lines {
+            assert!(line.ends_with("retrying with fresh randomness"), "{line}");
+        }
+    }
+
+    #[test]
+    #[ignore = "complete native proof, minutes in the test profile; run explicitly"]
+    fn a_failed_witness_check_is_retried_into_a_valid_proof() {
+        let (status, left, proof, lines) = prove_with_witness_faults(1, true);
+        assert_eq!(status, 0, "{lines:?}");
+        assert_eq!(left, 0);
+        assert!(lines[0].starts_with("quil_native_prove attempt=1/8 failed: "));
+        assert!(lines.len() < 8, "{lines:?}");
+        for line in &lines {
+            assert!(line.ends_with("retrying with fresh randomness"), "{line}");
+        }
+        assert!(verify_pair_proof(PAIRS, &proof));
     }
 }

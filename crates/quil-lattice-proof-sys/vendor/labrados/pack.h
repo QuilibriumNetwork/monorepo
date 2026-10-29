@@ -29,7 +29,8 @@ void pack_params_gen(pack_params pp, size_t *pibits, const statement st, int zk,
 void pack_params_print(const pack_params pp);
 void pack_params_free(pack_params pp);
 
-/* Returns 0 on success; nonzero aborts proving without a usable proof. */
+/* Returns 0 on success; nonzero aborts proving without a usable proof.
+ * lnp_prove's status passes through unchanged (2: retry may succeed). */
 int pack_prove(pack_proof pi, const statement ist, const witness iwt,
                 const pack_params pp);
 int pack_verify(const statement ist, const pack_params pp, 

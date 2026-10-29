@@ -15,6 +15,7 @@
 #include "resource_trace.h"
 #include "refresh_parallel.h"
 #include "lnp_parallel.h"
+#include "witness_fault.h"
 
 #include <assert.h>
 #include <math.h>
@@ -452,7 +453,6 @@ int lnp_prove(lnp_proof pi, statement ost, witness owt, const statement ist, con
     assert(ist->normty[2] == L2APPROX);
     assert(ist->normty[3] == BIN);
     assert(ist->normty[4] == L2APPROX);
-    assert(verify(ist, iwt));
 
     lnp_witness_init(owt, pp);
     lnp_statement_init(ost, ist, pp);
@@ -479,6 +479,11 @@ int lnp_prove(lnp_proof pi, statement ost, witness owt, const statement ist, con
       polxvec_frompolyvec (stildex, iwt->s[i], 1, iwt->n[i], 1);
       off += iwt->n[i];
     }
+
+    // Quilibrium: the amortized input witness carries no rejection bound and
+    // can exceed its norm bound; fail the attempt (status 2, outputs
+    // initialised for the caller's cleanup) so it retries with fresh randomness.
+    if(quil_lnp_witness_fault() || !verify(ist, iwt)) { status=2;goto cleanup_early; }
 
     // internal randomness 1
     randombytes (seed, sizeof(seed));

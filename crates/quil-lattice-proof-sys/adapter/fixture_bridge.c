@@ -26,6 +26,10 @@
 #include "labrador.h"
 #include "rotation_parallel.h"
 #include "public_refresh.h"
+#include "witness_fault.h"
+/* Proof attempts before a persistent LNP input-witness failure is returned. */
+#define FIXTURE_PROVE_ATTEMPTS 8
+unsigned int quil_lnp_witness_faults;
 typedef struct {
   statement st;
   size_t *offsets;
@@ -190,7 +194,20 @@ static int fixture_prove(void *opaque,const char *path,uint8_t *bytes,size_t cap
   // No cached assignment result survives native proof construction.
   ctx->checked=0;
   quil_resource_trace("prove_begin");
-  if(py_prove(proof,ctx->st,ctx->wt,pp)) {
+  // LNP's input-witness check fails on a few percent of attempts (status 2).
+  // Each attempt samples fresh randomness, so retry a bounded number of times.
+  int status;
+  for(unsigned int attempt=1;;attempt++) {
+    status=py_prove(proof,ctx->st,ctx->wt,pp);
+    if(status!=2)break;
+    fixture_decoded_free(proof);
+    fprintf(stderr,"quil_native_prove attempt=%u/%u failed: LNP input-witness check; %s\n",
+            attempt,FIXTURE_PROVE_ATTEMPTS,
+            attempt<FIXTURE_PROVE_ATTEMPTS ? "retrying with fresh randomness" : "giving up (status 8)");
+    fflush(stderr);
+    if(attempt==FIXTURE_PROVE_ATTEMPTS){py_free_params(pp);return 8;}
+  }
+  if(status) {
     fixture_decoded_free(proof);py_free_params(pp);return 7;
   }
   quil_resource_trace("prove_end");
@@ -217,6 +234,15 @@ int quil_fixture_prove_encoded(void *opaque,uint8_t *bytes,size_t capacity,size_
 int quil_fixture_test_sampling_error(void *opaque,unsigned int stage,uint8_t *bytes,size_t capacity,size_t *written) {
   if(stage<1 || stage>3 || !bytes || !written)return -1;
   return fixture_prove(opaque,NULL,bytes,capacity,written,stage);
+}
+/* Diagnostic entry point: the next `faults` LNP input-witness checks fail as
+ * a natural norm overflow would; *left returns the unconsumed count. */
+int quil_fixture_test_witness_faults(void *opaque,unsigned int faults,unsigned int *left,uint8_t *bytes,size_t capacity,size_t *written) {
+  if(!left || !bytes || !written)return -1;
+  quil_lnp_witness_faults=faults;
+  int status=fixture_prove(opaque,NULL,bytes,capacity,written,0);
+  *left=quil_lnp_witness_faults;quil_lnp_witness_faults=0;
+  return status;
 }
 void quil_fixture_drop_witness(void *opaque) {
   fixture_context *ctx=opaque;
