@@ -3,6 +3,7 @@ use std::sync::Arc;
 use quil_types::store::{ClockStore, KvDb};
 use tracing::{debug, info, warn};
 
+use quil_hypergraph::snapshot::SCAN_MAX_AGE;
 use quil_lifecycle::Supervisor;
 
 type RemoteAppShardMap =
@@ -292,11 +293,50 @@ struct CompositeScan {
     /// `(filter, that store's scan identity)`, in address-range order.
     stores: Vec<(Vec<u8>, [u8; 32])>,
     root_record: Option<Vec<u8>>,
+    /// When the scan started, against [`SCAN_MAX_AGE`].
     created: std::time::Instant,
+    /// When a page of the scan was last read.
+    used: std::time::Instant,
+    /// Pages served, for the expiry log.
+    pages: u64,
 }
 
-const COMPOSITE_SCAN_TTL: std::time::Duration = std::time::Duration::from_secs(900);
+/// A scan nobody has paged for this long is dropped, as each store drops a
+/// scan snapshot nobody pages. A scan still paging lives until
+/// [`SCAN_MAX_AGE`] after its start, as each store's scan snapshot does: a
+/// fixed 900 s failed every wallet whose page budget (2,048 pages) took
+/// longer to page, as a scan forwarded to an archive can, while paging alone
+/// must not keep the stores' snapshots pinned.
+const COMPOSITE_SCAN_IDLE: std::time::Duration = quil_hypergraph::snapshot::SCAN_IDLE;
 const MAX_COMPOSITE_SCANS: usize = 64;
+
+/// Drop multi-store scans idle past [`COMPOSITE_SCAN_IDLE`] or started more
+/// than [`SCAN_MAX_AGE`] ago, as each store releases its scan snapshots;
+/// continuing a dropped scan reports it expired, so the client restarts it.
+/// Logs one info line per sweep that drops scans for age.
+fn expire_composite_scans(scans: &mut std::collections::HashMap<[u8; 32], CompositeScan>) {
+    let (mut aged, mut oldest, mut pages) = (0usize, std::time::Duration::ZERO, 0u64);
+    scans.retain(|_, scan| {
+        let age = scan.created.elapsed();
+        if age >= SCAN_MAX_AGE {
+            aged += 1;
+            oldest = oldest.max(age);
+            pages += scan.pages;
+            return false;
+        }
+        scan.used.elapsed() < COMPOSITE_SCAN_IDLE
+    });
+    if aged > 0 {
+        info!(
+            released = aged,
+            oldest_age_secs = oldest.as_secs(),
+            pages_served = pages,
+            max_age_secs = SCAN_MAX_AGE.as_secs(),
+            "multi-store wallet scans released at their maximum age; a client still \
+             paging one is told the scan expired and must restart it"
+        );
+    }
+}
 
 /// The peer listener's deadline for a PQNoise handshake.
 const PQ_HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
@@ -728,7 +768,7 @@ fn composite_page<T>(
             QuilError::NotFound("coin scan snapshot unavailable or expired; restart scan".into())
         };
         let mut scans = composite_scans.lock();
-        scans.retain(|_, scan| scan.created.elapsed() < COMPOSITE_SCAN_TTL);
+        expire_composite_scans(&mut scans);
         let id = match snapshot_id {
             Some(id) => *id,
             None => {
@@ -737,6 +777,7 @@ fn composite_page<T>(
                         "too many coin scans in progress; retry shortly".into(),
                     ));
                 }
+                let now = std::time::Instant::now();
                 let mut stores = Vec::with_capacity(ranged.len());
                 let mut hash = sha2::Sha256::new();
                 hash.update(b"quil/node/composite-coin-scan/v1");
@@ -749,18 +790,37 @@ fn composite_page<T>(
                     stores.push((filter.clone(), scan_id));
                 }
                 let id: [u8; 32] = hash.finalize().into();
-                scans.insert(
-                    id,
-                    CompositeScan {
-                        stores,
-                        root_record: None,
-                        created: std::time::Instant::now(),
-                    },
-                );
+                // A scan started over the same store snapshots is the same
+                // scan, and keeps its start time.
+                scans.entry(id).or_insert(CompositeScan {
+                    stores,
+                    root_record: None,
+                    created: now,
+                    used: now,
+                    pages: 0,
+                });
                 id
             }
         };
         let scan = scans.get_mut(&id).ok_or_else(expired)?;
+        scan.used = std::time::Instant::now();
+        scan.pages += 1;
+        // Page the snapshots of the stores still ahead too: each store drops
+        // one nobody pages after its idle time, or first when newer scans
+        // crowd it out, and the scan would expire on reaching that store.
+        for (last, _, filter, crdt) in &ranged {
+            if after.is_some_and(|after| after >= last) {
+                continue;
+            }
+            let store_scan = scan
+                .stores
+                .iter()
+                .find(|(f, _)| f == filter)
+                .map(|(_, id)| *id)
+                .ok_or_else(expired)?;
+            let generation = crdt.acquire_or_capture_scan_snapshot(Some(&store_scan))?;
+            generation.ok_or_else(expired)?;
+        }
 
         for (index, (last, path, filter, crdt)) in ranged.iter().enumerate() {
             // Stores whose whole range lies at or below the cursor are done.
@@ -2290,9 +2350,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         node_rpc_builder = node_rpc_builder
             .with_remote_coin_page({
                 let reader = reader.clone();
-                Arc::new(move |domain, snapshot, after| {
+                Arc::new(move |domain, snapshot, after, max_coins| {
                     let reader = reader.clone();
-                    Box::pin(async move { reader.coin_page(domain, snapshot, after).await })
+                    Box::pin(
+                        async move { reader.coin_page(domain, snapshot, after, max_coins).await },
+                    )
                 })
             })
             .with_remote_legacy_coins({
@@ -2304,9 +2366,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
             })
             .with_remote_escrow_page({
                 let reader = reader.clone();
-                Arc::new(move |domain, snapshot, after| {
+                Arc::new(move |domain, snapshot, after, max_escrows| {
                     let reader = reader.clone();
-                    Box::pin(async move { reader.escrow_page(domain, snapshot, after).await })
+                    Box::pin(async move {
+                        reader
+                            .escrow_page(domain, snapshot, after, max_escrows)
+                            .await
+                    })
                 })
             })
             .with_remote_vertex({
@@ -4575,6 +4641,179 @@ mod composite_scan_tests {
             ),
         ];
         assert!(composite_page(&scans, other, id.as_ref(), None, &scan_store).is_err());
+    }
+
+    /// A scan lives on while it is paged, within its maximum age, and is
+    /// dropped once nobody has paged it for the stores' idle time.
+    #[test]
+    fn a_composite_scan_lives_while_paged_and_expires_when_idle() {
+        let app = [0x11u8; 32];
+        let low = quil_forest::encode_shard_bit_path(&app, &[false]);
+        let high = quil_forest::encode_shard_bit_path(&app, &[true]);
+        let scan_store =
+            |_: &[u8], _: &dyn quil_types::store::SnapshotReadable, after: Option<&[u8; 32]>| {
+                let next = after.map_or(1, |a| a[31] + 1);
+                Ok(StorePage {
+                    entries: vec![(address(0x01, next), next)],
+                    cursor: Some(address(0x01, next)),
+                    has_more: true,
+                    root_record: Some(vec![0xaa]),
+                })
+            };
+        let scans = parking_lot::Mutex::new(std::collections::HashMap::new());
+        let stores = vec![(low, store()), (high, store())];
+        let (id, _, _, mut after, _) =
+            composite_page(&scans, stores.clone(), None, None, &scan_store).unwrap();
+        let idle_for = |idle: std::time::Duration| {
+            scans.lock().get_mut(&id).unwrap().used = std::time::Instant::now() - idle;
+        };
+        idle_for(COMPOSITE_SCAN_IDLE - std::time::Duration::from_secs(5));
+        let (_, _, entries, cursor, _) = composite_page(
+            &scans,
+            stores.clone(),
+            Some(&id),
+            after.as_ref(),
+            &scan_store,
+        )
+        .unwrap();
+        assert_eq!(entries, vec![(address(0x01, 2), 2)]);
+        assert!(
+            scans.lock()[&id].used.elapsed() < std::time::Duration::from_secs(60),
+            "a page keeps the scan alive"
+        );
+        after = cursor;
+        idle_for(COMPOSITE_SCAN_IDLE);
+        assert!(composite_page(&scans, stores, Some(&id), after.as_ref(), &scan_store).is_err());
+        assert!(scans.lock().is_empty(), "an idle scan is dropped");
+    }
+
+    /// A client paging a scan more often than the idle time does not keep it
+    /// past [`SCAN_MAX_AGE`], as no store keeps a scan snapshot past it:
+    /// continuing it then reports the scan expired, and it is dropped.
+    #[test]
+    fn a_composite_scan_paged_within_the_idle_time_expires_at_its_maximum_age() {
+        let app = [0x11u8; 32];
+        let low = quil_forest::encode_shard_bit_path(&app, &[false]);
+        let high = quil_forest::encode_shard_bit_path(&app, &[true]);
+        let scan_store =
+            |_: &[u8], _: &dyn quil_types::store::SnapshotReadable, after: Option<&[u8; 32]>| {
+                let next = after.map_or(1, |a| a[31] + 1);
+                Ok(StorePage {
+                    entries: vec![(address(0x01, next), next)],
+                    cursor: Some(address(0x01, next)),
+                    has_more: true,
+                    root_record: Some(vec![0xaa]),
+                })
+            };
+        let scans = parking_lot::Mutex::new(std::collections::HashMap::new());
+        let stores = vec![(low, store()), (high, store())];
+        let (id, _, _, mut after, _) =
+            composite_page(&scans, stores.clone(), None, None, &scan_store).unwrap();
+        // Move the scan's clocks back by `by`, as if `by` had passed.
+        let elapse = |by: std::time::Duration| {
+            let mut scans = scans.lock();
+            let scan = scans.get_mut(&id).unwrap();
+            scan.created -= by;
+            scan.used -= by;
+        };
+        let page_every = COMPOSITE_SCAN_IDLE - std::time::Duration::from_secs(1);
+        let mut paged = std::time::Duration::ZERO;
+        while paged + page_every < SCAN_MAX_AGE {
+            elapse(page_every);
+            paged += page_every;
+            let (_, _, _, cursor, _) = composite_page(
+                &scans,
+                stores.clone(),
+                Some(&id),
+                after.as_ref(),
+                &scan_store,
+            )
+            .unwrap_or_else(|e| panic!("paged for {paged:?}, under the maximum age: {e}"));
+            after = cursor;
+        }
+        elapse(page_every);
+        let paged = paged + page_every;
+        let result = composite_page(&scans, stores, Some(&id), after.as_ref(), &scan_store);
+        assert!(
+            matches!(
+                result,
+                Err(quil_types::error::QuilError::NotFound(ref m)) if m.contains("expired")
+            ),
+            "a scan paged every {}s for {}s is still served",
+            page_every.as_secs(),
+            paged.as_secs()
+        );
+        assert!(scans.lock().is_empty(), "an expired scan is dropped");
+    }
+
+    /// A long scan keeps the snapshots of the stores it has still to reach:
+    /// each page touches them, so newer scans of such a store do not crowd
+    /// its snapshot out before the scan gets there.
+    #[test]
+    fn a_long_scan_keeps_the_stores_it_has_still_to_reach() {
+        use quil_hypergraph::snapshot::MAX_SCAN_GENERATIONS;
+        let app = [0x11u8; 32];
+        let low = quil_forest::encode_shard_bit_path(&app, &[false]);
+        let high = quil_forest::encode_shard_bit_path(&app, &[true]);
+        // The low store lists one record a page, for more pages than a store
+        // keeps scan snapshots; the high store holds one record.
+        let records: u8 = 128;
+        assert!(usize::from(records) > MAX_SCAN_GENERATIONS);
+        let low_for_scan = low.clone();
+        let scan_store = move |filter: &[u8],
+                               _: &dyn quil_types::store::SnapshotReadable,
+                               after: Option<&[u8; 32]>| {
+            let (first, count) = if filter == low_for_scan.as_slice() {
+                (0x01, records)
+            } else {
+                (0x80, 1)
+            };
+            let next = after.filter(|a| a[0] == first).map_or(1, |a| a[31] + 1);
+            Ok(StorePage {
+                entries: vec![(address(first, next), next)],
+                cursor: Some(address(first, next)),
+                has_more: next < count,
+                root_record: Some(vec![0xaa]),
+            })
+        };
+        let scans = parking_lot::Mutex::new(std::collections::HashMap::new());
+        let high_store = store();
+        let stores = vec![(low, store()), (high, high_store.clone())];
+        let (mut id, mut after) = (None, None);
+        let mut seen = Vec::new();
+        let mut newer = std::collections::HashSet::new();
+        for frame in 1.. {
+            let (scan, _, entries, cursor, has_more) = composite_page(
+                &scans,
+                stores.clone(),
+                id.as_ref(),
+                after.as_ref(),
+                &scan_store,
+            )
+            .unwrap();
+            id = Some(scan);
+            seen.extend(entries.into_iter().map(|(_, value)| value));
+            if !has_more {
+                break;
+            }
+            after = cursor;
+            // Another wallet starts a scan of the high store after a commit.
+            high_store
+                .checkpoint_frame_cursor(frame, b"test/scan-cursor")
+                .unwrap();
+            let generation = high_store
+                .acquire_or_capture_scan_snapshot(None)
+                .unwrap()
+                .unwrap();
+            newer.insert(generation.scan_id.unwrap());
+            assert!(frame < 1_000, "the scan must terminate");
+        }
+        assert!(
+            newer.len() > MAX_SCAN_GENERATIONS,
+            "newer scans of the high store outnumber its retained snapshots"
+        );
+        assert_eq!(seen.len(), usize::from(records) + 1);
+        assert_eq!(seen.last(), Some(&1), "the high store's record, at the end");
     }
 }
 

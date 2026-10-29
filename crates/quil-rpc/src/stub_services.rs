@@ -326,6 +326,7 @@ impl AppShardService for AppShardRpcServer {
                 domain: req.domain,
                 snapshot_id: req.snapshot_id,
                 after: req.after,
+                max_coins: req.max_coins,
             }))
             .await?
             .into_inner();
@@ -377,6 +378,7 @@ impl AppShardService for AppShardRpcServer {
                 domain: req.domain,
                 snapshot_id: req.snapshot_id,
                 after: req.after,
+                max_coins: req.max_coins,
             }))
             .await?
             .into_inner();

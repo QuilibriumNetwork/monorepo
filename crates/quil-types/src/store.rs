@@ -875,6 +875,28 @@ pub struct LegacyCoinPageData {
 /// Legacy coins one page carries.
 pub const MAX_LEGACY_COINS_PER_PAGE: usize = 512;
 
+/// Coins (or escrows) a wallet scan page carries unless its request asks for
+/// more: the page every node and wallet used before `max_coins`, and the
+/// page a [`CoinWitnessProvider`] answers.
+pub const DEFAULT_SCAN_PAGE_ENTRIES: usize = 8;
+/// The most coins (or escrows) a wallet scan page carries on request.
+pub const MAX_SCAN_PAGE_ENTRIES: usize = 64;
+
+/// The page size a scan request's `max_coins` asks for: unset (zero) and
+/// values below [`DEFAULT_SCAN_PAGE_ENTRIES`] mean the default, values above
+/// [`MAX_SCAN_PAGE_ENTRIES`] the maximum.
+pub fn scan_page_entries(max_coins: u32) -> usize {
+    usize::try_from(max_coins)
+        .unwrap_or(MAX_SCAN_PAGE_ENTRIES)
+        .clamp(DEFAULT_SCAN_PAGE_ENTRIES, MAX_SCAN_PAGE_ENTRIES)
+}
+
+/// The most bytes an encoded scan page of `entries` coins or escrows takes:
+/// 32 KiB an entry, 256 KiB for the default page.
+pub fn scan_page_bytes(entries: usize) -> usize {
+    entries.saturating_mul(32 * 1024)
+}
+
 /// Node-side QCT3 wallet discovery, membership and mint-witness provider.
 pub trait CoinWitnessProvider: Send + Sync {
     /// `owner`'s legacy coins in `domain` after `after`. `None` when this node
@@ -1556,5 +1578,23 @@ pub trait SnapshotReadable: Send + Sync {
         _vertex_key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod scan_page_tests {
+    use super::*;
+
+    /// A request without `max_coins` gets the page it always got; a larger
+    /// one is bounded by the node's maximum.
+    #[test]
+    fn a_scan_page_size_defaults_to_eight_and_is_bounded() {
+        assert_eq!(scan_page_entries(0), DEFAULT_SCAN_PAGE_ENTRIES);
+        assert_eq!(scan_page_entries(1), DEFAULT_SCAN_PAGE_ENTRIES);
+        assert_eq!(scan_page_entries(20), 20);
+        assert_eq!(scan_page_entries(64), MAX_SCAN_PAGE_ENTRIES);
+        assert_eq!(scan_page_entries(u32::MAX), MAX_SCAN_PAGE_ENTRIES);
+        assert_eq!(scan_page_bytes(DEFAULT_SCAN_PAGE_ENTRIES), 256 * 1024);
+        assert_eq!(scan_page_bytes(MAX_SCAN_PAGE_ENTRIES), 2 << 20);
     }
 }

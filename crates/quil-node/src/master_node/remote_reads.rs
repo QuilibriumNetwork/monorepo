@@ -323,6 +323,7 @@ impl PeerCoinReader {
         domain: &[u8; 32],
         snapshot_id: Option<&[u8; 32]>,
         after: Option<&[u8; 32]>,
+        max_coins: u32,
     ) -> Result<CoinPageData, String> {
         let mut client = quil_rpc::ArchiveClient::connect_mtls(endpoint, &self.falcon_key)
             .await
@@ -332,6 +333,7 @@ impl PeerCoinReader {
                 domain.to_vec(),
                 snapshot_id.map(|id| id.to_vec()).unwrap_or_default(),
                 after.map(|a| a.to_vec()).unwrap_or_default(),
+                max_coins,
             )
             .await
             .map_err(|error| match error {
@@ -473,15 +475,16 @@ impl PeerCoinReader {
         None
     }
 
-    /// One page of `domain`'s coins from a node that holds it: covering nodes
-    /// first, an archive last. `Err` when nobody answered, with the peers'
-    /// reasons; the caller then reports that this node cannot serve the
-    /// application, never an empty page.
+    /// One page of up to `max_coins` of `domain`'s coins from a node that
+    /// holds it: covering nodes first, an archive last. `Err` when nobody
+    /// answered, with the peers' reasons; the caller then reports that this
+    /// node cannot serve the application, never an empty page.
     pub async fn coin_page(
         &self,
         domain: [u8; 32],
         snapshot_id: Option<[u8; 32]>,
         after: Option<[u8; 32]>,
+        max_coins: u32,
     ) -> Result<CoinPageData, String> {
         // Continuing a scan goes back to the peer whose snapshot it names; no
         // retry brings back a pin that is gone.
@@ -491,7 +494,7 @@ impl PeerCoinReader {
         }
         let (budget, delay) = self.read_retry;
         retry_until_ok(budget, delay, || {
-            self.coin_page_once(domain, snapshot_id, after)
+            self.coin_page_once(domain, snapshot_id, after, max_coins)
         })
         .await
     }
@@ -501,6 +504,7 @@ impl PeerCoinReader {
         domain: [u8; 32],
         snapshot_id: Option<[u8; 32]>,
         after: Option<[u8; 32]>,
+        max_coins: u32,
     ) -> Result<CoinPageData, String> {
         let endpoints = match snapshot_id {
             Some(id) => vec![self
@@ -515,7 +519,13 @@ impl PeerCoinReader {
         let mut rootless = None;
         for endpoint in endpoints {
             match self
-                .page_from(&endpoint, &domain, snapshot_id.as_ref(), after.as_ref())
+                .page_from(
+                    &endpoint,
+                    &domain,
+                    snapshot_id.as_ref(),
+                    after.as_ref(),
+                    max_coins,
+                )
                 .await
             {
                 Ok(page) if page.root_record.is_empty() => {
@@ -628,13 +638,14 @@ impl PeerCoinReader {
         domain: [u8; 32],
         snapshot_id: Option<[u8; 32]>,
         after: Option<[u8; 32]>,
+        max_escrows: u32,
     ) -> Option<EscrowPageData> {
         if let Some(id) = snapshot_id {
             self.pinned_endpoint(ScanKind::Escrows, domain, id)?;
         }
         let (budget, delay) = self.read_retry;
         retry_within(budget, delay, || {
-            self.escrow_page_once(domain, snapshot_id, after)
+            self.escrow_page_once(domain, snapshot_id, after, max_escrows)
         })
         .await
     }
@@ -644,6 +655,7 @@ impl PeerCoinReader {
         domain: [u8; 32],
         snapshot_id: Option<[u8; 32]>,
         after: Option<[u8; 32]>,
+        max_escrows: u32,
     ) -> Option<EscrowPageData> {
         let endpoints = match snapshot_id {
             Some(id) => vec![self.pinned_endpoint(ScanKind::Escrows, domain, id)?],
@@ -660,6 +672,7 @@ impl PeerCoinReader {
                     domain.to_vec(),
                     snapshot_id.map(|id| id.to_vec()).unwrap_or_default(),
                     after.map(|id| id.to_vec()).unwrap_or_default(),
+                    max_escrows,
                 )
                 .await
             {
@@ -916,8 +929,8 @@ mod tests {
         .with_read_retry(Duration::from_millis(60), Duration::from_millis(10));
         let domain = [3; 32];
         let started = Instant::now();
-        assert!(reader.coin_page(domain, None, None).await.is_err());
-        assert!(reader.escrow_page(domain, None, None).await.is_none());
+        assert!(reader.coin_page(domain, None, None, 0).await.is_err());
+        assert!(reader.escrow_page(domain, None, None, 0).await.is_none());
         assert!(reader.vertex(domain, vec![4; 32]).await.is_none());
         assert!(
             started.elapsed() >= Duration::from_millis(150),
@@ -925,11 +938,11 @@ mod tests {
         );
         let started = Instant::now();
         assert!(reader
-            .coin_page(domain, Some([5; 32]), Some([6; 32]))
+            .coin_page(domain, Some([5; 32]), Some([6; 32]), 0)
             .await
             .is_err());
         assert!(reader
-            .escrow_page(domain, Some([5; 32]), None)
+            .escrow_page(domain, Some([5; 32]), None, 0)
             .await
             .is_none());
         assert!(
@@ -986,7 +999,7 @@ mod tests {
             1,
         )
         .with_read_retry(Duration::ZERO, Duration::from_millis(1));
-        let Err(reasons) = reader.coin_page([3; 32], None, None).await else {
+        let Err(reasons) = reader.coin_page([3; 32], None, None, 0).await else {
             panic!("nobody serves the application");
         };
         assert!(reasons.starts_with("2 peers declined: "), "{reasons}");
