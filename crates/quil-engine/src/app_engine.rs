@@ -121,9 +121,12 @@ pub enum AppEngineMessage {
         reply: tokio::sync::oneshot::Sender<Option<Vec<Vec<u8>>>>,
     },
     /// The certified origin state a shard with no frame of its own syncs
-    /// against (`app_handoff::origin_anchors`).
+    /// against (`app_handoff::origin_anchors`). A lookup while a GLOBAL
+    /// state sync installs its chunks answers its wait
+    /// ([`quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS`]),
+    /// which the shard sync waits out.
     OriginAnchors {
-        reply: tokio::sync::oneshot::Sender<Vec<(Vec<u8>, [[u8; 32]; 4])>>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<(Vec<u8>, [[u8; 32]; 4])>>>,
     },
     /// The frame GLOBAL has executed this shard's current session through
     /// (`app_handoff::committed_tip`).
@@ -507,9 +510,9 @@ impl AppEngineHandle {
                         "shard engine stopped before origin lookup".into(),
                     )
                 })?;
-            receive
-                .await
-                .map_err(|_| QuilError::ExecutionUnavailable("origin lookup was cancelled".into()))
+            receive.await.map_err(|_| {
+                QuilError::ExecutionUnavailable("origin lookup was cancelled".into())
+            })?
         })
         .await
         .map_err(|_| QuilError::ExecutionUnavailable("origin lookup timed out".into()))?
@@ -5262,6 +5265,14 @@ impl AppConsensusEngine {
                     )),
                 };
                 result.map_err(|error| {
+                    // A check that read committed GLOBAL state (a session
+                    // certificate's authorization) while a GLOBAL state sync
+                    // installs is the sync's wait too: named as the frame's
+                    // refusal, it was not waited out, and the attempt failed
+                    // as the archive's checkpoint (2026-10-29).
+                    if quil_execution::global_intrinsic::handoff::global_sync_in_progress(&error) {
+                        global_sync.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     QuilError::InvalidArgument(format!(
                         "archive sync {role} frame {number}: {error}"
                     ))
@@ -6346,14 +6357,13 @@ impl AppConsensusEngine {
                             let _ = reply.send(roots);
                         }
                         Some(AppEngineMessage::OriginAnchors { reply }) => {
+                            // The shard sync logs a failed lookup, and waits
+                            // out a GLOBAL state sync's.
                             let anchors = match self.global_hypergraph.as_ref() {
                                 Some(global) if quil_types::consensus::committee_handoff_policy().is_some() => {
-                                    crate::app_handoff::origin_anchors(global, &self.filter).unwrap_or_else(|error| {
-                                        warn!(core_id = self.core_id, %error, "origin anchors unavailable");
-                                        Vec::new()
-                                    })
+                                    crate::app_handoff::origin_anchors(global, &self.filter)
                                 }
-                                _ => Vec::new(),
+                                _ => Ok(Vec::new()),
                             };
                             let _ = reply.send(anchors);
                         }
@@ -15185,6 +15195,9 @@ fn reanchor_wait(
                 "an archive request of the re-anchor failed; it retries"
             }
             "archive_state" => "an archive lacked what the re-anchor asked of it; it retries",
+            crate::worker_execution::GLOBAL_SYNC => {
+                "this node's GLOBAL state sync is installing; the re-anchor waits"
+            }
             _ => "a step of the re-anchor failed on this node; it retries",
         };
         (wait, scope, action)
@@ -15377,6 +15390,12 @@ mod fence_reanchor_tests {
                 "failed on this node",
                 "this node",
             ),
+            (
+                "execution unavailable: global state sync in progress",
+                None,
+                "GLOBAL state sync is installing",
+                "this node",
+            ),
         ];
         let mut lines = std::collections::HashSet::new();
         for (reason, refusal, line, scope) in cases {
@@ -15386,7 +15405,7 @@ mod fence_reanchor_tests {
             assert!(!action.is_empty());
             lines.insert(wait);
         }
-        assert_eq!(lines.len(), 12, "a line of its own for each cause");
+        assert_eq!(lines.len(), 13, "a line of its own for each cause");
         assert_eq!(
             crate::worker_execution::failure_class(REANCHOR_REFUSED),
             "archive_state",
@@ -19314,6 +19333,61 @@ mod tests {
             .await
             .unwrap_err();
         assert!(global_sync_in_progress(&error), "{error}");
+    }
+
+    /// A certified anchor's certificate check reads its session's
+    /// authorization from committed GLOBAL state, which this node's GLOBAL
+    /// state sync withholds while it installs: the check answers the sync's
+    /// wait too. Named as the frame's refusal ("archive sync anchor frame
+    /// 27200: execution unavailable: global state sync in progress"), it was
+    /// not waited out and failed the attempt as the archive's checkpoint
+    /// (2026-10-29).
+    #[tokio::test]
+    async fn a_certified_anchors_check_answers_a_global_sync_install_as_a_wait() {
+        use quil_execution::global_intrinsic::handoff::{
+            global_sync_in_progress, GLOBAL_SYNC_IN_PROGRESS,
+        };
+        use quil_types::consensus::{CommitteeHandoffPolicy, LegacyHistory};
+        struct RestorePolicy(Option<CommitteeHandoffPolicy>);
+        impl Drop for RestorePolicy {
+            fn drop(&mut self) {
+                quil_types::consensus::set_committee_handoff_policy(self.0);
+            }
+        }
+        let (mut engine, predecessor, _, global) = engine_with_sessions_from_seven(0x43, None);
+        let _restore = RestorePolicy(quil_types::consensus::committee_handoff_policy());
+        quil_types::consensus::set_committee_handoff_policy(Some(CommitteeHandoffPolicy {
+            activation_frame: 0,
+            chain_id: [7; 32],
+            legacy_history: LegacyHistory::Discard,
+            membership_boundary_frame: u64::MAX,
+            first_session_boundary_frame: u64::MAX,
+        }));
+        let mut anchor = sealed_frame_eight(1);
+        anchor
+            .header
+            .as_mut()
+            .unwrap()
+            .public_key_signature_bls48581 = certified_frame_nine(2)
+            .header
+            .unwrap()
+            .public_key_signature_bls48581;
+        let refused = engine
+            .validate_archive_sync_anchor(&anchor, Some(&predecessor), None)
+            .await
+            .unwrap_err();
+        assert!(!global_sync_in_progress(&refused), "{refused}");
+
+        begin_global_sync(&global);
+        let error = engine
+            .validate_archive_sync_anchor(&anchor, Some(&predecessor), None)
+            .await
+            .unwrap_err();
+        assert!(global_sync_in_progress(&error), "{error}");
+        assert_eq!(
+            error.to_string(),
+            format!("execution unavailable: {GLOBAL_SYNC_IN_PROGRESS}")
+        );
     }
 
     /// GLOBAL fenced generation 1 of QUIL_TOKEN at its base 0 without

@@ -114,8 +114,9 @@ const RECOVERY_PHASES: [(&str, RecoveryPhase); 6] = [
     ("installing_checkpoint", RecoveryPhase::InstallingCheckpoint),
 ];
 
-const FAILURES: [(&str, RecoveryFailure); 6] = [
+const FAILURES: [(&str, RecoveryFailure); 7] = [
     ("no_archive_known", RecoveryFailure::NoArchiveKnown),
+    ("global_sync", RecoveryFailure::GlobalSync),
     ("connect", RecoveryFailure::Connect),
     ("archive_request", RecoveryFailure::ArchiveRequest),
     ("archive_state", RecoveryFailure::ArchiveState),

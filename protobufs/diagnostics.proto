@@ -88,6 +88,9 @@ enum RecoveryFailure {
   // The archive's frames do not replay onto the worker's local state.
   RECOVERY_FAILURE_REPLAY_MISMATCH = 5;
   RECOVERY_FAILURE_OTHER = 6;
+  // This node's own GLOBAL state sync was installing and withheld committed
+  // GLOBAL state: an expected wait, no archive's failure.
+  RECOVERY_FAILURE_GLOBAL_SYNC = 7;
 }
 
 message FailureCount {

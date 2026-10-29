@@ -54,8 +54,9 @@ pub const RECOVERY_PHASES: [&str; 6] = [
 ];
 
 /// Every class [`failure_class`] gives a failed recovery attempt.
-pub const FAILURE_CLASSES: [&str; 6] = [
+pub const FAILURE_CLASSES: [&str; 7] = [
     NO_ARCHIVE,
+    GLOBAL_SYNC,
     "connect",
     "archive_request",
     "archive_state",
@@ -523,7 +524,9 @@ impl SharedWorkerExecution {
                 (Some(failure), _) => {
                     r.last_error = failure.clone();
                     r.last_error_unix_ms = now;
-                    r.consecutive_failures += 1;
+                    if failure_class(failure) != GLOBAL_SYNC {
+                        r.consecutive_failures += 1;
+                    }
                     let count = r
                         .failures_by_class
                         .entry(failure_class(failure).into())
@@ -553,6 +556,17 @@ impl SharedWorkerExecution {
             ended.source.as_str()
         };
         let class = failure.as_deref().map(failure_class);
+        // An attempt that waited for this node's GLOBAL state sync to finish
+        // installing failed nothing of an archive's: it neither extends nor
+        // ends the shard's failure streak, its gap pacing or the node's
+        // archive state, and the wait logged its start and end itself
+        // (`prover_tree_syncer::waiting_out_global_sync`).
+        if class == Some(GLOBAL_SYNC) {
+            tracing::debug!(filter = %hex::encode(filter), error = failure.as_deref().unwrap_or("none"),
+                attempt_secs = ended.attempt_ms / 1000,
+                "archive recovery attempt waited for this node's GLOBAL state sync; not counted as a failure");
+            return result;
+        }
         let (logged, classes, failed_before, first_failure) = {
             let mut streaks = self
                 .streaks
@@ -672,6 +686,21 @@ const STREAK_REPEAT: Duration = Duration::from_secs(10 * 60);
 
 /// The class of a failure that found no archive at all.
 pub(crate) const NO_ARCHIVE: &str = "no_archive_known";
+
+/// The class of an attempt that stopped waiting for this node's own GLOBAL
+/// state sync to finish installing: committed GLOBAL state is withheld
+/// until its last chunk is in
+/// ([`quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS`]).
+/// An expected wait of this node, no archive's failure: it does not count
+/// toward the shard's failure streak.
+pub(crate) const GLOBAL_SYNC: &str = "global_sync";
+
+/// Why an attempt that waited out this node's GLOBAL state sync within its
+/// budget (`prover_tree_syncer::waiting_out_global_sync`) installed
+/// nothing.
+pub(crate) const GLOBAL_SYNC_STILL_INSTALLING: &str =
+    "this node's GLOBAL state sync is still installing, which withholds the committed GLOBAL state \
+    the archive checkpoint is checked against";
 
 /// The first back-off of a recovery whose attempts stop again at the same
 /// shard frame no archive serves ([`ArchiveGapPacing`]); each later one
@@ -1058,8 +1087,17 @@ fn note_archive_known(filter: &[u8], reached: bool, error: Option<&str>, now: In
 
 /// The class of a failed recovery attempt, from its error or not-ready
 /// text: one of [`FAILURE_CLASSES`].
+///
+/// This node's GLOBAL state sync is matched first, as an error about an
+/// archive's frame or checkpoint can name its wait: read as the archive's,
+/// it told operators to report archives that had failed nothing (38 to 40
+/// "archive_state" failures in a row on 4 shards of a node restarted into
+/// its GLOBAL sync, 2026-10-29).
 pub fn failure_class(error: &str) -> &'static str {
-    if error.contains("no archive known")
+    use quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS;
+    if error.contains(GLOBAL_SYNC_IN_PROGRESS) || error.contains(GLOBAL_SYNC_STILL_INSTALLING) {
+        GLOBAL_SYNC
+    } else if error.contains("no archive known")
         || error.contains("discovered an archive")
         || error.contains("archive discovery")
     {
@@ -1085,6 +1123,8 @@ pub(crate) fn failure_guidance(class: &str) -> (&'static str, &'static str) {
     match class {
         NO_ARCHIVE => ("this node", "this node's master knows no reachable archive yet; \
             check its 'archive endpoint added' lines and outbound connectivity; it retries"),
+        GLOBAL_SYNC => ("this node", "this node's GLOBAL state sync is installing; recovery resumes when \
+            it finishes — an expected wait, no action"),
         "connect" => ("archive", "the archive refused or timed out the connection; \
             check this node's outbound connectivity to it; the next attempt tries another archive"),
         "archive_request" => ("archive", "the archive failed a read; the next attempt tries another archive; \
@@ -1714,6 +1754,94 @@ mod tests {
         }
         assert_eq!(failure_guidance("no_archive_known").0, "this node");
         assert_eq!(failure_guidance("connect").0, "archive");
+    }
+
+    /// This node's own GLOBAL state sync withholding committed GLOBAL state
+    /// is its own class, matched before the rules that name an archive:
+    /// the texts a node restarted into its GLOBAL sync logged, read as
+    /// "archive_state", told its operator an archive had failed
+    /// (2026-10-29). Real archive failures keep their classes.
+    #[test]
+    fn this_nodes_global_sync_is_not_read_as_an_archive_failure() {
+        for error in [
+            "execution unavailable: global state sync in progress",
+            "invalid argument: archive sync anchor frame 27200: execution unavailable: \
+                global state sync in progress",
+            "origin anchors unavailable: execution unavailable: global state sync in progress",
+            GLOBAL_SYNC_STILL_INSTALLING,
+        ] {
+            assert_eq!(failure_class(error), GLOBAL_SYNC, "{error}");
+        }
+        for (error, class) in [
+            ("the archive checkpoint failed validation", "archive_state"),
+            (
+                "the archive does not hold the session's certified base state, or its roots differ",
+                "archive_state",
+            ),
+            (
+                "execution unavailable: archive replay is missing shard frame 9",
+                "archive_state",
+            ),
+            (
+                "invalid argument: archive sync anchor frame 33228: invalid signature: \
+                    app session certificate: generation has no authorization",
+                "other",
+            ),
+        ] {
+            assert_eq!(failure_class(error), class, "{error}");
+        }
+        let (scope, action) = failure_guidance(GLOBAL_SYNC);
+        assert_eq!(scope, "this node");
+        assert!(action.contains("expected wait, no action"), "{action}");
+        assert!(!action.contains("report it"), "{action}");
+    }
+
+    /// An attempt that waited for this node's GLOBAL state sync is recorded
+    /// with its class, but neither counts toward the shard's failure streak
+    /// nor ends it: 40 of them in a row warn nothing, and the archive
+    /// failure before them still counts once.
+    #[tokio::test]
+    async fn a_global_sync_wait_counts_toward_no_failure_streak() {
+        let worker = SharedWorkerExecution::default();
+        let _ = worker
+            .recovering(&[6; 32], async {
+                Err(quil_types::error::QuilError::Internal(
+                    "archive connect: refused".into(),
+                ))
+            })
+            .await;
+        for _ in 0..40 {
+            let _ = worker
+                .recovering(&[6; 32], async {
+                    Ok(ShardRecoveryProgress::NotReady(
+                        GLOBAL_SYNC_STILL_INSTALLING,
+                    ))
+                })
+                .await;
+            let _ = worker
+                .recovering(&[6; 32], async {
+                    Err(quil_types::error::QuilError::ExecutionUnavailable(
+                        quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS.into(),
+                    ))
+                })
+                .await;
+        }
+        let r = worker.snapshot().recovery.unwrap();
+        assert_eq!((r.attempts, r.consecutive_failures), (81, 1));
+        assert_eq!(failure_class(&r.last_error), GLOBAL_SYNC);
+        let classes: BTreeMap<String, u32> = r.failures_by_class.into_iter().collect();
+        assert_eq!(
+            classes,
+            BTreeMap::from([("connect".into(), 1), (GLOBAL_SYNC.into(), 80)])
+        );
+        let streaks = worker.streaks.lock().unwrap();
+        assert_eq!(
+            (
+                streaks[&vec![6; 32]].failures,
+                streaks[&vec![6; 32]].reported
+            ),
+            (1, false)
+        );
     }
 
     #[tokio::test]
