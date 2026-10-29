@@ -460,6 +460,7 @@ impl FrameMaterializer {
             .as_ref()
             .ok_or_else(|| QuilError::InvalidArgument("frame has no header".into()))?;
         let frame_number = header.frame_number;
+        quil_types::consensus::note_frame_time_head(frame_number);
 
         // 1. Idempotency check
         self.ensure_no_pending_execution()?;

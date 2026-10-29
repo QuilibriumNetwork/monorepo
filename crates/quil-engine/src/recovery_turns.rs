@@ -80,13 +80,14 @@ const SATURATION_TICK: Duration = Duration::from_secs(60);
 
 /// How long a withdrawn claim's place waits for its worker's next claim of
 /// the shard ([`State::keep_place`]): an epoch of wall time from its first
-/// withdrawal since the place last got a turn. An engine restarts within
+/// withdrawal since the place last got a turn, at the GLOBAL frame interval
+/// of this process's latest GLOBAL frame. An engine restarts within
 /// seconds to minutes; on an operator's node the engine of a seat it kept
 /// restarted seven times in 81 minutes while its recovery waited.
 fn place_kept_for() -> Duration {
     Duration::from_millis(
         quil_types::consensus::epoch_length_frames()
-            .saturating_mul(crate::difficulty::IDEAL_FRAME_TIME.unsigned_abs()),
+            .saturating_mul(quil_types::consensus::ideal_frame_time_ms()),
     )
 }
 

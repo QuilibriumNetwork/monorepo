@@ -521,7 +521,7 @@ fn proposal_pacing_runs_until_the_parent_timestamp_and_no_longer_than_an_interva
         "a parent in the past needs none"
     );
     assert_eq!(
-        crate::leader_provider::proposal_pacing_wait(0, 5),
+        crate::leader_provider::proposal_pacing_wait(1, 0, 5),
         std::time::Duration::ZERO
     );
 }

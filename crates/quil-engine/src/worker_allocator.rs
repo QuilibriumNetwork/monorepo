@@ -76,12 +76,13 @@ fn manual_release_reason(
     }
 }
 
-/// Whether a GLOBAL head stamped `head_unix_ms` is current at `now_unix_ms`:
-/// at most an epoch of ideal frame time old. An older stored head belongs to
-/// a node returning from downtime, whose seats may have lapsed since.
-pub fn stored_head_current(head_unix_ms: u64, now_unix_ms: u64) -> bool {
+/// Whether GLOBAL head `head`, stamped `head_unix_ms`, is current at
+/// `now_unix_ms`: at most an epoch of ideal frame time old (at the head's
+/// interval throughout). An older stored head belongs to a node returning
+/// from downtime, whose seats may have lapsed since.
+pub fn stored_head_current(head: u64, head_unix_ms: u64, now_unix_ms: u64) -> bool {
     let epoch_ms = quil_types::consensus::epoch_length_frames()
-        .saturating_mul(crate::difficulty::IDEAL_FRAME_TIME.unsigned_abs());
+        .saturating_mul(quil_types::consensus::ideal_frame_time_ms_at(head));
     now_unix_ms.saturating_sub(head_unix_ms) <= epoch_ms
 }
 
@@ -1593,7 +1594,7 @@ impl WorkerAllocator {
         head_unix_ms: u64,
         now_unix_ms: u64,
     ) -> Result<bool> {
-        if !stored_head_current(head_unix_ms, now_unix_ms) {
+        if !stored_head_current(head, head_unix_ms, now_unix_ms) {
             return Ok(false);
         }
         self.on_new_frame(head)?;
@@ -4382,7 +4383,7 @@ mod tests {
         let e = epoch_length_frames();
         let (stored, current) = (1274 * e + 100, 1292 * e + 50);
         let now = 1_800_000_000_000;
-        let epoch_ms = e * crate::difficulty::IDEAL_FRAME_TIME.unsigned_abs();
+        let epoch_ms = e * quil_types::consensus::ideal_frame_time_ms();
         let idle = |wm: &MockWorkerManager| wm.range_workers().unwrap()[0].filter.is_empty();
         let wm = Arc::new(MockWorkerManager::new());
         wm.allocate_worker(1, &[]).unwrap();
@@ -4420,8 +4421,8 @@ mod tests {
         );
         assert_eq!(wm.range_workers().unwrap()[0].filter, vec![4; 32]);
         assert!(
-            stored_head_current(now - epoch_ms, now)
-                && !stored_head_current(now - epoch_ms - 1, now)
+            stored_head_current(stored, now - epoch_ms, now)
+                && !stored_head_current(stored, now - epoch_ms - 1, now)
         );
     }
 

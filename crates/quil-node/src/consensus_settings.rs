@@ -10,10 +10,85 @@ fn epoch_length(network: u8, local_override: Option<&str>) -> u64 {
         .unwrap_or(quil_types::consensus::TESTNET_EPOCH_LENGTH_FRAMES)
 }
 
+/// The shortest GLOBAL frame interval a local network may set. The VDF at
+/// the difficulty floor takes about three seconds, so a shorter interval
+/// only means the leader never waits.
+const MIN_FRAME_TIME_MS: u64 = 500;
+
+/// The GLOBAL frame-interval schedule `QUIL_FRAME_TIME_MS` sets, as
+/// `(first frame, interval ms)` entries: empty (the ten-second default) on
+/// mainnet whatever the setting, and when it is unset or empty. Elsewhere it is one
+/// interval (`2500`) or comma-separated intervals keyed by the GLOBAL frame
+/// they start at (`2500,10000@240`: 2.5 s from genesis, 10 s from frame 240
+/// on), the first from frame 0 (no `@` or `@0`), frames strictly ascending;
+/// each interval at least [`MIN_FRAME_TIME_MS`]. An invalid setting is
+/// refused with its reason.
+fn frame_time_schedule(
+    network: u8,
+    local_override: Option<&str>,
+) -> Result<Vec<(u64, u64)>, String> {
+    let Some(setting) = local_override.filter(|setting| network != 0 && !setting.trim().is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+    let mut schedule: Vec<(u64, u64)> = Vec::new();
+    for entry in setting.split(',').map(str::trim) {
+        let (millis, from) = match entry.split_once('@') {
+            Some((millis, from)) => (
+                millis.trim(),
+                from.trim()
+                    .parse::<u64>()
+                    .map_err(|_| format!("bad start frame in {entry:?}"))?,
+            ),
+            None => (entry, 0),
+        };
+        let millis = millis
+            .parse::<u64>()
+            .ok()
+            .filter(|millis| *millis > 0)
+            .ok_or_else(|| format!("bad interval in {entry:?}"))?;
+        match schedule.last() {
+            None if from != 0 => {
+                return Err(format!(
+                    "the first interval must start at frame 0, not {from}"
+                ))
+            }
+            Some((last, _)) if from <= *last => {
+                return Err(format!("start frame {from} does not follow {last}"))
+            }
+            _ => schedule.push((from, millis.max(MIN_FRAME_TIME_MS))),
+        }
+    }
+    Ok(schedule)
+}
+
 pub(crate) fn initialize(network: u8) {
     let local_override = std::env::var("QUIL_EPOCH_LENGTH_FRAMES").ok();
     let frames = epoch_length(network, local_override.as_deref());
     quil_types::consensus::set_epoch_length_frames(frames);
+    let frame_time_setting = std::env::var("QUIL_FRAME_TIME_MS").ok();
+    match frame_time_schedule(network, frame_time_setting.as_deref()) {
+        Ok(schedule) if schedule.is_empty() => {}
+        Ok(schedule) => {
+            let intervals = schedule
+                .iter()
+                .map(|(from, millis)| format!("{millis} ms from frame {from}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                intervals = %intervals,
+                "QUIL_FRAME_TIME_MS override active: GLOBAL frame interval set instead of \
+                 10000 ms (local networks only; mainnet ignores it)"
+            );
+            quil_types::consensus::set_frame_time_schedule(schedule);
+        }
+        Err(reason) => tracing::warn!(
+            setting = frame_time_setting.as_deref().unwrap_or_default(),
+            reason = %reason,
+            "QUIL_FRAME_TIME_MS ignored: GLOBAL frames keep the 10000 ms default; set one \
+             interval in ms or ascending entries like 2500,10000@240 (local networks only)"
+        ),
+    }
     let penalty_epoch = quil_types::consensus::init_seniority_penalty_epoch(network);
     if network != 0 && penalty_epoch != u64::MAX {
         tracing::warn!(
@@ -146,6 +221,63 @@ mod tests {
                     super::epoch_length(network, setting),
                     if network == 0 { 720 } else { testnet_frames }
                 );
+            }
+        }
+    }
+
+    /// Mainnet keeps the ten-second GLOBAL frame interval whatever
+    /// `QUIL_FRAME_TIME_MS` says, a single value or a schedule.
+    #[test]
+    fn local_frame_time_override_cannot_change_mainnet() {
+        for setting in [
+            None,
+            Some("1000"),
+            Some("2500"),
+            Some("2500,10000@240"),
+            Some("bad"),
+        ] {
+            assert_eq!(super::frame_time_schedule(0, setting), Ok(Vec::new()));
+        }
+    }
+
+    /// Other networks take one interval or ascending entries keyed by start
+    /// frame, each at least 500 ms; zero, garbage, a first entry after
+    /// frame 0 and start frames out of order are refused.
+    #[test]
+    fn local_frame_time_schedule_parses_and_floors() {
+        for network in [1, 2] {
+            let schedule = |setting| super::frame_time_schedule(network, Some(setting));
+            assert_eq!(super::frame_time_schedule(network, None), Ok(Vec::new()));
+            assert_eq!(schedule(" "), Ok(Vec::new()), "empty is unset");
+            assert_eq!(schedule("1000"), Ok(vec![(0, 1_000)]));
+            assert_eq!(schedule("2500"), Ok(vec![(0, 2_500)]));
+            assert_eq!(schedule("2500@0"), Ok(vec![(0, 2_500)]));
+            assert_eq!(schedule("100"), Ok(vec![(0, 500)]));
+            assert_eq!(schedule("499"), Ok(vec![(0, 500)]));
+            assert_eq!(schedule("500"), Ok(vec![(0, 500)]));
+            assert_eq!(
+                schedule("2500,10000@240"),
+                Ok(vec![(0, 2_500), (240, 10_000)])
+            );
+            assert_eq!(
+                schedule(" 2500 , 100@240 , 3000@ 500"),
+                Ok(vec![(0, 2_500), (240, 500), (500, 3_000)])
+            );
+            for invalid in [
+                "0",
+                "bad",
+                "-1",
+                "2500,",
+                "2500,0@240",
+                "2500,10000@x",
+                "2500@10",
+                "10000@240",
+                "2500,10000@240,3000@240",
+                "2500,10000@240,3000@100",
+                "2500,10000@0",
+                "18446744073709551616",
+            ] {
+                assert!(schedule(invalid).is_err(), "{invalid:?} is refused");
             }
         }
     }

@@ -480,13 +480,14 @@ pub fn label_estimate(nodes: u64) -> std::time::Duration {
 /// The frames left at GLOBAL frame `frame` to the renewal's grace frame for
 /// `epoch` (`crate::app_shard_metadata::storage_snapshot_grace`) when
 /// labelling a leaf of `nodes` nodes now would end past it by its estimate
-/// ([`label_estimate`]), a frame taking `crate::difficulty::IDEAL_FRAME_TIME`;
+/// ([`label_estimate`]), a frame taking the interval at `frame`
+/// ([`quil_types::consensus::ideal_frame_time_ms_at`]) up to the grace frame;
 /// `None` when it would end in time.
 fn misses_grace(epoch: u64, nodes: u64, frame: u64) -> Option<u64> {
     let grace = quil_types::consensus::storage_snapshot_frame(epoch)
         .saturating_add(crate::app_shard_metadata::storage_snapshot_grace());
     let left = grace.saturating_sub(frame);
-    let frame_millis = u128::try_from(crate::difficulty::IDEAL_FRAME_TIME).unwrap_or(1);
+    let frame_millis = u128::from(quil_types::consensus::ideal_frame_time_ms_at(frame));
     (label_estimate(nodes).as_millis() > u128::from(left) * frame_millis).then_some(left)
 }
 
@@ -961,6 +962,7 @@ static GLOBAL_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// not started ([`misses_grace`]).
 pub fn note_global_frame(frame: u64) {
     GLOBAL_FRAME.fetch_max(frame, std::sync::atomic::Ordering::Relaxed);
+    quil_types::consensus::note_frame_time_head(frame);
 }
 
 /// The latest GLOBAL frame this process saw ([`note_global_frame`]), if any.

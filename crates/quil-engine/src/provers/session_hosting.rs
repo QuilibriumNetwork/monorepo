@@ -93,9 +93,11 @@ const PEERS_VOTING_MS: u64 = crate::own_votes::PEERS_VOTING.as_millis() as u64;
 /// withheld for silence, unless it votes or restarts first.
 pub(crate) const HELD_BACK_EPOCHS: u64 = 4;
 
-/// The wall-clock time `epoch_frames` take at the ideal GLOBAL frame time.
+/// The wall-clock time `epoch_frames` take at the ideal GLOBAL frame time:
+/// the interval at this process's latest GLOBAL frame throughout
+/// ([`quil_types::consensus::ideal_frame_time_ms`]).
 pub(crate) fn epoch_ms(epoch_frames: u64) -> u64 {
-    epoch_frames.saturating_mul(crate::difficulty::IDEAL_FRAME_TIME.unsigned_abs())
+    epoch_frames.saturating_mul(quil_types::consensus::ideal_frame_time_ms())
 }
 
 /// How long after a start a worker seen unable to host may still be
