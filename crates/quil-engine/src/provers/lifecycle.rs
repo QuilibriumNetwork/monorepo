@@ -521,6 +521,24 @@ struct SurplusSelection {
     eligible: usize,
     shielded: std::collections::HashSet<Vec<u8>>,
     picks: Vec<Vec<u8>>,
+    /// Seats the ranking would have picked that are spared while their
+    /// storage renewal is under way (`ProverLifecycle::storage_renewals_under_way`).
+    spared: Vec<Vec<u8>>,
+}
+
+pub use super::renewal_storage::RenewalStorage;
+
+/// The epoch a renewal at `frame_number` registers storage for, and its
+/// grace frame (`crate::app_shard_metadata::storage_snapshot_grace`), past
+/// which a seat renews without its snapshot; `None` before hash storage
+/// proofs.
+fn renewal_grace(frame_number: u64) -> Option<(u64, u64)> {
+    let epoch = quil_types::consensus::epoch_for_frame(frame_number) + 1;
+    quil_types::consensus::hash_storage_proofs_at(epoch).then(|| {
+        let grace = quil_types::consensus::storage_snapshot_frame(epoch)
+            .saturating_add(crate::app_shard_metadata::storage_snapshot_grace());
+        (epoch, grace)
+    })
 }
 
 /// Tracks the lifecycle state for this node's prover.
@@ -641,6 +659,21 @@ pub struct ProverLifecycle {
     /// Seats whose renewal was skipped for a pending leave, with the epoch
     /// it was last reported in (`renewal_awaits_leave`).
     renewal_skips_reported: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
+    /// Seats whose storage for the epoch their renewal registers was encoding
+    /// or encoded when the confirm pipeline last prepared them, with that
+    /// epoch (`note_renewal_storage`); kept in the node's store from
+    /// `configure_leave_decision_store` on, so a restart keeps them.
+    renewal_storage: super::renewal_storage::RenewalStorageNotes,
+    /// Seats whose renewal a leave skipped while their storage work was
+    /// under way, with the epoch they were last warned of in
+    /// (`renewal_awaits_leave`).
+    storage_skips_warned: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
+    /// Seats the capacity shed spares while their storage renewal is under
+    /// way, with the frame it first did (`report_storage_spared`).
+    storage_shed_spared: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
+    /// Capacity leaves the halt-risk shield kept, with the epoch they were
+    /// last reported in (`report_capacity_shield`).
+    capacity_shield_reported: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
     /// Per-filter "last frame we proposed Join on this filter."
     /// Worker-level `pending_filter_frame` already prevents re-using
     /// the same worker slot mid-flight, but it times out after 10
@@ -731,6 +764,10 @@ impl ProverLifecycle {
             shards_store: RwLock::new(None),
             last_leave_attempt: RwLock::new(HashMap::new()),
             renewal_skips_reported: std::sync::Mutex::new(HashMap::new()),
+            renewal_storage: super::renewal_storage::RenewalStorageNotes::default(),
+            storage_skips_warned: std::sync::Mutex::new(HashMap::new()),
+            storage_shed_spared: std::sync::Mutex::new(HashMap::new()),
+            capacity_shield_reported: std::sync::Mutex::new(HashMap::new()),
             last_join_attempt: RwLock::new(HashMap::new()),
             shard_info_loaded: AtomicBool::new(false),
             submission_attempts,
@@ -984,10 +1021,15 @@ impl ProverLifecycle {
             .store(frame, Ordering::Relaxed);
     }
 
-    /// Load durable rejection decisions before enabling lifecycle dispatch.
+    /// Load durable rejection decisions before enabling lifecycle dispatch,
+    /// and the capacity shed's storage notes (`note_renewal_storage`): the
+    /// first shed after a restart runs before the confirm pipeline prepares
+    /// any seat again.
     pub fn configure_leave_decision_store(&self, db: Arc<quil_store::RocksDb>) -> Result<()> {
         self.allocation_reasons
             .attach(db.clone(), &self.prover_address)?;
+        self.renewal_storage
+            .attach(db.clone(), &self.prover_address);
         self.leave_decisions.attach(db, &self.prover_address)
     }
 
@@ -1047,7 +1089,10 @@ impl ProverLifecycle {
     /// `LEAVE_COOLDOWN_FRAMES` of `frame_number`, so its renewal waits: once
     /// the leave lands the seat is Leaving, every node refuses a confirm that
     /// names it, and the refusal takes the other seats of its message down
-    /// with it. Reported at info once per seat per epoch.
+    /// with it. Reported at info once per seat per epoch, or warned of once
+    /// per seat per epoch while the seat's storage for the next epoch is
+    /// being encoded or is encoded and the renewal's grace frame is ahead:
+    /// that work is then lost.
     fn renewal_awaits_leave(&self, filter: &[u8], frame_number: u64) -> bool {
         let Some(proposed) = self
             .last_leave_attempt
@@ -1059,6 +1104,32 @@ impl ProverLifecycle {
             return false;
         };
         let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        if let Some((storage, registers, grace_frame)) =
+            self.renewal_storage_under_way(filter, frame_number)
+        {
+            let due = self.storage_skips_warned.lock().is_ok_and(|mut warned| {
+                if warned.get(filter).is_some_and(|last| *last >= epoch) {
+                    return false;
+                }
+                warned.retain(|_, last| last.saturating_add(1) >= epoch);
+                warned.insert(filter.to_vec(), epoch);
+                true
+            });
+            if due {
+                tracing::warn!(frame = frame_number, epoch = registers, filter = hex::encode(filter),
+                    storage = storage.name(), leave_proposed_frame = proposed,
+                    resume_frame = proposed + LEAVE_COOLDOWN_FRAMES, grace_frame,
+                    frames_to_grace = grace_frame.saturating_sub(frame_number), scope = "local",
+                    action = "expected after an operator's leave; otherwise find this seat's cause in this \
+                              node's 'proposing leaves' line and report both lines",
+                    "seat renewal skipped while its storage for the next epoch is being encoded or is encoded: \
+                     this node proposed leaving the seat, and a seat being left is not renewed, so the encoding \
+                     is wasted and the seat holds no storage registration that epoch. If the leave has not \
+                     landed by the resume frame the seat renews, past the grace frame without a registration \
+                     (reported once per seat per epoch)");
+            }
+            return true;
+        }
         let due = self
             .renewal_skips_reported
             .lock()
@@ -1078,6 +1149,190 @@ impl ProverLifecycle {
                  has not landed by the resume frame (reported once per seat per epoch)");
         }
         true
+    }
+
+    /// Record how the confirm pipeline prepared seats' storage at
+    /// `frame_number` for the epoch their renewal registers: `encoded` seats'
+    /// snapshots are encoded, `encoding` seats' are requested and not
+    /// encoded yet. The capacity shed spares them until their renewal lands
+    /// or its grace frame passes (`storage_renewals_under_way`). Saved in the
+    /// node's store when they change, so a restart keeps them.
+    pub fn note_renewal_storage(
+        &self,
+        frame_number: u64,
+        encoded: &[Vec<u8>],
+        encoding: &[Vec<u8>],
+    ) {
+        let epoch = quil_types::consensus::epoch_for_frame(frame_number) + 1;
+        self.renewal_storage.note(epoch, encoded, encoding);
+    }
+
+    /// `filter`'s storage work for the epoch a renewal at `frame_number`
+    /// registers (`note_renewal_storage`), with that epoch and the renewal's
+    /// grace frame, while the grace frame is ahead.
+    fn renewal_storage_under_way(
+        &self,
+        filter: &[u8],
+        frame_number: u64,
+    ) -> Option<(RenewalStorage, u64, u64)> {
+        let (epoch, grace_frame) = renewal_grace(frame_number)?;
+        if frame_number >= grace_frame {
+            return None;
+        }
+        match self.renewal_storage.get(filter) {
+            Some((registers, storage)) if registers == epoch => Some((storage, epoch, grace_frame)),
+            _ => None,
+        }
+    }
+
+    /// The seats among `renewing` (bound seats whose renewal for the next
+    /// epoch has not landed) whose storage for it is being encoded or is
+    /// encoded while the renewal's grace frame is ahead. The capacity shed
+    /// spares them: a leave proposed now skips their renewal
+    /// (`renewal_awaits_leave`), wasting the encoding and, if the leave is
+    /// rejected, costing the seat its storage registration for the epoch.
+    /// The spare is bounded by the renewal landing or the grace frame.
+    fn storage_renewals_under_way<'a>(
+        &self,
+        renewing: impl Iterator<Item = &'a Vec<u8>>,
+        frame_number: u64,
+    ) -> HashMap<Vec<u8>, RenewalStorage> {
+        renewing
+            .filter_map(|filter| {
+                self.renewal_storage_under_way(filter, frame_number)
+                    .map(|(storage, ..)| (filter.clone(), storage))
+            })
+            .collect()
+    }
+
+    /// Report the seats the capacity shed (`path`) spared at `frame_number`
+    /// while their storage renewal is under way, once each as it is first
+    /// spared, with how many seats it shed instead and how many sheds wait.
+    fn report_storage_spared(
+        &self,
+        frame_number: u64,
+        path: &'static str,
+        spared: &[Vec<u8>],
+        protected: &HashMap<Vec<u8>, RenewalStorage>,
+        shed_instead: usize,
+    ) {
+        let Ok(mut known) = self.storage_shed_spared.lock() else {
+            return;
+        };
+        let new: Vec<&Vec<u8>> = spared.iter().filter(|f| !known.contains_key(*f)).collect();
+        if new.is_empty() {
+            return;
+        }
+        for filter in &new {
+            known.insert((*filter).clone(), frame_number);
+        }
+        drop(known);
+        let (epoch, grace_frame) = renewal_grace(frame_number).unwrap_or((0, frame_number));
+        let seats: Vec<String> = new
+            .iter()
+            .map(|f| {
+                let storage = protected.get(*f).map_or("unknown", |s| s.name());
+                format!("{}:{storage}", hex::encode(f))
+            })
+            .collect();
+        info!(frame = frame_number, epoch, path, spared = new.len(), shed_instead,
+            waiting = spared.len(), grace_frame, frames_to_grace = grace_frame.saturating_sub(frame_number),
+            ?seats, scope = "local",
+            "capacity shed spares seats whose storage for the next epoch is being encoded or is encoded: \
+             it sheds other seats instead, or waits for each spared seat's renewal to land or its grace \
+             frame to pass, whichever comes first (reported once per spared seat)");
+    }
+
+    /// End the capacity shed's spare of seats no longer in `protected`:
+    /// their renewal landed (no longer in `renewing`), the grace frame
+    /// passed, or their storage work is no longer reported. One line with
+    /// each seat's reason and how long it was spared.
+    fn end_storage_spares(
+        &self,
+        frame_number: u64,
+        protected: &HashMap<Vec<u8>, RenewalStorage>,
+        renewing: &[Vec<u8>],
+    ) {
+        let Ok(mut known) = self.storage_shed_spared.lock() else {
+            return;
+        };
+        let ended: Vec<(Vec<u8>, u64)> = known
+            .iter()
+            .filter(|(f, _)| !protected.contains_key(*f))
+            .map(|(f, since)| (f.clone(), *since))
+            .collect();
+        if ended.is_empty() {
+            return;
+        }
+        for (filter, _) in &ended {
+            known.remove(filter);
+        }
+        drop(known);
+        let grace_passed =
+            renewal_grace(frame_number).is_none_or(|(_, grace)| frame_number >= grace);
+        let seats: Vec<String> = ended
+            .iter()
+            .map(|(f, since)| {
+                let reason = if !renewing.contains(f) {
+                    "renewal landed or seat no longer renewing"
+                } else if grace_passed {
+                    "grace frame passed"
+                } else {
+                    "storage work no longer reported"
+                };
+                format!(
+                    "{}:{reason}:{}",
+                    hex::encode(f),
+                    frame_number.saturating_sub(*since)
+                )
+            })
+            .collect();
+        info!(
+            frame = frame_number,
+            ended = ended.len(),
+            ?seats,
+            scope = "local",
+            "capacity shed spares end: these seats may be shed again (seat:reason:frames spared)"
+        );
+    }
+
+    /// Report the leaves rejected at `frame_number` because the halt-risk
+    /// shield kept them, although the node serves more seats than its worker
+    /// count: the seat stays and renews, and the surplus leave does not
+    /// propose it again while its shard is that small. Once per seat per
+    /// epoch.
+    fn report_capacity_shield(
+        &self,
+        frame_number: u64,
+        kept: &[&Vec<u8>],
+        held: &[ShardDescriptor],
+        serving: usize,
+        worker_capacity: usize,
+    ) {
+        if kept.is_empty() {
+            return;
+        }
+        let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        let Ok(mut reported) = self.capacity_shield_reported.lock() else {
+            return;
+        };
+        reported.retain(|_, last| *last >= epoch);
+        for filter in kept {
+            if reported.insert((*filter).clone(), epoch).is_some() {
+                continue;
+            }
+            let active_after = held
+                .iter()
+                .find(|d| &d.filter == *filter)
+                .map_or(0, |d| d.active_count);
+            info!(frame = frame_number, epoch, filter = %hex::encode(filter), active_after,
+                halt_risk_count = proposer::HALT_RISK_PROVER_COUNT, serving, worker_capacity,
+                scope = "local",
+                "capacity leave rejected: once this seat departed its shard would hold no more \
+                 active provers than the halt-risk count, so the seat stays and renews for the \
+                 next epoch, and the surplus leave does not propose it again while the shard is \
+                 that small (reported once per seat per epoch)");
+        }
     }
 
     /// Drop filters whose last Leave proposal is within
@@ -1309,6 +1564,7 @@ impl ProverLifecycle {
         difficulty: u64,
         world_bytes: &BigInt,
         draining_filters: &std::collections::HashSet<Vec<u8>>,
+        storage_protected: &HashMap<Vec<u8>, RenewalStorage>,
     ) -> SurplusSelection {
         let mm_filters = manually_managed_filters(workers);
         let bound_filters: std::collections::HashSet<Vec<u8>> = workers
@@ -1411,13 +1667,30 @@ impl ProverLifecycle {
         // `leaveProposalCandidates = append(...)` — we deliberately
         // do NOT pick those here. The empty-allocated path in the
         // main ProposeLeave block surfaces them.
-        let mut picks: Vec<Vec<u8>> = ranked.into_iter().take(surplus).map(|(f, _)| f).collect();
+        //
+        // A seat whose storage for the next epoch is being encoded or is
+        // encoded is spared while its renewal's grace frame is ahead
+        // (`storage_renewals_under_way`): the next-worst seat goes instead,
+        // or the shed waits for the renewal to land or the grace to pass.
+        let spared: Vec<Vec<u8>> = ranked
+            .iter()
+            .take(surplus.min(MAX_PROPOSALS_PER_CYCLE))
+            .filter(|(f, _)| storage_protected.contains_key(f))
+            .map(|(f, _)| f.clone())
+            .collect();
+        let mut picks: Vec<Vec<u8>> = ranked
+            .into_iter()
+            .filter(|(f, _)| !storage_protected.contains_key(f))
+            .take(surplus)
+            .map(|(f, _)| f)
+            .collect();
         picks.truncate(MAX_PROPOSALS_PER_CYCLE);
         SurplusSelection {
             surplus,
             eligible,
             shielded,
             picks,
+            spared,
         }
     }
 
@@ -2371,6 +2644,16 @@ impl ProverLifecycle {
         // no vote in that session while the other members vote (decided
         // 2026-10-22): it renews once the worker votes or its engine or host
         // restarts, and until then the worker takes no new seats.
+        // Bound seats whose renewal has not landed and whose storage for it
+        // is being encoded or is encoded: the capacity shed spares them
+        // until the renewal lands or its grace frame passes.
+        let storage_protected = self.storage_renewals_under_way(
+            expired_epoch_filters
+                .iter()
+                .filter(|f| worker_bound_filters.contains(*f)),
+            frame_number,
+        );
+        self.end_storage_spares(frame_number, &storage_protected, &expired_epoch_filters);
         let epoch_frames = quil_types::consensus::epoch_length_frames();
         let mut settling: Vec<(Vec<u8>, u64)> = Vec::new();
         let renewal_filters: Vec<Vec<u8>> = {
@@ -2556,8 +2839,16 @@ impl ProverLifecycle {
             difficulty,
             &world_bytes,
             &draining_filters,
+            &storage_protected,
         );
         if shard_info_ready && !active_filters.is_empty() && !join_proposed_this_cycle {
+            self.report_storage_spared(
+                frame_number,
+                "surplus actives",
+                &surplus_selection.spared,
+                &storage_protected,
+                surplus_selection.picks.len(),
+            );
             let surplus = surplus_selection.picks.clone();
             if !surplus.is_empty() {
                 let last_join = self.allocator.last_join_attempt();
@@ -3112,11 +3403,29 @@ impl ProverLifecycle {
                             .cmp(&bound_filters.contains(&b.0))
                     })
                 });
-                ranked
+                // As in `select_excess_active_filters`, a seat whose storage
+                // renewal is under way is spared until it lands or its grace
+                // frame passes; the next-worst seat goes instead, if any.
+                let spared: Vec<Vec<u8>> = ranked
+                    .iter()
+                    .take(overcapacity)
+                    .filter(|(f, _)| storage_protected.contains_key(f))
+                    .map(|(f, _)| f.clone())
+                    .collect();
+                let picks: Vec<Vec<u8>> = ranked
                     .into_iter()
+                    .filter(|(f, _)| !storage_protected.contains_key(f))
                     .take(overcapacity)
                     .map(|(f, _)| f)
-                    .collect()
+                    .collect();
+                self.report_storage_spared(
+                    frame_number,
+                    "overcapacity",
+                    &spared,
+                    &storage_protected,
+                    picks.len(),
+                );
+                picks
             };
 
             // SPLIT-PARENT filters — an Active filter that has been
@@ -3575,9 +3884,21 @@ impl ProverLifecycle {
                 })
                 .count()
                 .saturating_sub(orphan_ready.len() + lapsed_ready.len() + manual_ready.len());
+            // The halt-risk shield, as the surplus leave applies it: a shard
+            // is shielded when our departure would leave it at the halt-risk
+            // count or below. Every seat decided here is ours and Leaving, and
+            // the registry's Active count leaves a Leaving seat out, so that
+            // count already is the shard's after our departure. The surplus
+            // leave counted our seat Active and shielded at one over the
+            // halt-risk count; doing the same here read our departure twice.
+            // The boundary then rejected the leave the surplus had proposed
+            // off a shard one over the threshold, the seat came back lapsed,
+            // and once it renewed the leave was proposed again, every other
+            // epoch, skipping the seat's renewal each time (devnet,
+            // 2026-10-29).
             let shielded: std::collections::HashSet<Vec<u8>> = held_descriptors
                 .iter()
-                .filter(|d| d.size > 0 && d.active_count <= proposer::HALT_RISK_PROVER_COUNT + 1)
+                .filter(|d| d.size > 0 && d.active_count <= proposer::HALT_RISK_PROVER_COUNT)
                 .map(|d| d.filter.clone())
                 .collect();
             // As the surplus leave picks: lowest score first, and among equal
@@ -3597,13 +3918,25 @@ impl ProverLifecycle {
                         .cmp(&draining_filters.contains(&a.0))
                 })
             });
+            let capacity_needed = serving.saturating_sub(worker_capacity);
             let capacity_ready: Vec<Vec<u8>> = capacity_ranked
                 .into_iter()
                 .map(|(f, _)| f)
                 .filter(|f| auto_ready.contains(f))
-                .take(serving.saturating_sub(worker_capacity))
+                .take(capacity_needed)
                 .collect();
             auto_ready.retain(|f| !capacity_ready.contains(f));
+            // Leaves the shield keeps although the node serves more seats
+            // than its worker count: reported below if they are rejected.
+            let capacity_shielded: Vec<Vec<u8>> = if capacity_ready.len() < capacity_needed {
+                auto_ready
+                    .iter()
+                    .filter(|f| shielded.contains(*f))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
             // Confirmed notice-period departures already provide future slots.
             // Count only workers actually serving them, once per worker; local
@@ -3759,6 +4092,17 @@ impl ProverLifecycle {
             auto_reject.extend(penalty_withheld.iter().map(|(f, _)| f.clone()));
 
             auto_reject.extend(retained_rejections);
+            let kept: Vec<&Vec<u8>> = capacity_shielded
+                .iter()
+                .filter(|f| auto_reject.contains(*f))
+                .collect();
+            self.report_capacity_shield(
+                frame_number,
+                &kept,
+                &held_descriptors,
+                serving,
+                worker_capacity,
+            );
             info!(
                 frame = frame_number,
                 score = auto_confirm.len(),
@@ -8379,6 +8723,416 @@ mod proposal_loop_tests {
              got {:?}",
             actions
         );
+    }
+
+    /// A seat's storage for the next epoch is noted as the confirm pipeline
+    /// prepared it, at `frame` (`note_renewal_storage`).
+    fn note_storage(lc: &ProverLifecycle, frame: u64, filter: &[u8], storage: RenewalStorage) {
+        let seat = [filter.to_vec()];
+        match storage {
+            RenewalStorage::Encoding => lc.note_renewal_storage(frame, &[], &seat),
+            RenewalStorage::Encoded => lc.note_renewal_storage(frame, &seat, &[]),
+        }
+    }
+
+    fn proposed_leaves(actions: &[LifecycleAction]) -> Vec<Vec<u8>> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeLeave { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    fn renewed(actions: &[LifecycleAction]) -> Vec<Vec<u8>> {
+        let mut filters: Vec<Vec<u8>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ReconfirmEpoch { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        filters.sort();
+        filters
+    }
+
+    /// Seats ordered worst first by size alone, ten provers each (no
+    /// halt-risk shield).
+    fn sized_summaries(filters: &[Vec<u8>]) -> Vec<ProverShardSummary> {
+        filters
+            .iter()
+            .enumerate()
+            .map(|(i, filter)| ProverShardSummary {
+                filter: filter.clone(),
+                status_counts: HashMap::from([(ProverStatus::Active, 10)]),
+                total_size: 1_000_000 * (1 + 4 * i as u64),
+            })
+            .collect()
+    }
+
+    /// An allocation registered through epoch 1, renewing for epoch 2 in
+    /// epoch 1 (frames 720..1440; its snapshot frame 736, grace frame 1056).
+    fn renewing(filter: Vec<u8>) -> ProverAllocationInfo {
+        ProverAllocationInfo {
+            epoch: 1,
+            ..alloc(filter, ProverStatus::Active, 10)
+        }
+    }
+
+    /// Oct28: the overcapacity shed picked the worst-scoring seat while its
+    /// storage for the next epoch was encoding; the leave skipped the seat's
+    /// renewal and it lost its storage registration for the epoch. A seat
+    /// whose storage is encoding or encoded is spared while the renewal's
+    /// grace frame is ahead; the next-worst seat goes instead.
+    #[test]
+    fn overcapacity_sheds_another_seat_while_the_worst_ones_storage_renews() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let address = vec![0xCDu8; 32];
+        let (a1, a2, a3) = (filter_bytes(0xA1), filter_bytes(0xA2), filter_bytes(0xA3));
+        for (storage, shed) in [
+            (None, a1.clone()),
+            (Some(RenewalStorage::Encoding), a2.clone()),
+            (Some(RenewalStorage::Encoded), a2.clone()),
+        ] {
+            // Two workers and three seats with room for three: the surplus
+            // path sheds nothing, the overcapacity shed one. 0xA3, the best,
+            // is unbound; 0xA1, the worst, renews.
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            wm.add(allocated_worker(1, a1.clone()));
+            wm.add(allocated_worker(2, a2.clone()));
+            wm.set_allocation_capacity(3);
+            let reg = Arc::new(ConfigurableRegistry::new());
+            reg.set_prover(prover(
+                address.clone(),
+                vec![
+                    renewing(a1.clone()),
+                    alloc(a2.clone(), ProverStatus::Active, 10),
+                    alloc(a3.clone(), ProverStatus::Active, 10),
+                ],
+            ));
+            reg.set_summaries(sized_summaries(&[a1.clone(), a2.clone(), a3.clone()]));
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            if let Some(storage) = storage {
+                note_storage(&lc, 790, &a1, storage);
+            }
+            lc.set_prover_root_verified_frame(800);
+            let actions = lc.evaluate(800, 1, reg.as_ref(), wm.as_ref()).unwrap();
+            assert_eq!(
+                proposed_leaves(&actions),
+                vec![shed],
+                "{storage:?}: {actions:?}"
+            );
+            // A leave of a seat outranks its renewal in the compiled plan.
+            let renews = if storage.is_some() {
+                vec![a1.clone()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(renewed(&actions), renews, "{storage:?}: {actions:?}");
+        }
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// When every seat the capacity shed could take has its storage renewal
+    /// under way, the shed waits, bounded: it takes the worst seat once that
+    /// seat's renewal lands, or at the renewal's grace frame if it has not.
+    /// Each spare is reported as it starts and as it ends.
+    #[test]
+    fn the_capacity_shed_waits_for_storage_renewals_until_they_land_or_the_grace_passes() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let grace_frame = quil_types::consensus::storage_snapshot_frame(2)
+            + crate::app_shard_metadata::storage_snapshot_grace();
+        assert_eq!(grace_frame, 1056);
+        let address = vec![0xCDu8; 32];
+        let seats = vec![filter_bytes(0xA1), filter_bytes(0xA2), filter_bytes(0xA3)];
+        let worst = seats[0].clone();
+        let spares = "capacity shed spares seats whose storage";
+        let spares_end = "capacity shed spares end";
+        for landed in [true, false] {
+            // Three bound seats, room for two: both the surplus path and the
+            // overcapacity shed want one leave.
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            for (core, filter) in seats.iter().enumerate() {
+                wm.add(allocated_worker(core as u32 + 1, filter.clone()));
+            }
+            wm.set_allocation_capacity(2);
+            let reg = Arc::new(ConfigurableRegistry::new());
+            reg.set_prover(prover(
+                address.clone(),
+                seats.iter().cloned().map(renewing).collect(),
+            ));
+            reg.set_summaries(sized_summaries(&seats));
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            for (i, filter) in seats.iter().enumerate() {
+                let storage = if i == 1 {
+                    RenewalStorage::Encoded
+                } else {
+                    RenewalStorage::Encoding
+                };
+                note_storage(&lc, 790, filter, storage);
+            }
+            let evaluate = |frame: u64| {
+                lc.set_prover_root_verified_frame(frame);
+                evaluate_logged(&lc, frame, reg.as_ref(), wm.as_ref())
+            };
+            let (actions, logged) = evaluate(800);
+            assert!(
+                proposed_leaves(&actions).is_empty(),
+                "the shed waits: {actions:?}"
+            );
+            assert_eq!(renewed(&actions), seats, "every seat renews: {actions:?}");
+            assert_eq!(logged.matches(spares).count(), 1, "{logged}");
+            assert!(logged.contains(&hex::encode(&worst)), "{logged}");
+            let (actions, logged) = evaluate(801);
+            assert!(proposed_leaves(&actions).is_empty(), "{actions:?}");
+            assert!(!logged.contains(spares), "reported once: {logged}");
+            let frame = if landed {
+                // The worst seat's renewal lands: it registered for epoch 2.
+                let mut allocations: Vec<_> = seats.iter().cloned().map(renewing).collect();
+                allocations[0].epoch = 2;
+                reg.set_prover(prover(address.clone(), allocations));
+                900
+            } else {
+                let (actions, _) = evaluate(grace_frame - 1);
+                assert!(
+                    proposed_leaves(&actions).is_empty(),
+                    "still within the grace: {actions:?}"
+                );
+                grace_frame
+            };
+            let (actions, logged) = evaluate(frame);
+            assert_eq!(
+                proposed_leaves(&actions),
+                vec![worst.clone()],
+                "landed {landed}: the worst seat goes once spared no more: {actions:?}"
+            );
+            assert_eq!(logged.matches(spares_end).count(), 1, "{logged}");
+            let reason = if landed {
+                "renewal landed"
+            } else {
+                "grace frame passed"
+            };
+            assert!(logged.contains(reason), "{logged}");
+        }
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// A renewal a leave skips while the seat's storage for the next epoch is
+    /// encoding is warned of, once per seat per epoch, while the renewal's
+    /// grace frame is ahead; past it, or for a seat whose storage is not
+    /// under way, the skip is reported at info as before.
+    #[test]
+    fn a_renewal_a_leave_skips_while_its_storage_is_encoding_is_warned_once() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let address = vec![0xCDu8; 32];
+        let (held, other) = (filter_bytes(0xA1), filter_bytes(0xA2));
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, held.clone()));
+        wm.add(allocated_worker(2, other.clone()));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(
+            address.clone(),
+            vec![renewing(held.clone()), renewing(other.clone())],
+        ));
+        reg.set_summaries(sized_summaries(&[held.clone(), other.clone()]));
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        note_storage(&lc, 790, &held, RenewalStorage::Encoding);
+        let warning = "seat renewal skipped while its storage for the next epoch";
+        let skipped = "seat renewal skipped: this node proposed leaving the seat";
+        let evaluate = |frame: u64| {
+            lc.set_prover_root_verified_frame(frame);
+            evaluate_logged(&lc, frame, reg.as_ref(), wm.as_ref())
+        };
+        lc.record_leave_attempts(&[held.clone(), other.clone()], 800);
+        let (actions, logged) = evaluate(801);
+        assert!(renewed(&actions).is_empty(), "{actions:?}");
+        let warned: Vec<&str> = logged.lines().filter(|l| l.contains(warning)).collect();
+        assert_eq!(warned.len(), 1, "{logged}");
+        assert!(
+            warned[0].contains("WARN") && warned[0].contains(&hex::encode(&held)),
+            "{logged}"
+        );
+        let infos: Vec<&str> = logged.lines().filter(|l| l.contains(skipped)).collect();
+        assert_eq!(infos.len(), 1, "{logged}");
+        assert!(infos[0].contains(&hex::encode(&other)), "{logged}");
+        let (_, logged) = evaluate(802);
+        assert!(
+            !logged.contains(warning),
+            "once per seat per epoch: {logged}"
+        );
+        // Past the grace frame the skip loses no storage the seat could
+        // still register: reported at info.
+        lc.record_leave_attempts(&[held.clone()], 1050);
+        let (actions, logged) = evaluate(1056);
+        assert!(!renewed(&actions).contains(&held), "{actions:?}");
+        assert!(!logged.contains(warning), "{logged}");
+        assert!(
+            logged.contains(skipped) && logged.contains(&hex::encode(&held)),
+            "{logged}"
+        );
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// Oct29 devnet: a node restarted with fewer workers shed, at its first
+    /// evaluation, the seat whose storage for the next epoch was encoding:
+    /// the note of it lived only in memory and the confirm pipeline had not
+    /// prepared the seat again yet. The note is kept in the node's store, so
+    /// the first shed after a restart spares the seat and the next-worst one
+    /// goes; with nothing noted the worst one goes, as before.
+    #[test]
+    fn the_first_shed_after_a_restart_spares_a_seat_whose_storage_was_encoding() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let address = vec![0xCDu8; 32];
+        let (a1, a2, a3) = (filter_bytes(0xA1), filter_bytes(0xA2), filter_bytes(0xA3));
+        // As in `overcapacity_sheds_another_seat_while_the_worst_ones_storage_renews`:
+        // the overcapacity shed takes one of the two bound seats, worst first.
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, a1.clone()));
+        wm.add(allocated_worker(2, a2.clone()));
+        wm.set_allocation_capacity(3);
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(
+            address.clone(),
+            vec![
+                renewing(a1.clone()),
+                alloc(a2.clone(), ProverStatus::Active, 10),
+                alloc(a3.clone(), ProverStatus::Active, 10),
+            ],
+        ));
+        reg.set_summaries(sized_summaries(&[a1.clone(), a2.clone(), a3.clone()]));
+        let store = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let before = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+        before
+            .configure_leave_decision_store(store.clone())
+            .unwrap();
+        note_storage(&before, 790, &a1, RenewalStorage::Encoding);
+        drop(before);
+        let first_shed = |db: Arc<quil_store::RocksDb>| {
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            lc.configure_leave_decision_store(db).unwrap();
+            lc.set_prover_root_verified_frame(800);
+            evaluate_logged(&lc, 800, reg.as_ref(), wm.as_ref())
+        };
+        let (actions, logged) = first_shed(store);
+        assert_eq!(proposed_leaves(&actions), vec![a2.clone()], "{actions:?}");
+        assert_eq!(renewed(&actions), vec![a1.clone()], "{actions:?}");
+        assert!(
+            logged.contains("capacity shed spares seats whose storage")
+                && logged.contains(&format!("{}:encoding", hex::encode(&a1))),
+            "{logged}"
+        );
+        // Control: a store with no note sheds the worst seat.
+        let (actions, _) = first_shed(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        assert_eq!(proposed_leaves(&actions), vec![a1], "{actions:?}");
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// The leaves an evaluation decided: (confirmed, rejected).
+    fn decided_leaves(actions: &[LifecycleAction]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let of = |confirm: bool| {
+            actions
+                .iter()
+                .flat_map(|a| match a {
+                    LifecycleAction::ConfirmLeaves { filters, .. } if confirm => filters.clone(),
+                    LifecycleAction::RejectLeaves { filters, .. } if !confirm => filters.clone(),
+                    _ => Vec::new(),
+                })
+                .collect::<Vec<_>>()
+        };
+        (of(true), of(false))
+    }
+
+    /// Oct29 devnet: after the worker count was lowered, the surplus leave
+    /// took a seat off a shard of six provers, a second node left the same
+    /// shard, and at the boundary this node rejected its own leave: the
+    /// registry's Active count (four) leaves the Leaving seats out, and the
+    /// shield applied one-over-the-threshold to it as if our seat were still
+    /// in it. The seat came back lapsed and the leave was proposed again once
+    /// it renewed, every other epoch. The boundary shields the shard only
+    /// when the count after our departure is at the halt-risk count or below,
+    /// as the surplus leave does, and reports that once per seat per epoch.
+    #[test]
+    fn a_capacity_leave_is_rejected_only_if_the_shard_is_left_at_halt_risk() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCDu8; 32];
+        let (keep, shed) = (filter_bytes(0xA1), filter_bytes(0xA2));
+        let summary = |filter: &Vec<u8>, active: u32, leaving: u32, size: u64| {
+            let mut status_counts = HashMap::from([(ProverStatus::Active, active)]);
+            if leaving > 0 {
+                status_counts.insert(ProverStatus::Leaving, leaving);
+            }
+            ProverShardSummary {
+                filter: filter.clone(),
+                status_counts,
+                total_size: size,
+            }
+        };
+        let rejected_line = "capacity leave rejected";
+        // `others`: the shard's Active provers besides this node.
+        let run = |others: u32| {
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            wm.add(allocated_worker(1, keep.clone()));
+            wm.add(allocated_worker(2, shed.clone()));
+            wm.set_allocation_capacity(1);
+            let reg = Arc::new(ConfigurableRegistry::new());
+            reg.set_summaries(vec![
+                summary(&keep, 10, 0, 5_000_000),
+                summary(&shed, others + 1, 0, 1_000_000),
+            ]);
+            let mut allocations = vec![
+                alloc(keep.clone(), ProverStatus::Active, 10),
+                alloc(shed.clone(), ProverStatus::Active, 10),
+            ];
+            reg.set_prover(prover(address.clone(), allocations.clone()));
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            lc.set_prover_root_verified_frame(100);
+            let proposed =
+                proposed_leaves(&lc.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap());
+            // Our leave of `shed` in its decision epoch; the registry counts
+            // our seat Leaving, no longer Active.
+            allocations[1].status = ProverStatus::Leaving;
+            allocations[1].leave_frame_number = 100;
+            reg.set_prover(prover(address.clone(), allocations));
+            reg.set_summaries(vec![
+                summary(&keep, 10, 0, 5_000_000),
+                summary(&shed, others, 1, 1_000_000),
+            ]);
+            let mut decisions = Vec::new();
+            let mut lines = 0;
+            for frame in [800, 801] {
+                lc.set_prover_root_verified_frame(frame);
+                let (actions, logged) = evaluate_logged(&lc, frame, reg.as_ref(), wm.as_ref());
+                decisions.push(decided_leaves(&actions));
+                lines += logged.matches(rejected_line).count();
+            }
+            (proposed, decisions, lines)
+        };
+        let threshold = proposer::HALT_RISK_PROVER_COUNT as u32;
+        // One over the threshold once we go: proposed, and confirmed.
+        let (proposed, decisions, lines) = run(threshold + 1);
+        assert_eq!(proposed, vec![shed.clone()]);
+        assert_eq!(
+            decisions[0],
+            (vec![shed.clone()], Vec::new()),
+            "{decisions:?}"
+        );
+        assert_eq!(lines, 0);
+        // At the threshold once we go: shielded, so the surplus leave takes
+        // the other seat, and a leave of it (say proposed before another
+        // node's leave of the shard) is rejected, reported once.
+        let (proposed, decisions, lines) = run(threshold);
+        assert_eq!(proposed, vec![keep.clone()]);
+        for decision in &decisions {
+            assert_eq!(decision, &(Vec::new(), vec![shed.clone()]), "{decisions:?}");
+        }
+        assert_eq!(lines, 1);
     }
 
     /// An unbound allocation that fits inside worker capacity is a
