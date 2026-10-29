@@ -1217,7 +1217,11 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         }
                     }
                 }
-                if validation_started.elapsed() >= crate::stage_clock::SLOW_EXECUTION {
+                let validated_in = validation_started.elapsed();
+                if validated_in >= crate::stage_clock::SLOW_EXECUTION {
+                    crate::stage_clock::note_slow("GLOBAL message validation", validated_in);
+                }
+                if validated_in >= crate::stage_clock::WARN_AFTER {
                     let mut by_kind: Vec<_> = validation_ms.into_iter().collect();
                     by_kind.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
                     tracing::warn!(
