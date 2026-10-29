@@ -1019,10 +1019,37 @@ pub(crate) async fn recover_shard_from_latest(
             turn,
         });
     }
-    let anchors = target.origin_anchors().await.unwrap_or_else(|error| {
-        tracing::warn!(filter = %hex::encode(filter), %error, "origin anchors unavailable; bootstrap unpinned");
-        Vec::new()
-    });
+    // The origins' sealed state, read from committed GLOBAL state, which
+    // this node's own GLOBAL state sync withholds while it installs: waited
+    // out like the anchor's validation below. Read as "no origins", it
+    // bootstrapped without them, and its anchor fallback, which needs the
+    // frame GLOBAL committed, failed the attempt as the archive's
+    // checkpoint (38 to 40 failures in a row on 4 shards of a node
+    // restarted into its GLOBAL sync, 2026-10-29).
+    let anchors = match waiting_out_global_sync(
+        sync_wait,
+        target,
+        filter,
+        target.materialized(),
+        "origin state lookup",
+        || target.origin_anchors(),
+    )
+    .await
+    {
+        Ok(anchors) => anchors,
+        Err(error)
+            if quil_execution::global_intrinsic::handoff::global_sync_in_progress(&error) =>
+        {
+            return Ok(ShardRecoveryProgress::NotReady(
+                crate::worker_execution::GLOBAL_SYNC_STILL_INSTALLING,
+            ));
+        }
+        Err(error) => {
+            tracing::warn!(core_id = target.core_id(), filter = %hex::encode(filter), %error,
+                "origin anchors unavailable; bootstrap unpinned");
+            Vec::new()
+        }
+    };
     let committed_tip = target.committed_tip().await;
     recovery_phase("fetching_checkpoint");
     let synced = sync_shard_from_latest_attested(
@@ -6109,7 +6136,9 @@ mod tests {
 
     /// An install that does not finish within the attempt's budget fails the
     /// attempt with its wait, as before, once the budget is spent: the turn
-    /// is held no longer than [`GLOBAL_SYNC_WAIT_BUDGET`].
+    /// is held no longer than [`GLOBAL_SYNC_WAIT_BUDGET`]. The failure is
+    /// this node's expected wait, classed as such, and counts toward no
+    /// failure streak.
     #[tokio::test(start_paused = true)]
     async fn a_global_sync_install_past_the_budget_fails_the_attempt() {
         use quil_execution::global_intrinsic::handoff::global_sync_in_progress;
@@ -6141,7 +6170,171 @@ mod tests {
         );
         assert_eq!(target.materialized(), 129);
         let recovery = worker.snapshot().recovery.unwrap();
-        assert_eq!(recovery.consecutive_failures, 1);
+        assert_eq!(recovery.consecutive_failures, 0);
+        assert_eq!(
+            recovery.failures_by_class.get("global_sync").copied(),
+            Some(1)
+        );
+    }
+
+    /// Answers its first `refusals` origin lookups with a GLOBAL state
+    /// sync's wait, as an engine does while its master installs the GLOBAL
+    /// prover tree, then names no origins; otherwise `Target`.
+    struct OriginsWithheld {
+        inner: Target,
+        refusals: std::sync::atomic::AtomicUsize,
+        refused: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ShardRecoveryTarget for OriginsWithheld {
+        fn materialized(&self) -> u64 {
+            self.inner.materialized()
+        }
+        async fn replay(
+            &self,
+            frame: AppShardFrame,
+            descendants: Vec<AppShardFrame>,
+        ) -> Result<u64> {
+            self.inner.replay(frame, descendants).await
+        }
+        async fn validate(
+            &self,
+            anchor: AppShardFrame,
+            predecessor: Option<AppShardFrame>,
+        ) -> Result<bool> {
+            self.inner.validate(anchor, predecessor).await
+        }
+        async fn install(
+            &self,
+            anchor: AppShardFrame,
+            predecessor: Option<AppShardFrame>,
+        ) -> Result<()> {
+            self.inner.install(anchor, predecessor).await
+        }
+        fn inherited(&self) {
+            panic!("a certified archive tip must never use unanchored inheritance")
+        }
+        async fn origin_anchors(&self) -> Result<Vec<(Vec<u8>, [[u8; 32]; 4])>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.refusals.load(SeqCst) > 0 {
+                self.refusals.fetch_sub(1, SeqCst);
+                self.refused.fetch_add(1, SeqCst);
+                return Err(quil_types::error::QuilError::ExecutionUnavailable(
+                    quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS.into(),
+                ));
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    fn withholding_origins(calls: &Arc<Mutex<Vec<String>>>, refusals: usize) -> OriginsWithheld {
+        OriginsWithheld {
+            inner: Target {
+                calls: calls.clone(),
+                cursor: 0.into(),
+                valid: true,
+                install_ok: true,
+                blocked: false.into(),
+                unblock_at: 0,
+            },
+            refusals: refusals.into(),
+            refused: 0.into(),
+        }
+    }
+
+    /// A worker with no frame of its own looks up its origins' sealed state
+    /// in committed GLOBAL state, which this node's GLOBAL state sync
+    /// withholds while it installs: the lookup waits the install out within
+    /// the attempt, then anchors, counting no failure. Read as "no
+    /// origins", the attempt failed as "the archive checkpoint failed
+    /// validation", 38 to 40 times in a row on 4 shards of a node restarted
+    /// into its GLOBAL sync (2026-10-29).
+    #[tokio::test(start_paused = true)]
+    async fn an_origin_lookup_waits_out_a_global_sync_install_before_any_archive_read() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive {
+            latest: Some(frame(500)),
+            calls: calls.clone(),
+        };
+        let target = withholding_origins(&calls, 4);
+        let worker = crate::worker_execution::SharedWorkerExecution::default();
+        let started = tokio::time::Instant::now();
+        let result = worker
+            .recovering(
+                &[5; 32],
+                recover_shard_from_latest(&archive, &[5; 32], None, &target, &[], None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, ShardRecoveryProgress::Anchored { frame: 500 });
+        assert_eq!(target.refused.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "fetch 0",
+                "fetch 499",
+                "validate 500",
+                "sync 244",
+                "install 500"
+            ]
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= 4 * GLOBAL_SYNC_POLL && waited < GLOBAL_SYNC_WAIT_BUDGET,
+            "{waited:?}"
+        );
+        let recovery = worker.snapshot().recovery.unwrap();
+        assert_eq!(
+            (recovery.consecutive_failures, recovery.last_error_unix_ms),
+            (0, 0)
+        );
+        assert!(recovery.failures_by_class.is_empty());
+    }
+
+    /// Past the attempt's budget, the lookup gives up without reading any
+    /// archive: the attempt is not ready for this node's GLOBAL state sync,
+    /// named so and classed as this node's expected wait, not the archive's
+    /// failure, and counts toward no failure streak.
+    #[tokio::test(start_paused = true)]
+    async fn an_origin_lookup_past_the_budget_names_this_nodes_global_sync() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive {
+            latest: Some(frame(500)),
+            calls: calls.clone(),
+        };
+        let target = withholding_origins(&calls, usize::MAX);
+        let worker = crate::worker_execution::SharedWorkerExecution::default();
+        let started = tokio::time::Instant::now();
+        let result = worker
+            .recovering(
+                &[5; 32],
+                recover_shard_from_latest(&archive, &[5; 32], None, &target, &[], None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            ShardRecoveryProgress::NotReady(crate::worker_execution::GLOBAL_SYNC_STILL_INSTALLING)
+        );
+        let read = calls.lock().unwrap().clone();
+        assert!(read.is_empty(), "{read:?}");
+        let waited = started.elapsed();
+        assert!(
+            waited >= GLOBAL_SYNC_WAIT_BUDGET - GLOBAL_SYNC_POLL
+                && waited <= GLOBAL_SYNC_WAIT_BUDGET + GLOBAL_SYNC_POLL,
+            "{waited:?}"
+        );
+        let recovery = worker.snapshot().recovery.unwrap();
+        assert_eq!(
+            crate::worker_execution::failure_class(&recovery.last_error),
+            "global_sync"
+        );
+        assert_eq!(recovery.consecutive_failures, 0);
+        assert_eq!(
+            recovery.failures_by_class.get("global_sync").copied(),
+            Some(1)
+        );
     }
 
     /// An archive serving the shard's frames through `tip` except
