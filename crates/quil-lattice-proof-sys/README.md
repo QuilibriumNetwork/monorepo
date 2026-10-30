@@ -17,7 +17,14 @@ contraction settings and enabled assertions. ARM64 compilation requires the
 crypto extensions. Linux ARM64 native ABI and candidate tests also pass through the Taskfile.
 Full Linux proving and x86-64 execution remain untested; the x86 configuration
 uses SIMDe's portable path. Build configuration is not evidence of proving
-support on those platforms.
+support on those platforms. `QUIL_LATTICE_X86_NATIVE=1` instead compiles the
+reference AVX-512 code natively for whatever the C compiler targets (set it
+with `CFLAGS`; plain x86-64 is SSE2); SIMDe lowers instructions the target
+lacks. `QUIL_LATTICE_X86_NATIVE=avx512` does the same and fails the build
+unless the target has AVX-512 F/BW/DQ/VL. `docker/Dockerfile.source` sets `1` (its
+amd64 binaries stay baseline x86-64); `docker/Dockerfile.sourceavx512` sets `avx512`
+with `-march=skylake-avx512`. Local builds without the variable keep SIMDe's
+portable path, the reference the native builds must cross-verify against.
 
 The raw ABI is unsafe and uses process-global key state. Callers must serialize
 all native contexts using `NATIVE_STATE` for their entire lifetime, including

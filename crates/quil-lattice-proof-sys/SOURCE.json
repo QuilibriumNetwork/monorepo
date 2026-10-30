@@ -11,8 +11,8 @@
     "adapter/fixture_proof_decode.h": "ba29799334fe1727cde5b954112b3a0ebbd1ebc43006284e987eed85db676a94",
     "adapter/fixture_proof_dump.h": "bbc02c34c56b6d15d6bdc324ad421961dc0e3506d2343fb5994ef34374c3f3e3",
     "adapter/fixture_proof_encode.h": "50db1b5f1f5b31ce6889108ab698fb8cbab42e42db99dea1be461105a7b14e28",
-    "adapter/intrinsics.h": "df562c22aadb808f90e9b280c3a480fc60ddf05bc3dc04e44ee9ca315a0bc560",
-    "adapter/shim/immintrin.h": "cb405db88e7ef02e4c4cad7fc1ac574430d3c4794d54a6e0442398319d968bb8",
+    "adapter/intrinsics.h": "6dc8d7b42dccf07d7fc7820b3f870724e29fa7e92713ffcfe30a954fb722b340",
+    "adapter/shim/immintrin.h": "19d0f93d1fcb6de44c7aeaa7f923debc61704f6b94db1e577ff4936744dcbd2b",
     "adapter/shim/x86intrin.h": "44914519e30ba3575995eb4702f8b7e94a870abd5637311e60ad64426d6d4e2f",
     "vendor/labrados/LAZER-LICENSE": "364d467c45559b6dbb83bd317cbb4e971d02eaabf3c1cd390182b2409cf6cee5",
     "vendor/labrados/UPSTREAM-LICENSE": "3660dc2412130f84ec69d00ad01bb86484ed1745184bf5b168ff4a9fa7c513f2",
@@ -579,5 +579,6 @@
   "cached_offsets": "Adapter retains immutable witness-vector prefix offsets once per context; generic frontend wrappers remain available. Regression compares native coefficients, offsets and statement transcript.",
   "coefficient_pool": "Original input statements share exact matching public zero, signed unit monomial and signed all-one coefficient vectors within each context. Pool owns storage until statement destruction; transformed statements retain native deep copies.",
   "diagnostic_policy": "No unconditional mask-rejection retry logging. DEBUG dumps, NDEBUG assertion removal, and disabled native randomness/masking/rejection configurations are rejected; optional coarse resource tracing remains available.",
-  "private_prg": "LNP uses a fresh 32-byte private seed and AES-256 streams for Gaussian masks, uniform masks, uniform bytes and rejection draws. Shared sampler kernels preserve public AES-128 interfaces. Does not revise public transcript/challenge security parameters."
+  "private_prg": "LNP uses a fresh 32-byte private seed and AES-256 streams for Gaussian masks, uniform masks, uniform bytes and rejection draws. Shared sampler kernels preserve public AES-128 interfaces. Does not revise public transcript/challenge security parameters.",
+  "x86_native": "QUIL_LATTICE_X86_NATIVE (build.rs): unset or 0 keeps SIMDE_NO_NATIVE on x86-64; 1 compiles natively for the C target (CFLAGS), the shim forwarding to the system immintrin.h and each scalar adapter applying only when the target lacks its feature (AVX512F/BW/DQ, VAES, AES), under quil_-prefixed names; avx512 also fails the build without AVX-512 F/BW/DQ/VL. docker/Dockerfile.source sets 1 (baseline x86-64, SSE2), docker/Dockerfile.sourceavx512 sets avx512. ARM64 assembly is unchanged."
 }

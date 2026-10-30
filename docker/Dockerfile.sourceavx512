@@ -134,6 +134,11 @@ RUN bash /opt/build-emp.sh
 # -----------------------------------------------------------------------------
 FROM gen-avx512 AS build-avx512
 
+# The lattice proof backend (quil-lattice-proof-sys) runs its AVX-512 kernels
+# natively for the CFLAGS target above; the build fails rather than fall back
+# to SIMDe's portable path.
+ENV QUIL_LATTICE_X86_NATIVE=avx512
+
 WORKDIR /opt/ceremonyclient
 
 # Copy full source tree for the Rust builds. node/ is brought in by the stages
@@ -161,10 +166,10 @@ RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=lo
 FROM build-avx512 AS build-qclient-avx512
 ARG TARGETOS
 ARG TARGETARCH
-# Build and install the Rust `qclient` (crates/quil-client). qclient needs no
-# AVX-512 tuning (that targets the node's VDF/crypto), so this is a plain
-# release build. The `cp` runs in the same RUN as the build because target/ is
-# a cache mount.
+# Build and install the Rust `qclient` (crates/quil-client). It needs no tuning
+# of its own; its wallet proofs still run the lattice backend's native AVX-512
+# kernels set up in build-avx512. The `cp` runs in the same RUN as the build
+# because target/ is a cache mount.
 WORKDIR /opt/ceremonyclient
 # quil-client depends on quil-execution, which embeds the genesis seniority
 # compat data from node/execution/... (retro JSONs via include_bytes! +

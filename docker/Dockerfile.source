@@ -146,6 +146,11 @@ COPY --from=rust-base /root/.rustup /root/.rustup
 ENV PATH="${PATH}:/root/.cargo/bin/"
 
 ENV QUILIBRIUM_SIGNATURE_CHECK=true
+# The lattice proof backend (quil-lattice-proof-sys) runs its kernels natively:
+# plain x86-64 (SSE2, no -march here, so the binary runs on any amd64 host) or
+# NEON on arm64, which ignores this. docker/Dockerfile.sourceavx512 targets
+# AVX-512.
+ENV QUIL_LATTICE_X86_NATIVE=1
 
 WORKDIR /opt/ceremonyclient
 

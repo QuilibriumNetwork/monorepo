@@ -3,6 +3,7 @@ use std::env;
 fn main() {
     println!("cargo:rerun-if-changed=vendor");
     println!("cargo:rerun-if-changed=adapter");
+    println!("cargo:rerun-if-env-changed=QUIL_LATTICE_X86_NATIVE");
     if env::var_os("CARGO_FEATURE_NATIVE_BACKEND").is_none() {
         return;
     }
@@ -39,7 +40,23 @@ fn main() {
             build.flag("-march=armv8-a+crypto");
         }
         "x86_64" => {
-            build.define("SIMDE_NO_NATIVE", None);
+            // QUIL_LATTICE_X86_NATIVE selects how the reference AVX-512 code
+            // runs. Unset or "0": SIMDe's portable path. "1": natively on the
+            // instructions the C compiler targets (CFLAGS; plain x86-64 is
+            // SSE2), SIMDe lowering what the target lacks. "avx512": the same,
+            // and the build fails unless that target has AVX-512 F/BW/DQ/VL.
+            match env::var("QUIL_LATTICE_X86_NATIVE").as_deref() {
+                Err(_) | Ok("") | Ok("0") => {
+                    build.define("SIMDE_NO_NATIVE", None);
+                }
+                Ok("1") => {}
+                Ok("avx512") => {
+                    build.define("QUIL_REQUIRE_X86_AVX512", None);
+                }
+                Ok(other) => {
+                    panic!("QUIL_LATTICE_X86_NATIVE must be 0, 1 or avx512, got {other:?}")
+                }
+            }
         }
         _ => panic!("unsupported native proof architecture"),
     }
