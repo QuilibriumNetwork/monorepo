@@ -2127,10 +2127,12 @@ mod tests {
             end.abort();
             end.crdt().commit(frame).unwrap();
         };
+        // By message, not by substring: the slow-rebuild warning's action
+        // text names this line, and a slow runner logs the warning too.
         let rebuilt = |lines: &[String]| -> Vec<String> {
             lines
                 .iter()
-                .filter(|line| line.contains("coin root summary rebuilt"))
+                .filter(|line| line.contains(" message=coin root summary rebuilt"))
                 .cloned()
                 .collect()
         };
