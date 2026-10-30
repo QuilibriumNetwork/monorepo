@@ -196,12 +196,19 @@ fn log_connect_outage(
     use quil_engine::outage::OutageEvent;
     match event {
         Some(OutageEvent::Began) => {
-            tracing::warn!(%addr, error_chain, scope = "peer", action = "wait",
-            "archive connection failing; retried until the archive accepts connections again")
+            info!(%addr, error_chain, scope = "peer",
+                warn_after_s = quil_engine::outage::OUTAGE_LOG_EVERY.as_secs(),
+                action = "no action needed: retried until the archive accepts connections, \
+                          and this node uses the other archives meanwhile; it warns if it \
+                          lasts 10 min",
+                "cannot connect to an archive; retrying")
         }
         Some(OutageEvent::Continues { secs, failures }) => {
-            tracing::warn!(%addr, secs, failures, error_chain,
-            scope = "peer", action = "wait", "archive connection still failing")
+            tracing::warn!(%addr, secs, failures, error_chain, scope = "peer",
+                action = "if this warning names every archive, check this node's outbound \
+                          connections, DNS and firewall; if it names one, that archive is down \
+                          and this node uses the others: no action needed",
+                "archive connection still failing")
         }
         Some(OutageEvent::Ended { secs, failures }) => {
             info!(%addr, secs, failures, "archive connection recovered")
@@ -1521,7 +1528,7 @@ mod tests {
         );
     }
 
-    /// Each archive address has its own outage: failures warn once when
+    /// Each archive address has its own outage: failures log once when
     /// they begin, and a success ends only that address's outage.
     #[test]
     fn connection_failures_are_one_outage_per_archive() {

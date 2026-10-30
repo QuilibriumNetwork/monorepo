@@ -58,6 +58,25 @@ pub(super) fn collect(
 /// How long a continuing unavailability stays quiet between reminders.
 pub(super) const UNAVAILABLE_REPEAT: Duration = Duration::from_secs(600);
 
+/// How long an expected wait ([`Cause::Bootstrap`], [`Cause::GlobalSync`])
+/// logs at info before its reminders warn. A regular node first writes its
+/// GLOBAL materialized cursor from its startup state jump (retried every
+/// 3 s) or from a periodic prover tree reconcile (every 300 s by default);
+/// 30 min covers the initial sync and six reconcile passes, so a wait past
+/// it means both kept failing.
+pub(super) const EXPECTED_WAIT_WARN_AFTER: Duration = Duration::from_secs(30 * 60);
+
+/// What an operator does about an expected wait, at info and past its bound.
+const EXPECTED_WAIT_ACTION: &str = "no action needed: this ends when this node \
+    materializes its first GLOBAL frame from archive sync, and the line 'committee \
+    membership readable again' follows; a missing port forward does not cause it; past \
+    30 min it warns: then check that 'initial prover tree sync complete' was logged and \
+    that no 'archive connection still failing' warning repeats";
+
+/// What peers lose while the policy is unavailable.
+const EFFECT: &str = "members of this node's committees that share an IP address \
+    get no IP-colocation exemption from peer scoring until it ends";
+
 /// Why the committed session heads cannot be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Cause {
@@ -127,9 +146,10 @@ struct Episode {
     failures: u64,
 }
 
-/// Turns the refresh's per-tick failures (every 5 s) into one warning when an
+/// Turns the refresh's per-tick failures (every 5 s) into one line when an
 /// unavailability starts, a reminder every [`UNAVAILABLE_REPEAT`] with its
-/// duration and failure count, and one info line when it ends.
+/// duration and failure count, and one info line when it ends. An expected
+/// wait logs at info until [`EXPECTED_WAIT_WARN_AFTER`] ([`Transition::warns`]).
 #[derive(Default)]
 pub(super) struct Unavailability(Option<Episode>);
 
@@ -185,9 +205,22 @@ impl Unavailability {
 }
 
 impl Transition {
+    /// Whether the line warns: an unreadable state at once, an expected wait
+    /// only once it lasts [`EXPECTED_WAIT_WARN_AFTER`].
+    fn warns(&self) -> bool {
+        match *self {
+            Transition::Started { cause, .. } => cause == Cause::Other,
+            Transition::Repeated {
+                cause, duration, ..
+            } => cause == Cause::Other || duration >= EXPECTED_WAIT_WARN_AFTER,
+            Transition::Suppressed | Transition::Ended { .. } => false,
+        }
+    }
+
     fn log(&self, error: Option<&QuilError>) {
         let error = error.map_or_else(String::new, ToString::to_string);
         let repeat_every_s = UNAVAILABLE_REPEAT.as_secs();
+        let warn_after_s = EXPECTED_WAIT_WARN_AFTER.as_secs();
         match *self {
             Transition::Started { cause, replaced } => {
                 let replaced = replaced.map_or_else(
@@ -202,22 +235,26 @@ impl Transition {
                     },
                 );
                 match cause {
-                    Cause::Bootstrap => warn!(
+                    Cause::Bootstrap => info!(
                         scope = "this node",
                         cause = cause.as_str(),
                         %error,
                         replaced = %replaced,
                         repeat_every_s,
-                        action = "expected wait after a fresh start: it ends when this node commits its first materialized GLOBAL frame",
-                        "committed committee peer policy unavailable; served committees' members get no IP-colocation exemption until then"
+                        warn_after_s,
+                        effect = EFFECT,
+                        action = EXPECTED_WAIT_ACTION,
+                        "waiting for the first synced GLOBAL state after start; nothing to fix yet"
                     ),
                     Cause::GlobalSync => info!(
                         scope = "this node",
                         cause = cause.as_str(),
                         replaced = %replaced,
                         repeat_every_s,
-                        action = "expected wait: committed GLOBAL state is withheld while a GLOBAL state sync from an archive installs its chunks; it ends when the sync installs its last chunk, or when a later prover tree sync completes if this one fails",
-                        "committed committee peer policy waits for a GLOBAL state sync; served committees' members get no IP-colocation exemption until then"
+                        warn_after_s,
+                        effect = EFFECT,
+                        action = "no action needed: this ends when the GLOBAL state sync from an archive installs its last chunk, or when a later prover tree sync completes if this one fails; past 30 min it warns: then check that no 'archive connection still failing' warning repeats",
+                        "waiting for a GLOBAL state sync from an archive to finish; nothing to fix yet"
                     ),
                     Cause::Other => warn!(
                         scope = "this node",
@@ -225,8 +262,9 @@ impl Transition {
                         %error,
                         replaced = %replaced,
                         repeat_every_s,
-                        action = "this node cannot read committed GLOBAL session heads; report the error if it persists",
-                        "committed committee peer policy unavailable; served committees' members get no IP-colocation exemption until it recovers"
+                        effect = EFFECT,
+                        action = "if the 10-min reminder shows it continues, report the error text to the maintainer",
+                        "this node cannot read the committee membership in its committed GLOBAL state"
                     ),
                 }
             }
@@ -235,15 +273,44 @@ impl Transition {
                 cause,
                 duration,
                 failures,
-            } => warn!(
-                scope = "this node",
-                cause = cause.as_str(),
-                %error,
-                duration_s = duration.as_secs(),
-                failures,
-                expected = cause == Cause::Bootstrap,
-                "committed committee peer policy still unavailable"
-            ),
+            } => {
+                let duration_s = duration.as_secs();
+                if cause == Cause::Other {
+                    warn!(
+                        scope = "this node",
+                        cause = cause.as_str(),
+                        %error,
+                        duration_s,
+                        failures,
+                        effect = EFFECT,
+                        action = "report the error text to the maintainer",
+                        "this node still cannot read the committee membership in its committed GLOBAL state"
+                    );
+                } else if self.warns() {
+                    warn!(
+                        scope = "this node",
+                        cause = cause.as_str(),
+                        %error,
+                        duration_s,
+                        failures,
+                        warn_after_s,
+                        effect = EFFECT,
+                        action = "check that 'initial prover tree sync complete' was logged and that no 'archive connection still failing' warning repeats; if both look fine, report this line to the maintainer",
+                        "the first synced GLOBAL state is overdue: this node has waited past its bound"
+                    );
+                } else {
+                    info!(
+                        scope = "this node",
+                        cause = cause.as_str(),
+                        %error,
+                        duration_s,
+                        failures,
+                        warn_after_s,
+                        action = EXPECTED_WAIT_ACTION,
+                        "still waiting for synced GLOBAL state; nothing to fix yet"
+                    );
+                }
+            }
             Transition::Ended {
                 cause,
                 duration,
@@ -253,7 +320,7 @@ impl Transition {
                 cause = cause.as_str(),
                 duration_s = duration.as_secs(),
                 failures,
-                "committed committee peer policy available again"
+                "committee membership readable again; committee peers get their IP-colocation exemption"
             ),
         }
     }
@@ -458,5 +525,41 @@ mod tests {
                 replaced: Some((Cause::Other, Duration::from_secs(10), 2))
             }
         );
+    }
+
+    /// A fresh start's wait for its first synced GLOBAL state logs at info
+    /// (an operator read the old warning as a port-forward problem) and
+    /// warns only once it lasts [`EXPECTED_WAIT_WARN_AFTER`]; an unreadable
+    /// state warns at once.
+    #[test]
+    fn an_expected_wait_logs_at_info_until_its_bound_then_warns() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut state = Unavailability::default();
+        assert!(!state.failed(&bootstrap(), t0).warns(), "a fresh start");
+        let mut reminders = Vec::new();
+        for s in (5..=1800).step_by(5) {
+            let transition = state.failed(&bootstrap(), at(s));
+            if transition != Transition::Suppressed {
+                reminders.push((s, transition.warns()));
+            }
+        }
+        assert_eq!(
+            reminders,
+            vec![(600, false), (1200, false), (1800, true)],
+            "reminders inside the bound stay at info"
+        );
+        let sync = QuilError::ExecutionUnavailable(
+            quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS.into(),
+        );
+        let mut syncing = Unavailability::default();
+        assert!(!syncing.failed(&sync, t0).warns());
+        assert!(!syncing.failed(&sync, at(600)).warns());
+        assert!(syncing.failed(&sync, at(1800)).warns());
+        let mut other = Unavailability::default();
+        let unreadable = QuilError::Store("read failure".into());
+        assert!(other.failed(&unreadable, t0).warns());
+        assert!(other.failed(&unreadable, at(600)).warns());
+        assert!(!other.recovered(at(605)).unwrap().warns());
     }
 }

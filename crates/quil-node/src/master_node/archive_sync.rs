@@ -754,9 +754,13 @@ async fn run_record_only_backfill(
 
     let endpoints = pool.get_all().await;
     if endpoints.is_empty() {
-        warn!(
+        info!(
             holes = initial,
-            "record-only backfill: no archive endpoints known yet — skipping"
+            lo,
+            hi,
+            "record-only backfill: no archive known yet; the next backfill pass retries \
+             (no action needed: a node that finds no archive warns 'initial prover tree \
+             sync failed on every archive')"
         );
         return BackfillOutcome {
             filled: promoted_local,
@@ -2677,15 +2681,23 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     Ok(Some(_)) => {
                                         return true;
                                     }
-                                    Ok(None) => warn!(peer = %addr, round,
+                                    Ok(None) => info!(peer = %addr, round,
                                         "initial prover tree sync: archive cannot serve the tree; trying the next"),
-                                    Err(e) => warn!(peer = %addr, round, error = %e,
+                                    Err(e) => info!(peer = %addr, round, error = %e,
                                         "initial prover tree sync failed; trying the next archive"),
                                 }
                                 crate::prover_tree_syncer_prod::source_failed(addr);
                             }
                         }
-                        warn!("initial prover tree sync failed on every archive; lifecycle gate stays held");
+                        let archives = sync_pool.len().await;
+                        warn!(rounds = INITIAL_SYNC_ROUNDS, archives,
+                            retry_every_s = sync_interval_secs, scope = "this node",
+                            action = "check this node's outbound connections and DNS to the archives \
+                                      (the 'initial prover tree sync' lines above give each archive's \
+                                      error); the periodic sync retries, and 'incremental prover tree \
+                                      sync complete' shows it recovered",
+                            "initial prover tree sync failed on every archive: this node does not \
+                             plan shard joins or leaves until a later sync succeeds");
                         false
                     }).await;
                     let Some(synced) = synced else { return Ok(()); };
@@ -2748,9 +2760,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     sync_pl.set_sync_complete();
                     info!("initial prover tree sync complete, lifecycle enabled");
                 } else {
-                    warn!(
-                        "no prover-tree data available; lifecycle gate held — \
-                         will retry via the periodic sync task"
+                    // The failure that held the gate was warned above.
+                    info!(
+                        retry_every_s = sync_interval_secs,
+                        "no prover-tree data yet: shard join and leave planning waits for the \
+                         periodic prover tree sync"
                     );
                 }
 
@@ -3018,9 +3032,20 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 selector = %hex::encode(&qc.selector),
                                 "bootstrap: latest QC in store",
                             ),
+                            Err(quil_types::error::QuilError::NotFound(_)) => info!(
+                                committed_head = committed_head_fn,
+                                "no saved GLOBAL consensus position yet (a fresh store): consensus \
+                                 starts from the synced head; nothing to fix",
+                            ),
                             Err(e) => warn!(
                                 error = %e,
-                                "bootstrap: no latest QC in store",
+                                committed_head = committed_head_fn,
+                                scope = "this node",
+                                action = "check this node's disk and store directory for read \
+                                          errors; consensus still starts from the synced head; \
+                                          report the error if it repeats at every start",
+                                "could not read this node's saved GLOBAL consensus position; \
+                                 starting from the synced head",
                             ),
                         }
                         let candidate = latest_qc.ok().and_then(|qc| {
@@ -3070,14 +3095,17 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                             // consensus — safe. The two are distinguished purely by
                             // sign: qc.frame_number </> committed_head_fn.)
                             if qc.frame_number < committed_head_fn {
-                                warn!(
+                                info!(
                                     qc_frame = qc.frame_number,
                                     qc_rank = qc.rank,
                                     committed_head = committed_head_fn,
+                                    behind = committed_head_fn - qc.frame_number,
                                     selector = %hex::encode(&qc.selector),
-                                    "bootstrap: latest QC is BELOW the record head — \
-                                     STALE (consensus lagged synced records); anchoring \
-                                     at the record head and resetting the stale CW journal",
+                                    scope = "this node",
+                                    action = "no action needed: repaired here",
+                                    "saved GLOBAL consensus position was behind this node's synced \
+                                     frame records: consensus restarts from the synced head and \
+                                     its stale vote journal is reset",
                                 );
                                 return None;
                             }
@@ -3321,8 +3349,14 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 if gaps.is_empty() {
                                     continue;
                                 }
-                                warn!(holes = ?gaps, from, head,
-                                    "GLOBAL frame-record holes below the head; backfilling");
+                                let missing: u64 = gaps.iter().map(|(lo, hi)| hi - lo + 1).sum();
+                                info!(holes = gaps.len(), missing_frames = missing,
+                                    lowest = gaps.iter().map(|gap| gap.0).min().unwrap_or(0),
+                                    highest = gaps.iter().map(|gap| gap.1).max().unwrap_or(0), from, head,
+                                    "GLOBAL frame records missing below the head (frames this node \
+                                     missed on gossip); backfilling them from archives, no action \
+                                     needed: 'record-only backfill could not fill every height' \
+                                     warns if archives cannot serve them");
                                 backfill_record_gaps(gap_pool.clone(), gap_cs.clone(), gap_validate.clone(),
                                     (*seed).clone(), gap_cancel.clone(), gaps, gap_backfill_floor(network as u32)).await;
                             }

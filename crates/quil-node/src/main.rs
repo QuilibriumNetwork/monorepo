@@ -1385,17 +1385,19 @@ fn stop_detached_work() {
         );
     }
     if hosts_left > 0 {
-        warn!(
+        info!(
             hosts = hosts_left,
             grace_secs = STOP_GRACE.as_secs(),
-            "consensus hosts still running at exit; the node exits without waiting for them, and their journals and stores recover at the next start (no action needed)"
+            action = "no action needed: their journals and stores recover at the next start",
+            "exiting without waiting for consensus hosts still running"
         );
     }
     if !jobs.is_empty() {
-        warn!(
+        info!(
             jobs = %jobs.join(", "),
             grace_secs = STOP_GRACE.as_secs(),
-            "storage jobs still running at exit; the node exits without closing its stores, which replay their write-ahead log at the next start (no action needed; the jobs run again when next needed)"
+            action = "no action needed: the stores replay their write-ahead log at the next start and the jobs run again when next needed",
+            "exiting without waiting for storage jobs still running"
         );
     }
 }

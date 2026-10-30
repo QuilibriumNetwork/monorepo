@@ -716,8 +716,17 @@ pub(crate) async fn sync_shard_phases_on(
         }
         let Some(source) = resolve_phase_source(&mut client, &crdt, shard_id, phase, exp).await?
         else {
-            warn!(phase, shard = %hex::encode(shard_id), anchor = %hex::encode(exp),
-                "phase cannot reach its anchor: source unavailable or empty source with stale local data");
+            // The caller tries another archive, or retries at its next pass,
+            // and logs its own outcome.
+            let reason = match phase_anchor(exp) {
+                Ok(Some(anchor)) if is_empty_phase_root(&anchor) => {
+                    "the committed phase is empty but this node's is not"
+                }
+                Ok(Some(_)) => "the archive does not hold the committed version of this phase",
+                _ => "the archive holds no data for this phase but this node does",
+            };
+            info!(phase, shard = %hex::encode(shard_id), anchor = %hex::encode(exp), reason,
+                "this archive cannot serve the shard tree this node needs; trying another archive");
             return Ok(None);
         };
         let PhaseSource::Tree {
