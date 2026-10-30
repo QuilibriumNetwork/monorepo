@@ -386,6 +386,13 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<ExitCode> {
+    // A native lattice build compiled for CPU features this host lacks dies
+    // with SIGILL in its first proof: refuse before anything runs, the proof
+    // worker mode included. The error prints as one line on stderr.
+    #[cfg(feature = "native-proof")]
+    if let Some(message) = quil_lattice_ct::native_cpu::unsupported_cpu_message("quil-node") {
+        anyhow::bail!(message);
+    }
     // The node is its own token proof worker (proof_worker.rs): in that mode it
     // verifies one request and exits, before logging, the runtime or arguments.
     #[cfg(feature = "native-proof")]
