@@ -739,7 +739,8 @@ fn encode_member_with(
 }
 
 /// [`encode_member_with`], given up once `stop` says so: looked at before
-/// each leaf, once it has its memory, and while it is labelled.
+/// each leaf, while it waits for its memory and once it has it, and while it
+/// is labelled.
 fn encode_member_until(
     captured: &Captured,
     member: &[u8],
@@ -757,12 +758,17 @@ fn encode_member_until(
         if stop() {
             return Err(stopped());
         }
-        let mut memory = crate::storage_jobs::reserve(encoding_bytes(data_node_count(
-            estimated_leaf_bytes(captured.leaf_size(prefix)?),
-        )));
-        if stop() {
+        // A leaf whose seat's renewal is past its grace leaves the queue for
+        // memory, where it would hold its place before other seats' leaves.
+        let memory = crate::storage_jobs::reserve_until(
+            encoding_bytes(data_node_count(estimated_leaf_bytes(
+                captured.leaf_size(prefix)?,
+            ))),
+            stop,
+        );
+        let Some(mut memory) = memory.filter(|_| !stop()) else {
             return Err(stopped());
-        }
+        };
         let data = captured.leaf_data(prefix)?;
         let exact = data_node_count(data.len() as u64);
         let ahead = store.and_then(|store| {

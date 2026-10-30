@@ -724,9 +724,11 @@ pub fn precompute(
             return Ok(None);
         }
         let exact = {
-            let _memory =
-                crate::storage_jobs::reserve_ahead(crate::storage_snapshot::leaf_read_bytes(size));
-            if expired(epoch) {
+            let memory = crate::storage_jobs::reserve_ahead(
+                crate::storage_snapshot::leaf_read_bytes(size),
+                &|| expired(epoch),
+            );
+            if memory.is_none() || expired(epoch) {
                 log_expired(
                     epoch,
                     filter,
@@ -777,8 +779,8 @@ pub fn precompute(
 /// (`crate::storage_jobs::wait_for_due_work`), and labels it again from its
 /// start, unless the epoch's snapshot of the shard labelled it meanwhile.
 /// Once GLOBAL reaches the epoch's snapshot frame ([`expired`]), looked at
-/// once the leaf has its memory, while it is labelled and once work due now
-/// is done, the leaf is given up.
+/// while the leaf waits for its memory and once it has it, while it is
+/// labelled and once work due now is done, the leaf is given up.
 fn label_leaf_ahead(
     store: &LabelStore,
     member: &[u8],
@@ -796,8 +798,10 @@ fn label_leaf_ahead(
         let Some(admitted) = store.admit(epoch, member, leaf_id, n, Stage::Ahead) else {
             return Ok(None);
         };
-        let memory = crate::storage_jobs::reserve_ahead(crate::storage_snapshot::encoding_bytes(n));
-        if expired(epoch) {
+        let bytes = crate::storage_snapshot::encoding_bytes(n);
+        let memory = crate::storage_jobs::reserve_ahead(bytes, &|| expired(epoch))
+            .filter(|_| !expired(epoch));
+        let Some(memory) = memory else {
             log_expired(
                 epoch,
                 filter,
@@ -805,7 +809,7 @@ fn label_leaf_ahead(
                 "waiting for memory to label the leaf",
             );
             return Ok(Some(0));
-        }
+        };
         let progress = crate::storage_snapshot::leaf_started(
             epoch,
             filter,
