@@ -165,6 +165,32 @@ pub(super) struct CoinScan {
     /// The node answered that the application has no coin root yet.
     rootless: bool,
 }
+
+/// What a balance scan read, for the line `token balance` ends it with.
+#[derive(Default)]
+pub(super) struct ScanReport {
+    pages: usize,
+    coins: usize,
+    /// Coins whose memo the wallet tried to open.
+    opened: usize,
+    /// Spent-marker reads for coins that opened as ours.
+    spent_checks: usize,
+}
+
+impl ScanReport {
+    pub(super) fn line(&self, elapsed: std::time::Duration) -> String {
+        format!(
+            "confidential scan: {} pages (≈{:.1} coins/page, asked {}) in {:.1} s; {} opened, {} spent checks",
+            self.pages,
+            self.coins as f64 / self.pages.max(1) as f64,
+            SCAN_PAGE_ENTRIES,
+            elapsed.as_secs_f64(),
+            self.opened,
+            self.spent_checks
+        )
+    }
+}
+
 impl CoinScan {
     pub(super) fn new(max_pages: usize) -> anyhow::Result<Self> {
         anyhow::ensure!(max_pages > 0, "scan page budget must be positive");
@@ -1915,7 +1941,7 @@ impl RecipientWallet {
         max_owned: usize,
     ) -> anyhow::Result<Vec<OwnedCoin>> {
         Ok(self
-            .scan_unspent_or_rootless(client, max_pages, max_owned)
+            .scan_unspent_or_rootless(client, max_pages, max_owned, &mut ScanReport::default())
             .await?
             .unwrap_or_default())
     }
@@ -1929,15 +1955,20 @@ impl RecipientWallet {
         >,
         max_pages: usize,
         max_owned: usize,
+        report: &mut ScanReport,
     ) -> anyhow::Result<Option<Vec<OwnedCoin>>> {
         anyhow::ensure!(max_owned > 0, "owned coin limit must be positive");
         let mut scan = CoinScan::new(max_pages)?;
         let mut unspent = Vec::new();
         while !scan.finished() {
             let page = self.scan_next(client, &mut scan).await?;
+            report.pages += 1;
+            report.coins += page.len();
+            report.opened += page.len();
             let wallet = self.clone();
             let owned = tokio::task::spawn_blocking(move || wallet.recover_page(page)).await??;
             for coin in owned {
+                report.spent_checks += 1;
                 if self.is_unspent_hint(client, &coin.image).await? {
                     anyhow::ensure!(
                         unspent.len() < max_owned,
@@ -2855,22 +2886,31 @@ pub(super) async fn run_balance(
     // which names it and the fix, ends the output.
     let client = tc.connect().await;
     let unreachable = || anyhow::anyhow!("the node did not answer; see the error below");
+    // Each phase's cost goes to stderr: a slow balance shows where it went.
     if quil {
+        let (started, mut pages) = (std::time::Instant::now(), 0);
         let legacy = match &client {
-            Ok(client) => super::legacy::unshielded(tc, client, &application_id).await,
+            Ok(client) => super::legacy::unshielded(tc, client, &application_id, &mut pages).await,
             Err(_) => Err(unreachable()),
         };
+        if pages > 0 {
+            eprintln!(
+                "legacy listing: {pages} pages in {:.1} s",
+                started.elapsed().as_secs_f64()
+            );
+        }
         if legacy.is_err() {
             failed.push("legacy coins");
         }
         println!("{}", super::balance::format_legacy_coins(legacy));
     }
+    let (started, mut report) = (std::time::Instant::now(), ScanReport::default());
     let confidential = match &client {
         Err(_) => Err(unreachable()),
         Ok(client) => match RecipientWallet::load(tc, &network, &application_id) {
             Err(error) => Err(error),
             Ok(wallet) => match std::sync::Arc::new(wallet)
-                .scan_unspent_or_rootless(client, max_pages, max_coins)
+                .scan_unspent_or_rootless(client, max_pages, max_coins, &mut report)
                 .await
             {
                 Ok(Some(coins)) => coins
@@ -2883,6 +2923,9 @@ pub(super) async fn run_balance(
             },
         },
     };
+    if report.pages > 0 {
+        eprintln!("{}", report.line(started.elapsed()));
+    }
     if confidential.is_err() {
         failed.push("confidential coins");
     }
