@@ -756,6 +756,30 @@ impl TokenExecutionEngine {
         counts
     }
 
+    /// Byte sizes of the confidential operations in `bundles` whose verdicts
+    /// `policy` has not cached yet: what executing them would still verify.
+    #[cfg(feature = "native-proof")]
+    pub fn unverified_operation_sizes(
+        policy: &crate::token_intrinsic::dispatch::TokenPolicy,
+        bundles: &[(Vec<u8>, Vec<u8>)],
+    ) -> Vec<usize> {
+        Self::confidential_operations(bundles)
+            .into_iter()
+            .filter(|(address, bytes, tp)| !policy.verdict_cached(address, bytes, *tp))
+            .map(|(_, bytes, _)| bytes.len())
+            .collect()
+    }
+
+    /// The per-frame verification budget, in worker-seconds (budget seconds
+    /// times the worker's concurrency); `None` without a configured worker.
+    #[cfg(feature = "native-proof")]
+    pub fn verification_budget(&self) -> Option<f64> {
+        self.token_worker.as_ref().map(|worker| {
+            crate::token_intrinsic::dispatch::verification_budget_secs()
+                * worker.concurrency().max(1) as f64
+        })
+    }
+
     /// Confidential operations a proposal may schedule under the verification
     /// budget; unbounded without a configured worker.
     #[cfg(feature = "native-proof")]

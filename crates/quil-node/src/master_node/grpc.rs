@@ -163,6 +163,9 @@ pub(crate) struct GrpcArgs {
     /// `SubmitGlobalConsensus` RPCs are admitted here, within size limits and
     /// budgets, into the message loop's remote consensus queues.
     pub consensus_intake: Arc<super::consensus_intake::ConsensusIntake>,
+    /// The message loop's self-loopback: a shard-domain submission this node
+    /// publishes reaches its own engines through it, as if gossiped.
+    pub consensus_loopback: tokio::sync::mpsc::Sender<quil_p2p::node::ReceivedMessage>,
 }
 
 /// Serves forest-sync JMT nodes/values from the local CRDT's forest — the
@@ -1576,6 +1579,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         app_frame_misses,
         spawner,
         consensus_intake,
+        consensus_loopback,
     } = args;
 
     // Prover authorizer (mirrors Go `authenticateProverFromContext`, used by
@@ -2510,6 +2514,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
             "Send authentication pubkey wired"
         );
         let send_p2p = p2p_handle.clone();
+        let send_loopback = consensus_loopback.clone();
         // Reuse the prover pipeline's transport for GLOBAL_PROVER-domain
         // sends. The transport already implements the correct fan-out:
         // gRPC to every known archive (so non-archive nodes have a
@@ -2531,6 +2536,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                 Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
             > {
                 let p2p = send_p2p.clone();
+                let loopback = send_loopback.clone();
                 let transport = send_transport.clone();
                 let lifecycle = send_lifecycle.clone();
                 let owner = send_owner.clone();
@@ -2619,6 +2625,21 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                                 }
                                 Err(e) => return Err(format!("p2p publish failed: {}", e)),
                             }
+                        }
+                        // BlossomSub does not deliver a node's own message to
+                        // it: hand the submission to this node's own engines
+                        // of the application too, as if gossiped, so they
+                        // verify its proofs on arrival like every other
+                        // member. A submitting member verified its own batch
+                        // shield only once a frame carried it, 490 s after
+                        // the others (devnet, 2026-10-29).
+                        if let Err(error) = loopback.try_send(quil_p2p::node::ReceivedMessage {
+                            bitmask,
+                            data: payload,
+                            from: Vec::new(),
+                            direct: false,
+                        }) {
+                            tracing::warn!(%error, scope = "this node", action = "its own engines verify the submission once a proposal or frame carries it", "own submission not looped back to this node's engines");
                         }
                     }
                     Ok(())

@@ -1625,6 +1625,7 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                             .unwrap_or(0)
                     })
             });
+            note_routing_shards(&self.app_address, &shards);
             let hashes: Vec<[u8; 32]> = canonical_requests
                 .iter()
                 .map(|canon| {
@@ -1714,50 +1715,73 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                 );
             }
         }
-        // Proof-verification budget: keep only as many confidential token
-        // operations as the configured worker concurrency can verify within
-        // the per-frame budget at the measured mean duration, so a finalized
-        // frame never carries more proof work than materialization can
-        // complete before the next proposal is due. The rest are held back,
-        // not dropped: they are carried to this rank so that waiting behind
-        // other work never ages them out of the retention window.
-        let capacity = self
-            .execution_engine
-            .as_ref()
-            .map(|manager| manager.token_verification_capacity())
-            .unwrap_or(usize::MAX);
-        if capacity != usize::MAX {
-            let operations: Vec<usize> = canonical_requests
-                .iter()
-                .map(|canon| {
-                    quil_execution::ExecutionEngineManager::confidential_operation_count(
-                        &self.app_address,
-                        canon,
-                    )
-                })
-                .collect();
-            let keep = verification_budget_selection(&operations, capacity);
-            let held: Vec<Vec<u8>> = keep
-                .iter()
-                .zip(&origins)
-                .filter(|(keep, _)| !**keep)
-                .map(|(_, origin)| raw_messages[*origin].clone())
-                .collect();
-            if !held.is_empty() {
-                info!(
-                    frame = frame_number,
-                    rank,
-                    deferred = held.len(),
-                    capacity,
-                    "deferring confidential token bundles beyond the proof-verification budget"
-                );
-                self.mempool.carry_forward(rank, &held);
-                retain_kept(
-                    &keep,
-                    &mut request_bundles,
-                    &mut canonical_requests,
-                    &mut origins,
-                );
+        // Proof-verification budget. A confidential bundle whose verdicts are
+        // cached costs nothing to execute and is always carried. One with an
+        // operation not known to verify within the budget (a batch shield, or
+        // a size class this node has not measured) is held until its proofs
+        // are verified in the background (`admission_verify`, started when it
+        // arrived, or now), however long that takes: a frame carrying it held
+        // every member's materialization, and nobody proposes past a frame it
+        // has not materialized (1,150 s without a QUIL frame on a devnet,
+        // 2026-10-29). Members verify in arrival order, so they hold its
+        // verdict when its leader does. The rest are carried while their
+        // estimated verification fits the per-frame budget, the first even
+        // when it alone exceeds it, and verify when the frame executes, as
+        // before. A bundle whose background verification failed
+        // `admission_verify::MAX_FAILURES` times on this node is left out and
+        // ages out of the pool; one that cannot be queued is budgeted as
+        // before. Held bundles are carried forward to this rank, not dropped,
+        // so waiting never ages them out of retention.
+        if let Some(manager) = self.execution_engine.as_ref() {
+            if let Some(budget_secs) = manager.token_verification_budget() {
+                let application = &self.app_address[..self.app_address.len().min(32)];
+                let queue = crate::admission_verify::global();
+                let proofs: Vec<BundleProofs> = canonical_requests
+                    .iter()
+                    .map(|canon| bundle_proofs(manager, queue, application, canon, budget_secs))
+                    .collect();
+                let selection = verification_budget_selection(&proofs, budget_secs);
+                let held: Vec<Vec<u8>> = selection
+                    .iter()
+                    .zip(&origins)
+                    .filter(|(choice, _)| **choice == Budgeted::Hold)
+                    .map(|(_, origin)| raw_messages[*origin].clone())
+                    .collect();
+                let released = selection
+                    .iter()
+                    .filter(|choice| **choice == Budgeted::Release)
+                    .count();
+                if !held.is_empty() || released > 0 {
+                    let verifying = selection
+                        .iter()
+                        .zip(&proofs)
+                        .filter(|(choice, proofs)| **choice == Budgeted::Hold && proofs.verifying)
+                        .count();
+                    if budget_note_due(&self.filter, std::time::Instant::now()) {
+                        info!(
+                            frame = frame_number,
+                            rank,
+                            deferred = held.len(),
+                            verifying,
+                            released,
+                            budget_secs,
+                            "deferring confidential token bundles: proofs verifying in the background \
+                             (verifying) or beyond the proof-verification budget ride a later frame; \
+                             released ones failed to verify on this node and are left out"
+                        );
+                    }
+                    self.mempool.carry_forward(rank, &held);
+                    let keep: Vec<bool> = selection
+                        .iter()
+                        .map(|choice| *choice == Budgeted::Carry)
+                        .collect();
+                    retain_kept(
+                        &keep,
+                        &mut request_bundles,
+                        &mut canonical_requests,
+                        &mut origins,
+                    );
+                }
             }
         }
         // The leader executes these after finalization like every member;
@@ -3578,6 +3602,117 @@ impl AppConsensusEngine {
         });
     }
 
+    /// Put this frame's materialization off while its confidential proofs
+    /// verify on a background thread (`admission_verify`), so the engine
+    /// keeps serving consensus, storage proofs and confirmations instead of
+    /// holding `&mut self` for the whole verification: a 96-source batch
+    /// shield held every member's engine for 5-14 min, and the members, who
+    /// built no storage snapshot meanwhile, were kicked (devnet, 2026-10-29).
+    /// The caller keeps the frame and retries (`PROOF_VERIFICATION_PENDING`).
+    /// A leader carries such an operation only once it verified it, and
+    /// members verify in arrival order, so a member waits here only when it
+    /// trails the leader. `None`: materialize now — every verdict is cached,
+    /// the operations left are known to verify within the budget (inline, as
+    /// before), or the background verification cannot finish them (not
+    /// queued, released, ended without a verdict [`MAX_DEFERRAL_RESTARTS`]
+    /// times, or past [`MAX_PROOF_DEFERRAL`]), in which case materialization
+    /// verifies inline as before.
+    fn defer_for_proof_verification(
+        &self,
+        exec: &Arc<quil_execution::ExecutionEngineManager>,
+        requests: &[quil_types::proto::global::MessageBundle],
+        frame_number: u64,
+    ) -> Option<QuilError> {
+        let application = &self.app_address[..self.app_address.len().min(32)];
+        let queue = crate::admission_verify::global();
+        let budget_secs = exec.token_verification_budget();
+        // Operations not known to verify within the budget; the others verify
+        // when the frame executes, as before.
+        let mut unverified: Vec<usize> = Vec::new();
+        let mut verifying = true;
+        let mut restarted = false;
+        for bundle in requests {
+            let Ok(canon) = crate::consensus_wire::app_bundle_to_canonical_bytes(bundle) else {
+                continue;
+            };
+            let sizes =
+                exec.unverified_confidential_operations(&[(application.to_vec(), canon.clone())]);
+            if !verifies_in_background(&sizes, budget_secs) {
+                continue;
+            }
+            unverified.extend(sizes);
+            let digest = crate::admission_verify::digest(&canon);
+            restarted |= !(queue.pending(&digest) || proof_prewarm_running(&canon));
+            verifying &=
+                crate::admission_verify::offer_submission(queue, exec, application, &canon, true)
+                    || proof_prewarm_running(&canon);
+        }
+        if unverified.is_empty() && !proof_deferral_known(&self.filter, frame_number) {
+            return None;
+        }
+        let estimate_secs: f64 = unverified
+            .iter()
+            .map(|bytes| quil_execution::ExecutionEngineManager::estimated_verify_secs(*bytes))
+            .sum();
+        let decision = PROOF_DEFERRALS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .decide(
+                &self.filter,
+                frame_number,
+                unverified.len(),
+                verifying,
+                restarted,
+                std::time::Instant::now(),
+            );
+        match decision {
+            Deferral::Wait { first: true } => {
+                info!(
+                    core_id = self.core_id,
+                    filter = %hex::encode(&self.filter),
+                    frame = frame_number,
+                    operations = unverified.len(),
+                    estimate_secs = estimate_secs.round() as u64,
+                    scope = "this worker",
+                    action = "an expected wait: the frame materializes once its proofs verify; this worker keeps \
+                              voting and serving its seats meanwhile",
+                    "app-shard frame materialization waits for its proof verification on a background thread"
+                );
+                Some(QuilError::ExecutionUnavailable(
+                    quil_execution::token_intrinsic::PROOF_VERIFICATION_PENDING.to_string(),
+                ))
+            }
+            Deferral::Wait { first: false } => Some(QuilError::ExecutionUnavailable(
+                quil_execution::token_intrinsic::PROOF_VERIFICATION_PENDING.to_string(),
+            )),
+            Deferral::Proceed { waited, inline } => {
+                match (inline, waited) {
+                    (Some(reason), waited) => warn!(
+                        core_id = self.core_id,
+                        filter = %hex::encode(&self.filter),
+                        frame = frame_number,
+                        operations = unverified.len(),
+                        waited_secs = waited.map_or(0, |w| w.as_secs()),
+                        reason,
+                        scope = "this worker",
+                        action = "this worker verifies the frame's proofs inline and pauses until they verify; \
+                                  if it repeats, check the proof worker (proofWorker settings, CPU)",
+                        "app-shard frame proofs did not verify in the background; verifying inline"
+                    ),
+                    (None, Some(waited)) => info!(
+                        core_id = self.core_id,
+                        filter = %hex::encode(&self.filter),
+                        frame = frame_number,
+                        waited_secs = waited.as_secs(),
+                        "app-shard frame proofs verified in the background; materializing"
+                    ),
+                    (None, None) => {}
+                }
+                None
+            }
+        }
+    }
+
     /// Run a frame's `requests` through the execution engines on the
     /// blocking thread pool, off the engine's `tokio::select!` task.
     /// Materialization is CPU- and DB-bound; running it inline on the
@@ -3602,6 +3737,9 @@ impl AppConsensusEngine {
             None => return Ok((0, 0)),
         };
         self.prove_storage_epoch_if_due(global_frame_number);
+        if let Some(pending) = self.defer_for_proof_verification(&exec, &requests, frame_number) {
+            return Err(pending);
+        }
         let collector = self.message_collector.clone();
         // Price from the network size certified by global consensus on the
         // anchored global frame — identical on every member — never from this
@@ -9434,8 +9572,10 @@ impl AppConsensusEngine {
                         self.extend_audited_history(frame_number);
                     }
                     Err(error) => {
-                        warn!(core_id = self.core_id, frame = frame_number, %error,
-                            "implied app frame materialize failed (cursor held; will retry)");
+                        if !quil_execution::token_intrinsic::is_proof_verification_pending(&error) {
+                            warn!(core_id = self.core_id, frame = frame_number, %error,
+                                "implied app frame materialize failed (cursor held; will retry)");
+                        }
                         self.finalized_requests_roots
                             .entry(frame_number)
                             .or_insert_with(|| header.requests_root.clone());
@@ -9684,8 +9824,10 @@ impl AppConsensusEngine {
                 // frame is finalized, since nobody may propose past a frame it
                 // has not materialized, and "next finalize" never comes.
                 Err(e) => {
-                    warn!(core_id = self.core_id, frame = frame_number, error = %e,
-                        "cw-finalized materialize failed (cursor held; will retry)");
+                    if !quil_execution::token_intrinsic::is_proof_verification_pending(&e) {
+                        warn!(core_id = self.core_id, frame = frame_number, error = %e,
+                            "cw-finalized materialize failed (cursor held; will retry)");
+                    }
                     self.finalized_requests_roots
                         .entry(frame_number)
                         .or_insert_with(|| header.requests_root.clone());
@@ -10319,6 +10461,31 @@ impl AppConsensusEngine {
     fn add_app_message(&mut self, data: &[u8]) {
         let data = canonical_app_message(data);
         stamp_arrival(&self.routing_seen, &data, std::time::Instant::now());
+        // Verify its confidential proofs now, in the background, so the
+        // proposal that carries it and the frame that executes it find the
+        // verdicts cached instead of verifying for minutes. Only on the shard
+        // that proposes it: every shard of the application collects it.
+        if let Some(exec) = self.execution_engine.as_ref() {
+            if quil_execution::ExecutionEngineManager::confidential_operation_count(
+                &self.app_address,
+                &data,
+            ) > 0
+                && arrival_designated(
+                    &self.filter,
+                    routing_shards(&self.app_address).as_deref(),
+                    &crate::admission_verify::digest(&data),
+                    quil_execution::ExecutionEngineManager::shield_source(&data),
+                )
+            {
+                crate::admission_verify::offer_submission(
+                    crate::admission_verify::global(),
+                    exec,
+                    &self.app_address,
+                    &data,
+                    false,
+                );
+            }
+        }
         if !self.message_collector.add_message_newest(data.clone()) {
             // Buffer full — spill to next rank
             let next_rank = self.current_rank + 1;
@@ -10505,6 +10672,11 @@ impl AppConsensusEngine {
                         skipped,
                         "materialized received shard frame (follower)"
                     );
+                }
+                // Its proofs verify in the background: the frame is kept and
+                // retried on the retry timer; the wait is logged where it starts.
+                Err(e) if quil_execution::token_intrinsic::is_proof_verification_pending(&e) => {
+                    break
                 }
                 Err(e) if quil_execution::token_intrinsic::is_proof_worker_busy(&e) => {
                     // Local contention for the proof worker: the frame is
@@ -10708,13 +10880,15 @@ impl AppConsensusEngine {
                         );
                     }
                     Err(e) => {
-                        warn!(
-                            core_id = self.core_id,
-                            parent_rank,
-                            frame = frame_number,
-                            error = %e,
-                            "app-shard materialize failed; retaining certified parent for retry"
-                        );
+                        if !quil_execution::token_intrinsic::is_proof_verification_pending(&e) {
+                            warn!(
+                                core_id = self.core_id,
+                                parent_rank,
+                                frame = frame_number,
+                                error = %e,
+                                "app-shard materialize failed; retaining certified parent for retry"
+                            );
+                        }
                         return;
                     }
                 }
@@ -11693,6 +11867,17 @@ fn claim_proof_prewarm(bundles: &[Vec<u8>]) -> Option<Vec<[u8; 32]>> {
     (!claimed.is_empty()).then_some(claimed)
 }
 
+/// Whether a proposal-time warm-up ([`prewarm_proof_verdicts`]) is verifying
+/// `canonical`'s proofs now.
+fn proof_prewarm_running(canonical: &[u8]) -> bool {
+    use sha2::{Digest as _, Sha256};
+    let digest: [u8; 32] = Sha256::digest(canonical).into();
+    PROOF_PREWARM
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(&digest)
+}
+
 fn release_proof_prewarm(claimed: &[[u8; 32]]) {
     let mut in_flight = PROOF_PREWARM.lock().unwrap_or_else(|p| p.into_inner());
     for digest in claimed {
@@ -11710,7 +11895,9 @@ static PROOF_PREWARM_THREADS: std::sync::atomic::AtomicUsize =
 /// transfer's frame spent 10.6 s verifying after finalization, delaying the
 /// next frame that relays its spend. Verdicts are deterministic; this changes
 /// only when they are computed. Bounded: at most [`MAX_PROOF_PREWARMS`] threads,
-/// and a body already warming is not warmed again.
+/// and a body already warming is not warmed again. A body with an operation
+/// not known to verify within the budget goes to the front of the admission
+/// queue ([`crate::admission_verify`]) instead, which verifies one at a time.
 pub(crate) fn prewarm_proof_verdicts(
     exec: &Arc<quil_execution::ExecutionEngineManager>,
     app_address: &[u8],
@@ -11724,6 +11911,26 @@ pub(crate) fn prewarm_proof_verdicts(
         })
         .cloned()
         .collect();
+    // A bundle with an operation not known to verify within the budget (a
+    // batch shield) goes to the front of the node's one admission queue
+    // instead: verified beside the queue's own verification, each ran at
+    // half speed (devnet, 2026-10-29).
+    let budget = exec.token_verification_budget();
+    let (long, bundles): (Vec<Vec<u8>>, Vec<Vec<u8>>) = bundles.into_iter().partition(|bundle| {
+        verifies_in_background(
+            &exec.unverified_confidential_operations(&[(addr.clone(), bundle.clone())]),
+            budget,
+        )
+    });
+    for bundle in &long {
+        crate::admission_verify::offer_submission(
+            crate::admission_verify::global(),
+            exec,
+            &addr,
+            bundle,
+            true,
+        );
+    }
     if bundles.is_empty() {
         return;
     }
@@ -12239,27 +12446,266 @@ fn routed_selection(
         .collect()
 }
 
-/// Which collected bundles a proposal carries under the proof-verification
-/// budget: `operations[i]` is bundle `i`'s count of confidential operations.
-/// Bundles without any are always carried; confidential ones are taken in
-/// collection (arrival) order while they fit `capacity`, the first even when
-/// it alone exceeds it. Every shard of the application collects the same
-/// submissions in much the same order, so the shards a node works for carry
-/// the same bundle at about the same time and its one cached verdict serves
-/// them all: the budget is per proposal, but a node's proof worker is shared.
-fn verification_budget_selection(operations: &[usize], capacity: usize) -> Vec<bool> {
-    let mut scheduled = 0usize;
-    operations
-        .iter()
-        .map(|&ops| {
-            if ops > 0 && scheduled > 0 && scheduled + ops > capacity {
-                false
+/// How long a frame's materialization waits for its proofs to verify in the
+/// background before verifying them inline, blocking the engine, as before.
+const MAX_PROOF_DEFERRAL: std::time::Duration = std::time::Duration::from_secs(1800);
+/// Background verifications of one frame that may end without a verdict (no
+/// worker slot, worker failure) before it verifies inline.
+const MAX_DEFERRAL_RESTARTS: u32 = 2;
+
+/// Frames whose materialization waits for background proof verification.
+static PROOF_DEFERRALS: std::sync::LazyLock<std::sync::Mutex<ProofDeferrals>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn proof_deferral_known(filter: &[u8], frame: u64) -> bool {
+    PROOF_DEFERRALS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entries
+        .contains_key(&(filter.to_vec(), frame))
+}
+
+#[derive(Default)]
+struct ProofDeferrals {
+    /// `(filter, frame)` → when it was first put off, and how often its
+    /// background verification ended without a verdict.
+    entries: HashMap<(Vec<u8>, u64), (std::time::Instant, u32)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Deferral {
+    /// Put the materialization off; `first` when this frame was not waiting.
+    Wait { first: bool },
+    /// Materialize now. `waited`: how long it was put off; `inline`: why its
+    /// proofs did not verify in the background, when they did not.
+    Proceed {
+        waited: Option<std::time::Duration>,
+        inline: Option<&'static str>,
+    },
+}
+
+impl ProofDeferrals {
+    /// Whether to put off materializing `frame` of `filter`, whose execution
+    /// still needs `unverified` worker verifications; `verifying`: all of
+    /// them are verifying in the background; `restarted`: one of them had to
+    /// be queued again since the last call, its earlier verification having
+    /// ended without a verdict.
+    fn decide(
+        &mut self,
+        filter: &[u8],
+        frame: u64,
+        unverified: usize,
+        verifying: bool,
+        restarted: bool,
+        now: std::time::Instant,
+    ) -> Deferral {
+        self.entries
+            .retain(|_, (since, _)| now.saturating_duration_since(*since) < MAX_PROOF_DEFERRAL * 2);
+        let key = (filter.to_vec(), frame);
+        let waited = self
+            .entries
+            .get(&key)
+            .map(|(since, _)| now.saturating_duration_since(*since));
+        let inline = if unverified == 0 {
+            self.entries.remove(&key);
+            return Deferral::Proceed {
+                waited,
+                inline: None,
+            };
+        } else if !verifying {
+            Some("its proofs could not be queued for background verification")
+        } else if let Some((since, restarts)) = self.entries.get_mut(&key) {
+            *restarts += u32::from(restarted);
+            if *restarts > MAX_DEFERRAL_RESTARTS {
+                Some("background verification ended without a verdict")
+            } else if now.saturating_duration_since(*since) >= MAX_PROOF_DEFERRAL {
+                Some("background verification outlasted the deferral limit")
             } else {
-                scheduled += ops;
-                true
+                return Deferral::Wait { first: false };
             }
+        } else {
+            self.entries.insert(key, (now, 0));
+            return Deferral::Wait { first: true };
+        };
+        self.entries.remove(&key);
+        Deferral::Proceed { waited, inline }
+    }
+}
+
+/// What a proposal knows of one collected bundle's confidential proofs.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct BundleProofs {
+    /// Confidential operations whose verdicts are not cached yet.
+    unverified: usize,
+    /// Their estimated seconds of worker verification.
+    unverified_secs: f64,
+    /// One of them is not known to verify within the budget.
+    long: bool,
+    /// Its proofs are queued or verifying in the background on this node.
+    verifying: bool,
+    /// Its background verification failed `admission_verify::MAX_FAILURES`
+    /// times on this node.
+    released: bool,
+}
+
+/// Whether a bundle whose unverified confidential operations are `sizes`
+/// bytes each is verified in the background before a frame carries it: one
+/// of them is not known to verify within `budget_secs` (a batch shield, or a
+/// size class this node has not measured). Never without a proof worker
+/// (`None`), whose verifications are not budgeted.
+fn verifies_in_background(sizes: &[usize], budget_secs: Option<f64>) -> bool {
+    budget_secs.is_some_and(|budget| {
+        sizes.iter().any(|bytes| {
+            !quil_execution::ExecutionEngineManager::verification_known_to_fit(*bytes, budget)
+        })
+    })
+}
+
+/// What a proposal does with one collected bundle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Budgeted {
+    /// Carried now.
+    Carry,
+    /// Carried forward to a later proposal.
+    Hold,
+    /// Left out and not carried forward: it ages out of the pool.
+    Release,
+}
+
+/// [`BundleProofs`] of one canonical bundle; queues a long bundle not
+/// verifying yet (it arrived before a restart, the queue dropped it, or
+/// another shard was designated for it).
+fn bundle_proofs(
+    manager: &Arc<quil_execution::ExecutionEngineManager>,
+    queue: &Arc<crate::admission_verify::AdmissionQueue>,
+    application: &[u8],
+    canonical: &[u8],
+    budget_secs: f64,
+) -> BundleProofs {
+    let unverified =
+        manager.unverified_confidential_operations(&[(application.to_vec(), canonical.to_vec())]);
+    if unverified.is_empty() {
+        return BundleProofs::default();
+    }
+    let long = verifies_in_background(&unverified, Some(budget_secs));
+    let released = queue.released(&crate::admission_verify::digest(canonical));
+    let verifying = long
+        && !released
+        && (crate::admission_verify::offer_submission(
+            queue,
+            manager,
+            application,
+            canonical,
+            false,
+        ) || proof_prewarm_running(canonical));
+    BundleProofs {
+        unverified: unverified.len(),
+        unverified_secs: unverified
+            .iter()
+            .map(|bytes| quil_execution::ExecutionEngineManager::estimated_verify_secs(*bytes))
+            .sum(),
+        long,
+        verifying,
+        released,
+    }
+}
+
+/// What a proposal does with each collected bundle under the
+/// proof-verification budget (`budget_secs` worker-seconds). Bundles whose
+/// proofs need no more verification are carried. A released bundle is left
+/// out. A long one verifying in the background is held until it is
+/// verified, however long that takes. The rest are taken in collection
+/// (arrival) order while their estimated verification fits the budget, the
+/// first even when it alone exceeds it. Every shard of the application
+/// collects the same submissions in much the same order, so the shards a
+/// node works for carry the same bundle at about the same time and its one
+/// cached verdict serves them all.
+fn verification_budget_selection(bundles: &[BundleProofs], budget_secs: f64) -> Vec<Budgeted> {
+    let mut scheduled = 0.0f64;
+    let mut any = false;
+    bundles
+        .iter()
+        .map(|bundle| {
+            if bundle.unverified == 0 {
+                return Budgeted::Carry;
+            }
+            if bundle.released {
+                return Budgeted::Release;
+            }
+            if bundle.long && bundle.verifying {
+                return Budgeted::Hold;
+            }
+            if any && scheduled + bundle.unverified_secs > budget_secs {
+                return Budgeted::Hold;
+            }
+            any = true;
+            scheduled += bundle.unverified_secs;
+            Budgeted::Carry
         })
         .collect()
+}
+
+/// The live shards of each application, as this node's last proposal for it
+/// listed them, for [`arrival_designated`].
+static ROUTING_SHARDS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn note_routing_shards(application: &[u8], shards: &[Vec<u8>]) {
+    let application = application[..application.len().min(32)].to_vec();
+    let mut known = ROUTING_SHARDS.lock().unwrap_or_else(|e| e.into_inner());
+    if known.get(&application).map(Vec::as_slice) != Some(shards) {
+        known.insert(application, shards.to_vec());
+    }
+}
+
+fn routing_shards(application: &[u8]) -> Option<Vec<Vec<u8>>> {
+    ROUTING_SHARDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&application[..application.len().min(32)])
+        .cloned()
+}
+
+/// Whether shard `filter` verifies an arriving confidential bundle's proofs:
+/// whether it is the shard [`routed_selection`] has propose it first. A
+/// shield goes to the shard holding its source; another bundle to its
+/// designated shard of `shards` (the live shards as this node last listed
+/// them), and to every shard while no list is known. A shard that proposes
+/// a bundle later, past the routing fallback, queues it then.
+fn arrival_designated(
+    filter: &[u8],
+    shards: Option<&[Vec<u8>]>,
+    hash: &[u8; 32],
+    source: Option<[u8; 32]>,
+) -> bool {
+    if let Some(source) = source {
+        return shard_covers(filter, &source);
+    }
+    match shards {
+        Some(shards) if !shards.is_empty() => routing_offset(filter, shards, hash) == Some(0),
+        _ => true,
+    }
+}
+
+/// Whether a proposal of shard `filter` may log the bundles it defers: at
+/// most once a minute per shard, since a held bundle is deferred by every
+/// proposal while it verifies.
+fn budget_note_due(filter: &[u8], now: std::time::Instant) -> bool {
+    static NOTES: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<Vec<u8>, std::time::Instant>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let mut notes = NOTES.lock().unwrap_or_else(|e| e.into_inner());
+    notes.retain(|_, at| now.saturating_duration_since(*at) < std::time::Duration::from_secs(3600));
+    match notes.get(filter) {
+        Some(at) if now.saturating_duration_since(*at) < std::time::Duration::from_secs(60) => {
+            false
+        }
+        _ => {
+            notes.insert(filter.to_vec(), now);
+            true
+        }
+    }
 }
 
 /// The fee total of a materialized frame, from memory or the clock store.
@@ -18464,24 +18910,333 @@ mod tests {
         assert_eq!(routing_offset(&[9u8], &shards, &hash), None);
     }
 
-    /// The budget takes confidential bundles in arrival order while they fit,
-    /// the first even over budget, and never holds back a bundle without any.
+    /// Bundles needing `secs` of verification (0: verified, or none needed),
+    /// each known to fit the budget, none verifying in the background.
+    fn costs(secs: &[f64]) -> Vec<BundleProofs> {
+        secs.iter()
+            .map(|&unverified_secs| BundleProofs {
+                unverified: usize::from(unverified_secs > 0.0),
+                unverified_secs,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn carried(selection: &[Budgeted]) -> Vec<bool> {
+        selection.iter().map(|c| *c == Budgeted::Carry).collect()
+    }
+
+    /// The budget takes unverified bundles in arrival order while their
+    /// estimated verification fits, the first even over budget, and never
+    /// holds back a bundle that needs no verification.
     #[test]
     fn the_verification_budget_takes_submissions_in_arrival_order() {
         assert_eq!(
-            verification_budget_selection(&[1, 0, 1, 1, 0], 1),
+            carried(&verification_budget_selection(
+                &costs(&[8.0, 0.0, 8.0, 8.0, 0.0]),
+                8.0
+            )),
             vec![true, true, false, false, true]
         );
         assert_eq!(
-            verification_budget_selection(&[2, 2, 1], 3),
+            carried(&verification_budget_selection(
+                &costs(&[4.0, 4.0, 2.0]),
+                6.0
+            )),
             vec![true, false, true]
         );
-        assert_eq!(verification_budget_selection(&[5, 1], 1), vec![true, false]);
-        assert_eq!(verification_budget_selection(&[0, 0], 1), vec![true, true]);
         assert_eq!(
-            verification_budget_selection(&[1, 1, 1], 3),
+            carried(&verification_budget_selection(&costs(&[300.0, 1.0]), 6.0)),
+            vec![true, false]
+        );
+        assert_eq!(
+            carried(&verification_budget_selection(&costs(&[0.0, 0.0]), 6.0)),
+            vec![true, true]
+        );
+        // A verified bundle is not the "first" that may exceed the budget.
+        assert_eq!(
+            carried(&verification_budget_selection(&costs(&[0.0, 300.0]), 6.0)),
+            vec![true, true]
+        );
+        assert_eq!(
+            carried(&verification_budget_selection(
+                &costs(&[2.0, 2.0, 2.0]),
+                6.0
+            )),
             vec![true, true, true]
         );
+    }
+
+    /// A long bundle verifying in the background is held however long it
+    /// waits, and carried once its verdicts are cached; one released after
+    /// failing in the worker is left out; one that cannot verify in the
+    /// background is budgeted as before. A held bundle does not use up the
+    /// budget of the ones behind it.
+    #[test]
+    fn a_long_bundle_rides_only_once_verified() {
+        let long = BundleProofs {
+            unverified: 1,
+            unverified_secs: 300.0,
+            long: true,
+            verifying: true,
+            released: false,
+        };
+        assert_eq!(
+            verification_budget_selection(&[long, BundleProofs::default()], 6.0),
+            vec![Budgeted::Hold, Budgeted::Carry]
+        );
+        assert_eq!(
+            verification_budget_selection(&[long, costs(&[2.0])[0]], 6.0),
+            vec![Budgeted::Hold, Budgeted::Carry]
+        );
+        // Verified: its verdicts are cached and it costs nothing.
+        assert_eq!(
+            verification_budget_selection(&[BundleProofs::default()], 6.0),
+            vec![Budgeted::Carry]
+        );
+        let released = BundleProofs {
+            verifying: false,
+            released: true,
+            ..long
+        };
+        assert_eq!(
+            verification_budget_selection(&[released, costs(&[2.0])[0]], 6.0),
+            vec![Budgeted::Release, Budgeted::Carry]
+        );
+        let unqueued = BundleProofs {
+            verifying: false,
+            ..long
+        };
+        assert_eq!(
+            verification_budget_selection(&[unqueued, unqueued], 6.0),
+            vec![Budgeted::Carry, Budgeted::Hold]
+        );
+    }
+
+    /// The leader's hold ends when the background verification does: a
+    /// bundle held while its proofs verify on the admission thread is
+    /// carried by the first proposal after the verdict, and one whose
+    /// verification keeps failing is released after `MAX_FAILURES` and
+    /// never held again.
+    #[test]
+    fn the_hold_ends_with_the_background_verification() {
+        use crate::admission_verify::{AdmissionQueue, MAX_FAILURES};
+        use quil_execution::manager::PreverifyCounts;
+        let queue = AdmissionQueue::new(8, 1 << 20, false);
+        let digest = [4u8; 32];
+        let verdict = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let job: crate::admission_verify::AdmissionJob = {
+            let verdict = verdict.clone();
+            Arc::new(move || {
+                verdict.store(true, std::sync::atomic::Ordering::SeqCst);
+                PreverifyCounts {
+                    operations: 1,
+                    verified: 1,
+                    ..Default::default()
+                }
+            })
+        };
+        assert!(queue.offer(digest, 10, 1, job, false));
+        let proofs = |queue: &AdmissionQueue| {
+            if verdict.load(std::sync::atomic::Ordering::SeqCst) {
+                BundleProofs::default()
+            } else {
+                BundleProofs {
+                    unverified: 1,
+                    unverified_secs: 300.0,
+                    long: true,
+                    verifying: queue.pending(&digest),
+                    released: queue.released(&digest),
+                }
+            }
+        };
+        assert_eq!(
+            verification_budget_selection(&[proofs(&queue)], 6.0),
+            vec![Budgeted::Hold]
+        );
+        assert!(queue.run_one());
+        assert_eq!(
+            verification_budget_selection(&[proofs(&queue)], 6.0),
+            vec![Budgeted::Carry]
+        );
+        let failing: crate::admission_verify::AdmissionJob = Arc::new(|| PreverifyCounts {
+            operations: 1,
+            unavailable: 1,
+            ..Default::default()
+        });
+        let other = [5u8; 32];
+        assert!(queue.offer(other, 10, 1, failing, false));
+        let mut runs = 0;
+        while queue.run_one() {
+            runs += 1;
+            let failing = BundleProofs {
+                unverified: 1,
+                unverified_secs: 300.0,
+                long: true,
+                verifying: queue.pending(&other),
+                released: queue.released(&other),
+            };
+            let expected = if runs < MAX_FAILURES as usize {
+                Budgeted::Hold
+            } else {
+                Budgeted::Release
+            };
+            assert_eq!(
+                verification_budget_selection(&[failing], 6.0),
+                vec![expected]
+            );
+        }
+        assert_eq!(runs, MAX_FAILURES as usize);
+    }
+
+    /// A bundle with an operation of a size class this node has not
+    /// measured verifies in the background first; none does without unverified
+    /// operations or without a proof worker's budget.
+    #[test]
+    fn unmeasured_operations_verify_in_the_background() {
+        assert!(verifies_in_background(&[177_490], Some(12.0)));
+        assert!(verifies_in_background(&[2048, 177_490], Some(12.0)));
+        assert!(!verifies_in_background(&[], Some(12.0)));
+        assert!(!verifies_in_background(&[177_490], None));
+    }
+
+    /// An arriving confidential bundle is verified on the shard that
+    /// proposes it first: a shield on the shard holding its source, another
+    /// bundle on its designated shard of the known list, on every shard while
+    /// none is known.
+    #[test]
+    fn arriving_bundles_verify_on_their_designated_shard() {
+        let app = [0x11u8; 32];
+        let shards: Vec<Vec<u8>> = [[false, false], [false, true], [true, false], [true, true]]
+            .iter()
+            .map(|bits| quil_forest::encode_shard_bit_path(&app, bits))
+            .collect();
+        for n in 0..32u8 {
+            let hash: [u8; 32] = {
+                use sha3::{Digest, Sha3_256};
+                Sha3_256::digest([n]).into()
+            };
+            let designated: Vec<bool> = shards
+                .iter()
+                .map(|shard| arrival_designated(shard, Some(&shards), &hash, None))
+                .collect();
+            assert_eq!(
+                designated.iter().filter(|d| **d).count(),
+                1,
+                "one shard verifies it"
+            );
+            assert!(shards
+                .iter()
+                .all(|shard| arrival_designated(shard, None, &hash, None)));
+            let mut source = [0u8; 32];
+            source[0] = n << 3;
+            let holding: Vec<bool> = shards
+                .iter()
+                .map(|shard| arrival_designated(shard, Some(&shards), &hash, Some(source)))
+                .collect();
+            assert_eq!(
+                holding,
+                shards
+                    .iter()
+                    .map(|shard| shard_covers(shard, &source))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                holding.iter().filter(|d| **d).count(),
+                1,
+                "one shard holds the source"
+            );
+        }
+        // The whole application's shard verifies every bundle.
+        assert!(arrival_designated(
+            &app,
+            Some(&[app.to_vec()]),
+            &[9; 32],
+            None
+        ));
+        assert!(arrival_designated(&app, None, &[9; 32], Some([0xff; 32])));
+    }
+
+    /// A frame whose proofs verify in the background is put off, and taken
+    /// up once they are verified; it verifies inline when its verification
+    /// cannot be queued, ends without a verdict too often, or outlasts the
+    /// deferral limit, so a background verification that never finishes
+    /// delays the frame by the limit at most and never strands it.
+    #[test]
+    fn a_frame_waits_for_background_verification_within_bounds() {
+        let start = std::time::Instant::now();
+        let at = |secs: u64| start + std::time::Duration::from_secs(secs);
+        let mut deferrals = ProofDeferrals::default();
+        let filter = [7u8; 4];
+        // Nothing to verify: materialize at once, nothing remembered.
+        assert_eq!(
+            deferrals.decide(&filter, 1, 0, true, false, at(0)),
+            Deferral::Proceed {
+                waited: None,
+                inline: None
+            }
+        );
+        // Verifying: wait, then proceed with the time waited once verified.
+        assert_eq!(
+            deferrals.decide(&filter, 2, 1, true, false, at(0)),
+            Deferral::Wait { first: true }
+        );
+        assert_eq!(
+            deferrals.decide(&filter, 2, 1, true, false, at(10)),
+            Deferral::Wait { first: false }
+        );
+        assert_eq!(
+            deferrals.decide(&filter, 2, 0, true, false, at(200)),
+            Deferral::Proceed {
+                waited: Some(std::time::Duration::from_secs(200)),
+                inline: None
+            }
+        );
+        assert!(deferrals.entries.is_empty());
+        // Not queued: inline at once.
+        assert!(matches!(
+            deferrals.decide(&filter, 3, 1, false, false, at(0)),
+            Deferral::Proceed {
+                inline: Some(_),
+                ..
+            }
+        ));
+        // Ended without a verdict more than the restart bound: inline.
+        assert_eq!(
+            deferrals.decide(&filter, 4, 1, true, false, at(0)),
+            Deferral::Wait { first: true }
+        );
+        for restart in 1..=MAX_DEFERRAL_RESTARTS {
+            assert_eq!(
+                deferrals.decide(&filter, 4, 1, true, true, at(u64::from(restart))),
+                Deferral::Wait { first: false }
+            );
+        }
+        assert!(matches!(
+            deferrals.decide(&filter, 4, 1, true, true, at(9)),
+            Deferral::Proceed {
+                inline: Some("background verification ended without a verdict"),
+                ..
+            }
+        ));
+        // Past the deferral limit: inline, and the frame is forgotten.
+        let limit = MAX_PROOF_DEFERRAL.as_secs();
+        assert_eq!(
+            deferrals.decide(&filter, 5, 1, true, false, at(0)),
+            Deferral::Wait { first: true }
+        );
+        assert_eq!(
+            deferrals.decide(&filter, 5, 1, true, false, at(limit - 1)),
+            Deferral::Wait { first: false }
+        );
+        assert!(matches!(
+            deferrals.decide(&filter, 5, 1, true, false, at(limit)),
+            Deferral::Proceed {
+                inline: Some("background verification outlasted the deferral limit"),
+                ..
+            }
+        ));
+        assert!(deferrals.entries.is_empty());
     }
 
     /// The collector holds a submission in the encoding a finalized frame's

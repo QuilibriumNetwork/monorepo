@@ -362,24 +362,91 @@ impl ExecutionEngineManager {
         }
     }
 
-    /// Confidential operations a proposal may schedule per frame under the
-    /// configured verification budget (unbounded without a worker).
-    pub fn token_verification_capacity(&self) -> usize {
+    /// Byte sizes of the confidential token operations in `bundles` whose
+    /// verdicts are not cached yet: what materializing them would still
+    /// verify. Empty when every proof is verified, and without a worker.
+    pub fn unverified_confidential_operations(&self, bundles: &[(Vec<u8>, Vec<u8>)]) -> Vec<usize> {
         #[cfg(feature = "native-proof")]
         {
-            let engines = match self.engines.read() {
-                Ok(engines) => engines,
-                Err(_) => return usize::MAX,
+            let routed: Vec<(Vec<u8>, Vec<u8>)> = bundles
+                .iter()
+                .filter(|(address, _)| {
+                    self.select_engine(address)
+                        .map(|name| name == "token")
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            if routed.is_empty() {
+                return Vec::new();
+            }
+            let policy = match self.engines.read() {
+                Ok(engines) => engines
+                    .get("token")
+                    .and_then(|e| e.as_any())
+                    .and_then(|e| e.downcast_ref::<TokenExecutionEngine>())
+                    .and_then(TokenExecutionEngine::token_verifier)
+                    .map(|(policy, _)| policy),
+                Err(_) => None,
             };
+            match policy {
+                Some(policy) => TokenExecutionEngine::unverified_operation_sizes(&policy, &routed),
+                None => Vec::new(),
+            }
+        }
+        #[cfg(not(feature = "native-proof"))]
+        {
+            let _ = bundles;
+            Vec::new()
+        }
+    }
+
+    /// The per-frame proof-verification budget in worker-seconds; `None`
+    /// (unbounded) without a worker.
+    pub fn token_verification_budget(&self) -> Option<f64> {
+        #[cfg(feature = "native-proof")]
+        {
+            let engines = self.engines.read().ok()?;
             return engines
                 .get("token")
                 .and_then(|e| e.as_any())
                 .and_then(|e| e.downcast_ref::<TokenExecutionEngine>())
-                .map(|token| token.verification_capacity())
-                .unwrap_or(usize::MAX);
+                .and_then(|token| token.verification_budget());
         }
         #[cfg(not(feature = "native-proof"))]
-        usize::MAX
+        None
+    }
+
+    /// Whether verifying one confidential operation of `operation_bytes`
+    /// bytes is known to take at most `budget_secs` on this node: its size
+    /// class was measured and fits. Always without the native prover.
+    pub fn verification_known_to_fit(operation_bytes: usize, budget_secs: f64) -> bool {
+        #[cfg(feature = "native-proof")]
+        {
+            return crate::token_intrinsic::dispatch::verification_known_to_fit(
+                operation_bytes,
+                budget_secs,
+            );
+        }
+        #[cfg(not(feature = "native-proof"))]
+        {
+            let _ = (operation_bytes, budget_secs);
+            true
+        }
+    }
+
+    /// Estimated wall time of verifying one confidential operation of
+    /// `operation_bytes` bytes on this node (measured per size class).
+    pub fn estimated_verify_secs(operation_bytes: usize) -> f64 {
+        #[cfg(feature = "native-proof")]
+        {
+            return crate::token_intrinsic::dispatch::estimated_verify_secs(operation_bytes);
+        }
+        #[cfg(not(feature = "native-proof"))]
+        {
+            let _ = operation_bytes;
+            0.0
+        }
     }
 
     /// Number of confidential token operations in a canonical bundle

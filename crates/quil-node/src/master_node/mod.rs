@@ -1849,6 +1849,7 @@ pub(crate) async fn start(
             app_frame_misses: archive_mode.then_some(frame_miss_tx),
             spawner: detached_spawner.clone(),
             consensus_intake: consensus_intake.clone(),
+            consensus_loopback: consensus_loopback_tx.clone(),
         },
     )?;
 
