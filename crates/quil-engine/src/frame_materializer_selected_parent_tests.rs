@@ -1636,3 +1636,67 @@ fn only_an_unreceipted_voter_reconciles_toward_the_proposers_parent_root() {
     assert!(!seam.verify_with_context(context, id(&child), Some(encoded)));
     assert_eq!(*flagged.lock().unwrap(), vec![declared]);
 }
+
+/// A voter that executed the parent itself keeps its state, so it refuses
+/// a proposal declaring another parent state and nothing reconciles it: at
+/// an early fence, an archive on a build without the fence frame halted
+/// GLOBAL with no line saying why. It warns once with both roots, not per
+/// proposal nor again after an agreeing proposal at the same frame (another
+/// proposer on its side), and says when one agrees at a later frame.
+#[test]
+fn a_voter_whose_own_parent_state_differs_warns_once_with_both_roots() {
+    use crate::outage::test_logs::CapturedLogs;
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    let rig = Rig::new();
+    let mut parent = rig.deploy();
+    certify(&mut parent, &rig.signer, 0);
+    rig.source.materialize(&parent).unwrap();
+    save(rig.clock.as_ref(), &parent);
+    let context = rig.context(&parent);
+    let child = state_frame(&rig.source, 2, context.view, context.parent);
+    let mut other = child.clone();
+    other.header.as_mut().unwrap().prover_tree_commitment[0] ^= 1;
+    let root =
+        |frame: &GlobalFrame| hex::encode(&frame.header.as_ref().unwrap().prover_tree_commitment);
+    let encode = |frame: &GlobalFrame| crate::consensus_wire::encode_global_frame(frame).unwrap();
+    let seam = rig.seam(&parent);
+
+    for _ in 0..3 {
+        assert!(!seam.verify_with_context(context, id(&other), Some(encode(&other))));
+    }
+    let warned = logs.lines_with("own execution of its parent frame; refusing it");
+    assert_eq!(warned.len(), 1, "once, not per proposal: {warned:?}");
+    for field in [
+        "WARN".to_string(),
+        "frame=2".to_string(),
+        format!("own_prover_root={}", root(&child)),
+        format!("proposed_prover_root={}", root(&other)),
+        "MAINNET_EARLY_FENCE_FRAME".to_string(),
+    ] {
+        assert!(warned[0].contains(&field), "{field}: {}", warned[0]);
+    }
+    assert!(logs
+        .lines_with("agree with this node's own execution")
+        .is_empty());
+
+    // A proposer on this node's side: it votes, but the split goes on.
+    assert!(seam.verify_with_context(context, id(&child), Some(encode(&child))));
+    assert!(!seam.verify_with_context(context, id(&other), Some(encode(&other))));
+    assert_eq!(
+        logs.lines_with("own execution of its parent frame").len(),
+        1
+    );
+    assert!(logs
+        .lines_with("agree with this node's own execution")
+        .is_empty());
+
+    seam.note_own_parent_state(context.view + 1, 3, true, None);
+    let agreed = logs.lines_with("agree with this node's own execution of their parent again");
+    assert_eq!(agreed.len(), 1, "{agreed:?}");
+    assert!(
+        agreed[0].contains("frame=3") && agreed[0].contains("refusals=4"),
+        "{}",
+        agreed[0]
+    );
+}

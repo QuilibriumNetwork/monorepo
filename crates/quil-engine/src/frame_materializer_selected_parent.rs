@@ -299,6 +299,15 @@ impl ParentState {
     }
 }
 
+/// How a proposal's declared parent state differs from this node's own
+/// execution of the parent ([`PreparedGlobalParent::own_parent_state_differs`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParentStateDifference {
+    pub(crate) own_prover_root: Vec<u8>,
+    pub(crate) proposed_prover_root: Vec<u8>,
+    pub(crate) auxiliary_roots_differ: bool,
+}
+
 pub(crate) struct PreparedGlobalParent {
     branch: MaterializerBranch,
     leader: Option<GlobalLeaderProvider>,
@@ -355,19 +364,34 @@ impl PreparedGlobalParent {
     /// its base itself keeps it; a reconcile must not move it toward any single
     /// proposer's declaration.
     pub(crate) fn divergent_parent_root(&self, header: &GlobalFrameHeader) -> Option<Vec<u8>> {
-        let extends = self
-            .parent
-            .header
-            .as_ref()
-            .and_then(|h| h.frame_number.checked_add(1))
-            == Some(header.frame_number)
-            && header.rank == self.context.view
-            && header.parent_selector == self.context.parent.as_ref();
-        (extends && !self.state.matches(header) && !self.receipted_base)
+        (self.extends(header) && !self.state.matches(header) && !self.receipted_base)
             .then(|| header.prover_tree_commitment.clone())
     }
 
+    /// A child that extends this parent's height, view and identity but
+    /// declares another parent state than this node's own receipted
+    /// execution of it, which this node keeps
+    /// ([`Self::divergent_parent_root`]): one side executed the parent under
+    /// other rules. Nothing reconciles it.
+    pub(crate) fn own_parent_state_differs(
+        &self,
+        header: &GlobalFrameHeader,
+    ) -> Option<ParentStateDifference> {
+        (self.extends(header) && !self.state.matches(header) && self.receipted_base).then(|| {
+            ParentStateDifference {
+                own_prover_root: self.state.prover.clone(),
+                proposed_prover_root: header.prover_tree_commitment.clone(),
+                auxiliary_roots_differ: header.prover_tree_aux_roots != self.state.auxiliary,
+            }
+        })
+    }
+
     pub(crate) fn matches_child(&self, header: &GlobalFrameHeader) -> bool {
+        self.extends(header) && self.state.matches(header)
+    }
+
+    /// The child's height, view and parent identity follow this parent.
+    fn extends(&self, header: &GlobalFrameHeader) -> bool {
         self.parent
             .header
             .as_ref()
@@ -375,7 +399,6 @@ impl PreparedGlobalParent {
             == Some(header.frame_number)
             && header.rank == self.context.view
             && header.parent_selector == self.context.parent.as_ref()
-            && self.state.matches(header)
     }
 
     pub(crate) fn prove(
