@@ -153,8 +153,8 @@ pub struct ShardBodyNeed {
 pub type ShardBodyAvailability = Arc<dyn Fn(&[ShardBodyNeed]) -> Vec<Option<u64>> + Send + Sync>;
 
 /// Application frames the shard headers one GLOBAL proposal carries make
-/// archives materialize, at most, beyond the one smallest header that does
-/// not fit ([`hold_back_unavailable_shard_proofs`]).
+/// archives materialize, at most, beyond the one header furthest behind of
+/// those that do not fit ([`hold_back_unavailable_shard_proofs`]).
 ///
 /// Every archive materializes them, holding its application frame ingest,
 /// before it publishes the GLOBAL frame, and GLOBAL waits for the slowest.
@@ -215,6 +215,24 @@ pub(crate) struct ShardProofSelection {
     /// Application frames those would have added, and the most one would.
     pub deferred_frames: u64,
     pub largest_deferred: u64,
+    /// Every shard whose bodies are held, in the order given.
+    pub shards: Vec<HeldShard>,
+    /// The shard of the proof furthest behind of those the budget does not
+    /// fit, which rides anyway.
+    pub furthest: Option<HeldShard>,
+}
+
+/// A shard a proof whose bodies are held carries a header of
+/// ([`hold_back_unavailable_shard_proofs`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeldShard {
+    pub address: Vec<u8>,
+    /// The application frame archives executed the shard through.
+    pub cursor: u64,
+    /// Application frames above it the header makes archives materialize.
+    pub frames: u64,
+    /// Whether its proof rides this proposal.
+    pub rides: bool,
 }
 
 /// Split shard proofs into those whose headers' bodies `available` reports
@@ -223,13 +241,26 @@ pub(crate) struct ShardProofSelection {
 /// proposal within its anchor window once the bodies arrive.
 ///
 /// Of the proofs whose bodies are held, those making archives materialize
-/// the fewest application frames ride first, within `budget` frames, and the
-/// smallest one that does not fit rides too, so a shard further behind than
-/// the budget is still carried. The rest stay in the mempool and ride a
-/// later proposal, with the shard's newer header. Carried all at once after
-/// headers were held back for long, about 100 shards 300–600 frames behind
-/// would make every archive materialize some 45,000 frames before executing
-/// one GLOBAL frame.
+/// the fewest application frames ride first, within `budget` frames, so as
+/// many shards as fit stay current. Of those that do not fit, the one
+/// furthest behind rides too, whatever its size; the rest stay in the
+/// mempool and ride a later proposal, with the shard's newer header. Carried
+/// all at once after headers were held back for long, about 100 shards
+/// 300–600 frames behind would make every archive materialize some 45,000
+/// frames before executing one GLOBAL frame.
+///
+/// Carrying the furthest behind, not the smallest that does not fit, bounds
+/// every shard's wait while inflow exceeds the budget: the smallest gaps are
+/// the shards carried last, so the smallest-overflow rule kept carrying them
+/// and the shards furthest behind never rode again. Now, while at most `d`
+/// proofs are deferred per proposal and no shard adds more than `r`
+/// application frames per GLOBAL frame, no shard falls more than `(d + 1)·r`
+/// frames behind once a backlog has drained: the `k`-th furthest behind stays
+/// within `(d + 2 − k)·r`, as each proposal carries the furthest and the rest
+/// grow by at most `r`. Shards producing at one rate are carried oldest
+/// first, so each rides within `d + 1` GLOBAL frames, and a backlog of `n`
+/// shards drains furthest behind first within `n`. A proposal then makes
+/// archives materialize at most the budget plus `(d + 1)·r` frames.
 pub(crate) fn hold_back_unavailable_shard_proofs(
     proofs: Vec<Vec<u8>>,
     available: &dyn Fn(&[ShardBodyNeed]) -> Vec<Option<u64>>,
@@ -239,49 +270,86 @@ pub(crate) fn hold_back_unavailable_shard_proofs(
     let all: Vec<ShardBodyNeed> = needs.iter().flatten().cloned().collect();
     let mut answers = available(all.as_slice()).into_iter();
     let mut selection = ShardProofSelection::default();
-    // (proof, the frames it makes archives materialize)
-    let mut held: Vec<(Vec<u8>, u64)> = Vec::with_capacity(proofs.len());
+    // (proof, the frames it makes archives materialize, its shards)
+    let mut held: Vec<(Vec<u8>, u64, Vec<HeldShard>)> = Vec::with_capacity(proofs.len());
     for (raw, needs) in proofs.into_iter().zip(needs) {
         let before = selection.missing.len();
         // A shard materializes once, through its highest header.
-        let mut frames: std::collections::HashMap<Vec<u8>, u64> = std::collections::HashMap::new();
+        let mut shards: Vec<HeldShard> = Vec::new();
         for need in needs {
             match answers.next().flatten() {
                 Some(count) => {
-                    let shard = frames.entry(need.address).or_insert(0);
-                    *shard = (*shard).max(count);
+                    let cursor = need.frame_number.saturating_sub(count);
+                    match shards
+                        .iter_mut()
+                        .find(|shard| shard.address == need.address)
+                    {
+                        Some(shard) if shard.frames >= count => {}
+                        Some(shard) => (shard.cursor, shard.frames) = (cursor, count),
+                        None => shards.push(HeldShard {
+                            address: need.address,
+                            cursor,
+                            frames: count,
+                            rides: false,
+                        }),
+                    }
                 }
                 None => selection.missing.push(need),
             }
         }
         if selection.missing.len() == before {
-            held.push((
-                raw,
-                frames.values().fold(0, |sum, &n| sum.saturating_add(n)),
-            ));
+            let frames = shards
+                .iter()
+                .fold(0u64, |sum, shard| sum.saturating_add(shard.frames));
+            held.push((raw, frames, shards));
         }
     }
     let mut order: Vec<usize> = (0..held.len()).collect();
     order.sort_by_key(|&index| (held[index].1, index));
     let mut rides = vec![false; held.len()];
-    let mut overflowed = false;
-    for index in order {
-        let frames = held[index].1;
-        if selection.frames.saturating_add(frames) <= budget || !overflowed {
-            overflowed |= selection.frames.saturating_add(frames) > budget;
-            selection.frames = selection.frames.saturating_add(frames);
-            rides[index] = true;
-        } else {
+    // The smallest gaps, while they fit.
+    let fitting = order
+        .iter()
+        .take_while(|&&index| {
+            let fits = selection.frames.saturating_add(held[index].1) <= budget;
+            if fits {
+                selection.frames = selection.frames.saturating_add(held[index].1);
+            }
+            fits
+        })
+        .count();
+    for &index in &order[..fitting] {
+        rides[index] = true;
+    }
+    // Then the furthest behind of the rest, whatever its size.
+    if let Some((&furthest, rest)) = order[fitting..].split_last() {
+        rides[furthest] = true;
+        selection.frames = selection.frames.saturating_add(held[furthest].1);
+        selection.furthest = held[furthest]
+            .2
+            .iter()
+            .max_by_key(|shard| shard.frames)
+            .map(|shard| HeldShard {
+                rides: true,
+                ..shard.clone()
+            });
+        for &index in rest {
+            let frames = held[index].1;
             selection.deferred += 1;
             selection.deferred_frames = selection.deferred_frames.saturating_add(frames);
             selection.largest_deferred = selection.largest_deferred.max(frames);
         }
     }
-    selection.ready = held
-        .into_iter()
-        .zip(rides)
-        .filter_map(|((raw, _), rides)| rides.then_some(raw))
-        .collect();
+    let mut ready = Vec::with_capacity(held.len());
+    for ((raw, _, shards), rides) in held.into_iter().zip(rides) {
+        selection
+            .shards
+            .extend(shards.into_iter().map(|shard| HeldShard { rides, ..shard }));
+        if rides {
+            ready.push(raw);
+        }
+    }
+    selection.ready = ready;
     selection
 }
 
@@ -1312,6 +1380,13 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         selection.deferred,
                         selection.largest_deferred,
                     );
+                    crate::inclusion_summary::note_budget(
+                        frame_number,
+                        budget,
+                        &selection.shards,
+                        selection.furthest.as_ref(),
+                        selection.deferred,
+                    );
                     tracing::debug!(
                         frame = frame_number,
                         offered,
@@ -1325,7 +1400,8 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         largest_deferred_gap = selection.largest_deferred,
                         budget,
                         "shard tips selected for this GLOBAL proposal: those whose application frame bodies this \
-                         archive holds, smallest gap first within the application frame budget"
+                         archive holds, smallest gap first within the application frame budget, and the furthest \
+                         behind of the rest"
                     );
                 }
                 let coalesced = tips.superseded.len();
@@ -2469,12 +2545,12 @@ mod tests {
     }
 
     /// Shard headers whose bodies are held ride smallest gap first within the
-    /// application frame budget, plus the smallest that does not fit, so a
-    /// shard further behind than the budget is still carried; the rest wait
-    /// for a later proposal, and a header whose body is not held never rides,
-    /// however small.
+    /// application frame budget, plus the furthest behind of those that do
+    /// not fit, so a shard further behind than the budget is still carried;
+    /// the rest wait for a later proposal, and a header whose body is not
+    /// held never rides, however small.
     #[test]
-    fn shard_tips_ride_smallest_gap_first_within_the_app_frame_budget() {
+    fn shard_tips_ride_smallest_gap_first_and_the_furthest_behind_beyond_the_budget() {
         // Shard `addr` is `addr` frames behind; 0x05's bodies are not held.
         let available = |needs: &[ShardBodyNeed]| -> Vec<Option<u64>> {
             needs
@@ -2488,24 +2564,50 @@ mod tests {
         let mut with_junk = proofs.clone();
         with_junk.push(junk.clone());
 
-        // Budget 100: 10 + 20 + 30 = 60 fit, 200 does not and rides as the
-        // smallest overflow; 480 and 640 wait. 0x05 is held back for its body.
+        // Budget 100: 10 + 20 + 30 = 60 fit, 200 does not; of 200, 480 and
+        // 640, the furthest behind rides and the others wait. 0x05 is held
+        // back for its body.
         let selection = hold_back_unavailable_shard_proofs(with_junk, &available, 100);
         assert_eq!(
             selection.ready,
             vec![
                 proofs[1].clone(),
-                proofs[2].clone(),
                 proofs[4].clone(),
+                proofs[5].clone(),
                 proofs[6].clone(),
                 junk.clone(),
             ],
-            "the smallest gaps, the first overflow and the proof without headers ride, in the order given"
+            "the smallest gaps, the furthest behind and the proof without headers ride, in the order given"
         );
-        assert_eq!(selection.frames, 260);
+        assert_eq!(selection.frames, 60 + 640);
         assert_eq!(selection.deferred, 2);
-        assert_eq!(selection.deferred_frames, 480 + 640);
-        assert_eq!(selection.largest_deferred, 640);
+        assert_eq!(selection.deferred_frames, 200 + 480);
+        assert_eq!(selection.largest_deferred, 480);
+        assert_eq!(
+            selection.furthest,
+            Some(HeldShard {
+                address: vec![0x40; 32],
+                cursor: 0,
+                frames: 640,
+                rides: true,
+            })
+        );
+        let riding: Vec<(u8, bool)> = selection
+            .shards
+            .iter()
+            .map(|shard| (shard.address[0], shard.rides))
+            .collect();
+        assert_eq!(
+            riding,
+            vec![
+                (0x30, false),
+                (0x01, true),
+                (0x14, false),
+                (0x02, true),
+                (0x40, true),
+                (0x03, true),
+            ]
+        );
         assert_eq!(
             selection.missing,
             vec![ShardBodyNeed {
@@ -2521,13 +2623,196 @@ mod tests {
             &available,
             100,
         );
-        assert_eq!(selection.ready, vec![proofs[0].clone()]);
-        assert_eq!((selection.deferred, selection.largest_deferred), (1, 640));
+        assert_eq!(selection.ready, vec![proofs[5].clone()]);
+        assert_eq!((selection.deferred, selection.largest_deferred), (1, 480));
 
         // Within the budget everything rides and nothing is deferred.
         let selection = hold_back_unavailable_shard_proofs(proofs.clone(), &available, u64::MAX);
         assert_eq!(selection.ready.len(), proofs.len() - 1);
         assert_eq!(selection.deferred, 0);
+        assert_eq!(selection.furthest, None);
+    }
+
+    /// What [`drive_budget`] saw.
+    struct BudgetRun {
+        /// Per shard, the most GLOBAL frames between its carries, counting
+        /// from the start and, at the end, to the last proposal.
+        longest_wait: Vec<u64>,
+        /// Per shard, the first proposal carrying it.
+        first_carried: Vec<Option<u64>>,
+        /// The most application frames a shard was behind at a proposal,
+        /// from proposal `settle` on.
+        most_behind: u64,
+        /// The most proofs one proposal deferred, from proposal `settle` on.
+        most_deferred: u64,
+        /// The fewest proofs one proposal carried.
+        fewest_carried: usize,
+    }
+
+    /// Runs `proposals` GLOBAL proposals through
+    /// [`hold_back_unavailable_shard_proofs`] with `budget`. Shard `k`
+    /// (address `k + 1`) starts `start[k]` application frames above its
+    /// cursor and adds `rate(k, proposal)` before each proposal; each shard
+    /// with frames above its cursor offers one tip, and a carried shard's
+    /// cursor moves to its tip.
+    fn drive_budget(
+        start: &[u64],
+        budget: u64,
+        proposals: u64,
+        settle: u64,
+        rate: impl Fn(usize, u64) -> u64,
+    ) -> BudgetRun {
+        let tips: Vec<Vec<u8>> = (0..start.len())
+            .map(|k| make_shard_frame(k as u8 + 1, 7))
+            .collect();
+        let mut behind = start.to_vec();
+        let mut last = vec![0u64; start.len()];
+        let mut run = BudgetRun {
+            longest_wait: vec![0; start.len()],
+            first_carried: vec![None; start.len()],
+            most_behind: 0,
+            most_deferred: 0,
+            fewest_carried: usize::MAX,
+        };
+        for proposal in 1..=proposals {
+            for (k, frames) in behind.iter_mut().enumerate() {
+                *frames += rate(k, proposal);
+            }
+            let offered: Vec<Vec<u8>> = (0..tips.len())
+                .filter(|&k| behind[k] > 0)
+                .map(|k| tips[k].clone())
+                .collect();
+            let now = behind.clone();
+            let available = move |needs: &[ShardBodyNeed]| -> Vec<Option<u64>> {
+                needs
+                    .iter()
+                    .map(|need| Some(now[need.address[0] as usize - 1]))
+                    .collect()
+            };
+            let selection = hold_back_unavailable_shard_proofs(offered, &available, budget);
+            if proposal >= settle {
+                run.most_behind = run
+                    .most_behind
+                    .max(behind.iter().copied().max().unwrap_or(0));
+                run.most_deferred = run.most_deferred.max(selection.deferred as u64);
+            }
+            run.fewest_carried = run.fewest_carried.min(selection.ready.len());
+            for shard in selection.shards.iter().filter(|shard| shard.rides) {
+                let k = shard.address[0] as usize - 1;
+                run.longest_wait[k] = run.longest_wait[k].max(proposal - last[k]);
+                if run.first_carried[k].is_none() {
+                    run.first_carried[k] = Some(proposal);
+                }
+                last[k] = proposal;
+                behind[k] = 0;
+            }
+        }
+        for (k, &at) in last.iter().enumerate() {
+            run.longest_wait[k] = run.longest_wait[k].max(proposals - at);
+        }
+        run
+    }
+
+    /// Inflow above the budget at one rate: 100 shards adding 3 application
+    /// frames per GLOBAL frame against a budget of 256. Smallest gap first
+    /// keeps 85 shards current; the other 15 take turns at the furthest
+    /// behind slot, so no shard waits more than `d + 1` GLOBAL frames or
+    /// falls more than `(d + 1)·r` frames behind (`d` the proofs deferred,
+    /// here 14), and every proposal carries 86 shards. Carrying the smallest
+    /// that does not fit left 14 shards behind for good.
+    #[test]
+    fn app_frame_budget_carries_every_shard_within_d_plus_one_frames_at_one_rate() {
+        let run = drive_budget(&[0; 100], 256, 400, 1, |_, _| 3);
+        let d = run.most_deferred;
+        assert_eq!(d, 14);
+        assert_eq!(
+            run.fewest_carried, 86,
+            "as many as the budget fits, plus one"
+        );
+        let longest = run.longest_wait.iter().copied().max().unwrap();
+        assert_eq!(
+            longest,
+            d + 1,
+            "every shard rides within d + 1 GLOBAL frames: {:?}",
+            run.longest_wait
+        );
+        assert_eq!(
+            run.most_behind,
+            (d + 1) * 3,
+            "no shard falls more than (d + 1)·r frames behind"
+        );
+    }
+
+    /// Inflow above the budget at unequal rates: shards add 1 to 5
+    /// application frames per GLOBAL frame in turn, or a pseudo-random 0 to 6
+    /// each frame. No shard falls more than `(d + 1)·r` frames behind, `r`
+    /// the most one adds per frame, and every shard keeps riding.
+    #[test]
+    fn app_frame_budget_bounds_how_far_behind_shards_fall_at_unequal_rates() {
+        let run = drive_budget(&[0; 100], 256, 400, 1, |k, _| 1 + (k as u64 % 5));
+        assert!(run.most_deferred > 0, "inflow exceeds the budget");
+        assert!(
+            run.most_behind <= (run.most_deferred + 1) * 5,
+            "{} frames behind, {} deferred",
+            run.most_behind,
+            run.most_deferred
+        );
+        // A shard adding at least 1 frame per GLOBAL frame rides within
+        // (d + 1)·r of them.
+        let bound = (run.most_deferred + 1) * 5;
+        assert!(
+            run.longest_wait.iter().all(|&wait| wait <= bound),
+            "{:?}",
+            run.longest_wait
+        );
+
+        let noise = |k: usize, proposal: u64| {
+            let x = (k as u64 + 1)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(proposal.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+            (x ^ (x >> 29)) % 7
+        };
+        // The first 20 proposals let shards start apart.
+        let run = drive_budget(&[0; 100], 256, 400, 20, noise);
+        assert!(run.most_deferred > 0, "inflow exceeds the budget");
+        assert!(
+            run.most_behind <= (run.most_deferred + 1) * 6,
+            "{} frames behind, {} deferred",
+            run.most_behind,
+            run.most_deferred
+        );
+        assert!(
+            run.longest_wait.iter().all(|&wait| wait < 100),
+            "{:?}",
+            run.longest_wait
+        );
+    }
+
+    /// A backlog drains furthest behind first: 100 shards 300 to 597
+    /// application frames behind, each adding 3 per GLOBAL frame against a
+    /// budget of 256, are carried one per proposal from the furthest, all
+    /// within 100 GLOBAL frames, and then stay within `(d + 1)·r` frames.
+    #[test]
+    fn app_frame_budget_drains_a_backlog_furthest_behind_first() {
+        let start: Vec<u64> = (0..100).map(|k| 300 + 3 * k).collect();
+        let run = drive_budget(&start, 256, 400, 200, |_, _| 3);
+        let first: Vec<u64> = run.first_carried.iter().map(|at| at.unwrap()).collect();
+        assert_eq!(
+            first,
+            (1..=100).rev().collect::<Vec<u64>>(),
+            "furthest behind first, one per proposal"
+        );
+        assert!(
+            run.longest_wait.iter().all(|&wait| wait <= 100),
+            "{:?}",
+            run.longest_wait
+        );
+        assert!(
+            run.most_behind <= (run.most_deferred + 1) * 3,
+            "{} frames behind, {} deferred",
+            run.most_behind,
+            run.most_deferred
+        );
     }
 
     fn make_shard_frame(addr: u8, local_frame: u64) -> Vec<u8> {
