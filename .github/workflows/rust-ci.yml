@@ -209,6 +209,82 @@ jobs:
           echo "partitions: $RESULT"
           [ "$RESULT" = success ]
 
+  # -----------------------------------------------------------------
+  # lattice-native — the lattice tests on the native x86 builds that
+  # the docker images ship: docker/Dockerfile.source sets
+  # QUIL_LATTICE_X86_NATIVE=1, Dockerfile.sourceavx512 sets avx512.
+  # The test job above covers only the portable build (variable unset).
+  # Not a required check; the merge queue skips it like release-build,
+  # and the push of the merged commit runs it.
+  # -----------------------------------------------------------------
+  lattice-native:
+    name: lattice-native (x86-64)
+    runs-on: ubuntu-latest
+    needs: scope
+    if: needs.scope.outputs.run == 'true' && github.event_name != 'merge_group'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Pull LFS files
+        run: git lfs pull
+
+      - id: native-deps
+        uses: ./.github/actions/setup-native-deps
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # Don't let the action set RUSTFLAGS
+          rustflags: ""
+          # The explicit cache below owns restore/save for this job.
+          cache: false
+
+      # The variables below are set per step, so the cache key matches
+      # the test job's: restore its dependencies, never save.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
+          shared-key: rust-test
+          save-if: false
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      # The workspace build gives the lattice crates the features the
+      # node and qclient enable (native-proof); the filter picks the
+      # lattice crates' tests and the execution modules that prove or
+      # verify through the native backend.
+      - name: lattice tests, QUIL_LATTICE_X86_NATIVE=1 (baseline x86-64)
+        env:
+          QUIL_LATTICE_X86_NATIVE: "1"
+        run: |
+          cargo nextest run --workspace --locked --no-fail-fast --config-file .nextest.toml -E '
+            package(quil-lattice-proof-sys) | package(quil-lattice-ct) | (package(quil-execution) &
+            test(/^token_intrinsic::(commit_verify|custom_mint|dispatch|mint|mint_authorization|pending_claim|shield)::/))'
+
+      # Only the lattice crate gets these CFLAGS, as only its C needs
+      # them: a workspace build would rebuild every C dependency. The
+      # build always runs; the tests need an AVX-512 runner.
+      - name: lattice-proof-sys tests, QUIL_LATTICE_X86_NATIVE=avx512
+        env:
+          QUIL_LATTICE_X86_NATIVE: avx512
+          CFLAGS: -march=skylake-avx512 -mtune=skylake-avx512
+        run: |
+          args=(-p quil-lattice-proof-sys --features native-backend --locked --config-file .nextest.toml)
+          cargo nextest run "${args[@]}" --no-run
+          missing=""
+          for f in avx512f avx512bw avx512dq avx512vl; do
+            grep -qw "$f" /proc/cpuinfo || missing="$missing $f"
+          done
+          if [ -n "$missing" ]; then
+            cpu=$(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2-)
+            echo "::notice::avx512 lattice tests built, not run: this runner's CPU ($cpu) lacks$missing"
+            exit 0
+          fi
+          cargo nextest run "${args[@]}" --no-fail-fast
+
   # ------------------------------------------------------------------
   # release-build — verify `node/build.sh` succeeds on every supported
   # deployment target.
