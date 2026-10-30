@@ -1138,6 +1138,75 @@ pub fn set_unsealed_issuance_epoch_for_thread(epoch: Option<u64>) {
     UNSEALED_ISSUANCE_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
+/// The epoch from which a storage seat that closes an epoch with committed
+/// openings roots its member never proved no longer kicks the member. The
+/// seat's epoch still ends `Expired` and its held issuance shares are still
+/// never paid, so the member loses that seat's epoch rewards and nothing
+/// else: it stays a prover with its seniority and allocations. From
+/// [`MAINNET_HASH_STORAGE_PROOF_EPOCH`] a missing epoch proof kicked the
+/// whole prover for good (Status 4, Seniority 0, every allocation, no
+/// rejoin), while a regular node often cannot seal or settle in time. From
+/// this epoch a prover that rule kicked may rejoin too. Read from the GLOBAL
+/// frame that closes the seat or executes the join. Consensus-affecting
+/// (prover state): every node that executes GLOBAL frames must run a build
+/// carrying the epoch before it. Mainnet epoch 1342 (GLOBAL frame 966,240;
+/// decided 2026-10-30); `QUIL_STORAGE_KICK_SUSPENSION_EPOCH` elsewhere,
+/// never by default.
+pub const MAINNET_STORAGE_KICK_SUSPENSION_EPOCH: Option<u64> = Some(1342);
+
+static STORAGE_KICK_SUSPENSION_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static STORAGE_KICK_SUSPENSION_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn storage_kick_suspension_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_STORAGE_KICK_SUSPENSION_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's storage kick suspension epoch from its network, and
+/// return it. Called at startup before any frame is processed; the first
+/// call decides.
+pub fn init_storage_kick_suspension_epoch(network: u8) -> u64 {
+    *STORAGE_KICK_SUSPENSION_EPOCH.get_or_init(|| {
+        storage_kick_suspension_epoch_for(
+            network,
+            std::env::var("QUIL_STORAGE_KICK_SUSPENSION_EPOCH")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The epoch fixed by [`init_storage_kick_suspension_epoch`]; the mainnet
+/// epoch in a process that never called it, so the setting cannot reach
+/// mainnet. `u64::MAX` when the network has none.
+pub fn storage_kick_suspension_epoch() -> u64 {
+    if let Some(epoch) = STORAGE_KICK_SUSPENSION_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *STORAGE_KICK_SUSPENSION_EPOCH.get_or_init(|| storage_kick_suspension_epoch_for(0, None))
+}
+
+/// Whether GLOBAL frame `frame` closes an unproven storage seat without
+/// kicking its member, and lets a member that rule kicked rejoin
+/// ([`MAINNET_STORAGE_KICK_SUSPENSION_EPOCH`]).
+pub fn storage_kicks_suspended(frame: u64) -> bool {
+    epoch_for_frame(frame) >= storage_kick_suspension_epoch()
+}
+
+/// Set the storage kick suspension epoch for the calling thread only
+/// (tests). `Some(u64::MAX)` disables it; `None` restores the process
+/// setting.
+pub fn set_storage_kick_suspension_epoch_for_thread(epoch: Option<u64>) {
+    STORAGE_KICK_SUSPENSION_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
 /// The epoch from which a vertex membership proof authenticates a field only
 /// when the field's leaf commitment binds its value. A leaf carrying a
 /// `hash_target` commits that target instead of its value, so its value is
@@ -1273,6 +1342,23 @@ mod exact_state_size_epoch_tests {
         assert_eq!(super::exact_state_size_epoch_for(1, Some("4")), 4);
         assert_eq!(super::exact_state_size_epoch_for(1, Some("x")), u64::MAX);
         assert_eq!(super::exact_state_size_epoch_for(1, None), u64::MAX);
+    }
+
+    /// Mainnet stops storage epoch proof kicks from GLOBAL frame 966,240,
+    /// the first frame of epoch 1342, whatever the setting says; other
+    /// networks take the setting, and none without it.
+    #[test]
+    fn storage_kicks_are_suspended_from_the_first_frame_of_epoch_1342() {
+        assert_eq!(super::MAINNET_STORAGE_KICK_SUSPENSION_EPOCH, Some(1342));
+        assert_eq!(1342 * super::EPOCH_LENGTH_FRAMES, 966_240);
+        assert_eq!(super::storage_kick_suspension_epoch_for(0, Some("5")), 1342);
+        assert_eq!(super::storage_kick_suspension_epoch_for(0, None), 1342);
+        assert_eq!(super::storage_kick_suspension_epoch_for(1, Some("5")), 5);
+        assert_eq!(super::storage_kick_suspension_epoch_for(1, None), u64::MAX);
+        super::set_storage_kick_suspension_epoch_for_thread(None);
+        assert_eq!(super::storage_kick_suspension_epoch(), 1342);
+        assert!(!super::storage_kicks_suspended(966_239));
+        assert!(super::storage_kicks_suspended(966_240));
     }
 
     /// Mainnet's rule starts at GLOBAL frame 943,920, with the other gates

@@ -612,6 +612,18 @@ where
     Ok(())
 }
 
+/// The `KickFrameNumber` [`verify_prover_join_not_kicked`] reads from a
+/// prover vertex, if it holds one.
+pub fn recorded_kick_frame(prover_tree: &quil_tries::VectorCommitmentTree) -> Option<u64> {
+    let kf_bytes = read_field(
+        prover_tree,
+        "allocation:ProverAllocation",
+        "KickFrameNumber",
+    )
+    .or_else(|| read_field(prover_tree, "prover:Prover", "KickFrameNumber"))?;
+    Some(u64::from_be_bytes(kf_bytes.try_into().ok()?))
+}
+
 /// ProverJoin kicked-prover gate. Mirrors Go
 /// `global_prover_join.go:972-988`: if the existing prover vertex has
 /// a non-zero `KickFrameNumber`, the join must be rejected. A
@@ -626,19 +638,9 @@ pub fn verify_prover_join_not_kicked(
     prover_tree: &quil_tries::VectorCommitmentTree,
     current_frame: u64,
 ) -> Result<()> {
-    let kf_bytes = read_field(
-        prover_tree,
-        "allocation:ProverAllocation",
-        "KickFrameNumber",
-    )
-    .or_else(|| read_field(prover_tree, "prover:Prover", "KickFrameNumber"));
-    let Some(kf_bytes) = kf_bytes else {
+    let Some(kf) = recorded_kick_frame(prover_tree) else {
         return Ok(());
     };
-    if kf_bytes.len() != 8 {
-        return Ok(());
-    }
-    let kf = u64::from_be_bytes(kf_bytes.try_into().unwrap());
     // Spurious-kick amnesty: a kick recorded before the flag-day frame no longer
     // bars re-join once the chain reaches it (see `materialize::KICK_AMNESTY_FRAME`).
     if super::materialize::kick_bars_rejoin(kf, current_frame) {

@@ -1204,7 +1204,8 @@ pub fn materialize_prover_shard_update_with_fees(
 /// (`storage_seat::SeatSlot::release`). A seat's first root of an epoch
 /// queues it for the epoch's expiry sweep. Each seat touched first closes an
 /// epoch whose settlement window ended; one that closes with committed roots
-/// never proved kicks its member (`storage.kicks`). Returns how many
+/// never proved kicks its member (`storage.kicks`), before the storage kick
+/// suspension epoch only (`storage_seat::Seat::expire`). Returns how many
 /// participants had shares held, their total, and which participants hold a
 /// sealed registration ([`HeldShares`]).
 fn hold_storage_shares(
@@ -3279,6 +3280,90 @@ mod tests {
             "the same frame applied again"
         );
         assert_eq!(slot(&provers[1]), committed);
+    }
+
+    /// Suspend storage kicks from `epoch` on this thread; `None` restores
+    /// the process setting.
+    fn suspend_storage_kicks(epoch: Option<u64>) {
+        quil_types::consensus::set_storage_kick_suspension_epoch_for_thread(epoch);
+    }
+
+    /// The frame path: a participant whose seat closes an epoch with a root
+    /// it never proved is kicked (`storage.kicks`) by a GLOBAL frame before
+    /// the storage kick suspension epoch, and not by its first frame. Its
+    /// held share stays unpaid either way.
+    #[test]
+    fn from_the_suspension_epoch_the_frame_path_withholds_without_a_kick() {
+        use super::super::storage_seat::{self, Seat};
+        let length = quil_types::consensus::epoch_length_frames();
+        let (epoch, suspension) = (5, 8);
+        let flag = suspension * length;
+        for (frame, kicked) in [(flag - 1, true), (flag, false)] {
+            suspend_storage_kicks(Some(suspension));
+            let state = make_state();
+            let filter = vec![0xA9u8; 32];
+            let provers: Vec<ProverInfo> = (1u8..=2)
+                .map(|s| fake_prover(s, s as u64, 0, &filter))
+                .collect();
+            for p in &provers {
+                seed_alloc_blob(&state, p, &filter);
+            }
+            let member = <[u8; 32]>::try_from(provers[0].address.as_slice()).unwrap();
+            let mut seat = Seat::new(member, filter.clone());
+            seat.register(epoch, &[vec![]], 10);
+            assert!(seat.seal(epoch, 11));
+            assert!(seat.hold(epoch, 12, 40, &BigInt::from(1_000), 2));
+            assert!(seat.commit(epoch, 40, 11, 12, &[1; 32], &[2; 32]));
+            storage_seat::write(&state, 12, &seat).unwrap();
+
+            let reward_issuance: Arc<dyn RewardIssuance> =
+                Arc::new(StubReward(BigInt::from(8_000)));
+            let mut storage = StorageFrame {
+                epoch: quil_types::consensus::epoch_for_frame(frame),
+                commitment: None,
+                kicks: Vec::new(),
+            };
+            let header = fake_header(filter.clone(), 60);
+            materialize_prover_shard_update_with_fees(
+                &header,
+                frame,
+                &state,
+                &noop_registry(),
+                &noop_frame_prover(),
+                &reward_issuance,
+                4096,
+                provers.clone(),
+                &[0, 1],
+                ShardMetadata {
+                    state_size: 1024,
+                    shard_count: 1,
+                },
+                0,
+                None,
+                Some(&mut storage),
+                HeaderIssuance::claimed(&header),
+            )
+            .unwrap();
+            let expected: Vec<Vec<u8>> = if kicked {
+                vec![member.to_vec()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                storage.kicks, expected,
+                "GLOBAL frame {frame} (suspension from {flag}): a seat expiring from the \
+                 suspension epoch kicked its member on the frame path"
+            );
+            let slot = storage_seat::read(&state, &member, &filter)
+                .unwrap()
+                .unwrap()
+                .slot(epoch)
+                .cloned()
+                .unwrap();
+            assert_eq!(slot.outcome, storage_seat::Outcome::Expired(frame));
+            assert_eq!(slot.pending_amount(), BigInt::from(1_000), "withheld");
+        }
+        suspend_storage_kicks(None);
     }
 
     /// Distribute `header` to all of `provers` as an app frame anchored in
