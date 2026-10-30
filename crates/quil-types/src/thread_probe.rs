@@ -64,6 +64,7 @@ sections! {
     EngineCleanupTimer => "cleanup timer",
     EngineDeliveryTimer => "delivery source timer",
     EngineRetryTimer => "consensus retry timer",
+    EngineHistoryWalk => "outgoing history walk batch",
     EngineUpkeep => "loop upkeep",
     // Synchronous sections.
     CommitLockWait => "CRDT commit lock wait",

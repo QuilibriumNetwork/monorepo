@@ -11,7 +11,8 @@
 //! [`ViewRefresh`] lets the sync task pull early: when the GLOBAL head has
 //! passed an epoch boundary the committed view has not, when a seal arrives
 //! whose closing request the view lacks, and (at most every
-//! [`SUCCESSOR_INTERVAL`]) while a sealed session awaits its successor, and
+//! [`SUCCESSOR_INTERVAL`]) while a sealed session awaits its successor, also
+//! for a worker the closing session does not seat and the successor does, and
 //! while a hash storage proof record this node waits for is not in its view:
 //! its shard's snapshot, which a renewal encodes, its own registration, which
 //! it seals, or a seal or settlement it sent (its proposals commit roots only

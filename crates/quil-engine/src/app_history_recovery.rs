@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -49,31 +49,188 @@ fn unavailable(message: impl Into<String>) -> QuilError {
 
 /// How often a running outgoing-history walk logs a batch at info; its
 /// first batch in this process and its last always do.
-const WALK_PROGRESS_REPEAT: Duration = Duration::from_secs(5 * 60);
+const WALK_PROGRESS_REPEAT: Duration = Duration::from_secs(60);
 
-/// Running walks by filter: when each last logged at info, and its
-/// `(done, next, target)` after its latest batch. An abandoned walk leaves
-/// one entry, bounded by the filters this process served.
-static WALKS: Mutex<BTreeMap<Vec<u8>, (Instant, (u64, u64, u64))>> = Mutex::new(BTreeMap::new());
+/// Peer frame reads one walk starts per second, on average. A walker holds
+/// one read at a time, so this and its batches' round trips set its load on
+/// the archives. One batch per 10 s retry made a walk 0.8 reads a second, and
+/// a session's 1,366 frames 40 minutes with this member out of its committee.
+const WALK_PEER_READS_PER_SEC: u32 = 8;
+/// Peer frame reads all walks of this process start per second, on average.
+/// The workers of a node walk at once after a restart or a batch of kicks;
+/// this is what forty workers read at one batch per 10 s.
+const NODE_PEER_READS_PER_SEC: u32 = 32;
+/// The shortest pause between a walk's batches, when peers supply no frames.
+const WALK_MIN_PAUSE: Duration = Duration::from_millis(100);
+/// When the peer reads every walk of this process made so far are paid for
+/// at [`NODE_PEER_READS_PER_SEC`].
+static NODE_PEER_READS_PAID: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// Record a committed batch of `filter`'s walk at `now`: whether it is
-/// logged at info. A finished walk is forgotten.
-fn walk_batch(filter: &[u8], progress: (u64, u64, u64), now: Instant) -> bool {
+/// When the batch after one that began at `began`, ended at `now` and read
+/// `peer_reads` frames from peers may start. It waits for
+/// - [`WALK_PEER_READS_PER_SEC`], for the peers it reads from;
+/// - [`NODE_PEER_READS_PER_SEC`], for those peers again, across this process;
+/// - as long as the batch took, and at least [`WALK_MIN_PAUSE`]: the engine's
+///   loop runs nothing else during a batch, so it stays free half the time at
+///   worst, and peers that answer slowly are asked less often.
+fn next_batch_at(
+    peer_reads: u64,
+    began: Instant,
+    now: Instant,
+    node_paid: &mut Option<Instant>,
+) -> Instant {
+    let reads = u32::try_from(peer_reads).unwrap_or(u32::MAX);
+    let walk = Duration::from_secs(1) * reads / WALK_PEER_READS_PER_SEC;
+    let node = Duration::from_secs(1) * reads / NODE_PEER_READS_PER_SEC;
+    let paid = node_paid.map_or(now, |paid| paid.max(now)) + node;
+    *node_paid = Some(paid);
+    let took = now.saturating_duration_since(began);
+    (began + walk).max(now + took.max(WALK_MIN_PAUSE)).max(paid)
+}
+
+/// The batch a running walk runs next, beside the retry timer's. Every start
+/// attempt forgets it and only a batch that left the walk unfinished sets it,
+/// so anything else (a failing source, a moved cursor, another session, a
+/// finished walk) leaves this worker on the retry timer as it would be without
+/// this, with that path's warnings. The walk's own checks hold for every batch:
+/// its session, its cursor against committed state, and its checkpoint.
+#[derive(Default)]
+pub(crate) struct WalkPace {
+    next: Option<(Session, u64, Instant)>,
+}
+
+impl WalkPace {
+    /// Note how a batch of `session`'s walk through `through` ended.
+    pub(crate) fn note(
+        &mut self,
+        session: &Session,
+        through: u64,
+        batch: &Result<WalkBatch>,
+        began: Instant,
+        now: Instant,
+    ) {
+        self.next = match batch {
+            Ok(batch) if !batch.complete => {
+                let mut paid = NODE_PEER_READS_PAID
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let at = next_batch_at(batch.peer_reads, began, now, &mut paid);
+                Some((session.clone(), through, at))
+            }
+            _ => None,
+        };
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.next = None;
+    }
+
+    /// When the next batch is due, if one is.
+    pub(crate) fn due_at(&self) -> Option<Instant> {
+        self.next.as_ref().map(|(_, _, at)| *at)
+    }
+
+    /// The next batch's session and frame, unless the engine's cursor has
+    /// moved off the frame it walks from.
+    pub(crate) fn take(&mut self, cursor: u64) -> Option<(Session, u64)> {
+        self.next
+            .take()
+            .filter(|(_, through, _)| *through == cursor)
+            .map(|(session, through, _)| (session, through))
+    }
+}
+
+/// What batches spent, which tells a slow peer from slow verification or a
+/// slow store: frames asked of peers and microseconds in each kind of work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WalkCosts {
+    peer_fetches: u64,
+    fetch_us: u64,
+    prepare_us: u64,
+    validate_us: u64,
+    commit_us: u64,
+}
+
+impl WalkCosts {
+    fn add(&mut self, other: &Self) {
+        self.peer_fetches += other.peer_fetches;
+        self.fetch_us += other.fetch_us;
+        self.prepare_us += other.prepare_us;
+        self.validate_us += other.validate_us;
+        self.commit_us += other.commit_us;
+    }
+}
+
+/// A running walk in this process.
+struct Walk {
+    started: Instant,
+    /// When it last logged at info.
+    logged: Instant,
+    /// `(done, next, target)` after its latest batch.
+    progress: (u64, u64, u64),
+    frames: u64,
+    costs: WalkCosts,
+}
+
+/// Running walks by filter. An abandoned walk leaves one entry, bounded by
+/// the filters this process served.
+static WALKS: Mutex<BTreeMap<Vec<u8>, Walk>> = Mutex::new(BTreeMap::new());
+
+/// A walk's totals after a committed batch, and the batch's place in its log.
+#[derive(Debug)]
+struct WalkReport {
+    /// `start`, `progress` or `end` when the batch logs at info.
+    phase: Option<&'static str>,
+    elapsed: Duration,
+    frames: u64,
+    costs: WalkCosts,
+}
+
+/// Record a batch of `filter`'s walk that began at `began` and committed at
+/// `now`. A finished walk is forgotten.
+fn walk_batch(
+    filter: &[u8],
+    progress: (u64, u64, u64),
+    frames: u64,
+    costs: WalkCosts,
+    began: Instant,
+    now: Instant,
+) -> WalkReport {
     let mut walks = WALKS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let first = !walks.contains_key(filter);
+    let walk = walks.entry(filter.to_vec()).or_insert_with(|| Walk {
+        started: began,
+        logged: now,
+        progress,
+        frames: 0,
+        costs: WalkCosts::default(),
+    });
+    walk.progress = progress;
+    walk.frames += frames;
+    walk.costs.add(&costs);
     let (done, _, target) = progress;
+    let phase = if done == target {
+        Some("end")
+    } else if first {
+        Some("start")
+    } else if now.saturating_duration_since(walk.logged) >= WALK_PROGRESS_REPEAT {
+        walk.logged = now;
+        Some("progress")
+    } else {
+        None
+    };
+    let report = WalkReport {
+        phase,
+        elapsed: now.saturating_duration_since(walk.started),
+        frames: walk.frames,
+        costs: walk.costs,
+    };
     if done == target {
         walks.remove(filter);
-        return true;
     }
-    let last = walks.get(filter).map(|(at, _)| *at);
-    let due = last.is_none_or(|at| now.saturating_duration_since(at) >= WALK_PROGRESS_REPEAT);
-    walks.insert(
-        filter.to_vec(),
-        (if due { now } else { last.unwrap_or(now) }, progress),
-    );
-    due
+    report
 }
 
 /// `filter`'s running walk in this process, `(done, next, target)`.
@@ -82,7 +239,7 @@ pub(crate) fn walk_progress(filter: &[u8]) -> Option<(u64, u64, u64)> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(filter)
-        .map(|(_, progress)| *progress)
+        .map(|walk| walk.progress)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -286,11 +443,25 @@ struct Headers<'a> {
     /// When this batch stops reading ([`BATCH_BUDGET`]).
     deadline: Instant,
     peer_fetches: AtomicUsize,
+    fetch_us: AtomicU64,
+    prepare_us: AtomicU64,
+    validate_us: AtomicU64,
 }
 
 #[async_trait::async_trait]
 trait VerifiedHeaders: Sync {
     async fn get(&self, number: u64) -> Result<FrameHeader>;
+
+    /// What reading headers has cost so far.
+    fn costs(&self) -> WalkCosts {
+        WalkCosts::default()
+    }
+}
+
+/// Add the time since `began` to `spent`.
+fn spent_since(spent: &AtomicU64, began: Instant) {
+    let micros = u64::try_from(began.elapsed().as_micros()).unwrap_or(u64::MAX);
+    spent.fetch_add(micros, Ordering::Relaxed);
 }
 
 /// How long fetching one historical frame from a peer may take.
@@ -300,7 +471,7 @@ const FRAME_FETCH_BUDGET: Duration = Duration::from_secs(8);
 /// own 15 s budget, whose errors this leaves visible. One 3 s budget for
 /// fetch, preparation and validation together cut every frame that needed a
 /// peer short, so recovery never progressed. Recovery runs on the engine's
-/// retry tick; the batch still stops after 3 s between frames.
+/// loop ([`WalkPace`]); the batch still stops after 3 s between frames.
 const FRAME_HISTORY_BUDGET: Duration = Duration::from_secs(17);
 
 /// A frame's header without its body, which linked validation never reads.
@@ -349,6 +520,9 @@ impl<'a> Headers<'a> {
             authenticated: Mutex::new(BTreeMap::new()),
             deadline: Instant::now() + BATCH_BUDGET,
             peer_fetches: AtomicUsize::new(0),
+            fetch_us: AtomicU64::new(0),
+            prepare_us: AtomicU64::new(0),
+            validate_us: AtomicU64::new(0),
         }
     }
 
@@ -417,8 +591,11 @@ impl<'a> Headers<'a> {
                     )));
                 }
                 let budget = FRAME_FETCH_BUDGET.min(self.remaining(number)?);
-                tokio::time::timeout(budget, source(self.filter.to_vec(), number))
-                    .await
+                let began = Instant::now();
+                let fetched =
+                    tokio::time::timeout(budget, source(self.filter.to_vec(), number)).await;
+                spent_since(&self.fetch_us, began);
+                fetched
                     .map_err(|_| {
                         unavailable(format!(
                             "fetching historical frame {number} timed out after {} ms",
@@ -449,6 +626,7 @@ impl<'a> Headers<'a> {
     async fn prepare(&self, frame: &AppShardFrame, certified: bool) -> Result<()> {
         let number = frame.header.as_ref().map_or(0, |h| h.frame_number);
         let budget = FRAME_HISTORY_BUDGET.min(self.remaining(number)?);
+        let began = Instant::now();
         let prepared = if certified {
             tokio::time::timeout(budget, self.validator.prepare_storage_history(frame)).await
         } else {
@@ -458,6 +636,7 @@ impl<'a> Headers<'a> {
             )
             .await
         };
+        spent_since(&self.prepare_us, began);
         prepared
             .map_err(|_| unavailable(format!(
                 "preparing historical frame {number}'s anchor and storage history timed out after {} ms",
@@ -481,7 +660,11 @@ impl<'a> Headers<'a> {
         let number = header.frame_number;
         if header.public_key_signature_bls48581.is_some() {
             self.prepare(frame, true).await?;
-            if !crate::app_engine::validate_app_frame_panic_safe(self.validator, frame, false)? {
+            let began = Instant::now();
+            let valid =
+                crate::app_engine::validate_app_frame_panic_safe(self.validator, frame, false);
+            spent_since(&self.validate_us, began);
+            if !valid? {
                 return Err(QuilError::InvalidSignature(format!(
                     "historical frame {number} rejected"
                 )));
@@ -494,7 +677,10 @@ impl<'a> Headers<'a> {
         }
         let body = header_only(header);
         self.prepare(&body, false).await?;
-        if !validate_linked(self.validator, &body)? {
+        let began = Instant::now();
+        let valid = validate_linked(self.validator, &body);
+        spent_since(&self.validate_us, began);
+        if !valid? {
             return Err(QuilError::InvalidSignature(format!(
                 "historical frame {number} rejected"
             )));
@@ -586,13 +772,16 @@ impl<'a> Headers<'a> {
         for frame in frames[..frames.len() - 1].iter().rev() {
             self.prepare(frame, false).await?;
         }
-        validate_archive_replay_chain(
+        let began = Instant::now();
+        let valid = validate_archive_replay_chain(
             &frames[0],
             &frames[1..],
             // Authenticated above, by itself or earlier in this batch.
             |frame| Ok(frame.header.as_ref() == Some(&terminal)),
             |frame| validate_linked(self.validator, frame),
-        )?;
+        );
+        spent_since(&self.validate_us, began);
+        valid?;
         for (header, _) in &run[..run.len() - 1] {
             self.remember(header.clone());
         }
@@ -615,6 +804,16 @@ impl VerifiedHeaders for Headers<'_> {
         // Recovery consumes authenticated headers only. Unchecked request
         // bodies are never installed into the canonical frame store.
         Ok(header)
+    }
+
+    fn costs(&self) -> WalkCosts {
+        WalkCosts {
+            peer_fetches: self.peer_fetches.load(Ordering::Relaxed) as u64,
+            fetch_us: self.fetch_us.load(Ordering::Relaxed),
+            prepare_us: self.prepare_us.load(Ordering::Relaxed),
+            validate_us: self.validate_us.load(Ordering::Relaxed),
+            commit_us: 0,
+        }
     }
 }
 
@@ -785,10 +984,18 @@ fn recorded_report(records: &dyn SnapshotReadable, filter: &[u8], frame: u64) ->
     Ok(report)
 }
 
-/// One bounded batch; false means the caller must remain out of consensus and
-/// retry. Completed records and the next recovery position share one write.
-/// `global` supplies the digests GLOBAL committed for the shard's frames,
-/// which authenticate a frame without a certificate of its own.
+/// How one batch of a walk ended.
+#[derive(Debug)]
+pub struct WalkBatch {
+    /// False: the caller must remain out of consensus and retry.
+    pub complete: bool,
+    /// Frames it asked peers for.
+    peer_reads: u64,
+}
+
+/// One bounded batch. Completed records and the next recovery position share
+/// one write. `global` supplies the digests GLOBAL committed for the shard's
+/// frames, which authenticate a frame without a certificate of its own.
 pub async fn recover(
     session: &Session,
     manager: Arc<ExecutionEngineManager>,
@@ -797,7 +1004,7 @@ pub async fn recover(
     global: Option<&Arc<quil_hypergraph::HypergraphCrdt>>,
     source: Option<&DeliveryFrameSource>,
     expected_cursor: u64,
-) -> Result<bool> {
+) -> Result<WalkBatch> {
     let committed = |number: u64| committed_digest(global, &session.filter, number);
     let headers = Headers::new(
         &session.filter,
@@ -807,7 +1014,11 @@ pub async fn recover(
         source,
         &committed,
     );
-    recover_with_headers(session, manager, &headers, expected_cursor).await
+    let complete = recover_with_headers(session, manager, &headers, expected_cursor).await?;
+    Ok(WalkBatch {
+        complete,
+        peer_reads: headers.peer_fetches.load(Ordering::Relaxed) as u64,
+    })
 }
 
 async fn recover_with_headers(
@@ -822,6 +1033,7 @@ async fn recover_with_headers(
     if expected_cursor == session.base_frame {
         return Ok(true);
     }
+    let began = Instant::now();
     let shard = manager.crdt();
     let snapshot = shard.capture_committed_shard(&session.filter)?;
     let cursor_key = encoding::consensus_materialized_cursor_key(&session.filter);
@@ -1032,6 +1244,7 @@ async fn recover_with_headers(
     {
         return Err(unavailable("recovery batch exceeds byte limit"));
     }
+    let committing = Instant::now();
     shard.checkpoint_shard_records(
         &session.filter,
         &snapshot.roots,
@@ -1039,20 +1252,37 @@ async fn recover_with_headers(
         expected_cursor,
         &records,
     )?;
-    if walk_batch(
+    let committed = Instant::now();
+    let mut costs = headers.costs();
+    costs.commit_us =
+        u64::try_from(committed.duration_since(committing).as_micros()).unwrap_or(u64::MAX);
+    let walk = walk_batch(
         &session.filter,
         (progress.done, progress.next, progress.target),
-        Instant::now(),
-    ) {
+        processed as u64,
+        costs,
+        began,
+        committed,
+    );
+    if let Some(phase) = walk.phase {
         tracing::info!(
             filter = hex::encode(&session.filter),
             generation = session.generation,
+            phase,
             processed,
             target = progress.target,
             next = progress.next,
             done = progress.done,
             remaining = progress.next.saturating_sub(progress.done),
             completed = progress.done == progress.target,
+            batch_ms = committed.duration_since(began).as_millis() as u64,
+            walk_secs = walk.elapsed.as_secs(),
+            walk_frames = walk.frames,
+            peer_fetches = walk.costs.peer_fetches,
+            fetch_ms = walk.costs.fetch_us / 1000,
+            prepare_ms = walk.costs.prepare_us / 1000,
+            validate_ms = walk.costs.validate_us / 1000,
+            commit_ms = walk.costs.commit_us / 1000,
             "recovered authenticated outgoing history batch"
         );
     } else {
@@ -2834,29 +3064,200 @@ mod tests {
         assert_eq!(field(), None);
     }
 
+    /// Each bound of the pace holds the next batch back when reached, and
+    /// lets it go once its time has passed.
+    #[test]
+    fn a_walks_pace_holds_each_bound_and_recovers() {
+        let start = Instant::now();
+        let quick = start + Duration::from_millis(10);
+        // The walk's peer reads: a full batch's frames a second.
+        let mut paid = None;
+        assert_eq!(
+            next_batch_at(u64::from(WALK_PEER_READS_PER_SEC), start, quick, &mut paid),
+            start + Duration::from_secs(1)
+        );
+        // A batch that read a run up to a certified descendant waits longer.
+        let mut paid = None;
+        assert_eq!(
+            next_batch_at(
+                4 * u64::from(WALK_PEER_READS_PER_SEC),
+                start,
+                quick,
+                &mut paid
+            ),
+            start + Duration::from_secs(4)
+        );
+        // The node's peer reads: one full batch each is within every walk's
+        // own rate, but past the node's they pay in turn; time clears the debt.
+        let mut paid = None;
+        let reads = u64::from(WALK_PEER_READS_PER_SEC);
+        let walkers = 2 * NODE_PEER_READS_PER_SEC / WALK_PEER_READS_PER_SEC;
+        let mut last = start;
+        for _ in 0..walkers {
+            last = next_batch_at(reads, start, quick, &mut paid);
+        }
+        assert_eq!(
+            last,
+            quick + Duration::from_secs(2),
+            "the last walker waits for all of them"
+        );
+        let later = quick + Duration::from_secs(60);
+        assert_eq!(
+            next_batch_at(0, later, later, &mut paid),
+            later + WALK_MIN_PAUSE,
+            "a paid debt holds nothing back"
+        );
+        // A slow batch leaves the loop as long free as it took.
+        let mut paid = None;
+        let slow = start + Duration::from_secs(3);
+        assert_eq!(
+            next_batch_at(1, start, slow, &mut paid),
+            slow + Duration::from_secs(3)
+        );
+        // Frames from the store cost no peer anything, and still pause.
+        let mut paid = None;
+        assert_eq!(
+            next_batch_at(0, start, quick, &mut paid),
+            quick + WALK_MIN_PAUSE
+        );
+    }
+
+    /// Only an unfinished batch sets the next one. A failure or a moved
+    /// cursor leaves the walk to the retry timer, whose next unfinished batch
+    /// resumes the pace.
+    #[test]
+    fn a_failed_batch_leaves_the_walk_to_the_retry_timer_until_one_succeeds() {
+        let session = session();
+        let now = Instant::now();
+        let unfinished = || {
+            Ok(WalkBatch {
+                complete: false,
+                peer_reads: 0,
+            })
+        };
+        let mut pace = WalkPace::default();
+        assert_eq!(pace.due_at(), None);
+        pace.note(&session, 95, &unfinished(), now, now);
+        assert_eq!(pace.due_at(), Some(now + WALK_MIN_PAUSE));
+        pace.note(&session, 95, &Err(unavailable("no peer")), now, now);
+        assert_eq!(pace.due_at(), None, "a failure is the retry timer's");
+        assert!(pace.take(95).is_none());
+        pace.note(&session, 95, &unfinished(), now, now);
+        assert_eq!(pace.take(95).map(|(_, frame)| frame), Some(95));
+        assert_eq!(pace.due_at(), None, "a batch runs once");
+        pace.note(&session, 95, &unfinished(), now, now);
+        assert!(pace.take(96).is_none(), "the cursor moved");
+        assert_eq!(pace.due_at(), None);
+        let done = Ok(WalkBatch {
+            complete: true,
+            peer_reads: 0,
+        });
+        pace.note(&session, 95, &unfinished(), now, now);
+        pace.note(&session, 95, &done, now, now);
+        assert_eq!(pace.due_at(), None, "a finished walk has no next batch");
+        pace.note(&session, 95, &unfinished(), now, now);
+        pace.clear();
+        assert_eq!(pace.due_at(), None, "a start attempt decides afresh");
+    }
+
+    /// Batches run back to back at the pace, a source failing midway stops
+    /// them, and retries finish the same walk with nothing lost.
+    #[tokio::test]
+    async fn a_paced_walk_survives_a_failing_source_and_finishes() {
+        let directory = Directory::new();
+        let session = session();
+        let cursor_key = encoding::consensus_materialized_cursor_key(&session.filter);
+        let headers = VerifiedFixture {
+            frames: (78..=96)
+                .map(|n| (n, header(&session, n, [[0; 32]; 4])))
+                .collect(),
+            fail_at: Mutex::new(Some(85)),
+            reads: Mutex::new(vec![]),
+        };
+        let (_db, _store, manager) = open(&directory.0);
+        manager
+            .crdt()
+            .commit_with_frame_cursor_and_records(95, &cursor_key, &tip(&session, 95))
+            .unwrap();
+        let mut pace = WalkPace::default();
+        let batch = |pace: &mut WalkPace, outcome: Result<bool>| {
+            let now = Instant::now();
+            let outcome = outcome.map(|complete| WalkBatch {
+                complete,
+                peer_reads: 0,
+            });
+            let complete = matches!(outcome, Ok(WalkBatch { complete: true, .. }));
+            pace.note(&session, 95, &outcome, now, now);
+            complete
+        };
+        let mut failures = 0;
+        let mut paced = 0;
+        let mut complete = false;
+        for _ in 0..16 {
+            let outcome = recover_with_headers(&session, manager.clone(), &headers, 95).await;
+            if outcome.is_err() {
+                failures += 1;
+                *headers.fail_at.lock().unwrap() = None;
+            }
+            complete = batch(&mut pace, outcome);
+            if complete {
+                break;
+            }
+            paced += usize::from(pace.take(95).is_some());
+        }
+        assert!(complete, "the walk finishes");
+        assert_eq!(pace.due_at(), None);
+        assert_eq!(failures, 1, "the source failed once");
+        assert!(paced >= 1, "unfinished batches set the next one");
+        let snapshot = manager
+            .crdt()
+            .capture_committed_shard(&session.filter)
+            .unwrap();
+        for n in 78..=95 {
+            assert!(snapshot
+                .records
+                .read_record(&encoding::clock_shard_frame_fee_total_key(
+                    &session.filter,
+                    n
+                ))
+                .unwrap()
+                .is_some());
+        }
+    }
+
     /// A walk logs its first batch, then at most one batch per interval,
-    /// and its last; it is forgotten once finished.
+    /// and its last with its duration and totals; it is forgotten once
+    /// finished.
     #[test]
     fn a_walk_logs_its_first_batch_every_interval_and_its_end() {
         let filter = [0x5a; 35];
         let start = Instant::now();
-        assert!(walk_batch(&filter, (10, 95, 100), start));
-        assert!(!walk_batch(
-            &filter,
-            (10, 87, 100),
-            start + Duration::from_secs(10)
-        ));
+        let costs = WalkCosts {
+            peer_fetches: 8,
+            fetch_us: 1000,
+            ..WalkCosts::default()
+        };
+        let batch = |progress, secs| {
+            let at = start + Duration::from_secs(secs);
+            walk_batch(&filter, progress, 8, costs, at, at)
+        };
+        assert_eq!(batch((10, 95, 100), 0).phase, Some("start"));
+        assert_eq!(batch((10, 87, 100), 10).phase, None);
         assert_eq!(walk_progress(&filter), Some((10, 87, 100)));
-        assert!(walk_batch(
-            &filter,
-            (10, 40, 100),
-            start + WALK_PROGRESS_REPEAT
-        ));
-        assert!(walk_batch(
-            &filter,
-            (100, 100, 100),
-            start + WALK_PROGRESS_REPEAT + Duration::from_secs(10)
-        ));
+        assert_eq!(
+            batch((10, 40, 100), WALK_PROGRESS_REPEAT.as_secs()).phase,
+            Some("progress")
+        );
+        let end = batch((100, 100, 100), WALK_PROGRESS_REPEAT.as_secs() + 10);
+        assert_eq!(end.phase, Some("end"));
+        assert_eq!(
+            end.elapsed,
+            WALK_PROGRESS_REPEAT + Duration::from_secs(10),
+            "the end names the walk's duration"
+        );
+        assert_eq!(end.frames, 32);
+        assert_eq!(end.costs.peer_fetches, 32);
+        assert_eq!(end.costs.fetch_us, 4000);
         assert_eq!(walk_progress(&filter), None);
     }
 }
