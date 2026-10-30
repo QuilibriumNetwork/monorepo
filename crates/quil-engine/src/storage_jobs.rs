@@ -316,6 +316,18 @@ pub fn reserve_ahead(bytes: u64, expired: &dyn Fn() -> bool) -> Option<Reservati
     admission().reserve_until(bytes, Urgency::Ahead, expired)
 }
 
+/// Reserve `bytes` for a storage settlement's work (its held replicas, or
+/// proving it alone): at once, beside every job and whether or not a slot is
+/// free, when it fits in the headroom left beside the jobs' share of the
+/// memory available now (a quarter, [`MEMORY_SHARE_PERCENT`]); otherwise as
+/// [`reserve`]. A settlement takes seconds, and GLOBAL withholds the storage
+/// share (before epoch 1342: kicks) of a member whose committed roots go
+/// unproven by the window's end: it must not wait behind seals relabelling
+/// for an hour.
+pub fn reserve_settlement(bytes: u64) -> Reservation {
+    admission().reserve_settlement(bytes)
+}
+
 /// Wait until no work due now has waited for memory or held any for
 /// [`DUE_QUIET`]: when work ahead that gave its memory back to it
 /// ([`Reservation::yield_requested`]) starts again. False, without waiting
@@ -858,6 +870,32 @@ impl Admission {
         }
     }
 
+    /// Reserve `bytes` for a settlement ([`reserve_settlement`]).
+    pub fn reserve_settlement(&'static self, bytes: u64) -> Reservation {
+        let mut state = self.state();
+        let now = (self.available)();
+        let headroom =
+            now.map(|now| u128::from(now) * u128::from(100 - MEMORY_SHARE_PERCENT) / 100);
+        if state.holders > 0 && !headroom.is_some_and(|room| u128::from(bytes) <= room) {
+            drop(state);
+            return self.reserve(bytes);
+        }
+        if state.holders == 0 {
+            state.idle_available = now;
+        }
+        state.reserved = state.reserved.saturating_add(bytes);
+        state.holders += 1;
+        state.due_held += 1;
+        state.due_last = Some(Instant::now());
+        drop(state);
+        self.changed.notify_all();
+        Reservation {
+            admission: self,
+            bytes,
+            urgency: Urgency::Due,
+        }
+    }
+
     /// Whether `bytes` more fit beside the reservations held.
     ///
     /// Alone, a job runs whatever its size, and what is available then is
@@ -1010,6 +1048,36 @@ mod tests {
         assert!(still_waiting(&fourth), "40 GiB do not");
         drop(first.release);
         assert!(granted(&fourth), "it runs once one finishes");
+    }
+
+    /// A settlement's reservation does not wait for a free slot while seals
+    /// hold them all, when it fits in the headroom; one that does not waits
+    /// like any other.
+    #[test]
+    fn a_settlement_does_not_wait_behind_seals_holding_every_slot() {
+        let (admission, _) = admission(2, 40 * GIB);
+        let seals = [hold(admission, 10 * GIB), hold(admission, 10 * GIB)];
+        assert!(seals.iter().all(granted));
+        let (granted_tx, settled) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _reservation = admission.reserve_settlement(GIB);
+            granted_tx.send(()).unwrap();
+        });
+        assert!(
+            settled.recv_timeout(SOON).is_ok(),
+            "the settlement waited for a slot the seals hold"
+        );
+        let (granted_tx, large) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _reservation = admission.reserve_settlement(20 * GIB);
+            granted_tx.send(()).unwrap();
+        });
+        assert!(
+            large.recv_timeout(NOT_YET).is_err(),
+            "beyond the headroom it waits"
+        );
+        drop(seals);
+        assert!(large.recv_timeout(SOON).is_ok());
     }
 
     /// A reservation for work due now (a renewal's snapshot) goes before

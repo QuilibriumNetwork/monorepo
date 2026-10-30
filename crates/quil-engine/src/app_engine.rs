@@ -3375,6 +3375,11 @@ impl AppConsensusEngine {
             .filter(|slot| slot.registered_at + 1 < global_frame_number);
         let (from, until) =
             quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+        // Near the window's end the settlement waits for nothing: not for a
+        // seal that may still come, nor in the seat's lane
+        // (`storage_epoch_batch::settle_closing_frames`).
+        let closing = global_frame_number
+            >= until.saturating_sub(crate::storage_epoch_batch::settle_closing_frames());
         let registration_closed = global_frame_number
             >= storage_snapshot_frame(seal_epoch)
                 + crate::app_shard_metadata::storage_snapshot_grace()
@@ -3382,7 +3387,8 @@ impl AppConsensusEngine {
         // Settling shares a proof with the seal when one can still come: a
         // registration GLOBAL recorded whose beacon frame is not here yet, or
         // one that may still land.
-        let awaiting_seal = seal.is_none()
+        let awaiting_seal = !closing
+            && seal.is_none()
             && hash_storage_proofs_at(seal_epoch)
             && (next.is_some() || (slot(seal_epoch).is_none() && !registration_closed));
         // The frame this runs from and the slot may trail GLOBAL; past the
@@ -3424,6 +3430,15 @@ impl AppConsensusEngine {
             self.global_anchor_store
                 .get_global_clock_frame(number)
                 .is_err()
+        };
+        // Near the window's end a seal whose beacon frame is not here yet
+        // does not hold the settlement up; it follows once the frame is.
+        let seal = match seal {
+            Some(slot) if closing && settle.is_some() && missing(slot.registered_at + 1) => {
+                recover(vec![slot.registered_at + 1]);
+                None
+            }
+            seal => seal,
         };
         let beacon_output = match &seal {
             Some(slot) => match self
@@ -3502,9 +3517,27 @@ impl AppConsensusEngine {
                 publish(SeatMessage::Announce(member, key).to_bytes());
             }
         };
-        match (seal.is_some(), settle.is_some()) {
-            (true, true) if attempt > 1 => {}
-            (seals, settles) => announce(seals, settles),
+        // A settlement is prepared in a lane of its own, apart from its seal,
+        // unless it shares a first part with the seal: it never waits behind
+        // the seal's relabelling (about an hour per GiB) or the seat's
+        // encodes. Sent again, or near the window's end, it goes alone and the
+        // node proves it at once.
+        let has_seal = seal.is_some();
+        let settle_inputs_present = settle.is_some();
+        let split = settle_inputs_present && (attempt > 1 || closing || !has_seal);
+        let settle_alone = attempt > 1 || closing;
+        if closing && settle_inputs_present {
+            warn!(epoch, attempt, global_frame = global_frame_number, window_end = until,
+                frames_left = until.saturating_sub(global_frame_number), filter = %hex::encode(&self.filter),
+                "storage settlement not recorded near its window's end: sending it alone, apart from its seal. This node's storage \
+                 work held it (a seal still being prepared, a restart, or the node waiting for another seat's part), or GLOBAL has \
+                 not applied the part sent; GLOBAL withholds the member's storage share (before epoch 1342: kicks it) if none lands by the window's end");
+        }
+        // The node's collection waits only for what goes in it: not for a
+        // settlement sent alone.
+        let batched_settle = settle.is_some() && !settle_alone;
+        if has_seal || batched_settle {
+            announce(has_seal, batched_settle);
         }
         // What each half of the part is prepared from: a retry reuses a half
         // prepared from the same inputs.
@@ -3523,7 +3556,8 @@ impl AppConsensusEngine {
                     accumulator: slot.accumulator,
                 });
         let lane = filter.clone();
-        crate::storage_jobs::spawn(&lane, "epoch proof part", move || {
+        let settlement_lane = [b"settlement ".as_slice(), &filter].concat();
+        let job = move |seals_here: bool, settles_here: bool| -> quil_types::error::Result<()> {
             let prove = |seals: bool, settles: bool| -> quil_types::error::Result<()> {
                 let withdraw = |error: quil_types::error::QuilError| {
                     use crate::storage_epoch_batch::{SeatKey, SeatMessage};
@@ -3589,12 +3623,14 @@ impl AppConsensusEngine {
                     },
                 )
                 .map_err(withdraw)?;
-                seat.solo = attempt > 1;
+                seat.solo = attempt > 1 || (settle_alone && !seals);
                 let bytes = seat.to_bytes();
                 info!(epoch, seals, settles, attempt, reused, frames = settle.as_ref().filter(|_| settles).map_or(0, |slot| slot.frames),
                     bytes = bytes.len(), seconds = started.elapsed().as_secs_f64(), filter = %hex::encode(&filter),
                     "storage epoch proof part prepared for the node");
                 publish(bytes);
+                // GLOBAL needs a retry interval from now, not from the claim.
+                crate::storage_snapshot::note_epoch_proof_published(&member, &filter, epoch);
                 Ok(())
             };
             // A settlement not prepared before its window closed is moot:
@@ -3607,7 +3643,7 @@ impl AppConsensusEngine {
                     let global_frame = crate::storage_snapshot::global_frame().unwrap_or(0);
                     if attempt == 1 {
                         warn!(epoch, frames, global_frame, %error, filter = %hex::encode(&filter),
-                            "storage settlement window closed before this node sent its part; unless an earlier run's part landed, GLOBAL kicks the member for the unproven roots: check this shard's storage job backlog");
+                            "storage settlement window closed before this node sent its part; unless an earlier run's part landed, GLOBAL withholds the member's storage share for the unproven roots (before epoch 1342: kicks it): check this shard's storage job backlog");
                     } else {
                         info!(epoch, attempt, frames, global_frame, %error, filter = %hex::encode(&filter),
                             "storage settlement retry dropped: its window closed and its replicas are evicted; the slot shows whether an earlier part landed");
@@ -3616,14 +3652,9 @@ impl AppConsensusEngine {
                 }
                 result => result,
             };
-            match (seal.is_some(), settle.is_some()) {
-                // A seal that fails here, or one GLOBAL refused once, must not
-                // keep the settlement out: the held rewards and the seat ride
-                // on it. Send the parts apart.
-                (true, true) if attempt > 1 => {
-                    let settled = closed(prove(false, true));
-                    prove(true, false).and(settled)
-                }
+            match (seals_here, settles_here) {
+                // A seal that fails here must not keep the settlement out:
+                // the held rewards and the seat ride on it.
                 (true, true) => prove(true, true).or_else(|error| {
                     if crate::storage_snapshot::settlement_closed(epoch, 0) {
                         return closed(Err(error)).and_then(|()| prove(true, false));
@@ -3634,7 +3665,19 @@ impl AppConsensusEngine {
                 (false, true) => closed(prove(false, true)),
                 (seals, settles) => prove(seals, settles),
             }
-        });
+        };
+        if split {
+            let settling = job.clone();
+            crate::storage_jobs::spawn(&settlement_lane, "settlement part", move || {
+                settling(false, true)
+            });
+            if has_seal {
+                crate::storage_jobs::spawn(&lane, "epoch proof part", move || job(true, false));
+            }
+        } else {
+            let settles = settle_inputs_present;
+            crate::storage_jobs::spawn(&lane, "epoch proof part", move || job(has_seal, settles));
+        }
     }
 
     /// Put this frame's materialization off while its confidential proofs
@@ -6884,7 +6927,9 @@ impl AppConsensusEngine {
                     // The epoch proof job also runs from here, not only when a
                     // frame materializes: a joiner materializes nothing before
                     // consensus starts, and a stalled committee nothing at all,
-                    // yet a seal or a settlement left undone kicks the member
+                    // yet a seal left undone earns no storage share, and GLOBAL
+                    // withholds it for a settlement left undone (before epoch
+                    // 1342: kicks the member)
                     // (an in-process engine receives no GLOBAL frame messages).
                     // `claim_epoch_proof` paces the attempts.
                     if let Some(head) = self.global_anchor_store.get_latest_global_clock_frame().ok()
@@ -10442,7 +10487,8 @@ impl AppConsensusEngine {
         // messages), not only when a frame materializes: a joiner's first
         // registration must be sealed before consensus starts, and a member
         // whose committee stalls in the settlement window must still settle
-        // what it committed, or it is kicked.
+        // what it committed, or GLOBAL withholds its storage share (before
+        // epoch 1342: kicks it).
         self.prove_storage_epoch_if_due(global_frame_number);
 
         // Update difficulty from global frame header
@@ -17759,9 +17805,259 @@ mod tests {
         (engine, handle, received)
     }
 
+    /// An engine owing GLOBAL the settlement of `epoch` on a seat whose
+    /// replicas it holds (`storage_snapshot::tests::settlement_owed`), with
+    /// a registration for `epoch + 2` to seal; the seal's beacon frame is
+    /// stored when `beacon_stored`. Returns the engine, what it publishes
+    /// to its node, and the settlement window's bounds.
+    fn engine_owing_a_settlement(
+        epoch: u64,
+        beacon_stored: bool,
+        sealing: bool,
+    ) -> (
+        AppConsensusEngine,
+        Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        (u64, u64),
+    ) {
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry.clone());
+        let published = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink = published.clone();
+        engine.coverage_publish = Some(Arc::new(move |bytes| sink.lock().unwrap().push(bytes)));
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        engine.kv_db = Some(db.clone());
+        engine.cw_handle = Some(crate::cw_app_seams::AppConsensusCwHandle::idle_for_test());
+        let window = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+        let store_frame = |number: u64| {
+            engine
+                .global_anchor_store
+                .put_global_clock_frame(
+                    &quil_types::proto::global::GlobalFrame {
+                        header: Some(quil_types::proto::global::GlobalFrameHeader {
+                            frame_number: number,
+                            output: vec![9; 32],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    &AppNoopTxn,
+                )
+                .unwrap();
+        };
+        let anchor = window.0 - 20;
+        store_frame(anchor);
+        let app: [u8; 32] = engine.filter.clone().try_into().unwrap();
+        let owed = crate::storage_snapshot::tests::settlement_owed(
+            &quil_store::replica_store::ReplicaStore::new(db),
+            &[1; 32],
+            &app,
+            epoch,
+            anchor + 5,
+            anchor,
+            &[9; 32],
+        );
+        registry.set_storage_seat_slot(&[1; 32], &engine.filter, owed);
+        let registered_at = window.0 - 10;
+        if beacon_stored {
+            store_frame(registered_at + 1);
+        }
+        if sealing {
+            registry.set_storage_seat_slot(
+                &[1; 32],
+                &engine.filter,
+                quil_types::consensus::StorageSeatSlot {
+                    epoch: epoch + 2,
+                    leaves: vec![vec![0]],
+                    registered_at,
+                    sealed_at: None,
+                    frames: 0,
+                    accumulator: [0; 32],
+                    chained: Vec::new(),
+                    open: true,
+                },
+            );
+        }
+        (engine, published, window)
+    }
+
+    /// Drive `engine` to GLOBAL frame `number`, as a stalled committee does.
+    fn at_global_frame(engine: &mut AppConsensusEngine, number: u64) {
+        let frame = quil_types::proto::global::GlobalFrame {
+            header: Some(quil_types::proto::global::GlobalFrameHeader {
+                frame_number: number,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        engine.handle_global_frame_message(
+            &crate::consensus_wire::encode_global_frame(&frame).unwrap(),
+        );
+    }
+
+    /// Storage work holding the seat's lane and every job slot, as seals
+    /// relabelling do (about an hour per GiB); dropping the sender ends it.
+    fn seals_holding_the_lane_and_every_slot(filter: &[u8]) -> std::sync::mpsc::Sender<()> {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Arc::new(std::sync::Mutex::new(held));
+        let (granted_tx, granted) = std::sync::mpsc::channel::<()>();
+        for slot in 0..crate::storage_jobs::job_slots() {
+            let (held, granted_tx) = (held.clone(), granted_tx.clone());
+            let work = move || {
+                let _memory = crate::storage_jobs::reserve(1 << 20);
+                granted_tx.send(()).unwrap();
+                let _ = held.lock().unwrap().recv_timeout(Duration::from_secs(60));
+                Ok(())
+            };
+            if slot == 0 {
+                crate::storage_jobs::spawn(filter, "epoch proof part", work);
+            } else {
+                std::thread::spawn(work);
+            }
+        }
+        for _ in 0..crate::storage_jobs::job_slots() {
+            granted.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        release
+    }
+
+    /// The settlement parts `published` holds: sent alone, settling only.
+    fn settlements_sent_alone(published: &std::sync::Mutex<Vec<Vec<u8>>>) -> usize {
+        use crate::storage_epoch_batch::SeatMessage;
+        published
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|bytes| {
+                matches!(SeatMessage::from_bytes(bytes),
+                    Ok(SeatMessage::Part(part)) if part.part.settles && !part.part.seals && part.solo)
+            })
+            .count()
+    }
+
+    /// Wait up to 20 s for `count` settlements sent alone.
+    fn until_settlements_sent(published: &std::sync::Mutex<Vec<Vec<u8>>>, count: usize) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while settlements_sent_alone(published) < count {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        true
+    }
+
+    /// A settlement sent again is prepared and sent while its seal still
+    /// holds the seat's lane and every job slot (relabelling, about an hour
+    /// per GiB): GLOBAL withholds the member's storage share for roots it
+    /// committed and never proved by the window's end.
+    #[tokio::test]
+    async fn a_settlement_sent_again_does_not_wait_for_its_seal() {
+        let (mut engine, published, (from, _)) = engine_owing_a_settlement(5, true, true);
+        let release = seals_holding_the_lane_and_every_slot(&engine.filter);
+        at_global_frame(&mut engine, from + 1);
+        at_global_frame(
+            &mut engine,
+            from + 1 + crate::storage_snapshot::seal_retry_frames(),
+        );
+        let sent = until_settlements_sent(&published, 1);
+        drop(release);
+        for lane in [
+            engine.filter.clone(),
+            [b"settlement ".as_slice(), &engine.filter].concat(),
+        ] {
+            assert!(crate::storage_jobs::wait_lane_idle(
+                &lane,
+                Duration::from_secs(30)
+            ));
+        }
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert!(
+            sent,
+            "the settlement sent again waited behind its seal in the seat's lane: GLOBAL withholds the member's storage share for roots it never proved"
+        );
+    }
+
+    /// A settlement queued in its lane while GLOBAL passed its window's end
+    /// is not sent when its job runs: GLOBAL refuses it. The part the node
+    /// was told of is withdrawn.
+    #[tokio::test]
+    async fn a_settlement_queued_past_its_window_is_not_sent() {
+        use crate::storage_epoch_batch::SeatMessage;
+        let (mut engine, published, (_, until)) = engine_owing_a_settlement(5, false, false);
+        let settlement_lane = [b"settlement ".as_slice(), &engine.filter].concat();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        crate::storage_jobs::spawn(&settlement_lane, "ahead in the lane", move || {
+            let _ = held.recv_timeout(Duration::from_secs(60));
+            Ok(())
+        });
+        at_global_frame(
+            &mut engine,
+            until - crate::storage_epoch_batch::settle_closing_frames() - 1,
+        );
+        crate::storage_snapshot::note_global_frame(until);
+        drop(release);
+        for lane in [engine.filter.clone(), settlement_lane] {
+            assert!(crate::storage_jobs::wait_lane_idle(
+                &lane,
+                Duration::from_secs(30)
+            ));
+        }
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        let sent: Vec<_> = published
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|bytes| SeatMessage::from_bytes(bytes).ok())
+            .collect();
+        assert!(
+            matches!(sent.first(), Some(SeatMessage::Announce(..))),
+            "the settlement was due when queued"
+        );
+        assert!(
+            !sent
+                .iter()
+                .any(|message| matches!(message, SeatMessage::Part(..))),
+            "a settlement past its window's end was sent from its lane"
+        );
+        assert!(
+            sent.iter()
+                .any(|message| matches!(message, SeatMessage::Withdraw(..))),
+            "the announced part is withdrawn"
+        );
+    }
+
+    /// In its window's last frames a settlement waits for nothing: not for a
+    /// seal whose beacon frame is not here, nor behind seals holding the
+    /// seat's lane and every job slot.
+    #[tokio::test]
+    async fn a_settlement_near_its_window_end_waits_for_nothing() {
+        let (mut engine, published, (_, until)) = engine_owing_a_settlement(5, false, true);
+        let release = seals_holding_the_lane_and_every_slot(&engine.filter);
+        at_global_frame(&mut engine, until - 1);
+        let sent = until_settlements_sent(&published, 1);
+        drop(release);
+        for lane in [
+            engine.filter.clone(),
+            [b"settlement ".as_slice(), &engine.filter].concat(),
+        ] {
+            assert!(crate::storage_jobs::wait_lane_idle(
+                &lane,
+                Duration::from_secs(30)
+            ));
+        }
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert!(
+            sent,
+            "the settlement owed at GLOBAL frame {}, its window's last before {until}, was not sent: GLOBAL withholds the member's storage share for roots it never proved",
+            until - 1
+        );
+    }
+
     /// A member whose committee runs consensus but materializes nothing (a
     /// stalled committee) still settles its storage epoch, from GLOBAL frames:
-    /// GLOBAL kicks a member that committed roots and never proved them.
+    /// GLOBAL withholds the storage share of a member that committed roots
+    /// and never proved them.
     #[tokio::test]
     async fn a_stalled_member_settles_its_storage_epoch_from_global_frames() {
         use crate::storage_epoch_batch::SeatMessage;
@@ -17791,7 +18087,9 @@ mod tests {
         );
         let frame = quil_types::proto::global::GlobalFrame {
             header: Some(quil_types::proto::global::GlobalFrameHeader {
-                frame_number: until - 1,
+                // Before the window's closing frames: a settlement sent
+                // alone there is announced to no collection.
+                frame_number: until - crate::storage_epoch_batch::settle_closing_frames() - 1,
                 ..Default::default()
             }),
             ..Default::default()
@@ -17801,10 +18099,15 @@ mod tests {
         );
         // The settlement's proof part runs on a storage job thread reading
         // the engine's store; the test must not end while it runs.
-        assert!(
-            crate::storage_jobs::wait_lane_idle(&engine.filter, Duration::from_secs(30)),
-            "the settlement's proof part job finishes"
-        );
+        for lane in [
+            engine.filter.clone(),
+            [b"settlement ".as_slice(), &engine.filter].concat(),
+        ] {
+            assert!(
+                crate::storage_jobs::wait_lane_idle(&lane, Duration::from_secs(30)),
+                "the settlement's proof part job finishes"
+            );
+        }
         let announced = published.lock().unwrap().iter().any(|bytes| {
             matches!(
                 SeatMessage::from_bytes(bytes),
@@ -17959,18 +18262,25 @@ mod tests {
         let epoch = 5;
         let (engine, _handle, _events, published) = engine_owing_settlement(epoch);
         let (_, until) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+        // A settlement without a seal queues in its own lane, and from the
+        // window's closing frames on it is announced to no collection.
+        let settlement_lane = [b"settlement ".as_slice(), &engine.filter].concat();
         let (release, held) = std::sync::mpsc::channel::<()>();
-        crate::storage_jobs::spawn(&engine.filter, "ahead in the lane", move || {
+        crate::storage_jobs::spawn(&settlement_lane, "ahead in the lane", move || {
             let _ = held.recv();
             Ok(())
         });
-        engine.prove_storage_epoch_if_due(until - 1);
+        engine.prove_storage_epoch_if_due(
+            until - crate::storage_epoch_batch::settle_closing_frames() - 1,
+        );
         evict_replicas(&engine, epoch + 2);
         release.send(()).unwrap();
-        assert!(
-            crate::storage_jobs::wait_lane_idle(&engine.filter, Duration::from_secs(30)),
-            "the epoch proof part job finishes"
-        );
+        for lane in [engine.filter.clone(), settlement_lane] {
+            assert!(
+                crate::storage_jobs::wait_lane_idle(&lane, Duration::from_secs(30)),
+                "the epoch proof part job finishes"
+            );
+        }
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
         let sent: Vec<_> = published
             .lock()

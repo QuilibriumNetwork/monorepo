@@ -782,6 +782,7 @@ pub(crate) fn init(
                 let kind = worker_submission(&header_canonical_bytes);
                 if coverage_halt.any_halted() {
                     debug!("suppressing coverage publish — coverage halt active");
+                    quil_engine::storage_epoch_batch::note_withheld(&header_canonical_bytes);
                     unpublished(&header_canonical_bytes, false);
                     return;
                 }

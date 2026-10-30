@@ -1132,9 +1132,10 @@ impl AppSeamProposer {
             return false;
         }
         // Hash storage proofs (decided 2026-10-21): GLOBAL chains a frame's
-        // openings root into its proposer's storage seat and kicks a member
-        // that never proves what was chained there, so a frame must name the
-        // view's leader as its proposer.
+        // openings root into its proposer's storage seat and withholds the
+        // storage share (before epoch 1342: kicks) of a member that never
+        // proves what was chained there, so a frame must name the view's
+        // leader as its proposer.
         let hash_storage = header.global_frame_number > 0
             && quil_types::consensus::hash_storage_proofs_at(
                 quil_types::consensus::epoch_for_frame(header.global_frame_number),
