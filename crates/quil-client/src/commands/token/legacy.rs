@@ -558,6 +558,7 @@ async fn list_owner(
     client: &Client,
     application: &[u8; 32],
     owner: &[u8; 32],
+    pages: &mut usize,
     mut progress: impl FnMut(usize),
 ) -> anyhow::Result<Vec<([u8; 32], u128, bool)>> {
     let mut coins = Vec::new();
@@ -578,6 +579,7 @@ async fn list_owner(
             }
             Err(status) => anyhow::bail!("legacy coins: {}", status.message()),
         };
+        *pages += 1;
         for coin in &page.coins {
             let amount = u128::from_le_bytes(
                 coin.amount
@@ -614,13 +616,14 @@ async fn list_owners(
     application: &[u8; 32],
     owners: &[(OwnerForm, [u8; 32])],
     label: &str,
+    pages: &mut usize,
 ) -> anyhow::Result<Vec<Coin>> {
     use std::io::{IsTerminal, Write};
     let terminal = std::io::stderr().is_terminal();
     let mut coins = Vec::new();
     for (form, owner) in owners {
         let mut shown = false;
-        let listed = list_owner(client, application, owner, |count| {
+        let listed = list_owner(client, application, owner, pages, |count| {
             if terminal {
                 eprint!(
                     "\r{label}: {count} legacy coins listed under the {} owner, more follow",
@@ -656,22 +659,32 @@ pub(crate) async fn list(
     let public = config_public_key(&tc.node_config.p2p.peer_priv_key).ok_or_else(|| {
         anyhow::anyhow!("this node has no Ed448 identity, so it holds no legacy coins")
     })?;
-    list_owners(client, application, &key_owners(&public)?, "this identity").await
+    list_owners(
+        client,
+        application,
+        &key_owners(&public)?,
+        "this identity",
+        &mut 0,
+    )
+    .await
 }
 
 /// This identity's legacy coins tallied for `token balance`, as
 /// `(unshielded total, unshielded, shielded)`, or `None` when the node has
-/// no Ed448 identity and so holds none.
+/// no Ed448 identity and so holds none. `pages` counts the pages read.
 #[cfg(feature = "confidential-tokens")]
 pub(crate) async fn unshielded(
     tc: &TokenCtx,
     client: &Client,
     application: &[u8; 32],
+    pages: &mut usize,
 ) -> anyhow::Result<Option<(u128, usize, usize)>> {
-    if config_public_key(&tc.node_config.p2p.peer_priv_key).is_none() {
+    let Some(public) = config_public_key(&tc.node_config.p2p.peer_priv_key) else {
         return Ok(None);
-    }
-    let tally = Tally::of(&list(tc, client, application).await?)?;
+    };
+    let owners = key_owners(&public)?;
+    let tally =
+        Tally::of(&list_owners(client, application, &owners, "this identity", pages).await?)?;
     Ok(Some((tally.units, tally.unshielded, tally.shielded)))
 }
 
@@ -1558,7 +1571,9 @@ pub(crate) async fn list_all(
                         if first.is_none() {
                             first = Some(client.clone());
                         }
-                        match list_owners(client, application, &owners, &identity.label).await {
+                        match list_owners(client, application, &owners, &identity.label, &mut 0)
+                            .await
+                        {
                             Ok(coins) => {
                                 dedup.record(&owners, &identity.label);
                                 Outcome::Listed(coins)
