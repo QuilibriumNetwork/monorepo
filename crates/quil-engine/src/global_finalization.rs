@@ -173,9 +173,13 @@ impl GlobalFinalizationPipeline {
         }
     }
 
-    /// Run `ingest` on each frame before executing it (archives only).
+    /// Run `ingest` on each frame before executing it (archives only). A
+    /// proposal or vote then waits for finalized frames to publish rather than
+    /// execute them without it
+    /// ([`GlobalParentExecutor::sequenced_publication_wait`]).
     pub fn with_sequenced_ingest(mut self, ingest: SequencedIngest) -> Self {
         self.sequenced_ingest = Some(ingest);
+        self.executor.sequence_with_ingest();
         self
     }
 

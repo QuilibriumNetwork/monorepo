@@ -175,6 +175,9 @@ pub struct GlobalParentExecutor {
     /// Highest frame whose certified finalization waits to be published here
     /// ([`Self::note_finalized`]).
     finalized: std::sync::atomic::AtomicU64,
+    /// Finalization materializes the application frames each GLOBAL frame
+    /// sequences before executing it ([`Self::sequence_with_ingest`]).
+    sequenced: AtomicBool,
 }
 
 /// Ancestors an earlier preparation executed above the published base,
@@ -767,7 +770,38 @@ impl GlobalParentExecutor {
             authenticated: Default::default(),
             executed: Default::default(),
             finalized: std::sync::atomic::AtomicU64::new(0),
+            sequenced: AtomicBool::new(false),
         }
+    }
+
+    /// Finalization brings this archive's application state to each GLOBAL
+    /// frame's sequenced point before executing it
+    /// ([`crate::global_finalization::GlobalFinalizationPipeline::with_sequenced_ingest`]);
+    /// see [`Self::sequenced_publication_wait`].
+    pub(crate) fn sequence_with_ingest(&self) {
+        self.sequenced.store(true, Ordering::Release);
+    }
+
+    /// `Some((published, finalized))` while executing the parent `number`
+    /// privately would miss application frames: it is above the published
+    /// frame, and finalized frames wait to publish here. An archive
+    /// materializes the application frames a GLOBAL frame sequences only when
+    /// finalization publishes that frame, and shard-header rewards read the
+    /// shard and world sizes they change. A private execution before then
+    /// declared a prover root the finalized execution did not reproduce:
+    /// every archive logged a prover root mismatch and GLOBAL stalled for
+    /// 70-160 s until a leader proposed on the published state (devnet,
+    /// 2026-10-30). Publication needs nothing from consensus, so the wait ends
+    /// once those frames publish. A parent nothing above the published frame
+    /// is finalized for executes as before: it may finalize only through the
+    /// child, which waiting would never build.
+    pub(crate) fn sequenced_publication_wait(&self, number: u64) -> Option<(u64, u64)> {
+        if !self.sequenced.load(Ordering::Acquire) {
+            return None;
+        }
+        let published = self.source.last_materialized_frame();
+        let finalized = self.finalized.load(Ordering::Acquire);
+        (number > published && finalized > published).then_some((published, finalized))
     }
 
     /// The finalization pipeline holds `number`'s certified finalization.

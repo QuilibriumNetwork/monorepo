@@ -64,6 +64,14 @@ struct Fixture {
 }
 impl Fixture {
     fn new(key: Option<&[u8]>) -> Self {
+        Self::seeded(key, |_| {})
+    }
+
+    /// [`Self::new`], with `seed` adding to the state before its first commit.
+    fn seeded(
+        key: Option<&[u8]>,
+        seed: impl FnOnce(&Arc<quil_hypergraph::HypergraphCrdt>),
+    ) -> Self {
         let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
         let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
         let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
@@ -81,6 +89,7 @@ impl Fixture {
         if let Some(key) = key {
             crate::genesis::seed_active_prover_on_filter(&crdt, key, 1000, 0, &[]).unwrap();
         }
+        seed(&crdt);
         let stubs = quil_execution::testing::NoopExecutionCrypto::new();
         let manager = Arc::new(
             quil_execution::ExecutionEngineManager::new_with_shards(
