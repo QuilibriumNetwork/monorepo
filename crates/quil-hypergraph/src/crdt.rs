@@ -4976,6 +4976,47 @@ impl HypergraphCrdt {
         let _guard = self.commit_lock.lock().map_err(|_| {
             QuilError::ExecutionUnavailable("historical proof commit lock poisoned".into())
         })?;
+        let Some((version, vertex, blob)) = self.global_vertex_blob_at_root(root, data_address)?
+        else {
+            return Ok(None);
+        };
+        let forest = self.forest.read().unwrap();
+        let proof = forest
+            .build_vertex_membership_proof(&[0xff; 32], PHASES[0], version, &vertex, &blob)
+            .map_err(|e| {
+                QuilError::ExecutionUnavailable(format!("historical global reward proof: {e}"))
+            })?;
+        // Also detects alternate backends that only implement latest-blob reads.
+        quil_forest::verify_vertex_membership(root, &proof, &[]).map_err(|_| {
+            QuilError::ExecutionUnavailable("historical global reward blob/root mismatch".into())
+        })?;
+        Ok(Some(proof))
+    }
+
+    /// Whether a GLOBAL vertex exists at a retained root: the read of
+    /// [`Self::global_vertex_membership_at_root`] without building a proof, so
+    /// a caller checking several roots holds the commit lock only for two
+    /// point reads each.
+    pub fn global_vertex_present_at_root(
+        &self,
+        root: &[u8; 32],
+        data_address: &[u8; 32],
+    ) -> Result<bool> {
+        let _guard = self.commit_lock.lock().map_err(|_| {
+            QuilError::ExecutionUnavailable("historical proof commit lock poisoned".into())
+        })?;
+        Ok(self
+            .global_vertex_blob_at_root(root, data_address)?
+            .is_some())
+    }
+
+    /// `(version, vertex key, blob)` of a GLOBAL vertex at a retained root. The
+    /// caller holds the commit lock.
+    fn global_vertex_blob_at_root(
+        &self,
+        root: &[u8; 32],
+        data_address: &[u8; 32],
+    ) -> Result<Option<(u64, Vec<u8>, Vec<u8>)>> {
         let app = [0xff; 32];
         let (version, _) = self
             .store
@@ -4989,24 +5030,10 @@ impl HypergraphCrdt {
         };
         let mut vertex = app.to_vec();
         vertex.extend_from_slice(data_address);
-        let blob = match self
+        let blob = self
             .store
-            .load_vertex_underlying_at("vertex", "adds", &shard, &vertex, version)?
-        {
-            Some(blob) => blob,
-            None => return Ok(None),
-        };
-        let forest = self.forest.read().unwrap();
-        let proof = forest
-            .build_vertex_membership_proof(&app, PHASES[0], version, &vertex, &blob)
-            .map_err(|e| {
-                QuilError::ExecutionUnavailable(format!("historical global reward proof: {e}"))
-            })?;
-        // Also detects alternate backends that only implement latest-blob reads.
-        quil_forest::verify_vertex_membership(root, &proof, &[]).map_err(|_| {
-            QuilError::ExecutionUnavailable("historical global reward blob/root mismatch".into())
-        })?;
-        Ok(Some(proof))
+            .load_vertex_underlying_at("vertex", "adds", &shard, &vertex, version)?;
+        Ok(blob.map(|blob| (version, vertex, blob)))
     }
 
     /// Index the current head root of (`shard_id`, `phase_idx`) into the

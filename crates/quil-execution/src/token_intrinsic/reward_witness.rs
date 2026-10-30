@@ -111,16 +111,24 @@ pub fn newest_retained_global_root(
                 None => continue,
             }
         };
-        let root: [u8; 32] = header
-            .prover_tree_commitment
-            .as_slice()
-            .try_into()
-            .map_err(|_| unavailable("global reward root is not 32 bytes"))?;
-        if state.crdt().global_root_available(&root)? {
+        if let Some(root) = retained_header_root(state, &header)? {
             return Ok((root, header));
         }
     }
     Err(unavailable("historical global reward root unavailable"))
+}
+
+/// The global root `header` names, when this node retains it.
+pub(crate) fn retained_header_root(
+    state: &HypergraphState,
+    header: &quil_types::proto::global::GlobalFrameHeader,
+) -> Result<Option<[u8; 32]>> {
+    let root: [u8; 32] = header
+        .prover_tree_commitment
+        .as_slice()
+        .try_into()
+        .map_err(|_| unavailable("global reward root is not 32 bytes"))?;
+    Ok(state.crdt().global_root_available(&root)?.then_some(root))
 }
 
 pub fn quil_reward_witness(

@@ -1085,6 +1085,21 @@ impl quil_types::store::CoinWitnessProvider for CrdtCoinWitness {
             anchor,
         )
     }
+
+    fn mint_authorization_status(
+        &self,
+        receipt: &[u8; 32],
+    ) -> quil_types::error::Result<quil_types::store::MintAuthorizationStatusData> {
+        let state = quil_execution::hypergraph_state::HypergraphState::new(self.crdt.clone());
+        let anchor = (self.shard_anchor)();
+        quil_execution::token_intrinsic::mint_authorization_witness::status(
+            &state,
+            self.clock.as_ref(),
+            receipt,
+            anchor,
+        )
+    }
+
     #[cfg(feature = "confidential-tokens")]
     fn escrow_page(
         &self,
