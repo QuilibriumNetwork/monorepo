@@ -3157,7 +3157,11 @@ pub(super) async fn run_pay(
             .statement,
     )?;
     wallet
-        .submit(&mut tc.connect_submit().await?, &tc.key_manager, bytes)
+        .submit(
+            &mut tc.connect_submit().await?,
+            &tc.submit_key_manager,
+            bytes,
+        )
         .await?;
     println!(
         "Settlement submitted: {amount} base units to {} (fee {fee}).",
@@ -3607,7 +3611,11 @@ async fn submit_refreshed_operation(
 ) -> anyhow::Result<()> {
     if wallet.application == quil_execution::domains::QUIL_TOKEN {
         return wallet
-            .submit(&mut tc.connect_submit().await?, &tc.key_manager, bytes)
+            .submit(
+                &mut tc.connect_submit().await?,
+                &tc.submit_key_manager,
+                bytes,
+            )
             .await;
     }
     submit_paid_operation(tc, wallet, bytes, None, SETTLEMENT_WAIT).await
@@ -3657,7 +3665,7 @@ async fn submit_paid_operation(
     };
     crate::send::send_to_venue(
         &mut tc.connect_submit().await?,
-        &tc.key_manager,
+        &tc.submit_key_manager,
         domain,
         global_execution,
         bundle,
