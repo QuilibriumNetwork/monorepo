@@ -282,6 +282,35 @@ struct PreparedConfirm {
 }
 
 impl PreparedConfirm {
+    /// The seats whose storage snapshot this confirm registers (a leaf-root
+    /// group of theirs names a leaf), and those left out while theirs is
+    /// requested and not encoded yet (`LeftOutCause::SnapshotPending`). A
+    /// seat renewing without a registration is in neither.
+    fn storage_seats(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut groups = self.roots.iter();
+        let encoded = self
+            .filters
+            .iter()
+            .zip(&self.seat_groups)
+            .filter_map(|(filter, count)| {
+                // Every group of the seat is consumed, to keep the next
+                // seat's aligned.
+                let registers = groups
+                    .by_ref()
+                    .take(*count)
+                    .fold(false, |any, group| any || !group.entries.is_empty());
+                registers.then(|| filter.clone())
+            })
+            .collect();
+        let encoding = self
+            .left_out
+            .iter()
+            .filter(|seat| seat.cause == LeftOutCause::SnapshotPending)
+            .map(|seat| seat.filter.clone())
+            .collect();
+        (encoded, encoding)
+    }
+
     /// Settle the left-out seats' reservations: a seat its worker did not
     /// prepare is released, so the next cycle retries it; a seat over the
     /// decode limits is fenced from `frame` until the epoch ends, as
@@ -1408,6 +1437,11 @@ impl ProverPipeline {
                 .await;
                 match prepared {
                     Ok((Ok(prepared), mut attempt)) => {
+                        // The capacity shed spares seats whose storage for the
+                        // next epoch is encoding or encoded until they renew.
+                        let (encoded, encoding) = prepared.storage_seats();
+                        me.lifecycle
+                            .note_renewal_storage(frame_number, &encoded, &encoding);
                         if !prepared.left_out.is_empty() {
                             prepared.settle_left_out(&mut attempt, me.frame_now(frame_number));
                             me.report_left_out_seats(frame_number, &prepared);
@@ -4248,6 +4282,52 @@ mod tests {
         assert!(!later.roots[0].entries.is_empty());
         assert!(later.left_out.is_empty());
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// A confirm tells the lifecycle which seats' storage it registers and
+    /// which are still encoding; a seat renewing without a registration (an
+    /// empty leaf-root group) or left out for another cause is neither.
+    #[test]
+    fn a_confirm_reports_which_seats_storage_is_encoded_or_encoding() {
+        use quil_execution::global_intrinsic::leaf_root_registration::LeafRootEntry;
+        let encoded = |filter: &[u8]| {
+            let mut roots = roots_of(filter);
+            roots.entries.push(LeafRootEntry {
+                prefix: vec![0],
+                leaf_root: vec![7; 32],
+                num_blocks: 1,
+            });
+            roots
+        };
+        let filters = vec![vec![1], vec![2], vec![3], vec![4], vec![5]];
+        let prepared = super::prepare_confirm(
+            &filters,
+            &[],
+            2,
+            |filter, _| match filter {
+                // No registration (past the grace), then two groups whose
+                // second registers.
+                [1] => Ok(super::Prepared::Roots(vec![roots_of(filter)])),
+                [2] => Ok(super::Prepared::Roots(vec![
+                    roots_of(filter),
+                    encoded(filter),
+                ])),
+                [3] => Err(quil_types::error::QuilError::StorageSnapshotPending(
+                    "leaf snapshot not encoded yet".into(),
+                )),
+                [4] => Ok(super::Prepared::Unanswered(
+                    super::LeftOutCause::Failed,
+                    unanswered(),
+                )),
+                _ => Ok(super::Prepared::Roots(vec![encoded(filter)])),
+            },
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.storage_seats(),
+            (vec![vec![2], vec![5]], vec![vec![3]])
+        );
     }
 
     /// A confirm whose every seat awaits its snapshot submits none and
