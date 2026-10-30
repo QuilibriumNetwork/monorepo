@@ -4956,6 +4956,16 @@ impl GlobalIntrinsic {
             });
             super::handoff::exclusion::seated(state, frame_number, filter, desired)
         };
+        // From the seal successor eligibility frame a sealed membership
+        // source's successor waits for this pass, and takes the same
+        // eligibility a fence's would.
+        super::handoff::schedule::activate_sealed_successors(
+            state,
+            frame_number,
+            &filters,
+            &mut eligible,
+        )?;
+        timing.lap("sealed successors");
         let checkpoint = state.changeset_len();
         if let Err(error) = super::handoff::schedule::fence_stalled_sources(
             state,
