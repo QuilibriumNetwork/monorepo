@@ -12,6 +12,8 @@
 #[cfg(feature = "native-backend")]
 pub static NATIVE_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+pub mod cpu;
+
 #[cfg(feature = "native-backend")]
 pub mod ffi {
     use std::ffi::{c_int, c_void};
@@ -19,6 +21,8 @@ pub mod ffi {
     pub type RejectionDecider =
         unsafe extern "C" fn(u32, i64, i64, *const u8, *const u8, i32, *const u8, i32) -> c_int;
     extern "C" {
+        /// adapter/target_features.c; read through [`crate::cpu`].
+        pub fn quil_lattice_target_x86_features() -> *const std::ffi::c_char;
         pub fn quil_set_private_gaussian_sampler(sampler: Option<GaussianSampler>);
         pub fn quil_set_rejection_decider(decider: Option<RejectionDecider>);
         pub fn quil_fixture_exact_rejection(

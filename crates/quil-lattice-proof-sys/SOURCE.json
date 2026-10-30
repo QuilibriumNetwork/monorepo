@@ -14,6 +14,7 @@
     "adapter/intrinsics.h": "6dc8d7b42dccf07d7fc7820b3f870724e29fa7e92713ffcfe30a954fb722b340",
     "adapter/shim/immintrin.h": "19d0f93d1fcb6de44c7aeaa7f923debc61704f6b94db1e577ff4936744dcbd2b",
     "adapter/shim/x86intrin.h": "44914519e30ba3575995eb4702f8b7e94a870abd5637311e60ad64426d6d4e2f",
+    "adapter/target_features.c": "c32c5ab945cd9fcefc6c85c610328a3c3f7cc0e94b1c521a9c1bd8b7a2b5362e",
     "vendor/labrados/LAZER-LICENSE": "364d467c45559b6dbb83bd317cbb4e971d02eaabf3c1cd390182b2409cf6cee5",
     "vendor/labrados/UPSTREAM-LICENSE": "3660dc2412130f84ec69d00ad01bb86484ed1745184bf5b168ff4a9fa7c513f2",
     "vendor/labrados/aesctr.c": "79f3b337e4935d4a2da98cb46fa85d0adf69cdd887467c76722e0c64e724b261",
@@ -576,6 +577,7 @@
     "adapter/witness_fault.h": "c589a84dcf60047beeb1f5f01d38aa2bc6973dc7432d0ac36ca7ad558dc6fcda"
   },
   "portability_note": "Projection buffer uses C11 _Alignas, equivalent to the 64-byte alignas spelling and accepted by Ubuntu 22.04 clang without stdalign.h.",
+  "cpu_check": "adapter/target_features.c lists the x86 features the C compiler's predefined macros enable (empty for the portable build at baseline x86-64 and on ARM64); src/cpu.rs checks them with is_x86_feature_detected! so binaries refuse to start instead of faulting with SIGILL. No proof code changes.",
   "resource_trace": "Opt-in QUIL_NATIVE_RESOURCE_TRACE=1 stage names and process peak RSS; diagnostics only, proof relations/parameters unchanged.",
   "cached_offsets": "Adapter retains immutable witness-vector prefix offsets once per context; generic frontend wrappers remain available. Regression compares native coefficients, offsets and statement transcript.",
   "coefficient_pool": "Original input statements share exact matching public zero, signed unit monomial and signed all-one coefficient vectors within each context. Pool owns storage until statement destruction; transformed statements retain native deep copies.",

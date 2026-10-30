@@ -128,6 +128,12 @@ fn main() {
 }
 
 fn real_main() -> anyhow::Result<()> {
+    // A native lattice build compiled for CPU features this host lacks dies
+    // with SIGILL in its first proof: refuse every command up front.
+    #[cfg(feature = "native-proof")]
+    if let Some(message) = quil_lattice_ct::native_cpu::unsupported_cpu_message("qclient") {
+        anyhow::bail!(message);
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
