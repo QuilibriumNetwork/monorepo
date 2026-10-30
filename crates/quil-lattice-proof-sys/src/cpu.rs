@@ -83,11 +83,8 @@ x86_features!(
     "tbm",
     "movbe",
     "adx",
-    "rdrand",
-    "rdseed",
     "aes",
     "pclmulqdq",
-    "sha",
     "avx",
     "f16c",
     "fma",
@@ -111,6 +108,12 @@ x86_features!(
     "vaes",
     "vpclmulqdq",
 );
+
+/// Features compilers emit only for explicit intrinsics or inline asm, which
+/// the backend never uses: adapter/target_features.c leaves them out even when
+/// the target has them, so a CPU (or VM) hiding one still runs the build.
+#[cfg(test)]
+const INTRINSIC_ONLY: &[&str] = &["rdrand", "rdseed", "sha"];
 
 /// Off x86-64 the C list is empty, so nothing is ever looked up.
 #[cfg(not(target_arch = "x86_64"))]
@@ -137,15 +140,92 @@ mod tests {
 
     #[test]
     fn every_feature_the_c_list_can_name_is_checked() {
-        let source = include_str!("../adapter/target_features.c");
-        let names: Vec<&str> = source
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix('"')?.strip_suffix(",\""))
-            .collect();
+        let names = c_list_names();
         assert_eq!(names.len(), KNOWN.len(), "{names:?}");
         for name in names {
             assert!(KNOWN.contains(&name), "{name} has no CPU check");
         }
+    }
+
+    /// The names adapter/target_features.c can list: all of them are required
+    /// for a target that defines every macro it tests.
+    fn c_list_names() -> Vec<&'static str> {
+        include_str!("../adapter/target_features.c")
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix('"')?.strip_suffix(",\""))
+            .collect()
+    }
+
+    #[test]
+    fn a_cpu_lacking_only_intrinsic_only_features_runs_the_widest_build() {
+        let required = c_list_names();
+        assert!(required.contains(&"avx512f"), "{required:?}");
+        // A target with every listed feature plus RDRAND, RDSEED and SHA (such
+        // as -march=znver4) on an AVX-512 CPU reporting none of those three.
+        let has = |name: &str| !INTRINSIC_ONLY.contains(&name);
+        assert_eq!(missing(&required, has), Vec::<&str>::new());
+        let has = |name: &str| name != "avx512f";
+        assert_eq!(missing(&required, has), ["avx512f"]);
+    }
+
+    #[test]
+    fn the_c_list_names_no_intrinsic_only_feature() {
+        for name in c_list_names() {
+            assert!(!INTRINSIC_ONLY.contains(&name), "{name} is intrinsic-only");
+        }
+    }
+
+    /// Leaving INTRINSIC_ONLY out of the required list is safe only while no C
+    /// source build.rs compiles or includes uses those instructions.
+    #[test]
+    fn the_backend_uses_no_intrinsic_only_instruction() {
+        const NEEDLES: &[&str] = &[
+            "rdrand",
+            "rdrnd",
+            "rdseed",
+            "_mm_sha1",
+            "_mm_sha256",
+            "ia32_sha1",
+            "ia32_sha256",
+            "sha1rnds",
+            "sha1nexte",
+            "sha1msg",
+            "sha256rnds",
+            "sha256msg",
+        ];
+        fn scan(dir: &std::path::Path, files: &mut usize, hits: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    scan(&path, files, hits);
+                    continue;
+                }
+                let source = matches!(
+                    path.extension().and_then(|ext| ext.to_str()),
+                    Some("c" | "h" | "S" | "s" | "inc")
+                );
+                if !source || path.ends_with("adapter/target_features.c") {
+                    continue;
+                }
+                *files += 1;
+                let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).to_lowercase();
+                for needle in NEEDLES {
+                    if text.contains(needle) {
+                        hits.push(format!("{}: {needle}", path.display()));
+                    }
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (mut files, mut hits) = (0, Vec::new());
+        for dir in ["adapter", "vendor"] {
+            scan(&root.join(dir), &mut files, &mut hits);
+        }
+        assert!(files > 100, "scanned only {files} files");
+        assert!(
+            hits.is_empty(),
+            "intrinsic-only instructions in the backend: {hits:?}"
+        );
     }
 
     #[cfg(target_arch = "x86_64")]

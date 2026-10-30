@@ -2,7 +2,12 @@
  * emit for this crate, from its target (CFLAGS such as -march; build.rs:
  * QUIL_LATTICE_X86_NATIVE), as comma-terminated is_x86_feature_detected!
  * names. src/cpu.rs checks them against the running CPU and must know every
- * name listed here. Empty on other architectures. */
+ * name listed here. Empty on other architectures.
+ *
+ * RDRAND, RDSEED and SHA are left out: compilers emit their instructions
+ * only for explicit intrinsics or inline asm, and this backend has none
+ * (src/cpu.rs scans adapter/ and vendor/ to keep it so). Requiring them
+ * refused AVX-512 hosts that run the build but report no RDSEED. */
 const char *quil_lattice_target_x86_features(void) {
   return ""
 #if defined(__x86_64__)
@@ -42,20 +47,11 @@ const char *quil_lattice_target_x86_features(void) {
 #ifdef __ADX__
          "adx,"
 #endif
-#ifdef __RDRND__
-         "rdrand,"
-#endif
-#ifdef __RDSEED__
-         "rdseed,"
-#endif
 #ifdef __AES__
          "aes,"
 #endif
 #ifdef __PCLMUL__
          "pclmulqdq,"
-#endif
-#ifdef __SHA__
-         "sha,"
 #endif
 #ifdef __AVX__
          "avx,"

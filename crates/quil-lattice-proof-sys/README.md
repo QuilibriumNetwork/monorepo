@@ -25,7 +25,8 @@ unless the target has AVX-512 F/BW/DQ/VL. `docker/Dockerfile.source` sets `1` (i
 amd64 binaries stay baseline x86-64); `docker/Dockerfile.sourceavx512` sets `avx512`
 with `-march=skylake-avx512`. Local builds without the variable keep SIMDe's
 portable path, the reference the native builds must cross-verify against.
-`adapter/target_features.c` records the x86 features the C compiler targeted;
+`adapter/target_features.c` records the x86 features the C compiler targeted
+(less RDRAND, RDSEED and SHA, emitted only by intrinsics the backend never uses);
 quil-node, qclient and the amount-proof worker refuse to start on a CPU that
 lacks any of them (`cpu::required_cpu_features_missing`) rather than die with
 SIGILL mid-proof.
