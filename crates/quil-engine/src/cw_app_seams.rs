@@ -949,7 +949,8 @@ impl AppSeamProposer {
         let prior_state_id: Vec<u8> = digest_to_identity(&parent_digest).to_vec();
         let Some(prior_frame_number) = self.block_meta.lock().unwrap().get(&parent_digest).copied()
         else {
-            tracing::warn!(
+            // Counted by reason in the worker's refusal summary.
+            tracing::debug!(
                 view,
                 "cw app propose: parent block metadata unknown — skipping turn"
             );
@@ -1071,17 +1072,25 @@ impl AppSeamProposer {
         if !self.data_ready.load(std::sync::atomic::Ordering::Acquire)
             || requests_root_check.is_none()
         {
-            tracing::warn!("cw app verify: state or validation dependencies unavailable");
+            // Counted by reason in the worker's refusal summary.
+            tracing::debug!(
+                view,
+                "cw app verify: state or validation dependencies unavailable"
+            );
             self.note(Step::Verify, view, self.unready_reason(), String::new());
             return false;
         }
         let Some(bytes) = bytes else {
-            tracing::warn!("cw app verify: block not delivered (nullify)");
+            // Counted by reason in the worker's refusal summary.
+            tracing::debug!(view, "cw app verify: block not delivered (nullify)");
             self.note(Step::Verify, view, "block not delivered", String::new());
             return false;
         };
         let Some(frame) = decode_app_frame(&bytes) else {
-            tracing::warn!("cw app verify: undecodable block (nullify)");
+            tracing::warn!(view, filter = %hex::encode(&self.filter), bytes = bytes.len(),
+                leader = %leader.map(hex::encode).unwrap_or_default(), action = "no action needed for a one-off refusal; if the same leader repeats it, report this \
+                          line with its shard and frame to the maintainer",
+                "refused to vote for a shard proposal: its block does not decode");
             self.note(
                 Step::Verify,
                 view,
@@ -1101,7 +1110,12 @@ impl AppSeamProposer {
             tracing::warn!(
                 view,
                 rank = header.rank,
-                "cw app verify: shard, view or parent mismatch"
+                frame = header.frame_number,
+                filter = %hex::encode(&self.filter),
+                leader = %leader.map(hex::encode).unwrap_or_default(),
+                action = "no action needed for a one-off refusal; if the same leader repeats it, report this \
+                          line with its shard and frame to the maintainer",
+                "refused to vote for a shard proposal: it names another shard, view or parent"
             );
             self.note(
                 Step::Verify,
@@ -1129,7 +1143,9 @@ impl AppSeamProposer {
             leader.filter(|leader| hash_storage && header.prover.as_slice() != leader)
         {
             tracing::warn!(view, frame = header.frame_number, prover = %hex::encode(&header.prover),
-                leader = %hex::encode(leader), "cw app verify: the frame names another proposer than the view's leader");
+                leader = %hex::encode(leader), filter = %hex::encode(&self.filter), action = "no action needed for a one-off refusal; if the same leader repeats it, report this \
+                          line with its shard and frame to the maintainer",
+                "refused to vote for a shard proposal: it names another proposer than the view's leader");
             self.note(
                 Step::Verify,
                 view,
@@ -1143,7 +1159,11 @@ impl AppSeamProposer {
                 view,
                 frame = header.frame_number,
                 latest_global = latest,
-                "cw app verify: the frame names no GLOBAL anchor, which GLOBAL requires now"
+                filter = %hex::encode(&self.filter),
+                leader = %leader.map(hex::encode).unwrap_or_default(),
+                action = "no action needed for a one-off refusal; if the same leader repeats it, report this \
+                          line with its shard and frame to the maintainer",
+                "refused to vote for a shard proposal: it names no GLOBAL anchor, which GLOBAL requires now"
             );
             self.note(
                 Step::Verify,
@@ -1158,8 +1178,13 @@ impl AppSeamProposer {
         }
         if app_frame_digest(&frame) != Some(digest) {
             tracing::warn!(
+                view,
                 frame = header.frame_number,
-                "cw app verify: digest mismatch"
+                filter = %hex::encode(&self.filter),
+                leader = %leader.map(hex::encode).unwrap_or_default(),
+                action = "no action needed for a one-off refusal; if the same leader repeats it, report this \
+                          line with its shard and frame to the maintainer",
+                "refused to vote for a shard proposal: its block does not match the proposed digest"
             );
             self.note(
                 Step::Verify,
@@ -1183,11 +1208,20 @@ impl AppSeamProposer {
                 match requests_root_check {
                     Some(check) => {
                         if let Err((reason, detail)) = check(&frame) {
-                            tracing::warn!(
-                                frame = header.frame_number, reason, %detail,
-                                "cw app verify: requests_root/state-root check failed \
-                                 (body/pre-state does not match declared roots) — nullify",
-                            );
+                            if reason == "not at the parent frame" {
+                                // This worker's lag, counted by reason in its
+                                // refusal summary.
+                                tracing::debug!(view, frame = header.frame_number, reason, %detail,
+                                    "cw app verify: not at the parent frame — nullify");
+                            } else {
+                                tracing::warn!(view, frame = header.frame_number, reason, %detail,
+                                    filter = %hex::encode(&self.filter),
+                                    leader = %leader.map(hex::encode).unwrap_or_default(),
+                                    action = "no action needed for a one-off refusal; if the same leader repeats it, report this \
+                          line with its shard and frame to the maintainer",
+                                    "refused to vote for a shard proposal: its contents do not match \
+                                     its declared roots");
+                            }
                             self.note(Step::Verify, view, reason, detail);
                             return false;
                         }
@@ -1212,15 +1246,28 @@ impl AppSeamProposer {
                 true
             }
             other => {
-                tracing::warn!(frame = header.frame_number, result = ?other, "cw app verify: validate failed");
                 let detail = match &other {
                     Err(error) => error.to_string(),
                     _ => "invalid".to_string(),
                 };
+                let reason = validation_reason(&detail);
+                if reason == "anchored GLOBAL frame missing" {
+                    // This worker's lag, counted by reason in its refusal
+                    // summary.
+                    tracing::debug!(view, frame = header.frame_number, reason, %detail,
+                        "cw app verify: validate failed");
+                } else {
+                    tracing::warn!(view, frame = header.frame_number, reason, %detail,
+                        filter = %hex::encode(&self.filter),
+                        leader = %leader.map(hex::encode).unwrap_or_default(),
+                        action = "no action needed for a one-off refusal; if the same leader repeats it, report this \
+                          line with its shard and frame to the maintainer",
+                        "refused to vote for a shard proposal: frame validation failed");
+                }
                 self.note(
                     Step::Verify,
                     view,
-                    validation_reason(&detail),
+                    reason,
                     format!("frame {}: {detail}", header.frame_number),
                 );
                 false

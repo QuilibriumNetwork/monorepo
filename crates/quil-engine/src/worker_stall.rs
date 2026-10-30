@@ -283,8 +283,8 @@ pub fn watch(core_id: u32, probe: &Arc<ThreadProbe>) {
 }
 
 const BLOCKED_ACTION: &str =
-    "a defect in this node's worker thread: votes and other work on it wait while it lasts; \
-    report this line with its 'worker thread unblocked' line";
+    "a defect in this node's worker thread (blocked over 6 s): votes and other work on it wait \
+    while it lasts; report this line and its 'worker thread unblocked' line to the maintainer";
 
 fn log(report: &StallReport) {
     let route = LOG_ROUTE.get();
@@ -324,8 +324,8 @@ fn log(report: &StallReport) {
                 engine_step = label(place.step), step_secs = secs(place.step, *at_ms),
                 section = label(place.section), section_secs = secs(place.section, *at_ms),
                 within = label(place.outer), within_secs = secs(place.outer, *at_ms),
-                scope = "this node's worker thread", action = BLOCKED_ACTION,
-                "{message}: {} has not returned for {}s", place.describe(), blocked.as_secs());
+                place = %place.describe(), scope = "this node's worker thread",
+                action = BLOCKED_ACTION, "{message}");
         }
         StallReport::Ended {
             core_id,
