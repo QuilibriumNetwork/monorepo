@@ -23,6 +23,9 @@ quil-consensus = { path = "../quil-consensus" }
 quil-cw-consensus = { path = "../quil-cw-consensus" }
 # Shard sizing reads the coin accumulator (`shard_info::committed_deliveries`).
 quil-execution = { path = "../quil-execution", features = ["confidential-tokens"] }
+# Storage jobs run on the process's CPUs, not a pinned worker's
+# (`worker_process::use_process_cpus`).
+quil-lattice-ct = { path = "../quil-lattice-ct", features = ["confidential-tokens"] }
 tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
 tokio-util = "0.7"
 tracing = "0.1"

@@ -112,6 +112,26 @@ pub fn remember_process_cpus() {
     cpus::process();
 }
 
+/// Let the calling thread run on this process's CPU set
+/// ([`remember_process_cpus`]) rather than the narrower one it inherited: a
+/// thread starts on its spawning thread's set, and the node pins each data
+/// worker thread to one core. True once it runs on the process's set, or
+/// where threads are not pinned; false when the set is unknown or the
+/// kernel refuses it.
+pub fn use_process_cpus() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        match (cpus::process(), cpus::current()) {
+            (Some(process), Some(thread)) => {
+                cpus::equal(&process, &thread) || cpus::set_current(&process)
+            }
+            _ => false,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    true
+}
+
 #[cfg(target_os = "linux")]
 mod cpus {
     use std::sync::{

@@ -6384,6 +6384,7 @@ dependencies = [
  "quil-forest-migrate",
  "quil-hypergraph",
  "quil-keys",
+ "quil-lattice-ct",
  "quil-p2p",
  "quil-store",
  "quil-tries",
