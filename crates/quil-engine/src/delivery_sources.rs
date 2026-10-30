@@ -54,14 +54,56 @@ type Source = (Vec<u8>, u64);
 /// deliveries that this node does not hold, in delivery order. It blocks, so
 /// a sweep runs it on a blocking thread; it does not log, since a worker's
 /// log lines are routed by the thread that writes them.
-pub(crate) type Collect = Box<dyn FnOnce() -> Result<Vec<Source>, String> + Send>;
+pub(crate) type Collect = Box<dyn FnOnce() -> Result<Sources, String> + Send>;
+
+/// What a [`Collect`] read.
+#[derive(Debug, Default)]
+pub(crate) struct Sources {
+    /// The source frames this node lacks, in delivery order.
+    pub(crate) missing: Vec<Source>,
+    /// The shard's pending deliveries read.
+    pub(crate) pending: usize,
+    /// The shard's owned blocks read.
+    pub(crate) blocks: usize,
+}
+
+#[cfg(test)]
+impl From<Vec<Source>> for Sources {
+    fn from(missing: Vec<Source>) -> Self {
+        Self {
+            missing,
+            ..Self::default()
+        }
+    }
+}
 
 /// What one sweep's read found, sent back to the select loop.
 struct Collected {
     /// The missing source frames, or why they could not be read.
     missing: Result<Vec<Source>, String>,
-    /// How long the read took.
-    read: Duration,
+    read: Read,
+}
+
+/// How long one read took, and what for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Read {
+    /// From the sweep's start to the end of the read.
+    total: Duration,
+    /// Waiting for a blocking thread to run it.
+    queued: Duration,
+    /// Waiting for a store commit lock (the worker's or the GLOBAL view's
+    /// the read also reads) while another local task
+    /// (a commit, a sync, retention pruning) held it.
+    lock_wait: Duration,
+    pending: usize,
+    blocks: usize,
+}
+
+impl Read {
+    /// Whether the read mostly waited for the store's commit lock.
+    fn lock_bound(&self) -> bool {
+        self.lock_wait * 2 >= self.total
+    }
 }
 
 /// A source frame whose fetch failed.
@@ -132,7 +174,7 @@ impl DeliverySources {
     ) {
         let now = Instant::now();
         while let Ok(collected) = self.collected_rx.try_recv() {
-            observe_read(&mut self.slow_reads, filter, collected.read, now);
+            observe_read(&mut self.slow_reads, filter, &collected.read, now);
             match collected.missing {
                 Ok(missing) => self.missing = Some(missing),
                 Err(error) => {
@@ -202,21 +244,45 @@ fn report(
 }
 
 /// Log the start, bounded repeats and end of slow reads of the shard
-/// `filter`'s pending deliveries; `read` is how long the latest one took.
-fn observe_read(slow_reads: &mut Outage, filter: &[u8], read: Duration, now: Instant) {
-    let read_secs = read.as_secs();
-    match slow_reads.observe(now.into_std(), read < SLOW_READ) {
-        Some(OutageEvent::Began) => warn!(
-            filter = %hex::encode(filter), read_secs, scope = "local", action = "report",
+/// `filter`'s pending deliveries; `read` is the latest one. A read that
+/// mostly waited for a store commit lock names that, since
+/// another local task held it; one that did not is the store's.
+fn observe_read(slow_reads: &mut Outage, filter: &[u8], read: &Read, now: Instant) {
+    let read_secs = read.total.as_secs();
+    let lock_wait_ms = read.lock_wait.as_millis() as u64;
+    let queued_ms = read.queued.as_millis() as u64;
+    let (pending, blocks_scanned) = (read.pending, read.blocks);
+    let (waited_on, action) = if read.lock_bound() {
+        ("commit_lock", "check")
+    } else {
+        ("store", "report")
+    };
+    match (
+        slow_reads.observe(now.into_std(), read.total < SLOW_READ),
+        read.lock_bound(),
+    ) {
+        (Some(OutageEvent::Began), true) => warn!(
+            filter = %hex::encode(filter), read_secs, lock_wait_ms, queued_ms, pending, blocks_scanned,
+            waited_on, scope = "local", action,
+            "reading this shard's pending deliveries is slow: it waited for a store commit lock (this worker's \
+             or the GLOBAL view's), which another local task held (a commit, a sync or retention pruning); the \
+             engine goes on, but \
+             fetching their source frames waits for the read; if it persists, check this node's logs for \
+             a retained-version pruning lock-hold warning at the same time"),
+        (Some(OutageEvent::Began), false) => warn!(
+            filter = %hex::encode(filter), read_secs, lock_wait_ms, queued_ms, pending, blocks_scanned,
+            waited_on, scope = "local", action,
             "reading this shard's pending deliveries from the store is slow; the engine goes on, but \
              fetching their source frames waits for the read; report this line if it persists"),
-        Some(OutageEvent::Continues { secs, failures }) => warn!(
-            filter = %hex::encode(filter), read_secs, secs, slow_reads = failures, scope = "local",
-            action = "report", "reading this shard's pending deliveries from the store is still slow"),
-        Some(OutageEvent::Ended { secs, failures }) => info!(
-            filter = %hex::encode(filter), read_ms = read.as_millis() as u64, secs, slow_reads = failures,
+        (Some(OutageEvent::Continues { secs, failures }), _) => warn!(
+            filter = %hex::encode(filter), read_secs, lock_wait_ms, queued_ms, pending, blocks_scanned, secs,
+            slow_reads = failures, waited_on, scope = "local", action,
+            "reading this shard's pending deliveries is still slow"),
+        (Some(OutageEvent::Ended { secs, failures }), _) => info!(
+            filter = %hex::encode(filter), read_ms = read.total.as_millis() as u64, lock_wait_ms, pending,
+            blocks_scanned, secs, slow_reads = failures,
             "reading this shard's pending deliveries from the store is fast again"),
-        None => {}
+        (None, _) => {}
     }
 }
 
@@ -230,10 +296,34 @@ async fn run_sweep(
     collected: mpsc::UnboundedSender<Collected>,
 ) {
     let started = Instant::now();
-    let missing = tokio::task::spawn_blocking(collect)
-        .await
-        .unwrap_or_else(|error| Err(format!("the read did not finish: {error}")));
-    let read = started.elapsed();
+    let (sources, began, lock_wait) = tokio::task::spawn_blocking(move || {
+        let began = std::time::Instant::now();
+        let waited = quil_hypergraph::commit_lock_wait_on_this_thread();
+        let sources = collect();
+        let lock_wait = quil_hypergraph::commit_lock_wait_on_this_thread().saturating_sub(waited);
+        (sources, Some(began), lock_wait)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        (
+            Err(format!("the read did not finish: {error}")),
+            None,
+            Duration::ZERO,
+        )
+    });
+    let (pending, blocks) = sources
+        .as_ref()
+        .map_or((0, 0), |sources| (sources.pending, sources.blocks));
+    let read = Read {
+        total: started.elapsed(),
+        queued: began.map_or(Duration::ZERO, |began| {
+            began.saturating_duration_since(started.into_std())
+        }),
+        lock_wait,
+        pending,
+        blocks,
+    };
+    let missing = sources.map(|sources| sources.missing);
     let due: Vec<Source> = match &missing {
         Ok(missing) => {
             let now = Instant::now();
@@ -451,7 +541,7 @@ mod tests {
         let missing = missing.to_vec();
         sources.sweep(
             &FILTER,
-            Box::new(move || Ok(missing)),
+            Box::new(move || Ok(Sources::from(missing))),
             fetch.clone(),
             clock.clone(),
         );
@@ -476,7 +566,7 @@ mod tests {
                 reading.store(true, Ordering::SeqCst);
                 let _ = gate.recv_timeout(Duration::from_secs(5));
                 reading.store(false, Ordering::SeqCst);
-                Ok(vec![(SOURCE.to_vec(), 7)])
+                Ok(Sources::from(vec![(SOURCE.to_vec(), 7)]))
             })
         };
         // Another message for the loop, sent once the read has begun.
@@ -612,6 +702,13 @@ mod tests {
         assert_eq!(logs.lines_with("no longer wait").len(), 1);
     }
 
+    fn took(total: Duration) -> Read {
+        Read {
+            total,
+            ..Read::default()
+        }
+    }
+
     /// A slow read of the pending deliveries is reported once, with its
     /// duration, and the end of the slow reads is logged.
     #[test]
@@ -620,22 +717,29 @@ mod tests {
         let _logging = logs.install();
         let mut slow_reads = Outage::default();
         let start = Instant::now();
-        observe_read(&mut slow_reads, &FILTER, Duration::from_millis(30), start);
         observe_read(
             &mut slow_reads,
             &FILTER,
-            Duration::from_secs(41),
+            &took(Duration::from_millis(30)),
+            start,
+        );
+        observe_read(
+            &mut slow_reads,
+            &FILTER,
+            &took(Duration::from_secs(41)),
             start + TICK,
         );
         observe_read(
             &mut slow_reads,
             &FILTER,
-            Duration::from_secs(38),
+            &took(Duration::from_secs(38)),
             start + 2 * TICK,
         );
         let slow = logs.lines_with("is slow");
         assert_eq!(slow.len(), 1, "{slow:?}");
         assert!(slow[0].contains("read_secs=41"), "{}", slow[0]);
+        assert!(slow[0].contains("waited_on=\"store\""), "{}", slow[0]);
+        assert!(slow[0].contains("report this line"), "{}", slow[0]);
         assert!(
             slow[0].contains(&format!("filter={}", hex::encode(FILTER))),
             "{}",
@@ -645,9 +749,46 @@ mod tests {
         observe_read(
             &mut slow_reads,
             &FILTER,
-            Duration::from_millis(40),
+            &took(Duration::from_millis(40)),
             start + 3 * TICK,
         );
         assert_eq!(logs.lines_with("fast again").len(), 1);
+    }
+
+    /// A slow read that mostly waited for the store's commit lock says so,
+    /// with the wait and the read's scale, and asks for no report: another
+    /// local task held the lock.
+    #[test]
+    fn a_slow_read_waiting_on_the_commit_lock_names_the_lock() {
+        let logs = CapturedLogs::default();
+        let _logging = logs.install();
+        let mut slow_reads = Outage::default();
+        let start = Instant::now();
+        let read = Read {
+            total: Duration::from_secs(12),
+            queued: Duration::from_millis(3),
+            lock_wait: Duration::from_millis(11_400),
+            pending: 17,
+            blocks: 64,
+        };
+        observe_read(&mut slow_reads, &FILTER, &read, start);
+        let slow = logs.lines_with("is slow");
+        assert_eq!(slow.len(), 1, "{slow:?}");
+        for field in [
+            "lock_wait_ms=11400",
+            "queued_ms=3",
+            "pending=17",
+            "blocks_scanned=64",
+            "waited_on=\"commit_lock\"",
+            "commit lock",
+        ] {
+            assert!(slow[0].contains(field), "{field}: {}", slow[0]);
+        }
+        assert!(!slow[0].contains("report this line"), "{}", slow[0]);
+        assert!(slow[0].contains("action=\"check\""), "{}", slow[0]);
+        observe_read(&mut slow_reads, &FILTER, &read, start + 61 * TICK);
+        let still = logs.lines_with("still slow");
+        assert_eq!(still.len(), 1, "{still:?}");
+        assert!(still[0].contains("action=\"check\""), "{}", still[0]);
     }
 }

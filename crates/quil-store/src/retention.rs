@@ -28,6 +28,8 @@ use std::collections::HashMap;
 pub(crate) type TreeKey = (u8, u8, Vec<u8>);
 /// One index entry: `(index key, version, frame)`.
 pub(crate) type IndexEntry = (Vec<u8>, u64, u64);
+/// Index entries grouped by tree.
+pub(crate) type IndexedTrees = HashMap<TreeKey, Vec<IndexEntry>>;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct PrunePlan {

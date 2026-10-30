@@ -8,12 +8,13 @@ pub mod testing;
 
 pub use addressing::{shard_key_for_location, Location};
 pub use crdt::{
-    ExecutionCapture, ExecutionFork, ExecutionForkLimits, ExecutionMetadataUsage,
-    ForestConfinement, ForestWriteGuard, HypergraphCrdt, LineageRecord, Mutation,
-    PreparedCrdtAdoption, ShardMetadata,
+    commit_lock_wait_on_this_thread, ExecutionCapture, ExecutionFork, ExecutionForkLimits,
+    ExecutionMetadataUsage, ForestConfinement, ForestWriteGuard, HypergraphCrdt, LineageRecord,
+    Mutation, PreparedCrdtAdoption, ShardMetadata,
 };
 pub use retention::{
-    snapshot_pin_limit_from_env, spawn_retention_pruner, RetentionPass, RetentionPolicy,
+    snapshot_pin_limit_from_env, spawn_retention_pruner, RetentionPacing, RetentionPass,
+    RetentionPolicy, RetentionStep,
 };
 pub use snapshot::{
     GenerationHandle, SnapshotManager, MAX_GENERATIONS as SNAPSHOT_MAX_GENERATIONS,
