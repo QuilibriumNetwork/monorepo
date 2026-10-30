@@ -68,6 +68,8 @@ pub fn commit_and_place(
                 "global commit: placement names another output".into(),
             ));
         }
+        // A globally executed application is never split: its store holds
+        // every block.
         delivery::place_committed(
             state,
             frame,
@@ -77,6 +79,7 @@ pub fn commit_and_place(
             tree,
             placement.block,
             placement.seq,
+            &[],
             limits,
         )?;
         placed.push(address);

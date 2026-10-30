@@ -1076,6 +1076,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                         self.clock_store.as_ref(),
                         _address,
                         inner_bytes,
+                        self.shard_store(),
                     );
                 }
                 if crate::token_intrinsic::dispatch::is_confidential_type(inner_tp) {
@@ -1857,6 +1858,16 @@ impl TokenExecutionEngine {
     /// The venue this engine executes in.
     pub fn mode(&self) -> ExecutionMode {
         self.mode
+    }
+
+    /// Whether this engine's store holds only the shard whose frames it
+    /// executes: a worker's own store. Workers configure the application
+    /// venue (`with_application_venue`); a manager built without the global
+    /// engine starts there too. A manager in the global venue (the master's:
+    /// GLOBAL, and an archive replaying every shard into one store) holds the
+    /// whole application, whatever venue a frame's context names.
+    pub fn shard_store(&self) -> bool {
+        self.mode == ExecutionMode::Application
     }
 
     /// Read canonical global frames (reward mint and mint-claim citations)

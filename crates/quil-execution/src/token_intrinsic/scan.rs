@@ -1467,6 +1467,7 @@ mod tests {
                 tree,
                 block,
                 seq,
+                &[],
                 limits,
             )
             .map(|()| address)
