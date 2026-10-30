@@ -7,7 +7,7 @@
   "statement_patch_sha256": "66b68bd5352ce77fc0b3fe2f062d9c833636b436de5e575c94be3fac4bc70648",
   "sha256": {
     "LICENSE-APACHE": "d4191ec728cab3b8f5371a8e42089b5f32942e37d1581cf6131e56a7fe576891",
-    "adapter/fixture_bridge.c": "14b32d16422065cbb829b655855db24406c29677a8139a25c2e6481c0e5df1d7",
+    "adapter/fixture_bridge.c": "1e06e8444ff7d512fbb991a334ea28c5084d23dfcdd76b6e391f1a3809b522d7",
     "adapter/fixture_proof_decode.h": "ba29799334fe1727cde5b954112b3a0ebbd1ebc43006284e987eed85db676a94",
     "adapter/fixture_proof_dump.h": "bbc02c34c56b6d15d6bdc324ad421961dc0e3506d2343fb5994ef34374c3f3e3",
     "adapter/fixture_proof_encode.h": "50db1b5f1f5b31ce6889108ab698fb8cbab42e42db99dea1be461105a7b14e28",
@@ -44,14 +44,14 @@
     "vendor/labrados/labrador_tail.h": "9da49afdb95badd53a67af388bf907de65b5bdee73a580c6820f2be1006c7ac2",
     "vendor/labrados/labrados_python.c": "a4197d8b99388fe257c302942a55bb8293d49d8feb2892b43f7c5ec76ac9ade3",
     "vendor/labrados/labrados_python.h": "671938cbdca16deac8f5e561bb5f46ba08de2de85b2700febd5b456483b73e26",
-    "vendor/labrados/lnp.c": "16672d7119458a10a4ad5988533f16c01b82cc170e37a1e0a2011a849b737410",
-    "vendor/labrados/lnp.h": "2af6c5b1948a60b01c50e08f0759c1aca558940800645051b9a1f2ff569ba42f",
+    "vendor/labrados/lnp.c": "c4c78eb8db74df77aac629e934363ef182ab9bfae03e478b3eeb0c428ba57767",
+    "vendor/labrados/lnp.h": "f0831efb10e5f12d2955a3c46ea8aec540ac8ded91bfd30fc7cd57dd87646954",
     "vendor/labrados/malloc.h": "cecf5395ad4e81e1639b9274281858f1025e27bd04844cb5ebfb7accfbd06636",
     "vendor/labrados/ntt.c": "10e9924699b506ef91f5d9950ade514a8514ab798e846de0fb6c7e684bf72494",
     "vendor/labrados/orthus.h": "931c8918a3b956a39aa3b5f34e77d6aaf2f08cd58549d44542a5f040f0666143",
     "vendor/labrados/orthus_pack.h": "146be7f9aac503dcc8815a766d380ae2e5c1bb680878b59b1356fad04a5c4491",
-    "vendor/labrados/pack.c": "b5e4d6c4cf9ae7e66d0648affa1256ed45f0abc18a01c5d0c604b013d94c8070",
-    "vendor/labrados/pack.h": "23cc29f96ea9fa26ae3523ec5f3d59b294ed6f52b49c1208214443e883ee2331",
+    "vendor/labrados/pack.c": "88bb96bf3e207b59deb0a272d5bbef752ddef9591baefe43b08be36704cfa5b0",
+    "vendor/labrados/pack.h": "b31b9945bd6fd3512b416280c36f38a24ce583e22f9db5340c0487a4f3505438",
     "vendor/labrados/polx.c": "51fb777dbe9888d1d6d23ffa23c18a272d744c27422ce96ba949f45e2d205d45",
     "vendor/labrados/polx.h": "3c4a6eeacf9e90d0a1daed55c25249f6d87b4faff025fc9dfae186aff5b7021e",
     "vendor/labrados/poly.c": "bab20fbc01d937e6a423df9919b1df0521fbd95f72aa6eca527b76e563632e4b",
@@ -572,7 +572,8 @@
     "tools/proof_codec.py": "ee6b65efc781ed32d21dd14beb0ffebe164beb775ca3145ff555826d7f50888c",
     "tools/public_encoding_check.c": "e544b484f44082907310f7afedfd61f44d45391889e75dbd4401b26d77d0e41d",
     "tools/summarize_native_trace.py": "151c9e3bdd0c0b9de0fa910a0f4c1bc67194df41a152750d830c35b7914cc9e1",
-    "tools/test_proof_codec.py": "730c192c3299bb8767af5181ce3b4631e817456d43ce538cb4e700432dc7acf4"
+    "tools/test_proof_codec.py": "730c192c3299bb8767af5181ce3b4631e817456d43ce538cb4e700432dc7acf4",
+    "adapter/witness_fault.h": "c589a84dcf60047beeb1f5f01d38aa2bc6973dc7432d0ac36ca7ad558dc6fcda"
   },
   "portability_note": "Projection buffer uses C11 _Alignas, equivalent to the 64-byte alignas spelling and accepted by Ubuntu 22.04 clang without stdalign.h.",
   "resource_trace": "Opt-in QUIL_NATIVE_RESOURCE_TRACE=1 stage names and process peak RSS; diagnostics only, proof relations/parameters unchanged.",
@@ -580,5 +581,6 @@
   "coefficient_pool": "Original input statements share exact matching public zero, signed unit monomial and signed all-one coefficient vectors within each context. Pool owns storage until statement destruction; transformed statements retain native deep copies.",
   "diagnostic_policy": "No unconditional mask-rejection retry logging. DEBUG dumps, NDEBUG assertion removal, and disabled native randomness/masking/rejection configurations are rejected; optional coarse resource tracing remains available.",
   "private_prg": "LNP uses a fresh 32-byte private seed and AES-256 streams for Gaussian masks, uniform masks, uniform bytes and rejection draws. Shared sampler kernels preserve public AES-128 interfaces. Does not revise public transcript/challenge security parameters.",
-  "x86_native": "QUIL_LATTICE_X86_NATIVE (build.rs): unset or 0 keeps SIMDE_NO_NATIVE on x86-64; 1 compiles natively for the C target (CFLAGS), the shim forwarding to the system immintrin.h and each scalar adapter applying only when the target lacks its feature (AVX512F/BW/DQ, VAES, AES), under quil_-prefixed names; avx512 also fails the build without AVX-512 F/BW/DQ/VL. docker/Dockerfile.source sets 1 (baseline x86-64, SSE2), docker/Dockerfile.sourceavx512 sets avx512. ARM64 assembly is unchanged."
+  "x86_native": "QUIL_LATTICE_X86_NATIVE (build.rs): unset or 0 keeps SIMDE_NO_NATIVE on x86-64; 1 compiles natively for the C target (CFLAGS), the shim forwarding to the system immintrin.h and each scalar adapter applying only when the target lacks its feature (AVX512F/BW/DQ, VAES, AES), under quil_-prefixed names; avx512 also fails the build without AVX-512 F/BW/DQ/VL. docker/Dockerfile.source sets 1 (baseline x86-64, SSE2), docker/Dockerfile.sourceavx512 sets avx512. ARM64 assembly is unchanged.",
+  "witness_retry": "LNP returns status 2 instead of asserting when its input witness fails verify() (Labradoodle's amortized witness has no rejection bound); pack_prove passes the status through and the adapter retries with fresh randomness up to 8 times, logging each failed attempt, then returns 8. witness_fault.h is a test-only fault counter. Proof relations and parameters unchanged."
 }

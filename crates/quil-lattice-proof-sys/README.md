@@ -29,7 +29,10 @@ portable path, the reference the native builds must cross-verify against.
 The raw ABI is unsafe and uses process-global key state. Callers must serialize
 all native contexts using `NATIVE_STATE` for their entire lifetime, including
 cleanup. The opt-in `native-proof` adapter in `quil-lattice-ct`
-holds this lock and frees contexts on submission errors. Native allocation/assertion failures can abort, private
+holds this lock and frees contexts on submission errors. LNP's input-witness
+check (Labradoodle's amortized witness has no rejection bound) fails on some
+attempts (about 1 in 10 for a small test relation); the adapter retries with fresh randomness up to 8 times,
+logs each failed attempt to stderr and returns status 8 if all fail. Native allocation/assertion failures can abort, private
 buffers do not yet have complete erasure guarantees, reference logging remains,
 and symbol isolation, sampling/timing/security bounds and production resource
 limits require further work. This is not a production-approved verifier.

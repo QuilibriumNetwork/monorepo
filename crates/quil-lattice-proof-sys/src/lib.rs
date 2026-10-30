@@ -67,6 +67,16 @@ pub mod ffi {
             capacity: usize,
             written: *mut usize,
         ) -> c_int;
+        /// Prove with the next `faults` LNP input-witness checks failing;
+        /// `left` receives the unconsumed count. Diagnostic only.
+        pub fn quil_fixture_test_witness_faults(
+            ctx: *mut c_void,
+            faults: u32,
+            left: *mut u32,
+            bytes: *mut u8,
+            capacity: usize,
+            written: *mut usize,
+        ) -> c_int;
         pub fn quil_fixture_test_gaussian_limits() -> c_int;
         pub fn quil_fixture_test_partial_proof_cleanup() -> c_int;
         pub fn quil_fixture_test_coefficient_pool() -> c_int;
@@ -132,6 +142,8 @@ pub mod ffi {
         pub fn quil_fixture_check(ctx: *mut c_void) -> c_int;
         pub fn quil_fixture_check_count(ctx: *mut c_void) -> usize;
         pub fn quil_fixture_drop_witness(ctx: *mut c_void);
+        /// 0 on success. 8: all 8 attempts failed LNP's input-witness check
+        /// (one stderr line each); a new call may succeed. 7: other failure.
         pub fn quil_fixture_prove_encoded(
             ctx: *mut c_void,
             bytes: *mut u8,
