@@ -11,7 +11,11 @@
 //! available to the node ([`MEMORY_SHARE_PERCENT`]) and a core is free of
 //! them. A node with the memory encodes every seat at once; one without
 //! encodes as many as fit, then the next as each finishes. A job alone runs
-//! whatever its size.
+//! whatever its size. One that does not fit lets later ones that do pass it,
+//! a bounded number of times ([`PASS_LIMIT`], [`PASS_WINDOW`]): a large leaf
+//! labelled ahead at the head of the queue kept smaller ones that fit waiting
+//! for an hour while one job held memory (2026-10-29). A job whose work's
+//! window passes while it waits leaves the queue ([`reserve_until`]).
 //!
 //! Labelling a leaf is one chain of hashes, a core's work for about 80
 //! minutes per GiB. With one job at a time for the whole node, a node's
@@ -30,7 +34,7 @@
 //! A stopping node stops its jobs ([`shut_down`]) before it exits: they use
 //! its stores, which exit tears down under a thread still using them.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -57,6 +61,19 @@ const DUE_QUIET: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(60)
 };
+
+/// How often later reservations that fit may pass one that does not before
+/// none may ([`Admission::admit_waiting`]): it then holds its place until it
+/// fits, at the latest once the jobs holding memory end and it runs alone.
+/// Each pass is a job that ends within its own run, so the one passed waits
+/// at most for those granted before the bound, not for every job asked after
+/// it.
+const PASS_LIMIT: u32 = 8;
+
+/// How long after a reservation was first passed later ones may still pass
+/// it ([`PASS_LIMIT`]): a few small jobs a while apart do not keep a large
+/// one waiting for hours.
+const PASS_WINDOW: Duration = Duration::from_secs(600);
 
 type Job = Box<dyn FnOnce() + Send>;
 
@@ -269,14 +286,22 @@ pub fn reserve(bytes: u64) -> Reservation {
     admission().reserve(bytes)
 }
 
+/// [`reserve`] for work that is of no use once `expired` says so (a
+/// renewal's grace passed): `None` once it does while the reservation
+/// waits, which then leaves the queue, holding neither memory nor a place.
+pub fn reserve_until(bytes: u64, expired: &dyn Fn() -> bool) -> Option<Reservation> {
+    admission().reserve_until(bytes, Urgency::Due, expired)
+}
+
 /// Reserve `bytes` for work done ahead of when it is needed (labelling a
 /// later epoch's leaves, `crate::storage_labels`): like [`reserve`], behind
 /// every reservation asked for work due now, whenever asked. Once granted,
 /// the work gives the memory back while work due now waits for memory
 /// ([`Reservation::yield_requested`]), so a renewal's snapshot never waits
-/// for it for long.
-pub fn reserve_ahead(bytes: u64) -> Reservation {
-    admission().reserve_with(bytes, Urgency::Ahead)
+/// for it for long. `None` once `expired` says the work is of no use any
+/// more while it waits ([`reserve_until`]).
+pub fn reserve_ahead(bytes: u64, expired: &dyn Fn() -> bool) -> Option<Reservation> {
+    admission().reserve_until(bytes, Urgency::Ahead, expired)
 }
 
 /// Wait until no work due now has waited for memory or held any for
@@ -388,6 +413,7 @@ impl Reservation {
             .saturating_sub(self.bytes)
             .saturating_add(bytes);
         self.bytes = bytes;
+        state.stale = true;
         drop(state);
         self.admission.changed.notify_all();
     }
@@ -410,6 +436,7 @@ impl Drop for Reservation {
             state.due_held = state.due_held.saturating_sub(1);
             state.due_last = Some(Instant::now());
         }
+        state.stale = true;
         drop(state);
         self.admission.changed.notify_all();
     }
@@ -417,9 +444,11 @@ impl Drop for Reservation {
 
 /// Grants the jobs' reservations ([`reserve`]): those for work due now
 /// smallest first, then those for work ahead in the order asked, each once
-/// it fits.
+/// it fits ([`Admission::admit_waiting`]).
 pub struct Admission {
     state: Mutex<State>,
+    /// [`PASS_WINDOW`], shorter in tests.
+    pass_window: Duration,
     changed: Condvar,
     slots: usize,
     available: Box<dyn Fn() -> Option<u64> + Send + Sync>,
@@ -432,8 +461,9 @@ struct State {
     /// Reservations held.
     holders: usize,
     /// Tickets of the reservations waiting, with their urgency and bytes, in
-    /// the order granted: those due now smallest first, then in the order
-    /// asked, then those ahead in the order asked.
+    /// the order looked at ([`Admission::admit_waiting`]): those due now
+    /// smallest first, then in the order asked, then those ahead in the order
+    /// asked.
     waiting: VecDeque<(u64, Urgency, u64)>,
     next_ticket: u64,
     /// Memory available when the last reservation granted to no others was.
@@ -446,6 +476,27 @@ struct State {
     due_waiting: usize,
     /// When a reservation for work due now last was granted or given back.
     due_last: Option<Instant>,
+    /// Tickets granted by a pass over the waiting reservations
+    /// ([`Admission::admit_waiting`]) that their jobs have not taken up yet:
+    /// counted as held.
+    granted: HashSet<u64>,
+    /// Waiting reservations later ones passed, by ticket.
+    passed: HashMap<u64, Passed>,
+    /// Whether a reservation was asked for, given back, resized or left
+    /// since the last pass.
+    stale: bool,
+    /// When the last pass was.
+    last_pass: Option<Instant>,
+}
+
+/// How a waiting reservation was passed by later ones that fit while it did
+/// not ([`PASS_LIMIT`]).
+#[derive(Debug, Clone, Copy)]
+struct Passed {
+    times: u32,
+    first: Instant,
+    /// Whether it holds its place now, logged as it began to.
+    holding: bool,
 }
 
 impl Admission {
@@ -454,6 +505,7 @@ impl Admission {
     pub fn new(slots: usize, available: Box<dyn Fn() -> Option<u64> + Send + Sync>) -> Self {
         Self {
             state: Mutex::new(State::default()),
+            pass_window: PASS_WINDOW,
             changed: Condvar::new(),
             slots: slots.max(1),
             available,
@@ -471,6 +523,21 @@ impl Admission {
 
     /// Reserve `bytes` for work of `urgency` ([`reserve`], [`reserve_ahead`]).
     pub fn reserve_with(&'static self, bytes: u64, urgency: Urgency) -> Reservation {
+        let Some(reservation) = self.reserve_until(bytes, urgency, &|| false) else {
+            unreachable!("a reservation whose work never expires does not leave the queue")
+        };
+        reservation
+    }
+
+    /// Reserve `bytes` for work of `urgency`, or `None` once `expired` says
+    /// its work is of no use any more while it waits, looked at whenever it
+    /// looks at the memory again ([`reserve_until`]).
+    pub fn reserve_until(
+        &'static self,
+        bytes: u64,
+        urgency: Urgency,
+        expired: &dyn Fn() -> bool,
+    ) -> Option<Reservation> {
         let mut state = self.state();
         let ticket = state.next_ticket;
         state.next_ticket += 1;
@@ -485,11 +552,10 @@ impl Admission {
             Urgency::Ahead => state.waiting.len(),
         };
         state.waiting.insert(position, (ticket, urgency, bytes));
+        state.stale = true;
         let started = Instant::now();
         let mut waited = false;
-        while state.waiting.front().map(|&(front, _, _)| front) != Some(ticket)
-            || !self.fits(&mut state, bytes)
-        {
+        while !self.take_grant(&mut state, ticket) {
             if !waited {
                 waited = true;
                 if urgency == Urgency::Due {
@@ -513,10 +579,15 @@ impl Admission {
                 .wait_timeout(state, RECHECK)
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
+            // Not under the lock: the caller's look may take its own.
+            drop(state);
+            let gone = expired();
+            state = self.state();
+            if gone {
+                self.leave(state, ticket, urgency, bytes, started);
+                return None;
+            }
         }
-        state.waiting.pop_front();
-        state.reserved = state.reserved.saturating_add(bytes);
-        state.holders += 1;
         if urgency == Urgency::Due {
             if waited {
                 state.due_waiting = state.due_waiting.saturating_sub(1);
@@ -530,17 +601,149 @@ impl Admission {
             info!(
                 bytes,
                 jobs,
+                due = urgency == Urgency::Due,
                 seconds = started.elapsed().as_secs_f64(),
                 "storage job has its memory"
             );
         }
         // The next in line may fit beside this one.
         self.changed.notify_all();
-        Reservation {
+        Some(Reservation {
             admission: self,
             bytes,
             urgency,
+        })
+    }
+
+    /// Whether `ticket`'s reservation was granted, after a pass over the
+    /// waiting ones ([`Admission::admit_waiting`]) when one changed since the
+    /// last or [`RECHECK`] passed; taken up if so.
+    fn take_grant(&self, state: &mut State, ticket: u64) -> bool {
+        if state.stale || state.last_pass.is_none_or(|at| at.elapsed() >= RECHECK) {
+            self.admit_waiting(state);
         }
+        if !state.granted.remove(&ticket) {
+            return false;
+        }
+        state.passed.remove(&ticket);
+        true
+    }
+
+    /// Grant the waiting reservations that fit now, in their order
+    /// ([`State::waiting`]), first fit: one that does not fit lets later ones
+    /// that do pass it, except that
+    /// - work ahead never passes work due now: granted, it would be asked to
+    ///   give its memory back at once ([`Reservation::yield_requested`]);
+    /// - nothing passes one passed [`PASS_LIMIT`] times, or first passed
+    ///   [`PASS_WINDOW`] ago. It holds its place until it fits beside the
+    ///   jobs holding memory, at the latest once they end and it runs alone.
+    fn admit_waiting(&self, state: &mut State) {
+        state.stale = false;
+        state.last_pass = Some(Instant::now());
+        let mut skipped: Vec<u64> = Vec::new();
+        let mut due_skipped = false;
+        let mut granted = false;
+        let mut index = 0;
+        while index < state.waiting.len() && state.holders < self.slots {
+            let (ticket, urgency, bytes) = state.waiting[index];
+            if urgency == Urgency::Ahead && due_skipped {
+                break;
+            }
+            if self.fits(state, bytes) {
+                state.waiting.remove(index);
+                state.reserved = state.reserved.saturating_add(bytes);
+                state.holders += 1;
+                state.granted.insert(ticket);
+                let now = Instant::now();
+                for &passed in &skipped {
+                    let entry = state.passed.entry(passed).or_insert(Passed {
+                        times: 0,
+                        first: now,
+                        holding: false,
+                    });
+                    entry.times = entry.times.saturating_add(1);
+                }
+                granted = true;
+                continue;
+            }
+            if self.holds_place(state, ticket, urgency, bytes) {
+                break;
+            }
+            skipped.push(ticket);
+            due_skipped |= urgency == Urgency::Due;
+            index += 1;
+        }
+        if granted {
+            self.changed.notify_all();
+        }
+    }
+
+    /// Whether the waiting reservation `ticket`, which does not fit, holds
+    /// its place: nothing later passes it ([`PASS_LIMIT`], [`PASS_WINDOW`]).
+    /// Logged once, as it begins to.
+    fn holds_place(&self, state: &mut State, ticket: u64, urgency: Urgency, bytes: u64) -> bool {
+        let (reserved, jobs) = (state.reserved, state.holders);
+        let Some(passed) = state.passed.get_mut(&ticket) else {
+            return false;
+        };
+        let since = passed.first.elapsed();
+        if passed.times < PASS_LIMIT && since < self.pass_window {
+            return false;
+        }
+        if !passed.holding {
+            passed.holding = true;
+            info!(
+                bytes,
+                due = urgency == Urgency::Due,
+                passed = passed.times,
+                seconds = since.as_secs_f64(),
+                reserved,
+                jobs,
+                "storage job holds its place for memory: smaller jobs that fit passed it while it \
+                 did not; none passes it now until it fits beside the jobs holding memory, at the \
+                 latest once they end and it runs alone: an expected wait"
+            );
+        }
+        true
+    }
+
+    /// `ticket`'s reservation leaves the queue: its work's window passed
+    /// while it waited ([`reserve_until`]). Granted meanwhile but not taken
+    /// up, its memory is given back.
+    fn leave(
+        &self,
+        mut state: MutexGuard<'_, State>,
+        ticket: u64,
+        urgency: Urgency,
+        bytes: u64,
+        started: Instant,
+    ) {
+        if let Some(index) = state.waiting.iter().position(|&(t, _, _)| t == ticket) {
+            state.waiting.remove(index);
+        } else if state.granted.remove(&ticket) {
+            state.reserved = state.reserved.saturating_sub(bytes);
+            state.holders = state.holders.saturating_sub(1);
+        }
+        state.passed.remove(&ticket);
+        if urgency == Urgency::Due {
+            // It waited: its window is looked at only after a wait.
+            state.due_waiting = state.due_waiting.saturating_sub(1);
+            state.due_last = Some(Instant::now());
+        }
+        state.stale = true;
+        let (waiting, jobs) = (state.waiting.len(), state.holders);
+        drop(state);
+        info!(
+            bytes,
+            due = urgency == Urgency::Due,
+            seconds = started.elapsed().as_secs_f64(),
+            waiting,
+            jobs,
+            "storage job leaves the queue for memory: its work's window passed while it waited, \
+             so it takes neither memory nor a place before other jobs (its own line says which \
+             window)"
+        );
+        self.changed.notify_all();
     }
 
     /// Wait until no reservation for work due now has waited or been held
@@ -679,7 +882,7 @@ mod tests {
         assert!(granted(&first));
         let ahead = hold_with(admission, 20 * GIB, Urgency::Ahead);
         until_waiting(admission, 1);
-        let later_ahead = hold_with(admission, GIB, Urgency::Ahead);
+        let later_ahead = hold_with(admission, 15 * GIB, Urgency::Ahead);
         until_waiting(admission, 2);
         let due = hold(admission, 20 * GIB);
         until_waiting(admission, 3);
@@ -699,6 +902,8 @@ mod tests {
         assert!(still_waiting(&later_ahead));
         drop(due.release);
         assert!(granted(&ahead));
+        assert!(still_waiting(&later_ahead), "35 GiB do not fit in 30");
+        drop(ahead.release);
         assert!(granted(&later_ahead), "work ahead keeps its own order");
     }
 
@@ -849,6 +1054,155 @@ mod tests {
         assert!(still_waiting(&second));
         drop(first.release);
         assert!(granted(&second));
+    }
+
+    /// An admission of `slots` jobs sharing a constant `available`, whose
+    /// waiting reservations may be passed for `window` after first being.
+    fn admission_passing(slots: usize, available: u64, window: Duration) -> &'static Admission {
+        let admission = Box::leak(Box::new(Admission::new(
+            slots,
+            Box::new(move || Some(available)),
+        )));
+        admission.pass_window = window;
+        admission
+    }
+
+    /// A reservation that fits passes a larger one before it that does not,
+    /// rather than waiting behind it while memory is free (2026-10-29:
+    /// leaves labelled ahead that fit waited an hour behind one of 8 GB
+    /// while a single job held memory).
+    #[test]
+    fn a_smaller_job_ahead_passes_a_larger_one_that_does_not_fit() {
+        let (admission, _) = admission(8, 40 * GIB);
+        let first = hold(admission, 20 * GIB);
+        assert!(granted(&first));
+        let large = hold_with(admission, 20 * GIB, Urgency::Ahead);
+        until_waiting(admission, 1);
+        let small = hold_with(admission, 5 * GIB, Urgency::Ahead);
+        assert!(
+            granted(&small),
+            "25 GiB fit in 30: it passes the 20 GiB one asked before it"
+        );
+        assert!(still_waiting(&large), "40 GiB do not fit in 30");
+        drop(first.release);
+        assert!(granted(&large), "it runs once it fits");
+        drop(small.release);
+        drop(large.release);
+    }
+
+    /// Work ahead that fits does not pass work due now that does not: it
+    /// would be asked to give its memory back at once.
+    #[test]
+    fn work_ahead_that_fits_does_not_pass_work_due_now() {
+        let (admission, _) = admission(8, 40 * GIB);
+        let first = hold(admission, 20 * GIB);
+        assert!(granted(&first));
+        let due = hold(admission, 20 * GIB);
+        until_waiting(admission, 1);
+        let ahead = hold_with(admission, GIB, Urgency::Ahead);
+        assert!(
+            still_waiting(&ahead),
+            "21 GiB fit in 30, but work due now waits"
+        );
+        drop(first.release);
+        assert!(granted(&due));
+        assert!(granted(&ahead), "then it runs beside it: 21 GiB fit");
+        drop(due.release);
+        drop(ahead.release);
+    }
+
+    /// A reservation passed [`PASS_LIMIT`] times holds its place: later ones
+    /// that fit wait behind it until it runs, alone if it fits beside no job.
+    #[test]
+    fn a_job_passed_too_often_holds_its_place_and_runs_alone() {
+        let (admission, _) = admission(PASS_LIMIT as usize + 4, 40 * GIB);
+        let first = hold(admission, 20 * GIB);
+        assert!(granted(&first));
+        let large = hold_with(admission, 35 * GIB, Urgency::Ahead);
+        until_waiting(admission, 1);
+        let passers: Vec<Held> = (0..PASS_LIMIT)
+            .map(|_| {
+                let small = hold_with(admission, GIB, Urgency::Ahead);
+                assert!(granted(&small), "it fits and passes the large one");
+                small
+            })
+            .collect();
+        let late = hold_with(admission, GIB, Urgency::Ahead);
+        assert!(
+            still_waiting(&late),
+            "29 GiB fit in 30, but nothing passes the large one any more"
+        );
+        drop(first.release);
+        assert!(still_waiting(&large), "43 GiB do not fit in 30");
+        assert!(still_waiting(&late), "nor does anything pass it");
+        drop(passers);
+        assert!(granted(&large), "it runs alone once no job holds memory");
+        assert!(
+            still_waiting(&late),
+            "nothing runs beside a job larger than the share"
+        );
+        drop(large.release);
+        assert!(granted(&late));
+    }
+
+    /// A reservation first passed [`PASS_WINDOW`] ago holds its place however
+    /// few passed it, until it fits.
+    #[test]
+    fn a_job_passed_for_the_window_holds_its_place_until_it_fits() {
+        let window = Duration::from_millis(300);
+        let admission = admission_passing(8, 40 * GIB, window);
+        let first = hold(admission, 20 * GIB);
+        assert!(granted(&first));
+        let large = hold_with(admission, 20 * GIB, Urgency::Ahead);
+        until_waiting(admission, 1);
+        let small = hold_with(admission, GIB, Urgency::Ahead);
+        assert!(granted(&small), "it passes the large one");
+        std::thread::sleep(window * 2);
+        let late = hold_with(admission, GIB, Urgency::Ahead);
+        assert!(
+            still_waiting(&late),
+            "22 GiB fit in 30, but the large one was first passed a window ago"
+        );
+        drop(first.release);
+        assert!(granted(&large), "it runs once it fits: 21 GiB");
+        assert!(granted(&late), "then the late one beside it: 22 GiB");
+        drop(small.release);
+        drop(large.release);
+        drop(late.release);
+    }
+
+    /// A reservation whose work's window passes while it waits leaves the
+    /// queue: it is not granted, and work behind it no longer waits for it.
+    #[test]
+    fn a_job_whose_window_passed_leaves_the_queue() {
+        let (admission, _) = admission(8, 40 * GIB);
+        let first = hold(admission, 20 * GIB);
+        assert!(granted(&first));
+        let expired = Arc::new(AtomicBool::new(false));
+        let flag = expired.clone();
+        let (left_tx, left) = mpsc::channel();
+        std::thread::spawn(move || {
+            let reservation =
+                admission.reserve_until(20 * GIB, Urgency::Due, &|| flag.load(Ordering::SeqCst));
+            left_tx.send(reservation.is_none()).unwrap();
+        });
+        until_waiting(admission, 1);
+        let ahead = hold_with(admission, 5 * GIB, Urgency::Ahead);
+        assert!(
+            still_waiting(&ahead),
+            "work ahead waits behind work due now"
+        );
+        expired.store(true, Ordering::SeqCst);
+        assert_eq!(
+            left.recv_timeout(SOON),
+            Ok(true),
+            "it leaves the queue without memory"
+        );
+        assert!(granted(&ahead), "25 GiB fit in 30 once it left");
+        assert_eq!(admission.state().due_waiting, 0, "no work due now waits");
+        assert_eq!(waiting(admission), 0);
+        drop(first.release);
+        drop(ahead.release);
     }
 
     #[test]
