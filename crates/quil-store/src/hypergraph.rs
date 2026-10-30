@@ -113,6 +113,14 @@ fn byte_phase_str(b: u8) -> Option<&'static str> {
     }
 }
 
+/// The shard key of an application's blob keyspace.
+fn retention_shard(application: &[u8; 32]) -> ShardKey {
+    ShardKey {
+        l1: quil_hypergraph::addressing::get_bloom_filter_indices(application, 256, 3),
+        l2: *application,
+    }
+}
+
 /// Exclusive upper bound for a `delete_range` that covers every key beginning
 /// with `prefix`: increment the last byte that is `< 0xFF`, dropping any
 /// trailing `0xFF` bytes. `None` if `prefix` is empty or all `0xFF` (no bound —

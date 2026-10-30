@@ -40,8 +40,8 @@ pub use global_schema::{
     TYPE_HASH_ALLOCATION, TYPE_HASH_PROVER, TYPE_HASH_REWARD, TYPE_HASH_TABLE,
 };
 pub use manager::{
-    busy_unavailable, lock_unavailable, source_busy, ExecutionBranch, ExecutionBranchLimits,
-    ExecutionEngineManager, ExecutionForkContext, ExecutionPublicationGuard,
+    busy_unavailable, lock_unavailable, source_busy, DeliverySourceScan, ExecutionBranch,
+    ExecutionBranchLimits, ExecutionEngineManager, ExecutionForkContext, ExecutionPublicationGuard,
 };
 pub use prover_registry::{
     EvictionCandidate, InMemoryProverRegistry, RegistryLimits, RegistryUsage, SharedProverRegistry,

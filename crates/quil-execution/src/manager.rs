@@ -73,6 +73,19 @@ fn executing_filter(application: &[u8; 32], shard: &[bool]) -> Vec<u8> {
     quil_forest::encode_shard_bit_path(application, shard)
 }
 
+/// What a read of a shard's pending deliveries found
+/// ([`ExecutionEngineManager::pending_delivery_sources`]): their source
+/// frames, without repeats, and the scale of the read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeliverySourceScan {
+    /// `(executing filter, frame number)` of each source frame.
+    pub sources: Vec<(Vec<u8>, u64)>,
+    /// Pending deliveries read.
+    pub pending: usize,
+    /// Owned blocks read.
+    pub blocks: usize,
+}
+
 /// What a proof pre-verification pass ([`ExecutionEngineManager::preverify_bundles`])
 /// found: confidential operations, and of them how many had a cached verdict,
 /// were verified (and cached), found no worker slot, or failed in the worker.
@@ -1469,32 +1482,37 @@ impl ExecutionEngineManager {
         &self,
         global: Arc<quil_hypergraph::HypergraphCrdt>,
         filter: &[u8],
-    ) -> Result<Vec<(Vec<u8>, u64)>> {
+    ) -> Result<DeliverySourceScan> {
         #[cfg(not(feature = "native-proof"))]
         {
             let _ = (global, filter);
-            Ok(Vec::new())
+            Ok(DeliverySourceScan::default())
         }
         #[cfg(feature = "native-proof")]
         {
             let Some((application, _)) = quil_forest::decode_shard_filter_or_root(filter, 32)
             else {
-                return Ok(Vec::new());
+                return Ok(DeliverySourceScan::default());
             };
             let Ok(application) = <[u8; 32]>::try_from(application.as_slice()) else {
-                return Ok(Vec::new());
+                return Ok(DeliverySourceScan::default());
             };
-            let mut sources: Vec<(Vec<u8>, u64)> = Vec::new();
-            for item in self.pending_deliveries(global, filter)? {
+            let (pending, blocks) = self.pending_deliveries_counted(global, filter)?;
+            let mut scan = DeliverySourceScan {
+                pending: pending.len(),
+                blocks,
+                ..DeliverySourceScan::default()
+            };
+            for item in pending {
                 let Some(bits) = item.source_shard.bits() else {
                     continue;
                 };
                 let source = (executing_filter(&application, &bits), item.source_frame);
-                if !sources.contains(&source) {
-                    sources.push(source);
+                if !scan.sources.contains(&source) {
+                    scan.sources.push(source);
                 }
             }
-            Ok(sources)
+            Ok(scan)
         }
     }
 
@@ -1504,20 +1522,34 @@ impl ExecutionEngineManager {
         global: Arc<quil_hypergraph::HypergraphCrdt>,
         filter: &[u8],
     ) -> Result<Vec<crate::token_intrinsic::delivery::PendingDelivery>> {
+        self.pending_deliveries_counted(global, filter)
+            .map(|(pending, _)| pending)
+    }
+
+    /// [`Self::pending_deliveries`] and how many owned blocks it read.
+    #[cfg(feature = "native-proof")]
+    fn pending_deliveries_counted(
+        &self,
+        global: Arc<quil_hypergraph::HypergraphCrdt>,
+        filter: &[u8],
+    ) -> Result<(
+        Vec<crate::token_intrinsic::delivery::PendingDelivery>,
+        usize,
+    )> {
         use crate::token_intrinsic::{delivery, dispatch::TokenPolicy};
         let Some((application, shard)) = quil_forest::decode_shard_filter_or_root(filter, 32)
         else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         };
         let Ok(application) = <[u8; 32]>::try_from(application.as_slice()) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         };
         let network =
             quil_lattice_ct::confidential::transfer::network_identifier(self.pricing_network());
         let limits = TokenPolicy::for_network(self.pricing_network()).snapshots;
         let global = crate::hypergraph_state::HypergraphState::new(global);
         let local = crate::hypergraph_state::HypergraphState::new(self.crdt());
-        delivery::pending_deliveries(
+        delivery::pending_deliveries_counted(
             &global,
             &local,
             &network,
