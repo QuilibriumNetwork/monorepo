@@ -36,6 +36,7 @@ mod execution_checkpoint;
 pub use execution_checkpoint::{GlobalExecutionCheckpoint, UnfinishedExecution};
 #[path = "frame_materializer_selected_parent.rs"]
 mod selected_parent;
+pub(crate) use selected_parent::ParentStateDifference;
 pub use selected_parent::{
     GlobalFinalizationAttempt, GlobalParentExecutor, GlobalParentLimits, MAX_GLOBAL_FRAME_BYTES,
 };

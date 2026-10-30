@@ -11,7 +11,7 @@
 //! the grid flips and allocations move.
 //!
 //! A source committee that can no longer assemble a quorum never seals. After
-//! [`FENCE_AFTER_EPOCHS`] epochs (one from [`super::early_fence_frame`]:
+//! [`FENCE_AFTER_EPOCHS`] epochs (two from [`super::early_fence_frame`]:
 //! [`fence_due_frame`]) GLOBAL fences it instead
 //! ([`fence_stalled_sources`]): the session ends at the last data frame GLOBAL
 //! executed for it (its `tip`), frames beyond that are refused like frames after
@@ -799,7 +799,7 @@ pub const FENCE_AFTER_EPOCHS: u64 = 4;
 
 /// Epochs a closing session requested at or after
 /// [`super::early_fence_frame`] may take to seal before GLOBAL fences it.
-pub const EARLY_FENCE_AFTER_EPOCHS: u64 = 1;
+pub const EARLY_FENCE_AFTER_EPOCHS: u64 = 2;
 
 /// Epochs a closing session whose request GLOBAL made at `request_frame` may
 /// take to seal before GLOBAL fences it. The request's committed frame

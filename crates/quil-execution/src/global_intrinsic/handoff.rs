@@ -848,7 +848,7 @@ pub fn set_presence_exclusion_frame_for_thread(frame: Option<u64>) {
 }
 
 /// From this GLOBAL frame GLOBAL fences a closing session that has not
-/// sealed one epoch after its closing request, instead of
+/// sealed two epochs after its closing request, instead of
 /// [`schedule::FENCE_AFTER_EPOCHS`] epochs ([`schedule::fence_due_frame`]).
 /// The request's frame selects the rule, so a request's fence is due at the
 /// same frame whenever and wherever it is evaluated, and a request made
@@ -857,12 +857,17 @@ pub fn set_presence_exclusion_frame_for_thread(frame: Option<u64>) {
 /// committees sat closing one to three votes short for the full four epochs
 /// before their fences. Not shorter than an epoch: stale seats stay eligible
 /// until the next epoch boundary, so a successor seated sooner would take
-/// them again and be fenced again. Consensus-affecting for GLOBAL: every
-/// archive and GLOBAL prover must run a build with it before the frame. App
-/// provers date fences by the same rule when they rewind past one
-/// (`fence_rewind` in the engine), so they should too. Not scheduled on
-/// mainnet; `QUIL_EARLY_FENCE_FRAME` elsewhere, never by default.
-pub const MAINNET_EARLY_FENCE_FRAME: Option<u64> = None;
+/// them again and be fenced again. Two, not one: in the seven days to
+/// 2026-10-29, 30 of 572 closing sessions sealed one to two epochs after
+/// their request (at most 1.84) while GLOBAL ran slow; one epoch would have
+/// fenced them and discarded their undrained frames. Consensus-affecting for
+/// GLOBAL: every archive and GLOBAL prover must run a build with it before
+/// the frame. App provers date fences by the same rule when they rewind past
+/// one (`fence_rewind` in the engine), so they should too. Mainnet: 984,240,
+/// the first frame of epoch 1367, which GLOBAL cannot reach before
+/// 2026-11-02 00:00 UTC even at ten seconds a frame;
+/// `QUIL_EARLY_FENCE_FRAME` elsewhere, never by default.
+pub const MAINNET_EARLY_FENCE_FRAME: Option<u64> = Some(984_240);
 
 static EARLY_FENCE_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 

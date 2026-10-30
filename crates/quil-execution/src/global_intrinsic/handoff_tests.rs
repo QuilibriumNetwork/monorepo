@@ -2987,13 +2987,13 @@ fn seal_successor_eligibility_is_not_scheduled_by_default() {
 }
 
 /// From the early fence frame GLOBAL fences a closing session that has not
-/// sealed one epoch after its request, and not before: stale seats stay
-/// eligible until the next epoch boundary (GLOBAL frame 907,920: six app
-/// committees whose older-build members refused every closing seal sat
-/// closing for the full four epochs). The request's frame selects the rule:
-/// a request made before the frame keeps four epochs, even past the frame.
+/// sealed two epochs after its request, and not before: not at one epoch,
+/// where seals delayed by a slow GLOBAL still land (GLOBAL frame 907,920:
+/// six app committees whose older-build members refused every closing seal
+/// sat closing for the full four epochs). The request's frame selects the
+/// rule: a request made before the frame keeps four epochs, even past it.
 #[test]
-fn an_unsealed_close_is_fenced_one_epoch_after_its_request_from_the_early_fence_frame() {
+fn an_unsealed_close_is_fenced_two_epochs_after_its_request_from_the_early_fence_frame() {
     let epoch = quil_types::consensus::epoch_length_frames();
     let fenced_after = |activation: Option<u64>, requested: u64| -> u64 {
         set_early_fence_frame_for_thread(activation);
@@ -3032,8 +3032,12 @@ fn an_unsealed_close_is_fenced_one_epoch_after_its_request_from_the_early_fence_
     };
     // Without a setting, never (assumes QUIL_EARLY_FENCE_FRAME is unset).
     assert_eq!(fenced_after(None, 2), 4 * epoch, "by default four epochs");
-    assert_eq!(fenced_after(Some(0), 2), epoch);
-    assert_eq!(fenced_after(Some(2), 2), epoch, "a request at the frame");
+    assert_eq!(fenced_after(Some(0), 2), 2 * epoch);
+    assert_eq!(
+        fenced_after(Some(2), 2),
+        2 * epoch,
+        "a request at the frame"
+    );
     assert_eq!(
         fenced_after(Some(3), 2),
         4 * epoch,
@@ -3041,13 +3045,15 @@ fn an_unsealed_close_is_fenced_one_epoch_after_its_request_from_the_early_fence_
     );
 }
 
-/// Early fences are GLOBAL consensus and not scheduled on mainnet: by
-/// default every closing session keeps the four-epoch timeout.
+/// Early fences are GLOBAL consensus: mainnet starts them at a fixed epoch
+/// boundary whatever the environment says; other networks only when set, so
+/// by default every closing session there keeps the four-epoch timeout.
 #[test]
-fn early_fences_are_not_scheduled_by_default() {
-    assert_eq!(MAINNET_EARLY_FENCE_FRAME, None);
-    assert_eq!(early_fence_frame_for(0, None), u64::MAX);
-    assert_eq!(early_fence_frame_for(0, Some("7")), u64::MAX);
+fn early_fences_activate_only_at_a_scheduled_frame() {
+    assert_eq!(MAINNET_EARLY_FENCE_FRAME, Some(984_240));
+    assert_eq!(984_240 % quil_types::consensus::EPOCH_LENGTH_FRAMES, 0);
+    assert_eq!(early_fence_frame_for(0, None), 984_240);
+    assert_eq!(early_fence_frame_for(0, Some("7")), 984_240);
     assert_eq!(early_fence_frame_for(1, Some("7")), 7);
     assert_eq!(early_fence_frame_for(1, Some("soon")), u64::MAX);
     assert_eq!(early_fence_frame_for(1, None), u64::MAX);

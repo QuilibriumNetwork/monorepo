@@ -343,7 +343,9 @@ pub fn emit(log: &GlobalLog) {
                 tracing::warn!(frame, stalled_secs, view, provers, reachable, quorum, %unreachable, repeat,
                     scope = "network", action = "check",
                     "GLOBAL head not advancing although {reachable} of {provers} GLOBAL provers are reachable \
-                     ({quorum} needed): compare the GLOBAL head and the proposal and verify warnings on the reachable provers");
+                     ({quorum} needed): compare the GLOBAL head and the proposal and verify warnings on the reachable provers; \
+                     one that a proposal declares a parent state other than a prover's own execution means the provers \
+                     run builds with different activation constants");
             }
         }
         GlobalLog::Resumed {

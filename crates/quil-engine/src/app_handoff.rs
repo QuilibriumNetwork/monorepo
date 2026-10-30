@@ -4500,7 +4500,7 @@ mod successor_tests {
         successor_state_matches(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
     }
 
-    // From the early fence frame GLOBAL fences one epoch after the closing
+    // From the early fence frame GLOBAL fences two epochs after the closing
     // request (`schedule::fence_due_frame`). A frame past the fence that
     // extends the fenced frame is the predecessor's and is discarded, here
     // one anchored the frame before the fence; the successor's own first
@@ -4509,7 +4509,7 @@ mod successor_tests {
     #[test]
     fn an_early_fence_rewinds_the_predecessors_frame_and_keeps_the_sessions_own() {
         handoff::set_early_fence_frame_for_thread(Some(0));
-        let due = 3 + quil_types::consensus::epoch_length_frames();
+        let due = 3 + 2 * quil_types::consensus::epoch_length_frames();
         assert_eq!(schedule::fence_due_frame(3), due);
         let past = past_fence_due(due);
         let header = |rank: u64, output: u8, anchor: u64| quil_types::proto::global::FrameHeader {

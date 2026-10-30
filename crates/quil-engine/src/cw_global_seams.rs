@@ -125,6 +125,9 @@ pub struct GlobalSeamProposer {
     /// Without it, the vote-time check halts on the fork but the reconcile never
     /// hears about it → permanent stall. `None` in tests / non-archive nodes.
     on_prover_fork: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    /// Proposals declaring a parent state other than this node's own
+    /// execution of it ([`Self::note_own_parent_state`]).
+    own_state_differs: Mutex<crate::bounded_warn::WarnLimiter<()>>,
     /// The view this node is letting a finalized parent publish in, and since
     /// when ([`Self::yield_to_publication`]), and how long it may.
     publication_wait: Mutex<Option<(u64, std::time::Instant)>>,
@@ -213,6 +216,7 @@ impl GlobalSeamProposer {
             block_store: None,
             selected_execution: None,
             on_prover_fork,
+            own_state_differs: Mutex::new(crate::bounded_warn::WarnLimiter::new()),
             publication_wait: Mutex::new(None),
             publication_priority: PUBLICATION_PRIORITY,
             vote_waits: Mutex::default(),
@@ -585,6 +589,65 @@ impl GlobalSeamProposer {
         Ok(recovered)
     }
 
+    /// Warn, bounded, while proposals declare a parent state other than this
+    /// node's own execution of that parent. Nothing reconciles it: this node
+    /// keeps its executed state, so it refuses every such proposal, and when
+    /// the GLOBAL provers split this way no side reaches quorum. The likely
+    /// cause is a GLOBAL prover on a build with other activation constants.
+    /// One line when it starts, a repeat at most every ten minutes, and one
+    /// when a proposal for a later frame agrees: in a split, proposers on
+    /// this node's side still agree at the refused frame, and GLOBAL has not
+    /// moved past it.
+    pub(crate) fn note_own_parent_state(
+        &self,
+        view: u64,
+        frame: u64,
+        agrees: bool,
+        difference: Option<crate::frame_materializer::ParentStateDifference>,
+    ) {
+        let now = std::time::Instant::now();
+        let mut limiter = self
+            .own_state_differs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(difference) = difference else {
+            if agrees {
+                if let Some(crate::bounded_warn::Report::Recovered { attempts, duration }) =
+                    limiter.succeeded_at(&(), frame.saturating_sub(1), now)
+                {
+                    tracing::info!(
+                        view,
+                        frame,
+                        refusals = attempts,
+                        secs = duration.as_secs(),
+                        "GLOBAL proposals agree with this node's own execution of their parent again"
+                    );
+                }
+            }
+            return;
+        };
+        if let Some(crate::bounded_warn::Report::Failing { attempts, duration }) =
+            limiter.failed_at(&(), frame, now)
+        {
+            tracing::warn!(
+                view,
+                frame,
+                parent_frame = frame.saturating_sub(1),
+                own_prover_root = %hex::encode(&difference.own_prover_root),
+                proposed_prover_root = %hex::encode(&difference.proposed_prover_root),
+                auxiliary_roots_differ = difference.auxiliary_roots_differ,
+                refusals = attempts,
+                since_secs = duration.as_secs(),
+                scope = "this node or the proposer",
+                check = "whether GLOBAL provers run builds with different activation constants \
+                         (such as MAINNET_EARLY_FENCE_FRAME); this does not resolve by itself: upgrade \
+                         the provers on the other build, then stop each and replace its state for this \
+                         frame (--adopt-prover-root from an upgraded prover, or a store resync)",
+                "GLOBAL proposal declares a parent state other than this node's own execution of its parent frame; refusing it"
+            );
+        }
+    }
+
     fn persist_candidate(&self, frame: &GlobalFrame) -> bool {
         self.clock_store.put_global_clock_frame_candidate(frame, &NoopTxn)
             .inspect_err(|error| tracing::warn!(%error, "cw global: could not persist proposal body; abstaining"))
@@ -748,6 +811,12 @@ impl GlobalProposer for GlobalSeamProposer {
                 return Ok(false);
             }
         };
+        self.note_own_parent_state(
+            context.view,
+            header.frame_number,
+            prepared.matches_child(header),
+            prepared.own_parent_state_differs(header),
+        );
         if !prepared.matches_child(header) {
             // A re-synced or unreceipted member that disagrees with the
             // proposers' parent state routes the fork to the prover-tree
