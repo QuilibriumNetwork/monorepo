@@ -71,7 +71,15 @@ async fn wallet_scans_owned_unspent_coins_over_rpc() {
             .unwrap(),
         )
     };
-    let wallet = make_wallet();
+    // Scans keep the coins they find not ours: every scan after the first
+    // runs against that cache and must still find each owned coin.
+    let cache_dir = tempfile::tempdir().unwrap();
+    let wallet = Arc::new(
+        Arc::try_unwrap(make_wallet())
+            .ok()
+            .unwrap()
+            .with_scan_cache(cache_dir.path()),
+    );
     let other = make_wallet();
     // Coins sit in the block their address selects, at that block's next free
     // index — the wallet refuses a scanned coin whose position says otherwise.
@@ -211,7 +219,26 @@ async fn wallet_scans_owned_unspent_coins_over_rpc() {
     provider
         .fail_continuation
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(wallet.scan_unspent(&client, 4, 2).await.unwrap().len(), 2);
+    assert_eq!(
+        wallet
+            .clone()
+            .scan_unspent(&client, 4, 2)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let cache = super::super::scan_cache::ScanCache::load(
+        cache_dir.path(),
+        &wallet.context,
+        &wallet.kem_secret,
+    );
+    assert_eq!(
+        super::super::scan_cache::read_entries(cache.path(), super::super::scan_cache::MAX_ENTRIES)
+            .map(|entries| entries.len()),
+        Some(1),
+        "the cache holds the one coin that is not ours"
+    );
     stop.send(()).unwrap();
     serving.await.unwrap();
 }

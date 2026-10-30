@@ -1,5 +1,6 @@
 //! Recipient wallet using the existing encrypted q-onion key.
 //! No plaintext spend-key file or legacy spend-base derivation is used here.
+use super::scan_cache::ScanCache;
 use super::TokenCtx;
 use quil_crypto::sntrup761;
 use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
@@ -23,6 +24,10 @@ mod native_tests;
 #[path = "wallet_submission_tests.rs"]
 mod submission_tests;
 
+#[cfg(test)]
+#[path = "wallet_scan_cache_tests.rs"]
+mod scan_cache_tests;
+
 // Shared by mint, shield and transfer preparation as well as native work. A permit
 // stays in the blocking worker when its async caller is cancelled.
 #[cfg(feature = "native-proof")]
@@ -35,6 +40,25 @@ pub(super) struct RecipientWallet {
     kem_secret: Zeroizing<Vec<u8>>,
     recipient: RecipientSecret,
     address: RecipientAddress,
+    /// Where scans keep the coins they found not ours ([`ScanCache`]);
+    /// `None` opens every listed coin.
+    scan_cache_dir: Option<std::path::PathBuf>,
+}
+
+/// One scan page's recovery: the coins that opened, the cache entries of
+/// those that did not (known before or found now), and how many were opened.
+struct PageRecovery {
+    owned: Vec<OwnedCoin>,
+    not_ours: Vec<super::scan_cache::Entry>,
+    /// Coins the cache did not answer for; tests count them.
+    #[cfg(test)]
+    opened: usize,
+}
+
+/// Threads opening one page's uncached coins: a cold scan is CPU-bound in
+/// memo decapsulation, one coin at a time.
+fn open_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get().min(8))
 }
 
 /// What a settlement binds: the bundle it funds, or — when the payer does not
@@ -1878,17 +1902,69 @@ impl RecipientWallet {
         self.decode_scan_page(scan, response)
     }
 
+    #[cfg(test)]
     fn recover_page(&self, page: Vec<([u8; 32], Output)>) -> anyhow::Result<Vec<OwnedCoin>> {
+        Ok(self.recover_page_with(page, None, 1)?.owned)
+    }
+
+    /// Open the page's coins that `cache` does not know as not ours, on up to
+    /// `threads` threads. Only a failed memo authentication marks a coin not
+    /// ours; any other failure fails the page.
+    fn recover_page_with(
+        &self,
+        page: Vec<([u8; 32], Output)>,
+        cache: Option<&ScanCache>,
+        threads: usize,
+    ) -> anyhow::Result<PageRecovery> {
         use quil_lattice_ct::confidential::{memo::MemoError, relation::membership::MembershipKey};
-        let key = MembershipKey::derive(&self.context);
-        let mut owned = Vec::new();
+        let mut not_ours = Vec::new();
+        let mut unknown = Vec::with_capacity(page.len());
         for (address, output) in page {
-            let opened =
-                match open_output(&self.context, &self.kem_secret, &self.recipient, &output) {
-                    Ok(opened) => opened,
-                    Err(MemoError::Authentication) => continue,
-                    Err(error) => anyhow::bail!("coin recovery: {error:?}"),
-                };
+            let entry = cache.map(|cache| (cache, cache.entry(&address, &output)));
+            match entry {
+                Some((cache, entry)) if cache.known_not_ours(&entry) => not_ours.push(entry),
+                _ => unknown.push((address, output, entry.map(|(_, entry)| entry))),
+            }
+        }
+        let open = |coins: &[([u8; 32], Output, Option<super::scan_cache::Entry>)]| {
+            coins
+                .iter()
+                .map(|(_, output, _)| {
+                    open_output(&self.context, &self.kem_secret, &self.recipient, output)
+                })
+                .collect::<Vec<_>>()
+        };
+        let threads = threads.clamp(1, unknown.len().max(1));
+        let results = if threads == 1 {
+            open(&unknown)
+        } else {
+            std::thread::scope(|scope| {
+                unknown
+                    .chunks(unknown.len().div_ceil(threads))
+                    .map(|part| scope.spawn(move || open(part)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .flat_map(|thread| {
+                        thread
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                    })
+                    .collect()
+            })
+        };
+        let key = MembershipKey::derive(&self.context);
+        #[cfg(test)]
+        let opens = unknown.len();
+        let mut owned = Vec::new();
+        for ((address, output, entry), result) in unknown.into_iter().zip(results) {
+            let opened = match result {
+                Ok(opened) => opened,
+                Err(MemoError::Authentication) => {
+                    not_ours.extend(entry);
+                    continue;
+                }
+                Err(error) => anyhow::bail!("coin recovery: {error:?}"),
+            };
             let image = key
                 .key_image(&opened.secrets.owner)
                 .identity_bytes()
@@ -1900,7 +1976,12 @@ impl RecipientWallet {
                 image,
             });
         }
-        Ok(owned)
+        Ok(PageRecovery {
+            owned,
+            not_ours,
+            #[cfg(test)]
+            opened: opens,
+        })
     }
 
     /// Complete bounded scan. Errors discard partial results. The RPC provider
@@ -1932,22 +2013,48 @@ impl RecipientWallet {
     ) -> anyhow::Result<Option<Vec<OwnedCoin>>> {
         anyhow::ensure!(max_owned > 0, "owned coin limit must be positive");
         let mut scan = CoinScan::new(max_pages)?;
-        let mut unspent = Vec::new();
-        while !scan.finished() {
-            let page = self.scan_next(client, &mut scan).await?;
-            let wallet = self.clone();
-            let owned = tokio::task::spawn_blocking(move || wallet.recover_page(page)).await??;
-            for coin in owned {
-                if self.is_unspent_hint(client, &coin.image).await? {
-                    anyhow::ensure!(
-                        unspent.len() < max_owned,
-                        "owned coin limit exceeded; scan incomplete"
-                    );
-                    unspent.push(coin);
+        let cache = match self.scan_cache_dir.clone() {
+            Some(dir) => {
+                let wallet = self.clone();
+                Some(std::sync::Arc::new(
+                    tokio::task::spawn_blocking(move || {
+                        ScanCache::load(&dir, &wallet.context, &wallet.kem_secret)
+                    })
+                    .await?,
+                ))
+            }
+            None => None,
+        };
+        let mut not_ours = Vec::new();
+        let scanned = async {
+            let mut unspent = Vec::new();
+            while !scan.finished() {
+                let page = self.scan_next(client, &mut scan).await?;
+                let (wallet, cache) = (self.clone(), cache.clone());
+                let recovered = tokio::task::spawn_blocking(move || {
+                    wallet.recover_page_with(page, cache.as_deref(), open_threads())
+                })
+                .await??;
+                not_ours.extend(recovered.not_ours);
+                for coin in recovered.owned {
+                    if self.is_unspent_hint(client, &coin.image).await? {
+                        anyhow::ensure!(
+                            unspent.len() < max_owned,
+                            "owned coin limit exceeded; scan incomplete"
+                        );
+                        unspent.push(coin);
+                    }
                 }
             }
+            anyhow::Ok(unspent)
         }
-        Ok((!scan.rootless).then_some(unspent))
+        .await;
+        if let Some(cache) = cache {
+            // Only a complete scan shows which coins left the unspent set.
+            let complete = scanned.is_ok();
+            let _ = tokio::task::spawn_blocking(move || cache.store(not_ours, complete)).await;
+        }
+        Ok((!scan.rootless).then_some(scanned?))
     }
 
     fn decode_escrow_page(
@@ -2260,7 +2367,7 @@ impl RecipientWallet {
             .key_manager
             .get_public_key_bytes_by_id("q-onion-key")
             .map_err(|e| anyhow::anyhow!("q-onion-key public: {e}"))?;
-        Self::from_keys(network, application, &public, secret)
+        Ok(Self::from_keys(network, application, &public, secret)?.with_scan_cache(&tc.config_dir))
     }
     fn from_keys(
         network: &[u8; 32],
@@ -2299,7 +2406,15 @@ impl RecipientWallet {
             kem_secret: secret,
             recipient,
             address,
+            scan_cache_dir: None,
         })
+    }
+
+    /// Keep scans' not-ours coins in `dir` (the node's config directory), so
+    /// a later scan skips them.
+    pub(super) fn with_scan_cache(mut self, dir: &std::path::Path) -> Self {
+        self.scan_cache_dir = Some(dir.to_path_buf());
+        self
     }
 
     fn unix_now() -> u64 {

@@ -19,6 +19,8 @@ mod account;
 pub(crate) mod balance;
 mod legacy;
 #[cfg(feature = "confidential-tokens")]
+mod scan_cache;
+#[cfg(feature = "confidential-tokens")]
 mod wallet;
 
 /// Flags shared by every `token` subcommand (Go `TokenCmd` persistent
