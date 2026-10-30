@@ -691,6 +691,8 @@ fn report_long_leaves() {
                 .map_or_else(|| "unknown".to_string(), |e| (e.as_secs() / 60).to_string());
             let (longest, filter) = (seat.longest.as_secs() / 60, hex::encode(&filter));
             let overrun = seat.estimate.is_some_and(|e| seat.longest > e);
+            let grace_frame = quil_types::consensus::storage_snapshot_frame(epoch)
+                .saturating_add(crate::app_shard_metadata::storage_snapshot_grace());
             match work {
                 LeafWork::LabellingAhead if !overrun => info!(epoch, filter = %filter,
                     leaves = seat.leaves, nodes = seat.nodes, longest_minutes = longest,
@@ -702,11 +704,21 @@ fn report_long_leaves() {
                     estimated_minutes = %estimated, work = work.name(), scope = "local",
                     action = "check this node's CPU load: the labelling runs past its estimate",
                     "storage labels for a later epoch's snapshot still being computed ahead, past their estimate"),
+                // Within its estimate (or with none, from labels kept
+                // ahead) this is the expected wait of a renewal.
+                _ if !overrun => info!(epoch, filter = %filter, leaves = seat.leaves,
+                    nodes = seat.nodes, longest_minutes = longest, estimated_minutes = %estimated,
+                    grace_frame, work = work.name(), scope = "local",
+                    action = "no action needed: the seat's renewal registers its storage once \
+                              they end; this warns if they pass their estimate",
+                    "this node is still preparing a seat's storage proof data; its renewal waits for it"),
                 _ => warn!(epoch, filter = %filter, leaves = seat.leaves, nodes = seat.nodes,
-                    longest_minutes = longest, estimated_minutes = %estimated,
+                    longest_minutes = longest, estimated_minutes = %estimated, grace_frame,
                     work = work.name(), scope = "local",
-                    "storage snapshot leaves still encoding: this seat's renewal registers its storage once \
-                     they end, and renews without a storage registration if they have not by the grace frame"),
+                    action = "check this node's CPU and disk load: storage labelling is CPU-bound; \
+                              if the leaves have not ended by the grace frame, the seat renews \
+                              without a storage registration and earns no storage share that epoch",
+                    "this node's storage proof data for a seat runs past its estimate; its renewal waits for it"),
             }
         }
     }
@@ -787,10 +799,11 @@ fn encode_member_until(
                     leaf = %hex::encode(&leaf_id), nodes = exact,
                     estimated_minutes = label_estimate(exact).as_secs() / 60, frames_left,
                     global_frame = frame, scope = "local",
-                    "storage snapshot given up: labelling this leaf now would end past the \
-                     renewal's grace frame by its estimate, so this seat renews without a storage \
-                     registration at once and earns no storage share on its shard that epoch; its \
-                     memory goes to other seats' storage work");
+                    action = "check this node's CPU headroom and how many seats it labels at \
+                              once; the next epoch's snapshot starts again",
+                    "storage snapshot given up: this node would finish a seat's storage proof data \
+                     after the renewal's grace frame, so the seat renews without a storage \
+                     registration and earns no storage share on its shard this epoch");
             }
             return Err(stopped());
         }

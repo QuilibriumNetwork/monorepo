@@ -2869,6 +2869,10 @@ pub struct AppConsensusEngine {
     start_block: StartBlock,
     /// cw-finalized frames deferred ahead of the cursor, for bounded logging.
     ahead_deferral: AheadDeferral,
+    /// Whether this worker is behind its shard, by either check above.
+    behind_shard: BehindShard,
+    /// Proposals refused and turns declined since the last summary.
+    refusals: RefusalWindow,
     /// What the last start attempt learned before it was refused.
     start_context: StartContext,
 
@@ -3122,6 +3126,8 @@ impl AppConsensusEngine {
             predecessor_block: PredecessorBlock::default(),
             start_block: StartBlock::default(),
             ahead_deferral: AheadDeferral::default(),
+            behind_shard: BehindShard::default(),
+            refusals: RefusalWindow::default(),
             start_context: StartContext::default(),
             local_prover_address: deps.local_prover_address,
             local_bls_pubkey: deps.local_bls_pubkey,
@@ -4465,17 +4471,77 @@ impl AppConsensusEngine {
         }
     }
 
+    /// Log that this worker is behind its shard ([`BehindShard`]), as the
+    /// frame-gap check (`gap`) or the deferral check found it at `now`: the
+    /// next frame it needs is `missing_from`, and it holds or was handed
+    /// frames up to `highest`.
+    fn log_behind(&mut self, gap: bool, missing_from: u64, highest: u64, now: std::time::Instant) {
+        let Some(line) = self.behind_shard.behind(gap, now) else {
+            return;
+        };
+        let seen_by = if gap {
+            "frames received above one this worker lacks"
+        } else {
+            "finalized frames above this worker's cursor"
+        };
+        let cursor = self.last_materialized_frame;
+        let behind_frames = highest.saturating_sub(cursor);
+        match line {
+            Behind::Started => info!(core_id = self.core_id, filter = hex::encode(&self.filter),
+                cursor, missing_from, highest, behind_frames, seen_by,
+                warn_after_s = BEHIND_WARN_AFTER.as_secs(), scope = "this node's worker",
+                action = "no action needed: the shard sync this worker requests fills the missing \
+                          frames, which then apply in order; 'this worker caught up with its shard' \
+                          ends it, and it warns if it lasts 10 min",
+                "this worker is behind its shard and is catching up"),
+            Behind::Overdue(lasted) => warn!(core_id = self.core_id,
+                filter = hex::encode(&self.filter), cursor, missing_from, highest, behind_frames,
+                seen_by, behind_secs = lasted.as_secs(), scope = "this node's worker",
+                action = "run `qclient node diagnostics health --self` and compare this worker's \
+                          LOCAL with COMMITTEE and its RECOVERY failures; if every worker is behind, \
+                          check this node's archive connections ('archive connection still \
+                          failing'); if only this one stays behind, report this line with its shard \
+                          to the maintainer",
+                "this worker is still behind its shard"),
+        }
+    }
+
+    /// The frame-gap check (`gap`) or the deferral check ended at `now`
+    /// with `outcome`: log the end of [`BehindShard`] once both did.
+    fn log_caught_up(&mut self, gap: bool, outcome: &'static str, now: std::time::Instant) {
+        if let Some(behind) = self.behind_shard.caught_up(gap, now) {
+            info!(
+                core_id = self.core_id,
+                filter = hex::encode(&self.filter),
+                cursor = self.last_materialized_frame,
+                behind_secs = behind.as_secs(),
+                outcome,
+                "this worker caught up with its shard"
+            );
+        }
+    }
+
     fn set_materialized_frame(&mut self, n: u64) {
         let prev = self.last_materialized_frame;
         self.execution.materialized(n);
         self.last_materialized_frame = n;
-        if let Some(Report::Recovered { attempts, duration }) = self
-            .ahead_deferral
-            .materialized(n, std::time::Instant::now())
+        let now = std::time::Instant::now();
+        if let Some(Report::Recovered { attempts, duration }) =
+            self.ahead_deferral.materialized(n, now)
         {
-            info!(core_id = self.core_id, filter = hex::encode(&self.filter), cursor = n,
-                deferred = attempts, deferred_secs = duration.as_secs(),
-                "cw-finalized frames deferred ahead of this worker's cursor are materialized; caught up");
+            debug!(
+                core_id = self.core_id,
+                filter = hex::encode(&self.filter),
+                cursor = n,
+                deferred = attempts,
+                deferred_secs = duration.as_secs(),
+                "cw-finalized frames deferred ahead of this worker's cursor are materialized"
+            );
+            self.log_caught_up(
+                false,
+                "materialized through the highest deferred frame",
+                now,
+            );
         }
         if let Some(parents) = self.private_parents.as_ref() {
             parents.retire_through(n);
@@ -4509,14 +4575,15 @@ impl AppConsensusEngine {
             ),
         }
         if let Some((Report::Recovered { attempts, duration }, opened_at)) =
-            self.frame_gap.materialized(n, std::time::Instant::now())
+            self.frame_gap.materialized(n, now)
         {
             let outcome = if n < opened_at {
                 "cursor reset below the frame it stood at when the gap opened"
             } else {
                 "materialized through the highest buffered frame"
             };
-            info!(
+            self.log_caught_up(true, outcome, now);
+            debug!(
                 core_id = self.core_id,
                 filter = hex::encode(&self.filter),
                 opened_at,
@@ -7009,6 +7076,37 @@ impl AppConsensusEngine {
         self.session_liveness_logged = Some(std::time::Instant::now());
         let seen = liveness.snapshot();
         let decided = liveness.decisions();
+        if let Some(refusals) =
+            self.refusals
+                .observe(std::time::Instant::now(), session.generation, &decided)
+        {
+            let (refused, declined) = (by_reason(&refusals.refused), by_reason(&refusals.declined));
+            if refusals.warns() {
+                warn!(core_id = self.core_id, filter = hex::encode(&self.filter),
+                    generation = session.generation, secs = refusals.secs,
+                    refused_total = refusals.refused_total(), accepted = refusals.accepted,
+                    refused = %refused, declined_total = refusals.declined_total(),
+                    declined = %declined, proposed = refusals.proposed,
+                    materialized = self.last_materialized_frame, scope = "this node's worker",
+                    action = "run `qclient node diagnostics health --self` and compare this worker's \
+                              LOCAL with COMMITTEE; if it is caught up and the reasons name the \
+                              proposals' contents (roots, digest, proposer), report this line with \
+                              its shard to the maintainer",
+                    "this worker refused most proposals on its shard; it is likely behind its shard");
+            } else {
+                info!(core_id = self.core_id, filter = hex::encode(&self.filter),
+                    generation = session.generation, secs = refusals.secs,
+                    refused_total = refusals.refused_total(), accepted = refusals.accepted,
+                    refused = %refused, declined_total = refusals.declined_total(),
+                    declined = %declined, proposed = refusals.proposed,
+                    materialized = self.last_materialized_frame, scope = "this node's worker",
+                    action = "no action needed: consensus skips a refused proposal's view and the \
+                              next leader proposes; 'not at the parent frame', 'block not \
+                              delivered' and 'parent block unknown' end once this worker catches up",
+                    "this worker refused some proposals or skipped leader turns on its shard; \
+                     consensus moved on without them");
+            }
+        }
         let best_signers = liveness.view_signers(seen.best.view);
         let members = session.members.len();
         let quorum = members - members.saturating_sub(1) / 3;
@@ -9320,9 +9418,18 @@ impl AppConsensusEngine {
                     other => {
                         warn!(
                             core_id = self.core_id,
+                            filter = hex::encode(&self.filter),
+                            frame = frame.header.as_ref().map_or(0, |h| h.frame_number),
+                            cursor = self.last_materialized_frame,
                             result = ?other,
-                            "cw finalized frame: unverified bytes failed re-validation \
-                             (substitution or inconsistent header) — dropping",
+                            scope = "this node's worker or the frame's proposer",
+                            action = "no action needed if 'this worker caught up with its shard' \
+                                      follows: the shard sync replaces the frame; if it repeats \
+                                      while this worker is caught up, report this line to the \
+                                      maintainer",
+                            "dropped a finalized shard frame this worker had not verified: it \
+                             fails validation against this worker's state; the shard sync \
+                             fetches it again",
                         );
                         return;
                     }
@@ -9423,19 +9530,11 @@ impl AppConsensusEngine {
             // prior frame failed fatally). Materializing here would apply N+k on
             // state missing N..N+k-1's mutations and permanently skip them. Refuse;
             // the follower/shard-sync path fills the gap strictly (== last+1).
-            if let Some((Report::Failing { attempts, duration }, highest)) = self
-                .ahead_deferral
-                .deferred(frame_number, std::time::Instant::now())
-            {
-                let cursor = self.last_materialized_frame;
-                warn!(
-                    core_id = self.core_id, filter = hex::encode(&self.filter), frame = frame_number,
-                    highest_deferred = highest, cursor, gap = highest.saturating_sub(cursor),
-                    deferred = attempts, ongoing_secs = duration.as_secs(),
-                    "cw-finalized frames ahead of this worker's cursor are deferred to catch-up (not skipped); \
-                     they materialize in order once the frames above the cursor arrive",
-                );
-            }
+            // Logging only: the tracker keeps the condition for its end.
+            let now = std::time::Instant::now();
+            let _ = self.ahead_deferral.deferred(frame_number, now);
+            let highest = self.ahead_deferral.highest;
+            self.log_behind(false, self.last_materialized_frame + 1, highest, now);
             // Kept for the ordered follower path, which applies it from its
             // committed clock header once the missing frames are filled in.
             self.finalized_requests_roots
@@ -10364,18 +10463,13 @@ impl AppConsensusEngine {
         if !self.received_full_frames.contains_key(&next_needed) && !ahead.is_empty() {
             let cursor = self.last_materialized_frame;
             let highest = ahead.iter().copied().max().unwrap_or(next_needed);
-            if let Some((Report::Failing { attempts, duration }, filled, highest_buffered)) = self
+            // Logging only: the tracker keeps the condition for its end.
+            let now = std::time::Instant::now();
+            let highest_buffered = self
                 .frame_gap
-                .observed(cursor, highest, std::time::Instant::now())
-            {
-                warn!(
-                    core_id = self.core_id, filter = hex::encode(&self.filter), missing_from = next_needed,
-                    materialized = cursor, buffered_ahead = ahead.len(), highest_buffered, filled,
-                    sync_requests = attempts, ongoing_secs = duration.as_secs(),
-                    "app-shard frame gap: this worker holds frames above one it has not received and \
-                     requests a shard sync; they materialize in order once the missing frames arrive",
-                );
-            }
+                .observed(cursor, highest, now)
+                .map_or(highest, |(_, _, top)| top);
+            self.log_behind(true, next_needed, highest_buffered, now);
             let _ = self.event_tx.send(AppEngineEvent::AncestorSyncRequested {
                 filter: self.filter.clone(),
                 missing_frames: vec![next_needed],
@@ -11346,7 +11440,8 @@ pub(crate) fn build_requests_root_check(
                 let mat =
                     shard_mat.load(std::sync::atomic::Ordering::Relaxed);
                 if mat + 1 != n {
-                    tracing::warn!(
+                    // Counted by reason in the worker's refusal summary.
+                    tracing::debug!(
                         frame = n, mat,
                         "cw app verify: not at N-1, cannot validate declared \
                          pre-state (frame-number jump or lag) — nullify",
@@ -14782,6 +14877,303 @@ impl AheadDeferral {
         let caught_up = self.limiter.succeeded_at(&(), cursor, now)?;
         self.highest = 0;
         Some(caught_up)
+    }
+}
+
+/// How long a worker stays behind its shard ([`BehindShard`]) before it
+/// warns. The shard sync it requests at once usually fills a gap within a
+/// few frames, and a lagging voter's archive recovery turns come first
+/// after [`LAGGING_VOTER_AFTER`]; the gap and deferral checks this replaces
+/// repeated every [`bounded_warn::WARN_REPEAT`], so a worker still behind
+/// after that long has failed several recovery attempts.
+const BEHIND_WARN_AFTER: Duration = bounded_warn::WARN_REPEAT;
+
+/// A worker behind its shard, as either check sees it: frames received
+/// above one it has not received ([`FrameGap`]) or cw-finalized frames
+/// above its cursor ([`AheadDeferral`]). Both mean the same and end the
+/// same way, so they log as one condition: its start at info, a warning
+/// once it lasts [`BEHIND_WARN_AFTER`] and at most every
+/// [`bounded_warn::WARN_REPEAT`] after, and its end once neither holds.
+#[derive(Default)]
+struct BehindShard {
+    since: Option<std::time::Instant>,
+    warned: Option<std::time::Instant>,
+    gap: bool,
+    deferred: bool,
+}
+
+/// What a [`BehindShard`] check logs.
+#[derive(Debug, PartialEq, Eq)]
+enum Behind {
+    Started,
+    /// Still behind, this long after it started.
+    Overdue(Duration),
+}
+
+impl BehindShard {
+    /// A check (`gap`: the frame-gap check, else the deferral) found the
+    /// worker behind at `now`: the line to log, if any.
+    fn behind(&mut self, gap: bool, now: std::time::Instant) -> Option<Behind> {
+        if gap {
+            self.gap = true;
+        } else {
+            self.deferred = true;
+        }
+        let Some(since) = self.since else {
+            self.since = Some(now);
+            return Some(Behind::Started);
+        };
+        let lasted = now.saturating_duration_since(since);
+        if lasted < BEHIND_WARN_AFTER
+            || self
+                .warned
+                .is_some_and(|at| now.saturating_duration_since(at) < bounded_warn::WARN_REPEAT)
+        {
+            return None;
+        }
+        self.warned = Some(now);
+        Some(Behind::Overdue(lasted))
+    }
+
+    /// One check's condition ended at `now`: how long the worker was behind,
+    /// once neither check holds.
+    fn caught_up(&mut self, gap: bool, now: std::time::Instant) -> Option<Duration> {
+        if gap {
+            self.gap = false;
+        } else {
+            self.deferred = false;
+        }
+        if self.gap || self.deferred {
+            return None;
+        }
+        self.warned = None;
+        Some(now.saturating_duration_since(self.since.take()?))
+    }
+}
+
+#[cfg(test)]
+mod behind_shard_tests {
+    use super::*;
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    /// The frame-gap and deferral checks of one worker log one condition:
+    /// a start at info, nothing more inside the bound, then a warning at
+    /// most once per interval, and one end once both checks end.
+    #[test]
+    fn both_checks_log_one_condition_that_warns_only_past_its_bound() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut behind = BehindShard::default();
+        assert_eq!(behind.behind(true, at(0)), Some(Behind::Started));
+        let mut lines = Vec::new();
+        for minute in 1..=25 {
+            for gap in [true, false] {
+                if let Some(line) = behind.behind(gap, at(minute)) {
+                    lines.push((minute, line));
+                }
+            }
+        }
+        assert_eq!(
+            lines,
+            vec![
+                (10, Behind::Overdue(MINUTE * 10)),
+                (20, Behind::Overdue(MINUTE * 20)),
+            ],
+            "no line inside the bound, then one warning per interval"
+        );
+        assert_eq!(behind.caught_up(true, at(26)), None, "deferral still holds");
+        assert_eq!(behind.caught_up(false, at(27)), Some(MINUTE * 27));
+        assert_eq!(behind.caught_up(false, at(28)), None, "ended once");
+        assert_eq!(behind.behind(false, at(30)), Some(Behind::Started));
+        assert_eq!(behind.caught_up(false, at(31)), Some(MINUTE));
+    }
+}
+
+/// How often a worker summarizes the proposals it refused to vote for and
+/// the leader turns it declined, by reason ([`RefusalWindow`]).
+const REFUSALS_EVERY: Duration = Duration::from_secs(5 * 60);
+
+/// The fewest refusals in a window that warn, once they outnumber the
+/// proposals this worker accepted: a worker refusing most proposals is
+/// usually behind its shard, and one refusal now and then is routine.
+const REFUSALS_WARN_MIN: u64 = 10;
+
+/// This worker's consensus decisions since its last summary
+/// ([`quil_cw_consensus::adapters::Decisions`]): one line every
+/// [`REFUSALS_EVERY`] that saw a refusal or a declined turn, by reason, in
+/// place of a warning per view.
+#[derive(Default)]
+struct RefusalWindow {
+    since: Option<std::time::Instant>,
+    generation: u64,
+    base: quil_cw_consensus::adapters::Decisions,
+}
+
+/// One [`RefusalWindow`] summary.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RefusalSummary {
+    secs: u64,
+    accepted: u64,
+    refused: std::collections::BTreeMap<&'static str, u64>,
+    proposed: u64,
+    declined: std::collections::BTreeMap<&'static str, u64>,
+}
+
+impl RefusalSummary {
+    fn refused_total(&self) -> u64 {
+        self.refused.values().sum()
+    }
+
+    fn declined_total(&self) -> u64 {
+        self.declined.values().sum()
+    }
+
+    /// Whether this worker refused most proposals of the window.
+    fn warns(&self) -> bool {
+        let refused = self.refused_total();
+        refused >= REFUSALS_WARN_MIN && refused > self.accepted
+    }
+}
+
+/// `reason: count, ...`, in reason order.
+fn by_reason(counts: &std::collections::BTreeMap<&'static str, u64>) -> String {
+    counts
+        .iter()
+        .map(|(reason, count)| format!("{reason}: {count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+impl RefusalWindow {
+    /// The decisions of session `generation` so far, `decided`, at `now`:
+    /// the window's summary once it is due and saw a refusal or a declined
+    /// turn. A new session counts from zero.
+    fn observe(
+        &mut self,
+        now: std::time::Instant,
+        generation: u64,
+        decided: &quil_cw_consensus::adapters::Decisions,
+    ) -> Option<RefusalSummary> {
+        let Some(since) = self.since else {
+            self.since = Some(now);
+            self.generation = generation;
+            self.base = decided.clone();
+            return None;
+        };
+        let elapsed = now.saturating_duration_since(since);
+        if elapsed < REFUSALS_EVERY {
+            return None;
+        }
+        let mut base = std::mem::replace(&mut self.base, decided.clone());
+        let fewer = |now: &std::collections::BTreeMap<&'static str, u64>,
+                     then: &std::collections::BTreeMap<&'static str, u64>| {
+            then.iter()
+                .any(|(reason, count)| now.get(reason).copied().unwrap_or(0) < *count)
+        };
+        if generation != self.generation
+            || decided.accepted < base.accepted
+            || decided.proposed < base.proposed
+            || fewer(&decided.refused, &base.refused)
+            || fewer(&decided.declined, &base.declined)
+        {
+            base = Default::default();
+        }
+        self.since = Some(now);
+        self.generation = generation;
+        let delta = |now: &std::collections::BTreeMap<&'static str, u64>,
+                     then: &std::collections::BTreeMap<&'static str, u64>| {
+            now.iter()
+                .filter_map(|(reason, count)| {
+                    let new = count.saturating_sub(then.get(reason).copied().unwrap_or(0));
+                    (new > 0).then_some((*reason, new))
+                })
+                .collect()
+        };
+        let summary = RefusalSummary {
+            secs: elapsed.as_secs(),
+            accepted: decided.accepted.saturating_sub(base.accepted),
+            refused: delta(&decided.refused, &base.refused),
+            proposed: decided.proposed.saturating_sub(base.proposed),
+            declined: delta(&decided.declined, &base.declined),
+        };
+        (summary.refused_total() + summary.declined_total() > 0).then_some(summary)
+    }
+}
+
+#[cfg(test)]
+mod refusal_window_tests {
+    use super::*;
+    use quil_cw_consensus::adapters::Decisions;
+
+    fn decided(accepted: u64, refused: &[(&'static str, u64)], proposed: u64) -> Decisions {
+        Decisions {
+            accepted,
+            refused: refused.iter().copied().collect(),
+            proposed,
+            ..Decisions::default()
+        }
+    }
+
+    /// Each summary counts only its own window: one line per interval with
+    /// the refusals since the previous one, none for a quiet window, and a
+    /// new session counted from zero.
+    #[test]
+    fn each_window_summarizes_its_own_refusals_by_reason() {
+        let start = std::time::Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let mut window = RefusalWindow::default();
+        assert_eq!(
+            window.observe(at(0), 7, &decided(5, &[("block not delivered", 1)], 1)),
+            None
+        );
+        let first = decided(
+            9,
+            &[("block not delivered", 3), ("not at the parent frame", 2)],
+            2,
+        );
+        assert_eq!(
+            window.observe(at(60), 7, &first),
+            None,
+            "inside the interval"
+        );
+        let summary = window
+            .observe(at(300), 7, &first)
+            .expect("a window with refusals");
+        assert_eq!(
+            summary,
+            RefusalSummary {
+                secs: 300,
+                accepted: 4,
+                refused: [("block not delivered", 2), ("not at the parent frame", 2)].into(),
+                proposed: 1,
+                declined: Default::default(),
+            }
+        );
+        assert!(!summary.warns(), "4 refusals beside 4 acceptances");
+        assert_eq!(
+            by_reason(&summary.refused),
+            "block not delivered: 2, not at the parent frame: 2"
+        );
+        assert_eq!(
+            window.observe(at(600), 7, &first),
+            None,
+            "a quiet window logs nothing"
+        );
+        let lagging = decided(
+            10,
+            &[("block not delivered", 3), ("not at the parent frame", 14)],
+            2,
+        );
+        let summary = window.observe(at(900), 7, &lagging).expect("refusals");
+        assert_eq!(summary.refused, [("not at the parent frame", 12)].into());
+        assert!(summary.warns(), "12 refusals beside 1 acceptance");
+        let next_session = decided(3, &[("not at the parent frame", 20)], 0);
+        let summary = window
+            .observe(at(1200), 8, &next_session)
+            .expect("refusals");
+        assert_eq!(summary.refused, [("not at the parent frame", 20)].into());
+        assert_eq!(summary.accepted, 3);
     }
 }
 
