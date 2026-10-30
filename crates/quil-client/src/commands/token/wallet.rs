@@ -688,6 +688,14 @@ impl RecipientWallet {
             &self.application,
         )
         .map_err(|e| anyhow::anyhow!("invalid original mint: {e:?}"))?;
+        // The saved authorization carries the claimed rewards and the fee in
+        // the clear: the amount being claimed needs no decryption.
+        if let Ok(reward) = mint.statement.total() {
+            println!(
+                "{}",
+                mint_amounts_line("Claiming", reward, mint.statement.fee)
+            );
+        }
         let receipt = receipt_address(&mint.statement)?;
         let response = client
             .clone()
@@ -4001,6 +4009,18 @@ pub(super) async fn run_pending_create(
     Ok(())
 }
 
+/// The reward, fee and net amount of a reward mint, in QUIL: `verb` is
+/// "Minting" when authorizing and "Claiming" when claiming.
+fn mint_amounts_line(verb: &str, reward: u128, fee: u128) -> String {
+    use super::balance::quil_amount;
+    format!(
+        "{verb} {} QUIL (reward {} QUIL less fee {} QUIL).",
+        quil_amount(reward.saturating_sub(fee)),
+        quil_amount(reward),
+        quil_amount(fee)
+    )
+}
+
 /// Two-stage QUIL reward mint. Without `--claim`, discover this prover's reward,
 /// prove and submit the global authorization, and save its bytes for the claim
 /// stage. With `--claim <file>`, build the application claim from the finalized
@@ -4032,6 +4052,7 @@ pub(super) async fn run_mint(
         .checked_sub(fee)
         .filter(|value| *value > 0)
         .ok_or_else(|| anyhow::anyhow!("claimable reward must exceed the fee"))?;
+    println!("{}", mint_amounts_line("Minting", reward.value, fee));
     let recipient = match recipient {
         Some(recipient) => parse_recipient(recipient, &wallet.context)?,
         None => wallet.address().clone(),
@@ -4562,6 +4583,19 @@ mod tests {
 
     use super::*;
     use quil_lattice_ct::confidential::{memo::create_output, relation::membership::MembershipKey};
+
+    #[test]
+    fn mint_lines_show_the_net_amount_beside_reward_and_fee() {
+        // 12.5 QUIL less 0.25 QUIL (8e9 base units per QUIL).
+        assert_eq!(
+            mint_amounts_line("Minting", 100_000_000_000, 2_000_000_000),
+            "Minting 12.250000000000 QUIL (reward 12.500000000000 QUIL less fee 0.250000000000 QUIL)."
+        );
+        assert_eq!(
+            mint_amounts_line("Claiming", 8, 0),
+            "Claiming 0.000000001000 QUIL (reward 0.000000001000 QUIL less fee 0.000000000000 QUIL)."
+        );
+    }
 
     #[cfg(feature = "native-proof")]
     #[tokio::test]
