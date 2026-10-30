@@ -1046,17 +1046,13 @@ pub fn decide_leaves(
             None => confirm.push(p.clone()),
             Some(score) => {
                 // Halt-risk bypass: reject (stay on shard) when the
-                // pending leave targets a halt-risk shard OR would
-                // push it into halt risk on confirm. `<=
-                // HALT_RISK_PROVER_COUNT + 1` matches `plan_leaves`
-                // and `select_excess_active_filters`: a Leaving
-                // prover is still contributing coverage to the shard
-                // until the leave is confirmed, so the effective
-                // safety margin we should preserve is one above the
-                // strict halt-risk floor.
+                // shard would be at halt risk once we depart. Our seat
+                // is Leaving and the Active count leaves it out, so
+                // the count already is the shard's after we go; see
+                // `decide_leaves_with_reserved_capacity`.
                 let is_halt_risk = desc_by_hex
                     .get(&key)
-                    .map(|d| d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT + 1)
+                    .map(|d| d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT)
                     .unwrap_or(false);
 
                 if is_halt_risk || *score >= threshold {
@@ -1122,8 +1118,15 @@ pub(crate) fn decide_leaves_with_reserved_capacity(
         .iter()
         .filter_map(|filter| {
             let (holding, score) = held_scores.get(filter.as_slice())?;
+            // The halt-risk shield, applied to a seat that is already
+            // Leaving: the Active count leaves it out, so it is the shard's
+            // count after we depart. The plan shields at one over the
+            // halt-risk count because it counts our seat Active; doing the
+            // same here read our departure twice and rejected every leave
+            // the plan proposed off a shard one over its shield, so the
+            // seat was proposed and rejected again each cycle.
             if (strategy == Strategy::RewardGreedy && holding.shards == 0)
-                || (holding.size > 0 && holding.active_count <= HALT_RISK_PROVER_COUNT + 1)
+                || (holding.size > 0 && holding.active_count <= HALT_RISK_PROVER_COUNT)
             {
                 return None;
             }
@@ -3056,6 +3059,115 @@ mod tests {
             "halt-risk pending leave must be rejected (stay); got confirm={confirm:?}"
         );
         assert!(confirm.is_empty());
+    }
+
+    /// A held shard where a pending leave is decided: our seat is Leaving,
+    /// so `active_count` counts the other provers only.
+    fn held_with_active(active_count: u64) -> ShardDescriptor {
+        ShardDescriptor {
+            filter: vec![0xAA],
+            size: 5_000,
+            ring: 3,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: active_count,
+            active_count,
+            activating_count: 0,
+        }
+    }
+
+    /// The plan proposes a leave off a shard one over its shield (our seat
+    /// Active). At the decision our seat is Leaving and the shard keeps
+    /// `HALT_RISK_PROVER_COUNT + 1` Active provers, which is not halt risk:
+    /// the leave confirms, under both decision rules.
+    #[test]
+    fn a_planned_leave_confirms_when_the_shard_keeps_one_over_halt_risk() {
+        let available = vec![make_shard(vec![0xBB], 500_000, 0, 1)];
+        let planned = plan_score_replacements(
+            &[held_with_active(HALT_RISK_PROVER_COUNT + 2)],
+            &available,
+            50_000,
+            &BigInt::from(600_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            &std::collections::HashSet::<Vec<u8>>::new(),
+        );
+        assert_eq!(
+            planned.iter().map(|r| &r.leave_filter).collect::<Vec<_>>(),
+            vec![&vec![0xAAu8]],
+            "the plan proposes the leave"
+        );
+        let held = vec![held_with_active(HALT_RISK_PROVER_COUNT + 1)];
+        let pending = vec![vec![0xAA]];
+        let (reject, confirm) = decide_leaves_against_replacements(
+            &held,
+            &available,
+            &pending,
+            50_000,
+            &BigInt::from(600_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+        );
+        assert_eq!(
+            (reject, confirm),
+            (Vec::<Vec<u8>>::new(), pending.clone()),
+            "a shard keeping {} Active provers must release the leave the plan proposed",
+            HALT_RISK_PROVER_COUNT + 1
+        );
+        let mut all = held;
+        all.extend(available);
+        let (reject, confirm) = decide_leaves(
+            &all,
+            &pending,
+            50_000,
+            &BigInt::from(600_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+        );
+        assert_eq!(
+            (reject, confirm),
+            (Vec::<Vec<u8>>::new(), pending),
+            "decide_leaves must release it too"
+        );
+    }
+
+    /// One prover fewer: the shard would keep `HALT_RISK_PROVER_COUNT`
+    /// Active provers, halt risk, so the pending leave is rejected however
+    /// much better the replacement scores.
+    #[test]
+    fn a_pending_leave_into_halt_risk_is_rejected() {
+        let available = vec![make_shard(vec![0xBB], 500_000, 0, 1)];
+        let held = vec![held_with_active(HALT_RISK_PROVER_COUNT)];
+        let pending = vec![vec![0xAA]];
+        let (reject, confirm) = decide_leaves_against_replacements(
+            &held,
+            &available,
+            &pending,
+            50_000,
+            &BigInt::from(600_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+        );
+        assert_eq!(
+            (reject, confirm),
+            (pending.clone(), Vec::<Vec<u8>>::new()),
+            "a shard keeping {HALT_RISK_PROVER_COUNT} Active provers must keep the seat"
+        );
+        let mut all = held;
+        all.extend(available);
+        let (reject, confirm) = decide_leaves(
+            &all,
+            &pending,
+            50_000,
+            &BigInt::from(600_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+        );
+        assert_eq!(
+            (reject, confirm),
+            (pending, Vec::<Vec<u8>>::new()),
+            "decide_leaves must keep it too"
+        );
     }
 
     #[test]
