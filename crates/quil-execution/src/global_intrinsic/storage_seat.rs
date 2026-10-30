@@ -28,7 +28,10 @@
 //! never issued. No proof by the end of the next epoch forfeits them, and a
 //! member that committed any root then is kicked: at its next frame on the
 //! shard, or by the epoch's expiry sweep (`enqueue_expiry`), whichever comes
-//! first, so a member that never returns is kicked too.
+//! first, so a member that never returns is kicked too. From the storage kick
+//! suspension epoch (`quil_types::consensus::storage_kicks_suspended`) it
+//! only forfeits them, and a member kicked so before may rejoin
+//! (`kick_forgiven`).
 //!
 //! Response window: a frame commits at the beacon of its proposer's freshest
 //! GLOBAL frame (`encode_commitment`), and its root counts as published only
@@ -311,14 +314,32 @@ impl Seat {
 
     /// Close every open slot whose settlement window ended before `frame`.
     /// True when one of them had committed a root: its member never proved
-    /// what it committed, and is kicked.
+    /// what it committed, and is kicked. From the storage kick suspension
+    /// epoch such a slot only forfeits its held shares, as every expired
+    /// slot does, and is logged; the member is not kicked.
     pub fn expire(&mut self, frame: u64) -> bool {
+        let suspended = quil_types::consensus::storage_kicks_suspended(frame);
         let mut kick = false;
         for slot in &mut self.slots {
             if slot.outcome == Outcome::Open && frame >= settlement_window(slot.epoch).1 {
                 slot.outcome = Outcome::Expired(frame);
                 slot.chained.clear();
-                kick |= slot.frames > 0;
+                if slot.frames == 0 {
+                    continue;
+                }
+                if suspended {
+                    tracing::warn!(
+                        frame,
+                        member = %hex::encode(self.member),
+                        shard = %hex::encode(&self.filter),
+                        epoch = slot.epoch,
+                        frames = slot.frames,
+                        withheld = %slot.pending_amount(),
+                        "storage epoch proof missing for committed openings: share withheld, not kicked"
+                    );
+                } else {
+                    kick = true;
+                }
             }
         }
         kick
@@ -471,6 +492,61 @@ pub fn read_address(state: &HypergraphState, address: &[u8; 32]) -> Result<Optio
         .map(Some),
         _ => Ok(None),
     }
+}
+
+/// Whether GLOBAL frame `frame` forgives `member`'s kick at GLOBAL frame
+/// `kick_frame`: from the storage kick suspension epoch, a kick in a
+/// hash-proof epoch before it that closed one of the member's seats with
+/// committed roots it never proved, in that very frame, as
+/// [`Seat::expire`] kicked for. The seats are looked up on the filters of
+/// the member's allocations, which the kick leaves in place, and an
+/// expired slot is never changed again. False for any other kick, and
+/// when no such seat is found.
+pub fn kick_forgiven(
+    state: &HypergraphState,
+    member: &[u8; 32],
+    kick_frame: u64,
+    frame: u64,
+) -> Result<bool> {
+    use quil_types::consensus::{epoch_for_frame, hash_storage_proofs_at, storage_kicks_suspended};
+    if !storage_kicks_suspended(frame)
+        || storage_kicks_suspended(kick_frame)
+        || !hash_storage_proofs_at(epoch_for_frame(kick_frame))
+    {
+        return Ok(false);
+    }
+    let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+    let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
+    let ha_disc = crate::hypergraph_state::hyperedge_adds_discriminator()?;
+    let hyperedge = state.get(domain, member, &ha_disc)?.unwrap_or_default();
+    let mut filters: Vec<Vec<u8>> = Vec::new();
+    for allocation in super::materialize::hyperedge_allocation_addresses(&hyperedge)? {
+        let Some(blob) = state
+            .get(domain, &allocation, &va_disc)?
+            .filter(|blob| !blob.is_empty())
+        else {
+            continue;
+        };
+        let tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+        if let Some(filter) = read_field(&tree, "allocation:ProverAllocation", "ConfirmationFilter")
+        {
+            if !filters.contains(&filter) {
+                filters.push(filter);
+            }
+        }
+    }
+    for filter in filters {
+        if let Some(seat) = read(state, member, &filter)? {
+            if seat
+                .slots
+                .iter()
+                .any(|slot| slot.outcome == Outcome::Expired(kick_frame) && slot.frames > 0)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Write `seat` at GLOBAL frame `frame`.
@@ -1240,5 +1316,90 @@ mod tests {
         assert!(!seat.expire(until + 1), "expired once");
         seat.prune(8);
         assert!(seat.slot(5).is_none());
+    }
+
+    /// Suspend storage kicks from `epoch` on this thread; `None` restores
+    /// the process setting.
+    fn suspend_storage_kicks(epoch: Option<u64>) {
+        quil_types::consensus::set_storage_kick_suspension_epoch_for_thread(epoch);
+    }
+
+    /// From the storage kick suspension epoch an unproven seat still closes
+    /// and forfeits what it held, but no longer kicks its member: the last
+    /// frame before the epoch kicks, its first frame does not.
+    #[test]
+    fn from_the_suspension_epoch_an_unproven_seat_withholds_its_share_without_a_kick() {
+        let length = quil_types::consensus::epoch_length_frames();
+        let suspension = 8;
+        suspend_storage_kicks(Some(suspension));
+        let mut seat = sealed_seat(5);
+        assert!(seat.hold(5, 330, 39, &BigInt::from(1_000), 4));
+        assert!(seat.commit(5, 40, 330, 331, &[1; 32], &[2; 32]));
+        let flag = suspension * length;
+        assert!(flag > settlement_window(5).1);
+        let mut before = seat.clone();
+        assert!(
+            before.expire(flag - 1),
+            "the frame before the suspension epoch still kicks"
+        );
+        assert!(
+            !seat.expire(flag),
+            "a seat expiring from the suspension epoch kicked its member"
+        );
+        let slot = seat.slot(5).unwrap();
+        assert_eq!(slot.outcome, Outcome::Expired(flag));
+        assert_eq!(slot.chained, vec![]);
+        assert_eq!(
+            slot.pending_amount(),
+            BigInt::from(1_000),
+            "the share stays held, never paid"
+        );
+        assert!(
+            seat.settle(5, flag + 1, 1).is_none(),
+            "an expired epoch cannot be settled"
+        );
+        let mut idle = sealed_seat(5);
+        assert!(!idle.expire(flag), "nothing committed: forfeit only");
+        suspend_storage_kicks(None);
+    }
+
+    /// The expiry sweep in the epoch before the suspension epoch kicks an
+    /// unproven committer; from it, it closes the seat without a kick.
+    #[test]
+    fn from_the_suspension_epoch_the_expiry_sweep_closes_without_kicking() {
+        let epoch = 5;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch));
+        for (suspension, kicks) in [(epoch + 3, 1usize), (epoch + 2, 0)] {
+            suspend_storage_kicks(Some(suspension));
+            let state =
+                HypergraphState::new(std::sync::Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                    std::sync::Arc::new(crate::hypergraph_state::InMemoryHypergraphStore::new()),
+                    std::sync::Arc::new(StubProver),
+                )));
+            let frame = epoch * quil_types::consensus::epoch_length_frames() + 30;
+            let mut seat = sealed_seat(epoch);
+            assert!(seat.commit(epoch, 40, frame - 3, frame - 2, &[1; 32], &[2; 32]));
+            let address = seat_address(&seat.member, &seat.filter).unwrap();
+            enqueue_expiry(&state, frame, epoch, &address).unwrap();
+            write(&state, frame, &seat).unwrap();
+            let close = settlement_window(epoch).1;
+            let mut kicked = 0;
+            for frame in close..close + EXPIRY_BUCKETS + 2 {
+                kicked += sweep_expiries(&state, frame).unwrap().len();
+            }
+            assert_eq!(
+                kicked,
+                kicks,
+                "suspension epoch {suspension}: the sweep in epoch {} kicked {kicked}",
+                epoch + 2
+            );
+            let seat = read(&state, &seat.member, &seat.filter).unwrap().unwrap();
+            assert!(matches!(
+                seat.slot(epoch).unwrap().outcome,
+                Outcome::Expired(_)
+            ));
+        }
+        suspend_storage_kicks(None);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 }

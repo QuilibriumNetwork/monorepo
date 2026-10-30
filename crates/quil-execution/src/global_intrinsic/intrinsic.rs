@@ -653,8 +653,26 @@ impl GlobalIntrinsic {
                 // validate would accept; materialize would reject;
                 // and consensus would split between nodes that did vs
                 // did not run materialization.
+                //
+                // A missing storage epoch proof's kick before the suspension
+                // epoch is forgiven from it where committed state can show
+                // it (`storage_seat::kick_forgiven`), as materialize does.
                 if let Some(pt) = prover_tree {
-                    verify::verify_prover_join_not_kicked(pt, frame_number)?;
+                    if let Err(refusal) = verify::verify_prover_join_not_kicked(pt, frame_number) {
+                        let forgiven =
+                            match (self.hypergraph.as_ref(), verify::recorded_kick_frame(pt)) {
+                                (Some(hg), Some(kf)) => super::storage_seat::kick_forgiven(
+                                    &crate::hypergraph_state::HypergraphState::new(hg.clone()),
+                                    &super::materialize::prover_address_from_pubkey(&v.public_key)?,
+                                    kf,
+                                    frame_number,
+                                )?,
+                                _ => false,
+                            };
+                        if !forgiven {
+                            return Err(refusal);
+                        }
+                    }
                 }
                 // Existing-allocation expiry gate. For each filter
                 // in the join, check the prover's current allocation:
@@ -1939,6 +1957,7 @@ impl GlobalIntrinsic {
         let prover_address = materialize::prover_address_from_pubkey(&pubkey)?;
 
         // Check if prover was previously kicked (Go: global_prover_join.go:972-988)
+        let mut storage_amnesty: Option<u64> = None;
         if let Ok(Some(existing_data)) = state.get(domain, &prover_address, va_disc) {
             if !existing_data.is_empty() {
                 let existing_tree =
@@ -1950,10 +1969,21 @@ impl GlobalIntrinsic {
                     // Spurious-kick amnesty (must mirror the validate-side gate in
                     // `verify_prover_join_not_kicked` exactly): a kick before the
                     // flag-day frame stops barring re-join once the chain reaches it.
+                    // A missing storage epoch proof's kick before the
+                    // suspension epoch is forgiven from it, as validate
+                    // forgives it (`storage_seat::kick_forgiven`).
                     if materialize::kick_bars_rejoin(kf, frame_number) {
-                        return Err(QuilError::InvalidArgument(
-                            "invoke_step join: prover has been previously kicked".into(),
-                        ));
+                        if !super::storage_seat::kick_forgiven(
+                            state,
+                            &prover_address,
+                            kf,
+                            frame_number,
+                        )? {
+                            return Err(QuilError::InvalidArgument(
+                                "invoke_step join: prover has been previously kicked".into(),
+                            ));
+                        }
+                        storage_amnesty = Some(kf);
                     }
                 }
 
@@ -2112,6 +2142,17 @@ impl GlobalIntrinsic {
                     }
                 })
                 .unwrap_or(0);
+            // A forgiven storage kick zeroed the seniority; the rejoin keeps
+            // what the vertex holds, as any rejoin does.
+            if let Some(kick_frame) = storage_amnesty {
+                tracing::info!(
+                    frame = frame_number,
+                    prover = %hex::encode(prover_address),
+                    kick_frame,
+                    seniority = existing,
+                    "rejoin of a prover kicked for a missing storage epoch proof: kick forgiven"
+                );
+            }
             match &join_credit {
                 Some((credit, _)) => existing.saturating_add(*credit),
                 None => std::cmp::max(existing, computed_seniority),
@@ -3202,7 +3243,8 @@ impl GlobalIntrinsic {
     /// epoch's expiry queue at a time (`storage_seat::enqueue_expiry`),
     /// kicking each member that committed roots it never proved — also one
     /// that never takes part in its shard again, which the frame path
-    /// (`StorageFrame::kicks`) would never reach. Where seats are written
+    /// (`StorageFrame::kicks`) would never reach — before the storage kick
+    /// suspension epoch (`storage_seat::Seat::expire`). Where seats are written
     /// (the archive-mode deps of `invoke_frame_header`) only.
     fn sweep_storage_expiries(&self, frame_number: u64, state: &HypergraphState) -> Result<()> {
         use super::storage_seat;
@@ -8156,6 +8198,235 @@ mod tests {
                 keys, expected,
                 "hyperedge must enumerate exactly the join's allocations"
             );
+        }
+
+        // -------------------------------------------------------------
+        // Storage kick suspension: from its epoch a seat closing an
+        // epoch with roots its member never proved no longer kicks the
+        // prover, and a prover that rule kicked before may rejoin.
+        // -------------------------------------------------------------
+
+        /// Suspend storage kicks from `epoch` on this thread; `None`
+        /// restores the process setting.
+        fn suspend_storage_kicks(epoch: Option<u64>) {
+            quil_types::consensus::set_storage_kick_suspension_epoch_for_thread(epoch);
+        }
+
+        /// Issuance that pays nothing: the expiry sweep runs only where
+        /// frame-header deps are installed, as on an archive.
+        struct NoIssuance;
+        impl quil_types::consensus::RewardIssuance for NoIssuance {
+            fn calculate(
+                &self,
+                _: u64,
+                _: u64,
+                _: u64,
+                _: &[std::collections::HashMap<String, quil_types::consensus::ProverAllocation>],
+            ) -> Result<Vec<num_bigint::BigInt>> {
+                Ok(Vec::new())
+            }
+        }
+
+        /// An active prover with one allocation on `filter` whose seat there
+        /// committed a root in `epoch` and never proved it, queued for the
+        /// epoch's expiry sweep, and the intrinsic an archive sweeps it with.
+        fn unproven_committer(
+            pubkey: &[u8],
+            filter: &[u8],
+            epoch: u64,
+        ) -> (GlobalIntrinsic, HypergraphState, [u8; 32]) {
+            use crate::global_intrinsic::storage_seat;
+            let store = Arc::new(crate::hypergraph_state::InMemoryHypergraphStore::new());
+            let crdt = Arc::new(HypergraphCrdt::new(store, Arc::new(StubProver)));
+            let state = HypergraphState::new(crdt.clone());
+            let (prover_addr, _) = seed_prover(&state, pubkey, filter, 1, true);
+            let frame = epoch * quil_types::consensus::epoch_length_frames() + 30;
+            let mut seat = storage_seat::Seat::new(prover_addr, filter.to_vec());
+            seat.register(epoch, &[vec![]], frame - 10);
+            assert!(seat.seal(epoch, frame - 9));
+            assert!(seat.commit(epoch, 40, frame - 3, frame - 2, &[1; 32], &[2; 32]));
+            storage_seat::write(&state, frame, &seat).unwrap();
+            let address = storage_seat::seat_address(&prover_addr, filter).unwrap();
+            storage_seat::enqueue_expiry(&state, frame, epoch, &address).unwrap();
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_frame_header_deps(
+                    Arc::new(super::ActiveCountRegistry { count: 0 }),
+                    Arc::new(NoIssuance),
+                )
+                .with_hypergraph(crdt);
+            (gi, state, prover_addr)
+        }
+
+        /// Run `epoch`'s expiry sweep over every frame it is due in.
+        fn sweep(gi: &GlobalIntrinsic, state: &HypergraphState, epoch: u64) {
+            use crate::global_intrinsic::storage_seat;
+            let close = storage_seat::settlement_window(epoch).1;
+            for frame in close..close + storage_seat::EXPIRY_BUCKETS + 2 {
+                gi.sweep_storage_expiries(frame, state).unwrap();
+            }
+        }
+
+        /// The whole prover survives an unproven seat expiring from the
+        /// suspension epoch: before it, the sweep kicked the prover and
+        /// every allocation, zeroed its seniority and barred its rejoin.
+        #[test]
+        fn from_the_suspension_epoch_the_expiry_sweep_leaves_an_unproven_committer_a_prover() {
+            use crate::global_intrinsic::storage_seat;
+            let epoch = 5;
+            quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch));
+            suspend_storage_kicks(Some(epoch + 2));
+            let pubkey = vec![0xD1u8; 897];
+            let filter = vec![0x61u8; 32];
+            let (gi, state, prover_addr) = unproven_committer(&pubkey, &filter, epoch);
+            sweep(&gi, &state, epoch);
+            assert_ne!(
+                read_status(&state, &prover_addr, "prover:Prover"),
+                Some(STATUS_KICKED),
+                "an unproven seat expiring from the suspension epoch kicked its prover (status 4)"
+            );
+            assert_eq!(read_kick_frame(&state, &prover_addr, "prover:Prover"), None);
+            assert_eq!(
+                read_status(
+                    &state,
+                    &allocation_address(&pubkey, &filter).unwrap(),
+                    "allocation:ProverAllocation"
+                ),
+                Some(1),
+                "the allocation stays active"
+            );
+            let seat = storage_seat::read(&state, &prover_addr, &filter)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                seat.slot(epoch).unwrap().outcome,
+                storage_seat::Outcome::Expired(_)
+            ));
+            suspend_storage_kicks(None);
+            quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        }
+
+        /// A prover the sweep kicked for an unproven seat before the
+        /// suspension epoch is refused a rejoin until the epoch and admitted
+        /// from its first frame, by validate and by materialize alike.
+        #[test]
+        fn a_prover_kicked_for_an_unproven_seat_may_rejoin_from_the_suspension_epoch() {
+            let epoch = 5;
+            let length = quil_types::consensus::epoch_length_frames();
+            let suspension = epoch + 4;
+            quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch));
+            suspend_storage_kicks(Some(suspension));
+            let pubkey = vec![0xD2u8; 897];
+            let filter = vec![0x62u8; 32];
+            let (gi, state, prover_addr) = unproven_committer(&pubkey, &filter, epoch);
+            sweep(&gi, &state, epoch);
+            let kick = read_kick_frame(&state, &prover_addr, "prover:Prover")
+                .expect("kicked before the suspension epoch");
+            assert_eq!(quil_types::consensus::epoch_for_frame(kick), epoch + 2);
+            state.commit().unwrap();
+            let va_disc = vertex_adds_discriminator().unwrap();
+            let prover_tree = rebuild_vertex_tree_from_blob(
+                &state
+                    .get(&GLOBAL_INTRINSIC_ADDRESS[..], &prover_addr, &va_disc)
+                    .unwrap()
+                    .unwrap(),
+            );
+            let flag = suspension * length;
+            let validate = |frame: u64| {
+                let bytes = join_op(&pubkey, &filter, frame)
+                    .to_canonical_bytes()
+                    .unwrap();
+                gi.validate(frame, &bytes, Some(&prover_tree), None)
+            };
+            let refused = validate(flag - 1).unwrap_err();
+            assert!(
+                refused.to_string().contains("previously kicked"),
+                "{refused}"
+            );
+            assert!(
+                validate(flag)
+                    .expect("validate must forgive a storage kick from the suspension epoch"),
+                "validate must accept the rejoin"
+            );
+            let refused = gi
+                .invoke_join(
+                    flag - 1,
+                    &join_op(&pubkey, &filter, flag - 1),
+                    &state,
+                    &va_disc,
+                )
+                .unwrap_err();
+            assert!(
+                refused.to_string().contains("previously kicked"),
+                "{refused}"
+            );
+            gi.invoke_join(flag, &join_op(&pubkey, &filter, flag), &state, &va_disc)
+                .expect("materialize must forgive a storage kick from the suspension epoch");
+            assert_eq!(read_kick_frame(&state, &prover_addr, "prover:Prover"), None);
+            assert_ne!(
+                read_status(&state, &prover_addr, "prover:Prover"),
+                Some(STATUS_KICKED)
+            );
+            suspend_storage_kicks(None);
+            quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        }
+
+        /// The suspension forgives only a kick for an unproven seat in that
+        /// very frame: a signed kick stays a bar, and so does a storage kick
+        /// a later signed kick restamped.
+        #[test]
+        fn the_suspension_forgives_no_other_kick() {
+            let epoch = 5;
+            let length = quil_types::consensus::epoch_length_frames();
+            let suspension = epoch + 4;
+            let flag = suspension * length;
+            quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch));
+            suspend_storage_kicks(Some(suspension));
+            let va_disc = vertex_adds_discriminator().unwrap();
+            let signed_kick =
+                |gi: &GlobalIntrinsic, state: &HypergraphState, pubkey: &[u8], frame| {
+                    let op = ProverKick {
+                        frame_number: frame,
+                        kicked_prover_public_key: pubkey.to_vec(),
+                        conflicting_frame_1: vec![],
+                        conflicting_frame_2: vec![],
+                        commitment: vec![],
+                        proof: vec![],
+                        traversal_proof: vec![],
+                    };
+                    gi.invoke_kick(frame, &op, state, &va_disc).unwrap();
+                };
+
+            // A signed kick in a hash-proof epoch, no seat expired.
+            let pubkey = vec![0xD3u8; 897];
+            let filter = vec![0x63u8; 32];
+            let state = make_state();
+            seed_prover(&state, &pubkey, &filter, 1, true);
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
+            signed_kick(&gi, &state, &pubkey, (epoch + 2) * length + 5);
+            let refused = gi
+                .invoke_join(flag, &join_op(&pubkey, &filter, flag), &state, &va_disc)
+                .unwrap_err();
+            assert!(
+                refused.to_string().contains("previously kicked"),
+                "{refused}"
+            );
+
+            // A storage kick, then a signed kick restamping the frame.
+            let pubkey = vec![0xD4u8; 897];
+            let filter = vec![0x64u8; 32];
+            let (gi, state, prover_addr) = unproven_committer(&pubkey, &filter, epoch);
+            sweep(&gi, &state, epoch);
+            let storage_kick = read_kick_frame(&state, &prover_addr, "prover:Prover").unwrap();
+            signed_kick(&gi, &state, &pubkey, storage_kick + 100);
+            let refused = gi
+                .invoke_join(flag, &join_op(&pubkey, &filter, flag), &state, &va_disc)
+                .unwrap_err();
+            assert!(
+                refused.to_string().contains("previously kicked"),
+                "a kick restamped by another rule must still bar: {refused}"
+            );
+            suspend_storage_kicks(None);
+            quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
         }
 
         /// A prover with one allocation on `filter_a`, marked with `status`.
