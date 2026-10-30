@@ -1154,6 +1154,24 @@ pub fn claim_epoch_proof(
     Some(attempt)
 }
 
+/// Restart the retry clock of `(member, filter)`'s epoch proof settling
+/// `epoch` at the latest GLOBAL frame this process saw ([`global_frame`]):
+/// its part, or the node's proof carrying it, just went out, and GLOBAL needs
+/// [`seal_retry_frames`] from then to record it. Claimed long before (a seal
+/// relabelling, the node's batch waiting for other seats), a part was sent
+/// again a minute after its proof landed, and GLOBAL refused it as settling
+/// an epoch already settled.
+pub fn note_epoch_proof_published(member: &[u8], filter: &[u8], epoch: u64) {
+    let Some(frame) = global_frame() else {
+        return;
+    };
+    if let Ok(mut attempts) = epoch_proof_attempts().lock() {
+        if let Some((at, _)) = attempts.get_mut(&(member.to_vec(), filter.to_vec(), epoch)) {
+            *at = (*at).max(frame);
+        }
+    }
+}
+
 /// This member's replicas of a seat's registered leaves for `epoch`, as its
 /// commitments open them and its epoch proof proves them.
 pub struct HeldReplicas {
@@ -1327,12 +1345,21 @@ pub fn prepare_member_seat(
         self as epoch_proof, SeatClaim, SeatProof,
     };
     use quil_types::error::QuilError;
-    let _memory = crate::storage_jobs::reserve(seat_part_bytes(
+    let bytes = seat_part_bytes(
         replicas,
         filter,
         seal.map(|(slot, _, _)| (epoch + 2, slot.leaves.as_slice())),
         settle.map(|(slot, _)| (epoch, slot.leaves.as_slice())),
-    )?);
+    )?;
+    // A settlement alone loads its held replicas for seconds, and never
+    // waits behind seals relabelling: GLOBAL withholds the member's storage
+    // share (before epoch 1342: kicks it) when its roots go unproven by the
+    // window's end.
+    let _memory = if seal.is_none() {
+        crate::storage_jobs::reserve_settlement(bytes)
+    } else {
+        crate::storage_jobs::reserve(bytes)
+    };
     let mut claim = SeatClaim {
         seal_epoch: epoch + 2,
         settle_epoch: epoch,
@@ -1514,9 +1541,58 @@ pub fn request(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use quil_hypergraph::Location;
+
+    /// A seat of `member` on `app` owing GLOBAL the settlement of `epoch`:
+    /// its replicas encoded into `replicas`, and one root committed in GLOBAL
+    /// frame `frame_number`, chained as GLOBAL chains it, with the beacon of
+    /// GLOBAL frame `anchor` whose output is `output`.
+    pub(crate) fn settlement_owed(
+        replicas: &ReplicaStore,
+        member: &[u8; 32],
+        app: &[u8; 32],
+        epoch: u64,
+        frame_number: u64,
+        anchor: u64,
+        output: &[u8],
+    ) -> quil_types::consensus::StorageSeatSlot {
+        let crdt = test_crdt();
+        for d in 0u8..3 {
+            crdt.add_vertex(
+                &Location {
+                    app_address: *app,
+                    data_address: [d; 32],
+                },
+                &vec![d + 3; 500],
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let captured = capture_at(&crdt, app, epoch, &[current_source(&crdt, app, epoch)]).unwrap();
+        encode_member(&captured, member, replicas).unwrap();
+        let mut leaves = captured.prefixes.clone();
+        leaves.sort();
+        let mut slot = quil_types::consensus::StorageSeatSlot {
+            epoch,
+            leaves,
+            registered_at: 1,
+            sealed_at: Some(2),
+            frames: 1,
+            accumulator: [0; 32],
+            chained: vec![(frame_number, anchor)],
+            open: true,
+        };
+        let rho_n: [u8; 32] = quil_crypto::porep::derive_storage_beacon(anchor, output)
+            .try_into()
+            .unwrap();
+        let root = commitment(replicas, member, app, &slot, frame_number, &rho_n).unwrap();
+        slot.accumulator = quil_execution::global_intrinsic::storage_seat::chain(
+            [(frame_number, &rho_n[..], &root)].into_iter(),
+        );
+        slot
+    }
 
     fn test_crdt() -> Arc<HypergraphCrdt> {
         let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
@@ -2334,6 +2410,37 @@ mod tests {
             .find(epoch, &other, &leaf_id, |n| n == exact)
             .is_some());
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// An epoch proof is not sent again until GLOBAL had
+    /// [`seal_retry_frames`] to record it from when it went out: a part
+    /// claimed long before (a seal relabelling, the node's batch waiting)
+    /// was sent again a minute after its proof landed, and GLOBAL refused it
+    /// as settling an epoch already settled.
+    #[test]
+    fn an_epoch_proof_retry_waits_from_when_it_went_out() {
+        let (member, app, epoch) = ([0x7A; 32], [0x7B; 32], 41);
+        let retry = seal_retry_frames();
+        assert_eq!(claim_epoch_proof(&member, &app, epoch, 1000), Some(1));
+        // Its proof goes out just before the claim's clock would run out.
+        note_global_frame(1000 + retry - 1);
+        note_epoch_proof_published(&member, &app, epoch);
+        assert_eq!(
+            claim_epoch_proof(&member, &app, epoch, 1000 + retry),
+            None,
+            "sent again right after its proof went out, timed from its claim"
+        );
+        assert_eq!(
+            claim_epoch_proof(&member, &app, epoch, 1000 + 2 * retry - 2),
+            None
+        );
+        assert_eq!(
+            claim_epoch_proof(&member, &app, epoch, 1000 + 2 * retry - 1),
+            Some(2)
+        );
+        // A seat never claimed here gets no clock.
+        note_epoch_proof_published(&member, &[0x7C; 32], epoch);
+        assert_eq!(epoch_proof_sent_at(&member, &[0x7C; 32], epoch), None);
     }
 
     /// An epoch's replicas are evicted only once GLOBAL is past its

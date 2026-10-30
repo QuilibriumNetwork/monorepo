@@ -469,6 +469,7 @@ fn worker_global_submissions(
                 core_id,
                 "holding back GLOBAL submission — coverage halt active"
             );
+            crate::storage_epoch_batch::note_withheld(&canonical);
             crate::presence_reports::publication_failed(&canonical);
             return;
         }

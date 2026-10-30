@@ -2059,6 +2059,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                     let publish: quil_engine::storage_epoch_batch::Publish = Arc::new(move |proof: Vec<u8>| {
                         if halt.any_halted() {
                             tracing::debug!("holding back a storage epoch proof — coverage halt active");
+                            quil_engine::storage_epoch_batch::note_withheld(&proof);
                             return;
                         }
                         let Ok(bundle) = prover_bundle(proof) else { return };
