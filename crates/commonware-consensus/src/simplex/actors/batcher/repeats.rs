@@ -65,10 +65,6 @@ impl Counts {
         }
     }
 
-    const fn equivocations(&self) -> u64 {
-        self.conflicting + self.nullify_finalize
-    }
-
     fn merge(&mut self, other: Self) {
         self.resigned += other.resigned;
         self.conflicting += other.conflicting;
@@ -197,13 +193,18 @@ impl<P: Clone> Repeats<P> {
     }
 }
 
+/// What this node's operator does about a remote prover's repeated votes.
+const ACTION: &str = "no action needed on this node: ignored votes cost nothing, and only that \
+    prover's operator can fix it (a duplicate instance, or a restart without its vote journal); \
+    repeats are summarized every 10 min at info";
+
 impl<P: std::fmt::Debug> Line<P> {
     /// Log the line for a member in epoch `epoch` of the engine journaling to
-    /// `partition`. Equivocation (votes for two proposals, or a nullify and
-    /// a finalize, in one view) logs a warning: the evidence is reported and
-    /// a maintainer may want it. A re-signed duplicate logs at info: it
-    /// changes no outcome (the vote counts once) and this operator cannot
-    /// act on it.
+    /// `partition`. A signer's first equivocation (votes for two proposals,
+    /// or a nullify and a finalize, in one view) logs a warning: the
+    /// evidence is reported and a maintainer may want it. Its summaries log
+    /// at info, as does a re-signed duplicate: they change no outcome (the
+    /// vote counts once) and this operator cannot act on them.
     pub(super) fn log(&self, partition: &str, epoch: u64) {
         match self {
             Self::First { signer, index, kind, view } => {
@@ -218,7 +219,8 @@ impl<P: std::fmt::Debug> Line<P> {
                         signer = ?signer,
                         index = %index,
                         kind,
-                        "ignored a repeated vote from a remote signer: the same vote again with other signature bytes (likely re-signed by a duplicate instance of that prover, or by one that restarted without its vote journal); it is not counted twice and only that prover's operator can fix it; further repeats of this signer are summarized every 10 min"
+                        action = ACTION,
+                        "a remote prover sent the same vote twice with other signature bytes; the copy is ignored"
                     );
                 } else {
                     tracing::warn!(
@@ -229,38 +231,27 @@ impl<P: std::fmt::Debug> Line<P> {
                         signer = ?signer,
                         index = %index,
                         kind,
-                        "ignored a conflicting vote from a remote signer and reported the equivocation (likely a duplicate instance of that prover, or one that restarted without its vote journal); it is not counted twice and only that prover's operator can fix it; further repeats of this signer are summarized every 10 min"
+                        action = ACTION,
+                        "a remote prover is signing conflicting votes; its extra votes are ignored and the equivocation is reported"
                     );
                 }
             }
+            // The first line said it all: repeats are counts at info.
             Self::Summary { signer, index, counts, secs, last_view } => {
-                if counts.equivocations() > 0 {
-                    tracing::warn!(
-                        scope = "peer",
-                        partition,
-                        epoch,
-                        signer = ?signer,
-                        index = %index,
-                        resigned = counts.resigned,
-                        conflicting = counts.conflicting,
-                        nullify_finalize = counts.nullify_finalize,
-                        secs,
-                        last_view,
-                        "a remote signer still sends conflicting votes (equivocation reported; likely a duplicate instance of that prover, or one that restarted without its vote journal); ignored and not counted twice; counts since the previous line"
-                    );
-                } else {
-                    tracing::info!(
-                        scope = "peer",
-                        partition,
-                        epoch,
-                        signer = ?signer,
-                        index = %index,
-                        resigned = counts.resigned,
-                        secs,
-                        last_view,
-                        "a remote signer still repeats votes with other signature bytes (likely a duplicate instance of that prover, or one that restarted without its vote journal); ignored and not counted twice; counts since the previous line"
-                    );
-                }
+                tracing::info!(
+                    scope = "peer",
+                    partition,
+                    epoch,
+                    signer = ?signer,
+                    index = %index,
+                    resigned = counts.resigned,
+                    conflicting = counts.conflicting,
+                    nullify_finalize = counts.nullify_finalize,
+                    secs,
+                    last_view,
+                    action = ACTION,
+                    "a remote prover still sends repeated or conflicting votes, all ignored; counts since the previous line"
+                );
             }
             Self::End { signer, index, totals, secs, last_view } => {
                 tracing::info!(
@@ -274,7 +265,7 @@ impl<P: std::fmt::Debug> Line<P> {
                     nullify_finalize = totals.nullify_finalize,
                     secs,
                     last_view,
-                    "a remote signer's repeated or conflicting votes stopped: none for 10 min; totals of the episode"
+                    "a remote prover's repeated or conflicting votes stopped: none for 10 min; totals of the episode"
                 );
             }
         }
@@ -400,8 +391,8 @@ mod tests {
         let out = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
         assert_eq!(out.lines().count(), 3, "first, one summary and the end, not 102 lines: {out}");
         assert_eq!(out.matches("partition=\"app-00a2080\"").count(), 3, "{out}");
-        assert_eq!(out.matches(" INFO ").count(), 2, "the re-signed first repeat and the end: {out}");
-        assert_eq!(out.matches(" WARN ").count(), 1, "the summary with a conflicting vote: {out}");
+        assert_eq!(out.matches(" INFO ").count(), 3, "the re-signed first repeat, the summary and the end: {out}");
+        assert_eq!(out.matches(" WARN ").count(), 0, "a summary with a conflicting vote is counts at info: {out}");
         assert!(out.contains("resigned=100 conflicting=1"), "{out}");
         assert!(!out.contains("invalid signature"), "{out}");
     }
