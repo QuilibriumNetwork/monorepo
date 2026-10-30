@@ -49,6 +49,15 @@ pub const MEMORY_SHARE_PERCENT: u64 = 75;
 /// besides whenever another one changes.
 const RECHECK: Duration = Duration::from_secs(5);
 
+/// How long one look at the memory beside the reservations held bounds the
+/// jobs' share ([`Admission`]). A reservation granted a moment ago has
+/// allocated nothing yet, so what is available just after it still holds
+/// its memory: the look taken before it bounds the next ones until it has
+/// allocated (a leaf's read took about three minutes to, 2026-10-28). Five
+/// minutes also hold the node's own peaks, its periodic prover-tree pull
+/// among them.
+const LOOK_WINDOW: Duration = Duration::from_secs(300);
+
 /// How long work due now must have neither waited for memory nor held any
 /// before work ahead that yielded to it starts again ([`wait_for_due_work`]):
 /// a gap between one seat's encode and the next's does not end it.
@@ -423,6 +432,8 @@ pub struct Admission {
     changed: Condvar,
     slots: usize,
     available: Box<dyn Fn() -> Option<u64> + Send + Sync>,
+    /// [`LOOK_WINDOW`], shorter in tests.
+    window: Duration,
 }
 
 #[derive(Default)]
@@ -436,8 +447,16 @@ struct State {
     /// asked, then those ahead in the order asked.
     waiting: VecDeque<(u64, Urgency, u64)>,
     next_ticket: u64,
-    /// Memory available when the last reservation granted to no others was.
+    /// Memory available when the last reservation granted to no others was,
+    /// raised to what is available beside the ones held whenever that is
+    /// more: the most the jobs could have.
     idle_available: Option<u64>,
+    /// What was available plus the reservations held, at the looks within
+    /// [`LOOK_WINDOW`] that were lower than every later one: the front is
+    /// the lowest.
+    looks: VecDeque<(Instant, u64)>,
+    /// The latest look at the memory beside reservations held.
+    last_look: Option<Look>,
     /// Reservations held for work due now.
     due_held: usize,
     /// Reservations for work due now waiting, once they found they do not
@@ -446,6 +465,15 @@ struct State {
     due_waiting: usize,
     /// When a reservation for work due now last was granted or given back.
     due_last: Option<Instant>,
+}
+
+/// One look at the memory beside the reservations held ([`Admission`]).
+#[derive(Debug, Clone, Copy)]
+struct Look {
+    available: u64,
+    idle_available: u64,
+    window_low: u64,
+    share: u64,
 }
 
 impl Admission {
@@ -457,6 +485,7 @@ impl Admission {
             changed: Condvar::new(),
             slots: slots.max(1),
             available,
+            window: LOOK_WINDOW,
         }
     }
 
@@ -495,10 +524,15 @@ impl Admission {
                 if urgency == Urgency::Due {
                     state.due_waiting += 1;
                 }
+                let look = state.last_look;
                 info!(
                     bytes,
                     reserved = state.reserved,
                     jobs = state.holders,
+                    available = look.map(|look| look.available),
+                    idle_available = look.map(|look| look.idle_available),
+                    window_low = look.map(|look| look.window_low),
+                    share = look.map(|look| look.share),
                     ahead = state
                         .waiting
                         .iter()
@@ -569,25 +603,67 @@ impl Admission {
     }
 
     /// Whether `bytes` more fit beside the reservations held.
+    ///
+    /// Alone, a job runs whatever its size, and what is available then is
+    /// the most the jobs could have. Beside others, the jobs share
+    /// [`MEMORY_SHARE_PERCENT`] of the less of two bounds, looked at again
+    /// whenever a reservation asks or waits:
+    /// - the most the jobs could have, raised whenever more is available
+    ///   beside the ones held (the node gave memory back);
+    /// - the lowest look within [`LOOK_WINDOW`] at what was available plus
+    ///   the reservations held: less when the node has grown, and a
+    ///   reservation granted a moment ago, which has allocated nothing yet,
+    ///   is not counted both as available and as held.
+    ///
+    /// The share is never less than that of what is available now, which
+    /// the reservations fit in even if none has allocated anything. So no
+    /// single look decides for longer than the window (2026-10-29: the one
+    /// taken when the last job alone was granted decided for as long as any
+    /// job held memory, too high once the node had grown, too low once it
+    /// had given memory back).
     fn fits(&self, state: &mut State, bytes: u64) -> bool {
+        let now = Instant::now();
         if state.holders == 0 {
-            // Alone, a job runs whatever its size. What is available while
-            // no job holds anything is what the next ones share.
             state.idle_available = (self.available)();
+            state.looks.clear();
+            if let Some(idle) = state.idle_available {
+                state.looks.push_back((now, idle));
+            }
             return true;
         }
         if state.holders >= self.slots {
             return false;
         }
-        let (Some(idle), Some(now)) = (state.idle_available, (self.available)()) else {
+        let Some(available) = (self.available)() else {
             return false;
         };
+        let idle = state
+            .idle_available
+            .map_or(available, |idle| idle.max(available));
+        state.idle_available = Some(idle);
         // The reservations held are mostly allocated, so what is available
-        // now plus them is what the jobs could have: less when the node has
-        // grown, and never more than with none held, as one granted a moment
-        // ago has allocated nothing yet.
-        let could = idle.min(now.saturating_add(state.reserved));
+        // now plus them is what the jobs could have.
+        let bound = available.saturating_add(state.reserved);
+        while state
+            .looks
+            .front()
+            .is_some_and(|&(at, _)| now.saturating_duration_since(at) > self.window)
+        {
+            state.looks.pop_front();
+        }
+        while state.looks.back().is_some_and(|&(_, low)| low >= bound) {
+            state.looks.pop_back();
+        }
+        state.looks.push_back((now, bound));
+        let window_low = state.looks.front().map_or(bound, |&(_, low)| low);
+        let could = idle.min(window_low).max(available);
         let share = u128::from(could) * u128::from(MEMORY_SHARE_PERCENT) / 100;
+        state.last_look = Some(Look {
+            available,
+            idle_available: idle,
+            window_low,
+            share: u64::try_from(share).unwrap_or(u64::MAX),
+        });
         u128::from(state.reserved) + u128::from(bytes) <= share
     }
 }
@@ -603,13 +679,23 @@ mod tests {
     const NOT_YET: Duration = Duration::from_millis(300);
 
     fn admission(slots: usize, available: u64) -> (&'static Admission, Arc<AtomicU64>) {
+        admission_looking(slots, available, Duration::from_secs(1))
+    }
+
+    /// [`admission`] whose looks at the memory bound the share for `window`.
+    fn admission_looking(
+        slots: usize,
+        available: u64,
+        window: Duration,
+    ) -> (&'static Admission, Arc<AtomicU64>) {
         let memory = Arc::new(AtomicU64::new(available));
         let probe = memory.clone();
-        let admission = Box::leak(Box::new(Admission::new(
+        let mut admission = Admission::new(
             slots,
             Box::new(move || Some(probe.load(Ordering::SeqCst)).filter(|&bytes| bytes > 0)),
-        )));
-        (admission, memory)
+        );
+        admission.window = window;
+        (Box::leak(Box::new(admission)), memory)
     }
 
     /// A reservation held on a thread of its own: `granted` hears when it is,
@@ -875,6 +961,105 @@ mod tests {
         assert!(still_waiting(&second));
         memory.store(30 * GIB, Ordering::SeqCst);
         assert!(granted(&second), "it looks again without being told");
+    }
+
+    /// A reservation granted a moment ago has allocated nothing, so what is
+    /// available still holds its memory: the next one is weighed against
+    /// what the node had before it was granted, not against what was
+    /// available when no job held memory, before the node grew.
+    #[test]
+    fn a_reservation_granted_a_moment_ago_is_not_counted_twice_once_the_node_grew() {
+        let (admission, memory) = admission_looking(8, 40 * GIB, Duration::from_secs(600));
+        let first = hold(admission, 10 * GIB);
+        assert!(granted(&first), "alone, with 40 GiB available");
+        // It allocated its 10 GiB and the node grew by 16: the jobs could
+        // have 14 + 10 GiB, and share 18.
+        memory.store(14 * GIB, Ordering::SeqCst);
+        let second = hold(admission, 4 * GIB);
+        assert!(granted(&second), "14 GiB fit in 18");
+        // It has allocated nothing yet: 14 GiB are still available.
+        let third = hold(admission, 5 * GIB);
+        assert!(
+            still_waiting(&third),
+            "19 GiB do not fit in the 18 the jobs share, though 14 available plus 14 held \
+             would come to 28 and with none held 40 were"
+        );
+        // The second allocated its memory and the first gave its back.
+        memory.store(20 * GIB, Ordering::SeqCst);
+        drop(first.release);
+        assert!(granted(&third), "9 GiB fit in 18");
+        drop(second.release);
+        drop(third.release);
+    }
+
+    /// Memory the node gives back while jobs hold theirs is shared at once,
+    /// not once every job has ended: what is available beside them is less
+    /// than what would be with none held.
+    #[test]
+    fn memory_the_node_gives_back_is_shared_while_jobs_hold_theirs() {
+        let (admission, memory) = admission_looking(8, 10 * GIB, Duration::from_secs(600));
+        let first = hold(admission, 4 * GIB);
+        assert!(
+            granted(&first),
+            "alone, while the node peaks at 10 GiB available"
+        );
+        memory.store(6 * GIB, Ordering::SeqCst);
+        let second = hold(admission, 20 * GIB);
+        assert!(still_waiting(&second), "24 GiB do not fit in 7.5");
+        // The node gave 30 GiB back.
+        memory.store(36 * GIB, Ordering::SeqCst);
+        assert!(
+            granted(&second),
+            "24 GiB fit in 27 of the 36 available, though the first still holds its memory"
+        );
+        drop(first.release);
+        drop(second.release);
+    }
+
+    /// What the node gave back stays the most the jobs could have once they
+    /// have allocated it, until a job is granted alone again.
+    #[test]
+    fn memory_given_back_stays_shared_once_jobs_allocate_it() {
+        let window = Duration::from_millis(200);
+        let (admission, memory) = admission_looking(8, 10 * GIB, window);
+        let first = hold(admission, 4 * GIB);
+        assert!(granted(&first));
+        memory.store(36 * GIB, Ordering::SeqCst);
+        let second = hold(admission, 20 * GIB);
+        assert!(granted(&second), "24 GiB fit in 27");
+        // The second allocated its 20 GiB; the looks before are past.
+        memory.store(16 * GIB, Ordering::SeqCst);
+        std::thread::sleep(window * 2);
+        let third = hold(admission, 2 * GIB);
+        assert!(
+            granted(&third),
+            "26 GiB fit in 27 of the 36 seen beside the first, not in 12 of the 16 available"
+        );
+        drop(first.release);
+        drop(second.release);
+        drop(third.release);
+    }
+
+    /// A peak of the node's lowers the share for the window only: once the
+    /// peak is past, the share comes back without every job ending.
+    #[test]
+    fn a_peak_of_the_node_lowers_the_share_for_the_window_only() {
+        let window = Duration::from_millis(500);
+        let (admission, memory) = admission_looking(8, 40 * GIB, window);
+        let first = hold(admission, 10 * GIB);
+        assert!(granted(&first));
+        // The first allocated its memory, and the node peaks at 20 GiB more.
+        memory.store(10 * GIB, Ordering::SeqCst);
+        let second = hold(admission, 14 * GIB);
+        assert!(still_waiting(&second), "24 GiB do not fit in 15");
+        memory.store(30 * GIB, Ordering::SeqCst);
+        assert!(
+            granted(&second),
+            "24 GiB fit in 30 once the peak's look is past, though 22.5 is all of the 30 \
+             available alone"
+        );
+        drop(first.release);
+        drop(second.release);
     }
 
     #[test]
