@@ -35,8 +35,7 @@ fn check_source(state: &HypergraphState, s: &ShieldStatement) -> Result<()> {
         &s.application,
         &s.transparent_address,
         s.amount,
-        &s.owner_public_key,
-        false,
+        &owner_addresses(&s.owner_public_key, false)?,
     )
 }
 
@@ -59,20 +58,32 @@ pub(crate) fn check_sources(
     if shield.is_batch() && !active {
         return Err(invalid("batch shields are not active yet"));
     }
+    // One key signs every source, so its owner forms are hashed once per
+    // shield, not once per source.
+    let owners = owner_addresses(shield.owner_public_key(), migrated_owners)?;
     for source in shield.sources() {
         if active && !shard.covers(&source.address) {
             return Err(invalid("source outside this shard"));
         }
-        check_coin(
-            state,
-            application,
-            &source.address,
-            source.amount,
-            shield.owner_public_key(),
-            migrated_owners,
-        )?;
+        check_coin(state, application, &source.address, source.amount, &owners)?;
     }
     Ok(())
+}
+
+/// The owner fields a legacy coin of `owner_public_key` may carry:
+/// `poseidon(owner_public_key)` and `poseidon(peer-id multihash)`, each in the
+/// form the migration wrote it when `migrated_owners`.
+fn owner_addresses(owner_public_key: &[u8; 57], migrated_owners: bool) -> Result<[[u8; 32]; 2]> {
+    let peer = quil_crypto::peer_id_multihash_from_ed448_pubkey(owner_public_key);
+    let addresses = [
+        quil_crypto::poseidon::hash_bytes_to_32(owner_public_key)?,
+        quil_crypto::poseidon::hash_bytes_to_32(&peer)?,
+    ];
+    Ok(if migrated_owners {
+        addresses.map(|address| legacy_migration::migrated_owner(&address))
+    } else {
+        addresses
+    })
 }
 
 fn check_coin(
@@ -80,8 +91,7 @@ fn check_coin(
     application: &[u8; 32],
     address: &[u8; 32],
     expected_amount: u128,
-    owner_public_key: &[u8; 57],
-    migrated_owners: bool,
+    owners: &[[u8; 32]; 2],
 ) -> Result<()> {
     let disc = vertex_adds_discriminator()?;
     let blob = state
@@ -112,15 +122,7 @@ fn check_coin(
     if amount != expected_amount {
         return Err(invalid("source amount mismatch"));
     }
-    let peer = quil_crypto::peer_id_multihash_from_ed448_pubkey(owner_public_key);
-    let mut addresses = [
-        quil_crypto::poseidon::hash_bytes_to_32(owner_public_key)?,
-        quil_crypto::poseidon::hash_bytes_to_32(&peer)?,
-    ];
-    if migrated_owners {
-        addresses = addresses.map(|address| legacy_migration::migrated_owner(&address));
-    }
-    if !addresses.contains(&owner) {
+    if !owners.contains(&owner) {
         return Err(invalid("source owner mismatch"));
     }
     Ok(())
