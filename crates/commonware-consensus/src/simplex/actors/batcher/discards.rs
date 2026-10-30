@@ -20,6 +20,13 @@ pub(super) const SUMMARY_EVERY: Duration = Duration::from_secs(600);
 /// Distinct peers remembered per summary.
 const PEERS: usize = 256;
 
+/// Undecodable messages in one summary that warn, when they come from more
+/// than one peer: about half of one committee member's vote stream over
+/// [`SUMMARY_EVERY`] (three votes a view, a view every few seconds). Fewer,
+/// or from one peer, is a stray or a peer on another build: its operator's
+/// problem.
+pub(super) const UNDECODABLE_WARN: u64 = 100;
+
 /// What was discarded since the last summary.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Summary {
@@ -33,6 +40,8 @@ pub(super) struct Summary {
     pub later: u64,
     /// Distinct senders (at most [`PEERS`] are counted).
     pub peers: usize,
+    /// Distinct senders of undecodable messages (at most [`PEERS`]).
+    pub undecodable_peers: usize,
     /// Lowest and highest foreign epoch seen.
     pub epochs: Option<(u64, u64)>,
 }
@@ -46,11 +55,18 @@ pub(super) struct Discards<P: Ord> {
     logged: Option<SystemTime>,
     pending: Summary,
     peers: BTreeSet<P>,
+    undecodable_peers: BTreeSet<P>,
 }
 
 impl<P: Ord> Default for Discards<P> {
     fn default() -> Self {
-        Self { partition: String::new(), logged: None, pending: Summary::default(), peers: BTreeSet::new() }
+        Self {
+            partition: String::new(),
+            logged: None,
+            pending: Summary::default(),
+            peers: BTreeSet::new(),
+            undecodable_peers: BTreeSet::new(),
+        }
     }
 }
 
@@ -58,6 +74,9 @@ impl<P: Ord + Clone> Discards<P> {
     /// A message from `peer` that did not decode; returns a summary to log.
     pub(super) fn undecodable(&mut self, now: SystemTime, peer: &P) -> Option<Summary> {
         self.pending.undecodable += 1;
+        if self.undecodable_peers.len() < PEERS {
+            self.undecodable_peers.insert(peer.clone());
+        }
         self.record(now, peer)
     }
 
@@ -88,31 +107,59 @@ impl<P: Ord + Clone> Discards<P> {
         let mut summary = std::mem::take(&mut self.pending);
         summary.secs = since.map_or(0, |since| since.as_secs());
         summary.peers = std::mem::take(&mut self.peers).len();
+        summary.undecodable_peers = std::mem::take(&mut self.undecodable_peers).len();
         Some(summary)
     }
 }
 
 impl Summary {
+    /// Whether the undecodable messages pass [`UNDECODABLE_WARN`] from more
+    /// than one peer: then this node may be the one on another build.
+    pub(super) const fn warns(&self) -> bool {
+        self.undecodable >= UNDECODABLE_WARN && self.undecodable_peers > 1
+    }
+
     /// Log the summary for a member in epoch `ours` of the engine journaling
-    /// to `partition`: a warning when peers sent undecodable messages,
-    /// otherwise an info line (messages of another epoch are expected for a
-    /// while after a committee handoff).
+    /// to `partition`: a warning when undecodable messages pass their bound
+    /// ([`Self::warns`]), otherwise an info line (messages of another epoch
+    /// are expected for a while after a committee handoff, and a few
+    /// undecodable ones are the sender's problem).
     pub(super) fn log(&self, partition: &str, ours: u64) {
         let (low, high) = self.epochs.unwrap_or_default();
-        if self.undecodable > 0 {
+        if self.warns() {
             tracing::warn!(
-                scope = "peer",
+                scope = "this node or its peers",
                 partition,
-                action = "report",
                 epoch = ours,
                 undecodable = self.undecodable,
+                undecodable_peers = self.undecodable_peers,
                 earlier = self.earlier,
                 later = self.later,
                 peers = self.peers,
                 lowest_epoch = low,
                 highest_epoch = high,
                 secs = self.secs,
-                "discarded consensus messages from peers: some did not decode (a peer on an incompatible build); report with its build if it persists"
+                action = "check with `qclient node info` that this node runs the current release and \
+                          update it if not; if it does, report this line to the maintainer",
+                "consensus messages from several peers could not be read and were dropped"
+            );
+        } else if self.undecodable > 0 {
+            tracing::info!(
+                scope = "peer",
+                partition,
+                epoch = ours,
+                undecodable = self.undecodable,
+                undecodable_peers = self.undecodable_peers,
+                earlier = self.earlier,
+                later = self.later,
+                peers = self.peers,
+                lowest_epoch = low,
+                highest_epoch = high,
+                secs = self.secs,
+                warn_from = UNDECODABLE_WARN,
+                action = "no action needed: usually a peer on another build; it warns past the bound \
+                          from more than one peer",
+                "some consensus messages from peers could not be read and were dropped"
             );
         } else {
             tracing::info!(
@@ -149,7 +196,7 @@ mod tests {
         }
         assert_eq!(d.undecodable(at(599), &9), None);
         let summary = d.epoch(at(600), &1, 28, 27).expect("one summary per interval");
-        assert_eq!(summary, Summary { secs: 600, undecodable: 1, earlier: 1_000, later: 1, peers: 8, epochs: Some((25, 28)) });
+        assert_eq!(summary, Summary { secs: 600, undecodable: 1, earlier: 1_000, later: 1, peers: 8, undecodable_peers: 1, epochs: Some((25, 28)) });
     }
 
     #[test]
@@ -157,7 +204,33 @@ mod tests {
         let mut d = Discards::<u8>::default();
         assert!(d.undecodable(at(0), &1).is_some());
         let again = d.undecodable(at(3_000), &2).expect("a new burst");
-        assert_eq!(again, Summary { secs: 3_000, undecodable: 1, peers: 1, ..Summary::default() });
+        assert_eq!(again, Summary { secs: 3_000, undecodable: 1, peers: 1, undecodable_peers: 1, ..Summary::default() });
+    }
+
+    /// Undecodable messages warn only past their bound and from more than
+    /// one peer: a single peer on another build, or a few strays, is info.
+    #[test]
+    fn undecodable_messages_warn_only_past_the_bound_from_several_peers() {
+        let mut d = Discards::<u8>::default();
+        assert!(!d.undecodable(at(0), &1).expect("a burst begins with a line").warns(), "one message");
+        for n in 1..=500u64 {
+            assert_eq!(d.undecodable(at(n), &1), None);
+        }
+        let one_peer = d.undecodable(at(600), &1).expect("one summary per interval");
+        assert_eq!((one_peer.undecodable, one_peer.undecodable_peers), (501, 1));
+        assert!(!one_peer.warns(), "one peer on another build is its operator's problem");
+        for n in 1..UNDECODABLE_WARN {
+            assert_eq!(d.undecodable(at(600 + n), &((n % 5) as u8)), None);
+        }
+        let several = d.undecodable(at(1_200), &9).expect("one summary per interval");
+        assert_eq!((several.undecodable, several.undecodable_peers), (UNDECODABLE_WARN, 6));
+        assert!(several.warns(), "the bound from several peers");
+        for n in 1..UNDECODABLE_WARN - 1 {
+            assert_eq!(d.undecodable(at(1_200 + n), &((n % 5) as u8)), None);
+        }
+        let below = d.undecodable(at(1_800), &9).expect("one summary per interval");
+        assert_eq!(below.undecodable, UNDECODABLE_WARN - 1);
+        assert!(!below.warns(), "below the bound");
     }
 
     #[test]

@@ -1,5 +1,7 @@
 mod actor;
 mod ingress;
+// QUILIBRIUM: summary of refused proposals.
+mod rejections;
 mod round;
 mod slot;
 mod state;

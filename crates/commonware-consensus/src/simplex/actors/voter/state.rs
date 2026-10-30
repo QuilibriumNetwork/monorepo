@@ -71,6 +71,17 @@ enum ParentPayloadError {
 }
 
 impl ParentPayloadError {
+    /// QUILIBRIUM: the reason a refusal is counted under (`rejections.rs`).
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::ParentNotBeforeProposal { .. } => "parent view not before the proposal",
+            Self::ParentBeforeFinalized { .. } => "parent below the last finalized view",
+            Self::MissingNullification { .. } | Self::ParentNotCertified { .. } => {
+                "ancestry not yet certified"
+            }
+        }
+    }
+
     /// Returns whether the ancestry error permanently invalidates the proposal.
     const fn invalid_proposal(self) -> bool {
         match self {
@@ -119,6 +130,8 @@ pub struct State<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: ElectorConfig<
     // QUILIBRIUM: our fallback turns that hit `FALLBACK_NULLIFICATIONS`; picks
     // the window of views forwarded next.
     fallback_capped_turns: usize,
+    // QUILIBRIUM: proposals refused since the last summary (`rejections.rs`).
+    rejections: super::rejections::Rejections,
 
     current_view: Gauge,
     tracked_views: Gauge,
@@ -156,6 +169,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: ElectorConfig<S>, D: Diges
             parent_fallback: None,
             fallback_gap: None,
             fallback_capped_turns: 0,
+            rejections: Default::default(),
             current_view,
             tracked_views,
             timeouts,
@@ -668,7 +682,10 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: ElectorConfig<S>, D: Diges
             Ok(parent_payload) => parent_payload,
             Err(err) => {
                 if err.invalid_proposal() {
-                    warn!(round = ?proposal.round, ?err, "proposal failed verification");
+                    // QUILIBRIUM: counted by reason in the refusal summary
+                    // (`rejections.rs`) instead of a warning per proposal.
+                    debug!(round = ?proposal.round, ?err, "proposal failed verification");
+                    self.note_rejected(view, err.reason());
                     self.trigger_timeout(view, TimeoutReason::InvalidProposal);
                 } else {
                     debug!(
@@ -690,6 +707,26 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: ElectorConfig<S>, D: Diges
             parent: (proposal.parent, parent_payload),
         };
         Some((context, proposal))
+    }
+
+    /// QUILIBRIUM: count a refusal of `view`'s proposal for `reason`
+    /// (`rejections.rs`).
+    pub(super) fn note_rejected(&mut self, view: View, reason: &'static str) {
+        let leader = self.leader_index(view);
+        let now = self.context.current();
+        self.rejections.rejected(now, reason, leader, view.get());
+    }
+
+    /// QUILIBRIUM: count a verified proposal (`rejections.rs`).
+    pub(super) fn note_accepted(&mut self) {
+        let now = self.context.current();
+        self.rejections.accepted(now);
+    }
+
+    /// QUILIBRIUM: the refusal summary, once due (`rejections.rs`).
+    pub(super) fn rejection_summary(&mut self) -> Option<super::rejections::Summary> {
+        let now = self.context.current();
+        self.rejections.due(now)
     }
 
     /// Marks proposal verification as complete when the peer payload validates.

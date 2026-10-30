@@ -373,11 +373,21 @@ impl<
         Some(Request(context, span, receiver))
     }
 
+    /// QUILIBRIUM: log the refusal summary once due (`rejections.rs`).
+    fn log_rejections(&mut self) {
+        if let Some(summary) = self.state.rejection_summary() {
+            summary.log(&self.partition, self.state.epoch().get());
+        }
+    }
+
     /// Attempt to verify a proposed block.
     #[allow(clippy::async_yields_async)]
     async fn try_verify(&mut self) -> Option<Request<Context<D, S::PublicKey>, bool>> {
         // Check if we are ready to verify
-        let (context, proposal) = self.state.try_verify()?;
+        let verify = self.state.try_verify();
+        // QUILIBRIUM: a refused ancestry is summarized here too.
+        self.log_rejections();
+        let (context, proposal) = verify?;
 
         // Request verification
         let span = info_span!(
@@ -677,9 +687,14 @@ impl<
             Ok(true) => {
                 // Mark verification complete
                 self.state.verified(view);
+                // QUILIBRIUM: counted for the refusal summary (`rejections.rs`).
+                self.state.note_accepted();
             }
             Ok(false) => {
-                warn!(round = ?context.round, "proposal failed verification");
+                // QUILIBRIUM: counted by reason in the refusal summary
+                // (`rejections.rs`) instead of a warning per proposal.
+                debug!(round = ?context.round, "proposal failed verification");
+                self.state.note_rejected(view, "the application refused it");
                 self.state
                     .trigger_timeout(context.view(), TimeoutReason::InvalidProposal);
             }
@@ -689,6 +704,7 @@ impl<
                     .trigger_timeout(context.view(), TimeoutReason::IgnoredProposal);
             }
         };
+        self.log_rejections();
         view
     }
 
@@ -877,7 +893,23 @@ impl<
         }
         if let Some((nullification, floor)) = staged.nullification {
             if let Some(floor) = floor {
-                warn!(?floor, "broadcasting nullification floor");
+                // QUILIBRIUM: one short line, not the whole certificate.
+                let floor_kind = match &floor {
+                    Certificate::Notarization(_) => "notarization",
+                    Certificate::Nullification(_) => "nullification",
+                    Certificate::Finalization(_) => "finalization",
+                };
+                info!(
+                    partition = %self.partition,
+                    view = %nullification.view(),
+                    floor_view = %floor.view(),
+                    floor_kind,
+                    action = "no action needed: members that lacked it can vote on the next \
+                              proposals",
+                    "the view this node proposed in was skipped; re-sending the certificate its \
+                     proposal built on"
+                );
+                debug!(?floor, "broadcasting nullification floor");
                 self.broadcast_certificate(certificate_sender, floor);
             }
             debug!(round=?nullification.round(), "broadcasting nullification");
