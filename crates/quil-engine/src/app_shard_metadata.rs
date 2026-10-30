@@ -432,6 +432,7 @@ pub fn retire_unchallengeable_replicas(
     if keep_from <= previous {
         return false;
     }
+    crate::storage_snapshot::note_replica_eviction(current_epoch);
     match replica_store.evict_below_epoch(keep_from) {
         Ok(()) => {
             retired_below.fetch_max(keep_from, Ordering::AcqRel);

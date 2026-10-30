@@ -2762,6 +2762,7 @@ fn prune_confirmation_replicas(
     current_epoch: u64,
 ) {
     let keep_from = crate::app_shard_metadata::replica_keep_from(current_epoch);
+    crate::storage_snapshot::note_replica_eviction(current_epoch);
     let workers = filters.iter().filter_map(|filter| {
         worker
             .and_then(|resolve| resolve(filter))
@@ -2826,6 +2827,13 @@ mod tests {
             unrelated.get(5, b"leaf").unwrap(),
             Some(vec![5]),
             "unselected stores are untouched"
+        );
+        // The GLOBAL frame the eviction happened at is noted first: a
+        // settlement of an epoch evicted here finds its window closed.
+        assert_eq!(
+            crate::storage_snapshot::global_frame(),
+            Some(quil_types::consensus::epoch_start_frame(7)),
+            "the eviction notes the epoch GLOBAL reached"
         );
         // A low epoch cannot underflow the retention boundary.
         super::prune_confirmation_replicas(None, Some(&resolve), &[vec![1]], 0);

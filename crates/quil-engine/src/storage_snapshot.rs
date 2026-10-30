@@ -990,6 +990,26 @@ pub fn global_frame() -> Option<u64> {
     (frame > 0).then_some(frame)
 }
 
+/// Note, before evicting the replicas below
+/// `replica_keep_from(current_epoch)`, that GLOBAL reached `current_epoch`:
+/// an epoch's replicas go only once its settlement window has ended, and a
+/// settlement that finds them gone must see that ([`settlement_closed`]).
+pub fn note_replica_eviction(current_epoch: u64) {
+    note_global_frame(quil_types::consensus::epoch_start_frame(current_epoch));
+}
+
+/// Whether GLOBAL can no longer record a settlement of `epoch`: `frame` or
+/// the latest GLOBAL frame this process saw ([`global_frame`]) is past its
+/// settlement window, which GLOBAL enforces. A seat's slot and the frame a
+/// proof runs from may trail that frame (a GLOBAL stall, a registry view a
+/// pull behind), while the replicas of `epoch` are already evicted
+/// ([`note_replica_eviction`]): a settlement they still show owed can be
+/// neither prepared nor recorded.
+pub fn settlement_closed(epoch: u64, frame: u64) -> bool {
+    let (_, until) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+    global_frame().unwrap_or(0).max(frame) >= until
+}
+
 fn keep(captured: Arc<Captured>) {
     if let Ok(mut kept) = kept().lock() {
         // A registration is sealed before its epoch begins.
@@ -2314,6 +2334,28 @@ mod tests {
             .find(epoch, &other, &leaf_id, |n| n == exact)
             .is_some());
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// An epoch's replicas are evicted only once GLOBAL is past its
+    /// settlement window: a settlement finding them gone finds its window
+    /// closed, and one within it finds them.
+    #[test]
+    fn replicas_are_evicted_only_past_their_settlement_window() {
+        for current in 1..12 {
+            note_replica_eviction(current);
+            let keep_from = crate::app_shard_metadata::replica_keep_from(current);
+            for epoch in 0..keep_from {
+                assert!(
+                    settlement_closed(epoch, 0),
+                    "epoch {epoch} evicted in {current}"
+                );
+            }
+            assert!(
+                !settlement_closed(current - 1, 0),
+                "epoch {} settles during {current}",
+                current - 1
+            );
+        }
     }
 
     /// How the leaves of `filter` for `epoch` doing `work` ended, in order
