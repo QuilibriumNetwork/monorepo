@@ -814,6 +814,23 @@ pub struct MintAuthorizationWitnessData {
     pub global_root: Vec<u8>,
 }
 
+/// Where a mint authorization stands on this node; see
+/// `GetMintAuthorizationStatusResponse` for each field.
+#[derive(Debug, Clone, Default)]
+pub struct MintAuthorizationStatusData {
+    pub state: crate::proto::node::MintAuthorizationState,
+    pub found: bool,
+    pub inclusion_frame: u64,
+    pub inclusion_frame_earliest: u64,
+    pub claim_cap: u64,
+    pub cap_from_shard_anchor: bool,
+    pub head_frame: u64,
+    pub searched_frame: u64,
+    pub cited_frame: u64,
+    pub first_root_frame: u64,
+    pub reason: String,
+}
+
 /// Coin witness transport data, independent of lattice implementation types.
 pub struct CoinWitnessData {
     pub address: [u8; 32],
@@ -928,6 +945,16 @@ pub trait CoinWitnessProvider: Send + Sync {
             "mint authorization witnesses unavailable".into(),
         ))
     }
+
+    fn mint_authorization_status(
+        &self,
+        _receipt: &[u8; 32],
+    ) -> Result<MintAuthorizationStatusData> {
+        Err(crate::error::QuilError::ExecutionUnavailable(
+            "mint authorization status unavailable".into(),
+        ))
+    }
+
     fn coin_page(
         &self,
         _domain: &[u8; 32],
