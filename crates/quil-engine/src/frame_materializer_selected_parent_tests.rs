@@ -139,6 +139,9 @@ impl Rig {
     fn new() -> Self {
         let signer = Arc::new(quil_crypto::FalconSigner::generate());
         let fixture = Fixture::new(Some(signer.public_key()));
+        Self::over(signer, fixture)
+    }
+    fn over(signer: Arc<quil_crypto::FalconSigner>, fixture: Fixture) -> Self {
         let source = Arc::new(fixture.source);
         let genesis_frame = state_frame(&source, 0, 0, digest_from_identity([0; 32]));
         let genesis = id(&genesis_frame);
@@ -1135,6 +1138,25 @@ fn certify_parent(
     epoch: u64,
     parent_view: u64,
 ) {
+    let h = frame.header.as_mut().unwrap();
+    let certificate =
+        finalization_certificate(b"global", signer, epoch, h.rank, parent_view, &h.output);
+    h.public_key_signature_bls48581 = Some(quil_types::proto::keys::Bls48581AggregateSignature {
+        signature: certificate,
+        ..Default::default()
+    });
+}
+
+/// `signer`'s one-member finalization of the frame with VDF `output` at view
+/// `view`, wrapped as a header carries it.
+fn finalization_certificate(
+    namespace: &[u8],
+    signer: &quil_crypto::FalconSigner,
+    epoch: u64,
+    view: u64,
+    parent_view: u64,
+    output: &[u8],
+) -> Vec<u8> {
     use quil_cw_consensus::{
         _consensus::{
             simplex::{
@@ -1150,14 +1172,13 @@ fn certify_parent(
         falcon_scheme::Generic,
         falcon_simplex::SimplexFalconScheme,
     };
-    let h = frame.header.as_mut().unwrap();
     let key = FalconPrivateKey::from_bytes(signer.private_key(), signer.public_key()).unwrap();
     let participants: Set<_> = vec![key.public_key()].try_into().unwrap();
-    let scheme = Generic::<Namespace>::signer(b"global", participants, key).unwrap();
+    let scheme = Generic::<Namespace>::signer(namespace, participants, key).unwrap();
     let proposal = Proposal::new(
-        Round::new(Epoch::new(epoch), View::new(h.rank)),
+        Round::new(Epoch::new(epoch), View::new(view)),
         View::new(parent_view),
-        CwDigest(quil_crypto::poseidon::hash_bytes_to_32(&h.output).unwrap()),
+        CwDigest(quil_crypto::poseidon::hash_bytes_to_32(output).unwrap()),
     );
     let vote = scheme
         .sign::<SimplexFalconScheme, CwDigest>(Subject::Finalize {
@@ -1167,13 +1188,10 @@ fn certify_parent(
     let certificate = scheme
         .assemble::<SimplexFalconScheme, _, N3f1>(vec![vote])
         .unwrap();
-    h.public_key_signature_bls48581 = Some(quil_types::proto::keys::Bls48581AggregateSignature {
-        signature: wrap_cert_for_header(&encode_finalization(&Finalization {
-            proposal,
-            certificate,
-        })),
-        ..Default::default()
-    });
+    wrap_cert_for_header(&encode_finalization(&Finalization {
+        proposal,
+        certificate,
+    }))
 }
 
 #[test]

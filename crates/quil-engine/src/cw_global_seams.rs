@@ -137,11 +137,41 @@ pub struct GlobalSeamProposer {
     /// Proposal retries that found an execution source in use
     /// ([`Self::note_proposal_prepare`]).
     proposal_busy: Mutex<ProposalBusy>,
+    /// This archive's wait for its finalized frames to publish
+    /// ([`Self::await_sequenced_publication`]).
+    sequenced_wait: Mutex<SequencedWait>,
 }
 
 /// Longest a proposal or vote waits per view for this node to publish its
-/// finalized parent rather than execute it privately.
+/// finalized parent rather than execute it privately, where executing it
+/// privately gives the same state ([`GlobalSeamProposer::yield_to_publication`]).
+/// An archive waits until publication instead
+/// ([`GlobalSeamProposer::await_sequenced_publication`]).
 const PUBLICATION_PRIORITY: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// How often an archive still waiting for its finalized frames to publish is
+/// logged again.
+const SEQUENCED_WAIT_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// An archive's wait for its finalized GLOBAL frames to publish, as one
+/// outage: its start, a repeat at most every [`SEQUENCED_WAIT_LOG_EVERY`] and
+/// its end.
+struct SequencedWait {
+    outage: crate::outage::Outage,
+    /// The published and highest finalized frame when last seen waiting.
+    published: u64,
+    finalized: u64,
+}
+
+impl Default for SequencedWait {
+    fn default() -> Self {
+        Self {
+            outage: crate::outage::Outage::begin_after_repeating(1, SEQUENCED_WAIT_LOG_EVERY),
+            published: 0,
+            finalized: 0,
+        }
+    }
+}
 
 /// How long a vote this node cannot check yet waits before it asks again.
 const VOTE_DEFER: std::time::Duration = std::time::Duration::from_millis(200);
@@ -162,6 +192,8 @@ struct VoteWait {
     /// The view's first deferral on a source in use is logged; later ones
     /// are not.
     source_logged: bool,
+    /// The wait was for an expected event that ends it, not an overrun.
+    expected: bool,
 }
 
 /// Why a vote is deferred.
@@ -170,6 +202,13 @@ enum Deferral<'a> {
     OwnExecution,
     /// The finalized parent is publishing ([`GlobalSeamProposer::yield_to_publication`]).
     Publication,
+    /// This archive's finalized frames wait to publish
+    /// ([`GlobalSeamProposer::await_sequenced_publication`]).
+    SequencedPublication {
+        parent: u64,
+        published: u64,
+        finalized: u64,
+    },
     /// The capture found a source in use ([`quil_execution::source_busy`]).
     BusySource {
         parent: u64,
@@ -221,6 +260,7 @@ impl GlobalSeamProposer {
             publication_priority: PUBLICATION_PRIORITY,
             vote_waits: Mutex::default(),
             proposal_busy: Mutex::default(),
+            sequenced_wait: Mutex::default(),
         }
     }
 
@@ -238,7 +278,9 @@ impl GlobalSeamProposer {
             cause: String::new(),
             check: "",
             source_logged: false,
+            expected: false,
         });
+        wait.expected = matches!(why, Deferral::SequencedPublication { .. });
         match why {
             Deferral::OwnExecution => {
                 wait.cause = "this node's own GLOBAL execution (lease or frame lock)".into();
@@ -247,6 +289,16 @@ impl GlobalSeamProposer {
             Deferral::Publication => {
                 wait.cause = "publication of the finalized parent".into();
                 wait.check = "this node's parent publication outlasted the patience; check its publication lines";
+            }
+            Deferral::SequencedPublication {
+                parent,
+                published,
+                finalized,
+            } => {
+                wait.cause = format!(
+                    "parent {parent} is above this archive's published frame {published} while finalized frames through {finalized} wait to publish"
+                );
+                wait.check = "expected while finalization ingests the application frames those frames sequence; it ends when they publish";
             }
             Deferral::BusySource { parent, error } => {
                 wait.cause = error.to_string();
@@ -326,6 +378,61 @@ impl GlobalSeamProposer {
     pub(crate) fn with_publication_priority(mut self, priority: std::time::Duration) -> Self {
         self.publication_priority = priority;
         self
+    }
+
+    /// [`crate::frame_materializer::GlobalParentExecutor::sequenced_publication_wait`]
+    /// for `view`'s parent `number`: `Some((published, finalized))` while the
+    /// proposal or vote waits for this archive's finalized frames to publish.
+    /// Not bounded per view: the proposal retries and the vote defers while
+    /// the view lasts, and the views after it wait the same way until those
+    /// frames publish, which needs nothing from consensus. Logs the wait's
+    /// start, a repeat every [`SEQUENCED_WAIT_LOG_EVERY`] and its end.
+    fn await_sequenced_publication(
+        &self,
+        executor: &crate::frame_materializer::GlobalParentExecutor,
+        view: u64,
+        number: u64,
+    ) -> Option<(u64, u64)> {
+        use crate::outage::OutageEvent;
+        let wait = executor.sequenced_publication_wait(number);
+        let Ok(mut state) = self.sequenced_wait.lock() else {
+            return wait;
+        };
+        if let Some((published, finalized)) = wait {
+            state.published = published;
+            state.finalized = finalized;
+        }
+        let (published, finalized) = (state.published, state.finalized);
+        match state.outage.observe(std::time::Instant::now(), wait.is_none()) {
+            Some(OutageEvent::Began) => tracing::info!(
+                view,
+                parent = number,
+                published,
+                finalized,
+                "GLOBAL proposals and votes wait for this archive's finalized frames to publish: executing them \
+                 first would miss the application frames their finalization ingests; the wait ends when they publish"
+            ),
+            Some(OutageEvent::Continues { secs, .. }) => tracing::warn!(
+                view,
+                parent = number,
+                published,
+                finalized,
+                waited_s = secs,
+                scope = "local",
+                action = "wait",
+                check = "finalization of the frame after the published one is still ingesting its application frames; its sequenced pass and ingest lines show progress",
+                "GLOBAL proposals and votes still wait for this archive's finalized frames to publish"
+            ),
+            Some(OutageEvent::Ended { secs, .. }) => tracing::info!(
+                view,
+                parent = number,
+                through = finalized,
+                waited_s = secs,
+                "GLOBAL proposals and votes no longer wait: this archive published its finalized frames"
+            ),
+            _ => {}
+        }
+        wait
     }
 
     /// Let the finalized parent `number` publish before executing it
@@ -664,7 +771,11 @@ impl GlobalProposer for GlobalSeamProposer {
             return None;
         }
         let number = self.selected_parent_number(context.parent)?;
-        if self.yield_to_publication(executor, context.view, number) {
+        if self
+            .await_sequenced_publication(executor, context.view, number)
+            .is_some()
+            || self.yield_to_publication(executor, context.view, number)
+        {
             return None; // retried by `propose_retry`
         }
         let prepared = executor.prepare(
@@ -782,6 +893,18 @@ impl GlobalProposer for GlobalSeamProposer {
         let Some(number) = self.selected_parent_number(context.parent) else {
             return Ok(false);
         };
+        if let Some((published, finalized)) =
+            self.await_sequenced_publication(executor, context.view, number)
+        {
+            return Err(self.defer_vote(
+                context.view,
+                Deferral::SequencedPublication {
+                    parent: number,
+                    published,
+                    finalized,
+                },
+            ));
+        }
         if self.yield_to_publication(executor, context.view, number) {
             return Err(self.defer_vote(context.view, Deferral::Publication));
         }
@@ -855,15 +978,28 @@ impl GlobalProposer for GlobalSeamProposer {
         let wait = self.vote_waits.lock().ok().and_then(|waits| {
             waits
                 .get(&context.view)
-                .map(|wait| (wait.cause.clone(), wait.check))
+                .map(|wait| (wait.cause.clone(), wait.check, wait.expected))
         });
-        let (cause, check) = wait.map_or(
+        let (cause, check, expected) = wait.map_or(
             (
                 "unrecorded".to_string(),
                 "no deferral was recorded for this view; report this line",
+                false,
             ),
             |wait| wait,
         );
+        if expected {
+            tracing::info!(
+                view = context.view,
+                waited_s = waited.as_secs(),
+                cause = %cause,
+                scope = "local",
+                action = "wait",
+                check,
+                "GLOBAL vote declined: still deferred when the verify patience ran out"
+            );
+            return;
+        }
         tracing::warn!(
             view = context.view,
             waited_s = waited.as_secs(),
