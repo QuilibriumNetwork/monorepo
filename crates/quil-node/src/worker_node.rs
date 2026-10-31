@@ -646,6 +646,11 @@ pub(crate) async fn start(
                             .map(|m| crate::mem_stats::fmt_mb(m.rss_bytes))
                             .unwrap_or_else(|| "?".to_string());
                         let dbm = db_for_mem.memory_usage();
+                        // As the master's "memory snapshot" gives them.
+                        let (replica_loads, replica_loads_peak) =
+                            quil_store::replica_store::replica_load_bytes();
+                        let replica_loads = crate::mem_stats::fmt_mb(replica_loads);
+                        let replica_loads_peak = crate::mem_stats::fmt_mb(replica_loads_peak);
                         if let Some(j) = crate::mem_stats::jemalloc_stats() {
                             info!(
                                 core_id,
@@ -654,6 +659,8 @@ pub(crate) async fn start(
                                 resident_mb = %crate::mem_stats::fmt_mb(j.resident),
                                 retained_mb = %crate::mem_stats::fmt_mb(j.retained),
                                 rocksdb_mb = %crate::mem_stats::fmt_mb(dbm.total()),
+                                replica_loads_mb = %replica_loads,
+                                replica_loads_peak_mb = %replica_loads_peak,
                                 "worker process memory",
                             );
                             let br = crate::mem_stats::jemalloc_size_classes();
@@ -667,6 +674,8 @@ pub(crate) async fn start(
                                 core_id,
                                 rss_mb = %rss,
                                 rocksdb_mb = %crate::mem_stats::fmt_mb(dbm.total()),
+                                replica_loads_mb = %replica_loads,
+                                replica_loads_peak_mb = %replica_loads_peak,
                                 "worker process memory",
                             );
                         }
