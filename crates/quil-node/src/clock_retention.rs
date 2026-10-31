@@ -12,7 +12,9 @@
 //!   every standalone worker, every `QUIL_PRUNE_INTERVAL_SECS`, delete the
 //!   request bodies of global frames more than
 //!   `QUIL_PRUNE_GLOBAL_REQUESTS_KEEP` (default and minimum two days of
-//!   frames) below the head. Headers are kept. A worker's first pass waits
+//!   frames) below the head. Headers are kept. A pass compacts the pruned
+//!   range only once table files of pruned bodies reach
+//!   `RocksClockStore::REQUEST_RECLAIM_BYTES`. A worker's first pass waits
 //!   an extra minute per core (repeating after an hour of cores).
 //! - `QUIL_SNAPSHOT_PINNED_MAX=<n>`: keep store snapshots only on the newest
 //!   `n` (default 64, at least 16; `off` also disables it) published
@@ -154,8 +156,12 @@ pub(crate) fn spawn_request_pruner_for_core(
             let Some(store) = clock.upgrade() else { return };
             let started = std::time::Instant::now();
             match store.prune_global_frame_requests(keep) {
+                // `deferred`: RocksDB's own compaction reclaims the space.
                 Ok(pass) if pass.frames > 0 => info!(store = %label, frames = pass.frames,
-                    retained_from = pass.retained_from, secs = started.elapsed().as_secs(), "pruned GLOBAL request bodies"),
+                    retained_from = pass.retained_from, dead_mib = pass.dead_bytes >> 20,
+                    reclaim = if pass.compacted { "compacted" } else { "deferred" },
+                    reclaim_at_mib = quil_store::RocksClockStore::REQUEST_RECLAIM_BYTES >> 20,
+                    secs = started.elapsed().as_secs(), "pruned GLOBAL request bodies"),
                 Ok(_) => {}
                 Err(error) => warn!(store = %label, %error, "GLOBAL request prune failed; retrying next pass"),
             }
