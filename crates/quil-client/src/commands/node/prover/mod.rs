@@ -88,7 +88,6 @@ pub enum ProverCommand {
 
 /// Shared prover context (Go `getConfig` + `getNodeClient`).
 pub struct ProverCtx {
-    #[allow(dead_code)]
     pub node_config: Config,
     pub connect_opts: ConnectOpts,
     /// Key manager for signing prover ops (`q-prover-key` Falcon inner

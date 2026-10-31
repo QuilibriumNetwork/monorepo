@@ -17,8 +17,12 @@ use ratatui::{
 
 #[cfg(test)]
 use super::super::format_quil_daily_round;
+use super::coins;
 use super::model::*;
 use super::util::{center_trunc, clamp_offset, filter_label, shared_filter_address};
+
+#[path = "coins_view.rs"]
+mod coins_view;
 
 // ── Colors: red is reserved for execution failures and errors ───────────────────────────────────
 
@@ -355,6 +359,10 @@ pub fn draw(f: &mut Frame, m: &mut Model) {
         render_help_screen(f, m, area);
         return;
     }
+    if m.tab == Tab::Coins {
+        coins_view::render(f, m, area);
+        return;
+    }
     render_main(f, m, area);
 }
 
@@ -624,15 +632,25 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         m.horizontal_limits[1],
     );
 
-    render_notifications(f, m, status, chunks[3]);
+    let lines = message_lines(m, status, chunks[3].width.saturating_sub(2));
+    let focused = m.focus == PanelFocus::Notifications;
+    render_notifications(f, m, lines, focused, chunks[3]);
     f.render_widget(
         Paragraph::new(actions).style(Style::new().fg(HELP)),
         chunks[4],
     );
 }
 
-fn render_notifications(f: &mut Frame, m: &mut Model, primary: Line<'static>, area: Rect) {
-    let mut lines = message_lines(m, primary, area.width.saturating_sub(2));
+fn render_notifications(
+    f: &mut Frame,
+    m: &mut Model,
+    mut lines: Vec<Line<'static>>,
+    focused: bool,
+    area: Rect,
+) {
+    if lines.is_empty() {
+        lines.push(Line::default());
+    }
     if lines.len() == 1 && lines[0].width() == 0 {
         lines[0] = Line::from(Span::styled(
             match m.notice_minimum {
@@ -659,11 +677,7 @@ fn render_notifications(f: &mut Frame, m: &mut Model, primary: Line<'static>, ar
         .title(panel_title(title))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if m.focus == PanelFocus::Notifications {
-            PRIMARY
-        } else {
-            DIM
-        }));
+        .border_style(Style::new().fg(if focused { PRIMARY } else { DIM }));
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(
@@ -689,12 +703,97 @@ fn render_notifications(f: &mut Frame, m: &mut Model, primary: Line<'static>, ar
 
 // ── Header ───────────────────────────────────────────────────────────────
 
+fn severity_color(severity: NoticeSeverity) -> Color {
+    match severity {
+        NoticeSeverity::Info => PRIMARY,
+        NoticeSeverity::Warning => WARNING,
+        NoticeSeverity::Error => ERROR,
+    }
+}
+
+/// How many notices the Provers tab shows at the current level, and the
+/// highest severity among them; the transient status line is not counted.
+fn provers_notice_summary(m: &Model) -> Option<(usize, NoticeSeverity)> {
+    let mut found = Vec::new();
+    if global_alarm_active(m) {
+        found.push(NoticeSeverity::Error);
+    }
+    if m.notice_minimum <= NoticeSeverity::Warning {
+        if rpc_status_is_fresh(m)
+            && m.reported_app_stall_counts(std::time::Instant::now())
+                .is_some()
+        {
+            found.push(NoticeSeverity::Warning);
+        }
+        if m.app_stall_time.is_some() {
+            found.push(NoticeSeverity::Warning);
+        }
+    }
+    found.extend(
+        condition_notices(m)
+            .into_iter()
+            .map(|(_, severity, _)| severity)
+            .filter(|severity| *severity >= m.notice_minimum),
+    );
+    let shards = shard_severity(m);
+    if shards >= m.notice_minimum && shard_message(m).is_some() {
+        found.push(shards);
+    }
+    Some((found.len(), found.into_iter().max()?))
+}
+
+/// The same for the Coins tab; items waiting for an action count from the
+/// default level, as they show there.
+fn coins_notice_summary(m: &Model) -> Option<(usize, NoticeSeverity)> {
+    let shown = coins::shown_notices(m, fmt_claimable);
+    Some((
+        shown.len(),
+        shown.iter().map(|notice| notice.severity).max()?,
+    ))
+}
+
+/// `‹1› Provers  ‹2› Coins`, the current tab bold. The tab not on screen
+/// carries the count of its notices in the color of the highest, with a
+/// `!` for a warning or error when colors are off.
+fn tab_bar(m: &Model) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (tab, key, name) in [(Tab::Provers, "1", "Provers"), (Tab::Coins, "2", "Coins")] {
+        if !spans.is_empty() {
+            spans.push(Span::raw("  "));
+        }
+        let current = m.tab == tab;
+        spans.push(Span::styled(
+            format!("‹{key}› {name}"),
+            if current {
+                Style::new().fg(TEXT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(HELP)
+            },
+        ));
+        if current {
+            continue;
+        }
+        let summary = match tab {
+            Tab::Provers => provers_notice_summary(m),
+            Tab::Coins => coins_notice_summary(m),
+        };
+        if let Some((count, severity)) = summary {
+            let mark = !m.color_coding && severity >= NoticeSeverity::Warning;
+            spans.push(Span::styled(
+                format!(" {count}{}", if mark { "!" } else { "" }),
+                Style::new()
+                    .fg(severity_color(severity))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    Line::from(spans)
+}
+
 /// Pack complete KPI blocks, never splitting their internal pipe-separated fields.
 fn header_lines(m: &Model, width: u16) -> Vec<Line<'static>> {
-    let blocks = header_kpis(m);
-    if blocks.is_empty() {
-        return vec![];
-    }
+    let mut blocks = header_kpis(m);
+    blocks.insert(0, tab_bar(m));
     pack_kpis(blocks, width)
         .into_iter()
         .flat_map(|line| {
@@ -3520,7 +3619,7 @@ fn render_help_screen(f: &mut Frame, m: &mut Model, area: Rect) {
     let max_offset = body.len().saturating_sub(body_height);
     m.help_offset = m.help_offset.min(max_offset);
     let title = format!(
-        " Shard Manager — Help  ({}–{} of {})",
+        " Node Manager — Help  ({}–{} of {})",
         m.help_offset + 1,
         (m.help_offset + body_height).min(body.len()),
         body.len()
@@ -3934,6 +4033,9 @@ fn help_items() -> Vec<HelpItem> {
 
     vec![
         HelpItem::Blank,
+        sec("Tabs"),
+        kv("‹1› / ‹2›", "Show the Provers or the Coins tab; while a filter is edited, digits stay text. ‹tab› still moves between the panels of a tab"),
+        kv("Tab bar", "First block of the top header, `‹1› Provers  ‹2› Coins`, the current tab bold. The other tab shows how many notices it has at the current level, in the color of the highest (`!` marks a warning or error with colors off); items waiting for an action (`◆`) count from the default level"),
         sec("Top header KPIs"),
         kv("Peer ID", "This node's identity; compact `Peer: …` shows the last 8 characters, ‹n› expands it"),
         kv("Strategy", "Allocation scoring strategy the node reports; expanded mode spells out the priorities:"),
@@ -4144,7 +4246,46 @@ fn help_items() -> Vec<HelpItem> {
         kv("‹enter›", "Apply the filter"),
         kv("‹esc›", "Cancel without changing the filter"),
         HelpItem::Blank,
+        sec(COINS_HELP_SECTION),
+        note("Read only: this node's claimable rewards and legacy coins, as `qclient token legacy` lists them; mint and shield from the CLI for now. ‹h› on this tab opens the help here."),
+        kv("Balances", "One row per kind; the cursor row's detail follows the table:"),
+        item("`claimable`: the reward balance the GLOBAL reward witness shows at the `As of` frame, read with each Provers refresh; `qclient token mint` authorizes a mint of it"),
+        item("`legacy`: Coins `U of N` are the unshielded of all listed legacy coins, Amount their unshielded total. Read in the background when the manager starts, every 10 min while the tab is open and on ‹r›; `As of` is the read's UTC time, a spinner beside it marks a read in progress. The detail gives the shielded count, the `qclient token shield-all` plan (batches of up to 96 coins from one shard each; coins on no live shard wait for a later run), when shields open, and the read's pages and duration"),
+        kv("State", "What the row needs:"),
+        item("`◆ claimable` / `◆ unshielded`: waiting for your action; `blue`, and the `◆` marker keeps the meaning with colors off"),
+        item("`unshielded` without `◆`: shields are not open yet, an expected wait; the notice gives the frame"),
+        item("`shielded`: every listed legacy coin is shielded; `none`: nothing to show"),
+        item("`loading`: the first read is in progress; `unavailable`: the read failed (`yellow`, or `!` with colors off); `no key`: the node config has no Ed448 key, so it owns no legacy coins"),
+        kv("Coins notices", "`Claimable: …` and `Legacy coins: … unshielded` carry `◆` and show from the default level. `Shields open at f…` and `… on no live shard` are expected waits (info). A failing read is a warning that says since when it fails and how old the figures are; `Shield plan: shard list unavailable` means the batch count is a lower bound"),
+        kv("‹r›", "Read legacy coins now; one read at a time"),
+        kv("‹tab›", "Move between Balances and Notifications"),
+        kv("‹↑/k› / ‹↓/j›", "Move the Balances cursor; scroll Notifications when it is focused"),
+        HelpItem::Blank,
     ]
+}
+
+/// The help section the Coins tab opens its help at.
+const COINS_HELP_SECTION: &str = "Coins tab";
+
+/// The first help line of `section` at `width`, so help can open there.
+pub(super) fn help_section_offset(width: u16, section: &str) -> usize {
+    let mut line = 0;
+    for (item, entry) in help_entries() {
+        if matches!(item, HelpItem::Section(name) if name == section) {
+            return line;
+        }
+        line += item.wrapped(usize::from(width), entry, false).len();
+    }
+    0
+}
+
+/// Open help at the current tab's section.
+pub(super) fn open_help(m: &mut Model) {
+    m.show_help = true;
+    m.help_offset = match m.tab {
+        Tab::Provers => 0,
+        Tab::Coins => help_section_offset(m.width.max(40), COINS_HELP_SECTION),
+    };
 }
 
 /// All settings groups stay on screen; Tab moves focus rather than replacing content.
@@ -4594,7 +4735,7 @@ mod tests {
             .to_string()
             .contains("Workers: running 15"));
         m.data_loaded = false;
-        assert_eq!(header_lines(&m, 40).len(), 1);
+        assert_eq!(header_lines(&m, 80).len(), 1);
     }
 
     #[test]
@@ -7479,6 +7620,10 @@ mod tests {
             "Cursor",
             "Boundaries",
             "Typing",
+            "Tab bar",
+            "Balances",
+            "State",
+            "Coins notices",
         ];
         for (section, key, _) in &sections {
             let named = key.starts_with('‹')
@@ -7842,8 +7987,8 @@ mod tests {
         let after = text(terminal.backend().buffer());
         assert!(m.help_offset > 0);
         assert_ne!(before, after);
-        assert!(before.starts_with(" Shard Manager — Help"));
-        assert!(after.starts_with(" Shard Manager — Help"));
+        assert!(before.starts_with(" Node Manager — Help"));
+        assert!(after.starts_with(" Node Manager — Help"));
         assert!(handle_key(&mut m, key(KeyCode::Esc)).is_empty());
         assert!(!m.show_help);
         assert_eq!(m.help_offset, 0);
@@ -7902,7 +8047,10 @@ mod compact_action_tests {
         for name in TOP_KPI_NAMES {
             m.hidden_header_kpis.insert((*name).into());
         }
-        assert!(header_lines(&m, 40).is_empty());
+        // The tab bar stays: it is how the other tab's notices show.
+        let lines = header_lines(&m, 40);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].to_string(), "‹1› Provers  ‹2› Coins");
     }
 
     #[test]

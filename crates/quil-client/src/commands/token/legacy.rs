@@ -610,16 +610,18 @@ async fn list_owner(
 
 /// Every coin of `owners`. A long listing shows its progress on one line
 /// of a terminal's stderr, rewritten after each page and cleared once the
-/// listing ends; piped or redirected output gets none.
+/// listing ends; piped or redirected output gets none, nor does a `quiet`
+/// listing (the node manager, whose screen that line would overwrite).
 async fn list_owners(
     client: &Client,
     application: &[u8; 32],
     owners: &[(OwnerForm, [u8; 32])],
     label: &str,
     pages: &mut usize,
+    quiet: bool,
 ) -> anyhow::Result<Vec<Coin>> {
     use std::io::{IsTerminal, Write};
-    let terminal = std::io::stderr().is_terminal();
+    let terminal = !quiet && std::io::stderr().is_terminal();
     let mut coins = Vec::new();
     for (form, owner) in owners {
         let mut shown = false;
@@ -665,6 +667,7 @@ pub(crate) async fn list(
         &key_owners(&public)?,
         "this identity",
         &mut 0,
+        false,
     )
     .await
 }
@@ -683,9 +686,60 @@ pub(crate) async fn unshielded(
         return Ok(None);
     };
     let owners = key_owners(&public)?;
-    let tally =
-        Tally::of(&list_owners(client, application, &owners, "this identity", pages).await?)?;
+    let tally = Tally::of(
+        &list_owners(client, application, &owners, "this identity", pages, false).await?,
+    )?;
     Ok(Some((tally.units, tally.unshielded, tally.shielded)))
+}
+
+/// One identity's legacy coins as the node manager shows them: the tally,
+/// how `token shield-all` would batch them, and when shields open. The
+/// listing is `token legacy`'s for one config identity, both owner forms,
+/// without its terminal progress line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Snapshot {
+    pub tally: Tally,
+    pub plan: Option<ShieldPlan>,
+    /// Coins per `token shield-all` batch; `None` without shield commands.
+    pub batch_max: Option<usize>,
+    pub head: Result<u64, String>,
+    pub rule: Option<ShieldRule>,
+    /// Listing pages read.
+    pub pages: usize,
+}
+
+/// The [`Snapshot`] of the identity with Ed448 public key `public` on
+/// `network`, read from `client`.
+pub(crate) async fn snapshot(
+    client: &Client,
+    application: &[u8; 32],
+    public: &[u8; 57],
+    network: u8,
+) -> anyhow::Result<Snapshot> {
+    let mut pages = 0;
+    let coins = list_owners(
+        client,
+        application,
+        &key_owners(public)?,
+        "",
+        &mut pages,
+        true,
+    )
+    .await?;
+    let tally = Tally::of(&coins)?;
+    let shards = if tally.unshielded > 0 && BATCH_SHIELDS.is_some() {
+        live_shard_paths(client, application).await.ok()
+    } else {
+        None
+    };
+    Ok(Snapshot {
+        tally,
+        plan: shield_plan(&coins, shards.as_deref()),
+        batch_max: BATCH_SHIELDS.map(|(max, _)| max),
+        head: global_head(client).await,
+        rule: shield_rule(network),
+        pages,
+    })
 }
 
 /// What to ask for an identity, given the owners listed for earlier ones.
@@ -1571,8 +1625,15 @@ pub(crate) async fn list_all(
                         if first.is_none() {
                             first = Some(client.clone());
                         }
-                        match list_owners(client, application, &owners, &identity.label, &mut 0)
-                            .await
+                        match list_owners(
+                            client,
+                            application,
+                            &owners,
+                            &identity.label,
+                            &mut 0,
+                            false,
+                        )
+                        .await
                         {
                             Ok(coins) => {
                                 dedup.record(&owners, &identity.label);

@@ -17,7 +17,7 @@ use crate::rpc::ConnectOpts;
 mod account;
 #[cfg(feature = "confidential-tokens")]
 pub(crate) mod balance;
-mod legacy;
+pub(crate) mod legacy;
 #[cfg(feature = "confidential-tokens")]
 mod wallet;
 

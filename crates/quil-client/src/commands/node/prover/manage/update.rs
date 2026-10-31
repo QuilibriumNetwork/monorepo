@@ -7,8 +7,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::super::epoch::{epoch_len, ConfirmWindow, WindowState};
 use super::super::sign;
+use super::coins;
 use super::model::{
-    AwaitFilterEntry, ColumnFilter, FilterColKind, Model, PanelFocus, PendingAction,
+    AwaitFilterEntry, ColumnFilter, FilterColKind, Model, PanelFocus, PendingAction, Tab,
 };
 use super::msg::Msg;
 
@@ -18,6 +19,8 @@ const MAX_AWAIT_RETRIES: u32 = 3;
 /// equivalent). The loop spawns the matching async task or timer.
 pub enum Cmd {
     Fetch,
+    /// Read this node's legacy coins for the Coins tab.
+    FetchLegacy,
     Join(Vec<Vec<u8>>),
     Lifecycle {
         action: String,
@@ -41,8 +44,13 @@ pub enum Cmd {
 
 pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
     match msg {
+        Msg::LegacyRefresh { answer, took } => {
+            coins::apply_legacy(m, answer, took);
+            vec![]
+        }
         Msg::RewardRefresh(result) => {
             m.reward_loaded = true;
+            m.reward_error = result.as_ref().err().cloned();
             m.claimable_reward = result.ok().flatten();
             m.reward_last_success = m.claimable_reward.map(|_| Instant::now());
             vec![]
@@ -516,6 +524,17 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         }
         return vec![];
     }
+    if m.tab == Tab::Coins {
+        if m.show_help {
+            return handle_help_key(m, ev);
+        }
+        return match ev.code {
+            _ if is_quit(&ev) => vec![Cmd::Quit],
+            KeyCode::Char(_) if ev.modifiers.contains(KeyModifiers::CONTROL) => vec![],
+            KeyCode::Char(_) if shared_view_key(m, &ev) => vec![],
+            _ => coins::handle_key(m, ev),
+        };
+    }
     if m.filter_edit_active
         && ev.code == KeyCode::Char('h')
         && ev.modifiers == KeyModifiers::CONTROL
@@ -635,26 +654,13 @@ fn move_panel_boundary(m: &mut Model, upper: bool, down: bool) {
         (i32::from(m.panel_content_heights[i + 1]) - i32::from(movement)) as u16;
 }
 
-fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
-    if is_quit(&ev) {
-        return vec![Cmd::Quit];
-    }
-    let c = ch(&ev);
+/// Keys both tabs share: display, refresh, notice level and help.
+/// Returns whether `ev` was one.
+fn shared_view_key(m: &mut Model, ev: &KeyEvent) -> bool {
     match ev.code {
-        KeyCode::Char('b') => {
-            if m.focus == PanelFocus::Notifications {
-                return vec![];
-            }
-            m.column_picker_active = true;
-            m.visibility_section = 0;
-            m.column_picker_cursor = 2;
-            m.column_picker_offset = 0;
-            return vec![];
-        }
         KeyCode::Char('n') => {
             m.compact_actions = !m.compact_actions;
             m.compact_units = m.compact_actions;
-            return vec![];
         }
         KeyCode::Char('t') => {
             m.refresh_seconds = match m.refresh_seconds {
@@ -664,11 +670,37 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
                 _ => 5,
             };
             m.refresh_changed_at = Some(Instant::now());
-            return vec![];
         }
         KeyCode::Char('v') => {
             m.notice_minimum = m.notice_minimum.next();
             m.notice_offset = 0;
+        }
+        KeyCode::Char('h') => super::view::open_help(m),
+        KeyCode::Char('c') => m.color_coding = !m.color_coding,
+        _ => return false,
+    }
+    true
+}
+
+fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
+    if is_quit(&ev) {
+        return vec![Cmd::Quit];
+    }
+    if shared_view_key(m, &ev) {
+        return vec![];
+    }
+    let c = ch(&ev);
+    match ev.code {
+        KeyCode::Char('1') => return vec![],
+        KeyCode::Char('2') => return coins::open(m),
+        KeyCode::Char('b') => {
+            if m.focus == PanelFocus::Notifications {
+                return vec![];
+            }
+            m.column_picker_active = true;
+            m.visibility_section = 0;
+            m.column_picker_cursor = 2;
+            m.column_picker_offset = 0;
             return vec![];
         }
         KeyCode::PageUp => {
@@ -686,15 +718,6 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         }
         KeyCode::End => {
             m.notice_offset = m.notice_lines.saturating_sub(m.notice_visible);
-            return vec![];
-        }
-        KeyCode::Char('h') => {
-            m.show_help = true;
-            m.help_offset = 0;
-            return vec![];
-        }
-        KeyCode::Char('c') => {
-            m.color_coding = !m.color_coding;
             return vec![];
         }
         KeyCode::Char('e') => {
