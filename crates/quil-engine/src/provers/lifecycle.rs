@@ -2657,6 +2657,7 @@ impl ProverLifecycle {
         self.end_storage_spares(frame_number, &storage_protected, &expired_epoch_filters);
         let epoch_frames = quil_types::consensus::epoch_length_frames();
         let mut settling: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut withheld_renewals = Vec::new();
         let renewal_filters: Vec<Vec<u8>> = {
             use super::session_hosting::Hold;
             let mut hosting = self
@@ -2666,7 +2667,14 @@ impl ProverLifecycle {
             let renewals = expired_epoch_filters.into_iter()
                 .filter(|f| worker_bound_filters.contains(f))
                 .filter(|f| !self.renewal_awaits_leave(f, frame_number))
-                .filter(|f| match hosting.withhold(f, frame_number, epoch_frames) {
+                .filter(|f| {
+                    let hold = hosting.withhold(f, frame_number, epoch_frames);
+                    // The seat's worker names this decision, not a failed
+                    // confirmation, when its lapsed seat refuses its start.
+                    if let Some(why) = hold.as_ref().and_then(super::session_hosting::RenewalWithheld::of) {
+                        withheld_renewals.push((f.clone(), why));
+                    }
+                    match hold {
                     None => true,
                     Some(Hold::Settling { until }) => {
                         settling.push((f.clone(), until));
@@ -2700,8 +2708,9 @@ impl ProverLifecycle {
                         }
                         false
                     }
-                })
+                }})
                 .collect();
+            super::session_hosting::note_renewals_withheld(frame_number, withheld_renewals);
             if let Some((_, until)) = settling.first() {
                 if hosting.report_settling() {
                     tracing::info!(frame = frame_number, seats = settling.len(), settle_until = until,
@@ -6667,6 +6676,13 @@ mod proposal_loop_tests {
             !renews(&actions, &held) && renews(&actions, &unseated),
             "{actions:?}"
         );
+        // The seat's worker reads the decision when its start is refused.
+        use crate::provers::session_hosting::{renewal_withheld, RenewalWithheld};
+        assert_eq!(
+            renewal_withheld(&held, 725),
+            Some(RenewalWithheld::Unhosted)
+        );
+        assert_eq!(renewal_withheld(&unseated, 725), None);
         // The seat lapses and the next session leaves it out.
         lc.allocator.set_session_authority(left_out.clone());
         let actions = evaluate(&lc, &wm, 1_445);
@@ -6674,12 +6690,17 @@ mod proposal_loop_tests {
             !renews(&actions, &held),
             "a lapsed seat whose worker cannot host stays lapsed: {actions:?}"
         );
+        assert_eq!(
+            renewal_withheld(&held, 1_445),
+            Some(RenewalWithheld::Unhosted)
+        );
         wm.set_execution(1, &held, seat_only());
         let actions = evaluate(&lc, &wm, 1_450);
         assert!(
             renews(&actions, &held),
             "only its seat keeps the worker out: {actions:?}"
         );
+        assert_eq!(renewal_withheld(&held, 1_450), None, "renewed");
 
         // A restart in the recovery epoch, the worker still unable: the
         // lapsed seat waits, then is withheld; the unseated one renews.
