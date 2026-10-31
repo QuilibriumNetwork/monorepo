@@ -672,7 +672,7 @@ where
                         tree_cache,
                         &node_key,
                         child_index,
-                    );
+                    )?;
                     (child_key.unwrap(), siblings)
                 } else {
                     (
@@ -709,7 +709,7 @@ where
                 // we are looking for.
                 let merkle_proof = if with_proof {
                     let (child_key_opt, mut siblings) = internal_node
-                        .get_only_child_with_siblings::<H>(tree_cache, &node_key, child_index);
+                        .get_only_child_with_siblings::<H>(tree_cache, &node_key, child_index)?;
 
                     let leaf: Option<SparseMerkleLeafNode> = child_key_opt.map(|child_key|
                     {
@@ -1035,7 +1035,7 @@ where
                             self.reader,
                             &next_node_key,
                             queried_child_index,
-                        );
+                        )?;
 
                     siblings.append(&mut siblings_in_internal);
                     next_node_key = match child_node_key {

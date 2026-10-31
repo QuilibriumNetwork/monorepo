@@ -3583,46 +3583,61 @@ impl AppConsensusEngine {
                     ));
                 }
                 let started = std::time::Instant::now();
-                let (mut seat, reused) = crate::storage_epoch_batch::prepare_reusing(
-                    &member,
-                    &filter,
-                    epoch,
-                    seal_inputs.clone().filter(|_| seals),
-                    settle_inputs.clone().filter(|_| settles),
-                    |seals, settles| {
-                        // The sealed registration's bindings read the
-                        // snapshot its data was taken from.
-                        let captured = match (seal.as_ref().filter(|_| seals), crdt.as_ref()) {
-                            (Some(_), Some(crdt)) => Some(crate::storage_snapshot::captured_for(
-                                crdt,
+                let (mut seat, reused) = unwound(|| {
+                    crate::storage_epoch_batch::prepare_reusing(
+                        &member,
+                        &filter,
+                        epoch,
+                        seal_inputs.clone().filter(|_| seals),
+                        settle_inputs.clone().filter(|_| settles),
+                        |seals, settles| {
+                            // The sealed registration's bindings read the
+                            // snapshot its data was taken from.
+                            let captured = match (seal.as_ref().filter(|_| seals), crdt.as_ref()) {
+                                (Some(_), Some(crdt)) => Some(crate::storage_snapshot::captured_for(
+                                    crdt,
+                                    &replicas,
+                                    &filter,
+                                    epoch + 2,
+                                )?),
+                                (Some(_), None) => {
+                                    return Err(quil_types::error::QuilError::ExecutionUnavailable(
+                                        "no shard store to read the sealed snapshot from".into(),
+                                    ))
+                                }
+                                _ => None,
+                            };
+                            crate::storage_snapshot::prepare_member_seat(
                                 &replicas,
+                                &member,
                                 &filter,
-                                epoch + 2,
-                            )?),
-                            (Some(_), None) => {
-                                return Err(quil_types::error::QuilError::ExecutionUnavailable(
-                                    "no shard store to read the sealed snapshot from".into(),
-                                ))
-                            }
-                            _ => None,
+                                epoch,
+                                seal.as_ref()
+                                    .filter(|_| seals)
+                                    .zip(captured.as_deref())
+                                    .map(|(slot, captured)| (slot, beacon_output.as_slice(), captured)),
+                                settle
+                                    .as_ref()
+                                    .filter(|_| settles)
+                                    .map(|slot| (slot, beacons.as_slice())),
+                            )
+                        },
+                    )
+                })
+                .map_err(|error| {
+                    if seals {
+                        let next = if settles {
+                            "its settlement is prepared alone now"
+                        } else {
+                            "the seal is tried again at its next attempt"
                         };
-                        crate::storage_snapshot::prepare_member_seat(
-                            &replicas,
-                            &member,
-                            &filter,
-                            epoch,
-                            seal.as_ref()
-                                .filter(|_| seals)
-                                .zip(captured.as_deref())
-                                .map(|(slot, captured)| (slot, beacon_output.as_slice(), captured)),
-                            settle
-                                .as_ref()
-                                .filter(|_| settles)
-                                .map(|slot| (slot, beacons.as_slice())),
-                        )
-                    },
-                )
-                .map_err(withdraw)?;
+                        warn!(epoch, attempt, global_frame = crate::storage_snapshot::global_frame().unwrap_or(0),
+                            filter = %hex::encode(&filter), %error, next,
+                            "storage seal part not prepared: withdrawn from the node's batch, so the member's other seats are proved without it; \
+                             GLOBAL withholds this seat's storage share unless a seal lands in its window. A missing forest node in the error is a store defect to report");
+                    }
+                    withdraw(error)
+                })?;
                 seat.solo = attempt > 1 || (settle_alone && !seals);
                 let bytes = seat.to_bytes();
                 info!(epoch, seals, settles, attempt, reused, frames = settle.as_ref().filter(|_| settles).map_or(0, |slot| slot.frames),
@@ -3659,7 +3674,7 @@ impl AppConsensusEngine {
                     if crate::storage_snapshot::settlement_closed(epoch, 0) {
                         return closed(Err(error)).and_then(|()| prove(true, false));
                     }
-                    warn!(epoch, %error, "storage epoch proof with the seal failed; settling alone");
+                    // `prove` logged the seal's failure and withdrew it.
                     prove(false, true)
                 }),
                 (false, true) => closed(prove(false, true)),
@@ -13970,6 +13985,23 @@ fn anchor_refusal_cause(history: Option<&str>, global_missing: bool) -> &'static
     }
 }
 
+/// Run `prepare`, turning a panic into an error, so a seat's part whose
+/// preparation panics is still withdrawn from the node's batch and its
+/// settlement still sent alone: a seal reading a forest node its store
+/// lost panicked in the proof's sibling read and skipped both.
+fn unwound<T>(prepare: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(prepare)).unwrap_or_else(|panic| {
+        let reason = panic
+            .downcast_ref::<&str>()
+            .map(|reason| reason.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "no message".into());
+        Err(QuilError::Internal(format!(
+            "preparing the part panicked: {reason}"
+        )))
+    })
+}
+
 #[cfg(test)]
 mod predecessor_block_tests {
     use super::*;
@@ -18025,6 +18057,55 @@ mod tests {
                 .any(|message| matches!(message, SeatMessage::Withdraw(..))),
             "the announced part is withdrawn"
         );
+    }
+
+    /// A seal part that cannot be prepared (here no snapshot to read it
+    /// from; on a store that lost a forest node its proof reads, the
+    /// proof's error) is withdrawn from the node's batch, and the seat's
+    /// settlement still goes, without it.
+    #[tokio::test]
+    async fn a_seal_that_fails_to_prepare_is_withdrawn_and_its_settlement_sent() {
+        use crate::storage_epoch_batch::SeatMessage;
+        let (mut engine, published, (from, _)) = engine_owing_a_settlement(5, true, true);
+        at_global_frame(&mut engine, from + 1);
+        for lane in [
+            engine.filter.clone(),
+            [b"settlement ".as_slice(), &engine.filter].concat(),
+        ] {
+            assert!(crate::storage_jobs::wait_lane_idle(
+                &lane,
+                Duration::from_secs(30)
+            ));
+        }
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        let sent: Vec<_> = published
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|bytes| SeatMessage::from_bytes(bytes).ok())
+            .collect();
+        assert!(
+            sent.iter()
+                .any(|message| matches!(message, SeatMessage::Withdraw(_, key) if key.seals)),
+            "the seal part is withdrawn"
+        );
+        assert!(
+            sent.iter().any(|message| matches!(message,
+                SeatMessage::Part(part) if part.part.settles && !part.part.seals)),
+            "the settlement is sent without the seal"
+        );
+    }
+
+    /// A panic preparing a part is an error, so the part is withdrawn.
+    #[test]
+    fn a_panic_preparing_a_part_is_an_error() {
+        let error =
+            super::unwound(|| -> Result<()> { panic!("Missing node at a sibling") }).unwrap_err();
+        assert!(
+            error.to_string().contains("Missing node at a sibling"),
+            "{error}"
+        );
+        assert_eq!(super::unwound(|| Ok(7)).unwrap(), 7);
     }
 
     /// In its window's last frames a settlement waits for nothing: not for a
