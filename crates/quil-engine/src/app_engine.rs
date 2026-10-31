@@ -154,6 +154,13 @@ pub enum AppEngineMessage {
         descendants: Vec<quil_types::proto::global::AppShardFrame>,
         reply: tokio::sync::oneshot::Sender<Result<u64>>,
     },
+    /// Retry the materialization of the frame after the cursor when it waits
+    /// for this node's proof verification
+    /// ([`AppConsensusEngine::retry_proof_wait`]): the frame it still waits
+    /// for, if any.
+    RetryProofWait {
+        reply: tokio::sync::oneshot::Sender<Option<u64>>,
+    },
     /// A worker with no local app-shard clock head fetched an archive anchor and
     /// synced its tree to that anchor's pre-state. The engine validates the
     /// certified frames, checkpoints the predecessor, replays the anchor itself
@@ -662,6 +669,25 @@ impl AppEngineHandle {
         })
         .await
         .map_err(|_| QuilError::ExecutionUnavailable("archive replay timed out".into()))?
+    }
+
+    /// The frame after the cursor, when its materialization still waits for
+    /// this node's proof verification once retried
+    /// ([`AppConsensusEngine::retry_proof_wait`]). `None` also when the
+    /// engine does not answer within 30 s: the recovery then replays as
+    /// before.
+    pub(crate) async fn retry_proof_wait(&self) -> Option<u64> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            self.msg_tx
+                .send(AppEngineMessage::RetryProofWait { reply })
+                .await
+                .ok()?;
+            receive.await.ok().flatten()
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Tell the engine whether the network is in a coverage halt. The
@@ -2883,6 +2909,9 @@ pub struct AppConsensusEngine {
     /// Archive frames that keep failing to replay onto this worker's trees,
     /// which past a bound owe a re-anchor ([`Self::note_replay_mismatch`]).
     replay_mismatch: ReplayMismatch,
+    /// The frame after the cursor whose materialization last stopped to wait
+    /// for this node's proof verification ([`ProofWait`]).
+    proof_wait: Option<ProofWait>,
     /// Committees that certified legacy frames, when today's registry no
     /// longer reproduces them (see `historical_committee`).
     historical_committee_source: Option<crate::historical_committee::HistoricalCommitteeSource>,
@@ -3163,6 +3192,7 @@ impl AppConsensusEngine {
             unrewindable_fence: UnrewindableFenceBlock::default(),
             fence_reanchor: FenceReanchor::default(),
             replay_mismatch: ReplayMismatch::default(),
+            proof_wait: None,
             historical_committee_source: None,
             predecessor_block: PredecessorBlock::default(),
             history_walk: Default::default(),
@@ -3875,6 +3905,10 @@ impl AppConsensusEngine {
             None => return Ok((0, 0)),
         };
         self.prove_storage_epoch_if_due(global_frame_number);
+        #[cfg(test)]
+        if let Some(held) = held_for_proofs(&self.filter, frame_number) {
+            return Err(held);
+        }
         if let Some(pending) = self.defer_for_proof_verification(&exec, &requests, frame_number) {
             return Err(pending);
         }
@@ -5191,13 +5225,79 @@ impl AppConsensusEngine {
         if number <= materialized {
             return;
         }
-        self.predecessor_block.refusal = result.as_ref().err().map(|error| AnchorRefusal {
+        // A frame waiting for this node's proof verification passed every
+        // check: nothing refused it.
+        let refused = result.as_ref().err().filter(|error| {
+            !crate::worker_execution::waits_for_proof_verification(&error.to_string())
+        });
+        self.predecessor_block.refusal = refused.map(|error| AnchorRefusal {
             frame: Some(unanchored.map_or(number, |(frame, _)| frame)),
             global_frame: unanchored.map(|(_, global)| global),
             at_unix_ms: crate::worker_execution::now_ms(),
             cause: "archive replay frame refused",
             error: error.to_string(),
         });
+    }
+
+    /// Retry materializing the frame after the cursor when its last attempt
+    /// stopped to wait for this node's proof verification ([`ProofWait`]),
+    /// a frame an archive replay or consensus committed and kept: the frame
+    /// it still waits for, if any. A recovery finding one fetches and
+    /// validates nothing, as an archive's copy would wait for the same
+    /// proofs. The wait ends as the materialization's does: with the
+    /// verdicts cached, or with the proofs verified inline once the
+    /// background verification cannot finish them; any other stop ends it
+    /// too, and the recovery replays as before.
+    async fn retry_proof_wait(&mut self) -> Option<u64> {
+        let next = self.last_materialized_frame + 1;
+        self.proof_wait.filter(|wait| wait.frame == next)?;
+        self.try_materialize_follower_frames().await;
+        let wait = self
+            .proof_wait
+            .filter(|wait| wait.frame == self.last_materialized_frame + 1)?;
+        self.log_proof_wait(std::time::Instant::now());
+        Some(wait.frame)
+    }
+
+    /// Log [`Self::proof_wait`] for an archive recovery: when it starts,
+    /// then every [`PROOF_WAIT_REPEAT`] with the time waited; the frame's
+    /// materialization logs its end.
+    fn log_proof_wait(&mut self, now: std::time::Instant) {
+        let Some(wait) = self.proof_wait.filter(|wait| {
+            wait.logged
+                .is_none_or(|at| now.saturating_duration_since(at) >= PROOF_WAIT_REPEAT)
+        }) else {
+            return;
+        };
+        let operations = match (
+            self.execution_engine.as_ref(),
+            self.received_full_frames.get(&wait.frame),
+        ) {
+            (Some(exec), Some(frame)) => {
+                let application = self.app_address[..self.app_address.len().min(32)].to_vec();
+                let bundles: Vec<(Vec<u8>, Vec<u8>)> = frame
+                    .requests
+                    .iter()
+                    .filter_map(|bundle| {
+                        crate::consensus_wire::app_bundle_to_canonical_bytes(bundle).ok()
+                    })
+                    .map(|canon| (application.clone(), canon))
+                    .collect();
+                exec.unverified_confidential_operations(&bundles).len()
+            }
+            _ => 0,
+        };
+        info!(core_id = self.core_id, filter = hex::encode(&self.filter), frame = wait.frame, operations,
+            waited_secs = now.saturating_duration_since(wait.since).as_secs(),
+            cause = wait.cause(), class = crate::worker_execution::PROOF_VERIFICATION,
+            scope = "this node's proof worker",
+            action = "an expected wait: the frame is authenticated and committed, and materializes once its \
+                proofs verify, without another archive fetch; its recovery defers meanwhile and counts no \
+                failure; if it lasts hours, check this node's CPU and proofWorker settings",
+            "archive replay frame waits for its proof verification");
+        if let Some(wait) = self.proof_wait.as_mut() {
+            wait.logged = Some(now);
+        }
     }
 
     /// Replay `frame`, which has no certificate of its own and no certified
@@ -5442,6 +5542,13 @@ impl AppConsensusEngine {
         self.received_full_frames.insert(number, frame);
         self.try_materialize_follower_frames().await;
         if self.last_materialized_frame < number {
+            // Authenticated, committed and kept: it materializes once its
+            // proofs verify, on the retry timer or at the next recovery's
+            // `retry_proof_wait`, without being fetched again.
+            if let Some(wait) = self.proof_wait.filter(|wait| wait.frame == number) {
+                self.log_proof_wait(std::time::Instant::now());
+                return Err(QuilError::ExecutionUnavailable(wait.reason()));
+            }
             return Err(QuilError::ExecutionUnavailable(
                 "archive replay materialization did not commit".into(),
             ));
@@ -6705,6 +6812,12 @@ impl AppConsensusEngine {
                             if !reply.is_closed() {
                                 let result = self.replay_archive_frame_for_sync(frame, descendants).await;
                                 let _ = reply.send(result);
+                            }
+                        }
+                        Some(AppEngineMessage::RetryProofWait { reply }) => {
+                            if !reply.is_closed() {
+                                let waiting = self.retry_proof_wait().await;
+                                let _ = reply.send(waiting);
                             }
                         }
                         Some(AppEngineMessage::DiscardedBaseRoots { frame, reply }) => {
@@ -10808,6 +10921,9 @@ impl AppConsensusEngine {
         }
         loop {
             let next = self.last_materialized_frame + 1;
+            // Kept only while this attempt stops to wait again: any other
+            // outcome ends the wait.
+            let waiting = self.proof_wait.take().filter(|wait| wait.frame == next);
             let trusted_root = match self.finalized_requests_roots.get(&next) {
                 Some(r) => r.clone(),
                 None => break, // not finalized through consensus yet
@@ -10923,6 +11039,15 @@ impl AppConsensusEngine {
                     }
                     self.received_full_frames.remove(&next);
                     self.materialize_failures.remove(&next);
+                    if let Some(wait) = waiting.filter(|wait| wait.logged.is_some()) {
+                        info!(
+                            core_id = self.core_id,
+                            filter = hex::encode(&self.filter),
+                            frame = next,
+                            waited_secs = wait.since.elapsed().as_secs(),
+                            "archive replay frame materialized after its proof verification wait"
+                        );
+                    }
                     debug!(
                         core_id = self.core_id,
                         frame = next,
@@ -10934,9 +11059,11 @@ impl AppConsensusEngine {
                 // Its proofs verify in the background: the frame is kept and
                 // retried on the retry timer; the wait is logged where it starts.
                 Err(e) if quil_execution::token_intrinsic::is_proof_verification_pending(&e) => {
-                    break
+                    self.proof_wait = Some(ProofWait::at(next, false, waiting));
+                    break;
                 }
                 Err(e) if quil_execution::token_intrinsic::is_proof_worker_busy(&e) => {
+                    self.proof_wait = Some(ProofWait::at(next, true, waiting));
                     // Local contention for the proof worker: the frame is
                     // fine and a shard sync would not relieve it. Keep the
                     // frame and retry without counting toward the drop;
@@ -11293,7 +11420,8 @@ fn message_step(message: &Option<AppEngineMessage>) -> probe::Section {
     use probe::Section;
     match message {
         Some(AppEngineMessage::Frame(_)) => Section::EngineFrameMessage,
-        Some(AppEngineMessage::ReplayArchiveFrame { .. }) => Section::EngineReplayArchiveFrame,
+        Some(AppEngineMessage::ReplayArchiveFrame { .. })
+        | Some(AppEngineMessage::RetryProofWait { .. }) => Section::EngineReplayArchiveFrame,
         Some(AppEngineMessage::ValidateShardSyncAnchor { .. }) => Section::EngineSyncAnchor,
         Some(AppEngineMessage::ShardSyncCompleted { .. }) => Section::EngineSyncCompleted,
         Some(AppEngineMessage::ShardBootstrapCompleted { .. }) => Section::EngineBootstrapCompleted,
@@ -16377,6 +16505,96 @@ impl UnrewindableFenceBlock {
     }
 }
 
+/// How often an archive recovery that keeps finding its frame waiting for
+/// this node's proof verification logs the wait again.
+const PROOF_WAIT_REPEAT: Duration = Duration::from_secs(10 * 60);
+
+/// The frame after the cursor whose materialization stopped to wait for this
+/// node's proof verification: its proofs verify in the background
+/// (`PROOF_VERIFICATION_PENDING`) or the proof worker refused it busy
+/// (`PROOF_WORKER_BUSY`). Kept by
+/// [`AppConsensusEngine::try_materialize_follower_frames`] only while each
+/// attempt stops so again.
+#[derive(Clone, Copy, Debug)]
+struct ProofWait {
+    frame: u64,
+    /// When the frame first stopped so.
+    since: std::time::Instant,
+    /// The proof worker refused it busy.
+    busy: bool,
+    /// When an archive recovery last logged the wait.
+    logged: Option<std::time::Instant>,
+}
+
+impl ProofWait {
+    /// `frame` stops to wait now; `previous`, its wait so far, keeps its start.
+    fn at(frame: u64, busy: bool, previous: Option<ProofWait>) -> Self {
+        let previous = previous.filter(|wait| wait.frame == frame);
+        Self {
+            frame,
+            since: previous.map_or_else(std::time::Instant::now, |wait| wait.since),
+            busy,
+            logged: previous.and_then(|wait| wait.logged),
+        }
+    }
+
+    fn cause(&self) -> &'static str {
+        if self.busy {
+            quil_execution::token_intrinsic::PROOF_WORKER_BUSY
+        } else {
+            quil_execution::token_intrinsic::PROOF_VERIFICATION_PENDING
+        }
+    }
+
+    /// The replay's error, which names the cause
+    /// (`worker_execution::waits_for_proof_verification`).
+    fn reason(&self) -> String {
+        format!(
+            "archive replay of frame {} waits for this node's proof verification ({})",
+            self.frame,
+            self.cause()
+        )
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Frames whose materialization a test on this thread holds as a proof
+    /// verification would: `(filter, frame, busy)`.
+    static HELD_FOR_PROOFS: std::cell::RefCell<Vec<(Vec<u8>, u64, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Hold (`Some(busy)`) or release (`None`) the materialization of `frame`
+/// of `filter`.
+#[cfg(test)]
+fn hold_for_proofs(filter: &[u8], frame: u64, held: Option<bool>) {
+    HELD_FOR_PROOFS.with_borrow_mut(|frames| {
+        frames.retain(|(f, n, _)| !(f == filter && *n == frame));
+        if let Some(busy) = held {
+            frames.push((filter.to_vec(), frame, busy));
+        }
+    });
+}
+
+#[cfg(test)]
+fn held_for_proofs(filter: &[u8], frame: u64) -> Option<QuilError> {
+    let busy = HELD_FOR_PROOFS.with_borrow(|frames| {
+        frames
+            .iter()
+            .find(|(f, n, _)| f == filter && *n == frame)
+            .map(|(_, _, busy)| *busy)
+    })?;
+    Some(QuilError::ExecutionUnavailable(
+        if busy {
+            quil_execution::token_intrinsic::PROOF_WORKER_BUSY
+        } else {
+            quil_execution::token_intrinsic::PROOF_VERIFICATION_PENDING
+        }
+        .to_string(),
+    ))
+}
+
 /// Failed replays of one archive frame onto this worker's trees, and how
 /// long they must persist, before the shard owes a re-anchor: a mismatch
 /// while the trees are mid-write passes within minutes, one in the trees
@@ -17291,6 +17509,78 @@ mod fence_reanchor_tests {
             "a materialized replay starts over"
         );
         assert!(engine.replay_mismatch.since.is_none());
+    }
+
+    /// A replayed frame whose materialization waits for this node's proof
+    /// verification is its own outcome, no mismatch: it stays committed and
+    /// kept, counts nothing toward a re-anchor however often it is replayed,
+    /// and materializes once its proofs verify, retried in place without
+    /// another replay; the proof worker refusing it busy keeps the wait and
+    /// its start. A frame no longer kept ends the wait, and the recovery
+    /// replays as before.
+    #[tokio::test]
+    async fn a_replayed_frame_waiting_for_its_proofs_materializes_once_they_verify() {
+        let (mut engine, _events, crdt) = shard_engine();
+        let frame = first_frame(&engine, &crdt).await;
+        let filter = engine.filter.clone();
+        hold_for_proofs(&filter, 1, Some(false));
+        for _ in 0..12 {
+            let error = engine
+                .replay_archive_frame_with(frame.clone(), None, |_| Ok(true))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                crate::worker_execution::failure_class(&error),
+                crate::worker_execution::PROOF_VERIFICATION,
+                "{error}"
+            );
+            assert!(error.contains("frame 1 waits"), "{error}");
+        }
+        assert_eq!(engine.last_materialized_frame, 0);
+        assert!(engine.received_full_frames.contains_key(&1), "kept");
+        let wait = engine.proof_wait.expect("the wait is noted");
+        assert_eq!((wait.frame, wait.busy), (1, false));
+        assert!(wait.logged.is_some(), "the replay logged the wait");
+        assert_eq!(engine.replay_mismatch.failures, 0, "no mismatch counted");
+        assert!(engine.replay_mismatch.since.is_none());
+        assert!(
+            !matches!(engine.fence_reanchor.marker, Some(Some(_))),
+            "no re-anchor recorded"
+        );
+        hold_for_proofs(&filter, 1, Some(true));
+        assert_eq!(engine.retry_proof_wait().await, Some(1));
+        let busy = engine.proof_wait.unwrap();
+        assert!(busy.busy);
+        assert_eq!(busy.since, wait.since, "the wait keeps its start");
+        hold_for_proofs(&filter, 1, None);
+        assert_eq!(engine.retry_proof_wait().await, None, "the verdicts are in");
+        assert_eq!(engine.last_materialized_frame, 1, "materialized in place");
+        assert!(engine.proof_wait.is_none());
+        assert_eq!(
+            engine
+                .replay_archive_frame_with(frame.clone(), None, |_| Ok(true))
+                .await
+                .unwrap(),
+            1
+        );
+
+        let (mut engine, _events, crdt) = shard_engine();
+        let frame = first_frame(&engine, &crdt).await;
+        hold_for_proofs(&engine.filter.clone(), 1, Some(false));
+        assert!(engine
+            .replay_archive_frame_with(frame, None, |_| Ok(true))
+            .await
+            .is_err());
+        assert!(engine.proof_wait.is_some());
+        engine.received_full_frames.remove(&1);
+        assert_eq!(
+            engine.retry_proof_wait().await,
+            None,
+            "a frame no longer kept waits no more"
+        );
+        assert!(engine.proof_wait.is_none());
+        hold_for_proofs(&engine.filter.clone(), 1, None);
     }
 
     /// A persistent mismatch records a re-anchor at the frame GLOBAL
