@@ -80,6 +80,10 @@ pub struct ExplorerState {
     /// `/token/coins/:owner`) read every coin of the domain, so they run one
     /// at a time and a request arriving during one is answered 503.
     pub(crate) token_scan: Arc<tokio::sync::Semaphore>,
+    /// Permits for shard-frame reads (`/shards/:filter/frames`): a frame
+    /// can be megabytes, so only `handlers::MAX_SHARD_FRAME_READS` are read
+    /// at once and a request beyond them is answered 503.
+    pub(crate) shard_frame_reads: Arc<tokio::sync::Semaphore>,
     /// Every prover known to the registry at one frame, with its build
     /// time, shared by requests within that frame and a few seconds (see
     /// `handlers::all_provers`). Holds at most one snapshot.
@@ -141,6 +145,9 @@ impl ExplorerState {
             current_frame,
             cache: Arc::new(RwLock::new(HashMap::new())),
             token_scan: Arc::new(tokio::sync::Semaphore::new(1)),
+            shard_frame_reads: Arc::new(tokio::sync::Semaphore::new(
+                handlers::MAX_SHARD_FRAME_READS,
+            )),
             provers_snapshot: Arc::new(Mutex::new(None)),
             eviction: Arc::new(RwLock::new(None)),
             eviction_making: Arc::new(Mutex::new(())),
@@ -187,7 +194,7 @@ pub const MAX_IN_FLIGHT: usize = 64;
 /// delays other explorer requests, not the node's consensus and sync.
 pub const HTTP_WORKERS: usize = 2;
 
-/// Build the explorer router with all 11 endpoints. Every route accepts
+/// Build the explorer router with all its endpoints. Every route accepts
 /// any method (handlers themselves return 405 for non-GET, matching Go's
 /// per-handler `if r.Method != GET` check); CORS + OPTIONS short-circuit is
 /// applied as a layer (matching Go's `withCORS` wrapper).
@@ -217,6 +224,11 @@ pub fn router(state: ExplorerState) -> Router {
         .route(
             "/shards/production/history",
             any(handlers::handle_shard_production_history),
+        )
+        .route("/shards/:filter/frames", any(handlers::handle_shard_frames))
+        .route(
+            "/shards/:filter/frames/:number",
+            any(handlers::handle_shard_frame),
         )
         .route("/token/supply", any(handlers::handle_token_supply))
         .route("/token/coin/:address", any(handlers::handle_token_coin))
