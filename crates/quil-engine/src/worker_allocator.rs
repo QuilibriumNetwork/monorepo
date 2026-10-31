@@ -114,6 +114,14 @@ pub enum GivenUp {
     /// (`quil_execution::prover_registry::leaver_seated`, from the leaver
     /// currency frame on); a renewal naming a leaving seat is refused.
     LeftLapsed,
+    /// Its leave is confirmed, so it departs at its leave boundary, the
+    /// worker asking holds no frame of its shard, and even the fastest
+    /// archive install seen would end after the seat departs: it would read
+    /// the whole shard for a seat that leaves without voting again.
+    /// Only the archive-recovery gate reports it, for such an install
+    /// ([`WorkerAllocator::departing_install`]); the reconcile keeps the
+    /// worker bound, and a replay onto frames the worker holds still runs.
+    DepartingInstall,
 }
 
 impl GivenUp {
@@ -126,6 +134,10 @@ impl GivenUp {
                 "it is being left after its storage registration lapsed past its recovery epoch, \
                 and its committee no longer seats it"
             }
+            Self::DepartingInstall => {
+                "its leave is confirmed, this worker holds none of its shard, and even the fastest install \
+                seen would end after the seat departs at its leave boundary"
+            }
         }
     }
 
@@ -135,6 +147,8 @@ impl GivenUp {
             Self::Lapsed => "none: unless a renewal of the seat starts, the allocator releases this worker and the \
                 lifecycle leaves the seat",
             Self::LeftLapsed => "none: the allocator releases this worker and the seat departs at its leave boundary",
+            Self::DepartingInstall => "none: the worker stays bound and serves no state until the seat departs at its \
+                leave boundary, which frees it",
         }
     }
 }
@@ -152,9 +166,11 @@ pub struct GivenUpSeat {
 }
 
 /// What a worker manager's workers ask before they recover a shard from an
-/// archive: the GLOBAL frame it judges at, and the seat on that filter this
-/// node gives up there, if it does ([`WorkerAllocator::install_recovery_gate`]).
-pub type RecoveryGate = Arc<dyn Fn(&[u8]) -> (u64, Option<GivenUpSeat>) + Send + Sync>;
+/// archive, passing whether the worker holds no frame of it (`cold`: the
+/// recovery installs the shard): the GLOBAL frame it judges at, and the seat
+/// on that filter this node gives up there, if it does
+/// ([`WorkerAllocator::install_recovery_gate`]).
+pub type RecoveryGate = Arc<dyn Fn(&[u8], bool) -> (u64, Option<GivenUpSeat>) + Send + Sync>;
 
 /// The registry's part of [`WorkerAllocator::gives_up`]: a seat lapsed past
 /// its recovery epoch, or one left after it so lapsed that its committee no
@@ -472,6 +488,37 @@ pub struct AllocationPriorityEvidence {
     pub leave_reject_frame: Option<u64>,
 }
 
+#[cfg(test)]
+impl AllocationPriorityEvidence {
+    /// Evidence for a shard of `data_shards` leaves, at `frame`.
+    pub(crate) fn sized(frame: u64, data_shards: u64) -> Self {
+        Self {
+            frame_number: frame,
+            active: 3,
+            joining: 0,
+            paused: 0,
+            leaving: 0,
+            scoring_ring: 0,
+            ring_source: "current_committee",
+            ring_member_count: Some(3),
+            ring_target_frame: Some(frame),
+            size_bytes: data_shards * 664,
+            data_shards,
+            difficulty: 100,
+            world_bytes_input: "123".into(),
+            world_bytes_source: "registry_count_proxy",
+            allocation_epoch: None,
+            stored_ring: None,
+            allocation_status: None,
+            allocation_raw_status: None,
+            join_confirm_frame: None,
+            leave_frame: None,
+            leave_confirm_frame: None,
+            leave_reject_frame: None,
+        }
+    }
+}
+
 /// A whole-frame ranking of allocations, published by the lifecycle.
 ///
 /// The allocator cannot compute this itself: scoring needs archive-
@@ -563,48 +610,207 @@ impl RebindOutcome {
     }
 }
 
+/// The most leaves an archive install was seen to put in place per second
+/// of its turns: the fastest of 14 install series in mainnet peers' logs
+/// (12,350; the 14 together put 83.4M leaves in place in 138,371 s, 603
+/// leaves/s; 2026-11-01). An install reads as many leaves as the shard's
+/// `data_shards`: on 15 mainnet shards an install's planned leaves matched
+/// them within 0.1%. The recovery gate skips a departing seat's install
+/// only when even this fast an install would end after the seat departs
+/// ([`WorkerAllocator::departing_install`]), so no install that could
+/// still give its committee a vote is skipped.
+pub(crate) const FASTEST_INSTALL_LEAVES_PER_SEC: u64 = 12_350;
+
+/// Leaves an archive install puts in place in the time an archive replay
+/// materializes one frame ([`shard_data_trail`]): replay batches of 8 or
+/// more frames on a regular node's 13 workers and in 19 recovery series of
+/// mainnet peers' logs materialized 17,065 frames in 16,455 s of fetch and
+/// replay (1.04 frames/s; series 0.03 to 6.0; 2026-11-01), against the 603
+/// leaves/s of the installs ([`FASTEST_INSTALL_LEAVES_PER_SEC`]): 580,
+/// rounded up. Per node the ratio ranged from a few leaves to about 2,100.
+/// A replay also keeps the worker's own state, and reads frames from
+/// archives where an install reads the whole shard, about 660 bytes per
+/// leaf.
+const INSTALL_LEAVES_PER_REPLAY_FRAME: u64 = 600;
+
 /// How far a worker's held shard may trail the frame GLOBAL committed for
-/// it and still be bound to that worker: an epoch's worth of frames. A
-/// lineage further behind replays that many frames from archives, a cost
-/// that outgrows the install a worker without it makes.
-fn shard_data_trail() -> u64 {
-    quil_types::consensus::epoch_length_frames()
+/// it and still be bound to that worker: the frames a replay materializes
+/// while an install of the shard's `install_leaves` runs
+/// ([`INSTALL_LEAVES_PER_REPLAY_FRAME`]), and at least an epoch's worth,
+/// which is all when the size is unknown. A lineage further behind replays
+/// more frames from archives than installing the shard costs a worker
+/// without it; one within it replays them sooner. On an operator's node, a
+/// restart passed over the holders of 15 shards that trailed by 1,600 to
+/// 2,500 frames, and every one installed anew; mainnet shards hold 0.16 to
+/// 2.5M leaves.
+fn shard_data_trail(install_leaves: Option<u64>) -> u64 {
+    let epoch = quil_types::consensus::epoch_length_frames();
+    install_leaves.map_or(epoch, |leaves| {
+        epoch.max(leaves / INSTALL_LEAVES_PER_REPLAY_FRAME)
+    })
 }
 
-/// For each of `filters` in turn, the worker among `eligible` whose store
-/// holds that shard's data (`holders`, [`WorkerManager::shard_data`]): the
-/// one with the highest materialized cursor, then the lowest core, among
-/// those within [`shard_data_trail`] of the shard's committed tip (`tip`;
-/// any holder when it is unknown). Each worker is chosen once; a filter no
-/// eligible worker holds is absent.
-fn data_holders<'a>(
-    filters: impl Iterator<Item = &'a [u8]>,
-    eligible: &[u32],
-    holders: &HashMap<u32, Vec<(Vec<u8>, u64)>>,
-    tip: impl Fn(&[u8]) -> Option<u64>,
-) -> HashMap<Vec<u8>, u32> {
-    let mut chosen: HashMap<Vec<u8>, u32> = HashMap::new();
-    for filter in filters {
-        let tip = tip(filter);
-        let best = eligible
-            .iter()
-            .filter(|core| !chosen.values().any(|taken| taken == *core))
-            .filter_map(|core| {
-                let (_, cursor) = holders
-                    .get(core)?
-                    .iter()
-                    .find(|(held, _)| held.as_slice() == filter)?;
-                Some((*cursor, *core))
-            })
-            .filter(|(cursor, _)| {
-                tip.is_none_or(|tip| cursor.saturating_add(shard_data_trail()) >= tip)
-            })
-            .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
-        if let Some((_, core)) = best {
-            chosen.entry(filter.to_vec()).or_insert(core);
+/// The leaves an archive install of `filter` puts in place, by the
+/// lifecycle's latest ranking (`AllocationPriorityEvidence::data_shards`):
+/// `None` without a fresh ranking, evidence for it, or a size.
+fn install_leaves(
+    priority: Option<&HashMap<Vec<u8>, AllocationPriorityEntry>>,
+    filter: &[u8],
+) -> Option<u64> {
+    priority?
+        .get(filter)?
+        .evidence
+        .as_ref()
+        .map(|evidence| evidence.data_shards)
+        .filter(|leaves| *leaves > 0)
+}
+
+/// Why an idle worker holding a shard's data was not bound to that shard
+/// ([`data_holders`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HolderSkip {
+    /// Its lineage trails the shard's committed tip by more than
+    /// [`shard_data_trail`].
+    Behind,
+    /// It was chosen for another shard bound before this one.
+    Taken,
+    /// It is held back from new seats for sending no vote.
+    HeldBack,
+    /// Its store stopped writing.
+    StoreStopped,
+}
+
+impl HolderSkip {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Behind => "behind",
+            Self::Taken => "taken",
+            Self::HeldBack => "held_back",
+            Self::StoreStopped => "store_stopped",
         }
     }
-    chosen
+}
+
+/// An idle worker holding the data of a shard that no holder was chosen
+/// for, and why it was passed over ([`data_holders`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PassedHolder {
+    core: u32,
+    filter: Vec<u8>,
+    cursor: u64,
+    tip: Option<u64>,
+    trail: u64,
+    reason: HolderSkip,
+}
+
+/// For each of `filters` in turn, the worker among `idle` whose store
+/// holds that shard's data (`holders`, [`WorkerManager::shard_data`]): the
+/// one with the highest materialized cursor, then the lowest core, among
+/// those `excluded` lets take a seat (`None`) and within the shard's
+/// `trail` ([`shard_data_trail`]) of its committed tip (`tip`; any holder
+/// when it is unknown). Each worker is chosen once; a filter no eligible
+/// worker holds is absent. Also returns, for each filter no holder was
+/// chosen for, the idle holders of its data passed over and why.
+fn data_holders<'a>(
+    filters: impl Iterator<Item = &'a [u8]>,
+    idle: &[u32],
+    excluded: impl Fn(u32) -> Option<HolderSkip>,
+    holders: &HashMap<u32, Vec<(Vec<u8>, u64)>>,
+    tip: impl Fn(&[u8]) -> Option<u64>,
+    trail: impl Fn(&[u8]) -> u64,
+) -> (HashMap<Vec<u8>, u32>, Vec<PassedHolder>) {
+    let mut chosen: HashMap<Vec<u8>, u32> = HashMap::new();
+    let mut passed_over = Vec::new();
+    for filter in filters {
+        if chosen.contains_key(filter) {
+            continue;
+        }
+        let (tip, trail) = (tip(filter), trail(filter));
+        let mut best: Option<(u64, u32)> = None;
+        let mut passed = Vec::new();
+        for &core in idle {
+            let Some(cursor) = holders.get(&core).and_then(|held| {
+                held.iter()
+                    .find(|(shard, _)| shard.as_slice() == filter)
+                    .map(|(_, cursor)| *cursor)
+            }) else {
+                continue;
+            };
+            let reason = excluded(core)
+                .or_else(|| {
+                    chosen
+                        .values()
+                        .any(|taken| *taken == core)
+                        .then_some(HolderSkip::Taken)
+                })
+                .or_else(|| {
+                    tip.is_some_and(|tip| cursor.saturating_add(trail) < tip)
+                        .then_some(HolderSkip::Behind)
+                });
+            match reason {
+                Some(reason) => passed.push(PassedHolder {
+                    core,
+                    filter: filter.to_vec(),
+                    cursor,
+                    tip,
+                    trail,
+                    reason,
+                }),
+                None => {
+                    if best.is_none_or(|(at, by)| cursor > at || (cursor == at && core < by)) {
+                        best = Some((cursor, core));
+                    }
+                }
+            }
+        }
+        match best {
+            Some((_, core)) => {
+                chosen.insert(filter.to_vec(), core);
+            }
+            None => passed_over.extend(passed),
+        }
+    }
+    (chosen, passed_over)
+}
+
+/// Log, once for a binding pass that had any, the idle workers holding the
+/// data of a shard that was bound to a worker without it, which installs
+/// the shard from an archive, and why each was passed over: one line with
+/// counts per reason and the first few holders.
+fn log_passed_over_holders(frame: u64, passed: &[PassedHolder]) {
+    if passed.is_empty() {
+        return;
+    }
+    let count = |reason: HolderSkip| passed.iter().filter(|p| p.reason == reason).count();
+    let shards = passed
+        .iter()
+        .map(|p| p.filter.as_slice())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let holders: Vec<String> = passed
+        .iter()
+        .take(8)
+        .map(|p| {
+            let tip = p
+                .tip
+                .map_or_else(|| "unknown".to_string(), |tip| tip.to_string());
+            format!(
+                "{}:{}:cursor={},tip={tip},trail={},{}",
+                p.core,
+                hex::encode(&p.filter),
+                p.cursor,
+                p.trail,
+                p.reason.as_str()
+            )
+        })
+        .collect();
+    info!(frame, shards, passed = passed.len(), behind = count(HolderSkip::Behind),
+        taken = count(HolderSkip::Taken), held_back = count(HolderSkip::HeldBack),
+        store_stopped = count(HolderSkip::StoreStopped), holders = ?holders, scope = "this node",
+        action = "none: each shard installs from an archive on the worker it was bound to; a holder behind trails \
+            the committed tip by more frames than replaying costs against installing the shard, a taken one \
+            serves another shard, and one held back or whose store stopped takes no new seat",
+        "idle workers holding a shard's data were not bound to it");
 }
 
 /// Snapshot of the current allocation state across the network.
@@ -874,24 +1080,97 @@ impl WorkerAllocator {
         given_up
     }
 
+    /// The seat on `filter` whose leave GLOBAL confirmed, at GLOBAL `frame`,
+    /// for a worker that holds no frame of its shard, when even the fastest
+    /// install seen would end after the seat departs
+    /// ([`GivenUp::DepartingInstall`]): every allocation of this prover on
+    /// `filter` departs at its leave boundary or has ended, one departs
+    /// (`app_engine::seat_departs`), and the shard's leaves in the latest
+    /// ranking take [`FASTEST_INSTALL_LEAVES_PER_SEC`] at least as long as
+    /// the GLOBAL frames left until that boundary at the ideal frame
+    /// interval.
+    /// Such an install reads the whole shard, up to millions of leaves, for a
+    /// seat that leaves without voting again, and waits behind every seat
+    /// this node keeps (`recovery_turns::DEPARTING_GAP_FILL_FRAMES`): an
+    /// operator's node that bound 15 departing seats to workers without
+    /// their data at a restart had their installs wait up to 5,303 s for a
+    /// turn. One that could end sooner installs as before: the seat may then
+    /// vote for the rest of its notice, which its committee's quorum may
+    /// need. `None` before a reconcile has run, while the registry is
+    /// unreadable, without a fresh ranking that sizes the shard, or while
+    /// the seat's committee session retains the worker
+    /// ([`Self::session_retains`]): a closing session's seal needs its
+    /// quorum.
+    pub fn departing_install(&self, filter: &[u8], frame: u64) -> Option<GivenUpSeat> {
+        use quil_types::consensus::{epoch_for_frame, epoch_start_frame, AllocationPhase};
+        if frame == 0 {
+            return None;
+        }
+        let prover = self
+            .prover_registry
+            .get_prover_info(&self.local_prover_address)
+            .ok()
+            .flatten()?;
+        if !crate::app_engine::seat_departs(&prover.allocations, filter, frame) {
+            return None;
+        }
+        let departing = prover.allocations.iter().find(|allocation| {
+            allocation.confirmation_filter == filter
+                && allocation.phase(frame) == Some(AllocationPhase::Departing)
+        })?;
+        let departs_at =
+            epoch_start_frame(epoch_for_frame(departing.leave_confirm_frame_number) + 1);
+        let notice_ms = departs_at
+            .saturating_sub(frame)
+            .saturating_mul(quil_types::consensus::ideal_frame_time_ms_at(frame));
+        let install_ms = self
+            .ranked_install_leaves(filter, frame)?
+            .saturating_mul(1000)
+            / FASTEST_INSTALL_LEAVES_PER_SEC;
+        if install_ms < notice_ms || self.session_retains(filter, &prover.public_key) {
+            return None;
+        }
+        Some(GivenUpSeat {
+            cause: GivenUp::DepartingInstall,
+            frame,
+            allocation_epoch: departing.epoch,
+            current_epoch: epoch_for_frame(frame),
+        })
+    }
+
+    /// The leaves an archive install of `filter` puts in place, by the
+    /// lifecycle's ranking when it is fresh at `frame` ([`install_leaves`]).
+    fn ranked_install_leaves(&self, filter: &[u8], frame: u64) -> Option<u64> {
+        let guard = self.allocation_priority.read().ok()?;
+        let snapshot = guard.as_ref()?;
+        if frame.abs_diff(snapshot.frame_number) > PRIORITY_SNAPSHOT_MAX_AGE_FRAMES {
+            return None;
+        }
+        install_leaves(Some(&snapshot.entries), filter)
+    }
+
     /// Have the workers ask [`Self::given_up_seat`] before they recover a
-    /// shard from an archive, at the frame the latest reconcile ran at: the
-    /// registry follows executed GLOBAL state, so judged at a gossip head
-    /// beyond it, every seat of a node whose execution lags would read lapsed
-    /// and lose its catch-up recovery while the reconcile keeps its worker.
-    /// Until the registry has loaded, or a reconcile has run, it gives
-    /// nothing up.
+    /// shard from an archive, and for a worker holding no frame of the shard
+    /// also [`Self::departing_install`], at the frame the latest reconcile ran
+    /// at: the registry follows executed GLOBAL state, so judged at a gossip
+    /// head beyond it, every seat of a node whose execution lags would read
+    /// lapsed and lose its catch-up recovery while the reconcile keeps its
+    /// worker. Until the registry has loaded, or a reconcile has run, it
+    /// gives nothing up.
     pub fn install_recovery_gate(self: &Arc<Self>) {
         let allocator = Arc::downgrade(self);
         self.worker_manager
-            .set_recovery_gate(Arc::new(move |filter: &[u8]| {
+            .set_recovery_gate(Arc::new(move |filter: &[u8], cold: bool| {
                 let Some(allocator) = allocator.upgrade() else {
                     return (0, None);
                 };
                 let frame = allocator
                     .reconciled_frame
                     .load(std::sync::atomic::Ordering::Relaxed);
-                (frame, allocator.given_up_seat(filter, frame))
+                let seat = allocator
+                    .given_up_seat(filter, frame)
+                    .or_else(|| cold.then(|| allocator.departing_install(filter, frame))?);
+                (frame, seat)
             }));
     }
 
@@ -1919,7 +2198,8 @@ impl WorkerAllocator {
                             self.release_worker(worker, retained)?;
                             continue;
                         }
-                        None => {}
+                        // `gives_up` never reports it: only the recovery gate does.
+                        Some(GivenUp::DepartingInstall) | None => {}
                     }
 
                     // Compute desired_allocated AFTER the
@@ -2273,13 +2553,6 @@ impl WorkerAllocator {
         let served = bind_candidates
             .len()
             .min(manual_pending.len() + idle_workers.len());
-        let eligible: Vec<u32> = idle_workers
-            .iter()
-            .copied()
-            .filter(|core| {
-                !held_back.contains(core) && !crate::worker_execution::store_stopped(*core)
-            })
-            .collect();
         let from_idle: Vec<Vec<u8>> = bind_candidates[manual_pending.len().min(served)..served]
             .iter()
             .map(|a| a.confirmation_filter.clone())
@@ -2290,12 +2563,25 @@ impl WorkerAllocator {
         } else {
             HashMap::new()
         };
-        let mut on_data = data_holders(
+        // A holder trailing by more frames than replaying costs against
+        // installing the shard, by its size in the ranking, is passed over.
+        let (mut on_data, passed_over) = data_holders(
             from_idle.iter().map(Vec::as_slice),
-            &eligible,
+            &idle_workers,
+            |core| {
+                if held_back.contains(&core) {
+                    Some(HolderSkip::HeldBack)
+                } else if crate::worker_execution::store_stopped(core) {
+                    Some(HolderSkip::StoreStopped)
+                } else {
+                    None
+                }
+            },
             &holders,
             |filter| tips.get(filter).copied(),
+            |filter| shard_data_trail(install_leaves(priority.as_ref(), filter)),
         );
+        log_passed_over_holders(frame_number, &passed_over);
         idle_workers.retain(|core| !on_data.values().any(|held| held == core));
         let mut bound_on_data: Vec<String> = Vec::new();
 
@@ -3317,7 +3603,7 @@ mod tests {
     #[test]
     fn a_holder_far_behind_the_committed_tip_is_not_preferred() {
         let f = |byte: u8| vec![byte; 32];
-        let trail = shard_data_trail();
+        let trail = shard_data_trail(None);
         let holders = HashMap::from([
             (1, vec![(f(1), 10), (f(2), 10)]),
             (2, vec![(f(1), 5000 - trail)]),
@@ -3327,9 +3613,12 @@ mod tests {
             let mut chosen: Vec<_> = data_holders(
                 filters.iter().map(Vec::as_slice),
                 &[1, 2],
+                |_| None,
                 &holders,
                 |filter| tips.get(filter).copied(),
+                |_| trail,
             )
+            .0
             .into_iter()
             .collect();
             chosen.sort();
@@ -3344,6 +3633,427 @@ mod tests {
             pick(&[f(2)], &HashMap::new()),
             vec![(f(2), 1)],
             "an unknown tip bounds nothing"
+        );
+    }
+
+    /// A holder may trail by the frames a replay materializes while an
+    /// install of the shard would run, and by at least an epoch: a large
+    /// shard's holder far behind is still preferred, a small or unsized
+    /// shard's is not.
+    #[test]
+    fn the_trail_weighs_the_replay_against_the_install() {
+        let f = |byte: u8| vec![byte; 32];
+        let e = epoch_length_frames();
+        assert_eq!(shard_data_trail(None), e);
+        assert_eq!(
+            shard_data_trail(Some(e * INSTALL_LEAVES_PER_REPLAY_FRAME / 2)),
+            e
+        );
+        assert_eq!(
+            shard_data_trail(Some((4 * e + 1) * INSTALL_LEAVES_PER_REPLAY_FRAME - 1)),
+            4 * e
+        );
+        let tip = 10 * e;
+        let behind = tip - 3 * e;
+        let holders = HashMap::from([
+            (1, vec![(f(1), behind)]),
+            (2, vec![(f(2), behind)]),
+            (3, vec![(f(3), behind)]),
+        ]);
+        let leaves = HashMap::from([
+            (f(1), 4 * e * INSTALL_LEAVES_PER_REPLAY_FRAME),
+            (f(2), 2 * e * INSTALL_LEAVES_PER_REPLAY_FRAME),
+        ]);
+        let (chosen, passed) = data_holders(
+            [f(1), f(2), f(3)].iter().map(Vec::as_slice),
+            &[1, 2, 3],
+            |_| None,
+            &holders,
+            |_| Some(tip),
+            |filter| shard_data_trail(leaves.get(filter).copied()),
+        );
+        assert_eq!(
+            chosen,
+            HashMap::from([(f(1), 1)]),
+            "only the large shard's holder"
+        );
+        let behind: Vec<_> = passed.iter().map(|p| (p.core, p.trail, p.reason)).collect();
+        assert_eq!(
+            behind,
+            vec![(2, 2 * e, HolderSkip::Behind), (3, e, HolderSkip::Behind)]
+        );
+    }
+
+    /// Holders passed over are reported with their reason for each shard no
+    /// holder was chosen for: one taken by a shard bound before, one too far
+    /// behind, one excluded from new seats; a holder passed over or beaten
+    /// for a shard that did get a holder is not.
+    #[test]
+    fn passed_over_holders_carry_their_reason() {
+        let f = |byte: u8| vec![byte; 32];
+        let e = epoch_length_frames();
+        let holders = HashMap::from([
+            (1, vec![(f(1), 100), (f(2), 100)]),
+            (2, vec![(f(3), 100)]),
+            (3, vec![(f(2), 1)]),
+            (4, vec![(f(4), 5)]),
+            (5, vec![(f(4), 1)]),
+        ]);
+        let (chosen, passed) = data_holders(
+            [f(1), f(2), f(3), f(4)].iter().map(Vec::as_slice),
+            &[1, 2, 3, 4, 5],
+            |core| matches!(core, 2 | 5).then_some(HolderSkip::HeldBack),
+            &holders,
+            |filter| (filter == f(2).as_slice()).then_some(e + 10),
+            |_| e,
+        );
+        // Core 5 holds f(4) too but is held back; f(4) went to core 4, so it
+        // is not reported.
+        assert_eq!(chosen, HashMap::from([(f(1), 1), (f(4), 4)]));
+        let reasons: Vec<_> = passed
+            .iter()
+            .map(|p| (p.core, p.filter.clone(), p.reason))
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                (1, f(2), HolderSkip::Taken),
+                (3, f(2), HolderSkip::Behind),
+                (2, f(3), HolderSkip::HeldBack),
+            ]
+        );
+        assert_eq!(
+            (passed[1].cursor, passed[1].tip, passed[1].trail),
+            (1, Some(e + 10), e)
+        );
+    }
+
+    /// A shard is bound to the idle worker holding its data although that
+    /// worker trails GLOBAL's committed tip by more than an epoch, when the
+    /// ranking sizes the shard so that replaying the gap costs less than
+    /// installing it; unsized, the holder is passed over, logged with its
+    /// reason, and the shard takes the lowest free core.
+    #[test]
+    fn a_far_behind_holder_of_a_large_shard_keeps_its_shard() {
+        use quil_types::crypto::Signer as _;
+
+        let f = |byte: u8| vec![byte; 32];
+        let e = epoch_length_frames();
+        let tip = 10 * e;
+        let mut members: Vec<Vec<u8>> = (0..2)
+            .map(|_| quil_crypto::FalconSigner::generate().public_key().to_vec())
+            .collect();
+        members.sort();
+        let (_db, global) = global_with_session(f(1), tip, members);
+
+        let frame = 101;
+        let bind = |data_shards: Option<u64>| {
+            let wm = Arc::new(MockWorkerManager::new());
+            for core in 1..=2u32 {
+                wm.allocate_worker(core, &[]).unwrap();
+            }
+            wm.set_shard_data(2, vec![(f(1), tip - 3 * e)]);
+            let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+                ProverAllocationInfo {
+                    epoch: u64::MAX,
+                    ..make_alloc(f(1))
+                },
+            ])));
+            let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
+            alloc.set_session_authority(global.clone());
+            if let Some(data_shards) = data_shards {
+                alloc.publish_allocation_priority_with_evidence(
+                    frame,
+                    vec![(f(1), false, 1.into())],
+                    HashMap::from([(f(1), AllocationPriorityEvidence::sized(frame, data_shards))]),
+                );
+            }
+            let logged = reconcile_logged(&alloc, frame);
+            (bound_to(&wm), logged)
+        };
+        let (bound, logged) = bind(Some(4 * e * INSTALL_LEAVES_PER_REPLAY_FRAME));
+        assert_eq!(
+            bound,
+            vec![(2, f(1))],
+            "replaying 3 epochs beats the install"
+        );
+        assert!(
+            logged.contains("bound shards to the idle workers whose stores hold their data")
+                && !logged.contains("were not bound to it"),
+            "{logged}"
+        );
+        let (bound, logged) = bind(None);
+        assert_eq!(bound, vec![(1, f(1))], "unsized: the epoch trail");
+        assert!(
+            logged.contains("idle workers holding a shard's data were not bound to it")
+                && logged.contains("behind=1")
+                && logged.contains(&format!(
+                    "2:{}:cursor={},tip={tip},trail={e},behind",
+                    hex::encode(f(1)),
+                    tip - 3 * e
+                )),
+            "{logged}"
+        );
+    }
+
+    /// The recovery gate's departing check names a seat whose leave is
+    /// confirmed while installing its shard, by the ranking's size, would end
+    /// after it departs; not one whose install ends sooner or whose size is
+    /// unknown, one whose leave is unconfirmed, one this prover joined
+    /// again, another filter, or anything before the first reconcile.
+    #[test]
+    fn departing_install_names_only_installs_ending_after_the_seat_departs() {
+        let e = epoch_length_frames();
+        let filter = vec![3u8; 32];
+        let departing = ProverAllocationInfo {
+            status: ProverStatus::Leaving,
+            leave_frame_number: 10 * e + 3,
+            leave_confirm_frame_number: 11 * e + 4,
+            epoch: 11,
+            ..make_alloc(filter.clone())
+        };
+        let unconfirmed = ProverAllocationInfo {
+            leave_confirm_frame_number: 0,
+            ..departing.clone()
+        };
+        let rejoining = ProverAllocationInfo {
+            status: ProverStatus::Joining,
+            join_frame_number: 11 * e + 1,
+            join_confirm_frame_number: 0,
+            ..make_alloc(filter.clone())
+        };
+        let frame = 11 * e + 9;
+        // The leaves an install puts in place in the notice left at `frame`.
+        let notice_leaves = (12 * e - frame) * ideal_frame_time_ms_at(frame) / 1000
+            * FASTEST_INSTALL_LEAVES_PER_SEC;
+        // Ranked at `published`, sizing the shard at `leaves`.
+        let allocator =
+            |allocations: Vec<ProverAllocationInfo>, leaves: Option<u64>, published: u64| {
+                let allocator = WorkerAllocator::new(
+                    Arc::new(MockWorkerManager::new()),
+                    Arc::new(TestProverRegistry::with_prover(prover_with(allocations))),
+                    vec![0xAA; 32],
+                );
+                if let Some(leaves) = leaves {
+                    allocator.publish_allocation_priority_with_evidence(
+                        published,
+                        vec![(filter.clone(), false, 1.into())],
+                        HashMap::from([(
+                            filter.clone(),
+                            AllocationPriorityEvidence::sized(published, leaves),
+                        )]),
+                    );
+                }
+                allocator
+            };
+        let cause = |allocator: &WorkerAllocator, filter: &[u8], frame: u64| {
+            allocator
+                .departing_install(filter, frame)
+                .map(|seat| seat.cause)
+        };
+        let large = Some(notice_leaves + FASTEST_INSTALL_LEAVES_PER_SEC);
+        let leaving = allocator(vec![departing.clone()], large, frame);
+        assert_eq!(cause(&leaving, &filter, 0), None, "no reconcile yet");
+        assert_eq!(
+            cause(&leaving, &filter, frame),
+            Some(GivenUp::DepartingInstall)
+        );
+        assert_eq!(
+            leaving
+                .departing_install(&filter, frame)
+                .map(|seat| seat.current_epoch),
+            Some(11)
+        );
+        assert_eq!(cause(&leaving, &[4u8; 32], frame), None, "another filter");
+        assert_eq!(
+            cause(
+                &allocator(vec![departing.clone()], large, 12 * e + 1),
+                &filter,
+                12 * e + 1
+            ),
+            None,
+            "departed"
+        );
+        assert_eq!(
+            cause(
+                &leaving,
+                &filter,
+                frame + PRIORITY_SNAPSHOT_MAX_AGE_FRAMES + 1
+            ),
+            None,
+            "a stale ranking sizes nothing"
+        );
+        let ends_sooner = allocator(
+            vec![departing.clone()],
+            Some(
+                notice_leaves
+                    .saturating_sub(2 * FASTEST_INSTALL_LEAVES_PER_SEC)
+                    .max(1),
+            ),
+            frame,
+        );
+        assert_eq!(
+            cause(&ends_sooner, &filter, frame),
+            None,
+            "ends before it departs"
+        );
+        // Half the leaves the fastest install puts in place in the notice:
+        // ten times what the aggregate rate would.
+        let fast_enough = allocator(vec![departing.clone()], Some(notice_leaves / 2), frame);
+        assert_eq!(
+            cause(&fast_enough, &filter, frame),
+            None,
+            "the fastest install ends before it departs"
+        );
+        // Fixed leaf counts, independent of the rate constant: the notice
+        // in seconds at 1,000 leaves/s is slower than the aggregate install
+        // rate (600) and far faster than the fastest (12,350).
+        let notice_secs = (12 * e - frame) * ideal_frame_time_ms_at(frame) / 1000;
+        assert_eq!(
+            cause(
+                &allocator(vec![departing.clone()], Some(notice_secs * 1000), frame),
+                &filter,
+                frame
+            ),
+            None,
+            "1,000 leaves/s ends before it departs"
+        );
+        assert_eq!(
+            cause(
+                &allocator(vec![departing.clone()], Some(notice_secs * 100_000), frame),
+                &filter,
+                frame
+            ),
+            Some(GivenUp::DepartingInstall),
+            "100,000 leaves/s still ends after it departs"
+        );
+        assert_eq!(
+            cause(
+                &allocator(vec![departing.clone()], None, frame),
+                &filter,
+                frame
+            ),
+            None,
+            "unsized"
+        );
+        assert_eq!(
+            cause(
+                &allocator(vec![unconfirmed], large, 10 * e + 9),
+                &filter,
+                10 * e + 9
+            ),
+            None,
+            "unconfirmed"
+        );
+        assert_eq!(
+            cause(
+                &allocator(vec![departing, rejoining], large, frame),
+                &filter,
+                frame
+            ),
+            None,
+            "joined again"
+        );
+    }
+
+    /// Authenticated GLOBAL state holding one active committee session on
+    /// `filter`, of `members` (sorted Falcon keys) from `base_frame`.
+    fn global_with_session(
+        filter: Vec<u8>,
+        base_frame: u64,
+        members: Vec<Vec<u8>>,
+    ) -> (quil_store::RocksDb, Arc<quil_hypergraph::HypergraphCrdt>) {
+        use quil_cw_consensus::handoff::Session;
+        use quil_execution::global_intrinsic::handoff;
+        use quil_execution::hypergraph_state::HypergraphState;
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        global.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
+        let state = HypergraphState::new(global.clone());
+        let commit = |frame: u64| {
+            state.commit().unwrap();
+            state.abort();
+            global
+                .commit_with_global_cursor(
+                    frame,
+                    &quil_store::encoding::global_materialized_cursor_key(),
+                )
+                .unwrap();
+        };
+        let session = Session {
+            chain_id: [7; 32],
+            filter,
+            generation: 1,
+            genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
+            base_frame,
+            authorization: [0; 32],
+            members,
+        };
+        commit(1);
+        handoff::initialize(&state, 2, &session).unwrap();
+        commit(2);
+        (db, global)
+    }
+
+    /// A departing seat's install that would otherwise be skipped still
+    /// runs while the seat's committee session retains this node's worker:
+    /// a session counting this prover is not closed, and its seal needs its
+    /// quorum. One whose session does not count it is skipped.
+    #[test]
+    fn departing_install_runs_while_the_session_retains_the_worker() {
+        use quil_types::crypto::Signer as _;
+        let e = epoch_length_frames();
+        let filter = vec![3u8; 32];
+        let frame = 11 * e + 9;
+        let local = quil_crypto::FalconSigner::generate().public_key().to_vec();
+        let other = quil_crypto::FalconSigner::generate().public_key().to_vec();
+        let departing = ProverAllocationInfo {
+            status: ProverStatus::Leaving,
+            leave_frame_number: 10 * e + 3,
+            leave_confirm_frame_number: 11 * e + 4,
+            epoch: 11,
+            ..make_alloc(filter.clone())
+        };
+        let skipped = |members: Vec<Vec<u8>>| {
+            let mut members = members;
+            members.sort();
+            let (_db, global) = global_with_session(filter.clone(), 0, members);
+            let allocator = WorkerAllocator::new(
+                Arc::new(MockWorkerManager::new()),
+                Arc::new(TestProverRegistry::with_prover(ProverInfo {
+                    public_key: local.clone(),
+                    ..prover_with(vec![departing.clone()])
+                })),
+                vec![0xAA; 32],
+            );
+            allocator.set_session_authority(global);
+            allocator.publish_allocation_priority_with_evidence(
+                frame,
+                vec![(filter.clone(), false, 1.into())],
+                HashMap::from([(
+                    filter.clone(),
+                    AllocationPriorityEvidence::sized(frame, 1 << 40),
+                )]),
+            );
+            allocator
+                .departing_install(&filter, frame)
+                .map(|seat| seat.cause)
+        };
+        assert_eq!(
+            skipped(vec![other.clone()]),
+            Some(GivenUp::DepartingInstall),
+            "a session without this prover retains nothing"
+        );
+        assert_eq!(
+            skipped(vec![local.clone(), other.clone()]),
+            None,
+            "retained by its session"
         );
     }
 

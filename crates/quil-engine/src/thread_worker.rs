@@ -257,17 +257,20 @@ const ENGINE_TEARDOWN: std::time::Duration = std::time::Duration::from_secs(2);
 const RETIRE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Whether worker `core_id` recovers nothing of `filter` from an archive:
-/// the seat on it is one this node gives up (`WorkerAllocator::gives_up`).
-/// `withheld` keeps this engine's last answer, so each change is logged
-/// once: withholding starts, or ends because the seat is served again.
+/// the seat on it is one this node gives up (`WorkerAllocator::gives_up`),
+/// or, the worker holding no frame of the shard (`cold`), one whose leave
+/// is confirmed (`WorkerAllocator::departing_install`). `withheld` keeps
+/// this engine's last answer, so each change is logged once: withholding
+/// starts, or ends because the seat is served again.
 fn recovery_withheld(
     gate: &std::sync::RwLock<Option<crate::worker_allocator::RecoveryGate>>,
     withheld: &std::sync::atomic::AtomicBool,
     core_id: u32,
     filter: &[u8],
+    cold: bool,
 ) -> bool {
     let gate = gate.read().unwrap_or_else(|e| e.into_inner()).clone();
-    let (frame, seat) = gate.map_or((0, None), |gate| gate(filter));
+    let (frame, seat) = gate.map_or((0, None), |gate| gate(filter, cold));
     match (
         &seat,
         withheld.swap(seat.is_some(), std::sync::atomic::Ordering::Relaxed),
@@ -1071,10 +1074,14 @@ impl ThreadWorkerManager {
                                                                             Err(quil_types::error::QuilError::NotFound(_)) => Ok(None),
                                                                             Err(error) => Err(error),
                                                                         };
-                                                                        let given_up = || recovery_withheld(&gate, &withheld, core_id, &filter);
+                                                                        // Without a frame of the shard the recovery
+                                                                        // installs it, which a departing seat skips.
+                                                                        let given_up = || recovery_withheld(
+                                                                            &gate, &withheld, core_id, &filter, matches!(lineage(), Ok(None)),
+                                                                        );
                                                                         let _ = crate::prover_tree_syncer::recover_in_turns(
                                                                             &crate::recovery_turns::SHARD_RECOVERY_TURNS, syncer.as_ref(), &filter,
-                                                                            core_id, &lb, lb.execution_record(), lineage, given_up,
+                                                                            core_id, &lb, lb.execution_record(), &lineage, given_up,
                                                                         ).await;
                                                                     }));
                                                                 }
@@ -1580,7 +1587,7 @@ mod tests {
         let manager = Arc::new(ThreadWorkerManager::new_with_count(1));
         let withheld = AtomicBool::new(false);
         assert!(
-            !recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter),
+            !recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter, false),
             "no gate installed"
         );
         let lapsed = ProverAllocationInfo {
@@ -1619,17 +1626,17 @@ mod tests {
         ));
         allocator.install_recovery_gate();
         assert!(
-            !recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter),
+            !recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter, false),
             "before the first reconcile"
         );
         allocator.on_new_frame(3 * e + 5).unwrap();
         assert!(
-            !recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter),
+            !recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter, false),
             "in its recovery epoch"
         );
         allocator.on_new_frame(20 * e + 5).unwrap();
         assert!(
-            recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter),
+            recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter, false),
             "lapsed 18 epochs"
         );
         assert!(withheld.load(Ordering::Relaxed));
@@ -1643,11 +1650,99 @@ mod tests {
             )
             .unwrap();
         assert!(
-            !recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter),
+            !recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter, false),
             "its renewal runs"
         );
         assert!(!withheld.load(Ordering::Relaxed), "withholding ended");
         drop(renewal);
+    }
+
+    /// A worker holding no frame of a seat whose leave is confirmed installs
+    /// nothing for it when the install would end after the seat departs; one
+    /// holding frames of it still replays them, a seat whose leave is
+    /// unconfirmed still installs, and nothing is withheld before the first
+    /// reconcile.
+    #[test]
+    fn a_cold_install_of_a_departing_seat_is_withheld() {
+        use quil_types::consensus::{
+            epoch_length_frames, ProverAllocationInfo, ProverInfo, ProverStatus,
+        };
+        use std::sync::atomic::AtomicBool;
+        let e = epoch_length_frames();
+        let filter = vec![3u8; 32];
+        let leaving = |confirm: u64| ProverAllocationInfo {
+            status: ProverStatus::Leaving,
+            confirmation_filter: filter.clone(),
+            rejection_filter: vec![],
+            join_frame_number: 1,
+            leave_frame_number: 10 * e + 3,
+            pause_frame_number: 0,
+            resume_frame_number: 0,
+            kick_frame_number: 0,
+            join_confirm_frame_number: 2,
+            join_reject_frame_number: 0,
+            leave_confirm_frame_number: confirm,
+            leave_reject_frame_number: 0,
+            last_active_frame_number: 100,
+            last_signed_frame_number: 0,
+            epoch: 11,
+            ring: 0,
+            vertex_address: vec![],
+        };
+        // Installing this many leaves outlasts the notice left at 11e+9.
+        let leaves = 2 * e * quil_types::consensus::ideal_frame_time_ms_at(11 * e + 9) / 1000
+            * crate::worker_allocator::FASTEST_INSTALL_LEAVES_PER_SEC;
+        let gate_for = |allocation: ProverAllocationInfo, published: u64| {
+            let manager = Arc::new(ThreadWorkerManager::new_with_count(1));
+            let prover = ProverInfo {
+                public_key: vec![0xBB; 585],
+                address: vec![0xAA; 32],
+                status: ProverStatus::Active,
+                kick_frame_number: 0,
+                allocations: vec![allocation],
+                available_storage: 0,
+                seniority: 100,
+                delegate_address: vec![],
+            };
+            let allocator = Arc::new(crate::worker_allocator::WorkerAllocator::new(
+                manager.clone(),
+                Arc::new(crate::test_support::TestProverRegistry::with_prover(prover)),
+                vec![0xAA; 32],
+            ));
+            allocator.install_recovery_gate();
+            allocator.publish_allocation_priority_with_evidence(
+                published,
+                vec![(filter.clone(), false, 1.into())],
+                std::collections::HashMap::from([(
+                    filter.clone(),
+                    crate::worker_allocator::AllocationPriorityEvidence::sized(published, leaves),
+                )]),
+            );
+            (manager, allocator)
+        };
+        let withheld = AtomicBool::new(false);
+        let (manager, allocator) = gate_for(leaving(11 * e + 4), 11 * e + 9);
+        assert!(
+            !recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter, true),
+            "before the first reconcile"
+        );
+        allocator.on_new_frame(11 * e + 9).unwrap();
+        assert!(
+            recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter, true),
+            "a cold install of a departing seat"
+        );
+        let replay = AtomicBool::new(false);
+        assert!(
+            !recovery_withheld(&manager.recovery_gate, &replay, 1, &filter, false),
+            "a replay onto held frames of a departing seat"
+        );
+        let (manager, allocator) = gate_for(leaving(0), 10 * e + 9);
+        allocator.on_new_frame(10 * e + 9).unwrap();
+        let unconfirmed = AtomicBool::new(false);
+        assert!(
+            !recovery_withheld(&manager.recovery_gate, &unconfirmed, 1, &filter, true),
+            "an unconfirmed leave still installs"
+        );
     }
 
     #[test]
