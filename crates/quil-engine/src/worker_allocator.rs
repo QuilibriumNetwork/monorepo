@@ -948,22 +948,81 @@ impl WorkerAllocator {
     }
 
     /// Whether this prover's seat on `filter` still owes GLOBAL an epoch proof
-    /// for roots it committed: a sealed, open slot of the previous or current
-    /// epoch with committed roots, whose settlement window has not closed.
-    /// Only the shard's engine proves a seat, and GLOBAL kicks a member that
-    /// committed roots and never proved them, so the worker stays bound (and
-    /// its engine running) until the epoch settles or its window closes.
+    /// for roots it committed ([`Self::owed_storage_settlements`]). Only the
+    /// shard's engine proves a seat, and GLOBAL withholds the storage share
+    /// (before epoch 1342: kicks) of a member that committed roots and never
+    /// proved them, so the worker stays bound (and its engine running) until
+    /// the epoch settles or its window closes.
     fn owes_storage_settlement(&self, filter: &[u8], frame_number: u64) -> bool {
+        !self
+            .owed_storage_settlements(filter, frame_number)
+            .is_empty()
+    }
+
+    /// The epochs this prover's seat on `filter` still owes GLOBAL an epoch
+    /// proof for, each with the frame its settlement window ends at: a
+    /// sealed, open slot of the previous or current epoch with committed
+    /// roots, whose window has not closed.
+    fn owed_storage_settlements(&self, filter: &[u8], frame_number: u64) -> Vec<(u64, u64)> {
         use quil_types::consensus::{epoch_for_frame, hash_storage_proofs_at};
         let current = epoch_for_frame(frame_number);
-        [current.saturating_sub(1), current].into_iter().any(|epoch| {
-            hash_storage_proofs_at(epoch)
-                && self.prover_registry.get_storage_seat_slot(&self.local_prover_address, filter, epoch).ok().flatten()
-                    .is_some_and(|slot| {
-                        slot.sealed_at.is_some() && slot.open && slot.frames > 0
-                            && frame_number < quil_execution::global_intrinsic::storage_seat::settlement_window(epoch).1
+        let mut epochs = vec![current.saturating_sub(1), current];
+        epochs.dedup();
+        epochs
+            .into_iter()
+            .filter_map(|epoch| {
+                let until =
+                    quil_execution::global_intrinsic::storage_seat::settlement_window(epoch).1;
+                (hash_storage_proofs_at(epoch)
+                    && frame_number < until
+                    && self
+                        .prover_registry
+                        .get_storage_seat_slot(&self.local_prover_address, filter, epoch)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|slot| {
+                            slot.sealed_at.is_some() && slot.open && slot.frames > 0
+                        }))
+                .then_some((epoch, until))
+            })
+            .collect()
+    }
+
+    /// Log, once at this start, the storage settlements this prover's seats
+    /// owe and when their windows end: each proof must reach an archive by
+    /// then, or GLOBAL withholds its storage share (before epoch 1342: kicks
+    /// it), and the catch-up after a start competes with it for this node's
+    /// uplink and CPU.
+    fn log_owed_storage_settlements(&self, workers: &[WorkerInfo], frame_number: u64) {
+        let frame_ms = quil_types::consensus::ideal_frame_time_ms();
+        let owed: Vec<String> = workers
+            .iter()
+            .filter(|w| !w.filter.is_empty())
+            .flat_map(|w| {
+                self.owed_storage_settlements(&w.filter, frame_number)
+                    .into_iter()
+                    .map(move |(epoch, until)| {
+                        let left = until.saturating_sub(frame_number);
+                        format!(
+                            "{} epoch {epoch}: window ends at frame {until}, {left} frames (~{} min) left",
+                            hex::encode(&w.filter),
+                            left.saturating_mul(frame_ms) / 60_000
+                        )
                     })
-        })
+            })
+            .collect();
+        if owed.is_empty() {
+            info!(
+                frame = frame_number,
+                "no storage settlement owed at this start"
+            );
+        } else {
+            info!(frame = frame_number, owed = owed.len(), seats = ?owed,
+                "storage settlements owed at this start: each epoch proof must reach an archive before its \
+                 window ends, or GLOBAL withholds this prover's storage share (before epoch 1342: kicks \
+                 it); the catch-up after a start \
+                 competes with it for uplink and CPU");
+        }
     }
 
     /// The frame GLOBAL committed for each of `filters` that has one
@@ -1697,6 +1756,7 @@ impl WorkerAllocator {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if seats.is_none() {
+                self.log_owed_storage_settlements(&workers, frame_number);
                 let found: std::collections::HashSet<Vec<u8>> = workers
                     .iter()
                     .filter(|w| !w.filter.is_empty())
@@ -3632,8 +3692,9 @@ mod tests {
 
     /// A departing member whose seat committed roots in its last epoch keeps
     /// its worker, engine running, until that epoch settles or its settlement
-    /// window closes: only the engine proves the seat, and GLOBAL kicks a
-    /// member that committed roots and never proved them.
+    /// window closes: only the engine proves the seat, and GLOBAL withholds
+    /// the storage share of a member that committed roots and never proved
+    /// them.
     #[test]
     fn a_departing_worker_stays_bound_while_its_seat_owes_a_settlement() {
         let e = EPOCH_LENGTH_FRAMES;
@@ -3675,6 +3736,15 @@ mod tests {
                 },
             );
             let allocator = WorkerAllocator::new(wm.clone(), Arc::new(registry), vec![0xAA; 32]);
+            // What the start's line names: the epoch, and its window's end.
+            assert_eq!(
+                allocator.owed_storage_settlements(&filter, 3 * e),
+                if open { vec![(2, 4 * e)] } else { Vec::new() },
+                "open={open}"
+            );
+            assert!(allocator
+                .owed_storage_settlements(&filter, 4 * e)
+                .is_empty());
             allocator.on_new_frame(3 * e).unwrap();
             let worker = wm.range_workers().unwrap().remove(0);
             assert_eq!(
