@@ -1243,6 +1243,12 @@ impl HeldReplicas {
 /// anchored GLOBAL frame's beacon is `rho_n`, for its sealed registration
 /// `slot` (hash storage proofs): its replica nodes the beacon chose, hashed in
 /// order. Its epoch proof later proves them.
+///
+/// Every frame the seat proposes runs this, on the proposal path, for every
+/// seat at once: it reads only each opened node's subtree below the cap
+/// (`quil_store::replica_store::CHUNK_NODES` nodes, 32 KiB) and the leaf's
+/// cached cap, never a whole replica, and never waits on another seat's
+/// replica conversion.
 pub fn commitment(
     replicas: &ReplicaStore,
     member: &[u8],
@@ -1253,12 +1259,56 @@ pub fn commitment(
 ) -> Result<[u8; 32]> {
     use quil_execution::global_intrinsic::storage_epoch_proof as epoch_proof;
     use quil_types::error::QuilError;
-    let held = HeldReplicas::load(replicas, filter, slot.epoch, &slot.leaves)?;
-    let opened =
-        epoch_proof::frame_openings(member, slot.epoch, &held.leaves, &held.replicas(), rho_n)
+    let mut stored = Vec::with_capacity(slot.leaves.len());
+    let mut held = Vec::with_capacity(slot.leaves.len());
+    for prefix in &slot.leaves {
+        let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(filter, prefix);
+        let leaf = replicas
+            .try_get_hash_leaf(slot.epoch, &leaf_id)?
             .ok_or_else(|| {
-                QuilError::InvalidArgument("a stored replica is not the registered one".into())
+                QuilError::ExecutionUnavailable(format!(
+                    "no stored replica of leaf {} for epoch {}",
+                    hex::encode(&leaf_id),
+                    slot.epoch
+                ))
             })?;
+        let registered =
+            quil_crypto::storage_proof::parse_registration_root(&leaf.registration_root)
+                .ok_or_else(|| {
+                    QuilError::InvalidArgument(
+                        "a stored replica without a hash registration".into(),
+                    )
+                })?;
+        held.push(epoch_proof::HeldLeaf {
+            leaf_id,
+            n: leaf.cap.n,
+            comm_r: registered.comm_r,
+        });
+        stored.push(leaf);
+    }
+    let caps: Vec<&quil_crypto::storage_proof::MerkleCap> =
+        stored.iter().map(|leaf| &leaf.cap).collect();
+    let mut failed = None;
+    let opened = epoch_proof::frame_openings_from(
+        member,
+        slot.epoch,
+        &held,
+        &caps,
+        rho_n,
+        &mut |i, nodes| match replicas.read_nodes(slot.epoch, &held[i].leaf_id, &stored[i], nodes) {
+            Ok(nodes) => Some(nodes),
+            Err(error) => {
+                failed.get_or_insert(error);
+                None
+            }
+        },
+    );
+    if let Some(error) = failed {
+        return Err(error);
+    }
+    let opened = opened.ok_or_else(|| {
+        QuilError::InvalidArgument("a stored replica is not the registered one".into())
+    })?;
     epoch_proof::openings_root(frame_number, &opened)
         .ok_or_else(|| QuilError::InvalidArgument("a replica node is not canonical".into()))
 }
@@ -1449,7 +1499,7 @@ pub fn prepare_member_seat(
         }
         None => None,
     };
-    let sealed_refs: Vec<&[u8]> = sealed.iter().map(Vec::as_slice).collect();
+    let sealed_refs: Vec<&[u8]> = sealed.iter().map(|replica| &replica[..]).collect();
     let held_refs = held
         .as_ref()
         .map(HeldReplicas::replicas)

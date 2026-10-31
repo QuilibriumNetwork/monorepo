@@ -1381,6 +1381,18 @@ fn stop_detached_work() {
     let started = Instant::now();
     let hosts = quil_cw_consensus::engine_host::stop_hosts();
     let jobs = quil_engine::storage_jobs::shut_down(STOP_GRACE);
+    // Storage replica conversions and compactions (`quil_store::replica_store`).
+    let replica_work = quil_store::replica_store::wait_for_background_work(
+        STOP_GRACE.saturating_sub(started.elapsed()),
+    );
+    if replica_work > 0 {
+        info!(
+            threads = replica_work,
+            grace_secs = STOP_GRACE.as_secs(),
+            action = "no action needed: an interrupted conversion or compaction runs again at the next start",
+            "exiting without waiting for storage replica conversions still running"
+        );
+    }
     let hosts_left = quil_cw_consensus::engine_host::wait_for_hosts(
         STOP_GRACE.saturating_sub(started.elapsed()),
     );

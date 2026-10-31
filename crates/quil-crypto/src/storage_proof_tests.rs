@@ -119,7 +119,15 @@ fn a_cap_gives_the_same_paths_as_the_whole_tree() {
                     Some(tree.path(index)),
                     "n={n} height={height} index={index}"
                 );
+                // The same path from only the leaves below the cap.
+                let below = cap.subtree(index).unwrap();
+                let subtree =
+                    &nodes[below.start as usize * NODE_BYTES..below.end as usize * NODE_BYTES];
+                assert!(below.end - below.start <= 1 << cap.height);
+                assert_eq!(cap.subtree_path(subtree, index), Some(tree.path(index)));
+                assert_eq!(cap.subtree_path(&subtree[NODE_BYTES..], index), None);
             }
+            assert_eq!(cap.subtree(n), None);
             assert_eq!(MerkleCap::from_bytes(&cap.to_bytes()), Some(cap.clone()));
             let mut other = nodes.clone();
             other[0] ^= 1;

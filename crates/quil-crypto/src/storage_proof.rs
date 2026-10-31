@@ -240,9 +240,32 @@ impl MerkleCap {
         if index >= self.n || nodes.len() as u64 != self.n * NODE_BYTES as u64 {
             return None;
         }
-        let start = ((index >> self.height) << self.height) as usize;
-        let end = (start + (1usize << self.height)).min(self.n as usize);
-        let mut level = hash::digests_from_bytes(&nodes[start * NODE_BYTES..end * NODE_BYTES])?;
+        let below = self.subtree(index)?;
+        self.subtree_path(
+            &nodes[below.start as usize * NODE_BYTES..below.end as usize * NODE_BYTES],
+            index,
+        )
+    }
+
+    /// The leaves below the cap that a path for `index` is recomputed from:
+    /// all a member reads of its replica to open that node.
+    pub fn subtree(&self, index: u64) -> Option<std::ops::Range<u64>> {
+        if index >= self.n {
+            return None;
+        }
+        let start = (index >> self.height) << self.height;
+        Some(start..(start + (1u64 << self.height)).min(self.n))
+    }
+
+    /// [`Self::path`] from only the leaves [`Self::subtree`] names for
+    /// `index` (`subtree`, serialized). `None` when they do not fit the tree.
+    pub fn subtree_path(&self, subtree: &[u8], index: u64) -> Option<Vec<Node>> {
+        let below = self.subtree(index)?;
+        if subtree.len() as u64 != (below.end - below.start) * NODE_BYTES as u64 {
+            return None;
+        }
+        let start = below.start as usize;
+        let mut level = hash::digests_from_bytes(subtree)?;
         let mut path = Vec::with_capacity(tree_depth(self.n));
         let mut i = index as usize - start;
         for height in 0..self.height {
