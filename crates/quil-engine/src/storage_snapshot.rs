@@ -2708,23 +2708,55 @@ pub(crate) mod tests {
         (crdt, leaf_id)
     }
 
+    /// Labelling ahead on a thread of its own ([`label_ahead_in_background`]).
+    struct LabellingAhead {
+        done: std::sync::mpsc::Receiver<Result<()>>,
+        thread: std::thread::JoinHandle<()>,
+        /// Handles of the store before the thread took one.
+        held: usize,
+    }
+
+    impl LabellingAhead {
+        /// The labelling's result, once its thread has ended. The thread
+        /// holds the store: a test that returns before it ends lets it close
+        /// the store while the process exits, which aborts the process
+        /// ("pthread lock: Invalid argument"; CI 2026-10-31).
+        fn ended(self, crdt: &Arc<HypergraphCrdt>) -> Result<()> {
+            let result = self
+                .done
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the labelling ahead ends");
+            self.thread.join().expect("the labelling ahead's thread");
+            assert_eq!(
+                Arc::strong_count(crdt),
+                self.held,
+                "the labelling ahead's thread still holds the store"
+            );
+            result
+        }
+    }
+
     /// Label `member`'s leaves of `app` ahead for `epoch` into `store` on a
     /// thread of its own, and return once a leaf of `app` is being labelled
-    /// ahead: the labelling's result, once it ends.
+    /// ahead.
     fn label_ahead_in_background(
         store: &'static crate::storage_labels::LabelStore,
         crdt: &Arc<HypergraphCrdt>,
         member: [u8; 32],
         app: [u8; 32],
         epoch: u64,
-    ) -> std::sync::mpsc::Receiver<Result<()>> {
+    ) -> LabellingAhead {
         use std::time::{Duration, Instant};
         let (done_tx, done) = std::sync::mpsc::channel();
+        let held = Arc::strong_count(crdt);
         let crdt = crdt.clone();
-        std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
             quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
             let result = crate::storage_labels::precompute(store, &crdt, &member, &app, epoch);
             done_tx.send(result).unwrap();
+            // As a loaded runner may: the test goes on before this thread
+            // drops its handle of the store.
+            std::thread::sleep(Duration::from_millis(50));
         });
         let deadline = Instant::now() + Duration::from_secs(60);
         while !running_leaves()
@@ -2735,7 +2767,7 @@ pub(crate) mod tests {
             assert!(Instant::now() < deadline, "the leaf is labelled ahead");
             std::thread::sleep(Duration::from_millis(5));
         }
-        done
+        LabellingAhead { done, thread, held }
     }
 
     /// A leaf being labelled ahead is given up, leaving no labels, once
@@ -2750,11 +2782,9 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store: &'static LabelStore =
             Box::leak(Box::new(LabelStore::with_space(dir.clone(), ample_space())));
-        let done = label_ahead_in_background(store, &crdt, member, app, epoch);
+        let labelling = label_ahead_in_background(store, &crdt, member, app, epoch);
         note_global_frame(quil_types::consensus::storage_snapshot_frame(epoch));
-        done.recv_timeout(std::time::Duration::from_secs(60))
-            .expect("the labelling ahead ends")
-            .unwrap();
+        labelling.ended(&crdt).unwrap();
         assert!(
             store.find(epoch, &member, &leaf_id, |_| true).is_none(),
             "the labelling ahead ran on past the epoch's snapshot frame"
@@ -2782,14 +2812,12 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store: &'static LabelStore =
             Box::leak(Box::new(LabelStore::with_space(dir.clone(), ample_space())));
-        let done = label_ahead_in_background(store, &crdt, member, app, epoch);
+        let labelling = label_ahead_in_background(store, &crdt, member, app, epoch);
         // Granted once the labelling ahead gives its memory back.
         let due = crate::storage_jobs::reserve(u64::MAX / 4);
         note_global_frame(quil_types::consensus::storage_snapshot_frame(epoch));
         drop(due);
-        done.recv_timeout(std::time::Duration::from_secs(60))
-            .expect("the labelling ahead ends")
-            .unwrap();
+        labelling.ended(&crdt).unwrap();
         assert!(
             store.find(epoch, &member, &leaf_id, |_| true).is_none(),
             "the leaf was labelled ahead again past the epoch's snapshot frame"
