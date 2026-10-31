@@ -73,6 +73,7 @@ pub mod storage_labels;
 pub mod storage_snapshot;
 pub mod thread_worker;
 pub mod time_reel;
+mod unheld_finalization;
 pub mod worker;
 pub mod worker_allocator;
 pub mod worker_consensus_storage;

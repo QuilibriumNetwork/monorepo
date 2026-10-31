@@ -804,6 +804,18 @@ impl GlobalParentExecutor {
         (number > published && finalized > published).then_some((published, finalized))
     }
 
+    /// Whether finalization ingests application frames before executing a
+    /// GLOBAL frame here ([`Self::sequence_with_ingest`]): a private execution
+    /// of a finalized frame before its publication then differs from it.
+    pub(crate) fn sequences_with_ingest(&self) -> bool {
+        self.sequenced.load(Ordering::Acquire)
+    }
+
+    /// The highest GLOBAL frame published here.
+    pub(crate) fn published_frame(&self) -> u64 {
+        self.source.last_materialized_frame()
+    }
+
     /// The finalization pipeline holds `number`'s certified finalization.
     pub(crate) fn note_finalized(&self, number: u64) {
         self.finalized.fetch_max(number, Ordering::AcqRel);

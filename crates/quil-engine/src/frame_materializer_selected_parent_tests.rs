@@ -1658,9 +1658,10 @@ fn only_an_unreceipted_voter_reconciles_toward_the_proposers_parent_root() {
 /// A voter that executed the parent itself keeps its state, so it refuses
 /// a proposal declaring another parent state and nothing reconciles it: at
 /// an early fence, an archive on a build without the fence frame halted
-/// GLOBAL with no line saying why. It warns once with both roots, not per
-/// proposal nor again after an agreeing proposal at the same frame (another
-/// proposer on its side), and says when one agrees at a later frame.
+/// GLOBAL with no line saying why. It warns once with both roots, the
+/// proposer and both causes' checks, not per proposal nor again after an
+/// agreeing proposal at the same frame (another proposer on its side), and
+/// says when one agrees at a later frame.
 #[test]
 fn a_voter_whose_own_parent_state_differs_warns_once_with_both_roots() {
     use crate::outage::test_logs::CapturedLogs;
@@ -1671,7 +1672,10 @@ fn a_voter_whose_own_parent_state_differs_warns_once_with_both_roots() {
     certify(&mut parent, &rig.signer, 0);
     rig.source.materialize(&parent).unwrap();
     save(rig.clock.as_ref(), &parent);
-    let context = rig.context(&parent);
+    let mut context = rig.context(&parent);
+    let mut leader = [0x11; 32];
+    leader[26..].copy_from_slice(&[0xab, 0xcd, 0xef, 0x01, 0x23, 0x45]);
+    context.leader = Some(leader);
     let child = state_frame(&rig.source, 2, context.view, context.parent);
     let mut other = child.clone();
     other.header.as_mut().unwrap().prover_tree_commitment[0] ^= 1;
@@ -1691,6 +1695,10 @@ fn a_voter_whose_own_parent_state_differs_warns_once_with_both_roots() {
         format!("own_prover_root={}", root(&child)),
         format!("proposed_prover_root={}", root(&other)),
         "MAINNET_EARLY_FENCE_FRAME".to_string(),
+        "proposer=…012345".to_string(),
+        "action=\"check\"".to_string(),
+        "executed its parent before that parent published".to_string(),
+        "nothing is needed".to_string(),
     ] {
         assert!(warned[0].contains(&field), "{field}: {}", warned[0]);
     }
@@ -1709,7 +1717,7 @@ fn a_voter_whose_own_parent_state_differs_warns_once_with_both_roots() {
         .lines_with("agree with this node's own execution")
         .is_empty());
 
-    seam.note_own_parent_state(context.view + 1, 3, true, None);
+    seam.note_own_parent_state(context.view + 1, 3, None, true, None);
     let agreed = logs.lines_with("agree with this node's own execution of their parent again");
     assert_eq!(agreed.len(), 1, "{agreed:?}");
     assert!(
