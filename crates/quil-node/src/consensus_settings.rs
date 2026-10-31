@@ -204,6 +204,15 @@ pub(crate) fn initialize(network: u8) {
             "QUIL_STORAGE_KICK_SUSPENSION_EPOCH override active (localnet only)"
         );
     }
+    let (restoration_frame, restored_provers) =
+        quil_types::consensus::init_kicked_seniority_restoration(network);
+    if network != 0 && restoration_frame != u64::MAX {
+        tracing::warn!(
+            frame = restoration_frame,
+            provers = restored_provers,
+            "QUIL_KICKED_SENIORITY_RESTORATION_FRAME override active (localnet only)"
+        );
+    }
 }
 
 #[cfg(test)]
