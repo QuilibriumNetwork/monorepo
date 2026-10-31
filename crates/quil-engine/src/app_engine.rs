@@ -2889,6 +2889,9 @@ pub struct AppConsensusEngine {
     /// How long this successor has been unable to start on its predecessor's
     /// state, and why the shard sync last failed to recover it.
     predecessor_block: PredecessorBlock,
+    /// The next batch of a running outgoing-history walk, which this loop runs
+    /// between the retry timer's start attempts.
+    history_walk: crate::app_history_recovery::WalkPace,
     /// How long consensus has been refused a start, for bounded logging.
     start_block: StartBlock,
     /// cw-finalized frames deferred ahead of the cursor, for bounded logging.
@@ -3162,6 +3165,7 @@ impl AppConsensusEngine {
             replay_mismatch: ReplayMismatch::default(),
             historical_committee_source: None,
             predecessor_block: PredecessorBlock::default(),
+            history_walk: Default::default(),
             start_block: StartBlock::default(),
             ahead_deferral: AheadDeferral::default(),
             behind_shard: BehindShard::default(),
@@ -7135,6 +7139,23 @@ impl AppConsensusEngine {
                     );
                     break;
                 }
+
+                // A running outgoing-history walk's next batch, at its pace,
+                // when nothing above is ready. The walk ends with a start
+                // attempt: the member votes as soon as it can.
+                _ = tokio::time::sleep_until(
+                    self.history_walk
+                        .due_at()
+                        .map_or_else(tokio::time::Instant::now, tokio::time::Instant::from_std),
+                ), if self.history_walk.due_at().is_some()
+                    && cw_transport_ready
+                    && self.cw_handle.is_none() =>
+                {
+                    probe::step(probe::Section::EngineHistoryWalk);
+                    if self.continue_history_walk().await {
+                        cw_retry_timer.reset_immediately();
+                    }
+                }
             }
 
             probe::step(probe::Section::EngineUpkeep);
@@ -8599,6 +8620,57 @@ impl AppConsensusEngine {
             .consensus_phase(ready, closing, session_id, sealed_id);
     }
 
+    /// One batch of `session`'s outgoing-history walk through `through`, and
+    /// the next one's time when it leaves the walk unfinished.
+    async fn history_walk_batch(
+        &mut self,
+        manager: Arc<quil_execution::ExecutionEngineManager>,
+        session: &quil_cw_consensus::handoff::Session,
+        through: u64,
+    ) -> Result<crate::app_history_recovery::WalkBatch> {
+        let began = std::time::Instant::now();
+        let batch = crate::app_history_recovery::recover(
+            session,
+            manager,
+            self.clock_store.clone(),
+            self.frame_validator(),
+            self.global_hypergraph.as_ref(),
+            self.delivery_frame_source.as_ref(),
+            through,
+        )
+        .await;
+        self.history_walk
+            .note(session, through, &batch, began, std::time::Instant::now());
+        batch
+    }
+
+    /// Run a walk's next batch; true when the walk just finished. A failure
+    /// leaves the walk to the next start attempt, which reports it.
+    async fn continue_history_walk(&mut self) -> bool {
+        let Some(manager) = self.execution_engine.clone() else {
+            self.history_walk.clear();
+            return false;
+        };
+        let Some((session, through)) = self.history_walk.take(self.last_materialized_frame) else {
+            return false;
+        };
+        let batch = self.history_walk_batch(manager, &session, through).await;
+        // A batch may have corrected old records, as at a start attempt. No
+        // host runs yet, so its parent/history cache will be built afresh.
+        self.frame_outflows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        match batch {
+            Ok(batch) => batch.complete,
+            Err(error) => {
+                debug!(core_id = self.core_id, filter = hex::encode(&self.filter), %error,
+                    "outgoing history walk left to the next consensus start attempt");
+                false
+            }
+        }
+    }
+
     async fn start_consensus_cw(
         &mut self,
         signer: Box<dyn quil_types::crypto::Signer>,
@@ -8658,6 +8730,7 @@ impl AppConsensusEngine {
         let filter = self.filter.clone();
         let app_address = self.app_address.clone();
         self.start_context = StartContext::default();
+        self.history_walk.clear();
         self.discard_legacy_history_if_due().await?;
         self.drop_discarded_finalized_records()?;
         self.rewind_past_fence()?;
@@ -8733,7 +8806,12 @@ impl AppConsensusEngine {
             self.start_context.members = Some(session.members.len());
             let my_pk = bls_signer.public_key();
             if !session.members.iter().any(|key| key.as_slice() == my_pk) {
-                self.start_context.not_seated = Some(self.local_seat(Some(session)));
+                let seat = self.local_seat(Some(session));
+                seat.ask_for_successor_view(
+                    &crate::global_view_refresh::shared(),
+                    std::time::Instant::now(),
+                );
+                self.start_context.not_seated = Some(seat);
             }
         }
         let mut session_genesis = None;
@@ -8794,16 +8872,10 @@ impl AppConsensusEngine {
                     )?
                 };
                 for (source, checkpoint) in sources {
-                    match crate::app_history_recovery::recover(
-                        &source,
-                        manager.clone(),
-                        self.clock_store.clone(),
-                        self.frame_validator(),
-                        Some(global),
-                        self.delivery_frame_source.as_ref(),
-                        checkpoint.frame,
-                    )
-                    .await
+                    match self
+                        .history_walk_batch(manager.clone(), &source, checkpoint.frame)
+                        .await
+                        .map(|batch| batch.complete)
                     {
                         Ok(true) => {
                             let key = (
@@ -9000,16 +9072,10 @@ impl AppConsensusEngine {
 
         if let (Some(session), Some(manager)) = (session.as_ref(), self.execution_engine.clone()) {
             let validator = self.frame_validator();
-            let recovered = crate::app_history_recovery::recover(
-                session,
-                manager.clone(),
-                self.clock_store.clone(),
-                validator.clone(),
-                self.global_hypergraph.as_ref(),
-                self.delivery_frame_source.as_ref(),
-                self.last_materialized_frame,
-            )
-            .await;
+            let recovered = self
+                .history_walk_batch(manager.clone(), session, self.last_materialized_frame)
+                .await
+                .map(|batch| batch.complete);
             // The next header's accumulator field reads the carry window below
             // the tip, which a member that joined at the tip never executed.
             if matches!(recovered, Ok(true)) {
@@ -14535,6 +14601,28 @@ impl NotSeated {
         })
     }
 
+    /// Ask for an early view of GLOBAL when this worker waits for a successor
+    /// that seats it. Its session's members ask as their session seals; this
+    /// worker holds no such session, and it found its seat only at the next
+    /// periodic pull, up to five minutes after GLOBAL started the successor,
+    /// with the shard short of quorum meanwhile (2 of 6 members, 2026-10-30).
+    /// The same interval and budgets bound the asks of both.
+    fn ask_for_successor_view(
+        &self,
+        refresh: &crate::global_view_refresh::ViewRefresh,
+        now: std::time::Instant,
+    ) -> bool {
+        matches!(
+            self.awaits_seat(),
+            Some(SessionWait::Seal { seats: true, .. })
+        ) && self.global_frame > 0
+            && refresh.request(
+                crate::global_view_refresh::Reason::SealedSessionAwaitsSuccessor,
+                crate::seal_follow::successor_pull_through(self.global_frame, None),
+                now,
+            )
+    }
+
     fn joining(&self) -> bool {
         self.allocations
             .contains(&quil_types::consensus::EffectiveStatus::Joining)
@@ -14976,6 +15064,66 @@ mod start_block_tests {
                 blocked: MINUTE * 130,
                 warn: true
             })
+        );
+    }
+
+    /// A worker a closing session's successor seats asks for an early view,
+    /// no more than once a minute; one the successor leaves out, or whose
+    /// session is not closing, or whose allocation is not active, does not.
+    #[test]
+    fn a_worker_its_successor_seats_asks_for_an_early_view_once_a_minute() {
+        use crate::global_view_refresh::{Reason, ViewRefresh, SUCCESSOR_INTERVAL};
+        use quil_types::consensus::EffectiveStatus;
+        let seat = |status, session_wait| NotSeated {
+            allocations: vec![status],
+            global_frame: 243,
+            release: None,
+            join_wait: None,
+            session_wait,
+        };
+        let seats = |seats| {
+            Some(SessionWait::Seal {
+                fence_frame: 480,
+                seats,
+            })
+        };
+        let now = std::time::Instant::now();
+        for quiet in [
+            seat(EffectiveStatus::Active, seats(false)),
+            seat(
+                EffectiveStatus::Active,
+                Some(SessionWait::Boundary { frame: 300 }),
+            ),
+            seat(EffectiveStatus::Active, None),
+            seat(EffectiveStatus::Joining, seats(true)),
+        ] {
+            let refresh = ViewRefresh::default();
+            refresh.enable(60);
+            assert!(!quiet.ask_for_successor_view(&refresh, now));
+            assert_eq!(
+                refresh.requested(Reason::SealedSessionAwaitsSuccessor),
+                None
+            );
+        }
+        let refresh = ViewRefresh::default();
+        refresh.enable(60);
+        let waiting = seat(EffectiveStatus::Active, seats(true));
+        assert!(waiting.ask_for_successor_view(&refresh, now));
+        assert_eq!(
+            refresh.requested(Reason::SealedSessionAwaitsSuccessor),
+            Some(242),
+            "the frame below the head, whose prover root binds the state before it"
+        );
+        refresh.settle(242);
+        assert!(!waiting.ask_for_successor_view(&refresh, now + SUCCESSOR_INTERVAL / 2));
+        assert_eq!(
+            refresh.requested(Reason::SealedSessionAwaitsSuccessor),
+            None
+        );
+        assert!(waiting.ask_for_successor_view(&refresh, now + SUCCESSOR_INTERVAL));
+        assert_eq!(
+            refresh.requested(Reason::SealedSessionAwaitsSuccessor),
+            Some(242)
         );
     }
 
