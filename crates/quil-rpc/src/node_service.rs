@@ -113,6 +113,10 @@ const MAX_RETRO_SENIORITY_KEYS: usize = 32;
 /// Each key scans the four retro tables, so lookups run one at a time.
 static RETRO_SENIORITY_WORKER: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
+/// A status read walks up to a lookback of headers and several roots, each
+/// briefly under the commit lock, so they run one at a time.
+static MINT_STATUS_WORKER: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 /// A worker slot from `workers`, waiting briefly in a bounded queue when all
 /// are busy.
 async fn coin_read_permit(
@@ -1326,6 +1330,50 @@ impl NodeService for NodeRpcServer {
         }))
     }
 
+    async fn get_mint_authorization_status(
+        &self,
+        request: Request<node::GetMintAuthorizationStatusRequest>,
+    ) -> Result<Response<node::GetMintAuthorizationStatusResponse>, Status> {
+        let receipt: [u8; 32] = request
+            .into_inner()
+            .receipt
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("mint authorization receipt must be 32 bytes"))?;
+        let provider = self
+            .coin_witness_provider
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("coin witness provider not available"))?
+            .clone();
+        let permit = coin_read_permit(&MINT_STATUS_WORKER, "mint authorization status").await?;
+        let status = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            provider.mint_authorization_status(&receipt)
+        })
+        .await
+        .map_err(|_| Status::internal("mint authorization status worker failed"))?
+        .map_err(|e| {
+            if e.is_execution_unavailable() {
+                Status::unavailable(format!("mint authorization status: {e}"))
+            } else {
+                Status::internal(format!("mint authorization status: {e}"))
+            }
+        })?;
+        Ok(Response::new(node::GetMintAuthorizationStatusResponse {
+            state: status.state as i32,
+            found: status.found,
+            inclusion_frame: status.inclusion_frame,
+            inclusion_frame_earliest: status.inclusion_frame_earliest,
+            claim_cap: status.claim_cap,
+            cap_from_shard_anchor: status.cap_from_shard_anchor,
+            head_frame: status.head_frame,
+            searched_frame: status.searched_frame,
+            cited_frame: status.cited_frame,
+            first_root_frame: status.first_root_frame,
+            reason: status.reason,
+        }))
+    }
+
     async fn get_retro_seniority(
         &self,
         request: Request<node::GetRetroSeniorityRequest>,
@@ -2079,6 +2127,102 @@ mod mint_authorization_witness_tests {
         assert_eq!(
             NodeRpcServer::new()
                 .get_mint_authorization_witness(request(32))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+    }
+}
+
+#[cfg(test)]
+mod mint_authorization_status_tests {
+    use super::*;
+    use quil_types::store::*;
+    struct Provider {
+        fail: bool,
+    }
+    impl CoinWitnessProvider for Provider {
+        fn mint_authorization_status(
+            &self,
+            receipt: &[u8; 32],
+        ) -> quil_types::error::Result<MintAuthorizationStatusData> {
+            assert_eq!(receipt, &[7; 32]);
+            if self.fail {
+                return Err(quil_types::error::QuilError::ExecutionUnavailable(
+                    "history pruned".into(),
+                ));
+            }
+            Ok(MintAuthorizationStatusData {
+                state: node::MintAuthorizationState::AwaitingCitableRoot,
+                found: true,
+                inclusion_frame: 10,
+                inclusion_frame_earliest: 9,
+                claim_cap: 8,
+                cap_from_shard_anchor: true,
+                head_frame: 20,
+                searched_frame: 19,
+                cited_frame: 7,
+                first_root_frame: 11,
+                reason: "waiting".into(),
+            })
+        }
+    }
+    fn request(len: usize) -> Request<node::GetMintAuthorizationStatusRequest> {
+        Request::new(node::GetMintAuthorizationStatusRequest {
+            receipt: vec![7; len],
+        })
+    }
+    fn server(fail: bool) -> NodeRpcServer {
+        NodeRpcServer::new().with_coin_witness_provider(Arc::new(Provider { fail }))
+    }
+
+    #[tokio::test]
+    async fn status_rpc_carries_every_field_and_classifies_failures() {
+        assert_eq!(
+            server(false)
+                .get_mint_authorization_status(request(31))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let response = server(false)
+            .get_mint_authorization_status(request(32))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            node::GetMintAuthorizationStatusResponse {
+                state: node::MintAuthorizationState::AwaitingCitableRoot as i32,
+                found: true,
+                inclusion_frame: 10,
+                inclusion_frame_earliest: 9,
+                claim_cap: 8,
+                cap_from_shard_anchor: true,
+                head_frame: 20,
+                searched_frame: 19,
+                cited_frame: 7,
+                first_root_frame: 11,
+                reason: "waiting".into(),
+            }
+        );
+        assert_eq!(
+            server(true)
+                .get_mint_authorization_status(request(32))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        // The provider's default: a build that cannot answer says so.
+        struct Silent;
+        impl CoinWitnessProvider for Silent {}
+        assert_eq!(
+            NodeRpcServer::new()
+                .with_coin_witness_provider(Arc::new(Silent))
+                .get_mint_authorization_status(request(32))
                 .await
                 .unwrap_err()
                 .code(),

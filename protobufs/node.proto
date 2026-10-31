@@ -596,6 +596,8 @@ service NodeService {
   rpc ListLegacyCoins(quilibrium.node.global.pb.ListLegacyCoinsRequest) returns (quilibrium.node.global.pb.ListLegacyCoinsResponse);
   rpc GetProverRewardWitness(GetProverRewardWitnessRequest) returns (GetProverRewardWitnessResponse);
   rpc GetMintAuthorizationWitness(GetMintAuthorizationWitnessRequest) returns (GetMintAuthorizationWitnessResponse);
+  // Read-only: whether a mint authorization is included and claimable here.
+  rpc GetMintAuthorizationStatus(GetMintAuthorizationStatusRequest) returns (GetMintAuthorizationStatusResponse);
   rpc GetRetroSeniority(GetRetroSeniorityRequest) returns (GetRetroSeniorityResponse);
 }
 
@@ -625,6 +627,42 @@ message GetMintAuthorizationWitnessResponse {
   bytes forest_proof = 2; // bounded membership witness; caller checks authorization fields
   uint64 cited_frame = 3;
   bytes global_root = 4; // root in the cited canonical global header
+}
+enum MintAuthorizationState {
+  MINT_AUTHORIZATION_STATE_UNSPECIFIED = 0;
+  // In the newest retained global root at or below the claim cap. Says nothing
+  // about whether the claim was already made: the app shard records that.
+  MINT_AUTHORIZATION_STATE_CLAIMABLE = 1;
+  // Included, but the newest retained root at or below the cap predates it.
+  MINT_AUTHORIZATION_STATE_AWAITING_CITABLE_ROOT = 2;
+  // Absent from the newest retained root: not yet included, or rejected.
+  MINT_AUTHORIZATION_STATE_NOT_INCLUDED = 3;
+  // Included, but this node retains no global root at or below the cap.
+  MINT_AUTHORIZATION_STATE_NO_CITABLE_ROOT = 4;
+  // This node retains no recent global root: nothing can be said.
+  MINT_AUTHORIZATION_STATE_NO_RETAINED_ROOT = 5;
+}
+message GetMintAuthorizationStatusRequest {
+  bytes receipt = 1; // 32-byte authorization identity derived from the original mint
+}
+message GetMintAuthorizationStatusResponse {
+  MintAuthorizationState state = 1;
+  bool found = 2; // the receipt is in a retained global root
+  // A frame's header carries the root of its parent, so a receipt first seen
+  // in the root of frame F was included at frame F-1 or earlier. Retained roots
+  // can be sparse: inclusion lies in this range, one frame when the two are
+  // equal; earliest is 0 when no older retained root lacks the receipt.
+  uint64 inclusion_frame = 3;
+  uint64 inclusion_frame_earliest = 4;
+  uint64 claim_cap = 5; // newest global frame a claim through this node may cite
+  // The cap is the slowest live QUIL worker anchor, else the head minus a lag.
+  bool cap_from_shard_anchor = 6;
+  uint64 head_frame = 7;     // this node's latest global frame
+  uint64 searched_frame = 8; // newest retained root checked, at or below the head
+  uint64 cited_frame = 9;    // newest retained root at or below the cap; 0 if none
+  // First retained root holding the receipt: a claim must cite it or a later one.
+  uint64 first_root_frame = 10;
+  string reason = 11; // one line: why it is not claimable and what ends the wait
 }
 message GetProverRewardWitnessResponse {
   bool found = 1;
