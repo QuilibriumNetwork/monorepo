@@ -7,11 +7,13 @@
 //! headers. The summary counts them per interval; transitions (inclusion
 //! stalling and resuming) keep lines of their own.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
+
+use crate::leader_provider::HeldShard;
 
 /// How often the summary is logged: at the first event after this long.
 const INTERVAL: Duration = Duration::from_secs(600);
@@ -46,6 +48,9 @@ struct Window {
     lease_max_ms: u64,
     gaps: HashMap<Vec<u8>, u64>,
     gap_requests: u64,
+    relief_carries: u64,
+    relief_most_behind: u64,
+    relief_longest_wait: u64,
 }
 
 struct Stall {
@@ -55,6 +60,52 @@ struct Stall {
     warned: Option<Instant>,
 }
 
+/// Proposals the application frame budget deferred shard headers in, each
+/// carrying the shard furthest behind of those it did not fit.
+struct Relief {
+    since: Instant,
+    since_frame: u64,
+    proposals: u64,
+    most_behind: u64,
+    longest_wait: u64,
+    warned: Option<Instant>,
+}
+
+/// GLOBAL frames each shard waited at its cursor, as this archive's proposals
+/// saw it: from the first proposal offering its header at that cursor.
+#[derive(Default)]
+struct Waits(HashMap<Vec<u8>, (u64, u64)>);
+
+impl Waits {
+    /// A proposal at `frame` offered headers of `shards`; those it did not
+    /// offer are forgotten.
+    fn observe(&mut self, frame: u64, shards: &[HeldShard]) {
+        let offered: HashSet<&[u8]> = shards
+            .iter()
+            .map(|shard| shard.address.as_slice())
+            .collect();
+        self.0
+            .retain(|address, _| offered.contains(address.as_slice()));
+        for shard in shards {
+            let tracked = self.0.len();
+            match self.0.get_mut(&shard.address) {
+                Some((cursor, _)) if *cursor == shard.cursor => {}
+                Some(entry) => *entry = (shard.cursor, frame),
+                None if tracked < MAX_SHARDS => {
+                    self.0.insert(shard.address.clone(), (shard.cursor, frame));
+                }
+                None => {}
+            }
+        }
+    }
+
+    fn waited(&self, shard: &[u8], frame: u64) -> u64 {
+        self.0
+            .get(shard)
+            .map_or(0, |&(_, since)| frame.saturating_sub(since))
+    }
+}
+
 struct State {
     since: Instant,
     window: Window,
@@ -62,6 +113,8 @@ struct State {
     /// buffer, and how far.
     behind: HashMap<Vec<u8>, u64>,
     stall: Option<Stall>,
+    waits: Waits,
+    relief: Option<Relief>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -75,6 +128,8 @@ fn with_state(record: impl FnOnce(&mut State)) {
         window: Window::default(),
         behind: HashMap::new(),
         stall: None,
+        waits: Waits::default(),
+        relief: None,
     });
     record(state);
     if state.since.elapsed() >= INTERVAL {
@@ -145,6 +200,86 @@ pub fn note_proposal(
                 "application shard inclusion stalled: this archive's GLOBAL proposals offered shard headers but \
                  carried none, so shard state and rewards are not applied from them; the inclusion summary line \
                  counts why. Repeated while it lasts; a line follows when a proposal carries headers again");
+        }
+    });
+}
+
+/// A GLOBAL proposal this archive led at `frame` offered headers of `shards`
+/// whose bodies it holds; the application frame `budget` deferred `deferred`
+/// of them and carried `furthest`, the one furthest behind of those it did
+/// not fit, anyway.
+///
+/// Lines: one when the budget starts deferring headers, naming the shard
+/// carried furthest behind; one when it stops; a warning, every
+/// [`STALL_REPEAT`] while it lasts, when a deferred shard waited longer than
+/// the bound, as many GLOBAL frames as shards offered.
+pub(crate) fn note_budget(
+    frame: u64,
+    budget: u64,
+    shards: &[HeldShard],
+    furthest: Option<&HeldShard>,
+    deferred: usize,
+) {
+    with_state(|state| {
+        state.waits.observe(frame, shards);
+        let waits = &state.waits;
+        let Some(furthest) = furthest.filter(|_| deferred > 0) else {
+            if let Some(relief) = state.relief.take() {
+                info!(scope = SCOPE, frame, budget, lasted_secs = relief.since.elapsed().as_secs(),
+                    global_frames = frame.saturating_sub(relief.since_frame), proposals = relief.proposals,
+                    most_frames_behind_carried = relief.most_behind,
+                    longest_wait_global_frames = relief.longest_wait,
+                    "application frame budget no longer defers shard headers: this archive's GLOBAL proposals \
+                     carry every shard header whose bodies it holds again");
+            }
+            return;
+        };
+        let bound = shards.len() as u64;
+        let waited = waits.waited(&furthest.address, frame);
+        let window = &mut state.window;
+        window.relief_carries += 1;
+        window.relief_most_behind = window.relief_most_behind.max(furthest.frames);
+        window.relief_longest_wait = window.relief_longest_wait.max(waited);
+        let relief = state.relief.get_or_insert_with(|| {
+            info!(scope = SCOPE, frame, budget, deferred_tips = deferred,
+                furthest_shard = %hex::encode(&furthest.address), furthest_frames_behind = furthest.frames,
+                furthest_waited_global_frames = waited, bound_global_frames = bound,
+                "application frame budget defers shard headers: more application frames wait than one GLOBAL \
+                 proposal carries, so this archive's proposals carry the smallest gaps that fit and the shard \
+                 furthest behind, and each shard rides within the bound. Expected while GLOBAL frames run slow \
+                 or after shard headers were held back; a line follows when the budget no longer defers any");
+            Relief {
+                since: Instant::now(),
+                since_frame: frame,
+                proposals: 0,
+                most_behind: 0,
+                longest_wait: 0,
+                warned: None,
+            }
+        });
+        relief.proposals += 1;
+        relief.most_behind = relief.most_behind.max(furthest.frames);
+        relief.longest_wait = relief.longest_wait.max(waited);
+        let overdue = || {
+            shards
+                .iter()
+                .filter(|shard| !shard.rides)
+                .map(|shard| (waits.waited(&shard.address, frame), shard))
+                .filter(|&(waited, _)| waited > bound)
+        };
+        let Some((waited, shard)) = overdue().max_by_key(|&(waited, _)| waited) else {
+            return;
+        };
+        if relief.warned.is_none_or(|at| at.elapsed() >= STALL_REPEAT) {
+            relief.warned = Some(Instant::now());
+            warn!(scope = SCOPE, frame, budget, shard = %hex::encode(&shard.address),
+                frames_behind = shard.frames, waited_global_frames = waited, bound_global_frames = bound,
+                overdue_shards = overdue().count(),
+                "shard header waited longer than the application frame budget's bound: this archive's GLOBAL \
+                 proposals carry the shard furthest behind every frame, so each should ride within as many GLOBAL \
+                 frames as shards wait. Expected only while other GLOBAL leaders run a build that carries the \
+                 smallest gaps only, or the shard produces far slower than the rest; otherwise a defect to \
+                 report. Repeated every 10 minutes while it lasts");
         }
     });
 }
@@ -246,6 +381,9 @@ impl State {
                     first_held_back_frame = held_back_frame,
                     tips_deferred_by_budget = w.deferred,
                     largest_deferred_gap = w.largest_deferred,
+                    budget_furthest_carried = w.relief_carries,
+                    budget_furthest_most_frames_behind = w.relief_most_behind,
+                    budget_furthest_longest_wait = w.relief_longest_wait,
                     headers_body_check_unavailable = w.unavailable,
                     shards_behind_buffer,
                     largest_gap,
@@ -262,7 +400,8 @@ impl State {
                     gap_example_missing_from = gap_missing_from,
                     "application shard inclusion summary: shard tips (headers) this archive's GLOBAL proposals \
                      carried, held back because this archive lacks application frame bodies executing them needs, \
-                     or deferred by the application frame budget; shards whose headers wait further behind than \
+                     or deferred by the application frame budget, and the shards furthest behind carried beyond \
+                     it; shards whose headers wait further behind than \
                      the frame buffer; GLOBAL execution lease holds; shards with frame gaps the ingest asked for. \
                      A warning when most proposals offering shard headers carried none: shard state and rewards \
                      then lag on every archive"
@@ -274,5 +413,34 @@ impl State {
         } else {
             summary!(info);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shard(address: u8, cursor: u64) -> HeldShard {
+        HeldShard {
+            address: vec![address; 32],
+            cursor,
+            frames: 1,
+            rides: false,
+        }
+    }
+
+    /// A shard waits from the first proposal offering its header at a cursor
+    /// until its cursor moves; a shard no proposal offers is forgotten.
+    #[test]
+    fn shard_waits_count_from_the_first_proposal_at_its_cursor() {
+        let mut waits = Waits::default();
+        waits.observe(10, &[shard(1, 5), shard(2, 7)]);
+        waits.observe(14, &[shard(1, 5), shard(2, 9)]);
+        assert_eq!(waits.waited(&[1; 32], 14), 4);
+        assert_eq!(waits.waited(&[2; 32], 14), 0, "its cursor moved");
+        waits.observe(15, &[shard(2, 9)]);
+        waits.observe(20, &[shard(1, 5), shard(2, 9)]);
+        assert_eq!(waits.waited(&[1; 32], 20), 0, "forgotten while not offered");
+        assert_eq!(waits.waited(&[2; 32], 20), 6);
     }
 }
