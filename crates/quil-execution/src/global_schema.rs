@@ -125,6 +125,16 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
                 size: 8,
                 rdf_type: RdfType::Uint,
             },
+            // order 38 — not in the Go schema: the GLOBAL frame that gave this
+            // prover back the seniority a storage epoch proof kick took
+            // (`seniority_restoration`), u64 BE, so it is given once. Key
+            // 0x98, unique.
+            FieldTag {
+                name: "SeniorityRestorationFrame",
+                order: 38,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
         ],
     },
     ClassDef {
@@ -629,12 +639,12 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
     },
 ];
 
-/// The schema's max `order` across all classes — now 37 (a prover's
-/// `SeniorityPenalty`). Still within the single-byte band (`≤ 63`),
+/// The schema's max `order` across all classes — now 38 (a prover's
+/// `SeniorityRestorationFrame`). Still within the single-byte band (`≤ 63`),
 /// so `order_to_key` returns `order << 2` exactly as before: every existing
 /// field key is unchanged, no allocation vertex is re-keyed. Used to decide
 /// the `order_to_key` encoding width.
-pub const GLOBAL_MAX_ORDER: u16 = 37;
+pub const GLOBAL_MAX_ORDER: u16 = 38;
 
 /// Encoding boundaries from `types/schema/order_encoding.go`.
 pub const MAX_ORDER_SINGLE_BYTE: u16 = 63;
@@ -949,8 +959,12 @@ mod tests {
             Some(vec![0x94])
         );
         assert_eq!(
-            GLOBAL_MAX_ORDER, 37,
-            "SeniorityPenalty (order 37) is the highest"
+            field_key("prover:Prover", "SeniorityRestorationFrame"),
+            Some(vec![0x98])
+        );
+        assert_eq!(
+            GLOBAL_MAX_ORDER, 38,
+            "SeniorityRestorationFrame (order 38) is the highest"
         );
         assert!(GLOBAL_MAX_ORDER <= MAX_ORDER_SINGLE_BYTE);
         assert_eq!(
@@ -972,6 +986,7 @@ mod tests {
                     (cls, "AbsentFrameCount", 0x8C),
                     (cls, "LastAbsentFrameNumber", 0x90),
                     ("prover:Prover", "SeniorityPenalty", 0x94),
+                    ("prover:Prover", "SeniorityRestorationFrame", 0x98),
                 ] {
                     if class.name == owner && field.name == name {
                         continue;

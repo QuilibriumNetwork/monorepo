@@ -2192,6 +2192,19 @@ impl GlobalIntrinsic {
                 }
             }
         }
+        // Any rejoin keeps the frame that restored the seniority a storage
+        // kick took (`seniority_restoration`), so it is restored once.
+        if prover_already_exists {
+            let field = super::seniority_restoration::RESTORATION_FIELD;
+            let existing_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(
+                &state
+                    .get(domain, &prover_address, va_disc)?
+                    .unwrap_or_default(),
+            );
+            if let Some(value) = read_field(&existing_tree, "prover:Prover", field) {
+                write_field(&mut output.prover_tree, "prover:Prover", field, &value)?;
+            }
+        }
         if let Some((_, parts)) = &join_credit {
             super::seniority_succession::set_credited_retro(&mut output.prover_tree, parts)?;
         }
@@ -4124,6 +4137,7 @@ impl GlobalIntrinsic {
         #[cfg(not(feature = "confidential-tokens"))]
         let _ = flipped;
         self.sweep_storage_expiries(frame_number, state)?;
+        super::seniority_restoration::restore_kicked_seniority(state, frame_number)?;
         self.reconcile_committee_sessions(frame_number, state)?;
         self.log_local_shard_grid_once_per_epoch(frame_number, state);
         // Logging only: the stale seal-drain copy summary is written once its
@@ -8425,6 +8439,116 @@ mod tests {
                 refused.to_string().contains("previously kicked"),
                 "a kick restamped by another rule must still bar: {refused}"
             );
+            suspend_storage_kicks(None);
+            quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        }
+
+        /// A prover the sweep kicked for an unproven seat before the
+        /// suspension epoch, which rejoined from it, regains at the
+        /// restoration frame what the kick took, keeping what it earned since
+        /// the rejoin; the frame's maintenance gives it once, also after a
+        /// later rejoin rewrote its vertex.
+        #[test]
+        fn the_restoration_frame_gives_a_storage_kicked_prover_its_seniority_back_once() {
+            use crate::global_intrinsic::seniority_restoration;
+            let epoch = 5;
+            let length = quil_types::consensus::epoch_length_frames();
+            let suspension = epoch + 4;
+            let flag = suspension * length;
+            let restoration = flag + 20;
+            quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch));
+            suspend_storage_kicks(Some(suspension));
+            let pubkey = vec![0xD5u8; 897];
+            let filter = vec![0x65u8; 32];
+            let (gi, state, prover_addr) = unproven_committer(&pubkey, &filter, epoch);
+            let seniority = |state: &HypergraphState| {
+                let va_disc = vertex_adds_discriminator().unwrap();
+                let blob = state
+                    .get(&GLOBAL_INTRINSIC_ADDRESS[..], &prover_addr, &va_disc)
+                    .unwrap()
+                    .unwrap();
+                let tree = rebuild_vertex_tree_from_blob(&blob);
+                let bytes = read_field(&tree, "prover:Prover", "Seniority").unwrap();
+                u64::from_be_bytes(bytes.try_into().unwrap())
+            };
+            let before_kick = seniority(&state);
+            assert!(before_kick > 0);
+            sweep(&gi, &state, epoch);
+            assert!(read_kick_frame(&state, &prover_addr, "prover:Prover").is_some());
+            assert_eq!(seniority(&state), 0, "the kick zeroes the seniority");
+            state.commit().unwrap();
+            let va_disc = vertex_adds_discriminator().unwrap();
+            gi.invoke_join(flag, &join_op(&pubkey, &filter, flag), &state, &va_disc)
+                .expect("a storage-kicked prover rejoins from the suspension epoch");
+            let at_rejoin = seniority(&state);
+            // Seniority earned after the rejoin.
+            let earned = 70;
+            let mut tree = rebuild_vertex_tree_from_blob(
+                &state
+                    .get(&GLOBAL_INTRINSIC_ADDRESS[..], &prover_addr, &va_disc)
+                    .unwrap()
+                    .unwrap(),
+            );
+            write_field(
+                &mut tree,
+                "prover:Prover",
+                "Seniority",
+                &(at_rejoin + earned).to_be_bytes(),
+            )
+            .unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &prover_addr,
+                    &va_disc,
+                    flag + 3,
+                    vertex_tree_to_blob(&tree),
+                )
+                .unwrap();
+            state.commit().unwrap();
+
+            quil_types::consensus::set_kicked_seniority_restoration_frame_for_thread(Some(
+                restoration,
+            ));
+            quil_types::consensus::set_kicked_seniority_restorations_for_thread(Some(vec![
+                quil_types::consensus::SeniorityRestoration {
+                    prover: prover_addr,
+                    before_kick,
+                    at_rejoin,
+                },
+            ]));
+            gi.apply_due_shard_changes(restoration - 1, &state).unwrap();
+            state.commit().unwrap();
+            assert_eq!(seniority(&state), at_rejoin + earned, "restored early");
+            gi.apply_due_shard_changes(restoration, &state).unwrap();
+            state.commit().unwrap();
+            assert_eq!(
+                seniority(&state),
+                before_kick + earned,
+                "the restoration frame's maintenance gives back what the kick took"
+            );
+
+            // A later rejoin on another shard rewrites the vertex and keeps
+            // the restoration's mark, so executing the restoration frame
+            // again over that state gives nothing more.
+            let other = vec![0x66u8; 32];
+            gi.invoke_join(
+                restoration + 5,
+                &join_op(&pubkey, &other, restoration + 5),
+                &state,
+                &va_disc,
+            )
+            .unwrap();
+            state.commit().unwrap();
+            assert_eq!(seniority(&state), before_kick + earned);
+            seniority_restoration::restore_kicked_seniority(&state, restoration).unwrap();
+            assert_eq!(
+                seniority(&state),
+                before_kick + earned,
+                "the restoration was given twice"
+            );
+            quil_types::consensus::set_kicked_seniority_restoration_frame_for_thread(None);
+            quil_types::consensus::set_kicked_seniority_restorations_for_thread(None);
             suspend_storage_kicks(None);
             quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
         }
