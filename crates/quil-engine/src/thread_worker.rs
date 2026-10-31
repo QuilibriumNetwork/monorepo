@@ -308,7 +308,8 @@ pub struct ThreadWorkerManager {
     worker_store: Mutex<Option<Arc<dyn quil_types::store::WorkerStore>>>,
     /// The shards whose data each worker's own store holds
     /// ([`WorkerManager::shard_data`]), read by the worker when its store
-    /// opens, at each change of its binding and after each eviction.
+    /// opens, at each change of its binding and after each eviction that
+    /// may have changed it.
     shard_data: Arc<ShardData>,
 }
 
@@ -316,8 +317,18 @@ pub struct ThreadWorkerManager {
 /// failed read of each was last warned about.
 #[derive(Default)]
 struct ShardData {
-    held: Mutex<HashMap<u32, Vec<(Vec<u8>, u64)>>>,
+    state: Mutex<ShardDataState>,
     warned: Mutex<HashMap<u32, std::time::Instant>>,
+}
+
+#[derive(Default)]
+struct ShardDataState {
+    held: HashMap<u32, Vec<(Vec<u8>, u64)>>,
+    /// Per core, the latest read begun or withdrawal, numbered from `next`:
+    /// a read records its result only while it is still the latest, so a
+    /// read that ends after a newer one or after a withdrawal is dropped.
+    latest: HashMap<u32, u64>,
+    next: u64,
 }
 
 /// How often a worker's failed shard-data read is warned about again.
@@ -325,41 +336,161 @@ const SHARD_DATA_WARN_REPEAT: std::time::Duration = std::time::Duration::from_se
 
 impl ShardData {
     /// Record the shards whose data worker `core_id`'s store holds
-    /// ([`crate::worker_payload_eviction::held_shards`]), for binding. A
-    /// failed read leaves none recorded for it, and is warned about at
-    /// once, then every [`SHARD_DATA_WARN_REPEAT`].
-    fn publish(&self, core_id: u32, crdt: &quil_hypergraph::HypergraphCrdt) {
-        match crate::worker_payload_eviction::held_shards(crdt) {
-            Ok(held) => {
-                self.held.lock().unwrap().insert(core_id, held);
-            }
-            Err(error) => {
-                self.forget(core_id);
-                let now = std::time::Instant::now();
-                let mut warned = self.warned.lock().unwrap();
-                if warned
-                    .get(&core_id)
-                    .is_none_or(|at| now.saturating_duration_since(*at) >= SHARD_DATA_WARN_REPEAT)
-                {
-                    warned.insert(core_id, now);
-                    warn!(core_id, error = %quil_forest::storage_health::redact_paths(&error.to_string()),
-                        scope = "this node",
-                        action = "binding gives this worker no preference for the shards its store holds; check the \
-                            worker's store if it persists",
-                        "this worker's shard data could not be read");
-                }
-            }
-        }
+    /// ([`crate::worker_payload_eviction::held_shards`]), for binding. The
+    /// read takes a point read and leaf counts per lineage the store keeps,
+    /// seconds under I/O pressure, so it runs on the runtime's blocking pool
+    /// and the calling worker thread goes on at once; the handle ends with
+    /// how it was recorded. A failed read leaves none recorded for it, and
+    /// is warned about at once, then every [`SHARD_DATA_WARN_REPEAT`].
+    fn publish(
+        self: &Arc<Self>,
+        core_id: u32,
+        crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+    ) -> tokio::task::JoinHandle<crate::worker_payload_eviction::Publish> {
+        let ticket = self.begin(core_id);
+        tokio::spawn(self.clone().read(core_id, ticket, crdt.clone()))
     }
 
-    /// Record none for worker `core_id`, while its store may lose shards.
+    /// Number a read of worker `core_id`'s shards as its latest.
+    fn begin(&self, core_id: u32) -> u64 {
+        let mut state = self.state.lock().unwrap();
+        state.next += 1;
+        let ticket = state.next;
+        state.latest.insert(core_id, ticket);
+        ticket
+    }
+
+    /// The read numbered `ticket`, on the blocking pool, then its record.
+    async fn read(
+        self: Arc<Self>,
+        core_id: u32,
+        ticket: u64,
+        crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    ) -> crate::worker_payload_eviction::Publish {
+        let started = std::time::Instant::now();
+        let read =
+            tokio::task::spawn_blocking(move || crate::worker_payload_eviction::held_shards(&crdt))
+                .await
+                .unwrap_or_else(|error| {
+                    Err(QuilError::Internal(format!(
+                        "shard data read task failed: {error}"
+                    )))
+                });
+        self.record(core_id, ticket, read, started.elapsed())
+    }
+
+    fn record(
+        &self,
+        core_id: u32,
+        ticket: u64,
+        read: Result<crate::worker_payload_eviction::HeldShards>,
+        took: std::time::Duration,
+    ) -> crate::worker_payload_eviction::Publish {
+        use crate::worker_payload_eviction::Publish;
+        let mut state = self.state.lock().unwrap();
+        if state.latest.get(&core_id) != Some(&ticket) {
+            return Publish::Superseded { took };
+        }
+        let error = match read {
+            Ok(read) => {
+                let (lineages, held) = (read.lineages, read.held.len());
+                state.held.insert(core_id, read.held);
+                return Publish::Read {
+                    lineages,
+                    held,
+                    took,
+                };
+            }
+            Err(error) => error,
+        };
+        state.held.remove(&core_id);
+        drop(state);
+        let now = std::time::Instant::now();
+        let mut warned = self.warned.lock().unwrap();
+        if warned
+            .get(&core_id)
+            .is_none_or(|at| now.saturating_duration_since(*at) >= SHARD_DATA_WARN_REPEAT)
+        {
+            warned.insert(core_id, now);
+            warn!(core_id, error = %quil_forest::storage_health::redact_paths(&error.to_string()),
+                scope = "this node",
+                action = "binding gives this worker no preference for the shards its store holds; check the \
+                    worker's store if it persists",
+                "this worker's shard data could not be read");
+        }
+        Publish::Failed { took }
+    }
+
+    /// Record none for worker `core_id`, while its store may lose shards; a
+    /// read begun earlier records nothing.
     fn forget(&self, core_id: u32) {
-        self.held.lock().unwrap().remove(&core_id);
+        let mut state = self.state.lock().unwrap();
+        state.next += 1;
+        let ticket = state.next;
+        state.latest.insert(core_id, ticket);
+        state.held.remove(&core_id);
+    }
+
+    /// Whether shards are recorded for worker `core_id`.
+    fn holds(&self, core_id: u32) -> bool {
+        self.state.lock().unwrap().held.contains_key(&core_id)
     }
 
     fn snapshot(&self) -> HashMap<u32, Vec<(Vec<u8>, u64)>> {
-        self.held.lock().unwrap().clone()
+        self.state.lock().unwrap().held.clone()
     }
+}
+
+/// One eviction run of worker `core_id` for `keep`, spawned on its thread's
+/// runtime: the passes ([`crate::worker_payload_eviction::run_passes`]),
+/// then a read of the shards its store holds, only where the passes may
+/// have changed them or none is recorded, then one line on the run. Every
+/// store read runs on the blocking pool, so the worker's thread keeps
+/// voting meanwhile. `evicting` is set while it runs; a rebind meanwhile
+/// withdraws the worker's record rather than read it, leaving the read to
+/// this run's end.
+async fn eviction_run<R>(
+    core_id: u32,
+    filter: String,
+    crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    keep: Vec<Vec<u8>>,
+    storage: Option<(std::path::PathBuf, R)>,
+    bound: Arc<dyn Fn() -> bool + Send + Sync>,
+    shard_data: Arc<ShardData>,
+    evicting: Arc<std::sync::atomic::AtomicBool>,
+) -> (
+    crate::worker_payload_eviction::PassReport,
+    crate::worker_payload_eviction::Publish,
+)
+where
+    R: Fn(&[u8]) -> bool + Send + 'static,
+{
+    let started = std::time::Instant::now();
+    // Withdrawn just before the payload deletion: from then until the read
+    // below, the store may hold a shard's forest without its payload.
+    let table = shard_data.clone();
+    let before_delete: Arc<dyn Fn() + Send + Sync> = Arc::new(move || table.forget(core_id));
+    let report = crate::worker_payload_eviction::run_passes(
+        core_id,
+        filter.clone(),
+        crdt.clone(),
+        keep,
+        storage,
+        bound,
+        before_delete,
+    )
+    .await;
+    // In one poll with the check below: a rebind handled before it withdrew
+    // the record, one handled after it reads the store itself.
+    evicting.store(false, std::sync::atomic::Ordering::SeqCst);
+    let publish = if report.changed || !shard_data.holds(core_id) {
+        let ticket = shard_data.begin(core_id);
+        shard_data.clone().read(core_id, ticket, crdt).await
+    } else {
+        crate::worker_payload_eviction::Publish::Skipped
+    };
+    crate::worker_payload_eviction::log_run(core_id, &filter, &report, &publish, started.elapsed());
+    (report, publish)
 }
 
 impl ThreadWorkerManager {
@@ -674,10 +805,6 @@ impl ThreadWorkerManager {
                     return;
                 }
 
-                if let Some(owned) = worker_owned.as_ref() {
-                    shard_data.publish(core_id, &owned.hypergraph);
-                }
-
                 // Create per-thread tokio runtime
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -694,6 +821,9 @@ impl ThreadWorkerManager {
                 rt.spawn(crate::worker_stall::heartbeat(Arc::downgrade(&probe), crate::worker_stall::HEARTBEAT));
 
                 rt.block_on(probed(ProbeSection::WorkerLoop, async move {
+                    if let Some(owned) = worker_owned.as_ref() {
+                        shard_data.publish(core_id, &owned.hypergraph);
+                    }
                     let mut current_filter: Vec<u8> = Vec::new();
                     let mut engine_cancel: Option<tokio_util::sync::CancellationToken> = None;
                     // The last engine's mempool and its application. A split or
@@ -752,9 +882,14 @@ impl ThreadWorkerManager {
                                             // Give the engine a moment to clean up
                                             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                                         }
-                                        // The shard it leaves holds data here.
+                                        // The shard it leaves holds data here. A running
+                                        // eviction may still drop shards: its end reads them.
                                         if let Some(owned) = worker_owned.as_ref() {
-                                            shard_data.publish(core_id, &owned.hypergraph);
+                                            if evicting.load(std::sync::atomic::Ordering::SeqCst) {
+                                                shard_data.forget(core_id);
+                                            } else {
+                                                shard_data.publish(core_id, &owned.hypergraph);
+                                            }
                                         }
 
                                         if filter.is_empty() {
@@ -1170,15 +1305,8 @@ impl ThreadWorkerManager {
                                         let (slot, binding) = (execution_slot.clone(), current_filter.clone());
                                         let bound: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move ||
                                             slot.lock().unwrap().as_ref().is_some_and(|h| h.filter == binding && h.is_running()));
-                                        // The store is not read as holding the shards the
-                                        // passes may drop until they end.
-                                        let shard_data = shard_data.clone();
-                                        shard_data.forget(core_id);
-                                        tokio::spawn(probed(ProbeSection::PayloadEviction, async move {
-                                            crate::worker_payload_eviction::run_passes(core_id, filter, crdt.clone(), keep, storage, bound).await;
-                                            shard_data.publish(core_id, &crdt);
-                                            flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                                        }));
+                                        tokio::spawn(probed(ProbeSection::PayloadEviction, eviction_run(
+                                            core_id, filter, crdt, keep, storage, bound, shard_data.clone(), flag)));
                                     }
                                     Some(MasterToWorker::CreateJoinProof {
                                         challenge,
@@ -2216,14 +2344,14 @@ mod tests {
 
     /// A worker's shard data is withdrawn while an eviction pass may drop
     /// shards from its store, and read again after it.
-    #[test]
-    fn shard_data_is_withdrawn_during_an_eviction_and_read_again_after() {
+    #[tokio::test]
+    async fn shard_data_is_withdrawn_during_an_eviction_and_read_again_after() {
         let db = quil_store::RocksDb::open_in_memory().unwrap();
         let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
-        let crdt = quil_hypergraph::HypergraphCrdt::new(
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
             store,
             Arc::new(quil_types::crypto::NoopInclusionProver),
-        );
+        ));
         crdt.set_forest(quil_forest::Forest::with_namespace(
             db.inner(),
             quil_store::FOREST_NAMESPACE,
@@ -2235,8 +2363,8 @@ mod tests {
                 9u64.to_be_bytes(),
             )
             .unwrap();
-        let table = ShardData::default();
-        table.publish(3, &crdt);
+        let table = Arc::new(ShardData::default());
+        table.publish(3, &crdt).await.unwrap();
         assert_eq!(
             table.snapshot(),
             HashMap::from([(3, vec![(filter.clone(), 9)])])
@@ -2246,8 +2374,214 @@ mod tests {
             table.snapshot().is_empty(),
             "withdrawn while the passes run"
         );
-        table.publish(3, &crdt);
+        table.publish(3, &crdt).await.unwrap();
         assert_eq!(table.snapshot(), HashMap::from([(3, vec![(filter, 9)])]));
+    }
+
+    /// A read that ends after a withdrawal, or after a newer read began,
+    /// records nothing: what stands is the newer state.
+    #[test]
+    fn a_read_overtaken_by_a_withdrawal_or_a_newer_read_records_nothing() {
+        use crate::worker_payload_eviction::{HeldShards, Publish};
+        let zero = std::time::Duration::ZERO;
+        let read = |n: u8| {
+            Ok(HeldShards {
+                lineages: 1,
+                held: vec![(vec![n], n as u64)],
+            })
+        };
+        let table = ShardData::default();
+        let first = table.begin(3);
+        table.forget(3);
+        assert_eq!(
+            table.record(3, first, read(1), zero),
+            Publish::Superseded { took: zero }
+        );
+        assert!(!table.holds(3), "a withdrawal stands over an older read");
+        let (older, newer) = (table.begin(3), table.begin(3));
+        let other = table.begin(4);
+        assert!(matches!(
+            table.record(3, newer, read(2), zero),
+            Publish::Read {
+                lineages: 1,
+                held: 1,
+                ..
+            }
+        ));
+        assert_eq!(
+            table.record(3, older, read(1), zero),
+            Publish::Superseded { took: zero }
+        );
+        assert!(matches!(
+            table.record(4, other, read(4), zero),
+            Publish::Read { .. }
+        ));
+        assert_eq!(
+            table.snapshot(),
+            HashMap::from([(3, vec![(vec![2], 2)]), (4, vec![(vec![4], 4)])]),
+            "a newer read stands over an older one; other workers are their own"
+        );
+    }
+
+    /// An eviction run whose passes delete payload withdraws the worker's
+    /// record before the deletion and reads the shards its store holds
+    /// again after the passes, off the worker's thread: the thread keeps
+    /// beating while that read waits on the store. A run that then changes
+    /// nothing keeps the record without reading the store.
+    #[test]
+    fn an_eviction_run_reads_the_shards_held_off_the_worker_thread_only_after_a_change() {
+        use crate::worker_payload_eviction::Publish;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let delay = std::time::Duration::from_millis(3000);
+        let (db, crdt, reads, filter) = shard_data_reads::slow_store(delay);
+        let app = shard_data_reads::APP;
+        let shard = quil_types::store::ShardKey {
+            l1: quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3),
+            l2: app,
+        };
+        let mut id = app.to_vec();
+        id.extend([129u8; 32]);
+        // Payload of the half the worker left, for the payload pass to delete.
+        let left =
+            quil_store::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &shard, &id, 0);
+        db.inner().put(&left, b"left").unwrap();
+        let table = Arc::new(ShardData::default());
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        let (worker_table, worker_crdt, seen) = (table.clone(), crdt.clone(), runs.clone());
+        let (reports, longest) =
+            shard_data_reads::on_worker_thread(reads.clone(), move || async move {
+                worker_table.publish(5, &worker_crdt).await.unwrap();
+                for _ in 0..2 {
+                    let evicting = Arc::new(AtomicBool::new(true));
+                    // Asked between the passes: whether the record was withdrawn.
+                    let (record, withdrawn) =
+                        (worker_table.clone(), Arc::new(AtomicBool::new(false)));
+                    let saw = withdrawn.clone();
+                    let bound: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+                        if !record.holds(5) {
+                            saw.store(true, Ordering::SeqCst);
+                        }
+                        true
+                    });
+                    let no_storage: Option<(std::path::PathBuf, fn(&[u8]) -> bool)> = None;
+                    let (report, publish) = tokio::spawn(probed(
+                        ProbeSection::PayloadEviction,
+                        eviction_run(
+                            5,
+                            "test".into(),
+                            worker_crdt.clone(),
+                            vec![filter.clone()],
+                            no_storage,
+                            bound,
+                            worker_table.clone(),
+                            evicting.clone(),
+                        ),
+                    ))
+                    .await
+                    .unwrap();
+                    assert!(!evicting.load(Ordering::SeqCst), "the run clears its flag");
+                    seen.lock().unwrap().push((
+                        report.changed,
+                        withdrawn.load(Ordering::SeqCst),
+                        publish,
+                    ));
+                }
+            });
+        shard_data_reads::assert_beating(&reports, longest);
+        assert!(
+            db.inner().get(&left).unwrap().is_none(),
+            "the payload outside the kept scope stays"
+        );
+        let runs = runs.lock().unwrap().clone();
+        assert!(
+            matches!(
+                runs[0],
+                (
+                    true,
+                    true,
+                    Publish::Read {
+                        lineages: 1,
+                        held: 0,
+                        ..
+                    }
+                )
+            ),
+            "a run that deletes withdraws the record, then reads it again: {runs:?}"
+        );
+        assert_eq!(
+            runs[1],
+            (false, false, Publish::Skipped),
+            "a run that changes nothing keeps the record unread"
+        );
+        assert_eq!(
+            reads.done.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the store was read at the start and after the deleting run only"
+        );
+        assert_eq!(table.snapshot(), HashMap::from([(5, Vec::new())]));
+    }
+
+    /// A run whose forest pass fails may have dropped a shard before the
+    /// failure: its end reads the shards held again, though the record
+    /// stood throughout.
+    #[tokio::test]
+    async fn a_run_whose_forest_pass_fails_reads_the_shards_held_again() {
+        use crate::worker_payload_eviction::Publish;
+        let (_db, crdt, reads, filter) = shard_data_reads::slow_store(std::time::Duration::ZERO);
+        let table = Arc::new(ShardData::default());
+        table.publish(5, &crdt).await.unwrap();
+        // A staged mutation of the application: both passes refuse.
+        let location = quil_hypergraph::Location {
+            app_address: shard_data_reads::APP,
+            data_address: [1; 32],
+        };
+        crdt.add_vertex(&location, &[1; 48]).unwrap();
+        let no_storage: Option<(std::path::PathBuf, fn(&[u8]) -> bool)> = None;
+        let (report, publish) = eviction_run(
+            5,
+            "test".into(),
+            crdt,
+            vec![filter],
+            no_storage,
+            Arc::new(|| true),
+            table.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+        .await;
+        assert!(report.changed, "{report:?}");
+        assert!(matches!(publish, Publish::Read { .. }), "{publish:?}");
+        assert_eq!(reads.done.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A rebind during a run that changes nothing withdraws the record; the
+    /// run's end reads it again rather than leave the worker without one.
+    #[tokio::test]
+    async fn a_record_withdrawn_during_a_run_is_read_again_at_its_end() {
+        use crate::worker_payload_eviction::Publish;
+        let (_db, crdt, reads, filter) = shard_data_reads::slow_store(std::time::Duration::ZERO);
+        let table = Arc::new(ShardData::default());
+        table.publish(5, &crdt).await.unwrap();
+        let rebind = table.clone();
+        let bound: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+            rebind.forget(5);
+            true
+        });
+        let no_storage: Option<(std::path::PathBuf, fn(&[u8]) -> bool)> = None;
+        let (report, publish) = eviction_run(
+            5,
+            "test".into(),
+            crdt,
+            vec![filter],
+            no_storage,
+            bound,
+            table.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+        .await;
+        assert!(!report.changed, "{report:?}");
+        assert!(matches!(publish, Publish::Read { .. }), "{publish:?}");
+        assert!(table.holds(5));
+        assert_eq!(reads.done.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -2275,5 +2609,410 @@ mod tests {
             self_test_with(&key, |n| n % 4 == 0),
             FALCON_SELF_TEST_MESSAGES / 4
         );
+    }
+}
+
+/// Reads of the shards a worker's store holds, which take a point read and
+/// leaf counts per lineage, against a store whose reads wait on the disk.
+#[cfg(test)]
+mod shard_data_reads {
+    use super::*;
+    use crate::worker_stall::{heartbeat, StallReport, StallWatch};
+    use quil_types::store::{ChangeRecord, HypergraphStore, ShardKey, Transaction};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    pub(super) const APP: [u8; 32] = [0x21; 32];
+
+    /// Store reads that waited, and those waiting now.
+    #[derive(Default)]
+    pub(super) struct Reads {
+        pub(super) waiting: AtomicUsize,
+        pub(super) done: AtomicUsize,
+    }
+
+    /// A worker store whose reads of incomplete-sync markers, which the read
+    /// of the shards held makes per lineage, take `delay`.
+    struct SlowReads {
+        inner: Arc<dyn HypergraphStore>,
+        delay: Duration,
+        reads: Arc<Reads>,
+    }
+
+    struct SlowTxn {
+        inner: Box<dyn Transaction>,
+        delay: Duration,
+        reads: Arc<Reads>,
+    }
+
+    impl Transaction for SlowTxn {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+            if key.starts_with(b"quil/forest-sync/incomplete/v1/") {
+                self.reads.waiting.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(self.delay);
+                self.reads.waiting.fetch_sub(1, Ordering::SeqCst);
+                self.reads.done.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get(key)
+        }
+        fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
+            self.inner.set(key, value)
+        }
+        fn commit(self: Box<Self>) -> Result<()> {
+            self.inner.commit()
+        }
+        fn delete(&self, key: &[u8]) -> Result<()> {
+            self.inner.delete(key)
+        }
+        fn abort(self: Box<Self>) -> Result<()> {
+            self.inner.abort()
+        }
+        fn new_iter(
+            &self,
+            lower: &[u8],
+            upper: &[u8],
+        ) -> Result<Box<dyn quil_types::store::Iterator>> {
+            self.inner.new_iter(lower, upper)
+        }
+        fn delete_range(&self, lower: &[u8], upper: &[u8]) -> Result<()> {
+            self.inner.delete_range(lower, upper)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self.inner.as_any()
+        }
+    }
+
+    impl HypergraphStore for SlowReads {
+        // Forest maintenance refuses a store it cannot identify.
+        fn backing_store_identity(&self) -> Option<quil_types::store::BackingStoreIdentity> {
+            self.inner.backing_store_identity()
+        }
+        fn new_transaction(&self, indexed: bool) -> Result<Box<dyn Transaction>> {
+            Ok(Box::new(SlowTxn {
+                inner: self.inner.new_transaction(indexed)?,
+                delay: self.delay,
+                reads: self.reads.clone(),
+            }))
+        }
+        fn get_node_by_key(
+            &self,
+            set: &str,
+            phase: &str,
+            shard: &ShardKey,
+            key: &[u8],
+        ) -> Result<Option<Vec<u8>>> {
+            self.inner.get_node_by_key(set, phase, shard, key)
+        }
+        fn get_node_by_path(
+            &self,
+            set: &str,
+            phase: &str,
+            shard: &ShardKey,
+            path: &[i32],
+        ) -> Result<Option<Vec<u8>>> {
+            self.inner.get_node_by_path(set, phase, shard, path)
+        }
+        fn insert_node(
+            &self,
+            txn: &dyn Transaction,
+            set: &str,
+            phase: &str,
+            shard: &ShardKey,
+            key: &[u8],
+            path: &[i32],
+            data: &[u8],
+        ) -> Result<()> {
+            self.inner
+                .insert_node(txn, set, phase, shard, key, path, data)
+        }
+        fn save_root(
+            &self,
+            txn: &dyn Transaction,
+            set: &str,
+            phase: &str,
+            shard: &ShardKey,
+            data: &[u8],
+        ) -> Result<()> {
+            self.inner.save_root(txn, set, phase, shard, data)
+        }
+        fn delete_node(
+            &self,
+            txn: &dyn Transaction,
+            set: &str,
+            phase: &str,
+            shard: &ShardKey,
+            key: &[u8],
+            path: &[i32],
+        ) -> Result<()> {
+            self.inner.delete_node(txn, set, phase, shard, key, path)
+        }
+        fn set_covered_prefix(&self, covered_prefix: &[i32]) -> Result<()> {
+            self.inner.set_covered_prefix(covered_prefix)
+        }
+        fn set_shard_commit(
+            &self,
+            txn: &dyn Transaction,
+            frame: u64,
+            phase: &str,
+            set: &str,
+            shard_address: &[u8],
+            commitment: &[u8],
+        ) -> Result<()> {
+            self.inner
+                .set_shard_commit(txn, frame, phase, set, shard_address, commitment)
+        }
+        fn get_shard_commit(
+            &self,
+            frame: u64,
+            phase: &str,
+            set: &str,
+            shard_address: &[u8],
+        ) -> Result<Vec<u8>> {
+            self.inner
+                .get_shard_commit(frame, phase, set, shard_address)
+        }
+        fn get_root_commits(&self, frame: u64) -> Result<HashMap<ShardKey, Vec<Vec<u8>>>> {
+            self.inner.get_root_commits(frame)
+        }
+        fn load_vertex_underlying_raw(
+            &self,
+            set: &str,
+            phase: &str,
+            shard: &ShardKey,
+            key: &[u8],
+        ) -> Result<Option<Vec<u8>>> {
+            self.inner
+                .load_vertex_underlying_raw(set, phase, shard, key)
+        }
+        fn save_vertex_underlying(
+            &self,
+            txn: &dyn Transaction,
+            set: &str,
+            phase: &str,
+            shard: &ShardKey,
+            key: &[u8],
+            data: &[u8],
+        ) -> Result<()> {
+            self.inner
+                .save_vertex_underlying(txn, set, phase, shard, key, data)
+        }
+        fn for_each_vertex_underlying(
+            &self,
+            set: &str,
+            phase: &str,
+            shard: &ShardKey,
+            callback: &mut dyn FnMut(Vec<u8>, Vec<u8>),
+        ) -> Result<usize> {
+            self.inner
+                .for_each_vertex_underlying(set, phase, shard, callback)
+        }
+        fn apply_snapshot(&self, path: &str) -> Result<()> {
+            self.inner.apply_snapshot(path)
+        }
+        fn set_alt_shard_commit(
+            &self,
+            txn: &dyn Transaction,
+            frame: u64,
+            shard_address: &[u8],
+            vertex_adds: &[u8],
+            vertex_removes: &[u8],
+            hyperedge_adds: &[u8],
+            hyperedge_removes: &[u8],
+        ) -> Result<()> {
+            self.inner.set_alt_shard_commit(
+                txn,
+                frame,
+                shard_address,
+                vertex_adds,
+                vertex_removes,
+                hyperedge_adds,
+                hyperedge_removes,
+            )
+        }
+        fn get_latest_alt_shard_commit(
+            &self,
+            shard_address: &[u8],
+        ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+            self.inner.get_latest_alt_shard_commit(shard_address)
+        }
+        fn range_alt_shard_addresses(&self) -> Result<Vec<Vec<u8>>> {
+            self.inner.range_alt_shard_addresses()
+        }
+        fn reap_old_changesets(&self, txn: &dyn Transaction, frame: u64) -> Result<()> {
+            self.inner.reap_old_changesets(txn, frame)
+        }
+        fn track_change(
+            &self,
+            txn: &dyn Transaction,
+            key: &[u8],
+            old_value: Option<&[u8]>,
+            frame: u64,
+            phase: &str,
+            set: &str,
+            shard: &ShardKey,
+        ) -> Result<()> {
+            self.inner
+                .track_change(txn, key, old_value, frame, phase, set, shard)
+        }
+        fn get_changes(
+            &self,
+            frame_start: u64,
+            frame_end: u64,
+            phase: &str,
+            set: &str,
+            shard: &ShardKey,
+        ) -> Result<Vec<ChangeRecord>> {
+            self.inner
+                .get_changes(frame_start, frame_end, phase, set, shard)
+        }
+        fn untrack_change(
+            &self,
+            txn: &dyn Transaction,
+            key: &[u8],
+            frame: u64,
+            phase: &str,
+            set: &str,
+            shard: &ShardKey,
+        ) -> Result<()> {
+            self.inner
+                .untrack_change(txn, key, frame, phase, set, shard)
+        }
+    }
+
+    /// A unified worker store keeping one lineage, the lower half of
+    /// [`APP`] at cursor 9, whose read of the shards held waits `delay`.
+    pub(super) fn slow_store(
+        delay: Duration,
+    ) -> (
+        quil_store::RocksDb,
+        Arc<quil_hypergraph::HypergraphCrdt>,
+        Arc<Reads>,
+        Vec<u8>,
+    ) {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let reads = Arc::new(Reads::default());
+        let store = Arc::new(SlowReads {
+            inner: Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            delay,
+            reads: reads.clone(),
+        });
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            store,
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
+        crdt.set_unified_tree(true);
+        let filter = quil_forest::encode_shard_bit_path(&APP, &[false]);
+        db.inner()
+            .put(
+                quil_store::encoding::consensus_materialized_cursor_key(&filter),
+                9u64.to_be_bytes(),
+            )
+            .unwrap();
+        (db, crdt, reads, filter)
+    }
+
+    /// Run `work` on a thread set up as a node's worker thread: a
+    /// current-thread runtime whose heartbeat a watchdog follows. Returns
+    /// the watchdog's reports and the longest the heartbeat was overdue
+    /// while a store read waited.
+    pub(super) fn on_worker_thread<F, Fut>(
+        reads: Arc<Reads>,
+        work: F,
+    ) -> (Vec<StallReport>, Option<u64>)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let probe = ThreadProbe::new();
+        // Well above the heartbeat, for parallel test load; the reads wait
+        // twice as long, so a thread they block is reported.
+        let mut watch = StallWatch::new(Duration::from_millis(1500), Duration::from_millis(300));
+        watch.add(5, &probe);
+        let observer = probe.clone();
+        let worker = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let installed = install_probe(probe.clone());
+            rt.spawn(heartbeat(Arc::downgrade(&probe), Duration::from_millis(50)));
+            rt.block_on(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                work().await;
+            });
+            drop(installed);
+        });
+        let (mut reports, mut longest) = (Vec::new(), None);
+        while !worker.is_finished() {
+            let now = quil_types::thread_probe::now_ms();
+            reports.extend(watch.poll(now));
+            if reads.waiting.load(Ordering::SeqCst) > 0 {
+                let overdue = now.saturating_sub(observer.snapshot().last_beat_ms);
+                longest = Some(longest.map_or(overdue, |l: u64| l.max(overdue)));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if let Err(panic) = worker.join() {
+            std::panic::resume_unwind(panic);
+        }
+        (reports, longest)
+    }
+
+    pub(super) fn assert_beating(reports: &[StallReport], longest: Option<u64>) {
+        let blocked: Vec<String> = reports
+            .iter()
+            .filter_map(|report| match report {
+                StallReport::Blocked { blocked, place, .. } => Some(format!(
+                    "blocked {:.1}s in {}",
+                    blocked.as_secs_f32(),
+                    place.describe()
+                )),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            blocked.is_empty(),
+            "the worker thread stalled while its store was read: {}",
+            blocked.join("; ")
+        );
+        let longest = longest.expect("no store read waited while the thread was watched");
+        assert!(
+            longest < 1000,
+            "the worker thread's heartbeat was {longest} ms overdue while a store read waited"
+        );
+    }
+
+    /// Recording the shards a worker's store holds, as the end of each
+    /// eviction run does, leaves the worker's thread beating while the
+    /// store's reads wait. Each due worker of a node runs at once, so a
+    /// read on its thread held its votes for as long as its store took.
+    #[test]
+    fn recording_the_shards_held_leaves_the_worker_thread_beating() {
+        let (_db, crdt, reads, _) = slow_store(Duration::from_millis(3000));
+        let table = Arc::new(ShardData::default());
+        let worker_table = table.clone();
+        let (reports, longest) = on_worker_thread(reads.clone(), move || async move {
+            let recorder = worker_table.clone();
+            tokio::spawn(probed(ProbeSection::PayloadEviction, async move {
+                recorder.publish(5, &crdt);
+            }))
+            .await
+            .unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while worker_table.snapshot().is_empty() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the shards held were never recorded"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        assert_beating(&reports, longest);
+        assert_eq!(table.snapshot(), HashMap::from([(5, Vec::new())]));
+        assert_eq!(reads.done.load(Ordering::SeqCst), 1);
     }
 }

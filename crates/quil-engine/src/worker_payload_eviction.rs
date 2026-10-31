@@ -396,12 +396,16 @@ pub(crate) fn lineage_drop_records(
 /// and, while the store commits unified trees, whose subtree holds committed
 /// leaves ([`crate::app_shard_metadata::has_committed_shard_data`]). Binding
 /// a shard to the worker that holds it saves an archive install of it.
-pub(crate) fn held_shards(crdt: &HypergraphCrdt) -> Result<Vec<(Vec<u8>, u64)>> {
+/// Each lineage costs point reads and subtree leaf counts, so a store that
+/// served many shards takes long: run it off a worker's runtime thread.
+pub(crate) fn held_shards(crdt: &HypergraphCrdt) -> Result<HeldShards> {
     let Some(db) = crdt.forest_store() else {
-        return Ok(Vec::new());
+        return Ok(HeldShards::default());
     };
+    let lineages = lineages(&db)?;
+    let count = lineages.len();
     let mut held = Vec::new();
-    for (filter, cursor) in lineages(&db)? {
+    for (filter, cursor) in lineages {
         let dropped = db
             .get(quil_store::encoding::app_lineage_dropped_key(&filter))
             .map_err(store_error)?
@@ -414,7 +418,17 @@ pub(crate) fn held_shards(crdt: &HypergraphCrdt) -> Result<Vec<(Vec<u8>, u64)>> 
         }
         held.push((filter, cursor));
     }
-    Ok(held)
+    Ok(HeldShards {
+        lineages: count,
+        held,
+    })
+}
+
+/// What [`held_shards`] read: the shards held and the lineages examined.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct HeldShards {
+    pub lineages: usize,
+    pub held: Vec<(Vec<u8>, u64)>,
 }
 
 /// Forest node records a confinement sweep examines per hold of the worker's
@@ -441,6 +455,112 @@ pub(crate) fn deferral(
     }
 }
 
+/// How long one eviction run, its passes and the read of the shards its
+/// store holds, may take before it is warned about. A run that removes
+/// nothing takes seconds even where the read of the shards held contends
+/// for I/O with every other worker's.
+pub(crate) const RUN_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// What a worker's eviction passes did, for its run line ([`log_run`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct PassReport {
+    pub payload: std::time::Duration,
+    pub forest: std::time::Duration,
+    pub storage: std::time::Duration,
+    /// The passes may have changed which shards the store holds: payload
+    /// was deleted, the forest of a left shard was dropped or swept, or a
+    /// pass failed and its effect is unknown.
+    pub changed: bool,
+    /// The pass a rebind stopped, if any.
+    pub stopped: Option<&'static str>,
+}
+
+/// How a run left the record of the shards a worker's store holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Publish {
+    /// The passes changed nothing it reads, and it was recorded: kept.
+    Skipped,
+    /// Read again and recorded.
+    Read {
+        lineages: usize,
+        held: usize,
+        took: std::time::Duration,
+    },
+    /// Read again, but a newer read or a withdrawal began meanwhile, which
+    /// stands instead.
+    Superseded { took: std::time::Duration },
+    /// The read failed; none is recorded for the worker.
+    Failed { took: std::time::Duration },
+    /// A standalone worker keeps no such record.
+    NotKept,
+}
+
+impl Publish {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Skipped => "kept: the passes changed no shard the store holds",
+            Self::Read { .. } => "read again",
+            Self::Superseded { .. } => "superseded by a newer read",
+            Self::Failed { .. } => "read failed",
+            Self::NotKept => "not kept by a standalone worker",
+        }
+    }
+
+    fn took(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Read { took, .. } | Self::Superseded { took } | Self::Failed { took } => {
+                Some(*took)
+            }
+            Self::Skipped | Self::NotKept => None,
+        }
+    }
+}
+
+/// One line per eviction run, no-op runs included: each pass's duration,
+/// how the record of the shards held was left, and the run's total. A run
+/// over [`RUN_BUDGET`] is warned about instead, once per run (each worker
+/// runs at most once per eviction interval).
+pub(crate) fn log_run(
+    core_id: u32,
+    filter: &str,
+    report: &PassReport,
+    publish: &Publish,
+    total: std::time::Duration,
+) {
+    let (lineages, held) = match publish {
+        Publish::Read { lineages, held, .. } => (Some(*lineages as u64), Some(*held as u64)),
+        _ => (None, None),
+    };
+    let ms = |d: std::time::Duration| d.as_millis() as u64;
+    let publish_ms = publish.took().map(ms);
+    let stopped = report.stopped.unwrap_or("none");
+    if total > RUN_BUDGET {
+        tracing::warn!(core_id, filter, payload_ms = ms(report.payload), forest_ms = ms(report.forest),
+            storage_ms = ms(report.storage), changed = report.changed, stopped, shard_data = publish.label(),
+            lineages, held, publish_ms, secs = total.as_secs(), budget_secs = RUN_BUDGET.as_secs(),
+            scope = "this node",
+            action = "the run does not block the worker's thread; if this repeats, check the worker store's disk \
+                and I/O pressure, then report it with this line",
+            "worker eviction run overran its budget");
+    } else {
+        tracing::info!(
+            core_id,
+            filter,
+            payload_ms = ms(report.payload),
+            forest_ms = ms(report.forest),
+            storage_ms = ms(report.storage),
+            changed = report.changed,
+            stopped,
+            shard_data = publish.label(),
+            lineages,
+            held,
+            publish_ms,
+            secs = total.as_secs(),
+            "worker eviction run finished"
+        );
+    }
+}
+
 /// A worker's eviction passes for `keep`, in a thread or a standalone
 /// process: the payload outside its served scopes, the forest of the shards
 /// it left, then, under `storage`'s base directory, the consensus storage of
@@ -450,6 +570,9 @@ pub(crate) fn deferral(
 /// were started for: the deferral is checked once, at the start, and a
 /// worker rebound meanwhile may serve a shard `keep` does not protect, so
 /// the forest and storage passes stop as soon as it says no.
+/// `before_delete` runs under the forest write barrier just before the
+/// payload deletion, the one write after which the store holds a shard's
+/// forest without its payload until the forest pass drops it.
 pub(crate) async fn run_passes<R>(
     core_id: u32,
     filter: String,
@@ -457,22 +580,42 @@ pub(crate) async fn run_passes<R>(
     keep: Vec<Vec<u8>>,
     storage: Option<(std::path::PathBuf, R)>,
     bound: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
-) where
+    before_delete: std::sync::Arc<dyn Fn() + Send + Sync>,
+) -> PassReport
+where
     R: Fn(&[u8]) -> bool + Send + 'static,
 {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tracing::{debug, info, warn};
     let (forest_crdt, forest_keep, storage_keep) = (crdt.clone(), keep.clone(), keep.clone());
-    let rebound = |stage: &str| {
+    let mut report = PassReport::default();
+    let rebound = |stage: &'static str, mut report: PassReport| {
         info!(core_id, filter, stage,
             "worker eviction stopped: the worker was rebound during the pass; the next pass resumes it");
+        report.stopped = Some(stage);
+        report
     };
     let started = std::time::Instant::now();
     let payload_bound = bound.clone();
-    let outcome =
-        tokio::task::spawn_blocking(move || evict_outside_while(&crdt, &keep, &*payload_bound))
-            .await;
+    let deleting = std::sync::Arc::new(AtomicBool::new(false));
+    let deleted = deleting.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        evict_outside_while(&crdt, &keep, &|| {
+            let proceed = payload_bound();
+            if proceed {
+                deleting.store(true, Ordering::SeqCst);
+                before_delete();
+            }
+            proceed
+        })
+    })
+    .await;
+    report.payload = started.elapsed();
+    // A refusal comes before the deletion; a task that failed may have
+    // deleted.
+    report.changed = deleted.load(Ordering::SeqCst) || outcome.is_err();
     if matches!(&outcome, Ok(Ok(o)) if o.stopped) {
-        return rebound("payload eviction");
+        return rebound("payload eviction", report);
     }
     match outcome {
         Ok(Ok(o)) if o.ranges > 0 || o.compacted_ranges > 0 => info!(
@@ -494,7 +637,7 @@ pub(crate) async fn run_passes<R>(
     // The forest subtrees of the shards this worker left, recording each
     // shard whose frames it keeps.
     if !bound() {
-        return rebound("forest confinement");
+        return rebound("forest confinement", report);
     }
     let started = std::time::Instant::now();
     let proceed = bound.clone();
@@ -503,6 +646,12 @@ pub(crate) async fn run_passes<R>(
         forest_crdt.confine_forest_recording(&forest_keep, FOREST_SCAN_BUDGET, &lineages, &*proceed)
     })
     .await;
+    report.forest = started.elapsed();
+    // A refusal may follow another application's commit.
+    report.changed |= match &outcome {
+        Ok(Ok(o)) => !o.dropped_lineages.is_empty() || o.commits > 0 || o.nodes > 0,
+        _ => true,
+    };
     let stopped = matches!(&outcome, Ok(Ok(o)) if o.stopped);
     if let Ok(Ok(o)) = &outcome {
         if !o.dropped_lineages.is_empty() {
@@ -528,18 +677,21 @@ pub(crate) async fn run_passes<R>(
         Err(error) => warn!(core_id, filter, %error, "worker forest confinement task failed"),
     }
     if stopped {
-        return rebound("forest confinement");
+        return rebound("forest confinement", report);
     }
     // Consensus storage of shards this worker left, unless it still owes
-    // that shard's committee a vote or seal.
+    // that shard's committee a vote or seal. The record of the shards the
+    // store holds reads none of it.
     if !bound() {
-        return rebound("consensus storage");
+        return rebound("consensus storage", report);
     }
     if let Some((base, retained)) = storage {
+        let started = std::time::Instant::now();
         let outcome = tokio::task::spawn_blocking(move || {
             crate::worker_consensus_storage::remove_outside(&base, &storage_keep, retained)
         })
         .await;
+        report.storage = started.elapsed();
         match outcome {
             Ok(Ok(o)) if o.entries > 0 => info!(
                 core_id,
@@ -557,6 +709,7 @@ pub(crate) async fn run_passes<R>(
             }
         }
     }
+    report
 }
 
 /// Compact gap ranges that still contain SST files lying wholly inside them:
@@ -995,7 +1148,7 @@ mod tests {
             held
         };
         assert_eq!(
-            sorted(held_shards(&target).unwrap()),
+            sorted(held_shards(&target).unwrap().held),
             sorted(vec![(served[0].clone(), 40), (left.clone(), 31)]),
             "another application's lineage holds no data here"
         );
@@ -1054,7 +1207,10 @@ mod tests {
             target.unified_subtree_leaf_count("vertex", "adds", &APP, &[true]),
             0
         );
-        assert_eq!(held_shards(&target).unwrap(), vec![(served[0].clone(), 40)]);
+        assert_eq!(
+            held_shards(&target).unwrap().held,
+            vec![(served[0].clone(), 40)]
+        );
         assert!(
             target
                 .confine_forest_recording(
@@ -1360,6 +1516,7 @@ mod tests {
             keep.clone(),
             Some((base.clone(), retained)),
             Arc::new(|| true),
+            Arc::new(|| {}),
         )
         .await;
         assert_eq!(inner.get(key(1)).unwrap().as_deref(), Some(&b"kept"[..]));

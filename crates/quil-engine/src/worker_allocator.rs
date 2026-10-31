@@ -25,6 +25,13 @@ pub(crate) const PAYLOAD_EVICTION_SETTLE: std::time::Duration =
 /// retry refusals (pending mutations, an unfinished sync) and are cheap once
 /// nothing remains outside the protected scopes.
 const PAYLOAD_EVICTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// Workers asked to evict per GLOBAL frame. Workers bound at once settle at
+/// once; asked together, their passes and shard reads contend for the same
+/// disk and page cache. The rest wait for later frames, those waiting
+/// longest first, so a run of `n` due workers is asked within
+/// `n.div_ceil(PAYLOAD_EVICTION_PER_FRAME)` frames, and from then on their
+/// repeats stay spread over those frames.
+const PAYLOAD_EVICTION_PER_FRAME: usize = 2;
 
 pub type PendingShardChanges =
     Arc<dyn Fn() -> Result<Vec<quil_types::store::PendingShardChange>> + Send + Sync>;
@@ -33,6 +40,10 @@ struct EvictionTrack {
     filter: Vec<u8>,
     since: std::time::Instant,
     requested: Option<std::time::Instant>,
+    /// The last request, also when it failed: due workers are asked in
+    /// this order, so one whose request keeps failing waits behind the
+    /// others rather than taking a slot every frame.
+    attempted: Option<std::time::Instant>,
 }
 
 /// A rejected leave restores Active without renewing storage. Keep its worker
@@ -1220,9 +1231,10 @@ impl WorkerAllocator {
     }
 
     /// Ask each settled, serving worker to drop payload its store keeps from
-    /// shards it no longer serves. Protected: the binding (a closing session
-    /// keeps it bound) and staged split/merge filters of the bound
-    /// application.
+    /// shards it no longer serves, at most [`PAYLOAD_EVICTION_PER_FRAME`] per
+    /// call, those asked least recently first. Protected: the binding (a
+    /// closing session keeps it bound) and staged split/merge filters of the
+    /// bound application.
     pub(crate) fn schedule_payload_eviction(&self, now: std::time::Instant) -> Result<()> {
         let _reconcile = self
             .reconcile_lock
@@ -1254,12 +1266,14 @@ impl WorkerAllocator {
                     filter: worker.filter.clone(),
                     since: now,
                     requested: None,
+                    attempted: None,
                 });
             if track.filter != worker.filter {
                 *track = EvictionTrack {
                     filter: worker.filter.clone(),
                     since: now,
                     requested: None,
+                    attempted: None,
                 };
             }
             let settled = now.saturating_duration_since(track.since) >= PAYLOAD_EVICTION_SETTLE;
@@ -1273,6 +1287,8 @@ impl WorkerAllocator {
         if due.is_empty() {
             return Ok(());
         }
+        due.sort_by_key(|core| (tracks.get(core).and_then(|t| t.attempted), *core));
+        due.truncate(PAYLOAD_EVICTION_PER_FRAME);
         let staged = changes()?;
         // A regular node never consumes staged changes, so a change whose
         // shards are all gone would protect their payload forever. Retained
@@ -1318,6 +1334,9 @@ impl WorkerAllocator {
             );
             keep.sort();
             keep.dedup();
+            if let Some(track) = tracks.get_mut(&worker.core_id) {
+                track.attempted = Some(now);
+            }
             match self.worker_manager.evict_payload(worker.core_id, keep) {
                 Ok(()) => {
                     if let Some(track) = tracks.get_mut(&worker.core_id) {
@@ -5439,6 +5458,56 @@ mod tests {
         alloc.schedule_payload_eviction(t0 + minutes(130)).unwrap();
         assert_eq!(wm.evictions().len(), 3);
         assert!(wm.evictions()[2].1.contains(&filter(7, 0xc0)));
+    }
+
+    /// Workers whose bindings settled together are asked a few per GLOBAL
+    /// frame rather than all at once, and each within a bounded number of
+    /// frames, also while some of their requests keep failing.
+    #[test]
+    fn payload_eviction_spreads_workers_settled_together_over_frames() {
+        let filter = |n: u8| {
+            let mut f = vec![7; 32];
+            f.extend([0, 1, n]);
+            f
+        };
+        let wm = Arc::new(MockWorkerManager::new());
+        for core in 1..=15u32 {
+            wm.add_with_filter(core, filter(core as u8));
+        }
+        // Their requests fail every frame, as when a worker's channel is full.
+        wm.fail_evictions(&[1, 2]);
+        let reg = Arc::new(TestProverRegistry::new());
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+        alloc.set_pending_shard_changes(Arc::new(|| Ok(Vec::new())));
+        let t0 = std::time::Instant::now();
+        alloc.schedule_payload_eviction(t0).unwrap();
+        assert!(wm.evictions().is_empty());
+        let frame = std::time::Duration::from_secs(10);
+        let bound = 15usize.div_ceil(PAYLOAD_EVICTION_PER_FRAME);
+        let mut asked: HashMap<u32, usize> = HashMap::new();
+        for n in 0..bound {
+            let before = wm.evictions().len();
+            alloc
+                .schedule_payload_eviction(t0 + PAYLOAD_EVICTION_SETTLE + frame * n as u32)
+                .unwrap();
+            let new = wm.evictions()[before..].to_vec();
+            assert!(
+                new.len() <= PAYLOAD_EVICTION_PER_FRAME,
+                "frame {n} asked {} workers at once: {:?}",
+                new.len(),
+                new.iter().map(|(core, _)| core).collect::<Vec<_>>()
+            );
+            for (core, _) in new {
+                assert!(asked.insert(core, n).is_none(), "worker {core} asked twice");
+            }
+        }
+        let mut cores: Vec<u32> = asked.keys().copied().collect();
+        cores.sort();
+        assert_eq!(
+            cores,
+            (3..=15).collect::<Vec<_>>(),
+            "every worker whose request goes through is asked within {bound} frames"
+        );
     }
 
     /// A staged change protects its shards only while a prover or worker holds

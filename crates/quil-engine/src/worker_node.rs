@@ -2186,16 +2186,26 @@ where
     let serving: Arc<dyn Fn() -> bool + Send + Sync> =
         Arc::new(move || engine.as_ref().is_some_and(|h| h.is_running()));
     tokio::spawn(async move {
-        crate::worker_payload_eviction::run_passes(
+        let started = std::time::Instant::now();
+        let filter = hex::encode(&bound);
+        let report = crate::worker_payload_eviction::run_passes(
             core_id,
-            hex::encode(&bound),
+            filter.clone(),
             crdt,
             keep,
             storage,
             serving,
+            Arc::new(|| {}),
         )
         .await;
         flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        crate::worker_payload_eviction::log_run(
+            core_id,
+            &filter,
+            &report,
+            &crate::worker_payload_eviction::Publish::NotKept,
+            started.elapsed(),
+        );
     });
     None
 }
