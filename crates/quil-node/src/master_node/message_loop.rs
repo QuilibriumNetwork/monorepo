@@ -716,6 +716,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     let proc_mem = crate::mem_stats::process_memory();
                     let host_mem = crate::mem_stats::host_memory();
                     let global_frames = clock_store_recv.global_frame_cache_stats();
+                    let global_mempool = mc_for_recv.pending_totals();
                     info!(
                         rss_mb = proc_mem
                             .map(|m| crate::mem_stats::fmt_mb(m.rss_bytes))
@@ -746,7 +747,12 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         time_reel_pending = sizes.time_reel_pending,
                         time_reel_equivocators = sizes.time_reel_equivocators,
                         app_engine_frame_store = sizes.app_engine_frame_store,
-                        app_engine_message_spillover = sizes.app_engine_message_spillover,
+                        // Shard mempools, summed over this process's engines,
+                        // and the GLOBAL one.
+                        app_engine_mempool_messages = sizes.app_engine_mempool_messages,
+                        app_engine_mempool_mb = %crate::mem_stats::fmt_mb(sizes.app_engine_mempool_bytes as u64),
+                        global_mempool_messages = global_mempool.0,
+                        global_mempool_mb = %crate::mem_stats::fmt_mb(global_mempool.1 as u64),
                         app_engine_proposal_cache = sizes.app_engine_proposal_cache,
                         app_engine_pending_certified_parents = sizes.app_engine_pending_certified_parents,
                         // Finalized GLOBAL frames cached with their request
