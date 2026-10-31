@@ -717,3 +717,434 @@ fn a_finalization_handed_over_after_failed_attempts_is_not_attempted_again() {
     assert!(matches!(synced.step(1), FinalizationStep::Legacy));
     assert!(!synced.attempted(1));
 }
+
+/// A pipeline whose sequenced ingest reports the frame's application frames
+/// ingested once `ready` is set.
+fn sequenced_pipeline(
+    rig: &Rig,
+    input: &GlobalFrame,
+    ready: &Arc<std::sync::atomic::AtomicBool>,
+) -> GlobalFinalizationPipeline {
+    let (pipeline, _) = pipeline(rig, prover(input), 8);
+    let ready = ready.clone();
+    pipeline.with_sequenced_ingest(Arc::new(move |_: &GlobalFrame| {
+        Ok(ready.load(Ordering::SeqCst))
+    }))
+}
+
+/// An archive materializes the application frames a GLOBAL frame sequences
+/// only when finalization publishes the frame, and shard-header rewards read
+/// the shard and world sizes they change. A leader or voter that executed the
+/// finalized parent privately before then, past the publication priority,
+/// declared or accepted a prover root the finalized execution did not
+/// reproduce: every archive logged a prover root mismatch and GLOBAL stalled
+/// for 70-160 s (devnet, 2026-10-30). The archive waits until the parent
+/// publishes, then votes and proposes on the published state.
+#[test]
+fn an_archive_never_executes_a_finalized_parent_before_its_sequenced_ingest() {
+    use crate::outage::test_logs::CapturedLogs;
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    let rig = Rig::new();
+    let parent = certified_deploy(&rig);
+    rig.put(&parent);
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pipeline = sequenced_pipeline(&rig, &parent, &ready);
+    assert!(pipeline.offer(parent.clone()));
+    assert!(
+        matches!(pipeline.step(1), FinalizationStep::Retry(_)),
+        "the parent's application frames are not ingested yet"
+    );
+    let expected = Fixture::new(Some(rig.signer.public_key()));
+    expected.source.materialize(&parent).unwrap();
+    let context = rig.context(&parent);
+    let child = state_frame(&expected.source, 2, context.view, context.parent);
+    let encoded = crate::consensus_wire::encode_global_frame(&child).unwrap();
+    // Without the wait, a node past its publication priority executes the
+    // parent privately (a_voter_lets_its_finalized_parent_publish_before_executing_it_privately).
+    let seam = rig.seam(&parent).with_publication_priority(Duration::ZERO);
+    for attempt in 0..3 {
+        assert!(
+            seam.verify_or_defer(context, id(&child), Some(encoded.clone()))
+                .is_err(),
+            "attempt {attempt}: the vote executed the finalized parent privately before its sequenced ingest"
+        );
+        assert!(
+            seam.propose_with_context(context).is_none(),
+            "attempt {attempt}: the proposal executed the finalized parent privately before its sequenced ingest"
+        );
+    }
+    assert!(!rig.executor.busy(), "waiting takes no lease");
+    assert_eq!(rig.source.last_materialized_frame(), 0);
+    seam.verify_patience_ran_out(context, Duration::from_secs(20));
+
+    ready.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        pipeline.step(1),
+        FinalizationStep::Published { .. }
+    ));
+    assert_eq!(
+        seam.verify_or_defer(context, id(&child), Some(encoded)),
+        Ok(true),
+        "then it votes on the published state"
+    );
+    assert!(
+        seam.propose_with_context(context).is_some(),
+        "and proposes on it"
+    );
+
+    let began = logs.lines_with("wait for this archive's finalized frames to publish");
+    assert_eq!(began.len(), 1, "one line for the wait: {began:?}");
+    assert!(
+        began[0].contains("INFO")
+            && began[0].contains("parent=1")
+            && began[0].contains("published=0")
+            && began[0].contains("finalized=1"),
+        "{}",
+        began[0]
+    );
+    let declined = logs.lines_with("GLOBAL vote declined");
+    assert_eq!(declined.len(), 1, "{declined:?}");
+    assert!(
+        declined[0].contains("INFO")
+            && declined[0].contains("action=\"wait\"")
+            && declined[0].contains("finalized frames through 1 wait to publish"),
+        "an expected wait, with the event ending it: {}",
+        declined[0]
+    );
+    let ended = logs.lines_with("no longer wait");
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert!(
+        ended[0].contains("INFO") && ended[0].contains("through=1"),
+        "{}",
+        ended[0]
+    );
+}
+
+/// The wait holds only while finalized frames wait to publish here. A parent
+/// that is not finalized may finalize only through its child, so an archive
+/// executes it privately at once, as before: waiting for it would halt
+/// GLOBAL.
+#[test]
+fn an_archive_executes_a_parent_not_finalized_here_at_once() {
+    let rig = Rig::new();
+    let parent = certified_deploy(&rig);
+    rig.put(&parent);
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _pipeline = sequenced_pipeline(&rig, &parent, &ready);
+    let expected = Fixture::new(Some(rig.signer.public_key()));
+    expected.source.materialize(&parent).unwrap();
+    let context = rig.context(&parent);
+    let child = state_frame(&expected.source, 2, context.view, context.parent);
+    let encoded = crate::consensus_wire::encode_global_frame(&child).unwrap();
+    let seam = rig.seam(&parent);
+    assert_eq!(
+        seam.verify_or_defer(context, id(&child), Some(encoded)),
+        Ok(true),
+        "a notarized parent is voted on at once"
+    );
+    assert!(seam.propose_with_context(context).is_some(), "and built on");
+}
+
+/// The bounds of the wait, through the consensus adapter: a vote still
+/// waiting when its verify patience (20 s) runs out is declined, and the views
+/// after it wait the same way; a vote whose parent publishes within the
+/// patience is cast on the published state.
+#[test]
+fn an_archive_vote_waiting_for_publication_declines_at_its_patience_and_votes_once_published() {
+    use quil_cw_consensus::_consensus::simplex::types::Context;
+    use quil_cw_consensus::_consensus::types::{Epoch, Round, View};
+    use quil_cw_consensus::_consensus::Automaton as _;
+    use quil_cw_consensus::_runtime::{deterministic, Clock as _, Runner as _, Supervisor as _};
+    let rig = Rig::new();
+    let parent = certified_deploy(&rig);
+    rig.put(&parent);
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pipeline = sequenced_pipeline(&rig, &parent, &ready);
+    assert!(pipeline.offer(parent.clone()));
+    let expected = Fixture::new(Some(rig.signer.public_key()));
+    expected.source.materialize(&parent).unwrap();
+    let mut context = rig.context(&parent);
+    let child = state_frame(&expected.source, 2, context.view, context.parent);
+    let store = BlockStore::new();
+    // Past its publication priority only the wait keeps the vote from
+    // executing the parent.
+    let seam = Arc::new(rig.seam(&parent).with_publication_priority(Duration::ZERO));
+    let leader =
+        quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(rig.signer.public_key())
+            .unwrap();
+    // Checks `child` for `context.view`; publishes the parent after
+    // `published_after`, if given. Returns the answer and when it came.
+    let verify = |context: ProposalContext,
+                  child: &GlobalFrame,
+                  published_after: Option<Duration>| {
+        let digest = id(child);
+        store.put(
+            digest,
+            crate::consensus_wire::encode_global_frame(child).unwrap(),
+        );
+        let (seam, store, leader, pipeline, ready) = (&seam, &store, &leader, &pipeline, &ready);
+        deterministic::Runner::timed(Duration::from_secs(120)).start(|runtime| async move {
+            let mut automaton = quil_cw_consensus::adapters::FalconAutomaton::new(
+                runtime.child("automaton"),
+                seam.clone(),
+                store.clone(),
+            );
+            let started = runtime.current();
+            let pending = automaton
+                .verify(
+                    Context {
+                        round: Round::new(Epoch::new(context.epoch), View::new(context.view)),
+                        leader: leader.clone(),
+                        parent: (View::new(context.parent_view), context.parent),
+                    },
+                    digest,
+                )
+                .await;
+            if let Some(after) = published_after {
+                runtime.sleep(after).await;
+                ready.store(true, Ordering::SeqCst);
+                assert!(matches!(
+                    pipeline.step(1),
+                    FinalizationStep::Published { .. }
+                ));
+            }
+            let verdict = pending.await.ok();
+            (verdict, runtime.current().duration_since(started).unwrap())
+        })
+    };
+
+    for view in [73, 74] {
+        context.view = view;
+        let mut child = child.clone();
+        child.header.as_mut().unwrap().rank = view;
+        body_root(&mut child);
+        let (verdict, answered) = verify(context, &child, None);
+        assert_eq!(verdict, Some(false), "view {view}: unpublished, no vote");
+        assert!(
+            answered >= Duration::from_secs(20) && answered < Duration::from_secs(21),
+            "view {view}: declined when its patience ran out: {answered:?}"
+        );
+        assert!(!rig.executor.busy());
+    }
+    assert_eq!(rig.source.last_materialized_frame(), 0);
+
+    context.view = 75;
+    let mut child = child.clone();
+    child.header.as_mut().unwrap().rank = 75;
+    body_root(&mut child);
+    let (verdict, answered) = verify(context, &child, Some(Duration::from_secs(5)));
+    assert_eq!(verdict, Some(true), "published within the patience: a vote");
+    assert!(
+        answered >= Duration::from_secs(5) && answered < Duration::from_secs(6),
+        "{answered:?}"
+    );
+    assert_eq!(rig.source.last_materialized_frame(), 1);
+}
+
+/// The application whose committee the shard-reward tests certify a header of.
+const REWARDED_APP: [u8; 32] = [0x55; 32];
+
+fn app_data(data: u8) -> (quil_hypergraph::Location, Vec<u8>) {
+    (
+        quil_hypergraph::Location {
+            app_address: REWARDED_APP,
+            data_address: [data; 32],
+        },
+        vec![data; 4096],
+    )
+}
+
+/// A fixture whose registry holds `shard` as [`REWARDED_APP`]'s committee,
+/// whose application holds some data, and which executes shard headers and
+/// issues their rewards as an archive does. `extra` more application vertices
+/// stand for frames an ingest already materialized.
+fn rewarding_fixture(
+    global: &quil_crypto::FalconSigner,
+    shard: &quil_crypto::FalconSigner,
+    extra: bool,
+) -> Fixture {
+    let fixture = Fixture::seeded(Some(global.public_key()), |crdt| {
+        crate::genesis::seed_active_prover_on_filter(
+            crdt,
+            shard.public_key(),
+            1000,
+            0,
+            &REWARDED_APP,
+        )
+        .unwrap();
+        let (location, value) = app_data(1);
+        crdt.add_vertex(&location, &value).unwrap();
+        crdt.commit(0).unwrap();
+    });
+    fixture
+        .source
+        .execution_manager
+        .install_global_frame_header_deps(
+            fixture.source.prover_registry.clone(),
+            Arc::new(crate::rewards::OptRewardIssuance),
+            Arc::new(quil_crypto::FalconKeyConstructor),
+            Arc::new(quil_tries::ShaInclusionProver),
+            Arc::new(TestFrameProver),
+        )
+        .unwrap();
+    if extra {
+        let (location, value) = app_data(2);
+        fixture
+            .source
+            .hypergraph
+            .add_vertex(&location, &value)
+            .unwrap();
+        fixture.source.hypergraph.commit(0).unwrap();
+    }
+    fixture
+}
+
+/// `parent` with a shard header of [`REWARDED_APP`] that `shard` certified.
+fn with_shard_header(mut parent: GlobalFrame, shard: &quil_crypto::FalconSigner) -> GlobalFrame {
+    let mut header = quil_types::proto::global::FrameHeader {
+        address: REWARDED_APP.to_vec(),
+        frame_number: 1,
+        rank: 5,
+        timestamp: 1,
+        difficulty: 200_000,
+        parent_selector: vec![0; 32],
+        requests_root: vec![0; 32],
+        state_roots: vec![vec![0; 32]; 4],
+        prover: quil_crypto::poseidon::hash_bytes_to_32(shard.public_key())
+            .unwrap()
+            .to_vec(),
+        ..Default::default()
+    };
+    header.output = quil_crypto::porep::deterministic_app_frame_output(
+        &header.parent_selector,
+        &header.requests_root,
+        &header.state_roots,
+        &quil_crypto::porep::derive_storage_beacon(0, &[]),
+        header.frame_number,
+        header.rank,
+        &header.prover,
+        header.difficulty,
+        0,
+        header.timestamp,
+        &[],
+        0,
+        &[],
+        &[],
+        &[],
+    );
+    let mut namespace = b"appshard".to_vec();
+    namespace.extend_from_slice(&REWARDED_APP);
+    header.public_key_signature_bls48581 =
+        Some(quil_types::proto::keys::Bls48581AggregateSignature {
+            signature: finalization_certificate(&namespace, shard, 0, 5, 0, &header.output),
+            ..Default::default()
+        });
+    parent.requests = vec![quil_types::proto::global::MessageBundle {
+        requests: vec![quil_types::proto::global::MessageRequest {
+            request: Some(quil_types::proto::global::message_request::Request::Shard(
+                header,
+            )),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }];
+    body_root(&mut parent);
+    parent
+}
+
+/// The defect itself, through the real reward path: the parent carries a
+/// certified shard header, and the ingest finalization runs first adds data
+/// to that shard, which moves the reward the header credits into the prover
+/// tree. A private execution before the ingest therefore yields another root
+/// than the finalized execution, and a voter that accepts it votes for a chain
+/// no member can execute: every archive logged a prover root mismatch and
+/// GLOBAL stalled (devnet, 2026-10-30). The archive waits instead, then accepts
+/// only the root finalization published.
+#[test]
+fn an_archive_never_accepts_a_root_its_finalized_execution_does_not_reproduce() {
+    let global = Arc::new(quil_crypto::FalconSigner::generate());
+    let shard = quil_crypto::FalconSigner::generate();
+    let rig = Rig::over(global.clone(), rewarding_fixture(&global, &shard, false));
+    let mut parent = with_shard_header(state_frame(&rig.source, 1, 41, rig.genesis), &shard);
+    parent.header.as_mut().unwrap().prover = vec![0x42; 32];
+    certify(&mut parent, &rig.signer, 0);
+    rig.put(&parent);
+    let context = rig.context(&parent);
+
+    // What executing the parent yields without and with the ingest.
+    let child_of = |extra: bool| {
+        let twin = rewarding_fixture(&global, &shard, extra);
+        twin.source.materialize(&parent).unwrap();
+        state_frame(&twin.source, 2, context.view, context.parent)
+    };
+    let private_child = child_of(false);
+    let finalized_child = child_of(true);
+    let root = |child: &GlobalFrame| {
+        child
+            .header
+            .as_ref()
+            .unwrap()
+            .prover_tree_commitment
+            .clone()
+    };
+    assert_ne!(
+        root(&private_child),
+        root(&finalized_child),
+        "the ingest moves the reward basis, so the two executions declare different prover roots"
+    );
+
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (pipeline, _) = pipeline(&rig, prover(&parent), 8);
+    let pipeline = pipeline.with_sequenced_ingest({
+        let (ready, crdt) = (ready.clone(), rig.source.hypergraph.clone());
+        let done = std::sync::atomic::AtomicBool::new(false);
+        Arc::new(move |_: &GlobalFrame| -> quil_types::error::Result<bool> {
+            if !ready.load(Ordering::SeqCst) {
+                return Ok(false);
+            }
+            if !done.swap(true, Ordering::SeqCst) {
+                let (location, value) = app_data(2);
+                crdt.add_vertex(&location, &value)?;
+                crdt.commit(0)?;
+            }
+            Ok(true)
+        })
+    });
+    assert!(pipeline.offer(parent.clone()));
+    assert!(matches!(pipeline.step(1), FinalizationStep::Retry(_)));
+
+    let check = |seam: &GlobalSeamProposer, child: &GlobalFrame| {
+        seam.verify_or_defer(
+            context,
+            id(child),
+            Some(crate::consensus_wire::encode_global_frame(child).unwrap()),
+        )
+    };
+    let seam = rig.seam(&parent).with_publication_priority(Duration::ZERO);
+    for _ in 0..3 {
+        assert!(
+            check(&seam, &private_child).is_err(),
+            "the vote accepted prover root {} of a private execution before the sequenced \
+             ingest; the finalized execution yields {}",
+            hex::encode(root(&private_child)),
+            hex::encode(root(&finalized_child)),
+        );
+    }
+
+    ready.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        pipeline.step(1),
+        FinalizationStep::Published { .. }
+    ));
+    assert_eq!(
+        check(&seam, &private_child),
+        Ok(false),
+        "published: the root of the private execution is refused"
+    );
+    assert_eq!(
+        check(&seam, &finalized_child),
+        Ok(true),
+        "and the finalized root accepted"
+    );
+}
