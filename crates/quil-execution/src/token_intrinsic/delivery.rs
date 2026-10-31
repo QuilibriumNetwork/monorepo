@@ -487,6 +487,20 @@ pub fn pending_deliveries(
     limits: SnapshotLimits,
     cap: usize,
 ) -> Result<Vec<PendingDelivery>> {
+    pending_deliveries_counted(global, local, network, application, shard, limits, cap)
+        .map(|(pending, _)| pending)
+}
+
+/// [`pending_deliveries`] and how many owned blocks it read.
+pub fn pending_deliveries_counted(
+    global: &HypergraphState,
+    local: &HypergraphState,
+    network: &[u8; 32],
+    application: &[u8; 32],
+    shard: &[bool],
+    limits: SnapshotLimits,
+    cap: usize,
+) -> Result<(Vec<PendingDelivery>, usize)> {
     // Every width the application has placed at, narrowest first. Within one
     // width the shard owns exactly the blocks whose path extends its own, so
     // only those are enumerated (a whole-application holder at the widest
@@ -494,8 +508,10 @@ pub fn pending_deliveries(
     // the shard is skipped, since it owns no whole block there.
     let placed_at = global_commit::placement_width(global, application)?;
     let mut pending = Vec::new();
+    let mut blocks = 0usize;
     for block in coin_blocks::owned_blocks(shard, placed_at) {
         debug_assert!(coin_blocks::shard_owns_block(shard, block));
+        blocks += 1;
         for escrow in [false, true] {
             let (committed, mut seq) = if escrow {
                 (
@@ -531,7 +547,7 @@ pub fn pending_deliveries(
             break;
         }
     }
-    Ok(pending)
+    Ok((pending, blocks))
 }
 
 /// What a committed operation delivered at `address`, rebuilt from the

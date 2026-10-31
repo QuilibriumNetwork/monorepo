@@ -262,20 +262,31 @@ macro_rules! impl_hypergraph_storage {
             }
 
             /// Read the whole `root → (version, frame)` index, grouped by tree.
-            fn indexed_trees(
+            fn indexed_trees(&self) -> Result<crate::retention::IndexedTrees> {
+                self.indexed_trees_under(&[crate::encoding::HG_ROOT_VERSION], false)
+                    .map(|(trees, _)| trees)
+            }
+
+            /// The `root → (version, frame)` index entries whose keys start with
+            /// `prefix` (at least the index tag), grouped by tree, and how many
+            /// were read. A `sweep` leaves the block cache alone.
+            fn indexed_trees_under(
                 &self,
-            ) -> Result<HashMap<crate::retention::TreeKey, Vec<crate::retention::IndexEntry>>> {
-                let first = [crate::encoding::HG_ROOT_VERSION];
-                let mut trees: HashMap<crate::retention::TreeKey, Vec<crate::retention::IndexEntry>> =
-                    HashMap::new();
-                for entry in self.db.iterator(rocksdb::IteratorMode::From(
-                    &first,
-                    rocksdb::Direction::Forward,
-                )) {
+                prefix: &[u8],
+                sweep: bool,
+            ) -> Result<(crate::retention::IndexedTrees, usize)> {
+                let mut trees = crate::retention::IndexedTrees::new();
+                let options = if sweep { sweep_read_options() } else { rocksdb::ReadOptions::default() };
+                let mut read = 0usize;
+                for entry in self.db.iterator_opt(
+                    rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+                    options,
+                ) {
                     let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
-                    if k.first() != Some(&crate::encoding::HG_ROOT_VERSION) {
+                    if !k.starts_with(prefix) || k.first() != Some(&crate::encoding::HG_ROOT_VERSION) {
                         break;
                     }
+                    read += 1;
                     // key = [0x35][set][phase][shard_id(var)][root(32)]; value = ver(8)‖frame(8)
                     if k.len() < 1 + 1 + 1 + 32 || v.len() != 16 {
                         continue;
@@ -286,7 +297,13 @@ macro_rules! impl_hypergraph_storage {
                         u64::from_be_bytes(v[8..16].try_into().unwrap()),
                     ));
                 }
-                Ok(trees)
+                Ok((trees, read))
+            }
+
+            /// Each tree's retention cull frame: the last `retain_frames` of its
+            /// own frames stay.
+            fn retention_cull(retain_frames: u64) -> impl Fn(u64) -> Option<u64> {
+                move |newest: u64| newest.checked_sub(retain_frames)
             }
 
             /// Apply a retention plan's index and blob deletions in one transaction.
@@ -303,10 +320,7 @@ macro_rules! impl_hypergraph_storage {
                     let (Some(set_s), Some(phase_s)) = (byte_set_str(*set_b), byte_phase_str(*phase_b)) else {
                         continue;
                     };
-                    let shard = ShardKey {
-                        l1: quil_hypergraph::addressing::get_bloom_filter_indices(app, 256, 3),
-                        l2: *app,
-                    };
+                    let shard = retention_shard(app);
                     self.prune_blob_versions(txn, set_s, phase_s, &shard, *watermark, &mut blob_budget)?;
                 }
                 Ok(())
@@ -1017,21 +1031,156 @@ macro_rules! impl_hypergraph_storage {
                 Ok(deleted)
             }
 
-            fn prune_versioned_retaining(
+            fn retention_plan(
                 &self,
                 retain_frames: u64,
-                max_blob_deletes: usize,
                 head: &dyn Fn(&[u8], usize) -> Option<u64>,
-            ) -> Result<Vec<(Vec<u8>, usize, u64)>> {
+            ) -> Result<quil_types::store::RetentionScan> {
                 // Each tree keeps the last `retain_frames` of its OWN frames, so trees
                 // committed under different frame sequences never cull each other.
-                let plan = crate::retention::plan_prune(self.indexed_trees()?, |newest| {
-                    newest.checked_sub(retain_frames)
-                }, |(set, phase, shard_id)| head(shard_id, usize::from(*set) * 2 + usize::from(*phase)));
-                let txn = self.new_transaction(false)?;
-                self.apply_prune_plan(txn.as_ref(), &plan, max_blob_deletes)?;
-                txn.commit()?;
-                Ok(plan.trees)
+                let (trees, index_entries) =
+                    self.indexed_trees_under(&[crate::encoding::HG_ROOT_VERSION], true)?;
+                let plan = crate::retention::plan_prune(trees, Self::retention_cull(retain_frames),
+                    |(set, phase, shard_id)| head(shard_id, usize::from(*set) * 2 + usize::from(*phase)));
+                Ok(quil_types::store::RetentionScan {
+                    trees: plan.trees,
+                    keyspaces: plan
+                        .blobs
+                        .into_iter()
+                        .map(|((set, phase, application), watermark)| quil_types::store::RetentionKeyspace {
+                            set,
+                            phase,
+                            application,
+                            watermark,
+                        })
+                        .collect(),
+                    index_entries,
+                })
+            }
+
+            fn retention_blob_candidates(
+                &self,
+                keyspace: &quil_types::store::RetentionKeyspace,
+                budget: &mut usize,
+            ) -> Result<(Vec<Vec<u8>>, usize)> {
+                const VERTEX_KEY: usize = 64;
+                let (Some(set_s), Some(phase_s)) = (byte_set_str(keyspace.set), byte_phase_str(keyspace.phase)) else {
+                    return Ok((Vec::new(), 0));
+                };
+                let sprefix = crate::encoding::hypergraph_vertex_data_v2_shard_prefix(
+                    set_s, phase_s, &retention_shard(&keyspace.application),
+                );
+                let watermark = keyspace.watermark;
+                let mut vertices: Vec<Vec<u8>> = Vec::new();
+                let mut read = 0usize;
+                // One vertex's versions at a time: they are adjacent, ascending.
+                let mut current: Option<Vec<u8>> = None;
+                let mut versions: Vec<u64> = Vec::new();
+                let mut judge = |vertex: Option<Vec<u8>>, versions: &mut Vec<u64>, budget: &mut usize| {
+                    let floor = versions.iter().copied().filter(|v| *v <= watermark).max();
+                    let doomed = floor.map_or(0, |floor| versions.iter().filter(|v| **v < floor).count());
+                    if let (Some(vertex), true) = (vertex, doomed > 0) {
+                        vertices.push(vertex);
+                        *budget = budget.saturating_sub(doomed);
+                    }
+                    versions.clear();
+                };
+                let mut it = self.db.raw_iterator_opt(sweep_read_options());
+                it.seek(&sprefix);
+                while *budget > 0 {
+                    let Some(k) = it.key() else { break };
+                    if !k.starts_with(&sprefix) {
+                        break;
+                    }
+                    read += 1;
+                    if k.len() == sprefix.len() + VERTEX_KEY + 8 {
+                        let vk = &k[sprefix.len()..k.len() - 8];
+                        if current.as_deref() != Some(vk) {
+                            judge(current.take(), &mut versions, budget);
+                            current = Some(vk.to_vec());
+                        }
+                        versions.push(u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap()));
+                    }
+                    it.next();
+                }
+                it.status().map_err(|e| QuilError::Store(e.to_string()))?;
+                judge(current.take(), &mut versions, budget);
+                Ok((vertices, read))
+            }
+
+            fn retention_replan(
+                &self,
+                retain_frames: u64,
+                set: u8,
+                phase: u8,
+                scope: &[u8],
+                head: &dyn Fn(&[u8], usize) -> Option<u64>,
+            ) -> Result<quil_types::store::RetentionLive> {
+                let mut prefix = vec![crate::encoding::HG_ROOT_VERSION, set, phase];
+                prefix.extend_from_slice(scope);
+                let (trees, _) = self.indexed_trees_under(&prefix, false)?;
+                let plan = crate::retention::plan_prune(trees, Self::retention_cull(retain_frames),
+                    |(set, phase, shard_id)| head(shard_id, usize::from(*set) * 2 + usize::from(*phase)));
+                let keyspace = plan
+                    .blobs
+                    .iter()
+                    .find(|((s, p, application), _)| *s == set && *p == phase && application.as_slice() == scope)
+                    .map(|(_, watermark)| *watermark);
+                Ok(quil_types::store::RetentionLive {
+                    trees: plan.trees,
+                    delete_roots: plan.delete_roots,
+                    keyspace,
+                })
+            }
+
+            fn retention_prune_vertices(
+                &self,
+                txn: &dyn Transaction,
+                keyspace: &quil_types::store::RetentionKeyspace,
+                vertices: &[Vec<u8>],
+                budget: &mut usize,
+            ) -> Result<usize> {
+                const VERTEX_KEY: usize = 64;
+                let (Some(set_s), Some(phase_s)) = (byte_set_str(keyspace.set), byte_phase_str(keyspace.phase)) else {
+                    return Ok(0);
+                };
+                let sprefix = crate::encoding::hypergraph_vertex_data_v2_shard_prefix(
+                    set_s, phase_s, &retention_shard(&keyspace.application),
+                );
+                let watermark = keyspace.watermark;
+                let mut deleted = 0usize;
+                for vertex in vertices.iter().filter(|v| v.len() == VERTEX_KEY) {
+                    if *budget == 0 {
+                        break;
+                    }
+                    let mut prefix = sprefix.clone();
+                    prefix.extend_from_slice(vertex);
+                    let mut versions: Vec<(u64, Vec<u8>)> = Vec::new();
+                    let mut it = self.db.raw_iterator_opt(rocksdb::ReadOptions::default());
+                    it.seek(&prefix);
+                    while let Some(k) = it.key() {
+                        if !k.starts_with(&prefix) {
+                            break;
+                        }
+                        if k.len() == prefix.len() + 8 {
+                            versions.push((u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap()), k.to_vec()));
+                        }
+                        it.next();
+                    }
+                    it.status().map_err(|e| QuilError::Store(e.to_string()))?;
+                    let Some(floor) = versions.iter().map(|(v, _)| *v).filter(|v| *v <= watermark).max() else {
+                        continue;
+                    };
+                    for (_, key) in versions.iter().filter(|(v, _)| *v < floor) {
+                        if *budget == 0 {
+                            break;
+                        }
+                        txn.delete(key)?;
+                        *budget -= 1;
+                        deleted += 1;
+                    }
+                }
+                Ok(deleted)
             }
 
             fn apply_snapshot(&self, db_path: &str) -> Result<()> {

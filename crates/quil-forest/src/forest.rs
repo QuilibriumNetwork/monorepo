@@ -1679,18 +1679,57 @@ impl Forest {
             .prune(min_readable_version)
     }
 
-    /// Superseded leaf values of one shard/phase tree below its retention
-    /// watermark (see [`crate::RocksTreeStore::prune_values`]). An in-memory
-    /// forest keeps them.
-    pub fn prune_shard_phase_values(
+    /// One bounded batch of [`Self::prune_shard_phase`]: at most
+    /// `max_records` stale records from `from` on (see
+    /// [`crate::RocksTreeStore::prune_batch`]). Returns the nodes reclaimed
+    /// and where the next batch starts, if any. An in-memory forest prunes
+    /// the whole tree at once.
+    pub fn prune_shard_phase_batch(
+        &self,
+        shard_id: &[u8],
+        phase: Phase,
+        min_readable_version: u64,
+        from: Option<&[u8]>,
+        max_records: usize,
+    ) -> Result<(usize, Option<Vec<u8>>)> {
+        match self.store(&TreeId::shard_phase(shard_id, phase)) {
+            TreeStore::Rocks(store) => store.prune_batch(min_readable_version, from, max_records),
+            TreeStore::Mem(store) => Ok((store.prune(min_readable_version)?, None)),
+        }
+    }
+
+    /// The key hashes of one shard/phase tree holding leaf values below its
+    /// retention watermark, found without deleting or locking (see
+    /// [`crate::RocksTreeStore::value_prune_candidates`]), and the records
+    /// read. An in-memory forest keeps its values, so has none.
+    pub fn shard_phase_value_candidates(
         &self,
         shard_id: &[u8],
         phase: Phase,
         min_readable_version: u64,
         budget: &mut usize,
+    ) -> Result<(Vec<[u8; 32]>, usize)> {
+        match self.store(&TreeId::shard_phase(shard_id, phase)) {
+            TreeStore::Rocks(store) => store.value_prune_candidates(min_readable_version, budget),
+            TreeStore::Mem(_) => Ok((Vec::new(), 0)),
+        }
+    }
+
+    /// Delete the superseded leaf values of `key_hashes` in one shard/phase
+    /// tree below its retention watermark (see
+    /// [`crate::RocksTreeStore::prune_values_of`]).
+    pub fn prune_shard_phase_values_of(
+        &self,
+        shard_id: &[u8],
+        phase: Phase,
+        min_readable_version: u64,
+        key_hashes: &[[u8; 32]],
+        budget: &mut usize,
     ) -> Result<usize> {
         match self.store(&TreeId::shard_phase(shard_id, phase)) {
-            TreeStore::Rocks(store) => store.prune_values(min_readable_version, budget),
+            TreeStore::Rocks(store) => {
+                store.prune_values_of(min_readable_version, key_hashes, budget)
+            }
             TreeStore::Mem(_) => Ok(0),
         }
     }

@@ -51,6 +51,19 @@ pub(crate) struct CommitLock {
     releases: AtomicU64,
 }
 
+thread_local! {
+    static COMMIT_LOCK_WAIT: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+/// How long this thread has waited, in total, for any CRDT's commit lock
+/// while another thread held it. The difference across a call is the part of
+/// it spent waiting for commits, syncs or retention pruning rather than
+/// reading.
+pub fn commit_lock_wait_on_this_thread() -> std::time::Duration {
+    COMMIT_LOCK_WAIT.with(std::cell::Cell::get)
+}
+
 /// A held [`CommitLock`]; its release is counted before the lock is free.
 pub(crate) struct CommitGuard<'a> {
     _guard: std::sync::MutexGuard<'a, ()>,
@@ -85,11 +98,23 @@ impl CommitLock {
     }
 
     /// Take the lock, marking the wait on a worker thread's probe: a
-    /// commit holding it stalls every task of a worker that waits.
+    /// commit holding it stalls every task of a worker that waits. A wait
+    /// for a held lock is added to this thread's
+    /// [`commit_lock_wait_on_this_thread`].
     fn wait(&self) -> std::result::Result<std::sync::MutexGuard<'_, ()>, ()> {
         let _probe =
             quil_types::thread_probe::section(quil_types::thread_probe::Section::CommitLockWait);
-        self.inner.lock().map_err(|_| ())
+        match self.inner.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err(()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let asked = std::time::Instant::now();
+                let guard = self.inner.lock().map_err(|_| ());
+                let waited = asked.elapsed();
+                COMMIT_LOCK_WAIT.with(|total| total.set(total.get().saturating_add(waited)));
+                guard
+            }
+        }
     }
 
     /// Counted releases so far.
@@ -1565,7 +1590,7 @@ impl HypergraphCrdt {
     /// Whether mutations are staged in memory but not committed. A failed
     /// in-place execution can leave them, and any later commit publishes them.
     pub fn has_staged_mutations(&self) -> bool {
-        let _guard = self.commit_lock.lock().unwrap();
+        let _guard = self.commit_lock.lock_to_read().unwrap();
         !self.pending.read().unwrap().is_empty()
             || !self.pending_blobs.read().unwrap().is_empty()
             || !self.pending_records.read().unwrap().is_empty()
@@ -1574,12 +1599,12 @@ impl HypergraphCrdt {
     /// Execution-only overlay. Callers serialize execution while deriving state.
     /// External readers continue to use the committed store.
     pub fn staged_records(&self) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
-        let _guard = self.commit_lock.lock().unwrap();
+        let _guard = self.commit_lock.lock_to_read().unwrap();
         self.pending_records.read().unwrap().clone()
     }
 
     pub fn read_execution_record(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let _guard = self.commit_lock.lock().unwrap();
+        let _guard = self.commit_lock.lock_to_read().unwrap();
         if let Some(value) = self.pending_records.read().unwrap().get(key) {
             return Ok(value.clone());
         }
@@ -5188,67 +5213,464 @@ impl HypergraphCrdt {
         max_blob_deletes: usize,
         max_value_deletes: Option<usize>,
     ) -> Result<crate::retention::RetentionPass> {
-        let _guard = self.commit_lock.lock().map_err(|_| {
-            QuilError::ExecutionUnavailable("retention prune commit lock poisoned".into())
-        })?;
-        let forest = self.forest.read().unwrap();
-        let watermarks = self.store.prune_versioned_retaining(
+        self.prune_retaining_observed(
             retain_frames,
             max_blob_deletes,
-            &|shard_id, phase_idx| {
-                (phase_idx < 4)
-                    .then(|| self.resolve_phase_version_with(&forest, shard_id, phase_idx))
-                    .flatten()
+            max_value_deletes,
+            &mut |_| {},
+        )
+    }
+
+    /// [`Self::prune_retaining_with`], telling `observe` each
+    /// [`RetentionStep`](crate::retention::RetentionStep) as it is reached.
+    pub fn prune_retaining_observed(
+        &self,
+        retain_frames: u64,
+        max_blob_deletes: usize,
+        max_value_deletes: Option<usize>,
+        observe: &mut dyn FnMut(crate::retention::RetentionStep),
+    ) -> Result<crate::retention::RetentionPass> {
+        self.prune_retaining_paced(
+            retain_frames,
+            max_blob_deletes,
+            max_value_deletes,
+            crate::retention::RetentionPacing::default(),
+            observe,
+        )
+    }
+
+    /// [`Self::prune_retaining_observed`] with its holds of the commit lock
+    /// sized by `pacing`.
+    ///
+    /// The index, blob-version and leaf-value scans, which read the whole
+    /// keyspace of every pruned tree, run without the commit lock: they only
+    /// find where superseded versions may lie. Every deletion is decided under
+    /// the commit lock, from the live index and heads
+    /// ([`HypergraphStore::retention_replan`]) and the versions the store holds
+    /// then, exactly as a pass holding the lock throughout would decide it at
+    /// that moment, in holds of about `pacing.hold`: a commit or a reader waits
+    /// for one hold, not for a scan. A version committed after the scan lies
+    /// above every watermark it read, and a tree reset or rebuilt meanwhile
+    /// loses its watermark in the live index, so neither is deleted.
+    ///
+    /// A replan stays valid while nobody else has taken the lock to write:
+    /// every writer of the index or of a tree head does so under it, and its
+    /// release is counted, so a hold replans only
+    /// after a commit, sync or reset, not every time. A tree wiped or whose
+    /// head is dropped meanwhile (the forest's tree generation moves; a head
+    /// drop holds the forest write lock, not this one) ends the pass; the next
+    /// one plans afresh.
+    pub fn prune_retaining_paced(
+        &self,
+        retain_frames: u64,
+        max_blob_deletes: usize,
+        max_value_deletes: Option<usize>,
+        pacing: crate::retention::RetentionPacing,
+        observe: &mut dyn FnMut(crate::retention::RetentionStep),
+    ) -> Result<crate::retention::RetentionPass> {
+        use crate::retention::{RetentionPass, RetentionStep, LONG_HOLD};
+        use std::collections::{HashSet, VecDeque};
+        use std::time::Instant;
+        /// The trees and blob keyspace one live replan covers: `(set, phase,
+        /// application or shorter tree id)`.
+        type Scope = (u8, u8, Vec<u8>);
+        fn scope_of(shard_id: &[u8], phase_idx: usize) -> Scope {
+            (
+                (phase_idx / 2) as u8,
+                (phase_idx % 2) as u8,
+                shard_id[..shard_id.len().min(32)].to_vec(),
+            )
+        }
+        enum Work {
+            Blobs {
+                keyspace: quil_types::store::RetentionKeyspace,
+                vertices: Vec<Vec<u8>>,
+                next: usize,
             },
-        )?;
-        let (mut trees, mut nodes, mut values) = (0usize, 0usize, 0usize);
-        let mut value_budget = max_value_deletes.unwrap_or(0);
-        for (shard_id, phase_idx, min_ver) in &watermarks {
-            if *phase_idx >= 4 {
-                continue;
-            }
-            match self.resolve_phase_version_checked(&forest, shard_id, *phase_idx) {
-                Ok(Some(head)) if head >= *min_ver => {}
-                head => {
-                    tracing::warn!(shard = %hex::encode(shard_id), phase = *phase_idx, min_ver, ?head,
-                        "retention watermark is above the tree head; not pruning its nodes");
-                    continue;
+            Nodes {
+                shard_id: Vec<u8>,
+                phase_idx: usize,
+                from: Option<Vec<u8>>,
+            },
+            Values {
+                shard_id: Vec<u8>,
+                phase_idx: usize,
+                key_hashes: Vec<[u8; 32]>,
+                next: usize,
+            },
+        }
+        impl Work {
+            fn scope(&self) -> Scope {
+                match self {
+                    Work::Blobs { keyspace, .. } => {
+                        (keyspace.set, keyspace.phase, keyspace.application.to_vec())
+                    }
+                    Work::Nodes {
+                        shard_id,
+                        phase_idx,
+                        ..
+                    }
+                    | Work::Values {
+                        shard_id,
+                        phase_idx,
+                        ..
+                    } => scope_of(shard_id, *phase_idx),
                 }
             }
-            match forest.prune_shard_phase(shard_id, PHASES[*phase_idx], *min_ver) {
-                Ok(n) => {
-                    trees += 1;
-                    nodes += n;
+        }
+        let (hold_budget, chunk, node_batch) =
+            (pacing.hold, pacing.chunk.max(1), pacing.node_batch.max(1));
+        let poisoned = |name: &str| {
+            QuilError::ExecutionUnavailable(format!("retention prune {name} lock poisoned"))
+        };
+
+        let started = Instant::now();
+        let generation = quil_forest::tree_generation();
+        let plan = self
+            .store
+            .retention_plan(retain_frames, &|shard_id, phase_idx| {
+                if phase_idx >= 4 {
+                    return None;
+                }
+                let forest = self.forest.read().ok()?;
+                self.resolve_phase_version_with(&forest, shard_id, phase_idx)
+            })?;
+        let mut pass = RetentionPass {
+            scanned: plan.index_entries,
+            ..RetentionPass::default()
+        };
+        observe(RetentionStep::Planned {
+            trees: plan.trees.len(),
+            keyspaces: plan.keyspaces.len(),
+            index_entries: plan.index_entries,
+        });
+
+        // Where superseded versions lie, read without any lock.
+        let mut queue: VecDeque<Work> = VecDeque::new();
+        let (mut blob_vertices, mut value_keys) = (0usize, 0usize);
+        let mut scan_budget = max_blob_deletes;
+        for keyspace in &plan.keyspaces {
+            if scan_budget == 0 {
+                break;
+            }
+            let (vertices, read) = self
+                .store
+                .retention_blob_candidates(keyspace, &mut scan_budget)?;
+            pass.scanned += read;
+            if !vertices.is_empty() {
+                blob_vertices += vertices.len();
+                queue.push_back(Work::Blobs {
+                    keyspace: keyspace.clone(),
+                    vertices,
+                    next: 0,
+                });
+            }
+        }
+        // A handle sharing the forest's database: the scans hold no lock.
+        let forest = self.forest.read().map_err(|_| poisoned("forest"))?.clone();
+        let mut value_scan_budget = max_value_deletes.unwrap_or(0);
+        for (shard_id, phase_idx, watermark) in &plan.trees {
+            queue.push_back(Work::Nodes {
+                shard_id: shard_id.clone(),
+                phase_idx: *phase_idx,
+                from: None,
+            });
+            if value_scan_budget == 0 {
+                continue;
+            }
+            match forest.shard_phase_value_candidates(
+                shard_id,
+                PHASES[*phase_idx],
+                *watermark,
+                &mut value_scan_budget,
+            ) {
+                Ok((key_hashes, read)) => {
+                    pass.scanned += read;
+                    if !key_hashes.is_empty() {
+                        value_keys += key_hashes.len();
+                        queue.push_back(Work::Values {
+                            shard_id: shard_id.clone(),
+                            phase_idx: *phase_idx,
+                            key_hashes,
+                            next: 0,
+                        });
+                    }
                 }
                 Err(e) => tracing::warn!(
                     shard = %hex::encode(shard_id),
                     phase = *phase_idx,
                     error = %e,
-                    "forest prune of a shard/phase tree failed (will retry next cycle)",
+                    "forest value scan of a shard/phase tree failed (will retry next cycle)",
                 ),
             }
-            if max_value_deletes.is_some() && value_budget > 0 {
-                match forest.prune_shard_phase_values(
-                    shard_id,
-                    PHASES[*phase_idx],
-                    *min_ver,
-                    &mut value_budget,
-                ) {
-                    Ok(n) => values += n,
-                    Err(e) => tracing::warn!(
-                        shard = %hex::encode(shard_id),
-                        phase = *phase_idx,
-                        error = %e,
-                        "forest value prune of a shard/phase tree failed (will retry next cycle)",
-                    ),
+        }
+        drop(forest);
+        // One live replan per scope serves all of the scope's work, so keep
+        // it together. A replan deletes the index entries below the live
+        // watermarks before any node or value goes: a root the index still
+        // resolves stays readable.
+        queue.make_contiguous().sort_by_key(|work| {
+            let rank = match work {
+                Work::Blobs { .. } => 0,
+                Work::Nodes { .. } => 1,
+                Work::Values { .. } => 2,
+            };
+            (work.scope(), rank)
+        });
+        pass.scan = started.elapsed();
+        observe(RetentionStep::Scanned {
+            blob_vertices,
+            value_keys,
+            scanned: pass.scanned,
+            scan: pass.scan,
+        });
+
+        // The deletions, in short holds of the commit lock.
+        let mut blob_budget = max_blob_deletes;
+        let mut value_budget = max_value_deletes.unwrap_or(0);
+        // Live plans, valid while the lock's release count is ours.
+        let mut lives: HashMap<Scope, quil_types::store::RetentionLive> = HashMap::new();
+        let mut released_at: Option<u64> = None;
+        let mut warned: HashSet<(Vec<u8>, usize)> = HashSet::new();
+        let mut refused = 0usize;
+        while !queue.is_empty() {
+            let guard = self.commit_lock.lock().map_err(|_| poisoned("commit"))?;
+            let held = Instant::now();
+            let forest = self.forest.read().map_err(|_| poisoned("forest"))?;
+            if quil_forest::tree_generation() != generation {
+                pass.abandoned = true;
+                break;
+            }
+            if released_at != Some(self.commit_lock.releases()) {
+                lives.clear();
+            }
+            let head = |shard_id: &[u8], phase_idx: usize| {
+                (phase_idx < 4)
+                    .then(|| self.resolve_phase_version_with(&forest, shard_id, phase_idx))
+                    .flatten()
+            };
+            let mut worked = false;
+            while let Some(work) = queue.pop_front() {
+                // At least one chunk per hold, so a slow replan cannot stall
+                // the pass; after it, the hold ends at its budget.
+                if worked && held.elapsed() >= hold_budget {
+                    queue.push_front(work);
+                    break;
+                }
+                worked = true;
+                let scope = work.scope();
+                if !lives.contains_key(&scope) {
+                    let replanned = Instant::now();
+                    let mut live = self.store.retention_replan(
+                        retain_frames,
+                        scope.0,
+                        scope.1,
+                        &scope.2,
+                        &head,
+                    )?;
+                    pass.replans += 1;
+                    pass.max_replan = pass.max_replan.max(replanned.elapsed());
+                    if !live.delete_roots.is_empty() {
+                        let txn = self.store.new_transaction(false)?;
+                        for key in &live.delete_roots {
+                            txn.delete(key)?;
+                        }
+                        txn.commit()?;
+                        pass.roots += live.delete_roots.len();
+                        live.delete_roots.clear();
+                    }
+                    lives.insert(scope.clone(), live);
+                }
+                let live = &lives[&scope];
+                let tree_watermark = |shard_id: &[u8], phase_idx: usize| {
+                    live.trees
+                        .iter()
+                        .find(|(id, idx, _)| id.as_slice() == shard_id && *idx == phase_idx)
+                        .map(|(_, _, watermark)| *watermark)
+                };
+                // The tree's watermark now, if the head still admits it.
+                let mut checked_watermark = |shard_id: &[u8], phase_idx: usize| {
+                    let min_ver = tree_watermark(shard_id, phase_idx)?;
+                    match self.resolve_phase_version_checked(&forest, shard_id, phase_idx) {
+                        Ok(Some(head)) if head >= min_ver => Some(min_ver),
+                        head => {
+                            if warned.insert((shard_id.to_vec(), phase_idx)) {
+                                refused += 1;
+                                tracing::warn!(shard = %hex::encode(shard_id), phase = phase_idx, min_ver, ?head,
+                                    "retention watermark is above the tree head; not pruning its nodes");
+                            }
+                            None
+                        }
+                    }
+                };
+                match work {
+                    Work::Blobs {
+                        keyspace,
+                        vertices,
+                        mut next,
+                    } => {
+                        let (Some(watermark), true) = (live.keyspace, blob_budget > 0) else {
+                            continue;
+                        };
+                        let keyspace = quil_types::store::RetentionKeyspace {
+                            watermark,
+                            ..keyspace
+                        };
+                        let txn = self.store.new_transaction(false)?;
+                        loop {
+                            let end = (next + chunk).min(vertices.len());
+                            pass.blobs += self.store.retention_prune_vertices(
+                                txn.as_ref(),
+                                &keyspace,
+                                &vertices[next..end],
+                                &mut blob_budget,
+                            )?;
+                            next = end;
+                            if next == vertices.len()
+                                || blob_budget == 0
+                                || held.elapsed() >= hold_budget
+                            {
+                                break;
+                            }
+                        }
+                        txn.commit()?;
+                        if next < vertices.len() && blob_budget > 0 {
+                            queue.push_front(Work::Blobs {
+                                keyspace,
+                                vertices,
+                                next,
+                            });
+                            break;
+                        }
+                    }
+                    Work::Nodes {
+                        shard_id,
+                        phase_idx,
+                        mut from,
+                    } => {
+                        let Some(min_ver) = checked_watermark(&shard_id, phase_idx) else {
+                            continue;
+                        };
+                        let more = loop {
+                            match forest.prune_shard_phase_batch(
+                                &shard_id,
+                                PHASES[phase_idx],
+                                min_ver,
+                                from.as_deref(),
+                                node_batch,
+                            ) {
+                                Ok((reclaimed, None)) => {
+                                    pass.nodes += reclaimed;
+                                    pass.trees += 1;
+                                    break false;
+                                }
+                                Ok((reclaimed, Some(next))) => {
+                                    pass.nodes += reclaimed;
+                                    from = Some(next);
+                                    if held.elapsed() >= hold_budget {
+                                        break true;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        shard = %hex::encode(&shard_id),
+                                        phase = phase_idx,
+                                        error = %e,
+                                        "forest prune of a shard/phase tree failed (will retry next cycle)",
+                                    );
+                                    break false;
+                                }
+                            }
+                        };
+                        if more {
+                            queue.push_front(Work::Nodes {
+                                shard_id,
+                                phase_idx,
+                                from,
+                            });
+                            break;
+                        }
+                    }
+                    Work::Values {
+                        shard_id,
+                        phase_idx,
+                        key_hashes,
+                        mut next,
+                    } => {
+                        if value_budget == 0 {
+                            continue;
+                        }
+                        let Some(min_ver) = checked_watermark(&shard_id, phase_idx) else {
+                            continue;
+                        };
+                        loop {
+                            let end = (next + chunk).min(key_hashes.len());
+                            match forest.prune_shard_phase_values_of(
+                                &shard_id,
+                                PHASES[phase_idx],
+                                min_ver,
+                                &key_hashes[next..end],
+                                &mut value_budget,
+                            ) {
+                                Ok(deleted) => {
+                                    pass.values += deleted;
+                                    next = end;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        shard = %hex::encode(&shard_id),
+                                        phase = phase_idx,
+                                        error = %e,
+                                        "forest value prune of a shard/phase tree failed (will retry next cycle)",
+                                    );
+                                    next = key_hashes.len();
+                                }
+                            }
+                            if next == key_hashes.len()
+                                || value_budget == 0
+                                || held.elapsed() >= hold_budget
+                            {
+                                break;
+                            }
+                        }
+                        if next < key_hashes.len() && value_budget > 0 {
+                            queue.push_front(Work::Values {
+                                shard_id,
+                                phase_idx,
+                                key_hashes,
+                                next,
+                            });
+                            break;
+                        }
+                    }
                 }
             }
+            drop(forest);
+            let hold = held.elapsed();
+            // Our own release is the only one until somebody else writes.
+            released_at = Some(self.commit_lock.releases() + 1);
+            drop(guard);
+            pass.holds += 1;
+            pass.max_hold = pass.max_hold.max(hold);
+            pass.held += hold;
+            if hold >= LONG_HOLD {
+                pass.long_holds += 1;
+            }
+            observe(RetentionStep::Held { hold });
+            if !queue.is_empty() {
+                // Let the commits and readers that queued meanwhile in. A hold
+                // that overran (a slow replan) is followed by as long a pause,
+                // so the lock is free at least half the time.
+                let pause = if hold > hold_budget {
+                    hold
+                } else {
+                    pacing.pause
+                };
+                std::thread::sleep(pause.max(pacing.pause));
+            }
         }
-        Ok(crate::retention::RetentionPass {
-            trees,
-            nodes,
-            values,
-        })
+        pass.refused_trees = refused;
+        Ok(pass)
     }
 
     /// Forest-sync CLIENT: store a blob pulled during sync (the readable data),
@@ -6654,6 +7076,39 @@ mod phase_wipe_tests {
             hg.wipe_shard_phase(&prover, 1, [0; 32]).unwrap(),
             0,
             "an emptied phase has nothing left"
+        );
+    }
+}
+
+#[cfg(test)]
+mod commit_lock_wait_tests {
+    use super::*;
+    use crate::testing::{MemStore, StubProver};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A thread that waits for a commit lock another thread holds counts the
+    /// wait; an uncontended take counts nothing.
+    #[test]
+    fn a_wait_for_a_held_commit_lock_is_counted_on_the_waiting_thread() {
+        let hg = HypergraphCrdt::new(Arc::new(MemStore::new()), Arc::new(StubProver));
+        let before = commit_lock_wait_on_this_thread();
+        hg.read_execution_record(b"uncontended").unwrap();
+        assert_eq!(commit_lock_wait_on_this_thread(), before);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _guard = hg.commit_lock.lock().unwrap();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+            });
+            held_rx.recv().unwrap();
+            hg.read_execution_record(b"contended").unwrap();
+        });
+        let waited = commit_lock_wait_on_this_thread() - before;
+        assert!(
+            waited >= Duration::from_millis(200),
+            "the wait is counted: {waited:?}"
         );
     }
 }

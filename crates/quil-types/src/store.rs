@@ -1022,6 +1022,44 @@ pub enum LargeVertexIndexState {
     Complete,
 }
 
+/// A retention plan read without the commit lock
+/// ([`HypergraphStore::retention_plan`]): where a pass should look, not what
+/// it may delete.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RetentionScan {
+    /// `(shard id, phase index, watermark)` of each tree the index let be
+    /// pruned when read.
+    pub trees: Vec<(Vec<u8>, usize, u64)>,
+    /// Blob keyspaces every tree of which had a watermark when read.
+    pub keyspaces: Vec<RetentionKeyspace>,
+    /// Root-version index entries read.
+    pub index_entries: usize,
+}
+
+/// One blob keyspace of a [`RetentionScan`]: the `(set, phase)` bytes and
+/// application its keys share, and the least watermark of its trees.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetentionKeyspace {
+    pub set: u8,
+    pub phase: u8,
+    pub application: [u8; 32],
+    pub watermark: u64,
+}
+
+/// The retention plan of the trees under one `(set, phase, scope)`, read
+/// from the live index under the commit lock
+/// ([`HypergraphStore::retention_replan`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RetentionLive {
+    /// `(shard id, phase index, watermark)` of each prunable tree.
+    pub trees: Vec<(Vec<u8>, usize, u64)>,
+    /// Index entries below their tree's watermark.
+    pub delete_roots: Vec<Vec<u8>>,
+    /// The watermark of the blob keyspace `scope` names, when `scope` is an
+    /// application every tree of which has one.
+    pub keyspace: Option<u64>,
+}
+
 pub trait HypergraphStore: Send + Sync {
     /// Clear legacy and versioned underlying rows in all four phases of one
     /// shard. Forest maintenance is separate and must share the same barrier.
@@ -1344,19 +1382,61 @@ pub trait HypergraphStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Like [`prune_versioned`](Self::prune_versioned), but each tree keeps the
-    /// last `retain_frames` of its own indexed frames, and at most
-    /// `max_blob_deletes` blob versions are deleted per call. `head` gives a
-    /// tree's current version, `(shard id, phase index)`. Trees whose versions
-    /// restart are left untouched; with a head known, a tree whose frames fall
-    /// while its versions rise is pruned conservatively.
-    fn prune_versioned_retaining(
+    /// The retention plan of the whole index, read without any lock: each
+    /// tree keeps the last `retain_frames` of its own indexed frames. `head`
+    /// gives a tree's current version, `(shard id, phase index)`. Trees whose
+    /// versions restart are left untouched; with a head known, a tree whose
+    /// frames fall while its versions rise is pruned conservatively. Nothing
+    /// is deleted: the plan only says where to look, and every deletion is
+    /// decided again from the live index ([`Self::retention_replan`]).
+    fn retention_plan(
         &self,
         _retain_frames: u64,
-        _max_blob_deletes: usize,
         _head: &dyn Fn(&[u8], usize) -> Option<u64>,
-    ) -> Result<Vec<(Vec<u8>, usize, u64)>> {
-        Ok(Vec::new())
+    ) -> Result<RetentionScan> {
+        Ok(RetentionScan::default())
+    }
+
+    /// The vertices of one blob keyspace of a [`Self::retention_plan`] that
+    /// hold a version below their newest one at or below `watermark`, read
+    /// without any lock, until about `budget` such versions are found
+    /// (decremented). Returns them in key order and the keys read.
+    fn retention_blob_candidates(
+        &self,
+        _keyspace: &RetentionKeyspace,
+        _budget: &mut usize,
+    ) -> Result<(Vec<Vec<u8>>, usize)> {
+        Ok((Vec::new(), 0))
+    }
+
+    /// The live retention plan of the trees indexed under `(set, phase,
+    /// scope)` (`scope`: an application, or a shorter tree id), for a caller
+    /// holding the commit lock, so that no commit, reset or sync interleaves
+    /// with the deletions it decides.
+    fn retention_replan(
+        &self,
+        _retain_frames: u64,
+        _set: u8,
+        _phase: u8,
+        _scope: &[u8],
+        _head: &dyn Fn(&[u8], usize) -> Option<u64>,
+    ) -> Result<RetentionLive> {
+        Ok(RetentionLive::default())
+    }
+
+    /// Stage into `txn` the deletion of each of `vertices`' blob versions in
+    /// `keyspace` below its newest one at or below the keyspace's watermark,
+    /// as the store holds them now, at most `budget` (decremented). The
+    /// watermark must come from a [`Self::retention_replan`] under the same
+    /// commit lock. Returns the number staged.
+    fn retention_prune_vertices(
+        &self,
+        _txn: &dyn Transaction,
+        _keyspace: &RetentionKeyspace,
+        _vertices: &[Vec<u8>],
+        _budget: &mut usize,
+    ) -> Result<usize> {
+        Ok(0)
     }
 
     fn apply_snapshot(&self, db_path: &str) -> Result<()>;

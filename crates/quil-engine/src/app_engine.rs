@@ -6466,19 +6466,24 @@ impl AppConsensusEngine {
         };
         let (filter, clock_store) = (self.filter.clone(), self.clock_store.clone());
         let collect: crate::delivery_sources::Collect = Box::new(move || {
-            let sources = manager
+            let scan = manager
                 .pending_delivery_sources(global, &filter)
                 .map_err(|error| error.to_string())?;
             // Already here: this shard's own frames, and anything fetched
             // earlier. Nothing is refetched.
-            Ok(sources
-                .into_iter()
-                .filter(|(source, frame_number)| {
-                    clock_store
-                        .get_shard_clock_frame(source, *frame_number, false)
-                        .is_err()
-                })
-                .collect())
+            Ok(crate::delivery_sources::Sources {
+                missing: scan
+                    .sources
+                    .into_iter()
+                    .filter(|(source, frame_number)| {
+                        clock_store
+                            .get_shard_clock_frame(source, *frame_number, false)
+                            .is_err()
+                    })
+                    .collect(),
+                pending: scan.pending,
+                blocks: scan.blocks,
+            })
         });
         self.delivery_sources
             .sweep(&self.filter, collect, fetch, self.clock_store.clone());

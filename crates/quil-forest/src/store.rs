@@ -767,76 +767,101 @@ impl RocksTreeStore {
         batch_records: usize,
         mut flushed: impl FnMut(usize),
     ) -> Result<usize> {
+        let mut from: Option<Vec<u8>> = None;
+        let mut pruned = 0usize;
+        loop {
+            let (deleted, next) =
+                self.prune_batch(min_readable_version, from.as_deref(), batch_records)?;
+            if deleted > 0 {
+                flushed(deleted);
+            }
+            pruned += deleted;
+            match next {
+                Some(next) => from = Some(next),
+                None => return Ok(pruned),
+            }
+        }
+    }
+
+    /// One write batch of [`Self::prune_in_batches`]: at most `batch_records`
+    /// stale records from `from` on (the start of the stale records when
+    /// `None`). Returns the records deleted and where the next batch starts,
+    /// `None` once no record at or below the watermark remains. Records below
+    /// a watermark only ever come from commits at or below it, so a cursor
+    /// stays valid across commits at later versions.
+    pub fn prune_batch(
+        &self,
+        min_readable_version: Version,
+        from: Option<&[u8]>,
+        batch_records: usize,
+    ) -> Result<(usize, Option<Vec<u8>>)> {
         let batch_records = batch_records.max(1);
         let (lo, hi) = self.stale_scan_bounds();
         let vstart = self.prefix.len() + 1; // after prefix + TAG_STALE
-        let mut from = lo.clone();
-        let mut pruned = 0usize;
-        loop {
-            // Collect one batch of stale records with stale_since_version
-            // <= min, and release the iterator before writing.
-            let mut doomed: Vec<Vec<u8>> = Vec::with_capacity(batch_records);
-            let mut more = false;
-            {
-                let mut it = self
-                    .db
-                    .iterator(&lo, &hi, rocksdb::ReadOptions::default())?;
-                it.seek(&from)?;
-                while it.valid() {
-                    let k = match it.key() {
-                        Some(k) if k < hi.as_slice() => k,
-                        _ => break,
-                    };
-                    // Parse the 8-byte stale_since_version prefix.
-                    if k.len() < vstart + 8 {
-                        it.next()?;
-                        continue;
-                    }
-                    let mut vb = [0u8; 8];
-                    vb.copy_from_slice(&k[vstart..vstart + 8]);
-                    if Version::from_be_bytes(vb) > min_readable_version {
-                        // Records are version-ordered; nothing beyond is prunable.
-                        break;
-                    }
-                    if doomed.len() == batch_records {
-                        more = true;
-                        break;
-                    }
-                    doomed.push(k.to_vec());
+        let from = from.map_or_else(|| lo.clone(), <[u8]>::to_vec);
+        // Collect one batch of stale records with stale_since_version
+        // <= min, and release the iterator before writing.
+        let mut doomed: Vec<Vec<u8>> = Vec::with_capacity(batch_records);
+        let mut more = false;
+        {
+            let mut it = self
+                .db
+                .iterator(&lo, &hi, rocksdb::ReadOptions::default())?;
+            it.seek(&from)?;
+            while it.valid() {
+                let k = match it.key() {
+                    Some(k) if k < hi.as_slice() => k,
+                    _ => break,
+                };
+                // Parse the 8-byte stale_since_version prefix.
+                if k.len() < vstart + 8 {
                     it.next()?;
+                    continue;
                 }
+                let mut vb = [0u8; 8];
+                vb.copy_from_slice(&k[vstart..vstart + 8]);
+                if Version::from_be_bytes(vb) > min_readable_version {
+                    // Records are version-ordered; nothing beyond is prunable.
+                    break;
+                }
+                if doomed.len() == batch_records {
+                    more = true;
+                    break;
+                }
+                doomed.push(k.to_vec());
+                it.next()?;
             }
-            if doomed.is_empty() {
-                return Ok(pruned);
-            }
-            let mut wb = self.db.batch();
-            for stale_k in &doomed {
-                // Reconstruct the node key: prefix ++ 'n' ++ borsh(node_key).
-                // The borsh(node_key) bytes are exactly the tail after the
-                // 8-byte version. The parallel size-index memo (TAG_SIZE) for
-                // the same NodeKey goes in lockstep so the side column can't
-                // outgrow the node column.
-                let nk_borsh = &stale_k[vstart + 8..];
-                let mut node_k = self.prefix.clone();
-                node_k.push(TAG_NODE);
-                node_k.extend_from_slice(nk_borsh);
-                let mut size_k = self.prefix.clone();
-                size_k.push(TAG_SIZE);
-                size_k.extend_from_slice(nk_borsh);
-                wb.delete(&node_k);
-                wb.delete(&size_k);
-                wb.delete(stale_k);
-            }
-            self.db.write(wb)?;
-            flushed(doomed.len());
-            pruned += doomed.len();
-            if !more {
-                return Ok(pruned);
-            }
-            // Resume after the last record deleted, not over its tombstones.
-            from = doomed.pop().unwrap_or_default();
-            from.push(0);
         }
+        if doomed.is_empty() {
+            return Ok((0, None));
+        }
+        let mut wb = self.db.batch();
+        for stale_k in &doomed {
+            // Reconstruct the node key: prefix ++ 'n' ++ borsh(node_key).
+            // The borsh(node_key) bytes are exactly the tail after the
+            // 8-byte version. The parallel size-index memo (TAG_SIZE) for
+            // the same NodeKey goes in lockstep so the side column can't
+            // outgrow the node column.
+            let nk_borsh = &stale_k[vstart + 8..];
+            let mut node_k = self.prefix.clone();
+            node_k.push(TAG_NODE);
+            node_k.extend_from_slice(nk_borsh);
+            let mut size_k = self.prefix.clone();
+            size_k.push(TAG_SIZE);
+            size_k.extend_from_slice(nk_borsh);
+            wb.delete(&node_k);
+            wb.delete(&size_k);
+            wb.delete(stale_k);
+        }
+        self.db.write(wb)?;
+        let deleted = doomed.len();
+        if !more {
+            return Ok((deleted, None));
+        }
+        // Resume after the last record deleted, not over its tombstones.
+        let mut next = doomed.pop().unwrap_or_default();
+        next.push(0);
+        Ok((deleted, Some(next)))
     }
 }
 
@@ -997,62 +1022,121 @@ impl RocksTreeStore {
 }
 
 impl RocksTreeStore {
-    /// Delete leaf values no read at a version `>= min_readable_version` can
-    /// return: per key hash, every version below the greatest one at or below
-    /// the watermark. A read at version `v` takes the greatest version `<= v`,
-    /// so for any `v >= min_readable_version` that is the kept floor or a newer
-    /// one. Keys whose versions all lie above the watermark are untouched. At
-    /// most `budget` deletions (decremented); a later pass continues. Returns
-    /// the number deleted.
-    ///
-    /// Only sound at the same watermark [`ForestStore::prune`] uses, which the
-    /// caller derives from the tree's retention history.
-    pub fn prune_values(&self, min_readable_version: Version, budget: &mut usize) -> Result<usize> {
+    /// The key hashes holding leaf values no read at a version
+    /// `>= min_readable_version` can return: per key hash, every version below
+    /// the greatest one at or below the watermark. A read at version `v` takes
+    /// the greatest version `<= v`, so for any `v >= min_readable_version`
+    /// that is the kept floor or a newer one. Keys whose versions all lie
+    /// above the watermark have none. One sweep that leaves the block cache
+    /// alone and deletes nothing, so it needs no lock; it stops once about
+    /// `budget` such values are found (decremented), and only a completely
+    /// read key is judged. Returns the key hashes in key order and the value
+    /// records read; [`Self::prune_values_of`] deletes.
+    pub fn value_prune_candidates(
+        &self,
+        min_readable_version: Version,
+        budget: &mut usize,
+    ) -> Result<(Vec<[u8; 32]>, usize)> {
         let khs = self.prefix.len() + 1;
-        let mut doomed: Vec<Vec<u8>> = Vec::new();
-        {
-            let floor_out = |versions: &mut Vec<(Version, Vec<u8>)>,
-                             doomed: &mut Vec<Vec<u8>>,
-                             budget: &mut usize| {
-                if let Some(floor) = versions
-                    .iter()
-                    .map(|(v, _)| *v)
-                    .filter(|v| *v <= min_readable_version)
-                    .max()
-                {
-                    for (_, key) in versions.iter().filter(|(v, _)| *v < floor) {
-                        if *budget == 0 {
-                            break;
-                        }
-                        doomed.push(key.clone());
-                        *budget -= 1;
-                    }
-                }
-                versions.clear();
+        let mut candidates: Vec<[u8; 32]> = Vec::new();
+        let mut read = 0usize;
+        let judge = |group: Option<[u8; 32]>,
+                     versions: &mut Vec<Version>,
+                     candidates: &mut Vec<[u8; 32]>,
+                     budget: &mut usize| {
+            let floor = versions
+                .iter()
+                .copied()
+                .filter(|v| *v <= min_readable_version)
+                .max();
+            let doomed = floor.map_or(0, |floor| versions.iter().filter(|v| **v < floor).count());
+            if let (Some(group), true) = (group, doomed > 0) {
+                candidates.push(group);
+                *budget = budget.saturating_sub(doomed);
+            }
+            versions.clear();
+        };
+        let (mut it, hi) = self.seq_iter(TAG_VALUE)?;
+        let mut group: Option<[u8; 32]> = None;
+        let mut versions: Vec<Version> = Vec::new();
+        while it.valid() && *budget > 0 {
+            let k = match it.key() {
+                Some(k) if k < hi.as_slice() => k,
+                _ => break,
             };
-            let (mut it, hi) = self.seq_iter(TAG_VALUE)?;
-            let mut group: Option<[u8; 32]> = None;
+            read += 1;
+            if k.len() == khs + 40 {
+                let key_hash: [u8; 32] = k[khs..khs + 32].try_into().unwrap();
+                if group != Some(key_hash) {
+                    judge(group, &mut versions, &mut candidates, budget);
+                    group = Some(key_hash);
+                }
+                versions.push(Version::from_be_bytes(k[khs + 32..].try_into().unwrap()));
+            }
+            it.next()?;
+        }
+        // Only a complete group may be judged: a pass stopped by its budget
+        // leaves the partial one for the next.
+        if !it.valid() || it.key().is_none_or(|k| k >= hi.as_slice()) {
+            judge(group, &mut versions, &mut candidates, budget);
+        }
+        Ok((candidates, read))
+    }
+
+    /// Delete the values of `key_hashes` that no read at a version
+    /// `>= min_readable_version` can return (see
+    /// [`Self::value_prune_candidates`]), as the store holds them now, at most
+    /// `budget` (decremented). Only sound at the same watermark
+    /// [`ForestStore::prune`] uses, which the caller derives from the tree's
+    /// retention history under the lock that orders its commits. Returns the
+    /// number deleted.
+    pub fn prune_values_of(
+        &self,
+        min_readable_version: Version,
+        key_hashes: &[[u8; 32]],
+        budget: &mut usize,
+    ) -> Result<usize> {
+        let mut doomed: Vec<Vec<u8>> = Vec::new();
+        for key_hash in key_hashes {
+            if *budget == 0 {
+                break;
+            }
+            let vp = self.value_prefix(&KeyHash(*key_hash));
+            let mut upper = vp.clone();
+            upper.extend_from_slice(&[0xff; 8]);
+            upper.push(0);
             let mut versions: Vec<(Version, Vec<u8>)> = Vec::new();
-            while it.valid() && *budget > 0 {
+            let mut it = self
+                .db
+                .iterator(&vp, &upper, rocksdb::ReadOptions::default())?;
+            it.seek(&vp)?;
+            while it.valid() {
                 let k = match it.key() {
-                    Some(k) if k < hi.as_slice() => k,
+                    Some(k) if k.starts_with(&vp) => k,
                     _ => break,
                 };
-                if k.len() == khs + 40 {
-                    let key_hash: [u8; 32] = k[khs..khs + 32].try_into().unwrap();
-                    if group != Some(key_hash) {
-                        floor_out(&mut versions, &mut doomed, budget);
-                        group = Some(key_hash);
-                    }
-                    let version = Version::from_be_bytes(k[khs + 32..].try_into().unwrap());
-                    versions.push((version, k.to_vec()));
+                if k.len() == vp.len() + 8 {
+                    versions.push((
+                        Version::from_be_bytes(k[vp.len()..].try_into().unwrap()),
+                        k.to_vec(),
+                    ));
                 }
                 it.next()?;
             }
-            // Only a complete group may be judged: a pass stopped by its budget
-            // leaves the partial one for the next.
-            if !it.valid() || it.key().is_none_or(|k| k >= hi.as_slice()) {
-                floor_out(&mut versions, &mut doomed, budget);
+            let Some(floor) = versions
+                .iter()
+                .map(|(v, _)| *v)
+                .filter(|v| *v <= min_readable_version)
+                .max()
+            else {
+                continue;
+            };
+            for (_, key) in versions.iter().filter(|(v, _)| *v < floor) {
+                if *budget == 0 {
+                    break;
+                }
+                doomed.push(key.clone());
+                *budget -= 1;
             }
         }
         if doomed.is_empty() {
