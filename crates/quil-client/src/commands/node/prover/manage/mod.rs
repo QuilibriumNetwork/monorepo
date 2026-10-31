@@ -8,11 +8,13 @@
 //! * [`model`] holds all state (the `manageModel` struct),
 //! * [`update`] applies messages + key events (`Update`/`handleKey`),
 //! * [`actions`] performs the async RPC commands (the `tea.Cmd`s),
-//! * [`view`] renders (the `View`).
+//! * [`view`] renders (the `View`),
+//! * [`coins`] holds the Coins tab's state and conditions.
 
 mod actions;
 #[cfg(test)]
 mod cadence;
+mod coins;
 mod filter;
 mod model;
 mod msg;
@@ -127,6 +129,7 @@ pub(in crate::commands::node) async fn command(
 async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     let client = pc.connect().await?;
     let km = pc.key_manager.clone();
+    let refresh_state = RefreshState::for_node(pc);
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -134,7 +137,7 @@ async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = event_loop(&mut terminal, client, km).await;
+    let res = event_loop(&mut terminal, client, km, refresh_state).await;
 
     // Restore the terminal regardless of the loop outcome.
     disable_raw_mode()?;
@@ -148,11 +151,10 @@ async fn event_loop(
     terminal: &mut Term,
     client: Client,
     km: Arc<FileKeyManager>,
+    refresh_state: RefreshState,
 ) -> anyhow::Result<()> {
     let mut model = Model::new();
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
-
-    let refresh_state = RefreshState::default();
 
     // Kick off the initial fetch + auto-refresh + spinner tickers.
     spawn_action(&client, &km, &tx, &refresh_state, Cmd::Fetch);
@@ -167,7 +169,7 @@ async fn event_loop(
     terminal.draw(|f| view::draw(f, &mut model))?;
 
     loop {
-        let cmds: Vec<Cmd> = tokio::select! {
+        let mut cmds: Vec<Cmd> = tokio::select! {
             maybe_event = events.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
@@ -190,6 +192,8 @@ async fn event_loop(
                 Vec::new()
             }
         };
+
+        cmds.extend(coins::due(&mut model, std::time::Instant::now()));
 
         if model.refresh_seconds != polling_seconds {
             polling_seconds = model.refresh_seconds;
@@ -232,22 +236,30 @@ async fn render(pc: &ProverCtx, opts: RenderOptions) -> anyhow::Result<()> {
     let mut model = Model::new();
     model.color_coding = opts.color;
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
-    spawn_action(&client, &km, &tx, &RefreshState::default(), Cmd::Fetch);
+    let refresh_state = RefreshState::for_node(pc);
+    spawn_action(&client, &km, &tx, &refresh_state, Cmd::Fetch);
+    // The start's legacy read, as interactively.
+    for cmd in coins::due(&mut model, std::time::Instant::now()) {
+        spawn_action(&client, &km, &tx, &refresh_state, cmd);
+    }
     let deadline = tokio::time::Instant::now() + opts.timeout;
     let mut dropped = Vec::new();
-    // One node, shard and reward answer each.
-    let mut pending = 3;
+    // One node, shard, reward and legacy answer each.
+    let mut pending = 4;
     while pending > 0 {
         let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
             eprintln!(
-                "render: {pending} of 3 node answers missing after {}s",
+                "render: {pending} of 4 node answers missing after {}s",
                 opts.timeout.as_secs()
             );
             break;
         };
         if matches!(
             msg,
-            Msg::RewardRefresh(_) | Msg::ShardRefresh(_) | Msg::DataRefresh { .. }
+            Msg::RewardRefresh(_)
+                | Msg::ShardRefresh(_)
+                | Msg::DataRefresh { .. }
+                | Msg::LegacyRefresh { .. }
         ) {
             pending -= 1;
         }
@@ -257,8 +269,35 @@ async fn render(pc: &ProverCtx, opts: RenderOptions) -> anyhow::Result<()> {
                 .filter(|cmd| !matches!(cmd, Cmd::Fetch)),
         );
     }
-    let (frame, keyed) = render_frame(&mut model, &opts)?;
+    // Keys run first; a legacy read they start is read-only, so it runs and
+    // the frame waits for it.
+    let (legacy, keyed): (Vec<Cmd>, Vec<Cmd>) = apply_keys(&mut model, &opts.keys)?
+        .into_iter()
+        .partition(|cmd| matches!(cmd, Cmd::FetchLegacy));
     dropped.extend(keyed);
+    if !legacy.is_empty() {
+        spawn_action(&client, &km, &tx, &refresh_state, Cmd::FetchLegacy);
+        let deadline = tokio::time::Instant::now() + opts.timeout;
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg @ Msg::LegacyRefresh { .. })) => {
+                    apply_msg(&mut model, msg);
+                    break;
+                }
+                Ok(Some(msg)) => {
+                    apply_msg(&mut model, msg);
+                }
+                _ => {
+                    eprintln!(
+                        "render: legacy coins missing after {}s",
+                        opts.timeout.as_secs()
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    let frame = view::render_text(&mut model, opts.width, opts.height);
     for cmd in &dropped {
         eprintln!("render: not run (read-only): {}", command_name(cmd));
     }
@@ -266,18 +305,26 @@ async fn render(pc: &ProverCtx, opts: RenderOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Apply the render's keys to the model and draw the frame; also returns
-/// the commands the keys would start, which a render never runs.
-fn render_frame(model: &mut Model, opts: &RenderOptions) -> anyhow::Result<(String, Vec<Cmd>)> {
-    let mut dropped = Vec::new();
-    for key in &opts.keys {
-        dropped.extend(
+/// Apply the render's keys to the model; returns the commands they would
+/// start, refreshes aside.
+fn apply_keys(model: &mut Model, keys: &[String]) -> anyhow::Result<Vec<Cmd>> {
+    let mut started = Vec::new();
+    for key in keys {
+        started.extend(
             handle_key(model, parse_key(key)?)
                 .into_iter()
                 .filter(|cmd| !matches!(cmd, Cmd::Fetch)),
         );
     }
-    Ok((view::render_text(model, opts.width, opts.height), dropped))
+    Ok(started)
+}
+
+/// Apply the render's keys to the model and draw the frame; also returns
+/// the commands the keys would start.
+#[cfg(test)]
+fn render_frame(model: &mut Model, opts: &RenderOptions) -> anyhow::Result<(String, Vec<Cmd>)> {
+    let started = apply_keys(model, &opts.keys)?;
+    Ok((view::render_text(model, opts.width, opts.height), started))
 }
 
 /// `qclient node manage --help-text`: the TUI's help as plain text.
@@ -325,6 +372,7 @@ fn parse_key(name: &str) -> anyhow::Result<KeyEvent> {
 fn command_name(cmd: &Cmd) -> &'static str {
     match cmd {
         Cmd::Fetch => "refresh",
+        Cmd::FetchLegacy => "legacy read",
         Cmd::Join(_) => "join",
         Cmd::Lifecycle { .. } => "lifecycle operation",
         Cmd::ToggleManual { .. } | Cmd::MarkManual(_) => "worker mode change",
@@ -337,6 +385,10 @@ struct RefreshState {
     node: Arc<Semaphore>,
     shards: Arc<Semaphore>,
     rewards: Arc<Semaphore>,
+    legacy: Arc<Semaphore>,
+    /// The node config's Ed448 key and network, whose legacy coins the
+    /// Coins tab reads.
+    identity: (Option<[u8; 57]>, u8),
 }
 
 impl Default for RefreshState {
@@ -345,6 +397,21 @@ impl Default for RefreshState {
             node: Arc::new(Semaphore::new(1)),
             shards: Arc::new(Semaphore::new(1)),
             rewards: Arc::new(Semaphore::new(1)),
+            legacy: Arc::new(Semaphore::new(1)),
+            identity: (None, 0),
+        }
+    }
+}
+
+impl RefreshState {
+    fn for_node(pc: &ProverCtx) -> Self {
+        let p2p = &pc.node_config.p2p;
+        Self {
+            identity: (
+                crate::commands::token::legacy::config_public_key(&p2p.peer_priv_key),
+                p2p.network,
+            ),
+            ..Self::default()
         }
     }
 }
@@ -401,6 +468,15 @@ fn spawn_action(
                 &tx,
                 Some(Msg::ShardLoading),
                 actions::fetch_shards(client),
+            );
+        }
+        Cmd::FetchLegacy => {
+            let (public, network) = refresh.identity;
+            spawn_refresh(
+                &refresh.legacy,
+                &tx,
+                None,
+                actions::fetch_legacy(client, public, network),
             );
         }
         Cmd::Join(filters) => {

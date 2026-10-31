@@ -6,6 +6,11 @@ use quil_types::proto::node::{GetShardInfoResponse, NodeInfoResponse, WorkerInfo
 use super::model::FilterOutcome;
 
 pub enum Msg {
+    /// A finished legacy read of the Coins tab, and its duration.
+    LegacyRefresh {
+        answer: super::coins::LegacyAnswer,
+        took: std::time::Duration,
+    },
     RewardRefresh(Result<Option<(u128, u64)>, String>),
     ShardLoading,
     ShardRefresh(Result<GetShardInfoResponse, String>),

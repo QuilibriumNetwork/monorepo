@@ -490,6 +490,45 @@ async fn identities_are_listed_paged_deduplicated_and_kept_apart_on_failure() {
     serving_bare.await.unwrap();
 }
 
+/// The node manager's snapshot lists one identity as `token legacy` does:
+/// both owner forms, every page, the unshielded tally and a shield plan.
+#[tokio::test]
+async fn the_node_manager_snapshot_tallies_both_owner_forms() {
+    let [x_key, x_peer] = admitted_owners(&KEY_X);
+    let quil = 8_000_000_000u128;
+    let index = Index(HashMap::from([
+        (
+            x_key,
+            vec![
+                legacy_coin(0x10, quil, false),
+                legacy_coin(0x20, 2 * quil, true),
+            ],
+        ),
+        (x_peer, vec![legacy_coin(0x40, 5, false)]),
+    ]));
+    let (good, stop, serving) = serve(Arc::new(index)).await;
+    let client = node(&good).connect(None).await.unwrap();
+    let snapshot = snapshot(&client, &quil_execution::domains::QUIL_TOKEN, &KEY_X, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.tally,
+        Tally {
+            units: quil + 5,
+            unshielded: 2,
+            shielded: 1,
+        }
+    );
+    assert_eq!(snapshot.pages, 2);
+    assert_eq!(
+        snapshot.plan.is_some(),
+        cfg!(feature = "confidential-tokens")
+    );
+    assert_eq!(snapshot.rule, shield_rule(0));
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
 /// One identity: an empty listing reads "none", which is not an error.
 #[tokio::test]
 async fn a_single_identity_with_no_coins_reads_none() {

@@ -62,6 +62,40 @@ pub async fn fetch_rewards(client: Client, km: Arc<FileKeyManager>) -> Msg {
     Msg::RewardRefresh(result)
 }
 
+/// Longest a legacy read of the Coins tab may take.
+const LEGACY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Read the legacy coins of the identity with Ed448 key `public` (`None`:
+/// the config has none, so it owns no legacy coins).
+pub async fn fetch_legacy(client: Client, public: Option<[u8; 57]>, network: u8) -> Msg {
+    let started = std::time::Instant::now();
+    let answer = match public {
+        None => Ok(None),
+        Some(public) => tokio::time::timeout(
+            LEGACY_TIMEOUT,
+            crate::commands::token::legacy::snapshot(
+                &client,
+                &quil_execution::domains::QUIL_TOKEN,
+                &public,
+                network,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "no answer within {}s",
+                LEGACY_TIMEOUT.as_secs()
+            ))
+        })
+        .map(Some)
+        .map_err(|e| format!("{e:#}")),
+    };
+    Msg::LegacyRefresh {
+        answer,
+        took: started.elapsed(),
+    }
+}
+
 // ── Data fetch ───────────────────────────────────────────────────────────
 
 /// `fetchRPCData` — GetNodeInfo (required), GetShardInfo + GetWorkerInfo
