@@ -2899,6 +2899,14 @@ pub struct AppConsensusEngine {
     refusals: RefusalWindow,
     /// What the last start attempt learned before it was refused.
     start_context: StartContext,
+    /// The GLOBAL frame at which this store discarded its legacy app
+    /// history, once read ([`Self::legacy_history_discarded`]).
+    history_discarded: std::sync::OnceLock<u64>,
+    /// This engine dropped the finalized records of the discarded legacy
+    /// history ([`Self::drop_discarded_finalized_records`]).
+    discarded_records_dropped: bool,
+    /// When the passive retry next tries a start an expected wait refused.
+    start_pace: StartPace,
 
     // Identity
     local_prover_address: Vec<u8>,
@@ -3159,6 +3167,9 @@ impl AppConsensusEngine {
             behind_shard: BehindShard::default(),
             refusals: RefusalWindow::default(),
             start_context: StartContext::default(),
+            history_discarded: std::sync::OnceLock::new(),
+            discarded_records_dropped: false,
+            start_pace: StartPace::default(),
             local_prover_address: deps.local_prover_address,
             local_bls_pubkey: deps.local_bls_pubkey,
             halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3345,6 +3356,7 @@ impl AppConsensusEngine {
     /// longer land. Proving runs in the background, and a proof GLOBAL does
     /// not record is proven and sent again later.
     fn prove_storage_epoch_if_due(&self, global_frame_number: u64) {
+        let _probe = probe::section(probe::Section::StorageEpochProofCheck);
         use quil_types::consensus::{
             epoch_for_frame, hash_storage_proofs_at, storage_snapshot_frame,
         };
@@ -4285,6 +4297,7 @@ impl AppConsensusEngine {
     /// worker was rebound has committed by then, with its record, and a
     /// later one finds the binding changed and stops.
     fn check_evicted_lineage(&mut self, now: std::time::Instant) {
+        let _probe = probe::section(probe::Section::EvictedLineageCheck);
         let cursor = {
             let shard = self.execution_engine.as_ref().map(|manager| manager.crdt());
             let _barrier = shard.as_ref().map(|shard| shard.lock_forest_writes());
@@ -6956,11 +6969,26 @@ impl AppConsensusEngine {
                             let _ = dead.shutdown_and_join().await;
                         }
                     }
-                    if cw_transport_ready && self.cw_handle.is_none() {
+                    // An expected wait's start attempts follow its pace: each
+                    // repeats the start checks' store reads (`StartPace`).
+                    let paced = self.cw_handle.is_none()
+                        && !self.start_pace.due(
+                            std::time::Instant::now(),
+                            self.last_materialized_frame,
+                            || {
+                                self.global_anchor_store
+                                    .get_latest_global_clock_frame()
+                                    .ok()
+                                    .and_then(|frame| frame.header)
+                                    .map_or(0, |header| header.frame_number)
+                            },
+                        );
+                    if cw_transport_ready && self.cw_handle.is_none() && !paced {
                         // Passive-mode retry: keep trying until the committee is
                         // buildable (active provers present in this registry).
                         match self.start_consensus_cw((bls_signer_factory)()).await {
                             Ok(handle) => {
+                                self.start_pace = StartPace::default();
                                 self.cw_handle = Some(handle);
                                 info!(
                                     core_id = self.core_id,
@@ -6975,8 +7003,20 @@ impl AppConsensusEngine {
                                 // Under committee sessions this is the only
                                 // trace of why a shard is not running yet.
                                 self.note_start_refused(&e, std::time::Instant::now());
+                                let wait = paced_start_wait(
+                                    &e,
+                                    &self.start_context,
+                                    proof_verification_waiting(&self.filter),
+                                );
+                                self.start_pace.refused(
+                                    std::time::Instant::now(),
+                                    self.last_materialized_frame,
+                                    wait,
+                                );
                             }
                         }
+                    } else if cw_transport_ready && paced {
+                        // Its next attempt is due later, or once the cursor moves.
                     } else if cw_transport_ready && self.cw_session.is_none() {
                         // DYNAMIC COMMITTEE (legacy registry committees only; an
                         // authorized session changes through its handoff): if the shard's active-prover set
@@ -7468,6 +7508,7 @@ impl AppConsensusEngine {
     /// vote short of its quorum. Also publishes whether its seat departs
     /// ([`Self::publish_departing`]), which ranks its recoveries last.
     fn publish_lagging_voter(&mut self, now: std::time::Instant) {
+        let _probe = probe::section(probe::Section::LaggingVoterCheck);
         let seated = self.cw_session.is_some()
             && self.own_votes.member().is_some()
             && self.cw_handle.as_ref().is_some_and(|host| !host.is_dead());
@@ -8070,7 +8111,10 @@ impl AppConsensusEngine {
             self.execution.clear_seal();
         }
         self.republish_seal_if_due(&global, &session);
-        let status = crate::app_handoff::still_current(&global, &session);
+        let status = {
+            let _probe = probe::section(probe::Section::SessionStatusCheck);
+            crate::app_handoff::still_current(&global, &session)
+        };
         let now = std::time::Instant::now();
         let filter = hex::encode(&self.filter);
         let error = status
@@ -8267,9 +8311,7 @@ impl AppConsensusEngine {
             .ok()
             .and_then(|f| f.header.map(|h| h.frame_number))
             .unwrap_or(0);
-        if global_frame < policy.activation_frame
-            || self.clock_store.app_frame_history_discarded()?.is_some()
-        {
+        if global_frame < policy.activation_frame || self.legacy_history_discarded()?.is_some() {
             return Ok(false);
         }
         if let Some(old) = self.cw_handle.take() {
@@ -8278,6 +8320,7 @@ impl AppConsensusEngine {
             }
         }
         self.clock_store.discard_app_frame_history(global_frame)?;
+        let _ = self.history_discarded.set(global_frame);
         self.cw_discarded_through_epoch = Some(self.cw_host_epoch);
         // What this engine holds of the discarded chain.
         self.set_materialized_frame(0);
@@ -8321,31 +8364,59 @@ impl AppConsensusEngine {
         Ok(true)
     }
 
+    /// The GLOBAL frame at which this store discarded its legacy app history
+    /// ([`quil_types::store::ClockStore::app_frame_history_discarded`]), read
+    /// from the store until it has. The record is written once and never
+    /// removed, so a start check reads it once per engine, not every retry:
+    /// on a store whose table block holding it also holds a storage replica
+    /// (no bloom filter skips the block), each read copied the whole replica,
+    /// about 1 GB and 1 to 2 s on a mainnet worker, three times a retry
+    /// (2026-10-31).
+    fn legacy_history_discarded(&self) -> Result<Option<u64>> {
+        if let Some(frame) = self.history_discarded.get() {
+            return Ok(Some(*frame));
+        }
+        let _probe = probe::section(probe::Section::LegacyHistoryCheck);
+        let discarded = self.clock_store.app_frame_history_discarded()?;
+        if let Some(frame) = discarded {
+            let _ = self.history_discarded.set(frame);
+        }
+        Ok(discarded)
+    }
+
     /// After this store discarded its legacy history, finalized records this
     /// shard kept from a legacy instance (its own, or an earlier assignment's
-    /// left beside it) are not replayed into a session.
-    fn drop_discarded_finalized_records(&self) -> Result<()> {
+    /// left beside it) are not replayed into a session. Once per engine: no
+    /// legacy instance runs here after the discard, which stops it first, so
+    /// no such record is written later.
+    fn drop_discarded_finalized_records(&mut self) -> Result<()> {
+        if self.discarded_records_dropped {
+            return Ok(());
+        }
         let _probe = probe::section(probe::Section::FinalizedRecordsScan);
         let Some(policy) = quil_types::consensus::committee_handoff_policy() else {
             return Ok(());
         };
         if policy.legacy_history != quil_types::consensus::LegacyHistory::Discard
-            || self.clock_store.app_frame_history_discarded()?.is_none()
+            || self.legacy_history_discarded()?.is_none()
         {
             return Ok(());
         }
         let Some(base) = self.cw_storage_base.as_ref() else {
+            self.discarded_records_dropped = true;
             return Ok(());
         };
         let directory = base
             .join("cw-app-consensus")
             .join(format!("finalized-{}", hex::encode(&self.filter)));
         if !directory.exists() {
+            self.discarded_records_dropped = true;
             return Ok(());
         }
         let records = crate::cw_app_seams::FinalizedRecords::open(directory)
             .map_err(|e| QuilError::Internal(format!("open finalized app frames: {e}")))?;
         let dropped = records.discard_anchored_before(policy.activation_frame);
+        self.discarded_records_dropped = true;
         if dropped > 0 {
             info!(
                 core_id = self.core_id,
@@ -10627,9 +10698,12 @@ impl AppConsensusEngine {
                 Some(r) => r.clone(),
                 None => break, // not finalized through consensus yet
             };
-            let mut frame = match self.received_full_frames.get(&next) {
-                Some(f) => f.clone(),
-                None => break, // full frame not received yet
+            let mut frame = {
+                let _probe = probe::section(probe::Section::HeldFrameCheck);
+                match self.received_full_frames.get(&next) {
+                    Some(f) => f.clone(),
+                    None => break, // full frame not received yet
+                }
             };
             // Validate address + capture the fee vote (Copy) so we don't
             // hold a borrow of `frame.header` across the awaits below.
@@ -10663,11 +10737,14 @@ impl AppConsensusEngine {
 
             // Recompute requests_root over the frame's requests (canonical
             // encodings) and require it to equal what we finalized.
-            let canonical: Vec<Vec<u8>> = frame
-                .requests
-                .iter()
-                .filter_map(|b| crate::consensus_wire::app_bundle_to_canonical_bytes(b).ok())
-                .collect();
+            let canonical: Vec<Vec<u8>> = {
+                let _probe = probe::section(probe::Section::HeldFrameCheck);
+                frame
+                    .requests
+                    .iter()
+                    .filter_map(|b| crate::consensus_wire::app_bundle_to_canonical_bytes(b).ok())
+                    .collect()
+            };
             if canonical.len() != frame.requests.len() {
                 warn!(
                     core_id = self.core_id,
@@ -13862,6 +13939,210 @@ const PREDECESSOR_BLOCKED_AFTER: Duration = Duration::from_secs(10 * 60);
 /// How often a successor still blocked on its predecessor's state warns again.
 const PREDECESSOR_BLOCKED_REPEAT: Duration = Duration::from_secs(30 * 60);
 
+/// How often the passive retry tries a start an expected wait refused
+/// ([`paced_start_wait`]), unless the materialized cursor moves first.
+const START_WAIT_RETRY: Duration = Duration::from_secs(60);
+
+/// An expected wait the passive retry paces ([`paced_start_wait`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PacedWait {
+    label: &'static str,
+    /// The GLOBAL frame at which the wait can end, when known: an attempt
+    /// is due once the latest GLOBAL frame reaches it.
+    until_frame: Option<u64>,
+}
+
+/// Whether a refused start is an expected wait whose end no start attempt
+/// hastens, so the passive retry tries again only every
+/// [`START_WAIT_RETRY`], once the cursor moves, or once GLOBAL reaches the
+/// frame the wait ends at, instead of every 10 s: an attempt repeats every
+/// start check and its store reads, which held a mainnet worker's thread 6
+/// to 40 s a retry (2026-10-31). Waits that end with GLOBAL starting or
+/// seating a session are not paced: a member that started late would cost
+/// its committee quorum.
+fn paced_start_wait(
+    error: &QuilError,
+    context: &StartContext,
+    proof_wait: bool,
+) -> Option<PacedWait> {
+    let wait = |label, until_frame| Some(PacedWait { label, until_frame });
+    if refused_while_joining(error, context) {
+        let activation = context
+            .not_seated
+            .as_ref()
+            .and_then(|seat| seat.join_wait)
+            .map(quil_types::consensus::JoinWait::activation_frame);
+        wait("allocation joining", activation)
+    } else if quil_execution::global_intrinsic::handoff::global_sync_in_progress(error) {
+        wait("GLOBAL state sync installing", None)
+    } else if error.to_string().contains(REANCHOR_IN_PROGRESS) {
+        wait("shard re-anchor in progress", None)
+    } else if proof_wait && crate::app_handoff::predecessor_unrecovered(error) {
+        // The shard sync that recovers the state waits for the same proofs.
+        wait("predecessor state waits for proof verification", None)
+    } else {
+        None
+    }
+}
+
+/// Whether a frame of `filter` waits for its proofs to verify in the
+/// background (`defer_for_proof_verification`).
+fn proof_verification_waiting(filter: &[u8]) -> bool {
+    PROOF_DEFERRALS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entries
+        .keys()
+        .any(|(waiting, _)| waiting.as_slice() == filter)
+}
+
+/// The passive retry's pace through an expected wait ([`paced_start_wait`]).
+#[derive(Debug, Default)]
+struct StartPace {
+    /// The paced wait, when the last attempt was refused for one.
+    wait: Option<PacedWait>,
+    /// When that refusal came, and the materialized cursor then.
+    refused: Option<(std::time::Instant, u64)>,
+}
+
+impl StartPace {
+    /// Whether a start attempt is due at `now` with the cursor at `cursor`;
+    /// `global_frame` reads the latest GLOBAL frame, only for a wait that
+    /// ends at a known frame.
+    fn due(
+        &self,
+        now: std::time::Instant,
+        cursor: u64,
+        global_frame: impl FnOnce() -> u64,
+    ) -> bool {
+        let (Some(wait), Some((at, refused_at))) = (self.wait, self.refused) else {
+            return true;
+        };
+        now.saturating_duration_since(at) >= START_WAIT_RETRY
+            || cursor != refused_at
+            || wait
+                .until_frame
+                .is_some_and(|frame| global_frame() >= frame)
+    }
+
+    /// A start was refused at `now` with the cursor at `cursor`; `wait`: the
+    /// expected wait it paces, if any.
+    fn refused(&mut self, now: std::time::Instant, cursor: u64, wait: Option<PacedWait>) {
+        if let Some(paced) = wait.filter(|paced| Some(paced.label) != self.wait.map(|w| w.label)) {
+            debug!(
+                wait = paced.label,
+                until_frame = paced.until_frame,
+                retry_secs = START_WAIT_RETRY.as_secs(),
+                "consensus start attempts paced through an expected wait"
+            );
+        }
+        self.wait = wait;
+        self.refused = Some((now, cursor));
+    }
+}
+
+#[cfg(test)]
+mod start_pace_tests {
+    use super::*;
+
+    /// An expected wait no attempt hastens is retried once a minute, or as
+    /// soon as the cursor moves; any other refusal at the next tick.
+    #[test]
+    fn a_start_an_expected_wait_refused_is_retried_once_a_minute_or_when_the_cursor_moves() {
+        let now = std::time::Instant::now();
+        let head = || 100;
+        let mut pace = StartPace::default();
+        assert!(pace.due(now, 7, head));
+        let sync = PacedWait {
+            label: "GLOBAL state sync installing",
+            until_frame: None,
+        };
+        pace.refused(now, 7, Some(sync));
+        assert!(!pace.due(now + Duration::from_secs(10), 7, head));
+        assert!(!pace.due(now + START_WAIT_RETRY - Duration::from_millis(1), 7, head));
+        assert!(pace.due(now + START_WAIT_RETRY, 7, head));
+        assert!(
+            pace.due(now + Duration::from_secs(10), 8, head),
+            "the cursor moved"
+        );
+        // A joining allocation's wait ends at its activation frame.
+        let joining = |until_frame| PacedWait {
+            label: "allocation joining",
+            until_frame: Some(until_frame),
+        };
+        pace.refused(now, 7, Some(joining(101)));
+        assert!(!pace.due(now + Duration::from_secs(10), 7, head));
+        pace.refused(now, 7, Some(joining(100)));
+        assert!(
+            pace.due(now + Duration::from_secs(10), 7, head),
+            "GLOBAL reached it"
+        );
+        pace.refused(now, 7, None);
+        assert!(pace.due(now, 7, head), "a refusal that is not paced");
+    }
+
+    /// Which refusals are paced: the waits that end with no start attempt's
+    /// help; never one ending as GLOBAL starts or seats a session, nor a
+    /// predecessor wait the retry's shard sync request drives.
+    #[test]
+    fn only_waits_no_start_attempt_hastens_are_paced() {
+        use quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS;
+        let context = StartContext::default();
+        let unavailable = |reason: &str| QuilError::ExecutionUnavailable(reason.to_string());
+        let sync = unavailable(GLOBAL_SYNC_IN_PROGRESS);
+        let reanchor = unavailable(REANCHOR_IN_PROGRESS);
+        let predecessor = unavailable("predecessor state has not been recovered through its seal");
+        assert!(crate::app_handoff::predecessor_unrecovered(&predecessor));
+        let history = unavailable("predecessor outgoing history recovery is still in progress");
+        let successor =
+            QuilError::Consensus("app committee session is sealed; awaiting its successor".into());
+        let label = |error, proof_wait| {
+            paced_start_wait(error, &context, proof_wait).map(|wait| (wait.label, wait.until_frame))
+        };
+        assert_eq!(
+            label(&sync, false),
+            Some(("GLOBAL state sync installing", None))
+        );
+        assert_eq!(
+            label(&reanchor, false),
+            Some(("shard re-anchor in progress", None))
+        );
+        assert_eq!(
+            label(&predecessor, true),
+            Some(("predecessor state waits for proof verification", None))
+        );
+        let joining = StartContext {
+            not_seated: Some(NotSeated {
+                allocations: vec![quil_types::consensus::EffectiveStatus::Joining],
+                global_frame: 90,
+                release: None,
+                join_wait: Some(quil_types::consensus::JoinWait::Activation { frame: 120 }),
+                session_wait: None,
+            }),
+            ..StartContext::default()
+        };
+        let refused = QuilError::Consensus("app committee session member not seated".into());
+        assert_eq!(
+            paced_start_wait(&refused, &joining, false),
+            Some(PacedWait {
+                label: "allocation joining",
+                until_frame: Some(120),
+            })
+        );
+        for (error, proof_wait) in [(&predecessor, false), (&history, true), (&successor, true)] {
+            assert_eq!(
+                paced_start_wait(error, &context, proof_wait),
+                None,
+                "{error}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "app_engine_retry_tick_tests.rs"]
+mod retry_tick_tests;
+
 /// Why the shard sync's archive anchor was last refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AnchorRefusal {
@@ -14336,7 +14617,7 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
     } else if quil_execution::global_intrinsic::handoff::global_sync_in_progress(error) {
         (ExpectedWait, "this node is installing a GLOBAL state sync from an archive, and committed GLOBAL state is \
             withheld until its last chunk is in (the 'sync phase: installing' lines show its progress); it retries \
-            every 10 s", true)
+            every minute", true)
     } else if text.contains("authenticated GLOBAL state") {
         (ThisNode, "this worker has no authenticated GLOBAL state yet; it waits for its master's GLOBAL sync; \
             check the master if it persists", true)
