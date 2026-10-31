@@ -57,6 +57,25 @@ pub fn default_node_config_dir(network_override: Option<&str>) -> anyhow::Result
     )
 }
 
+/// The `./.config` under `cwd` holding a node config that the default
+/// resolution in `resolved` passed over: the default node config exists, so
+/// `./.config` is not read unless named with `--config`.
+pub fn unused_local_config(resolved: &Path, cwd: &Path) -> Option<PathBuf> {
+    let local = cwd.join(".config");
+    if !local.join("config.yml").is_file() {
+        return None;
+    }
+    let resolved = cwd.join(resolved);
+    let same = match (
+        std::fs::canonicalize(&local),
+        std::fs::canonicalize(&resolved),
+    ) {
+        (Ok(local), Ok(resolved)) => local == resolved,
+        _ => local == resolved,
+    };
+    (!same).then_some(local)
+}
+
 /// Resolve + load a node config. `config_directory` may be:
 /// - `"default"` or empty → resolve via `default_node_config_dir`
 /// - an explicit path → loaded directly
@@ -144,6 +163,34 @@ mod tests {
         assert_eq!(dir, empty);
         assert_eq!(config.listen_grpc_multiaddr, "/ip4/127.0.0.1/tcp/8888");
         assert_eq!(fs::read_dir(&empty).unwrap().count(), 1);
+    }
+
+    /// A `./.config` holding config.yml is reported only when the default
+    /// resolution chose another directory.
+    #[test]
+    fn a_local_config_passed_over_by_the_default_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("node");
+        let default = tmp.path().join("configs").join("default");
+        fs::create_dir_all(&default).unwrap();
+        fs::create_dir_all(cwd.join(".config")).unwrap();
+        // No config.yml in ./.config: nothing was passed over.
+        assert_eq!(unused_local_config(&default, &cwd), None);
+        fs::write(cwd.join(".config").join("config.yml"), "x").unwrap();
+        assert_eq!(
+            unused_local_config(&default, &cwd),
+            Some(cwd.join(".config"))
+        );
+        // The resolution fell back to ./.config itself, relative or absolute.
+        assert_eq!(unused_local_config(Path::new("./.config"), &cwd), None);
+        assert_eq!(unused_local_config(&cwd.join(".config"), &cwd), None);
+        // The default is a link to this ./.config: the same config.
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("configs").join("link");
+            std::os::unix::fs::symlink(cwd.join(".config"), &link).unwrap();
+            assert_eq!(unused_local_config(&link, &cwd), None);
+        }
     }
 
     #[test]

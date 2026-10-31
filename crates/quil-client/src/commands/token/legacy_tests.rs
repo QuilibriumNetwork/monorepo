@@ -677,6 +677,7 @@ fn shield_readiness_names_the_frame_and_the_next_command() {
     let common = TokenCommonArgs {
         public_rpc: false,
         config: Vec::new(),
+        submit_config: None,
         read_rpc: Some("/ip4/127.0.0.1/tcp/8888".into()),
         insecure_read_rpc: false,
         max_fee: 0,

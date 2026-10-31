@@ -63,9 +63,12 @@ async fn wallet_claim_command_proves_and_submits_both_authorities() {
     let mut tc = TokenCtx {
         node_config: quil_config::Config::default(),
         config_dir: directory.path().to_path_buf(),
-        key_manager: km,
+        key_manager: km.clone(),
         connect_opts: crate::rpc::ConnectOpts::default(),
         submit_opts: crate::rpc::ConnectOpts::default(),
+        submit_key_manager: km,
+        submit_config_dir: directory.path().to_path_buf(),
+        submit_identity: Default::default(),
         peer_id_bytes: Vec::new(),
         max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
     };
@@ -1069,9 +1072,12 @@ async fn wallet_transfer_flow_with_fee(command: bool, automatic_fee: bool) {
     let mut tc = TokenCtx {
         node_config: quil_config::Config::default(),
         config_dir: directory.path().to_path_buf(),
-        key_manager: km,
+        key_manager: km.clone(),
         connect_opts: crate::rpc::ConnectOpts::default(),
         submit_opts: crate::rpc::ConnectOpts::default(),
+        submit_key_manager: km,
+        submit_config_dir: directory.path().to_path_buf(),
+        submit_identity: Default::default(),
         peer_id_bytes: Vec::new(),
         max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
     };
