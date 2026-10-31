@@ -499,12 +499,15 @@ pub struct ForestWriteGuard<'a> {
 }
 
 /// What [`HypergraphCrdt::confine_forest`] did: confinement commits, deleted
-/// node and stale records, and leaf-key ranges deleted, and the lineages
-/// whose subtree a commit dropped ([`HypergraphCrdt::confine_forest_recording`]).
+/// node and stale records, and leaf-key ranges deleted, the top nodes of
+/// dropped subtrees kept for older versions' proofs until the retention
+/// pruner reaches them, and the lineages whose subtree a commit dropped
+/// ([`HypergraphCrdt::confine_forest_recording`]).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ForestConfinement {
     pub commits: usize,
     pub nodes: usize,
+    pub retained_nodes: usize,
     pub stale_records: usize,
     pub key_ranges: usize,
     pub dropped_lineages: Vec<Vec<u8>>,
@@ -4378,6 +4381,7 @@ impl HypergraphCrdt {
                             ))
                         })?;
                     outcome.nodes += deletion.nodes;
+                    outcome.retained_nodes += deletion.retained;
                     outcome.stale_records += deletion.stale_records;
                     outcome.key_ranges += deletion.key_ranges;
                     cursor = deletion.cursor;

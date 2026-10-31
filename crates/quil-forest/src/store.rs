@@ -1076,15 +1076,19 @@ impl RocksTreeStore {
         (lo, hi)
     }
 
-    /// Delete nodes whose path `doomed` selects, with their size memos,
+    /// Delete nodes whose path `doomed` selects, with their size memos, and
+    /// mark those `retired` selects stale at `stale_since` for the pruner,
     /// examining at most `scan_budget` node records from `after` on. Returns
-    /// the deletions and where the next call resumes (`None`: finished).
+    /// the deletions, the nodes marked and where the next call resumes
+    /// (`None`: finished).
     pub(crate) fn delete_nodes_where(
         &self,
         doomed: &dyn Fn(&NibblePath) -> bool,
+        retired: &dyn Fn(&NibblePath) -> bool,
+        stale_since: Version,
         after: Option<Vec<u8>>,
         scan_budget: usize,
-    ) -> Result<(usize, Option<Vec<u8>>)> {
+    ) -> Result<(usize, usize, Option<Vec<u8>>)> {
         let (lo, hi) = self.tag_bounds(TAG_NODE);
         let start = after.unwrap_or_else(|| lo.clone());
         anyhow::ensure!(
@@ -1092,7 +1096,7 @@ impl RocksTreeStore {
             "node sweep cursor outside this tree"
         );
         let mut wb = self.db.batch();
-        let (mut deleted, mut scanned) = (0usize, 0usize);
+        let (mut deleted, mut marked, mut scanned) = (0usize, 0usize, 0usize);
         let mut next = None;
         {
             let mut it = self
@@ -1115,13 +1119,22 @@ impl RocksTreeStore {
                         size.extend_from_slice(tail);
                         wb.delete(size);
                         deleted += 1;
+                    } else if retired(node_key.nibble_path()) {
+                        wb.put(
+                            self.stale_key_bytes(&StaleNodeIndex {
+                                stale_since_version: stale_since,
+                                node_key,
+                            }),
+                            Vec::new(),
+                        );
+                        marked += 1;
                     }
                 }
                 it.next()?;
             }
         }
         self.db.write(wb)?;
-        Ok((deleted, next))
+        Ok((deleted, marked, next))
     }
 
     /// Delete stale-index records of nodes whose path `doomed` selects.

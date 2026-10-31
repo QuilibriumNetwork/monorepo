@@ -9,7 +9,10 @@
 //! store holding only the kept leaves would build. Afterwards
 //! [`Forest::delete_outside_scope`] removes the records outside the scopes at
 //! every version; it refuses unless the head no longer reaches them. Older
-//! versions keep their in-scope reads, but no longer read the dropped subtrees.
+//! versions keep their in-scope reads and proofs, but no longer read the
+//! dropped subtrees: the sweep keeps only each dropped subtree's top node,
+//! which such a proof reads as a sibling, until the retention pruner
+//! reaches the sweep.
 use anyhow::Result;
 use jmt::storage::{
     Child, Children, NibblePath, Node, NodeBatch, NodeKey, StaleNodeIndex, StaleNodeIndexBatch,
@@ -42,6 +45,15 @@ fn scope_of(bits: &[bool], keep: &[Vec<bool>]) -> Scope {
     } else {
         Scope::Outside
     }
+}
+
+/// Whether a node at `bits` is outside every kept scope while its parent is
+/// not: the top of a dropped subtree. A proof of a kept key at a version
+/// before the confinement reads it as a sibling (the width-1 neighbour of
+/// the key's nibble, or a lone leaf beside it), so the sweep keeps it.
+fn tops_a_dropped_subtree(bits: &[bool], keep: &[Vec<bool>]) -> bool {
+    scope_of(bits, keep) == Scope::Outside
+        && scope_of(&bits[..bits.len().saturating_sub(4)], keep) != Scope::Outside
 }
 
 fn key_bits(key: &[u8; 32]) -> Vec<bool> {
@@ -219,10 +231,12 @@ pub(crate) fn outside_key_ranges(keep: &[Vec<bool>]) -> Vec<(Option<[u8; 32]>, O
 }
 
 /// Progress of [`Forest::delete_outside_scope`]; `cursor` resumes the node
-/// sweep, `None` once it is complete.
+/// sweep, `None` once it is complete. `retained` counts the tops of dropped
+/// subtrees kept for older versions' proofs and marked stale at the head.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ScopeDeletion {
     pub nodes: usize,
+    pub retained: usize,
     pub stale_records: usize,
     pub key_ranges: usize,
     pub cursor: Option<Vec<u8>>,
@@ -286,7 +300,10 @@ impl Forest {
     /// version: nodes and their size memos (at most `scan_budget` node records
     /// examined per call, resuming at `cursor`), then, once the node sweep is
     /// complete, stale records, leaf values and preimages. Refuses unless the
-    /// head at `head` reaches nothing outside `keep`.
+    /// head at `head` reaches nothing outside `keep`. The top node of each
+    /// dropped subtree stays, with its size memo, as a proof of a kept key
+    /// at an older version reads it; it is marked stale at `head`, so the
+    /// retention pruner removes it once no readable version reaches it.
     pub fn delete_outside_scope(
         &self,
         app: &[u8],
@@ -310,15 +327,21 @@ impl Forest {
         let TreeStore::Rocks(store) = &reader else {
             return Ok(ScopeDeletion::default());
         };
-        let outside = |path: &NibblePath| scope_of(&path_bits(path), keep) == Scope::Outside;
-        let (nodes, cursor) = store.delete_nodes_where(&outside, cursor, scan_budget)?;
+        let below_top = |path: &NibblePath| {
+            let bits = path_bits(path);
+            scope_of(&bits, keep) == Scope::Outside && !tops_a_dropped_subtree(&bits, keep)
+        };
+        let top = |path: &NibblePath| tops_a_dropped_subtree(&path_bits(path), keep);
+        let (nodes, retained, cursor) =
+            store.delete_nodes_where(&below_top, &top, head, cursor, scan_budget)?;
         let mut deletion = ScopeDeletion {
             nodes,
+            retained,
             cursor,
             ..Default::default()
         };
         if deletion.cursor.is_none() {
-            deletion.stale_records = store.delete_stale_where(&outside)?;
+            deletion.stale_records = store.delete_stale_where(&below_top)?;
             let ranges = outside_key_ranges(keep);
             deletion.key_ranges = ranges.len();
             store.delete_keyed_ranges(&ranges)?;
@@ -392,7 +415,18 @@ mod tests {
         forest.shard_phase_root(&APP, PHASE, 0).unwrap().unwrap()
     }
 
+    /// Outside the kept scopes and not the top of a dropped subtree: what a
+    /// sweep deletes.
+    fn below_a_top(bits: &[bool], keep: &[Vec<bool>]) -> bool {
+        scope_of(bits, keep) == Scope::Outside && !tops_a_dropped_subtree(bits, keep)
+    }
+
     fn outside_nodes(db: &crate::CoordinatedDb, keep: &[Vec<bool>]) -> usize {
+        nodes_where(db, |bits| scope_of(bits, keep) == Scope::Outside)
+    }
+
+    /// The test tree's node records whose path `select` picks.
+    fn nodes_where(db: &crate::CoordinatedDb, select: impl Fn(&[bool]) -> bool) -> usize {
         let mut prefix = b"scope-test/".to_vec();
         prefix.extend_from_slice(&TreeId::shard_phase(&APP, PHASE).prefix());
         prefix.push(b'n');
@@ -402,7 +436,7 @@ mod tests {
         while it.valid() && it.key().is_some_and(|k| k.starts_with(&prefix)) {
             let node_key =
                 borsh::from_slice::<NodeKey>(&it.key().unwrap()[prefix.len()..]).unwrap();
-            if scope_of(&path_bits(node_key.nibble_path()), keep) == Scope::Outside {
+            if select(&path_bits(node_key.nibble_path())) {
                 count += 1;
             }
             it.next();
@@ -504,7 +538,8 @@ mod tests {
             }
         }
         assert!(calls > 1);
-        assert_eq!(outside_nodes(&db, &keep), 0);
+        assert_eq!(nodes_where(&db, |bits| below_a_top(bits, &keep)), 0);
+        assert!(nodes_where(&db, |bits| tops_a_dropped_subtree(bits, &keep)) > 0);
         let reader = forest.shard_phase_reader(&APP, PHASE);
         let hash = |k: Vec<u8>| crate::KeyHash(k.try_into().unwrap());
         assert_eq!(
@@ -539,6 +574,113 @@ mod tests {
             forest.shard_phase_root(&APP, PHASE, 3).unwrap().unwrap(),
             fresh_root(&expected)
         );
+        // The retention pruner reaching the sweep reclaims the tops.
+        forest.prune_shard_phase(&APP, PHASE, 2).unwrap();
+        assert_eq!(outside_nodes(&db, &keep), 0);
+    }
+
+    /// A proof of a kept key at a version before the confinement reads the
+    /// top node of a dropped subtree beside the key's path: the width-1
+    /// sibling of the kept nibble (an internal node), or a lone leaf in a
+    /// sibling range. The sweep keeps those tops, and only them, until the
+    /// retention pruner reaches it.
+    #[test]
+    fn older_proofs_of_kept_keys_survive_the_sweep() {
+        let keep = vec![bits(0x10, 4)];
+        // Beside the kept nibble 1: a dropped subtree at nibble 0, or a
+        // lone dropped leaf at nibble 3; another dropped subtree or leaf at 8.
+        for dropped in [&[0x01u8, 0x02, 0x81, 0x82][..], &[0x31, 0x81][..]] {
+            let (_dir, db, forest) = open();
+            let leaves: Vec<_> = dropped
+                .iter()
+                .chain(&[0x11, 0x12])
+                .map(|&first| (key(first, first), vec![first]))
+                .collect();
+            forest
+                .commit_shard_phase_raw(&APP, PHASE, 0, leaves)
+                .unwrap();
+            // A version rewriting the dropped and the kept side.
+            forest
+                .commit_shard_phase_raw(
+                    &APP,
+                    PHASE,
+                    1,
+                    vec![
+                        (key(dropped[0], dropped[0]), vec![0xee]),
+                        (key(0x12, 0x12), vec![0xef]),
+                    ],
+                )
+                .unwrap();
+            let roots: Vec<_> = (0..2)
+                .map(|version| {
+                    forest
+                        .shard_phase_root(&APP, PHASE, version)
+                        .unwrap()
+                        .unwrap()
+                })
+                .collect();
+            let (_, puts) = forest
+                .stage_scope_confinement(&APP, PHASE, 1, 2, &keep)
+                .unwrap()
+                .unwrap();
+            apply(&db, puts);
+            let mut cursor = None;
+            loop {
+                cursor = forest
+                    .delete_outside_scope(&APP, PHASE, 2, &keep, cursor, 3)
+                    .unwrap()
+                    .cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+
+            let proves = |version: u64, root: [u8; 32]| {
+                for (first, value) in [
+                    (0x11, Some(vec![0x11])),
+                    (
+                        0x12,
+                        Some(if version == 0 { vec![0x12] } else { vec![0xef] }),
+                    ),
+                    (0x13, None),
+                ] {
+                    let key = key(first, first);
+                    let (read, proof) = forest
+                        .shard_phase_get_with_proof_raw(&APP, PHASE, version, &key)
+                        .unwrap();
+                    assert_eq!(read, value, "key {first:#x} at version {version}");
+                    proof
+                        .verify(
+                            jmt::RootHash(root),
+                            crate::shard_path_key_hash(&key),
+                            value.as_ref(),
+                        )
+                        .unwrap();
+                }
+            };
+            for (version, root) in roots.iter().enumerate() {
+                proves(version as u64, *root);
+            }
+            assert_eq!(
+                nodes_where(&db, |bits| below_a_top(bits, &keep)),
+                0,
+                "nothing below the tops stays"
+            );
+            assert_eq!(
+                nodes_where(&db, |bits| tops_a_dropped_subtree(bits, &keep)),
+                3,
+                "the tops at both versions of the side the second commit \
+                 rewrote, and the other dropped top"
+            );
+
+            forest.prune_shard_phase(&APP, PHASE, 2).unwrap();
+            assert_eq!(
+                outside_nodes(&db, &keep),
+                0,
+                "the retention pruner reclaims the tops"
+            );
+            proves(2, forest.shard_phase_root(&APP, PHASE, 2).unwrap().unwrap());
+        }
     }
 
     #[test]
@@ -578,9 +720,12 @@ mod tests {
             forest.shard_phase_root(&APP, PHASE, 1).unwrap().unwrap(),
             root
         );
-        forest
+        let deletion = forest
             .delete_outside_scope(&APP, PHASE, 1, &keep, None, 100)
             .unwrap();
+        assert_eq!((deletion.nodes, deletion.retained), (2, 1));
+        assert_eq!(nodes_where(&db, |bits| below_a_top(bits, &keep)), 0);
+        forest.prune_shard_phase(&APP, PHASE, 1).unwrap();
         assert_eq!(outside_nodes(&db, &keep), 0);
     }
 }
