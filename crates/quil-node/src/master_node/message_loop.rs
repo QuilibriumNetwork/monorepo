@@ -709,6 +709,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     // Memory snapshot. Logged separately so the size
                     // fields don't crowd `node status`; growth between
                     // ticks is the diagnosis signal.
+                    let (replica_loads, replica_loads_peak) =
+                        quil_store::replica_store::replica_load_bytes();
                     let sizes = mem_sources.snapshot(
                         archive_peers_seen.len(),
                         peer_info_digest_cache.len(),
@@ -757,6 +759,15 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         // Pinned RocksDB views of live execution branches in
                         // this process; each retains superseded versions on disk.
                         execution_views_held = quil_forest::ExecutionViewAdmission::process().active(),
+                        // Whole storage replicas held now and at most since
+                        // the last snapshot: seals and settlements, admitted
+                        // as storage jobs; a frame reads only the nodes it
+                        // opens. Then the cached leaf caps frames open with.
+                        replica_loads_mb = %crate::mem_stats::fmt_mb(replica_loads),
+                        replica_loads_peak_mb = %crate::mem_stats::fmt_mb(replica_loads_peak),
+                        replica_leaf_cache_mb = %crate::mem_stats::fmt_mb(
+                            quil_store::replica_store::leaf_cache_bytes() as u64
+                        ),
                         "memory snapshot"
                     );
                     if let Some(h) = host_mem {
