@@ -1794,6 +1794,11 @@ pub(crate) async fn start(
             spawner: detached_spawner.clone(),
             archive_app_shard_ingest,
             recent_messages: recent_messages.clone(),
+            config_brief: crate::effective_config::EffectiveConfig::resolve(
+                config,
+                &crate::effective_config::Runtime::detect(0, network, archive_mode, false),
+            )
+            .status_brief(),
         },
     );
 
