@@ -700,7 +700,7 @@ async fn automatic_quil_fee_is_quoted_by_the_configured_node_and_bounded() {
     let mut tc = TokenCtx {
         node_config,
         config_dir: directory.path().to_path_buf(),
-        key_manager,
+        key_manager: key_manager.clone(),
         connect_opts: crate::rpc::ConnectOpts {
             listen_grpc_multiaddr: read.clone(),
             ..Default::default()
@@ -709,6 +709,9 @@ async fn automatic_quil_fee_is_quoted_by_the_configured_node_and_bounded() {
             listen_grpc_multiaddr: configured,
             ..Default::default()
         },
+        submit_key_manager: key_manager,
+        submit_config_dir: directory.path().to_path_buf(),
+        submit_identity: Default::default(),
         peer_id_bytes: Vec::new(),
         max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
     };
@@ -964,6 +967,281 @@ async fn a_default_wallet_scan_finds_its_coin_behind_the_old_page_budget() {
     assert_eq!(unspent.len(), 1);
     assert_eq!(unspent[0].address, my_address);
     assert_eq!(*unspent[0].amount, 5);
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// Serve `server` on `listener` until the returned sender fires.
+#[cfg(feature = "native-proof")]
+fn serve_node(
+    listener: tokio::net::TcpListener,
+    server: quil_rpc::node_service::NodeRpcServer,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let incoming = futures::stream::unfold(listener, |listener| async {
+        let result = listener.accept().await.map(|(socket, _)| socket);
+        Some((result, listener))
+    });
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(async {
+        tonic::transport::Server::builder()
+            .add_service(
+                quil_types::proto::node::node_service_server::NodeServiceServer::new(server),
+            )
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    (stop, serving)
+}
+
+#[cfg(feature = "native-proof")]
+async fn bind_loopback() -> (tokio::net::TcpListener, String) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let multiaddr = format!(
+        "/ip4/127.0.0.1/tcp/{}",
+        listener.local_addr().unwrap().port()
+    );
+    (listener, multiaddr)
+}
+
+/// Parse and dispatch a token command against a loaded context.
+#[cfg(feature = "native-proof")]
+async fn run_token_command(tc: &TokenCtx, arguments: &[&str]) -> anyhow::Result<()> {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        token: super::super::TokenArgs,
+    }
+    // Boxed: the command's future outgrows a test thread's stack.
+    Box::pin(super::super::run_with_context(
+        tc,
+        &Cli::try_parse_from(arguments)?.token,
+    ))
+    .await
+}
+
+/// A reward mint from a config other than the running node's is refused
+/// before its fee quote and proof, naming both peers and the fix; nothing is
+/// saved or sent. Through the node's own config the check passes and the
+/// mint goes on to its fee quote.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_mint_from_another_config_fails_before_proving() {
+    use super::super::{short_peer, test_nodes};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let directory = tempfile::tempdir().unwrap();
+    let (listener, listen) = bind_loopback().await;
+    let node = test_nodes::write(&directory.path().join("node"), 41, &listen);
+    // A dormant prover's config naming the same listener, as a copy does.
+    let dormant = test_nodes::write(&directory.path().join("dormant"), 42, &listen);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (quoted, sent) = (calls.clone(), calls.clone());
+    let server = quil_rpc::node_service::NodeRpcServer::new()
+        .with_peer_id(node.peer_id.clone())
+        .with_token_fee_provider(Arc::new(move |_, _| {
+            quoted.fetch_add(1, Ordering::SeqCst);
+            Err(quil_types::error::QuilError::ExecutionUnavailable(
+                "test node has no fee snapshot".into(),
+            ))
+        }))
+        .with_send_handler_fn(Arc::new(move |_, _, _| {
+            sent.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err("test node takes no submissions".into()) })
+        }));
+    let (stop, serving) = serve_node(listener, server);
+
+    let tc = TokenCtx::from_context(
+        &test_nodes::context(false),
+        &test_nodes::common(&dormant.dir, None, false),
+    )
+    .unwrap();
+    let error = run_token_command(&tc, &["token", "mint"])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.starts_with(&format!(
+            "the node at {listen} is peer {}, but submissions would be signed by {} (peer {})",
+            short_peer(&node.peer_id),
+            dormant.dir.display(),
+            short_peer(&dormant.peer_id)
+        )),
+        "{error}"
+    );
+    assert!(error.ends_with("pass --submit-config <DIR> with the running node's config directory"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "a quote or send was made");
+    let saved: Vec<_> = std::fs::read_dir(&dormant.dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("mint-"))
+        .collect();
+    assert!(saved.is_empty(), "a mint was saved: {saved:?}");
+
+    // Through the running node's config, the mint passes the check and asks
+    // that node for its fee quote.
+    let tc = TokenCtx::from_context(
+        &test_nodes::context(false),
+        &test_nodes::common(&dormant.dir, Some(&node.dir), false),
+    )
+    .unwrap();
+    tc.check_submit_identity().await.unwrap();
+    let error = run_token_command(&tc, &["token", "mint"])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("fee estimate unavailable"), "{error}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+
+    // A node that reports no peer ID is not second-guessed.
+    let (listener, _) = bind_loopback().await;
+    let mut tc = TokenCtx::from_context(
+        &test_nodes::context(false),
+        &test_nodes::common(&dormant.dir, None, false),
+    )
+    .unwrap();
+    tc.submit_opts.listen_grpc_multiaddr = format!(
+        "/ip4/127.0.0.1/tcp/{}",
+        listener.local_addr().unwrap().port()
+    );
+    let (stop, serving) = serve_node(listener, quil_rpc::node_service::NodeRpcServer::new());
+    tc.check_submit_identity().await.unwrap();
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// With `--submit-config`, the Send authentication is signed with the running
+/// node's peer key, which that node's check (Ed448 over `NODE_AUTHENTICATION
+/// ‖ domain ‖ payload`) accepts, while the reward mint inside is signed with
+/// the `--config` prover key. Signed with the `--config` peer key, the same
+/// submission is refused.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn submit_config_signs_the_send_and_the_wallet_signs_the_mint() {
+    use super::super::test_nodes;
+    use quil_lattice_ct::confidential::mint::{Mint, RewardClaim};
+    use quil_types::crypto::Signer;
+    let directory = tempfile::tempdir().unwrap();
+    let (listener, listen) = bind_loopback().await;
+    let node = test_nodes::write(&directory.path().join("node"), 51, &listen);
+    let dormant = test_nodes::write(
+        &directory.path().join("dormant"),
+        52,
+        "/ip4/127.0.0.1/tcp/9",
+    );
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let captured = received.clone();
+    let node_public = node.ed448_public.clone();
+    let server = quil_rpc::node_service::NodeRpcServer::new()
+        .with_peer_id(node.peer_id.clone())
+        .with_send_handler_fn(Arc::new(move |domain, payload, authentication| {
+            let public = node_public.clone();
+            let captured = captured.clone();
+            Box::pin(async move {
+                // The node's Send check, against its own peer key.
+                let mut digest = b"NODE_AUTHENTICATION".to_vec();
+                digest.extend_from_slice(&domain);
+                digest.extend_from_slice(&payload);
+                if !quil_crypto::ed448_verify(&public, &digest, &authentication) {
+                    return Err("authentication failed: InvalidSignature".into());
+                }
+                let bundle =
+                    quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(
+                        &payload,
+                    )
+                    .map_err(|e| e.to_string())?;
+                let request = bundle
+                    .requests
+                    .into_iter()
+                    .flatten()
+                    .next()
+                    .ok_or("missing operation")?;
+                captured.lock().unwrap().push((domain, request.inner_bytes));
+                Ok(())
+            })
+        }));
+    let (stop, serving) = serve_node(listener, server);
+
+    let tc = TokenCtx::from_context(
+        &test_nodes::context(false),
+        &test_nodes::common(&dormant.dir, Some(&node.dir), false),
+    )
+    .unwrap();
+    let network =
+        quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let wallet =
+        RecipientWallet::load(&tc, &network, &quil_execution::domains::QUIL_TOKEN).unwrap();
+    // The reward claimant is the --config prover key, as `token mint` signs it.
+    let signer = falcon_signer(&tc).unwrap();
+    assert_eq!(signer.public_key(), dormant.falcon_public.as_slice());
+    let claim = RewardClaim {
+        owner: quil_crypto::poseidon::hash_bytes_to_32(&dormant.falcon_public).unwrap(),
+        value: 8,
+        public_key: dormant.falcon_public.as_slice().try_into().unwrap(),
+        forest_proof: vec![1],
+    };
+    let signer: std::sync::Arc<dyn Signer> = signer;
+    let signers = vec![signer];
+    let (statement, signatures, _) = wallet
+        .prepare_mint(
+            1,
+            [3; 32],
+            &[claim],
+            &signers,
+            &[(wallet.address().clone(), 7)],
+            1,
+            1,
+            1,
+        )
+        .unwrap();
+    let mut proof = vec![0; 40];
+    proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
+    let mint = Mint {
+        statement,
+        signatures,
+        proof,
+    }
+    .encode()
+    .unwrap();
+
+    // Signed with the dormant config's own peer key, the node refuses it.
+    let refused = wallet
+        .submit(
+            &mut tc.connect_submit().await.unwrap(),
+            &tc.key_manager,
+            mint.clone(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("authentication failed"), "{refused}");
+    submit_refreshed_operation(&tc, &wallet, mint.clone())
+        .await
+        .unwrap();
+    let received = received.lock().unwrap().clone();
+    assert_eq!(
+        received,
+        vec![(quil_execution::domains::GLOBAL.to_vec(), mint)]
+    );
+    let delivered = Mint::decode(
+        &received[0].1,
+        &network,
+        &quil_execution::domains::QUIL_TOKEN,
+    )
+    .unwrap();
+    assert!(quil_crypto::falcon_verify(
+        &dormant.falcon_public,
+        &delivered.signatures[0],
+        &delivered.statement.context_bytes().unwrap(),
+        &wallet.context
+    ));
     stop.send(()).unwrap();
     serving.await.unwrap();
 }
