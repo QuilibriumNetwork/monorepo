@@ -27,6 +27,7 @@ pub const BALANCE_ROWS: usize = 2;
 pub enum CoinsFocus {
     #[default]
     Balances,
+    ShieldPlan,
     Notifications,
 }
 
@@ -48,6 +49,9 @@ pub struct Legacy {
     /// Consecutive failed reads, and when the first of them failed.
     pub failures: u32,
     pub failing_since: Option<SystemTime>,
+    /// A read due at this time on either tab: one looking for a submitted
+    /// shield's inclusion.
+    pub refresh_at: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -56,6 +60,11 @@ pub struct Coins {
     /// The Balances row under the cursor: 0 claimable, 1 legacy.
     pub cursor: usize,
     pub legacy: Legacy,
+    /// The Shield plan row under the cursor, and its first row on screen.
+    pub plan_cursor: usize,
+    pub plan_offset: usize,
+    /// The shield action.
+    pub shield: super::shield::Shield,
     /// When each current notice was first shown, by its key.
     pub notice_since: HashMap<&'static str, SystemTime>,
 }
@@ -67,6 +76,7 @@ fn start_legacy(m: &mut Model, now: Instant) -> Vec<Cmd> {
     }
     m.coins.legacy.reading = Some(now);
     m.coins.legacy.last_start = Some(now);
+    m.coins.legacy.refresh_at = None;
     vec![Cmd::FetchLegacy]
 }
 
@@ -75,7 +85,8 @@ fn start_legacy(m: &mut Model, now: Instant) -> Vec<Cmd> {
 pub fn due(m: &mut Model, now: Instant) -> Vec<Cmd> {
     let last = m.coins.legacy.last_start;
     let stale = last.is_none_or(|start| now.saturating_duration_since(start) >= LEGACY_REFRESH);
-    if last.is_none() || (m.tab == Tab::Coins && stale) {
+    let asked = m.coins.legacy.refresh_at.is_some_and(|at| now >= at);
+    if last.is_none() || asked || (m.tab == Tab::Coins && stale) {
         start_legacy(m, now)
     } else {
         vec![]
@@ -99,6 +110,7 @@ pub fn apply_legacy(m: &mut Model, answer: LegacyAnswer, took: Duration) {
             legacy.error = None;
             legacy.failures = 0;
             legacy.failing_since = None;
+            super::shield::observe_inclusion(m);
         }
         Err(error) => {
             legacy.error = Some(error);
@@ -115,10 +127,22 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         return vec![];
     }
     let notices = m.coins.focus == CoinsFocus::Notifications;
+    let plan = m.coins.focus == CoinsFocus::ShieldPlan;
+    let plan_rows = match &m.coins.legacy.answer {
+        Some((Some(snapshot), _, _)) => snapshot.batches.len(),
+        _ => 0,
+    };
     match ev.code {
         KeyCode::Char('1') => {
             m.tab = Tab::Provers;
             m.notice_offset = 0;
+            m.coins.shield.dialog = None;
+        }
+        KeyCode::Char('S') => return super::shield::request(m),
+        KeyCode::Esc if m.coins.shield.dialog.is_some() => {
+            m.coins.shield.dialog = None;
+            m.status_msg = "Shield: cancelled; nothing was submitted.".into();
+            m.status_is_error = false;
         }
         KeyCode::Char('r') => {
             if m.coins.legacy.reading.is_some() {
@@ -128,12 +152,25 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             }
             return start_legacy(m, Instant::now());
         }
-        KeyCode::Tab | KeyCode::BackTab => {
-            m.coins.focus = if notices {
-                CoinsFocus::Balances
-            } else {
-                CoinsFocus::Notifications
+        KeyCode::Tab => {
+            m.coins.focus = match m.coins.focus {
+                CoinsFocus::Balances => CoinsFocus::ShieldPlan,
+                CoinsFocus::ShieldPlan => CoinsFocus::Notifications,
+                CoinsFocus::Notifications => CoinsFocus::Balances,
             };
+        }
+        KeyCode::BackTab => {
+            m.coins.focus = match m.coins.focus {
+                CoinsFocus::Balances => CoinsFocus::Notifications,
+                CoinsFocus::ShieldPlan => CoinsFocus::Balances,
+                CoinsFocus::Notifications => CoinsFocus::ShieldPlan,
+            };
+        }
+        KeyCode::Up | KeyCode::Char('k') if plan => {
+            m.coins.plan_cursor = m.coins.plan_cursor.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') if plan => {
+            m.coins.plan_cursor = (m.coins.plan_cursor + 1).min(plan_rows.saturating_sub(1));
         }
         KeyCode::Up | KeyCode::Char('k') if notices => {
             m.notice_offset = m.notice_offset.saturating_sub(1);
@@ -172,18 +209,22 @@ pub fn utc_hm(time: SystemTime) -> String {
 /// A Coins notice. `attention` marks an item waiting for the user's
 /// action: it is drawn in the info color with the `◆` marker, and shows
 /// from the default (warnings+) level.
+/// `progress` marks an action under way, which also shows from the
+/// default level, without the marker; `success` draws it green.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     pub key: &'static str,
     pub severity: NoticeSeverity,
     pub attention: bool,
+    pub progress: bool,
+    pub success: bool,
     pub text: String,
 }
 
 impl Notice {
     /// The level from which the notice shows.
     pub fn rank(&self) -> NoticeSeverity {
-        if self.attention {
+        if self.attention || self.progress {
             NoticeSeverity::Warning
         } else {
             self.severity
@@ -208,12 +249,15 @@ pub fn shields_open_at(snapshot: &Snapshot) -> Option<(u64, u64)> {
 
 /// Every current Coins condition, in display order.
 pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
-    let mut out = Vec::new();
+    let mut out = super::shield::notices(m, &fmt_amount);
+    let busy = m.coins.shield.dialog.is_some() || super::shield::running(m);
     let mut push = |key, severity, attention, text: String| {
         out.push(Notice {
             key,
             severity,
             attention,
+            progress: false,
+            success: false,
             text,
         })
     };
@@ -270,17 +314,17 @@ pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
                 plural(left as usize, "frame", "frames")
             ),
         ),
-        (None, Some(plan)) => push(
+        (None, Some(plan)) if !busy => push(
             "coins-unshielded",
             NoticeSeverity::Info,
             true,
             format!(
-                "Legacy coins: {unshielded} of {total} unshielded in {}{}; \
-                 `qclient token shield-all` shields them.",
+                "Legacy coins: {unshielded} of {total} unshielded in {}{}; ‹S› shields them.",
                 if plan.exact { "" } else { "≥" },
                 plural(plan.batches, "batch", "batches")
             ),
         ),
+        (None, Some(_)) => {}
         (None, None) => push(
             "coins-unshielded",
             NoticeSeverity::Info,
@@ -351,6 +395,9 @@ mod coins_tests {
                 shield_all_from: 1000,
             }),
             pages: 4,
+            batches: Vec::new(),
+            pending: 0,
+            shielded: Default::default(),
         }
     }
 
@@ -425,7 +472,7 @@ mod coins_tests {
             texts,
             [
                 "Claimable: 7 Q at f120; `qclient token mint` authorizes a mint.",
-                "Legacy coins: 4 of 6 unshielded in 3 batches; `qclient token shield-all` shields them.",
+                "Legacy coins: 4 of 6 unshielded in 3 batches; ‹S› shields them.",
             ],
             "the outside-shard note is info and hides at the default level"
         );

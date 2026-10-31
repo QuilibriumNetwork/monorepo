@@ -18,8 +18,11 @@ mod account;
 #[cfg(feature = "confidential-tokens")]
 pub(crate) mod balance;
 pub(crate) mod legacy;
+pub(crate) mod output;
 #[cfg(feature = "confidential-tokens")]
 mod wallet;
+#[cfg(feature = "native-proof")]
+pub(crate) use wallet::{execute_shield_all, plan_shield_all, shield_batch_fee, ShieldEvent};
 
 /// Flags shared by every `token` subcommand (Go `TokenCmd` persistent
 /// flags).
@@ -526,9 +529,25 @@ impl TokenCtx {
         .await
     }
 
+    /// The context `qclient token` builds for the default node config and
+    /// no read or public RPC: the node manager's coin actions use it, so
+    /// they read, quote and submit as the CLI does.
+    pub(crate) fn for_manager(global: GlobalArgs, max_fee: u128) -> anyhow::Result<Self> {
+        Self::load(
+            global,
+            &TokenCommonArgs {
+                public_rpc: false,
+                config: Vec::new(),
+                read_rpc: None,
+                insecure_read_rpc: false,
+                max_fee,
+            },
+        )
+    }
+
     fn load(global: GlobalArgs, common: &TokenCommonArgs) -> anyhow::Result<Self> {
         let ctx = Context::load(global)?;
-        println!("Loading node config...");
+        output::line("Loading node config...".into());
         let (node_config, config_dir) = ctx.load_node_config(common.single_config()?)?;
 
         // The Ed448 identity is kept ONLY for the legacy coin address
@@ -544,16 +563,13 @@ impl TokenCtx {
         let key_manager = ctx.key_manager(&node_config, &config_dir)?;
         match key_manager.get_public_key_bytes_by_id("q-prover-key") {
             Ok(falcon_pub) => {
-                println!(
-                    "{}",
-                    quil_p2p::peer_id_base58_from_falcon_pubkey(&falcon_pub)
-                );
+                output::line(quil_p2p::peer_id_base58_from_falcon_pubkey(&falcon_pub));
             }
             // Fall back to the legacy Ed448 peer id only if the Falcon network key
             // is absent (a pre-migration keystore).
             Err(_) => match &identity {
-                Some(identity) => println!("{}", identity.peer_id_base58()),
-                None => println!("(no network identity configured)"),
+                Some(identity) => output::line(identity.peer_id_base58()),
+                None => output::line("(no network identity configured)".into()),
             },
         }
         let submit_opts = ctx.connect_opts(&node_config, common.public_rpc);

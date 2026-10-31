@@ -13,6 +13,7 @@ use super::model::{
 };
 use super::msg::Msg;
 use super::settings;
+use super::shield;
 
 const MAX_AWAIT_RETRIES: u32 = 3;
 
@@ -22,6 +23,10 @@ pub enum Cmd {
     Fetch,
     /// Read this node's legacy coins for the Coins tab.
     FetchLegacy,
+    /// Read and quote `token shield-all`'s batches for its confirmation.
+    ShieldPrepare,
+    /// Prove and submit the confirmed batches.
+    ShieldRun(super::shield::Preview),
     Join(Vec<Vec<u8>>),
     Lifecycle {
         action: String,
@@ -47,6 +52,14 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
     match msg {
         Msg::LegacyRefresh { answer, took } => {
             coins::apply_legacy(m, answer, took);
+            vec![]
+        }
+        Msg::ShieldPreview(preview) => {
+            shield::apply_preview(m, preview);
+            vec![]
+        }
+        Msg::Shield(progress) => {
+            shield::apply_progress(m, progress);
             vec![]
         }
         Msg::RewardRefresh(result) => {
@@ -501,6 +514,9 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     if ev.kind != KeyEventKind::Press {
         return vec![];
     }
+    if let Some(cmds) = shield::quit_guard(m, &ev, is_quit(&ev)) {
+        return cmds;
+    }
     if m.column_picker_active {
         return handle_column_picker_key(m, ev);
     }
@@ -526,6 +542,9 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         return vec![];
     }
     if m.tab == Tab::Coins {
+        if matches!(m.coins.shield.dialog, Some(shield::Dialog::Confirm(_))) {
+            return shield::dialog_key(m, ev);
+        }
         if m.show_help {
             return handle_help_key(m, ev);
         }

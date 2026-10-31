@@ -508,9 +508,15 @@ async fn the_node_manager_snapshot_tallies_both_owner_forms() {
     ]));
     let (good, stop, serving) = serve(Arc::new(index)).await;
     let client = node(&good).connect(None).await.unwrap();
-    let snapshot = snapshot(&client, &quil_execution::domains::QUIL_TOKEN, &KEY_X, 0)
-        .await
-        .unwrap();
+    let snapshot = snapshot(
+        &client,
+        &quil_execution::domains::QUIL_TOKEN,
+        &KEY_X,
+        0,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         snapshot.tally,
         Tally {

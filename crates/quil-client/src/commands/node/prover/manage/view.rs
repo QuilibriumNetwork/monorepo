@@ -4268,7 +4268,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("‹esc›", "Cancel without changing the filter"),
         HelpItem::Blank,
         sec(COINS_HELP_SECTION),
-        note("Read only: this node's claimable rewards and legacy coins, as `qclient token legacy` lists them; mint and shield from the CLI for now. ‹h› on this tab opens the help here."),
+        note("This node's claimable rewards and legacy coins, as `qclient token legacy` lists them, and the shield action; mint from the CLI for now. ‹h› on this tab opens the help here."),
         kv("Balances", "One row per kind; the cursor row's detail follows the table:"),
         item("`claimable`: the reward balance the GLOBAL reward witness shows at the `As of` frame, read with each Provers refresh; `qclient token mint` authorizes a mint of it"),
         item("`legacy`: Coins `U of N` are the unshielded of all listed legacy coins, Amount their unshielded total. Read in the background when the manager starts, every 10 min while the tab is open and on ‹r›; `As of` is the read's UTC time, a spinner beside it marks a read in progress. The detail gives the shielded count, the `qclient token shield-all` plan (batches of up to 96 coins from one shard each; coins on no live shard wait for a later run), when shields open, and the read's pages and duration"),
@@ -4278,9 +4278,12 @@ fn help_items() -> Vec<HelpItem> {
         item("`shielded`: every listed legacy coin is shielded; `none`: nothing to show"),
         item("`loading`: the first read is in progress; `unavailable`: the read failed (`yellow`, or `!` with colors off); `no key`: the node config has no Ed448 key, so it owns no legacy coins"),
         kv("Coins notices", "`Claimable: …` and `Legacy coins: … unshielded` carry `◆` and show from the default level. `Shields open at f…` and `… on no live shard` are expected waits (info). A failing read is a warning that says since when it fails and how old the figures are; `Shield plan: shard list unavailable` means the batch count is a lower bound"),
+        kv("Shield plan", "One row per `qclient token shield-all` batch, in its order: Batch `i/N`, the Shard whose members verify it (its filter shortened from the middle), its Coins and Amount. The footer counts batches of up to 96 coins and coins on no live shard, which wait for a later run; coins submitted within the hour are hidden until their batch commits. `Shields open at f…` shows while shields are not yet admitted"),
+        kv("‹S›", "Shield: read the coins and quote each batch's fee, then confirm. The confirmation names the coins and batches, the amount, the recipient (this wallet, in full), the quoted fees and the `--max-fee` cap; ‹y› starts, any other key cancels. Batches are proved here one at a time and submitted to this node; one action runs at a time, and quitting during it asks first"),
+        kv("Shield notices", "`Shield batch i/N: proving … <60s` / `>60s` while a batch is proved; `submitted; inclusion not yet confirmed` until a legacy read shows its coins shielded (read every 2 min while waiting), then `included` (`green`). A failure (`red`) names the batch; batches before it stay submitted. `--render` reads and quotes for the confirmation but never runs it"),
         kv("‹r›", "Read legacy coins now; one read at a time"),
-        kv("‹tab›", "Move between Balances and Notifications"),
-        kv("‹↑/k› / ‹↓/j›", "Move the Balances cursor; scroll Notifications when it is focused"),
+        kv("‹tab›", "Move between Balances, Shield plan and Notifications"),
+        kv("‹↑/k› / ‹↓/j›", "Move the Balances or Shield plan cursor; scroll Notifications when it is focused"),
         HelpItem::Blank,
     ]
 }
@@ -7646,6 +7649,8 @@ mod tests {
             "Balances",
             "State",
             "Coins notices",
+            "Shield plan",
+            "Shield notices",
         ];
         for (section, key, _) in &sections {
             let named = key.starts_with('‹')
