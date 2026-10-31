@@ -45,7 +45,9 @@ pub struct StructuralSizes {
     /// internal cache. Per-shard counts × shard count — diagnostic
     /// for the "per-shard caches multiplied by shard count" risk.
     pub app_engine_frame_store: usize,
-    pub app_engine_message_spillover: usize,
+    /// Messages and bytes held by the shard mempools.
+    pub app_engine_mempool_messages: usize,
+    pub app_engine_mempool_bytes: usize,
     pub app_engine_proposal_cache: usize,
     pub app_engine_pending_certified_parents: usize,
 }
@@ -513,20 +515,22 @@ impl StructuralSources {
         // Aggregate per-shard engine sizes. Quick read-lock on the
         // shard_engines map, then snapshot each handle's atomic
         // sizes slot.
-        let (fs, sp, pc, pcp) = {
+        let (fs, mm, mb, pc, pcp) = {
             let engines = self.shard_engines.read();
             let mut fs = 0usize;
-            let mut sp = 0usize;
+            let mut mm = 0usize;
+            let mut mb = 0usize;
             let mut pc = 0usize;
             let mut pcp = 0usize;
             for handle in engines.values() {
                 let s = handle.sizes();
                 fs += s.frame_store;
-                sp += s.message_spillover;
+                mm += s.mempool_messages;
+                mb += s.mempool_bytes;
                 pc += s.proposal_cache;
                 pcp += s.pending_certified_parents;
             }
-            (fs, sp, pc, pcp)
+            (fs, mm, mb, pc, pcp)
         };
         StructuralSizes {
             peer_info_cache: self.peer_info_cache.read().len(),
@@ -540,7 +544,8 @@ impl StructuralSources {
             time_reel_pending: tr_pending,
             time_reel_equivocators: tr_eq,
             app_engine_frame_store: fs,
-            app_engine_message_spillover: sp,
+            app_engine_mempool_messages: mm,
+            app_engine_mempool_bytes: mb,
             app_engine_proposal_cache: pc,
             app_engine_pending_certified_parents: pcp,
         }

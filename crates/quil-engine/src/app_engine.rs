@@ -304,7 +304,9 @@ pub enum AppEngineEvent {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AppEngineSizes {
     pub frame_store: usize,
-    pub message_spillover: usize,
+    /// Messages this shard's mempool holds, across its ranks, and their bytes.
+    pub mempool_messages: usize,
+    pub mempool_bytes: usize,
     pub proposal_cache: usize,
     pub pending_certified_parents: usize,
     pub current_rank: u64,
@@ -2760,8 +2762,6 @@ pub struct AppConsensusEngine {
 
     // Message queues
     _pending_messages: VecDeque<Vec<u8>>,
-    /// Spillover messages when current rank is full.
-    message_spillover: HashMap<u64, Vec<Vec<u8>>>,
 
     // Proposal/frame caches
     proposal_cache: HashMap<u64, Vec<u8>>,
@@ -3117,7 +3117,6 @@ impl AppConsensusEngine {
             routing_seen: Default::default(),
             shard_frame_number: 0,
             _pending_messages: VecDeque::with_capacity(MAX_APP_MESSAGES_PER_RANK),
-            message_spillover: HashMap::new(),
             proposal_cache: HashMap::new(),
             frame_store: HashMap::new(),
             pending_certified_parents: HashMap::new(),
@@ -3206,9 +3205,11 @@ impl AppConsensusEngine {
     /// Called from the event loop after any mutation that could change
     /// one of the tracked caches. Cheap — single small mutex lock.
     fn publish_sizes(&self) {
+        let (mempool_messages, mempool_bytes) = self.message_collector.pending_totals();
         self.sizes.store(AppEngineSizes {
             frame_store: self.frame_store.len(),
-            message_spillover: self.message_spillover.values().map(|v| v.len()).sum(),
+            mempool_messages,
+            mempool_bytes,
             proposal_cache: self.proposal_cache.len(),
             pending_certified_parents: self.pending_certified_parents.len(),
             current_rank: self.current_rank,
@@ -8291,7 +8292,6 @@ impl AppConsensusEngine {
         self.pending_follower_clock = None;
         self.finalized_requests_roots.clear();
         self.materialize_failures.clear();
-        self.message_spillover.clear();
         self.proposal_cache.clear();
         self.pending_certified_parents.clear();
         self.retry_parent_seals.clear();
@@ -10533,12 +10533,17 @@ impl AppConsensusEngine {
     }
 
     // ---------------------------------------------------------------
-    // Message collection with spillover
+    // Message collection
     // ---------------------------------------------------------------
 
-    /// Add an application message to the message collector for
-    /// inclusion in the next frame. If the current rank's buffer is
-    /// full, spill over to the next rank.
+    /// Add an application message to this shard's mempool for inclusion in
+    /// a later frame. Nothing else holds it: a copy the mempool already
+    /// holds adds nothing, and one its full rank buffer refuses is dropped,
+    /// counted by the collector's bounded "rank buffer full" line. Every
+    /// shard of an application gets each of its submissions, and a stalled
+    /// shard's mempool stays full; kept aside for a rank that never came,
+    /// refused copies grew without bound (2026-10-31: 1,515 to 6,888 of
+    /// about 190 KB in 8 h on one node) and no proposal read them.
     fn add_app_message(&mut self, data: &[u8]) {
         let data = canonical_app_message(data);
         stamp_arrival(&self.routing_seen, &data, std::time::Instant::now());
@@ -10567,26 +10572,7 @@ impl AppConsensusEngine {
                 );
             }
         }
-        if !self.message_collector.add_message_newest(data.clone()) {
-            // Buffer full — spill to next rank
-            let next_rank = self.current_rank + 1;
-            self.message_spillover
-                .entry(next_rank)
-                .or_insert_with(Vec::new)
-                .push(data);
-        }
-    }
-
-    /// Flush spillover messages into the collector for the target rank.
-    /// Called on rank change (ControlEventAppNewHead equivalent).
-    // Retained legacy rank-transition helper; simplex handles current transitions.
-    #[allow(dead_code)]
-    fn flush_deferred_messages(&mut self, target_rank: u64) {
-        if let Some(messages) = self.message_spillover.remove(&target_rank) {
-            for msg in messages {
-                self.message_collector.add_message(target_rank, msg);
-            }
-        }
+        self.message_collector.add_message_newest(data);
     }
 
     // ---------------------------------------------------------------
@@ -11098,10 +11084,8 @@ impl AppConsensusEngine {
             entries.truncate(50);
             self.frame_store = entries.into_iter().collect();
         }
-        // Also prune old spillover entries
-        let cutoff = self.current_rank.saturating_sub(10);
-        self.message_spillover.retain(|&rank, _| rank >= cutoff);
         // Prune old proposal cache and pending parents
+        let cutoff = self.current_rank.saturating_sub(10);
         self.drain_proposal_cache();
         self.pending_certified_parents
             .retain(|&r, _| r >= cutoff || self.retry_parent_seals.contains(&r));
@@ -17803,6 +17787,81 @@ mod tests {
             events,
         );
         (engine, handle, received)
+    }
+
+    /// An application submission of `size` bytes, distinct by `i`.
+    fn app_message(i: u32, size: usize) -> Vec<u8> {
+        let mut message = vec![0xa5; size];
+        message[..4].copy_from_slice(&i.to_be_bytes());
+        message
+    }
+
+    /// A 1 MiB submission; 64 fill a rank's byte cap.
+    fn mib_app_message(i: u32) -> Vec<u8> {
+        app_message(i, MIB_APP_MESSAGE)
+    }
+
+    const MIB_APP_MESSAGE: usize = 1 << 20;
+
+    /// What a full shard mempool refuses is dropped, not kept aside: every
+    /// shard of an application receives each of its submissions, and a
+    /// stalled shard's mempool stays full.
+    #[test]
+    fn submissions_a_full_shard_mempool_refuses_are_not_retained() {
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry);
+        for i in 0..64 {
+            engine.handle_dispatch_message(&mib_app_message(i));
+        }
+        assert_eq!(engine.message_collector.total_pending(), 64);
+        let refused = 16;
+        let ((), retained) = crate::test_alloc::retained_by(|| {
+            for i in 64..64 + refused {
+                engine.handle_dispatch_message(&mib_app_message(i));
+            }
+        });
+        assert_eq!(engine.message_collector.total_pending(), 64);
+        assert!(
+            retained < MIB_APP_MESSAGE as isize,
+            "the shard engine retained {retained} bytes for {refused} submissions of \
+             {MIB_APP_MESSAGE} bytes its full mempool refused: unbounded growth while \
+             the shard's mempool stays full"
+        );
+    }
+
+    /// A copy of a submission the shard mempool already holds adds nothing.
+    #[test]
+    fn copies_of_a_held_submission_are_not_retained() {
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry);
+        let held = mib_app_message(0);
+        engine.handle_dispatch_message(&held);
+        let copies = 16;
+        let ((), retained) = crate::test_alloc::retained_by(|| {
+            for _ in 0..copies {
+                engine.handle_prover_message(&held);
+            }
+        });
+        assert_eq!(engine.message_collector.total_pending(), 1);
+        assert!(
+            retained < MIB_APP_MESSAGE as isize,
+            "the shard engine retained {retained} bytes for {copies} copies of a \
+             submission its mempool already holds: unbounded growth while copies \
+             keep arriving"
+        );
+    }
+
+    /// The memory snapshot reads each shard mempool's messages and bytes
+    /// from the sizes its engine publishes.
+    #[test]
+    fn published_sizes_carry_the_shard_mempool() {
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, handle, _events) = test_engine(registry);
+        engine.handle_dispatch_message(&app_message(0, 1000));
+        engine.handle_dispatch_message(&app_message(1, 3000));
+        engine.publish_sizes();
+        let sizes = handle.sizes();
+        assert_eq!((sizes.mempool_messages, sizes.mempool_bytes), (2, 4000));
     }
 
     /// An engine owing GLOBAL the settlement of `epoch` on a seat whose

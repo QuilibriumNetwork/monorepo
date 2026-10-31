@@ -1568,6 +1568,18 @@ impl MessageCollector {
         self.buffers.read().unwrap().values().map(|b| b.len()).sum()
     }
 
+    /// Messages held across all ranks and their bytes, for the memory
+    /// snapshot.
+    pub fn pending_totals(&self) -> (usize, usize) {
+        self.buffers
+            .read()
+            .unwrap()
+            .values()
+            .fold((0, 0), |(messages, bytes), b| {
+                (messages + b.len(), bytes + b.bytes)
+            })
+    }
+
     /// Set prover-only mode. When enabled, non-prover messages are
     /// rejected. Used during degraded coverage.
     pub fn set_prover_only_mode(&self, enabled: bool) {

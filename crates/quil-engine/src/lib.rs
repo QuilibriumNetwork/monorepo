@@ -88,6 +88,10 @@ pub mod worker_stall;
 #[doc(hidden)]
 pub mod test_support;
 
+/// Per-thread heap accounting for this crate's unit tests.
+#[cfg(test)]
+mod test_alloc;
+
 pub use app_engine::AppConsensusEngine;
 pub use app_shard_cache::AppShardCache;
 pub use difficulty::AsertDifficultyAdjuster;
