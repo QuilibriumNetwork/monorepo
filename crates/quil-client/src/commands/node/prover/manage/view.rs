@@ -450,14 +450,30 @@ fn sync_panel_heights(m: &mut Model, total: u16) -> [u16; 3] {
     heights
 }
 
+/// The single key row `?` leaves in place of the UI and Workers rows.
+fn collapsed_keys_line() -> Line<'static> {
+    let style = Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD);
+    Line::from(vec![
+        command_hint("?", "keys", style),
+        Span::raw(" "),
+        command_hint("h", "help", style),
+        Span::raw(" "),
+        command_hint("q", "quit", style),
+    ])
+}
+
 fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     let (actions, status) = footer_lines(m);
-    let mut actions = wrap_actions(actions, area.width);
-    if !m.filter_edit_active
+    let normal = !m.filter_edit_active
         && !m.is_filter_mode_active()
         && !m.sort_mode
-        && m.operation_confirmation.is_none()
-    {
+        && m.operation_confirmation.is_none();
+    let mut actions = if normal && !m.show_key_rows {
+        vec![collapsed_keys_line()]
+    } else {
+        wrap_actions(actions, area.width)
+    };
+    if normal && m.show_key_rows {
         actions.extend(wrap_actions(worker_commands_line(m), area.width));
     }
     let max_actions = usize::from(area.height.saturating_sub(15).max(1));
@@ -3390,6 +3406,7 @@ fn help_commands() -> Line<'static> {
         ("↓/j", "down"),
         ("Pg↑/↓", "page"),
         ("Home/End", "first/last"),
+        ("d", "default view"),
         ("h/esc", "close"),
         ("q", "quit"),
     ] {
@@ -3477,7 +3494,7 @@ fn legend_line(m: &Model, workers: bool) -> Line<'static> {
     };
     let units_label = format!("thresholds {}", m.threshold_unit.label());
     // (key, desc, action-tag)
-    let entries: [(&str, &str, &str); 24] = [
+    let entries: [(&str, &str, &str); 25] = [
         ("tab", "switch", ""),
         ("↑/k", "up", ""),
         ("↓/j", "down", ""),
@@ -3504,6 +3521,7 @@ fn legend_line(m: &Model, workers: bool) -> Line<'static> {
         ("v", "notice level", ""),
         ("t", refresh_label.as_str(), ""),
         ("[/] {/}", "upper/lower edge", ""),
+        ("?", "hide keys", ""),
         ("h", "help", ""),
         ("q", "quit", ""),
     ];
@@ -4178,12 +4196,15 @@ fn help_items() -> Vec<HelpItem> {
         sec("Display"),
         kv("‹n›", "Toggle compact / expanded display (n: names; default compact): identity, KPIs, action/reason names, threshold estimates, units and recovery/seal detail; default actions remain named"),
         kv("‹b›", "Visibility picker (b: blocks): ‹tab› moves focus between Columns, Top header and every panel header group; ‹↑/↓› selects, ‹space› toggles, ‹a› restores the focused group, ‹enter›/‹esc› closes. Interval, reward and Global field options nest beneath their KPI. Panel names and identity columns stay visible"),
-        kv("Columns group", "In the picker, visibility shared by both panels; ‹Shift+↑/↓› reorders focused table columns with their sub-items, ‹r› restores order, ‹c› hides Provers/Size/Shards and ‹a› restores all columns. Select/Filter stay pinned; settings last for the TUI session"),
+        kv("Columns group", "In the picker, visibility shared by both panels; ‹Shift+↑/↓› reorders focused table columns with their sub-items, ‹r› restores order, ‹c› hides Provers/Size/Shards and ‹a› restores all columns. Select/Filter stay pinned; the choice is kept between runs (see Saved view)"),
         kv("‹t›", "Cycle refresh (t: timer) 5/15/30/60s (default 15); startup and post-action fetches are immediate"),
         kv("‹c›", "Toggle color-coding of Ring, Mat/Lag/State, GlobalHead, ProverPhases, Worker, Status and Mode; values quoted in this help follow it"),
         kv("‹e›", "Show Next/Default Action thresholds relative to the received GLOBAL frame (`in Nf`, default) or as absolute frames (`@f…`)"),
+        kv("‹?›", "Hide or show the UI and Workers key rows; hidden, the one row `‹?› keys ‹h› help ‹q› quit` remains"),
         kv("‹h›", "Open this help (‹↑/↓› or ‹Pg↑/↓› scroll; ‹h› or ‹esc› closes)"),
         kv("‹q› / ‹Ctrl+C›", "Quit"),
+        kv("Saved view", "Visible columns and their order, hidden KPIs and their fields, panel edges, sort, colors, thresholds mode, notice level, refresh interval and the key rows are kept between runs, per user, in `qclient-node-manage.yaml` beside the qclient config. Filters, scroll, selection and expanded rows are not. Entries a newer or older qclient does not know are skipped"),
+        kv("‹d› (in help)", "Restore the saved view's defaults; starting with `--reset-ui` does the same"),
         sec("Navigation"),
         kv("‹↑/k›", "Move cursor up; scrolls Notifications when it is focused"),
         kv("‹↓/j›", "Move cursor down; scrolls Notifications when it is focused"),
@@ -7621,6 +7642,7 @@ mod tests {
             "Boundaries",
             "Typing",
             "Tab bar",
+            "Saved view",
             "Balances",
             "State",
             "Coins notices",

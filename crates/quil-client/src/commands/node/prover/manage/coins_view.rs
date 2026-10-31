@@ -260,8 +260,11 @@ fn notice_lines(m: &mut Model, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-/// The UI key row of the Coins tab.
+/// The UI key row of the Coins tab, or the collapsed row.
 fn key_rows(m: &Model, width: u16) -> Vec<Line<'static>> {
+    if !m.show_key_rows {
+        return vec![collapsed_keys_line()];
+    }
     let compact = if m.compact_actions {
         "expand"
     } else {
@@ -290,6 +293,7 @@ fn key_rows(m: &Model, width: u16) -> Vec<Line<'static>> {
         ("c", colors, true),
         ("v", "notice level", true),
         ("t", refresh.as_str(), true),
+        ("?", "hide keys", true),
         ("h", "help", true),
         ("q", "quit", true),
     ];
@@ -460,5 +464,23 @@ mod coins_render_tests {
         assert!(header_line(&m)
             .to_string()
             .starts_with("‹1› Provers  ‹2› Coins 3 "));
+    }
+
+    #[test]
+    fn question_mark_collapses_the_key_rows_on_both_tabs() {
+        for tab in [Tab::Provers, Tab::Coins] {
+            let mut m = loaded();
+            m.tab = tab;
+            let full = render_text(&mut m, 120, 30);
+            assert!(full.contains("‹?› hide keys"), "{full}");
+            super::super::super::update::handle_key(
+                &mut m,
+                crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('?')),
+            );
+            let collapsed = render_text(&mut m, 120, 30);
+            let last = collapsed.lines().last().unwrap();
+            assert_eq!(last, "‹?› keys ‹h› help ‹q› quit", "{collapsed}");
+            assert!(!collapsed.contains("UI:"), "{collapsed}");
+        }
     }
 }

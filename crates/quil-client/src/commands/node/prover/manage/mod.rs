@@ -9,7 +9,8 @@
 //! * [`update`] applies messages + key events (`Update`/`handleKey`),
 //! * [`actions`] performs the async RPC commands (the `tea.Cmd`s),
 //! * [`view`] renders (the `View`),
-//! * [`coins`] holds the Coins tab's state and conditions.
+//! * [`coins`] holds the Coins tab's state and conditions,
+//! * [`settings`] keeps the view settings between runs.
 
 mod actions;
 #[cfg(test)]
@@ -18,6 +19,7 @@ mod coins;
 mod filter;
 mod model;
 mod msg;
+mod settings;
 mod update;
 mod util;
 mod view;
@@ -59,8 +61,8 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct ManageArgs {
     /// Print one frame as plain text and exit, after fetching once and
-    /// applying --keys; never runs joins, lifecycle operations or worker
-    /// changes.
+    /// applying --keys, with the saved view settings; never runs joins,
+    /// lifecycle operations or worker changes, nor saves settings.
     #[arg(long)]
     pub render: bool,
     /// Print the TUI help as plain text and exit.
@@ -82,6 +84,11 @@ pub struct ManageArgs {
     /// Seconds --render waits for the node's answers.
     #[arg(long, default_value_t = 30)]
     pub timeout: u64,
+    /// Restore the view settings kept between runs (columns, KPIs, panel
+    /// edges, sort, colors, notice level, refresh, key rows) to their
+    /// defaults, then start.
+    #[arg(long)]
+    pub reset_ui: bool,
 }
 
 /// What an invocation does, decided by its flags alone.
@@ -115,6 +122,12 @@ pub(in crate::commands::node) async fn command(
     global: GlobalArgs,
     args: &ManageArgs,
 ) -> anyhow::Result<()> {
+    if args.reset_ui {
+        if let Some(path) = settings::default_path() {
+            settings::reset(&path)?;
+            eprintln!("View settings restored to their defaults.");
+        }
+    }
     match args.mode() {
         Mode::HelpText(width) => {
             print!("{}", help_text(width));
@@ -154,6 +167,7 @@ async fn event_loop(
     refresh_state: RefreshState,
 ) -> anyhow::Result<()> {
     let mut model = Model::new();
+    let mut saved = settings::Store::open(settings::default_path(), &mut model);
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
 
     // Kick off the initial fetch + auto-refresh + spinner tickers.
@@ -194,6 +208,10 @@ async fn event_loop(
         };
 
         cmds.extend(coins::due(&mut model, std::time::Instant::now()));
+        if let Some(error) = saved.sync(&model) {
+            model.status_msg = format!("View settings: not saved ({error}).");
+            model.status_is_error = true;
+        }
 
         if model.refresh_seconds != polling_seconds {
             polling_seconds = model.refresh_seconds;
@@ -234,6 +252,9 @@ async fn render(pc: &ProverCtx, opts: RenderOptions) -> anyhow::Result<()> {
     let client = pc.connect().await?;
     let km = pc.key_manager.clone();
     let mut model = Model::new();
+    if let Some(path) = settings::default_path() {
+        settings::apply(&mut model, &settings::read(&path));
+    }
     model.color_coding = opts.color;
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
     let refresh_state = RefreshState::for_node(pc);
@@ -621,6 +642,7 @@ mod entry_tests {
                 keys: String::new(),
                 color: false,
                 timeout: 30,
+                reset_ui: false,
             }
         );
         let (entry, alias) = both(&[
@@ -634,6 +656,7 @@ mod entry_tests {
             "--color",
             "--timeout",
             "5",
+            "--reset-ui",
         ]);
         assert_eq!(entry, alias);
         assert_eq!(
@@ -646,6 +669,7 @@ mod entry_tests {
                 keys: "n Tab".into(),
                 color: true,
                 timeout: 5,
+                reset_ui: true,
             }
         );
         // Names, defaults and help of every flag, so help reads the same too.
@@ -669,7 +693,7 @@ mod entry_tests {
                 .and_then(|c| c.find_subcommand("manage"))
                 .unwrap(),
         );
-        assert_eq!(entry.len(), 7);
+        assert_eq!(entry.len(), 8);
         assert_eq!(entry, alias);
     }
 

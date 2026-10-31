@@ -407,6 +407,8 @@ pub struct Model {
     pub tab: Tab,
     /// The Coins tab's panels and data.
     pub coins: super::coins::Coins,
+    /// The UI and Workers key rows are shown (`?` collapses them to one).
+    pub show_key_rows: bool,
     // Header data.
     pub peer_id: String,
     pub seniority: String,
@@ -674,6 +676,7 @@ impl Model {
             avail_sort_col: 10, // Reward column
             avail_sort_asc: false,
             reachable: false,
+            show_key_rows: true,
             ..Default::default()
         }
     }
