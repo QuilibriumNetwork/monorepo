@@ -4,7 +4,7 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
-use tracing::debug;
+use tracing::{debug, info};
 
 use quil_types::proto::global;
 use quil_types::proto::global::global_service_server::GlobalService;
@@ -26,11 +26,337 @@ pub trait FrameLookup: Send + Sync {
     /// can sync proposals into its consensus engine (not just mirror frames).
     /// Mirrors Go `GlobalConsensusEngine.GetGlobalProposal`. The default errors;
     /// the concrete clock-store-backed impl overrides it.
-    fn get_global_proposal(
-        &self,
-        _frame_number: u64,
-    ) -> Result<global::GlobalProposal, String> {
+    fn get_global_proposal(&self, _frame_number: u64) -> Result<global::GlobalProposal, String> {
         Err("get_global_proposal not supported by this FrameLookup".into())
+    }
+
+    /// Frame `frame_number` as this node holds it, for its own worker's
+    /// historical anchor (`GetGlobalFrame` with `historical_anchor`), which
+    /// needs only the header: unlike [`Self::get_frame`], a frame whose
+    /// request bodies were pruned is returned as its header. `Ok(None)` when
+    /// the frame is not held. Never cached and never served to a peer. The
+    /// default holds none.
+    fn get_anchor_frame(&self, _frame_number: u64) -> Result<Option<global::GlobalFrame>, String> {
+        Ok(None)
+    }
+
+    /// The header of frame `frame_number` (`0`: the latest), for a peer that
+    /// asks for headers alone (`GetGlobalFrame` with `header_only`). The
+    /// default takes it from [`Self::get_frame`]; the clock-store lookup
+    /// reads the header alone, never the request bundles, and has one even
+    /// for a frame whose bundles were pruned.
+    fn get_frame_header(&self, frame_number: u64) -> Result<global::GlobalFrameHeader, String> {
+        let frame = if frame_number == 0 {
+            self.get_latest_frame()?
+        } else {
+            self.get_frame(frame_number)?
+        };
+        frame
+            .header
+            .ok_or_else(|| format!("frame {frame_number} has no header"))
+    }
+}
+
+/// Read-through, bounded in-memory cache in front of a [`FrameLookup`].
+///
+/// Why: the peer-facing `GlobalService` (`:8340`) serves `get_global_frame`
+/// and `get_global_proposal` to the whole network. With hundreds of nodes
+/// polling the same recent frames once a second, the inner clock-store impl
+/// hits RocksDB on *every* request — and `get_global_proposal` additionally
+/// re-assembles the proposal (parent QC + prior TC + proposer vote, several
+/// decodes) per call. That re-read storm is what overwhelms a handful of
+/// archives.
+///
+/// Safety: a finalized frame is **immutable by number** — the canonical
+/// chain never rewrites a committed height — so caching `get_frame(n)` /
+/// `get_global_proposal(n)` by frame number can never serve a stale-but-wrong
+/// value. The only entry that legitimately changes is the chain head, so
+/// `get_latest_frame` is cached under a short TTL rather than by key.
+///
+/// Both maps are bounded; eviction drops the *lowest* frame number, because
+/// the hot set is always the recent tip that everyone is polling.
+pub struct CachingFrameLookup<F: FrameLookup> {
+    inner: F,
+    frames: std::sync::RwLock<std::collections::BTreeMap<u64, Arc<global::GlobalFrame>>>,
+    proposals: std::sync::RwLock<std::collections::BTreeMap<u64, Arc<global::GlobalProposal>>>,
+    latest: std::sync::RwLock<Option<(std::time::Instant, Arc<global::GlobalFrame>)>>,
+    // Separate miss locks keep cache hits independent of storage latency.
+    // Stripes bound bookkeeping while allowing unrelated heights to load.
+    frame_loads: [std::sync::Mutex<()>; 32],
+    proposal_loads: [std::sync::Mutex<()>; 32],
+    latest_load: std::sync::Mutex<()>,
+    capacity: usize,
+    frame_capacity: usize,
+    latest_ttl: std::time::Duration,
+}
+
+impl<F: FrameLookup> CachingFrameLookup<F> {
+    /// `capacity` is the per-map ceiling (frames and proposals are bounded
+    /// independently); `latest_ttl` bounds how stale the served chain head
+    /// may be. A 1s TTL collapses N pollers/second into ~1 store read while
+    /// staying well inside the frame cadence.
+    pub fn new(inner: F, capacity: usize, latest_ttl: std::time::Duration) -> Self {
+        Self {
+            inner,
+            frames: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+            proposals: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+            latest: std::sync::RwLock::new(None),
+            frame_loads: std::array::from_fn(|_| std::sync::Mutex::new(())),
+            proposal_loads: std::array::from_fn(|_| std::sync::Mutex::new(())),
+            latest_load: std::sync::Mutex::new(()),
+            capacity,
+            frame_capacity: capacity,
+            latest_ttl,
+        }
+    }
+
+    /// Disable the duplicate frame map when the backing clock store already
+    /// retains finalized frames. Proposal caching remains independently bounded.
+    pub fn with_frame_capacity(mut self, capacity: usize) -> Self {
+        self.frame_capacity = capacity;
+        self
+    }
+
+    fn insert_frame(&self, n: u64, frame: Arc<global::GlobalFrame>) {
+        if self.frame_capacity == 0 {
+            return;
+        }
+        let mut w = self.frames.write().unwrap();
+        w.insert(n, frame);
+        while w.len() > self.frame_capacity {
+            // Drop the lowest frame number — the tip is the hot set.
+            let lowest = match w.keys().next().copied() {
+                Some(k) => k,
+                None => break,
+            };
+            w.remove(&lowest);
+        }
+    }
+
+    fn insert_proposal(&self, n: u64, proposal: Arc<global::GlobalProposal>) {
+        let mut w = self.proposals.write().unwrap();
+        w.insert(n, proposal);
+        while w.len() > self.capacity {
+            let lowest = match w.keys().next().copied() {
+                Some(k) => k,
+                None => break,
+            };
+            w.remove(&lowest);
+        }
+    }
+
+    /// The chain head under the TTL, shared rather than copied: a caller
+    /// that needs only its number does not copy a frame of several MB.
+    fn latest_shared(&self) -> Result<Arc<global::GlobalFrame>, String> {
+        if let Some((at, frame)) = self.latest.read().unwrap().as_ref() {
+            if at.elapsed() < self.latest_ttl {
+                return Ok(frame.clone());
+            }
+        }
+        let _load = self.latest_load.lock().unwrap();
+        if let Some((at, frame)) = self.latest.read().unwrap().as_ref() {
+            if at.elapsed() < self.latest_ttl {
+                return Ok(frame.clone());
+            }
+        }
+        let frame = Arc::new(self.inner.get_latest_frame()?);
+        // Opportunistically populate the by-number cache too: the head is
+        // the single most-requested frame.
+        if let Some(n) = frame.header.as_ref().map(|h| h.frame_number) {
+            if n != 0 {
+                self.insert_frame(n, frame.clone());
+            }
+        }
+        *self.latest.write().unwrap() = Some((std::time::Instant::now(), frame.clone()));
+        Ok(frame)
+    }
+}
+
+impl<F: FrameLookup> FrameLookup for CachingFrameLookup<F> {
+    fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> {
+        self.latest_shared().map(|frame| (*frame).clone())
+    }
+
+    fn get_frame(&self, frame_number: u64) -> Result<global::GlobalFrame, String> {
+        if self.frame_capacity == 0 {
+            return self.inner.get_frame(frame_number);
+        }
+        if let Some(frame) = self.frames.read().unwrap().get(&frame_number).cloned() {
+            return Ok((*frame).clone());
+        }
+        let _load = self.frame_loads[(frame_number % 32) as usize]
+            .lock()
+            .unwrap();
+        if let Some(frame) = self.frames.read().unwrap().get(&frame_number).cloned() {
+            return Ok((*frame).clone());
+        }
+        let frame = self.inner.get_frame(frame_number)?;
+        if self.frame_capacity > 0 {
+            self.insert_frame(frame_number, Arc::new(frame.clone()));
+        }
+        Ok(frame)
+    }
+
+    fn get_global_proposal(&self, frame_number: u64) -> Result<global::GlobalProposal, String> {
+        if let Some(p) = self.proposals.read().unwrap().get(&frame_number).cloned() {
+            return Ok((*p).clone());
+        }
+        let _load = self.proposal_loads[(frame_number % 32) as usize]
+            .lock()
+            .unwrap();
+        if let Some(p) = self.proposals.read().unwrap().get(&frame_number).cloned() {
+            return Ok((*p).clone());
+        }
+        let proposal = self.inner.get_global_proposal(frame_number)?;
+        // Only cache *settled* proposals. Near the head a proposal's
+        // best-effort parts (proposer vote, prior-rank TC) may not be
+        // persisted yet at first request and fill in moments later;
+        // caching the head would pin that incomplete view. Once a frame is
+        // a few ranks below the head, every cert it carries is long since
+        // formed and immutable, so it is safe to cache permanently.
+        // Catch-up — the dominant repeated-read workload — pulls exactly
+        // these settled, well-below-head proposals.
+        const PROPOSAL_SETTLE_MARGIN: u64 = 4;
+        // Proposal-only catchup must refresh the head itself; it cannot rely
+        // on another RPC having populated (and kept refreshing) latest.
+        let head = self
+            .latest_shared()
+            .ok()
+            .and_then(|f| f.header.as_ref().map(|h| h.frame_number));
+        if frame_number == 0
+            || head.is_some_and(|h| h.saturating_sub(frame_number) >= PROPOSAL_SETTLE_MARGIN)
+        {
+            self.insert_proposal(frame_number, Arc::new(proposal.clone()));
+        }
+        Ok(proposal)
+    }
+
+    /// Uncached: a header-only frame must never reach the by-number cache
+    /// the peer-facing `get_frame` reads.
+    fn get_anchor_frame(&self, frame_number: u64) -> Result<Option<global::GlobalFrame>, String> {
+        self.inner.get_anchor_frame(frame_number)
+    }
+
+    /// Uncached: the inner lookup reads a header cheaply, and a header must
+    /// never stand in for a frame in the by-number cache. The head's header
+    /// is read from the shared head, without copying its bundles.
+    fn get_frame_header(&self, frame_number: u64) -> Result<global::GlobalFrameHeader, String> {
+        if frame_number == 0 {
+            return self
+                .latest_shared()?
+                .header
+                .clone()
+                .ok_or_else(|| "the latest frame has no header".to_string());
+        }
+        self.inner.get_frame_header(frame_number)
+    }
+}
+
+/// Peer frame reads (`GetGlobalFrame`, `GetGlobalProposal`,
+/// `GetAppShardFrame`) running at once. Each holds a blocking thread and a
+/// copy of a frame of up to several MB; unbounded, a catch-up burst held
+/// hundreds of them at once on the few archives every node syncs from.
+const FRAME_READ_SLOTS: usize = 8;
+/// Frame reads waiting for a slot beyond which further reads are refused at
+/// once.
+const MAX_FRAME_READ_WAITERS: usize = 64;
+/// How long a frame read waits for a slot before the server answers busy. A
+/// catching-up poller pauses and asks another archive, without passing over
+/// this one.
+const FRAME_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How often refused frame reads are summarized in the log.
+const FRAME_READ_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The bound on peer frame reads, shared by every peer-facing service.
+pub(crate) static FRAME_READS: FrameReadBound =
+    FrameReadBound::new(FRAME_READ_SLOTS, MAX_FRAME_READ_WAITERS, FRAME_READ_WAIT);
+
+/// Peer reads of the latest GLOBAL or app-shard frame, or of a GLOBAL
+/// header, running at once. They take no frame read slot, since a poller
+/// whose head read fails passes over the archive, but unbounded any peer
+/// could start them by the thousand on the blocking pool, each holding a copy
+/// of a frame of up to several MB. Each takes milliseconds, so these slots
+/// serve thousands of reads a second, far above every node polling the head.
+const HEAD_READ_SLOTS: usize = 32;
+/// Head reads waiting for a slot beyond which further ones are refused.
+const MAX_HEAD_READ_WAITERS: usize = 1024;
+/// How long a head read waits for a slot before the server answers busy.
+const HEAD_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The bound on peers' head and header reads, shared by every peer-facing
+/// service. This node's own workers do not take it.
+pub(crate) static HEAD_READS: FrameReadBound =
+    FrameReadBound::new(HEAD_READ_SLOTS, MAX_HEAD_READ_WAITERS, HEAD_READ_WAIT);
+
+/// Slots for blocking frame reads and a bounded queue for them. A read keeps
+/// its slot until its storage work and copy finish, even when its caller has
+/// gone.
+pub(crate) struct FrameReadBound {
+    slots: usize,
+    workers: tokio::sync::Semaphore,
+    /// Reads running or waiting for a slot.
+    admitted: tokio::sync::Semaphore,
+    wait: std::time::Duration,
+    refused: std::sync::atomic::AtomicU64,
+    /// When refusals were last logged, and the count then.
+    reported: std::sync::Mutex<(Option<std::time::Instant>, u64)>,
+}
+
+impl FrameReadBound {
+    pub(crate) const fn new(slots: usize, waiters: usize, wait: std::time::Duration) -> Self {
+        Self {
+            slots,
+            workers: tokio::sync::Semaphore::const_new(slots),
+            admitted: tokio::sync::Semaphore::const_new(slots + waiters),
+            wait,
+            refused: std::sync::atomic::AtomicU64::new(0),
+            reported: std::sync::Mutex::new((None, 0)),
+        }
+    }
+
+    /// Start `read` on the blocking pool once a slot is free. Past the wait,
+    /// or with the queue full, answer busy: the caller retries later or asks
+    /// another archive.
+    pub(crate) async fn spawn<T: Send + 'static>(
+        &'static self,
+        read: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<tokio::task::JoinHandle<T>, Status> {
+        let Ok(admitted) = self.admitted.try_acquire() else {
+            return Err(self.busy());
+        };
+        let slot = match self.workers.try_acquire() {
+            Ok(slot) => slot,
+            Err(_) => match tokio::time::timeout(self.wait, self.workers.acquire()).await {
+                Ok(Ok(slot)) => slot,
+                _ => return Err(self.busy()),
+            },
+        };
+        Ok(tokio::task::spawn_blocking(move || {
+            let _held = (admitted, slot);
+            read()
+        }))
+    }
+
+    /// Count a refusal, and log the refusals at most once per interval, so
+    /// an operator sees how often peers were turned away.
+    fn busy(&self) -> Status {
+        use std::sync::atomic::Ordering;
+        self.refused.fetch_add(1, Ordering::Relaxed);
+        let mut reported = self.reported.lock().unwrap_or_else(|e| e.into_inner());
+        if reported
+            .0
+            .is_none_or(|at| at.elapsed() >= FRAME_READ_REPORT_INTERVAL)
+        {
+            let refused = self.refused.load(Ordering::Relaxed);
+            info!(
+                refused = refused - reported.1,
+                refused_total = refused,
+                slots = self.slots,
+                "frame reads for peers refused: all frame read slots busy; peers retry later or ask another archive"
+            );
+            *reported = (Some(std::time::Instant::now()), refused);
+        }
+        Status::resource_exhausted("frame reads busy; retry later")
     }
 }
 
@@ -44,10 +370,92 @@ pub trait FrameLookup: Send + Sync {
 /// [`crate::peer_auth_middleware::AuthenticatedPeer`] extension and
 /// gate writes on peer identity.
 ///
-/// Returns `Ok(())` to acknowledge acceptance, or an error string that
-/// will be surfaced as `Status::invalid_argument`.
+/// Resolves to `Ok(())` to acknowledge acceptance, or a [`SubmitRefusal`].
+/// Asynchronous, so a handler can verify off the RPC runtime.
 pub type SubmitHandler = Arc<
-    dyn Fn(Request<global::SubmitGlobalMessageRequest>) -> Result<(), String>
+    dyn Fn(
+            Request<global::SubmitGlobalMessageRequest>,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SubmitRefusal>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Why a submission was refused, and whether to retry it. A retryable
+/// refusal (the receiver's mempool is full, or it cannot verify the message
+/// yet) is `Status::resource_exhausted`; it was `invalid_argument` like any
+/// other until 2026-10-15, so submitters dropped messages a full archive
+/// would have taken later.
+#[derive(Debug, Clone)]
+pub struct SubmitRefusal {
+    pub reason: String,
+    pub retry: bool,
+}
+
+impl SubmitRefusal {
+    pub fn invalid(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            retry: false,
+        }
+    }
+
+    pub fn retry_later(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            retry: true,
+        }
+    }
+}
+
+impl From<String> for SubmitRefusal {
+    fn from(reason: String) -> Self {
+        Self::invalid(reason)
+    }
+}
+
+impl From<&str> for SubmitRefusal {
+    fn from(reason: &str) -> Self {
+        Self::invalid(reason)
+    }
+}
+
+/// Handler for `submit_global_consensus`: a directly-delivered global
+/// consensus message (proposal / vote / timeout) from a peer archive.
+/// The handler routes `(bitmask, data)` into the node's consensus
+/// receive path — the same one the BlossomSub GLOBAL_FRAME /
+/// GLOBAL_CONSENSUS arms feed — so global consensus runs point-to-point
+/// instead of over gossip (which can't carry a full-coverage proposal).
+/// Receives the full `Request` so the handler can read the authenticated
+/// peer identity. Returns `Ok(())` on accept or an error string.
+pub type ConsensusDeliveryHandler =
+    Arc<dyn Fn(Request<global::SubmitGlobalConsensusRequest>) -> Result<(), String> + Send + Sync>;
+
+/// Delivers a standalone worker's shard resolver message to the committee
+/// members it names, directly over this node's peer connections:
+/// `(filter, channel, data, recipient committee keys)` → every recipient
+/// accepted it.
+pub type ShardDirectRelay = Arc<
+    dyn Fn(
+            Vec<u8>,
+            u64,
+            Vec<u8>,
+            Vec<Vec<u8>>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Sends one of a standalone worker's GLOBAL requests (a certified shard
+/// `FrameHeader` or a committee-handoff submission) on through this node's
+/// archive transport: `(core_id, canonical request)` → queued (`Ok(false)`:
+/// held back by a coverage halt; `Err`: not a request a worker may submit).
+pub type WorkerProverSubmitter = Arc<
+    dyn Fn(
+            u32,
+            Vec<u8>,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send>>
         + Send
         + Sync,
 >;
@@ -64,40 +472,602 @@ pub type GlobalShardsProvider =
 
 /// Per-shard metadata provider used by [`GlobalRpcServer::get_app_shards`]:
 /// given a 35-byte `shard_key` (L1[3]||L2[32]) and a `prefix` path,
-/// returns `(size_be, data_shards, commitments[4])` derived from the
+/// returns `(size_be, data_shards, commitments[4], materialized_frame,
+/// latest_frame)` derived from the local archive state. The latter two values
+/// distinguish a committed app state from a stored-but-unmaterialized frame.
 /// local hypergraph CRDT's VertexAdds tree. Returns `None` for malformed
 /// keys; entries with no data return zero size/count and 64-byte zero
 /// commitments. Mirrors Go's `services.go:GetAppShards` which fills
 /// these from the engine-side shard metadata.
-pub type AppShardsProvider = Arc<
-    dyn Fn(&[u8], &[u32]) -> Option<(Vec<u8>, u64, [Vec<u8>; 4])> + Send + Sync,
->;
+pub type AppShardsProvider =
+    Arc<dyn Fn(&[u8], &[u32]) -> Option<(Vec<u8>, u64, [Vec<u8>; 4], u64, u64)> + Send + Sync>;
+
+/// Serves forest-sync data (JMT nodes/values of a shard/phase tree) from the
+/// local CRDT's forest, for [`GlobalRpcServer::get_forest_node`] /
+/// `get_forest_value`. A pure read proxy: the diff client authenticates every
+/// node against the trusted header root, so nothing served here is trusted on
+/// its own. Installed by the node (which owns the CRDT).
+pub trait ForestServer: Send + Sync {
+    fn global_vertex_proof(&self, _root: [u8; 32], _address: [u8; 32]) -> Option<Vec<u8>> {
+        None
+    }
+    /// `borsh(NodeKey)` → `borsh(Node)` (None if absent / malformed key).
+    fn serve_node(&self, shard_id: &[u8], phase: u32, node_key: &[u8]) -> Option<Vec<u8>>;
+    /// `(version, key_hash)` → leaf value (None if absent).
+    fn serve_value(
+        &self,
+        shard_id: &[u8],
+        phase: u32,
+        version: u64,
+        key_hash: [u8; 32],
+    ) -> Option<Vec<u8>>;
+    /// Head `(version, root)` of a shard/phase tree, for the client's
+    /// version-discovery step. None if the tree was never committed.
+    fn serve_head(&self, shard_id: &[u8], phase: u32) -> Option<(u64, [u8; 32])>;
+    /// The raw l3 key (`vertex_id ‖ field_key`) a `key_hash` was committed from.
+    fn serve_preimage(&self, shard_id: &[u8], phase: u32, key_hash: [u8; 32]) -> Option<Vec<u8>>;
+    /// A vertex's committed blob (the readable data), keyed under the app
+    /// ShardKey bytes (`l1[3] ‖ l2[32]`). `version` MVCC-pins the read to the
+    /// tree version the diff addressed (`None` means latest).
+    fn serve_vertex_blob(
+        &self,
+        shard_key: &[u8],
+        phase: u32,
+        id: &[u8],
+        version: Option<u64>,
+    ) -> Option<Vec<u8>>;
+    /// Leaves of a shard/phase tree with keys in `[first, last]` after `after`,
+    /// each at its newest value at or below `version`, in key order, at most
+    /// [`MAX_FOREST_LEAVES`] and about [`MAX_FOREST_BATCH_BYTES`], and whether
+    /// more may follow. `None` when this server cannot list leaves.
+    #[allow(clippy::too_many_arguments)]
+    fn serve_leaves(
+        &self,
+        _shard_id: &[u8],
+        _phase: u32,
+        _version: u64,
+        _first: &[u8; 32],
+        _last: &[u8; 32],
+        _after: Option<&[u8; 32]>,
+    ) -> Option<(Vec<([u8; 32], Vec<u8>)>, bool)> {
+        None
+    }
+    /// Sync-by-hash: authenticated tree `root` → local `(version, global_frame)`
+    /// for a `(shard_id, phase)` tree. None if never committed here or pruned.
+    fn resolve_root(&self, shard_id: &[u8], phase: u32, root: [u8; 32]) -> Option<(u64, u64)>;
+    /// Sync-by-hash (split apps): the sub-shard manifest folding into an
+    /// aggregate `app_root` — `[(prefix_words, sub_root, sub_version)]`.
+    #[allow(clippy::type_complexity)]
+    fn serve_app_manifest(
+        &self,
+        app_address: &[u8],
+        phase: u32,
+        app_root: [u8; 32],
+    ) -> Option<Vec<(Vec<u8>, [u8; 32], u64)>>;
+}
+
+/// The committed GLOBAL frame the node's state is at, if known. Shard
+/// topology and pending changes are written only by GLOBAL commits, so rows
+/// read at one value stay current until it changes.
+pub type AppShardsVersion = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// Distinct requests whose shard rows are kept; prefixes are caller-chosen.
+const APP_SHARD_TOPOLOGY_ENTRIES: usize = 256;
+
+/// Callers waiting for a shard-row read of their request in progress.
+static APP_SHARDS_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One request's shard rows and whether a pending split or merge freezes each.
+type ShardTopology = Vec<(quil_types::store::ShardInfo, bool)>;
+/// A request's rows and the committed frame they were read at. Each request
+/// has its own lock: callers of one request share its read, and never wait
+/// for another request's.
+type KeptTopology = Arc<tokio::sync::Mutex<Option<(u64, Arc<ShardTopology>)>>>;
+type AppShardTopologies = std::collections::HashMap<(Vec<u8>, Vec<u32>), KeptTopology>;
+
+/// The shard rows a `GetAppShards` request names: one application's when
+/// `shard_key` is a full 35-byte key, otherwise every application's.
+fn read_shard_topology(
+    store: &dyn ShardsStore,
+    shard_key: &[u8],
+    prefix: &[u32],
+) -> Result<ShardTopology, String> {
+    let shards = if shard_key.len() == 35 {
+        store
+            .get_app_shards(shard_key, prefix)
+            .map_err(|e| format!("get_app_shards: {e}"))?
+    } else {
+        store
+            .range_app_shards()
+            .map_err(|e| format!("range_app_shards: {e}"))?
+    };
+    let pending = store
+        .all_pending_shard_changes()
+        .map_err(|e| format!("all_pending_shard_changes: {e}"))?;
+    Ok(shards
+        .into_iter()
+        .map(|s| {
+            let frozen = frozen_by_pending_change(&s.shard_key, &s.prefix, &pending);
+            (s, frozen)
+        })
+        .collect())
+}
+
+/// The rows kept for request `key`, added if new. A full table first drops
+/// the requests no caller is reading whose rows are not from `version`, then
+/// every request no caller is reading.
+fn kept_topology(
+    topologies: &parking_lot::Mutex<AppShardTopologies>,
+    key: &(Vec<u8>, Vec<u32>),
+    version: Option<u64>,
+) -> KeptTopology {
+    let mut kept = topologies.lock();
+    if let Some(slot) = kept.get(key) {
+        return slot.clone();
+    }
+    if kept.len() >= APP_SHARD_TOPOLOGY_ENTRIES {
+        kept.retain(|_, slot| match slot.try_lock() {
+            Ok(rows) => version.is_some() && rows.as_ref().map(|(at, _)| *at) == version,
+            Err(_) => true,
+        });
+        if kept.len() >= APP_SHARD_TOPOLOGY_ENTRIES {
+            kept.retain(|_, slot| slot.try_lock().is_err());
+        }
+    }
+    kept.entry(key.clone()).or_default().clone()
+}
 
 /// gRPC GlobalService implementation. Serves frames from the clock
 /// store so other nodes can sync from us.
 pub struct GlobalRpcServer {
+    /// `GetAppShards` shard rows, read once per committed GLOBAL frame (see
+    /// [`AppShardsVersion`]): every prover polls them.
+    app_shard_topologies: Arc<parking_lot::Mutex<AppShardTopologies>>,
+    app_shards_version: Option<AppShardsVersion>,
     frames: Arc<dyn FrameLookup>,
+    /// Bounds peers' frame and proposal reads ([`FRAME_READS`]).
+    frame_reads: &'static FrameReadBound,
     submit_handler: Option<SubmitHandler>,
+    consensus_delivery: Option<ConsensusDeliveryHandler>,
     shards_store: Option<Arc<dyn ShardsStore>>,
     worker_snapshot: Option<WorkerSnapshotFn>,
     global_shards: Option<GlobalShardsProvider>,
     app_shards: Option<AppShardsProvider>,
+    forest_server: Option<Arc<dyn ForestServer>>,
+    global_vertex_proof_source: Option<quil_engine::storage_history::GlobalVertexProofSource>,
+    /// Authenticated archive copies of GLOBAL frames this node never held,
+    /// for its own workers' historical anchors; `None` answers "not found".
+    global_anchor_source: Option<quil_engine::global_anchor::GlobalAnchorSource>,
+    archive_directory: Option<Arc<crate::ArchiveEndpointPool>>,
     /// Broadcast channel for `StreamGlobalMessages`. Producers
     /// (BlossomSub recv loop) send each received message; every
     /// connected streamer gets a `Receiver` clone.
     message_broadcast: Option<broadcast::Sender<global::StreamGlobalMessagesResponse>>,
+    /// The node's OWN peer id (`PeerId::to_bytes()`). When set, worker-privileged
+    /// RPCs (`StreamGlobalMessages`, `GetWorkerInfo`, `GetAppShards`) require the
+    /// authenticated caller to present THIS identity — i.e. only the node's own
+    /// data-worker processes (which dial with the node's Ed448 seed) may invoke
+    /// them, mirroring Go's `bytes.Equal(GetPeerID(), peerID)` self-gate. A remote
+    /// machine handshakes as a different peer_id and is denied. `None` ⇒ no gate
+    /// (single-machine/thread mode, where there is no gRPC boundary).
+    self_peer_id: Option<Vec<u8>>,
+    /// See [`ShardDirectRelay`]; `None` answers "not delivered".
+    shard_direct_relay: Option<ShardDirectRelay>,
+    /// See [`WorkerProverSubmitter`]; `None` answers "unimplemented".
+    worker_prover_submitter: Option<WorkerProverSubmitter>,
+    /// Rebuilds legacy committees for the node's own workers; `None` answers
+    /// "unimplemented".
+    historical_committees: Option<quil_engine::historical_committee::HistoricalCommitteeSource>,
+    /// Authorizer for prover-gated RPCs (`GetGlobalProposal`): returns `true` iff
+    /// the authenticated caller is the node's own identity OR resolves to an
+    /// ACTIVE prover (Go `authenticateProverFromContext`). `None` ⇒ no gate.
+    #[allow(clippy::type_complexity)]
+    prover_authorizer:
+        Option<Arc<dyn Fn(&crate::peer_auth_middleware::AuthenticatedPeer) -> bool + Send + Sync>>,
+}
+
+// Shared across peer-facing server instances. A cancelled RPC keeps its
+// permit inside the blocking closure until the storage read in progress
+// finishes; a batch then stops (`BatchDeadline`).
+// `QUIL_FOREST_READ_SLOTS` concurrent storage reads (default
+// `default_forest_read_slots`); a batched request reads up to
+// `MAX_FOREST_BATCH_KEYS` keys under one slot, and cached nodes, values and
+// prover-tree blobs (`forest_read_cache`) take no slot at all.
+static FOREST_READ_WORKERS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| {
+        let slots = std::env::var("QUIL_FOREST_READ_SLOTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| (1..=1024).contains(n))
+            .unwrap_or_else(|| {
+                default_forest_read_slots(
+                    std::thread::available_parallelism().map_or(4, |n| n.get()),
+                )
+            });
+        tokio::sync::Semaphore::new(slots)
+    });
+
+/// A quarter of `cores`, from 1 to 32. Each slot is a blocking storage read
+/// that can hold a core: 32 of them on a 32-core archive, decompressing
+/// blocks for peers, left its own GLOBAL execution and votes nothing, and
+/// GLOBAL halted (2026-10-13). A refused peer retries another archive.
+fn default_forest_read_slots(cores: usize) -> usize {
+    (cores / 4).clamp(1, 32)
+}
+static HISTORY_FORWARD_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+/// Concurrent own-worker GLOBAL anchor fetches from archives.
+static GLOBAL_ANCHOR_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// How long a forest read waits for a storage slot before the archive answers
+/// busy. A syncing client retries; a long queue would only hold its
+/// connection open.
+const FOREST_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Reads waiting for a slot beyond which further reads are refused at once.
+const MAX_FOREST_READ_WAITERS: usize = 64;
+/// Storage slots one authenticated peer may hold at once, so a single syncing
+/// client cannot occupy all of them. A node's workers all reach the archive
+/// under its identity, so this is shared by every worker bootstrapping at
+/// once (4 starved a node of 15 after the committee-handoff flag day).
+const FOREST_READ_SLOTS_PER_PEER: usize = 8;
+/// Keys one batched forest read may name.
+pub const MAX_FOREST_BATCH_KEYS: usize = 512;
+/// Leaves one leaf listing returns (vertex leaves are 40 bytes, so about
+/// 4.7 MB of keys and values).
+pub const MAX_FOREST_LEAVES: usize = 65_536;
+/// A batched response stops (answering a prefix) once it carries this many
+/// bytes; the client asks again for the rest.
+pub const MAX_FOREST_BATCH_BYTES: usize = 8 * 1024 * 1024;
+
+static FOREST_READ_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FOREST_READ_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FOREST_READ_QUEUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FOREST_LEAVES_LISTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FOREST_READ_PEER_SLOTS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<Vec<u8>, usize>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Forest reads this process has served, refused and queued, and its read
+/// cache, since start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForestReadStats {
+    pub cache: crate::forest_read_cache::ForestReadCacheStats,
+    pub refused: u64,
+    pub queued: u64,
+    /// Leaves served by bootstrap listings (no per-node reads).
+    pub listed: u64,
+}
+
+pub fn forest_read_stats() -> ForestReadStats {
+    ForestReadStats {
+        cache: crate::forest_read_cache::ForestReadCache::process().stats(),
+        refused: FOREST_READ_REFUSED.load(std::sync::atomic::Ordering::Relaxed),
+        queued: FOREST_READ_QUEUED.load(std::sync::atomic::Ordering::Relaxed),
+        listed: FOREST_LEAVES_LISTED.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// The authenticated caller, for the per-peer slot limit.
+fn forest_reader(extensions: &tonic::Extensions) -> Option<Vec<u8>> {
+    extensions
+        .get::<crate::peer_auth_middleware::AuthenticatedPeer>()
+        .map(|auth| auth.peer_id.to_bytes())
+}
+
+/// One of a peer's storage slots, released on drop.
+struct PeerSlot(Option<Vec<u8>>);
+
+impl PeerSlot {
+    fn take(peer: Option<Vec<u8>>, limit: usize) -> Result<Self, Status> {
+        let Some(peer) = peer else {
+            return Ok(Self(None));
+        };
+        let mut slots = FOREST_READ_PEER_SLOTS.lock();
+        let held = slots.entry(peer.clone()).or_insert(0);
+        if *held >= limit {
+            FOREST_READ_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(Status::resource_exhausted(
+                "forest reads for this peer at their limit; retry later",
+            ));
+        }
+        *held += 1;
+        Ok(Self(Some(peer)))
+    }
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let Some(peer) = self.0.take() else { return };
+        let mut slots = FOREST_READ_PEER_SLOTS.lock();
+        if let Some(held) = slots.get_mut(&peer) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                slots.remove(&peer);
+            }
+        }
+    }
+}
+
+async fn forest_read<T: Send + 'static>(
+    server: Option<Arc<dyn ForestServer>>,
+    peer: Option<Vec<u8>>,
+    read: impl FnOnce(&dyn ForestServer) -> Option<T> + Send + 'static,
+) -> Result<Option<T>, Status> {
+    let Some(server) = server else {
+        return Ok(None);
+    };
+    bounded_forest_read(&*FOREST_READ_WORKERS, FOREST_READ_WAIT, peer, move || {
+        read(server.as_ref())
+    })
+    .await
+}
+
+/// Run `read` on a storage slot. A free slot is taken at once; otherwise the
+/// read waits up to `wait` in a bounded queue, and is refused as busy past
+/// that or when the queue is full. A peer holds at most
+/// `FOREST_READ_SLOTS_PER_PEER` slots, queued or running.
+async fn bounded_forest_read<T: Send + 'static>(
+    workers: &'static tokio::sync::Semaphore,
+    wait: std::time::Duration,
+    peer: Option<Vec<u8>>,
+    read: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Status> {
+    use std::sync::atomic::Ordering;
+    let busy = || {
+        FOREST_READ_REFUSED.fetch_add(1, Ordering::Relaxed);
+        Status::resource_exhausted("forest read workers busy; retry later")
+    };
+    let peer_slot = PeerSlot::take(peer, FOREST_READ_SLOTS_PER_PEER)?;
+    let permit = match workers.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) if wait.is_zero() => return Err(busy()),
+        Err(_) => {
+            if FOREST_READ_WAITERS.fetch_add(1, Ordering::Relaxed) >= MAX_FOREST_READ_WAITERS {
+                FOREST_READ_WAITERS.fetch_sub(1, Ordering::Relaxed);
+                return Err(busy());
+            }
+            FOREST_READ_QUEUED.fetch_add(1, Ordering::Relaxed);
+            let acquired = tokio::time::timeout(wait, workers.acquire()).await;
+            FOREST_READ_WAITERS.fetch_sub(1, Ordering::Relaxed);
+            match acquired {
+                Ok(Ok(permit)) => permit,
+                _ => return Err(busy()),
+            }
+        }
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _peer_slot = peer_slot;
+        read()
+    })
+    .await
+    .map_err(|e| Status::internal(format!("forest read task failed: {e}")))
+}
+
+/// How long a batched read may go on reading storage from its arrival, slot
+/// wait included, before it answers the keys read so far. A syncing client
+/// gives up after 15 s and sends the whole batch again, so storage reads past
+/// that served no one: at an epoch boundary every regular node syncs the
+/// prover tree, and timed-out batches kept the slots of the 4 archives busy
+/// for over an hour (GLOBAL 925,920). The client asks again for the rest of
+/// a prefix answer.
+const FOREST_BATCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// When a batched read stops reading storage: past its budget, or once its
+/// caller has gone (the RPC was cancelled or timed out, and its handler
+/// dropped).
+struct BatchDeadline {
+    ends: std::time::Instant,
+    abandoned: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Held by a request handler; dropping it marks its batch abandoned.
+struct BatchCaller(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for BatchCaller {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl BatchDeadline {
+    /// A deadline `budget` from now, and the guard its handler holds.
+    fn start(budget: std::time::Duration) -> (Self, BatchCaller) {
+        let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ends = std::time::Instant::now() + budget;
+        (
+            Self {
+                ends,
+                abandoned: abandoned.clone(),
+            },
+            BatchCaller(abandoned),
+        )
+    }
+
+    fn passed(&self) -> bool {
+        self.abandoned.load(std::sync::atomic::Ordering::Relaxed)
+            || std::time::Instant::now() >= self.ends
+    }
+}
+
+/// Answer a batched read: each key from `hits` when cached, else through
+/// `read` (which may cache it), stopping after `MAX_FOREST_BATCH_BYTES`, or
+/// at the first key to read from storage once `deadline` has passed. The
+/// first key is always answered.
+fn answer_batch<K>(
+    keys: Vec<K>,
+    hits: Vec<Option<Arc<Vec<u8>>>>,
+    deadline: &BatchDeadline,
+    mut read: impl FnMut(&K) -> Option<Vec<u8>>,
+) -> Vec<global::ForestReadResult> {
+    let mut out = Vec::with_capacity(keys.len());
+    let mut bytes = 0usize;
+    for (key, hit) in keys.iter().zip(hits) {
+        if !out.is_empty() && bytes >= MAX_FOREST_BATCH_BYTES {
+            break;
+        }
+        let data = match hit {
+            Some(data) => Some(data.as_ref().clone()),
+            None if !out.is_empty() && deadline.passed() => break,
+            None => read(key),
+        };
+        bytes += data.as_ref().map_or(0, Vec::len);
+        out.push(global::ForestReadResult {
+            found: data.is_some(),
+            data: data.unwrap_or_default(),
+        });
+    }
+    out
+}
+
+/// The leading cached entries of a batch.
+fn cached_prefix(hits: &[Option<Arc<Vec<u8>>>]) -> Vec<Arc<Vec<u8>>> {
+    hits.iter().map_while(Option::clone).collect()
+}
+
+/// A batched read's answer; when no storage slot was free, its leading
+/// cached keys (`prefix`) if there are any, within `MAX_FOREST_BATCH_BYTES`,
+/// and the client asks again for the rest.
+fn or_cached_prefix(
+    read: Result<Option<Vec<global::ForestReadResult>>, Status>,
+    prefix: Vec<Arc<Vec<u8>>>,
+    unserved: usize,
+) -> Result<Vec<global::ForestReadResult>, Status> {
+    match read {
+        Ok(answered) => {
+            Ok(answered.unwrap_or_else(|| vec![global::ForestReadResult::default(); unserved]))
+        }
+        Err(busy) if busy.code() == tonic::Code::ResourceExhausted && !prefix.is_empty() => {
+            let mut bytes = 0usize;
+            Ok(prefix
+                .into_iter()
+                .take_while(|data| {
+                    let room = bytes < MAX_FOREST_BATCH_BYTES;
+                    bytes += data.len();
+                    room
+                })
+                .map(|data| global::ForestReadResult {
+                    found: true,
+                    data: data.as_ref().clone(),
+                })
+                .collect())
+        }
+        Err(status) => Err(status),
+    }
+}
+
+/// The GLOBAL prover tree's id, also the app part of its blobs' ShardKey.
+const PROVER_TREE: [u8; 32] = [0xff; 32];
+
+/// Whether `shard_key` keys the GLOBAL prover tree's blobs. That tree is
+/// never split, so a blob version names one tree's version, whose head says
+/// whether a read is final; a split app's blobs carry its sub-shards'
+/// versions instead.
+fn prover_blobs(shard_key: &[u8]) -> bool {
+    shard_key.len() == 35 && shard_key[3..] == PROVER_TREE
 }
 
 impl GlobalRpcServer {
     pub fn new(frames: Arc<dyn FrameLookup>) -> Self {
         Self {
+            app_shard_topologies: Arc::new(parking_lot::Mutex::new(AppShardTopologies::new())),
+            app_shards_version: None,
             frames,
+            frame_reads: &FRAME_READS,
             submit_handler: None,
+            consensus_delivery: None,
             shards_store: None,
             worker_snapshot: None,
             global_shards: None,
             app_shards: None,
+            forest_server: None,
+            global_vertex_proof_source: None,
+            global_anchor_source: None,
+            archive_directory: None,
             message_broadcast: None,
+            self_peer_id: None,
+            shard_direct_relay: None,
+            worker_prover_submitter: None,
+            historical_committees: None,
+            prover_authorizer: None,
+        }
+    }
+
+    /// Install the source for `GetHistoricalCommittees`.
+    pub fn with_historical_committees(
+        mut self,
+        source: quil_engine::historical_committee::HistoricalCommitteeSource,
+    ) -> Self {
+        self.historical_committees = Some(source);
+        self
+    }
+
+    /// Install the submitter for `SubmitWorkerProverMessage`.
+    pub fn with_worker_prover_submitter(mut self, submitter: WorkerProverSubmitter) -> Self {
+        self.worker_prover_submitter = Some(submitter);
+        self
+    }
+
+    /// Install the relay for `SendShardConsensusDirect`.
+    pub fn with_shard_direct_relay(mut self, relay: ShardDirectRelay) -> Self {
+        self.shard_direct_relay = Some(relay);
+        self
+    }
+
+    /// Install the prover authorizer for `GetGlobalProposal` (self OR active
+    /// prover). See [`prover_authorizer`](Self::prover_authorizer).
+    #[allow(clippy::type_complexity)]
+    pub fn with_prover_authorizer(
+        mut self,
+        f: Arc<dyn Fn(&crate::peer_auth_middleware::AuthenticatedPeer) -> bool + Send + Sync>,
+    ) -> Self {
+        self.prover_authorizer = Some(f);
+        self
+    }
+
+    /// Strictly the node's own workers, for calls that act as the node (they
+    /// send under its identity). Unlike the other worker-privileged calls, no
+    /// configured identity is no access.
+    fn is_own_identity(&self, ext: &tonic::Extensions) -> bool {
+        self.self_peer_id.as_ref().is_some_and(|me| {
+            ext.get::<crate::peer_auth_middleware::AuthenticatedPeer>()
+                .is_some_and(|auth| auth.peer_id.to_bytes() == *me)
+        })
+    }
+
+    /// Guard a prover-gated RPC (`GetGlobalProposal`): the authenticated caller
+    /// must be the node's own identity OR an active prover. No-op when no
+    /// authorizer is configured.
+    fn require_prover(&self, ext: &tonic::Extensions) -> Result<(), tonic::Status> {
+        let Some(ref authz) = self.prover_authorizer else {
+            return Ok(());
+        };
+        match ext.get::<crate::peer_auth_middleware::AuthenticatedPeer>() {
+            Some(auth) if authz(auth) => Ok(()),
+            _ => Err(tonic::Status::permission_denied(
+                "GetGlobalProposal: caller is not this node's identity or an active prover",
+            )),
+        }
+    }
+
+    /// Set the node's own peer id so worker-privileged RPCs are gated to the
+    /// node's own identity (see [`self_peer_id`](Self::self_peer_id)).
+    pub fn with_self_peer_id(mut self, peer_id: Vec<u8>) -> Self {
+        self.self_peer_id = Some(peer_id);
+        self
+    }
+
+    /// Guard a worker-privileged RPC: the authenticated caller must be the node's
+    /// OWN identity. Returns `PermissionDenied` otherwise. No-op when no self
+    /// peer id is configured (thread mode). `ext` is the request's extensions.
+    fn require_self_identity(&self, ext: &tonic::Extensions) -> Result<(), tonic::Status> {
+        let Some(ref me) = self.self_peer_id else {
+            return Ok(());
+        };
+        match ext.get::<crate::peer_auth_middleware::AuthenticatedPeer>() {
+            Some(auth) if auth.peer_id.to_bytes() == *me => Ok(()),
+            _ => Err(tonic::Status::permission_denied(
+                "worker-privileged RPC: caller is not this node's own identity",
+            )),
         }
     }
 
@@ -106,8 +1076,77 @@ impl GlobalRpcServer {
         self
     }
 
+    /// Install the forest-sync server (serves JMT nodes/values). Without it, the
+    /// `GetForestNode`/`GetForestValue` RPCs report "not found".
+    pub fn with_forest_server(mut self, s: Arc<dyn ForestServer>) -> Self {
+        self.forest_server = Some(s);
+        self
+    }
+
+    pub fn with_global_vertex_proof_source(
+        mut self,
+        source: Option<quil_engine::storage_history::GlobalVertexProofSource>,
+    ) -> Self {
+        self.global_vertex_proof_source = source;
+        self
+    }
+
+    /// Install the archive fallback for own-worker historical anchors (see
+    /// [`Self::own_worker_anchor`]).
+    pub fn with_global_anchor_source(
+        mut self,
+        source: Option<quil_engine::global_anchor::GlobalAnchorSource>,
+    ) -> Self {
+        self.global_anchor_source = source;
+        self
+    }
+
+    /// A historical GLOBAL frame for this node's own worker, which validates
+    /// an app frame anchored to it and needs only its header: the stored
+    /// frame even when its request bodies were pruned, else an authenticated
+    /// archive copy from `global_anchor_source`. A peer asking the
+    /// same is served by `get_frame`, which refuses both.
+    async fn own_worker_anchor(&self, frame_number: u64) -> Result<global::GlobalFrame, Status> {
+        let frames = self.frames.clone();
+        let held = tokio::task::spawn_blocking(move || frames.get_anchor_frame(frame_number))
+            .await
+            .map_err(|e| Status::internal(format!("get_global_frame task panicked: {e}")))?
+            .map_err(|e| Status::unavailable(format!("frame {frame_number} unreadable: {e}")))?;
+        if let Some(frame) = held {
+            return Ok(frame);
+        }
+        let Some(source) = self.global_anchor_source.as_ref() else {
+            return Err(Status::not_found(format!("frame {frame_number} not found")));
+        };
+        let _permit = GLOBAL_ANCHOR_WORKERS
+            .try_acquire()
+            .map_err(|_| Status::resource_exhausted("GLOBAL anchor fetches busy"))?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), source(frame_number))
+            .await
+            .map_err(|_| Status::unavailable("GLOBAL anchor archive fetch timed out"))?
+            .map_err(|e| Status::unavailable(e.to_string()))
+    }
+
+    pub fn with_archive_directory(mut self, pool: Arc<crate::ArchiveEndpointPool>) -> Self {
+        self.archive_directory = Some(pool);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_frame_reads(mut self, reads: &'static FrameReadBound) -> Self {
+        self.frame_reads = reads;
+        self
+    }
+
     pub fn with_app_shards_provider(mut self, p: AppShardsProvider) -> Self {
         self.app_shards = Some(p);
+        self
+    }
+
+    /// Keep `GetAppShards` shard rows until the committed GLOBAL frame moves.
+    /// Without it they are read for every request.
+    pub fn with_app_shards_version(mut self, version: AppShardsVersion) -> Self {
+        self.app_shards_version = Some(version);
         self
     }
 
@@ -130,6 +1169,14 @@ impl GlobalRpcServer {
         self
     }
 
+    /// Install a handler for `submit_global_consensus` — direct
+    /// point-to-point delivery of global consensus messages between
+    /// genesis archives (replaces gossip for global consensus).
+    pub fn with_consensus_delivery(mut self, handler: ConsensusDeliveryHandler) -> Self {
+        self.consensus_delivery = Some(handler);
+        self
+    }
+
     pub fn with_shards_store(mut self, store: Arc<dyn ShardsStore>) -> Self {
         self.shards_store = Some(store);
         self
@@ -143,22 +1190,174 @@ impl GlobalRpcServer {
 
 #[tonic::async_trait]
 impl GlobalService for GlobalRpcServer {
+    async fn get_archive_endpoints(
+        &self,
+        request: Request<global::GetArchiveEndpointsRequest>,
+    ) -> Result<Response<global::GetArchiveEndpointsResponse>, Status> {
+        self.require_self_identity(request.extensions())?;
+        let pool = self
+            .archive_directory
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("archive directory unavailable"))?;
+        let endpoints = pool
+            .get_all()
+            .await
+            .into_iter()
+            .filter(|entry| !entry.is_empty() && entry.len() <= 512)
+            .take(32)
+            .collect();
+        Ok(Response::new(global::GetArchiveEndpointsResponse {
+            endpoints,
+        }))
+    }
+    async fn get_global_vertex_proof(
+        &self,
+        request: Request<global::GetGlobalVertexProofRequest>,
+    ) -> Result<Response<global::GetGlobalVertexProofResponse>, Status> {
+        use quil_engine::storage_history::verify_global_vertex_proof;
+        let peer = forest_reader(request.extensions());
+        let req = request.into_inner();
+        let root: [u8; 32] = req
+            .root
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("GLOBAL root must be 32 bytes"))?;
+        let address: [u8; 32] = req
+            .address
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("GLOBAL address must be 32 bytes"))?;
+        let mut proof = forest_read(self.forest_server.clone(), peer, move |s| {
+            s.global_vertex_proof(root, address)
+        })
+        .await?;
+        if proof.is_none() && req.allow_forward {
+            if let Some(source) = self.global_vertex_proof_source.as_ref() {
+                let _permit = HISTORY_FORWARD_WORKERS
+                    .try_acquire()
+                    .map_err(|_| Status::resource_exhausted("history forwarding busy"))?;
+                proof =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), source(root, address))
+                        .await
+                        .map_err(|_| Status::unavailable("historical proof forwarding timed out"))?
+                        .map_err(|e| Status::unavailable(e.to_string()))?;
+            }
+        }
+        if let Some(bytes) = proof.as_ref() {
+            verify_global_vertex_proof(&root, &address, bytes)
+                .map_err(|e| Status::data_loss(e.to_string()))?;
+        }
+        Ok(Response::new(global::GetGlobalVertexProofResponse {
+            found: proof.is_some(),
+            proof: proof.unwrap_or_default(),
+        }))
+    }
     async fn get_global_frame(
         &self,
         request: Request<global::GetGlobalFrameRequest>,
     ) -> Result<Response<global::GlobalFrameResponse>, Status> {
+        // Only this node's own worker may ask for an anchor; from anyone else
+        // the flag is ignored. The latest-frame alias is never an anchor.
+        let own = self.is_own_identity(request.extensions());
+        let anchor =
+            request.get_ref().historical_anchor && request.get_ref().frame_number != 0 && own;
         let req = request.into_inner();
         let frame_number = req.frame_number;
+        if anchor {
+            let frame = self.own_worker_anchor(frame_number).await?;
+            return Ok(Response::new(global::GlobalFrameResponse {
+                frame: Some(frame),
+                proof: Vec::new(),
+            }));
+        }
+        // A peer that checks only headers and their links (a historical
+        // anchor and the frames certifying it) asks for the header alone:
+        // the bundles are never read or sent, which keeps the answer small
+        // enough for its short deadline.
+        if req.header_only {
+            let frames = self.frames.clone();
+            let read = move || frames.get_frame_header(frame_number);
+            let task = if own {
+                tokio::task::spawn_blocking(read)
+            } else {
+                HEAD_READS.spawn(read).await?
+            };
+            let header = task
+                .await
+                .map_err(|e| Status::internal(format!("get_global_frame task panicked: {e}")))?
+                .map_err(|e| {
+                    Status::not_found(format!("frame {frame_number} header not found: {e}"))
+                })?;
+            let frame = global::GlobalFrame {
+                header: Some(header),
+                requests: Vec::new(),
+            };
+            return Ok(Response::new(global::GlobalFrameResponse {
+                frame: Some(frame),
+                proof: Vec::new(),
+            }));
+        }
+        // A poller asks for the head whole only if it is newer than its own.
+        // While it is not, the header tells the poller this archive's height
+        // without the request bundles it already holds.
+        if frame_number == 0 && req.if_newer_than > 0 {
+            let frames = self.frames.clone();
+            let read = move || frames.get_frame_header(0);
+            let task = if own {
+                tokio::task::spawn_blocking(read)
+            } else {
+                HEAD_READS.spawn(read).await?
+            };
+            let header = task
+                .await
+                .map_err(|e| Status::internal(format!("get_global_frame task panicked: {e}")))?
+                .map_err(|e| Status::not_found(format!("no frames: {e}")))?;
+            if header.frame_number <= req.if_newer_than {
+                let frame = global::GlobalFrame {
+                    header: Some(header),
+                    requests: Vec::new(),
+                };
+                return Ok(Response::new(global::GlobalFrameResponse {
+                    frame: Some(frame),
+                    proof: Vec::new(),
+                }));
+            }
+        }
 
-        let frame = if frame_number == 0 {
-            self.frames
-                .get_latest_frame()
-                .map_err(|e| Status::not_found(format!("no frames: {}", e)))?
-        } else {
-            self.frames
-                .get_frame(frame_number)
-                .map_err(|e| Status::not_found(format!("frame {} not found: {}", frame_number, e)))?
+        // Store read runs on the blocking pool, NOT inline on a peer-gRPC
+        // runtime worker. This is the hottest serving RPC on the network
+        // (every archive poller + proposal catch-up hits it in a loop) and
+        // a global frame record can be multi-MB — a burst of inline
+        // synchronous RocksDB reads occupies the runtime's workers and
+        // starves the latency-critical consensus delivery (votes/proposals)
+        // sharing them. Same treatment as `get_app_shards` below.
+        let frames = self.frames.clone();
+        let read = move || {
+            if frame_number == 0 {
+                frames
+                    .get_latest_frame()
+                    .map_err(|e| format!("no frames: {}", e))
+            } else {
+                frames
+                    .get_frame(frame_number)
+                    .map_err(|e| format!("frame {} not found: {}", frame_number, e))
+            }
         };
+        // A peer's numbered frame takes a frame read slot. The head takes a
+        // head read slot instead: it is one cached frame, and a poller whose
+        // head read fails passes over the archive for a minute. This node's
+        // own workers take neither: they must not wait behind peers.
+        let task = if own {
+            tokio::task::spawn_blocking(read)
+        } else if frame_number != 0 {
+            self.frame_reads.spawn(read).await?
+        } else {
+            HEAD_READS.spawn(read).await?
+        };
+        let frame = task
+            .await
+            .map_err(|e| Status::internal(format!("get_global_frame task panicked: {e}")))?
+            .map_err(Status::not_found)?;
 
         Ok(Response::new(global::GlobalFrameResponse {
             frame: Some(frame),
@@ -170,19 +1369,43 @@ impl GlobalService for GlobalRpcServer {
         &self,
         request: Request<global::GetGlobalProposalRequest>,
     ) -> Result<Response<global::GlobalProposalResponse>, Status> {
+        // Prover-gated (Go `authenticateProverFromContext`, services.go:95): the
+        // global proposal is served only to this node's own identity or an ACTIVE
+        // prover.
+        self.require_prover(request.extensions())?;
+        let own = self.is_own_identity(request.extensions());
         let req = request.into_inner();
         // Assemble state + parent QC + prior TC + vote from the clock store
         // (see `FrameLookup::get_global_proposal`). Mirrors Go
         // `GlobalConsensusEngine.GetGlobalProposal`; on any lookup miss Go
         // returns an empty response rather than an error (qclient shows
         // "no proposal at frame N"), so we do the same.
-        match self.frames.get_global_proposal(req.frame_number) {
+        //
+        // Offloaded to the blocking pool for the same reason as
+        // `get_global_frame`: multiple synchronous store reads (frame,
+        // parent frame, QC, TC, vote) that must not hold a peer-gRPC
+        // runtime worker while catch-up peers hammer this in a loop.
+        // A peer's read takes a frame read slot, as in `get_global_frame`.
+        let frames = self.frames.clone();
+        let frame_number = req.frame_number;
+        let read = move || frames.get_global_proposal(frame_number);
+        let task = if own {
+            tokio::task::spawn_blocking(read)
+        } else {
+            self.frame_reads.spawn(read).await?
+        };
+        let result = task
+            .await
+            .map_err(|e| Status::internal(format!("get_global_proposal task panicked: {e}")))?;
+        match result {
             Ok(proposal) => Ok(Response::new(global::GlobalProposalResponse {
                 proposal: Some(proposal),
             })),
             Err(e) => {
                 debug!(frame_number = req.frame_number, error = %e, "get_global_proposal: returning empty");
-                Ok(Response::new(global::GlobalProposalResponse { proposal: None }))
+                Ok(Response::new(global::GlobalProposalResponse {
+                    proposal: None,
+                }))
             }
         }
     }
@@ -191,53 +1414,137 @@ impl GlobalService for GlobalRpcServer {
         &self,
         request: Request<global::GetAppShardsRequest>,
     ) -> Result<Response<global::GetAppShardsResponse>, Status> {
-        let shards_store = match &self.shards_store {
-            Some(s) => s,
-            None => {
-                // Shards store not wired yet — return empty list so
-                // qclient displays "no shards yet" rather than erroring.
-                return Ok(Response::new(global::GetAppShardsResponse {
-                    info: Vec::new(),
-                }));
-            }
+        let Some(shards_store) = self.shards_store.clone() else {
+            // Shards store not wired yet — return empty list so
+            // qclient displays "no shards yet" rather than erroring.
+            return Ok(Response::new(global::GetAppShardsResponse {
+                info: Vec::new(),
+            }));
         };
+        let app_shards = self.app_shards.clone();
         let req = request.into_inner();
-        let shards = if req.shard_key.len() == 35 {
-            shards_store
-                .get_app_shards(&req.shard_key, &req.prefix)
-                .map_err(|e| Status::internal(format!("get_app_shards: {e}")))?
-        } else {
-            shards_store
-                .range_app_shards()
-                .map_err(|e| Status::internal(format!("range_app_shards: {e}")))?
-        };
         let include_shard_key = req.shard_key.len() != 35;
-        // `RocksShardsStore` only persists the prefix path bytes — it
-        // doesn't carry `size`, `data_shards`, or `commitment`. Fill
-        // those in by consulting the live CRDT via the provider, which
-        // walks the per-shard phase trees and reads the root metadata.
-        // Without this, every entry would report `size=0` and the
-        // caller's `build_proposal_descriptors` filters it out → no
-        // ProposeJoin ever fires.
-        let info: Vec<global::AppShardInfo> = shards
-            .into_iter()
-            .map(|s| {
-                let (size, data_shards, commitment) = match &self.app_shards {
-                    Some(p) => match p(&s.shard_key, &s.prefix) {
-                        Some((sz, ds, cm)) => (sz, ds, cm.to_vec()),
-                        None => (Vec::new(), 0, (0..4).map(|_| vec![0u8; 64]).collect()),
-                    },
-                    None => (s.size, s.data_shards, s.commitment),
-                };
-                global::AppShardInfo {
-                    shard_key: if include_shard_key { s.shard_key } else { Vec::new() },
-                    prefix: s.prefix,
-                    size,
-                    data_shards,
-                    commitment,
+        let key = (req.shard_key, req.prefix);
+        let topologies = self.app_shard_topologies.clone();
+        let version = self.app_shards_version.clone();
+        // Detached so a caller that gives up still leaves its read behind: the
+        // blocking work cannot be cancelled, and the next caller must not
+        // start a second copy of it.
+        let task = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            // Where a slow call's time went: waiting for the shared rows,
+            // reading them (None: kept from this frame), waiting for a blocking
+            // thread, and the per-shard reads by section.
+            let lock_wait;
+            let mut rows_read = None;
+            // Rows change only with a committed GLOBAL frame: one caller reads
+            // them per frame, and callers of the same request arriving
+            // meanwhile wait and share it.
+            let topology = {
+                let version = version.as_ref().and_then(|version| version());
+                let slot = kept_topology(&topologies, &key, version);
+                APP_SHARDS_WAITING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut kept = slot.lock_owned().await;
+                APP_SHARDS_WAITING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                lock_wait = started.elapsed();
+                match (version, kept.as_ref()) {
+                    (Some(version), Some((at, rows))) if *at == version => rows.clone(),
+                    _ => {
+                        let read_started = std::time::Instant::now();
+                        let (store, (shard_key, prefix)) = (shards_store, key.clone());
+                        let rows = Arc::new(
+                            tokio::task::spawn_blocking(move || {
+                                read_shard_topology(store.as_ref(), &shard_key, &prefix)
+                            })
+                            .await
+                            .map_err(|e| {
+                                Status::internal(format!("get_app_shards task panicked: {e}"))
+                            })?
+                            .map_err(Status::internal)?,
+                        );
+                        rows_read = Some(read_started.elapsed());
+                        if let Some(version) = version {
+                            *kept = Some((version, rows.clone()));
+                        }
+                        rows
+                    }
                 }
+            };
+            // Sizes, executed and latest frames move with every application
+            // frame: read now, from memory and per-shard indexes. `RocksShardsStore`
+            // persists only the prefix path; without the provider every entry
+            // would report `size=0` and `build_proposal_descriptors` would
+            // filter it out → no ProposeJoin.
+            let shard_reads_started = std::time::Instant::now();
+            let (info, shard_reads, sections) = tokio::task::spawn_blocking(move || {
+                let started = std::time::Instant::now();
+                let sections = quil_execution::step_timing::collect();
+                let info: Vec<global::AppShardInfo> = topology
+                    .iter()
+                    .map(|(s, pending_change)| {
+                        let (size, data_shards, commitment, materialized_frame, latest_frame) =
+                            match &app_shards {
+                                Some(p) => match p(&s.shard_key, &s.prefix) {
+                                    Some((sz, ds, cm, mat, latest)) => {
+                                        (sz, ds, cm.to_vec(), mat, latest)
+                                    }
+                                    None => (
+                                        Vec::new(),
+                                        0,
+                                        (0..4).map(|_| vec![0u8; 64]).collect(),
+                                        0,
+                                        0,
+                                    ),
+                                },
+                                None => (s.size.clone(), s.data_shards, s.commitment.clone(), 0, 0),
+                            };
+                        global::AppShardInfo {
+                            shard_key: if include_shard_key {
+                                s.shard_key.clone()
+                            } else {
+                                Vec::new()
+                            },
+                            prefix: s.prefix.clone(),
+                            size,
+                            data_shards,
+                            commitment,
+                            materialized_frame,
+                            latest_frame,
+                            pending_change: *pending_change,
+                        }
+                    })
+                    .collect();
+                (info, started.elapsed(), sections.finish())
             })
-            .collect();
+            .await
+            .map_err(|e| Status::internal(format!("get_app_shards task panicked: {e}")))?;
+            let blocking_queue = shard_reads_started.elapsed().saturating_sub(shard_reads);
+            if started.elapsed() >= std::time::Duration::from_secs(1) {
+                let ms = |d: std::time::Duration| d.as_millis() as u64;
+                let mut sections = sections;
+                sections.sort_by(|a, b| b.2.cmp(&a.2));
+                tracing::warn!(
+                    ms = ms(started.elapsed()),
+                    shards = info.len(),
+                    waiting = APP_SHARDS_WAITING.load(std::sync::atomic::Ordering::Relaxed),
+                    lock_wait_ms = ms(lock_wait),
+                    rows_kept = rows_read.is_none(),
+                    rows_read_ms = rows_read.map_or(0, ms),
+                    blocking_queue_ms = ms(blocking_queue),
+                    shard_reads_ms = ms(shard_reads),
+                    sections = %sections
+                        .iter()
+                        .map(|(name, n, total)| format!("{name}: {n}× {} ms", total.as_millis()))
+                        .collect::<Vec<_>>()
+                        .join(" | "),
+                    "slow GetAppShards computation",
+                );
+            }
+            Result::<_, Status>::Ok(info)
+        });
+        let info = task
+            .await
+            .map_err(|e| Status::internal(format!("get_app_shards task failed: {e}")))??;
         Ok(Response::new(global::GetAppShardsResponse { info }))
     }
 
@@ -258,12 +1565,14 @@ impl GlobalService for GlobalRpcServer {
         // collect per-phase root commitments + sizes. Matches Go's
         // `services.go:313-368` exactly. Without a provider, fall
         // back to the zero-commitment response (structured but empty)
-        // so qclient doesn't error out.
-        let (size, commitment) = match &self.global_shards {
+        // so qclient doesn't error out. The walk is heavy synchronous
+        // work → offload to the blocking pool so it doesn't hold an async
+        // worker on the dedicated peer-gRPC runtime.
+        let global_shards = self.global_shards.clone();
+        let (size, commitment) = tokio::task::spawn_blocking(move || match &global_shards {
             Some(p) => {
                 let entries = p(&l1, &l2);
-                let mut total =
-                    num_bigint::BigInt::from(0u64);
+                let mut total = num_bigint::BigInt::from(0u64);
                 let mut commits: Vec<Vec<u8>> = Vec::with_capacity(4);
                 for (commit, size_be, _leaf_count) in entries.iter() {
                     total += num_bigint::BigInt::from_signed_bytes_be(size_be);
@@ -272,7 +1581,9 @@ impl GlobalService for GlobalRpcServer {
                 (total.to_signed_bytes_be(), commits)
             }
             None => (Vec::new(), (0..4).map(|_| vec![0u8; 64]).collect()),
-        };
+        })
+        .await
+        .map_err(|e| Status::internal(format!("get_global_shards task panicked: {e}")))?;
         Ok(Response::new(global::GetGlobalShardsResponse {
             size,
             commitment,
@@ -293,35 +1604,41 @@ impl GlobalService for GlobalRpcServer {
 
     async fn get_worker_info(
         &self,
-        _request: Request<global::GlobalGetWorkerInfoRequest>,
+        request: Request<global::GlobalGetWorkerInfoRequest>,
     ) -> Result<Response<global::GlobalGetWorkerInfoResponse>, Status> {
-        // NOTE: Go gates this on `peer_id == self.peer_id` — an
-        // operator-only check. Our peer-auth interceptor gives us
-        // `AuthenticatedPeer`; we could add the self-peer check here
-        // but for archive-node parity we trust the caller (reads
-        // only).
+        // Worker-privileged: only the node's own data-worker processes may read
+        // the worker roster (Go `services.go:413` self-gate). A remote peer is
+        // denied.
+        self.require_self_identity(request.extensions())?;
         let workers = match &self.worker_snapshot {
             Some(s) => s(),
             None => Vec::new(),
         };
-        Ok(Response::new(global::GlobalGetWorkerInfoResponse { workers }))
+        Ok(Response::new(global::GlobalGetWorkerInfoResponse {
+            workers,
+        }))
     }
 
     type StreamGlobalMessagesStream = std::pin::Pin<
         Box<
-            dyn tokio_stream::Stream<
-                    Item = Result<global::StreamGlobalMessagesResponse, Status>,
-                > + Send,
+            dyn tokio_stream::Stream<Item = Result<global::StreamGlobalMessagesResponse, Status>>
+                + Send,
         >,
     >;
 
     async fn stream_global_messages(
         &self,
-        _request: Request<global::StreamGlobalMessagesRequest>,
+        request: Request<global::StreamGlobalMessagesRequest>,
     ) -> Result<Response<Self::StreamGlobalMessagesStream>, Status> {
-        let sender = self.message_broadcast.as_ref().ok_or_else(|| {
-            Status::unavailable("global message broadcast not wired")
-        })?;
+        // Worker-privileged: the full global dispatch stream is for this node's
+        // OWN data-workers only — "only local workers may stream global messages"
+        // (Go `services.go:452`). A remote machine that completes the handshake as
+        // a different peer_id must NOT be able to subscribe to our dispatch.
+        self.require_self_identity(request.extensions())?;
+        let sender = self
+            .message_broadcast
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("global message broadcast not wired"))?;
         let rx = sender.subscribe();
         // Map broadcast Receiver → Stream, discarding Lagged errors
         // (they signal a slow subscriber but shouldn't kill the
@@ -331,7 +1648,9 @@ impl GlobalService for GlobalRpcServer {
             Ok(msg) => Some(Ok(msg)),
             Err(_lag) => None,
         });
-        Ok(Response::new(Box::pin(stream) as Self::StreamGlobalMessagesStream))
+        Ok(Response::new(
+            Box::pin(stream) as Self::StreamGlobalMessagesStream
+        ))
     }
 
     async fn submit_global_message(
@@ -339,15 +1658,2370 @@ impl GlobalService for GlobalRpcServer {
         request: Request<global::SubmitGlobalMessageRequest>,
     ) -> Result<Response<global::SubmitGlobalMessageResponse>, Status> {
         match &self.submit_handler {
-            Some(handler) => {
-                handler(request)
-                    .map_err(|e| Status::invalid_argument(format!("submit rejected: {}", e)))?;
-                Ok(Response::new(global::SubmitGlobalMessageResponse {}))
-            }
+            Some(handler) => match handler(request).await {
+                Ok(()) => Ok(Response::new(global::SubmitGlobalMessageResponse {})),
+                Err(refusal) => {
+                    tracing::debug!(error = %refusal.reason, retry = refusal.retry, "global message submit rejected by collector");
+                    let message = format!("submit rejected: {}", refusal.reason);
+                    Err(if refusal.retry {
+                        Status::resource_exhausted(message)
+                    } else {
+                        Status::invalid_argument(message)
+                    })
+                }
+            },
             None => {
-                debug!("submit_global_message called with no handler installed — dropping");
+                tracing::warn!(
+                    "global message submit received but no handler installed — dropping"
+                );
                 Ok(Response::new(global::SubmitGlobalMessageResponse {}))
             }
         }
+    }
+
+    async fn submit_global_consensus(
+        &self,
+        request: Request<global::SubmitGlobalConsensusRequest>,
+    ) -> Result<Response<global::SubmitGlobalConsensusResponse>, Status> {
+        match &self.consensus_delivery {
+            Some(handler) => {
+                handler(request).map_err(|e| {
+                    Status::invalid_argument(format!("consensus delivery rejected: {}", e))
+                })?;
+                Ok(Response::new(global::SubmitGlobalConsensusResponse {}))
+            }
+            None => {
+                debug!("submit_global_consensus called with no handler installed — dropping");
+                Ok(Response::new(global::SubmitGlobalConsensusResponse {}))
+            }
+        }
+    }
+
+    async fn send_shard_consensus_direct(
+        &self,
+        request: Request<global::SendShardConsensusDirectRequest>,
+    ) -> Result<Response<global::SendShardConsensusDirectResponse>, Status> {
+        if !self.is_own_identity(request.extensions()) {
+            return Err(Status::permission_denied(
+                "SendShardConsensusDirect: caller is not this node's own identity",
+            ));
+        }
+        let req = request.into_inner();
+        let delivered = match &self.shard_direct_relay {
+            Some(relay) => relay(req.filter, req.channel, req.data, req.recipients).await,
+            None => false,
+        };
+        Ok(Response::new(global::SendShardConsensusDirectResponse {
+            delivered,
+        }))
+    }
+
+    async fn get_historical_committees(
+        &self,
+        request: Request<global::GetHistoricalCommitteesRequest>,
+    ) -> Result<Response<global::GetHistoricalCommitteesResponse>, Status> {
+        if !self.is_own_identity(request.extensions()) {
+            return Err(Status::permission_denied(
+                "GetHistoricalCommittees: caller is not this node's own identity",
+            ));
+        }
+        let Some(source) = &self.historical_committees else {
+            return Err(Status::unimplemented(
+                "GetHistoricalCommittees: not available",
+            ));
+        };
+        let req = request.into_inner();
+        let committees = source(req.filter, req.anchor)
+            .await
+            .map_err(|e| Status::unavailable(e.to_string()))?;
+        Ok(Response::new(global::GetHistoricalCommitteesResponse {
+            committees: committees
+                .into_iter()
+                .map(|members| global::HistoricalCommittee { members })
+                .collect(),
+        }))
+    }
+
+    async fn submit_worker_prover_message(
+        &self,
+        request: Request<global::SubmitWorkerProverMessageRequest>,
+    ) -> Result<Response<global::SubmitWorkerProverMessageResponse>, Status> {
+        if !self.is_own_identity(request.extensions()) {
+            return Err(Status::permission_denied(
+                "SubmitWorkerProverMessage: caller is not this node's own identity",
+            ));
+        }
+        let Some(submitter) = &self.worker_prover_submitter else {
+            return Err(Status::unimplemented(
+                "SubmitWorkerProverMessage: no prover transport",
+            ));
+        };
+        let req = request.into_inner();
+        match submitter(req.core_id, req.request).await {
+            Ok(accepted) => Ok(Response::new(global::SubmitWorkerProverMessageResponse {
+                accepted,
+            })),
+            Err(error) => Err(Status::invalid_argument(error)),
+        }
+    }
+
+    async fn get_forest_node(
+        &self,
+        request: Request<global::GetForestNodeRequest>,
+    ) -> Result<Response<global::GetForestNodeResponse>, Status> {
+        use crate::forest_read_cache::{CacheKey, ForestReadCache, Origin};
+        let peer = forest_reader(request.extensions());
+        let req = request.into_inner();
+        let Some(origin) = self.forest_server.as_ref().map(Origin::of) else {
+            return Ok(Response::new(global::GetForestNodeResponse {
+                found: false,
+                node: Vec::new(),
+            }));
+        };
+        let cache = ForestReadCache::process();
+        let key = CacheKey::node(origin, &req.shard_id, req.phase, &req.node_key);
+        let node = match cache.get(&key) {
+            Some(node) => Some(node.as_ref().clone()),
+            None => {
+                forest_read(self.forest_server.clone(), peer, move |s| {
+                    let node = s.serve_node(&req.shard_id, req.phase, &req.node_key);
+                    if let Some(node) = &node {
+                        cache.put(key, node.clone());
+                    }
+                    node
+                })
+                .await?
+            }
+        };
+        Ok(Response::new(global::GetForestNodeResponse {
+            found: node.is_some(),
+            node: node.unwrap_or_default(),
+        }))
+    }
+
+    async fn get_forest_value(
+        &self,
+        request: Request<global::GetForestValueRequest>,
+    ) -> Result<Response<global::GetForestValueResponse>, Status> {
+        let peer = forest_reader(request.extensions());
+        let req = request.into_inner();
+        let key_hash: [u8; 32] = req
+            .key_hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("key_hash must be 32 bytes"))?;
+        let value = forest_read(self.forest_server.clone(), peer, move |s| {
+            s.serve_value(&req.shard_id, req.phase, req.version, key_hash)
+        })
+        .await?;
+        Ok(Response::new(global::GetForestValueResponse {
+            found: value.is_some(),
+            value: value.unwrap_or_default(),
+        }))
+    }
+
+    async fn get_forest_head(
+        &self,
+        request: Request<global::GetForestHeadRequest>,
+    ) -> Result<Response<global::GetForestHeadResponse>, Status> {
+        let peer = forest_reader(request.extensions());
+        let req = request.into_inner();
+        let head = forest_read(self.forest_server.clone(), peer, move |s| {
+            s.serve_head(&req.shard_id, req.phase)
+        })
+        .await?;
+        Ok(Response::new(match head {
+            Some((version, root)) => global::GetForestHeadResponse {
+                found: true,
+                version,
+                root: root.to_vec(),
+            },
+            None => global::GetForestHeadResponse {
+                found: false,
+                version: 0,
+                root: Vec::new(),
+            },
+        }))
+    }
+
+    async fn get_forest_preimage(
+        &self,
+        request: Request<global::GetForestPreimageRequest>,
+    ) -> Result<Response<global::GetForestPreimageResponse>, Status> {
+        let peer = forest_reader(request.extensions());
+        let req = request.into_inner();
+        let key_hash: [u8; 32] = req
+            .key_hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("key_hash must be 32 bytes"))?;
+        let raw = forest_read(self.forest_server.clone(), peer, move |s| {
+            s.serve_preimage(&req.shard_id, req.phase, key_hash)
+        })
+        .await?;
+        Ok(Response::new(global::GetForestPreimageResponse {
+            found: raw.is_some(),
+            raw_key: raw.unwrap_or_default(),
+        }))
+    }
+
+    async fn get_vertex_blob(
+        &self,
+        request: Request<global::GetVertexBlobRequest>,
+    ) -> Result<Response<global::GetVertexBlobResponse>, Status> {
+        let peer = forest_reader(request.extensions());
+        let req = request.into_inner();
+        let version = (req.exact_version || req.version != 0).then_some(req.version);
+        let blob = forest_read(self.forest_server.clone(), peer, move |s| {
+            s.serve_vertex_blob(&req.shard_key, req.phase, &req.id, version)
+        })
+        .await?;
+        Ok(Response::new(global::GetVertexBlobResponse {
+            found: blob.is_some(),
+            blob: blob.unwrap_or_default(),
+        }))
+    }
+
+    async fn get_forest_nodes(
+        &self,
+        request: Request<global::GetForestNodesRequest>,
+    ) -> Result<Response<global::GetForestNodesResponse>, Status> {
+        use crate::forest_read_cache::{CacheKey, ForestReadCache, Origin};
+        let peer = forest_reader(request.extensions());
+        let req = request.into_inner();
+        if req.node_keys.len() > MAX_FOREST_BATCH_KEYS {
+            return Err(Status::invalid_argument(format!(
+                "at most {MAX_FOREST_BATCH_KEYS} keys per request"
+            )));
+        }
+        let Some(origin) = self.forest_server.as_ref().map(Origin::of) else {
+            let nodes = vec![global::ForestReadResult::default(); req.node_keys.len()];
+            return Ok(Response::new(global::GetForestNodesResponse { nodes }));
+        };
+        let cache = ForestReadCache::process();
+        let hits: Vec<_> = req
+            .node_keys
+            .iter()
+            .map(|key| cache.get(&CacheKey::node(origin, &req.shard_id, req.phase, key)))
+            .collect();
+        let (deadline, _caller) = BatchDeadline::start(FOREST_BATCH_BUDGET);
+        let (shard_id, phase, keys) = (req.shard_id, req.phase, req.node_keys);
+        let nodes = if hits.iter().all(Option::is_some) {
+            answer_batch(keys, hits, &deadline, |_| None)
+        } else {
+            let (unserved, prefix) = (keys.len(), cached_prefix(&hits));
+            or_cached_prefix(
+                forest_read(self.forest_server.clone(), peer, move |s| {
+                    Some(answer_batch(keys, hits, &deadline, |key| {
+                        let cached = CacheKey::node(origin, &shard_id, phase, key);
+                        if let Some(node) = cache.recheck(&cached) {
+                            return Some(node.as_ref().clone());
+                        }
+                        let node = s.serve_node(&shard_id, phase, key);
+                        if let Some(node) = &node {
+                            cache.put(cached, node.clone());
+                        }
+                        node
+                    }))
+                })
+                .await,
+                prefix,
+                unserved,
+            )?
+        };
+        Ok(Response::new(global::GetForestNodesResponse { nodes }))
+    }
+
+    async fn get_forest_values(
+        &self,
+        request: Request<global::GetForestValuesRequest>,
+    ) -> Result<Response<global::GetForestValuesResponse>, Status> {
+        use crate::forest_read_cache::{CacheKey, ForestReadCache, Origin};
+        let peer = forest_reader(request.extensions());
+        let req = request.into_inner();
+        if req.keys.len() > MAX_FOREST_BATCH_KEYS {
+            return Err(Status::invalid_argument(format!(
+                "at most {MAX_FOREST_BATCH_KEYS} keys per request"
+            )));
+        }
+        let keys = req
+            .keys
+            .into_iter()
+            .map(|key| {
+                <[u8; 32]>::try_from(key.key_hash.as_slice())
+                    .map(|hash| (key.version, hash))
+                    .map_err(|_| Status::invalid_argument("key_hash must be 32 bytes"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(origin) = self.forest_server.as_ref().map(Origin::of) else {
+            let values = vec![global::ForestReadResult::default(); keys.len()];
+            return Ok(Response::new(global::GetForestValuesResponse { values }));
+        };
+        let cache = ForestReadCache::process();
+        let hits: Vec<_> = keys
+            .iter()
+            .map(|(version, hash)| {
+                cache.get(&CacheKey::value(
+                    origin,
+                    &req.shard_id,
+                    req.phase,
+                    *version,
+                    hash,
+                ))
+            })
+            .collect();
+        let (deadline, _caller) = BatchDeadline::start(FOREST_BATCH_BUDGET);
+        let (shard_id, phase) = (req.shard_id, req.phase);
+        let values = if hits.iter().all(Option::is_some) {
+            answer_batch(keys, hits, &deadline, |_| None)
+        } else {
+            let (unserved, prefix) = (keys.len(), cached_prefix(&hits));
+            or_cached_prefix(
+                forest_read(self.forest_server.clone(), peer, move |s| {
+                    // A value read above the tree's head could change when that
+                    // version commits, so only reads at or below it are kept.
+                    let head = s.serve_head(&shard_id, phase).map(|(version, _)| version);
+                    Some(answer_batch(keys, hits, &deadline, |(version, hash)| {
+                        let cached = CacheKey::value(origin, &shard_id, phase, *version, hash);
+                        if let Some(value) = cache.recheck(&cached) {
+                            return Some(value.as_ref().clone());
+                        }
+                        let value = s.serve_value(&shard_id, phase, *version, *hash);
+                        if let Some(value) = value
+                            .as_ref()
+                            .filter(|_| head.is_some_and(|head| *version <= head))
+                        {
+                            cache.put(cached, value.clone());
+                        }
+                        value
+                    }))
+                })
+                .await,
+                prefix,
+                unserved,
+            )?
+        };
+        Ok(Response::new(global::GetForestValuesResponse { values }))
+    }
+
+    async fn get_forest_leaves(
+        &self,
+        request: Request<global::GetForestLeavesRequest>,
+    ) -> Result<Response<global::GetForestLeavesResponse>, Status> {
+        let peer = forest_reader(request.extensions());
+        let req = request.into_inner();
+        let key = |bytes: &[u8], name: &str| -> Result<[u8; 32], Status> {
+            bytes
+                .try_into()
+                .map_err(|_| Status::invalid_argument(format!("{name} must be 32 bytes")))
+        };
+        let (first, last) = (key(&req.first, "first")?, key(&req.last, "last")?);
+        let after = if req.after.is_empty() {
+            None
+        } else {
+            Some(key(&req.after, "after")?)
+        };
+        let (shard_id, phase, version) = (req.shard_id, req.phase, req.version);
+        let listed = forest_read(self.forest_server.clone(), peer, move |s| {
+            s.serve_leaves(&shard_id, phase, version, &first, &last, after.as_ref())
+        })
+        .await?;
+        let Some((leaves, more)) = listed else {
+            return Err(Status::unimplemented(
+                "this archive does not list forest leaves",
+            ));
+        };
+        FOREST_LEAVES_LISTED.fetch_add(leaves.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(Response::new(global::GetForestLeavesResponse {
+            leaves: leaves
+                .into_iter()
+                .map(|(key_hash, value)| global::ForestLeaf {
+                    key_hash: key_hash.to_vec(),
+                    value,
+                })
+                .collect(),
+            more,
+        }))
+    }
+
+    async fn get_vertex_blobs(
+        &self,
+        request: Request<global::GetVertexBlobsRequest>,
+    ) -> Result<Response<global::GetVertexBlobsResponse>, Status> {
+        use crate::forest_read_cache::{CacheKey, ForestReadCache, Origin};
+        let peer = forest_reader(request.extensions());
+        let req = request.into_inner();
+        if req.blobs.len() > MAX_FOREST_BATCH_KEYS {
+            return Err(Status::invalid_argument(format!(
+                "at most {MAX_FOREST_BATCH_KEYS} keys per request"
+            )));
+        }
+        let Some(origin) = self.forest_server.as_ref().map(Origin::of) else {
+            let blobs = vec![global::ForestReadResult::default(); req.blobs.len()];
+            return Ok(Response::new(global::GetVertexBlobsResponse { blobs }));
+        };
+        let cache = ForestReadCache::process();
+        let cached = prover_blobs(&req.shard_key);
+        let hits: Vec<_> = req
+            .blobs
+            .iter()
+            .map(|key| {
+                cached
+                    .then(|| {
+                        cache.get(&CacheKey::blob(
+                            origin,
+                            &req.shard_key,
+                            req.phase,
+                            key.version,
+                            &key.id,
+                        ))
+                    })
+                    .flatten()
+            })
+            .collect();
+        let (deadline, _caller) = BatchDeadline::start(FOREST_BATCH_BUDGET);
+        let (shard_key, phase, keys) = (req.shard_key, req.phase, req.blobs);
+        let blobs = if hits.iter().all(Option::is_some) {
+            answer_batch(keys, hits, &deadline, |_| None)
+        } else {
+            let (unserved, prefix) = (keys.len(), cached_prefix(&hits));
+            or_cached_prefix(
+                forest_read(self.forest_server.clone(), peer, move |s| {
+                    // As for values: only reads at or below the tree's head are
+                    // kept.
+                    let head = cached
+                        .then(|| {
+                            s.serve_head(&PROVER_TREE, phase)
+                                .map(|(version, _)| version)
+                        })
+                        .flatten();
+                    Some(answer_batch(keys, hits, &deadline, |key| {
+                        let entry = CacheKey::blob(origin, &shard_key, phase, key.version, &key.id);
+                        if let Some(blob) = cached.then(|| cache.recheck(&entry)).flatten() {
+                            return Some(blob.as_ref().clone());
+                        }
+                        let blob =
+                            s.serve_vertex_blob(&shard_key, phase, &key.id, Some(key.version));
+                        if let Some(blob) = blob
+                            .as_ref()
+                            .filter(|_| head.is_some_and(|head| key.version <= head))
+                        {
+                            cache.put(entry, blob.clone());
+                        }
+                        blob
+                    }))
+                })
+                .await,
+                prefix,
+                unserved,
+            )?
+        };
+        Ok(Response::new(global::GetVertexBlobsResponse { blobs }))
+    }
+
+    async fn resolve_root(
+        &self,
+        request: Request<global::ResolveRootRequest>,
+    ) -> Result<Response<global::ResolveRootResponse>, Status> {
+        let peer = forest_reader(request.extensions());
+        let req = request.into_inner();
+        let root: [u8; 32] = req
+            .root
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("root must be 32 bytes"))?;
+        let resolved = forest_read(self.forest_server.clone(), peer, move |s| {
+            s.resolve_root(&req.shard_id, req.phase, root)
+        })
+        .await?;
+        Ok(Response::new(match resolved {
+            Some((version, global_frame)) => global::ResolveRootResponse {
+                found: true,
+                version,
+                global_frame,
+            },
+            None => global::ResolveRootResponse {
+                found: false,
+                version: 0,
+                global_frame: 0,
+            },
+        }))
+    }
+
+    async fn get_app_manifest(
+        &self,
+        request: Request<global::GetAppManifestRequest>,
+    ) -> Result<Response<global::GetAppManifestResponse>, Status> {
+        let peer = forest_reader(request.extensions());
+        let req = request.into_inner();
+        let app_root: [u8; 32] = req
+            .app_root
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("app_root must be 32 bytes"))?;
+        let manifest = forest_read(self.forest_server.clone(), peer, move |s| {
+            s.serve_app_manifest(&req.app_address, req.phase, app_root)
+        })
+        .await?;
+        Ok(Response::new(match manifest {
+            Some(entries) => global::GetAppManifestResponse {
+                found: true,
+                entries: entries
+                    .into_iter()
+                    .map(|(prefix, root, version)| global::AppManifestEntry {
+                        prefix,
+                        root: root.to_vec(),
+                        version,
+                    })
+                    .collect(),
+            },
+            None => global::GetAppManifestResponse {
+                found: false,
+                entries: Vec::new(),
+            },
+        }))
+    }
+}
+
+/// Whether a recorded split or merge that has not applied yet names the shard
+/// at `(shard_key, prefix)`. The chain refuses a join that includes such a
+/// shard, so a regular node leaves it out of its join candidates.
+fn frozen_by_pending_change(
+    shard_key: &[u8],
+    prefix: &[u32],
+    pending: &[quil_types::store::PendingShardChange],
+) -> bool {
+    let Some(app) = shard_key.get(3..35) else {
+        return false;
+    };
+    let filter = quil_forest::shard_prefix_to_filter(app, prefix);
+    pending.iter().any(|change| change.affects_shard(&filter))
+}
+
+#[cfg(test)]
+mod pending_change_tests {
+    use quil_types::store::{PendingShardChange, ShardChangeKind};
+
+    // A live width run: three shards were staged to split at frame 247 and
+    // flipped at 304. Every join the regular nodes proposed in between named
+    // one of them, and the chain refused each whole join.
+    #[test]
+    fn a_shard_named_by_a_pending_split_is_reported_frozen() {
+        let app = [0x21u8; 32];
+        let shard_key: Vec<u8> = [0u8, 0, 0].into_iter().chain(app).collect();
+        let prefix = quil_forest::bit_path_to_prefix;
+        let parent = quil_forest::encode_shard_bit_path(&app, &[false, true]);
+        let split = PendingShardChange {
+            kind: ShardChangeKind::Split,
+            parent,
+            children: vec![
+                quil_forest::encode_shard_bit_path(&app, &[false, true, false]),
+                quil_forest::encode_shard_bit_path(&app, &[false, true, true]),
+            ],
+            effective_epoch: 10,
+            proposed_frame: 247,
+        };
+        let pending = [split];
+        assert!(super::frozen_by_pending_change(
+            &shard_key,
+            &prefix(&[false, true]),
+            &pending
+        ));
+        assert!(!super::frozen_by_pending_change(
+            &shard_key,
+            &prefix(&[false, false]),
+            &pending
+        ));
+        assert!(!super::frozen_by_pending_change(
+            &shard_key,
+            &prefix(&[false, true]),
+            &[]
+        ));
+    }
+}
+
+#[cfg(test)]
+mod identity_gate_tests {
+    use super::*;
+    use crate::peer_auth_middleware::AuthenticatedPeer;
+
+    struct NoopLookup;
+    impl FrameLookup for NoopLookup {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> {
+            Err("n/a".into())
+        }
+        fn get_frame(&self, _: u64) -> Result<global::GlobalFrame, String> {
+            Err("n/a".into())
+        }
+        fn get_global_proposal(&self, _: u64) -> Result<global::GlobalProposal, String> {
+            Err("n/a".into())
+        }
+    }
+
+    fn auth_ext(peer_id: quil_p2p::PeerId) -> tonic::Extensions {
+        let mut ext = tonic::Extensions::new();
+        ext.insert(AuthenticatedPeer {
+            peer_id,
+            falcon_public_key: Vec::new(),
+        });
+        ext
+    }
+
+    #[tokio::test]
+    async fn archive_directory_is_bounded_and_only_served_to_own_workers() {
+        let me = quil_p2p::PeerId::random();
+        let pool = Arc::new(crate::ArchiveEndpointPool::new(std::time::Duration::ZERO));
+        let server = GlobalRpcServer::new(Arc::new(NoopLookup))
+            .with_self_peer_id(me.to_bytes())
+            .with_archive_directory(pool.clone());
+        let request = |peer| {
+            let mut request = Request::new(global::GetArchiveEndpointsRequest {});
+            if let Some(peer) = peer {
+                *request.extensions_mut() = auth_ext(peer);
+            }
+            request
+        };
+        for peer in [None, Some(quil_p2p::PeerId::random())] {
+            assert_eq!(
+                server
+                    .get_archive_endpoints(request(peer))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+        }
+        assert!(server
+            .get_archive_endpoints(request(Some(me)))
+            .await
+            .unwrap()
+            .into_inner()
+            .endpoints
+            .is_empty());
+        pool.add(String::new()).await;
+        pool.add("x".repeat(513)).await;
+        for index in 0..40 {
+            pool.add(format!("192.0.2.{}:8340", index + 1)).await;
+        }
+        let endpoints = server
+            .get_archive_endpoints(request(Some(me)))
+            .await
+            .unwrap()
+            .into_inner()
+            .endpoints;
+        assert_eq!(endpoints.len(), 32);
+        assert_eq!(endpoints[0], "192.0.2.1:8340");
+        assert_eq!(endpoints[31], "192.0.2.32:8340");
+    }
+
+    #[test]
+    fn self_gate_allows_self_denies_others_and_missing() {
+        let me = quil_p2p::PeerId::random();
+        let other = quil_p2p::PeerId::random();
+        let server = GlobalRpcServer::new(Arc::new(NoopLookup)).with_self_peer_id(me.to_bytes());
+        // The node's own identity (its data-workers) → allowed.
+        assert!(server.require_self_identity(&auth_ext(me)).is_ok());
+        // A different machine's identity → denied (the security fix).
+        assert!(server.require_self_identity(&auth_ext(other)).is_err());
+        // Unauthenticated (no handshake identity) → denied.
+        assert!(server
+            .require_self_identity(&tonic::Extensions::new())
+            .is_err());
+    }
+
+    #[test]
+    fn no_self_peer_id_configured_is_ungated() {
+        // Thread mode (workers in-process, no gRPC boundary): no gate installed,
+        // so the check is a no-op.
+        let server = GlobalRpcServer::new(Arc::new(NoopLookup));
+        assert!(server
+            .require_self_identity(&auth_ext(quil_p2p::PeerId::random()))
+            .is_ok());
+        assert!(server
+            .require_self_identity(&tonic::Extensions::new())
+            .is_ok());
+    }
+
+    #[test]
+    fn require_prover_honors_authorizer_and_presence() {
+        // Authorizer that only accepts one specific peer (the "active prover").
+        let prover = quil_p2p::PeerId::random();
+        let prover_bytes = prover.to_bytes();
+        let authz: Arc<dyn Fn(&AuthenticatedPeer) -> bool + Send + Sync> =
+            Arc::new(move |a: &AuthenticatedPeer| a.peer_id.to_bytes() == prover_bytes);
+        let server = GlobalRpcServer::new(Arc::new(NoopLookup)).with_prover_authorizer(authz);
+        // active prover → allowed
+        assert!(server.require_prover(&auth_ext(prover)).is_ok());
+        // non-prover → denied
+        assert!(server
+            .require_prover(&auth_ext(quil_p2p::PeerId::random()))
+            .is_err());
+        // unauthenticated → denied
+        assert!(server.require_prover(&tonic::Extensions::new()).is_err());
+        // no authorizer configured → ungated
+        let ungated = GlobalRpcServer::new(Arc::new(NoopLookup));
+        assert!(ungated.require_prover(&tonic::Extensions::new()).is_ok());
+    }
+
+    /// The relay sends as the node, so only the node's own identity may use
+    /// it, and without a configured identity nobody may.
+    #[tokio::test]
+    async fn only_the_nodes_own_workers_may_relay_shard_consensus() {
+        let me = quil_p2p::PeerId::random();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let relay: ShardDirectRelay = {
+            let seen = seen.clone();
+            Arc::new(move |filter, channel, data, recipients| {
+                seen.lock()
+                    .unwrap()
+                    .push((filter, channel, data, recipients));
+                Box::pin(async { true })
+            })
+        };
+        let request = |caller: Option<quil_p2p::PeerId>| {
+            let mut request = Request::new(global::SendShardConsensusDirectRequest {
+                filter: vec![1; 32],
+                channel: 2,
+                data: b"response".to_vec(),
+                recipients: vec![vec![5; 897]],
+            });
+            if let Some(caller) = caller {
+                *request.extensions_mut() = auth_ext(caller);
+            }
+            request
+        };
+        let server = GlobalRpcServer::new(Arc::new(NoopLookup))
+            .with_self_peer_id(me.to_bytes())
+            .with_shard_direct_relay(relay.clone());
+        for caller in [None, Some(quil_p2p::PeerId::random())] {
+            let denied = server
+                .send_shard_consensus_direct(request(caller))
+                .await
+                .unwrap_err();
+            assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        }
+        let response = server
+            .send_shard_consensus_direct(request(Some(me)))
+            .await
+            .unwrap();
+        assert!(response.get_ref().delivered);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[(vec![1; 32], 2, b"response".to_vec(), vec![vec![5; 897]])]
+        );
+        let unconfigured =
+            GlobalRpcServer::new(Arc::new(NoopLookup)).with_shard_direct_relay(relay);
+        let denied = unconfigured
+            .send_shard_consensus_direct(request(Some(me)))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            denied.code(),
+            tonic::Code::PermissionDenied,
+            "no identity configured: no access"
+        );
+    }
+
+    /// Historical committees go only to the node's own workers.
+    #[tokio::test]
+    async fn only_the_nodes_own_workers_may_ask_for_historical_committees() {
+        let me = quil_p2p::PeerId::random();
+        let source: quil_engine::historical_committee::HistoricalCommitteeSource =
+            Arc::new(|filter, anchor| {
+                Box::pin(async move { Ok(vec![vec![filter, anchor.to_be_bytes().to_vec()]]) })
+            });
+        let request = |caller: Option<quil_p2p::PeerId>| {
+            let mut request = Request::new(global::GetHistoricalCommitteesRequest {
+                filter: b"shard".to_vec(),
+                anchor: 9,
+            });
+            if let Some(caller) = caller {
+                *request.extensions_mut() = auth_ext(caller);
+            }
+            request
+        };
+        let server = GlobalRpcServer::new(Arc::new(NoopLookup))
+            .with_self_peer_id(me.to_bytes())
+            .with_historical_committees(source);
+        for caller in [None, Some(quil_p2p::PeerId::random())] {
+            let denied = server
+                .get_historical_committees(request(caller))
+                .await
+                .unwrap_err();
+            assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        }
+        let answer = server
+            .get_historical_committees(request(Some(me)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(answer.committees.len(), 1);
+        assert_eq!(
+            answer.committees[0].members,
+            vec![b"shard".to_vec(), 9u64.to_be_bytes().to_vec()]
+        );
+        let without = GlobalRpcServer::new(Arc::new(NoopLookup)).with_self_peer_id(me.to_bytes());
+        assert_eq!(
+            without
+                .get_historical_committees(request(Some(me)))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unimplemented
+        );
+    }
+
+    /// A worker's GLOBAL submission goes out as the node, so only the node's
+    /// own identity may hand one in; the node's answer (queued, held back, or
+    /// refused) reaches the worker, and a node without a transport says so.
+    #[tokio::test]
+    async fn only_the_nodes_own_workers_may_submit_prover_messages() {
+        let me = quil_p2p::PeerId::random();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let submitter: WorkerProverSubmitter = {
+            let seen = seen.clone();
+            Arc::new(move |core_id, request: Vec<u8>| {
+                seen.lock().unwrap().push((core_id, request.clone()));
+                Box::pin(async move {
+                    match request.as_slice() {
+                        b"halted" => Ok(false),
+                        b"junk" => Err("not a worker submission".to_string()),
+                        _ => Ok(true),
+                    }
+                })
+            })
+        };
+        let request = |caller: Option<quil_p2p::PeerId>, body: &[u8]| {
+            let mut request = Request::new(global::SubmitWorkerProverMessageRequest {
+                core_id: 3,
+                request: body.to_vec(),
+            });
+            if let Some(caller) = caller {
+                *request.extensions_mut() = auth_ext(caller);
+            }
+            request
+        };
+        let server = GlobalRpcServer::new(Arc::new(NoopLookup))
+            .with_self_peer_id(me.to_bytes())
+            .with_worker_prover_submitter(submitter.clone());
+        for caller in [None, Some(quil_p2p::PeerId::random())] {
+            let denied = server
+                .submit_worker_prover_message(request(caller, b"header"))
+                .await
+                .unwrap_err();
+            assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a stranger's submission never reaches the transport"
+        );
+        let queued = server
+            .submit_worker_prover_message(request(Some(me), b"header"))
+            .await
+            .unwrap();
+        assert!(queued.get_ref().accepted);
+        let held = server
+            .submit_worker_prover_message(request(Some(me), b"halted"))
+            .await
+            .unwrap();
+        assert!(!held.get_ref().accepted);
+        let refused = server
+            .submit_worker_prover_message(request(Some(me), b"junk"))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+        assert_eq!(seen.lock().unwrap()[0], (3, b"header".to_vec()));
+
+        let without = GlobalRpcServer::new(Arc::new(NoopLookup)).with_self_peer_id(me.to_bytes());
+        let missing = without
+            .submit_worker_prover_message(request(Some(me), b"header"))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::Unimplemented);
+        let unconfigured =
+            GlobalRpcServer::new(Arc::new(NoopLookup)).with_worker_prover_submitter(submitter);
+        let denied = unconfigured
+            .submit_worker_prover_message(request(Some(me), b"header"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            denied.code(),
+            tonic::Code::PermissionDenied,
+            "no identity configured: no access"
+        );
+    }
+}
+
+#[cfg(test)]
+mod caching_lookup_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn frame(n: u64) -> global::GlobalFrame {
+        global::GlobalFrame {
+            header: Some(global::GlobalFrameHeader {
+                frame_number: n,
+                ..Default::default()
+            }),
+            requests: Vec::new(),
+        }
+    }
+
+    /// Counts inner calls so we can assert cache hits vs. store reads.
+    struct CountingLookup {
+        head: u64,
+        get_frame_calls: AtomicU64,
+        get_latest_calls: AtomicU64,
+        get_proposal_calls: AtomicU64,
+    }
+
+    impl CountingLookup {
+        fn new(head: u64) -> Self {
+            Self {
+                head,
+                get_frame_calls: AtomicU64::new(0),
+                get_latest_calls: AtomicU64::new(0),
+                get_proposal_calls: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl FrameLookup for CountingLookup {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> {
+            self.get_latest_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(frame(self.head))
+        }
+        fn get_frame(&self, n: u64) -> Result<global::GlobalFrame, String> {
+            self.get_frame_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(frame(n))
+        }
+        fn get_global_proposal(&self, n: u64) -> Result<global::GlobalProposal, String> {
+            self.get_proposal_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(global::GlobalProposal {
+                state: Some(frame(n)),
+                parent_quorum_certificate: None,
+                prior_rank_timeout_certificate: None,
+                vote: None,
+            })
+        }
+    }
+
+    #[test]
+    fn proposal_only_catchup_populates_cache_and_handles_max_height() {
+        let cache = CachingFrameLookup::new(
+            CountingLookup::new(100),
+            16,
+            std::time::Duration::from_secs(1),
+        );
+        cache.get_global_proposal(50).unwrap();
+        cache.get_global_proposal(50).unwrap();
+        assert_eq!(cache.inner.get_proposal_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.inner.get_latest_calls.load(Ordering::SeqCst), 1);
+        cache.get_global_proposal(u64::MAX).unwrap();
+        cache.get_global_proposal(u64::MAX).unwrap();
+        assert_eq!(cache.inner.get_proposal_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn concurrent_cold_reads_share_store_loads() {
+        struct SlowLookup(CountingLookup);
+        impl FrameLookup for SlowLookup {
+            fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                self.0.get_latest_frame()
+            }
+            fn get_frame(&self, n: u64) -> Result<global::GlobalFrame, String> {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                self.0.get_frame(n)
+            }
+            fn get_global_proposal(&self, n: u64) -> Result<global::GlobalProposal, String> {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                self.0.get_global_proposal(n)
+            }
+        }
+        let cache = CachingFrameLookup::new(
+            SlowLookup(CountingLookup::new(100)),
+            16,
+            std::time::Duration::from_secs(10),
+        );
+        let start = std::sync::Barrier::new(12);
+        std::thread::scope(|scope| {
+            for _ in 0..12 {
+                scope.spawn(|| {
+                    start.wait();
+                    cache.get_latest_frame().unwrap();
+                    cache.get_frame(42).unwrap();
+                    cache.get_global_proposal(50).unwrap();
+                });
+            }
+        });
+        assert_eq!(cache.inner.0.get_latest_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.inner.0.get_frame_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.inner.0.get_proposal_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn frames_cached_by_number_immutable() {
+        let cache = CachingFrameLookup::new(
+            CountingLookup::new(100),
+            8,
+            std::time::Duration::from_secs(1),
+        );
+        for _ in 0..5 {
+            let f = cache.get_frame(42).unwrap();
+            assert_eq!(f.header.unwrap().frame_number, 42);
+        }
+        // Only the first read hit the inner store.
+        assert_eq!(cache.inner.get_frame_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn latest_cached_under_ttl_then_refetched() {
+        let cache = CachingFrameLookup::new(
+            CountingLookup::new(100),
+            8,
+            std::time::Duration::from_millis(40),
+        );
+        cache.get_latest_frame().unwrap();
+        cache.get_latest_frame().unwrap();
+        assert_eq!(
+            cache.inner.get_latest_calls.load(Ordering::SeqCst),
+            1,
+            "within TTL → cached"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        cache.get_latest_frame().unwrap();
+        assert_eq!(
+            cache.inner.get_latest_calls.load(Ordering::SeqCst),
+            2,
+            "after TTL → refetch"
+        );
+    }
+
+    #[test]
+    fn eviction_drops_lowest_frame_number() {
+        let cache = CachingFrameLookup::new(
+            CountingLookup::new(100),
+            2,
+            std::time::Duration::from_secs(1),
+        );
+        cache.get_frame(10).unwrap();
+        cache.get_frame(11).unwrap();
+        cache.get_frame(12).unwrap(); // evicts 10 (lowest)
+        let before = cache.inner.get_frame_calls.load(Ordering::SeqCst);
+        cache.get_frame(11).unwrap(); // still cached
+        cache.get_frame(12).unwrap(); // still cached
+        assert_eq!(
+            cache.inner.get_frame_calls.load(Ordering::SeqCst),
+            before,
+            "tip stays resident"
+        );
+        cache.get_frame(10).unwrap(); // re-reads (was evicted)
+        assert_eq!(
+            cache.inner.get_frame_calls.load(Ordering::SeqCst),
+            before + 1
+        );
+    }
+
+    #[test]
+    fn settled_proposal_cached_but_head_not() {
+        let cache = CachingFrameLookup::new(
+            CountingLookup::new(100),
+            16,
+            std::time::Duration::from_secs(1),
+        );
+        // Prime the head so the settle-margin check has a head to compare to.
+        cache.get_latest_frame().unwrap();
+        // Settled (well below head=100): cached.
+        cache.get_global_proposal(50).unwrap();
+        cache.get_global_proposal(50).unwrap();
+        assert_eq!(
+            cache.inner.get_proposal_calls.load(Ordering::SeqCst),
+            1,
+            "settled proposal cached"
+        );
+        // Head (== 100, within the 4-rank settle margin): NOT cached.
+        cache.get_global_proposal(100).unwrap();
+        cache.get_global_proposal(100).unwrap();
+        assert_eq!(
+            cache.inner.get_proposal_calls.load(Ordering::SeqCst),
+            3,
+            "in-flux head proposal re-assembled each call (not pinned)"
+        );
+        // Genesis is always cacheable (fully static).
+        cache.get_global_proposal(0).unwrap();
+        let after_genesis = cache.inner.get_proposal_calls.load(Ordering::SeqCst);
+        cache.get_global_proposal(0).unwrap();
+        assert_eq!(
+            cache.inner.get_proposal_calls.load(Ordering::SeqCst),
+            after_genesis
+        );
+    }
+}
+
+#[cfg(test)]
+mod app_shards_cache_tests {
+    use super::*;
+    use quil_types::store::ShardInfo;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    struct NoFrames;
+    impl FrameLookup for NoFrames {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> {
+            Err("unused".into())
+        }
+        fn get_frame(&self, _: u64) -> Result<global::GlobalFrame, String> {
+            Err("unused".into())
+        }
+        fn get_global_proposal(&self, _: u64) -> Result<global::GlobalProposal, String> {
+            Err("unused".into())
+        }
+    }
+
+    /// One shard; counts its reads, and holds each until released when gated.
+    struct OneShard {
+        reads: AtomicUsize,
+        gate: Option<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    }
+    impl ShardsStore for OneShard {
+        fn range_app_shards(&self) -> quil_types::error::Result<Vec<ShardInfo>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = &self.gate {
+                let _ = gate.lock().unwrap().recv();
+            }
+            Ok(vec![ShardInfo {
+                shard_key: vec![0; 35],
+                prefix: vec![1],
+                size: Vec::new(),
+                data_shards: 0,
+                commitment: Vec::new(),
+            }])
+        }
+        fn get_app_shards(&self, _: &[u8], _: &[u32]) -> quil_types::error::Result<Vec<ShardInfo>> {
+            self.range_app_shards()
+        }
+        fn put_app_shard(
+            &self,
+            _: &dyn quil_types::store::Transaction,
+            _: &ShardInfo,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn delete_app_shard(
+            &self,
+            _: &dyn quil_types::store::Transaction,
+            _: &[u8],
+            _: &[u32],
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn ask(server: Arc<GlobalRpcServer>) -> Result<Vec<global::AppShardInfo>, Status> {
+        server
+            .get_app_shards(Request::new(global::GetAppShardsRequest {
+                shard_key: vec![0; 35],
+                prefix: vec![1],
+            }))
+            .await
+            .map(|r| r.into_inner().info)
+    }
+
+    /// Reports `size` as the shard's size; the test moves it between calls.
+    fn sized(size: Arc<AtomicU64>) -> AppShardsProvider {
+        Arc::new(move |_, _| {
+            let size = size.load(Ordering::SeqCst);
+            Some((
+                size.to_be_bytes().to_vec(),
+                1,
+                std::array::from_fn(|_| vec![0; 64]),
+                3,
+                4,
+            ))
+        })
+    }
+
+    // Every prover polls GetAppShards. Its shard rows change only when a
+    // GLOBAL frame commits, so they are read once per committed frame; sizes
+    // and frame progress move with every application frame and are read for
+    // every request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shard_rows_are_read_once_per_committed_frame_and_sizes_every_time() {
+        let store = Arc::new(OneShard {
+            reads: AtomicUsize::new(0),
+            gate: None,
+        });
+        let (committed, size) = (Arc::new(AtomicU64::new(5)), Arc::new(AtomicU64::new(10)));
+        let version = committed.clone();
+        let server = Arc::new(
+            GlobalRpcServer::new(Arc::new(NoFrames))
+                .with_shards_store(store.clone())
+                .with_app_shards_provider(sized(size.clone()))
+                .with_app_shards_version(Arc::new(move || Some(version.load(Ordering::SeqCst)))),
+        );
+        for expected in [10u64, 11, 12] {
+            size.store(expected, Ordering::SeqCst);
+            assert_eq!(
+                ask(server.clone()).await.unwrap()[0].size,
+                expected.to_be_bytes().to_vec()
+            );
+        }
+        assert_eq!(store.reads.load(Ordering::SeqCst), 1);
+        committed.store(6, Ordering::SeqCst);
+        ask(server.clone()).await.unwrap();
+        ask(server.clone()).await.unwrap();
+        assert_eq!(
+            store.reads.load(Ordering::SeqCst),
+            2,
+            "read again once the committed frame moves"
+        );
+
+        let unversioned = Arc::new(OneShard {
+            reads: AtomicUsize::new(0),
+            gate: None,
+        });
+        let server = Arc::new(
+            GlobalRpcServer::new(Arc::new(NoFrames))
+                .with_shards_store(unversioned.clone())
+                .with_app_shards_provider(sized(size)),
+        );
+        ask(server.clone()).await.unwrap();
+        ask(server).await.unwrap();
+        assert_eq!(
+            unversioned.reads.load(Ordering::SeqCst),
+            2,
+            "no committed frame known: read every time"
+        );
+    }
+
+    // Post-split, each answer took minutes and every prover kept asking; each
+    // retry started another copy of the work until the archives' CPUs were
+    // spent and GLOBAL stopped proposing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_and_abandoned_callers_share_one_read() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let store = Arc::new(OneShard {
+            reads: AtomicUsize::new(0),
+            gate: Some(std::sync::Mutex::new(release_rx)),
+        });
+        let server = Arc::new(
+            GlobalRpcServer::new(Arc::new(NoFrames))
+                .with_shards_store(store.clone())
+                .with_app_shards_provider(sized(Arc::new(AtomicU64::new(7))))
+                .with_app_shards_version(Arc::new(|| Some(9))),
+        );
+        let first = tokio::spawn(ask(server.clone()));
+        while store.reads.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let waiting: Vec<_> = (0..8).map(|_| tokio::spawn(ask(server.clone()))).collect();
+        release_tx.send(()).unwrap();
+        for caller in waiting {
+            let info = tokio::time::timeout(std::time::Duration::from_secs(5), caller)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(info[0].size, 7u64.to_be_bytes().to_vec());
+        }
+        assert_eq!(store.reads.load(Ordering::SeqCst), 1);
+    }
+
+    /// Two applications' shards; a read of the first is held until released.
+    struct TwoApps {
+        held: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        reads: AtomicUsize,
+    }
+    impl ShardsStore for TwoApps {
+        fn range_app_shards(&self) -> quil_types::error::Result<Vec<ShardInfo>> {
+            Ok(Vec::new())
+        }
+        fn get_app_shards(
+            &self,
+            shard_key: &[u8],
+            prefix: &[u32],
+        ) -> quil_types::error::Result<Vec<ShardInfo>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if shard_key[0] == 0 {
+                let _ = self.held.lock().unwrap().recv();
+            }
+            Ok(vec![ShardInfo {
+                shard_key: shard_key.to_vec(),
+                prefix: prefix.to_vec(),
+                size: Vec::new(),
+                data_shards: 0,
+                commitment: Vec::new(),
+            }])
+        }
+        fn put_app_shard(
+            &self,
+            _: &dyn quil_types::store::Transaction,
+            _: &ShardInfo,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn delete_app_shard(
+            &self,
+            _: &dyn quil_types::store::Transaction,
+            _: &[u8],
+            _: &[u32],
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Every prover polls its own applications' shards. A slow read of one
+    // application's rows held every other application's callers too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_read_of_one_application_holds_up_no_other() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let store = Arc::new(TwoApps {
+            held: std::sync::Mutex::new(release_rx),
+            reads: AtomicUsize::new(0),
+        });
+        let server = Arc::new(
+            GlobalRpcServer::new(Arc::new(NoFrames))
+                .with_shards_store(store.clone())
+                .with_app_shards_version(Arc::new(|| Some(9))),
+        );
+        let ask_app = |first: u8| {
+            let server = server.clone();
+            async move {
+                server
+                    .get_app_shards(Request::new(global::GetAppShardsRequest {
+                        shard_key: vec![first; 35],
+                        prefix: vec![1],
+                    }))
+                    .await
+                    .map(|r| r.into_inner().info)
+            }
+        };
+        let slow = tokio::spawn(ask_app(0));
+        while store.reads.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let other = tokio::time::timeout(std::time::Duration::from_secs(5), ask_app(1))
+            .await
+            .expect("another application's rows are not held up")
+            .unwrap();
+        assert_eq!(other[0].prefix, vec![1]);
+        release_tx.send(()).unwrap();
+        assert_eq!(slow.await.unwrap().unwrap().len(), 1);
+    }
+
+    /// A full table keeps the rows read at the current frame and those being
+    /// read, and makes room by dropping the rest.
+    #[test]
+    fn a_full_table_drops_rows_of_older_frames_first() {
+        let topologies = parking_lot::Mutex::new(AppShardTopologies::new());
+        let key = |n: usize| (vec![0; 35], vec![n as u32]);
+        for n in 0..APP_SHARD_TOPOLOGY_ENTRIES {
+            let slot = kept_topology(&topologies, &key(n), Some(1));
+            *slot.try_lock().unwrap() = Some((if n == 0 { 2 } else { 1 }, Arc::new(Vec::new())));
+        }
+        let reading = kept_topology(&topologies, &key(1), Some(1));
+        let _held = reading.try_lock().unwrap();
+        kept_topology(&topologies, &key(APP_SHARD_TOPOLOGY_ENTRIES), Some(2));
+        let kept = topologies.lock();
+        assert_eq!(
+            kept.len(),
+            3,
+            "the current frame's rows, the read in progress and the new request"
+        );
+        assert!(kept.contains_key(&key(0)) && kept.contains_key(&key(1)));
+    }
+}
+
+#[cfg(test)]
+mod forest_read_tests {
+    use super::*;
+
+    #[test]
+    fn peers_read_storage_on_a_quarter_of_the_cores() {
+        assert_eq!(default_forest_read_slots(32), 8);
+        assert_eq!(default_forest_read_slots(8), 2);
+        assert_eq!(default_forest_read_slots(2), 1);
+        assert_eq!(default_forest_read_slots(256), 32);
+        for cores in 2..=256 {
+            assert!(default_forest_read_slots(cores) < cores, "{cores} cores");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_keeps_storage_slot_and_runtime_responsive() {
+        static WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        // Dropping release_tx also releases the worker on assertion failure.
+        let caller = tokio::spawn(bounded_forest_read(
+            &WORKERS,
+            std::time::Duration::ZERO,
+            None,
+            move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+            },
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            bounded_forest_read(&WORKERS, std::time::Duration::ZERO, None, || ())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        release_tx.send(()).unwrap();
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(5), WORKERS.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+        assert_eq!(
+            bounded_forest_read(&WORKERS, std::time::Duration::ZERO, None, || 42)
+                .await
+                .unwrap(),
+            42
+        );
+    }
+
+    /// A read waits briefly for a slot instead of being refused at once, and
+    /// one peer holds at most its share of the slots.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reads_queue_briefly_and_each_peer_holds_a_bounded_share() {
+        static WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = tokio::spawn(bounded_forest_read(
+            &WORKERS,
+            std::time::Duration::ZERO,
+            None,
+            move || {
+                let _ = release_rx.recv();
+            },
+        ));
+        while WORKERS.available_permits() > 0 {
+            tokio::task::yield_now().await;
+        }
+        let queued = tokio::spawn(bounded_forest_read(
+            &WORKERS,
+            std::time::Duration::from_secs(5),
+            None,
+            || 7,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release_tx.send(()).unwrap();
+        holder.await.unwrap().unwrap();
+        assert_eq!(
+            queued.await.unwrap().unwrap(),
+            7,
+            "a queued read runs once a slot frees"
+        );
+        let timed_out =
+            bounded_forest_read(&WORKERS, std::time::Duration::from_millis(1), None, || ());
+        let held = WORKERS.try_acquire().unwrap();
+        assert_eq!(
+            timed_out.await.unwrap_err().code(),
+            tonic::Code::ResourceExhausted
+        );
+        drop(held);
+
+        let peer = b"one syncing peer".to_vec();
+        let slots: Vec<_> = (0..FOREST_READ_SLOTS_PER_PEER)
+            .map(|_| PeerSlot::take(Some(peer.clone()), FOREST_READ_SLOTS_PER_PEER).unwrap())
+            .collect();
+        assert_eq!(
+            PeerSlot::take(Some(peer.clone()), FOREST_READ_SLOTS_PER_PEER)
+                .err()
+                .unwrap()
+                .code(),
+            tonic::Code::ResourceExhausted,
+        );
+        assert!(PeerSlot::take(Some(b"another peer".to_vec()), FOREST_READ_SLOTS_PER_PEER).is_ok());
+        drop(slots);
+        assert!(
+            PeerSlot::take(Some(peer), FOREST_READ_SLOTS_PER_PEER).is_ok(),
+            "released on drop"
+        );
+    }
+
+    /// A batch answers a prefix in order, stopping at the byte budget, with
+    /// cached entries served as found.
+    #[test]
+    fn a_batch_answers_a_prefix_within_its_byte_budget() {
+        let keys: Vec<u32> = (0..5).collect();
+        let hits = vec![None, Some(Arc::new(vec![1u8; 3])), None, None, None];
+        let (deadline, _caller) = BatchDeadline::start(std::time::Duration::from_secs(600));
+        let out = answer_batch(keys, hits, &deadline, |key| match key {
+            2 => None,
+            _ => Some(vec![0u8; MAX_FOREST_BATCH_BYTES / 2]),
+        });
+        assert_eq!(out.len(), 4, "the fifth key is past the budget");
+        assert!(out[0].found && out[1].found && !out[2].found && out[3].found);
+        assert_eq!(out[1].data, vec![1u8; 3]);
+        let one = answer_batch(vec![0u32], vec![None], &deadline, |_| {
+            Some(vec![0u8; MAX_FOREST_BATCH_BYTES * 2])
+        });
+        assert_eq!(one.len(), 1, "a single oversized entry is still answered");
+    }
+
+    /// Past its deadline, or once its caller has gone, a batch reads no
+    /// further key from storage: it answers what it has, cached keys
+    /// included, and always at least its first key.
+    #[test]
+    fn a_batch_stops_reading_storage_past_its_deadline_or_once_its_caller_has_gone() {
+        let reads = std::cell::Cell::new(0);
+        let read = |_: &u32| {
+            reads.set(reads.get() + 1);
+            Some(vec![1u8])
+        };
+        let (passed, _caller) = BatchDeadline::start(std::time::Duration::ZERO);
+        let out = answer_batch(
+            vec![0, 1, 2],
+            vec![None, Some(Arc::new(vec![2u8])), None],
+            &passed,
+            read,
+        );
+        assert_eq!(
+            (out.len(), reads.get()),
+            (2, 1),
+            "the first key and the cached one"
+        );
+        assert_eq!(out[1].data, vec![2u8]);
+
+        let (deadline, caller) = BatchDeadline::start(std::time::Duration::from_secs(600));
+        let out = answer_batch(vec![0, 1, 2], vec![None; 3], &deadline, read);
+        assert_eq!(
+            (out.len(), reads.get()),
+            (3, 4),
+            "a live caller within budget gets every key"
+        );
+        drop(caller);
+        let out = answer_batch(vec![0, 1, 2], vec![None; 3], &deadline, read);
+        assert_eq!(
+            (out.len(), reads.get()),
+            (1, 5),
+            "an abandoned batch stops after its first key"
+        );
+    }
+
+    struct NoFrames;
+    impl FrameLookup for NoFrames {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> {
+            Err("n/a".into())
+        }
+        fn get_frame(&self, _: u64) -> Result<global::GlobalFrame, String> {
+            Err("n/a".into())
+        }
+        fn get_global_proposal(&self, _: u64) -> Result<global::GlobalProposal, String> {
+            Err("n/a".into())
+        }
+    }
+
+    type ReadHook = Box<dyn Fn(&[u8]) + Send>;
+
+    /// Serves every node and blob it is asked for, counting storage reads;
+    /// each tree's head is `head`.
+    struct CountingForest {
+        reads: std::sync::atomic::AtomicUsize,
+        head: u64,
+        /// Runs on each node read, as a concurrent request's read would.
+        on_node_read: std::sync::Mutex<Option<ReadHook>>,
+    }
+
+    impl CountingForest {
+        fn new(head: u64) -> Arc<Self> {
+            Arc::new(Self {
+                reads: Default::default(),
+                head,
+                on_node_read: Default::default(),
+            })
+        }
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl ForestServer for CountingForest {
+        fn serve_node(&self, _: &[u8], _: u32, node_key: &[u8]) -> Option<Vec<u8>> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(hook) = self.on_node_read.lock().unwrap().as_ref() {
+                hook(node_key);
+            }
+            Some(node_key.to_vec())
+        }
+        fn serve_value(&self, _: &[u8], _: u32, _: u64, _: [u8; 32]) -> Option<Vec<u8>> {
+            None
+        }
+        fn serve_head(&self, _: &[u8], _: u32) -> Option<(u64, [u8; 32])> {
+            Some((self.head, [0; 32]))
+        }
+        fn serve_preimage(&self, _: &[u8], _: u32, _: [u8; 32]) -> Option<Vec<u8>> {
+            None
+        }
+        fn serve_vertex_blob(
+            &self,
+            _: &[u8],
+            _: u32,
+            id: &[u8],
+            version: Option<u64>,
+        ) -> Option<Vec<u8>> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some([id, &version.unwrap_or(0).to_be_bytes()].concat())
+        }
+        fn resolve_root(&self, _: &[u8], _: u32, _: [u8; 32]) -> Option<(u64, u64)> {
+            None
+        }
+        fn serve_app_manifest(
+            &self,
+            _: &[u8],
+            _: u32,
+            _: [u8; 32],
+        ) -> Option<Vec<(Vec<u8>, [u8; 32], u64)>> {
+            None
+        }
+    }
+
+    fn blob_request(
+        shard_key: Vec<u8>,
+        keys: &[(&[u8], u64)],
+    ) -> Request<global::GetVertexBlobsRequest> {
+        let blobs = keys
+            .iter()
+            .map(|(id, version)| global::VertexBlobKey {
+                id: id.to_vec(),
+                version: *version,
+            })
+            .collect();
+        Request::new(global::GetVertexBlobsRequest {
+            shard_key,
+            phase: 0,
+            blobs,
+        })
+    }
+
+    /// Every node syncing the prover tree after an epoch asks for the same
+    /// blobs: one read at or below the tree's head is final and served to
+    /// the next asker from memory. Reads above the head, and blobs of other
+    /// shards (whose versions may be a split app's sub-shards'), are read
+    /// from storage each time.
+    #[tokio::test]
+    async fn prover_tree_blobs_at_or_below_its_head_are_read_from_storage_once() {
+        let forest = CountingForest::new(7);
+        let server = GlobalRpcServer::new(Arc::new(NoFrames)).with_forest_server(forest.clone());
+        let prover: Vec<u8> = [0x51, 0x52, 0x53].into_iter().chain(PROVER_TREE).collect();
+        let keys: [(&[u8], u64); 2] = [(b"blob kept a", 5), (b"blob kept b", 9)];
+        let first = server
+            .get_vertex_blobs(blob_request(prover.clone(), &keys))
+            .await
+            .unwrap()
+            .into_inner()
+            .blobs;
+        assert_eq!(forest.reads(), 2);
+        let again = server
+            .get_vertex_blobs(blob_request(prover, &keys))
+            .await
+            .unwrap()
+            .into_inner()
+            .blobs;
+        assert_eq!(again, first, "the same answer");
+        assert_eq!(
+            forest.reads(),
+            3,
+            "only the read above the head is repeated"
+        );
+
+        let app: Vec<u8> = [0x51, 0x52, 0x53].into_iter().chain([7u8; 32]).collect();
+        for _ in 0..2 {
+            server
+                .get_vertex_blobs(blob_request(app.clone(), &[(b"blob of an app", 5)]))
+                .await
+                .unwrap();
+        }
+        assert_eq!(forest.reads(), 5, "another shard's blobs are not kept");
+    }
+
+    /// A key cached by another peer's read while this batch waited is
+    /// served from memory when the batch reaches it.
+    #[tokio::test]
+    async fn a_node_cached_while_its_batch_waited_takes_no_storage_read() {
+        use crate::forest_read_cache::{CacheKey, ForestReadCache, Origin};
+        let forest = CountingForest::new(7);
+        let origin = Origin::of(&forest);
+        let shard: Vec<u8> = vec![0x61; 32];
+        let late: &[u8] = b"node cached late";
+        let shard_for_hook = shard.clone();
+        *forest.on_node_read.lock().unwrap() = Some(Box::new(move |_| {
+            ForestReadCache::process().put(
+                CacheKey::node(origin, &shard_for_hook, 0, late),
+                b"from memory".to_vec(),
+            );
+        }));
+        let server = GlobalRpcServer::new(Arc::new(NoFrames)).with_forest_server(forest.clone());
+        let request = Request::new(global::GetForestNodesRequest {
+            shard_id: shard,
+            phase: 0,
+            node_keys: vec![b"node read first".to_vec(), late.to_vec()],
+        });
+        let nodes = server
+            .get_forest_nodes(request)
+            .await
+            .unwrap()
+            .into_inner()
+            .nodes;
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[1].data, b"from memory".to_vec());
+        assert_eq!(forest.reads(), 1);
+    }
+
+    /// A peer refused a storage slot still gets the leading keys of its
+    /// batch that are cached; with none cached it is told to retry.
+    #[tokio::test]
+    async fn a_busy_archive_answers_the_cached_leading_keys() {
+        use crate::forest_read_cache::{CacheKey, ForestReadCache, Origin};
+        use crate::peer_auth_middleware::AuthenticatedPeer;
+        let forest = CountingForest::new(7);
+        let shard: Vec<u8> = vec![0x71; 32];
+        let warm: &[u8] = b"node already cached";
+        ForestReadCache::process().put(
+            CacheKey::node(Origin::of(&forest), &shard, 0, warm),
+            warm.to_vec(),
+        );
+        let server = GlobalRpcServer::new(Arc::new(NoFrames)).with_forest_server(forest.clone());
+        let peer = quil_p2p::PeerId::random();
+        let _held: Vec<_> = (0..FOREST_READ_SLOTS_PER_PEER)
+            .map(|_| PeerSlot::take(Some(peer.to_bytes()), FOREST_READ_SLOTS_PER_PEER).unwrap())
+            .collect();
+        let request = |node_keys: Vec<Vec<u8>>| {
+            let mut request = Request::new(global::GetForestNodesRequest {
+                shard_id: shard.clone(),
+                phase: 0,
+                node_keys,
+            });
+            request.extensions_mut().insert(AuthenticatedPeer {
+                peer_id: peer,
+                falcon_public_key: Vec::new(),
+            });
+            request
+        };
+        let nodes = server
+            .get_forest_nodes(request(vec![warm.to_vec(), b"node not cached".to_vec()]))
+            .await
+            .unwrap()
+            .into_inner()
+            .nodes;
+        assert_eq!(nodes.len(), 1, "the cached prefix");
+        assert_eq!(nodes[0].data, warm.to_vec());
+        let refused = server
+            .get_forest_nodes(request(vec![b"node not cached".to_vec(), warm.to_vec()]))
+            .await;
+        assert_eq!(refused.unwrap_err().code(), tonic::Code::ResourceExhausted);
+        assert_eq!(forest.reads(), 0);
+    }
+}
+
+#[cfg(test)]
+mod historical_proof_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct EmptyLookup;
+    impl FrameLookup for EmptyLookup {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> {
+            Err("unused".into())
+        }
+        fn get_frame(&self, _: u64) -> Result<global::GlobalFrame, String> {
+            Err("unused".into())
+        }
+        fn get_global_proposal(&self, _: u64) -> Result<global::GlobalProposal, String> {
+            Err("unused".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_proof_forwarding_is_bounded_one_hop_and_root_verified() {
+        let address = [9; 32];
+        let tree = quil_execution::global_intrinsic::materialize::create_leaf_root_vertex_tree(
+            &[7; 32],
+            &[8; 32],
+            &[],
+            11,
+            &[1; 74],
+            1,
+            330,
+        )
+        .unwrap();
+        let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+        let forest = quil_forest::Forest::in_memory();
+        let root = forest
+            .commit_shard_phase_raw(
+                &[0xff; 32],
+                quil_forest::Phase::VertexAdds,
+                0,
+                vec![(
+                    address.to_vec(),
+                    quil_tries::vertex_leaf_value(&blob).unwrap(),
+                )],
+            )
+            .unwrap();
+        let vertex: Vec<_> = [0xff; 32].into_iter().chain(address).collect();
+        let bytes = quil_forest::MembershipProof {
+            inputs: vec![forest
+                .build_vertex_membership_proof(
+                    &[0xff; 32],
+                    quil_forest::Phase::VertexAdds,
+                    0,
+                    &vertex,
+                    &blob,
+                )
+                .unwrap()],
+        }
+        .to_bytes();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = {
+            let calls = calls.clone();
+            let bytes = bytes.clone();
+            Arc::new(move |_: [u8; 32], _: [u8; 32]| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let bytes = bytes.clone();
+                Box::pin(async move { Ok(Some(bytes)) })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = quil_types::error::Result<Option<Vec<u8>>>,
+                                > + Send,
+                        >,
+                    >
+            }) as quil_engine::storage_history::GlobalVertexProofSource
+        };
+        let server = GlobalRpcServer::new(Arc::new(EmptyLookup))
+            .with_global_vertex_proof_source(Some(source));
+        let request = |root: Vec<u8>, address: Vec<u8>, allow_forward| {
+            Request::new(global::GetGlobalVertexProofRequest {
+                root,
+                address,
+                allow_forward,
+            })
+        };
+        let missing = server
+            .get_global_vertex_proof(request(root.to_vec(), address.to_vec(), false))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!missing.found);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            server
+                .get_global_vertex_proof(request(vec![0; 31], address.to_vec(), true))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let valid = server
+            .get_global_vertex_proof(request(root.to_vec(), address.to_vec(), true))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(valid.found);
+        assert_eq!(valid.proof, bytes);
+        assert_eq!(
+            server
+                .get_global_vertex_proof(request(vec![0; 32], address.to_vec(), true))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss
+        );
+        assert_eq!(
+            server
+                .get_global_vertex_proof(request(root.to_vec(), vec![0; 32], true))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss
+        );
+        let held: Vec<_> = (0..4)
+            .map(|_| HISTORY_FORWARD_WORKERS.try_acquire().unwrap())
+            .collect();
+        let before = calls.load(Ordering::SeqCst);
+        assert_eq!(
+            server
+                .get_global_vertex_proof(request(root.to_vec(), address.to_vec(), true))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), before);
+        drop(held);
+        let unavailable = GlobalRpcServer::new(Arc::new(EmptyLookup))
+            .with_global_vertex_proof_source(Some(Arc::new(|_, _| {
+                Box::pin(async {
+                    Err(quil_types::error::QuilError::ExecutionUnavailable(
+                        "pruned".into(),
+                    ))
+                })
+            })));
+        assert_eq!(
+            unavailable
+                .get_global_vertex_proof(request(root.to_vec(), address.to_vec(), true))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+    }
+}
+
+#[cfg(test)]
+mod global_anchor_tests {
+    use super::*;
+    use crate::peer_auth_middleware::AuthenticatedPeer;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn frame(number: u64) -> global::GlobalFrame {
+        global::GlobalFrame {
+            header: Some(global::GlobalFrameHeader {
+                frame_number: number,
+                ..Default::default()
+            }),
+            requests: vec![],
+        }
+    }
+
+    /// Holds frame 5 only as its header, its request bodies pruned, and
+    /// refuses it to `get_frame` as the clock-store lookup does.
+    struct PrunedLookup;
+    impl FrameLookup for PrunedLookup {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> {
+            Ok(frame(9))
+        }
+        fn get_frame(&self, n: u64) -> Result<global::GlobalFrame, String> {
+            Err(format!("frame {n} requests are not retained (kept from 8)"))
+        }
+        fn get_anchor_frame(&self, n: u64) -> Result<Option<global::GlobalFrame>, String> {
+            Ok((n == 5).then(|| frame(5)))
+        }
+    }
+
+    /// The node's own worker asking for an anchor gets a pruned frame's
+    /// header, and an archive copy of a frame the node never held. A peer,
+    /// even setting the flag, and a request without it keep the refusal and
+    /// cause no archive fetch; the latest-frame alias is never an anchor.
+    #[tokio::test]
+    async fn only_own_workers_get_pruned_headers_and_archive_anchors() {
+        let me = quil_p2p::PeerId::random();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source: quil_engine::global_anchor::GlobalAnchorSource = {
+            let calls = calls.clone();
+            Arc::new(move |n| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if n == 6 {
+                        Ok(frame(6))
+                    } else {
+                        Err(quil_types::error::QuilError::ExecutionUnavailable(
+                            "no archive served it".into(),
+                        ))
+                    }
+                })
+            })
+        };
+        let lookup = CachingFrameLookup::new(PrunedLookup, 16, std::time::Duration::from_secs(1));
+        let server = GlobalRpcServer::new(Arc::new(lookup))
+            .with_self_peer_id(me.to_bytes())
+            .with_global_anchor_source(Some(source));
+        let request = |frame_number, historical_anchor, peer: Option<quil_p2p::PeerId>| {
+            let mut request = Request::new(global::GetGlobalFrameRequest {
+                frame_number,
+                historical_anchor,
+                header_only: false,
+                if_newer_than: 0,
+            });
+            if let Some(peer_id) = peer {
+                request.extensions_mut().insert(AuthenticatedPeer {
+                    peer_id,
+                    falcon_public_key: Vec::new(),
+                });
+            }
+            request
+        };
+        let served = |result: Result<Response<global::GlobalFrameResponse>, Status>| {
+            result
+                .map(|response| {
+                    response
+                        .into_inner()
+                        .frame
+                        .and_then(|f| f.header)
+                        .map_or(u64::MAX, |h| h.frame_number)
+                })
+                .map_err(|status| status.code())
+        };
+        assert_eq!(
+            served(server.get_global_frame(request(5, true, Some(me))).await),
+            Ok(5)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a held header needs no archive"
+        );
+        assert_eq!(
+            served(server.get_global_frame(request(6, true, Some(me))).await),
+            Ok(6)
+        );
+        assert_eq!(
+            served(server.get_global_frame(request(7, true, Some(me))).await),
+            Err(tonic::Code::Unavailable)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        for (anchor, peer) in [
+            (true, Some(quil_p2p::PeerId::random())),
+            (true, None),
+            (false, Some(me)),
+        ] {
+            assert_eq!(
+                served(server.get_global_frame(request(5, anchor, peer)).await),
+                Err(tonic::Code::NotFound)
+            );
+            assert_eq!(
+                served(server.get_global_frame(request(6, anchor, peer)).await),
+                Err(tonic::Code::NotFound)
+            );
+        }
+        assert_eq!(
+            served(server.get_global_frame(request(0, true, Some(me))).await),
+            Ok(9)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Holds frame 3 with a request bundle, counting the frames read whole;
+    /// its header is read alone, as the clock store does.
+    struct BundledLookup(Arc<AtomicUsize>);
+    impl FrameLookup for BundledLookup {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> {
+            self.get_frame(3)
+        }
+        fn get_frame(&self, n: u64) -> Result<global::GlobalFrame, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            if n != 3 {
+                return Err(format!("frame {n} not held"));
+            }
+            let mut whole = frame(3);
+            whole.requests.push(global::MessageBundle {
+                timestamp: 3,
+                ..Default::default()
+            });
+            Ok(whole)
+        }
+        fn get_frame_header(&self, n: u64) -> Result<global::GlobalFrameHeader, String> {
+            frame(n)
+                .header
+                .filter(|_| n == 3)
+                .ok_or_else(|| format!("frame {n} not held"))
+        }
+    }
+
+    /// Any peer asking for a frame's header alone gets it without the
+    /// request bundles, which are not even read; asked without the flag, it
+    /// gets the whole frame as before.
+    #[tokio::test]
+    async fn header_only_requests_are_answered_without_request_bundles() {
+        let whole = Arc::new(AtomicUsize::new(0));
+        let lookup = CachingFrameLookup::new(
+            BundledLookup(whole.clone()),
+            16,
+            std::time::Duration::from_secs(1),
+        );
+        let server = GlobalRpcServer::new(Arc::new(lookup));
+        let ask = |frame_number, header_only| {
+            let mut request = Request::new(global::GetGlobalFrameRequest {
+                frame_number,
+                historical_anchor: false,
+                header_only,
+                if_newer_than: 0,
+            });
+            request.extensions_mut().insert(AuthenticatedPeer {
+                peer_id: quil_p2p::PeerId::random(),
+                falcon_public_key: Vec::new(),
+            });
+            request
+        };
+        let header = server
+            .get_global_frame(ask(3, true))
+            .await
+            .unwrap()
+            .into_inner()
+            .frame
+            .unwrap();
+        assert_eq!(header, frame(3), "the header, without the bundle");
+        assert_eq!(whole.load(Ordering::SeqCst), 0, "no bundle is read");
+        assert_eq!(
+            server
+                .get_global_frame(ask(4, true))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::NotFound
+        );
+        let full = server
+            .get_global_frame(ask(3, false))
+            .await
+            .unwrap()
+            .into_inner()
+            .frame
+            .unwrap();
+        assert_eq!(full.requests.len(), 1);
+        assert_eq!(full.header, frame(3).header);
+        assert_eq!(whole.load(Ordering::SeqCst), 1);
+    }
+
+    /// A peer asking for the head whole only if it is newer than its own gets
+    /// the header alone while the head is not newer, taken from the shared
+    /// head without copying its bundles, and the whole head once it is newer.
+    /// A request without the field gets the whole head as before.
+    #[tokio::test]
+    async fn head_requests_get_the_whole_head_only_when_it_is_newer() {
+        let whole = Arc::new(AtomicUsize::new(0));
+        let lookup = CachingFrameLookup::new(
+            BundledLookup(whole.clone()),
+            16,
+            std::time::Duration::from_secs(60),
+        );
+        let server = GlobalRpcServer::new(Arc::new(lookup));
+        let ask = |if_newer_than| {
+            let mut request = Request::new(global::GetGlobalFrameRequest {
+                frame_number: 0,
+                if_newer_than,
+                ..Default::default()
+            });
+            request.extensions_mut().insert(AuthenticatedPeer {
+                peer_id: quil_p2p::PeerId::random(),
+                falcon_public_key: Vec::new(),
+            });
+            request
+        };
+        for known in [3, 4] {
+            let head = server
+                .get_global_frame(ask(known))
+                .await
+                .unwrap()
+                .into_inner()
+                .frame
+                .unwrap();
+            assert_eq!(
+                head,
+                frame(3),
+                "head 3 is not newer than {known}: the header alone"
+            );
+        }
+        for known in [0, 2] {
+            let head = server
+                .get_global_frame(ask(known))
+                .await
+                .unwrap()
+                .into_inner()
+                .frame
+                .unwrap();
+            assert_eq!(
+                (head.header, head.requests.len()),
+                (frame(3).header, 1),
+                "the whole head for {known}"
+            );
+        }
+        assert_eq!(
+            whole.load(Ordering::SeqCst),
+            1,
+            "the head is read once and shared"
+        );
+    }
+}
+
+#[cfg(test)]
+mod frame_read_bound_tests {
+    use super::*;
+    use crate::peer_auth_middleware::AuthenticatedPeer;
+    use std::time::Duration;
+
+    fn frame(number: u64) -> global::GlobalFrame {
+        global::GlobalFrame {
+            header: Some(global::GlobalFrameHeader {
+                frame_number: number,
+                ..Default::default()
+            }),
+            requests: vec![],
+        }
+    }
+
+    struct Frames;
+    impl FrameLookup for Frames {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> {
+            Ok(frame(9))
+        }
+        fn get_frame(&self, n: u64) -> Result<global::GlobalFrame, String> {
+            Ok(frame(n))
+        }
+        fn get_global_proposal(&self, n: u64) -> Result<global::GlobalProposal, String> {
+            Ok(global::GlobalProposal {
+                state: Some(frame(n)),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// A read waits in the queue while the slots are taken, a read past a
+    /// full queue is refused at once, and a queued read runs once a slot
+    /// frees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frame_reads_past_the_bound_are_refused_until_a_slot_frees() {
+        static READS: FrameReadBound = FrameReadBound::new(1, 1, Duration::from_secs(5));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let running = READS
+            .spawn(move || {
+                let _ = release_rx.recv();
+            })
+            .await
+            .unwrap();
+        let queued = tokio::spawn(READS.spawn(|| 7));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while READS.admitted.available_permits() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second read queues for the slot");
+        let started = std::time::Instant::now();
+        assert_eq!(
+            READS.spawn(|| 0).await.unwrap_err().code(),
+            tonic::Code::ResourceExhausted
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a full queue refuses at once"
+        );
+        release_tx.send(()).unwrap();
+        running.await.unwrap();
+        assert_eq!(
+            queued.await.unwrap().unwrap().await.unwrap(),
+            7,
+            "a queued read runs once the slot frees"
+        );
+        assert_eq!(READS.spawn(|| 8).await.unwrap().await.unwrap(), 8);
+
+        static SHORT: FrameReadBound = FrameReadBound::new(1, 1, Duration::from_millis(20));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let running = SHORT
+            .spawn(move || {
+                let _ = release_rx.recv();
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            SHORT.spawn(|| 0).await.unwrap_err().code(),
+            tonic::Code::ResourceExhausted,
+            "the wait is bounded"
+        );
+        release_tx.send(()).unwrap();
+        running.await.unwrap();
+        assert_eq!(SHORT.spawn(|| 1).await.unwrap().await.unwrap(), 1);
+    }
+
+    /// While every frame read slot is busy, a peer asking for a numbered
+    /// GLOBAL frame or proposal is answered busy. The head, which every
+    /// poller reads and whose failure makes it pass over the archive, and
+    /// the node's own workers are still served.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn busy_frame_reads_refuse_only_peers_numbered_frames() {
+        static READS: FrameReadBound = FrameReadBound::new(1, 0, Duration::from_millis(20));
+        let me = quil_p2p::PeerId::random();
+        let peer = quil_p2p::PeerId::random();
+        let server = GlobalRpcServer::new(Arc::new(Frames))
+            .with_self_peer_id(me.to_bytes())
+            .with_frame_reads(&READS);
+        fn request_from<T>(message: T, peer_id: quil_p2p::PeerId) -> Request<T> {
+            let mut request = Request::new(message);
+            request.extensions_mut().insert(AuthenticatedPeer {
+                peer_id,
+                falcon_public_key: Vec::new(),
+            });
+            request
+        }
+        let frame_from = |frame_number, peer_id| {
+            request_from(
+                global::GetGlobalFrameRequest {
+                    frame_number,
+                    historical_anchor: false,
+                    ..Default::default()
+                },
+                peer_id,
+            )
+        };
+        let proposal_from = |frame_number, peer_id| {
+            request_from(global::GetGlobalProposalRequest { frame_number }, peer_id)
+        };
+        let frame_served = |result: Result<Response<global::GlobalFrameResponse>, Status>| {
+            result
+                .map(|response| {
+                    response
+                        .into_inner()
+                        .frame
+                        .and_then(|f| f.header)
+                        .map_or(u64::MAX, |h| h.frame_number)
+                })
+                .map_err(|status| status.code())
+        };
+        let proposal_served = |result: Result<Response<global::GlobalProposalResponse>, Status>| {
+            result
+                .map(|response| response.into_inner().proposal.is_some())
+                .map_err(|status| status.code())
+        };
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held = READS
+            .spawn(move || {
+                let _ = release_rx.recv();
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            frame_served(server.get_global_frame(frame_from(5, peer)).await),
+            Err(tonic::Code::ResourceExhausted)
+        );
+        assert_eq!(
+            proposal_served(server.get_global_proposal(proposal_from(5, peer)).await),
+            Err(tonic::Code::ResourceExhausted)
+        );
+        assert_eq!(
+            frame_served(server.get_global_frame(frame_from(0, peer)).await),
+            Ok(9),
+            "the head is never refused"
+        );
+        assert_eq!(
+            frame_served(server.get_global_frame(frame_from(5, me)).await),
+            Ok(5),
+            "own workers take no slot"
+        );
+        assert_eq!(
+            proposal_served(server.get_global_proposal(proposal_from(5, me)).await),
+            Ok(true)
+        );
+        release_tx.send(()).unwrap();
+        held.await.unwrap();
+        assert_eq!(
+            frame_served(server.get_global_frame(frame_from(5, peer)).await),
+            Ok(5)
+        );
+        assert_eq!(
+            proposal_served(server.get_global_proposal(proposal_from(5, peer)).await),
+            Ok(true)
+        );
     }
 }

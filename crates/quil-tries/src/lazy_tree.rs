@@ -6,13 +6,13 @@
 //! whole thing.
 //!
 //! - On `ensure_root_loaded`, reads only the root node via the
-//!   by-path index (`HypergraphStore::get_node_by_path(&[])`).
+//! by-path index (`HypergraphStore::get_node_by_path(&[])`).
 //! - During `insert`, walks the tree lazily — child branches are
-//!   pulled from the store one slot at a time as the walker
-//!   descends, never materializing untouched subtrees.
+//! pulled from the store one slot at a time as the walker
+//! descends, never materializing untouched subtrees.
 //! - During `commit`, persists each touched node individually via
-//!   the dual by-key + by-path index (per-node format —
-//!   `crate::serialize::serialize_node_solo`).
+//! the dual by-key + by-path index (per-node format —
+//! `crate::serialize::serialize_node_solo`).
 //!
 //! Mutating ops stage changes in an in-memory working set; `commit`
 //! flushes them through the caller-supplied `txn` and resets the
@@ -31,9 +31,7 @@ use quil_types::crypto::InclusionProver;
 use quil_types::error::{QuilError, Result};
 use quil_types::store::{HypergraphStore, ShardKey, Transaction};
 
-use crate::nibble::{
-    get_full_path, get_next_nibble, get_nibbles_until_diverge,
-};
+use crate::nibble::{get_full_path, get_next_nibble, get_nibbles_until_diverge};
 use crate::node::{BranchNode, LeafNode, VectorCommitmentNode};
 use crate::serialize::{deserialize_node_solo, serialize_node_solo};
 use crate::{BRANCH_BITS, BRANCH_NODES};
@@ -131,9 +129,7 @@ impl LazyVectorCommitmentTree {
     /// Intended for read-only callers (sync server's GetBranch root
     /// path) that need the root's commitment + each child's
     /// commitment but must not trigger an unbounded eager load.
-    pub fn load_root_and_immediate_children(
-        &self,
-    ) -> Result<Option<VectorCommitmentNode>> {
+    pub fn load_root_and_immediate_children(&self) -> Result<Option<VectorCommitmentNode>> {
         self.ensure_root_loaded()?;
         let mut root_guard = self.root.write().unwrap();
         let Some(Some(node)) = root_guard.as_mut() else {
@@ -152,9 +148,7 @@ impl LazyVectorCommitmentTree {
     /// within a bounded subtree. Bounded at 1 + 64 + 64*64 = 4161
     /// reads in the worst case — still independent of total leaf
     /// count.
-    pub fn load_root_and_two_levels(
-        &self,
-    ) -> Result<Option<VectorCommitmentNode>> {
+    pub fn load_root_and_two_levels(&self) -> Result<Option<VectorCommitmentNode>> {
         self.ensure_root_loaded()?;
         {
             let mut root_guard = self.root.write().unwrap();
@@ -176,6 +170,47 @@ impl LazyVectorCommitmentTree {
         Ok(root_guard.as_ref().and_then(|o| o.clone()))
     }
 
+    /// Recursively load the ENTIRE tree into memory from the by-path
+    /// index. Unlike [`load_root_and_two_levels`] (a memory guard for
+    /// huge token-shard trees that would be ~10^2 GB resident), this
+    /// pulls every node at every depth.
+    ///
+    /// CALLER MUST gate this to trees known to be RAM-safe — i.e. the
+    /// global prover shard (`l2 == [0xff; 32]`, ~10^5 leaves). Calling it
+    /// on a token shard can exhaust memory. It exists so the HyperSync
+    /// server can hold the full prover tree, pinned to its commit root,
+    /// and serve every peer's leaf walk from memory instead of a
+    /// per-request lazy descent into RocksDB.
+    pub fn load_full(&self) -> Result<Option<VectorCommitmentNode>> {
+        self.ensure_root_loaded()?;
+        {
+            let mut root_guard = self.root.write().unwrap();
+            let Some(Some(node)) = root_guard.as_mut() else {
+                return Ok(None);
+            };
+            if let VectorCommitmentNode::Branch(b) = node {
+                self.load_branch_recursive(b)?;
+            }
+        }
+        let root_guard = self.root.read().unwrap();
+        Ok(root_guard.as_ref().and_then(|o| o.clone()))
+    }
+
+    /// Depth-first load of every descendant of `branch`. Mirrors the
+    /// per-level loop in `load_root_and_two_levels` but recurses without
+    /// a depth bound.
+    fn load_branch_recursive(&self, branch: &mut BranchNode) -> Result<()> {
+        self.ensure_branch_children_loaded(branch)?;
+        for slot in branch.children.iter_mut() {
+            if let Some(child) = slot.as_mut() {
+                if let VectorCommitmentNode::Branch(cb) = child.as_mut() {
+                    self.load_branch_recursive(cb)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Load just the root node — `get_node_by_path(&[])` returns
     /// whatever node is rooted at the empty path (SeekGE; the store
     /// resolves prefix-compressed roots). Cheaper than walking the
@@ -193,12 +228,9 @@ impl LazyVectorCommitmentTree {
         // walker treats real per-node children as absent. Skipping the
         // blob altogether forces every read to go through the by-path
         // index, which is what the writers populate per-node.
-        let data = self.store.get_node_by_path(
-            &self.set_type,
-            &self.phase_type,
-            &self.shard_key,
-            &[],
-        )?;
+        let data =
+            self.store
+                .get_node_by_path(&self.set_type, &self.phase_type, &self.shard_key, &[])?;
         let root_node = match data {
             Some(d) => {
                 let mut n = deserialize_node_solo(&d)?;
@@ -226,10 +258,7 @@ impl LazyVectorCommitmentTree {
     ///
     /// Mirrors Go's lazy-load block at
     /// `types/tries/lazy_proof_tree.go:963-978`.
-    fn ensure_branch_children_loaded(
-        &self,
-        branch: &mut BranchNode,
-    ) -> Result<()> {
+    fn ensure_branch_children_loaded(&self, branch: &mut BranchNode) -> Result<()> {
         if branch.fully_loaded {
             return Ok(());
         }
@@ -278,7 +307,7 @@ impl LazyVectorCommitmentTree {
     }
 
     // -----------------------------------------------------------------
-    // Public API — stubs filled in by follow-up commits.
+    // Public API
     // -----------------------------------------------------------------
 
     /// Lazy Insert. Walks from the root toward the position of `key`,
@@ -334,20 +363,9 @@ impl LazyVectorCommitmentTree {
         // cycle so the borrow checker accepts recursion.
         let new_root = {
             let mut root_guard = self.root.write().unwrap();
-            let current = root_guard
-                .as_mut()
-                .map(|opt| opt.take())
-                .flatten();
-            let (_delta, new_node) = self.insert_recursive(
-                current,
-                key,
-                value,
-                hash_target,
-                size,
-                &size_delta,
-                0,
-                &[],
-            )?;
+            let current = root_guard.as_mut().map(|opt| opt.take()).flatten();
+            let (_delta, new_node) =
+                self.insert_recursive(current, key, value, hash_target, size, &size_delta, 0, &[])?;
             *root_guard = Some(Some(new_node.clone()));
             new_node
         };
@@ -457,16 +475,11 @@ impl LazyVectorCommitmentTree {
                     };
                     let new_leaf_node = VectorCommitmentNode::Leaf(new_leaf);
 
-                    self.mark_dirty(
-                        key.to_vec(),
-                        get_full_path(key),
-                        new_leaf_node.clone(),
-                    );
+                    self.mark_dirty(key.to_vec(), get_full_path(key), new_leaf_node.clone());
 
                     branch.children[old_nibble as usize] =
                         Some(Box::new(VectorCommitmentNode::Leaf(existing)));
-                    branch.children[new_nibble as usize] =
-                        Some(Box::new(new_leaf_node));
+                    branch.children[new_nibble as usize] = Some(Box::new(new_leaf_node));
 
                     let branch_node = VectorCommitmentNode::Branch(branch);
                     let bkey = branch_key_from_path(&full_prefix);
@@ -500,14 +513,11 @@ impl LazyVectorCommitmentTree {
                     }
                     // Key matches branch prefix in full — recurse into
                     // the child at the next nibble.
-                    let final_nibble =
-                        get_next_nibble(key, depth + n.prefix.len() * BRANCH_BITS);
+                    let final_nibble = get_next_nibble(key, depth + n.prefix.len() * BRANCH_BITS);
                     let mut child_path = n.full_prefix.clone();
                     child_path.push(final_nibble);
                     let next_depth = depth + n.prefix.len() * BRANCH_BITS + BRANCH_BITS;
-                    let child = n.children[final_nibble as usize]
-                        .take()
-                        .map(|b| *b);
+                    let child = n.children[final_nibble as usize].take().map(|b| *b);
                     let (delta, inserted) = self.insert_recursive(
                         child,
                         key,
@@ -532,9 +542,7 @@ impl LazyVectorCommitmentTree {
                     let mut child_path = n.full_prefix.clone();
                     child_path.push(nibble);
                     let next_depth = depth + BRANCH_BITS;
-                    let child = n.children[nibble as usize]
-                        .take()
-                        .map(|b| *b);
+                    let child = n.children[nibble as usize].take().map(|b| *b);
                     let (delta, inserted) = self.insert_recursive(
                         child,
                         key,
@@ -621,11 +629,7 @@ impl LazyVectorCommitmentTree {
         // Stage the displaced inner branch.
         let inner_by_key = branch_key_from_path(&n.full_prefix);
         let inner_node = VectorCommitmentNode::Branch(n);
-        self.mark_dirty(
-            inner_by_key,
-            new_inner_full_prefix,
-            inner_node.clone(),
-        );
+        self.mark_dirty(inner_by_key, new_inner_full_prefix, inner_node.clone());
 
         // New leaf at `actual`.
         let new_leaf = LeafNode {
@@ -636,11 +640,7 @@ impl LazyVectorCommitmentTree {
             size: size.clone(),
         };
         let new_leaf_node = VectorCommitmentNode::Leaf(new_leaf);
-        self.mark_dirty(
-            key.to_vec(),
-            get_full_path(key),
-            new_leaf_node.clone(),
-        );
+        self.mark_dirty(key.to_vec(), get_full_path(key), new_leaf_node.clone());
 
         // Wire children into the outer branch.
         outer.children[expected as usize] = Some(Box::new(inner_node));
@@ -684,12 +684,10 @@ impl LazyVectorCommitmentTree {
     /// already a leaf with this exact byte sequence" vs. "key happens
     /// to collide with a branch's sha3 path" vs. absent.
     fn lookup_by_key(&self, key: &[u8]) -> Result<Option<VectorCommitmentNode>> {
-        match self.store.get_node_by_key(
-            &self.set_type,
-            &self.phase_type,
-            &self.shard_key,
-            key,
-        )? {
+        match self
+            .store
+            .get_node_by_key(&self.set_type, &self.phase_type, &self.shard_key, key)?
+        {
             Some(bytes) => {
                 // Could be solo-encoded (per-node format) or whole-tree
                 // blob (legacy [0xFF;32] sentinel only — never hit here
@@ -714,12 +712,9 @@ impl LazyVectorCommitmentTree {
     /// returned node has `full_prefix = path ++ branch.prefix` so
     /// child paths line up correctly.
     fn load_node_at_path(&self, path: &[i32]) -> Result<Option<VectorCommitmentNode>> {
-        let data = self.store.get_node_by_path(
-            &self.set_type,
-            &self.phase_type,
-            &self.shard_key,
-            path,
-        )?;
+        let data =
+            self.store
+                .get_node_by_path(&self.set_type, &self.phase_type, &self.shard_key, path)?;
         Ok(match data {
             Some(bytes) => {
                 let mut n = deserialize_node_solo(&bytes)?;
@@ -737,16 +732,8 @@ impl LazyVectorCommitmentTree {
     /// Stage `node` for write to the store at commit time, keyed by
     /// `by_key` / `by_path`. Subsequent stages for the same `by_key`
     /// overwrite the prior entry — only the latest state matters.
-    fn mark_dirty(
-        &self,
-        by_key: Vec<u8>,
-        by_path: Vec<i32>,
-        node: VectorCommitmentNode,
-    ) {
-        self.dirty
-            .write()
-            .unwrap()
-            .insert(by_key, (by_path, node));
+    fn mark_dirty(&self, by_key: Vec<u8>, by_path: Vec<i32>, node: VectorCommitmentNode) {
+        self.dirty.write().unwrap().insert(by_key, (by_path, node));
     }
 
     /// Compute the current root commitment **in memory only** — the
@@ -758,10 +745,7 @@ impl LazyVectorCommitmentTree {
     /// and does not touch dirty / pending-deletion / dirty-flag
     /// bookkeeping, so it is safe to call for an uncommitted frame on a
     /// hot path. Use `commit` (with a real txn) to persist.
-    pub fn compute_root(
-        &self,
-        prover: &(dyn InclusionProver + Sync),
-    ) -> Result<Vec<u8>> {
+    pub fn compute_root(&self, prover: &(dyn InclusionProver + Sync)) -> Result<Vec<u8>> {
         self.ensure_root_loaded()?;
         let mut root_guard = self.root.write().unwrap();
         match root_guard.as_mut() {
@@ -828,8 +812,8 @@ impl LazyVectorCommitmentTree {
             let node = match in_mem_index.get(&by_key) {
                 Some(n) => n.clone(),
                 None => continue, // Was dropped during a split; the
-                // pending_deletions list will clean up the on-disk
-                // remnant separately.
+                                  // pending_deletions list will clean up the on-disk
+                                  // remnant separately.
             };
             let payload = serialize_node_solo(&node)?;
             self.store.insert_node(
@@ -860,15 +844,14 @@ impl LazyVectorCommitmentTree {
             )?;
         }
 
-        // The legacy whole-tree blob write was removed. With the lazy
-        // tree, `serialize_tree(root)` produces a stub that records
-        // `TYPE_NIL` for every child slot whose lazy node hasn't been
-        // pulled in this session — and `deserialize_tree` then hands
-        // the consumer a branch tagged `fully_loaded = true` with no
-        // children, so lazy walks early-exit and the sync server sees
-        // an empty tree even when the per-node store is populated.
-        // The canonical storage is the per-node by-path / by-key
-        // index; readers should always go through that.
+        // The legacy whole-tree blob write is intentionally omitted. With the
+        // lazy tree, `serialize_tree(root)` produces a stub that records
+        // `TYPE_NIL` for every child slot whose lazy node is not currently
+        // resident in memory — and `deserialize_tree` then hands the consumer a
+        // branch tagged `fully_loaded = true` with no children, so lazy walks
+        // early-exit and the sync server sees an empty tree even when the
+        // per-node store is populated. The canonical storage is the per-node
+        // by-path / by-key index; readers should always go through that.
 
         // Persist every leaf's underlying value into the per-vertex
         // keyspace — same as the legacy commit (vertex content lives
@@ -1044,10 +1027,7 @@ impl LazyVectorCommitmentTree {
     /// the metadata (commitment / leaf_count / size) of whichever
     /// node covers the path. Returns `None` if the path lands in an
     /// unpopulated slot.
-    pub fn get_node_metadata_at_path(
-        &self,
-        path: &[i32],
-    ) -> Result<Option<NodeMetadata>> {
+    pub fn get_node_metadata_at_path(&self, path: &[i32]) -> Result<Option<NodeMetadata>> {
         self.ensure_root_loaded()?;
         let root_guard = self.root.read().unwrap();
         let Some(Some(node)) = root_guard.as_ref() else {
@@ -1126,6 +1106,100 @@ impl LazyVectorCommitmentTree {
         }
     }
 
+    /// Collect every `(key, value)` leaf whose path lies under
+    /// `full_path` (an absolute tree nibble path), reading the COMMITTED
+    /// on-disk tree, returned in ascending-key order. Foundation of the
+    /// canonical PoRep leaf-data serialization
+    /// (`HypergraphCrdt::serialize_phase_subtrees`) — the result must be
+    /// byte-identical across nodes that reached the same committed state,
+    /// so traversal goes purely through `load_node_at_path` (the store),
+    /// never the uncommitted in-memory tree.
+    ///
+    /// `get_node_by_path` is a SeekGE (not an exact match), so it can
+    /// resolve to a node OUTSIDE the probed path when a slot is empty
+    /// (the next sibling in iteration order). Every loaded node is
+    /// therefore prefix-validated against the path it was probed for and
+    /// skipped if it falls outside. A leaf whose value was stripped from
+    /// the node (kept in the per-vertex keyspace) is re-fetched via
+    /// `load_vertex_underlying_raw`, matching `get`.
+    pub fn collect_leaves_under_path(&self, target: &[i32]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.ensure_root_loaded()?;
+        let guard = self.root.read().unwrap();
+        let Some(Some(root)) = guard.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        // The root hangs from the empty path; its own compressed prefix
+        // is consumed inside `collect_under`.
+        self.collect_under(root, &[], target, &mut out)?;
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    /// Recursive collector. `base` is the absolute nibble path of the
+    /// slot `node` hangs from (the path consumed BEFORE this node's own
+    /// compressed prefix / leaf key). Collects every leaf whose absolute
+    /// path is under `target`, pruning branches that can't contain such a
+    /// leaf. Mirrors `lazy_walk_path`'s in-memory-root + lazy-child model
+    /// (works with any store backend, unlike a pure by-path traversal).
+    fn collect_under(
+        &self,
+        node: &VectorCommitmentNode,
+        base: &[i32],
+        target: &[i32],
+        out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<()> {
+        match node {
+            VectorCommitmentNode::Leaf(l) => {
+                let leaf_path = get_full_path(&l.key);
+                if is_path_within_prefix(&leaf_path, target) {
+                    let value = if !l.value.is_empty() {
+                        l.value.clone()
+                    } else {
+                        self.store
+                            .load_vertex_underlying_raw(
+                                &self.set_type,
+                                &self.phase_type,
+                                &self.shard_key,
+                                &l.key,
+                            )?
+                            .unwrap_or_default()
+                    };
+                    out.push((l.key.clone(), value));
+                }
+            }
+            VectorCommitmentNode::Branch(b) => {
+                // Absolute path through this branch's compressed prefix.
+                let mut abs = base.to_vec();
+                abs.extend_from_slice(&b.prefix);
+                // If `abs` and `target` are on different paths (neither a
+                // prefix of the other), no leaf here can be under target.
+                if !paths_compatible(&abs, target) {
+                    return Ok(());
+                }
+                for i in 0..crate::BRANCH_NODES {
+                    let mut child_base = abs.clone();
+                    child_base.push(i as i32);
+                    // Prune child slots that diverge from target.
+                    if !paths_compatible(&child_base, target) {
+                        continue;
+                    }
+                    if let Some(child) = b.children[i].as_deref() {
+                        self.collect_under(child, &child_base, target, out)?;
+                    } else if !b.fully_loaded {
+                        if let Some(loaded) = self.load_node_at_path(&child_base)? {
+                            // SeekGE guard: skip if it resolved outside.
+                            if is_path_within_prefix(&root_full_prefix(&loaded), &child_base) {
+                                self.collect_under(&loaded, &child_base, target, out)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn is_dirty(&self) -> bool {
         *self.dirty_flag.read().unwrap()
     }
@@ -1160,6 +1234,14 @@ fn is_path_within_prefix(path: &[i32], prefix: &[i32]) -> bool {
     true
 }
 
+/// True when `a` and `b` lie on the same root-to-node path — i.e. one is
+/// a prefix of the other. Used to prune branch descent in
+/// `collect_under`: a branch/child whose path diverges from the target
+/// can contain no leaf under the target.
+fn paths_compatible(a: &[i32], b: &[i32]) -> bool {
+    is_path_within_prefix(a, b) || is_path_within_prefix(b, a)
+}
+
 /// Absolute path identifying `node`'s on-disk position. For branches
 /// this is `branch.full_prefix`; for leaves it's the nibble path of
 /// the leaf's key.
@@ -1183,10 +1265,7 @@ fn node_by_key(node: &VectorCommitmentNode, _path: &[i32]) -> Vec<u8> {
 /// would live under in the by-key index. Used by `commit` to
 /// efficiently locate the latest in-memory state for each dirty
 /// entry.
-fn index_by_key(
-    node: &VectorCommitmentNode,
-    out: &mut HashMap<Vec<u8>, VectorCommitmentNode>,
-) {
+fn index_by_key(node: &VectorCommitmentNode, out: &mut HashMap<Vec<u8>, VectorCommitmentNode>) {
     let key = node_by_key(node, &[]);
     out.insert(key, node.clone());
     if let VectorCommitmentNode::Branch(b) = node {
@@ -1220,6 +1299,69 @@ fn walk_leaves_persist(
     }
 }
 
+/// Fully load a tree from a point-in-time [`SnapshotReadable`], reading
+/// every node via `snap.get_node_by_path` so the entire walk is isolated
+/// to one captured sequence — no cross-commit mixing. Mirrors
+/// [`LazyVectorCommitmentTree::load_full`]'s root + recursive child load,
+/// but against a snapshot instead of the live store.
+///
+/// Intended for the global prover shard (RAM-safe, ~10^5 leaves). The
+/// caller MUST NOT run it on huge token shards.
+pub fn load_full_tree_from_snapshot(
+    snap: &dyn quil_types::store::SnapshotReadable,
+    set_type: &str,
+    phase_type: &str,
+    shard_key: &quil_types::store::ShardKey,
+) -> Result<Option<VectorCommitmentNode>> {
+    let data = snap.get_node_by_path(set_type, phase_type, shard_key, &[])?;
+    let mut root = match data {
+        Some(d) => deserialize_node_solo(&d)?,
+        None => return Ok(None),
+    };
+    if let VectorCommitmentNode::Branch(ref mut b) = root {
+        // Root branch full_prefix == its own prefix (root sits at the
+        // absolute path of its prefix nibbles) — mirrors
+        // `ensure_root_loaded`.
+        b.full_prefix = b.prefix.clone();
+        b.fully_loaded = false;
+        load_branch_recursive_from_snapshot(snap, set_type, phase_type, shard_key, b)?;
+    }
+    Ok(Some(root))
+}
+
+/// Depth-first load of every descendant of `branch` over a snapshot.
+/// Mirrors `ensure_branch_children_loaded` + `load_branch_recursive`,
+/// reading via `snap.get_node_by_path` (which performs the same SeekGE +
+/// prefix-compression resolution as the live store).
+fn load_branch_recursive_from_snapshot(
+    snap: &dyn quil_types::store::SnapshotReadable,
+    set_type: &str,
+    phase_type: &str,
+    shard_key: &quil_types::store::ShardKey,
+    branch: &mut BranchNode,
+) -> Result<()> {
+    for i in 0..BRANCH_NODES {
+        if branch.children[i].is_some() {
+            continue;
+        }
+        let mut child_path = branch.full_prefix.clone();
+        child_path.push(i as i32);
+        let Some(bytes) = snap.get_node_by_path(set_type, phase_type, shard_key, &child_path)?
+        else {
+            continue;
+        };
+        let mut child = deserialize_node_solo(&bytes)?;
+        if let VectorCommitmentNode::Branch(ref mut cb) = child {
+            cb.full_prefix = child_path.clone();
+            cb.full_prefix.extend_from_slice(&cb.prefix);
+            cb.fully_loaded = false;
+            load_branch_recursive_from_snapshot(snap, set_type, phase_type, shard_key, cb)?;
+        }
+        branch.children[i] = Some(Box::new(child));
+    }
+    branch.fully_loaded = true;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

@@ -29,13 +29,11 @@ pub struct FP16 {
     b: FP8,
 }
 
-
 impl std::fmt::Debug for FP16 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(formatter, "{}", self.tostring())
     }
-}    
-
+}
 
 impl std::fmt::Display for FP16 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -116,31 +114,31 @@ impl FP16 {
         self.a.iszilch() && self.b.iszilch()
     }
 
-    pub fn tobytes(&self,bf: &mut [u8]) {
-        const MB:usize = 4*(big::MODBYTES as usize);
+    pub fn tobytes(&self, bf: &mut [u8]) {
+        const MB: usize = 4 * (big::MODBYTES as usize);
         let mut t: [u8; MB] = [0; MB];
         self.b.tobytes(&mut t);
         for i in 0..MB {
-            bf[i]=t[i];
+            bf[i] = t[i];
         }
         self.a.tobytes(&mut t);
         for i in 0..MB {
-            bf[i+MB]=t[i];
-        }       
+            bf[i + MB] = t[i];
+        }
     }
 
     pub fn frombytes(bf: &[u8]) -> FP16 {
-        const MB:usize = 8*(big::MODBYTES as usize);
+        const MB: usize = 8 * (big::MODBYTES as usize);
         let mut t: [u8; MB] = [0; MB];
         for i in 0..MB {
-            t[i]=bf[i];
+            t[i] = bf[i];
         }
-        let tb=FP8::frombytes(&t);
+        let tb = FP8::frombytes(&t);
         for i in 0..MB {
-            t[i]=bf[i+MB];
+            t[i] = bf[i + MB];
         }
-        let ta=FP8::frombytes(&t);
-        FP16::new_fp8s(&ta,&tb)
+        let ta = FP8::frombytes(&t);
+        FP16::new_fp8s(&ta, &tb)
     }
 
     /* test self=1 ? */
@@ -337,7 +335,7 @@ impl FP16 {
     }
 
     /* output to hex string */
-    
+
     pub fn tostring(&self) -> String {
         format!("[{},{}]", self.a.tostring(), self.b.tostring())
     }
@@ -392,7 +390,7 @@ impl FP16 {
         self.b.times_i();
     }
 
-/* return this^e */
+    /* return this^e */
     pub fn pow(&self, e: &BIG) -> FP16 {
         let mut w = FP16::new_copy(self);
         w.norm();
@@ -415,152 +413,184 @@ impl FP16 {
     }
 
     /* XTR xtr_a function */
-/*
-    pub fn xtr_a(&mut self, w: &FP16, y: &FP16, z: &FP16) {
-        let mut r = FP16::new_copy(w);
-        let mut t = FP16::new_copy(w);
-        r.sub(y);
-        r.norm();
-        r.pmul(&self.a);
-        t.add(y);
-        t.norm();
-        t.pmul(&self.b);
-        t.times_i();
+    /*
+        pub fn xtr_a(&mut self, w: &FP16, y: &FP16, z: &FP16) {
+            let mut r = FP16::new_copy(w);
+            let mut t = FP16::new_copy(w);
+            r.sub(y);
+            r.norm();
+            r.pmul(&self.a);
+            t.add(y);
+            t.norm();
+            t.pmul(&self.b);
+            t.times_i();
 
-        self.copy(&r);
-        self.add(&t);
-        self.add(z);
+            self.copy(&r);
+            self.add(&t);
+            self.add(z);
 
-        self.norm();
-    }
-*/
+            self.norm();
+        }
+    */
     /* XTR xtr_d function */
-/*
-    pub fn xtr_d(&mut self) {
-        let mut w = FP16::new_copy(self);
-        self.sqr();
-        w.conj();
-        w.dbl();
-        w.norm();
-        self.sub(&w);
-        self.reduce();
-    }
-*/
+    /*
+        pub fn xtr_d(&mut self) {
+            let mut w = FP16::new_copy(self);
+            self.sqr();
+            w.conj();
+            w.dbl();
+            w.norm();
+            self.sub(&w);
+            self.reduce();
+        }
+    */
     /* r=x^n using XTR method on traces of FP48s */
-/*
-    pub fn xtr_pow(&self, n: &BIG) -> FP16 {
-        let mut sf = FP16::new_copy(self);
-        sf.norm();
-        let mut a = FP16::new_int(3);
-        let mut b = FP16::new_copy(&sf);
-        let mut c = FP16::new_copy(&b);
-        c.xtr_d();
-        let mut t = FP16::new();
-        let mut r = FP16::new();
+    /*
+        pub fn xtr_pow(&self, n: &BIG) -> FP16 {
+            let mut sf = FP16::new_copy(self);
+            sf.norm();
+            let mut a = FP16::new_int(3);
+            let mut b = FP16::new_copy(&sf);
+            let mut c = FP16::new_copy(&b);
+            c.xtr_d();
+            let mut t = FP16::new();
+            let mut r = FP16::new();
 
-        let par = n.parity();
-        let mut v = BIG::new_copy(n);
-        v.norm();
-        v.fshr(1);
-        if par == 0 {
-            v.dec(1);
+            let par = n.parity();
+            let mut v = BIG::new_copy(n);
             v.norm();
-        }
-
-        let nb = v.nbits();
-        for i in (0..nb).rev() {
-            if v.bit(i) != 1 {
-                t.copy(&b);
-                sf.conj();
-                c.conj();
-                b.xtr_a(&a, &sf, &c);
-                sf.conj();
-                c.copy(&t);
-                c.xtr_d();
-                a.xtr_d();
-            } else {
-                t.copy(&a);
-                t.conj();
-                a.copy(&b);
-                a.xtr_d();
-                b.xtr_a(&c, &sf, &t);
-                c.xtr_d();
+            v.fshr(1);
+            if par == 0 {
+                v.dec(1);
+                v.norm();
             }
-        }
-        if par == 0 {
-            r.copy(&c)
-        } else {
-            r.copy(&b)
-        }
-        r.reduce();
-        return r;
-    }
-*/
-    /* r=ck^a.cl^n using XTR double exponentiation method on traces of FP48s. See Stam thesis. */
-/*
-    pub fn xtr_pow2(&mut self, ck: &FP16, ckml: &FP16, ckm2l: &FP16, a: &BIG, b: &BIG) -> FP16 {
-        let mut e = BIG::new_copy(a);
-        let mut d = BIG::new_copy(b);
-        let mut w = BIG::new();
-        d.norm();
-        e.norm();
 
-        let mut cu = FP16::new_copy(ck); // can probably be passed in w/o copying
-        let mut cv = FP16::new_copy(self);
-        let mut cumv = FP16::new_copy(ckml);
-        let mut cum2v = FP16::new_copy(ckm2l);
-        let mut r = FP16::new();
-        let mut t = FP16::new();
-
-        let mut f2: usize = 0;
-        while d.parity() == 0 && e.parity() == 0 {
-            d.fshr(1);
-            e.fshr(1);
-            f2 += 1;
-        }
-
-        while BIG::comp(&d, &e) != 0 {
-            if BIG::comp(&d, &e) > 0 {
-                w.copy(&e);
-                w.imul(4);
-                w.norm();
-                if BIG::comp(&d, &w) <= 0 {
-                    w.copy(&d);
-                    d.copy(&e);
-                    e.rsub(&w);
-                    e.norm();
-
-                    t.copy(&cv);
-                    t.xtr_a(&cu, &cumv, &cum2v);
-                    cum2v.copy(&cumv);
-                    cum2v.conj();
-                    cumv.copy(&cv);
-                    cv.copy(&cu);
-                    cu.copy(&t);
+            let nb = v.nbits();
+            for i in (0..nb).rev() {
+                if v.bit(i) != 1 {
+                    t.copy(&b);
+                    sf.conj();
+                    c.conj();
+                    b.xtr_a(&a, &sf, &c);
+                    sf.conj();
+                    c.copy(&t);
+                    c.xtr_d();
+                    a.xtr_d();
                 } else {
-                    if d.parity() == 0 {
-                        d.fshr(1);
-                        r.copy(&cum2v);
-                        r.conj();
-                        t.copy(&cumv);
-                        t.xtr_a(&cu, &cv, &r);
+                    t.copy(&a);
+                    t.conj();
+                    a.copy(&b);
+                    a.xtr_d();
+                    b.xtr_a(&c, &sf, &t);
+                    c.xtr_d();
+                }
+            }
+            if par == 0 {
+                r.copy(&c)
+            } else {
+                r.copy(&b)
+            }
+            r.reduce();
+            return r;
+        }
+    */
+    /* r=ck^a.cl^n using XTR double exponentiation method on traces of FP48s. See Stam thesis. */
+    /*
+        pub fn xtr_pow2(&mut self, ck: &FP16, ckml: &FP16, ckm2l: &FP16, a: &BIG, b: &BIG) -> FP16 {
+            let mut e = BIG::new_copy(a);
+            let mut d = BIG::new_copy(b);
+            let mut w = BIG::new();
+            d.norm();
+            e.norm();
+
+            let mut cu = FP16::new_copy(ck); // can probably be passed in w/o copying
+            let mut cv = FP16::new_copy(self);
+            let mut cumv = FP16::new_copy(ckml);
+            let mut cum2v = FP16::new_copy(ckm2l);
+            let mut r = FP16::new();
+            let mut t = FP16::new();
+
+            let mut f2: usize = 0;
+            while d.parity() == 0 && e.parity() == 0 {
+                d.fshr(1);
+                e.fshr(1);
+                f2 += 1;
+            }
+
+            while BIG::comp(&d, &e) != 0 {
+                if BIG::comp(&d, &e) > 0 {
+                    w.copy(&e);
+                    w.imul(4);
+                    w.norm();
+                    if BIG::comp(&d, &w) <= 0 {
+                        w.copy(&d);
+                        d.copy(&e);
+                        e.rsub(&w);
+                        e.norm();
+
+                        t.copy(&cv);
+                        t.xtr_a(&cu, &cumv, &cum2v);
                         cum2v.copy(&cumv);
-                        cum2v.xtr_d();
-                        cumv.copy(&t);
-                        cu.xtr_d();
+                        cum2v.conj();
+                        cumv.copy(&cv);
+                        cv.copy(&cu);
+                        cu.copy(&t);
                     } else {
-                        if e.parity() == 1 {
-                            d.sub(&e);
-                            d.norm();
+                        if d.parity() == 0 {
                             d.fshr(1);
-                            t.copy(&cv);
-                            t.xtr_a(&cu, &cumv, &cum2v);
-                            cu.xtr_d();
-                            cum2v.copy(&cv);
+                            r.copy(&cum2v);
+                            r.conj();
+                            t.copy(&cumv);
+                            t.xtr_a(&cu, &cv, &r);
+                            cum2v.copy(&cumv);
                             cum2v.xtr_d();
-                            cum2v.conj();
-                            cv.copy(&t);
+                            cumv.copy(&t);
+                            cu.xtr_d();
                         } else {
+                            if e.parity() == 1 {
+                                d.sub(&e);
+                                d.norm();
+                                d.fshr(1);
+                                t.copy(&cv);
+                                t.xtr_a(&cu, &cumv, &cum2v);
+                                cu.xtr_d();
+                                cum2v.copy(&cv);
+                                cum2v.xtr_d();
+                                cum2v.conj();
+                                cv.copy(&t);
+                            } else {
+                                w.copy(&d);
+                                d.copy(&e);
+                                d.fshr(1);
+                                e.copy(&w);
+                                t.copy(&cumv);
+                                t.xtr_d();
+                                cumv.copy(&cum2v);
+                                cumv.conj();
+                                cum2v.copy(&t);
+                                cum2v.conj();
+                                t.copy(&cv);
+                                t.xtr_d();
+                                cv.copy(&cu);
+                                cu.copy(&t);
+                            }
+                        }
+                    }
+                }
+                if BIG::comp(&d, &e) < 0 {
+                    w.copy(&d);
+                    w.imul(4);
+                    w.norm();
+                    if BIG::comp(&e, &w) <= 0 {
+                        e.sub(&d);
+                        e.norm();
+                        t.copy(&cv);
+                        t.xtr_a(&cu, &cumv, &cum2v);
+                        cum2v.copy(&cumv);
+                        cumv.copy(&cu);
+                        cu.copy(&t);
+                    } else {
+                        if e.parity() == 0 {
                             w.copy(&d);
                             d.copy(&e);
                             d.fshr(1);
@@ -575,77 +605,45 @@ impl FP16 {
                             t.xtr_d();
                             cv.copy(&cu);
                             cu.copy(&t);
-                        }
-                    }
-                }
-            }
-            if BIG::comp(&d, &e) < 0 {
-                w.copy(&d);
-                w.imul(4);
-                w.norm();
-                if BIG::comp(&e, &w) <= 0 {
-                    e.sub(&d);
-                    e.norm();
-                    t.copy(&cv);
-                    t.xtr_a(&cu, &cumv, &cum2v);
-                    cum2v.copy(&cumv);
-                    cumv.copy(&cu);
-                    cu.copy(&t);
-                } else {
-                    if e.parity() == 0 {
-                        w.copy(&d);
-                        d.copy(&e);
-                        d.fshr(1);
-                        e.copy(&w);
-                        t.copy(&cumv);
-                        t.xtr_d();
-                        cumv.copy(&cum2v);
-                        cumv.conj();
-                        cum2v.copy(&t);
-                        cum2v.conj();
-                        t.copy(&cv);
-                        t.xtr_d();
-                        cv.copy(&cu);
-                        cu.copy(&t);
-                    } else {
-                        if d.parity() == 1 {
-                            w.copy(&e);
-                            e.copy(&d);
-                            w.sub(&d);
-                            w.norm();
-                            d.copy(&w);
-                            d.fshr(1);
-                            t.copy(&cv);
-                            t.xtr_a(&cu, &cumv, &cum2v);
-                            cumv.conj();
-                            cum2v.copy(&cu);
-                            cum2v.xtr_d();
-                            cum2v.conj();
-                            cu.copy(&cv);
-                            cu.xtr_d();
-                            cv.copy(&t);
                         } else {
-                            d.fshr(1);
-                            r.copy(&cum2v);
-                            r.conj();
-                            t.copy(&cumv);
-                            t.xtr_a(&cu, &cv, &r);
-                            cum2v.copy(&cumv);
-                            cum2v.xtr_d();
-                            cumv.copy(&t);
-                            cu.xtr_d();
+                            if d.parity() == 1 {
+                                w.copy(&e);
+                                e.copy(&d);
+                                w.sub(&d);
+                                w.norm();
+                                d.copy(&w);
+                                d.fshr(1);
+                                t.copy(&cv);
+                                t.xtr_a(&cu, &cumv, &cum2v);
+                                cumv.conj();
+                                cum2v.copy(&cu);
+                                cum2v.xtr_d();
+                                cum2v.conj();
+                                cu.copy(&cv);
+                                cu.xtr_d();
+                                cv.copy(&t);
+                            } else {
+                                d.fshr(1);
+                                r.copy(&cum2v);
+                                r.conj();
+                                t.copy(&cumv);
+                                t.xtr_a(&cu, &cv, &r);
+                                cum2v.copy(&cumv);
+                                cum2v.xtr_d();
+                                cumv.copy(&t);
+                                cu.xtr_d();
+                            }
                         }
                     }
                 }
             }
+            r.copy(&cv);
+            r.xtr_a(&cu, &cumv, &cum2v);
+            for _ in 0..f2 {
+                r.xtr_d()
+            }
+            r = r.xtr_pow(&mut d);
+            return r;
         }
-        r.copy(&cv);
-        r.xtr_a(&cu, &cumv, &cum2v);
-        for _ in 0..f2 {
-            r.xtr_d()
-        }
-        r = r.xtr_pow(&mut d);
-        return r;
-    }
-*/
+    */
 }

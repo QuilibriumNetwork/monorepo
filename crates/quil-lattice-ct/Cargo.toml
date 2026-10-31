@@ -1,0 +1,45 @@
+[package]
+name = "quil-lattice-ct"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "QCT3 confidential token commitments and proof relations"
+
+[dependencies]
+sha2 = "0.10"
+libc = { version = "0.2", optional = true }
+sha3 = { version = "0.10", optional = true }
+zeroize = { version = "1.8", optional = true }
+aes = { version = "0.8.4", features = ["zeroize"], optional = true }
+num-bigint = { version = "0.4.6", optional = true }
+aes-gcm = { version = "0.10.3", features = ["zeroize"], optional = true }
+pqcrypto-ntruprime = { version = "0.1", optional = true }
+pqcrypto-traits = { version = "0.3", optional = true }
+rand = { version = "0.8", optional = true }
+quil-lattice-proof-sys = { path = "../quil-lattice-proof-sys", features = ["native-backend"], optional = true }
+
+[features]
+# Token codecs and relations; the native proof backend is separately selectable.
+confidential-tokens = ["dep:sha3", "dep:zeroize", "dep:aes", "dep:num-bigint", "dep:aes-gcm", "dep:pqcrypto-ntruprime", "dep:pqcrypto-traits", "dep:rand", "dep:libc"]
+native-proof = ["confidential-tokens", "dep:quil-lattice-proof-sys"]
+# Benchmark-only relation ablation (QUIL_ABLATION=no_ownership|no_membership). Never enable in node or wallet builds.
+ablation-bench = ["quil-lattice-proof-sys?/bench-knobs"]
+
+[dev-dependencies]
+
+[[bin]]
+name = "quil-amount-proof-worker"
+path = "src/bin/amount_proof_worker.rs"
+required-features = ["native-proof"]
+
+[[example]]
+name = "amount_relation_profile"
+required-features = ["confidential-tokens"]
+
+[[example]]
+name = "transfer_roundtrip"
+required-features = ["native-proof"]
+
+[[example]]
+name = "integer_gaussian_profile"
+required-features = ["confidential-tokens"]

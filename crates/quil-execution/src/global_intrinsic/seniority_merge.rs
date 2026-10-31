@@ -4,15 +4,15 @@
 //!
 //! ```text
 //! [u32 BE type_prefix = 0x0310]
-//! [u32 BE sig_len]         [sig_len bytes signature]
+//! [u32 BE sig_len] [sig_len bytes signature]
 //! [u32 BE key_type]
-//! [u32 BE pubkey_len]      [pubkey_len bytes prover_public_key]
+//! [u32 BE pubkey_len] [pubkey_len bytes prover_public_key]
 //! ```
 //!
 //! Validation: sig_len <= 114, pubkey_len <= 585.
 
+use crate::canonical_cursor::{put_u32, read_bytes, read_u32};
 use quil_types::error::{QuilError, Result};
-use crate::canonical_cursor::{put_u32, read_u32, read_bytes};
 
 pub const TYPE_SENIORITY_MERGE: u32 = 0x0310;
 pub const MAX_SENIORITY_SIG_LEN: u32 = 114;
@@ -42,13 +42,15 @@ impl SeniorityMerge {
         let tp = read_u32(data, &mut cursor)?;
         if tp != TYPE_SENIORITY_MERGE {
             return Err(QuilError::InvalidArgument(format!(
-                "SeniorityMerge: invalid type prefix 0x{:08x}", tp
+                "SeniorityMerge: invalid type prefix 0x{:08x}",
+                tp
             )));
         }
         let sig_len = read_u32(data, &mut cursor)?;
         if sig_len > MAX_SENIORITY_SIG_LEN {
             return Err(QuilError::InvalidArgument(format!(
-                "SeniorityMerge: invalid signature length {}", sig_len
+                "SeniorityMerge: invalid signature length {}",
+                sig_len
             )));
         }
         let signature = read_bytes(data, &mut cursor, sig_len as usize)?;
@@ -56,11 +58,16 @@ impl SeniorityMerge {
         let key_len = read_u32(data, &mut cursor)?;
         if key_len > MAX_SENIORITY_KEY_LEN {
             return Err(QuilError::InvalidArgument(format!(
-                "SeniorityMerge: invalid key length {}", key_len
+                "SeniorityMerge: invalid key length {}",
+                key_len
             )));
         }
         let prover_public_key = read_bytes(data, &mut cursor, key_len as usize)?;
-        Ok(Self { signature, key_type, prover_public_key })
+        Ok(Self {
+            signature,
+            key_type,
+            prover_public_key,
+        })
     }
 }
 
@@ -87,7 +94,11 @@ mod tests {
 
     #[test]
     fn round_trip_empty_fields() {
-        let s = SeniorityMerge { signature: vec![], key_type: 0, prover_public_key: vec![] };
+        let s = SeniorityMerge {
+            signature: vec![],
+            key_type: 0,
+            prover_public_key: vec![],
+        };
         let bytes = s.to_canonical_bytes().unwrap();
         let restored = SeniorityMerge::from_canonical_bytes(&bytes).unwrap();
         assert_eq!(restored, s);

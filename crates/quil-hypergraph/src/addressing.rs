@@ -51,17 +51,19 @@ pub fn shard_key_for_location(location: &Location) -> ShardKey {
 /// 4. Deduplicate (extending k if collision)
 /// 5. Sort and concatenate
 pub fn get_bloom_filter_indices(data: &[u8], bit_length: usize, k: usize) -> [u8; 3] {
-    use sha3::{Shake256, digest::{ExtendableOutput, Update}};
+    use sha3::{
+        digest::{ExtendableOutput, Update},
+        Shake256,
+    };
 
     // Shortcut: addresses outside poseidon field or all-zero
     if data.is_empty() || data[0] > 0x3f || data.iter().all(|&b| b == 0) {
         return [0u8; 3];
     }
 
-    // size = number of bits needed to represent bitLength
-    // For bitLength=256: size = 9 (since 2^8=256, BigInt(256).BitLen()-1 = 8,
-    // but Go uses big.NewInt(256).BitLen()-1 = 8)
-    // Actually: big.NewInt(256) = 0x100, BitLen() = 9, so size = 9-1 = 8
+    // size = bits needed to index bitLength positions; Go computes
+    // big.NewInt(bitLength).BitLen()-1. For bitLength=256: big.NewInt(256) =
+    // 0x100, BitLen() = 9, so size = 9-1 = 8.
     let size = (bit_length as f64).log2().ceil() as usize; // 8 for 256
 
     let mut hasher = Shake256::default();
@@ -219,10 +221,9 @@ mod tests {
     fn get_bloom_filter_matches_go_four_byte_three_k() {
         let bloom = get_bloom_filter(&[0x00, 0x00, 0x00, 0x00], 256, 3);
         let expected: [u8; 32] = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x20,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x20, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
         ];
         assert_eq!(bloom, expected.to_vec());
     }
@@ -231,10 +232,9 @@ mod tests {
     fn get_bloom_filter_matches_go_sixty_byte_three_k() {
         let bloom = get_bloom_filter(&[0u8; 60], 256, 3);
         let expected: [u8; 32] = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x10,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
+            0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
         ];
         assert_eq!(bloom, expected.to_vec());
     }
@@ -315,6 +315,7 @@ mod tests {
         };
         let b = a.clone();
         a.app_address[0] = 0xFF;
+        assert_eq!(a.app_address[0], 0xFF);
         assert_eq!(b.app_address[0], 0);
     }
 
@@ -367,13 +368,19 @@ mod tests {
         // Addresses with first byte > 0x3f get L1 = [0,0,0]
         let mut app = [0u8; 32];
         app[0] = 0x40; // > 0x3f
-        let loc = Location { app_address: app, data_address: [0u8; 32] };
+        let loc = Location {
+            app_address: app,
+            data_address: [0u8; 32],
+        };
         let key = shard_key_for_location(&loc);
         assert_eq!(key.l1, [0, 0, 0]);
 
         // Valid address (first byte <= 0x3f) gets non-trivial L1
         app[0] = 0x01;
-        let loc = Location { app_address: app, data_address: [0u8; 32] };
+        let loc = Location {
+            app_address: app,
+            data_address: [0u8; 32],
+        };
         let key = shard_key_for_location(&loc);
         assert_ne!(key.l1, [0, 0, 0]); // SHAKE256 produces non-zero output
     }

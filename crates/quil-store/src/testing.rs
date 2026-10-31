@@ -40,7 +40,56 @@ impl Transaction for InMemoryTxn {
         Ok(())
     }
     fn new_iter(&self, _start: &[u8], _end: &[u8]) -> Result<Box<dyn StoreIterator>> {
-        Err(QuilError::NotFound("in-memory txn iteration unsupported".into()))
+        Err(QuilError::NotFound(
+            "in-memory txn iteration unsupported".into(),
+        ))
+    }
+    fn delete_range(&self, _start: &[u8], _end: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+// Error-propagation fixture only: store mutations remain immediate.
+struct FailingClockTxn {
+    commit_countdown: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn clock_fault_due(counter: &std::sync::atomic::AtomicUsize) -> bool {
+    counter.try_update(
+        std::sync::atomic::Ordering::SeqCst,
+        std::sync::atomic::Ordering::SeqCst,
+        |n| n.checked_sub(1),
+    ) == Ok(1)
+}
+
+impl Transaction for FailingClockTxn {
+    fn get(&self, _key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    fn set(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn commit(self: Box<Self>) -> Result<()> {
+        if clock_fault_due(&self.commit_countdown) {
+            return Err(QuilError::Store(
+                "injected clock transaction commit failure".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn delete(&self, _key: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn abort(self: Box<Self>) -> Result<()> {
+        Ok(())
+    }
+    fn new_iter(&self, _start: &[u8], _end: &[u8]) -> Result<Box<dyn StoreIterator>> {
+        Err(QuilError::NotFound(
+            "in-memory txn iteration unsupported".into(),
+        ))
     }
     fn delete_range(&self, _start: &[u8], _end: &[u8]) -> Result<()> {
         Ok(())
@@ -60,6 +109,9 @@ impl Transaction for InMemoryTxn {
 /// stay small (~hundreds).
 #[derive(Default)]
 pub struct InMemoryClockStore {
+    fail_transaction_countdown: std::sync::atomic::AtomicUsize,
+    fail_commit_countdown: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    fail_next_shard_stage: std::sync::atomic::AtomicBool,
     // Global frames
     global_frames: Mutex<HashMap<u64, gpb::GlobalFrame>>,
     /// Frame candidates indexed by `(frame_number, selector)`.
@@ -89,11 +141,28 @@ pub struct InMemoryClockStore {
     // Distance / seniority.
     total_distance: Mutex<HashMap<(Vec<u8>, u64, Vec<u8>), BigInt>>,
     seniority_maps: Mutex<HashMap<Vec<u8>, HashMap<String, u64>>>,
+    app_history_discarded: Mutex<Option<u64>>,
 }
 
 impl InMemoryClockStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Inject one storage error before the next shard-frame staging write.
+    /// Does not simulate transaction-commit atomicity (mutations are immediate).
+    pub fn fail_next_shard_stage(&self) {
+        self.fail_next_shard_stage
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Fail the nth subsequent transaction creation/commit (zero disables).
+    /// Tests error propagation, not rollback: mutations still apply immediately.
+    pub fn fail_clock_transaction(&self, creation: usize, commit: usize) {
+        self.fail_transaction_countdown
+            .store(creation, std::sync::atomic::Ordering::SeqCst);
+        self.fail_commit_countdown
+            .store(commit, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Seed a `GlobalFrame` directly. Useful for genesis bootstrapping
@@ -111,7 +180,14 @@ impl InMemoryClockStore {
 
 impl ClockStore for InMemoryClockStore {
     fn new_transaction(&self, _indexed: bool) -> Result<Box<dyn Transaction>> {
-        Ok(Box::new(InMemoryTxn))
+        if clock_fault_due(&self.fail_transaction_countdown) {
+            return Err(QuilError::Store(
+                "injected clock transaction creation failure".into(),
+            ));
+        }
+        Ok(Box::new(FailingClockTxn {
+            commit_countdown: self.fail_commit_countdown.clone(),
+        }))
     }
 
     // -----------------------------------------------------------------
@@ -196,6 +272,25 @@ impl ClockStore for InMemoryClockStore {
             .ok_or_else(|| QuilError::NotFound("no candidate".into()))
     }
 
+    fn range_global_clock_frame_candidates(
+        &self,
+        min: u64,
+        max: u64,
+        limit: usize,
+    ) -> Result<Vec<gpb::GlobalFrame>> {
+        let frames = self.global_frame_candidates.lock().unwrap();
+        let mut selected: Vec<_> = frames
+            .iter()
+            .filter(|((number, _), _)| *number >= min && *number <= max)
+            .collect();
+        selected.sort_by(|(a, _), (b, _)| a.cmp(b));
+        Ok(selected
+            .into_iter()
+            .take(limit)
+            .map(|(_, frame)| frame.clone())
+            .collect())
+    }
+
     fn delete_global_clock_frame_range(&self, min_frame: u64, max_frame: u64) -> Result<()> {
         self.global_frames
             .lock()
@@ -270,11 +365,7 @@ impl ClockStore for InMemoryClockStore {
             .ok_or_else(|| QuilError::NotFound("no QC".into()))
     }
 
-    fn get_quorum_certificate(
-        &self,
-        filter: &[u8],
-        rank: u64,
-    ) -> Result<gpb::QuorumCertificate> {
+    fn get_quorum_certificate(&self, filter: &[u8], rank: u64) -> Result<gpb::QuorumCertificate> {
         self.qcs
             .lock()
             .unwrap()
@@ -306,10 +397,7 @@ impl ClockStore for InMemoryClockStore {
     // Timeout certificates
     // -----------------------------------------------------------------
 
-    fn get_latest_timeout_certificate(
-        &self,
-        filter: &[u8],
-    ) -> Result<gpb::TimeoutCertificate> {
+    fn get_latest_timeout_certificate(&self, filter: &[u8]) -> Result<gpb::TimeoutCertificate> {
         self.latest_tc
             .lock()
             .unwrap()
@@ -318,11 +406,7 @@ impl ClockStore for InMemoryClockStore {
             .ok_or_else(|| QuilError::NotFound("no TC".into()))
     }
 
-    fn get_timeout_certificate(
-        &self,
-        filter: &[u8],
-        rank: u64,
-    ) -> Result<gpb::TimeoutCertificate> {
+    fn get_timeout_certificate(&self, filter: &[u8], rank: u64) -> Result<gpb::TimeoutCertificate> {
         self.tcs
             .lock()
             .unwrap()
@@ -418,6 +502,14 @@ impl ClockStore for InMemoryClockStore {
         frame: &gpb::AppShardFrame,
         _txn: &dyn Transaction,
     ) -> Result<()> {
+        if self
+            .fail_next_shard_stage
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(QuilError::Store(
+                "injected shard-frame staging failure".into(),
+            ));
+        }
         let header = frame
             .header
             .as_ref()
@@ -447,11 +539,7 @@ impl ClockStore for InMemoryClockStore {
             .ok_or_else(|| QuilError::NotFound("no staged shard frame".into()))
     }
 
-    fn set_latest_shard_clock_frame_number(
-        &self,
-        filter: &[u8],
-        frame_number: u64,
-    ) -> Result<()> {
+    fn set_latest_shard_clock_frame_number(&self, filter: &[u8], frame_number: u64) -> Result<()> {
         self.latest_shard_frame_number
             .lock()
             .unwrap()
@@ -472,6 +560,20 @@ impl ClockStore for InMemoryClockStore {
         Ok(())
     }
 
+    fn discard_app_frame_history(&self, global_frame: u64) -> Result<()> {
+        self.shard_frames.lock().unwrap().clear();
+        self.latest_shard_frame_number.lock().unwrap().clear();
+        self.staged_shard_frames.lock().unwrap().clear();
+        self.app_shard_certified.lock().unwrap().clear();
+        self.total_distance.lock().unwrap().clear();
+        *self.app_history_discarded.lock().unwrap() = Some(global_frame);
+        Ok(())
+    }
+
+    fn app_frame_history_discarded(&self) -> Result<Option<u64>> {
+        Ok(*self.app_history_discarded.lock().unwrap())
+    }
+
     fn reset_shard_clock_frames(&self, filter: &[u8]) -> Result<()> {
         self.shard_frames
             .lock()
@@ -488,10 +590,7 @@ impl ClockStore for InMemoryClockStore {
     // App-shard certified states
     // -----------------------------------------------------------------
 
-    fn get_latest_certified_app_shard_state(
-        &self,
-        filter: &[u8],
-    ) -> Result<gpb::AppShardProposal> {
+    fn get_latest_certified_app_shard_state(&self, filter: &[u8]) -> Result<gpb::AppShardProposal> {
         self.app_shard_certified
             .lock()
             .unwrap()
@@ -522,11 +621,7 @@ impl ClockStore for InMemoryClockStore {
     // Votes
     // -----------------------------------------------------------------
 
-    fn put_proposal_vote(
-        &self,
-        _txn: &dyn Transaction,
-        vote: &gpb::ProposalVote,
-    ) -> Result<()> {
+    fn put_proposal_vote(&self, _txn: &dyn Transaction, vote: &gpb::ProposalVote) -> Result<()> {
         let identity = vote
             .public_key_signature_bls48581
             .as_ref()
@@ -554,11 +649,7 @@ impl ClockStore for InMemoryClockStore {
             .ok_or_else(|| QuilError::NotFound("no proposal vote".into()))
     }
 
-    fn get_proposal_votes(
-        &self,
-        filter: &[u8],
-        rank: u64,
-    ) -> Result<Vec<gpb::ProposalVote>> {
+    fn get_proposal_votes(&self, filter: &[u8], rank: u64) -> Result<Vec<gpb::ProposalVote>> {
         Ok(self
             .proposal_votes
             .lock()
@@ -569,11 +660,7 @@ impl ClockStore for InMemoryClockStore {
             .collect())
     }
 
-    fn put_timeout_vote(
-        &self,
-        _txn: &dyn Transaction,
-        vote: &gpb::TimeoutState,
-    ) -> Result<()> {
+    fn put_timeout_vote(&self, _txn: &dyn Transaction, vote: &gpb::TimeoutState) -> Result<()> {
         let v = vote
             .vote
             .as_ref()
@@ -584,10 +671,7 @@ impl ClockStore for InMemoryClockStore {
             .map(|s| s.address.clone())
             .unwrap_or_default();
         let key = (v.filter.clone(), v.rank, identity);
-        self.timeout_votes
-            .lock()
-            .unwrap()
-            .insert(key, vote.clone());
+        self.timeout_votes.lock().unwrap().insert(key, vote.clone());
         Ok(())
     }
 
@@ -605,11 +689,7 @@ impl ClockStore for InMemoryClockStore {
             .ok_or_else(|| QuilError::NotFound("no timeout vote".into()))
     }
 
-    fn get_timeout_votes(
-        &self,
-        filter: &[u8],
-        rank: u64,
-    ) -> Result<Vec<gpb::TimeoutState>> {
+    fn get_timeout_votes(&self, filter: &[u8], rank: u64) -> Result<Vec<gpb::TimeoutState>> {
         Ok(self
             .timeout_votes
             .lock()
@@ -700,7 +780,9 @@ mod tests {
     fn put_and_get_global_frame() {
         let store = InMemoryClockStore::new();
         let txn = store.new_transaction(false).unwrap();
-        store.put_global_clock_frame(&frame(42), txn.as_ref()).unwrap();
+        store
+            .put_global_clock_frame(&frame(42), txn.as_ref())
+            .unwrap();
         let got = store.get_global_clock_frame(42).unwrap();
         assert_eq!(got.header.unwrap().frame_number, 42);
     }
@@ -709,9 +791,15 @@ mod tests {
     fn latest_returns_highest_frame_number() {
         let store = InMemoryClockStore::new();
         let txn = store.new_transaction(false).unwrap();
-        store.put_global_clock_frame(&frame(10), txn.as_ref()).unwrap();
-        store.put_global_clock_frame(&frame(50), txn.as_ref()).unwrap();
-        store.put_global_clock_frame(&frame(30), txn.as_ref()).unwrap();
+        store
+            .put_global_clock_frame(&frame(10), txn.as_ref())
+            .unwrap();
+        store
+            .put_global_clock_frame(&frame(50), txn.as_ref())
+            .unwrap();
+        store
+            .put_global_clock_frame(&frame(30), txn.as_ref())
+            .unwrap();
         let latest = store.get_latest_global_clock_frame().unwrap();
         assert_eq!(latest.header.unwrap().frame_number, 50);
     }
@@ -745,7 +833,9 @@ mod tests {
             aggregate_signature: None,
         };
         store.put_quorum_certificate(&qc_low, txn.as_ref()).unwrap();
-        store.put_quorum_certificate(&qc_high, txn.as_ref()).unwrap();
+        store
+            .put_quorum_certificate(&qc_high, txn.as_ref())
+            .unwrap();
         let latest = store.get_latest_quorum_certificate(&[1, 2, 3]).unwrap();
         assert_eq!(latest.rank, 10);
     }

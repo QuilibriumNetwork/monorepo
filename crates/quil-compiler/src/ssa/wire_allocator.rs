@@ -21,7 +21,12 @@ impl WireAllocator {
     }
 
     /// Allocate wires for a value.
-    pub fn alloc(&mut self, alloc: &mut circuits::Allocator, id: ValueId, bits: Size) -> Vec<usize> {
+    pub fn alloc(
+        &mut self,
+        alloc: &mut circuits::Allocator,
+        id: ValueId,
+        bits: Size,
+    ) -> Vec<usize> {
         let wires = alloc.wires(bits);
         self.map.insert(id, wires.clone());
         wires

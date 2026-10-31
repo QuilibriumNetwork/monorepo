@@ -15,10 +15,10 @@
 //!
 //! prover:Prover a rdfs:Class .
 //! prover:PublicKey a rdfs:Property ;
-//!   rdfs:domain qcl:ByteArray ;
-//!   qcl:size 585 ;
-//!   qcl:order 0 ;
-//!   rdfs:range prover:Prover .
+//! rdfs:domain qcl:ByteArray ;
+//! qcl:size 585 ;
+//! qcl:order 0 ;
+//! rdfs:range prover:Prover .
 //! ```
 //!
 //! Output type [`ParsedSchema`] gives the same surface Go's
@@ -28,9 +28,9 @@
 //! - No support for blank nodes, lists, or RDF reification.
 //! - No URI resolution against `BASE`.
 //! - Comments must be on their own line or at end of line; Turtle's
-//!   in-statement `#` form inside literal strings is not handled.
+//! in-statement `#` form inside literal strings is not handled.
 //! - Namespace prefixes are looked up by exact key; the trailing
-//!   slash quirk Go's parser handles is replicated here.
+//! slash quirk Go's parser handles is replicated here.
 
 use quil_types::error::{QuilError, Result};
 use std::collections::HashMap;
@@ -97,17 +97,16 @@ pub fn parse_turtle_schema(document: &str) -> Result<ParsedSchema> {
             let pred = expand_iri(&pred_obj.predicate, &prefix_map);
             for obj in &pred_obj.objects {
                 let obj_iri = expand_iri(obj, &prefix_map);
-                if (pred == RDF_TYPE_FULL || pred == "a")
-                    && obj_iri == RDFS_CLASS_FULL
-                {
+                if (pred == RDF_TYPE_FULL || pred == "a") && obj_iri == RDFS_CLASS_FULL {
                     class_iris.push(subject.clone());
                     let class_name = collapse_iri(&subject, &prefix_map);
-                    schema.classes.entry(class_name.clone()).or_insert_with(|| {
-                        ParsedClass {
+                    schema
+                        .classes
+                        .entry(class_name.clone())
+                        .or_insert_with(|| ParsedClass {
                             name: class_name,
                             fields: HashMap::new(),
-                        }
-                    });
+                        });
                 }
             }
         }
@@ -137,23 +136,23 @@ pub fn parse_turtle_schema(document: &str) -> Result<ParsedSchema> {
                 } else if pred == QCL_ORDER_FULL {
                     let v = parse_literal_or_iri_int(obj)?;
                     order = Some(u16::try_from(v).map_err(|_| {
-                        QuilError::InvalidArgument(format!(
-                            "turtle: order {} out of range", v
-                        ))
+                        QuilError::InvalidArgument(format!("turtle: order {} out of range", v))
                     })?);
                 } else if pred == QCL_SIZE_FULL {
                     let v = parse_literal_or_iri_int(obj)?;
                     size = Some(u32::try_from(v).map_err(|_| {
-                        QuilError::InvalidArgument(format!(
-                            "turtle: size {} out of range", v
-                        ))
+                        QuilError::InvalidArgument(format!("turtle: size {} out of range", v))
                     })?);
                 }
             }
         }
 
-        let Some(range) = range_class else { continue; };
-        let Some(class) = schema.classes.get_mut(&range) else { continue; };
+        let Some(range) = range_class else {
+            continue;
+        };
+        let Some(class) = schema.classes.get_mut(&range) else {
+            continue;
+        };
 
         let field_name = local_name(&subject_iri).to_string();
         // Bool has implicit size = 1 (matches Go).
@@ -265,9 +264,7 @@ fn tokenize(document: &str) -> Result<Vec<Statement>> {
 fn parse_statement(text: &str) -> Result<Statement> {
     let tokens = split_tokens(text);
     if tokens.is_empty() {
-        return Err(QuilError::InvalidArgument(
-            "turtle: empty statement".into(),
-        ));
+        return Err(QuilError::InvalidArgument("turtle: empty statement".into()));
     }
     let subject = tokens[0].clone();
     let mut predicate_objects: Vec<PredicateObjects> = Vec::new();
@@ -294,7 +291,10 @@ fn parse_statement(text: &str) -> Result<Statement> {
             objects: objs,
         });
     }
-    Ok(Statement { subject, predicate_objects })
+    Ok(Statement {
+        subject,
+        predicate_objects,
+    })
 }
 
 /// Split a single statement (already without `.`) into tokens.
@@ -407,8 +407,7 @@ fn extract_prefixes(document: &str) -> HashMap<String, String> {
             continue;
         }
         let lower = line.to_ascii_lowercase();
-        let is_prefix =
-            lower.starts_with("@prefix") || lower.starts_with("prefix ");
+        let is_prefix = lower.starts_with("@prefix") || lower.starts_with("prefix ");
         if !is_prefix {
             continue;
         }
@@ -493,9 +492,9 @@ fn local_name(iri: &str) -> &str {
 fn parse_literal_or_iri_int(token: &str) -> Result<u64> {
     let cleaned = if token.starts_with('"') {
         // `"5"` or `"5"^^<...>`
-        let end = token[1..].find('"').ok_or_else(|| QuilError::InvalidArgument(
-            format!("turtle: unterminated literal '{}'", token),
-        ))?;
+        let end = token[1..].find('"').ok_or_else(|| {
+            QuilError::InvalidArgument(format!("turtle: unterminated literal '{}'", token))
+        })?;
         &token[1..1 + end]
     } else if let Some(idx) = token.rfind(':') {
         // `qcl:5` — pull out everything after the last `:`
@@ -512,9 +511,12 @@ fn parse_literal_or_iri_int(token: &str) -> Result<u64> {
     } else {
         token
     };
-    cleaned.parse::<u64>().map_err(|e| QuilError::InvalidArgument(format!(
-        "turtle: invalid integer '{}' (cleaned '{}'): {e}", token, cleaned
-    )))
+    cleaned.parse::<u64>().map_err(|e| {
+        QuilError::InvalidArgument(format!(
+            "turtle: invalid integer '{}' (cleaned '{}'): {e}",
+            token, cleaned
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -566,7 +568,9 @@ config:Name a rdfs:Property ;
         assert_eq!(behavior.size, 2);
         assert_eq!(behavior.rdf_type, "Uint");
 
-        let mint = s.field("config:TokenConfiguration", "MintStrategy").unwrap();
+        let mint = s
+            .field("config:TokenConfiguration", "MintStrategy")
+            .unwrap();
         assert_eq!(mint.order, 1);
         assert_eq!(mint.size, 701);
         assert_eq!(mint.rdf_type, "ByteArray");
@@ -673,10 +677,8 @@ x:N a rdfs:Property ;
 
     #[test]
     fn schema_with_only_directives_yields_no_classes() {
-        let s = parse_turtle_schema(
-            "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .",
-        )
-        .unwrap();
+        let s =
+            parse_turtle_schema("@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .").unwrap();
         assert!(s.classes.is_empty());
     }
 }

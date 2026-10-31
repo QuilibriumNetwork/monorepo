@@ -1,14 +1,14 @@
 //! TokenDeploy (0x0504) and TokenUpdate (0x0505).
 
-use quil_types::error::Result;
 use super::cursor::*;
+use quil_types::error::Result;
 
 pub const TYPE_TOKEN_DEPLOY: u32 = 0x0504;
 pub const TYPE_TOKEN_UPDATE: u32 = 0x0505;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TokenDeploy {
-    pub config: Vec<u8>,      // nested TokenConfiguration canonical bytes
+    pub config: Vec<u8>, // nested TokenConfiguration canonical bytes
     pub rdf_schema: Vec<u8>,
 }
 
@@ -31,7 +31,7 @@ impl TokenDeploy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TokenUpdate {
-    pub config: Vec<u8>,      // nested TokenConfiguration canonical bytes
+    pub config: Vec<u8>, // nested TokenConfiguration canonical bytes
     pub rdf_schema: Vec<u8>,
     pub public_key_signature_bls48581: Vec<u8>, // nested BLS48581AggregateSignature
 }
@@ -51,7 +51,11 @@ impl TokenUpdate {
         let config = read_lp(data, &mut c)?;
         let rdf_schema = read_lp(data, &mut c)?;
         let public_key_signature_bls48581 = read_lp(data, &mut c)?;
-        Ok(Self { config, rdf_schema, public_key_signature_bls48581 })
+        Ok(Self {
+            config,
+            rdf_schema,
+            public_key_signature_bls48581,
+        })
     }
 }
 
@@ -61,7 +65,10 @@ mod tests {
 
     #[test]
     fn token_deploy_round_trip() {
-        let d = TokenDeploy { config: vec![0x11u8; 50], rdf_schema: b"schema".to_vec() };
+        let d = TokenDeploy {
+            config: vec![0x11u8; 50],
+            rdf_schema: b"schema".to_vec(),
+        };
         let b = d.to_canonical_bytes().unwrap();
         assert_eq!(&b[..4], &TYPE_TOKEN_DEPLOY.to_be_bytes());
         assert_eq!(TokenDeploy::from_canonical_bytes(&b).unwrap(), d);
@@ -69,7 +76,11 @@ mod tests {
 
     #[test]
     fn token_update_round_trip() {
-        let u = TokenUpdate { config: vec![0x22u8; 30], rdf_schema: vec![], public_key_signature_bls48581: vec![0x33u8; 74] };
+        let u = TokenUpdate {
+            config: vec![0x22u8; 30],
+            rdf_schema: vec![],
+            public_key_signature_bls48581: vec![0x33u8; 74],
+        };
         let b = u.to_canonical_bytes().unwrap();
         assert_eq!(&b[..4], &TYPE_TOKEN_UPDATE.to_be_bytes());
         assert_eq!(TokenUpdate::from_canonical_bytes(&b).unwrap(), u);

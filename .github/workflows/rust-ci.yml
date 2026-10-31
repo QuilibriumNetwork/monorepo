@@ -2,8 +2,18 @@ name: rust-ci
 
 on:
   push:
-    branches: [develop]
+    # Development moves between `develop`, versioned release branches, and
+    # their milestone branches.  Keep CI on every branch that can be a PR
+    # base so regressions are attributed to the push that introduced them.
+    branches: [develop, 'develop-*', 'v[0-9]*']
   pull_request:
+  # A merge queue tests each queued PR on the base plus the PRs ahead of
+  # it, so changes that pass alone but conflict together never land.
+  merge_group:
+
+# Jobs read the repository only; a job that needs more says so itself.
+permissions:
+  contents: read
 
 concurrency:
   group: rust-ci-${{ github.ref }}
@@ -15,14 +25,53 @@ env:
   # different fingerprints and target/ grows unboundedly.
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: short
+  # Use the runner image's installed formulae; refresh dependencies separately.
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_UPGRADE: "1"
 
 jobs:
   # -----------------------------------------------------------------
-  # build — `cargo check` against the whole workspace.
+  # scope — skip a pull request whose merge result push CI already
+  # tests: a branch of this repository that the push trigger covers,
+  # which contains its base (a release branch into develop). The merge
+  # is then the head's own tree, built and tested by its push.
+  # -----------------------------------------------------------------
+  scope:
+    name: scope
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+    steps:
+      - id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          run=true
+          # Keep in step with the push trigger's branch patterns above.
+          if [ "$EVENT" = pull_request ] && [ "$SAME_REPO" = true ] &&
+             [[ $HEAD_REF =~ ^(develop|develop-.+|v[0-9].*)$ ]]; then
+            # On an API error the jobs run: a skipped required check
+            # would count as passed.
+            status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE_SHA...$HEAD_SHA" --jq .status) || status=unknown
+            case $status in ahead|identical) run=false ;; esac
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+  # -----------------------------------------------------------------
+  # build — compile every workspace target early, including test-only code.
   # -----------------------------------------------------------------
   build:
     name: build (cargo check)
     runs-on: ubuntu-latest
+    needs: scope
+    if: needs.scope.outputs.run == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,7 +80,8 @@ jobs:
       - name: Pull LFS files
         run: git lfs pull
 
-      - uses: ./.github/actions/setup-native-deps
+      - id: native-deps
+        uses: ./.github/actions/setup-native-deps
 
       # Toolchain channel is read from rust-toolchain.toml at the repo
       # root. Update that file, not this workflow, to bump Rust.
@@ -39,23 +89,49 @@ jobs:
         with:
           # Don't let the action set RUSTFLAGS
           rustflags: ""
+          # The explicit cache below owns restore/save for this job.
+          cache: false
+          components: rustfmt
+
+      # Formatting needs no build: fail on it before compiling.
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: rust-ci
+          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
+          # Check artifacts must not win the immutable test-cache key race.
+          shared-key: rust-check
           cache-on-failure: true
+          # Only pushes to a base branch save caches. Pull requests and
+          # merge groups restore the base's, but caches they saved under
+          # their own refs, which no other run can read, filled the
+          # repository's 10 GB and evicted the base's: every new PR and
+          # every merge group then built from nothing.
+          save-if: ${{ github.event_name == 'push' }}
 
-      # channelwasm excluded: doesn't compile on native targets currently.
-      # Re-include once fixed.
-      - name: cargo check --workspace
-        run: cargo check --workspace --locked --exclude channelwasm
+      - name: cargo check --workspace --all-targets
+        run: cargo check --workspace --locked --all-targets
 
   # -----------------------------------------------------------------
-  # test — `cargo nextest run` against the whole workspace.
+  # test — `cargo nextest run` against the whole workspace, split
+  # across three runners: the run is CPU-bound (about 2,500
+  # test-seconds on a 4-vCPU runner), so each partition's share of the
+  # tests outweighs the compile it repeats. test-result below gathers
+  # them under the required check's name.
   # -----------------------------------------------------------------
   test:
-    name: test (cargo nextest)
+    name: test (cargo nextest ${{ matrix.partition }}/3)
     runs-on: ubuntu-latest
+    needs: scope
+    if: needs.scope.outputs.run == 'true'
+    permissions:
+      contents: read
+      checks: read
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,29 +140,150 @@ jobs:
       - name: Pull LFS files
         run: git lfs pull
 
-      - uses: ./.github/actions/setup-native-deps
+      - id: native-deps
+        uses: ./.github/actions/setup-native-deps
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           # Don't let the action set RUSTFLAGS
           rustflags: ""
+          # The explicit cache below owns restore/save for this job.
+          cache: false
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: rust-ci
+          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
+          shared-key: rust-test
+          # The partitions build the same artifacts; one saves them.
+          save-if: ${{ github.event_name == 'push' && matrix.partition == 1 }}
 
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
 
-      # channelwasm excluded: see comment in build job above.
-      #
-      # The list of temporarily-skipped failing tests lives in
-      # .nextest.toml `default-filter` (e2e_consensus binary +
-      # 8 individually-named tests). Keep that list in one place rather
-      # than splitting between YAML and config.
+      # A merge queue merges the commit its group tested, so the push of
+      # that commit only builds the tests in the first partition, which
+      # refreshes the base's cache. A push that skipped the queue still
+      # runs them.
+      - name: find this commit's passed test run
+        id: tested
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The check name is this job's name.
+          n=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?check_name=test%20(cargo%20nextest)&status=completed" \
+            --jq '[.check_runs[] | select(.conclusion == "success")] | length') || n=0
+          echo "tested=$([ "$n" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      # .nextest.toml gives the multi-node consensus e2e tests exclusive
+      # scheduling slots so they aren't starved by parallel tests on the
+      # 4-vCPU runner (it no longer skips any tests).
       - name: cargo nextest run --workspace
-        run: cargo nextest run --workspace --locked --no-fail-fast --exclude channelwasm --config-file .nextest.toml
+        env:
+          TESTED: ${{ steps.tested.outputs.tested }}
+          PARTITION: ${{ matrix.partition }}
+        run: |
+          if [ "$TESTED" = true ]; then
+            [ "$PARTITION" != 1 ] ||
+              cargo nextest run --workspace --locked --config-file .nextest.toml --no-run
+          else
+            cargo nextest run --workspace --locked --no-fail-fast --config-file .nextest.toml \
+              --partition "count:$PARTITION/3"
+          fi
+
+  # test-result — the required check `test (cargo nextest)`: passes only
+  # when every partition passed. It runs unless the run was cancelled or
+  # scope skipped the tests, so a failed or skipped partition, or a
+  # failed scope job, fails it instead of leaving a skipped check, which
+  # would count as passed.
+  test-result:
+    name: test (cargo nextest)
+    runs-on: ubuntu-latest
+    needs: [scope, test]
+    if: ${{ !cancelled() && needs.scope.outputs.run != 'false' }}
+    steps:
+      - env:
+          RESULT: ${{ needs.test.result }}
+        run: |
+          echo "partitions: $RESULT"
+          [ "$RESULT" = success ]
+
+  # -----------------------------------------------------------------
+  # lattice-native — the lattice tests on the native x86 builds that
+  # the docker images ship: docker/Dockerfile.source sets
+  # QUIL_LATTICE_X86_NATIVE=1, Dockerfile.sourceavx512 sets avx512.
+  # The test job above covers only the portable build (variable unset).
+  # Not a required check; the merge queue skips it like release-build,
+  # and the push of the merged commit runs it.
+  # -----------------------------------------------------------------
+  lattice-native:
+    name: lattice-native (x86-64)
+    runs-on: ubuntu-latest
+    needs: scope
+    if: needs.scope.outputs.run == 'true' && github.event_name != 'merge_group'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Pull LFS files
+        run: git lfs pull
+
+      - id: native-deps
+        uses: ./.github/actions/setup-native-deps
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # Don't let the action set RUSTFLAGS
+          rustflags: ""
+          # The explicit cache below owns restore/save for this job.
+          cache: false
+
+      # The variables below are set per step, so the cache key matches
+      # the test job's: restore its dependencies, never save.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
+          shared-key: rust-test
+          save-if: false
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      # The workspace build gives the lattice crates the features the
+      # node and qclient enable (native-proof); the filter picks the
+      # lattice crates' tests and the execution modules that prove or
+      # verify through the native backend.
+      - name: lattice tests, QUIL_LATTICE_X86_NATIVE=1 (baseline x86-64)
+        env:
+          QUIL_LATTICE_X86_NATIVE: "1"
+        run: |
+          cargo nextest run --workspace --locked --no-fail-fast --config-file .nextest.toml -E '
+            package(quil-lattice-proof-sys) | package(quil-lattice-ct) | (package(quil-execution) &
+            test(/^token_intrinsic::(commit_verify|custom_mint|dispatch|mint|mint_authorization|pending_claim|shield)::/))'
+
+      # Only the lattice crate gets these CFLAGS, as only its C needs
+      # them: a workspace build would rebuild every C dependency. The
+      # build always runs; the tests need an AVX-512 runner.
+      - name: lattice-proof-sys tests, QUIL_LATTICE_X86_NATIVE=avx512
+        env:
+          QUIL_LATTICE_X86_NATIVE: avx512
+          CFLAGS: -march=skylake-avx512 -mtune=skylake-avx512
+        run: |
+          args=(-p quil-lattice-proof-sys --features native-backend --locked --config-file .nextest.toml)
+          cargo nextest run "${args[@]}" --no-run
+          missing=""
+          for f in avx512f avx512bw avx512dq avx512vl; do
+            grep -qw "$f" /proc/cpuinfo || missing="$missing $f"
+          done
+          if [ -n "$missing" ]; then
+            cpu=$(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2-)
+            echo "::notice::avx512 lattice tests built, not run: this runner's CPU ($cpu) lacks$missing"
+            exit 0
+          fi
+          cargo nextest run "${args[@]}" --no-fail-fast
 
   # ------------------------------------------------------------------
   # release-build — verify `node/build.sh` succeeds on every supported
@@ -98,6 +295,9 @@ jobs:
     # no point burning three runners on a release build if the workspace
     # doesn't even compile in debug.
     needs: build
+    # Not required checks, so a merge queue merges without waiting for
+    # them; the push of the merged commit builds the releases.
+    if: github.event_name != 'merge_group'
     strategy:
       fail-fast: false
       matrix:
@@ -127,14 +327,18 @@ jobs:
         with:
           # Don't let the action set RUSTFLAGS
           rustflags: ""
+          # The explicit cache below owns restore/save for this job.
+          cache: false
 
       - uses: Swatinem/rust-cache@v2
         with:
+          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           # Per-target cache key — release target/ dirs don't overlap
           # with the debug target/ used by build+test, and the three
           # release targets don't overlap with each other.
           shared-key: rust-release-${{ matrix.name }}
           cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' }}
 
       - name: build release node binary
         env:

@@ -116,7 +116,7 @@ impl CircuitGenerator {
             Opcode::Mov => self.gen_mov(instr),
             Opcode::Ret | Opcode::Jump | Opcode::If | Opcode::Nop => Ok(()),
             Opcode::Phi => self.gen_mov(instr), // Simplified phi = mov from first operand
-            _ => Ok(()), // Other ops handled at higher level
+            _ => Ok(()),                        // Other ops handled at higher level
         }
     }
 
@@ -140,9 +140,9 @@ impl CircuitGenerator {
             .ok_or("missing wires for operand b")?;
 
         let out_bits = instr.type_info.bits;
-        let mut out_wires = self
-            .wire_alloc
-            .alloc(&mut self.circ_compiler.allocator, out_id, out_bits);
+        let mut out_wires =
+            self.wire_alloc
+                .alloc(&mut self.circ_compiler.allocator, out_id, out_bits);
 
         op(&mut self.circ_compiler, &a_wires, &b_wires, &mut out_wires)?;
 
@@ -154,8 +154,16 @@ impl CircuitGenerator {
         let out_id = instr.out.ok_or("divmod missing output")?;
         let (a_id, b_id) = self.get_two_value_operands(instr)?;
 
-        let a_wires = self.wire_alloc.get(a_id).cloned().ok_or("missing a wires")?;
-        let b_wires = self.wire_alloc.get(b_id).cloned().ok_or("missing b wires")?;
+        let a_wires = self
+            .wire_alloc
+            .get(a_id)
+            .cloned()
+            .ok_or("missing a wires")?;
+        let b_wires = self
+            .wire_alloc
+            .get(b_id)
+            .cloned()
+            .ok_or("missing b wires")?;
 
         let bits = instr.type_info.bits;
         let mut q_wires = self
@@ -189,8 +197,16 @@ impl CircuitGenerator {
         let out_id = instr.out.ok_or("compare missing output")?;
         let (a_id, b_id) = self.get_two_value_operands(instr)?;
 
-        let a_wires = self.wire_alloc.get(a_id).cloned().ok_or("missing a wires")?;
-        let b_wires = self.wire_alloc.get(b_id).cloned().ok_or("missing b wires")?;
+        let a_wires = self
+            .wire_alloc
+            .get(a_id)
+            .cloned()
+            .ok_or("missing a wires")?;
+        let b_wires = self
+            .wire_alloc
+            .get(b_id)
+            .cloned()
+            .ok_or("missing b wires")?;
 
         // Subtract and check sign bit.
         let n = a_wires.len().max(b_wires.len());
@@ -210,8 +226,16 @@ impl CircuitGenerator {
         let out_id = instr.out.ok_or("equality missing output")?;
         let (a_id, b_id) = self.get_two_value_operands(instr)?;
 
-        let a_wires = self.wire_alloc.get(a_id).cloned().ok_or("missing a wires")?;
-        let b_wires = self.wire_alloc.get(b_id).cloned().ok_or("missing b wires")?;
+        let a_wires = self
+            .wire_alloc
+            .get(a_id)
+            .cloned()
+            .ok_or("missing a wires")?;
+        let b_wires = self
+            .wire_alloc
+            .get(b_id)
+            .cloned()
+            .ok_or("missing b wires")?;
 
         // XOR each pair, OR all results, then INV for equality.
         let n = a_wires.len().max(b_wires.len());
@@ -222,13 +246,19 @@ impl CircuitGenerator {
             let aw = if i < a_wires.len() { a_wires[i] } else { zw };
             let bw = if i < b_wires.len() { b_wires[i] } else { zw };
             let x = self.circ_compiler.allocator.wire();
-            self.circ_compiler.gates.push(
-                circuits::Gate::new(crate::circuit::Operation::Xor, aw, bw, x),
-            );
+            self.circ_compiler.gates.push(circuits::Gate::new(
+                crate::circuit::Operation::Xor,
+                aw,
+                bw,
+                x,
+            ));
             let or_out = self.circ_compiler.allocator.wire();
-            self.circ_compiler.gates.push(
-                circuits::Gate::new(crate::circuit::Operation::Or, xor_result, x, or_out),
-            );
+            self.circ_compiler.gates.push(circuits::Gate::new(
+                crate::circuit::Operation::Or,
+                xor_result,
+                x,
+                or_out,
+            ));
             xor_result = or_out;
         }
 
@@ -246,8 +276,16 @@ impl CircuitGenerator {
         let out_id = instr.out.ok_or("bitwise missing output")?;
         let (a_id, b_id) = self.get_two_value_operands(instr)?;
 
-        let a_wires = self.wire_alloc.get(a_id).cloned().ok_or("missing a wires")?;
-        let b_wires = self.wire_alloc.get(b_id).cloned().ok_or("missing b wires")?;
+        let a_wires = self
+            .wire_alloc
+            .get(a_id)
+            .cloned()
+            .ok_or("missing a wires")?;
+        let b_wires = self
+            .wire_alloc
+            .get(b_id)
+            .cloned()
+            .ok_or("missing b wires")?;
 
         let n = a_wires.len().max(b_wires.len());
         let zw = self.circ_compiler.zero_wire();
@@ -270,7 +308,11 @@ impl CircuitGenerator {
         let out_id = instr.out.ok_or("not missing output")?;
         let a_id = self.get_one_value_operand(instr)?;
 
-        let a_wires = self.wire_alloc.get(a_id).cloned().ok_or("missing a wires")?;
+        let a_wires = self
+            .wire_alloc
+            .get(a_id)
+            .cloned()
+            .ok_or("missing a wires")?;
         let mut out_wires = Vec::with_capacity(a_wires.len());
         for &w in &a_wires {
             let o = self.circ_compiler.allocator.wire();
@@ -286,7 +328,11 @@ impl CircuitGenerator {
         let (a_id, _b_id) = self.get_two_value_operands(instr)?;
 
         // For constant shifts, we can just rewire.
-        let a_wires = self.wire_alloc.get(a_id).cloned().ok_or("missing a wires")?;
+        let a_wires = self
+            .wire_alloc
+            .get(a_id)
+            .cloned()
+            .ok_or("missing a wires")?;
 
         // Get shift amount from second operand (must be constant for circuit gen).
         let shift = match &instr.operands.get(1) {

@@ -1,0 +1,376 @@
+syntax = "proto3";
+
+package quilibrium.node.diagnostics.pb;
+
+option go_package = "source.quilibrium.com/quilibrium/monorepo/node/protobufs";
+
+// Opt-in diagnostics a node serves on its authenticated peer listener to the
+// peers its operator allowlists (`diagnostics.healthReport`,
+// `diagnostics.logRequests`). The schema carries no strings: free text from
+// the engine (blockers, errors, archive addresses) is mapped to the enums
+// below or left out, so a message cannot carry paths, addresses or log text;
+// logs travel only as a bundle sealed to the requester.
+
+// A worker's lifecycle phase (`WorkerExecution.state`).
+enum Phase {
+  // The worker reported no observation.
+  PHASE_UNSPECIFIED = 0;
+  PHASE_STARTING = 1;
+  // Waiting for its allocation to activate.
+  PHASE_WAITING = 2;
+  PHASE_SYNCING = 3;
+  PHASE_SERVING = 4;
+  PHASE_CLOSING = 5;
+  PHASE_HANDOFF = 6;
+  PHASE_BLOCKED = 7;
+  PHASE_STOPPED = 8;
+  // An older worker that reports only that its consensus host started.
+  PHASE_RUNNING = 9;
+  // The engine could not read its session state.
+  PHASE_UNKNOWN = 10;
+  // A phase this build does not know.
+  PHASE_UNRECOGNIZED = 11;
+  // The worker's allocation is joining or activating in this node's prover
+  // registry, so its consensus waits for activation (`join_confirm_epoch`,
+  // `activation_frame`). Readers that predate it see an unknown phase.
+  PHASE_JOINING = 12;
+}
+
+// Why a worker's phase holds (`WorkerExecution.blocker`).
+enum Blocker {
+  BLOCKER_NONE = 0;
+  // A reason this build does not know.
+  BLOCKER_UNRECOGNIZED = 1;
+  BLOCKER_WAITING_FOR_TRANSPORT = 2;
+  BLOCKER_RESTARTING_CONSENSUS_HOST = 3;
+  BLOCKER_ENGINE_EXITED = 4;
+  BLOCKER_AWAITING_SUCCESSOR = 5;
+  BLOCKER_STAGING_SHARD_DATA = 6;
+  BLOCKER_AWAITING_CLOSING_CERTIFICATE = 7;
+  BLOCKER_AWAITING_ALLOCATION_ACTIVATION = 8;
+  BLOCKER_CHECKPOINT_MISMATCH = 9;
+  BLOCKER_STATE_UNAVAILABLE = 10;
+  BLOCKER_COMMITTEE_ADMISSION_UNAVAILABLE = 11;
+  BLOCKER_CONSENSUS_STARTUP_UNAVAILABLE = 12;
+  BLOCKER_SESSION_IDENTITY_UNAVAILABLE = 13;
+  BLOCKER_SESSION_STATE_UNAVAILABLE = 14;
+  // The worker's own store stopped writing until it is reopened: after a
+  // failed write (a full disk, an I/O error), or below the node's
+  // free-space floor.
+  BLOCKER_STORAGE_WRITE_FAILED = 15;
+}
+
+// The phase of a worker's archive recovery (`ShardRecovery.phase`).
+enum RecoveryPhase {
+  // No recovery attempt since the engine started.
+  RECOVERY_PHASE_NONE = 0;
+  RECOVERY_PHASE_IDLE = 1;
+  RECOVERY_PHASE_WAITING_FOR_PERMIT = 2;
+  RECOVERY_PHASE_REPLAYING_FRAMES = 3;
+  RECOVERY_PHASE_FETCHING_CHECKPOINT = 4;
+  RECOVERY_PHASE_INSTALLING_LEAVES = 5;
+  RECOVERY_PHASE_INSTALLING_CHECKPOINT = 6;
+  // An attempt started and has not named its phase yet.
+  RECOVERY_PHASE_STARTING = 7;
+  RECOVERY_PHASE_UNRECOGNIZED = 8;
+}
+
+// The class of a failed archive recovery attempt, by whose problem it is.
+enum RecoveryFailure {
+  RECOVERY_FAILURE_NONE = 0;
+  // This node's master knows no reachable archive.
+  RECOVERY_FAILURE_NO_ARCHIVE_KNOWN = 1;
+  RECOVERY_FAILURE_CONNECT = 2;
+  // The archive failed a read.
+  RECOVERY_FAILURE_ARCHIVE_REQUEST = 3;
+  // No archive supplied the shard state the worker needs.
+  RECOVERY_FAILURE_ARCHIVE_STATE = 4;
+  // The archive's frames do not replay onto the worker's local state.
+  RECOVERY_FAILURE_REPLAY_MISMATCH = 5;
+  RECOVERY_FAILURE_OTHER = 6;
+  // This node's own GLOBAL state sync was installing and withheld committed
+  // GLOBAL state: an expected wait, no archive's failure.
+  RECOVERY_FAILURE_GLOBAL_SYNC = 7;
+}
+
+message FailureCount {
+  RecoveryFailure class = 1;
+  uint32 count = 2;
+}
+
+// One data worker, as its master observes it. Times are the reporting
+// node's clock; compare them with `HealthReport.generated_unix_ms`.
+message WorkerHealth {
+  uint32 core_id = 1;
+  // The public shard filter the worker is bound to; empty when unallocated.
+  bytes filter = 2;
+  bool allocated = 3;
+  Phase phase = 4;
+  Blocker blocker = 5;
+  // When the worker last refreshed its observation; 0 without one.
+  uint64 observed_unix_ms = 6;
+  // The worker's highest materialized app frame.
+  optional uint64 materialized_frame = 7;
+  // When that frame last advanced; 0 when it has not since the engine
+  // started.
+  uint64 last_advance_unix_ms = 8;
+  // The shard's committee session and its head in committed GLOBAL state,
+  // in this node's view.
+  optional uint64 committee_head_frame = 9;
+  optional uint64 committed_generation = 10;
+  RecoveryPhase recovery_phase = 11;
+  uint64 recovery_phase_since_unix_ms = 12;
+  // Recovery attempts finished since the engine started, and how many of
+  // the latest failed in a row.
+  uint32 recovery_attempts = 13;
+  uint32 recovery_consecutive_failures = 14;
+  // Failed attempts since the engine started, by class.
+  repeated FailureCount recovery_failures = 15;
+  RecoveryFailure last_failure = 16;
+  uint64 last_failure_unix_ms = 17;
+  uint64 last_success_unix_ms = 18;
+  // The longest wait for a recovery turn since the engine started.
+  uint64 longest_permit_wait_ms = 19;
+  // The session's finalized terminal seal, while the worker hands off.
+  optional uint64 seal_generation = 20;
+  // When this node saw GLOBAL record the seal; 0 until then.
+  uint64 seal_recorded_unix_ms = 21;
+  // While the worker's allocation joins: the epoch its join must be
+  // confirmed in, until it is confirmed.
+  optional uint64 join_confirm_epoch = 22;
+  // While it joins or activates: the GLOBAL frame it joins its committee
+  // at, if confirmed in time.
+  optional uint64 activation_frame = 23;
+  // While it waits on committed GLOBAL state (`PHASE_WAITING`): the GLOBAL
+  // frame by which the awaited event happens.
+  optional uint64 awaited_frame = 24;
+  // Above the node's configured worker count: the worker takes no new seat
+  // or join and stops once it holds none. Readers that predate it ignore it.
+  bool draining = 25;
+}
+
+message HealthReport {
+  uint32 schema = 1;
+  // The release, `version.patch.subpatch`: 3 version bytes.
+  bytes version = 2;
+  uint32 patch = 3;
+  // 0 when the build has no subpatch counter.
+  uint32 subpatch = 4;
+  // The SHA-256 build fingerprint this node also signs into its PeerInfo.
+  bytes build_fingerprint = 5;
+  // The newest GLOBAL frame this node advanced to the head of its time reel.
+  uint64 global_head_frame = 6;
+  uint64 generated_unix_ms = 7;
+  // Allocated workers first, at most 256 and 32 KiB in all.
+  repeated WorkerHealth workers = 8;
+  // Workers left out by those bounds.
+  uint32 omitted_workers = 9;
+  // The master's store refuses writes after a failed write (a full disk,
+  // an I/O error) until it is reopened.
+  bool master_store_write_failed = 10;
+  // The configured worker count; 0 from nodes that predate it.
+  uint32 worker_capacity = 11;
+}
+
+message GetHealthReportRequest {}
+
+service DiagnosticsService {
+  // Served only to this node itself and to allowlisted peers; others get
+  // PERMISSION_DENIED, and an allowlisted peer asking again within the
+  // configured interval RESOURCE_EXHAUSTED.
+  rpc GetHealthReport(GetHealthReportRequest) returns (HealthReport);
+}
+
+// A peer's request for this node's redacted logs (`diagnostics.logRequests`),
+// signed by the requester's network key. The target seals a redacted export
+// of the window to `recipient_kem_public_key`: its node does so itself, as
+// its operator's allowlist consents, or, when it writes no log files, its
+// operator after reviewing a redacted preview.
+message LogRequest {
+  // 1.
+  uint32 schema = 1;
+  // The peer ID of the node asked for its logs.
+  bytes target_peer_id = 2;
+  // The requester's Falcon-512 network public key; its peer ID must be the
+  // one the requester's handshake proved.
+  bytes requester_public_key = 3;
+  uint64 issued_unix_ms = 4;
+  // Random, 16 bytes; a target refuses a nonce it has seen.
+  bytes nonce = 5;
+  // The window, in UTC Unix seconds: at most 24 h.
+  uint64 since_unix = 6;
+  uint64 until_unix = 7;
+  // Full public shard filters whose lines to export (at most 16, each 32 to
+  // 64 bytes); none exports every line of the window.
+  repeated bytes filters = 8;
+  // A fresh sntrup761 public key of this request alone; only the requester
+  // holds its secret key.
+  bytes recipient_kem_public_key = 9;
+}
+
+// `request` is an encoded LogRequest, signed as it is with the domain
+// "quil/diagnostics/log-request/v1".
+message SignedLogRequest {
+  bytes request = 1;
+  bytes signature = 2;
+}
+
+enum LogRequestStatus {
+  LOG_REQUEST_STATUS_UNSPECIFIED = 0;
+  // Being exported by the target's node, or waiting for its operator.
+  LOG_REQUEST_STATUS_PENDING = 1;
+  // Approved: the sealed bundle waits for its fetch.
+  LOG_REQUEST_STATUS_READY = 2;
+  LOG_REQUEST_STATUS_DENIED = 3;
+  // Neither approved nor fetched in time.
+  LOG_REQUEST_STATUS_EXPIRED = 4;
+  // Fetched completely at least once; fetchable until it expires.
+  LOG_REQUEST_STATUS_SERVED = 5;
+  // Not queued: see the refusal.
+  LOG_REQUEST_STATUS_REFUSED = 6;
+}
+
+// Why an allowlisted peer's signed request was not queued.
+enum LogRequestRefusal {
+  LOG_REQUEST_REFUSAL_NONE = 0;
+  LOG_REQUEST_REFUSAL_MALFORMED = 1;
+  // The request names another node.
+  LOG_REQUEST_REFUSAL_WRONG_TARGET = 2;
+  // Issued, or ending, more than 10 minutes from the target's clock.
+  LOG_REQUEST_REFUSAL_STALE = 3;
+  LOG_REQUEST_REFUSAL_REPLAYED = 4;
+  LOG_REQUEST_REFUSAL_WINDOW_TOO_LONG = 5;
+  LOG_REQUEST_REFUSAL_TOO_MANY_FILTERS = 6;
+  // The peer's `requestsPerDay` are used up.
+  LOG_REQUEST_REFUSAL_OVER_BUDGET = 7;
+  // `maxPending` requests wait already.
+  LOG_REQUEST_REFUSAL_QUEUE_FULL = 8;
+  // A filter is not a full shard filter (32 to 64 bytes).
+  LOG_REQUEST_REFUSAL_FILTER_LENGTH = 9;
+  // This requester's requests awaiting a decision or a fetch hold half of
+  // `maxPending` already.
+  LOG_REQUEST_REFUSAL_TOO_MANY_PENDING = 10;
+}
+
+message SubmitLogRequestResponse {
+  // The first 16 bytes of SHA3-256 of the request bytes.
+  bytes request_id = 1;
+  LogRequestStatus status = 2;
+  LogRequestRefusal refusal = 3;
+  uint64 expires_unix_ms = 4;
+  // The target's node approves the request itself rather than waiting for
+  // its operator.
+  bool automatic = 5;
+  // The requester's budget of `requestsPerDay` in the last 24 h, after
+  // this submission: the requests it may still make, and the budget. A
+  // node of an earlier release sets neither.
+  optional uint32 requests_remaining = 6;
+  optional uint32 requests_per_day = 7;
+  // When the oldest request counted in the last 24 h ages out, freeing one
+  // request; unset while none is counted.
+  optional uint64 next_request_unix_ms = 8;
+}
+
+message GetLogRequestStatusRequest {
+  bytes request_id = 1;
+}
+
+// Who denied a request, and why.
+enum LogRequestDenial {
+  // The target's operator, or a node that reports no reason.
+  LOG_REQUEST_DENIAL_OPERATOR = 0;
+  // The target's node: the export exceeds its `maxBundleBytes`.
+  LOG_REQUEST_DENIAL_TOO_LARGE = 1;
+  // The target's node: its export failed; its log names the reason.
+  LOG_REQUEST_DENIAL_EXPORT_FAILED = 2;
+}
+
+message LogRequestStatusResponse {
+  bytes request_id = 1;
+  LogRequestStatus status = 2;
+  // The sealed bundle's size, once approved.
+  uint64 bundle_bytes = 3;
+  uint64 expires_unix_ms = 4;
+  // Once denied.
+  LogRequestDenial denial = 5;
+}
+
+message FetchLogBundleRequest {
+  bytes request_id = 1;
+  // Resume at this byte of the sealed bundle.
+  uint64 offset = 2;
+}
+
+message LogBundleChunk {
+  uint64 total_bytes = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  // SHA-256 of the whole sealed bundle.
+  bytes sha256 = 4;
+}
+
+message ListLogRequestsRequest {}
+
+// A request as the target's operator reviews it.
+message PendingLogRequest {
+  bytes request_id = 1;
+  bytes requester_peer_id = 2;
+  LogRequestStatus status = 3;
+  uint64 received_unix_ms = 4;
+  uint64 expires_unix_ms = 5;
+  uint64 since_unix = 6;
+  uint64 until_unix = 7;
+  repeated bytes filters = 8;
+  bytes recipient_kem_public_key = 9;
+  uint64 bundle_bytes = 10;
+}
+
+message ListLogRequestsResponse {
+  repeated PendingLogRequest requests = 1;
+  // `maxBundleBytes`: the largest sealed bundle this node accepts.
+  uint64 max_bundle_bytes = 2;
+  // This node approves pending requests itself.
+  bool automatic = 3;
+}
+
+message DenyLogRequestRequest {
+  bytes request_id = 1;
+}
+
+message DenyLogRequestResponse {
+  LogRequestStatus status = 1;
+}
+
+// One piece of a sealed bundle; the first names the request, the total size
+// and the SHA-256 of the whole bundle.
+message UploadLogBundleChunk {
+  bytes request_id = 1;
+  uint64 total_bytes = 2;
+  bytes sha256 = 3;
+  bytes data = 4;
+}
+
+message UploadLogBundleResponse {
+  LogRequestStatus status = 1;
+  uint64 expires_unix_ms = 2;
+}
+
+// For allowlisted peers (`diagnostics.logRequests`): every method answers
+// PERMISSION_DENIED to others, and NOT_FOUND for another peer's request.
+service DiagnosticsLogService {
+  rpc SubmitLogRequest(SignedLogRequest) returns (SubmitLogRequestResponse);
+  rpc GetLogRequestStatus(GetLogRequestStatusRequest) returns (LogRequestStatusResponse);
+  rpc FetchLogBundle(FetchLogBundleRequest) returns (stream LogBundleChunk);
+}
+
+// For this node's own identity only, which its operator's qclient holds:
+// whoever holds this node's network key acts as its operator here.
+service DiagnosticsOperatorService {
+  rpc ListLogRequests(ListLogRequestsRequest) returns (ListLogRequestsResponse);
+  // Deny a pending request, or withdraw an approved bundle, deleting it.
+  rpc DenyLogRequest(DenyLogRequestRequest) returns (DenyLogRequestResponse);
+  // Approve a pending request with its bundle, sealed by the operator's
+  // qclient to the request's key, on a node that does not approve requests
+  // itself.
+  rpc UploadLogBundle(stream UploadLogBundleChunk) returns (UploadLogBundleResponse);
+}

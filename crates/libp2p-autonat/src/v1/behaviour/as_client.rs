@@ -18,25 +18,26 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use crate::ResponseError;
-
-use super::{
-    Action, AutoNatCodec, Config, DialRequest, DialResponse, Event, HandleInnerEvent, NatStatus,
-    ProbeId,
-};
-use futures::FutureExt;
-use futures_timer::Delay;
-use libp2p_core::Multiaddr;
-use libp2p_identity::PeerId;
-use libp2p_request_response::{self as request_response, OutboundFailure, OutboundRequestId};
-use libp2p_swarm::{ConnectionId, ListenAddresses, ToSwarm};
-use rand::{seq::SliceRandom, thread_rng};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     task::{Context, Poll},
     time::Duration,
 };
+
+use futures::FutureExt;
+use futures_timer::Delay;
+use libp2p_core::{multiaddr::Protocol, Multiaddr};
+use libp2p_identity::PeerId;
+use libp2p_request_response::{self as request_response, OutboundFailure, OutboundRequestId};
+use libp2p_swarm::{ConnectionId, ListenAddresses, ToSwarm};
+use rand::{seq::SliceRandom, thread_rng};
 use web_time::Instant;
+
+use super::{
+    Action, AutoNatCodec, Config, DialRequest, DialResponse, Event, HandleInnerEvent, NatStatus,
+    ProbeId,
+};
+use crate::{protocol::MAX_MESSAGE_LEN, ResponseError};
 
 /// Outbound probe failed or was aborted.
 #[derive(Debug)]
@@ -95,10 +96,11 @@ pub(crate) struct AsClient<'a> {
     pub(crate) last_probe: &'a mut Option<Instant>,
     pub(crate) schedule_probe: &'a mut Delay,
     pub(crate) listen_addresses: &'a ListenAddresses,
-    pub(crate) other_candidates: &'a HashSet<Multiaddr>,
+    pub(crate) other_candidates: &'a VecDeque<Multiaddr>,
+    pub(crate) last_probe_addresses: &'a mut Vec<Multiaddr>,
 }
 
-impl<'a> HandleInnerEvent for AsClient<'a> {
+impl HandleInnerEvent for AsClient<'_> {
     fn handle_event(
         &mut self,
         event: request_response::Event<DialRequest, DialResponse>,
@@ -111,6 +113,7 @@ impl<'a> HandleInnerEvent for AsClient<'a> {
                         request_id,
                         response,
                     },
+                ..
             } => {
                 tracing::debug!(?response, "Outbound dial-back request returned response");
 
@@ -153,6 +156,7 @@ impl<'a> HandleInnerEvent for AsClient<'a> {
                 peer,
                 error,
                 request_id,
+                ..
             } => {
                 tracing::debug!(
                     %peer,
@@ -179,18 +183,19 @@ impl<'a> HandleInnerEvent for AsClient<'a> {
     }
 }
 
-impl<'a> AsClient<'a> {
+impl AsClient<'_> {
     pub(crate) fn poll_auto_probe(&mut self, cx: &mut Context<'_>) -> Poll<OutboundProbeEvent> {
         match self.schedule_probe.poll_unpin(cx) {
             Poll::Ready(()) => {
                 self.schedule_probe.reset(self.config.retry_interval);
 
-                let addresses = self
-                    .other_candidates
-                    .iter()
-                    .chain(self.listen_addresses.iter())
-                    .cloned()
-                    .collect();
+                // QUILIBRIUM: listen addresses first, one per dial-back
+                // stack, within the server's limits (see `probe_addresses`).
+                let addresses = probe_addresses(
+                    self.local_peer_id,
+                    self.listen_addresses.iter(),
+                    self.other_candidates.iter(),
+                );
 
                 let probe_id = self.probe_id.next();
                 let event = match self.do_probe(probe_id, addresses) {
@@ -274,6 +279,8 @@ impl<'a> AsClient<'a> {
         addresses: Vec<Multiaddr>,
     ) -> Result<PeerId, OutboundProbeError> {
         let _ = self.last_probe.insert(Instant::now());
+        // QUILIBRIUM: kept for `Behaviour::last_probe_addresses`.
+        self.last_probe_addresses.clone_from(&addresses);
         if addresses.is_empty() {
             tracing::debug!("Outbound dial-back request aborted: No dial-back addresses");
             return Err(OutboundProbeError::NoAddresses);
@@ -350,6 +357,66 @@ impl<'a> AsClient<'a> {
     }
 }
 
+/// QUILIBRIUM: the most addresses one dial-back request carries. A server
+/// keeps the first `Config::max_peer_addresses` (16 by default) and dials
+/// them one at a time, so each address delays the ones behind it.
+pub(crate) const MAX_PROBE_ADDRESSES: usize = 8;
+
+/// QUILIBRIUM: the dial-back addresses of a probe.
+///
+/// A server replaces the IP of each address with the one it observes for
+/// us, so an address tells it only the protocols after its IP (transport
+/// and port): one address per such stack is enough. The listen addresses
+/// come first, since a public or port-forwarded node is reachable on its
+/// listen port; then the external candidates, most recent first, for a NAT
+/// that maps another external port. The list holds at most
+/// [`MAX_PROBE_ADDRESSES`], and its request fits the server's frame limit.
+///
+/// Upstream sends every candidate ever observed, in hash order, ahead of
+/// the listen addresses. Peers behind address translation report many
+/// different ports for us, so the server's first dials went to closed
+/// ports until the request timed out, and with enough candidates the
+/// request outgrew the frame limit and no server could read it.
+pub(crate) fn probe_addresses<'a>(
+    local_peer_id: PeerId,
+    listen_addresses: impl Iterator<Item = &'a Multiaddr>,
+    candidates: impl Iterator<Item = &'a Multiaddr>,
+) -> Vec<Multiaddr> {
+    // Listen addresses are a hash set: sort them so each stack keeps the
+    // same representative.
+    let mut listen: Vec<&Multiaddr> = listen_addresses.collect();
+    listen.sort();
+    let mut stacks = HashSet::new();
+    let addresses = listen
+        .into_iter()
+        .chain(candidates)
+        .filter(|addr| dial_back_stack(addr).is_some_and(|stack| stacks.insert(stack)))
+        .take(MAX_PROBE_ADDRESSES)
+        .cloned()
+        .collect();
+    let mut request = DialRequest {
+        peer_id: local_peer_id,
+        addresses,
+    };
+    while !request.addresses.is_empty() && request.encoded_len() > MAX_MESSAGE_LEN {
+        request.addresses.pop();
+    }
+    request.addresses
+}
+
+/// QUILIBRIUM: what a server dials of `addr` besides our IP: the protocols
+/// after its first IP component, without `/p2p`. `None` without an IP
+/// component, since a server drops such an address.
+fn dial_back_stack(addr: &Multiaddr) -> Option<Multiaddr> {
+    let mut protocols = addr.iter();
+    protocols.find(|p| matches!(p, Protocol::Ip4(_) | Protocol::Ip6(_)))?;
+    Some(
+        protocols
+            .filter(|p| !matches!(p, Protocol::P2p(_)))
+            .collect(),
+    )
+}
+
 impl From<Result<Multiaddr, ResponseError>> for NatStatus {
     fn from(result: Result<Multiaddr, ResponseError>) -> Self {
         match result {
@@ -357,5 +424,87 @@ impl From<Result<Multiaddr, ResponseError>> for NatStatus {
             Err(ResponseError::DialError) => NatStatus::Private,
             _ => NatStatus::Unknown,
         }
+    }
+}
+
+// QUILIBRIUM: tests of the probe address list (see PATCHES.md).
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ma(s: &str) -> Multiaddr {
+        s.parse().unwrap()
+    }
+
+    /// A candidate on an ephemeral port, as peers behind address
+    /// translation report us.
+    fn junk(n: u16) -> Multiaddr {
+        ma(&format!("/ip4/203.0.113.7/tcp/{}", 40_000 + n))
+    }
+
+    fn stack(addr: &Multiaddr) -> String {
+        dial_back_stack(addr).unwrap().to_string()
+    }
+
+    fn encoded_len(peer_id: PeerId, addresses: Vec<Multiaddr>) -> usize {
+        DialRequest { peer_id, addresses }.encoded_len()
+    }
+
+    #[test]
+    fn listen_stacks_go_first_one_each_then_recent_candidates() {
+        let listen = [
+            ma("/ip4/127.0.0.1/tcp/9336"),
+            ma("/ip4/10.0.0.2/tcp/9336"),
+            ma("/ip4/10.0.0.2/udp/9336/quic-v1"),
+        ];
+        // Most recent first: an observation on the listen port adds nothing.
+        let mut candidates: Vec<Multiaddr> = (0..100).map(junk).collect();
+        candidates.insert(0, ma("/ip4/198.51.100.4/tcp/9336"));
+        let sent = probe_addresses(PeerId::random(), listen.iter(), candidates.iter());
+        assert_eq!(sent.len(), MAX_PROBE_ADDRESSES);
+        let mut first: Vec<String> = sent[..2].iter().map(stack).collect();
+        first.sort();
+        assert_eq!(first, ["/tcp/9336", "/udp/9336/quic-v1"]);
+        assert_eq!(sent.iter().filter(|a| stack(a) == "/tcp/9336").count(), 1);
+        assert_eq!(&sent[2..], &candidates[1..7]);
+    }
+
+    #[test]
+    fn addresses_without_an_ip_are_skipped() {
+        let listen = [ma("/dns4/node.example.com/tcp/9336")];
+        let candidates = [junk(1).with(Protocol::P2p(PeerId::random()))];
+        let sent = probe_addresses(PeerId::random(), listen.iter(), candidates.iter());
+        assert_eq!(sent, candidates);
+        assert_eq!(stack(&candidates[0]), "/tcp/40001");
+    }
+
+    /// Upstream's list (every candidate, then the listen addresses) outgrows
+    /// the server's frame limit; ours stays within it.
+    #[test]
+    fn the_request_fits_the_frame_limit() {
+        let me = PeerId::random();
+        let listen = [ma("/ip4/10.0.0.2/tcp/9336")];
+        let candidates: Vec<Multiaddr> =
+            (0..100).map(|n| junk(n).with(Protocol::P2p(me))).collect();
+        let upstream = candidates.iter().chain(listen.iter()).cloned().collect();
+        assert!(encoded_len(me, upstream) > MAX_MESSAGE_LEN);
+        let sent = probe_addresses(me, listen.iter(), candidates.iter());
+        assert_eq!(sent.len(), MAX_PROBE_ADDRESSES);
+        assert!(encoded_len(me, sent.clone()) <= MAX_MESSAGE_LEN);
+        assert_eq!(sent[0], listen[0]);
+
+        // Long stacks: the list stops short of the limit, listen port first.
+        let long: Vec<Multiaddr> = (0..8)
+            .map(|n| junk(n).with(Protocol::Ws(format!("/{}", "a".repeat(200)).into())))
+            .collect();
+        let sent = probe_addresses(me, listen.iter(), long.iter());
+        let len = encoded_len(me, sent.clone());
+        assert!(len <= MAX_MESSAGE_LEN, "{len} bytes");
+        assert!(
+            sent.len() > 1 && sent.len() < MAX_PROBE_ADDRESSES,
+            "{}",
+            sent.len()
+        );
+        assert_eq!(sent[0], listen[0]);
     }
 }

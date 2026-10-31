@@ -17,11 +17,12 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
-use super::{
-    Action, AutoNatCodec, Config, DialRequest, DialResponse, Event, HandleInnerEvent, ProbeId,
-    ResponseError,
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    num::NonZeroU8,
 };
-use libp2p_core::{multiaddr::Protocol, Multiaddr};
+
+use libp2p_core::{multiaddr::Protocol, transport::TransportError, Multiaddr};
 use libp2p_identity::PeerId;
 use libp2p_request_response::{
     self as request_response, InboundFailure, InboundRequestId, ResponseChannel,
@@ -30,11 +31,12 @@ use libp2p_swarm::{
     dial_opts::{DialOpts, PeerCondition},
     ConnectionId, DialError, ToSwarm,
 };
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    num::NonZeroU8,
-};
 use web_time::Instant;
+
+use super::{
+    Action, AutoNatCodec, Config, DialRequest, DialResponse, Event, HandleInnerEvent, ProbeId,
+    ResponseError,
+};
 
 /// Inbound probe failed.
 #[derive(Debug)]
@@ -79,19 +81,301 @@ pub(crate) struct AsServer<'a> {
     pub(crate) connected: &'a HashMap<PeerId, HashMap<ConnectionId, Option<Multiaddr>>>,
     pub(crate) probe_id: &'a mut ProbeId,
     pub(crate) throttled_clients: &'a mut Vec<(PeerId, Instant)>,
-    #[allow(clippy::type_complexity)]
-    pub(crate) ongoing_inbound: &'a mut HashMap<
-        PeerId,
-        (
-            ProbeId,
-            InboundRequestId,
-            Vec<Multiaddr>,
-            ResponseChannel<DialResponse>,
-        ),
-    >,
+    // QUILIBRIUM: with the connection id of the dial-back (see
+    // `dial_back_failure`).
+    pub(crate) ongoing_inbound: &'a mut OngoingInbounds,
+    // QUILIBRIUM: outcomes for the operator summary.
+    pub(crate) stats: &'a mut ServerStats,
 }
 
-impl<'a> HandleInnerEvent for AsServer<'a> {
+/// QUILIBRIUM: a dial-back request this server serves and has not answered
+/// yet. `dial` is the connection id of its dial-back.
+pub(crate) struct OngoingInbound<R, C> {
+    pub(crate) probe_id: ProbeId,
+    pub(crate) request_id: R,
+    pub(crate) addrs: Vec<Multiaddr>,
+    pub(crate) dial: ConnectionId,
+    pub(crate) channel: C,
+}
+
+/// QUILIBRIUM: the requests being served, by client.
+pub(crate) type OngoingInbounds =
+    HashMap<PeerId, OngoingInbound<InboundRequestId, ResponseChannel<DialResponse>>>;
+
+/// QUILIBRIUM: what this server did with dial-back requests since the last
+/// [`super::Behaviour::take_server_stats`], for an operator summary.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServerStats {
+    /// Dial-backs that reached the client.
+    pub served: u32,
+    /// Dial-backs that reached none of the client's addresses, or another
+    /// peer (`DialError`).
+    pub failed: u32,
+    /// Requests refused, and dial-backs this server denied or gave up
+    /// (`DialRefused`, `BadRequest`), by reason.
+    pub refused: BTreeMap<&'static str, u32>,
+    /// Requests whose exchange failed while their dial-back was pending.
+    pub request_failures: u32,
+    /// The clients behind `served`.
+    pub served_clients: BTreeSet<PeerId>,
+    /// The clients behind `failed`, with their failures.
+    pub failed_clients: BTreeMap<PeerId, u32>,
+    /// `failed` by the first address the dial-back tried (transport and
+    /// port class, see `address_class`).
+    pub failed_by_address: BTreeMap<&'static str, u32>,
+    /// `failed` by why the dial-back failed (see `dial_error_class`).
+    pub failed_by_error: BTreeMap<&'static str, u32>,
+}
+
+impl ServerStats {
+    /// Whether nothing happened.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The refusals by reason, most frequent first (`denied=3
+    /// throttled=1`), or `none`.
+    pub fn refused_by_reason(&self) -> String {
+        by_count(self.refused.iter().map(|(r, n)| (r.to_string(), *n)))
+    }
+
+    /// The failures by the first address tried (`tcp:default=3
+    /// quic:ephemeral=1`), or `none`.
+    pub fn failed_by_address(&self) -> String {
+        by_count(
+            self.failed_by_address
+                .iter()
+                .map(|(c, n)| (c.to_string(), *n)),
+        )
+    }
+
+    /// The failures by why the dial-back failed (`timeout=3 refused=1`), or
+    /// `none`.
+    pub fn failed_by_error(&self) -> String {
+        by_count(
+            self.failed_by_error
+                .iter()
+                .map(|(c, n)| (c.to_string(), *n)),
+        )
+    }
+
+    /// The `limit` clients with the most failures, by the last six
+    /// characters of their peer ID (`…a1b2c3=4`), or `none`.
+    pub fn top_failed_clients(&self, limit: usize) -> String {
+        let tail = |peer: &PeerId| {
+            let id = peer.to_base58();
+            format!("…{}", &id[id.len().saturating_sub(6)..])
+        };
+        let mut counts: Vec<(String, u32)> = self
+            .failed_clients
+            .iter()
+            .map(|(p, n)| (tail(p), *n))
+            .collect();
+        counts.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        counts.truncate(limit);
+        by_count(counts.into_iter())
+    }
+
+    fn refuse(&mut self, reason: &'static str) {
+        *self.refused.entry(reason).or_default() += 1;
+    }
+
+    fn serve(&mut self, client: PeerId) {
+        self.served += 1;
+        self.served_clients.insert(client);
+    }
+
+    fn fail(&mut self, client: PeerId, addrs: &[Multiaddr], error: &DialError) {
+        self.failed += 1;
+        *self.failed_clients.entry(client).or_default() += 1;
+        let address = addrs.first().map_or("none", address_class);
+        *self.failed_by_address.entry(address).or_default() += 1;
+        *self
+            .failed_by_error
+            .entry(dial_error_class(error))
+            .or_default() += 1;
+    }
+}
+
+/// QUILIBRIUM: `name=count` pairs, most frequent first, or `none`.
+fn by_count(counts: impl Iterator<Item = (String, u32)>) -> String {
+    let mut counts: Vec<(String, u32)> = counts.collect();
+    if counts.is_empty() {
+        return "none".to_string();
+    }
+    counts.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    counts
+        .iter()
+        .map(|(r, n)| format!("{r}={n}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// QUILIBRIUM: the transport and port class of a dial-back address, for the
+/// operator summary: `default` is the node's default port 8336, `worker`
+/// the remote worker range 25000–25999, `ephemeral` a port from 32768 up
+/// (an outbound connection's source port, which nothing listens on), and
+/// `other` any other port, such as a configured listen port.
+pub(crate) fn address_class(addr: &Multiaddr) -> &'static str {
+    let (mut tcp, mut udp, mut quic) = (None, None, false);
+    for protocol in addr.iter() {
+        match protocol {
+            Protocol::Tcp(port) => tcp = Some(port),
+            Protocol::Udp(port) => udp = Some(port),
+            Protocol::QuicV1 | Protocol::Quic => quic = true,
+            _ => {}
+        }
+    }
+    let (quic, port) = match (tcp, udp) {
+        (Some(port), _) => (false, port),
+        (None, Some(port)) if quic => (true, port),
+        _ => return "other",
+    };
+    match (quic, port) {
+        (false, 8336) => "tcp:default",
+        (false, 25000..=25999) => "tcp:worker",
+        (false, 32768..) => "tcp:ephemeral",
+        (false, _) => "tcp:other",
+        (true, 8336) => "quic:default",
+        (true, 25000..=25999) => "quic:worker",
+        (true, 32768..) => "quic:ephemeral",
+        (true, _) => "quic:other",
+    }
+}
+
+/// QUILIBRIUM: why a dial-back reached none of the client's addresses, from
+/// the last address it tried: `refused` (nothing listens there, or a
+/// firewall rejects), `timeout` (no answer: a firewall drops, or NAT),
+/// `reset` (the connection broke during the handshake), `no_route`,
+/// `wrong_peer` (another node answered), or `other` (e.g. a failed
+/// handshake upgrade).
+pub(crate) fn dial_error_class(error: &DialError) -> &'static str {
+    use std::io::ErrorKind;
+    let DialError::Transport(errors) = error else {
+        return match error {
+            DialError::WrongPeerId { .. } => "wrong_peer",
+            _ => "other",
+        };
+    };
+    let last = errors.iter().rev().find_map(|(_, error)| match error {
+        TransportError::Other(error) => Some(error.kind()),
+        TransportError::MultiaddrNotSupported(_) => None,
+    });
+    match last {
+        Some(ErrorKind::ConnectionRefused) => "refused",
+        Some(ErrorKind::TimedOut) => "timeout",
+        Some(
+            ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::BrokenPipe,
+        ) => "reset",
+        Some(ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable) => "no_route",
+        _ => "other",
+    }
+}
+
+/// QUILIBRIUM: dial `peer` back on `addrs`, one address at a time, and
+/// record the request under the dial's connection id.
+pub(crate) fn start_dial_back<R, C>(
+    ongoing: &mut HashMap<PeerId, OngoingInbound<R, C>>,
+    peer: PeerId,
+    probe_id: ProbeId,
+    request_id: R,
+    addrs: Vec<Multiaddr>,
+    channel: C,
+) -> DialOpts {
+    let opts = DialOpts::peer_id(peer)
+        .condition(PeerCondition::Always)
+        .override_dial_concurrency_factor(NonZeroU8::new(1).expect("1 > 0"))
+        .addresses(addrs.clone())
+        .allocate_new_port()
+        .build();
+    let dial = opts.connection_id();
+    ongoing.insert(
+        peer,
+        OngoingInbound {
+            probe_id,
+            request_id,
+            addrs,
+            dial,
+            channel,
+        },
+    );
+    opts
+}
+
+/// QUILIBRIUM: take `peer`'s request when `error`, reported for the dial
+/// `failed`, ends its dial-back, with the answer owed and its reason; leave
+/// it in place when `failed` is another dial.
+pub(crate) fn take_failed_dial_back<R, C>(
+    ongoing: &mut HashMap<PeerId, OngoingInbound<R, C>>,
+    peer: PeerId,
+    failed: ConnectionId,
+    error: &DialError,
+) -> Option<(OngoingInbound<R, C>, ResponseError, &'static str)> {
+    let (answer, reason) = dial_back_failure(ongoing.get(&peer)?.dial, failed, error)?;
+    let request = ongoing.remove(&peer)?;
+    Some((request, answer, reason))
+}
+
+/// QUILIBRIUM: the answer owed to a client whose dial-back `dial` is pending
+/// when the swarm reports `error` for the dial `failed` to the same peer,
+/// with the reason for the operator summary.
+///
+/// Upstream answered `DialError` to any failed dial to the client, and the
+/// client counts `DialError` as evidence that it is unreachable. But another
+/// behaviour's dial to the client can fail meanwhile, and the dial-back
+/// itself can be refused by this node before or after it reaches the client:
+/// the connection limits deny a third connection to a peer, a peer condition
+/// or a pending-dial limit stops it, or this node has no transport for the
+/// client's addresses. Reachable clients then saw most probes fail and
+/// AutoNAT held them private. So a failure of another dial is none of the
+/// probe's business (`None`), a dial this node refused, abandoned or could
+/// not attempt answers `DialRefused`, which leaves the client's status
+/// unchanged, and only a dial that reached none of the addresses, or reached
+/// another peer, answers `DialError`.
+pub(crate) fn dial_back_failure(
+    dial: ConnectionId,
+    failed: ConnectionId,
+    error: &DialError,
+) -> Option<(ResponseError, &'static str)> {
+    if dial != failed {
+        return None;
+    }
+    Some(match error {
+        DialError::Transport(errors)
+            if errors
+                .iter()
+                .all(|(_, e)| matches!(e, TransportError::MultiaddrNotSupported(_))) =>
+        {
+            (ResponseError::DialRefused, "unsupported_transport")
+        }
+        DialError::Transport(_) => (ResponseError::DialError, "unreachable"),
+        DialError::WrongPeerId { .. } => (ResponseError::DialError, "wrong_peer"),
+        DialError::Denied { .. } => (ResponseError::DialRefused, "denied"),
+        DialError::DialPeerConditionFalse(_) => (ResponseError::DialRefused, "peer_condition"),
+        DialError::Aborted => (ResponseError::DialRefused, "aborted"),
+        DialError::LocalPeerId { .. } => (ResponseError::DialRefused, "local_peer"),
+        DialError::NoAddresses => (ResponseError::DialRefused, "no_addresses"),
+    })
+}
+
+/// QUILIBRIUM: the reason of a request refused before any dial, from its
+/// status text (see `resolve_inbound_request`).
+fn refusal_reason(status_text: &str) -> &'static str {
+    match status_text {
+        "peer id mismatch" => "bad_request",
+        "dial-back already ongoing" => "already_ongoing",
+        "too many total dials" | "too many dials for peer" => "throttled",
+        "sender disconnected before request resolved" => "not_connected",
+        "refusing to dial peer with blocked observed address" => "no_observed_address",
+        "no dialable addresses" => "no_dialable_address",
+        _ => "other",
+    }
+}
+
+impl HandleInnerEvent for AsServer<'_> {
     fn handle_event(
         &mut self,
         event: request_response::Event<DialRequest, DialResponse>,
@@ -105,8 +389,25 @@ impl<'a> HandleInnerEvent for AsServer<'a> {
                         request,
                         channel,
                     },
+                ..
             } => {
                 let probe_id = self.probe_id.next();
+                if !self.connected.contains_key(&peer) {
+                    tracing::debug!(
+                        %peer,
+                        "Reject inbound dial request from peer since it is not connected"
+                    );
+                    self.stats.refuse("not_connected");
+
+                    return VecDeque::from([ToSwarm::GenerateEvent(Event::InboundProbe(
+                        InboundProbeEvent::Error {
+                            probe_id,
+                            peer,
+                            error: InboundProbeError::Response(ResponseError::DialRefused),
+                        },
+                    ))]);
+                }
+
                 match self.resolve_inbound_request(peer, request) {
                     Ok(addrs) => {
                         tracing::debug!(
@@ -115,8 +416,16 @@ impl<'a> HandleInnerEvent for AsServer<'a> {
                             addrs
                         );
 
-                        self.ongoing_inbound
-                            .insert(peer, (probe_id, request_id, addrs.clone(), channel));
+                        // QUILIBRIUM: remember the dial-back's connection id
+                        // (see `dial_back_failure`).
+                        let opts = start_dial_back(
+                            &mut *self.ongoing_inbound,
+                            peer,
+                            probe_id,
+                            request_id,
+                            addrs.clone(),
+                            channel,
+                        );
                         self.throttled_clients.push((peer, Instant::now()));
 
                         VecDeque::from([
@@ -124,19 +433,10 @@ impl<'a> HandleInnerEvent for AsServer<'a> {
                                 InboundProbeEvent::Request {
                                     probe_id,
                                     peer,
-                                    addresses: addrs.clone(),
+                                    addresses: addrs,
                                 },
                             )),
-                            ToSwarm::Dial {
-                                opts: DialOpts::peer_id(peer)
-                                    .condition(PeerCondition::Always)
-                                    .override_dial_concurrency_factor(
-                                        NonZeroU8::new(1).expect("1 > 0"),
-                                    )
-                                    .addresses(addrs)
-                                    .allocate_new_port()
-                                    .build(),
-                            },
+                            ToSwarm::Dial { opts },
                         ])
                     }
                     Err((status_text, error)) => {
@@ -145,6 +445,7 @@ impl<'a> HandleInnerEvent for AsServer<'a> {
                             status=%status_text,
                             "Reject inbound dial request from peer"
                         );
+                        self.stats.refuse(refusal_reason(&status_text));
 
                         let response = DialResponse {
                             result: Err(error.clone()),
@@ -166,6 +467,7 @@ impl<'a> HandleInnerEvent for AsServer<'a> {
                 peer,
                 error,
                 request_id,
+                ..
             } => {
                 tracing::debug!(
                     %peer,
@@ -174,8 +476,9 @@ impl<'a> HandleInnerEvent for AsServer<'a> {
                 );
 
                 let probe_id = match self.ongoing_inbound.get(&peer) {
-                    Some((_, rq_id, _, _)) if *rq_id == request_id => {
-                        self.ongoing_inbound.remove(&peer).unwrap().0
+                    Some(ongoing) if ongoing.request_id == request_id => {
+                        self.stats.request_failures += 1;
+                        self.ongoing_inbound.remove(&peer).unwrap().probe_id
                     }
                     _ => self.probe_id.next(),
                 };
@@ -193,13 +496,13 @@ impl<'a> HandleInnerEvent for AsServer<'a> {
     }
 }
 
-impl<'a> AsServer<'a> {
+impl AsServer<'_> {
     pub(crate) fn on_outbound_connection(
         &mut self,
         peer: &PeerId,
         address: &Multiaddr,
     ) -> Option<InboundProbeEvent> {
-        let (_, _, addrs, _) = self.ongoing_inbound.get(peer)?;
+        let addrs = &self.ongoing_inbound.get(peer)?.addrs;
 
         // Check if the dialed address was among the requested addresses.
         if !addrs.contains(address) {
@@ -212,7 +515,10 @@ impl<'a> AsServer<'a> {
             "Dial-back to peer succeeded"
         );
 
-        let (probe_id, _, _, channel) = self.ongoing_inbound.remove(peer).unwrap();
+        let OngoingInbound {
+            probe_id, channel, ..
+        } = self.ongoing_inbound.remove(peer).unwrap();
+        self.stats.serve(*peer);
         let response = DialResponse {
             result: Ok(address.clone()),
             status_text: None,
@@ -229,32 +535,47 @@ impl<'a> AsServer<'a> {
     pub(crate) fn on_outbound_dial_error(
         &mut self,
         peer: Option<PeerId>,
+        connection_id: ConnectionId,
         error: &DialError,
     ) -> Option<InboundProbeEvent> {
-        let (probe_id, _, _, channel) = peer.and_then(|p| self.ongoing_inbound.remove(&p))?;
+        let peer = peer?;
+        // QUILIBRIUM: only the dial-back's own failure answers the probe,
+        // and only a dial that failed to reach the client is a `DialError`
+        // (see `dial_back_failure`).
+        let (
+            OngoingInbound {
+                probe_id,
+                channel,
+                addrs,
+                ..
+            },
+            response_error,
+            reason,
+        ) = take_failed_dial_back(&mut *self.ongoing_inbound, peer, connection_id, error)?;
+        match response_error {
+            ResponseError::DialError => self.stats.fail(peer, &addrs, error),
+            _ => self.stats.refuse(reason),
+        }
 
-        match peer {
-            Some(p) => tracing::debug!(
-                peer=%p,
-                "Dial-back to peer failed with error {:?}",
-                error
-            ),
-            None => tracing::debug!(
-                "Dial-back to non existent peer failed with error {:?}",
-                error
-            ),
+        tracing::debug!(
+            %peer,
+            "Dial-back to peer failed with error {:?}",
+            error
+        );
+
+        let status_text = match response_error {
+            ResponseError::DialError => "dial failed",
+            _ => "dial-back refused by this server",
         };
-
-        let response_error = ResponseError::DialError;
         let response = DialResponse {
             result: Err(response_error.clone()),
-            status_text: Some("dial failed".to_string()),
+            status_text: Some(status_text.to_string()),
         };
         let _ = self.inner.send_response(channel, response);
 
         Some(InboundProbeEvent::Error {
             probe_id,
-            peer: peer.expect("PeerId is present."),
+            peer,
             error: InboundProbeError::Response(response_error),
         })
     }
@@ -299,25 +620,16 @@ impl<'a> AsServer<'a> {
 
         // Obtain an observed address from non-relayed connections.
         //
-        // Upstream uses `.expect("Peer is connected.")` here, which
-        // panics under a real race: an inbound dial-back request can
-        // be dispatched on a now-closed connection — `ConnectionClosed`
-        // has already removed the sender from `self.connected`, but
-        // the protocol message was already in flight. The upstream
-        // invariant ("if we're handling their request, they must be
-        // in our connected map") doesn't hold; `handle_event` lands
-        // `FromSwarm::ConnectionClosed` and inbound protocol traffic
-        // on the same task with no atomic ordering. When the panic
-        // fires it kills the whole swarm task, after which every
-        // subsequent `cmd_tx.send().await` returns "p2p command
-        // channel closed (swarm shutting down?)" forever — the
-        // node-internal symptom is the master losing coverage,
-        // shard-timeout, and shard-frame publishes until restart.
-        //
-        // Quilibrium-local patch (only delta from upstream
-        // libp2p-autonat 0.13.0): demote the missing-from-connected
-        // case to a transient refusal so the swarm keeps running. The
-        // client retries with a different server.
+        // QUILIBRIUM (see PATCHES.md): upstream libp2p-autonat 0.15.0 uses
+        // `.expect("Peer is connected.")` here, which panics under a real
+        // race — an inbound dial-back request can be
+        // dispatched on a now-closed connection (`ConnectionClosed` already
+        // removed the sender from `self.connected`, but the protocol message
+        // was already in flight). The panic kills the whole swarm task, after
+        // which every `cmd_tx.send().await` returns "p2p command channel
+        // closed" forever (master loses coverage until restart). Demote the
+        // missing-from-connected case to a transient refusal so the swarm
+        // keeps running; the client retries with a different server.
         let observed_addr = self
             .connected
             .get(&sender)
@@ -387,9 +699,266 @@ impl<'a> AsServer<'a> {
 
 #[cfg(test)]
 mod test {
+    use std::net::Ipv4Addr;
+
+    use libp2p_swarm::ConnectionDenied;
+
     use super::*;
 
-    use std::net::Ipv4Addr;
+    /// QUILIBRIUM: a failure of another dial to the client is ignored, a
+    /// dial-back this server refused, abandoned or could not attempt is
+    /// `DialRefused`, and only one that reached none of the addresses, or
+    /// another peer, is `DialError`.
+    #[test]
+    fn only_the_dial_backs_own_failure_to_reach_the_client_is_a_dial_error() {
+        let dial = ConnectionId::new_unchecked(7);
+        let other = ConnectionId::new_unchecked(8);
+        let addr: Multiaddr = "/ip4/203.0.113.7/tcp/8336".parse().unwrap();
+        let refused = || {
+            TransportError::Other(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "refused",
+            ))
+        };
+        let denied = || DialError::Denied {
+            cause: ConnectionDenied::new(std::io::Error::other("connection limit")),
+        };
+        let unreached = || DialError::Transport(vec![(addr.clone(), refused())]);
+        let unsupported = || TransportError::MultiaddrNotSupported(addr.clone());
+
+        // Another dial to the client failed: the probe's dial-back goes on.
+        assert_eq!(dial_back_failure(dial, other, &unreached()), None);
+        assert_eq!(dial_back_failure(dial, other, &denied()), None);
+        assert_eq!(
+            dial_back_failure(
+                dial,
+                other,
+                &DialError::DialPeerConditionFalse(PeerCondition::Disconnected)
+            ),
+            None
+        );
+
+        // This server refused, gave up or could not attempt its dial-back.
+        for (error, reason) in [
+            (denied(), "denied"),
+            (
+                DialError::DialPeerConditionFalse(PeerCondition::Always),
+                "peer_condition",
+            ),
+            (DialError::Aborted, "aborted"),
+            (DialError::NoAddresses, "no_addresses"),
+            (
+                DialError::LocalPeerId {
+                    address: addr.clone(),
+                },
+                "local_peer",
+            ),
+            (
+                DialError::Transport(vec![
+                    (addr.clone(), unsupported()),
+                    (addr.clone(), unsupported()),
+                ]),
+                "unsupported_transport",
+            ),
+        ] {
+            assert_eq!(
+                dial_back_failure(dial, dial, &error),
+                Some((ResponseError::DialRefused, reason)),
+                "{error:?}"
+            );
+        }
+
+        // The dial-back reached none of the addresses, or another peer; one
+        // supported address that failed is enough.
+        assert_eq!(
+            dial_back_failure(dial, dial, &unreached()),
+            Some((ResponseError::DialError, "unreachable"))
+        );
+        let mixed = DialError::Transport(vec![
+            (addr.clone(), unsupported()),
+            (addr.clone(), refused()),
+        ]);
+        assert_eq!(
+            dial_back_failure(dial, dial, &mixed),
+            Some((ResponseError::DialError, "unreachable"))
+        );
+        let wrong_peer = DialError::WrongPeerId {
+            obtained: PeerId::random(),
+            address: addr.clone(),
+        };
+        assert_eq!(
+            dial_back_failure(dial, dial, &wrong_peer),
+            Some((ResponseError::DialError, "wrong_peer"))
+        );
+    }
+
+    /// QUILIBRIUM: the request is recorded under the connection id of the
+    /// dial it starts; another dial's failure leaves it in place, and the
+    /// dial-back's own failure takes it with the answer owed.
+    #[test]
+    fn a_dial_back_is_answered_by_its_own_dial_only() {
+        let mut ongoing: HashMap<PeerId, OngoingInbound<(), &str>> = HashMap::new();
+        let peer = PeerId::random();
+        let addr: Multiaddr = "/ip4/203.0.113.7/tcp/8336".parse().unwrap();
+        let opts = start_dial_back(
+            &mut ongoing,
+            peer,
+            ProbeId(3),
+            (),
+            vec![addr.clone()],
+            "channel",
+        );
+        let dial = opts.connection_id();
+        assert_eq!(ongoing[&peer].dial, dial);
+        assert_eq!(ongoing[&peer].addrs, vec![addr.clone()]);
+
+        let other = ConnectionId::new_unchecked(usize::MAX);
+        assert_ne!(other, dial);
+        let unreached = DialError::Transport(vec![(
+            addr.clone(),
+            TransportError::Other(std::io::Error::other("refused")),
+        )]);
+        assert!(take_failed_dial_back(&mut ongoing, peer, other, &unreached).is_none());
+        assert!(take_failed_dial_back(&mut ongoing, PeerId::random(), dial, &unreached).is_none());
+        assert_eq!(ongoing[&peer].dial, dial);
+
+        let denied = DialError::Denied {
+            cause: ConnectionDenied::new(std::io::Error::other("limit")),
+        };
+        let (request, answer, reason) =
+            take_failed_dial_back(&mut ongoing, peer, dial, &denied).unwrap();
+        assert_eq!((request.probe_id, request.channel), (ProbeId(3), "channel"));
+        assert_eq!((answer, reason), (ResponseError::DialRefused, "denied"));
+        assert!(ongoing.is_empty());
+    }
+
+    /// QUILIBRIUM: the operator summary lists refusals by reason, most
+    /// frequent first.
+    #[test]
+    fn server_stats_list_refusals_by_reason() {
+        let mut stats = ServerStats::default();
+        assert!(stats.is_empty());
+        assert_eq!(stats.refused_by_reason(), "none");
+        stats.refuse("throttled");
+        stats.refuse("denied");
+        stats.refuse("denied");
+        stats.served += 1;
+        assert!(!stats.is_empty());
+        assert_eq!(stats.refused_by_reason(), "denied=2 throttled=1");
+        assert_eq!(refusal_reason("too many dials for peer"), "throttled");
+        assert_eq!(
+            refusal_reason("no dialable addresses"),
+            "no_dialable_address"
+        );
+    }
+
+    /// QUILIBRIUM: a failed dial-back is counted by client, by the class of
+    /// the first address tried and by why it failed; the summary names the
+    /// clients that failed most, by peer ID tail.
+    #[test]
+    fn server_stats_describe_failed_dial_backs() {
+        let io = |kind| TransportError::Other(std::io::Error::new(kind, "dial"));
+        let unreached =
+            |addr: &Multiaddr, kind| DialError::Transport(vec![(addr.clone(), io(kind))]);
+        let default: Multiaddr = "/ip4/203.0.113.7/tcp/8336".parse().unwrap();
+        let ephemeral: Multiaddr = "/ip4/203.0.113.8/tcp/51234".parse().unwrap();
+        let quic: Multiaddr = "/ip4/203.0.113.9/udp/8336/quic-v1".parse().unwrap();
+        let (a, b, c) = (PeerId::random(), PeerId::random(), PeerId::random());
+
+        let mut stats = ServerStats::default();
+        assert_eq!(stats.failed_by_address(), "none");
+        assert_eq!(stats.failed_by_error(), "none");
+        assert_eq!(stats.top_failed_clients(3), "none");
+        stats.fail(
+            a,
+            &[ephemeral.clone(), default.clone()],
+            &unreached(&default, std::io::ErrorKind::TimedOut),
+        );
+        stats.fail(
+            a,
+            &[ephemeral.clone()],
+            &unreached(&ephemeral, std::io::ErrorKind::TimedOut),
+        );
+        stats.fail(
+            b,
+            &[quic.clone()],
+            &unreached(&quic, std::io::ErrorKind::ConnectionRefused),
+        );
+        stats.serve(c);
+        stats.serve(c);
+
+        assert_eq!((stats.failed, stats.served), (3, 2));
+        assert_eq!(
+            (stats.failed_clients.len(), stats.served_clients.len()),
+            (2, 1)
+        );
+        assert_eq!(stats.failed_by_address(), "tcp:ephemeral=2 quic:default=1");
+        assert_eq!(stats.failed_by_error(), "timeout=2 refused=1");
+        let a_id = a.to_base58();
+        assert_eq!(
+            stats.top_failed_clients(1),
+            format!("…{}=2", &a_id[a_id.len() - 6..])
+        );
+        assert_eq!(stats.top_failed_clients(3).split(' ').count(), 2);
+    }
+
+    /// QUILIBRIUM: addresses are classed by transport and port, dial errors
+    /// by the last supported address tried.
+    #[test]
+    fn dial_backs_are_classed_by_address_and_error() {
+        for (addr, class) in [
+            ("/ip4/203.0.113.7/tcp/8336", "tcp:default"),
+            ("/ip4/203.0.113.7/tcp/25003", "tcp:worker"),
+            ("/ip4/203.0.113.7/tcp/40000", "tcp:ephemeral"),
+            (
+                "/ip4/203.0.113.7/tcp/9336/p2p/QmP9NNzAzRjCL8gdQBkKHwyBCWJGVb3jPrQzTveYdU24kH",
+                "tcp:other",
+            ),
+            ("/ip4/203.0.113.7/udp/8336/quic-v1", "quic:default"),
+            ("/ip4/203.0.113.7/udp/61000/quic-v1", "quic:ephemeral"),
+            ("/ip4/203.0.113.7/udp/8336", "other"),
+        ] {
+            assert_eq!(address_class(&addr.parse().unwrap()), class, "{addr}");
+        }
+        let addr: Multiaddr = "/ip4/203.0.113.7/tcp/8336".parse().unwrap();
+        let io = |kind| {
+            (
+                addr.clone(),
+                TransportError::Other(std::io::Error::new(kind, "dial")),
+            )
+        };
+        let unsupported = || {
+            (
+                addr.clone(),
+                TransportError::MultiaddrNotSupported(addr.clone()),
+            )
+        };
+        use std::io::ErrorKind::*;
+        for (errors, class) in [
+            (vec![io(ConnectionRefused)], "refused"),
+            (
+                vec![io(ConnectionRefused), io(TimedOut), unsupported()],
+                "timeout",
+            ),
+            (vec![io(ConnectionReset)], "reset"),
+            (vec![io(UnexpectedEof)], "reset"),
+            (vec![io(HostUnreachable)], "no_route"),
+            (vec![io(Other)], "other"),
+            (vec![unsupported()], "other"),
+        ] {
+            let shown = format!("{errors:?}");
+            assert_eq!(
+                dial_error_class(&DialError::Transport(errors)),
+                class,
+                "{shown}"
+            );
+        }
+        let wrong_peer = DialError::WrongPeerId {
+            obtained: PeerId::random(),
+            address: addr.clone(),
+        };
+        assert_eq!(dial_error_class(&wrong_peer), "wrong_peer");
+    }
 
     fn random_ip<'a>() -> Protocol<'a> {
         Protocol::Ip4(Ipv4Addr::new(

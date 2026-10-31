@@ -35,3 +35,11 @@ criterion = ">=0.2"
 name = "classgroup-bench"
 harness = false
 path = "bench/bench.rs"
+
+# Cosmetic warnings in the maintained poanetwork/vdf fork. Keep
+# initialization, FFI signature and shared-mutation diagnostics enabled.
+[lints.rust]
+bare_trait_objects = "allow"
+dead_code = "allow"
+noop_method_call = "allow"
+unexpected_cfgs = "allow"

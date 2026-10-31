@@ -7,10 +7,10 @@
 //! Two entry points:
 //!
 //! - `hash_bytes_to_32(msg)` → 32-byte big-endian hash. Mirrors
-//!   `poseidon.HashBytes(msg).FillBytes(make([]byte, 32))` from
-//!   `node/execution/intrinsics/global/...` usages.
+//! `poseidon.HashBytes(msg).FillBytes(make([]byte, 32))` from
+//! `node/execution/intrinsics/global/...` usages.
 //! - `hash_elements(inputs)` → one 32-byte hash from at most 16
-//!   field elements. Direct wrapper around `Poseidon::hash`.
+//! field elements. Direct wrapper around `Poseidon::hash`.
 //!
 //! The sponge parameters match iden3 exactly:
 //! - `SPONGE_CHUNK_SIZE = 31` — bytes per field element
@@ -25,6 +25,23 @@ use quil_types::error::{QuilError, Result};
 const SPONGE_CHUNK_SIZE: usize = 31;
 const FRAME_SIZE: usize = 16;
 
+/// A single process-wide Poseidon instance.
+///
+/// `Poseidon::new()` parses the entire round-constant + MDS table from decimal
+/// STRING literals (`Fr::from_str`) and allocates it — tens of microseconds and
+/// a burst of allocations EVERY call. Constructing it per hash (as the callers
+/// used to) made Poseidon-heavy loops — e.g. `coin_content_address` over 195M
+/// migration coins — spend the bulk of their time re-parsing constants, and the
+/// allocation storm serialized every worker on the global allocator (so a
+/// parallel run was *slower* per core than a serial one). The table is immutable
+/// and `Poseidon::hash` takes `&self`, so one shared read-only instance is
+/// correct and contention-free. Identical constants ⇒ identical output ⇒
+/// consensus-neutral.
+fn shared_poseidon() -> &'static Poseidon {
+    static POSEIDON: std::sync::OnceLock<Poseidon> = std::sync::OnceLock::new();
+    POSEIDON.get_or_init(Poseidon::new)
+}
+
 /// Hash an arbitrary byte slice using iden3's Poseidon sponge and return
 /// the result as 32 big-endian bytes. Matches Go's
 /// `poseidon.HashBytes(msg).FillBytes(make([]byte, 32))`.
@@ -34,7 +51,7 @@ pub fn hash_bytes_to_32(msg: &[u8]) -> Result<[u8; 32]> {
     let mut hash: Option<Fr> = None;
     let mut k = 0usize;
 
-    let poseidon = Poseidon::new();
+    let poseidon = shared_poseidon();
 
     // Process complete 31-byte chunks first.
     let num_chunks = msg.len() / SPONGE_CHUNK_SIZE;
@@ -98,7 +115,7 @@ pub fn hash_elements(inputs: &[[u8; 32]]) -> Result<[u8; 32]> {
     for bytes in inputs {
         frs.push(fr_from_be_bytes(bytes)?);
     }
-    let poseidon = Poseidon::new();
+    let poseidon = shared_poseidon();
     let h = poseidon
         .hash(frs)
         .map_err(|e| QuilError::Crypto(format!("poseidon hash: {}", e)))?;
@@ -155,9 +172,9 @@ mod tests {
         msg.extend_from_slice(b"prover:Prover");
         let h = hash_bytes_to_32(&msg).expect("hash");
         let expected: [u8; 32] = [
-            0x27, 0x99, 0x01, 0x8a, 0x52, 0xe2, 0xa0, 0x68, 0x99, 0x8e, 0xd0, 0xcd, 0xad,
-            0x60, 0xe8, 0x60, 0x12, 0xf3, 0x2b, 0x8d, 0xf0, 0xd3, 0x05, 0x99, 0x9f, 0x53,
-            0x67, 0xe1, 0x09, 0x8b, 0xda, 0xec,
+            0x27, 0x99, 0x01, 0x8a, 0x52, 0xe2, 0xa0, 0x68, 0x99, 0x8e, 0xd0, 0xcd, 0xad, 0x60,
+            0xe8, 0x60, 0x12, 0xf3, 0x2b, 0x8d, 0xf0, 0xd3, 0x05, 0x99, 0x9f, 0x53, 0x67, 0xe1,
+            0x09, 0x8b, 0xda, 0xec,
         ];
         assert_eq!(
             h, expected,
@@ -171,9 +188,9 @@ mod tests {
         msg.extend_from_slice(b"allocation:ProverAllocation");
         let h = hash_bytes_to_32(&msg).expect("hash");
         let expected: [u8; 32] = [
-            0x17, 0xfa, 0x31, 0x02, 0x82, 0x87, 0x55, 0x19, 0x78, 0xab, 0xcb, 0xc3, 0x14,
-            0x50, 0xb1, 0xb1, 0x4b, 0xe4, 0x3c, 0x09, 0xbe, 0xc9, 0x0d, 0x7d, 0x9f, 0xb0,
-            0x0e, 0xcd, 0x59, 0x56, 0xcf, 0x38,
+            0x17, 0xfa, 0x31, 0x02, 0x82, 0x87, 0x55, 0x19, 0x78, 0xab, 0xcb, 0xc3, 0x14, 0x50,
+            0xb1, 0xb1, 0x4b, 0xe4, 0x3c, 0x09, 0xbe, 0xc9, 0x0d, 0x7d, 0x9f, 0xb0, 0x0e, 0xcd,
+            0x59, 0x56, 0xcf, 0x38,
         ];
         assert_eq!(h, expected);
     }
@@ -184,9 +201,9 @@ mod tests {
         msg.extend_from_slice(b"reward:ProverReward");
         let h = hash_bytes_to_32(&msg).expect("hash");
         let expected: [u8; 32] = [
-            0x04, 0xb1, 0x0a, 0x01, 0x84, 0x44, 0x11, 0xbb, 0x0c, 0x39, 0x0f, 0x4c, 0xd2,
-            0x62, 0x9b, 0x48, 0xcc, 0x7e, 0xf5, 0x61, 0x45, 0x5c, 0x3a, 0xda, 0xc5, 0xeb,
-            0xcb, 0xad, 0x38, 0x34, 0xbf, 0xa4,
+            0x04, 0xb1, 0x0a, 0x01, 0x84, 0x44, 0x11, 0xbb, 0x0c, 0x39, 0x0f, 0x4c, 0xd2, 0x62,
+            0x9b, 0x48, 0xcc, 0x7e, 0xf5, 0x61, 0x45, 0x5c, 0x3a, 0xda, 0xc5, 0xeb, 0xcb, 0xad,
+            0x38, 0x34, 0xbf, 0xa4,
         ];
         assert_eq!(h, expected);
     }

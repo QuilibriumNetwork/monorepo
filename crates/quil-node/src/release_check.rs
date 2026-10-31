@@ -2,16 +2,19 @@
 //! signatures. Mirrors the Go path at `node/main.go:309-378`.
 //!
 //! On startup the node:
-//!   1. Computes SHA3-256 of its own executable.
-//!   2. Reads `<exe>.dgst` (an `sha3sum`-style line of the form
-//!      `SHA3-256(<filename>)= <hex>`) and checks that the parsed
-//!      hex digest equals the computed checksum.
-//!   3. For each present `<exe>.dgst.sig.N` (N=1..len(SIGNATORIES)),
-//!      verifies the Ed448 signature over the **full bytes of the
-//!      `.dgst` file** (not the parsed digest) against the (N-1)th
-//!      hardcoded signatory public key.
-//!   4. Refuses to start if fewer than `quorum_required(N_TOTAL)`
-//!      signatures verified.
+//! 1. Computes SHA3-256 of its own executable.
+//! 2. Reads `<exe>.dgst` (an `sha3sum`-style line of the form
+//! `SHA3-256(<filename>)= <hex>`) and checks that the parsed
+//! hex digest equals the computed checksum.
+//! 3. For each present `<exe>.dgst.sig.N` (N=1..len(SIGNATORIES)),
+//! verifies the Ed448 signature over the **full bytes of the
+//! `.dgst` file** (not the parsed digest) against the (N-1)th
+//! hardcoded signatory public key.
+//! 4. Refuses to start if fewer than `quorum_required(N_TOTAL)`
+//! signatures verified.
+//! 5. Refuses to start unless the signed `SHA3-256(<filename>)=` label
+//! names the executable's own file name, so a release signed for
+//! another version, type or platform does not pass under this name.
 //!
 //! Quorum follows the Go formula `((N-4)/2) + ((N-4) % 2)`. With
 //! N=17, that's `(13/2)+(13%2) = 6 + 1 = 7`.
@@ -80,6 +83,15 @@ pub enum ReleaseCheckError {
         required: usize,
         total: usize,
     },
+    #[error(
+        "digest file {path} is signed for another file ({label:?}), not {file}; run a release \
+         under its published file name"
+    )]
+    NameMismatch {
+        path: PathBuf,
+        label: String,
+        file: String,
+    },
 }
 
 /// Verify `<exe_path>`, `<exe_path>.dgst`, and `<exe_path>.dgst.sig.*`.
@@ -105,18 +117,17 @@ pub fn verify_release_signatures_with(
         path: dgst_path.clone(),
         source: e,
     })?;
-    let dgst_str = std::str::from_utf8(&dgst_contents).map_err(|e| {
-        ReleaseCheckError::DgstNotUtf8 {
+    let dgst_str =
+        std::str::from_utf8(&dgst_contents).map_err(|e| ReleaseCheckError::DgstNotUtf8 {
             path: dgst_path.clone(),
             source: e,
-        }
-    })?;
+        })?;
 
     // Format produced by Go releases: `SHA3-256(<file>)= <hex>\n`.
     // Match Go's parser: split on ' ', second token is the hex digest,
     // take the first 64 chars (32 bytes).
     let mut parts = dgst_str.split(' ');
-    let _label = parts.next();
+    let label = parts.next().unwrap_or_default();
     let hex_part = parts.next().ok_or_else(|| ReleaseCheckError::DgstFormat {
         path: dgst_path.clone(),
         detail: "missing space-separated hex".into(),
@@ -151,11 +162,12 @@ pub fn verify_release_signatures_with(
             idx: one_idx,
             detail: format!("hex decode: {}", e),
         })?;
-        let pubkey =
-            PublicKey::try_from(pk_bytes.as_slice()).map_err(|e| ReleaseCheckError::SignatoryDecode {
+        let pubkey = PublicKey::try_from(pk_bytes.as_slice()).map_err(|e| {
+            ReleaseCheckError::SignatoryDecode {
                 idx: one_idx,
                 detail: format!("ed448 key parse: {:?}", e),
-            })?;
+            }
+        })?;
         // Go does `ed448.Verify(pubkey, digest, sig, "")` — the message
         // is the *full digest file contents* (incl. label + trailing
         // newline), context is empty.
@@ -176,32 +188,28 @@ pub fn verify_release_signatures_with(
             total,
         });
     }
+
+    let file = exe_path.file_name().unwrap_or_default().to_string_lossy();
+    if !label_names(label, &file) {
+        return Err(ReleaseCheckError::NameMismatch {
+            path: dgst_path,
+            label: label.chars().take(120).collect(),
+            file: file.into_owned(),
+        });
+    }
     Ok(valid)
+}
+
+/// Whether a `.dgst` label, `SHA3-256(<filename>)=` as `openssl sha3-256`
+/// writes it, names `file`.
+fn label_names(label: &str, file: &str) -> bool {
+    label == format!("SHA3-256({file})=")
 }
 
 fn append_suffix(p: &Path, suffix: &str) -> PathBuf {
     let mut name = p.file_name().unwrap_or_default().to_os_string();
     name.push(suffix);
     p.with_file_name(name)
-}
-
-/// Default value for the signature-check flag, matching Go's
-/// `signatureCheckDefault()` at `node/main.go:195`. Honors
-/// `QUILIBRIUM_SIGNATURE_CHECK=true|false`; otherwise true.
-pub fn signature_check_default() -> bool {
-    match std::env::var("QUILIBRIUM_SIGNATURE_CHECK") {
-        Ok(v) => match v.parse::<bool>() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!(
-                    "Invalid environment variable QUILIBRIUM_SIGNATURE_CHECK, must be 'true' or 'false': {}",
-                    v
-                );
-                true
-            }
-        },
-        Err(_) => true,
-    }
 }
 
 #[cfg(test)]
@@ -288,8 +296,7 @@ mod tests {
         let bad_sig = attacker_sk.sign(&dgst_bytes, None).unwrap();
         std::fs::write(append_suffix(&exe, ".dgst.sig.1"), &bad_sig).unwrap();
 
-        let err =
-            verify_release_signatures_with(&exe, &[real_pk_hex.as_str()]).unwrap_err();
+        let err = verify_release_signatures_with(&exe, &[real_pk_hex.as_str()]).unwrap_err();
         match err {
             ReleaseCheckError::BadSignature { idx, .. } => assert_eq!(idx, 1),
             other => panic!("expected BadSignature, got {:?}", other),
@@ -314,6 +321,54 @@ mod tests {
             ReleaseCheckError::DigestMismatch { .. } => {}
             other => panic!("expected DigestMismatch, got {:?}", other),
         }
+    }
+
+    /// A quorum-signed release whose label names another release (an older
+    /// version here) is refused when run under this release's file name.
+    #[test]
+    fn release_signed_for_another_file_rejected() {
+        use ed448_rust::{PrivateKey, KEY_LENGTH};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let exe = tmp.path().join("node-2.1.0.25-linux-amd64");
+        std::fs::write(&exe, b"old release").unwrap();
+        let digest: [u8; 32] = Sha3_256::digest(b"old release").into();
+        let sk = PrivateKey::from([0xA1u8; KEY_LENGTH]);
+        let pk_hex = hex::encode(PublicKey::from(&sk).as_byte());
+        for signed_as in [
+            "node-2.1.0.24-linux-amd64",
+            "node-2.1.0.25-linux-arm64",
+            "qclient-2.1.0.25-linux-amd64",
+        ] {
+            let dgst = format!("SHA3-256({signed_as})= {}\n", hex::encode(digest));
+            std::fs::write(append_suffix(&exe, ".dgst"), &dgst).unwrap();
+            let sig = sk.sign(dgst.as_bytes(), None).unwrap();
+            std::fs::write(append_suffix(&exe, ".dgst.sig.1"), &sig).unwrap();
+            let err = verify_release_signatures_with(&exe, &[pk_hex.as_str()]).unwrap_err();
+            match err {
+                ReleaseCheckError::NameMismatch { label, file, .. } => {
+                    assert_eq!(label, format!("SHA3-256({signed_as})="));
+                    assert_eq!(file, "node-2.1.0.25-linux-amd64");
+                }
+                other => panic!("expected NameMismatch, got {:?}", other),
+            }
+        }
+    }
+
+    /// The committed published `.dgst` names its own file, and only it.
+    #[test]
+    fn published_label_names_its_file() {
+        const DGST: &[u8] =
+            include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst");
+        let label = std::str::from_utf8(DGST)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap();
+        assert!(label_names(label, "node-2.1.0.22-linux-amd64"));
+        assert!(!label_names(label, "node-2.1.0.23-linux-amd64"));
+        assert!(!label_names(label, "node-2.1.0.22-linux-arm64"));
+        assert!(!label_names(label, "qclient-2.1.0.22-linux-amd64"));
+        assert!(!label_names(label, "node"));
     }
 
     /// Quorum math test mirroring Go's formula.
@@ -343,28 +398,47 @@ mod tests {
     /// `REL_PREFIX` below.
     #[test]
     fn production_signatories_offline() {
-        const DGST: &[u8] = include_bytes!(
-            "../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst"
-        );
+        const DGST: &[u8] =
+            include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst");
         // (one-based signatory index, signature bytes) pairs for
         // every `.dgst.sig.N` present in the release. Quorum on N=17
         // is 7; the published set has exactly 7 here.
         let sigs: &[(usize, &[u8])] = &[
-            (1,  include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.1")),
-            (2,  include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.2")),
-            (10, include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.10")),
-            (13, include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.13")),
-            (14, include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.14")),
-            (16, include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.16")),
-            (17, include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.17")),
+            (
+                1,
+                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.1"),
+            ),
+            (
+                2,
+                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.2"),
+            ),
+            (
+                10,
+                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.10"),
+            ),
+            (
+                13,
+                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.13"),
+            ),
+            (
+                14,
+                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.14"),
+            ),
+            (
+                16,
+                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.16"),
+            ),
+            (
+                17,
+                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.17"),
+            ),
         ];
 
         let mut valid = 0;
         for (one_idx, sig) in sigs {
             let pk_hex = SIGNATORIES[one_idx - 1];
             let pk_bytes = hex::decode(pk_hex).expect("signatory hex");
-            let pubkey =
-                PublicKey::try_from(pk_bytes.as_slice()).expect("ed448 key parse");
+            let pubkey = PublicKey::try_from(pk_bytes.as_slice()).expect("ed448 key parse");
             assert!(
                 pubkey.verify(DGST, sig, None).is_ok(),
                 "signatory #{} ({}…) failed to verify against committed .dgst fixture",
@@ -385,8 +459,8 @@ mod tests {
     /// Network-gated test against an actual published release.
     /// Downloads only `.dgst` and `.dgst.sig.N` (small files), then:
     /// - Asserts every present signature validates against the
-    ///   production [`SIGNATORIES`] using the same Ed448 verify call
-    ///   the live `verify_release_signatures` path uses.
+    /// production [`SIGNATORIES`] using the same Ed448 verify call
+    /// the live `verify_release_signatures` path uses.
     /// - Asserts quorum is met by the present signatures.
     ///
     /// We deliberately do **not** download the binary itself (hundreds
@@ -396,8 +470,8 @@ mod tests {
     /// Ed448 verify implementation against published wire data.
     ///
     /// **Run manually**: `cargo test -p quil-node \
-    ///   release_check::tests::production_release_signatures \
-    ///   -- --ignored --nocapture`
+    /// release_check::tests::production_release_signatures \
+    /// -- --ignored --nocapture`
     #[test]
     #[ignore = "fetches files from releases.quilibrium.com — run on demand"]
     fn production_release_signatures() {
@@ -457,12 +531,34 @@ mod tests {
             .output()
         {
             Ok(out) if out.status.success() => Ok(out.stdout),
-            Ok(out) => Err(format!(
-                "curl {}: exit {}",
-                url,
-                out.status
-            )),
+            Ok(out) => Err(format!("curl {}: exit {}", url, out.status)),
             Err(e) => Err(format!("spawn curl: {}", e)),
         }
+    }
+
+    /// A release-origin attacker serves an older quorum-signed release under
+    /// the newer release's file name.
+    #[test]
+    fn reproduces_relabelled_release_passes_self_check() {
+        use ed448_rust::{PrivateKey, KEY_LENGTH};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let exe = tmp.path().join("node-2.1.0.25-linux-amd64");
+        std::fs::write(&exe, b"older release").unwrap();
+        let digest: [u8; 32] = Sha3_256::digest(b"older release").into();
+        let dgst = format!(
+            "SHA3-256(node-2.1.0.24-linux-amd64)= {}\n",
+            hex::encode(digest)
+        );
+        std::fs::write(append_suffix(&exe, ".dgst"), &dgst).unwrap();
+        let sk = PrivateKey::from([0xB2u8; KEY_LENGTH]);
+        let sig = sk.sign(dgst.as_bytes(), None).unwrap();
+        std::fs::write(append_suffix(&exe, ".dgst.sig.1"), sig).unwrap();
+        let pk_hex = hex::encode(PublicKey::from(&sk).as_byte());
+        let result = verify_release_signatures_with(&exe, &[pk_hex.as_str()]);
+        assert!(
+            result.is_err(),
+            "release signed for node-2.1.0.24 passed the self-check as \
+             node-2.1.0.25-linux-amd64: {result:?}"
+        );
     }
 }

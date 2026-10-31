@@ -1,0 +1,41 @@
+[package]
+name = "quil-explorer"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "In-process read-only explorer REST API over the node's live stores (Rust port of node/explorer)"
+
+[dependencies]
+quil-types = { path = "../quil-types" }
+quil-forest = { path = "../quil-forest" }
+quil-hypergraph = { path = "../quil-hypergraph" }
+quil-execution = { path = "../quil-execution" }
+# Reads the signer bitmap of an applied app frame's CW certificate.
+quil-cw-consensus = { path = "../quil-cw-consensus" }
+quil-tries = { path = "../quil-tries" }
+quil-p2p = { path = "../quil-p2p" }
+
+prost = "0.13"
+axum = "0.7"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "time", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+base64 = "0.22"
+bs58 = "0.5"
+num-bigint = "0.4"
+parking_lot = "0.12"
+tracing = "0.1"
+chrono = "0.4"
+sha2 = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tower = { version = "0.5", features = ["util"] }
+# The ignored production-index measurement opens a node store read-only
+# and wires the explorer over it as an archive does.
+quil-store = { path = "../quil-store" }
+quil-engine = { path = "../quil-engine" }
+quil-forest-migrate = { path = "../quil-forest-migrate" }
+# It reads the QUIL grid from an archive once, under a throwaway key.
+quil-rpc = { path = "../quil-rpc" }

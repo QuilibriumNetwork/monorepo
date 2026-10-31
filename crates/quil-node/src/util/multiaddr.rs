@@ -24,8 +24,12 @@ pub(crate) fn multiaddr_to_host_port_with_network(ma: &str, network: u8) -> Opti
     let reject = if allow_private {
         ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast()
     } else {
-        ip.is_loopback() || ip.is_private() || ip.is_link_local()
-            || ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast()
+        ip.is_loopback()
+            || ip.is_private()
+            || ip.is_link_local()
+            || ip.is_unspecified()
+            || ip.is_broadcast()
+            || ip.is_multicast()
     };
     if reject {
         return None;
@@ -60,8 +64,12 @@ pub(crate) fn archive_multiaddr_to_host_port(ma: &str, network: u8) -> Option<St
             let reject = if allow_private {
                 ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast()
             } else {
-                ip.is_loopback() || ip.is_private() || ip.is_link_local()
-                    || ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast()
+                ip.is_loopback()
+                    || ip.is_private()
+                    || ip.is_link_local()
+                    || ip.is_unspecified()
+                    || ip.is_broadcast()
+                    || ip.is_multicast()
             };
             if reject {
                 return None;
@@ -75,7 +83,7 @@ pub(crate) fn archive_multiaddr_to_host_port(ma: &str, network: u8) -> Option<St
             } else {
                 ip.is_loopback() || ip.is_unspecified() || ip.is_multicast()
                     || (ip.segments()[0] & 0xfe00) == 0xfc00  // unique-local fc00::/7
-                    || (ip.segments()[0] & 0xffc0) == 0xfe80  // link-local fe80::/10
+                    || (ip.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
             };
             if reject {
                 return None;
@@ -91,6 +99,17 @@ pub(crate) fn archive_multiaddr_to_host_port(ma: &str, network: u8) -> Option<St
         }
         _ => None,
     }
+}
+
+/// The peer an `engine.archiveEndpoints` multiaddr names (`.../p2p/<id>`),
+/// which a dial to its endpoint must then reach; `None` when it names none
+/// or the id does not parse.
+pub(crate) fn archive_multiaddr_peer(ma: &str) -> Option<quil_p2p::PeerId> {
+    let parts: Vec<&str> = ma.trim_start_matches('/').split('/').collect();
+    parts
+        .windows(2)
+        .find(|pair| pair[0] == "p2p")
+        .and_then(|pair| pair[1].parse().ok())
 }
 
 /// Build a stream multiaddr by extracting the IP from a pubsub multiaddr and
@@ -121,9 +140,7 @@ pub(crate) fn extract_stream_addr(pubsub_ma: &str, stream_listen: &str) -> Optio
         None
     };
 
-    let usable = |ip: &str| -> bool {
-        ip != "0.0.0.0" && ip != "127.0.0.1"
-    };
+    let usable = |ip: &str| -> bool { ip != "0.0.0.0" && ip != "127.0.0.1" };
 
     let ip = match (pub_ip, stream_ip) {
         (Some(p), _) if usable(p) => p,
@@ -136,7 +153,22 @@ pub(crate) fn extract_stream_addr(pubsub_ma: &str, stream_listen: &str) -> Optio
 
 #[cfg(test)]
 mod tests {
-    use super::archive_multiaddr_to_host_port;
+    use super::{archive_multiaddr_peer, archive_multiaddr_to_host_port};
+
+    #[test]
+    fn archive_multiaddr_names_its_peer_only_with_a_valid_p2p_id() {
+        let id = "QmRECrGL6yDoMgSydFDN5bhnnpJLAByKVuieAbwmmAiodC";
+        assert_eq!(
+            archive_multiaddr_peer(&format!("/ip4/165.140.86.86/tcp/8340/p2p/{id}"))
+                .map(|peer| peer.to_string()),
+            Some(id.to_string())
+        );
+        assert_eq!(archive_multiaddr_peer("/ip4/165.140.86.86/tcp/8340"), None);
+        assert_eq!(
+            archive_multiaddr_peer("/ip4/165.140.86.86/tcp/8340/p2p/not-a-peer"),
+            None
+        );
+    }
 
     #[test]
     fn archive_multiaddr_accepts_ip4() {
@@ -180,13 +212,19 @@ mod tests {
 
     #[test]
     fn archive_multiaddr_rejects_bare_host_port() {
-        assert_eq!(archive_multiaddr_to_host_port("archive.example.com:8340", 0), None);
+        assert_eq!(
+            archive_multiaddr_to_host_port("archive.example.com:8340", 0),
+            None
+        );
         assert_eq!(archive_multiaddr_to_host_port("1.2.3.4:8340", 0), None);
     }
 
     #[test]
     fn archive_multiaddr_rejects_non_tcp() {
-        assert_eq!(archive_multiaddr_to_host_port("/ip4/1.2.3.4/udp/8340", 0), None);
+        assert_eq!(
+            archive_multiaddr_to_host_port("/ip4/1.2.3.4/udp/8340", 0),
+            None
+        );
         assert_eq!(
             archive_multiaddr_to_host_port("/ip4/1.2.3.4/udp/8340/quic-v1", 0),
             None
@@ -199,15 +237,27 @@ mod tests {
         assert_eq!(archive_multiaddr_to_host_port("/ip4/1.2.3.4", 0), None);
         assert_eq!(archive_multiaddr_to_host_port("/ip4//tcp/8340", 0), None);
         assert_eq!(archive_multiaddr_to_host_port("/ip4/1.2.3.4/tcp/", 0), None);
-        assert_eq!(archive_multiaddr_to_host_port("/ip4/1.2.3.4/tcp/notaport", 0), None);
+        assert_eq!(
+            archive_multiaddr_to_host_port("/ip4/1.2.3.4/tcp/notaport", 0),
+            None
+        );
         assert_eq!(archive_multiaddr_to_host_port("/dns4//tcp/8340", 0), None);
     }
 
     #[test]
     fn archive_multiaddr_rejects_private_ip_on_mainnet() {
-        assert_eq!(archive_multiaddr_to_host_port("/ip4/192.168.1.1/tcp/8340", 0), None);
-        assert_eq!(archive_multiaddr_to_host_port("/ip4/10.0.0.1/tcp/8340", 0), None);
-        assert_eq!(archive_multiaddr_to_host_port("/ip4/127.0.0.1/tcp/8340", 0), None);
+        assert_eq!(
+            archive_multiaddr_to_host_port("/ip4/192.168.1.1/tcp/8340", 0),
+            None
+        );
+        assert_eq!(
+            archive_multiaddr_to_host_port("/ip4/10.0.0.1/tcp/8340", 0),
+            None
+        );
+        assert_eq!(
+            archive_multiaddr_to_host_port("/ip4/127.0.0.1/tcp/8340", 0),
+            None
+        );
     }
 
     #[test]

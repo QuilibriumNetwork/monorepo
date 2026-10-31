@@ -16,16 +16,12 @@ fn main() {
         std::process::exit(2);
     }
     let primary = Path::new(&args[1]);
-    let scratch = std::env::temp_dir().join(format!(
-        "inspect-subkeys-{}",
-        std::process::id(),
-    ));
+    let scratch = std::env::temp_dir().join(format!("inspect-subkeys-{}", std::process::id(),));
     std::fs::create_dir_all(&scratch).expect("scratch dir");
 
     let mut opts = rocksdb::Options::default();
     opts.set_max_open_files(64);
-    let db = rocksdb::DB::open_as_secondary(&opts, primary, &scratch)
-        .expect("open as secondary");
+    let db = rocksdb::DB::open_as_secondary(&opts, primary, &scratch).expect("open as secondary");
     let _ = db.try_catch_up_with_primary();
 
     // 256 x 256 = 65536 bucket counters keyed by (first, second) byte.
@@ -53,10 +49,7 @@ fn main() {
         for second in 0..=255u16 {
             let n = counts[(first * 256 + second) as usize];
             if n > 0 {
-                println!(
-                    "  [0x{:02X}, 0x{:02X}]: {}",
-                    first as u8, second as u8, n
-                );
+                println!("  [0x{:02X}, 0x{:02X}]: {}", first as u8, second as u8, n);
             }
         }
     }
