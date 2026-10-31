@@ -12,6 +12,7 @@ use super::model::{
     AwaitFilterEntry, ColumnFilter, FilterColKind, Model, PanelFocus, PendingAction, Tab,
 };
 use super::msg::Msg;
+use super::settings;
 
 const MAX_AWAIT_RETRIES: u32 = 3;
 
@@ -619,6 +620,11 @@ fn handle_help_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             m.show_help = false;
             m.help_offset = 0;
         }
+        KeyCode::Char('d') => {
+            settings::restore_defaults(m);
+            m.status_msg = "View settings restored to their defaults.".into();
+            m.status_is_error = false;
+        }
         KeyCode::Up | KeyCode::Char('k') => m.help_offset = m.help_offset.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') => m.help_offset = (m.help_offset + 1).min(max),
         KeyCode::PageUp => m.help_offset = m.help_offset.saturating_sub(page),
@@ -654,8 +660,8 @@ fn move_panel_boundary(m: &mut Model, upper: bool, down: bool) {
         (i32::from(m.panel_content_heights[i + 1]) - i32::from(movement)) as u16;
 }
 
-/// Keys both tabs share: display, refresh, notice level and help.
-/// Returns whether `ev` was one.
+/// Keys both tabs share: display, refresh, notice level, help and the key
+/// rows. Returns whether `ev` was one.
 fn shared_view_key(m: &mut Model, ev: &KeyEvent) -> bool {
     match ev.code {
         KeyCode::Char('n') => {
@@ -677,6 +683,7 @@ fn shared_view_key(m: &mut Model, ev: &KeyEvent) -> bool {
         }
         KeyCode::Char('h') => super::view::open_help(m),
         KeyCode::Char('c') => m.color_coding = !m.color_coding,
+        KeyCode::Char('?') => m.show_key_rows = !m.show_key_rows,
         _ => return false,
     }
     true
