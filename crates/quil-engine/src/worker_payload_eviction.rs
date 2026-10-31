@@ -517,6 +517,7 @@ pub(crate) async fn run_passes<R>(
             filter,
             commits = o.commits,
             nodes = o.nodes,
+            retained_nodes = o.retained_nodes,
             stale_records = o.stale_records,
             key_ranges = o.key_ranges,
             secs = started.elapsed().as_secs(),
