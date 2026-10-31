@@ -18,6 +18,7 @@ use quil_lifecycle::{ShutdownReason, Supervisor};
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+mod effective_config;
 mod logging;
 
 mod forest_sync;
@@ -1250,6 +1251,16 @@ async fn node_main() -> anyhow::Result<ExitCode> {
                 Ok(ExitCode::FAILURE)
             }
         };
+    }
+
+    // What this process runs with, as used: defaults applied, `QUIL_*`
+    // overrides resolved. The master and each standalone worker log their own.
+    {
+        let archive =
+            args.core == 0 && !args.dht_only && (args.archive || config.engine.archive_mode);
+        let runtime =
+            effective_config::Runtime::detect(args.core, args.network, archive, args.dht_only);
+        effective_config::EffectiveConfig::resolve(&config, &runtime).log();
     }
 
     // Hand off to the chosen node mode. It owns `sup` for its lifetime,

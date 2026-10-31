@@ -259,6 +259,46 @@ fn memory_budget_bytes() -> Option<u64> {
     Some(limit.map_or(physical, |limit| limit.min(physical)).max(1))
 }
 
+/// The block cache of a store opened with `base` bytes: `override_mb`
+/// (`QUIL_ROCKSDB_BLOCK_CACHE_MB`) replaces it when it parses.
+fn block_cache_with_override(base: usize, override_mb: Option<&str>) -> usize {
+    override_mb
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(base, |mb| mb.saturating_mul(1024 * 1024))
+}
+
+/// The block cache a store of this process opens with when it has one of
+/// its own, in bytes: an archive's memory-sized cache, or
+/// `QUIL_ROCKSDB_BLOCK_CACHE_MB` for any store. Without that override the
+/// other stores share one cache ([`shared_block_cache_bytes`]).
+pub fn effective_block_cache_bytes(archive: bool) -> usize {
+    let base = if archive {
+        archive_block_cache_bytes()
+    } else {
+        DEFAULT_BLOCK_CACHE_BYTES
+    };
+    block_cache_with_override(
+        base,
+        std::env::var("QUIL_ROCKSDB_BLOCK_CACHE_MB").ok().as_deref(),
+    )
+}
+
+/// RocksDB background flush and compaction threads per store:
+/// `QUIL_ROCKSDB_BG_THREADS`, else the CPUs available, within 2..=8.
+pub fn background_threads() -> i32 {
+    background_threads_for(std::env::var("QUIL_ROCKSDB_BG_THREADS").ok().as_deref())
+}
+
+fn background_threads_for(override_threads: Option<&str>) -> i32 {
+    override_threads
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| (n.get() as i32).clamp(2, 8))
+                .unwrap_or(4)
+        })
+}
+
 impl RocksDb {
     /// Open a RocksDB database at the given path.
     /// Runs pending migrations automatically.
@@ -325,14 +365,7 @@ impl RocksDb {
         // threads to keep up, plus extra memtable headroom to absorb bursts.
         // Threads scale with cores (compaction is the bottleneck on weak HW);
         // env-overridable for constrained nodes.
-        let bg_threads: i32 = std::env::var("QUIL_ROCKSDB_BG_THREADS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| (n.get() as i32).clamp(2, 8))
-                    .unwrap_or(4)
-            });
+        let bg_threads = background_threads();
         opts.increase_parallelism(bg_threads);
         opts.set_max_background_jobs(bg_threads);
         // More memtables in flight (default 2) so a flush stall doesn't immediately
@@ -615,6 +648,19 @@ mod read_only_tests {
         assert_eq!(shared_capacity(4, 1024 * MB), 1024 * MB);
         assert_eq!(shared_capacity(28, 1024 * MB), 1024 * MB);
         assert_eq!(shared_capacity(28, 64 * MB), 64 * MB);
+    }
+
+    /// The cache a store opens with is the override when it parses, else the
+    /// base; the thread count is the override when it parses, else bounded.
+    #[test]
+    fn block_cache_and_thread_overrides_replace_the_defaults() {
+        let base = DEFAULT_BLOCK_CACHE_BYTES;
+        assert_eq!(block_cache_with_override(base, None), base);
+        assert_eq!(block_cache_with_override(base, Some("junk")), base);
+        assert_eq!(block_cache_with_override(base, Some("64")), 64 << 20);
+        assert_eq!(background_threads_for(Some("3")), 3);
+        assert!((2..=8).contains(&background_threads_for(None)));
+        assert!((2..=8).contains(&background_threads_for(Some("x"))));
     }
 
     /// New table files carry a partitioned index; files written without one
