@@ -393,8 +393,22 @@ pub struct CommittedAppProgress {
 
 // ── Model ────────────────────────────────────────────────────────────────
 
+/// The manager's tabs: `1` and `2` select them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tab {
+    #[default]
+    Provers,
+    Coins,
+}
+
 #[derive(Default)]
 pub struct Model {
+    /// The tab on screen; every run starts on Provers.
+    pub tab: Tab,
+    /// The Coins tab's panels and data.
+    pub coins: super::coins::Coins,
+    /// The UI and Workers key rows are shown (`?` collapses them to one).
+    pub show_key_rows: bool,
     // Header data.
     pub peer_id: String,
     pub seniority: String,
@@ -429,6 +443,8 @@ pub struct Model {
 
     // Verified GLOBAL reward witness, refreshed independently of shard queries.
     pub claimable_reward: Option<(u128, u64)>,
+    /// Why the last reward read failed; cleared by a successful one.
+    pub reward_error: Option<String>,
     pub reward_loaded: bool,
     pub reward_last_success: Option<std::time::Instant>,
 
@@ -660,6 +676,7 @@ impl Model {
             avail_sort_col: 10, // Reward column
             avail_sort_asc: false,
             reachable: false,
+            show_key_rows: true,
             ..Default::default()
         }
     }
