@@ -1,7 +1,7 @@
 //! `qclient node …` — node management.
 //!
-//! The `prover` subgroup (status/lifecycle) and the install/update/
-//! service/config/log subcommands (OS plumbing).
+//! The `manage` TUI, the `prover` subgroup (status/lifecycle) and the
+//! install/update/service/config/log subcommands (OS plumbing).
 
 use clap::Subcommand;
 
@@ -19,6 +19,8 @@ pub mod service;
 
 #[derive(Debug, Subcommand)]
 pub enum NodeCommand {
+    /// Interactive node management TUI; `node prover manage` opens the same.
+    Manage(prover::ManageArgs),
     /// Prover management.
     Prover {
         #[command(subcommand)]
@@ -101,6 +103,7 @@ pub enum NodeCommand {
 
 pub async fn run(global: GlobalArgs, cmd: &NodeCommand) -> anyhow::Result<()> {
     match cmd {
+        NodeCommand::Manage(args) => prover::manage_command(global, args).await,
         NodeCommand::Prover { command } => prover::run(global, command).await,
         NodeCommand::Config { command } => nodeconfig::run(global, command),
         NodeCommand::Log { command } => log::run(global, command),
