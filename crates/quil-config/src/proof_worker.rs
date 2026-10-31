@@ -22,9 +22,6 @@ fn default_cpu_seconds() -> u64 {
 fn default_wall_timeout_secs() -> u64 {
     1800
 }
-fn default_max_concurrent() -> usize {
-    2
-}
 fn default_native_threads() -> u8 {
     4
 }
@@ -61,9 +58,14 @@ pub struct ProofWorkerConfig {
     /// Verifications admitted concurrently per node (1..=64), shared by every
     /// execution manager and node process through the admission file. Each
     /// child needs about 1 GB at depth 32; keep `maxConcurrent × nativeThreads`
-    /// at or below the machine's cores.
-    #[serde(default = "default_max_concurrent")]
-    pub max_concurrent: usize,
+    /// at or below the machine's cores. Unset: 2, except on an archive, which
+    /// takes its CPUs divided by `nativeThreads`, at most one per 3 GiB of
+    /// available memory, within 2..=8: an archive verifies the confidential
+    /// operations a GLOBAL frame carries before it publishes that frame, and
+    /// two slots fall behind their arrival. Unset stays unset when the node
+    /// saves its config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<usize>,
     /// Native aggregation threads per verifier child (1..=8). Aggregation
     /// scales to about four threads per verification; beyond that prefer more
     /// concurrent children.
@@ -98,7 +100,7 @@ impl Default for ProofWorkerConfig {
             cpu_seconds: default_cpu_seconds(),
             wall_timeout_secs: default_wall_timeout_secs(),
             address_space_bytes: 0,
-            max_concurrent: default_max_concurrent(),
+            max_concurrent: None,
             native_threads: default_native_threads(),
             verify_budget_secs: default_verify_budget_secs(),
             admission_wait_ms: default_admission_wait_ms(),
@@ -141,10 +143,9 @@ impl ProofWorkerConfig {
         if self.address_space_bytes >= i64::MAX as u64 {
             return Err("proofWorker.addressSpaceBytes is out of range".into());
         }
-        if !(1..=64).contains(&self.max_concurrent) {
+        if let Some(max) = self.max_concurrent.filter(|max| !(1..=64).contains(max)) {
             return Err(format!(
-                "proofWorker.maxConcurrent must be within 1..=64, got {}",
-                self.max_concurrent
+                "proofWorker.maxConcurrent must be within 1..=64, got {max}"
             ));
         }
         if !(1..=8).contains(&self.native_threads) {
@@ -211,6 +212,31 @@ mod tests {
             serde_yaml::from_str::<ProofWorkerConfig>(&encoded).unwrap(),
             parsed
         );
+    }
+
+    /// An unset `maxConcurrent` stays unset through a save, so a node that
+    /// rewrites its config does not pin today's default; a set one survives
+    /// and is range-checked.
+    #[test]
+    fn max_concurrent_is_written_only_when_set() {
+        let unset = ProofWorkerConfig::default();
+        assert_eq!(unset.max_concurrent, None);
+        let written = serde_yaml::to_string(&unset).unwrap();
+        assert!(!written.contains("maxConcurrent"), "{written}");
+        let parsed: ProofWorkerConfig = serde_yaml::from_str("maxConcurrent: 3\n").unwrap();
+        assert_eq!(parsed.max_concurrent, Some(3));
+        parsed.validate().unwrap();
+        let rewritten: ProofWorkerConfig =
+            serde_yaml::from_str(&serde_yaml::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(rewritten.max_concurrent, Some(3));
+        for bad in [0, 65] {
+            assert!(ProofWorkerConfig {
+                max_concurrent: Some(bad),
+                ..unset.clone()
+            }
+            .validate()
+            .is_err());
+        }
     }
 
     #[test]

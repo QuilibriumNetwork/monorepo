@@ -69,7 +69,7 @@ pub(crate) async fn start(
     // Check executable readiness before opening stores. All managers clone
     // this client; separate node processes also share its admission file.
     #[cfg(feature = "native-proof")]
-    let proof_worker = crate::proof_worker::build_node_worker(config)?;
+    let proof_worker = crate::proof_worker::build_node_worker_as(config, archive_mode)?;
     let storage = storage::init(config, archive_mode)?;
     // Thread workers register their stores with this process's watch too.
     crate::storage_watch::start(&config.db);
