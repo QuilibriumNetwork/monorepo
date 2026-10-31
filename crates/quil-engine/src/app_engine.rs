@@ -5982,12 +5982,19 @@ impl AppConsensusEngine {
         let session_wait = session
             .filter(|_| current)
             .and_then(|session| self.session_wait(session, global_frame));
+        let lapsed = own.iter().any(|a| {
+            a.effective_status(global_frame) == quil_types::consensus::EffectiveStatus::ExpiredEpoch
+        });
+        let withheld = lapsed
+            .then(|| crate::provers::session_hosting::renewal_withheld(&self.filter, global_frame))
+            .flatten();
         NotSeated {
             allocations,
             global_frame,
             release,
             join_wait,
             session_wait,
+            withheld,
         }
     }
 
@@ -14090,6 +14097,9 @@ struct NotSeated {
     join_wait: Option<quil_types::consensus::JoinWait>,
     /// What seats an active, current allocation, from committed GLOBAL state.
     session_wait: Option<SessionWait>,
+    /// Why this node's lifecycle withheld the renewal of a lapsed allocation
+    /// (`provers::session_hosting::renewal_withheld`), when it did.
+    withheld: Option<crate::provers::session_hosting::RenewalWithheld>,
 }
 
 /// The committed GLOBAL event that seats a worker whose allocation is
@@ -14301,19 +14311,31 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
                 true,
             );
         }
+        let lapsed = seat.allocations.contains(&EffectiveStatus::ExpiredEpoch);
+        let withheld = seat.withheld.filter(|_| lapsed);
         let action = if seat.allocations.is_empty() {
             "the prover registry holds no allocation of this prover for the shard: check this worker's \
                 allocation (join and confirm); it starts only once a committee session seats it"
-        } else if seat.allocations.contains(&EffectiveStatus::ExpiredEpoch) {
+        } else if let Some(withheld) = withheld {
+            withheld.action()
+        } else if lapsed {
             "this worker's allocation missed its epoch reconfirm: check this worker's prover confirmation \
                 (dispatch and publish in the master log); it starts only once a later session seats it"
         } else {
             "this worker is not a member of the shard's committee session: check the reconfirm and renewal \
                 of this worker's allocation; it starts only once a later session seats it"
         };
+        // The event that seats it once renewed: the first session pass of
+        // the next epoch, for a renewal in this one.
+        let renewal = withheld.map_or_else(String::new, |withheld| {
+            let epoch = quil_types::consensus::epoch_for_frame(seat.global_frame) + 1;
+            format!("; this node withheld its renewal: {}; once it renews, the first GLOBAL session pass of \
+                epoch {epoch}, at GLOBAL frame {}, seats it", withheld.reason(),
+                quil_types::consensus::epoch_start_frame(epoch))
+        });
         return refusal(
             format!("not seated: {}", seat.describe()),
-            format!("this worker's prover is not seated in the committee (allocation status {} at GLOBAL frame {}); \
+            format!("this worker's prover is not seated in the committee (allocation status {} at GLOBAL frame {}){renewal}; \
                 start refused with: {text}", seat.describe(), seat.global_frame),
             ThisNode, action, true,
         );
@@ -14649,6 +14671,7 @@ mod start_block_tests {
                 release: None,
                 join_wait: None,
                 session_wait: None,
+                withheld: None,
             }),
             ..StartContext::default()
         };
@@ -14677,6 +14700,7 @@ mod start_block_tests {
                 release: None,
                 join_wait: None,
                 session_wait: None,
+                withheld: None,
             }),
             ..StartContext::default()
         };
@@ -14697,6 +14721,7 @@ mod start_block_tests {
                 release: None,
                 join_wait: Some(quil_types::consensus::JoinWait::Activation { frame: 918_720 }),
                 session_wait: None,
+                withheld: None,
             }),
             ..StartContext::default()
         };
@@ -14720,6 +14745,7 @@ mod start_block_tests {
                 release: None,
                 join_wait: Some(quil_types::consensus::JoinWait::Confirmation { epoch: 1_276 }),
                 session_wait: None,
+                withheld: None,
             }),
             ..StartContext::default()
         };
@@ -14767,6 +14793,7 @@ mod start_block_tests {
                 release: None,
                 join_wait: None,
                 session_wait,
+                withheld: None,
             }),
             ..StartContext::default()
         };
@@ -14840,6 +14867,45 @@ mod start_block_tests {
             "{}",
             lapsed.action
         );
+        assert!(!lapsed.reason.contains("withheld"), "{}", lapsed.reason);
+        // This node's lifecycle withheld the renewal: no confirmation
+        // failed, and the next epoch's first session pass is named.
+        use crate::provers::session_hosting::RenewalWithheld;
+        let pass = quil_types::consensus::epoch_start_frame(
+            quil_types::consensus::epoch_for_frame(918_900) + 1,
+        );
+        for why in [RenewalWithheld::Unhosted, RenewalWithheld::Unvoted] {
+            let mut context = seat(vec![EffectiveStatus::ExpiredEpoch], None);
+            context.not_seated.as_mut().unwrap().withheld = Some(why);
+            let withheld = classify_start_refusal(&committee_build_failed(), &context);
+            assert_eq!(withheld.scope, StartScope::ThisNode);
+            assert!(
+                !withheld.action.contains("missed its epoch reconfirm")
+                    && withheld
+                        .action
+                        .contains("withheld the seat's renewal on purpose"),
+                "{}",
+                withheld.action
+            );
+            assert!(
+                withheld.reason.contains(why.reason())
+                    && withheld.reason.contains(&format!(
+                        "first GLOBAL session pass of epoch {}",
+                        quil_types::consensus::epoch_for_frame(918_900) + 1
+                    ))
+                    && withheld
+                        .reason
+                        .contains(&format!("at GLOBAL frame {pass}, seats it")),
+                "{}",
+                withheld.reason
+            );
+            assert_eq!(withheld.key, lapsed.key, "one refusal for the lapsed seat");
+        }
+        // A withholding noted for a seat that is not lapsed names nothing.
+        let mut active = seat(vec![EffectiveStatus::Active], None);
+        active.not_seated.as_mut().unwrap().withheld = Some(RenewalWithheld::Unhosted);
+        let active = classify_start_refusal(&committee_build_failed(), &active);
+        assert!(!active.reason.contains("withheld"), "{}", active.reason);
         let unread = classify_start_refusal(
             &committee_build_failed(),
             &seat(vec![EffectiveStatus::Active], None),
@@ -14868,6 +14934,7 @@ mod start_block_tests {
                     fence_frame: 920_000,
                     seats: true,
                 }),
+                withheld: None,
             }),
             ..StartContext::default()
         };
@@ -14946,6 +15013,7 @@ mod start_block_tests {
                     release: Some(shortfall),
                     join_wait: None,
                     session_wait: None,
+                    withheld: None,
                 }),
                 ..StartContext::default()
             };
@@ -18453,6 +18521,7 @@ mod tests {
             release: None,
             join_wait: None,
             session_wait: None,
+            withheld: None,
         });
         engine.note_predecessor_block(Some(&pending), std::time::Instant::now());
         assert!(
@@ -18710,6 +18779,7 @@ mod tests {
                 fence_frame: 920_000,
                 seats: true,
             }),
+            withheld: None,
         };
         let predecessor = QuilError::ExecutionUnavailable(
             "app committee session: predecessor state has not been recovered through its seal"
