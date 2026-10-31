@@ -1750,6 +1750,63 @@ mod tests {
         );
     }
 
+    /// A proof whose sibling the store lost (the width-1 sibling of the
+    /// proven key's nibble, an internal node, or a lone leaf in a sibling
+    /// range) fails, naming the lost node, instead of panicking the
+    /// caller's thread.
+    #[test]
+    fn a_proof_reading_a_lost_sibling_is_an_error() {
+        let namespace = b"lost-sibling-test/";
+        let (app, phase) = ([7; 32], Phase::VertexAdds);
+        let key = |first: u8| {
+            let mut key = vec![0; 32];
+            key[0] = first;
+            key[31] = first;
+            key
+        };
+        // Root children: nibble 0 an internal node, 1 the proven key's, 3 a
+        // lone leaf.
+        for lost in [0, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = crate::CoordinatedDb::new(rocksdb::DB::open_default(dir.path()).unwrap());
+            let forest = Forest::with_namespace(db.clone(), namespace);
+            let leaves: Vec<_> = [0x01, 0x02, 0x11, 0x12, 0x31]
+                .into_iter()
+                .map(|first| (key(first), vec![first]))
+                .collect();
+            forest
+                .commit_shard_phase_raw(&app, phase, 0, leaves)
+                .unwrap();
+            assert!(forest
+                .shard_phase_get_with_proof_raw(&app, phase, 0, &key(0x11))
+                .is_ok());
+            let root_key = NodeKey::new(0, NibblePath::new(vec![]));
+            let Node::Internal(root) = forest
+                .shard_phase_reader(&app, phase)
+                .get_node_option(&root_key)
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("expected branch");
+            };
+            let (nibble, child) = root.children_sorted().nth(lost).unwrap();
+            let lost = root_key.gen_child_node_key(child.version, nibble);
+            let mut encoded = namespace.to_vec();
+            encoded.extend_from_slice(&TreeId::shard_phase(&app, phase).prefix());
+            encoded.push(b'n');
+            encoded.extend_from_slice(&borsh::to_vec(&lost).unwrap());
+            assert!(db.get(&encoded).unwrap().is_some());
+            db.delete(encoded).unwrap();
+            let error = forest
+                .shard_phase_get_with_proof_raw(&app, phase, 0, &key(0x11))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(&format!("{lost:?}")),
+                "{error:#}"
+            );
+        }
+    }
+
     /// Unified tree: `app_subtree_root` reads per-shard commitments as
     /// in-place subtrees of the ONE app tree — nibble-aligned, non-nibble-aligned
     /// (6-bit), and empty — and the empty path is the JMT root over ALL shards.
