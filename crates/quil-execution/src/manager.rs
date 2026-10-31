@@ -73,6 +73,80 @@ fn executing_filter(application: &[u8; 32], shard: &[bool]) -> Vec<u8> {
     quil_forest::encode_shard_bit_path(application, shard)
 }
 
+/// The deliveries `build` makes of `pending`, in order, at most `cap`. A block
+/// whose next item `build` cannot make yet (`None`) is left there, since its
+/// later items would be out of sequence; the other blocks' items still are.
+#[cfg(feature = "native-proof")]
+fn take_deliverable(
+    pending: Vec<crate::token_intrinsic::delivery::PendingDelivery>,
+    cap: usize,
+    mut build: impl FnMut(&crate::token_intrinsic::delivery::PendingDelivery) -> Result<Option<Vec<u8>>>,
+) -> Result<Vec<Vec<u8>>> {
+    let mut deliveries = Vec::new();
+    let mut stalled = std::collections::BTreeSet::new();
+    for item in pending {
+        if deliveries.len() >= cap {
+            break;
+        }
+        if stalled.contains(&(item.escrow, item.block)) {
+            continue;
+        }
+        match build(&item)? {
+            Some(bytes) => deliveries.push(bytes),
+            None => {
+                stalled.insert((item.escrow, item.block));
+            }
+        }
+    }
+    Ok(deliveries)
+}
+
+/// One output or escrow committed to a shard that it has not taken yet
+/// ([`ExecutionEngineManager::pending_delivery_census`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeliveryItem {
+    /// `(executing filter, frame number)`: the certified frame holding the
+    /// operation's bytes.
+    pub source: (Vec<u8>, u64),
+    /// The operation's id.
+    pub tx_id: [u8; 32],
+    pub block: u64,
+    pub seq: u64,
+    pub escrow: bool,
+}
+
+/// What a read of the outputs and escrows committed to a shard that it has
+/// not taken yet found.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeliveryCensus {
+    /// The listed items: each block's in delivery order, the blocks in turn.
+    pub items: Vec<DeliveryItem>,
+    /// Owned blocks read.
+    pub blocks: usize,
+    /// Committed outputs and escrows not taken yet, over every owned block.
+    pub pending: u64,
+    /// Blocks with something pending, coins and escrows counted apart.
+    pub blocks_pending: usize,
+    /// Whether the per-frame cap left pending items unlisted.
+    pub capped: bool,
+    /// `(block, seq)` committed whose delivery record this GLOBAL view
+    /// lacks: its block lists nothing from there on.
+    pub missing_records: Vec<(u64, u64)>,
+}
+
+impl DeliveryCensus {
+    /// The listed items' source frames, in delivery order, without repeats.
+    pub fn sources(&self) -> Vec<(Vec<u8>, u64)> {
+        let mut sources: Vec<(Vec<u8>, u64)> = Vec::new();
+        for item in &self.items {
+            if !sources.contains(&item.source) {
+                sources.push(item.source.clone());
+            }
+        }
+        sources
+    }
+}
+
 /// What a read of a shard's pending deliveries found
 /// ([`ExecutionEngineManager::pending_delivery_sources`]): their source
 /// frames, without repeats, and the scale of the read.
@@ -1744,16 +1818,6 @@ impl ExecutionEngineManager {
         }
     }
 
-    /// Deliveries (`0x051A` operation bytes) of committed outputs the shard
-    /// `filter` owns and has not yet taken, in delivery order, at most
-    /// [`MAX_DELIVERIES_PER_FRAME`]. `global` holds GLOBAL state and `clock`
-    /// canonical global frames; each record is proven at the newest global
-    /// root retained at or before `anchor`. `operation(source frame, tx id)`
-    /// returns the committed operation's `(type prefix, bytes)` from that
-    /// certified shard frame. Stops at the first output it cannot deliver yet,
-    /// since later outputs of the block would be out of sequence.
-    ///
-    /// [`MAX_DELIVERIES_PER_FRAME`]: crate::token_intrinsic::delivery::MAX_DELIVERIES_PER_FRAME
     /// The certified frames holding the bytes of everything committed to the
     /// shard `filter` that it has not delivered yet: `(executing filter, frame
     /// number)`, without repeats. On a whole-application shard these are its
@@ -1764,73 +1828,87 @@ impl ExecutionEngineManager {
         global: Arc<quil_hypergraph::HypergraphCrdt>,
         filter: &[u8],
     ) -> Result<DeliverySourceScan> {
+        self.pending_delivery_census(global, filter)
+            .map(|census| DeliverySourceScan {
+                sources: census.sources(),
+                pending: census.items.len(),
+                blocks: census.blocks,
+            })
+    }
+
+    /// What is committed to the shard `filter` that it has not delivered
+    /// yet: the next items of every block, in turns, up to
+    /// [`MAX_DELIVERIES_PER_FRAME`] beyond those, and the backlog's scale.
+    ///
+    /// [`MAX_DELIVERIES_PER_FRAME`]: crate::token_intrinsic::delivery::MAX_DELIVERIES_PER_FRAME
+    pub fn pending_delivery_census(
+        &self,
+        global: Arc<quil_hypergraph::HypergraphCrdt>,
+        filter: &[u8],
+    ) -> Result<DeliveryCensus> {
         #[cfg(not(feature = "native-proof"))]
         {
             let _ = (global, filter);
-            Ok(DeliverySourceScan::default())
+            Ok(DeliveryCensus::default())
         }
         #[cfg(feature = "native-proof")]
         {
             let Some((application, _)) = quil_forest::decode_shard_filter_or_root(filter, 32)
             else {
-                return Ok(DeliverySourceScan::default());
+                return Ok(DeliveryCensus::default());
             };
             let Ok(application) = <[u8; 32]>::try_from(application.as_slice()) else {
-                return Ok(DeliverySourceScan::default());
+                return Ok(DeliveryCensus::default());
             };
-            let (pending, blocks) = self.pending_deliveries_counted(global, filter)?;
-            let mut scan = DeliverySourceScan {
-                pending: pending.len(),
-                blocks,
-                ..DeliverySourceScan::default()
-            };
-            for item in pending {
-                let Some(bits) = item.source_shard.bits() else {
-                    continue;
-                };
-                let source = (executing_filter(&application, &bits), item.source_frame);
-                if !scan.sources.contains(&source) {
-                    scan.sources.push(source);
-                }
-            }
-            Ok(scan)
+            let census = self.pending_census(global, filter)?;
+            Ok(DeliveryCensus {
+                items: census
+                    .items
+                    .iter()
+                    .filter_map(|item| {
+                        let bits = item.source_shard.bits()?;
+                        Some(DeliveryItem {
+                            source: (executing_filter(&application, &bits), item.source_frame),
+                            tx_id: item.tx_id,
+                            block: item.block,
+                            seq: item.seq,
+                            escrow: item.escrow,
+                        })
+                    })
+                    .collect(),
+                blocks: census.blocks,
+                pending: census.pending,
+                blocks_pending: census.blocks_pending,
+                capped: census.capped,
+                missing_records: census
+                    .missing_records
+                    .iter()
+                    .map(|(_, block, seq)| (*block, *seq))
+                    .collect(),
+            })
         }
     }
 
     #[cfg(feature = "native-proof")]
-    fn pending_deliveries(
+    fn pending_census(
         &self,
         global: Arc<quil_hypergraph::HypergraphCrdt>,
         filter: &[u8],
-    ) -> Result<Vec<crate::token_intrinsic::delivery::PendingDelivery>> {
-        self.pending_deliveries_counted(global, filter)
-            .map(|(pending, _)| pending)
-    }
-
-    /// [`Self::pending_deliveries`] and how many owned blocks it read.
-    #[cfg(feature = "native-proof")]
-    fn pending_deliveries_counted(
-        &self,
-        global: Arc<quil_hypergraph::HypergraphCrdt>,
-        filter: &[u8],
-    ) -> Result<(
-        Vec<crate::token_intrinsic::delivery::PendingDelivery>,
-        usize,
-    )> {
+    ) -> Result<crate::token_intrinsic::delivery::PendingCensus> {
         use crate::token_intrinsic::{delivery, dispatch::TokenPolicy};
         let Some((application, shard)) = quil_forest::decode_shard_filter_or_root(filter, 32)
         else {
-            return Ok((Vec::new(), 0));
+            return Ok(Default::default());
         };
         let Ok(application) = <[u8; 32]>::try_from(application.as_slice()) else {
-            return Ok((Vec::new(), 0));
+            return Ok(Default::default());
         };
         let network =
             quil_lattice_ct::confidential::transfer::network_identifier(self.pricing_network());
         let limits = TokenPolicy::for_network(self.pricing_network()).snapshots;
         let global = crate::hypergraph_state::HypergraphState::new(global);
         let local = crate::hypergraph_state::HypergraphState::new(self.crdt());
-        delivery::pending_deliveries_counted(
+        delivery::pending_census(
             &global,
             &local,
             &network,
@@ -1841,10 +1919,19 @@ impl ExecutionEngineManager {
         )
     }
 
-    /// `operation(executing filter, source frame, tx id)` supplies the bytes of
-    /// the committed operation, from the certified frame of the shard that
-    /// executed it — the owner's own frames on a whole-application shard, and
-    /// another shard's on a split one.
+    /// Deliveries (`0x051A` operation bytes) of committed outputs the shard
+    /// `filter` owns and has not yet taken, at most
+    /// [`MAX_DELIVERIES_PER_FRAME`]. `global` holds GLOBAL state and `clock`
+    /// canonical global frames; each record is proven at the newest global
+    /// root retained at or before `anchor`. `operation(executing filter,
+    /// source frame, tx id)` supplies the bytes of the committed operation,
+    /// from the certified frame of the shard that executed it — the owner's
+    /// own frames on a whole-application shard, and another shard's on a
+    /// split one. A block whose next output cannot be delivered yet is left
+    /// there, since its later outputs would be out of sequence; the other
+    /// blocks' outputs are still delivered.
+    ///
+    /// [`MAX_DELIVERIES_PER_FRAME`]: crate::token_intrinsic::delivery::MAX_DELIVERIES_PER_FRAME
     pub fn coin_deliveries(
         &self,
         global: Arc<quil_hypergraph::HypergraphCrdt>,
@@ -1870,46 +1957,34 @@ impl ExecutionEngineManager {
             };
             let network =
                 quil_lattice_ct::confidential::transfer::network_identifier(self.pricing_network());
-            let pending = self.pending_deliveries(global.clone(), filter)?;
+            let pending = self.pending_census(global.clone(), filter)?.items;
             let global = crate::hypergraph_state::HypergraphState::new(global);
-            let mut deliveries = Vec::with_capacity(pending.len());
-            let mut stalled = std::collections::BTreeSet::new();
-            for item in pending {
-                if stalled.contains(&(item.escrow, item.block)) {
-                    continue;
-                }
+            take_deliverable(pending, delivery::MAX_DELIVERIES_PER_FRAME, |item| {
                 // Where it ran is where its bytes are: the commit recorded it.
                 let Some(source) = item.source_shard.bits() else {
-                    continue;
+                    return Ok(None);
                 };
                 let source_filter = executing_filter(&application, &source);
                 let delivered = operation(&source_filter, item.source_frame, &item.tx_id).and_then(
                     |(tp, bytes)| {
-                        delivery::find_delivered(&network, &application, tp, &bytes, &item)
+                        delivery::find_delivered(&network, &application, tp, &bytes, item)
                             .ok()
                             .flatten()
                     },
                 );
-                let built = match delivered {
+                match delivered {
                     Some(delivered) => delivery::build_delivery(
                         &global,
                         clock,
                         &network,
                         &application,
                         anchor,
-                        &item,
+                        item,
                         delivered,
-                    )?,
-                    None => None,
-                };
-                match built {
-                    Some(bytes) => deliveries.push(bytes),
-                    None => {
-                        stalled.insert((item.escrow, item.block));
-                    }
+                    ),
+                    None => Ok(None),
                 }
-            }
-            Ok(deliveries)
+            })
         }
     }
 
@@ -2377,6 +2452,112 @@ mod tests {
         assert_eq!(
             manager.arrival_operations(&global, &crate::domains::GLOBAL, &fresh),
             Ok(Vec::new())
+        );
+    }
+
+    /// As a shard's members fetch: the pending
+    /// deliveries were listed block by block up to the per-frame cap, so one
+    /// block's backlog, undeliverable while its source frame was missing,
+    /// filled the list, and the source frame of an output committed to a later
+    /// block was never fetched. Its output stayed undelivered, and nothing
+    /// said so.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn a_backlogged_block_does_not_hide_a_later_blocks_source_frame() {
+        use crate::token_intrinsic::{delivery::MAX_DELIVERIES_PER_FRAME, global_commit};
+        let manager = build_manager(true);
+        let application = [2u8; 32];
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(MemStore::new()),
+            Arc::new(NoopInclusionProver),
+        ));
+        let state = crate::hypergraph_state::HypergraphState::new(global.clone());
+        let commit = |n: u32, first_byte: u8, source: &[bool], frame: u64| {
+            let mut output = [0u8; 32];
+            output[0] = first_byte;
+            output[28..].copy_from_slice(&n.to_be_bytes());
+            let mut tx_id = [0u8; 32];
+            tx_id[..4].copy_from_slice(&n.to_be_bytes());
+            let mut marker = tx_id;
+            marker[31] = 1;
+            let outcome = global_commit::commit_entry(
+                &state,
+                100,
+                &application,
+                &global_commit::SpendEntry {
+                    kind: 0x0512,
+                    tx_id,
+                    source_frame: frame,
+                    context: [8; 32],
+                    root_digest: None,
+                    consumptions: vec![marker],
+                    outputs: vec![output],
+                    escrow_create: None,
+                    escrow_claim: None,
+                    fee: 0,
+                    settlement: None,
+                },
+                quil_types::execution::ShardPath::from_bits(source),
+            )
+            .unwrap();
+            assert!(
+                matches!(outcome, global_commit::Outcome::Committed { .. }),
+                "{outcome:?}"
+            );
+        };
+        // One block's backlog, executed on one eight-bit shard...
+        for n in 0..MAX_DELIVERIES_PER_FRAME as u32 + 6 {
+            commit(n, 0, &[false; 8], 40 + u64::from(n));
+        }
+        // ...and one output of a later block, executed on another.
+        let later_shard = [false, false, false, false, false, false, true, false];
+        commit(1000, 2, &later_shard, 900);
+        state.commit().unwrap();
+        let filter = quil_forest::encode_shard_bit_path(&application, &[false; 6]);
+        let sources = manager
+            .pending_delivery_sources(global, &filter)
+            .unwrap()
+            .sources;
+        let later = (
+            quil_forest::encode_shard_bit_path(&application, &later_shard),
+            900,
+        );
+        assert!(
+            sources.contains(&later),
+            "the source frame of the output committed to a later block is never fetched, so the \
+             output is stranded: the {} frames listed are all one block's backlog",
+            sources.len()
+        );
+    }
+
+    /// Deliveries are taken in order up to the cap; a block whose next item
+    /// cannot be built yet is left there, and the other blocks' items still
+    /// are.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn deliveries_skip_a_waiting_block_and_stop_at_the_cap() {
+        use crate::token_intrinsic::delivery::PendingDelivery;
+        let item = |block: u64, seq: u64| PendingDelivery {
+            escrow: false,
+            block,
+            seq,
+            address: [0; 32],
+            source_frame: 0,
+            tx_id: [0; 32],
+            source_shard: quil_types::execution::ShardPath::from_bits(&[false; 8]),
+        };
+        let pending = vec![item(1, 0), item(2, 0), item(1, 1), item(2, 1), item(3, 0)];
+        let mut built = Vec::new();
+        let deliveries = take_deliverable(pending, 2, |item| {
+            built.push((item.block, item.seq));
+            Ok((item.block != 1).then(|| vec![item.block as u8, item.seq as u8]))
+        })
+        .unwrap();
+        assert_eq!(deliveries, vec![vec![2, 0], vec![2, 1]]);
+        assert_eq!(
+            built,
+            vec![(1, 0), (2, 0), (2, 1)],
+            "block 1's later item was tried out of sequence, or the cap was passed"
         );
     }
 
