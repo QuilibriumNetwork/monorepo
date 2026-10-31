@@ -43,11 +43,25 @@ pub trait LocalVertexCommitObserver: Send + Sync {
 /// Low-level key-value database interface (Pebble in Go, RocksDB in Rust).
 pub trait KvDb: Send + Sync {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    /// Show `key`'s value to `read` where the store keeps it, without
+    /// copying it out where the store allows (RocksDB pins it); whether the
+    /// key exists. For values too large to copy.
+    fn get_with(&self, key: &[u8], read: &mut dyn FnMut(&[u8])) -> Result<bool> {
+        Ok(self.get(key)?.map(|value| read(&value)).is_some())
+    }
     fn set(&self, key: &[u8], value: &[u8]) -> Result<()>;
     fn delete(&self, key: &[u8]) -> Result<()>;
     fn new_batch(&self, indexed: bool) -> Result<Box<dyn Transaction>>;
     fn new_iter(&self, lower: &[u8], upper: &[u8]) -> Result<Box<dyn Iterator>>;
     fn compact(&self, start: &[u8], end: &[u8], parallelize: bool) -> Result<()>;
+    /// Compact `[start, end)` through the bottommost level, without holding
+    /// off automatic compactions, when a live file overlapping it is at
+    /// least `min_file_bytes`: deleted values there stop taking space and
+    /// stop being read by lookups of keys beside them. Whether it ran.
+    fn compact_reclaiming(&self, start: &[u8], end: &[u8], min_file_bytes: u64) -> Result<bool> {
+        let _ = min_file_bytes;
+        self.compact(start, end, false).map(|()| true)
+    }
     fn compact_all(&self) -> Result<()>;
     fn close(&self) -> Result<()>;
     fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()>;

@@ -486,6 +486,14 @@ impl store::KvDb for RocksDb {
             .map_err(|e| QuilError::Store(e.to_string()))
     }
 
+    fn get_with(&self, key: &[u8], read: &mut dyn FnMut(&[u8])) -> Result<bool> {
+        let value = self
+            .db
+            .get_pinned(key)
+            .map_err(|e| QuilError::Store(e.to_string()))?;
+        Ok(value.map(|value| read(&value)).is_some())
+    }
+
     fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.db
             .put(key, value)
@@ -512,6 +520,28 @@ impl store::KvDb for RocksDb {
     fn compact(&self, start: &[u8], end: &[u8], _parallelize: bool) -> Result<()> {
         self.db.compact_range(Some(start), Some(end));
         Ok(())
+    }
+
+    fn compact_reclaiming(&self, start: &[u8], end: &[u8], min_file_bytes: u64) -> Result<bool> {
+        let files = self
+            .db
+            .live_files()
+            .map_err(|e| QuilError::Store(e.to_string()))?;
+        let overlapping = files.iter().any(|file| {
+            file.size as u64 >= min_file_bytes
+                && match (file.start_key.as_deref(), file.end_key.as_deref()) {
+                    (Some(first), Some(last)) => first < end && last >= start,
+                    _ => false,
+                }
+        });
+        if !overlapping {
+            return Ok(false);
+        }
+        let mut options = rocksdb::CompactOptions::default();
+        options.set_exclusive_manual_compaction(false);
+        options.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::ForceOptimized);
+        self.db.compact_range_opt(Some(start), Some(end), &options);
+        Ok(true)
     }
 
     fn compact_all(&self) -> Result<()> {

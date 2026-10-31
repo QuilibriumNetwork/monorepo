@@ -495,6 +495,13 @@ impl CoordinatedDb {
     ) -> Result<Option<Vec<u8>>, rocksdb::Error> {
         self.0.db.get_opt(key, options)
     }
+    /// A value read in place, without copying it out of RocksDB.
+    pub fn get_pinned(
+        &self,
+        key: impl AsRef<[u8]>,
+    ) -> Result<Option<rocksdb::DBPinnableSlice<'_>>, rocksdb::Error> {
+        self.0.db.get_pinned(key)
+    }
     pub fn raw_iterator(&self) -> DBRawIterator<'_> {
         self.0.db.raw_iterator()
     }

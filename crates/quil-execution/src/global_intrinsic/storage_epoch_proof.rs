@@ -384,6 +384,44 @@ pub fn frame_openings(
     Some(opened)
 }
 
+/// [`frame_openings`] reading each held leaf's replica only where a query
+/// opens it: `read(i, nodes)` gives the serialized nodes `nodes` of
+/// `held[i]`'s replica (the subtree below its cap that the opened node's path
+/// is recomputed from, `MerkleCap::subtree`), or `None` when they cannot be
+/// read. The same openings, in the same order, as from the whole replicas.
+pub fn frame_openings_from(
+    member: &[u8],
+    epoch: u64,
+    held: &[HeldLeaf],
+    caps: &[&quil_crypto::storage_proof::MerkleCap],
+    rho_n: &[u8],
+    read: &mut dyn FnMut(usize, std::ops::Range<u64>) -> Option<Vec<u8>>,
+) -> Option<Vec<quil_storage_stark::seal::Opened>> {
+    use quil_crypto::storage_proof::{opening_index, Tree, NODE_BYTES};
+    if held.len() != caps.len() {
+        return None;
+    }
+    let mut opened =
+        Vec::with_capacity(held.len() * quil_types::consensus::STORAGE_QUERIES_PER_LEAF as usize);
+    for (i, (leaf, cap)) in held.iter().zip(caps).enumerate() {
+        if cap.n != leaf.n || cap.commitment(Tree::Replica) != leaf.comm_r {
+            return None;
+        }
+        for query in 0..quil_types::consensus::STORAGE_QUERIES_PER_LEAF {
+            let index = opening_index(rho_n, &leaf.leaf_id, epoch, member, query, cap.n);
+            let below = cap.subtree(index)?;
+            let at = (index - below.start) as usize * NODE_BYTES;
+            let subtree = read(i, below)?;
+            let path = cap.subtree_path(&subtree, index)?;
+            opened.push(quil_storage_stark::seal::Opened {
+                value: subtree.get(at..at + NODE_BYTES)?.try_into().ok()?,
+                path,
+            });
+        }
+    }
+    Some(opened)
+}
+
 /// The root a frame commits for `opened` ([`frame_openings`]).
 pub fn openings_root(
     frame_number: u64,
@@ -857,6 +895,74 @@ fn check_seat(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Opening from the subtrees read gives what opening from the whole
+    /// replicas gives, for leaves of one and several cap subtrees.
+    #[test]
+    fn frame_openings_from_subtrees_match_the_whole_replicas() {
+        use quil_crypto::storage_proof::{MerkleTree, Tree, CAP_HEIGHT, NODE_BYTES};
+        let replica = |n: usize, seed: u32| -> Vec<u8> {
+            (0..n * 8)
+                .map(|i| {
+                    ((i as u32).wrapping_mul(0x9E37_79B9) ^ seed.wrapping_mul(0x85EB_CA6B))
+                        .rotate_left(seed % 31)
+                        & 0x3FFF_FFFF
+                })
+                .flat_map(u32::to_le_bytes)
+                .collect()
+        };
+        let replicas = [replica(3000, 1), replica(5, 2)];
+        let trees: Vec<MerkleTree> = replicas
+            .iter()
+            .map(|nodes| MerkleTree::from_nodes(nodes).unwrap())
+            .collect();
+        let caps: Vec<_> = trees.iter().map(|tree| tree.cap(CAP_HEIGHT)).collect();
+        let held: Vec<HeldLeaf> = trees
+            .iter()
+            .enumerate()
+            .map(|(i, tree)| HeldLeaf {
+                leaf_id: vec![i as u8; 37],
+                n: tree.n(),
+                comm_r: tree.commitment(Tree::Replica),
+            })
+            .collect();
+        let whole: Vec<HeldReplica> = replicas
+            .iter()
+            .zip(&caps)
+            .map(|(replica, cap)| HeldReplica { replica, cap })
+            .collect();
+        let cap_refs: Vec<_> = caps.iter().collect();
+        let member = [0x44u8; 32];
+        for rho in [[1u8; 32], [2; 32], [3; 32]] {
+            let expected = frame_openings(&member, 7, &held, &whole, &rho).unwrap();
+            let mut read_nodes = 0u64;
+            let mut read = |i: usize, nodes: std::ops::Range<u64>| {
+                read_nodes += nodes.end - nodes.start;
+                Some(
+                    replicas[i][nodes.start as usize * NODE_BYTES..nodes.end as usize * NODE_BYTES]
+                        .to_vec(),
+                )
+            };
+            let opened = frame_openings_from(&member, 7, &held, &cap_refs, &rho, &mut read);
+            assert_eq!(opened.as_ref().map(|o| o.len()), Some(expected.len()));
+            for (a, b) in opened.unwrap().iter().zip(&expected) {
+                assert_eq!((a.value, &a.path), (b.value, &b.path));
+            }
+            assert!(
+                read_nodes <= 2 * (1 << CAP_HEIGHT) + 2 * 5,
+                "read {read_nodes} nodes"
+            );
+            // A subtree that is not the replica's does not open.
+            let mut wrong = |i: usize, nodes: std::ops::Range<u64>| {
+                let mut bytes = replicas[i]
+                    [nodes.start as usize * NODE_BYTES..nodes.end as usize * NODE_BYTES]
+                    .to_vec();
+                bytes[0] ^= 1;
+                Some(bytes)
+            };
+            assert!(frame_openings_from(&member, 7, &held, &cap_refs, &rho, &mut wrong).is_none());
+        }
+    }
 
     #[test]
     fn a_proof_round_trips_and_nothing_else_decodes() {

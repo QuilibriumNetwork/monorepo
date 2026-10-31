@@ -705,17 +705,17 @@ fn snapshot_storage_confirm(
         let mut entries = Vec::with_capacity(prefixes.len());
         for prefix in prefixes {
             let lid = leaf_id_bytes(filter, &prefix);
-            let stored = replica_store.get_hash(epoch, &lid)?.ok_or_else(|| {
+            // The record beside the nodes: a renewal reads no replica.
+            let stored = replica_store.get_hash_leaf(epoch, &lid)?.ok_or_else(|| {
                 unavailable(format!(
                     "leaf {} of the epoch {epoch} snapshot has no replica",
                     hex::encode(&lid)
                 ))
             })?;
-            let nodes = (stored.replica.len() / quil_crypto::storage_proof::NODE_BYTES) as u64;
             entries.push(LeafRootEntry {
                 prefix,
-                leaf_root: stored.registration_root,
-                num_blocks: nodes,
+                leaf_root: stored.registration_root.clone(),
+                num_blocks: stored.n,
             });
         }
         all.push(ConfirmLeafRoots {
