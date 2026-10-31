@@ -614,19 +614,27 @@ fn write_placed(state: &HypergraphState, application: &[u8; 32], placed: &[(u64,
 /// Count a coin written at the next index of `block`, to be folded with the
 /// frame's others by [`fold_placed`]. Refuses it past the application's coin
 /// cap, as its fold would have.
+///
+/// `scope` is the bit path of the blocks a missing summary is rebuilt from
+/// (see [`prepare`]): empty for a store holding the whole application.
 pub(crate) fn add_placed(
     state: &HypergraphState,
     network: &[u8; 32],
     application: &[u8; 32],
     block: u64,
     address: &[u8; 32],
+    scope: &[bool],
     limits: SnapshotLimits,
 ) -> Result<()> {
     let context = parameter_context(network, application);
     let mut placed = read_placed(state, application)?;
     if placed.is_empty() {
-        // The private summary the cap counts from, ready as the fold needs it.
-        prepare(state, &context, application, limits)?;
+        // The private summary, ready as the fold needs it: the fold does not
+        // rebuild it again (see [`fold_placed`]). `held` counts the coins of
+        // `scope`'s blocks, which on a worker are its shard's, not the
+        // application's; the cap (2^32, the tree's capacity) is out of reach
+        // either way.
+        prepare(state, &context, application, Some(scope), limits)?;
     }
     let held = super::summary_tree::top(state, application)?.map_or(0, |top| top.coins);
     check_coin_cap(held, placed.len() + 1, limits)?;
@@ -639,6 +647,12 @@ pub(crate) fn add_placed(
 /// the root: once per application frame, before its report reads the blocks.
 /// `None`, and nothing written, when none were placed. `frame` only names the
 /// fold in its log line.
+///
+/// The fold never rebuilds a missing summary: the frame's first placement
+/// ([`add_placed`]) did, in the changeset that holds the placed list, and
+/// placements write no block records. Its rebuild of an application with no
+/// blocks wrote no summary top, so rebuilding here read every block a second
+/// time for the application's first coins.
 pub fn fold_placed(
     state: &HypergraphState,
     frame: u64,
@@ -646,12 +660,13 @@ pub fn fold_placed(
     application: &[u8; 32],
     limits: SnapshotLimits,
 ) -> Result<Option<RootRecord>> {
-    let coins = read_placed(state, application)?.len();
+    let placed = read_placed(state, application)?;
+    let coins = placed.len();
     if coins == 0 {
         return Ok(None);
     }
     let started = std::time::Instant::now();
-    let root = refresh_root(state, network, application, limits)?;
+    let root = refresh(state, network, application, placed, None, limits)?;
     note_fold(application, frame, coins, started.elapsed(), FOLD_SLOW);
     Ok(Some(root))
 }
@@ -788,10 +803,15 @@ pub fn full_rebuild_root(
 
 /// What a fold reads first: valid limits, the width's shape, and the private
 /// summary tree, ready to update.
+///
+/// `rebuild`: the bit path of the blocks this store's summary covers, read
+/// when the summary is missing; `None` when this frame's [`add_placed`]
+/// already rebuilt it (see [`fold_placed`]).
 fn prepare<'a>(
     state: &'a HypergraphState,
     context: &[u8; 32],
     application: &'a [u8; 32],
+    rebuild: Option<&[bool]>,
     limits: SnapshotLimits,
 ) -> Result<super::summary_tree::SummaryTree<'a>> {
     if !(1..=32).contains(&limits.max_depth) {
@@ -818,21 +838,45 @@ fn prepare<'a>(
     // fold, so on a node's first frame for an application it is still absent
     // when the fold prepares again after `add_placed` rebuilt the copies, and
     // the block records have not changed in between (decided 2026-10-28).
+    //
+    // Only the blocks of `rebuild`'s path are read: a worker's store holds
+    // its shard, whose summary `rebuild_block_summary` also builds from that
+    // shard's blocks alone, and the shard's report reads only those. Reading
+    // every block id instead (65,472) cost a worker store about 6 s, twice,
+    // for its first coin (2026-10-30). A store holding several shards (an
+    // archive, a globally executed application) passes the whole application.
+    let Some(scope) = rebuild else {
+        return Ok(tree);
+    };
     if super::summary_tree::top(state, application)?.is_none() {
         let disc = vertex_adds_discriminator()?;
+        let range = rebuild_range(scope);
+        let blocks = super::coin_blocks::owned_blocks(scope, super::coin_blocks::MAX_BLOCK_BITS)
+            .count() as u64;
+        tracing::info!(
+            application = %hex::encode(application),
+            range = %range,
+            blocks,
+            scope = "this node",
+            "coin root summary rebuild started: reading two block records per block \
+             of the range; the line 'summary rebuilt from block records' ends it"
+        );
         let started = std::time::Instant::now();
         let mut reads = 0u64;
         let mut next_progress = REBUILD_PROGRESS_EVERY;
-        let summary = block_summary_from_records(context, &[], |address| {
+        let summary = block_summary_from_records(context, scope, |address| {
             reads += 1;
             if reads % 1024 == 0 && started.elapsed() >= next_progress {
                 tracing::warn!(
                     application = %hex::encode(application),
+                    range = %range,
                     blocks_read = reads / 2,
+                    blocks,
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     scope = "this node",
                     action = "none: a one-time rebuild reads two records for each of the \
-                              application's blocks; it ends with 'coin root summary rebuilt'",
+                              range's blocks; the line 'summary rebuilt from block records' \
+                              ends it",
                     "coin root summary rebuild still reading block records"
                 );
                 next_progress = started.elapsed() + REBUILD_PROGRESS_EVERY;
@@ -842,6 +886,8 @@ fn prepare<'a>(
         tree.replace(&summary.blocks)?;
         tracing::info!(
             application = %hex::encode(application),
+            range = %range,
+            blocks_read = reads / 2,
             blocks = summary.blocks.len(),
             coins = summary.coins(),
             duration_ms = started.elapsed().as_millis() as u64,
@@ -853,6 +899,18 @@ fn prepare<'a>(
     Ok(tree)
 }
 
+/// The blocks a summary rebuild reads, for its log lines.
+fn rebuild_range(scope: &[bool]) -> String {
+    if scope.is_empty() {
+        return "whole application".into();
+    }
+    let path: String = scope
+        .iter()
+        .map(|bit| if *bit { '1' } else { '0' })
+        .collect();
+    format!("shard path {path}")
+}
+
 /// A summary rebuild still reading block records after this long logs its
 /// progress, at most this often.
 const REBUILD_PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
@@ -862,17 +920,34 @@ const REBUILD_PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_se
 /// those placed since the last fold ([`add_placed`]) and those in the pending
 /// changeset, at or beyond their block's frontier; each block's must be
 /// consecutive from there. Does not commit state. Callers serialize mutations
-/// and own rollback on error.
+/// and own rollback on error. A missing summary is rebuilt from every block
+/// of the application, unless coins were placed this frame: their first
+/// placement rebuilt it (see [`fold_placed`]).
 pub fn refresh_root(
     state: &HypergraphState,
     network: &[u8; 32],
     application: &[u8; 32],
     limits: SnapshotLimits,
 ) -> Result<RootRecord> {
+    let placed = read_placed(state, application)?;
+    let rebuild: Option<&[bool]> = placed.is_empty().then_some(&[][..]);
+    refresh(state, network, application, placed, rebuild, limits)
+}
+
+/// [`refresh_root`] with the frame's `placed` coins already read, rebuilding
+/// a missing summary from `rebuild`'s blocks (see [`prepare`]).
+fn refresh(
+    state: &HypergraphState,
+    network: &[u8; 32],
+    application: &[u8; 32],
+    placed: Vec<(u64, [u8; 32])>,
+    rebuild: Option<&[bool]>,
+    limits: SnapshotLimits,
+) -> Result<RootRecord> {
     let context = parameter_context(network, application);
     let disc = vertex_adds_discriminator()?;
     let subtree = usize::from(super::coin_blocks::SUBTREE_BITS);
-    let tree = prepare(state, &context, application, limits)?;
+    let tree = prepare(state, &context, application, rebuild, limits)?;
 
     // The coins this fold may take, once each: the placed ones are already
     // committed to the frame's staging, and anything else a caller staged is
@@ -885,7 +960,6 @@ pub fn refresh_root(
             records.insert(address, record);
         }
     }
-    let placed = read_placed(state, application)?;
     for (_, address) in &placed {
         if records.contains_key(address) {
             continue;
@@ -2070,11 +2144,11 @@ mod tests {
     }
 
     /// A node without the private copies rebuilds the summary from the block
-    /// records, and says so with its counts: in the frame placing the
-    /// application's first coins (an application with no blocks yet has no
-    /// summary top, so that frame's fold rebuilds its empty summary again),
-    /// and once on a node that took the application by sync. Frames after
-    /// that rebuild nothing and log nothing.
+    /// records, and says so with its counts: once in the frame placing the
+    /// application's first coins (its first placement rebuilds; the frame's
+    /// fold, which finds no summary top while the application has no blocks,
+    /// does not read the blocks again), and once on a node that took the
+    /// application by sync. Frames after that rebuild nothing and log nothing.
     #[cfg(feature = "native-proof")]
     #[test]
     fn a_summary_rebuild_logs_once_per_application() {
@@ -2111,6 +2185,7 @@ mod tests {
                 tree,
                 block,
                 *seq,
+                &[],
                 limits,
             )
             .unwrap();
@@ -2146,7 +2221,7 @@ mod tests {
             fold(&state, 1);
         });
         let lines = rebuilt(&lines);
-        assert!((1..=2).contains(&lines.len()), "{lines:?}");
+        assert_eq!(lines.len(), 1, "{lines:?}");
         for line in &lines {
             assert!(line.starts_with("INFO"), "{line}");
             assert!(
@@ -2188,6 +2263,400 @@ mod tests {
         for line in &lines {
             assert!(line.contains(" coins=4 duration_ms="), "{line}");
             assert!(!line.contains(" blocks=0 "), "{line}");
+        }
+    }
+
+    /// A worker's store holds its shard: a missing summary is rebuilt from
+    /// that shard's blocks alone, once a frame. An empty store's first coin
+    /// reads the 1,023 block ids under a six-bit path, not the application's
+    /// 65,472, and its fold reads none. With the shard's records the result
+    /// equals the whole-application rebuild's (root, coins and the shard's
+    /// report), and another shard's records left in the store change nothing
+    /// the shard reports.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn a_shard_store_rebuilds_from_its_own_blocks_once() {
+        use super::super::{
+            coin_blocks, delivery::place_committed, shard_accumulator, state::coin_identity,
+        };
+        use quil_lattice_ct::confidential::{
+            transfer::{Output, MEMO_BYTES},
+            AmountOpening, CommitmentKey,
+        };
+        let (network, application) = ([71u8; 32], [72u8; 32]);
+        let context = parameter_context(&network, &application);
+        let key = CommitmentKey::derive(&context);
+        let disc = vertex_adds_discriminator().unwrap();
+        let limits = SnapshotLimits {
+            max_coins: 64,
+            max_depth: 32,
+            max_nodes: 1 << 14,
+        };
+        let width = coin_blocks::INITIAL_BLOCK_BITS;
+        let coin = |amount: u64| {
+            let output = Output {
+                owner: [7; IDENTITY_BYTES],
+                commitment: key.commit(
+                    u128::from(amount),
+                    &AmountOpening::from_seed(&context, &[amount as u8; 32]),
+                ),
+                memo: [amount as u8; MEMO_BYTES],
+            };
+            let (address, tree) = coin_identity(&context, 5, &output).unwrap();
+            let block = coin_blocks::block_for_address(width, &address).unwrap();
+            (address, tree, block)
+        };
+        // Two coins of one six-bit block, the shard's, and one of another.
+        let shard_block = coin(1).2;
+        let shard = coin_blocks::block_path(shard_block);
+        let mut ours = vec![1u64];
+        let mut foreign = None;
+        for amount in 2..2_000 {
+            if ours.len() == 2 && foreign.is_some() {
+                break;
+            }
+            if coin(amount).2 == shard_block {
+                if ours.len() < 2 {
+                    ours.push(amount);
+                }
+            } else {
+                foreign.get_or_insert(amount);
+            }
+        }
+        assert_eq!(ours.len(), 2);
+        let foreign = foreign.unwrap();
+
+        let place = |state: &HypergraphState, amount: u64, scope: &[bool]| {
+            let (address, tree, block) = coin(amount);
+            let seq = block_count(state, &network, &application, block, limits).unwrap();
+            place_committed(
+                state,
+                5,
+                &network,
+                &application,
+                &address,
+                tree,
+                block,
+                seq,
+                scope,
+                limits,
+            )
+            .unwrap();
+            state.commit().unwrap();
+            state.abort();
+        };
+        let fold = |state: &HypergraphState, frame: u64| {
+            let end = HypergraphState::new(state.crdt().clone());
+            fold_placed(&end, frame, &network, &application, limits)
+                .unwrap()
+                .expect("the frame placed coins");
+            end.commit().unwrap();
+            end.abort();
+            end.crdt().commit(frame).unwrap();
+        };
+        let rebuilt = |run: &dyn Fn()| -> Vec<String> {
+            logged(run)
+                .into_iter()
+                .filter(|line| line.contains("coin root summary rebuilt"))
+                .collect()
+        };
+        // A store holding these coins' records but not the private copies,
+        // as sync leaves one.
+        let synced = |amounts: &[u64]| {
+            let executed = mem_state();
+            for amount in amounts {
+                place(&executed, *amount, &[]);
+            }
+            fold(&executed, 1);
+            let synced = mem_state();
+            let mut vertices = Vec::new();
+            executed
+                .crdt()
+                .for_each_live_vertex_add(&application, &mut |key, blob| vertices.push((key, blob)))
+                .unwrap();
+            for (key, blob) in vertices {
+                let address: [u8; 32] = key[32..].try_into().unwrap();
+                synced.set(&application, &address, &disc, 1, blob).unwrap();
+            }
+            synced.commit().unwrap();
+            synced.abort();
+            synced.crdt().commit(1).unwrap();
+            synced
+        };
+        let path: String = shard
+            .iter()
+            .map(|bit| if *bit { '1' } else { '0' })
+            .collect();
+        let owned = coin_blocks::owned_blocks(&shard, coin_blocks::MAX_BLOCK_BITS).count();
+        assert_eq!(owned, 1_023);
+        let report = |state: &HypergraphState| {
+            shard_accumulator::shard_report(state, &network, &application, &shard, false).unwrap()
+        };
+
+        // An empty worker store's first coin: one rebuild, of the shard.
+        let fresh = mem_state();
+        let lines = rebuilt(&|| {
+            place(&fresh, ours[1], &shard);
+            fold(&fresh, 2);
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains(&format!(
+                " range=shard path {path} blocks_read={owned} blocks=0 coins=0 "
+            )),
+            "{}",
+            lines[0]
+        );
+
+        // With the shard's records: the shard's rebuild equals the whole
+        // application's.
+        let scoped = synced(&ours[..1]);
+        let whole = synced(&ours[..1]);
+        let lines = rebuilt(&|| {
+            place(&scoped, ours[1], &shard);
+            fold(&scoped, 2);
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains(&format!(
+                " range=shard path {path} blocks_read={owned} blocks=1 coins=1 "
+            )),
+            "{}",
+            lines[0]
+        );
+        let lines = rebuilt(&|| {
+            place(&whole, ours[1], &[]);
+            fold(&whole, 2);
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains(" range=whole application blocks_read=65472 blocks=1 coins=1 "),
+            "{}",
+            lines[0]
+        );
+        let expected = read_current(&whole, &network, &application).unwrap();
+        assert_eq!(expected.as_ref().map(|root| root.coins), Some(2));
+        assert_eq!(
+            read_current(&scoped, &network, &application).unwrap(),
+            expected
+        );
+        assert_eq!(report(&scoped), report(&whole));
+        assert!(report(&scoped).is_some());
+
+        // Another shard's records in the store: the summary holds the shard's
+        // blocks alone (a whole-application rebuild would count the other
+        // coin), the one the report-time rebuild builds for it. The shard's
+        // report reads only its own blocks, so it is the same either way.
+        let mixed = synced(&[ours[0], foreign]);
+        place(&mixed, ours[1], &shard);
+        fold(&mixed, 2);
+        assert_eq!(summary_coins(&mixed, &application).unwrap(), 2);
+        assert_eq!(
+            fold_application_root(&mixed, &network, &application).unwrap(),
+            fold_application_root(&whole, &network, &application).unwrap()
+        );
+        assert_eq!(report(&mixed), report(&whole));
+        rebuild_block_summary(&mixed, &network, &application, &shard).unwrap();
+        assert_eq!(summary_coins(&mixed, &application).unwrap(), 2);
+        assert_eq!(
+            fold_application_root(&mixed, &network, &application).unwrap(),
+            fold_application_root(&whole, &network, &application).unwrap()
+        );
+    }
+
+    /// The scope comes from the manager that applies the delivery: placing an
+    /// application's first coin rebuilds from the executing shard's blocks on
+    /// a worker's manager (the application venue, configured or the default
+    /// without the global engine), and from the whole application on a
+    /// global-venue manager (the master's: GLOBAL and archive replay), whose
+    /// frames name the application venue too. The frame's fold rebuilds
+    /// nothing more.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn a_delivery_rebuilds_from_the_scope_its_manager_holds() {
+        use super::super::{
+            coin_blocks,
+            delivery::{CoinDelivery, Delivered},
+            dispatch::TokenPolicy,
+            global_accumulator, global_commit,
+            state::coin_identity,
+        };
+        use crate::message_envelope::CanonicalMessageRequest;
+        use quil_lattice_ct::confidential::{
+            relation::backend::worker_client::WorkerVerifier,
+            transfer::{Output, MEMO_BYTES},
+            AmountOpening, CommitmentKey,
+        };
+        use quil_types::execution::{FrameExecutionContext, ShardPath, Venue};
+        use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+        use std::sync::Arc;
+
+        let policy = TokenPolicy::for_network(crate::pricing::MAINNET_NETWORK);
+        let (network, application) = (policy.network, crate::domains::QUIL_TOKEN);
+        let context = parameter_context(&network, &application);
+        let key = CommitmentKey::derive(&context);
+        let output = Output {
+            owner: [9; IDENTITY_BYTES],
+            commitment: key.commit(7, &AmountOpening::from_seed(&context, &[9; 32])),
+            memo: [9; MEMO_BYTES],
+        };
+        let (source_frame, tx_id, source_shard) = (4u64, [3u8; 32], ShardPath::WHOLE);
+        let (address, _) = coin_identity(&context, source_frame, &output).unwrap();
+        let block =
+            coin_blocks::block_for_address(coin_blocks::INITIAL_BLOCK_BITS, &address).unwrap();
+        let shard = coin_blocks::block_path(block);
+        let path: String = shard
+            .iter()
+            .map(|bit| if *bit { '1' } else { '0' })
+            .collect();
+
+        // GLOBAL's record of the delivery, certified at global frame 9.
+        let record = global_commit::delivery_address(&application, block, 0).unwrap();
+        let fields = [
+            (
+                vec![0xff; 32],
+                global_accumulator::kind(global_commit::KIND_DELIVERY)
+                    .unwrap()
+                    .to_vec(),
+            ),
+            (vec![0], address.to_vec()),
+            (vec![4], source_frame.to_be_bytes().to_vec()),
+            (vec![8], tx_id.to_vec()),
+            (vec![12], source_shard.to_bytes().to_vec()),
+        ];
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        for (field, value) in &fields {
+            tree.insert(field, value, &[], &num_bigint::BigInt::from(value.len()))
+                .unwrap();
+        }
+        let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+        let forest = quil_forest::Forest::in_memory();
+        let root = forest
+            .commit_shard_phase_raw(
+                b"delivery-test",
+                quil_forest::Phase::VertexAdds,
+                0,
+                [(
+                    record.to_vec(),
+                    quil_tries::vertex_leaf_value(&blob).unwrap(),
+                )],
+            )
+            .unwrap();
+        let membership = forest
+            .build_vertex_membership_proof(
+                b"delivery-test",
+                quil_forest::Phase::VertexAdds,
+                0,
+                &[crate::domains::GLOBAL.to_vec(), record.to_vec()].concat(),
+                &blob,
+            )
+            .unwrap();
+        let delivery = CoinDelivery {
+            network,
+            application,
+            cited_global_frame: 9,
+            global_root: root,
+            block,
+            seq: 0,
+            source_frame,
+            tx_id,
+            source_shard,
+            delivered: Delivered::Coin(output),
+            forest_proof: quil_forest::MembershipProof {
+                inputs: vec![membership],
+            }
+            .to_bytes(),
+        }
+        .encode()
+        .unwrap();
+        let request = CanonicalMessageRequest::wrap(delivery)
+            .unwrap()
+            .to_canonical_bytes()
+            .unwrap();
+
+        let deliver = |include_global: bool, application_venue: bool| -> Vec<String> {
+            let inclusion: Arc<dyn quil_types::crypto::InclusionProver> =
+                Arc::new(quil_types::crypto::NoopInclusionProver);
+            let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                Arc::new(quil_hypergraph::testing::MemStore::new()),
+                inclusion.clone(),
+            ));
+            let stubs = crate::testing::NoopExecutionCrypto::new();
+            let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+            clock.seed_frame(GlobalFrame {
+                header: Some(GlobalFrameHeader {
+                    frame_number: 9,
+                    prover_tree_commitment: root.to_vec(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            // Construction spawns no worker; a delivery verifies no proof.
+            let worker = WorkerVerifier::new(
+                std::path::PathBuf::from("/unused/coin-root-scope-test-worker"),
+                10,
+                std::time::Duration::from_secs(10),
+            )
+            .unwrap();
+            let mut manager = crate::manager::ExecutionEngineManager::new(
+                inclusion,
+                stubs.key_manager.clone(),
+                crdt,
+                stubs.circuit_compiler,
+                stubs.clock_store,
+                Arc::new(crate::testing::NoopHypergraphConfigResolver),
+                include_global,
+            );
+            if application_venue {
+                manager = manager.with_application_venue().unwrap();
+            }
+            let manager = manager
+                .with_token_worker(policy, worker)
+                .unwrap()
+                .with_global_clock_store(clock)
+                .unwrap();
+            logged(|| {
+                manager
+                    .process_message_with_context(
+                        FrameExecutionContext {
+                            frame_number: 10,
+                            finalized_global_frame: Some(9),
+                            venue: Some(Venue::Application),
+                            shard: ShardPath::from_bits(&shard),
+                        },
+                        &num_bigint::BigInt::from(1),
+                        &application,
+                        &request,
+                    )
+                    .unwrap();
+                let end = HypergraphState::new(manager.crdt());
+                fold_placed(&end, 10, &network, &application, policy.snapshots)
+                    .unwrap()
+                    .expect("the delivery placed a coin");
+            })
+            .into_iter()
+            .filter(|line| line.contains("coin root summary rebuilt"))
+            .collect()
+        };
+        let shard_range = format!("shard path {path}");
+        for (include_global, application_venue, range, blocks_read) in [
+            (true, true, shard_range.as_str(), 1_023),
+            (false, false, shard_range.as_str(), 1_023),
+            (true, false, "whole application", 65_472),
+        ] {
+            let lines = deliver(include_global, application_venue);
+            assert_eq!(
+                lines.len(),
+                1,
+                "{include_global} {application_venue}: {lines:?}"
+            );
+            assert!(
+                lines[0].contains(&format!(
+                    " range={range} blocks_read={blocks_read} blocks=0 coins=0 "
+                )),
+                "{include_global} {application_venue}: {}",
+                lines[0]
+            );
         }
     }
 

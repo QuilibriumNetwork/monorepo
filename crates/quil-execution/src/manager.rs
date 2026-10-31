@@ -542,6 +542,12 @@ impl ExecutionEngineManager {
     /// crypto-less fallback. Production callers MUST supply real
     /// implementations; tests can wire noop stubs from
     /// `crate::testing::NoopExecutionCrypto`.
+    ///
+    /// `include_global = false` also starts every engine in the application
+    /// venue, as [`Self::with_application_venue`] sets the token engine: the
+    /// store is then taken to hold only the shard it executes, and a missing
+    /// coin summary is rebuilt from that shard's blocks
+    /// ([`TokenExecutionEngine::shard_store`]).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         inclusion_prover: Arc<dyn InclusionProver>,

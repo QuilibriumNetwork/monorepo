@@ -224,7 +224,12 @@ pub fn escrow_count(state: &HypergraphState, application: &[u8; 32], block: u64)
 
 /// Verify one delivery against the certified frame and apply it: a coin at
 /// its committed position and the block extended, or an escrow record written.
-/// Returns the delivered address.
+/// Returns the delivered address. `shard_store`: this node's store holds only
+/// the executing shard (a worker's own store), so a missing coin summary is
+/// rebuilt from that shard's blocks alone (`roots::add_placed`).
+// Each argument is a distinct input of the delivery; a struct would only
+// rename them at the single caller.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_and_apply(
     state: &HypergraphState,
     context: FrameExecutionContext,
@@ -232,6 +237,7 @@ pub fn verify_and_apply(
     network: &[u8; 32],
     application: &[u8; 32],
     bytes: &[u8],
+    shard_store: bool,
     limits: SnapshotLimits,
 ) -> Result<[u8; 32]> {
     let delivery = CoinDelivery::decode(bytes, network, application)?;
@@ -291,6 +297,7 @@ pub fn verify_and_apply(
                 tree,
                 delivery.block,
                 delivery.seq,
+                if shard_store { shard.as_slice() } else { &[] },
                 limits,
             )?;
             Ok(address)
@@ -335,7 +342,8 @@ pub fn verify_and_apply(
 /// executed application's inline commit. The block's records and the root
 /// take it when the placed coins are folded (`roots::fold_placed`): once per
 /// application frame, and once per operation a globally executed application
-/// commits.
+/// commits. `scope`: the bit path of the blocks this store's summary covers
+/// (`roots::add_placed`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn place_committed(
     state: &HypergraphState,
@@ -346,6 +354,7 @@ pub(crate) fn place_committed(
     mut tree: quil_tries::VectorCommitmentTree,
     block: u64,
     seq: u64,
+    scope: &[bool],
     limits: SnapshotLimits,
 ) -> Result<()> {
     // Exactly the block's next index: deliveries land in commit order.
@@ -375,7 +384,7 @@ pub(crate) fn place_committed(
         let blob = quil_tries::serialize_go_tree(tree.root.as_ref())
             .map_err(|e| QuilError::Internal(format!("coin encoding: {e}")))?;
         state.set(application, address, &disc, frame, blob)?;
-        roots::add_placed(state, network, application, block, address, limits)?;
+        roots::add_placed(state, network, application, block, address, scope, limits)?;
         Ok(())
     };
     if let Err(error) = apply() {
@@ -687,6 +696,7 @@ mod tests {
                 tree,
                 block,
                 seq,
+                &[],
                 limits,
             )
         };
@@ -764,6 +774,7 @@ mod tests {
             tree,
             narrow,
             0,
+            &[],
             limits,
         )
         .unwrap();
@@ -813,6 +824,7 @@ mod tests {
             tree,
             coin_blocks::block_for_address(8, &again).unwrap(),
             0,
+            &[],
             limits,
         )
         .unwrap_err();
@@ -832,6 +844,7 @@ mod tests {
             tree,
             target,
             seq,
+            &[],
             limits,
         )
         .unwrap();
@@ -913,6 +926,7 @@ mod tests {
                 tree,
                 block,
                 seq,
+                &[],
                 limits,
             )
         };
@@ -1032,6 +1046,7 @@ mod tests {
                 tree,
                 block,
                 seq,
+                &[],
                 limits,
             );
             state.commit().unwrap();

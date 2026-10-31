@@ -1583,7 +1583,8 @@ impl TokenPolicy {
         Ok(())
     }
 
-    /// Apply a delivery of a committed output.
+    /// Apply a delivery of a committed output. `shard_store`: see
+    /// [`super::delivery::verify_and_apply`].
     pub(crate) fn dispatch_delivery(
         &self,
         state: &HypergraphState,
@@ -1591,6 +1592,7 @@ impl TokenPolicy {
         clock: &dyn quil_types::store::ClockStore,
         address: &[u8],
         bytes: &[u8],
+        shard_store: bool,
     ) -> Result<()> {
         let application = self.application(address)?;
         super::delivery::verify_and_apply(
@@ -1600,6 +1602,7 @@ impl TokenPolicy {
             &self.network,
             &application,
             bytes,
+            shard_store,
             self.snapshots,
         )?;
         Ok(())
