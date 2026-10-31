@@ -115,7 +115,7 @@ impl RocksDbMemory {
 
 /// Block cache of a store that is not an archive's: enough for the hot
 /// working set of a regular node, which also runs a store per worker.
-const DEFAULT_BLOCK_CACHE_BYTES: usize = 256 << 20;
+pub(crate) const DEFAULT_BLOCK_CACHE_BYTES: usize = 256 << 20;
 /// Bounds of an archive's block cache ([`archive_block_cache_bytes`]).
 const MIN_ARCHIVE_BLOCK_CACHE_BYTES: usize = DEFAULT_BLOCK_CACHE_BYTES;
 const MAX_ARCHIVE_BLOCK_CACHE_BYTES: usize = 32 << 30;
@@ -180,6 +180,22 @@ impl RocksDb {
 
     /// `QUIL_ROCKSDB_BLOCK_CACHE_MB` overrides `block_cache_bytes`.
     fn open_with_block_cache(path: &Path, block_cache_bytes: usize) -> Result<Self> {
+        let opts = Self::store_options(block_cache_bytes);
+        let db = rocksdb::DB::open(&opts, path)
+            .map_err(|e| QuilError::Store(format!("failed to open rocksdb: {}", e)))?;
+
+        // Run pending migrations
+        let migrations = crate::migration::rust_node_migrations();
+        crate::migration::run_migrations(&db, &migrations)?;
+
+        Ok(Self {
+            db: Self::coordinated(db),
+        })
+    }
+
+    /// The options a node store opens with; tests that measure the store's
+    /// own behaviour open with them too.
+    pub(crate) fn store_options(block_cache_bytes: usize) -> rocksdb::Options {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
 
@@ -246,17 +262,7 @@ impl RocksDb {
         block_opts.set_metadata_block_size(4096);
         block_opts.set_pin_top_level_index_and_filter(true);
         opts.set_block_based_table_factory(&block_opts);
-
-        let db = rocksdb::DB::open(&opts, path)
-            .map_err(|e| QuilError::Store(format!("failed to open rocksdb: {}", e)))?;
-
-        // Run pending migrations
-        let migrations = crate::migration::rust_node_migrations();
-        crate::migration::run_migrations(&db, &migrations)?;
-
-        Ok(Self {
-            db: Self::coordinated(db),
-        })
+        opts
     }
 
     /// Inspect an existing, stopped database without writes or migrations.
