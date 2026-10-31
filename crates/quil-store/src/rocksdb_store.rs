@@ -165,6 +165,46 @@ fn memory_budget_bytes() -> Option<u64> {
     Some(limit.map_or(physical, |limit| limit.min(physical)).max(1))
 }
 
+/// The block cache of a store opened with `base` bytes: `override_mb`
+/// (`QUIL_ROCKSDB_BLOCK_CACHE_MB`) replaces it when it parses.
+fn block_cache_with_override(base: usize, override_mb: Option<&str>) -> usize {
+    override_mb
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(base, |mb| mb.saturating_mul(1024 * 1024))
+}
+
+/// The block cache every store of this process opens with, in bytes: an
+/// archive's memory-sized cache or a regular store's 256 MB, either replaced
+/// by `QUIL_ROCKSDB_BLOCK_CACHE_MB`. Each store has its own cache, so a
+/// thread-mode node holds one per data worker plus the master's.
+pub fn effective_block_cache_bytes(archive: bool) -> usize {
+    let base = if archive {
+        archive_block_cache_bytes()
+    } else {
+        DEFAULT_BLOCK_CACHE_BYTES
+    };
+    block_cache_with_override(
+        base,
+        std::env::var("QUIL_ROCKSDB_BLOCK_CACHE_MB").ok().as_deref(),
+    )
+}
+
+/// RocksDB background flush and compaction threads per store:
+/// `QUIL_ROCKSDB_BG_THREADS`, else the CPUs available, within 2..=8.
+pub fn background_threads() -> i32 {
+    background_threads_for(std::env::var("QUIL_ROCKSDB_BG_THREADS").ok().as_deref())
+}
+
+fn background_threads_for(override_threads: Option<&str>) -> i32 {
+    override_threads
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| (n.get() as i32).clamp(2, 8))
+                .unwrap_or(4)
+        })
+}
+
 impl RocksDb {
     /// Open a RocksDB database at the given path.
     /// Runs pending migrations automatically.
@@ -201,14 +241,7 @@ impl RocksDb {
         // threads to keep up, plus extra memtable headroom to absorb bursts.
         // Threads scale with cores (compaction is the bottleneck on weak HW);
         // env-overridable for constrained nodes.
-        let bg_threads: i32 = std::env::var("QUIL_ROCKSDB_BG_THREADS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| (n.get() as i32).clamp(2, 8))
-                    .unwrap_or(4)
-            });
+        let bg_threads = background_threads();
         opts.increase_parallelism(bg_threads);
         opts.set_max_background_jobs(bg_threads);
         // More memtables in flight (default 2) so a flush stall doesn't immediately
@@ -223,10 +256,10 @@ impl RocksDb {
 
         // Block-cache budget. Without an explicit cache RocksDB
         // grows an internal cache that can balloon under churn.
-        let cache_bytes = std::env::var("QUIL_ROCKSDB_BLOCK_CACHE_MB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map_or(block_cache_bytes, |mb| mb.saturating_mul(1024 * 1024));
+        let cache_bytes = block_cache_with_override(
+            block_cache_bytes,
+            std::env::var("QUIL_ROCKSDB_BLOCK_CACHE_MB").ok().as_deref(),
+        );
         let block_cache = rocksdb::Cache::new_lru_cache(cache_bytes);
         let mut block_opts = rocksdb::BlockBasedOptions::default();
         block_opts.set_block_cache(&block_cache);
@@ -427,6 +460,19 @@ mod read_only_tests {
         );
         assert_eq!(archive_block_cache_for(None), MIN_ARCHIVE_BLOCK_CACHE_BYTES);
         assert!(memory_budget_bytes().is_some_and(|bytes| bytes > 0));
+    }
+
+    /// The cache a store opens with is the override when it parses, else the
+    /// base; the thread count is the override when it parses, else bounded.
+    #[test]
+    fn block_cache_and_thread_overrides_replace_the_defaults() {
+        let base = DEFAULT_BLOCK_CACHE_BYTES;
+        assert_eq!(block_cache_with_override(base, None), base);
+        assert_eq!(block_cache_with_override(base, Some("junk")), base);
+        assert_eq!(block_cache_with_override(base, Some("64")), 64 << 20);
+        assert_eq!(background_threads_for(Some("3")), 3);
+        assert!((2..=8).contains(&background_threads_for(None)));
+        assert!((2..=8).contains(&background_threads_for(Some("x"))));
     }
 
     /// New table files carry a partitioned index; files written without one
