@@ -60,6 +60,16 @@ pub struct ArchiveAppShardIngest {
     /// such frames are admitted again, from this archive's store first
     /// ([`ArchiveFrameVerifier::stored_above_cursor`]).
     stored: HashMap<Vec<u8>, BTreeMap<u64, [u8; 32]>>,
+    /// Frames above the cursor that were admitted and stored for serving past
+    /// the digests [`Self::stored`] remembers ([`MAX_STORED_BODIES_PER_SHARD`]),
+    /// per address, as runs: first frame → last. They count as held for
+    /// proposals; GLOBAL sequencing them admits each again from this
+    /// archive's store first, verified, before it is materialized.
+    stored_runs: HashMap<Vec<u8>, BTreeMap<u64, u64>>,
+    /// Per address, the frame through which [`Self::held_through`] last found
+    /// every body above the cursor held, where its next walk starts; lowered
+    /// when a frame at or below it stops being held ([`Self::unhold`]).
+    held_run_end: HashMap<Vec<u8>, u64>,
     /// What [`Self::holds_bodies_through`] answers, per shard, readable
     /// without this ingest.
     held_bodies: HeldBodies,
@@ -149,6 +159,9 @@ pub struct ArchiveAppShardIngest {
     prewarm: Option<crate::archive_preverify::ProofPrewarm>,
     #[cfg(test)]
     skip_header_authentication: bool,
+    /// Frames [`Self::held_through`] stepped over, for tests of its cost.
+    #[cfg(test)]
+    held_walk_steps: u64,
 }
 
 const GAP_RETRY_INTERVAL: Duration = Duration::from_secs(30);
@@ -163,7 +176,16 @@ const MAX_BUFFERED_FRAMES_PER_SHARD: usize = 128;
 /// have a header proposed again: from 03:20Z on 2026-10-27 about 100 shards
 /// sat 270–600 frames behind, growing about 5 a minute, and GLOBAL frames
 /// carried almost no shard headers. This bound is about a day of such growth.
+/// Frames stored past it are kept as runs
+/// ([`ArchiveAppShardIngest::stored_runs`]), so they still count as held:
+/// forgotten, they latched a shard whose head ran past it for good.
 const MAX_STORED_BODIES_PER_SHARD: usize = 8192;
+/// Runs of frames stored past [`MAX_STORED_BODIES_PER_SHARD`] kept per shard,
+/// its lowest, 16 bytes each. Frames arrive in order, so a shard's frames make
+/// one run, or a few around frames gossip lost; past it the farthest run is
+/// forgotten, and its frames are admitted again once the run below reaches
+/// them ([`ArchiveAppShardIngest::holds_bodies_through`]).
+const MAX_STORED_RUNS_PER_SHARD: usize = 1024;
 /// Headers proposals could not carry that wait for the ingest to look into
 /// them ([`HeldBodies::frames_held`]), one per shard.
 const MAX_WANTED_SHARDS: usize = 4096;
@@ -493,6 +515,8 @@ impl ArchiveAppShardIngest {
             last_materialized: HashMap::new(),
             buffered: HashMap::new(),
             stored: HashMap::new(),
+            stored_runs: HashMap::new(),
+            held_run_end: HashMap::new(),
             held_bodies: HeldBodies::default(),
             held: HashMap::new(),
             gap_requests: None,
@@ -509,6 +533,8 @@ impl ArchiveAppShardIngest {
             slow_materialization: SLOW_MATERIALIZATION,
             #[cfg(test)]
             skip_header_authentication: false,
+            #[cfg(test)]
+            held_walk_steps: 0,
         }
     }
 
@@ -909,6 +935,20 @@ impl ArchiveAppShardIngest {
                 self.stored.remove(address);
             }
         }
+        if let Some(runs) = self.stored_runs.get_mut(address) {
+            let straddling = runs
+                .range(..=frame)
+                .next_back()
+                .map(|(_, &last)| last)
+                .filter(|&last| last > frame);
+            *runs = runs.split_off(&(frame + 1));
+            if let Some(last) = straddling {
+                runs.insert(frame + 1, last);
+            }
+            if runs.is_empty() {
+                self.stored_runs.remove(address);
+            }
+        }
         if let Some(requested) = self.requested.get_mut(address) {
             *requested = requested.split_off(&(frame + 1));
             if requested.is_empty() {
@@ -964,6 +1004,8 @@ impl ArchiveAppShardIngest {
         self.last_materialized.clear();
         self.buffered.clear();
         self.stored.clear();
+        self.stored_runs.clear();
+        self.held_run_end.clear();
         self.held_bodies.clear();
         self.held.clear();
         self.requested.clear();
@@ -1135,11 +1177,16 @@ impl ArchiveAppShardIngest {
             };
             let held = self.held.entry(address.to_vec()).or_default();
             held.insert((number, identity), frame);
+            let mut evicted = Vec::new();
             while held.len() > MAX_HELD_FRAMES_PER_SHARD {
                 let Some(farthest) = held.keys().next_back().copied() else {
                     break;
                 };
                 held.remove(&farthest);
+                evicted.push(farthest.0);
+            }
+            for number in evicted {
+                self.unhold(address, number);
             }
             return;
         }
@@ -1180,13 +1227,15 @@ impl ArchiveAppShardIngest {
         if buffered.len() > MAX_BUFFERED_FRAMES_PER_SHARD {
             if let Some(farthest) = buffered.keys().max().copied() {
                 buffered.remove(&farthest);
+                self.unhold(address, farthest);
             }
         }
     }
 
     /// Remember that the body of frame `number` of `address`, above the
     /// cursor, is stored with `digest`, within [`MAX_STORED_BODIES_PER_SHARD`]:
-    /// past it the farthest is forgotten, and asked for again once needed.
+    /// past it the farthest frame's digest is forgotten and the frame kept in
+    /// a stored run ([`Self::stored_runs`]), so it still counts as held.
     fn remember_stored(&mut self, address: &[u8], number: u64, digest: [u8; 32]) {
         if self
             .last_materialized
@@ -1200,9 +1249,52 @@ impl ArchiveAppShardIngest {
         if stored.len() > MAX_STORED_BODIES_PER_SHARD {
             let farthest = stored.pop_last().map_or(number, |(farthest, _)| farthest);
             let cursor = self.last_materialized.get(address).copied().unwrap_or(0);
+            self.remember_stored_run(address, farthest);
             self.held_bodies
                 .note_beyond_bound(address, cursor, farthest);
         }
+    }
+
+    /// Keep frame `number` of `address`, stored past the remembered digests,
+    /// in its run, within [`MAX_STORED_RUNS_PER_SHARD`]: past it the farthest
+    /// run is forgotten.
+    fn remember_stored_run(&mut self, address: &[u8], number: u64) {
+        let runs = self.stored_runs.entry(address.to_vec()).or_default();
+        let below = runs
+            .range(..=number)
+            .next_back()
+            .map(|(&first, &last)| (first, last));
+        if below.is_some_and(|(_, last)| last >= number) {
+            return;
+        }
+        let first = match below {
+            Some((first, last)) if last.checked_add(1) == Some(number) => first,
+            _ => number,
+        };
+        let last = number
+            .checked_add(1)
+            .and_then(|above| runs.remove(&above))
+            .unwrap_or(number);
+        runs.insert(first, last);
+        let mut forgotten = Vec::new();
+        while runs.len() > MAX_STORED_RUNS_PER_SHARD {
+            let Some((farthest, _)) = runs.pop_last() else {
+                break;
+            };
+            forgotten.push(farthest);
+        }
+        for first in forgotten {
+            self.unhold(address, first);
+        }
+    }
+
+    /// The last frame of the stored run holding frame `number` of `address`.
+    fn stored_run_end(&self, address: &[u8], number: u64) -> Option<u64> {
+        self.stored_runs
+            .get(address)?
+            .range(..=number)
+            .next_back()
+            .and_then(|(_, &last)| (last >= number).then_some(last))
     }
 
     fn forget_stored(&mut self, address: &[u8], number: u64) {
@@ -1212,6 +1304,41 @@ impl ArchiveAppShardIngest {
                 self.stored.remove(address);
             }
         }
+        if let Some(runs) = self.stored_runs.get_mut(address) {
+            let run = runs
+                .range(..=number)
+                .next_back()
+                .map(|(&first, &last)| (first, last))
+                .filter(|&(_, last)| last >= number);
+            if let Some((first, last)) = run {
+                runs.remove(&first);
+                if first < number {
+                    runs.insert(first, number - 1);
+                }
+                if last > number {
+                    runs.insert(number + 1, last);
+                }
+            }
+            if runs.is_empty() {
+                self.stored_runs.remove(address);
+            }
+        }
+        self.unhold(address, number);
+    }
+
+    /// Frame `number` of `address` may no longer be held: the next walk of
+    /// [`Self::held_through`] starts below it, unless it still is.
+    fn unhold(&mut self, address: &[u8], number: u64) {
+        if self
+            .held_run_end
+            .get(address)
+            .is_none_or(|&end| end < number)
+            || self.holds_body(address, number)
+        {
+            return;
+        }
+        self.held_run_end
+            .insert(address.to_vec(), number.saturating_sub(1));
     }
 
     /// Whether the body of frame `number` of `address` is buffered, or stored
@@ -1246,19 +1373,45 @@ impl ArchiveAppShardIngest {
         frame
     }
 
+    /// Whether the body of frame `number` of `address` counts as held for
+    /// proposals: buffered, stored with its digest remembered
+    /// ([`Self::body_held`]), in a stored run ([`Self::stored_runs`]) or held
+    /// as the frame GLOBAL committed at that height ([`Self::committed_held`]).
+    fn holds_body(&self, address: &[u8], number: u64) -> bool {
+        self.body_held(address, number)
+            || self.stored_run_end(address, number).is_some()
+            || self.committed_held(address, number).is_some()
+    }
+
     /// The highest frame of `address` through which every body above
-    /// `cursor` is held: buffered, stored ([`Self::body_held`]) or held as the
-    /// frame GLOBAL committed at that height ([`Self::committed_held`]).
-    fn held_through(&self, address: &[u8], cursor: u64) -> u64 {
-        let bound = cursor
-            .saturating_add((MAX_STORED_BODIES_PER_SHARD + MAX_BUFFERED_FRAMES_PER_SHARD) as u64);
-        let mut through = cursor;
-        while through < bound
-            && (self.body_held(address, through + 1)
-                || self.committed_held(address, through + 1).is_some())
-        {
-            through += 1;
+    /// `cursor` is held ([`Self::holds_body`]), however far: a bound here
+    /// latched a shard whose head ran past it for good, since GLOBAL carries
+    /// only a recent header, never one below it. The walk resumes where the
+    /// last one ended ([`Self::held_run_end`]) and crosses a stored run at
+    /// once: it ran from the cursor on every admit, about N²/2 lookups under
+    /// the ingest while a shard N frames behind caught up.
+    fn held_through(&mut self, address: &[u8], cursor: u64) -> u64 {
+        let mut through = self
+            .held_run_end
+            .get(address)
+            .copied()
+            .filter(|&end| end > cursor)
+            .unwrap_or(cursor);
+        while let Some(next) = through.checked_add(1) {
+            #[cfg(test)]
+            {
+                self.held_walk_steps += 1;
+            }
+            if let Some(last) = self.stored_run_end(address, next) {
+                through = last;
+            } else if self.body_held(address, next) || self.committed_held(address, next).is_some()
+            {
+                through = next;
+            } else {
+                break;
+            }
         }
+        self.held_run_end.insert(address.to_vec(), through);
         through
     }
 
@@ -2473,8 +2626,10 @@ impl ArchiveAppShardIngest {
     /// Whether this archive holds every frame of `address` that
     /// materializing it through `through` needs: each frame above its cursor
     /// buffered, stored with its digest remembered ([`Self::stored`]: frames
-    /// the buffer bound evicted), or held as the frame GLOBAL committed at that
-    /// height (a sealed session's last frame); `through` itself may instead be
+    /// the buffer bound evicted), in a stored run ([`Self::stored_runs`]:
+    /// frames past the remembered digests), or held as the frame GLOBAL
+    /// committed at that height (a sealed session's last frame); `through`
+    /// itself may instead be
     /// provably empty (`empty`: its certified header's `requests_root` is all
     /// zero), which [`Self::empty_frame_from_header`] rebuilds from that
     /// header. The first frame it lacks is asked for, with those above it to
@@ -2485,7 +2640,9 @@ impl ArchiveAppShardIngest {
     ///
     /// Buffered frames alone, a shard whose head ran more than the buffer
     /// bound past its cursor could never be held through a header GLOBAL can
-    /// still carry, and its headers were held back for good.
+    /// still carry, and its headers were held back for good; remembered
+    /// digests alone, so was one whose head ran more than
+    /// [`MAX_STORED_BODIES_PER_SHARD`] past it.
     ///
     /// A GLOBAL prover proposes a shard's certified header only while this
     /// holds. Execution on every archive waits for the body of each frame a
@@ -2505,10 +2662,19 @@ impl ArchiveAppShardIngest {
             return Ok(true);
         }
         let number = held + 1;
-        let known =
-            last > 0 || self.buffered.contains_key(address) || self.stored.contains_key(address);
+        let known = last > 0
+            || self.buffered.contains_key(address)
+            || self.stored.contains_key(address)
+            || self.stored_runs.contains_key(address);
         if known || self.held.contains_key(address) {
+            // A stored run above counts as held: its frames are admitted
+            // again only once GLOBAL sequences them.
             let upto = through.min(number.saturating_add(PREFETCH_DEPTH));
+            let upto = self
+                .stored_runs
+                .get(address)
+                .and_then(|runs| runs.range(number..).next())
+                .map_or(upto, |(&first, _)| upto.min(first.saturating_sub(1)));
             self.request_frames(
                 address,
                 number..=upto,
@@ -3045,7 +3211,8 @@ pub struct HeldBodies {
 struct HeldBodiesInner {
     runs: HashMap<Vec<u8>, HeldRun>,
     /// Shards whose frames ran further above the cursor than the ingest
-    /// tracks ([`MAX_STORED_BODIES_PER_SHARD`]), since when.
+    /// remembers digests of ([`MAX_STORED_BODIES_PER_SHARD`]), since when,
+    /// until a header of theirs can be proposed again.
     beyond_bound: HashMap<Vec<u8>, Instant>,
     /// Headers a proposal could not carry, per shard: (frame, empty).
     wanted: HashMap<Vec<u8>, (u64, bool)>,
@@ -3083,11 +3250,12 @@ impl HeldBodies {
                     crate::inclusion_summary::note_caught_up(address, frames);
                 }
                 if let Some(since) = inner.beyond_bound.remove(address) {
-                    info!(scope = "this archive", address = %hex::encode(address), through, frames,
-                        beyond_secs = since.elapsed().as_secs(),
-                        "archive holds a shard's application frame bodies again from its cursor through a header \
-                         GLOBAL can carry, after the shard ran further ahead than this archive tracks; its \
-                         headers can be proposed again");
+                    info!(scope = "GLOBAL inclusion of this shard", address = %hex::encode(address),
+                        cursor = run.cursor, through, frames, beyond_secs = since.elapsed().as_secs(),
+                        "archive holds every application frame body of a shard from its cursor through a header \
+                         GLOBAL can carry, after its frames ran more than the remembered digests above the \
+                         cursor; the header can be proposed, and GLOBAL sequencing it admits the frames past \
+                         them again from this archive's store");
                 }
                 return Some(frames);
             }
@@ -3110,19 +3278,21 @@ impl HeldBodies {
     }
 
     /// `address`'s frames ran past [`MAX_STORED_BODIES_PER_SHARD`] above its
-    /// `cursor`, to `farthest`: warned once, until its headers can be
-    /// proposed again ([`Self::frames_held`]).
+    /// `cursor`, to `farthest`: warned once, until a header of its can be
+    /// proposed again ([`Self::frames_held`]), which logs the end.
     fn note_beyond_bound(&self, address: &[u8], cursor: u64, farthest: u64) {
         let mut inner = self.lock();
         if inner.beyond_bound.contains_key(address) {
             return;
         }
         inner.beyond_bound.insert(address.to_vec(), Instant::now());
-        warn!(scope = "this archive", address = %hex::encode(address), cursor, farthest,
-            bound = MAX_STORED_BODIES_PER_SHARD,
-            "archive ingest: a shard's frames run further above its cursor than this archive tracks, so its \
-             newest headers cannot be proposed until frames below are executed; frames past the bound are asked \
-             for again once needed. A defect to report with this line; a line follows when it recovers");
+        warn!(scope = "GLOBAL inclusion of this shard", address = %hex::encode(address), cursor, farthest,
+            frames_behind = farthest.saturating_sub(cursor), bound = MAX_STORED_BODIES_PER_SHARD,
+            reason = "GLOBAL frames carried none of the shard's headers while it produced this many frames",
+            "archive ingest: a shard's frames run more than the remembered digests above its cursor; frames \
+             past them are kept as stored runs, so its newest header is proposed once every body below it is \
+             held, and GLOBAL sequencing it admits them again from this archive's store. Check the shard's \
+             inclusion in the GLOBAL proposal summary; a line follows when its header can be proposed again");
     }
 
     /// `address`'s cursor as last published.
@@ -4734,6 +4904,253 @@ mod tests {
         );
         assert!(ingest.materialize_through(&filter, 201).unwrap());
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 201);
+    }
+
+    /// A proof bundle carrying `filter`'s header `number`, as a GLOBAL
+    /// proposal takes it from the mempool.
+    fn shard_header_proof(filter: &[u8], number: u64) -> Vec<u8> {
+        use quil_execution::global_intrinsic::frame_header::{
+            FrameHeader as ProofHeader, TYPE_FRAME_HEADER,
+        };
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let header = ProofHeader {
+            address: filter.to_vec(),
+            frame_number: number,
+            global_frame_number: 99,
+            ..Default::default()
+        };
+        CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest {
+                inner_type_prefix: TYPE_FRAME_HEADER,
+                inner_bytes: header.to_canonical_bytes().unwrap(),
+            })],
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// Whether a GLOBAL proposal within the application frame budget carries
+    /// `filter`'s header `number`, by what `held` publishes.
+    fn proposed(held: &HeldBodies, filter: &[u8], number: u64) -> bool {
+        use crate::leader_provider::{hold_back_unavailable_shard_proofs, ShardBodyNeed};
+        let available = |needs: &[ShardBodyNeed]| -> Vec<Option<u64>> {
+            needs
+                .iter()
+                .map(|need| held.frames_held(&need.address, need.frame_number, need.empty))
+                .collect()
+        };
+        let proof = shard_header_proof(filter, number);
+        hold_back_unavailable_shard_proofs(vec![proof.clone()], &available, 256).ready
+            == vec![proof]
+    }
+
+    /// Serve what the ingest asked for as the gap fetch does, from this
+    /// archive's store first ([`ArchiveFrameVerifier::stored_above_cursor`]),
+    /// else from `network`, frame `n` at index `n - 1`, and admit it. Returns
+    /// how many frames were served.
+    fn serve_asked(
+        ingest: &mut ArchiveAppShardIngest,
+        asked: &mut [&mut Requests],
+        network: &[AppShardFrame],
+    ) -> usize {
+        let verifier = ingest.verifier();
+        let mut served = 0;
+        for requests in asked.iter_mut() {
+            for (address, number) in take_requests(requests) {
+                let frame = verifier
+                    .stored_above_cursor(&address, number)
+                    .or_else(|| network.get(number as usize - 1).cloned());
+                if let Some(frame) = frame {
+                    ingest.admit(&address, frame, true);
+                    served += 1;
+                }
+            }
+        }
+        served
+    }
+
+    /// A shard whose head ran further above its cursor than the bodies this
+    /// archive remembers digests of ([`MAX_STORED_BODIES_PER_SHARD`]) still
+    /// holds every body it received: those past the bound are kept as stored
+    /// runs. Its newest header is proposed within the application frame
+    /// budget; GLOBAL sequencing it admits the frames past the bound again
+    /// from this archive's store and materializes them all; and the shard's
+    /// next header is proposed as any other. Forgotten past the bound, such
+    /// a shard's headers were never proposed again: GLOBAL carries only a
+    /// recent header. Finding what is held walks each frame about once, not
+    /// from the cursor on every admit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shard_further_ahead_than_the_remembered_bodies_is_proposed_again_and_catches_up() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let head = 1 + (MAX_STORED_BODIES_PER_SHARD + MAX_BUFFERED_FRAMES_PER_SHARD) as u64 + 1000;
+        let frames = chain(&filter, head + 1);
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (ingest, _) = fixture_with_clock(Some(clock));
+        let (gap_tx, mut gap_rx) = tokio::sync::mpsc::channel(4096);
+        let (prefetch_tx, mut prefetch_rx) = tokio::sync::mpsc::channel(4096);
+        let mut ingest = ingest
+            .with_gap_fetch(gap_tx)
+            .with_prefetch(prefetch_tx)
+            .sequenced();
+        ingest.admit(&filter, frames[0].clone(), true);
+        assert!(ingest.materialize_through(&filter, 1).unwrap());
+        let steps_before = ingest.held_walk_steps;
+        let started = logged(|| {
+            for frame in &frames[1..head as usize] {
+                ingest.admit(&filter, frame.clone(), true);
+            }
+        });
+        let admitted = head - 1;
+        assert!(
+            ingest.held_walk_steps - steps_before <= 4 * admitted,
+            "finding what is held walked {} frames for {admitted} admitted: it walks from the cursor on every admit",
+            ingest.held_walk_steps - steps_before
+        );
+        assert_eq!(
+            ingest.stored[&filter].len(),
+            MAX_STORED_BODIES_PER_SHARD,
+            "the remembered digests are full"
+        );
+        assert_eq!(
+            started
+                .matches("frames run more than the remembered digests above its cursor")
+                .count(),
+            1,
+            "the start is logged once: {started}"
+        );
+        assert!(started.contains("frames_behind=8193"), "{started}");
+
+        assert!(
+            ingest.holds_bodies_through(&filter, head, false).unwrap(),
+            "shard latched: every frame above its cursor was received and stored, yet the header {} frames \
+             ahead is held back from every GLOBAL proposal",
+            head - 1
+        );
+        let held = ingest.held_bodies();
+        let ended = logged(|| assert!(proposed(&held, &filter, head)));
+        assert!(
+            ended.contains("the header can be proposed") && ended.contains("beyond_secs="),
+            "the end is logged with its duration: {ended}"
+        );
+
+        let mut rounds = 0;
+        while !ingest.materialize_through(&filter, head).unwrap() {
+            rounds += 1;
+            assert!(rounds <= head, "GLOBAL execution makes no progress");
+            let served = serve_asked(&mut ingest, &mut [&mut gap_rx, &mut prefetch_rx], &[]);
+            assert!(
+                served > 0,
+                "GLOBAL waits on frame {} and nothing it asks for is served from the store",
+                ingest.materialized_height(&filter).unwrap() + 1
+            );
+        }
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), head);
+        assert!(!ingest.stored_runs.contains_key(&filter));
+
+        ingest.admit(&filter, frames[head as usize].clone(), true);
+        assert!(
+            proposed(&held, &filter, head + 1),
+            "the shard's next header rides"
+        );
+        assert_eq!(held.frames_held(&filter, head + 1, false), Some(1));
+    }
+
+    /// Frames stored past the remembered digests are kept in at most
+    /// [`MAX_STORED_RUNS_PER_SHARD`] runs, the lowest. A shard whose frames
+    /// arrived with more holes than that past the digests is asked for the
+    /// frame above its held run until the run reaches its head, the
+    /// forgotten runs' frames admitted again from the store, and its header
+    /// is then proposed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shard_with_more_stored_runs_than_kept_is_proposed_once_its_holes_are_filled() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let remembered = 1 + MAX_STORED_BODIES_PER_SHARD as u64;
+        let runs = MAX_STORED_RUNS_PER_SHARD as u64 + 64;
+        let head = remembered + 2 * runs;
+        let frames = chain(&filter, head);
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (ingest, _) = fixture_with_clock(Some(clock));
+        let (prefetch_tx, mut prefetch_rx) = tokio::sync::mpsc::channel(4096);
+        let mut ingest = ingest.with_prefetch(prefetch_tx).sequenced();
+        ingest.admit(&filter, frames[0].clone(), true);
+        assert!(ingest.materialize_through(&filter, 1).unwrap());
+        for frame in &frames[1..remembered as usize] {
+            ingest.admit(&filter, frame.clone(), true);
+        }
+        // Past the digests, every other frame is lost on the way.
+        for number in (remembered + 2..=head).step_by(2) {
+            ingest.admit(&filter, frames[number as usize - 1].clone(), true);
+        }
+        assert_eq!(
+            ingest.stored_runs[&filter].len(),
+            MAX_STORED_RUNS_PER_SHARD,
+            "the runs are bounded"
+        );
+        let held = ingest.held_bodies();
+        let mut passes = 0;
+        while !ingest.holds_bodies_through(&filter, head, false).unwrap() {
+            passes += 1;
+            assert!(passes <= 2 * runs, "the held run never reaches the head");
+            assert!(
+                ingest.stored_runs.get(&filter).map_or(0, |runs| runs.len())
+                    <= MAX_STORED_RUNS_PER_SHARD
+            );
+            assert!(!proposed(&held, &filter, head));
+            let served = serve_asked(&mut ingest, &mut [&mut prefetch_rx], &frames);
+            assert!(served > 0, "the frame above the held run is not asked for");
+        }
+        assert!(proposed(&held, &filter, head));
+    }
+
+    /// An archive restarted while a shard's head ran further above its cursor
+    /// than the remembered digests remembers none of its bodies. It admits
+    /// them again from its store, from the cursor up, the prefetch depth per
+    /// retry pass, and proposes the shard's header once they reach it; the
+    /// same bound stopped it again past the digests.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restarted_archive_proposes_a_shard_further_ahead_than_the_remembered_bodies_again() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let head = 1 + (MAX_STORED_BODIES_PER_SHARD + MAX_BUFFERED_FRAMES_PER_SHARD) as u64 + 1000;
+        let frames = chain(&filter, head);
+        let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            store,
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        let clock: Arc<dyn quil_types::store::ClockStore> =
+            Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let mut ingest = fixture_over(crdt.clone(), Some(clock.clone())).sequenced();
+        ingest.admit(&filter, frames[0].clone(), true);
+        assert!(ingest.materialize_through(&filter, 1).unwrap());
+        for frame in &frames[1..] {
+            ingest.admit(&filter, frame.clone(), true);
+        }
+        drop(ingest);
+
+        let (prefetch_tx, mut prefetch_rx) = tokio::sync::mpsc::channel(4096);
+        let mut restarted = fixture_over(crdt, Some(clock))
+            .with_prefetch(prefetch_tx)
+            .sequenced();
+        assert_eq!(restarted.materialized_height(&filter).unwrap(), 1);
+        let held = restarted.held_bodies();
+        let mut passes = 0;
+        while !restarted
+            .holds_bodies_through(&filter, head, false)
+            .unwrap()
+        {
+            passes += 1;
+            assert!(
+                passes <= head / PREFETCH_DEPTH + 2,
+                "the restarted archive never holds the shard's head again"
+            );
+            let served = serve_asked(&mut restarted, &mut [&mut prefetch_rx], &[]);
+            assert!(
+                served > 0,
+                "frames this archive stored are not admitted again"
+            );
+        }
+        assert!(proposed(&held, &filter, head));
     }
 
     /// A body read back from the store counts as held only when this ingest
