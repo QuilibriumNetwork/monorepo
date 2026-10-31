@@ -541,7 +541,8 @@ impl InternalNode {
 
     /// [`build_sibling`] builds the sibling contained in the merkle tree between
     /// [start; start+width) under the internal node (`self`) using the `TreeReader` as
-    /// a node reader to get the leaves/internal nodes at the bottom level of this internal node
+    /// a node reader to get the leaves/internal nodes at the bottom level of this internal node.
+    /// A child the reader cannot supply is an error naming its node key.
     fn build_sibling<H: SimpleHasher>(
         &self,
         tree_reader: &impl TreeReader,
@@ -549,45 +550,39 @@ impl InternalNode {
         start: u8,
         width: u8,
         (existence_bitmap, leaf_bitmap): (u16, u16),
-    ) -> SparseMerkleNode {
+    ) -> anyhow::Result<SparseMerkleNode> {
         // Given a bit [start, 1 << nibble_height], return the value of that range.
         let (range_existence_bitmap, range_leaf_bitmap) =
             Self::range_bitmaps(start, width, (existence_bitmap, leaf_bitmap));
         if range_existence_bitmap == 0 {
             // No child under this subtree
-            SparseMerkleNode::Null
+            Ok(SparseMerkleNode::Null)
         } else if has_only_child(width, range_existence_bitmap, range_leaf_bitmap) {
             // Only 1 leaf child under this subtree or reach the lowest level
             let only_child_index = Nibble::from(range_existence_bitmap.trailing_zeros() as u8);
 
-            let child = self
-                .child(only_child_index)
-                .with_context(|| {
-                    format!(
-                        "Corrupted internal node: existence_bitmap indicates \
-                         the existence of a non-exist child at index {:x}",
-                        only_child_index
-                    )
-                })
-                .unwrap();
+            let child = self.child(only_child_index).with_context(|| {
+                format!(
+                    "Corrupted internal node: existence_bitmap indicates \
+                     the existence of a non-exist child at index {:x}",
+                    only_child_index
+                )
+            })?;
 
-            let child_node = tree_reader
-                .get_node(&node_key.gen_child_node_key(child.version, only_child_index))
-                .with_context(|| {
-                    format!(
-                        "Corruption error: the merkle tree reader supplied cannot find \
-                         the child of version {:?} at index {:x}.",
-                        child.version, only_child_index
-                    )
-                })
-                .unwrap();
+            let child_key = node_key.gen_child_node_key(child.version, only_child_index);
+            let child_node = tree_reader.get_node(&child_key).with_context(|| {
+                format!(
+                    "Corruption error: the merkle tree reader supplied cannot find \
+                     the sibling {child_key:?} under {node_key:?}"
+                )
+            })?;
 
             match child_node {
-                Node::Internal(node) => {
-                    SparseMerkleNode::Internal(SparseMerkleInternalNode::from::<H>(node))
-                }
-                Node::Leaf(node) => SparseMerkleNode::Leaf(SparseMerkleLeafNode::from(node)),
-                Node::Null => unreachable!("Impossible to get a null node at this location"),
+                Node::Internal(node) => Ok(SparseMerkleNode::Internal(
+                    SparseMerkleInternalNode::from::<H>(node),
+                )),
+                Node::Leaf(node) => Ok(SparseMerkleNode::Leaf(SparseMerkleLeafNode::from(node))),
+                Node::Null => anyhow::bail!("a null node is stored at sibling {child_key:?}"),
             }
         } else {
             let left_child = self.merkle_hash::<H>(
@@ -600,7 +595,10 @@ impl InternalNode {
                 width / 2,
                 (range_existence_bitmap, range_leaf_bitmap),
             );
-            SparseMerkleNode::Internal(SparseMerkleInternalNode::new(left_child, right_child))
+            Ok(SparseMerkleNode::Internal(SparseMerkleInternalNode::new(
+                left_child,
+                right_child,
+            )))
         }
     }
 
@@ -720,7 +718,7 @@ impl InternalNode {
         node_key: &NodeKey,
         n: Nibble,
         get_only_child: bool,
-    ) -> (Option<NodeKey>, Vec<SparseMerkleNode>) {
+    ) -> anyhow::Result<(Option<NodeKey>, Vec<SparseMerkleNode>)> {
         let mut siblings: Vec<SparseMerkleNode> = vec![];
         let (existence_bitmap, leaf_bitmap) = self.generate_bitmaps();
 
@@ -739,14 +737,14 @@ impl InternalNode {
                 sibling_half_start,
                 width,
                 (existence_bitmap, leaf_bitmap),
-            ));
+            )?);
 
             let (range_existence_bitmap, range_leaf_bitmap) =
                 Self::range_bitmaps(child_half_start, width, (existence_bitmap, leaf_bitmap));
 
             if range_existence_bitmap == 0 {
                 // No child in this range.
-                return (None, siblings);
+                return Ok((None, siblings));
             } else if get_only_child
                 && (has_only_child(width, range_existence_bitmap, range_leaf_bitmap))
             {
@@ -755,7 +753,7 @@ impl InternalNode {
                 // `None` because it's existence indirectly proves the n-th child doesn't exist.
                 // Please read proof format for details.
                 let only_child_index = Nibble::from(range_existence_bitmap.trailing_zeros() as u8);
-                return (
+                return Ok((
                     {
                         let only_child_version = self
                             .child(only_child_index)
@@ -766,19 +764,18 @@ impl InternalNode {
                                          the existence of a non-exist child at index {:x}",
                                     only_child_index
                                 )
-                            })
-                            .unwrap()
+                            })?
                             .version;
                         Some(node_key.gen_child_node_key(only_child_version, only_child_index))
                     },
                     siblings,
-                );
+                ));
             } else if !get_only_child
                 && (has_child(width, range_existence_bitmap, n_bitmap, range_leaf_bitmap))
             {
                 // Early return the child in that subtree iff it is the only child and the nibble points
                 // to it
-                return (
+                return Ok((
                     {
                         let only_child_version = self
                             .child(n)
@@ -789,13 +786,12 @@ impl InternalNode {
                                          the existence of a non-exist child at index {:x}",
                                     n
                                 )
-                            })
-                            .unwrap()
+                            })?
                             .version;
                         Some(node_key.gen_child_node_key(only_child_version, n))
                     },
                     siblings,
-                );
+                ));
             }
         }
         unreachable!("Impossible to get here without returning even at the lowest level.")
@@ -808,7 +804,7 @@ impl InternalNode {
         tree_cache: &impl TreeReader,
         node_key: &NodeKey,
         n: Nibble,
-    ) -> (Option<NodeKey>, Vec<SparseMerkleNode>) {
+    ) -> anyhow::Result<(Option<NodeKey>, Vec<SparseMerkleNode>)> {
         self.get_child_with_siblings_helper::<H>(tree_cache, node_key, n, false)
     }
 
@@ -823,7 +819,7 @@ impl InternalNode {
         tree_reader: &impl TreeReader,
         node_key: &NodeKey,
         n: Nibble,
-    ) -> (Option<NodeKey>, Vec<SparseMerkleNode>) {
+    ) -> anyhow::Result<(Option<NodeKey>, Vec<SparseMerkleNode>)> {
         self.get_child_with_siblings_helper::<H>(tree_reader, node_key, n, true)
     }
 

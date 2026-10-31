@@ -82,11 +82,9 @@ fn get_only_child_with_siblings_helper<H: SimpleHasher>(
     internal_node_key: &NodeKey,
     i: Nibble,
 ) -> (Option<NodeKey>, Vec<[u8; 32]>) {
-    let (child, siblings) = internal_node.get_only_child_with_siblings::<H>(
-        merkle_tree_reader,
-        internal_node_key,
-        i.into(),
-    );
+    let (child, siblings) = internal_node
+        .get_only_child_with_siblings::<H>(merkle_tree_reader, internal_node_key, i.into())
+        .unwrap();
     (
         child,
         siblings.into_iter().map(|sib| sib.hash::<H>()).collect(),
