@@ -3689,12 +3689,14 @@ impl AppConsensusEngine {
     /// The caller keeps the frame and retries (`PROOF_VERIFICATION_PENDING`).
     /// A leader carries such an operation only once it verified it, and
     /// members verify in arrival order, so a member waits here only when it
-    /// trails the leader. `None`: materialize now — every verdict is cached,
-    /// the operations left are known to verify within the budget (inline, as
-    /// before), or the background verification cannot finish them (not
-    /// queued, released, ended without a verdict [`MAX_DEFERRAL_RESTARTS`]
-    /// times, or past [`MAX_PROOF_DEFERRAL`]), in which case materialization
-    /// verifies inline as before.
+    /// trails the leader; the queue then verifies what frames wait on first.
+    /// The wait lasts until the verdicts are cached, warning every
+    /// [`PROOF_DEFERRAL_OVERRUN`]. `None`: materialize now — every verdict is
+    /// cached, the operations left are known to verify within the budget
+    /// (inline, as before), or the background verification cannot finish
+    /// them (not queued, released after failing in the worker, or ended
+    /// without a verdict [`MAX_DEFERRAL_RESTARTS`] times), in which case
+    /// materialization verifies inline as before.
     fn defer_for_proof_verification(
         &self,
         exec: &Arc<quil_execution::ExecutionEngineManager>,
@@ -3709,6 +3711,8 @@ impl AppConsensusEngine {
         let mut unverified: Vec<usize> = Vec::new();
         let mut verifying = true;
         let mut restarted = false;
+        // Submissions queued ahead of this frame's last one.
+        let mut queued_ahead = 0usize;
         for bundle in requests {
             let Ok(canon) = crate::consensus_wire::app_bundle_to_canonical_bytes(bundle) else {
                 continue;
@@ -3724,6 +3728,7 @@ impl AppConsensusEngine {
             verifying &=
                 crate::admission_verify::offer_submission(queue, exec, application, &canon, true)
                     || proof_prewarm_running(&canon);
+            queued_ahead = queued_ahead.max(queue.queued_ahead(&digest).unwrap_or(0));
         }
         if unverified.is_empty() && !proof_deferral_known(&self.filter, frame_number) {
             return None;
@@ -3744,13 +3749,14 @@ impl AppConsensusEngine {
                 std::time::Instant::now(),
             );
         match decision {
-            Deferral::Wait { first: true } => {
+            Deferral::Wait { first: true, .. } => {
                 info!(
                     core_id = self.core_id,
                     filter = %hex::encode(&self.filter),
                     frame = frame_number,
                     operations = unverified.len(),
                     estimate_secs = estimate_secs.round() as u64,
+                    queued_ahead,
                     scope = "this worker",
                     action = "an expected wait: the frame materializes once its proofs verify; this worker keeps \
                               voting and serving its seats meanwhile",
@@ -3760,9 +3766,31 @@ impl AppConsensusEngine {
                     quil_execution::token_intrinsic::PROOF_VERIFICATION_PENDING.to_string(),
                 ))
             }
-            Deferral::Wait { first: false } => Some(QuilError::ExecutionUnavailable(
-                quil_execution::token_intrinsic::PROOF_VERIFICATION_PENDING.to_string(),
-            )),
+            Deferral::Wait {
+                first: false,
+                overrun,
+            } => {
+                if let Some(waited) = overrun {
+                    warn!(
+                        core_id = self.core_id,
+                        filter = %hex::encode(&self.filter),
+                        frame = frame_number,
+                        operations = unverified.len(),
+                        waited_secs = waited.as_secs(),
+                        estimate_secs = estimate_secs.round() as u64,
+                        queued_ahead,
+                        scope = "this node's proof worker",
+                        action = "the frame keeps waiting and materializes once its proofs verify; this node \
+                                  verifies confidential proofs slower than its shards' frames carry them: check \
+                                  its CPU and proofWorker.maxConcurrent (the queue verifies maxConcurrent - 1 \
+                                  at once)",
+                        "app-shard frame materialization still waits for its proof verification on a background thread"
+                    );
+                }
+                Some(QuilError::ExecutionUnavailable(
+                    quil_execution::token_intrinsic::PROOF_VERIFICATION_PENDING.to_string(),
+                ))
+            }
             Deferral::Proceed { waited, inline } => {
                 match (inline, waited) {
                     (Some(reason), waited) => warn!(
@@ -11978,7 +12006,8 @@ static PROOF_PREWARM_THREADS: std::sync::atomic::AtomicUsize =
 /// only when they are computed. Bounded: at most [`MAX_PROOF_PREWARMS`] threads,
 /// and a body already warming is not warmed again. A body with an operation
 /// not known to verify within the budget goes to the front of the admission
-/// queue ([`crate::admission_verify`]) instead, which verifies one at a time.
+/// queue ([`crate::admission_verify`]) instead, behind the submissions frames
+/// already wait on.
 pub(crate) fn prewarm_proof_verdicts(
     exec: &Arc<quil_execution::ExecutionEngineManager>,
     app_address: &[u8],
@@ -12527,11 +12556,15 @@ fn routed_selection(
         .collect()
 }
 
-/// How long a frame's materialization waits for its proofs to verify in the
-/// background before verifying them inline, blocking the engine, as before.
-const MAX_PROOF_DEFERRAL: std::time::Duration = std::time::Duration::from_secs(1800);
-/// Background verifications of one frame that may end without a verdict (no
-/// worker slot, worker failure) before it verifies inline.
+/// How often a frame whose materialization still waits for its proofs to
+/// verify in the background warns, with the time waited. It keeps waiting:
+/// verifying them inline instead blocked the engine and, with the worker's
+/// slots taken by the backlog, failed the frame at once ("token proof
+/// worker: Busy"), whose retry then waited again from the start (mainnet,
+/// 2026-10-31: shards stalled up to 3.6 h).
+const PROOF_DEFERRAL_OVERRUN: std::time::Duration = std::time::Duration::from_secs(1800);
+/// Background verifications of one frame that may end without a verdict
+/// (its submission left the queue uncached) before it verifies inline.
 const MAX_DEFERRAL_RESTARTS: u32 = 2;
 
 /// Frames whose materialization waits for background proof verification.
@@ -12546,17 +12579,35 @@ fn proof_deferral_known(filter: &[u8], frame: u64) -> bool {
         .contains_key(&(filter.to_vec(), frame))
 }
 
+/// One frame put off for background proof verification.
+#[derive(Clone, Copy)]
+struct DeferredFrame {
+    /// When it was first put off.
+    since: std::time::Instant,
+    /// When it last asked; a frame not asking for [`PROOF_DEFERRAL_OVERRUN`]
+    /// is forgotten.
+    asked: std::time::Instant,
+    /// How often its background verification ended without a verdict.
+    restarts: u32,
+    /// Overruns ([`PROOF_DEFERRAL_OVERRUN`] each) reported.
+    overruns: u32,
+}
+
 #[derive(Default)]
 struct ProofDeferrals {
-    /// `(filter, frame)` → when it was first put off, and how often its
-    /// background verification ended without a verdict.
-    entries: HashMap<(Vec<u8>, u64), (std::time::Instant, u32)>,
+    /// `(filter, frame)` → its wait.
+    entries: HashMap<(Vec<u8>, u64), DeferredFrame>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum Deferral {
-    /// Put the materialization off; `first` when this frame was not waiting.
-    Wait { first: bool },
+    /// Put the materialization off; `first` when this frame was not waiting;
+    /// `overrun`: the time waited, when it passed another
+    /// [`PROOF_DEFERRAL_OVERRUN`].
+    Wait {
+        first: bool,
+        overrun: Option<std::time::Duration>,
+    },
     /// Materialize now. `waited`: how long it was put off; `inline`: why its
     /// proofs did not verify in the background, when they did not.
     Proceed {
@@ -12570,7 +12621,12 @@ impl ProofDeferrals {
     /// still needs `unverified` worker verifications; `verifying`: all of
     /// them are verifying in the background; `restarted`: one of them had to
     /// be queued again since the last call, its earlier verification having
-    /// ended without a verdict.
+    /// ended without a verdict. A frame whose proofs verify in the
+    /// background waits however long that takes: the queue verifies the
+    /// submissions frames wait on first and retries them while the worker is
+    /// busy, so the wait ends with their verdicts, or with their release
+    /// after `admission_verify::MAX_FAILURES` failures in the worker (then
+    /// they are no longer verifying and the frame verifies inline).
     fn decide(
         &mut self,
         filter: &[u8],
@@ -12581,12 +12637,12 @@ impl ProofDeferrals {
         now: std::time::Instant,
     ) -> Deferral {
         self.entries
-            .retain(|_, (since, _)| now.saturating_duration_since(*since) < MAX_PROOF_DEFERRAL * 2);
+            .retain(|_, entry| now.saturating_duration_since(entry.asked) < PROOF_DEFERRAL_OVERRUN);
         let key = (filter.to_vec(), frame);
         let waited = self
             .entries
             .get(&key)
-            .map(|(since, _)| now.saturating_duration_since(*since));
+            .map(|entry| now.saturating_duration_since(entry.since));
         let inline = if unverified == 0 {
             self.entries.remove(&key);
             return Deferral::Proceed {
@@ -12595,18 +12651,37 @@ impl ProofDeferrals {
             };
         } else if !verifying {
             Some("its proofs could not be queued for background verification")
-        } else if let Some((since, restarts)) = self.entries.get_mut(&key) {
-            *restarts += u32::from(restarted);
-            if *restarts > MAX_DEFERRAL_RESTARTS {
+        } else if let Some(entry) = self.entries.get_mut(&key) {
+            entry.asked = now;
+            entry.restarts += u32::from(restarted);
+            if entry.restarts > MAX_DEFERRAL_RESTARTS {
                 Some("background verification ended without a verdict")
-            } else if now.saturating_duration_since(*since) >= MAX_PROOF_DEFERRAL {
-                Some("background verification outlasted the deferral limit")
             } else {
-                return Deferral::Wait { first: false };
+                let waited = now.saturating_duration_since(entry.since);
+                let overruns =
+                    u32::try_from(waited.as_secs() / PROOF_DEFERRAL_OVERRUN.as_secs().max(1))
+                        .unwrap_or(u32::MAX);
+                let overrun = (overruns > entry.overruns).then_some(waited);
+                entry.overruns = overruns;
+                return Deferral::Wait {
+                    first: false,
+                    overrun,
+                };
             }
         } else {
-            self.entries.insert(key, (now, 0));
-            return Deferral::Wait { first: true };
+            self.entries.insert(
+                key,
+                DeferredFrame {
+                    since: now,
+                    asked: now,
+                    restarts: 0,
+                    overruns: 0,
+                },
+            );
+            return Deferral::Wait {
+                first: true,
+                overrun: None,
+            };
         };
         self.entries.remove(&key);
         Deferral::Proceed { waited, inline }
@@ -19690,13 +19765,18 @@ mod tests {
 
     /// A frame whose proofs verify in the background is put off, and taken
     /// up once they are verified; it verifies inline when its verification
-    /// cannot be queued, ends without a verdict too often, or outlasts the
-    /// deferral limit, so a background verification that never finishes
-    /// delays the frame by the limit at most and never strands it.
+    /// cannot be queued or ends without a verdict too often. While they
+    /// still verify it keeps waiting past [`PROOF_DEFERRAL_OVERRUN`],
+    /// reporting each one once, and keeps its start; a frame that stopped
+    /// asking is forgotten.
     #[test]
     fn a_frame_waits_for_background_verification_within_bounds() {
         let start = std::time::Instant::now();
         let at = |secs: u64| start + std::time::Duration::from_secs(secs);
+        let wait = |first| Deferral::Wait {
+            first,
+            overrun: None,
+        };
         let mut deferrals = ProofDeferrals::default();
         let filter = [7u8; 4];
         // Nothing to verify: materialize at once, nothing remembered.
@@ -19710,11 +19790,11 @@ mod tests {
         // Verifying: wait, then proceed with the time waited once verified.
         assert_eq!(
             deferrals.decide(&filter, 2, 1, true, false, at(0)),
-            Deferral::Wait { first: true }
+            wait(true)
         );
         assert_eq!(
             deferrals.decide(&filter, 2, 1, true, false, at(10)),
-            Deferral::Wait { first: false }
+            wait(false)
         );
         assert_eq!(
             deferrals.decide(&filter, 2, 0, true, false, at(200)),
@@ -19735,12 +19815,12 @@ mod tests {
         // Ended without a verdict more than the restart bound: inline.
         assert_eq!(
             deferrals.decide(&filter, 4, 1, true, false, at(0)),
-            Deferral::Wait { first: true }
+            wait(true)
         );
         for restart in 1..=MAX_DEFERRAL_RESTARTS {
             assert_eq!(
                 deferrals.decide(&filter, 4, 1, true, true, at(u64::from(restart))),
-                Deferral::Wait { first: false }
+                wait(false)
             );
         }
         assert!(matches!(
@@ -19750,24 +19830,43 @@ mod tests {
                 ..
             }
         ));
-        // Past the deferral limit: inline, and the frame is forgotten.
-        let limit = MAX_PROOF_DEFERRAL.as_secs();
+        // Still verifying past each overrun: one report each, the wait
+        // continues from its start, and ends with the verdict.
+        let limit = PROOF_DEFERRAL_OVERRUN.as_secs();
         assert_eq!(
             deferrals.decide(&filter, 5, 1, true, false, at(0)),
-            Deferral::Wait { first: true }
+            wait(true)
+        );
+        let mut reported = Vec::new();
+        for secs in (10..=3 * limit).step_by(10) {
+            match deferrals.decide(&filter, 5, 1, true, false, at(secs)) {
+                Deferral::Wait {
+                    first: false,
+                    overrun,
+                } => reported.extend(overrun.map(|waited| waited.as_secs())),
+                other => panic!("frame 5 stopped waiting at {secs}s: {other:?}"),
+            }
+        }
+        assert_eq!(reported, vec![limit, 2 * limit, 3 * limit]);
+        assert_eq!(
+            deferrals.decide(&filter, 5, 0, true, false, at(3 * limit + 5)),
+            Deferral::Proceed {
+                waited: Some(std::time::Duration::from_secs(3 * limit + 5)),
+                inline: None
+            }
+        );
+        assert!(deferrals.entries.is_empty());
+        // A frame that stopped asking (materialized elsewhere, dropped) is
+        // forgotten once it has not asked for an overrun.
+        assert_eq!(
+            deferrals.decide(&filter, 6, 1, true, false, at(0)),
+            wait(true)
         );
         assert_eq!(
-            deferrals.decide(&filter, 5, 1, true, false, at(limit - 1)),
-            Deferral::Wait { first: false }
+            deferrals.decide(&filter, 7, 1, true, false, at(limit)),
+            wait(true)
         );
-        assert!(matches!(
-            deferrals.decide(&filter, 5, 1, true, false, at(limit)),
-            Deferral::Proceed {
-                inline: Some("background verification outlasted the deferral limit"),
-                ..
-            }
-        ));
-        assert!(deferrals.entries.is_empty());
+        assert!(!deferrals.entries.contains_key(&(filter.to_vec(), 6)));
     }
 
     /// The collector holds a submission in the encoding a finalized frame's
@@ -24537,3 +24636,7 @@ mod storage_attestation_pause_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "app_engine_proof_backlog_tests.rs"]
+mod proof_backlog_tests;

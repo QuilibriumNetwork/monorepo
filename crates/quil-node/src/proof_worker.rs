@@ -148,6 +148,7 @@ pub(crate) fn build_node_worker(
         PathBuf::from(&config.db.path)
     };
     std::fs::create_dir_all(&base)?;
+    quil_engine::admission_verify::use_worker_slots(worker.concurrency());
     let lock = std::fs::canonicalize(base)?.join(".proof-worker-admission.lock");
     worker
         .with_shared_admission(lock.clone())
