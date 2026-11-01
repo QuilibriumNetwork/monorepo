@@ -95,6 +95,16 @@ pub fn capture(m: &Model) -> Mapping {
         ),
     );
     put(
+        "coinsPanelEdges",
+        Value::Sequence(
+            m.coins
+                .edges
+                .iter()
+                .map(|&edge| Value::from(i64::from(edge)))
+                .collect(),
+        ),
+    );
+    put(
         "allocationSortColumn",
         sort_name(m.alloc_sort_col, &ALLOC_COL_NAMES),
     );
@@ -213,6 +223,22 @@ pub fn apply(m: &mut Model, map: &Mapping) {
     {
         // Drawing clamps edges to the terminal; this bounds absurd values.
         m.panel_boundary_offsets = [upper.clamp(-500, 500), lower.clamp(-500, 500)];
+    }
+    // The Coins tab's own edges, apart from the Provers tab's. A list with
+    // more or fewer edges (another qclient's tab) sets those it shares.
+    if let Some(edges) = get(map, "coinsPanelEdges")
+        .and_then(Value::as_sequence)
+        .and_then(|edges| {
+            edges
+                .iter()
+                .map(|edge| edge.as_i64().and_then(|e| i16::try_from(e).ok()))
+                .collect::<Option<Vec<i16>>>()
+        })
+    {
+        m.coins.edges = Default::default();
+        for (kept, edge) in m.coins.edges.iter_mut().zip(edges) {
+            *kept = edge.clamp(-500, 500);
+        }
     }
     if let Some(col) =
         get(map, "allocationSortColumn").and_then(|v| sort_column(v, &ALLOC_COL_NAMES))
@@ -362,6 +388,7 @@ mod settings_tests {
         m.global_interval_windows = 2;
         m.global_fields = 5;
         m.panel_boundary_offsets = [-2, 3];
+        m.coins.edges = [1, -2];
         m.alloc_sort_col = 10;
         m.alloc_sort_asc = false;
         m.avail_sort_col = -1;
@@ -424,6 +451,46 @@ mod settings_tests {
         let mut m = Model::new();
         Store::open(Some(path.clone()), &mut m);
         assert_eq!(capture(&m), capture(&defaults));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The Coins tab's edges load by position under their own key: a list
+    /// with a value that is no edge is skipped, a shorter or longer one sets
+    /// the edges it holds; `--reset-ui` drops them with the file.
+    #[test]
+    fn coins_edges_load_by_position_and_skip_malformed_lists() {
+        let path = scratch("coins-edges");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let open = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            let mut m = Model::new();
+            m.coins.edges = [5; super::super::coins::EDGES];
+            Store::open(Some(path.clone()), &mut m);
+            m
+        };
+        let m = open("coinsPanelEdges: [1, x]\npanelEdges: [2, 3]\n");
+        assert_eq!(m.coins.edges, [5, 5]);
+        assert_eq!(m.panel_boundary_offsets, [2, 3]);
+        assert_eq!(open("coinsPanelEdges: [4]\n").coins.edges, [4, 0]);
+        assert_eq!(
+            open("coinsPanelEdges: [1, -2, 3, 4]\n").coins.edges,
+            [1, -2]
+        );
+        assert_eq!(
+            open("coinsPanelEdges: [9000, -9000]\n").coins.edges,
+            [500, -500]
+        );
+        assert_eq!(open("coinsPanelEdges: 3\n").coins.edges, [5, 5]);
+        // The Provers tab's edges stay its own.
+        let m = open("coinsPanelEdges: [4, 4]\n");
+        assert_eq!(
+            m.panel_boundary_offsets,
+            Model::new().panel_boundary_offsets
+        );
+        reset(&path).unwrap();
+        let mut m = Model::new();
+        Store::open(Some(path.clone()), &mut m);
+        assert_eq!(m.coins.edges, [0, 0]);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

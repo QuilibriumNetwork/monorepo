@@ -409,6 +409,9 @@ pub struct Model {
     pub coins: super::coins::Coins,
     /// The UI and Workers key rows are shown (`?` collapses them to one).
     pub show_key_rows: bool,
+    /// Private wallet fields (the recipient, an action's amounts) are
+    /// masked: `--render` without `--reveal`, whose text may be shared.
+    pub mask_private: bool,
     // Header data.
     pub peer_id: String,
     pub seniority: String,
@@ -439,6 +442,9 @@ pub struct Model {
     pub global_last_advance: Option<std::time::Instant>,
     /// Disruptive command and exact selected allocation identities/statuses.
     pub operation_confirmation: Option<(char, Vec<(String, u32, i64, bool)>)>,
+    /// The join the worker picker chose, awaiting its confirmation: the
+    /// shard filters and the workers set to manual.
+    pub join_choice: Option<(Vec<Vec<u8>>, Vec<u32>)>,
     pub difficulty: u64,
 
     // Verified GLOBAL reward witness, refreshed independently of shard queries.
@@ -545,6 +551,9 @@ pub struct Model {
     pub status_message_time: Option<std::time::SystemTime>,
     pub status_is_error: bool,
     pub status_sticky: bool,
+    /// The status line that answers a key that does not apply: it shows
+    /// from any notice level while it is the current status.
+    pub key_reply: Option<String>,
     pub action_in_flight: bool,
     pub show_help: bool,
     /// First help line drawn under the pinned title. The help outgrew a

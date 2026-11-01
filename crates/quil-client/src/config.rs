@@ -23,6 +23,15 @@ pub struct ClientConfig {
     pub custom_rpc: String,
     #[serde(rename = "nodeSymlinkName", default)]
     pub node_symlink_name: String,
+    /// `noActionLog: true` turns off the private action log of wallet
+    /// actions (`<node config dir>/wallet/actions.jsonl`); written only
+    /// when set.
+    #[serde(
+        rename = "noActionLog",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub no_action_log: bool,
 }
 
 impl ClientConfig {
@@ -37,6 +46,7 @@ impl ClientConfig {
             public_rpc: false,
             custom_rpc: String::new(),
             node_symlink_name: String::new(),
+            no_action_log: false,
         }
     }
 
@@ -98,6 +108,16 @@ pub fn create_default() -> anyhow::Result<()> {
     save(&ClientConfig::default_for_create())
 }
 
+/// Whether the qclient config turns the private action log off; read
+/// without creating the file.
+pub fn action_log_off() -> bool {
+    config_path()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|data| serde_yaml::from_str::<ClientConfig>(&data).ok())
+        .is_some_and(|cfg| cfg.no_action_log)
+}
+
 /// Whether the client config file exists.
 pub fn is_configured() -> bool {
     config_path().map(|p| p.exists()).unwrap_or(false)
@@ -114,8 +134,16 @@ mod tests {
         assert!(yaml.contains("dataDir:"));
         assert!(!yaml.contains("signatureCheck"));
         assert!(yaml.contains("publicRpc: false"));
+        assert!(!yaml.contains("noActionLog"), "{yaml}");
         let back: ClientConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(cfg, back);
+        let off = ClientConfig {
+            no_action_log: true,
+            ..cfg
+        };
+        let yaml = serde_yaml::to_string(&off).unwrap();
+        assert!(yaml.contains("noActionLog: true"), "{yaml}");
+        assert_eq!(serde_yaml::from_str::<ClientConfig>(&yaml).unwrap(), off);
     }
 
     #[test]

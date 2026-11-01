@@ -89,6 +89,8 @@ pub enum ProverCommand {
 /// Shared prover context (Go `getConfig` + `getNodeClient`).
 pub struct ProverCtx {
     pub node_config: Config,
+    /// The directory `node_config` was read from.
+    pub config_dir: std::path::PathBuf,
     pub connect_opts: ConnectOpts,
     /// Key manager for signing prover ops (`q-prover-key` Falcon inner
     /// sig + `q-peer-key` Ed448 outer auth). Lazily needed only by the
@@ -110,6 +112,7 @@ impl ProverCtx {
         };
         Ok(Self {
             node_config,
+            config_dir: dir,
             connect_opts,
             key_manager,
         })

@@ -13,6 +13,7 @@ use super::model::{
 };
 use super::msg::Msg;
 use super::settings;
+use super::shield;
 
 const MAX_AWAIT_RETRIES: u32 = 3;
 
@@ -22,6 +23,10 @@ pub enum Cmd {
     Fetch,
     /// Read this node's legacy coins for the Coins tab.
     FetchLegacy,
+    /// Read and quote `token shield-all`'s batches for its confirmation.
+    ShieldPrepare,
+    /// Prove and submit the confirmed batches.
+    ShieldRun(super::shield::Preview),
     Join(Vec<Vec<u8>>),
     Lifecycle {
         action: String,
@@ -47,6 +52,14 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
     match msg {
         Msg::LegacyRefresh { answer, took } => {
             coins::apply_legacy(m, answer, took);
+            vec![]
+        }
+        Msg::ShieldPreview(preview) => {
+            shield::apply_preview(m, preview);
+            vec![]
+        }
+        Msg::Shield(progress) => {
+            shield::apply_progress(m, progress);
             vec![]
         }
         Msg::RewardRefresh(result) => {
@@ -501,6 +514,9 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     if ev.kind != KeyEventKind::Press {
         return vec![];
     }
+    if let Some(cmds) = shield::quit_guard(m, &ev, is_quit(&ev)) {
+        return cmds;
+    }
     if m.column_picker_active {
         return handle_column_picker_key(m, ev);
     }
@@ -510,10 +526,12 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         }
         if ev.code == KeyCode::Esc {
             m.operation_confirmation = None;
+            m.join_choice = None;
             m.status_msg.clear();
         } else if ev.code == KeyCode::Enter {
             let (command, targets) = m.operation_confirmation.take().unwrap();
             if targets != operation_targets(m, command) {
+                m.join_choice = None;
                 m.status_msg =
                     "Allocation selection or state changed; request the action again.".into();
                 m.status_is_error = true;
@@ -521,11 +539,17 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
                 return vec![];
             }
             m.status_msg.clear();
+            if command == 'g' {
+                return join_submit(m);
+            }
             return dispatch_operation(m, command);
         }
         return vec![];
     }
     if m.tab == Tab::Coins {
+        if matches!(m.coins.shield.dialog, Some(shield::Dialog::Confirm(_))) {
+            return shield::dialog_key(m, ev);
+        }
         if m.show_help {
             return handle_help_key(m, ev);
         }
@@ -550,33 +574,37 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             || m.filter_edit_active
             || m.is_filter_mode_active()
             || m.sort_mode
-            || m.focus == PanelFocus::Notifications
-            || m.action_in_flight
         {
             return vec![];
         }
         if let KeyCode::Char(command @ ('g' | 'l' | 'y' | 'r' | 'p' | 'u' | 'o')) = ev.code {
+            // An action that does not apply, hidden or dimmed in the
+            // Workers row, does nothing but say why.
+            if let Some(why) = worker_action_refusal(m, command) {
+                m.key_reply = Some(why.clone());
+                m.status_msg = why;
+                m.status_is_error = false;
+                return vec![];
+            }
             if matches!(command, 'l' | 'y' | 'r') && !manual_actions_allowed(m) {
                 return vec![];
             }
-            if matches!(command, 'l' | 'r' | 'p' | 'o') {
+            // Every action that signs or sends something waits for Enter;
+            // Ctrl+G only opens the worker picker, whose choice asks too.
+            if matches!(command, 'l' | 'y' | 'r' | 'p' | 'u' | 'o') {
                 if !m.focus.is_alloc() {
                     return wrong_panel(m, "Allocation action");
                 }
                 let targets = operation_targets(m, command);
                 if targets.is_empty() {
-                    return vec![];
+                    // Confirm explains when its window opens.
+                    return if command == 'y' {
+                        action_confirm(m)
+                    } else {
+                        vec![]
+                    };
                 }
-                let label = match command {
-                    'l' => "Leave",
-                    'r' => "Reject",
-                    'p' => "Pause",
-                    _ => "Change worker mode",
-                };
-                m.status_msg = format!(
-                    "{label} for {} allocation(s)? Enter confirms; Esc cancels.",
-                    targets.len()
-                );
+                m.status_msg = confirmation_text(command, &targets);
                 m.status_is_error = false;
                 m.operation_confirmation = Some((command, targets));
                 return vec![];
@@ -660,6 +688,64 @@ fn move_panel_boundary(m: &mut Model, upper: bool, down: bool) {
         (i32::from(m.panel_content_heights[i + 1]) - i32::from(movement)) as u16;
 }
 
+/// Why a Workers action does nothing on the current panel and selection,
+/// as the one line pressing it shows; `None` when it applies. The Workers
+/// row hides (compact) or dims (expanded) exactly these keys.
+fn worker_action_refusal(m: &Model, command: char) -> Option<String> {
+    let (tag, verb) = match command {
+        'g' => ("Join", "Join"),
+        'l' => ("Leave", "Leave"),
+        'y' => ("Confirm", "Confirm"),
+        'r' => ("Reject", "Reject"),
+        'p' => ("Pause", "Pause"),
+        'u' => ("Resume", "Resume"),
+        'o' => ("ToggleManual", "Mode"),
+        _ => return None,
+    };
+    if super::view::applicable_worker_actions(m).contains(tag) {
+        return None;
+    }
+    let key = command.to_ascii_uppercase();
+    let table_name = if command == 'g' {
+        "Available Shards"
+    } else {
+        "Allocations"
+    };
+    let why = if m.action_in_flight {
+        "an action is in progress; one action at a time.".to_string()
+    } else if (command == 'g') != (m.focus == PanelFocus::Available)
+        || (command != 'g' && !m.focus.is_alloc())
+    {
+        format!(
+            "‹Ctrl+{key}› {} acts on the {table_name} table; ‹tab› selects it.",
+            verb.to_lowercase()
+        )
+    } else if command == 'g' {
+        "no free manual worker to join with.".to_string()
+    } else if command == 'o' {
+        "the row under the cursor has no worker.".to_string()
+    } else if m.selected_alloc_rows().is_empty() {
+        "no allocation selected.".to_string()
+    } else if matches!(command, 'l' | 'y' | 'r')
+        && m.selected_alloc_rows().iter().any(|r| !r.manually_managed)
+    {
+        "join/leave/confirm/reject require manual mode; AUTO allows pause/resume and mode \
+         changes."
+            .to_string()
+    } else if let (true, (_, Some(opens))) = (command == 'y', confirmable_rows(m)) {
+        format!(
+            "Confirm is not yet available (current frame: {}, opens at: {opens}).",
+            m.epoch_frame()
+        )
+    } else {
+        format!(
+            "{verb} does not apply to every selected allocation; they support: {}.",
+            m.applicable_actions_label()
+        )
+    };
+    Some(format!("Workers: {why}"))
+}
+
 /// Keys both tabs share: display, refresh, notice level, help and the key
 /// rows. Returns whether `ev` was one.
 fn shared_view_key(m: &mut Model, ev: &KeyEvent) -> bool {
@@ -697,6 +783,25 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         return vec![];
     }
     let c = ch(&ev);
+    let hint = match ev.code {
+        KeyCode::Up | KeyCode::Char('k') => Some("↑/k"),
+        KeyCode::Down | KeyCode::Char('j') => Some("↓/j"),
+        KeyCode::Left | KeyCode::Right => Some("←/→"),
+        KeyCode::Char('b') => Some("b"),
+        KeyCode::Char('s') => Some("s"),
+        KeyCode::Char('f') => Some("f"),
+        KeyCode::Char(' ') => Some("space"),
+        KeyCode::Char('a') => Some("a"),
+        _ => None,
+    };
+    // A key that does not apply, hidden or dimmed in the UI row, does
+    // nothing but say why.
+    if let Some(why) = hint.and_then(|key| super::view::ui_key_refusal(m, key)) {
+        m.key_reply = Some(why.clone());
+        m.status_msg = why;
+        m.status_is_error = false;
+        return vec![];
+    }
     match ev.code {
         KeyCode::Char('1') => return vec![],
         KeyCode::Char('2') => return coins::open(m),
@@ -929,6 +1034,41 @@ fn handle_column_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
 }
 
 fn operation_targets(m: &Model, command: char) -> Vec<(String, u32, i64, bool)> {
+    if command == 'g' {
+        // The chosen shards, and the chosen workers that are still free.
+        let Some((filters, workers)) = &m.join_choice else {
+            return vec![];
+        };
+        let free = m.manual_free_workers();
+        let mut targets: Vec<_> = filters
+            .iter()
+            .map(|filter| (hex::encode(filter), 0, -1, true))
+            .chain(
+                workers
+                    .iter()
+                    .filter(|id| free.contains(id))
+                    .map(|id| (format!("worker:{id}"), 0, i64::from(*id), true)),
+            )
+            .collect();
+        targets.sort();
+        return targets;
+    }
+    if command == 'y' {
+        let mut targets: Vec<_> = confirmable_rows(m)
+            .0
+            .into_iter()
+            .map(|row| {
+                (
+                    row.filter_key,
+                    row.status,
+                    row.worker_id,
+                    row.manually_managed,
+                )
+            })
+            .collect();
+        targets.sort();
+        return targets;
+    }
     let rows = if command == 'o' {
         m.sorted_allocations()
             .get(m.alloc_cursor)
@@ -942,6 +1082,7 @@ fn operation_targets(m: &Model, command: char) -> Vec<(String, u32, i64, bool)> 
         .into_iter()
         .filter(|row| match command {
             'l' | 'p' => row.status == 2,
+            'u' => row.status == 3,
             'r' => row.status == 1 || row.status == 4,
             'o' => row.worker_id >= 0,
             _ => false,
@@ -1071,6 +1212,26 @@ fn wrong_panel(m: &mut Model, verb: &str) -> Vec<Cmd> {
     vec![]
 }
 
+/// The confirmed join: request it and set the chosen workers to manual.
+fn join_submit(m: &mut Model) -> Vec<Cmd> {
+    let Some((filters, workers)) = m.join_choice.take() else {
+        return vec![];
+    };
+    reset_action(m);
+    m.action_in_flight = true;
+    m.status_msg = format!(
+        "Joining {} shard(s) (VDF may take a while)...",
+        filters.len()
+    );
+    m.status_is_error = false;
+    m.avail_selected.clear();
+    let mut cmds = vec![Cmd::Join(filters)];
+    if !workers.is_empty() {
+        cmds.push(Cmd::MarkManual(workers));
+    }
+    cmds
+}
+
 fn action_join(m: &mut Model) -> Vec<Cmd> {
     if m.action_in_flight {
         return vec![];
@@ -1119,6 +1280,24 @@ fn action_confirm(m: &mut Model) -> Vec<Cmd> {
     if !m.focus.is_alloc() {
         return wrong_panel(m, "Confirm");
     }
+    let current_frame = m.epoch_frame();
+    let (confirm_rows, earliest) = confirmable_rows(m);
+    if confirm_rows.is_empty() {
+        if let Some(earliest) = earliest {
+            m.status_msg = format!(
+                "Confirm not yet available (current frame: {}, opens at: {}). Applicable action(s): Reject",
+                current_frame, earliest
+            );
+            m.status_is_error = true;
+            return vec![];
+        }
+    }
+    start_multi_filter_action(m, "Confirm", confirm_rows, |s| s == 1 || s == 4)
+}
+
+/// The selected allocations whose join or leave Confirm can act on now
+/// (its window is open), and the earliest frame a pending window opens.
+fn confirmable_rows(m: &Model) -> (Vec<super::model::AllocationRow>, Option<u64>) {
     // Use the same epoch-aligned window and current frame as the hints.
     let current_frame = m.epoch_frame();
     let mut confirm_rows = Vec::new();
@@ -1141,17 +1320,74 @@ fn action_confirm(m: &mut Model) -> Vec<Cmd> {
             WindowState::Missed => {}
         }
     }
-    if confirm_rows.is_empty() {
-        if let Some(earliest) = earliest {
-            m.status_msg = format!(
-                "Confirm not yet available (current frame: {}, opens at: {}). Applicable action(s): Reject",
-                current_frame, earliest
-            );
-            m.status_is_error = true;
-            return vec![];
+    (confirm_rows, earliest)
+}
+
+/// A shard filter key as the tables shorten it.
+fn short_target(key: &str) -> String {
+    match key.strip_prefix("worker:") {
+        Some(id) => format!("worker {id}"),
+        None if key.len() > 9 => format!("…{}", &key[key.len() - 9..]),
+        None => key.to_string(),
+    }
+}
+
+/// Up to three targets by name, then how many more.
+fn target_list(names: Vec<String>) -> String {
+    let more = names.len().saturating_sub(3);
+    let mut text = names.into_iter().take(3).collect::<Vec<_>>().join(", ");
+    if more > 0 {
+        text.push_str(&format!(" and {more} more"));
+    }
+    text
+}
+
+/// The question an operation's confirmation asks, naming its targets.
+pub(super) fn confirmation_text(command: char, targets: &[(String, u32, i64, bool)]) -> String {
+    const ASK: &str = "Enter confirms; Esc cancels.";
+    match command {
+        'g' => {
+            let shards: Vec<String> = targets
+                .iter()
+                .filter(|t| t.2 < 0)
+                .map(|t| short_target(&t.0))
+                .collect();
+            let workers: Vec<String> = targets
+                .iter()
+                .filter(|t| t.2 >= 0)
+                .map(|t| t.2.to_string())
+                .collect();
+            format!(
+                "Join for {} shard(s): {}, with worker(s) {} set to manual? {ASK}",
+                shards.len(),
+                target_list(shards),
+                workers.join(", ")
+            )
+        }
+        'o' => match targets.first() {
+            Some((key, _, worker, manual)) => format!(
+                "Change worker mode for 1 allocation(s): worker {worker} on {} to {}? {ASK}",
+                short_target(key),
+                if *manual { "auto" } else { "manual" }
+            ),
+            None => String::new(),
+        },
+        _ => {
+            let label = match command {
+                'l' => "Leave",
+                'y' => "Confirm",
+                'r' => "Reject",
+                'p' => "Pause",
+                'u' => "Resume",
+                _ => "Allocation action",
+            };
+            format!(
+                "{label} for {} allocation(s): {}? {ASK}",
+                targets.len(),
+                target_list(targets.iter().map(|t| short_target(&t.0)).collect())
+            )
         }
     }
-    start_multi_filter_action(m, "Confirm", confirm_rows, |s| s == 1 || s == 4)
 }
 
 fn action_reject(m: &mut Model) -> Vec<Cmd> {
@@ -1605,19 +1841,14 @@ fn handle_join_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
                 return vec![];
             }
             m.join_picker_active = false;
-            reset_action(m);
-            m.action_in_flight = true;
-            m.status_msg = format!(
-                "Joining {} shard(s) (VDF may take a while)...",
-                m.join_picker_filters.len()
-            );
+            let mut workers = worker_ids;
+            workers.sort_unstable();
+            m.join_choice = Some((m.join_picker_filters.clone(), workers));
+            let targets = operation_targets(m, 'g');
+            m.status_msg = confirmation_text('g', &targets);
             m.status_is_error = false;
-            m.avail_selected.clear();
-            let mut cmds = vec![Cmd::Join(m.join_picker_filters.clone())];
-            if !worker_ids.is_empty() {
-                cmds.push(Cmd::MarkManual(worker_ids));
-            }
-            return cmds;
+            m.operation_confirmation = Some(('g', targets));
+            return vec![];
         }
         KeyCode::Esc => {
             m.join_picker_active = false;
@@ -2017,8 +2248,14 @@ mod tests {
             m.applicable_alloc_actions(),
             ["Resume".to_string()].into_iter().collect()
         );
+        // Ctrl+U alone only asks, naming the allocation; Enter sends.
+        assert!(handle_key(&mut m, key(KeyCode::Char('u'))).is_empty());
+        assert_eq!(
+            m.status_msg,
+            "Resume for 1 allocation(s): 01? Enter confirms; Esc cancels."
+        );
         assert!(
-            matches!(handle_key(&mut m, key(KeyCode::Char('u'))).as_slice(), [Cmd::Lifecycle { action, .. }] if action == "Resume")
+            matches!(handle_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).as_slice(), [Cmd::Lifecycle { action, .. }] if action == "Resume")
         );
         assert!(!m.allocations[0].manually_managed);
         let mut m = operational_model(2);
@@ -2075,6 +2312,50 @@ mod tests {
         );
         assert!(!m.action_in_flight && m.join_picker_active);
         assert!(m.manual_free_workers().is_empty());
+    }
+
+    /// The worker picker's choice is a question, not a join: Enter in the
+    /// picker names the shards and workers; only Enter again sends, and
+    /// only while the chosen workers are still free.
+    #[test]
+    fn the_join_pickers_choice_waits_for_enter_and_names_its_targets() {
+        let enter = || KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let choose = |m: &mut Model| {
+            m.join_picker_active = true;
+            m.join_picker_filters = vec![vec![0xab; 3]];
+            m.join_picker_selected.insert(2);
+            handle_join_picker_key(m, enter())
+        };
+        let mut m = operational_model(2);
+        m.allocations[0].status = 0;
+        m.allocations[0].worker_id = 2;
+        m.free_workers = vec![2];
+        assert!(choose(&mut m).is_empty());
+        assert!(!m.join_picker_active && !m.action_in_flight);
+        assert_eq!(
+            m.status_msg,
+            "Join for 1 shard(s): ababab, with worker(s) 2 set to manual? Enter confirms; Esc cancels."
+        );
+        // Esc cancels: nothing sent, nothing kept.
+        assert!(handle_key(&mut m, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).is_empty());
+        assert!(m.operation_confirmation.is_none() && m.join_choice.is_none());
+        // Enter sends the join and the mode change.
+        choose(&mut m);
+        assert!(matches!(
+            handle_key(&mut m, enter()).as_slice(),
+            [Cmd::Join(filters), Cmd::MarkManual(workers)]
+                if *filters == vec![vec![0xab; 3]] && *workers == vec![2]
+        ));
+        assert!(m.action_in_flight);
+        // A worker taken meanwhile voids the question.
+        let mut m = operational_model(2);
+        m.allocations[0].status = 0;
+        m.allocations[0].worker_id = 2;
+        m.free_workers = vec![2];
+        choose(&mut m);
+        m.free_workers.clear();
+        assert!(handle_key(&mut m, enter()).is_empty());
+        assert!(m.status_msg.contains("changed; request the action again"));
     }
 
     #[test]
@@ -2382,9 +2663,22 @@ mod tests {
                     for row in &mut model.allocations {
                         row.manually_managed = true;
                     }
+                    // Ctrl+Y alone only asks; Enter sends.
                     let cmds = handle_key(
                         &mut model,
                         KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+                    );
+                    assert!(cmds.is_empty(), "Ctrl+Y sent before Enter");
+                    assert_eq!(model.operation_confirmation.is_some(), expected);
+                    if expected {
+                        assert_eq!(
+                            model.status_msg,
+                            "Confirm for 1 allocation(s): ab? Enter confirms; Esc cancels."
+                        );
+                    }
+                    let cmds = handle_key(
+                        &mut model,
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                     );
                     let sent = cmds.iter().any(|cmd| matches!(cmd,
                         Cmd::Lifecycle { action, filters, .. } if action == "Confirm" && filters == &vec![filter.clone()]

@@ -21,7 +21,10 @@ use quil_types::proto::node::{
 use super::super::sign;
 use super::model::{AwaitFilterEntry, FilterOutcome};
 use super::msg::Msg;
+use super::shield;
 use super::util::{filters_label, trunc_hex};
+use crate::commands::token::action_log::ActionLog;
+use crate::context::GlobalArgs;
 
 type Client = NodeServiceClient<Channel>;
 
@@ -67,7 +70,12 @@ const LEGACY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Read the legacy coins of the identity with Ed448 key `public` (`None`:
 /// the config has none, so it owns no legacy coins).
-pub async fn fetch_legacy(client: Client, public: Option<[u8; 57]>, network: u8) -> Msg {
+pub async fn fetch_legacy(
+    client: Client,
+    public: Option<[u8; 57]>,
+    network: u8,
+    config_dir: Option<std::path::PathBuf>,
+) -> Msg {
     let started = std::time::Instant::now();
     let answer = match public {
         None => Ok(None),
@@ -78,6 +86,7 @@ pub async fn fetch_legacy(client: Client, public: Option<[u8; 57]>, network: u8)
                 &quil_execution::domains::QUIL_TOKEN,
                 &public,
                 network,
+                config_dir.as_deref(),
             ),
         )
         .await
@@ -94,6 +103,211 @@ pub async fn fetch_legacy(client: Client, public: Option<[u8; 57]>, network: u8)
         answer,
         took: started.elapsed(),
     }
+}
+
+/// `token shield-all`'s batches for the shield confirmation: read, cut and
+/// quoted as the CLI would, nothing proved or submitted. `token` is the
+/// manager's global flags and `--max-fee`.
+#[cfg(feature = "native-proof")]
+pub async fn shield_prepare(token: Option<(GlobalArgs, u128)>) -> Msg {
+    use crate::commands::token::{output, TokenCtx};
+    // The CLI's progress lines would overwrite the screen.
+    let (notes, _ignored) = tokio::sync::mpsc::unbounded_channel();
+    let result = output::capture(notes, async {
+        let (global, max_fee) = token.ok_or_else(|| anyhow::anyhow!("no node config"))?;
+        shield_preview(&TokenCtx::for_manager(global, max_fee)?).await
+    })
+    .await;
+    Msg::ShieldPreview(result.map_err(|e| format!("{e:#}")))
+}
+
+/// The fix for a submission signed by a config other than the running
+/// node's: the manager has no `--submit-config`, and signs with the config
+/// it loaded (`--network`, else the default config, else `./.config`).
+#[cfg(feature = "native-proof")]
+const MANAGER_CONFIG_REMEDY: &str = "start the manager with the running node's \
+     config: --network <name> loads ~/.quilibrium/configs/<name>, and the node directory's \
+     .config is used only when no default config exists";
+
+/// Refuse, before any read, a submission the node would reject because
+/// `tc` signs with another config than the node's own; the advice names the
+/// manager's options.
+#[cfg(feature = "native-proof")]
+async fn check_identity(tc: &crate::commands::token::TokenCtx) -> anyhow::Result<()> {
+    Box::pin(tc.check_submit_identity_advising(MANAGER_CONFIG_REMEDY)).await
+}
+
+/// [`shield_prepare`]'s reads and quotes with `tc`'s node and keys.
+#[cfg(feature = "native-proof")]
+async fn shield_preview(tc: &crate::commands::token::TokenCtx) -> anyhow::Result<shield::Preview> {
+    use crate::commands::token::{plan_shield_all, shield_batch_fee};
+    // Before any listing or proof: a submission the node would refuse.
+    check_identity(tc).await?;
+    let plan = plan_shield_all(tc, &quil_token(), shield::BATCH_COINS).await?;
+    anyhow::ensure!(
+        !plan.batches.is_empty(),
+        "no unshielded legacy coins on a live shard to shield"
+    );
+    let (coins, units) = plan.totals()?;
+    // One quote per batch size: the price follows the coin count.
+    let mut quoted = std::collections::BTreeMap::new();
+    let (mut fee, mut fee_max) = (0u128, 0u128);
+    for batch in &plan.batches {
+        let quote = match quoted.get(&batch.len()) {
+            Some(quote) => *quote,
+            None => {
+                let quote = shield_batch_fee(tc, batch.len()).await?;
+                quoted.insert(batch.len(), quote);
+                quote
+            }
+        };
+        fee = fee.saturating_add(quote);
+        fee_max = fee_max.max(quote);
+    }
+    Ok(shield::Preview {
+        batches: plan.batches.len(),
+        coins,
+        units,
+        fee,
+        fee_max,
+        max_fee: tc.max_fee,
+        recipient: plan.recipient(),
+        listed: plan.listed,
+        shielded: plan.shielded,
+        uncovered: plan.uncovered,
+        pending: plan.pending,
+        duplicates: plan.duplicates,
+    })
+}
+
+/// Run the confirmed shield through the CLI's own functions, reporting each
+/// batch on `progress` and recording the run in the private action `log`.
+/// The batches are read again and must match what was confirmed; otherwise
+/// nothing is submitted.
+#[cfg(feature = "native-proof")]
+pub async fn shield_run(
+    token: Option<(GlobalArgs, u128)>,
+    preview: shield::Preview,
+    progress: tokio::sync::mpsc::UnboundedSender<Msg>,
+    log: Option<ActionLog>,
+) -> Msg {
+    use crate::commands::token::action_log::ShieldRecorder;
+    use crate::commands::token::{output, TokenCtx};
+    let (notes, mut lines) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let forward = progress.clone();
+    tokio::spawn(async move {
+        while let Some(line) = lines.recv().await {
+            let _ = forward.send(Msg::Shield(shield::Progress::Note(line)));
+        }
+    });
+    let result = output::capture(notes, async {
+        let (global, max_fee) = token.ok_or_else(|| anyhow::anyhow!("no node config"))?;
+        let tc = TokenCtx::for_manager(global, max_fee)?;
+        shield_execute(
+            &tc,
+            &preview,
+            &progress,
+            &mut ShieldRecorder::new(log, "manager"),
+        )
+        .await
+    })
+    .await;
+    Msg::Shield(shield::Progress::Done(result.map_err(|e| format!("{e:#}"))))
+}
+
+/// Tell the manager the action log could not be written.
+#[cfg(feature = "native-proof")]
+fn log_failed(progress: &tokio::sync::mpsc::UnboundedSender<Msg>, why: Option<String>) {
+    if let Some(why) = why {
+        let _ = progress.send(Msg::Shield(shield::Progress::LogFailed(why)));
+    }
+}
+
+/// [`shield_run`]'s work with `tc`'s node and keys, recorded by `record`:
+/// the plan, each batch and the outcome.
+#[cfg(feature = "native-proof")]
+async fn shield_execute(
+    tc: &crate::commands::token::TokenCtx,
+    preview: &shield::Preview,
+    progress: &tokio::sync::mpsc::UnboundedSender<Msg>,
+    record: &mut crate::commands::token::action_log::ShieldRecorder,
+) -> anyhow::Result<()> {
+    let result = shield_batches(tc, preview, progress, record).await;
+    let outcome = result.as_ref().map(|_| ()).map_err(|e| format!("{e:#}"));
+    log_failed(progress, record.outcome(&outcome));
+    result
+}
+
+#[cfg(feature = "native-proof")]
+async fn shield_batches(
+    tc: &crate::commands::token::TokenCtx,
+    preview: &shield::Preview,
+    progress: &tokio::sync::mpsc::UnboundedSender<Msg>,
+    record: &mut crate::commands::token::action_log::ShieldRecorder,
+) -> anyhow::Result<()> {
+    use crate::commands::token::{execute_shield_all, plan_shield_all, ShieldEvent};
+    let plan = plan_shield_all(tc, &quil_token(), shield::BATCH_COINS).await?;
+    let (coins, units) = plan.totals()?;
+    anyhow::ensure!(
+        plan.batches.len() == preview.batches && coins == preview.coins && units == preview.units,
+        "the plan changed since it was confirmed ({} batches of {coins} coins now); press ‹S› \
+         again",
+        plan.batches.len()
+    );
+    log_failed(progress, record.start(&plan, tc.max_fee));
+    execute_shield_all(tc, plan, |event| {
+        log_failed(progress, record.event(&event));
+        let report = match event {
+            ShieldEvent::Proving {
+                index,
+                count,
+                coins,
+            } => shield::Progress::Proving {
+                index,
+                count,
+                coins,
+            },
+            ShieldEvent::Skipped { index, count, .. } => shield::Progress::Skipped { index, count },
+            ShieldEvent::Submitted {
+                index,
+                count,
+                addresses,
+                shielded,
+                ..
+            } => shield::Progress::Submitted {
+                index,
+                count,
+                addresses,
+                shielded,
+            },
+            ShieldEvent::Nothing { .. } | ShieldEvent::Uncovered(_) => return,
+        };
+        let _ = progress.send(Msg::Shield(report));
+    })
+    .await
+}
+
+#[cfg(feature = "native-proof")]
+fn quil_token() -> String {
+    hex::encode(quil_execution::domains::QUIL_TOKEN)
+}
+
+/// This build has no shield commands.
+#[cfg(not(feature = "native-proof"))]
+pub async fn shield_prepare(_token: Option<(GlobalArgs, u128)>) -> Msg {
+    Msg::ShieldPreview(Err("this qclient build has no shield commands".into()))
+}
+
+#[cfg(not(feature = "native-proof"))]
+pub async fn shield_run(
+    _token: Option<(GlobalArgs, u128)>,
+    _preview: shield::Preview,
+    _progress: tokio::sync::mpsc::UnboundedSender<Msg>,
+    _log: Option<ActionLog>,
+) -> Msg {
+    Msg::Shield(shield::Progress::Done(Err(
+        "this qclient build has no shield commands".into(),
+    )))
 }
 
 // ── Data fetch ───────────────────────────────────────────────────────────
@@ -478,5 +692,308 @@ pub async fn check_allocation_status(
         frame: current_frame,
         err: None,
         per_filter: outcomes,
+    }
+}
+
+/// The shield action end to end against a node double: reads, batches and
+/// quotes for the confirmation, then the run, whose quotes exceed every
+/// batch so nothing is proved or submitted.
+#[cfg(all(test, feature = "native-proof"))]
+mod shield_action_tests {
+    use super::*;
+    use quil_types::store::{CoinWitnessProvider, LegacyCoinData, LegacyCoinPageData};
+    use std::collections::HashMap;
+
+    struct Coins(HashMap<[u8; 32], Vec<LegacyCoinData>>);
+    impl CoinWitnessProvider for Coins {
+        fn legacy_coins(
+            &self,
+            _domain: &[u8; 32],
+            owner: &[u8; 32],
+            after: Option<&[u8; 32]>,
+        ) -> quil_types::error::Result<Option<LegacyCoinPageData>> {
+            let coins: Vec<LegacyCoinData> = self
+                .0
+                .get(owner)
+                .into_iter()
+                .flatten()
+                .filter(|coin| after.is_none_or(|after| coin.address > *after))
+                .cloned()
+                .collect();
+            Ok(Some(LegacyCoinPageData {
+                cursor: coins.last().map(|coin| coin.address),
+                coins,
+                has_more: false,
+            }))
+        }
+    }
+
+    /// One live shard: the QUIL root, which covers every address.
+    struct Root;
+    impl quil_types::consensus::ShardInfoProvider for Root {
+        fn get_shard_info(
+            &self,
+            _include_all: bool,
+        ) -> quil_types::error::Result<(
+            Vec<quil_types::consensus::ShardDetail>,
+            u64,
+            num_bigint::BigInt,
+            u64,
+            num_bigint::BigInt,
+        )> {
+            Ok((
+                vec![quil_types::consensus::ShardDetail {
+                    allocation_reason: None,
+                    ring_known: true,
+                    filter: quil_execution::domains::QUIL_TOKEN.to_vec(),
+                    shard_size: 0.into(),
+                    active_provers: 8,
+                    ring: 0,
+                    estimated_reward: 0.into(),
+                    is_allocated: false,
+                    data_shards: 1,
+                    materialized_frame: 1,
+                    latest_frame: 1,
+                    prover_counts: None,
+                }],
+                0,
+                0.into(),
+                1,
+                0.into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn s_previews_and_runs_through_the_cli_functions() {
+        let directory = tempfile::tempdir().unwrap();
+        let km = Arc::new(
+            FileKeyManager::new(
+                directory.path().join("keys.yml"),
+                &hex::encode([9; 32]),
+                "q-prover-key".into(),
+                Box::new(quil_crypto::FalconKeyConstructor),
+            )
+            .unwrap(),
+        );
+        km.create_agreement_key("q-onion-key", 9).unwrap();
+        let seed = [55; 57];
+        let public = quil_crypto::Ed448Signer::derive_public(&seed).unwrap();
+        let mut node_config = quil_config::Config::default();
+        node_config.p2p.peer_priv_key = hex::encode([&seed[..], &public[..]].concat());
+        let owners =
+            crate::commands::token::legacy::key_owners(&public.as_slice().try_into().unwrap())
+                .unwrap();
+        // Three coins under the key owner, one shielded already; another
+        // under the peer-id owner.
+        let coin = |byte: u8, shielded| LegacyCoinData {
+            address: [byte; 32],
+            amount: 5,
+            origin: [byte ^ 0xff; 32],
+            shielded,
+        };
+        let coins = Coins(HashMap::from([
+            (
+                owners[0].1,
+                vec![coin(0x10, false), coin(0x20, true), coin(0x30, false)],
+            ),
+            (owners[1].1, vec![coin(0x40, false)]),
+        ]));
+        let network = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(
+            node_config.p2p.network,
+        )
+        .network;
+        // The node reports a peer ID; a context with none to compare skips
+        // the identity check, one signing as another peer is refused below.
+        let server = quil_rpc::node_service::NodeRpcServer::new()
+            .with_peer_id("the-node-peer".into())
+            .with_coin_witness_provider(Arc::new(coins))
+            .with_shard_info_provider(Arc::new(Root))
+            .with_token_fee_provider(Arc::new(move |_, _| {
+                // A small world: each byte of growth costs far more than
+                // the five-unit coins, so every batch is skipped unproved.
+                Ok(quil_rpc::node_service::TokenFeeSnapshot {
+                    network,
+                    observed_frame: 42,
+                    global_execution: true,
+                    difficulty: 50_000,
+                    world_state_bytes: 1 << 24,
+                    fee_multiplier_vote: 1,
+                })
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let multiaddr = format!(
+            "/ip4/127.0.0.1/tcp/{}",
+            listener.local_addr().unwrap().port()
+        );
+        let incoming = futures::stream::unfold(listener, |listener| async {
+            let result = listener.accept().await.map(|(socket, _)| socket);
+            Some((result, listener))
+        });
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let serving = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    quil_types::proto::node::node_service_server::NodeServiceServer::new(server),
+                )
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        let opts = crate::rpc::ConnectOpts {
+            listen_grpc_multiaddr: multiaddr,
+            ..Default::default()
+        };
+        let tc = crate::commands::token::TokenCtx {
+            node_config,
+            config_dir: directory.path().to_path_buf(),
+            key_manager: km.clone(),
+            connect_opts: opts.clone(),
+            submit_opts: opts,
+            submit_key_manager: km,
+            submit_config_dir: directory.path().to_path_buf(),
+            submit_identity: Default::default(),
+            peer_id_bytes: Vec::new(),
+            max_fee: u128::MAX,
+        };
+        let (notes, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        let preview = crate::commands::token::output::capture(notes, shield_preview(&tc))
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                preview.batches,
+                preview.coins,
+                preview.units,
+                preview.uncovered
+            ),
+            (1, 3, 15, 0)
+        );
+        // Every listed coin is in a batch or named as left out.
+        assert_eq!((preview.listed, preview.shielded), (4, 1));
+        assert_eq!(
+            preview.coins
+                + preview.shielded
+                + preview.uncovered
+                + preview.pending
+                + preview.duplicates,
+            preview.listed
+        );
+        assert!(preview.fee > preview.units && preview.fee == preview.fee_max);
+        assert!(preview.recipient.starts_with("0x") && preview.recipient.len() > 66);
+        // The fee estimate went to the sink, not the terminal.
+        assert!(lines.try_recv().unwrap().starts_with("Estimated fee: "));
+
+        // The run: the model sees the batch skipped and the run end.
+        let mut m = super::super::model::Model::new();
+        m.coins.shield.dialog = Some(shield::Dialog::Confirm(preview.clone()));
+        let cmds = shield::dialog_key(
+            &mut m,
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('y')),
+        );
+        assert!(matches!(
+            cmds.as_slice(),
+            [super::super::update::Cmd::ShieldRun(_)]
+        ));
+        let (progress, mut reports) = tokio::sync::mpsc::unbounded_channel();
+        let (notes, _lines) = tokio::sync::mpsc::unbounded_channel();
+        let log = ActionLog::new(directory.path());
+        let recorder = || {
+            crate::commands::token::action_log::ShieldRecorder::new(Some(log.clone()), "manager")
+        };
+        let result = crate::commands::token::output::capture(
+            notes,
+            shield_execute(&tc, &preview, &progress, &mut recorder()),
+        )
+        .await;
+        drop(progress);
+        super::super::update::apply_msg(
+            &mut m,
+            Msg::Shield(shield::Progress::Done(result.map_err(|e| format!("{e:#}")))),
+        );
+        let mut seen = Vec::new();
+        while let Some(Msg::Shield(report)) = reports.recv().await {
+            seen.push(report.clone());
+            super::super::update::apply_msg(&mut m, Msg::Shield(report));
+        }
+        assert_eq!(seen, [shield::Progress::Skipped { index: 1, count: 1 }]);
+        assert!(!shield::running(&m));
+        let run = m.coins.shield.run.as_ref().unwrap();
+        assert_eq!((run.skipped, run.submitted.len()), (1, 0));
+        assert_eq!(run.done, Some(Ok(())));
+        // Nothing went into shield-all's journal.
+        assert!(!directory
+            .path()
+            .join(crate::commands::token::legacy::SHIELD_JOURNAL)
+            .exists());
+        // The private action log has the plan, the skipped batch and the
+        // outcome, with the details the operator log leaves out.
+        let records = || -> Vec<serde_json::Value> {
+            std::fs::read_to_string(log.path())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        };
+        let written = records();
+        let phases: Vec<&str> = written
+            .iter()
+            .map(|r| r["phase"].as_str().unwrap())
+            .collect();
+        assert_eq!(phases, ["start", "skipped", "outcome"]);
+        assert!(written
+            .iter()
+            .all(|r| r["kind"] == "shield" && r["source"] == "manager"));
+        assert_eq!(written[0]["recipient"], preview.recipient.as_str());
+        assert_eq!(
+            (written[0]["coins"].as_u64(), written[0]["units"].as_str()),
+            (Some(3), Some("15"))
+        );
+        assert_eq!(written[1]["units"], "15");
+        assert_eq!(written[2]["outcome"], "ok");
+
+        // A changed plan between confirmation and run submits nothing.
+        let mut stale = preview.clone();
+        stale.coins = 4;
+        let (progress, _reports) = tokio::sync::mpsc::unbounded_channel();
+        let (notes, _lines) = tokio::sync::mpsc::unbounded_channel();
+        let error = crate::commands::token::output::capture(
+            notes,
+            shield_execute(&tc, &stale, &progress, &mut recorder()),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("the plan changed"), "{error}");
+        let last = records().pop().unwrap();
+        assert_eq!(last["phase"], "outcome");
+        assert_eq!(last["outcome"], "failed");
+        assert!(last["error"].as_str().unwrap().contains("the plan changed"));
+
+        // Signed as another peer, the confirmation is refused before any
+        // listing, as `token shield-all` refuses it.
+        let other = crate::commands::token::TokenCtx {
+            submit_identity: crate::commands::token::ConfigIdentity {
+                falcon: Some("another-peer".into()),
+                ed448: None,
+            },
+            ..tc
+        };
+        let (notes, _lines) = tokio::sync::mpsc::unbounded_channel();
+        let error = crate::commands::token::output::capture(notes, shield_preview(&other))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("own peer key"), "{error}");
+        // The advice names the manager's options, not the CLI's.
+        assert!(
+            error.contains("start the manager with the running node's config: --network <name>"),
+            "{error}"
+        );
+        assert!(!error.contains("--submit-config"), "{error}");
+        stop.send(()).unwrap();
+        serving.await.unwrap();
     }
 }

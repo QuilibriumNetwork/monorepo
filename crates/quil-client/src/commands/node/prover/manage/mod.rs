@@ -20,6 +20,7 @@ mod filter;
 mod model;
 mod msg;
 mod settings;
+mod shield;
 mod update;
 mod util;
 mod view;
@@ -84,11 +85,30 @@ pub struct ManageArgs {
     /// Seconds --render waits for the node's answers.
     #[arg(long, default_value_t = 30)]
     pub timeout: u64,
+    /// Show private wallet fields in --render: a confirmation's amount and
+    /// the recipient's address, and shielded amounts. Without it a render,
+    /// which may be shared, shows them as hidden.
+    #[arg(long)]
+    pub reveal: bool,
+    /// Do not record wallet actions in the private action log
+    /// (<node config dir>/wallet/actions.jsonl, owner-only); `noActionLog:
+    /// true` in the qclient config does the same for every command.
+    #[arg(long)]
+    pub no_action_log: bool,
     /// Restore the view settings kept between runs (columns, KPIs, panel
     /// edges, sort, colors, notice level, refresh, key rows) to their
     /// defaults, then start.
     #[arg(long)]
     pub reset_ui: bool,
+    /// Largest fee in base units a shield batch pays from the node's quote
+    /// (default: 0.1 QUIL); a larger quote stops the run, as in `qclient
+    /// token`.
+    #[arg(
+        long,
+        env = "QUILIBRIUM_MAX_FEE",
+        default_value_t = crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE
+    )]
+    pub max_fee: u128,
 }
 
 /// What an invocation does, decided by its flags alone.
@@ -110,6 +130,7 @@ impl ManageArgs {
                 keys: self.keys.split_whitespace().map(str::to_string).collect(),
                 color: self.color,
                 timeout: Duration::from_secs(self.timeout),
+                reveal: self.reveal,
             })
         } else {
             Mode::Interactive
@@ -133,16 +154,24 @@ pub(in crate::commands::node) async fn command(
             print!("{}", help_text(width));
             Ok(())
         }
-        Mode::Render(opts) => render(&ProverCtx::load(global)?, opts).await,
-        Mode::Interactive => run(&ProverCtx::load(global)?).await,
+        Mode::Render(opts) => {
+            let pc = ProverCtx::load(global.clone())?;
+            // A render never runs an action, so it writes no action log.
+            let refresh = RefreshState::for_node(&pc, global, args.max_fee, true);
+            render(&pc, refresh, opts).await
+        }
+        Mode::Interactive => {
+            let pc = ProverCtx::load(global.clone())?;
+            let refresh = RefreshState::for_node(&pc, global, args.max_fee, args.no_action_log);
+            run(&pc, refresh).await
+        }
     }
 }
 
 /// The interactive TUI (`NodeProverManageCmd.Run`).
-async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
+async fn run(pc: &ProverCtx, refresh_state: RefreshState) -> anyhow::Result<()> {
     let client = pc.connect().await?;
     let km = pc.key_manager.clone();
-    let refresh_state = RefreshState::for_node(pc);
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -242,13 +271,27 @@ struct RenderOptions {
     color: bool,
     /// How long to wait for the node's answers.
     timeout: Duration,
+    /// Show private wallet fields (`--reveal`); else they are masked.
+    reveal: bool,
+}
+
+impl RenderOptions {
+    /// Set up the model a render draws: private wallet fields masked
+    /// unless `--reveal`.
+    fn prepare(&self, model: &mut Model) {
+        model.mask_private = !self.reveal;
+    }
 }
 
 /// `qclient node manage --render`: fetch the node's data once, apply
 /// the given keys, draw one frame and print it as plain text. Read-only: the
 /// commands keys or results would start (joins, lifecycle operations, worker
 /// changes, follow-up checks) are dropped and reported on stderr.
-async fn render(pc: &ProverCtx, opts: RenderOptions) -> anyhow::Result<()> {
+async fn render(
+    pc: &ProverCtx,
+    refresh_state: RefreshState,
+    opts: RenderOptions,
+) -> anyhow::Result<()> {
     let client = pc.connect().await?;
     let km = pc.key_manager.clone();
     let mut model = Model::new();
@@ -256,8 +299,8 @@ async fn render(pc: &ProverCtx, opts: RenderOptions) -> anyhow::Result<()> {
         settings::apply(&mut model, &settings::read(&path));
     }
     model.color_coding = opts.color;
+    opts.prepare(&mut model);
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
-    let refresh_state = RefreshState::for_node(pc);
     spawn_action(&client, &km, &tx, &refresh_state, Cmd::Fetch);
     // The start's legacy read, as interactively.
     for cmd in coins::due(&mut model, std::time::Instant::now()) {
@@ -290,30 +333,40 @@ async fn render(pc: &ProverCtx, opts: RenderOptions) -> anyhow::Result<()> {
                 .filter(|cmd| !matches!(cmd, Cmd::Fetch)),
         );
     }
-    // Keys run first; a legacy read they start is read-only, so it runs and
-    // the frame waits for it.
-    let (legacy, keyed): (Vec<Cmd>, Vec<Cmd>) = apply_keys(&mut model, &opts.keys)?
-        .into_iter()
-        .partition(|cmd| matches!(cmd, Cmd::FetchLegacy));
-    dropped.extend(keyed);
-    if !legacy.is_empty() {
-        spawn_action(&client, &km, &tx, &refresh_state, Cmd::FetchLegacy);
-        let deadline = tokio::time::Instant::now() + opts.timeout;
-        loop {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(msg @ Msg::LegacyRefresh { .. })) => {
-                    apply_msg(&mut model, msg);
-                    break;
+    // Keys apply in order. A read a key starts (legacy coins, a shield's
+    // reads and quotes) is read-only, so it runs and the next key waits for
+    // its answer; every other command is dropped.
+    for key in &opts.keys {
+        for cmd in handle_key(&mut model, parse_key(key)?) {
+            let answer: fn(&Msg) -> bool = match cmd {
+                Cmd::Fetch => continue,
+                Cmd::FetchLegacy => |msg| matches!(msg, Msg::LegacyRefresh { .. }),
+                Cmd::ShieldPrepare => |msg| matches!(msg, Msg::ShieldPreview(_)),
+                other => {
+                    dropped.push(other);
+                    continue;
                 }
-                Ok(Some(msg)) => {
-                    apply_msg(&mut model, msg);
-                }
-                _ => {
-                    eprintln!(
-                        "render: legacy coins missing after {}s",
-                        opts.timeout.as_secs()
-                    );
-                    break;
+            };
+            let what = command_name(&cmd);
+            spawn_action(&client, &km, &tx, &refresh_state, cmd);
+            let deadline = tokio::time::Instant::now() + opts.timeout;
+            loop {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some(msg)) => {
+                        let done = answer(&msg);
+                        dropped.extend(
+                            apply_msg(&mut model, msg)
+                                .into_iter()
+                                .filter(|cmd| !matches!(cmd, Cmd::Fetch)),
+                        );
+                        if done {
+                            break;
+                        }
+                    }
+                    _ => {
+                        eprintln!("render: {what} missing after {}s", opts.timeout.as_secs());
+                        break;
+                    }
                 }
             }
         }
@@ -328,6 +381,7 @@ async fn render(pc: &ProverCtx, opts: RenderOptions) -> anyhow::Result<()> {
 
 /// Apply the render's keys to the model; returns the commands they would
 /// start, refreshes aside.
+#[cfg(test)]
 fn apply_keys(model: &mut Model, keys: &[String]) -> anyhow::Result<Vec<Cmd>> {
     let mut started = Vec::new();
     for key in keys {
@@ -344,6 +398,7 @@ fn apply_keys(model: &mut Model, keys: &[String]) -> anyhow::Result<Vec<Cmd>> {
 /// the commands the keys would start.
 #[cfg(test)]
 fn render_frame(model: &mut Model, opts: &RenderOptions) -> anyhow::Result<(String, Vec<Cmd>)> {
+    opts.prepare(model);
     let started = apply_keys(model, &opts.keys)?;
     Ok((view::render_text(model, opts.width, opts.height), started))
 }
@@ -394,6 +449,8 @@ fn command_name(cmd: &Cmd) -> &'static str {
     match cmd {
         Cmd::Fetch => "refresh",
         Cmd::FetchLegacy => "legacy read",
+        Cmd::ShieldPrepare => "shield reads and quotes",
+        Cmd::ShieldRun(_) => "shield",
         Cmd::Join(_) => "join",
         Cmd::Lifecycle { .. } => "lifecycle operation",
         Cmd::ToggleManual { .. } | Cmd::MarkManual(_) => "worker mode change",
@@ -408,8 +465,14 @@ struct RefreshState {
     rewards: Arc<Semaphore>,
     legacy: Arc<Semaphore>,
     /// The node config's Ed448 key and network, whose legacy coins the
-    /// Coins tab reads.
+    /// Coins tab reads, and its directory (shield-all's journal).
     identity: (Option<[u8; 57]>, u8),
+    config_dir: Option<std::path::PathBuf>,
+    /// What the shield action loads `qclient token`'s context from, and
+    /// its `--max-fee`.
+    token: Option<(GlobalArgs, u128)>,
+    /// The private action log a shield records itself in, unless off.
+    action_log: Option<crate::commands::token::action_log::ActionLog>,
 }
 
 impl Default for RefreshState {
@@ -420,17 +483,27 @@ impl Default for RefreshState {
             rewards: Arc::new(Semaphore::new(1)),
             legacy: Arc::new(Semaphore::new(1)),
             identity: (None, 0),
+            config_dir: None,
+            token: None,
+            action_log: None,
         }
     }
 }
 
 impl RefreshState {
-    fn for_node(pc: &ProverCtx) -> Self {
+    /// `no_action_log`: `--no-action-log`, or a render.
+    fn for_node(pc: &ProverCtx, global: GlobalArgs, max_fee: u128, no_action_log: bool) -> Self {
         let p2p = &pc.node_config.p2p;
         Self {
             identity: (
                 crate::commands::token::legacy::config_public_key(&p2p.peer_priv_key),
                 p2p.network,
+            ),
+            config_dir: Some(pc.config_dir.clone()),
+            token: Some((global, max_fee)),
+            action_log: crate::commands::token::action_log::ActionLog::enabled(
+                &pc.config_dir,
+                no_action_log,
             ),
             ..Self::default()
         }
@@ -497,8 +570,22 @@ fn spawn_action(
                 &refresh.legacy,
                 &tx,
                 None,
-                actions::fetch_legacy(client, public, network),
+                actions::fetch_legacy(client, public, network, refresh.config_dir.clone()),
             );
+        }
+        Cmd::ShieldPrepare => {
+            let token = refresh.token.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(actions::shield_prepare(token).await);
+            });
+        }
+        Cmd::ShieldRun(preview) => {
+            let token = refresh.token.clone();
+            let log = refresh.action_log.clone();
+            tokio::spawn(async move {
+                let progress = tx.clone();
+                let _ = tx.send(actions::shield_run(token, preview, progress, log).await);
+            });
         }
         Cmd::Join(filters) => {
             tokio::spawn(async move {
@@ -642,7 +729,10 @@ mod entry_tests {
                 keys: String::new(),
                 color: false,
                 timeout: 30,
+                reveal: false,
+                no_action_log: false,
                 reset_ui: false,
+                max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
             }
         );
         let (entry, alias) = both(&[
@@ -657,6 +747,10 @@ mod entry_tests {
             "--timeout",
             "5",
             "--reset-ui",
+            "--max-fee",
+            "7",
+            "--reveal",
+            "--no-action-log",
         ]);
         assert_eq!(entry, alias);
         assert_eq!(
@@ -669,7 +763,10 @@ mod entry_tests {
                 keys: "n Tab".into(),
                 color: true,
                 timeout: 5,
+                reveal: true,
+                no_action_log: true,
                 reset_ui: true,
+                max_fee: 7,
             }
         );
         // Names, defaults and help of every flag, so help reads the same too.
@@ -693,7 +790,7 @@ mod entry_tests {
                 .and_then(|c| c.find_subcommand("manage"))
                 .unwrap(),
         );
-        assert_eq!(entry.len(), 8);
+        assert_eq!(entry.len(), 11);
         assert_eq!(entry, alias);
     }
 
@@ -717,6 +814,24 @@ mod entry_tests {
             );
         }
         view::render_text(&mut model, width, height)
+    }
+
+    /// A render masks private wallet fields unless `--reveal`.
+    #[test]
+    fn a_render_masks_private_fields_unless_revealed() {
+        for (flags, masked) in [
+            (&["--render"][..], true),
+            (&["--render", "--reveal"][..], false),
+        ] {
+            let (entry, _) = both(flags);
+            let Mode::Render(opts) = entry.mode() else {
+                panic!("{flags:?}: not a render");
+            };
+            let mut model = Model::new();
+            assert!(!model.mask_private);
+            render_frame(&mut model, &opts).unwrap();
+            assert_eq!(model.mask_private, masked, "{flags:?}");
+        }
     }
 
     #[test]
