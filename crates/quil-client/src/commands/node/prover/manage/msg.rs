@@ -14,7 +14,13 @@ pub enum Msg {
     LegacyRefresh {
         answer: super::coins::LegacyAnswer,
         took: std::time::Duration,
+        /// The saved mint authorizations, read with it.
+        mints: Vec<super::mint::Saved>,
     },
+    /// The mint confirmation's reads and quote, or why there is none.
+    MintPreview(Result<super::mint::Preview, String>),
+    /// A running mint's or claim's report.
+    Mint(super::mint::Progress),
     RewardRefresh(Result<Option<(u128, u64)>, String>),
     ShardLoading,
     ShardRefresh(Result<GetShardInfoResponse, String>),
