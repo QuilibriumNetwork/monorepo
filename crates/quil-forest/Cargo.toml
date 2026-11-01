@@ -34,3 +34,6 @@ tracing-subscriber = "0.3"
 [[bench]]
 name = "bench_forest"
 harness = false
+
+[lints]
+workspace = true

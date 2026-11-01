@@ -76,3 +76,6 @@ asynchronous-codec = "0.7"
 
 [build-dependencies]
 prost-build = "0.13"
+
+[lints]
+workspace = true

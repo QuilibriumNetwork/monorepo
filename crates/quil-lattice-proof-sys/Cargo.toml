@@ -14,3 +14,6 @@ bench-knobs = []
 
 [build-dependencies]
 cc = "1.2.67"
+
+[lints]
+workspace = true

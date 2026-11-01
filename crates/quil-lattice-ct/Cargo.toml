@@ -43,3 +43,6 @@ required-features = ["native-proof"]
 [[example]]
 name = "integer_gaussian_profile"
 required-features = ["confidential-tokens"]
+
+[lints]
+workspace = true

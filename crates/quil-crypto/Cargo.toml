@@ -51,3 +51,6 @@ criterion = "0.5"
 [[bench]]
 name = "bench_sig"
 harness = false
+
+[lints]
+workspace = true
