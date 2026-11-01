@@ -16,6 +16,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+// Vendored MIRACL Core code: clippy findings allowed, not restyled.
+#![allow(clippy::manual_is_multiple_of, clippy::manual_rotate)]
 
 const HASH512_H0: u64 = 0x6a09e667f3bcc908;
 const HASH512_H1: u64 = 0xbb67ae8584caa73b;

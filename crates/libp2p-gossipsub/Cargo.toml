@@ -160,6 +160,9 @@ manual_let_else = "warn"
 type_complexity = "allow"
 unnecessary_wraps = "warn"
 used_underscore_binding = "warn"
+# Findings in rust-libp2p code: allowed here, not restyled.
+collapsible_match = "allow"
+useless_vec = "allow"
 
 [lints.clippy.pedantic]
 level = "allow"

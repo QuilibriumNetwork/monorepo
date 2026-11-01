@@ -527,6 +527,8 @@ impl RangeProof {
     /// Deserializes the proof from a byte slice.
     ///
     /// Returns an error if the byte slice cannot be parsed into a `RangeProof`.
+    // Offsets are written index * 56 for every field, the first included.
+    #[allow(clippy::erasing_op)]
     pub fn from_bytes(slice: &[u8]) -> Result<RangeProof, ProofError> {
         // Decaf uses 56-byte elements instead of 32-byte
         if slice.len() % 56 != 0 {
