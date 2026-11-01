@@ -221,9 +221,29 @@ pub enum Tip {
     /// tip, drain and seal.
     AtEveryHead,
     /// Behind every member's head, as headers lag frames in production: the
-    /// legacy instance keeps finalizing past the tip until each member
-    /// switches, and those frames become generation-0 frames.
+    /// legacy instance finalized frames past the tip before the members
+    /// switch, and those frames become generation-0 frames.
     Lagging,
+}
+
+/// Halt every member and wait until the committee stops at one head, which
+/// it returns.
+async fn halt_at_one_head(harness: &AppShardHarness) -> u64 {
+    for worker in &harness.workers {
+        worker.handle.set_halted(true);
+    }
+    let mut last = (Vec::new(), Instant::now());
+    until(Duration::from_secs(60), || {
+        let now = cursors(harness);
+        if now != last.0 {
+            last = (now, Instant::now());
+            return None;
+        }
+        (now.iter().all(|c| *c == now[0]) && last.1.elapsed() > Duration::from_secs(3))
+            .then_some(now[0])
+    })
+    .await
+    .expect("a halted committee stops at one head")
 }
 
 pub async fn migrate_in_place(tip_kind: Tip) {
@@ -319,46 +339,37 @@ pub async fn migrate_in_place(tip_kind: Tip) {
 
     // 3. Registration: the tip has advanced; the maintenance pass registers
     // generation 0 at it and schedules generation 1 with the same members.
-    let tip = match tip_kind {
+    //
+    // The members halt before they switch, in both variants: a member that
+    // restarts while its peers produce misses their blocks and, with this
+    // harness's ephemeral journal, its own votes in the open view. A node
+    // recovers both (archive replay, the legacy journal generation 0
+    // keeps); this harness has neither, and a loaded runner stalled on a
+    // notarized parent most members could not execute.
+    let (tip, head) = match tip_kind {
         Tip::Lagging => {
-            // A frame every member has materialized, not merely the newest
-            // one some member finalized: a member whose head still precedes
-            // the registered tip at its maintenance tick is refused the
-            // generation-0 restart and stays without a consensus host,
-            // dropping its peers' blocks, until a later tick. A slow runner
-            // leaves a member that far behind.
-            let frame = until(Duration::from_secs(90), || {
+            // Every member two frames past the first recorded tip, so the
+            // tip one frame below the halted head still advanced.
+            until(Duration::from_secs(90), || {
                 let floor = cursors(&harness).into_iter().min()?;
-                if floor <= first_tip.checkpoint.frame {
-                    return None;
-                }
-                finalized(&harness).into_iter().find(|f| number(f) == floor)
+                (floor > first_tip.checkpoint.frame + 1).then_some(())
             })
             .await
             .expect("every member materializes past the first recorded tip");
-            tip_of(&frame)
+            let head = halt_at_one_head(&harness).await;
+            let frame = finalized(&harness)
+                .into_iter()
+                .find(|f| number(f) == head - 1)
+                .unwrap();
+            (tip_of(&frame), head)
         }
         Tip::AtEveryHead => {
-            for worker in &harness.workers {
-                worker.handle.set_halted(true);
-            }
-            let mut last = (Vec::new(), Instant::now());
-            let head = until(Duration::from_secs(60), || {
-                let now = cursors(&harness);
-                if now != last.0 {
-                    last = (now, Instant::now());
-                    return None;
-                }
-                (now.iter().all(|c| *c == now[0]) && last.1.elapsed() > Duration::from_secs(3))
-                    .then_some(now[0])
-            })
-            .await
-            .expect("a halted committee stops at one head");
+            let head = halt_at_one_head(&harness).await;
             let frame = finalized(&harness)
                 .into_iter()
                 .find(|f| number(f) == head)
                 .unwrap();
-            tip_of(&frame)
+            (tip_of(&frame), head)
         }
     };
     legacy::record_tip(&state, 3, &filter, &tip).unwrap();
@@ -402,23 +413,35 @@ pub async fn migrate_in_place(tip_kind: Tip) {
                 .cloned()
         })
     };
-    if tip_kind == Tip::AtEveryHead {
-        // Every member's maintenance tick (10 s) restarts it under generation 0
-        // at the tip. Nothing can be sealed there: a generation-0 seal must
-        // checkpoint a frame its own committee finalized after the tip.
-        tokio::time::sleep(Duration::from_secs(12)).await;
-        assert!(
-            submitted().is_none(),
-            "no generation-0 seal of the registered tip itself"
-        );
-        assert_eq!(cursors(&harness), vec![zero.base_frame; 4]);
-        for worker in &harness.workers {
-            worker.handle.set_halted(false);
+    // Every member's maintenance tick (10 s) restarts it under generation 0
+    // at its head, still halted.
+    let submission = match tip_kind {
+        Tip::AtEveryHead => {
+            // Nothing can be sealed there: a generation-0 seal must
+            // checkpoint a frame its own committee finalized after the tip.
+            tokio::time::sleep(Duration::from_secs(12)).await;
+            assert!(
+                submitted().is_none(),
+                "no generation-0 seal of the registered tip itself"
+            );
+            assert_eq!(cursors(&harness), vec![head; 4]);
+            for worker in &harness.workers {
+                worker.handle.set_halted(false);
+            }
+            until(Duration::from_secs(150), submitted).await
+        }
+        Tip::Lagging => {
+            // The head the legacy instance finalized past the tip is a
+            // generation-0 frame: the restarted members seal it while halted.
+            let submission = until(Duration::from_secs(150), submitted).await;
+            assert_eq!(cursors(&harness), vec![head; 4]);
+            for worker in &harness.workers {
+                worker.handle.set_halted(false);
+            }
+            submission
         }
     }
-    let submission = until(Duration::from_secs(150), submitted)
-        .await
-        .expect("the legacy committee seals generation 0");
+    .expect("the legacy committee seals generation 0");
     let submission = CertificateSubmission::from_canonical_bytes(&submission).unwrap();
     assert_eq!(submission.seal.session, zero.id().unwrap());
     assert_eq!(submission.seal.request, request);
