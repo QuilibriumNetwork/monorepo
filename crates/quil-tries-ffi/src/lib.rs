@@ -23,16 +23,15 @@ fn new_tree() -> Vec<u8> {
 /// are computed immediately; branch commitments are deferred until
 /// `commit()`.
 fn insert(tree_bytes: Vec<u8>, key: Vec<u8>, value: Vec<u8>) -> Vec<u8> {
-    let root = quil_tries::deserialize_tree(&tree_bytes)
-        .expect("insert: failed to deserialize tree");
+    let root =
+        quil_tries::deserialize_tree(&tree_bytes).expect("insert: failed to deserialize tree");
     let mut tree = quil_tries::VectorCommitmentTree { root };
 
     let size = BigInt::from(value.len() as u64);
     tree.insert(&key, &value, &[], &size)
         .expect("insert: failed to insert into tree");
 
-    quil_tries::serialize_tree(tree.root.as_ref())
-        .expect("insert: failed to serialize tree")
+    quil_tries::serialize_tree(tree.root.as_ref()).expect("insert: failed to serialize tree")
 }
 
 /// Delete a key from the tree. Returns the updated serialized tree.
@@ -40,16 +39,15 @@ fn insert(tree_bytes: Vec<u8>, key: Vec<u8>, value: Vec<u8>) -> Vec<u8> {
 /// Walks the trie to find the leaf with the matching key and removes it.
 /// If the key is not found, the tree is returned unchanged.
 fn delete_key(tree_bytes: Vec<u8>, key: Vec<u8>) -> Vec<u8> {
-    let root = quil_tries::deserialize_tree(&tree_bytes)
-        .expect("delete_key: failed to deserialize tree");
+    let root =
+        quil_tries::deserialize_tree(&tree_bytes).expect("delete_key: failed to deserialize tree");
 
     let new_root = match root {
         None => None,
         Some(node) => delete_recursive(node, &key, 0),
     };
 
-    quil_tries::serialize_tree(new_root.as_ref())
-        .expect("delete_key: failed to serialize tree")
+    quil_tries::serialize_tree(new_root.as_ref()).expect("delete_key: failed to serialize tree")
 }
 
 /// Recursively delete a key from the subtree rooted at `node`.
@@ -121,40 +119,24 @@ fn delete_recursive(
                         None
                     } else if live_count == 1 {
                         // Find the single remaining child
-                        let remaining = branch
-                            .children
-                            .iter_mut()
-                            .find_map(|c| c.take())
-                            .unwrap();
+                        let remaining = branch.children.iter_mut().find_map(|c| c.take()).unwrap();
                         match *remaining {
                             VectorCommitmentNode::Leaf(leaf) => {
                                 Some(VectorCommitmentNode::Leaf(leaf))
                             }
                             VectorCommitmentNode::Branch(mut child_branch) => {
-                                // Merge prefixes: parent prefix + child slot nibble + child prefix
-                                // We need the slot index to reconstruct the full prefix.
-                                // Since we already took the child out, we need to find which
-                                // slot it was in. We can compute this from the iterator.
-                                // Actually, we already know: it's not at `idx` (we may have
-                                // removed that). Let's find it properly.
-                                //
-                                // Simpler approach: just keep the branch as-is when
-                                // the sole remaining child is also a branch, with merged prefix.
+                                // Merge prefixes: parent prefix + child slot nibble + child prefix.
+                                // NOTE: the sole child was already taken out of `branch.children`
+                                // above, so `find_sole_slot_index` finds no occupied slot and
+                                // falls back to 0.
                                 let merged_prefix = branch.prefix.clone();
-                                // Find which slot the remaining child was in
-                                // We need to reconstruct — we already took it out.
-                                // Re-scan to find which index had the child.
-                                // Since we already moved it out, this won't work.
-                                // Instead, just put it back and return the branch.
                                 child_branch.prefix = {
-                                    // The remaining child was at some index. We need
-                                    // to figure out which. Since all children are None
-                                    // now (we took the last one), iterate the original
-                                    // state. This is getting complicated — simplify by
-                                    // just returning the branch with one child.
                                     merged_prefix
                                         .into_iter()
-                                        .chain(std::iter::once(find_sole_slot_index(&branch.children, idx)))
+                                        .chain(std::iter::once(find_sole_slot_index(
+                                            &branch.children,
+                                            idx,
+                                        )))
                                         .chain(child_branch.prefix.drain(..))
                                         .collect()
                                 };
@@ -189,8 +171,8 @@ fn find_sole_slot_index(
 
 /// Look up a key in the tree. Returns the value bytes if found, None otherwise.
 fn get_value(tree_bytes: Vec<u8>, key: Vec<u8>) -> Option<Vec<u8>> {
-    let root = quil_tries::deserialize_tree(&tree_bytes)
-        .expect("get_value: failed to deserialize tree");
+    let root =
+        quil_tries::deserialize_tree(&tree_bytes).expect("get_value: failed to deserialize tree");
     let tree = quil_tries::VectorCommitmentTree { root };
     tree.get(&key).map(|v| v.to_vec())
 }
@@ -201,8 +183,8 @@ fn get_value(tree_bytes: Vec<u8>, key: Vec<u8>) -> Option<Vec<u8>> {
 /// `prover_key` is accepted for API symmetry with the Go side but is
 /// not used by NoopInclusionProver. Returns the 64-byte root commitment.
 fn commit(tree_bytes: Vec<u8>, _prover_key: Vec<u8>) -> Vec<u8> {
-    let root = quil_tries::deserialize_tree(&tree_bytes)
-        .expect("commit: failed to deserialize tree");
+    let root =
+        quil_tries::deserialize_tree(&tree_bytes).expect("commit: failed to deserialize tree");
     let mut tree = quil_tries::VectorCommitmentTree { root };
 
     let prover = Sha512Prover;
@@ -216,8 +198,7 @@ fn commit(tree_bytes: Vec<u8>, _prover_key: Vec<u8>) -> Vec<u8> {
 fn serialize_tree(tree_bytes: Vec<u8>) -> Vec<u8> {
     let root = quil_tries::deserialize_tree(&tree_bytes)
         .expect("serialize_tree: failed to deserialize tree");
-    quil_tries::serialize_tree(root.as_ref())
-        .expect("serialize_tree: failed to serialize tree")
+    quil_tries::serialize_tree(root.as_ref()).expect("serialize_tree: failed to serialize tree")
 }
 
 /// Deserialize a tree from bytes.
@@ -240,8 +221,8 @@ fn deserialize_tree_ffi(serialized: Vec<u8>) -> Vec<u8> {
 /// `prover_key` is accepted for API symmetry but is not used by the
 /// stub prover.
 fn prove(tree_bytes: Vec<u8>, key: Vec<u8>, _prover_key: Vec<u8>) -> Vec<u8> {
-    let root = quil_tries::deserialize_tree(&tree_bytes)
-        .expect("prove: failed to deserialize tree");
+    let root =
+        quil_tries::deserialize_tree(&tree_bytes).expect("prove: failed to deserialize tree");
 
     match root {
         None => Vec::new(),
@@ -251,11 +232,7 @@ fn prove(tree_bytes: Vec<u8>, key: Vec<u8>, _prover_key: Vec<u8>) -> Vec<u8> {
 
 /// Walk the tree from root to the leaf matching `key`, collecting sibling
 /// commitments at each branch level.
-fn collect_proof(
-    node: &quil_tries::VectorCommitmentNode,
-    key: &[u8],
-    depth: usize,
-) -> Vec<u8> {
+fn collect_proof(node: &quil_tries::VectorCommitmentNode, key: &[u8], depth: usize) -> Vec<u8> {
     use quil_tries::{VectorCommitmentNode, BRANCH_BITS};
 
     match node {
@@ -418,21 +395,31 @@ impl InclusionProver for Sha512Prover {
     }
 
     fn prove_raw(
-        &self, _data: &[u8], _index: u64, _poly_size: u64,
+        &self,
+        _data: &[u8],
+        _index: u64,
+        _poly_size: u64,
     ) -> quil_types::error::Result<Vec<u8>> {
         Ok(vec![])
     }
 
     fn verify_raw(
-        &self, _data: &[u8], _commit: &[u8], _index: u64,
-        _proof: &[u8], _poly_size: u64,
+        &self,
+        _data: &[u8],
+        _commit: &[u8],
+        _index: u64,
+        _proof: &[u8],
+        _poly_size: u64,
     ) -> quil_types::error::Result<bool> {
         Ok(true)
     }
 
     fn prove_multiple(
-        &self, _commitments: &[&[u8]], _polys: &[&[u8]],
-        _indices: &[u64], _poly_size: u64,
+        &self,
+        _commitments: &[&[u8]],
+        _polys: &[&[u8]],
+        _indices: &[u64],
+        _poly_size: u64,
     ) -> quil_types::error::Result<Box<dyn Multiproof>> {
         Err(quil_types::error::QuilError::Internal(
             "batch multiproof generation not supported".into(),
@@ -440,8 +427,12 @@ impl InclusionProver for Sha512Prover {
     }
 
     fn verify_multiple(
-        &self, _commitments: &[&[u8]], _evaluations: &[&[u8]],
-        _indices: &[u64], _poly_size: u64, _multi_commitment: &[u8],
+        &self,
+        _commitments: &[&[u8]],
+        _evaluations: &[&[u8]],
+        _indices: &[u64],
+        _poly_size: u64,
+        _multi_commitment: &[u8],
         _proof: &[u8],
     ) -> bool {
         true

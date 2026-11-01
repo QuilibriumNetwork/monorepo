@@ -2,7 +2,9 @@
 //! `global_prover_kick.go:472-644` (`verifyEquivocation`).
 //!
 //! Verifies that two conflicting frames at the same frame number with
-//! different outputs constitute a valid equivocation by a prover.
+//! different outputs constitute a valid equivocation by a prover. From
+//! [`quil_types::consensus::kick_signed_slot_active`] the frames must instead
+//! be votes for the same signed slot ([`verify_signed_slot_equivocation`]).
 
 use quil_types::error::{QuilError, Result};
 
@@ -11,8 +13,7 @@ use super::prover_ops::ProverKick;
 // Re-use the authoritative type-prefix constants from `frame_header`
 // (Go `canonical_types.go:49-50`).
 use super::frame_header::{
-    TYPE_FRAME_HEADER as FRAME_HEADER_TYPE,
-    TYPE_GLOBAL_FRAME_HEADER as GLOBAL_FRAME_HEADER_TYPE,
+    TYPE_FRAME_HEADER as FRAME_HEADER_TYPE, TYPE_GLOBAL_FRAME_HEADER as GLOBAL_FRAME_HEADER_TYPE,
 };
 
 /// Verify that a ProverKick's conflicting frames constitute a valid
@@ -32,6 +33,11 @@ use super::frame_header::{
 /// runtime dependencies (FrameProver, BlsConstructor, ProverRegistry)
 /// that are injected at a higher level. This function performs the
 /// structural checks that can be done without those dependencies.
+///
+/// The rule GLOBAL applies before the signed-slot epoch. The vote signature
+/// does not cover `frame_number`, and outputs that differ can share the
+/// signed `Poseidon(output)`, so passing it does not show that the signer
+/// voted twice in one slot; [`verify_signed_slot_equivocation`] replaces it.
 pub fn verify_equivocation_structural(kick: &ProverKick) -> Result<bool> {
     // Both frames must be at least 4 bytes
     if kick.conflicting_frame_1.len() < 4 || kick.conflicting_frame_2.len() < 4 {
@@ -58,31 +64,107 @@ pub fn verify_equivocation_structural(kick: &ProverKick) -> Result<bool> {
     // Parse both frames and extract frame numbers + outputs
     match tp1 {
         GLOBAL_FRAME_HEADER_TYPE => {
-            verify_global_frame_equivocation(
-                &kick.conflicting_frame_1,
-                &kick.conflicting_frame_2,
-            )
+            verify_global_frame_equivocation(&kick.conflicting_frame_1, &kick.conflicting_frame_2)
         }
         FRAME_HEADER_TYPE => {
-            verify_app_frame_equivocation(
-                &kick.conflicting_frame_1,
-                &kick.conflicting_frame_2,
-            )
+            verify_app_frame_equivocation(&kick.conflicting_frame_1, &kick.conflicting_frame_2)
         }
         _ => Ok(false),
     }
+}
+
+/// Whether a `ProverKick` processed in GLOBAL frame `frame_number` carries
+/// conflicting frames that count as an equivocation: from
+/// [`quil_types::consensus::kick_signed_slot_active`] two votes for the same
+/// signed slot ([`verify_signed_slot_equivocation`]), before it the legacy
+/// [`verify_equivocation_structural`] rule, unchanged.
+pub fn verify_kick_equivocation(kick: &ProverKick, frame_number: u64) -> Result<bool> {
+    if quil_types::consensus::kick_signed_slot_active(frame_number) {
+        Ok(verify_signed_slot_equivocation(kick))
+    } else {
+        verify_equivocation_structural(kick)
+    }
+}
+
+/// What a conflicting frame's vote signature covers. A legacy vote signs
+/// `address ‖ Poseidon(output) ‖ rank` under `"appshard" ‖ address` for an
+/// app shard and `Poseidon(output) ‖ rank` under `"global"` for GLOBAL
+/// (`FrameProver::verify_frame_header_signature` and
+/// `verify_global_header_signature`). Every other header field, the frame
+/// number included, is unsigned and anyone can rewrite it.
+struct SignedVote {
+    frame_type: u32,
+    /// The shard address; empty for GLOBAL.
+    address: Vec<u8>,
+    /// The consensus slot the vote is for.
+    rank: u64,
+    /// `Poseidon(output)`, the signed frame identity.
+    identity: [u8; 32],
+}
+
+/// The signed vote of one conflicting frame, decoded with the canonical
+/// frame codec; `None` when the frame does not decode or carries no
+/// signature.
+fn signed_vote(frame_bytes: &[u8]) -> Option<SignedVote> {
+    let frame_type = u32::from_be_bytes(frame_bytes.get(..4)?.try_into().ok()?);
+    let (address, rank, output, signature) = if frame_type == GLOBAL_FRAME_HEADER_TYPE {
+        let h = super::frame_header::GlobalFrameHeader::from_canonical_bytes(frame_bytes).ok()?;
+        (
+            Vec::new(),
+            h.rank,
+            h.output,
+            h.public_key_signature_bls48581,
+        )
+    } else if frame_type == FRAME_HEADER_TYPE {
+        let h = super::frame_header::FrameHeader::from_canonical_bytes(frame_bytes).ok()?;
+        (h.address, h.rank, h.output, h.public_key_signature_bls48581)
+    } else {
+        return None;
+    };
+    if signature.is_empty() {
+        return None;
+    }
+    let identity = quil_crypto::poseidon::hash_bytes_to_32(&output).ok()?;
+    Some(SignedVote {
+        frame_type,
+        address,
+        rank,
+        identity,
+    })
+}
+
+/// Whether a `ProverKick`'s conflicting frames are two votes for one signed
+/// slot with different signed contents: the same frame type, shard address
+/// and rank, over different frame identities. Only these fields are signed,
+/// so this is what a pair of valid signatures can prove; the frame numbers
+/// and raw outputs are not compared. Rank 0 is the genesis slot, which
+/// provers sign again whenever a chain restarts from genesis, so votes there
+/// prove nothing. The signatures themselves and the kicked prover's bits
+/// are checked by [`verify_prover_kick_full`].
+pub fn verify_signed_slot_equivocation(kick: &ProverKick) -> bool {
+    let (Some(first), Some(second)) = (
+        signed_vote(&kick.conflicting_frame_1),
+        signed_vote(&kick.conflicting_frame_2),
+    ) else {
+        return false;
+    };
+    first.frame_type == second.frame_type
+        && first.address == second.address
+        && first.rank != 0
+        && first.rank == second.rank
+        && first.identity != second.identity
 }
 
 /// Full ProverKick verification. Ports Go `ProverKick.Verify` at
 /// `global_prover_kick.go:391-469`.
 ///
 /// Runs:
-/// 1. Structural equivocation check (`verify_equivocation_structural`).
+/// 1. Equivocation check (`verify_kick_equivocation`).
 /// 2. BLS aggregate signature verify on both conflicting frames.
 /// 3. Traversal-proof check against the prover tree at `frame N-1`
-///    (loaded from the `ClockStore`).
+/// (loaded from the `ClockStore`).
 /// 4. Multiproof verify of `[PublicKey, Status]` for the kicked prover
-///    against the supplied `proof`.
+/// against the supplied `proof`.
 ///
 /// The multi-message multiproof check (Go `rdfMultiprover.VerifyWithType`)
 /// is a best-effort call through the supplied `InclusionProver`; the
@@ -102,8 +184,9 @@ pub fn verify_prover_kick_full(
     inclusion_prover: &dyn quil_types::crypto::InclusionProver,
     prover_registry: Option<&dyn quil_types::consensus::ProverRegistry>,
 ) -> Result<()> {
-    // 1. Structural checks on the two conflicting frames.
-    if !verify_equivocation_structural(kick)? {
+    // 1. The two conflicting frames must be an equivocation: by signed
+    //    slot from the activation epoch, structurally before it.
+    if !verify_kick_equivocation(kick, frame_number)? {
         return Err(QuilError::InvalidArgument(
             "prover kick: no equivocation detected".into(),
         ));
@@ -134,21 +217,25 @@ pub fn verify_prover_kick_full(
         Err(e) => {
             let candidates = clock_store
                 .range_global_clock_frame_candidates(frame_number - 1, frame_number - 1, 1)
-                .map_err(|range_e| QuilError::InvalidArgument(format!(
-                    "prover kick: previous frame {} not certified ({e}) and \
+                .map_err(|range_e| {
+                    QuilError::InvalidArgument(format!(
+                        "prover kick: previous frame {} not certified ({e}) and \
                      candidate fallback failed: {range_e}",
-                    frame_number - 1,
-                )))?;
-            candidates.into_iter().next().ok_or_else(|| QuilError::InvalidArgument(format!(
-                "prover kick: previous frame {} not certified ({e}) and \
+                        frame_number - 1,
+                    ))
+                })?;
+            candidates.into_iter().next().ok_or_else(|| {
+                QuilError::InvalidArgument(format!(
+                    "prover kick: previous frame {} not certified ({e}) and \
                  no candidates available",
-                frame_number - 1,
-            )))?
+                    frame_number - 1,
+                ))
+            })?
         }
     };
-    let prev_header = prev_frame.header.ok_or_else(|| QuilError::InvalidArgument(
-        "prover kick: previous frame has no header".into(),
-    ))?;
+    let prev_header = prev_frame.header.ok_or_else(|| {
+        QuilError::InvalidArgument("prover kick: previous frame has no header".into())
+    })?;
     let reward_root = prev_header.prover_tree_commitment;
     if reward_root.is_empty() {
         return Err(QuilError::InvalidArgument(
@@ -156,65 +243,109 @@ pub fn verify_prover_kick_full(
         ));
     }
 
-    // Parse the kick's traversal proof bytes via the same Go-format
-    // decoder used by mint PoMW.
-    let traversal = crate::token_intrinsic::mint::parse_go_traversal_proof(
-        &kick.traversal_proof,
-    )?;
-    let traversal_ok = crate::traversal_proof::verify_traversal_proof(
-        inclusion_prover,
-        &reward_root,
-        &traversal,
-    )?;
-    if !traversal_ok || kick.proof.is_empty() {
-        return Err(QuilError::InvalidArgument(
-            "prover kick: traversal proof invalid".into(),
-        ));
-    }
+    // 3+4. Prove the kicked prover's vertex exists in the prover tree
+    //      (`reward_root` = frame N-1's ProverTreeCommitment) AND that its
+    //      PublicKey/Status fields carry the kicked prover's key + active
+    //      status. On a migrated node the prover tree is the forest
+    //      GLOBAL_INTRINSIC-shard vertex-adds JMT — the traversal chain and
+    //      the field multiproof collapse into per-field JMT existence proofs;
+    //      the legacy KZG path keeps the two-level check.
+    let use_forest = hypergraph.has_forest();
+    if !use_forest {
+        // Parse the kick's traversal proof bytes via the same Go-format
+        // decoder used by mint PoMW.
+        let traversal = crate::traversal_proof::parse_traversal_proof(&kick.traversal_proof)?;
+        let traversal_ok = crate::traversal_proof::verify_traversal_proof(
+            inclusion_prover,
+            &reward_root,
+            &traversal,
+        )?;
+        if !traversal_ok || kick.proof.is_empty() {
+            return Err(QuilError::InvalidArgument(
+                "prover kick: traversal proof invalid".into(),
+            ));
+        }
 
-    // 4. Multiproof verify: the kicked prover's PublicKey + Status=1
-    //    must verify against the kick's commitment + proof.
-    //    Full `rdfMultiprover.VerifyWithType` parity requires the RDF
-    //    schema + class/index encoding; we stand on the inclusion
-    //    prover's batch verify for now, exercising the wire layout
-    //    (commitment bytes, proof bytes, evaluations).
-    let evals: Vec<Vec<u8>> = vec![
-        kick.kicked_prover_public_key.clone(),
-        vec![1u8],
-    ];
-    // No per-commit split yet — we use the full commitment for each
-    // evaluation, matching the output of `RdfMultiprover.VerifyWithType`
-    // when called with a single aggregated commitment (Go path uses a
-    // [][]byte with one entry since commitment is the multiproof root).
-    let commit_refs: Vec<&[u8]> = vec![&kick.commitment, &kick.commitment];
-    let eval_refs: Vec<&[u8]> = evals.iter().map(|e| e.as_slice()).collect();
-    // Schema-driven field-order lookup. Hardcoding the indices
-    // `[0, 1]` would mean a future RDF schema reorder (PublicKey or
-    // Status moving) breaks consensus between Rust and Go nodes since
-    // each side picks its own ordering. Reading from
-    // `crate::global_schema::field_tag` keeps the indices in lockstep
-    // with the source-of-truth schema definition that every other
-    // lookup in the codebase uses.
-    let pk_tag = crate::global_schema::field_tag("prover:Prover", "PublicKey")
-        .ok_or_else(|| QuilError::Internal(
-            "ProverKick: prover:Prover.PublicKey missing from schema".into(),
-        ))?;
-    let status_tag = crate::global_schema::field_tag("prover:Prover", "Status")
-        .ok_or_else(|| QuilError::Internal(
-            "ProverKick: prover:Prover.Status missing from schema".into(),
-        ))?;
-    let indices: [u64; 2] = [pk_tag.order as u64, status_tag.order as u64];
-    if !inclusion_prover.verify_multiple(
-        &commit_refs,
-        &eval_refs,
-        &indices,
-        /* poly_size */ 64,
-        &kick.commitment,
-        &kick.proof,
-    ) {
-        return Err(QuilError::InvalidArgument(
-            "prover kick: multiproof verify failed".into(),
-        ));
+        // Multiproof verify: the kicked prover's PublicKey + Status=1 must
+        // verify against the kick's commitment + proof.
+        let evals: Vec<Vec<u8>> = vec![kick.kicked_prover_public_key.clone(), vec![1u8]];
+        let commit_refs: Vec<&[u8]> = vec![&kick.commitment, &kick.commitment];
+        let eval_refs: Vec<&[u8]> = evals.iter().map(|e| e.as_slice()).collect();
+        // Schema-driven field-order lookup keeps indices in lockstep with the
+        // source-of-truth schema (a reorder must not silently diverge nodes).
+        let pk_tag =
+            crate::global_schema::field_tag("prover:Prover", "PublicKey").ok_or_else(|| {
+                QuilError::Internal(
+                    "ProverKick: prover:Prover.PublicKey missing from schema".into(),
+                )
+            })?;
+        let status_tag =
+            crate::global_schema::field_tag("prover:Prover", "Status").ok_or_else(|| {
+                QuilError::Internal("ProverKick: prover:Prover.Status missing from schema".into())
+            })?;
+        let indices: [u64; 2] = [pk_tag.order as u64, status_tag.order as u64];
+        if !inclusion_prover.verify_multiple(
+            &commit_refs,
+            &eval_refs,
+            &indices,
+            /* poly_size */ 64,
+            &kick.commitment,
+            &kick.proof,
+        ) {
+            return Err(QuilError::InvalidArgument(
+                "prover kick: multiproof verify failed".into(),
+            ));
+        }
+    } else {
+        // Forest: one JMT membership proof for the kicked prover's vertex.
+        // The vertex address is its L3 id: GLOBAL_INTRINSIC ‖ poseidon(pubkey)
+        // (= `Location::to_id`). The PublicKey and Status fields flatten to
+        // `l3_leaf_key(vertex_id, field_key)` under the vertex-adds phase.
+        let root32: [u8; 32] = reward_root.as_slice().try_into().map_err(|_| {
+            QuilError::InvalidArgument(
+                "prover kick: prover_tree_commitment is not a 32-byte forest root".into(),
+            )
+        })?;
+        let prover_addr = quil_crypto::poseidon::hash_bytes_to_32(&kick.kicked_prover_public_key)?;
+        let mut vertex_id = [0u8; 64];
+        vertex_id[..32].copy_from_slice(&crate::global_schema::GLOBAL_INTRINSIC_ADDRESS);
+        vertex_id[32..].copy_from_slice(&prover_addr);
+        let pk_key =
+            crate::global_schema::field_key("prover:Prover", "PublicKey").ok_or_else(|| {
+                QuilError::Internal(
+                    "ProverKick: prover:Prover.PublicKey missing from schema".into(),
+                )
+            })?;
+        let status_key =
+            crate::global_schema::field_key("prover:Prover", "Status").ok_or_else(|| {
+                QuilError::Internal("ProverKick: prover:Prover.Status missing from schema".into())
+            })?;
+        let expected = vec![
+            (pk_key, kick.kicked_prover_public_key.clone()),
+            (status_key, vec![1u8]),
+        ];
+        let mp = quil_forest::MembershipProof::from_bytes(&kick.traversal_proof).map_err(|e| {
+            QuilError::InvalidArgument(format!(
+                "prover kick: decode forest membership proof: {}",
+                e
+            ))
+        })?;
+        let vertex = mp.inputs.first().ok_or_else(|| {
+            QuilError::InvalidArgument("prover kick: forest membership proof has no vertex".into())
+        })?;
+        if vertex.vertex_address != vertex_id {
+            return Err(QuilError::InvalidArgument(
+                "prover kick: forest proof vertex address != kicked prover's vertex".into(),
+            ));
+        }
+        let bind_values = quil_types::consensus::vertex_value_binding_active(frame_number);
+        quil_forest::verify_vertex_membership_with(&root32, vertex, &expected, bind_values)
+            .map_err(|e| {
+                QuilError::InvalidArgument(format!(
+                    "prover kick: forest membership failed (prover not present/active): {}",
+                    e
+                ))
+            })?;
     }
 
     // Double-tap: ensure the kicked prover vertex actually exists in
@@ -232,9 +363,8 @@ pub fn verify_prover_kick_full(
     // validated before any changeset would be applied, so going
     // through HypergraphState's changeset layer adds no value and
     // the CRDT doesn't impl Clone needed for Arc-wrapping).
-    let prover_addr_bytes = quil_crypto::poseidon::hash_bytes_to_32(
-        &kick.kicked_prover_public_key,
-    )?;
+    let prover_addr_bytes =
+        quil_crypto::poseidon::hash_bytes_to_32(&kick.kicked_prover_public_key)?;
     let mut prover_loc_id = [0u8; 64];
     prover_loc_id[..32].copy_from_slice(&crate::global_schema::GLOBAL_INTRINSIC_ADDRESS);
     prover_loc_id[32..].copy_from_slice(&prover_addr_bytes);
@@ -251,7 +381,8 @@ pub fn verify_prover_kick_full(
                         return Err(QuilError::InvalidArgument(
                             "ProverKick: kicked prover already has Status=4 — \
                              refusing to double-kick (avoids consensus split on \
-                             whether the materialize was a no-op)".into(),
+                             whether the materialize was a no-op)"
+                                .into(),
                         ));
                     }
                 }
@@ -259,22 +390,75 @@ pub fn verify_prover_kick_full(
         }
     }
 
-    // Bitmask-overlap check. Without this, anyone can submit two
-    // BLS-valid frames signed by arbitrary signer sets and have the
-    // network kick any prover whose pubkey they paste into
-    // `kicked_prover_public_key`. Go enforces this at
-    // `global_prover_kick.go:597-643`.
-    if let Some(pr) = prover_registry {
-        let (filter1, bitmask1) = extract_kick_frame_filter_and_bitmask(&kick.conflicting_frame_1)?;
-        let (filter2, bitmask2) = extract_kick_frame_filter_and_bitmask(&kick.conflicting_frame_2)?;
-        if filter1 != filter2 {
-            return Err(QuilError::InvalidArgument(
-                "ProverKick: conflicting frames have different filters/addresses".into(),
-            ));
-        }
-        verify_kick_bitmask_overlap(kick, &filter1, &bitmask1, &bitmask2, pr)?;
+    // Signer binding + bitmask overlap. The signature checks above verify
+    // each frame against the keys the frame itself DECLARES; on their own
+    // they prove nothing about the committee. Both checks below are
+    // required, so the registry is mandatory (fail-closed):
+    //   1. the declared keys must be exactly the active committee members
+    //      named by each frame's bitmask (as FrameHeader validation does), so
+    //      a signature over the victim's bit really is the victim's;
+    //   2. the kicked prover's bit must be set in both frames (Go
+    //      `global_prover_kick.go:597-643`).
+    // Without (1), anyone could sign two conflicting frames with their own
+    // key, set the victim's bit, and evict an honest prover.
+    let pr = prover_registry.ok_or_else(|| {
+        QuilError::InvalidArgument(
+            "ProverKick: prover registry unavailable — cannot bind signers to the committee".into(),
+        )
+    })?;
+    let (filter1, bitmask1) = extract_kick_frame_filter_and_bitmask(&kick.conflicting_frame_1)?;
+    let (filter2, bitmask2) = extract_kick_frame_filter_and_bitmask(&kick.conflicting_frame_2)?;
+    if filter1 != filter2 {
+        return Err(QuilError::InvalidArgument(
+            "ProverKick: conflicting frames have different filters/addresses".into(),
+        ));
     }
+    let active = pr.get_active_provers(&filter1, frame_number).map_err(|e| {
+        QuilError::InvalidArgument(format!("ProverKick: get_active_provers failed: {e}"))
+    })?;
+    verify_kick_frame_signers(&kick.conflicting_frame_1, &active, bls)?;
+    verify_kick_frame_signers(&kick.conflicting_frame_2, &active, bls)?;
+    verify_kick_bitmask_overlap(kick, &filter1, &bitmask1, &bitmask2, pr, frame_number)?;
 
+    Ok(())
+}
+
+/// Bind one conflicting frame's declared signer keys to the committee: the
+/// declared (concatenated) public key must equal the aggregate of the active
+/// provers' keys at the frame's bitmask positions, in bitmask order.
+pub fn verify_kick_frame_signers(
+    frame_bytes: &[u8],
+    active: &[quil_types::consensus::ProverInfo],
+    bls: &dyn quil_types::crypto::BlsConstructor,
+) -> Result<()> {
+    let (_, agg) = kick_frame_filter_and_aggregate(frame_bytes)?;
+    let mut keys: Vec<&[u8]> = Vec::new();
+    for index in quil_consensus::bitmask::set_bit_indices(&agg.bitmask) {
+        let prover = active.get(index).ok_or_else(|| {
+            QuilError::InvalidArgument(
+                "ProverKick: conflicting frame bitmask names a non-committee index".into(),
+            )
+        })?;
+        keys.push(prover.public_key.as_slice());
+    }
+    if keys.is_empty() {
+        return Err(QuilError::InvalidArgument(
+            "ProverKick: conflicting frame has no signers".into(),
+        ));
+    }
+    let expected = bls.aggregate_public_keys(&keys).map_err(|e| {
+        QuilError::InvalidArgument(format!("ProverKick: committee key aggregation failed: {e}"))
+    })?;
+    let declared = agg
+        .public_key
+        .as_ref()
+        .map(|k| k.key_value.as_slice())
+        .unwrap_or(&[]);
+    if expected.as_slice() != declared {
+        return Err(QuilError::InvalidArgument(
+            "ProverKick: conflicting frame's declared signer keys are not the committee members its bitmask names".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -285,12 +469,12 @@ pub fn verify_prover_kick_full(
 /// kick any prover.
 ///
 /// Steps:
-///   1. Extract each frame's BLS aggregate signature bitmask.
-///   2. Compute the kicked prover's address = `poseidon(pubkey)`.
-///   3. Look up active provers for the frame's filter/address via
-///      `prover_registry.get_active_provers`.
-///   4. Find the kicked prover's index in that set.
-///   5. Check both bitmasks have that bit set.
+/// 1. Extract each frame's BLS aggregate signature bitmask.
+/// 2. Compute the kicked prover's address = `poseidon(pubkey)`.
+/// 3. Look up active provers for the frame's filter/address via
+/// `prover_registry.get_active_provers`.
+/// 4. Find the kicked prover's index in that set.
+/// 5. Check both bitmasks have that bit set.
 ///
 /// Returns `Ok(())` only when the overlap is confirmed. `prover_filter`
 /// is the filter or shard address that both conflicting frames
@@ -301,21 +485,23 @@ pub fn verify_kick_bitmask_overlap(
     bitmask1: &[u8],
     bitmask2: &[u8],
     prover_registry: &dyn quil_types::consensus::ProverRegistry,
+    frame_number: u64,
 ) -> Result<()> {
-    let prover_addr = quil_crypto::poseidon::hash_bytes_to_32(
-        &kick.kicked_prover_public_key,
-    )?;
+    let prover_addr = quil_crypto::poseidon::hash_bytes_to_32(&kick.kicked_prover_public_key)?;
     let active = prover_registry
-        .get_active_provers(prover_filter)
-        .map_err(|e| QuilError::InvalidArgument(format!(
-            "ProverKick: get_active_provers failed: {e}"
-        )))?;
+        .get_active_provers(prover_filter, frame_number)
+        .map_err(|e| {
+            QuilError::InvalidArgument(format!("ProverKick: get_active_provers failed: {e}"))
+        })?;
     let index = active
         .iter()
         .position(|p| p.address.as_slice() == prover_addr.as_slice())
-        .ok_or_else(|| QuilError::InvalidArgument(
-            "ProverKick: kicked prover not in active set for the conflicting frames' filter".into(),
-        ))?;
+        .ok_or_else(|| {
+            QuilError::InvalidArgument(
+                "ProverKick: kicked prover not in active set for the conflicting frames' filter"
+                    .into(),
+            )
+        })?;
     let byte_index = index / 8;
     let bit_index = index % 8;
     let b = 1u8 << bit_index;
@@ -337,9 +523,18 @@ pub fn verify_kick_bitmask_overlap(
 /// `TYPE_GLOBAL_FRAME_HEADER` the "filter" is the empty address (global
 /// frames are not per-shard). For `TYPE_FRAME_HEADER` (app shard) it's
 /// the header's `address` field.
-pub fn extract_kick_frame_filter_and_bitmask(
+pub fn extract_kick_frame_filter_and_bitmask(frame_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let (filter, agg) = kick_frame_filter_and_aggregate(frame_bytes)?;
+    Ok((filter, agg.bitmask))
+}
+
+/// `(filter_or_address, aggregate signature)` of one conflicting frame.
+fn kick_frame_filter_and_aggregate(
     frame_bytes: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>)> {
+) -> Result<(
+    Vec<u8>,
+    crate::hypergraph_intrinsic::canonical::AggregateSignature,
+)> {
     if frame_bytes.len() < 4 {
         return Err(QuilError::InvalidArgument(
             "ProverKick: conflicting frame too short".into(),
@@ -353,16 +548,17 @@ pub fn extract_kick_frame_filter_and_bitmask(
         let agg = crate::hypergraph_intrinsic::canonical::AggregateSignature::from_canonical_bytes(
             &header.public_key_signature_bls48581,
         )?;
-        Ok((Vec::new(), agg.bitmask))
+        Ok((Vec::new(), agg))
     } else if tp == FRAME_HEADER_TYPE {
         let header = super::frame_header::FrameHeader::from_canonical_bytes(frame_bytes)?;
         let agg = crate::hypergraph_intrinsic::canonical::AggregateSignature::from_canonical_bytes(
             &header.public_key_signature_bls48581,
         )?;
-        Ok((header.address, agg.bitmask))
+        Ok((header.address, agg))
     } else {
         Err(QuilError::InvalidArgument(format!(
-            "ProverKick: conflicting frame has unknown type prefix 0x{:08x}", tp
+            "ProverKick: conflicting frame has unknown type prefix 0x{:08x}",
+            tp
         )))
     }
 }
@@ -394,7 +590,8 @@ fn verify_conflicting_frame_bls(
         }
     } else {
         return Err(QuilError::InvalidArgument(format!(
-            "prover kick: unrecognized frame type 0x{:08x}", frame_type
+            "prover kick: unrecognized frame type 0x{:08x}",
+            frame_type
         )));
     }
     Ok(())
@@ -408,17 +605,16 @@ fn decode_aggregate_signature_to_proto(
     if nested_bytes.is_empty() {
         return Ok(None);
     }
-    let local =
-        crate::hypergraph_intrinsic::canonical::AggregateSignature::from_canonical_bytes(
-            nested_bytes,
-        )?;
+    let local = crate::hypergraph_intrinsic::canonical::AggregateSignature::from_canonical_bytes(
+        nested_bytes,
+    )?;
     Ok(Some(quil_types::proto::keys::Bls48581AggregateSignature {
         signature: local.signature,
-        public_key: local.public_key.map(|pk| {
-            quil_types::proto::keys::Bls48581g2PublicKey {
+        public_key: local
+            .public_key
+            .map(|pk| quil_types::proto::keys::Bls48581g2PublicKey {
                 key_value: pk.key_value,
-            }
-        }),
+            }),
         bitmask: local.bitmask,
     }))
 }
@@ -435,6 +631,8 @@ fn local_global_header_to_proto(
         parent_selector: h.parent_selector.clone(),
         global_commitments: h.global_commitments.clone(),
         prover_tree_commitment: h.prover_tree_commitment.clone(),
+        prover_tree_aux_roots: h.prover_tree_aux_roots.clone(),
+        world_state_size: h.world_state_size,
         requests_root: h.requests_root.clone(),
         prover: h.prover.clone(),
         public_key_signature_bls48581: decode_aggregate_signature_to_proto(
@@ -461,14 +659,19 @@ fn local_app_header_to_proto(
         public_key_signature_bls48581: decode_aggregate_signature_to_proto(
             &h.public_key_signature_bls48581,
         )?,
+        storage_attestation_root: h.storage_attestation_root.clone(),
+        global_frame_number: h.global_frame_number,
+        storage_attestation: h.storage_attestation.clone(),
+        fee_total: h.fee_total.clone(),
+        settlements: h.settlements.clone(),
+        accumulator: h.accumulator.clone(),
+        spends: h.spends.clone(),
     })
 }
 
 /// Verify equivocation between two GlobalFrameHeaders.
 fn verify_global_frame_equivocation(frame1: &[u8], frame2: &[u8]) -> Result<bool> {
     // Decode both frames as protobuf GlobalFrameHeader
-    use prost::Message;
-    use quil_types::proto::global::GlobalFrameHeader;
 
     // Skip 4-byte type prefix for proto decoding
     // Note: FromCanonicalBytes in Go reads past the prefix. The proto
@@ -496,9 +699,7 @@ fn verify_global_frame_equivocation(frame1: &[u8], frame2: &[u8]) -> Result<bool
     }
 
     // Both must have BLS signatures
-    if h1.public_key_signature_bls48581.is_none()
-        || h2.public_key_signature_bls48581.is_none()
-    {
+    if h1.public_key_signature_bls48581.is_none() || h2.public_key_signature_bls48581.is_none() {
         return Ok(false);
     }
 
@@ -507,8 +708,6 @@ fn verify_global_frame_equivocation(frame1: &[u8], frame2: &[u8]) -> Result<bool
 
 /// Verify equivocation between two FrameHeaders (app shard frames).
 fn verify_app_frame_equivocation(frame1: &[u8], frame2: &[u8]) -> Result<bool> {
-    use quil_types::proto::global::FrameHeader;
-
     let h1 = match decode_app_header_from_canonical(frame1) {
         Some(h) => h,
         None => return Ok(false),
@@ -534,9 +733,7 @@ fn verify_app_frame_equivocation(frame1: &[u8], frame2: &[u8]) -> Result<bool> {
     }
 
     // Both must have BLS signatures
-    if h1.public_key_signature_bls48581.is_none()
-        || h2.public_key_signature_bls48581.is_none()
-    {
+    if h1.public_key_signature_bls48581.is_none() || h2.public_key_signature_bls48581.is_none() {
         return Ok(false);
     }
 
@@ -552,7 +749,9 @@ fn decode_global_header_from_canonical(
 ) -> Option<quil_types::proto::global::GlobalFrameHeader> {
     // Use the existing canonical-bytes decoder from the global_engine module
     // For now, try protobuf decode after skipping the 4-byte type prefix
-    if data.len() < 12 { return None; }
+    if data.len() < 12 {
+        return None;
+    }
 
     // The canonical format stores fields as big-endian length-prefixed.
     // For structural equivocation check, we need frame_number and output.
@@ -560,47 +759,67 @@ fn decode_global_header_from_canonical(
     let mut cursor = 4usize; // skip type prefix
 
     // frame_number: u64
-    if cursor + 8 > data.len() { return None; }
-    let frame_number = u64::from_be_bytes(data[cursor..cursor+8].try_into().ok()?);
+    if cursor + 8 > data.len() {
+        return None;
+    }
+    let frame_number = u64::from_be_bytes(data[cursor..cursor + 8].try_into().ok()?);
     cursor += 8;
 
     // rank: u64
-    if cursor + 8 > data.len() { return None; }
-    let rank = u64::from_be_bytes(data[cursor..cursor+8].try_into().ok()?);
+    if cursor + 8 > data.len() {
+        return None;
+    }
+    let rank = u64::from_be_bytes(data[cursor..cursor + 8].try_into().ok()?);
     cursor += 8;
 
     // timestamp: i64
-    if cursor + 8 > data.len() { return None; }
-    let timestamp = i64::from_be_bytes(data[cursor..cursor+8].try_into().ok()?);
+    if cursor + 8 > data.len() {
+        return None;
+    }
+    let timestamp = i64::from_be_bytes(data[cursor..cursor + 8].try_into().ok()?);
     cursor += 8;
 
     // difficulty: u32
-    if cursor + 4 > data.len() { return None; }
-    let difficulty = u32::from_be_bytes(data[cursor..cursor+4].try_into().ok()?);
+    if cursor + 4 > data.len() {
+        return None;
+    }
+    let difficulty = u32::from_be_bytes(data[cursor..cursor + 4].try_into().ok()?);
     cursor += 4;
 
     // output: length-prefixed
-    if cursor + 4 > data.len() { return None; }
-    let output_len = u32::from_be_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+    if cursor + 4 > data.len() {
+        return None;
+    }
+    let output_len = u32::from_be_bytes(data[cursor..cursor + 4].try_into().ok()?) as usize;
     cursor += 4;
-    if cursor + output_len > data.len() { return None; }
-    let output = data[cursor..cursor+output_len].to_vec();
+    if cursor + output_len > data.len() {
+        return None;
+    }
+    let output = data[cursor..cursor + output_len].to_vec();
     cursor += output_len;
 
     // parent_selector: length-prefixed
-    if cursor + 4 > data.len() { return None; }
-    let ps_len = u32::from_be_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+    if cursor + 4 > data.len() {
+        return None;
+    }
+    let ps_len = u32::from_be_bytes(data[cursor..cursor + 4].try_into().ok()?) as usize;
     cursor += 4;
-    if cursor + ps_len > data.len() { return None; }
-    let parent_selector = data[cursor..cursor+ps_len].to_vec();
+    if cursor + ps_len > data.len() {
+        return None;
+    }
+    let parent_selector = data[cursor..cursor + ps_len].to_vec();
     cursor += ps_len;
 
     // prover: length-prefixed
-    if cursor + 4 > data.len() { return None; }
-    let prover_len = u32::from_be_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+    if cursor + 4 > data.len() {
+        return None;
+    }
+    let prover_len = u32::from_be_bytes(data[cursor..cursor + 4].try_into().ok()?) as usize;
     cursor += 4;
-    if cursor + prover_len > data.len() { return None; }
-    let prover = data[cursor..cursor+prover_len].to_vec();
+    if cursor + prover_len > data.len() {
+        return None;
+    }
+    let prover = data[cursor..cursor + prover_len].to_vec();
     cursor += prover_len;
 
     // For signature presence check, we need to scan further but at minimum
@@ -625,32 +844,42 @@ fn decode_global_header_from_canonical(
 }
 
 /// Try to decode a FrameHeader from canonical bytes.
-fn decode_app_header_from_canonical(
-    data: &[u8],
-) -> Option<quil_types::proto::global::FrameHeader> {
-    if data.len() < 12 { return None; }
+fn decode_app_header_from_canonical(data: &[u8]) -> Option<quil_types::proto::global::FrameHeader> {
+    if data.len() < 12 {
+        return None;
+    }
 
     let mut cursor = 4usize; // skip type prefix
 
     // frame_number: u64
-    if cursor + 8 > data.len() { return None; }
-    let frame_number = u64::from_be_bytes(data[cursor..cursor+8].try_into().ok()?);
+    if cursor + 8 > data.len() {
+        return None;
+    }
+    let frame_number = u64::from_be_bytes(data[cursor..cursor + 8].try_into().ok()?);
     cursor += 8;
 
     // address: length-prefixed
-    if cursor + 4 > data.len() { return None; }
-    let addr_len = u32::from_be_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+    if cursor + 4 > data.len() {
+        return None;
+    }
+    let addr_len = u32::from_be_bytes(data[cursor..cursor + 4].try_into().ok()?) as usize;
     cursor += 4;
-    if cursor + addr_len > data.len() { return None; }
-    let address = data[cursor..cursor+addr_len].to_vec();
+    if cursor + addr_len > data.len() {
+        return None;
+    }
+    let address = data[cursor..cursor + addr_len].to_vec();
     cursor += addr_len;
 
     // output: length-prefixed
-    if cursor + 4 > data.len() { return None; }
-    let output_len = u32::from_be_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+    if cursor + 4 > data.len() {
+        return None;
+    }
+    let output_len = u32::from_be_bytes(data[cursor..cursor + 4].try_into().ok()?) as usize;
     cursor += 4;
-    if cursor + output_len > data.len() { return None; }
-    let output = data[cursor..cursor+output_len].to_vec();
+    if cursor + output_len > data.len() {
+        return None;
+    }
+    let output = data[cursor..cursor + output_len].to_vec();
     cursor += output_len;
 
     let has_signature = cursor < data.len();
@@ -712,8 +941,8 @@ mod tests {
             proof: vec![],
             traversal_proof: vec![],
         };
-        // Same output = same frame = not different, returns false
-        // Actually they ARE identical bytes so the identity check catches it
+        // Same output = same frame = not different, returns false: the
+        // frames are identical bytes, so the identity check catches it.
         assert!(!verify_equivocation_structural(&kick).unwrap());
     }
 
@@ -747,7 +976,7 @@ mod tests {
 
     #[test]
     fn no_equivocation_type_mismatch() {
-        let mut f1 = make_global_frame_bytes(100, &[0x01; 516]);
+        let f1 = make_global_frame_bytes(100, &[0x01; 516]);
         let mut f2 = make_global_frame_bytes(100, &[0x02; 516]);
         // Change f2's type prefix
         f2[0..4].copy_from_slice(&FRAME_HEADER_TYPE.to_be_bytes());
@@ -773,12 +1002,12 @@ mod tests {
     // extract_kick_frame_filter_and_bitmask
     // -----------------------------------------------------------------
 
-    use crate::hypergraph_intrinsic::canonical::AggregateSignature;
     use crate::global_intrinsic::frame_header::FrameHeader;
+    use crate::hypergraph_intrinsic::canonical::AggregateSignature;
 
     fn agg_sig_bytes(bitmask: &[u8]) -> Vec<u8> {
         AggregateSignature {
-            signature: vec![0xABu8; 74],
+            signature: vec![0xABu8; 666],
             public_key: None,
             bitmask: bitmask.to_vec(),
         }
@@ -800,8 +1029,97 @@ mod tests {
             prover: vec![],
             fee_multiplier_vote: 0,
             public_key_signature_bls48581: agg_sig_bytes(bitmask),
+            storage_attestation_root: Vec::new(),
+            global_frame_number: 0,
+            storage_attestation: Vec::new(),
+            fee_total: Vec::new(),
+            settlements: Vec::new(),
+            accumulator: Vec::new(),
+            spends: Vec::new(),
         };
         header.to_canonical_bytes().unwrap()
+    }
+
+    // -----------------------------------------------------------------
+    // verify_kick_frame_signers
+    // -----------------------------------------------------------------
+
+    fn committee_key(seed: u8) -> Vec<u8> {
+        vec![seed; quil_crypto::FALCON_PUBLIC_KEY_LEN]
+    }
+
+    fn committee(seeds: &[u8]) -> Vec<ProverInfo> {
+        seeds
+            .iter()
+            .map(|&seed| {
+                let key = committee_key(seed);
+                let mut info =
+                    fake_prover_info(quil_crypto::poseidon::hash_bytes_to_32(&key).unwrap());
+                info.public_key = key;
+                info
+            })
+            .collect()
+    }
+
+    fn app_frame_with_declared_keys(bitmask: &[u8], declared: Option<Vec<u8>>) -> Vec<u8> {
+        let mut bytes = app_frame_bytes(&[0x22u8; 32], bitmask);
+        let mut header = FrameHeader::from_canonical_bytes(&bytes).unwrap();
+        header.public_key_signature_bls48581 = AggregateSignature {
+            signature: vec![
+                0xABu8;
+                666 * bitmask
+                    .iter()
+                    .map(|b| b.count_ones() as usize)
+                    .sum::<usize>()
+            ],
+            public_key: declared.map(|key_value| {
+                crate::hypergraph_intrinsic::canonical::Bls48581G2PublicKey { key_value }
+            }),
+            bitmask: bitmask.to_vec(),
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        bytes = header.to_canonical_bytes().unwrap();
+        bytes
+    }
+
+    #[test]
+    fn kick_signers_accept_the_committee_members_named_by_the_bitmask() {
+        let active = committee(&[1, 2, 3]);
+        // Bits 0 and 2 → members 1 and 3, concatenated in bitmask order.
+        let declared = [committee_key(1), committee_key(3)].concat();
+        let frame = app_frame_with_declared_keys(&[0b0000_0101], Some(declared));
+        verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).unwrap();
+    }
+
+    /// The forged-kick shape: the attacker signs with their own key but sets
+    /// the victim's bit. The declared key is not the victim's → rejected.
+    #[test]
+    fn kick_signers_reject_a_foreign_key_behind_a_committee_bit() {
+        let active = committee(&[1, 2, 3]);
+        let frame = app_frame_with_declared_keys(&[0b0000_0010], Some(committee_key(0x99)));
+        assert!(
+            verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err()
+        );
+        // Right keys in the wrong order are rejected too.
+        let swapped = [committee_key(3), committee_key(1)].concat();
+        let frame = app_frame_with_declared_keys(&[0b0000_0101], Some(swapped));
+        assert!(
+            verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err()
+        );
+        // Missing declared key, empty bitmask, and out-of-committee indices.
+        let frame = app_frame_with_declared_keys(&[0b0000_0001], None);
+        assert!(
+            verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err()
+        );
+        let frame = app_frame_with_declared_keys(&[0], Some(committee_key(1)));
+        assert!(
+            verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err()
+        );
+        let frame = app_frame_with_declared_keys(&[0b0000_1000], Some(committee_key(4)));
+        assert!(
+            verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err()
+        );
     }
 
     #[test]
@@ -830,9 +1148,7 @@ mod tests {
     // verify_kick_bitmask_overlap
     // -----------------------------------------------------------------
 
-    use quil_types::consensus::{
-        ProverInfo, ProverRegistry, ProverShardSummary, ProverStatus,
-    };
+    use quil_types::consensus::{ProverInfo, ProverRegistry, ProverShardSummary, ProverStatus};
 
     struct FixedRegistry {
         active: Vec<ProverInfo>,
@@ -852,14 +1168,24 @@ mod tests {
     }
 
     impl ProverRegistry for FixedRegistry {
-        fn get_prover_info(&self, _: &[u8]) -> Result<Option<ProverInfo>> { Ok(None) }
-        fn get_next_prover(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<u8>> { Ok(vec![]) }
-        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<Vec<u8>>> { Ok(vec![]) }
-        fn get_active_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> {
+        fn get_prover_info(&self, _: &[u8]) -> Result<Option<ProverInfo>> {
+            Ok(None)
+        }
+        fn get_next_prover(&self, _: &[u8; 32], _: &[u8], _: u64) -> Result<Vec<u8>> {
+            Ok(vec![])
+        }
+        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _: u64) -> Result<Vec<Vec<u8>>> {
+            Ok(vec![])
+        }
+        fn get_active_provers(&self, _: &[u8], _: u64) -> Result<Vec<ProverInfo>> {
             Ok(self.active.clone())
         }
-        fn get_prover_count(&self, _: &[u8]) -> Result<usize> { Ok(self.active.len()) }
-        fn get_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> { Ok(self.active.clone()) }
+        fn get_prover_count(&self, _: &[u8]) -> Result<usize> {
+            Ok(self.active.len())
+        }
+        fn get_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> {
+            Ok(self.active.clone())
+        }
         fn get_provers_by_status(&self, _: &[u8], _: ProverStatus) -> Result<Vec<ProverInfo>> {
             Ok(vec![])
         }
@@ -885,10 +1211,12 @@ mod tests {
         let pubkey = vec![0x55u8; 585];
         let addr = quil_crypto::poseidon::hash_bytes_to_32(&pubkey).unwrap();
         // Put the kicked prover at index 0.
-        let reg = FixedRegistry { active: vec![fake_prover_info(addr)] };
+        let reg = FixedRegistry {
+            active: vec![fake_prover_info(addr)],
+        };
         let kick = kick_for_pubkey(pubkey);
         // bit 0 set in both bitmasks.
-        let r = verify_kick_bitmask_overlap(&kick, &[], &[0b1], &[0b1], &reg);
+        let r = verify_kick_bitmask_overlap(&kick, &[], &[0b1], &[0b1], &reg, 0);
         assert!(r.is_ok());
     }
 
@@ -896,10 +1224,12 @@ mod tests {
     fn bitmask_overlap_rejects_when_one_frame_misses_signer() {
         let pubkey = vec![0x55u8; 585];
         let addr = quil_crypto::poseidon::hash_bytes_to_32(&pubkey).unwrap();
-        let reg = FixedRegistry { active: vec![fake_prover_info(addr)] };
+        let reg = FixedRegistry {
+            active: vec![fake_prover_info(addr)],
+        };
         let kick = kick_for_pubkey(pubkey);
         // frame 1 has bit 0; frame 2 does not.
-        let r = verify_kick_bitmask_overlap(&kick, &[], &[0b1], &[0b0], &reg);
+        let r = verify_kick_bitmask_overlap(&kick, &[], &[0b1], &[0b0], &reg, 0);
         assert!(r.is_err());
     }
 
@@ -908,9 +1238,11 @@ mod tests {
         let pubkey = vec![0x55u8; 585];
         // Active set contains a DIFFERENT prover.
         let other_addr = [0x99u8; 32];
-        let reg = FixedRegistry { active: vec![fake_prover_info(other_addr)] };
+        let reg = FixedRegistry {
+            active: vec![fake_prover_info(other_addr)],
+        };
         let kick = kick_for_pubkey(pubkey);
-        let r = verify_kick_bitmask_overlap(&kick, &[], &[0b1], &[0b1], &reg);
+        let r = verify_kick_bitmask_overlap(&kick, &[], &[0b1], &[0b1], &reg, 0);
         assert!(r.is_err());
     }
 
@@ -919,16 +1251,241 @@ mod tests {
         // Place the kicked prover at index 9 → byte 1, bit 1.
         let pubkey = vec![0x55u8; 585];
         let addr = quil_crypto::poseidon::hash_bytes_to_32(&pubkey).unwrap();
-        let mut active: Vec<ProverInfo> =
-            (0..9).map(|i| fake_prover_info([i as u8; 32])).collect();
+        let mut active: Vec<ProverInfo> = (0..9).map(|i| fake_prover_info([i as u8; 32])).collect();
         active.push(fake_prover_info(addr)); // index 9
         let reg = FixedRegistry { active };
         let kick = kick_for_pubkey(pubkey);
         // index 9 → byte_index=1, bit_index=1 → mask byte [_, 0b10].
         let bitmask = vec![0x00u8, 0b10u8];
-        assert!(verify_kick_bitmask_overlap(&kick, &[], &bitmask, &bitmask, &reg).is_ok());
+        assert!(verify_kick_bitmask_overlap(&kick, &[], &bitmask, &bitmask, &reg, 0).is_ok());
         // Missing bit in second frame → reject.
         let no_bit = vec![0x00u8, 0x00u8];
-        assert!(verify_kick_bitmask_overlap(&kick, &[], &bitmask, &no_bit, &reg).is_err());
+        assert!(verify_kick_bitmask_overlap(&kick, &[], &bitmask, &no_bit, &reg, 0).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // verify_kick_equivocation: signed-slot rule
+    // -----------------------------------------------------------------
+
+    use crate::global_intrinsic::frame_header::GlobalFrameHeader;
+    use crate::hypergraph_intrinsic::canonical::Bls48581G2PublicKey;
+    use quil_types::crypto::Signer;
+
+    /// A GLOBAL frame number inside any activation epoch the tests set.
+    const KICK_FRAME: u64 = 100;
+
+    fn one_signer_aggregate(signer: &quil_crypto::FalconSigner, signature: Vec<u8>) -> Vec<u8> {
+        AggregateSignature {
+            signature,
+            public_key: Some(Bls48581G2PublicKey {
+                key_value: signer.public_key().to_vec(),
+            }),
+            bitmask: vec![0b1],
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// A GLOBAL frame carrying `signer`'s vote: `Poseidon(output) ‖ rank`
+    /// under `"global"`.
+    fn voted_global_frame(
+        signer: &quil_crypto::FalconSigner,
+        frame_number: u64,
+        rank: u64,
+        output: Vec<u8>,
+    ) -> GlobalFrameHeader {
+        let identity = quil_crypto::poseidon::hash_bytes_to_32(&output).unwrap();
+        let payload = [identity.as_slice(), &rank.to_be_bytes()].concat();
+        let signature = signer.sign_with_domain(&payload, b"global").unwrap();
+        GlobalFrameHeader {
+            frame_number,
+            rank,
+            output,
+            public_key_signature_bls48581: one_signer_aggregate(signer, signature),
+            ..Default::default()
+        }
+    }
+
+    /// An app frame carrying `signer`'s vote: `address ‖ Poseidon(output) ‖
+    /// rank` under `"appshard" ‖ address`.
+    fn voted_app_frame(
+        signer: &quil_crypto::FalconSigner,
+        address: &[u8],
+        rank: u64,
+        output: Vec<u8>,
+    ) -> Vec<u8> {
+        let identity = quil_crypto::poseidon::hash_bytes_to_32(&output).unwrap();
+        let payload = [address, identity.as_slice(), &rank.to_be_bytes()].concat();
+        let domain = [b"appshard".as_slice(), address].concat();
+        let signature = signer.sign_with_domain(&payload, &domain).unwrap();
+        FrameHeader {
+            address: address.to_vec(),
+            frame_number: 42,
+            rank,
+            output,
+            public_key_signature_bls48581: one_signer_aggregate(signer, signature),
+            ..Default::default()
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    fn kick_between(frame_1: Vec<u8>, frame_2: Vec<u8>) -> ProverKick {
+        ProverKick {
+            conflicting_frame_1: frame_1,
+            conflicting_frame_2: frame_2,
+            ..kick_for_pubkey(vec![0x55u8; 585])
+        }
+    }
+
+    /// Both frames carry a valid vote signature, as GLOBAL checks them.
+    fn assert_votes_verify(kick: &ProverKick) {
+        let prover = quil_crypto::WesolowskiFrameProver::new(2048);
+        let bls = quil_crypto::FalconKeyConstructor;
+        for frame in [&kick.conflicting_frame_1, &kick.conflicting_frame_2] {
+            let tp = u32::from_be_bytes(frame[..4].try_into().unwrap());
+            verify_conflicting_frame_bls(frame, tp, &prover, &bls).unwrap();
+        }
+    }
+
+    /// Two honest GLOBAL votes from consecutive frames, the second relabelled
+    /// to the first's frame number. The frame number is unsigned, so both
+    /// signatures still verify and the legacy rule calls it equivocation;
+    /// the signed-slot rule sees two ranks and rejects it.
+    #[test]
+    fn signed_slot_rejects_honest_votes_relabelled_to_one_frame_number() {
+        let signer = quil_crypto::FalconSigner::generate();
+        let first = voted_global_frame(&signer, KICK_FRAME, 7, vec![0x01; 516]);
+        let mut second = voted_global_frame(&signer, KICK_FRAME + 1, 8, vec![0x02; 516]);
+        second.frame_number = KICK_FRAME;
+        let kick = kick_between(
+            first.to_canonical_bytes().unwrap(),
+            second.to_canonical_bytes().unwrap(),
+        );
+        assert_votes_verify(&kick);
+
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(Some(u64::MAX));
+        assert!(verify_kick_equivocation(&kick, KICK_FRAME).unwrap());
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(Some(0));
+        assert!(!verify_kick_equivocation(&kick, KICK_FRAME).unwrap());
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(None);
+    }
+
+    /// One honest GLOBAL vote and a copy whose output gains a zero byte. The
+    /// Poseidon sponge pads the last chunk with zeros, so both outputs have
+    /// the signed identity and the one signature verifies on both frames.
+    #[test]
+    fn signed_slot_rejects_one_vote_with_a_padded_output() {
+        let signer = quil_crypto::FalconSigner::generate();
+        let vote = voted_global_frame(&signer, KICK_FRAME, 7, vec![0x01; 516]);
+        let mut padded = vote.clone();
+        padded.output.push(0);
+        assert_eq!(
+            quil_crypto::poseidon::hash_bytes_to_32(&vote.output).unwrap(),
+            quil_crypto::poseidon::hash_bytes_to_32(&padded.output).unwrap()
+        );
+        let kick = kick_between(
+            vote.to_canonical_bytes().unwrap(),
+            padded.to_canonical_bytes().unwrap(),
+        );
+        assert_votes_verify(&kick);
+
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(Some(u64::MAX));
+        assert!(verify_kick_equivocation(&kick, KICK_FRAME).unwrap());
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(Some(0));
+        assert!(!verify_kick_equivocation(&kick, KICK_FRAME).unwrap());
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(None);
+    }
+
+    /// Two GLOBAL votes for different frames in one rank are equivocation,
+    /// whatever frame numbers the headers carry.
+    #[test]
+    fn signed_slot_accepts_two_global_votes_in_one_rank() {
+        let signer = quil_crypto::FalconSigner::generate();
+        let first = voted_global_frame(&signer, KICK_FRAME, 7, vec![0x01; 516]);
+        let second = voted_global_frame(&signer, KICK_FRAME, 7, vec![0x02; 516]);
+        let kick = kick_between(
+            first.to_canonical_bytes().unwrap(),
+            second.to_canonical_bytes().unwrap(),
+        );
+        assert_votes_verify(&kick);
+
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(Some(0));
+        assert!(verify_kick_equivocation(&kick, KICK_FRAME).unwrap());
+        let mut renumbered = second;
+        renumbered.frame_number = KICK_FRAME + 5;
+        let kick = kick_between(
+            first.to_canonical_bytes().unwrap(),
+            renumbered.to_canonical_bytes().unwrap(),
+        );
+        assert!(verify_kick_equivocation(&kick, KICK_FRAME).unwrap());
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(None);
+    }
+
+    /// Two app votes for different frames in one rank of one shard are
+    /// equivocation; the same ranks on different shards, different ranks on
+    /// one shard, or the genesis rank are not.
+    #[test]
+    fn signed_slot_accepts_two_app_votes_in_one_rank_of_one_shard() {
+        let signer = quil_crypto::FalconSigner::generate();
+        let shard = [0x22u8; 32];
+        let other_shard = [0x33u8; 32];
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(Some(0));
+
+        let kick = kick_between(
+            voted_app_frame(&signer, &shard, 7, vec![0x01; 516]),
+            voted_app_frame(&signer, &shard, 7, vec![0x02; 516]),
+        );
+        assert_votes_verify(&kick);
+        assert!(verify_kick_equivocation(&kick, KICK_FRAME).unwrap());
+
+        for (frame_1, frame_2) in [
+            (
+                voted_app_frame(&signer, &shard, 7, vec![0x01; 516]),
+                voted_app_frame(&signer, &other_shard, 7, vec![0x02; 516]),
+            ),
+            (
+                voted_app_frame(&signer, &shard, 7, vec![0x01; 516]),
+                voted_app_frame(&signer, &shard, 8, vec![0x02; 516]),
+            ),
+            (
+                voted_app_frame(&signer, &shard, 0, vec![0x01; 516]),
+                voted_app_frame(&signer, &shard, 0, vec![0x02; 516]),
+            ),
+        ] {
+            let kick = kick_between(frame_1, frame_2);
+            assert_votes_verify(&kick);
+            assert!(!verify_kick_equivocation(&kick, KICK_FRAME).unwrap());
+        }
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(None);
+    }
+
+    /// An unsigned frame, a GLOBAL frame against an app frame, and a frame
+    /// the canonical codec cannot decode are no evidence.
+    #[test]
+    fn signed_slot_rejects_unsigned_mixed_or_undecodable_frames() {
+        let signer = quil_crypto::FalconSigner::generate();
+        let voted = voted_global_frame(&signer, KICK_FRAME, 7, vec![0x01; 516]);
+        let mut unsigned = voted_global_frame(&signer, KICK_FRAME, 7, vec![0x02; 516]);
+        unsigned.public_key_signature_bls48581 = Vec::new();
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(Some(0));
+        for (frame_1, frame_2) in [
+            (
+                voted.to_canonical_bytes().unwrap(),
+                unsigned.to_canonical_bytes().unwrap(),
+            ),
+            (
+                voted.to_canonical_bytes().unwrap(),
+                voted_app_frame(&signer, &[], 7, vec![0x02; 516]),
+            ),
+            (
+                make_global_frame_bytes(KICK_FRAME, &[0x01; 516]),
+                make_global_frame_bytes(KICK_FRAME, &[0x02; 516]),
+            ),
+        ] {
+            let kick = kick_between(frame_1, frame_2);
+            assert!(!verify_kick_equivocation(&kick, KICK_FRAME).unwrap());
+        }
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(None);
     }
 }

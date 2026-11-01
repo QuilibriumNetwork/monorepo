@@ -40,3 +40,6 @@ uniffi = { version = "0.28.3", features = [ "build" ] }
 [[bench]]
 name = "bench_channel"
 harness = false
+
+[lints]
+workspace = true

@@ -7,20 +7,20 @@
 //! scoring is:
 //!
 //! ```text
-//!     score(branch) = blend_bonus × Σ_i α^{n-i} · frame_score(i)
-//!     frame_score(i) = (w_r · ρ(dist_i) + w_p · π(seniority_i)) / w_denom
-//!     blend_bonus = 1 + (β · unique_provers_in_last_m / m)
+//! score(branch) = blend_bonus × Σ_i α^{n-i} · frame_score(i)
+//! frame_score(i) = (w_r · ρ(dist_i) + w_p · π(seniority_i)) / w_denom
+//! blend_bonus = 1 + (β · unique_provers_in_last_m / m)
 //! ```
 //!
 //! - `ρ` (rho) maps distance `r ∈ [0, R_max]` to `[0, SCALE]`, with
-//!   smaller distance → higher ρ. Closer frames to the target score
-//!   better.
+//! smaller distance → higher ρ. Closer frames to the target score
+//! better.
 //! - `π` (pi) maps seniority to `[0, SCALE]`, clamped.
 //! - `α` is the exponential-decay factor applied frame-by-frame —
-//!   older frames matter less.
+//! older frames matter less.
 //! - The blend bonus rewards branches that are extended by diverse
-//!   sets of provers within a sliding window of the last `m` frames,
-//!   penalizing single-prover forks.
+//! sets of provers within a sliding window of the last `m` frames,
+//! penalizing single-prover forks.
 //!
 //! The result is compared across branches with a tie-break
 //! tolerance ε: a new candidate must beat the incumbent by strictly
@@ -189,8 +189,8 @@ pub fn branch_score(br: &Branch, cfg: &Params) -> BigInt {
     let scale_bi = BigInt::from(SCALE);
     let blend_scaled = (BigInt::from(unique) * &scale_bi) / BigInt::from(m as u64);
     // div_bonus = SCALE + (beta_numer · blend_scaled / beta_denom)
-    let div_bonus = &scale_bi
-        + (BigInt::from(cfg.beta_numer) * &blend_scaled) / BigInt::from(cfg.beta_denom);
+    let div_bonus =
+        &scale_bi + (BigInt::from(cfg.beta_numer) * &blend_scaled) / BigInt::from(cfg.beta_denom);
 
     // Step 3: final = raw · div_bonus / SCALE
     (raw * div_bonus) / scale_bi
@@ -475,7 +475,9 @@ mod tests {
         // bounded score under exponential decay. The sum of
         // α^i · f0 converges; no panic or overflow should occur.
         let cfg = Params::default_params();
-        let frames: Vec<Frame> = (0..100).map(|i| frame(0, SCALE, &format!("p-{}", i))).collect();
+        let frames: Vec<Frame> = (0..100)
+            .map(|i| frame(0, SCALE, &format!("p-{}", i)))
+            .collect();
         let b = branch(frames);
         let score = branch_score(&b, &cfg);
         assert!(score > BigInt::zero());

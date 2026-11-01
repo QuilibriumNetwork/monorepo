@@ -1,0 +1,265 @@
+//! Background cleanup of a node store's clock records and pinned snapshots.
+//! Each piece is on by default and is switched off by setting it to `0`:
+//!
+//! - `QUIL_PRUNE_STAGED_SHARD_FRAMES`: once at startup, delete staged
+//!   application frames whose canonical copy is identical (stores written
+//!   before a commit dropped its staged copy hold each frame twice).
+//! - `QUIL_PRUNE_GLOBAL_CANDIDATES`: every `QUIL_PRUNE_INTERVAL_SECS`
+//!   (default 600), delete GLOBAL candidates `QUIL_PRUNE_CANDIDATE_MARGIN`
+//!   (default two epochs) or more below both the canonical head and the
+//!   executed cursor, at heights holding a canonical record.
+//! - `QUIL_PRUNE_GLOBAL_REQUESTS`: on a regular (non-archive) node and on
+//!   every standalone worker, every `QUIL_PRUNE_INTERVAL_SECS`, delete the
+//!   request bodies of global frames more than
+//!   `QUIL_PRUNE_GLOBAL_REQUESTS_KEEP` (default and minimum two days of
+//!   frames) below the head. Headers are kept. A pass compacts the pruned
+//!   range only once table files of pruned bodies reach
+//!   `RocksClockStore::REQUEST_RECLAIM_BYTES`. A worker's first pass waits
+//!   an extra minute per core (repeating after an hour of cores).
+//! - `QUIL_SNAPSHOT_PINNED_MAX=<n>`: keep store snapshots only on the newest
+//!   `n` (default 64, at least 16; `off` also disables it) published
+//!   generations.
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+
+use tracing::{info, warn};
+
+/// Staged keys examined per step of the startup cleanup.
+const STAGED_STEP: usize = 10_000;
+/// The startup cleanup waits this long first, like the periodic pruners, so
+/// a store closed soon after opening (a failed start, a test) is not scanned.
+const STAGED_START_DELAY: Duration = Duration::from_secs(60);
+/// Candidate headers examined per step of a candidate pass.
+const CANDIDATE_STEP: usize = 5_000;
+/// Never closer to the head than this, whatever is configured.
+const MIN_CANDIDATE_MARGIN: u64 = 64;
+/// Request bodies a regular node keeps: its gap backfill window
+/// (two days of frames), which also covers the frame cache and gossip drain.
+const MIN_REQUEST_KEEP: u64 = 2 * 1440;
+/// Workers' first request prunes start this far apart, by core id: the first
+/// pass of a store that kept every body deletes and compacts gigabytes, and a
+/// host runs dozens of workers on the same disks.
+const WORKER_FIRST_PRUNE_STEP: Duration = Duration::from_secs(60);
+/// Core slots before the first-pass offsets repeat (an hour of steps).
+const WORKER_FIRST_PRUNE_SLOTS: u32 = 60;
+
+fn setting(name: &str) -> Option<u64> {
+    std::env::var(name).ok().and_then(|v| v.parse().ok())
+}
+
+fn enabled(name: &str) -> bool {
+    default_on(std::env::var(name).ok().as_deref())
+}
+
+/// A default-on switch: anything but `0` leaves it on.
+fn default_on(setting: Option<&str>) -> bool {
+    setting.map(str::trim) != Some("0")
+}
+
+/// Apply the `QUIL_SNAPSHOT_PINNED_MAX` pin cap to `crdt`, unless it is off.
+pub(crate) fn apply_snapshot_pin_limit(crdt: &quil_hypergraph::HypergraphCrdt, label: &str) {
+    if let Some(limit) = quil_hypergraph::snapshot_pin_limit_from_env() {
+        info!(
+            store = label,
+            limit, "keeping store snapshots only on the newest published generations"
+        );
+        crdt.set_snapshot_pinned_limit(limit);
+    }
+}
+
+/// `QUIL_PRUNE_STAGED_SHARD_FRAMES` (default on): one bounded pass over the staged
+/// application frames in `db`, in the background, starting after
+/// [`STAGED_START_DELAY`]. It holds the store only for one step at a time and
+/// stops once the store is dropped, so it never keeps the database open past
+/// its owners (an open RocksDB at process exit aborts).
+pub(crate) fn spawn_staged_cleanup(db: &quil_forest::CoordinatedDb, label: String) {
+    if !enabled("QUIL_PRUNE_STAGED_SHARD_FRAMES") {
+        return;
+    }
+    let db = db.downgrade();
+    let spawned = std::thread::Builder::new()
+        .name(format!("staged-prune-{label}"))
+        .spawn(move || {
+            std::thread::sleep(STAGED_START_DELAY);
+            prune_staged(&db, &label)
+        });
+    if let Err(error) = spawned {
+        warn!(%error, "staged shard frame cleanup not started");
+    }
+}
+
+/// `QUIL_PRUNE_GLOBAL_CANDIDATES` (default on): prune `clock`'s GLOBAL candidates every
+/// interval until the store is dropped. Only a store that executes GLOBAL
+/// frames (a master) holds candidates.
+pub(crate) fn spawn_candidate_pruner(clock: &Arc<quil_store::RocksClockStore>, label: String) {
+    if !enabled("QUIL_PRUNE_GLOBAL_CANDIDATES") {
+        return;
+    }
+    let clock: Weak<quil_store::RocksClockStore> = Arc::downgrade(clock);
+    let margin = setting("QUIL_PRUNE_CANDIDATE_MARGIN")
+        .unwrap_or(2 * quil_types::consensus::EPOCH_LENGTH_FRAMES)
+        .max(MIN_CANDIDATE_MARGIN);
+    let interval = Duration::from_secs(setting("QUIL_PRUNE_INTERVAL_SECS").unwrap_or(600).max(10));
+    let spawned = std::thread::Builder::new()
+        .name(format!("candidate-prune-{label}"))
+        .spawn(move || {
+            info!(store = %label, margin, "GLOBAL candidate pruning enabled");
+            loop {
+                std::thread::sleep(interval);
+                let Some(store) = clock.upgrade() else { return };
+                prune_candidates(&store, margin, &label);
+            }
+        });
+    if let Err(error) = spawned {
+        warn!(%error, "GLOBAL candidate pruning not started");
+    }
+}
+
+/// `QUIL_PRUNE_GLOBAL_REQUESTS` (default on): on a node that neither executes
+/// GLOBAL frames nor serves their history, prune old request bodies every
+/// interval until the store is dropped. The caller decides that role.
+pub(crate) fn spawn_request_pruner(clock: &Arc<quil_store::RocksClockStore>, label: String) {
+    spawn_request_pruner_for_core(clock, label, 0);
+}
+
+/// When the first request prune of core `core_id`'s store runs: one interval
+/// after start for the master (core 0), and a slot of
+/// [`WORKER_FIRST_PRUNE_STEP`] later per worker core, so the workers of one
+/// host do not all delete and compact their backlog at once.
+fn first_request_prune(interval: Duration, core_id: u32) -> Duration {
+    interval + WORKER_FIRST_PRUNE_STEP * (core_id % WORKER_FIRST_PRUNE_SLOTS)
+}
+
+/// [`spawn_request_pruner`] for the store of core `core_id`, whose first pass
+/// waits for [`first_request_prune`].
+pub(crate) fn spawn_request_pruner_for_core(
+    clock: &Arc<quil_store::RocksClockStore>,
+    label: String,
+    core_id: u32,
+) {
+    if !enabled("QUIL_PRUNE_GLOBAL_REQUESTS") {
+        return;
+    }
+    let clock: Weak<quil_store::RocksClockStore> = Arc::downgrade(clock);
+    let keep = setting("QUIL_PRUNE_GLOBAL_REQUESTS_KEEP")
+        .unwrap_or(MIN_REQUEST_KEEP)
+        .max(MIN_REQUEST_KEEP);
+    let interval = Duration::from_secs(setting("QUIL_PRUNE_INTERVAL_SECS").unwrap_or(600).max(10));
+    let first = first_request_prune(interval, core_id);
+    let spawned = std::thread::Builder::new().name(format!("request-prune-{label}")).spawn(move || {
+        info!(store = %label, keep, first_pass_secs = first.as_secs(),
+            "GLOBAL request body pruning enabled");
+        let mut wait = first;
+        loop {
+            std::thread::sleep(wait);
+            wait = interval;
+            let Some(store) = clock.upgrade() else { return };
+            let started = std::time::Instant::now();
+            match store.prune_global_frame_requests(keep) {
+                // `deferred`: RocksDB's own compaction reclaims the space.
+                Ok(pass) if pass.frames > 0 => info!(store = %label, frames = pass.frames,
+                    retained_from = pass.retained_from, dead_mib = pass.dead_bytes >> 20,
+                    reclaim = if pass.compacted { "compacted" } else { "deferred" },
+                    reclaim_at_mib = quil_store::RocksClockStore::REQUEST_RECLAIM_BYTES >> 20,
+                    secs = started.elapsed().as_secs(), "pruned GLOBAL request bodies"),
+                Ok(_) => {}
+                Err(error) => warn!(store = %label, %error, "GLOBAL request prune failed; retrying next pass"),
+            }
+        }
+    });
+    if let Err(error) = spawned {
+        warn!(%error, "GLOBAL request pruning not started");
+    }
+}
+
+fn prune_staged(db: &quil_forest::WeakCoordinatedDb, label: &str) {
+    let mut after: Option<Vec<u8>> = None;
+    let (mut scanned, mut deleted, mut bytes, mut kept) = (0u64, 0u64, 0u64, 0u64);
+    loop {
+        let Some(db) = db.upgrade() else {
+            info!(store = %label, scanned, deleted, "staged shard frame cleanup stopped: the store closed; a restart resumes it");
+            return;
+        };
+        let store = quil_store::RocksClockStore::new(db);
+        match store.prune_committed_staged_shard_frames(after.as_deref(), STAGED_STEP, false) {
+            Ok(pass) => {
+                scanned += pass.scanned;
+                deleted += pass.deleted;
+                bytes += pass.deleted_bytes;
+                kept += pass.differing + pass.uncommitted + pass.malformed;
+                after = pass.next;
+            }
+            Err(error) => {
+                warn!(store = %label, %error, "staged shard frame cleanup stopped; a restart resumes it");
+                return;
+            }
+        }
+        drop(store);
+        if after.is_none() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    info!(store = %label, scanned, deleted, bytes, kept, "staged shard frame cleanup complete");
+}
+
+fn prune_candidates(store: &quil_store::RocksClockStore, margin: u64, label: &str) {
+    let (mut from, mut pruned, mut bytes) = (0u64, 0u64, 0u64);
+    loop {
+        match store.prune_global_candidates(margin, from, CANDIDATE_STEP, false) {
+            Ok(pass) => {
+                pruned += pass.pruned;
+                bytes += pass.pruned_bytes;
+                match pass.next_from {
+                    Some(next) => from = next,
+                    None => break,
+                }
+            }
+            Err(error) => {
+                warn!(store = %label, %error, "GLOBAL candidate prune failed; retrying next pass");
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if pruned > 0 {
+        info!(store = %label, pruned, bytes, "pruned GLOBAL candidates");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_on, first_request_prune};
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    /// The master's first request prune keeps its one-interval wait; the
+    /// workers of a host start theirs a minute apart, each in its own slot.
+    #[test]
+    fn worker_first_request_prunes_are_staggered_by_core() {
+        let interval = Duration::from_secs(600);
+        let first = |core: u32| first_request_prune(interval, core).as_secs();
+        assert_eq!(first(0), 600, "the master");
+        assert_eq!(first(1), 660);
+        assert_eq!(first(32), 600 + 32 * 60);
+        assert_eq!(first(60), 600, "slots repeat after an hour");
+        let starts: BTreeSet<u64> = (1..=32).map(first).collect();
+        assert_eq!(starts.len(), 32, "a minute of its own per worker");
+        assert!(starts.iter().all(|&start| start < 600 + 3600));
+        assert_eq!(
+            first_request_prune(Duration::from_secs(10), 3).as_secs(),
+            190,
+            "a slot does not shrink with the interval"
+        );
+    }
+
+    /// Every cleanup is on unless its setting is `0`.
+    #[test]
+    fn cleanups_are_on_unless_switched_off() {
+        assert!(default_on(None));
+        assert!(default_on(Some("1")));
+        assert!(default_on(Some("yes")));
+        assert!(!default_on(Some("0")));
+        assert!(!default_on(Some(" 0 ")));
+    }
+}

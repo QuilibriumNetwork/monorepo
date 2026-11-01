@@ -7,15 +7,15 @@
 //! own libp2p stack.
 //!
 //! Message routing model:
-//!   * Master's swarm event loop already fans every received message
-//!     into a `tokio::sync::broadcast::Sender<StreamGlobalMessagesResponse>`
-//!     (constructed in `main.rs`). We borrow a clone of that sender so
-//!     each `Subscribe` caller gets an independent receiver filtered
-//!     by bitmask.
-//!   * `PublishToBitmask` / `Publish` route through `P2PHandle.publish`.
-//!   * Peer-info, signing, and reachability queries delegate to small
-//!     closures handed in by `main.rs` so this crate doesn't have to
-//!     depend on the Ed448 keyring directly.
+//! * Master's swarm event loop already fans every received message
+//! into a `tokio::sync::broadcast::Sender<StreamGlobalMessagesResponse>`
+//! (constructed in `main.rs`). We borrow a clone of that sender so
+//! each `Subscribe` caller gets an independent receiver filtered
+//! by bitmask.
+//! * `PublishToBitmask` / `Publish` route through `P2PHandle.publish`.
+//! * Peer-info, signing, and reachability queries delegate to small
+//! closures handed in by `main.rs` so this crate doesn't have to
+//! depend on the Ed448 keyring directly.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -24,9 +24,7 @@ use tokio::sync::broadcast;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
-use quil_types::proto::proxy::{
-    self as pb, pub_sub_proxy_server::PubSubProxy,
-};
+use quil_types::proto::proxy::{self as pb, pub_sub_proxy_server::PubSubProxy};
 
 /// Closure that signs a message with the master's Ed448 key.
 pub type Ed448Signer = Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync>;
@@ -133,19 +131,39 @@ impl PubSubProxyServer {
         self.reachable = reachable;
         self
     }
+
+    /// Gate a privileged proxy RPC to the node's OWN cluster identity.
+    ///
+    /// The proxy signs arbitrary bytes with the node's raw Ed448 key
+    /// (`sign_message` — a signing oracle), injects gossip, and mutates local
+    /// mesh peer scores / connection state. Those are worker-privileged
+    /// operations: only the node's own data-workers (which authenticate on
+    /// :8340 AS this node's identity via the shared cluster key) may invoke
+    /// them. Any other authenticated peer is rejected with `PermissionDenied`.
+    ///
+    /// No-op when the node's own peer id is unknown (empty) — e.g. in unit
+    /// tests that construct the server without a real P2P stack.
+    fn require_self_identity(&self, ext: &tonic::Extensions) -> Result<(), Status> {
+        if self.p2p.peer_id_bytes.is_empty() {
+            return Ok(());
+        }
+        match ext.get::<crate::peer_auth_middleware::AuthenticatedPeer>() {
+            Some(auth) if auth.peer_id.to_bytes() == self.p2p.peer_id_bytes => Ok(()),
+            _ => Err(Status::permission_denied(
+                "privileged pubsub-proxy RPC: caller is not this node's own cluster identity",
+            )),
+        }
+    }
 }
 
-type SubscribeStream = Pin<
-    Box<dyn Stream<Item = Result<pb::MessageEvent, Status>> + Send + 'static>,
->;
+type SubscribeStream =
+    Pin<Box<dyn Stream<Item = Result<pb::MessageEvent, Status>> + Send + 'static>>;
 
-type MultiaddrStream = Pin<
-    Box<dyn Stream<Item = Result<pb::GetMultiaddrOfPeerResponse, Status>> + Send + 'static>,
->;
+type MultiaddrStream =
+    Pin<Box<dyn Stream<Item = Result<pb::GetMultiaddrOfPeerResponse, Status>> + Send + 'static>>;
 
-type ValidatorStreamOut = Pin<
-    Box<dyn Stream<Item = Result<pb::ValidationStreamMessage, Status>> + Send + 'static>,
->;
+type ValidatorStreamOut =
+    Pin<Box<dyn Stream<Item = Result<pb::ValidationStreamMessage, Status>> + Send + 'static>>;
 
 #[tonic::async_trait]
 impl PubSubProxy for PubSubProxyServer {
@@ -155,15 +173,13 @@ impl PubSubProxy for PubSubProxyServer {
         &self,
         request: Request<pb::PublishToBitmaskRequest>,
     ) -> Result<Response<()>, Status> {
+        self.require_self_identity(request.extensions())?;
         let req = request.into_inner();
         (self.p2p.publish)(req.bitmask, req.data);
         Ok(Response::new(()))
     }
 
-    async fn publish(
-        &self,
-        _request: Request<pb::PublishRequest>,
-    ) -> Result<Response<()>, Status> {
+    async fn publish(&self, _request: Request<pb::PublishRequest>) -> Result<Response<()>, Status> {
         // `Publish` (by address) is the direct-send path in Go. The
         // Rust P2P stack does not yet expose address-targeted sends;
         // accept and drop until that primitive lands.
@@ -178,6 +194,7 @@ impl PubSubProxy for PubSubProxyServer {
         &self,
         request: Request<pb::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        self.require_self_identity(request.extensions())?;
         let req = request.into_inner();
         let bitmask = req.bitmask;
         // Ensure the master is actually subscribed to this bitmask
@@ -214,6 +231,7 @@ impl PubSubProxy for PubSubProxyServer {
         &self,
         request: Request<pb::UnsubscribeRequest>,
     ) -> Result<Response<()>, Status> {
+        self.require_self_identity(request.extensions())?;
         let bitmask = request.into_inner().bitmask;
         (self.p2p.unsubscribe)(bitmask);
         Ok(Response::new(()))
@@ -225,8 +243,9 @@ impl PubSubProxy for PubSubProxyServer {
 
     async fn validator_stream(
         &self,
-        _request: Request<tonic::Streaming<pb::ValidationStreamMessage>>,
+        request: Request<tonic::Streaming<pb::ValidationStreamMessage>>,
     ) -> Result<Response<Self::ValidatorStreamStream>, Status> {
+        self.require_self_identity(request.extensions())?;
         // Minimal accept-all validator: return a stream that hangs
         // until the client disconnects. Workers that register
         // validators will have their registrations silently accepted
@@ -357,6 +376,7 @@ impl PubSubProxy for PubSubProxyServer {
         &self,
         request: Request<pb::SetPeerScoreRequest>,
     ) -> Result<Response<()>, Status> {
+        self.require_self_identity(request.extensions())?;
         let req = request.into_inner();
         (self.p2p.set_peer_score)(req.peer_id, req.score as f64);
         Ok(Response::new(()))
@@ -366,6 +386,7 @@ impl PubSubProxy for PubSubProxyServer {
         &self,
         request: Request<pb::AddPeerScoreRequest>,
     ) -> Result<Response<()>, Status> {
+        self.require_self_identity(request.extensions())?;
         let req = request.into_inner();
         (self.p2p.add_peer_score)(req.peer_id, req.score_delta as f64);
         Ok(Response::new(()))
@@ -377,6 +398,7 @@ impl PubSubProxy for PubSubProxyServer {
         &self,
         request: Request<pb::ReconnectRequest>,
     ) -> Result<Response<()>, Status> {
+        self.require_self_identity(request.extensions())?;
         let req = request.into_inner();
         (self.p2p.reconnect)(req.peer_id)
             .await
@@ -384,20 +406,16 @@ impl PubSubProxy for PubSubProxyServer {
         Ok(Response::new(()))
     }
 
-    async fn bootstrap(
-        &self,
-        _request: Request<()>,
-    ) -> Result<Response<()>, Status> {
+    async fn bootstrap(&self, request: Request<()>) -> Result<Response<()>, Status> {
+        self.require_self_identity(request.extensions())?;
         (self.p2p.bootstrap)()
             .await
             .map_err(|e| Status::internal(format!("bootstrap: {}", e)))?;
         Ok(Response::new(()))
     }
 
-    async fn discover_peers(
-        &self,
-        _request: Request<()>,
-    ) -> Result<Response<()>, Status> {
+    async fn discover_peers(&self, request: Request<()>) -> Result<Response<()>, Status> {
+        self.require_self_identity(request.extensions())?;
         (self.p2p.discover_peers)()
             .await
             .map_err(|e| Status::internal(format!("discover_peers: {}", e)))?;
@@ -419,13 +437,12 @@ impl PubSubProxy for PubSubProxyServer {
         &self,
         _request: Request<()>,
     ) -> Result<Response<pb::GetNetworkResponse>, Status> {
-        Ok(Response::new(pb::GetNetworkResponse { network: self.network }))
+        Ok(Response::new(pb::GetNetworkResponse {
+            network: self.network,
+        }))
     }
 
-    async fn reachability(
-        &self,
-        _request: Request<()>,
-    ) -> Result<Response<bool>, Status> {
+    async fn reachability(&self, _request: Request<()>) -> Result<Response<bool>, Status> {
         Ok(Response::new(self.reachable))
     }
 
@@ -433,6 +450,7 @@ impl PubSubProxy for PubSubProxyServer {
         &self,
         request: Request<pb::SignMessageRequest>,
     ) -> Result<Response<pb::SignMessageResponse>, Status> {
+        self.require_self_identity(request.extensions())?;
         let signer = self
             .signer
             .as_ref()
@@ -446,11 +464,80 @@ impl PubSubProxy for PubSubProxyServer {
         &self,
         _request: Request<()>,
     ) -> Result<Response<pb::GetPublicKeyResponse>, Status> {
-        let pk = self
-            .pubkey
-            .as_ref()
-            .map(|f| f())
-            .unwrap_or_default();
+        let pk = self.pubkey.as_ref().map(|f| f()).unwrap_or_default();
         Ok(Response::new(pb::GetPublicKeyResponse { public_key: pk }))
+    }
+}
+
+#[cfg(test)]
+mod self_identity_gate_tests {
+    use super::*;
+    use crate::peer_auth_middleware::AuthenticatedPeer;
+    use quil_p2p::PeerId;
+
+    fn noop_shim(peer_id_bytes: Vec<u8>) -> P2pHandleShim {
+        P2pHandleShim {
+            peer_id_bytes,
+            publish: Arc::new(|_, _| {}),
+            subscribe: Arc::new(|_| {}),
+            unsubscribe: Arc::new(|_| {}),
+            peer_count: Arc::new(|| 0),
+            get_peer_score: Arc::new(|_| Box::pin(async { Ok(0.0) })),
+            set_peer_score: Arc::new(|_, _| {}),
+            add_peer_score: Arc::new(|_, _| {}),
+            reconnect: Arc::new(|_| Box::pin(async { Ok(()) })),
+            bootstrap: Arc::new(|| Box::pin(async { Ok(()) })),
+            discover_peers: Arc::new(|| Box::pin(async { Ok(()) })),
+            is_peer_connected: Arc::new(|_| false),
+        }
+    }
+
+    fn server(peer_id_bytes: Vec<u8>) -> PubSubProxyServer {
+        let (tx, _rx) = broadcast::channel(4);
+        PubSubProxyServer::new(
+            noop_shim(peer_id_bytes),
+            tx,
+            Arc::new(Vec::new),
+            Arc::new(Vec::new),
+            0,
+        )
+    }
+
+    fn ext_with(peer_id: PeerId) -> tonic::Extensions {
+        let mut ext = tonic::Extensions::new();
+        ext.insert(AuthenticatedPeer {
+            peer_id,
+            falcon_public_key: Vec::new(),
+        });
+        ext
+    }
+
+    #[test]
+    fn accepts_own_identity_rejects_others_and_unauthenticated() {
+        let me = PeerId::random();
+        let other = PeerId::random();
+        let srv = server(me.to_bytes());
+
+        // Same identity → allowed.
+        assert!(srv.require_self_identity(&ext_with(me)).is_ok());
+        // Different authenticated peer → PermissionDenied.
+        let denied = srv.require_self_identity(&ext_with(other)).unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        // No AuthenticatedPeer in extensions → PermissionDenied (fail closed).
+        let empty = srv
+            .require_self_identity(&tonic::Extensions::new())
+            .unwrap_err();
+        assert_eq!(empty.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn no_self_identity_configured_is_noop() {
+        // Thread-mode / test servers with no known peer id must not gate
+        // (they never expose the proxy on the network anyway).
+        let srv = server(Vec::new());
+        assert!(srv.require_self_identity(&tonic::Extensions::new()).is_ok());
+        assert!(srv
+            .require_self_identity(&ext_with(PeerId::random()))
+            .is_ok());
     }
 }

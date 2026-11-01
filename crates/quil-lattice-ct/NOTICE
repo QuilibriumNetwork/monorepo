@@ -1,0 +1,20 @@
+The experimental portable Gaussian reference in
+src/amount_candidate/relation/backend/portable/gaussian.rs is adapted from
+labrados gaussian.c at commit 3f95485139ffaa65fe572da809b90772901372e5.
+
+Copyright (C) 2026, IBM Corp.
+Licensed under the Apache License, Version 2.0.
+https://www.apache.org/licenses/LICENSE-2.0
+
+The upstream exponential approximation identifies its algorithm as derived
+from the public-domain fdlibm e_exp.c implementation.
+
+The adaptation replaces architecture-specific randomness access with the
+portable expansion module, uses explicit little-endian loads, checked sizing
+and output conversion, and adds numerical domain checks. It is experimental.
+
+The experimental short-challenge reference in portable/challenge.rs and its
+roots.rs table are adapted from poly.c at the same labrados commit, under the
+same IBM copyright and Apache-2.0 license. The Rust adaptation replaces SIMD
+polynomial storage with canonical portable ring values and retains the scalar
+FFT constants and sampling schedule for reference compatibility testing.

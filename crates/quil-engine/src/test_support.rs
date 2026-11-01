@@ -15,9 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use quil_types::consensus::{
-    ProverInfo, ProverRegistry, ProverShardSummary, ProverStatus,
-};
+use quil_types::consensus::{ProverInfo, ProverRegistry, ProverShardSummary, ProverStatus};
 use quil_types::error::Result;
 
 use crate::worker::{WorkerInfo, WorkerManager};
@@ -34,6 +32,19 @@ pub struct TestProverRegistry {
     /// `None`, falls back to the first prover's address. Matches
     /// the leader-pin behavior the `committee` tests need.
     next_prover: Mutex<Option<Vec<u8>>>,
+    /// Registered storage leaf roots, keyed by `(member, leaf_id)` →
+    /// `(leaf_root, num_blocks, epoch)`. Production populates the equivalent via
+    /// the confirm intrinsic writing the prover trie; tests register directly so
+    /// the frame validator's registered-leaf cross-check on storage attestations
+    /// can pass. See [`Self::register_leaf_root`] / [`ProverRegistry::get_leaf_root`].
+    #[allow(clippy::type_complexity)]
+    leaf_roots: Mutex<std::collections::HashMap<(Vec<u8>, Vec<u8>, u64), (Vec<u8>, u64, u64)>>,
+    /// Storage seat slots, keyed by `(member, filter, epoch)`
+    /// ([`Self::set_storage_seat_slot`] / [`ProverRegistry::get_storage_seat_slot`]).
+    #[allow(clippy::type_complexity)]
+    seat_slots: Mutex<
+        std::collections::HashMap<(Vec<u8>, Vec<u8>, u64), quil_types::consensus::StorageSeatSlot>,
+    >,
 }
 
 impl Default for TestProverRegistry {
@@ -48,7 +59,39 @@ impl TestProverRegistry {
             provers: Mutex::new(Vec::new()),
             summaries: Mutex::new(Vec::new()),
             next_prover: Mutex::new(None),
+            leaf_roots: Mutex::new(std::collections::HashMap::new()),
+            seat_slots: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Record `member`'s storage seat slot on `filter` for `slot.epoch`.
+    pub fn set_storage_seat_slot(
+        &self,
+        member: &[u8],
+        filter: &[u8],
+        slot: quil_types::consensus::StorageSeatSlot,
+    ) {
+        self.seat_slots
+            .lock()
+            .unwrap()
+            .insert((member.to_vec(), filter.to_vec(), slot.epoch), slot);
+    }
+
+    /// Register a member's storage leaf root so `get_leaf_root` returns it (the
+    /// frame validator cross-checks every storage-attestation opening against
+    /// this). `leaf_id` is the opening's `shard_id` (`leaf_id_bytes(filter, prefix)`).
+    pub fn register_leaf_root(
+        &self,
+        member: &[u8],
+        leaf_id: &[u8],
+        leaf_root: Vec<u8>,
+        num_blocks: u64,
+        epoch: u64,
+    ) {
+        self.leaf_roots.lock().unwrap().insert(
+            (member.to_vec(), leaf_id.to_vec(), epoch),
+            (leaf_root, num_blocks, epoch),
+        );
     }
 
     pub fn with_provers(provers: Vec<ProverInfo>) -> Self {
@@ -84,6 +127,19 @@ impl TestProverRegistry {
 }
 
 impl ProverRegistry for TestProverRegistry {
+    fn get_storage_seat_slot(
+        &self,
+        member: &[u8],
+        filter: &[u8],
+        epoch: u64,
+    ) -> Result<Option<quil_types::consensus::StorageSeatSlot>> {
+        Ok(self
+            .seat_slots
+            .lock()
+            .unwrap()
+            .get(&(member.to_vec(), filter.to_vec(), epoch))
+            .cloned())
+    }
     fn get_prover_info(&self, address: &[u8]) -> Result<Option<ProverInfo>> {
         Ok(self
             .provers
@@ -94,7 +150,26 @@ impl ProverRegistry for TestProverRegistry {
             .cloned())
     }
 
-    fn get_next_prover(&self, _input: &[u8; 32], _filter: &[u8]) -> Result<Vec<u8>> {
+    fn get_leaf_root(
+        &self,
+        member: &[u8],
+        leaf_id: &[u8],
+        epoch: u64,
+    ) -> Result<Option<(Vec<u8>, u64, u64)>> {
+        Ok(self
+            .leaf_roots
+            .lock()
+            .unwrap()
+            .get(&(member.to_vec(), leaf_id.to_vec(), epoch))
+            .cloned())
+    }
+
+    fn get_next_prover(
+        &self,
+        _input: &[u8; 32],
+        _filter: &[u8],
+        _frame_number: u64,
+    ) -> Result<Vec<u8>> {
         if let Some(addr) = self.next_prover.lock().unwrap().clone() {
             return Ok(addr);
         }
@@ -107,7 +182,12 @@ impl ProverRegistry for TestProverRegistry {
             .unwrap_or_default())
     }
 
-    fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<Vec<u8>>> {
+    fn get_ordered_provers(
+        &self,
+        _: &[u8; 32],
+        _: &[u8],
+        _frame_number: u64,
+    ) -> Result<Vec<Vec<u8>>> {
         Ok(self
             .provers
             .lock()
@@ -117,15 +197,36 @@ impl ProverRegistry for TestProverRegistry {
             .collect())
     }
 
-    fn get_active_provers(&self, _filter: &[u8]) -> Result<Vec<ProverInfo>> {
-        Ok(self
-            .provers
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|p| p.status == ProverStatus::Active)
-            .cloned()
-            .collect())
+    fn get_active_provers(&self, filter: &[u8], frame_number: u64) -> Result<Vec<ProverInfo>> {
+        let provers = self.provers.lock().unwrap();
+        // Match the trait's committee contract: serving Leaving allocations
+        // remain members, while Joining/Paused are not active proof producers.
+        // Allocation-free Active fixtures retain the harness shorthand for
+        // an all-shard committee; an empty filter queries global membership.
+        let members = |floor: bool| {
+            provers
+                .iter()
+                .filter(|p| {
+                    (p.status == ProverStatus::Active
+                        && (filter.is_empty() || p.allocations.is_empty()))
+                        || p.allocations.iter().any(|a| {
+                            a.confirmation_filter == filter
+                                && (matches!(
+                                    a.effective_status(frame_number),
+                                    quil_types::consensus::EffectiveStatus::Active
+                                        | quil_types::consensus::EffectiveStatus::Leaving
+                                ) || (floor && a.status == ProverStatus::Active))
+                        })
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let strict = members(false);
+        Ok(if strict.is_empty() && !filter.is_empty() {
+            members(true)
+        } else {
+            strict
+        })
     }
 
     fn get_prover_count(&self, _filter: &[u8]) -> Result<usize> {
@@ -151,10 +252,7 @@ impl ProverRegistry for TestProverRegistry {
             .collect())
     }
 
-    fn get_prover_shard_summaries(
-        &self,
-        _frame_number: u64,
-    ) -> Result<Vec<ProverShardSummary>> {
+    fn get_prover_shard_summaries(&self, _frame_number: u64) -> Result<Vec<ProverShardSummary>> {
         Ok(self.summaries.lock().unwrap().clone())
     }
 }
@@ -164,15 +262,28 @@ impl ProverRegistry for TestProverRegistry {
 /// `HashMap<core_id, WorkerInfo>` so test setup is uniform:
 ///
 /// - `add(info)` inserts/replaces a worker directly (use for
-///   tests that need pre-populated state).
+/// tests that need pre-populated state).
 /// - `set_worker_filter(core_id, filter, start_consensus)`
-///   matches the production trait method and creates missing
-///   workers on demand.
+/// matches the production trait method and creates missing
+/// workers on demand.
 /// - `set_manually_managed` is also wired so tests can flip
-///   the manual flag without going through the full Worker
-///   plumbing.
+/// the manual flag without going through the full Worker
+/// plumbing.
 pub struct TestWorkerManager {
     workers: Mutex<HashMap<u32, WorkerInfo>>,
+    /// Configured worker count; `None` uses the number of workers.
+    capacity: Mutex<Option<usize>>,
+    evictions: Mutex<Vec<(u32, Vec<Vec<u8>>)>>,
+    executions: Mutex<HashMap<u32, (Vec<u8>, quil_types::proto::node::WorkerExecution)>>,
+    unanswered: Mutex<HashMap<u32, (Vec<u8>, &'static str)>>,
+    shard_data: Mutex<HashMap<u32, Vec<(Vec<u8>, u64)>>>,
+    /// Workers above this count drain, as a thread manager's above its
+    /// configured count; `None` drains none.
+    drain_above: Mutex<Option<u32>>,
+    retired: Mutex<Vec<u32>>,
+    refuse_retirement: Mutex<bool>,
+    /// Workers whose eviction requests fail, as when their channel is full.
+    failing_evictions: Mutex<Vec<u32>>,
 }
 
 impl Default for TestWorkerManager {
@@ -185,7 +296,76 @@ impl TestWorkerManager {
     pub fn new() -> Self {
         Self {
             workers: Mutex::new(HashMap::new()),
+            capacity: Mutex::new(None),
+            evictions: Mutex::new(Vec::new()),
+            executions: Mutex::new(HashMap::new()),
+            unanswered: Mutex::new(HashMap::new()),
+            shard_data: Mutex::new(HashMap::new()),
+            drain_above: Mutex::new(None),
+            retired: Mutex::new(Vec::new()),
+            refuse_retirement: Mutex::new(false),
+            failing_evictions: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Configure `count` workers, so those above it drain, as after an
+    /// operator lowers a thread manager's worker count.
+    pub fn set_configured_count(&self, count: u32) {
+        self.set_allocation_capacity(count as usize);
+        *self.drain_above.lock().unwrap() = Some(count);
+    }
+
+    /// Fail every retirement, as when a worker cannot be stopped.
+    pub fn refuse_retirement(&self) {
+        *self.refuse_retirement.lock().unwrap() = true;
+    }
+
+    /// Fail every eviction request to `cores`; failed requests are not
+    /// recorded in [`Self::evictions`].
+    pub fn fail_evictions(&self, cores: &[u32]) {
+        self.failing_evictions.lock().unwrap().extend(cores);
+    }
+
+    /// Workers retired so far, in order.
+    pub fn retired(&self) -> Vec<u32> {
+        self.retired.lock().unwrap().clone()
+    }
+
+    /// The shards whose data `core_id`'s store holds, with their cursors.
+    pub fn set_shard_data(&self, core_id: u32, shards: Vec<(Vec<u8>, u64)>) {
+        self.shard_data.lock().unwrap().insert(core_id, shards);
+    }
+
+    /// Configure fewer workers than there are records, as after an operator
+    /// lowers the worker count.
+    pub fn set_allocation_capacity(&self, capacity: usize) {
+        *self.capacity.lock().unwrap() = Some(capacity);
+    }
+
+    /// The execution report `core_id`'s engine gives for `filter`.
+    pub fn set_execution(
+        &self,
+        core_id: u32,
+        filter: &[u8],
+        execution: quil_types::proto::node::WorkerExecution,
+    ) {
+        self.executions
+            .lock()
+            .unwrap()
+            .insert(core_id, (filter.to_vec(), execution));
+    }
+
+    /// `core_id`, bound to `filter`, does not answer its report request.
+    pub fn set_unanswered(&self, core_id: u32, filter: &[u8], reason: &'static str) {
+        self.unanswered
+            .lock()
+            .unwrap()
+            .insert(core_id, (filter.to_vec(), reason));
+    }
+
+    /// Payload evictions requested so far, as `(core, protected filters)`.
+    pub fn evictions(&self) -> Vec<(u32, Vec<Vec<u8>>)> {
+        self.evictions.lock().unwrap().clone()
     }
 
     /// Insert or replace a worker directly. Useful when a test
@@ -213,12 +393,88 @@ impl TestWorkerManager {
 }
 
 impl WorkerManager for TestWorkerManager {
-    fn set_worker_filter(
-        &self,
-        core_id: u32,
-        filter: &[u8],
-        start_consensus: bool,
-    ) -> Result<()> {
+    fn allocation_capacity(&self) -> Result<usize> {
+        let configured = *self.capacity.lock().unwrap();
+        Ok(configured.unwrap_or_else(|| self.workers.lock().unwrap().len()))
+    }
+
+    fn is_draining(&self, core_id: u32) -> bool {
+        self.drain_above
+            .lock()
+            .unwrap()
+            .is_some_and(|count| core_id > count)
+    }
+
+    /// Like the thread manager: only an idle draining worker is retired.
+    fn retire_worker(&self, core_id: u32) -> Result<()> {
+        if !self.is_draining(core_id) {
+            return Err(quil_types::error::QuilError::InvalidArgument(format!(
+                "worker {core_id} is not draining"
+            )));
+        }
+        if *self.refuse_retirement.lock().unwrap() {
+            return Err(quil_types::error::QuilError::ExecutionUnavailable(format!(
+                "worker {core_id} cannot stop"
+            )));
+        }
+        let mut workers = self.workers.lock().unwrap();
+        if workers
+            .get(&core_id)
+            .is_some_and(|w| !w.filter.is_empty() || w.pending_filter_frame != 0)
+        {
+            return Err(quil_types::error::QuilError::InvalidArgument(format!(
+                "worker {core_id} holds a seat"
+            )));
+        }
+        if workers.remove(&core_id).is_some() {
+            self.retired.lock().unwrap().push(core_id);
+        }
+        Ok(())
+    }
+
+    /// Reports set with `set_execution`, for workers still bound to their filter.
+    fn worker_execution(&self) -> Vec<(u32, Vec<u8>, quil_types::proto::node::WorkerExecution)> {
+        let workers = self.workers.lock().unwrap();
+        self.executions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(core_id, (filter, _))| {
+                workers.get(core_id).is_some_and(|w| &w.filter == filter)
+            })
+            .map(|(core_id, (filter, execution))| (*core_id, filter.clone(), execution.clone()))
+            .collect()
+    }
+
+    /// Workers set with `set_unanswered`, still bound to their filter.
+    fn unanswered_workers(&self) -> Vec<(u32, Vec<u8>, &'static str)> {
+        let workers = self.workers.lock().unwrap();
+        self.unanswered
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(core_id, (filter, _))| {
+                workers.get(core_id).is_some_and(|w| &w.filter == filter)
+            })
+            .map(|(core_id, (filter, reason))| (*core_id, filter.clone(), *reason))
+            .collect()
+    }
+
+    fn evict_payload(&self, core_id: u32, keep: Vec<Vec<u8>>) -> Result<()> {
+        if self.failing_evictions.lock().unwrap().contains(&core_id) {
+            return Err(quil_types::error::QuilError::ExecutionUnavailable(
+                "payload eviction: channel full".into(),
+            ));
+        }
+        self.evictions.lock().unwrap().push((core_id, keep));
+        Ok(())
+    }
+
+    fn shard_data(&self) -> HashMap<u32, Vec<(Vec<u8>, u64)>> {
+        self.shard_data.lock().unwrap().clone()
+    }
+
+    fn set_worker_filter(&self, core_id: u32, filter: &[u8], start_consensus: bool) -> Result<()> {
         let mut g = self.workers.lock().unwrap();
         let entry = g.entry(core_id).or_insert(WorkerInfo {
             core_id,
@@ -235,7 +491,15 @@ impl WorkerManager for TestWorkerManager {
     }
 
     fn deallocate_worker(&self, core_id: u32) -> Result<()> {
-        self.workers.lock().unwrap().remove(&core_id);
+        // Match ThreadWorkerManager: releasing an allocation makes the
+        // existing core idle; it does not remove the worker from the node.
+        // Keeping the entry is essential for allocator tests that release a
+        // stale filter and immediately bind that core to a live allocation.
+        if let Some(worker) = self.workers.lock().unwrap().get_mut(&core_id) {
+            worker.filter.clear();
+            worker.allocated = false;
+            worker.pending_filter_frame = 0;
+        }
         Ok(())
     }
 
@@ -244,8 +508,7 @@ impl WorkerManager for TestWorkerManager {
     }
 
     fn range_workers(&self) -> Result<Vec<WorkerInfo>> {
-        let mut out: Vec<WorkerInfo> =
-            self.workers.lock().unwrap().values().cloned().collect();
+        let mut out: Vec<WorkerInfo> = self.workers.lock().unwrap().values().cloned().collect();
         out.sort_by_key(|w| w.core_id);
         Ok(out)
     }
@@ -332,12 +595,7 @@ impl SpawningWorkerManager {
 }
 
 impl crate::worker::WorkerManager for SpawningWorkerManager {
-    fn set_worker_filter(
-        &self,
-        core_id: u32,
-        filter: &[u8],
-        start_consensus: bool,
-    ) -> Result<()> {
+    fn set_worker_filter(&self, core_id: u32, filter: &[u8], start_consensus: bool) -> Result<()> {
         let mut g = self.workers.lock().unwrap();
         let entry = g.entry(core_id).or_insert(crate::worker::WorkerInfo {
             core_id,
@@ -467,10 +725,7 @@ impl crate::prover_message_transport::ProverMessageTransport for TestProverMessa
         Ok(self.head_header.lock().unwrap().clone())
     }
 
-    async fn publish_prover_bundle(
-        &self,
-        bundle_bytes: Vec<u8>,
-    ) -> quil_types::error::Result<()> {
+    async fn publish_prover_bundle(&self, bundle_bytes: Vec<u8>) -> quil_types::error::Result<()> {
         // Capture and forward.
         let sink = self.sink.lock().unwrap().clone();
         self.outbound.lock().unwrap().push(bundle_bytes.clone());
@@ -514,11 +769,9 @@ impl quil_keys::KeyManager for TestKeyManager {
         key_type: quil_types::crypto::KeyType,
     ) -> quil_types::error::Result<Box<dyn quil_types::crypto::Signer>> {
         match key_type {
-            quil_types::crypto::KeyType::Bls48581G1 => {
-                use quil_types::crypto::BlsConstructor;
-                let ctor = quil_crypto::Bls48581KeyConstructor;
-                ctor.from_bytes(&self.bls_private, &self.bls_public)
-            }
+            quil_types::crypto::KeyType::Falcon512 => Ok(Box::new(
+                quil_crypto::FalconSigner::from_bytes(&self.bls_private, &self.bls_public),
+            )),
             other => Err(quil_types::error::QuilError::Internal(format!(
                 "TestKeyManager does not support key type {:?}",
                 other
@@ -531,7 +784,7 @@ impl quil_keys::KeyManager for TestKeyManager {
         key_type: quil_types::crypto::KeyType,
     ) -> quil_types::error::Result<Vec<u8>> {
         match key_type {
-            quil_types::crypto::KeyType::Bls48581G1 => Ok(self.bls_public.clone()),
+            quil_types::crypto::KeyType::Falcon512 => Ok(self.bls_public.clone()),
             other => Err(quil_types::error::QuilError::Internal(format!(
                 "TestKeyManager does not support key type {:?}",
                 other
@@ -544,7 +797,7 @@ impl quil_keys::KeyManager for TestKeyManager {
         key_type: quil_types::crypto::KeyType,
     ) -> quil_types::error::Result<Vec<u8>> {
         match key_type {
-            quil_types::crypto::KeyType::Bls48581G1 => Ok(self.bls_private.clone()),
+            quil_types::crypto::KeyType::Falcon512 => Ok(self.bls_private.clone()),
             other => Err(quil_types::error::QuilError::Internal(format!(
                 "TestKeyManager does not support key type {:?}",
                 other
@@ -587,4 +840,86 @@ impl quil_types::crypto::KeyManager for AcceptAllKeyManager {
     ) -> quil_types::error::Result<bool> {
         Ok(true)
     }
+}
+
+/// A real Simplex finalization of `seal` by every member of `session`, for
+/// tests that drive a committee handoff without running a consensus host.
+pub fn certify_seal(
+    session: &quil_cw_consensus::handoff::Session,
+    signers: &[quil_crypto::FalconSigner],
+    seal: &quil_cw_consensus::handoff::Seal,
+) -> Vec<u8> {
+    certify_proposal(
+        session,
+        signers,
+        seal.view,
+        seal.checkpoint.view,
+        seal.digest(),
+    )
+}
+
+/// A real Simplex finalization by every member of `session` of the proposal
+/// of `digest` at `view` over `parent` (0: the session's genesis).
+pub fn certify_proposal(
+    session: &quil_cw_consensus::handoff::Session,
+    signers: &[quil_crypto::FalconSigner],
+    view: u64,
+    parent: u64,
+    digest: [u8; 32],
+) -> Vec<u8> {
+    use quil_cw_consensus::{
+        _consensus::{
+            simplex::{
+                scheme::Namespace,
+                types::{Finalization, Proposal, Subject},
+            },
+            types::{Epoch, Round, View},
+        },
+        _crypto::{sha256::Digest, Signer as _},
+        _utils::{ordered::Set, N3f1},
+        app_cert::encode_finalization,
+        falcon_base::FalconPrivateKey,
+        falcon_scheme::Generic,
+        falcon_simplex::SimplexFalconScheme,
+    };
+    use quil_types::crypto::Signer as _;
+    let keys: Vec<FalconPrivateKey> = signers
+        .iter()
+        .map(|s| FalconPrivateKey::from_bytes(s.private_key(), s.public_key()).unwrap())
+        .collect();
+    let proposal = Proposal::new(
+        Round::new(Epoch::new(session.generation), View::new(view)),
+        View::new(parent),
+        Digest(digest),
+    );
+    let participants: Set<_> = keys
+        .iter()
+        .map(|key| key.public_key())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let schemes: Vec<Generic<Namespace>> = keys
+        .iter()
+        .cloned()
+        .map(|key| {
+            Generic::signer(&session.namespace().unwrap(), participants.clone(), key).unwrap()
+        })
+        .collect();
+    let votes: Vec<_> = schemes
+        .iter()
+        .map(|scheme| {
+            scheme
+                .sign::<SimplexFalconScheme, Digest>(Subject::Finalize {
+                    proposal: &proposal,
+                })
+                .unwrap()
+        })
+        .collect();
+    let certificate = schemes[0]
+        .assemble::<SimplexFalconScheme, _, N3f1>(votes)
+        .unwrap();
+    encode_finalization(&Finalization {
+        proposal,
+        certificate,
+    })
 }

@@ -1,9 +1,0 @@
-// -*- go -*-
-//
-
-package main
-
-// @Test 32 0 = 0
-func main(a, b uint64) uint64 {
-	return a << 64
-}

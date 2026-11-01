@@ -120,8 +120,7 @@ pub fn deserialize_node_solo(data: &[u8]) -> Result<VectorCommitmentNode> {
             };
             let leaf_count = read_i64(&mut r)? as usize;
             let longest_branch = read_i32(&mut r)? as usize;
-            let children: [Option<Box<VectorCommitmentNode>>; 64] =
-                std::array::from_fn(|_| None);
+            let children: [Option<Box<VectorCommitmentNode>>; 64] = std::array::from_fn(|_| None);
             // `full_prefix` is filled in by the walker from its descent path.
             Ok(VectorCommitmentNode::Branch(BranchNode {
                 prefix,
@@ -312,16 +311,24 @@ fn write_length_prefixed(w: &mut Vec<u8>, data: &[u8]) -> Result<()> {
 }
 
 fn read_length_prefixed<R: Read>(r: &mut R) -> Result<Vec<u8>> {
-    let len = read_u64(r)? as usize;
+    let len = usize::try_from(read_u64(r)?)
+        .map_err(|_| QuilError::Serialization("tree field length overflow".into()))?;
     if len > MAX_LENGTH_PREFIXED_FIELD {
         return Err(QuilError::Serialization(format!(
             "tree deserialize: length-prefixed field {} exceeds max {}",
             len, MAX_LENGTH_PREFIXED_FIELD,
         )));
     }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)
+    // Grow only for bytes actually present. Legacy tree blobs are also read
+    // while building bounded execution contexts; a short forged field must
+    // not allocate its declared (up to 16 MiB) length before returning EOF.
+    let mut buf = Vec::new();
+    r.take(len as u64)
+        .read_to_end(&mut buf)
         .map_err(|e| QuilError::Serialization(e.to_string()))?;
+    if buf.len() != len {
+        return Err(QuilError::Serialization("truncated tree field".into()));
+    }
     Ok(buf)
 }
 
@@ -357,6 +364,31 @@ fn read_i64<R: Read>(r: &mut R) -> Result<i64> {
 mod tests {
     use super::*;
     use num_bigint::BigInt;
+
+    #[test]
+    fn short_field_does_not_request_its_forged_declared_allocation() {
+        struct ShortRead {
+            data: io::Cursor<Vec<u8>>,
+            largest_request: usize,
+        }
+        impl Read for ShortRead {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.largest_request = self.largest_request.max(buffer.len());
+                self.data.read(buffer)
+            }
+        }
+        let mut reader = ShortRead {
+            data: io::Cursor::new((1u64 << 20).to_be_bytes().to_vec()),
+            largest_request: 0,
+        };
+        let error = read_length_prefixed(&mut reader).unwrap_err().to_string();
+        assert!(error.contains("truncated tree field"), "{error}");
+        assert!(
+            reader.largest_request <= 8192,
+            "requested {} bytes",
+            reader.largest_request
+        );
+    }
 
     #[test]
     fn test_roundtrip_nil() {
@@ -404,8 +436,7 @@ mod tests {
             commitment: vec![0x44; 64],
             size: BigInt::from(5),
         };
-        let mut children: [Option<Box<VectorCommitmentNode>>; 64] =
-            std::array::from_fn(|_| None);
+        let mut children: [Option<Box<VectorCommitmentNode>>; 64] = std::array::from_fn(|_| None);
         children[7] = Some(Box::new(VectorCommitmentNode::Leaf(child_leaf.clone())));
         children[42] = Some(Box::new(VectorCommitmentNode::Leaf(child_leaf)));
         let branch = BranchNode {
@@ -548,11 +579,7 @@ mod tests {
             Ok(_) => panic!("expected error for TYPE_NIL in solo format"),
             Err(e) => {
                 let msg = format!("{}", e);
-                assert!(
-                    msg.contains("unexpected node type byte"),
-                    "got {}",
-                    msg
-                );
+                assert!(msg.contains("unexpected node type byte"), "got {}", msg);
             }
         }
     }
@@ -583,7 +610,10 @@ mod tests {
         match result {
             VectorCommitmentNode::Leaf(l) => {
                 assert_eq!(l.key, vec![1, 2, 3]);
-                assert_eq!(l.value, original_value, "blob must round-trip the leaf value");
+                assert_eq!(
+                    l.value, original_value,
+                    "blob must round-trip the leaf value"
+                );
                 assert_eq!(l.commitment, original_commitment);
                 assert_eq!(l.size, BigInt::from(100));
             }
@@ -612,24 +642,41 @@ mod tests {
                 h.update(data);
                 Ok(h.finalize().to_vec())
             }
-            fn prove_raw(
-                &self, _data: &[u8], _index: u64, _poly_size: u64,
-            ) -> QResult<Vec<u8>> { Ok(vec![]) }
+            fn prove_raw(&self, _data: &[u8], _index: u64, _poly_size: u64) -> QResult<Vec<u8>> {
+                Ok(vec![])
+            }
             fn verify_raw(
-                &self, _data: &[u8], _commit: &[u8], _index: u64,
-                _proof: &[u8], _poly_size: u64,
-            ) -> QResult<bool> { Ok(true) }
+                &self,
+                _data: &[u8],
+                _commit: &[u8],
+                _index: u64,
+                _proof: &[u8],
+                _poly_size: u64,
+            ) -> QResult<bool> {
+                Ok(true)
+            }
             fn prove_multiple(
-                &self, _commitments: &[&[u8]], _polys: &[&[u8]],
-                _indices: &[u64], _poly_size: u64,
+                &self,
+                _commitments: &[&[u8]],
+                _polys: &[&[u8]],
+                _indices: &[u64],
+                _poly_size: u64,
             ) -> QResult<Box<dyn quil_types::crypto::Multiproof>> {
-                Err(quil_types::error::QuilError::Internal("batch multiproof generation not supported".into()))
+                Err(quil_types::error::QuilError::Internal(
+                    "batch multiproof generation not supported".into(),
+                ))
             }
             fn verify_multiple(
-                &self, _commitments: &[&[u8]], _evaluations: &[&[u8]],
-                _indices: &[u64], _poly_size: u64, _multi_commitment: &[u8],
+                &self,
+                _commitments: &[&[u8]],
+                _evaluations: &[&[u8]],
+                _indices: &[u64],
+                _poly_size: u64,
+                _multi_commitment: &[u8],
                 _proof: &[u8],
-            ) -> bool { true }
+            ) -> bool {
+                true
+            }
         }
 
         // Outer-tree leaves carry a non-empty `hash_target` so the
@@ -640,7 +687,8 @@ mod tests {
         for i in 0u8..16 {
             let key = vec![i, i.wrapping_add(1), i.wrapping_add(2), 0xAB];
             let hash_target = vec![i; 64];
-            tree.insert(&key, &[i, i, i], &hash_target, &BigInt::from(i as i64 + 1)).unwrap();
+            tree.insert(&key, &[i, i, i], &hash_target, &BigInt::from(i as i64 + 1))
+                .unwrap();
         }
         let prover = StubProver;
         let original_root = tree.commit(&prover);
@@ -653,7 +701,9 @@ mod tests {
         // Re-committing on the deserialized tree should also yield the
         // same root, since all commitments are already cached in the
         // deserialized nodes.
-        let mut reloaded_tree = VectorCommitmentTree { root: Some(deserialized) };
+        let mut reloaded_tree = VectorCommitmentTree {
+            root: Some(deserialized),
+        };
         let reloaded_root = reloaded_tree.commit(&prover);
         assert_eq!(reloaded_root, original_root);
     }

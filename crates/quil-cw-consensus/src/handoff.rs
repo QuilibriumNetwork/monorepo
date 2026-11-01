@@ -1,0 +1,772 @@
+//! Authenticated committee sessions and terminal Simplex checkpoints.
+//!
+//! A seal is a consensus payload in the OLD session. A quorum certificate for
+//! an out-of-band statement about a local head is not a substitute. The app
+//! automaton must check the selected parent and materialized roots before voting,
+//! and refuse descendants of a seal other than a re-seal of the same checkpoint
+//! (`automaton::HandoffProposer::with_seal_parents`). Global execution
+//! authorizes the successor only after every source session in its transition
+//! has supplied such a seal.
+
+use commonware_consensus::{
+    simplex::types::Proposal,
+    types::{Epoch, Round, View},
+};
+use commonware_cryptography::{
+    certificate::Attestation,
+    sha256::{Digest as Sha256Digest, Sha256},
+    Hasher as _,
+};
+use commonware_utils::{ordered::Set, Participant};
+use quil_types::error::{QuilError, Result};
+
+use crate::app_cert::{verify_finalization_details, VerifiedFinalization};
+use crate::falcon_base::{FalconPublicKey, FalconSignature};
+use crate::falcon_simplex::SimplexFalconScheme;
+
+pub mod automaton;
+
+pub const MAX_MEMBERS: usize = 4096;
+pub const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_FILTER_BYTES: usize = 66;
+const SESSION_MAGIC: &[u8] = b"QHSS\x01";
+const SEAL_MAGIC: &[u8] = b"QHSL\x01";
+
+fn invalid(message: &str) -> QuilError {
+    QuilError::InvalidArgument(format!("committee handoff: {message}"))
+}
+
+/// A globally authorized, immutable session. Its ID binds all configuration,
+/// including the checkpoint that is implicitly finalized at Simplex view zero.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Session {
+    pub chain_id: [u8; 32],
+    pub filter: Vec<u8>,
+    pub generation: u64,
+    pub genesis: [u8; 32],
+    pub base_frame: u64,
+    pub authorization: [u8; 32],
+    /// Strictly ascending Falcon public keys, without duplicates.
+    pub members: Vec<Vec<u8>>,
+}
+
+impl Session {
+    pub fn validate(&self) -> Result<()> {
+        if !(32..=MAX_FILTER_BYTES).contains(&self.filter.len()) {
+            return Err(invalid("invalid full shard filter length"));
+        }
+        if self.members.is_empty()
+            || self.members.len() > MAX_MEMBERS
+            || self.members.windows(2).any(|pair| pair[0] >= pair[1])
+            || self
+                .members
+                .iter()
+                .any(|key| FalconPublicKey::from_bytes(key).is_none())
+        {
+            return Err(invalid(
+                "members must be bounded, unique, sorted Falcon keys",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut out = SESSION_MAGIC.to_vec();
+        out.extend_from_slice(&self.chain_id);
+        put_bytes(&mut out, &self.filter)?;
+        out.extend_from_slice(&self.generation.to_be_bytes());
+        out.extend_from_slice(&self.genesis);
+        out.extend_from_slice(&self.base_frame.to_be_bytes());
+        out.extend_from_slice(&self.authorization);
+        out.extend_from_slice(&(self.members.len() as u32).to_be_bytes());
+        for key in &self.members {
+            put_bytes(&mut out, key)?;
+        }
+        if out.len() > MAX_RECORD_BYTES {
+            return Err(invalid("session exceeds size limit"));
+        }
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut c = Cursor::new(bytes)?;
+        c.magic(SESSION_MAGIC)?;
+        let chain_id = c.array()?;
+        let filter = c.bytes(MAX_FILTER_BYTES)?;
+        let generation = c.u64()?;
+        let genesis = c.array()?;
+        let base_frame = c.u64()?;
+        let authorization = c.array()?;
+        let n = c.count(MAX_MEMBERS, 4 + quil_crypto::FALCON_PUBLIC_KEY_LEN)?;
+        let mut members = Vec::with_capacity(n);
+        for _ in 0..n {
+            members.push(c.bytes(quil_crypto::FALCON_PUBLIC_KEY_LEN)?);
+        }
+        c.finish()?;
+        let session = Self {
+            chain_id,
+            filter,
+            generation,
+            genesis,
+            base_frame,
+            authorization,
+            members,
+        };
+        session.validate()?;
+        Ok(session)
+    }
+
+    pub fn id(&self) -> Result<[u8; 32]> {
+        Ok(Sha256::hash(&self.encode()?).0)
+    }
+
+    /// Generation zero retains the deployed namespace ONLY for an explicitly
+    /// registered legacy source. It must not be used for a successor session.
+    /// Legacy journal reconciliation remains the migration caller's obligation.
+    pub fn namespace(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        if self.generation == 0 {
+            let mut namespace = b"appshard".to_vec();
+            namespace.extend_from_slice(&self.filter);
+            return Ok(namespace);
+        }
+        let mut namespace = b"quil/app/simplex/session/v1/".to_vec();
+        namespace.extend_from_slice(&self.id()?);
+        Ok(namespace)
+    }
+}
+
+/// State AFTER materializing the last data frame. Header pre-state roots alone
+/// do not establish this checkpoint. Outgoing history must be durably available
+/// and authenticated by `history_root` before a successor is allowed to vote.
+///
+/// In a seal, `view` is the view of the seal's consensus parent: the data
+/// frame's own, or, for a re-seal, the view of the notarized seal it extends
+/// (`verify_seal` binds the certified parent view to it). `frame`, `digest`
+/// and the roots always name the data frame (at the base, the genesis).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub frame: u64,
+    pub view: u64,
+    pub digest: [u8; 32],
+    pub state_roots: [[u8; 32]; 4],
+    pub history_root: [u8; 32],
+}
+
+impl Checkpoint {
+    pub fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.frame.to_be_bytes());
+        out.extend_from_slice(&self.view.to_be_bytes());
+        out.extend_from_slice(&self.digest);
+        for root in self.state_roots {
+            out.extend_from_slice(&root);
+        }
+        out.extend_from_slice(&self.history_root);
+    }
+
+    pub fn read(c: &mut Cursor<'_>) -> Result<Self> {
+        Ok(Self {
+            frame: c.u64()?,
+            view: c.u64()?,
+            digest: c.array()?,
+            state_roots: [c.array()?, c.array()?, c.array()?, c.array()?],
+            history_root: c.array()?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Seal {
+    pub request: [u8; 32],
+    pub session: [u8; 32],
+    pub view: u64,
+    pub checkpoint: Checkpoint,
+}
+
+impl Seal {
+    /// Identify the reserved payload family before strict decoding. Unsupported
+    /// versions and malformed seals must not fall through to data-frame parsing.
+    pub fn is_encoding(bytes: &[u8]) -> bool {
+        bytes.starts_with(&SEAL_MAGIC[..4])
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = SEAL_MAGIC.to_vec();
+        out.extend_from_slice(&self.request);
+        out.extend_from_slice(&self.session);
+        out.extend_from_slice(&self.view.to_be_bytes());
+        self.checkpoint.write(&mut out);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut c = Cursor::new(bytes)?;
+        c.magic(SEAL_MAGIC)?;
+        let seal = Self {
+            request: c.array()?,
+            session: c.array()?,
+            view: c.u64()?,
+            checkpoint: Checkpoint::read(&mut c)?,
+        };
+        c.finish()?;
+        Ok(seal)
+    }
+
+    pub fn digest(&self) -> [u8; 32] {
+        Sha256::hash(&self.encode()).0
+    }
+
+    pub fn validate(&self, session: &Session, request: &[u8; 32]) -> Result<()> {
+        self.validate_with(session, request, false)
+    }
+
+    /// [`Self::validate`], also accepting, when `base_reseal`, a re-seal of a
+    /// seal at the session base: the genesis at the view of the notarized
+    /// seal it extends (`automaton::HandoffProposer::with_seal_parents`).
+    /// Generation zero's base is a certified legacy frame no seal names.
+    pub fn validate_with(
+        &self,
+        session: &Session,
+        request: &[u8; 32],
+        base_reseal: bool,
+    ) -> Result<()> {
+        if self.session != session.id()? || &self.request != request {
+            return Err(invalid("seal belongs to another request or session"));
+        }
+        if self.view <= self.checkpoint.view || self.checkpoint.frame < session.base_frame {
+            return Err(invalid("seal regresses its checkpoint"));
+        }
+        if self.checkpoint.frame == session.base_frame {
+            let reseal = base_reseal && session.generation != 0;
+            if (self.checkpoint.view != 0 && !reseal) || self.checkpoint.digest != session.genesis {
+                return Err(invalid("seal changes the authorized genesis"));
+            }
+        } else if self.checkpoint.view == 0 {
+            return Err(invalid(
+                "a materialized data frame must have a nonzero view",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn verify_seal(
+    session: &Session,
+    request: &[u8; 32],
+    seal: &Seal,
+    certificate: &[u8],
+) -> Option<VerifiedFinalization> {
+    verify_seal_with(session, request, seal, certificate, false)
+}
+
+/// [`verify_seal`], also accepting a re-seal of a seal at the session base
+/// when `base_reseal` ([`Seal::validate_with`]). GLOBAL passes it from its
+/// seal recovery frame; a member authenticating its own finalized seal
+/// always does.
+pub fn verify_seal_with(
+    session: &Session,
+    request: &[u8; 32],
+    seal: &Seal,
+    certificate: &[u8],
+    base_reseal: bool,
+) -> Option<VerifiedFinalization> {
+    if certificate.len() > MAX_RECORD_BYTES {
+        return None;
+    }
+    seal.validate_with(session, request, base_reseal).ok()?;
+    let verified = verify_finalization_details(
+        certificate,
+        &session.members,
+        &session.namespace().ok()?,
+        seal.digest(),
+    )?;
+    let proposal = &verified.finalization.proposal;
+    if proposal.round.epoch().get() != session.generation
+        || proposal.round.view().get() != seal.view
+        || proposal.parent.get() != seal.checkpoint.view
+    {
+        return None;
+    }
+    Some(verified)
+}
+
+/// Checks single votes of one session's members, as GLOBAL checks a presence
+/// report. A certificate proves that a quorum voted; a vote proves only that
+/// its signer did.
+pub struct SessionVotes {
+    scheme: SimplexFalconScheme,
+}
+
+impl SessionVotes {
+    pub fn new(session: &Session) -> Result<Self> {
+        let keys: Vec<FalconPublicKey> = session
+            .members
+            .iter()
+            .map(|key| FalconPublicKey::from_bytes(key))
+            .collect::<Option<_>>()
+            .ok_or_else(|| invalid("members must be Falcon keys"))?;
+        let participants: Set<FalconPublicKey> = keys
+            .try_into()
+            .map_err(|_| invalid("members must be unique"))?;
+        Ok(Self {
+            scheme: SimplexFalconScheme::verifier(&session.namespace()?, participants),
+        })
+    }
+
+    /// Whether `signature` is member `signer`'s NOTARIZE of the proposal at
+    /// round (`epoch`, `view`) with `parent` and `payload`. `signer` indexes
+    /// the session's sorted members: an index outside them fails, as does a
+    /// signature of another length or another vote of the same round.
+    pub fn verify_notarize(
+        &self,
+        epoch: u64,
+        view: u64,
+        parent: u64,
+        payload: [u8; 32],
+        signer: u32,
+        signature: &[u8],
+    ) -> bool {
+        let mut bytes = signature;
+        let Ok(signature) = <FalconSignature as commonware_codec::Read>::read_cfg(&mut bytes, &())
+        else {
+            return false;
+        };
+        if !bytes.is_empty() {
+            return false;
+        }
+        let proposal = Proposal::new(
+            Round::new(Epoch::new(epoch), View::new(view)),
+            View::new(parent),
+            Sha256Digest(payload),
+        );
+        let attestation: Attestation<SimplexFalconScheme> = Attestation {
+            signer: Participant::new(signer),
+            signature: signature.into(),
+        };
+        self.scheme.verify_notarize(&proposal, &attestation)
+    }
+
+    /// Whether `signature` is member `signer`'s NULLIFY of round (`epoch`,
+    /// `view`). The round is all a nullify signs, so it can be signed for
+    /// any view once the session exists; the namespace binds the session.
+    pub fn verify_nullify(&self, epoch: u64, view: u64, signer: u32, signature: &[u8]) -> bool {
+        let mut bytes = signature;
+        let Ok(signature) = <FalconSignature as commonware_codec::Read>::read_cfg(&mut bytes, &())
+        else {
+            return false;
+        };
+        if !bytes.is_empty() {
+            return false;
+        }
+        let vote = commonware_consensus::simplex::types::Nullify::<SimplexFalconScheme> {
+            round: Round::new(Epoch::new(epoch), View::new(view)),
+            attestation: Attestation {
+                signer: Participant::new(signer),
+                signature: signature.into(),
+            },
+        };
+        self.scheme.verify_nullify(&vote)
+    }
+}
+
+/// Small bounded codec shared with the global authorization record. Counts are
+/// checked against both protocol limits and available input before allocating.
+pub fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    let len = u32::try_from(bytes.len()).map_err(|_| invalid("field exceeds size limit"))?;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+pub struct Cursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+impl<'a> Cursor<'a> {
+    pub fn new(bytes: &'a [u8]) -> Result<Self> {
+        if bytes.len() > MAX_RECORD_BYTES {
+            return Err(invalid("record exceeds size limit"));
+        }
+        Ok(Self { bytes, offset: 0 })
+    }
+    pub fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(n)
+            .ok_or_else(|| invalid("length overflow"))?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| invalid("truncated record"))?;
+        self.offset = end;
+        Ok(value)
+    }
+    pub fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        Ok(self.take(N)?.try_into().unwrap())
+    }
+    pub fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_be_bytes(self.array()?))
+    }
+    pub fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(self.array()?))
+    }
+    pub fn count(&mut self, max: usize, min_bytes: usize) -> Result<usize> {
+        let n = self.u32()? as usize;
+        if n > max || n > self.bytes.len().saturating_sub(self.offset) / min_bytes.max(1) {
+            return Err(invalid("invalid collection length"));
+        }
+        Ok(n)
+    }
+    pub fn bytes(&mut self, max: usize) -> Result<Vec<u8>> {
+        let n = self.u32()? as usize;
+        if n > max {
+            return Err(invalid("field exceeds size limit"));
+        }
+        Ok(self.take(n)?.to_vec())
+    }
+    pub fn magic(&mut self, expected: &[u8]) -> Result<()> {
+        if self.take(expected.len())? != expected {
+            return Err(invalid("unknown record version"));
+        }
+        Ok(())
+    }
+    pub fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+    /// Whether every byte has been read.
+    pub fn is_finished(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+    pub fn finish(self) -> Result<()> {
+        if self.offset != self.bytes.len() {
+            return Err(invalid("trailing record bytes"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        app_cert::encode_finalization, falcon_base::FalconPrivateKey,
+        falcon_simplex::SimplexFalconScheme,
+    };
+    use commonware_consensus::{
+        simplex::types::{Finalization, Proposal, Subject},
+        types::{Epoch, Round, View},
+    };
+    use commonware_cryptography::{certificate::Scheme as _, sha256::Digest, Signer as _};
+    use commonware_math::algebra::Random;
+    use commonware_parallel::Sequential;
+    use commonware_utils::{ordered::Set, N3f1};
+
+    fn keys() -> Vec<FalconPrivateKey> {
+        (0..4)
+            .map(|_| FalconPrivateKey::random(commonware_utils::test_rng()))
+            .collect()
+    }
+
+    fn session(keys: &[FalconPrivateKey]) -> Session {
+        let mut members: Vec<_> = keys
+            .iter()
+            .map(|k| k.public_key().as_ref().to_vec())
+            .collect();
+        members.sort();
+        Session {
+            chain_id: [1; 32],
+            filter: vec![2; 32],
+            generation: 7,
+            genesis: [3; 32],
+            base_frame: 10,
+            authorization: [4; 32],
+            members,
+        }
+    }
+
+    fn certify(
+        keys: &[FalconPrivateKey],
+        session: &Session,
+        seal: &Seal,
+        epoch: u64,
+        view: u64,
+        parent: u64,
+    ) -> Vec<u8> {
+        let members: Set<_> = keys
+            .iter()
+            .map(|key| key.public_key())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let schemes: Vec<_> = keys
+            .iter()
+            .cloned()
+            .map(|key| {
+                SimplexFalconScheme::signer(&session.namespace().unwrap(), members.clone(), key)
+                    .unwrap()
+            })
+            .collect();
+        let proposal = Proposal::new(
+            Round::new(Epoch::new(epoch), View::new(view)),
+            View::new(parent),
+            Digest(seal.digest()),
+        );
+        let votes: Vec<_> = schemes[..3]
+            .iter()
+            .map(|s| {
+                s.sign(Subject::Finalize {
+                    proposal: &proposal,
+                })
+                .unwrap()
+            })
+            .collect();
+        encode_finalization(&Finalization {
+            proposal,
+            certificate: schemes[0].assemble::<_, N3f1>(votes, &Sequential).unwrap(),
+        })
+    }
+
+    #[test]
+    fn closing_certificate_binds_request_checkpoint_and_simplex_coordinates() {
+        let keys = keys();
+        let session = session(&keys);
+        let request = [5; 32];
+        let seal = Seal {
+            request,
+            session: session.id().unwrap(),
+            view: 44,
+            checkpoint: Checkpoint {
+                frame: 19,
+                view: 40,
+                digest: [6; 32],
+                state_roots: [[7; 32]; 4],
+                history_root: [8; 32],
+            },
+        };
+        let certificate = certify(&keys, &session, &seal, 7, 44, 40);
+        assert!(verify_seal(&session, &request, &seal, &certificate).is_some());
+        for (epoch, view, parent) in [(8, 44, 40), (7, 45, 40), (7, 44, 39)] {
+            assert!(verify_seal(
+                &session,
+                &request,
+                &seal,
+                &certify(&keys, &session, &seal, epoch, view, parent)
+            )
+            .is_none());
+        }
+        for field in 0..7 {
+            let mut changed = seal.clone();
+            match field {
+                0 => changed.request[0] ^= 1,
+                1 => changed.session[0] ^= 1,
+                2 => changed.checkpoint.digest[0] ^= 1,
+                3 => changed.checkpoint.state_roots[2][0] ^= 1,
+                4 => changed.checkpoint.history_root[0] ^= 1,
+                5 => changed.checkpoint.frame += 1,
+                _ => changed.checkpoint.view += 1,
+            }
+            assert!(verify_seal(&session, &request, &changed, &certificate).is_none());
+        }
+        let mut trailing = certificate.clone();
+        trailing.push(0);
+        assert!(verify_seal(&session, &request, &seal, &trailing).is_none());
+        assert!(verify_seal(
+            &session,
+            &request,
+            &seal,
+            &certificate[..certificate.len() - 1]
+        )
+        .is_none());
+    }
+
+    /// A re-seal (`automaton::HandoffProposer::with_seal_parents`) names the
+    /// notarized seal it extends as `checkpoint.view`: its finalization, whose
+    /// certified parent is that seal's view, verifies exactly as a seal's; the
+    /// data frame's view no longer matches its parent.
+    #[test]
+    fn a_re_seal_verifies_against_the_seal_it_extends() {
+        let keys = keys();
+        let session = session(&keys);
+        let request = [5; 32];
+        let data = Checkpoint {
+            frame: 19,
+            view: 40,
+            digest: [6; 32],
+            state_roots: [[7; 32]; 4],
+            history_root: [8; 32],
+        };
+        let reseal = Seal {
+            request,
+            session: session.id().unwrap(),
+            view: 61,
+            checkpoint: Checkpoint {
+                view: 44,
+                ..data.clone()
+            },
+        };
+        let certificate = certify(&keys, &session, &reseal, 7, 61, 44);
+        assert!(verify_seal(&session, &request, &reseal, &certificate).is_some());
+        let as_data_child = Seal {
+            checkpoint: data,
+            ..reseal.clone()
+        };
+        assert!(verify_seal(
+            &session,
+            &request,
+            &as_data_child,
+            &certify(&keys, &session, &as_data_child, 7, 61, 44)
+        )
+        .is_none());
+        // A re-seal of a seal at the base names the genesis at that seal's
+        // view: refused unless base re-seals are accepted, and then only at
+        // the genesis itself.
+        let base = Checkpoint {
+            frame: session.base_frame,
+            view: 44,
+            digest: session.genesis,
+            ..reseal.checkpoint.clone()
+        };
+        let at_base = Seal {
+            checkpoint: base,
+            ..reseal
+        };
+        let certificate = certify(&keys, &session, &at_base, 7, 61, 44);
+        assert!(verify_seal(&session, &request, &at_base, &certificate).is_none());
+        assert!(verify_seal_with(&session, &request, &at_base, &certificate, true).is_some());
+        let mut not_genesis = at_base.clone();
+        not_genesis.checkpoint.digest[0] ^= 1;
+        let certificate = certify(&keys, &session, &not_genesis, 7, 61, 44);
+        assert!(verify_seal_with(&session, &request, &not_genesis, &certificate, true).is_none());
+        let mut legacy = session.clone();
+        legacy.generation = 0;
+        let at_legacy_base = Seal {
+            session: legacy.id().unwrap(),
+            ..at_base
+        };
+        let certificate = certify(&keys, &legacy, &at_legacy_base, 0, 61, 44);
+        assert!(verify_seal_with(&legacy, &request, &at_legacy_base, &certificate, true).is_none());
+    }
+
+    #[test]
+    fn returning_members_do_not_reuse_a_session_namespace() {
+        let keys = keys();
+        let first = session(&keys);
+        let mut returning = first.clone();
+        returning.generation += 2;
+        assert_ne!(first.namespace().unwrap(), returning.namespace().unwrap());
+        for field in 0..5 {
+            let mut changed = first.clone();
+            match field {
+                0 => changed.chain_id[0] ^= 1,
+                1 => changed.filter.push(1),
+                2 => changed.genesis[0] ^= 1,
+                3 => changed.authorization[0] ^= 1,
+                _ => changed.base_frame += 1,
+            }
+            assert_ne!(first.namespace().unwrap(), changed.namespace().unwrap());
+        }
+        let mut invalid = first.clone();
+        invalid.members.swap(0, 1);
+        assert!(invalid.encode().is_err());
+        invalid = first.clone();
+        invalid.members[1] = invalid.members[0].clone();
+        assert!(invalid.encode().is_err());
+    }
+
+    #[test]
+    fn strict_bounded_codecs_and_genesis_parent() {
+        let keys = keys();
+        let session = session(&keys);
+        let bytes = session.encode().unwrap();
+        assert_eq!(Session::decode(&bytes).unwrap(), session);
+        for n in 0..bytes.len() {
+            assert!(Session::decode(&bytes[..n]).is_err());
+        }
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(Session::decode(&extra).is_err());
+        assert!(Cursor::new(&vec![0; MAX_RECORD_BYTES + 1]).is_err());
+        let mut seal = Seal {
+            request: [5; 32],
+            session: session.id().unwrap(),
+            view: 1,
+            checkpoint: Checkpoint {
+                frame: session.base_frame,
+                view: 0,
+                digest: session.genesis,
+                state_roots: [[0; 32]; 4],
+                history_root: [8; 32],
+            },
+        };
+        assert!(seal.validate(&session, &[5; 32]).is_ok());
+        let bytes = seal.encode();
+        assert_eq!(Seal::decode(&bytes).unwrap(), seal);
+        for n in 0..bytes.len() {
+            assert!(Seal::decode(&bytes[..n]).is_err());
+        }
+        seal.checkpoint.digest[0] ^= 1;
+        assert!(seal.validate(&session, &[5; 32]).is_err());
+        seal.checkpoint.digest = session.genesis;
+        seal.checkpoint.frame += 1;
+        assert!(seal.validate(&session, &[5; 32]).is_err());
+    }
+
+    #[test]
+    fn session_votes_accept_only_a_members_notarize_of_the_proposal() {
+        let keys = keys();
+        let session = session(&keys);
+        let members: Set<_> = keys
+            .iter()
+            .map(|key| key.public_key())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let scheme =
+            SimplexFalconScheme::signer(&session.namespace().unwrap(), members, keys[1].clone())
+                .unwrap();
+        let proposal = Proposal::new(
+            Round::new(Epoch::new(7), View::new(12)),
+            View::new(11),
+            Digest([9; 32]),
+        );
+        let notarize = scheme
+            .sign(Subject::Notarize {
+                proposal: &proposal,
+            })
+            .unwrap();
+        let signer = notarize.signer.get();
+        let signature = notarize.signature.get().unwrap().to_vec();
+        let votes = SessionVotes::new(&session).unwrap();
+        assert!(votes.verify_notarize(7, 12, 11, [9; 32], signer, &signature));
+        // Another member's index, an index outside the committee, another
+        // round, parent or payload, or a truncated signature.
+        assert!(!votes.verify_notarize(7, 12, 11, [9; 32], (signer + 1) % 4, &signature));
+        assert!(!votes.verify_notarize(7, 12, 11, [9; 32], 4, &signature));
+        assert!(!votes.verify_notarize(8, 12, 11, [9; 32], signer, &signature));
+        assert!(!votes.verify_notarize(7, 13, 11, [9; 32], signer, &signature));
+        assert!(!votes.verify_notarize(7, 12, 10, [9; 32], signer, &signature));
+        assert!(!votes.verify_notarize(7, 12, 11, [8; 32], signer, &signature));
+        assert!(!votes.verify_notarize(7, 12, 11, [9; 32], signer, &signature[1..]));
+        // A finalize or a nullify of the same round is not a notarize.
+        let finalize = scheme
+            .sign(Subject::Finalize {
+                proposal: &proposal,
+            })
+            .unwrap();
+        let finalize = finalize.signature.get().unwrap().to_vec();
+        assert!(!votes.verify_notarize(7, 12, 11, [9; 32], signer, &finalize));
+        let nullify = scheme
+            .sign::<Digest>(Subject::Nullify {
+                round: proposal.round,
+            })
+            .unwrap();
+        let nullify = nullify.signature.get().unwrap().to_vec();
+        assert!(!votes.verify_notarize(7, 12, 11, [9; 32], signer, &nullify));
+        // The same members in another session sign under another namespace.
+        let mut other = session.clone();
+        other.generation += 1;
+        let other = SessionVotes::new(&other).unwrap();
+        assert!(!other.verify_notarize(7, 12, 11, [9; 32], signer, &signature));
+    }
+}

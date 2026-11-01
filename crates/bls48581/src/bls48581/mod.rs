@@ -16,6 +16,18 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+// Vendored MIRACL Core code: clippy findings allowed, not restyled.
+#![allow(
+    clippy::assign_op_pattern,
+    clippy::manual_div_ceil,
+    clippy::manual_is_multiple_of,
+    clippy::needless_borrow,
+    clippy::needless_late_init,
+    clippy::needless_return,
+    clippy::unnecessary_cast,
+    clippy::unnecessary_mut_passed
+)]
+
 pub mod big;
 pub mod bls256;
 pub mod dbig;

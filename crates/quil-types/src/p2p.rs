@@ -29,11 +29,7 @@ pub trait PubSub: Send + Sync {
     async fn publish_to_bitmask(&self, bitmask: &[u8], data: &[u8]) -> Result<()>;
 
     /// Subscribe to a bitmask topic with a message handler.
-    async fn subscribe(
-        &self,
-        bitmask: &[u8],
-        handler: MessageHandler,
-    ) -> Result<()>;
+    async fn subscribe(&self, bitmask: &[u8], handler: MessageHandler) -> Result<()>;
 
     /// Subscribe with a sync validator.
     async fn subscribe_with_sync_validator(

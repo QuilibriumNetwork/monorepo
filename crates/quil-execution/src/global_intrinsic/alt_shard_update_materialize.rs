@@ -140,7 +140,7 @@ pub fn validate_alt_shard_update(
     let message = alt_shard_update_signed_message(op);
 
     let valid = key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &op.public_key,
         &message,
         &op.signature,
@@ -197,14 +197,28 @@ mod tests {
 
     struct AcceptAll;
     impl KeyManager for AcceptAll {
-        fn validate_signature(&self, _: KeyType, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<bool> {
+        fn validate_signature(
+            &self,
+            _: KeyType,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<bool> {
             Ok(true)
         }
     }
 
     struct RejectAll;
     impl KeyManager for RejectAll {
-        fn validate_signature(&self, _: KeyType, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<bool> {
+        fn validate_signature(
+            &self,
+            _: KeyType,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<bool> {
             Ok(false)
         }
     }

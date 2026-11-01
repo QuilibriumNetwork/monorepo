@@ -1,0 +1,1130 @@
+//! Release download + signatory-quorum verification.
+//!
+//! Port of `client/utils/download.go` + the signature gate in
+//! `client/cmd/root.go`. Binaries and their `.dgst` / `.dgst.sig.N` files
+//! come from `https://releases.quilibrium.com`; a release is trusted when a
+//! quorum of the [`SIGNATORIES`](quil_config::SIGNATORIES) Ed448 keys sign
+//! its digest file.
+//!
+//! The signed digest file starts with the label `SHA3-256(<file name>)=`,
+//! and a release verifies only under the file name its label names, so a
+//! release signed for one version, type or platform never passes for
+//! another.
+//!
+//! A release is held in memory until it verifies: nothing is written under
+//! the install tree before that, and the verified files reach their final
+//! names by atomic rename from private temporary files beside them.
+
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use quil_config::{signatory_quorum, SIGNATORIES};
+
+use crate::system;
+
+/// Time limits of a release fetch.
+#[derive(Clone, Copy, Debug)]
+pub struct HttpTimeouts {
+    /// Connection setup, TLS included.
+    pub connect: Duration,
+    /// The longest wait for the next bytes of a response.
+    pub read: Duration,
+    /// The whole fetch, body included.
+    pub total: Duration,
+}
+
+/// The limits of every release fetch, so an unreachable or stalled server
+/// fails the fetch instead of holding the command, and the auto-update
+/// job, forever. The total admits a node binary (~270 MB) at ~150 kB/s.
+pub const HTTP_TIMEOUTS: HttpTimeouts = HttpTimeouts {
+    connect: Duration::from_secs(30),
+    read: Duration::from_secs(60),
+    total: Duration::from_secs(30 * 60),
+};
+
+/// An HTTP client enforcing `timeouts`.
+fn http_client(timeouts: HttpTimeouts) -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(timeouts.connect)
+        .read_timeout(timeouts.read)
+        .timeout(timeouts.total)
+        .build()
+        .map_err(|e| anyhow::anyhow!("build the HTTP client: {e}"))
+}
+
+/// Fetch a URL's body as bytes, within [`HTTP_TIMEOUTS`].
+pub async fn http_get_bytes(url: &str) -> anyhow::Result<Vec<u8>> {
+    http_get_bytes_with(HTTP_TIMEOUTS, url).await
+}
+
+/// [`http_get_bytes`] within `timeouts`.
+async fn http_get_bytes_with(timeouts: HttpTimeouts, url: &str) -> anyhow::Result<Vec<u8>> {
+    let failed = |what: &str, e: reqwest::Error| {
+        if e.is_timeout() {
+            anyhow::anyhow!(
+                "{what} {url}: timed out (limits: {}s to connect, {}s without data, {}s in \
+                 all)",
+                timeouts.connect.as_secs(),
+                timeouts.read.as_secs(),
+                timeouts.total.as_secs()
+            )
+        } else {
+            anyhow::anyhow!("{what} {url}: {e}")
+        }
+    };
+    let resp = http_client(timeouts)?
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| failed("GET", e))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("GET {url}: HTTP {}", resp.status());
+    }
+    Ok(resp.bytes().await.map_err(|e| failed("read", e))?.to_vec())
+}
+
+/// Whether a remote file exists (HEAD-ish via GET status), within
+/// [`HTTP_TIMEOUTS`].
+pub async fn remote_exists(url: &str) -> bool {
+    let Ok(client) = http_client(HTTP_TIMEOUTS) else {
+        return false;
+    };
+    client
+        .get(url)
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+/// A/B reproducers of the release-install findings. They call only
+/// functions whose signatures predate the fix, so they run unchanged on the
+/// code before and after it.
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+
+    /// The version from the release list named the install directory and
+    /// binary unchecked, so a crafted list could point both outside the
+    /// install tree.
+    #[test]
+    fn reproduces_server_version_used_as_path() {
+        for version in ["../../../../etc/cron.d/x", "2.1.0.25/../../x", "/etc"] {
+            if let Ok(name) = release_filename(crate::system::RELEASE_TYPE_NODE, version) {
+                let path = std::path::Path::new(crate::system::BINARY_PATH)
+                    .join(crate::system::RELEASE_TYPE_NODE)
+                    .join(version)
+                    .join(&name);
+                panic!(
+                    "server version {version:?} used as a path: the binary would be written to {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// One signatory's valid signature, listed once per required signer,
+    /// must count once rather than meet the quorum alone.
+    #[test]
+    fn reproduces_repeated_signature_meeting_quorum() {
+        const DGST: &[u8] =
+            include_bytes!("../../quil-node/tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst");
+        const SIG_1: &[u8] = include_bytes!(
+            "../../quil-node/tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.1"
+        );
+        let quorum = quil_config::signatory_quorum();
+        let sigs: Vec<(usize, Vec<u8>)> = (0..quorum).map(|_| (1, SIG_1.to_vec())).collect();
+        let count = verify_quorum(DGST, &sigs).unwrap();
+        assert!(
+            count < quorum,
+            "signatory #1's signature, listed {quorum} times, met the quorum alone ({count} valid)"
+        );
+    }
+}
+
+/// Fetch the latest version string for a release type (`node` or `qclient`).
+/// The `/release` (or `/qclient-release`) endpoint's first line is a
+/// filename `type-VERSION-os-arch`; the version is the 2nd `-`-segment.
+pub async fn get_latest_version(release_type: &str) -> anyhow::Result<String> {
+    let url = if release_type == system::RELEASE_TYPE_QCLIENT {
+        format!("{}/qclient-release", system::BASE_RELEASE_URL)
+    } else {
+        format!("{}/release", system::BASE_RELEASE_URL)
+    };
+    let body = http_get_bytes(&url).await?;
+    parse_latest_version(&String::from_utf8_lossy(&body))
+}
+
+/// The version named by the first line of a release list, which must be a
+/// release version ([`is_release_version`]).
+fn parse_latest_version(text: &str) -> anyhow::Result<String> {
+    let first = text.lines().next().unwrap_or("").trim();
+    let parts: Vec<&str> = first.split('-').collect();
+    if parts.len() < 2 {
+        anyhow::bail!("invalid release filename format: {first:?}");
+    }
+    validate_version(parts[1])?;
+    Ok(parts[1].to_string())
+}
+
+/// Whether `version` is a release version: two to five dot-separated
+/// decimal parts, such as `2.1.0.25`. Only such a version may name a file
+/// or directory under the install tree.
+pub fn is_release_version(version: &str) -> bool {
+    let parts: Vec<&str> = version.split('.').collect();
+    (2..=5).contains(&parts.len())
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.len() <= 18 && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Fail unless `version` is a release version ([`is_release_version`]).
+pub fn validate_version(version: &str) -> anyhow::Result<()> {
+    if !is_release_version(version) {
+        anyhow::bail!(
+            "invalid release version {version:?}: expected digits and dots, such as 2.1.0.25"
+        );
+    }
+    Ok(())
+}
+
+/// Order two release versions part by part, numerically (`2.1.0.9` is
+/// older than `2.1.0.25`); a missing part counts as 0.
+pub fn compare_versions(a: &str, b: &str) -> Ordering {
+    let parse = |v: &str| -> Vec<u64> { v.split('.').map(|p| p.parse().unwrap_or(0)).collect() };
+    let (a, b) = (parse(a), parse(b));
+    (0..a.len().max(b.len()))
+        .map(|i| {
+            let x = a.get(i).copied().unwrap_or(0);
+            x.cmp(&b.get(i).copied().unwrap_or(0))
+        })
+        .find(|o| o.is_ne())
+        .unwrap_or(Ordering::Equal)
+}
+
+/// The version of the release binary `symlink` points to, when it points to
+/// a `<release_type>-<version>-<os>-<arch>` file, directly or at the end of
+/// a chain of links (an operator's own link to a release file).
+pub fn linked_version(symlink: &Path, release_type: &str) -> Option<String> {
+    let target = std::fs::read_link(symlink).ok()?;
+    named_version(&target, release_type)
+        .or_else(|| named_version(&std::fs::canonicalize(symlink).ok()?, release_type))
+}
+
+/// The version in a `<release_type>-<version>-<os>-<arch>` file name.
+fn named_version(path: &Path, release_type: &str) -> Option<String> {
+    let rest = path
+        .file_name()?
+        .to_str()?
+        .strip_prefix(release_type)?
+        .strip_prefix('-')?;
+    let version = rest.split('-').next()?;
+    is_release_version(version).then(|| version.to_string())
+}
+
+/// Refuse to replace `symlink` with the release `target` unless
+/// `allow_downgrade` when it holds a binary whose version
+/// [`linked_version`] cannot read, such as a link to an operator's own
+/// build or a copied file: that binary may be newer than `target`.
+pub fn check_unversioned_link(
+    symlink: &Path,
+    release_type: &str,
+    target: &str,
+    allow_downgrade: bool,
+) -> anyhow::Result<()> {
+    if allow_downgrade || linked_version(symlink, release_type).is_some() {
+        return Ok(());
+    }
+    let held = match std::fs::read_link(symlink) {
+        Ok(to) => format!("links {}", to.display()),
+        Err(_) => match std::fs::symlink_metadata(symlink) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => anyhow::bail!("stat {}: {e}", symlink.display()),
+            Ok(_) => "is not a symlink".to_string(),
+        },
+    };
+    anyhow::bail!(
+        "refusing to replace {}, which {held}: it names no {release_type} release version, so \
+         {target} may be older; pass --allow-downgrade to replace it on purpose",
+        symlink.display()
+    )
+}
+
+/// Refuse to replace `installed` with the older `target` unless
+/// `allow_downgrade`: a served release list must not roll a host back to an
+/// older signed release.
+pub fn check_downgrade(
+    installed: Option<&str>,
+    target: &str,
+    allow_downgrade: bool,
+) -> anyhow::Result<()> {
+    if let Some(installed) = installed {
+        if !allow_downgrade && compare_versions(target, installed).is_lt() {
+            anyhow::bail!(
+                "refusing to downgrade from {installed} to {target}; pass --allow-downgrade \
+                 to install an older release on purpose"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The standardized binary filename `type-version-os-arch`. Fails unless
+/// `version` is a release version ([`is_release_version`]).
+pub fn release_filename(release_type: &str, version: &str) -> anyhow::Result<String> {
+    validate_version(version)?;
+    let (os, arch) = system::system_info()?;
+    Ok(format!("{release_type}-{version}-{os}-{arch}"))
+}
+
+/// Fetch the `.dgst` file + each present `.dgst.sig.N` signature for a
+/// release binary, writing nothing. Returns the digest bytes + the collected
+/// `(index, signature)` pairs.
+pub async fn fetch_signatures(
+    release_type: &str,
+    version: &str,
+) -> anyhow::Result<(Vec<u8>, Vec<(usize, Vec<u8>)>)> {
+    let base = release_filename(release_type, version)?;
+
+    // Digest file.
+    let dgst_url = format!("{}/{base}.dgst", system::BASE_RELEASE_URL);
+    let digest = http_get_bytes(&dgst_url).await?;
+    println!("Downloaded {base}.dgst");
+
+    // Signature files (1..=len(SIGNATORIES)); some may be absent.
+    let mut sigs = Vec::new();
+    for i in 1..=SIGNATORIES.len() {
+        let url = format!("{}/{base}.dgst.sig.{i}", system::BASE_RELEASE_URL);
+        if !remote_exists(&url).await {
+            continue;
+        }
+        if let Ok(sig) = http_get_bytes(&url).await {
+            sigs.push((i, sig));
+        }
+    }
+    println!("Downloaded {} signature file(s)", sigs.len());
+    Ok((digest, sigs))
+}
+
+/// Verify a quorum of signatories signed the digest file. Returns the count
+/// of valid signatures; a release is trusted when it is
+/// `>= signatory_quorum()`. `sigs` are `(1-based signatory index, signature)`.
+pub fn verify_quorum(digest: &[u8], sigs: &[(usize, Vec<u8>)]) -> anyhow::Result<usize> {
+    verify_quorum_with(digest, sigs, &SIGNATORIES)
+}
+
+/// [`verify_quorum`] against the given signatory keys (hex). A present but
+/// invalid signature fails the check; each signatory counts once.
+pub fn verify_quorum_with(
+    digest: &[u8],
+    sigs: &[(usize, Vec<u8>)],
+    signatories: &[&str],
+) -> anyhow::Result<usize> {
+    let mut valid = BTreeSet::new();
+    for (i, sig) in sigs {
+        let key = i
+            .checked_sub(1)
+            .and_then(|j| signatories.get(j))
+            .ok_or_else(|| anyhow::anyhow!("no signatory #{i}"))?;
+        let pubkey = hex::decode(key).map_err(|e| anyhow::anyhow!("bad signatory {i} hex: {e}"))?;
+        if quil_crypto::ed448_verify(&pubkey, digest, sig) {
+            valid.insert(*i);
+        } else {
+            anyhow::bail!("Failed signature check for signatory #{i}");
+        }
+    }
+    Ok(valid.len())
+}
+
+/// Parse the sha256 hex digest out of a `.dgst` file (`"SHA3-256 <hex>"` /
+/// `"<algo> <hex>"` — the checksum is the first 64 hex chars of field 2).
+pub fn digest_checksum(digest_file: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let text = String::from_utf8_lossy(digest_file);
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    if parts.len() < 2 || parts[1].len() < 64 {
+        anyhow::bail!("invalid digest file format");
+    }
+    hex::decode(&parts[1][..64]).map_err(|e| anyhow::anyhow!("invalid digest hex: {e}"))
+}
+
+/// Fail unless a `.dgst` file's label, `SHA3-256(<file name>)=` as the
+/// signers' `openssl sha3-256` writes it, names `base`. The signatures
+/// cover the label, so this binds the signed checksum to the release type,
+/// version and platform that `base` names.
+pub fn check_digest_label(digest_file: &[u8], base: &str) -> anyhow::Result<()> {
+    let text = String::from_utf8_lossy(digest_file);
+    let label = text.split_whitespace().next().unwrap_or("");
+    if label != format!("SHA3-256({base})=") {
+        let shown: String = label.chars().take(120).collect();
+        anyhow::bail!(
+            "the digest file of {base} is signed for another file ({shown:?}); refusing a \
+             release served under another name"
+        );
+    }
+    Ok(())
+}
+
+/// A downloaded release, held in memory until it verifies.
+pub struct Release {
+    /// The binary's file name, `type-version-os-arch`.
+    pub base: String,
+    /// The binary.
+    pub bin: Vec<u8>,
+    /// The `.dgst` file.
+    pub digest: Vec<u8>,
+    /// `(1-based signatory index, signature)` of each present `.dgst.sig.N`.
+    pub sigs: Vec<(usize, Vec<u8>)>,
+}
+
+impl Release {
+    /// Check that the binary matches the digest file, that at least
+    /// `quorum` of `signatories` signed it, and that its label names
+    /// `base` ([`check_digest_label`]). Returns the count of valid
+    /// signatures.
+    pub fn verify_with(&self, signatories: &[&str], quorum: usize) -> anyhow::Result<usize> {
+        let checksum = {
+            use sha3::{Digest, Sha3_256};
+            Sha3_256::digest(&self.bin).to_vec()
+        };
+        if checksum != digest_checksum(&self.digest)? {
+            anyhow::bail!("downloaded binary does not match its digest");
+        }
+        let count = verify_quorum_with(&self.digest, &self.sigs, signatories)?;
+        if count < quorum {
+            anyhow::bail!("signature quorum not met ({count}/{quorum})");
+        }
+        check_digest_label(&self.digest, &self.base)?;
+        Ok(count)
+    }
+
+    /// Verify the release ([`Release::verify_with`]), then install it into
+    /// `dest_dir`: the signatures and digest file first, then the binary
+    /// (0755), each by atomic rename. Nothing is written when verification
+    /// fails. Returns the installed binary path and the count of valid
+    /// signatures.
+    pub fn install_with(
+        &self,
+        dest_dir: &Path,
+        signatories: &[&str],
+        quorum: usize,
+    ) -> anyhow::Result<(PathBuf, usize)> {
+        let count = self.verify_with(signatories, quorum)?;
+        write_signature_files(dest_dir, &self.base, &self.digest, &self.sigs)?;
+        let bin_path = write_atomic(dest_dir, &self.base, &self.bin, 0o755)?;
+        Ok((bin_path, count))
+    }
+}
+
+/// Write a verified release's `.dgst` and `.dgst.sig.N` files into
+/// `dest_dir` (created if absent; it must not be a symlink), and remove any
+/// other `.dgst.sig.N` file of `base` there, so the set beside the binary is
+/// the one that verified.
+pub fn write_signature_files(
+    dest_dir: &Path,
+    base: &str,
+    digest: &[u8],
+    sigs: &[(usize, Vec<u8>)],
+) -> anyhow::Result<()> {
+    if base.is_empty() || base.starts_with('.') || base.contains('/') {
+        anyhow::bail!("invalid release file name {base:?}");
+    }
+    std::fs::create_dir_all(dest_dir)
+        .map_err(|e| anyhow::anyhow!("create {}: {e} (root required)", dest_dir.display()))?;
+    let meta = std::fs::symlink_metadata(dest_dir)
+        .map_err(|e| anyhow::anyhow!("stat {}: {e}", dest_dir.display()))?;
+    if !meta.is_dir() {
+        anyhow::bail!("{} is not a directory", dest_dir.display());
+    }
+    for (i, sig) in sigs {
+        write_atomic(dest_dir, &format!("{base}.dgst.sig.{i}"), sig, 0o644)?;
+    }
+    write_atomic(dest_dir, &format!("{base}.dgst"), digest, 0o644)?;
+    let kept: BTreeSet<usize> = sigs.iter().map(|(i, _)| *i).collect();
+    let prefix = format!("{base}.dgst.sig.");
+    for entry in std::fs::read_dir(dest_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let stale = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(prefix.as_str()))
+            .is_some_and(|i| !i.parse::<usize>().is_ok_and(|i| kept.contains(&i)));
+        if stale {
+            std::fs::remove_file(entry.path())
+                .map_err(|e| anyhow::anyhow!("remove {}: {e}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Write `bytes` to `dir/name` with `mode`: into a new private temporary
+/// file beside it (created exclusively, 0600), synced, then renamed over
+/// `dir/name`, so the name never holds partial content.
+fn write_atomic(dir: &Path, name: &str, bytes: &[u8], mode: u32) -> anyhow::Result<PathBuf> {
+    use std::io::Write;
+    let path = dir.join(name);
+    let tmp = dir.join(format!(".{name}.tmp-{:016x}", rand::random::<u64>()));
+    let result = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        std::fs::rename(&tmp, &path)
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::bail!("write {}: {e} (root required)", path.display());
+    }
+    Ok(path)
+}
+
+/// Point `link` at `target`, replacing what `link` held by atomic rename.
+#[cfg(unix)]
+pub fn switch_symlink(target: &Path, link: &Path) -> anyhow::Result<()> {
+    let name = link.file_name().and_then(|n| n.to_str()).unwrap_or("link");
+    let tmp = link.with_file_name(format!(".{name}.tmp-{:016x}", rand::random::<u64>()));
+    std::os::unix::fs::symlink(target, &tmp)
+        .and_then(|()| std::fs::rename(&tmp, link))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            anyhow::anyhow!("symlink {}: {e} (root required)", link.display())
+        })
+}
+
+/// Point `link` at `target`: unsupported off unix.
+#[cfg(not(unix))]
+pub fn switch_symlink(_target: &Path, link: &Path) -> anyhow::Result<()> {
+    anyhow::bail!("symlink {}: unsupported on this platform", link.display())
+}
+
+/// Verify an installed release binary against the `.dgst` and `.dgst.sig.N`
+/// files beside it, as [`download_and_install`] leaves them. Returns the
+/// count of valid signatures.
+pub fn verify_installed(bin_path: &Path) -> anyhow::Result<usize> {
+    verify_installed_with(bin_path, &SIGNATORIES, signatory_quorum())
+}
+
+/// [`verify_installed`] against the given signatory keys (hex) and quorum.
+pub fn verify_installed_with(
+    bin_path: &Path,
+    signatories: &[&str],
+    quorum: usize,
+) -> anyhow::Result<usize> {
+    let base = bin_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid binary path {}", bin_path.display()))?
+        .to_string();
+    let bin = read_file(bin_path)?;
+    let digest = read_file(&bin_path.with_file_name(format!("{base}.dgst")))?;
+    let mut sigs = Vec::new();
+    for i in 1..=signatories.len() {
+        let path = bin_path.with_file_name(format!("{base}.dgst.sig.{i}"));
+        match std::fs::read(&path) {
+            Ok(sig) => sigs.push((i, sig)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => anyhow::bail!("read {}: {e}", path.display()),
+        }
+    }
+    Release {
+        base,
+        bin,
+        digest,
+        sigs,
+    }
+    .verify_with(signatories, quorum)
+}
+
+/// Whether `symlink` links `bin_path` and that binary verifies against the
+/// release files beside it ([`verify_installed_with`]).
+pub fn is_linked_and_verified_with(
+    bin_path: &Path,
+    symlink: &Path,
+    signatories: &[&str],
+    quorum: usize,
+) -> bool {
+    std::fs::read_link(symlink).is_ok_and(|t| t.as_path() == bin_path)
+        && verify_installed_with(bin_path, signatories, quorum).is_ok()
+}
+
+fn read_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+    std::fs::read(path).map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))
+}
+
+/// Where [`download_and_install`] left a release.
+pub struct Installed {
+    /// The installed binary.
+    pub path: PathBuf,
+    /// Whether this call installed it; false when the symlink already
+    /// linked this verified release, which was then not downloaded again.
+    pub fresh: bool,
+}
+
+/// Download a release binary, verify its digest + signatory quorum, install
+/// it to `<binary_path>/<type>/<version>/<file>` (0755), and symlink
+/// `symlink` to it. Shared by `qclient update` and `node install`/`update`.
+/// Install paths require root.
+///
+/// Refuses a `version` older than the one `symlink` points to, or to
+/// replace a `symlink` naming no release version, unless `allow_downgrade`,
+/// and leaves an already linked, verified release as it is.
+pub async fn download_and_install(
+    release_type: &str,
+    version: &str,
+    symlink: &Path,
+    allow_downgrade: bool,
+) -> anyhow::Result<Installed> {
+    let base = release_filename(release_type, version)?;
+    let installed = linked_version(symlink, release_type);
+    check_downgrade(installed.as_deref(), version, allow_downgrade)?;
+    check_unversioned_link(symlink, release_type, version, allow_downgrade)?;
+    let dest_dir = Path::new(system::BINARY_PATH)
+        .join(release_type)
+        .join(version);
+    let current = dest_dir.join(&base);
+    if is_linked_and_verified_with(&current, symlink, &SIGNATORIES, signatory_quorum()) {
+        println!("{base} is already installed and linked");
+        return Ok(Installed {
+            path: current,
+            fresh: false,
+        });
+    }
+
+    let bin_url = format!("{}/{base}", system::BASE_RELEASE_URL);
+    println!("Downloading {base}...");
+    let bin = http_get_bytes(&bin_url).await?;
+    let (digest, sigs) = fetch_signatures(release_type, version).await?;
+    let release = Release {
+        base,
+        bin,
+        digest,
+        sigs,
+    };
+    let (bin_path, count) = release.install_with(&dest_dir, &SIGNATORIES, signatory_quorum())?;
+    println!("Signature quorum met ({count} valid)");
+
+    switch_symlink(&bin_path, symlink)?;
+    Ok(Installed {
+        path: bin_path,
+        fresh: true,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quil_types::crypto::Signer;
+
+    #[test]
+    fn quorum_threshold_is_seven() {
+        assert_eq!(quil_config::signatory_quorum(), 7);
+    }
+
+    /// A server that takes the connection but never answers fails the
+    /// fetch within the limits, rather than holding it forever.
+    #[tokio::test]
+    async fn silent_release_server_times_out() {
+        // Never accepted: the kernel completes the handshake, nothing
+        // answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/release", listener.local_addr().unwrap());
+        let timeouts = HttpTimeouts {
+            connect: Duration::from_secs(1),
+            read: Duration::from_secs(1),
+            total: Duration::from_secs(3),
+        };
+        let fetch = http_get_bytes_with(timeouts, &url);
+        let Ok(result) = tokio::time::timeout(Duration::from_secs(20), fetch).await else {
+            panic!("GET {url} still waits on a silent server after 20 s");
+        };
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("timed out"), "{err}");
+        drop(listener);
+    }
+
+    #[test]
+    fn digest_checksum_parses() {
+        let f =
+            b"SHA3-256 aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899 filename";
+        let sum = digest_checksum(f).unwrap();
+        assert_eq!(sum.len(), 32);
+        assert_eq!(sum[0], 0xaa);
+    }
+
+    #[test]
+    fn digest_label_must_name_the_release_file() {
+        let digest = format!("SHA3-256({BASE})= {}\n", "ab".repeat(32));
+        assert!(check_digest_label(digest.as_bytes(), BASE).is_ok());
+        for other in [
+            "node-2.1.0.24-linux-amd64",
+            "node-2.1.0.25-linux-arm64",
+            "node-2.1.0.25-darwin-arm64",
+            "qclient-2.1.0.25-linux-amd64",
+            "node-2.1.0.2-linux-amd64",
+            "node-2.1.0.25-linux-amd6",
+        ] {
+            let err = check_digest_label(digest.as_bytes(), other).unwrap_err();
+            assert!(err.to_string().contains("signed for another file"), "{err}");
+        }
+        for bad in [
+            "",
+            "ab",
+            "SHA3-256()= ab",
+            "SHA3-256(node-2.1.0.25-linux-amd64) ab",
+        ] {
+            assert!(check_digest_label(bad.as_bytes(), BASE).is_err(), "{bad:?}");
+        }
+    }
+
+    /// A published release (qclient 2.1.0.23 for linux-amd64, as served on
+    /// releases.quilibrium.com) still verifies: the production signatories
+    /// reach the quorum over its digest file, whose label names its file.
+    #[test]
+    fn published_release_digest_verifies_under_its_own_name() {
+        const DGST: &str = "SHA3-256(qclient-2.1.0.23-linux-amd64)= \
+             032a78caf3b838a168cd90ead806138ded0d5553939abb4254bb63f17a02d283\n";
+        const SIGS: &[(usize, &str)] = &[
+            (
+                1,
+                "ec05fcec946f71faf7932a0a0166e904dca473a94fc443159c3541303235d6950718629c322a95cf5875a0b5910cf62cdaae7a7456d544be00749a34a4bcc166faa35c68af3e05f9a07b2f859a816c2444c340d1ca1360ed7146642abed9dc3082994286ce2dfea3ca1289fca0d6fbed1a00",
+            ),
+            (
+                2,
+                "7c3663ff9a97a2cbeaea6c766b30c54191b1891378aecfdc962e11e289c8e569ba01d1278e3d3e5866f199626afd0a4077cf1be6a578686e0083dff92117458e0635b512e6a79d5bec18320a3606d3e1c2e343bfd1d175028186f2051a0d42d37ecb46e5e9d6e7e8cc1dbc00bc5ef2e51000",
+            ),
+            (
+                8,
+                "f5836adcee782f2514c4778c71c809d4d56ca30d3dd11df1e8956473706fc13b7b3d9e9ba628f841b165be0c97bde9d7660d352e3717f0fa00870d08e2ec5b11473222b9807ce801a8bcaf08e10c45632d429100d4d4ffeb881e7e7c8e53c61ffe89daad5fe5b5cb37b934acdada83912a00",
+            ),
+            (
+                11,
+                "835e971e8bd4b1ecd8777ecafbb58ed18f6905ddb20cb6be122077ff9e42b7ae4b071094cc76a33e128cd4dc6238613169f088dcbdbdae91006b3c4d968de0283c8004be814bdaad649edc7767cf7de9e4725bfc35a807e28fdb196e0789ce74ee7a5c349a7732fb5409830f81dad82f0900",
+            ),
+            (
+                13,
+                "01209709b5be9bdcc3ed00fa2e9062754464aa3a08ba75bfe5fa790e15d210f8844a42d47e69663dbc7d797c91da287245e147bddf28c4b00031cdc5ec79ee79597cc2b5021bed6aa150958d7e7edd1677cc32ce28e8cca4f21dc067addf91305182508ec95df0b2d836cb0dc09a722c0200",
+            ),
+            (
+                14,
+                "37b2fed784e9cd3dcd64185be559367e1433cff93396c1326eaf719e261042bbd299beb2a98032eef6a4d5b97fab4418c0b5ef6150fb71b00009f64d2e51eb7c72acc4465f99bf9dc83d769b3a92ed44225ce654306bea56a9007667cce0e22290ccf76460d1cc30e72b5fc4ff394c972100",
+            ),
+            (
+                17,
+                "bdd76d21dcbeb709c2abe8d13da0429df74147978b925e521b8afc65eff05c5c5a6b334cced2a1732cb145765fdd2aeb63d8cc7ab01e83ff00549ff699c6f70f8fb2a612aeb3bd88c83e020a15c6e5bf254267eab527b9af178dad0b2d12cf82b61a9aeee1f6f0b1192ff9da12d04a561700",
+            ),
+        ];
+        let sigs: Vec<(usize, Vec<u8>)> = SIGS
+            .iter()
+            .map(|(i, sig)| (*i, hex::decode(sig).unwrap()))
+            .collect();
+        let count = verify_quorum(DGST.as_bytes(), &sigs).unwrap();
+        assert!(count >= quil_config::signatory_quorum(), "{count}");
+        check_digest_label(DGST.as_bytes(), "qclient-2.1.0.23-linux-amd64").unwrap();
+        assert!(check_digest_label(DGST.as_bytes(), "qclient-2.1.0.24-linux-amd64").is_err());
+        assert!(check_digest_label(DGST.as_bytes(), "node-2.1.0.23-linux-amd64").is_err());
+    }
+
+    /// The release fix refuses a downgrade by the requested version; a
+    /// release-origin attacker could instead serve an older signed release
+    /// under the newer version's name. Its label names the older file, so it
+    /// is refused and nothing is written.
+    #[test]
+    fn release_signed_for_another_file_is_not_installed() {
+        use sha3::{Digest, Sha3_256};
+        let (signers, hex_keys) = signatories();
+        let keys = keys(&hex_keys);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("2.1.0.25");
+        for signed_as in [
+            "node-2.1.0.24-linux-amd64",
+            "node-2.1.0.25-linux-arm64",
+            "qclient-2.1.0.25-linux-amd64",
+        ] {
+            let digest = format!(
+                "SHA3-256({signed_as})= {}\n",
+                hex::encode(Sha3_256::digest(b"old"))
+            );
+            let served = Release {
+                base: BASE.to_string(),
+                bin: b"old".to_vec(),
+                sigs: [1, 2]
+                    .iter()
+                    .map(|&i| (i, signers[i - 1].sign(digest.as_bytes()).unwrap()))
+                    .collect(),
+                digest: digest.into_bytes(),
+            };
+            let err = served.install_with(&dest, &keys, 2).unwrap_err();
+            assert!(err.to_string().contains("signed for another file"), "{err}");
+            assert!(!dest.exists(), "{signed_as}: nothing is written");
+        }
+    }
+
+    #[test]
+    fn installed_release_renamed_to_another_version_does_not_verify() {
+        let (_, hex_keys) = signatories();
+        let keys = keys(&hex_keys);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (bin_path, _) = release(b"bin", b"bin", &[1, 2])
+            .install_with(&tmp.path().join("2.1.0.25"), &keys, 2)
+            .unwrap();
+        let renamed = tmp.path().join("2.1.0.26");
+        std::fs::create_dir(&renamed).unwrap();
+        let new_base = "node-2.1.0.26-linux-amd64";
+        for suffix in ["", ".dgst", ".dgst.sig.1", ".dgst.sig.2"] {
+            std::fs::copy(
+                bin_path.with_file_name(format!("{BASE}{suffix}")),
+                renamed.join(format!("{new_base}{suffix}")),
+            )
+            .unwrap();
+        }
+        assert!(verify_installed_with(&renamed.join(new_base), &keys, 2).is_err());
+        assert_eq!(verify_installed_with(&bin_path, &keys, 2).unwrap(), 2);
+    }
+
+    const BASE: &str = "node-2.1.0.25-linux-amd64";
+
+    /// Three test signatories with fixed seeds, and their public keys (hex).
+    fn signatories() -> (Vec<quil_crypto::Ed448Signer>, Vec<String>) {
+        (1u8..=3)
+            .map(|seed| {
+                let public = quil_crypto::Ed448Signer::derive_public(&[seed; 57]).unwrap();
+                let signer = quil_crypto::Ed448Signer::from_bytes(&[seed; 57], &public).unwrap();
+                (signer, hex::encode(public))
+            })
+            .unzip()
+    }
+
+    /// A release of `signed` bytes, its digest signed by the signatories at
+    /// `indices` (1-based), carrying `bin` as its binary.
+    fn release(bin: &[u8], signed: &[u8], indices: &[usize]) -> Release {
+        use sha3::{Digest, Sha3_256};
+        let (signers, _) = signatories();
+        let digest = format!(
+            "SHA3-256({BASE})= {}\n",
+            hex::encode(Sha3_256::digest(signed))
+        );
+        let sigs = indices
+            .iter()
+            .map(|&i| (i, signers[i - 1].sign(digest.as_bytes()).unwrap()))
+            .collect();
+        Release {
+            base: BASE.to_string(),
+            bin: bin.to_vec(),
+            digest: digest.into_bytes(),
+            sigs,
+        }
+    }
+
+    fn keys(hex_keys: &[String]) -> Vec<&str> {
+        hex_keys.iter().map(String::as_str).collect()
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn tampered_release_never_reaches_the_install_dir() {
+        let (_, hex_keys) = signatories();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("node").join("2.1.0.25");
+        let tampered = release(b"tampered", b"signed binary", &[1, 2]);
+        let err = tampered
+            .install_with(&dest, &keys(&hex_keys), 2)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not match its digest"),
+            "{err}"
+        );
+        assert!(
+            !dest.exists(),
+            "a failed release must not create its directory"
+        );
+    }
+
+    #[test]
+    fn tampered_release_leaves_the_installed_binary_untouched() {
+        let (_, hex_keys) = signatories();
+        let keys = keys(&hex_keys);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("2.1.0.25");
+        let (bin_path, _) = release(b"good", b"good", &[1, 2])
+            .install_with(&dest, &keys, 2)
+            .unwrap();
+        let before = entries(&dest);
+
+        // The same version again, with other bytes under the good digest.
+        let tampered = release(b"tampered", b"good", &[1, 2]);
+        assert!(tampered.install_with(&dest, &keys, 2).is_err());
+        assert_eq!(std::fs::read(&bin_path).unwrap(), b"good");
+        assert_eq!(entries(&dest), before, "no temporary or stray file is left");
+    }
+
+    #[test]
+    fn release_below_quorum_or_with_a_bad_signature_is_not_installed() {
+        let (_, hex_keys) = signatories();
+        let keys = keys(&hex_keys);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("2.1.0.25");
+
+        let under = release(b"bin", b"bin", &[1]);
+        let err = under.install_with(&dest, &keys, 2).unwrap_err();
+        assert!(err.to_string().contains("quorum not met"), "{err}");
+
+        // Signature 3 is signatory 1's, filed under index 3.
+        let mut forged = release(b"bin", b"bin", &[1, 2]);
+        forged.sigs.push((3, forged.sigs[0].1.clone()));
+        let err = forged.install_with(&dest, &keys, 2).unwrap_err();
+        assert!(err.to_string().contains("signatory #3"), "{err}");
+
+        // A signatory counts once, however often its signature is listed.
+        let mut repeated = release(b"bin", b"bin", &[1]);
+        repeated.sigs.push(repeated.sigs[0].clone());
+        assert!(repeated.install_with(&dest, &keys, 2).is_err());
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn verified_release_is_installed_with_its_signatures() {
+        let (_, hex_keys) = signatories();
+        let keys = keys(&hex_keys);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("2.1.0.25");
+        std::fs::create_dir_all(&dest).unwrap();
+        // A signature left by an earlier attempt, outside the verified set.
+        std::fs::write(dest.join(format!("{BASE}.dgst.sig.3")), b"junk").unwrap();
+
+        let (bin_path, count) = release(b"bin", b"bin", &[1, 2])
+            .install_with(&dest, &keys, 2)
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(bin_path, dest.join(BASE));
+        assert_eq!(std::fs::read(&bin_path).unwrap(), b"bin");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&bin_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755);
+        }
+        assert_eq!(
+            entries(&dest),
+            vec![
+                BASE.to_string(),
+                format!("{BASE}.dgst"),
+                format!("{BASE}.dgst.sig.1"),
+                format!("{BASE}.dgst.sig.2"),
+            ]
+        );
+        assert_eq!(verify_installed_with(&bin_path, &keys, 2).unwrap(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_verified_release_is_current() {
+        let (_, hex_keys) = signatories();
+        let keys = keys(&hex_keys);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let link = tmp.path().join("quilibrium-node");
+        let (bin_path, _) = release(b"bin", b"bin", &[1, 2])
+            .install_with(&tmp.path().join("2.1.0.25"), &keys, 2)
+            .unwrap();
+        assert!(!is_linked_and_verified_with(&bin_path, &link, &keys, 2));
+        switch_symlink(&bin_path, &link).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), bin_path);
+        assert!(is_linked_and_verified_with(&bin_path, &link, &keys, 2));
+        std::fs::write(&bin_path, b"changed").unwrap();
+        assert!(!is_linked_and_verified_with(&bin_path, &link, &keys, 2));
+    }
+
+    #[test]
+    fn installed_binary_without_signatures_does_not_verify() {
+        let (_, hex_keys) = signatories();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bin_path = tmp.path().join(BASE);
+        std::fs::write(&bin_path, b"bin").unwrap();
+        assert!(verify_installed_with(&bin_path, &keys(&hex_keys), 2).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_dir_symlink_is_refused() {
+        let (_, hex_keys) = signatories();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let dest = tmp.path().join("2.1.0.25");
+        std::os::unix::fs::symlink(&elsewhere, &dest).unwrap();
+        let ok = release(b"bin", b"bin", &[1, 2]);
+        assert!(ok.install_with(&dest, &keys(&hex_keys), 2).is_err());
+        assert!(entries(&elsewhere).is_empty());
+    }
+
+    #[test]
+    fn release_versions_are_digits_and_dots() {
+        for ok in ["2.1", "2.1.0.25", "2.1.0.25.87"] {
+            assert!(is_release_version(ok), "{ok}");
+            assert!(release_filename("node", ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "2",
+            "latest",
+            "..",
+            "../../../../etc/cron.d/x",
+            "2.1.0.25/../../x",
+            "/etc",
+            "2..1",
+            ".2.1",
+            "2.1.",
+            "1.2.3.4.5.6",
+            "2.1.0.25-rc1",
+            "2.1.0.25\n",
+        ] {
+            assert!(!is_release_version(bad), "{bad:?}");
+            assert!(release_filename("node", bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn latest_version_must_be_a_release_version() {
+        let list = "node-2.1.0.25-linux-amd64\nnode-2.1.0.25-linux-amd64.dgst\n";
+        assert_eq!(parse_latest_version(list).unwrap(), "2.1.0.25");
+        assert!(parse_latest_version("node-../../../../tmp/x-linux-amd64\n").is_err());
+        assert!(parse_latest_version("node-latest-linux-amd64\n").is_err());
+        assert!(parse_latest_version("").is_err());
+    }
+
+    #[test]
+    fn versions_compare_numerically() {
+        assert_eq!(compare_versions("2.1.0.9", "2.1.0.25"), Ordering::Less);
+        assert_eq!(compare_versions("2.1.0.25", "2.1.0.25"), Ordering::Equal);
+        assert_eq!(compare_versions("2.1.0.25", "2.1.0.25.0"), Ordering::Equal);
+        assert_eq!(
+            compare_versions("2.1.0.25.1", "2.1.0.25"),
+            Ordering::Greater
+        );
+        assert_eq!(compare_versions("2.2", "2.1.9.9"), Ordering::Greater);
+    }
+
+    #[test]
+    fn downgrade_needs_the_flag() {
+        let err = check_downgrade(Some("2.1.0.25"), "2.1.0.24", false).unwrap_err();
+        assert!(err.to_string().contains("--allow-downgrade"), "{err}");
+        assert!(check_downgrade(Some("2.1.0.25"), "2.1.0.24", true).is_ok());
+        // The same version, a newer one, or a fresh install proceed.
+        assert!(check_downgrade(Some("2.1.0.25"), "2.1.0.25", false).is_ok());
+        assert!(check_downgrade(Some("2.1.0.9"), "2.1.0.25", false).is_ok());
+        assert!(check_downgrade(None, "2.1.0.1", false).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_version_reads_the_symlink_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let link = tmp.path().join("quilibrium-node");
+        assert_eq!(linked_version(&link, "node"), None);
+        std::os::unix::fs::symlink(
+            "/var/quilibrium/bin/node/2.1.0.25/node-2.1.0.25-linux-amd64",
+            &link,
+        )
+        .unwrap();
+        assert_eq!(linked_version(&link, "node").as_deref(), Some("2.1.0.25"));
+        assert_eq!(linked_version(&link, "qclient"), None);
+    }
+
+    /// A release-origin attacker serves an older quorum-signed release under
+    /// the newer version's file name; the downgrade refusal compares only the
+    /// requested version, which is the newer one.
+    #[test]
+    fn reproduces_relabelled_old_release_installed() {
+        use sha3::{Digest, Sha3_256};
+        let (signers, hex_keys) = signatories();
+        let keys = keys(&hex_keys);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("2.1.0.25");
+        let digest = format!(
+            "SHA3-256(node-2.1.0.24-linux-amd64)= {}\n",
+            hex::encode(Sha3_256::digest(b"older release"))
+        );
+        let old = Release {
+            base: BASE.to_string(),
+            bin: b"older release".to_vec(),
+            sigs: [1, 2]
+                .iter()
+                .map(|&i| (i, signers[i - 1].sign(digest.as_bytes()).unwrap()))
+                .collect(),
+            digest: digest.into_bytes(),
+        };
+        let result = old.install_with(&dest, &keys, 2);
+        assert!(
+            result.is_err() && !dest.join(BASE).exists(),
+            "older signed release node-2.1.0.24 installed as {BASE}: {result:?}"
+        );
+    }
+
+    /// A link to a binary whose version qclient cannot read (an operator's
+    /// own build, a copied file) is not replaced without the flag; a link
+    /// chain ending at a release file compares by that file's version.
+    #[cfg(unix)]
+    #[test]
+    fn unversioned_link_needs_the_flag() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (bin, opt) = (tmp.path().join("bin"), tmp.path().join("opt"));
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&opt).unwrap();
+        let link = bin.join("quilibrium-node");
+        // A fresh install.
+        check_unversioned_link(&link, "node", "2.1.0.24", false).unwrap();
+
+        let own = opt.join("quil-node");
+        std::fs::write(&own, b"bin").unwrap();
+        symlink(&own, &link).unwrap();
+        let err = check_unversioned_link(&link, "node", "2.1.0.24", false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("quil-node") && err.contains("--allow-downgrade"),
+            "{err}"
+        );
+        check_unversioned_link(&link, "node", "2.1.0.24", true).unwrap();
+
+        let copied = bin.join("qclient");
+        std::fs::write(&copied, b"bin").unwrap();
+        let err = check_unversioned_link(&copied, "qclient", "2.1.0.23", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not a symlink"), "{err}");
+
+        // bin/quilibrium-node -> opt/quilibrium-node -> opt/node-2.1.0.25-*
+        let release = opt.join("node-2.1.0.25-linux-amd64");
+        std::fs::write(&release, b"bin").unwrap();
+        let own_link = opt.join("quilibrium-node");
+        symlink(&release, &own_link).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        symlink(&own_link, &link).unwrap();
+        assert_eq!(linked_version(&link, "node").as_deref(), Some("2.1.0.25"));
+        check_unversioned_link(&link, "node", "2.1.0.24", false).unwrap();
+        let installed = linked_version(&link, "node");
+        assert!(check_downgrade(installed.as_deref(), "2.1.0.24", false).is_err());
+    }
+}

@@ -1,20 +1,272 @@
 use std::sync::Arc;
+/// Canonical rank-1 identity encoding size (one packed polynomial) of the
+/// QCT token suite; mirrors `quil_lattice_ct::...::membership::IDENTITY_BYTES`.
+const IDENTITY_BYTES: usize = 3648;
+/// Canonical root record size: 8 + 32 + 1 + 8 + NODE_BYTES (six 1,216-byte proof-ring polynomials).
+const NODE_BYTES: usize = 4 * 1216;
+const ROOT_RECORD_BYTES: usize = 8 + 32 + 1 + 8 + NODE_BYTES;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tonic::{Request, Response, Status};
 
 use quil_engine::current_frame::CurrentFrame;
-use quil_types::consensus::{ProverRegistry, ShardInfoProvider};
-use quil_types::proto::{global, node};
+use quil_types::consensus::{
+    epoch_for_frame, epoch_length_frames, EffectiveStatus, ProverRegistry, ShardInfoProvider,
+};
 use quil_types::proto::node::node_service_server::NodeService;
-use quil_types::store::{ClockStore, TokenStore};
+use quil_types::proto::{global, node};
+use quil_types::store::ClockStore;
+
+fn coin_witness_status(error: quil_types::error::QuilError) -> Status {
+    use quil_types::error::QuilError;
+    match error {
+        QuilError::NotFound(message) | QuilError::ExecutionUnavailable(message) => {
+            Status::unavailable(message)
+        }
+        QuilError::InvalidArgument(message) => Status::invalid_argument(message),
+        other => Status::internal(format!("coin spend witness: {other}")),
+    }
+}
+
+/// A legacy coin listing request's domain, owner and cursor.
+pub fn legacy_coins_request(
+    req: global::ListLegacyCoinsRequest,
+) -> Result<([u8; 32], [u8; 32], Option<[u8; 32]>), Status> {
+    let domain = req
+        .domain
+        .try_into()
+        .map_err(|_| Status::invalid_argument("domain must be 32 bytes"))?;
+    let owner = req
+        .owner
+        .try_into()
+        .map_err(|_| Status::invalid_argument("owner must be 32 bytes"))?;
+    let after = if req.after.is_empty() {
+        None
+    } else {
+        Some(
+            req.after
+                .try_into()
+                .map_err(|_| Status::invalid_argument("cursor must be empty or 32 bytes"))?,
+        )
+    };
+    Ok((domain, owner, after))
+}
+
+/// A legacy coin page as sent, checked the same whether this node or a peer
+/// produced it: ascending addresses past the cursor, within the page bound,
+/// the cursor at the last coin, and more only after a non-empty page (so a
+/// listing always advances).
+pub fn legacy_coins_response(
+    page: quil_types::store::LegacyCoinPageData,
+    after: Option<[u8; 32]>,
+) -> Result<global::ListLegacyCoinsResponse, Status> {
+    let invalid = || Status::internal("invalid legacy coin page");
+    let cursor_ok = match page.coins.last() {
+        Some(last) => page.cursor == Some(last.address),
+        None => !page.has_more,
+    };
+    if page.coins.len() > quil_types::store::MAX_LEGACY_COINS_PER_PAGE || !cursor_ok {
+        return Err(invalid());
+    }
+    let mut previous = after;
+    for coin in &page.coins {
+        if previous.is_some_and(|previous| coin.address <= previous) {
+            return Err(invalid());
+        }
+        previous = Some(coin.address);
+    }
+    Ok(global::ListLegacyCoinsResponse {
+        coins: page
+            .coins
+            .into_iter()
+            .map(|coin| global::LegacyCoin {
+                address: coin.address.to_vec(),
+                amount: coin.amount.to_le_bytes().to_vec(),
+                origin: coin.origin.to_vec(),
+                shielded: coin.shielded,
+            })
+            .collect(),
+        cursor: page
+            .cursor
+            .map(|cursor| cursor.to_vec())
+            .unwrap_or_default(),
+        has_more: page.has_more,
+    })
+}
+
+// Rebuilding an entire domain accumulator is CPU/memory intensive. Acquire
+// before spawning, and retain the permit in the worker even if the RPC cancels.
+static COIN_WITNESS_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+// A scan or escrow page is one bounded read of a retained snapshot. Every
+// wallet whose own node lacks the application pages through an archive, and
+// with two shared slots and no queue a few wallets refused everyone else
+// ("no node serving application ... answered this node").
+static COIN_SCAN_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+static COIN_READ_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// How long a coin read waits for a worker before the node answers busy.
+const COIN_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Coin reads waiting for a worker beyond which more are refused at once.
+const MAX_COIN_READ_WAITERS: usize = 128;
+
+/// Keys one retro seniority request may name; a merge names a handful.
+const MAX_RETRO_SENIORITY_KEYS: usize = 32;
+/// Each key scans the four retro tables, so lookups run one at a time.
+static RETRO_SENIORITY_WORKER: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// A status read walks up to a lookback of headers and several roots, each
+/// briefly under the commit lock, so they run one at a time.
+static MINT_STATUS_WORKER: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// A worker slot from `workers`, waiting briefly in a bounded queue when all
+/// are busy.
+async fn coin_read_permit(
+    workers: &'static tokio::sync::Semaphore,
+    what: &str,
+) -> Result<tokio::sync::SemaphorePermit<'static>, Status> {
+    use std::sync::atomic::Ordering;
+    if let Ok(permit) = workers.try_acquire() {
+        return Ok(permit);
+    }
+    let busy = || Status::resource_exhausted(format!("{what} workers busy; retry later"));
+    if COIN_READ_WAITERS.fetch_add(1, Ordering::Relaxed) >= MAX_COIN_READ_WAITERS {
+        COIN_READ_WAITERS.fetch_sub(1, Ordering::Relaxed);
+        return Err(busy());
+    }
+    let acquired = tokio::time::timeout(COIN_READ_WAIT, workers.acquire()).await;
+    COIN_READ_WAITERS.fetch_sub(1, Ordering::Relaxed);
+    match acquired {
+        Ok(Ok(permit)) => Ok(permit),
+        _ => Err(busy()),
+    }
+}
+
+/// One page of a wallet scan as a provider answers it.
+trait ScanPage: Sized {
+    fn entries(&self) -> usize;
+    fn has_more(&self) -> bool;
+    fn snapshot_id(&self) -> [u8; 32];
+    fn cursor(&self) -> Option<[u8; 32]>;
+    /// Append `next`, the page read after this one's cursor, when it
+    /// continues the same scan; `false` leaves this page as it was.
+    fn append(&mut self, next: Self) -> bool;
+}
+
+impl ScanPage for quil_types::store::CoinPageData {
+    fn entries(&self) -> usize {
+        self.coins.len()
+    }
+    fn has_more(&self) -> bool {
+        self.has_more
+    }
+    fn snapshot_id(&self) -> [u8; 32] {
+        self.snapshot_id
+    }
+    fn cursor(&self) -> Option<[u8; 32]> {
+        self.cursor
+    }
+    fn append(&mut self, next: Self) -> bool {
+        if next.network != self.network
+            || next.snapshot_id != self.snapshot_id
+            || next.root_record != self.root_record
+            || next.cursor < self.cursor
+        {
+            return false;
+        }
+        self.coins.extend(next.coins);
+        self.cursor = next.cursor;
+        self.has_more = next.has_more;
+        true
+    }
+}
+
+impl ScanPage for quil_types::store::EscrowPageData {
+    fn entries(&self) -> usize {
+        self.escrows.len()
+    }
+    fn has_more(&self) -> bool {
+        self.has_more
+    }
+    fn snapshot_id(&self) -> [u8; 32] {
+        self.snapshot_id
+    }
+    fn cursor(&self) -> Option<[u8; 32]> {
+        self.cursor
+    }
+    fn append(&mut self, next: Self) -> bool {
+        if next.network != self.network
+            || next.snapshot_id != self.snapshot_id
+            || next.cursor < self.cursor
+        {
+            return false;
+        }
+        self.escrows.extend(next.escrows);
+        self.cursor = next.cursor;
+        self.has_more = next.has_more;
+        true
+    }
+}
+
+/// A scan page of up to `entries` coins or escrows, read through `read`,
+/// which answers provider pages of at most
+/// [`quil_types::store::DEFAULT_SCAN_PAGE_ENTRIES`] from one retained
+/// snapshot. The page continues while another provider page surely fits,
+/// with at most `entries / DEFAULT_SCAN_PAGE_ENTRIES` provider pages in all,
+/// so a larger page costs the node no more per entry than the default one,
+/// and the default page is exactly one provider page. A continuation that
+/// fails ends the page early: the wallet's next request meets the failure.
+fn gather_scan_page<P, F>(
+    entries: usize,
+    snapshot_id: Option<[u8; 32]>,
+    after: Option<[u8; 32]>,
+    mut read: F,
+) -> quil_types::error::Result<Option<P>>
+where
+    P: ScanPage,
+    F: FnMut(Option<&[u8; 32]>, Option<&[u8; 32]>) -> quil_types::error::Result<Option<P>>,
+{
+    use quil_types::store::DEFAULT_SCAN_PAGE_ENTRIES;
+    let Some(mut page) = read(snapshot_id.as_ref(), after.as_ref())? else {
+        return Ok(None);
+    };
+    for _ in 1..entries / DEFAULT_SCAN_PAGE_ENTRIES {
+        if !page.has_more() || page.entries() + DEFAULT_SCAN_PAGE_ENTRIES > entries {
+            break;
+        }
+        let (id, Some(cursor)) = (page.snapshot_id(), page.cursor()) else {
+            break;
+        };
+        let Ok(Some(next)) = read(Some(&id), Some(&cursor)) else {
+            break;
+        };
+        if !page.append(next) {
+            break;
+        }
+    }
+    Ok(Some(page))
+}
 
 /// Handler installed by the caller to route a Go-CLI `submit_message`
 /// into the same message-collection pipeline used by
 /// `GlobalService::submit_global_message`. Returns an error string
 /// surfaced as `Status::invalid_argument`.
-pub type UserSubmitHandler =
-    Arc<dyn Fn(Vec<u8>) -> Result<(), String> + Send + Sync>;
+pub type UserSubmitHandler = Arc<dyn Fn(Vec<u8>) -> Result<(), String> + Send + Sync>;
+
+/// A provider must resolve the application's execution venue and return its
+/// pricing inputs together. Never synthesize this from shard-info totals.
+#[derive(Clone, Debug)]
+pub struct TokenFeeSnapshot {
+    pub network: [u8; 32],
+    pub observed_frame: u64,
+    pub global_execution: bool,
+    pub difficulty: u64,
+    pub world_state_bytes: u64,
+    pub fee_multiplier_vote: u64,
+}
+/// `(application, global_venue)`: `global_venue` asks for the global frame
+/// materializer's pricing inputs instead of the application's current venue.
+pub type TokenFeeProvider =
+    Arc<dyn Fn([u8; 32], bool) -> quil_types::error::Result<TokenFeeSnapshot> + Send + Sync>;
+static TOKEN_FEE_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 /// A worker entry for populating WorkerInfoResponse.
 /// No WorkerManager trait exists yet — the caller pushes entries directly.
@@ -26,9 +278,90 @@ pub struct WorkerEntry {
     pub total_storage: u64,
     pub manually_managed: bool,
     pub allocated: bool,
+    pub execution: Option<node::WorkerExecution>,
+    /// Above the configured worker count (`WorkerManager::is_draining`).
+    pub draining: bool,
 }
 
 /// gRPC NodeService implementation with live node state.
+/// Forwards a coin-witness request to a node holding the application.
+pub type RemoteCoinWitnesses = Arc<
+    dyn Fn(
+            [u8; 32],
+            Vec<[u8; 32]>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Option<quil_types::store::CoinWitnessBundle>>
+                    + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
+/// Forwards one vertex read to a node holding the application, as
+/// `(present, blob)`.
+pub type RemoteVertex = Arc<
+    dyn Fn(
+            [u8; 32],
+            Vec<u8>,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(bool, Vec<u8>)>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Forwards one coin-scan page to a node holding the application, asking
+/// for pages of up to the given number of coins (`max_coins`). `Err`
+/// carries the asked peers' reasons for declining, for the wallet's status.
+pub type RemoteCoinPage = Arc<
+    dyn Fn(
+            [u8; 32],
+            Option<[u8; 32]>,
+            Option<[u8; 32]>,
+            u32,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<quil_types::store::CoinPageData, String>>
+                    + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
+/// Forwards one legacy coin page — `(domain, owner, after)` — to an archive.
+pub type RemoteLegacyCoins = Arc<
+    dyn Fn(
+            [u8; 32],
+            [u8; 32],
+            Option<[u8; 32]>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Option<quil_types::store::LegacyCoinPageData>>
+                    + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
+/// Forwards one escrow-scan page, as [`RemoteCoinPage`] does a coin page.
+pub type RemoteEscrowPage = Arc<
+    dyn Fn(
+            [u8; 32],
+            Option<[u8; 32]>,
+            Option<[u8; 32]>,
+            u32,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<quil_types::store::EscrowPageData>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+/// Every local worker store holding part of an application. An error means
+/// coverage changed while resolving the stores; an empty list uses the master.
+pub type AppHypergraphStores = Arc<
+    dyn Fn(&[u8]) -> Result<Vec<Arc<dyn quil_types::store::HypergraphStore>>, Status> + Send + Sync,
+>;
+
 pub struct NodeRpcServer {
     pub peer_id: String,
     pub version: Vec<u8>,
@@ -41,13 +374,30 @@ pub struct NodeRpcServer {
     pub last_global_head_frame: Arc<AtomicU64>,
     pub prover_address: Vec<u8>,
     pub reachable: bool,
+    pub frame_cadence_provider:
+        Option<Arc<dyn Fn(&[u8]) -> Option<node::FrameCadence> + Send + Sync>>,
 
     // Stores and registries (optional — None means unavailable).
-    pub token_store: Option<Arc<dyn TokenStore>>,
     pub prover_registry: Option<Arc<dyn ProverRegistry>>,
     pub shard_info_provider: Option<Arc<dyn ShardInfoProvider>>,
+    pub token_fee_provider: Option<TokenFeeProvider>,
     pub clock_store: Option<Arc<dyn ClockStore>>,
     pub hypergraph_store: Option<Arc<dyn quil_types::store::HypergraphStore>>,
+    /// Local stores for a vertex's application, instead of the master store.
+    pub app_hypergraph_stores: Option<AppHypergraphStores>,
+    /// See [`NodeRpcServer::with_application_coverage`].
+    pub application_coverage: Option<Arc<dyn Fn(&[u8]) -> bool + Send + Sync>>,
+    /// See [`NodeRpcServer::with_remote_coin_page`].
+    pub remote_coin_page: Option<RemoteCoinPage>,
+    pub remote_escrow_page: Option<RemoteEscrowPage>,
+    /// See [`NodeRpcServer::with_remote_legacy_coins`].
+    pub remote_legacy_coins: Option<RemoteLegacyCoins>,
+    /// See [`NodeRpcServer::with_remote_vertex`].
+    pub remote_vertex: Option<RemoteVertex>,
+    /// See [`NodeRpcServer::with_remote_coin_witnesses`].
+    pub remote_coin_witnesses: Option<RemoteCoinWitnesses>,
+    /// QCT3 coin/escrow discovery and membership/mint witnesses.
+    pub coin_witness_provider: Option<Arc<dyn quil_types::store::CoinWitnessProvider>>,
     pub submit_handler: Option<UserSubmitHandler>,
     /// Optional Prometheus text-format snapshot handle. When present,
     /// `get_metrics` returns the rendered text as response bytes.
@@ -57,9 +407,7 @@ pub struct NodeRpcServer {
     /// Snapshot function returning the current peer-info cache for
     /// `get_peer_info`. Each entry is a raw `CanonicalPeerInfo`
     /// decoded from GLOBAL_PEER_INFO bitmask.
-    pub peer_info_snapshot: Option<
-        Arc<dyn Fn() -> Vec<quil_p2p::CanonicalPeerInfo> + Send + Sync>,
-    >,
+    pub peer_info_snapshot: Option<Arc<dyn Fn() -> Vec<quil_p2p::CanonicalPeerInfo> + Send + Sync>>,
     /// Optional traversal-proof generator. Given
     /// `(domain, atom_type, phase_type, keys)`, returns the serialized
     /// `MultiKeyTraversalProof` bytes. Implemented by the caller so
@@ -70,24 +418,21 @@ pub struct NodeRpcServer {
     pub send_handler_fn: Option<SendHandler>,
     /// When unset, `peer_score` in `GetNodeInfo` returns 0.
     pub peer_score_provider: Option<PeerScoreProvider>,
+    /// The configured worker count, refreshed with `workers`; 0 unknown.
+    pub worker_capacity: Arc<std::sync::atomic::AtomicU32>,
     pub workers: Arc<std::sync::RwLock<Vec<WorkerEntry>>>,
+    /// This process's gossip traffic counters, reported by `GetNodeInfo`.
+    pub gossip_traffic: Option<Arc<quil_p2p::GossipTraffic>>,
 }
 
 /// Async closure returning the local node's peer-score as `f64`. The
 /// handler casts to `u64` by truncation.
-pub type PeerScoreProvider = Arc<
-    dyn Fn() -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = f64> + Send>,
-        > + Send
-        + Sync,
->;
+pub type PeerScoreProvider =
+    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = f64> + Send>> + Send + Sync>;
 
 /// Closure signature for traversal-proof generation.
-pub type TraversalProofGenerator = Arc<
-    dyn Fn([u8; 32], String, String, Vec<Vec<u8>>) -> Result<Vec<u8>, String>
-        + Send
-        + Sync,
->;
+pub type TraversalProofGenerator =
+    Arc<dyn Fn([u8; 32], String, String, Vec<Vec<u8>>) -> Result<Vec<u8>, String> + Send + Sync>;
 
 /// Closure signature for `NodeService::Send`. Arguments are
 /// `(domain, payload, authentication)`. Verifies the Ed448
@@ -95,9 +440,13 @@ pub type TraversalProofGenerator = Arc<
 /// `NODE_AUTHENTICATION || domain` prefix, then routes the
 /// MessageBundle to the correct BlossomSub bitmask.
 pub type SendHandler = Arc<
-    dyn Fn(Vec<u8>, Vec<u8>, Vec<u8>) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
-        > + Send
+    dyn Fn(
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        + Send
         + Sync,
 >;
 
@@ -130,9 +479,7 @@ pub trait WorkerControl: Send + Sync {
         filters: Vec<Vec<u8>>,
         worker_ids: Vec<u32>,
         delegate: Vec<u8>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
 impl NodeRpcServer {
@@ -145,11 +492,20 @@ impl NodeRpcServer {
             last_global_head_frame: Arc::new(AtomicU64::new(0)),
             prover_address: Vec::new(),
             reachable: false,
-            token_store: None,
+            frame_cadence_provider: None,
             prover_registry: None,
             shard_info_provider: None,
+            token_fee_provider: None,
             clock_store: None,
             hypergraph_store: None,
+            app_hypergraph_stores: None,
+            application_coverage: None,
+            remote_coin_page: None,
+            remote_escrow_page: None,
+            remote_legacy_coins: None,
+            remote_vertex: None,
+            remote_coin_witnesses: None,
+            coin_witness_provider: None,
             submit_handler: None,
             metrics_renderer: None,
             worker_control: None,
@@ -157,8 +513,15 @@ impl NodeRpcServer {
             traversal_proof_generator: None,
             send_handler_fn: None,
             peer_score_provider: None,
+            worker_capacity: Arc::default(),
             workers: Arc::new(std::sync::RwLock::new(Vec::new())),
+            gossip_traffic: None,
         }
+    }
+
+    pub fn with_token_fee_provider(mut self, provider: TokenFeeProvider) -> Self {
+        self.token_fee_provider = Some(provider);
+        self
     }
 
     pub fn with_peer_score_provider(mut self, provider: PeerScoreProvider) -> Self {
@@ -187,12 +550,15 @@ impl NodeRpcServer {
         self.reachable = reachable;
         self
     }
-    pub fn with_token_store(mut self, store: Arc<dyn TokenStore>) -> Self {
-        self.token_store = Some(store);
-        self
-    }
     pub fn with_prover_registry(mut self, registry: Arc<dyn ProverRegistry>) -> Self {
         self.prover_registry = Some(registry);
+        self
+    }
+    pub fn with_frame_cadence_provider(
+        mut self,
+        provider: Arc<dyn Fn(&[u8]) -> Option<node::FrameCadence> + Send + Sync>,
+    ) -> Self {
+        self.frame_cadence_provider = Some(provider);
         self
     }
     pub fn with_shard_info_provider(mut self, provider: Arc<dyn ShardInfoProvider>) -> Self {
@@ -203,11 +569,123 @@ impl NodeRpcServer {
         self.clock_store = Some(store);
         self
     }
+    /// Refuse a state read for an application this node does not hold, rather
+    /// than returning an empty answer that a caller cannot tell apart from
+    /// "there is nothing there". Applications with no declared coverage hook
+    /// are served as before.
+    // Regression helper for the production serves_application/coverage_error policy.
+    #[allow(dead_code)]
+    fn require_application_coverage(&self, application: &[u8]) -> Result<(), Status> {
+        if self.serves_application(application) {
+            return Ok(());
+        }
+        Err(self.coverage_error(application))
+    }
+
+    /// Whether this node holds `application`'s state. With no coverage hook
+    /// wired every application is served, as before.
+    fn serves_application(&self, application: &[u8]) -> bool {
+        self.application_coverage
+            .as_ref()
+            .is_none_or(|serves| serves(application))
+    }
+
+    fn coverage_error(&self, application: &[u8]) -> Status {
+        Status::unavailable(format!(
+            "this node does not serve application {}; read through a node covering it, or an archive",
+            hex::encode(&application[..application.len().min(32)])
+        ))
+    }
+
+    /// Forward a coin scan to a node that holds the application, when this one
+    /// does not. The page it returns faces exactly the same validation as a
+    /// local page — a peer is a source of data, not of authority.
+    pub fn with_remote_coin_page(mut self, remote: RemoteCoinPage) -> Self {
+        self.remote_coin_page = Some(remote);
+        self
+    }
+
+    pub fn with_remote_escrow_page(mut self, remote: RemoteEscrowPage) -> Self {
+        self.remote_escrow_page = Some(remote);
+        self
+    }
+
+    /// Ask an archive for legacy coins when this node has no complete owner
+    /// index (every node but an archive). Pages face the local validation.
+    pub fn with_remote_legacy_coins(mut self, remote: RemoteLegacyCoins) -> Self {
+        self.remote_legacy_coins = Some(remote);
+        self
+    }
+
+    /// `owner`'s legacy coins from this node's own owner index, never
+    /// forwarded: what a peer asking this node is served. `None` when this
+    /// node cannot list them.
+    pub async fn legacy_coins_local(
+        &self,
+        domain: [u8; 32],
+        owner: [u8; 32],
+        after: Option<[u8; 32]>,
+    ) -> Result<Option<quil_types::store::LegacyCoinPageData>, Status> {
+        let Some(provider) = self.coin_witness_provider.clone() else {
+            return Ok(None);
+        };
+        let permit = coin_read_permit(&COIN_SCAN_WORKERS, "legacy coin").await?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            provider.legacy_coins(&domain, &owner, after.as_ref())
+        })
+        .await
+        .map_err(|e| Status::internal(format!("legacy coin task: {e}")))?
+        .map_err(coin_witness_status)
+    }
+
+    /// Forward a vertex read to a node holding the application. A forwarded
+    /// coin scan is not usable without this: the wallet reads spent markers as
+    /// vertices to decide which coins it can still spend.
+    pub fn with_remote_vertex(mut self, remote: RemoteVertex) -> Self {
+        self.remote_vertex = Some(remote);
+        self
+    }
+
+    /// Forward coin witnesses to a node holding the application, so a holder
+    /// can spend a coin from a node that does not cover it.
+    pub fn with_remote_coin_witnesses(mut self, remote: RemoteCoinWitnesses) -> Self {
+        self.remote_coin_witnesses = Some(remote);
+        self
+    }
+
+    /// Whether this node can answer for an application's state at all: it
+    /// covers the application's shards, or holds it because it materializes
+    /// everything. A node that cannot must say so — answering "empty" for an
+    /// application it does not hold is indistinguishable from "you have
+    /// nothing", which reads as a zero balance for a token the caller owns.
+    pub fn with_application_coverage(
+        mut self,
+        serves: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
+    ) -> Self {
+        self.application_coverage = Some(serves);
+        self
+    }
+
+    /// Route vertex reads for applications whose state lives outside the
+    /// node's own hypergraph store (see `app_hypergraph_stores`).
+    pub fn with_app_hypergraph_stores(mut self, resolver: AppHypergraphStores) -> Self {
+        self.app_hypergraph_stores = Some(resolver);
+        self
+    }
+
     pub fn with_hypergraph_store(
         mut self,
         store: Arc<dyn quil_types::store::HypergraphStore>,
     ) -> Self {
         self.hypergraph_store = Some(store);
+        self
+    }
+    pub fn with_coin_witness_provider(
+        mut self,
+        provider: Arc<dyn quil_types::store::CoinWitnessProvider>,
+    ) -> Self {
+        self.coin_witness_provider = Some(provider);
         self
     }
     pub fn with_submit_handler(mut self, handler: UserSubmitHandler) -> Self {
@@ -221,6 +699,10 @@ impl NodeRpcServer {
         self.metrics_renderer = Some(renderer);
         self
     }
+    pub fn with_gossip_traffic(mut self, traffic: Arc<quil_p2p::GossipTraffic>) -> Self {
+        self.gossip_traffic = Some(traffic);
+        self
+    }
     pub fn with_worker_control(mut self, ctl: Arc<dyn WorkerControl>) -> Self {
         self.worker_control = Some(ctl);
         self
@@ -232,10 +714,7 @@ impl NodeRpcServer {
         self.peer_info_snapshot = Some(snapshot);
         self
     }
-    pub fn with_traversal_proof_generator(
-        mut self,
-        generator: TraversalProofGenerator,
-    ) -> Self {
+    pub fn with_traversal_proof_generator(mut self, generator: TraversalProofGenerator) -> Self {
         self.traversal_proof_generator = Some(generator);
         self
     }
@@ -243,11 +722,13 @@ impl NodeRpcServer {
         self.send_handler_fn = Some(handler);
         self
     }
-    pub fn with_workers_view(
-        mut self,
-        workers: Arc<std::sync::RwLock<Vec<WorkerEntry>>>,
-    ) -> Self {
+    pub fn with_workers_view(mut self, workers: Arc<std::sync::RwLock<Vec<WorkerEntry>>>) -> Self {
         self.workers = workers;
+        self
+    }
+    /// The configured worker count `GetNodeInfo` reports.
+    pub fn with_worker_capacity(mut self, capacity: Arc<std::sync::atomic::AtomicU32>) -> Self {
+        self.worker_capacity = capacity;
         self
     }
 }
@@ -257,14 +738,6 @@ impl Default for NodeRpcServer {
         Self::new()
     }
 }
-
-/// QUIL token domain address (poseidon("q_mainnet_token")).
-const QUIL_TOKEN_ADDRESS: [u8; 32] = [
-    0x11, 0x55, 0x85, 0x84, 0xaf, 0x70, 0x17, 0xa9,
-    0xbf, 0xd1, 0xff, 0x18, 0x64, 0x30, 0x2d, 0x64,
-    0x3f, 0xbe, 0x58, 0xc6, 0x2d, 0xcf, 0x90, 0xcb,
-    0xcd, 0x8f, 0xde, 0x74, 0xa2, 0x67, 0x94, 0xd9,
-];
 
 #[tonic::async_trait]
 impl NodeService for NodeRpcServer {
@@ -339,11 +812,16 @@ impl NodeService for NodeRpcServer {
                 // regardless of where the latest frame came from.
                 let current_frame = self.current_frame.effective();
                 for alloc in &info.allocations {
-                    // Only return live (non-terminal, non-expired)
-                    // allocations. `is_live` applies the 720-frame
-                    // grace check for Joining/Leaving and excludes
-                    // Rejected/Kicked terminal states.
-                    if !alloc.is_live(current_frame) {
+                    // Return live allocations, PLUS `ExpiredEpoch` ones. An
+                    // Active data-shard allocation that missed its per-epoch
+                    // re-confirm reads as `ExpiredEpoch` (recoverable — the
+                    // prover re-registers leaf roots and becomes Active again),
+                    // so surfacing it lets the client warn the operator instead
+                    // of the allocation silently vanishing. The truly terminal
+                    // states (Rejected/Kicked/ExpiredJoining/ExpiredLeaving) are
+                    // still filtered out.
+                    let eff = alloc.effective_status(current_frame);
+                    if !(eff.is_live() || eff == EffectiveStatus::ExpiredEpoch) {
                         continue;
                     }
                     shard_allocations.push(node::ShardAllocationInfo {
@@ -353,6 +831,8 @@ impl NodeService for NodeRpcServer {
                         join_confirm_frame_number: alloc.join_confirm_frame_number,
                         leave_frame_number: alloc.leave_frame_number,
                         last_active_frame_number: alloc.last_active_frame_number,
+                        epoch: alloc.epoch,
+                        leave_confirm_frame_number: alloc.leave_confirm_frame_number,
                     });
                 }
             }
@@ -371,6 +851,7 @@ impl NodeService for NodeRpcServer {
         };
 
         Ok(Response::new(node::NodeInfoResponse {
+            frame_cadence: self.frame_cadence_provider.as_ref().and_then(|p| p(&[])),
             peer_id: self.peer_id.clone(),
             peer_score,
             version: self.version.clone(),
@@ -382,6 +863,16 @@ impl NodeService for NodeRpcServer {
             last_global_head_frame: self.last_global_head_frame.load(Ordering::Relaxed),
             reachable: self.reachable,
             shard_allocations,
+            // Epoch is derived from the same frame the effective-status grace
+            // checks above used (`current_frame.effective()`), so the client's
+            // epoch matches the one the allocations were evaluated against.
+            current_epoch: epoch_for_frame(self.current_frame.effective()),
+            worker_capacity: self.worker_capacity.load(Ordering::Relaxed),
+            epoch_length_frames: epoch_length_frames(),
+            gossip_traffic: self
+                .gossip_traffic
+                .as_ref()
+                .map(|traffic| traffic.snapshot().to_proto()),
         }))
     }
 
@@ -398,6 +889,8 @@ impl NodeService for NodeRpcServer {
                 available_storage: w.available_storage,
                 total_storage: w.total_storage,
                 manually_managed: w.manually_managed,
+                execution: w.execution.clone(),
+                draining: w.draining,
             })
             .collect();
 
@@ -410,9 +903,10 @@ impl NodeService for NodeRpcServer {
         &self,
         request: Request<node::SendRequest>,
     ) -> Result<Response<node::SendResponse>, Status> {
-        let handler = self.send_handler_fn.as_ref().ok_or_else(|| {
-            Status::unavailable("send handler not wired")
-        })?;
+        let handler = self
+            .send_handler_fn
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("send handler not wired"))?;
         let req = request.into_inner();
         if req.authentication.is_empty() {
             return Err(Status::invalid_argument("authentication required"));
@@ -431,10 +925,9 @@ impl NodeService for NodeRpcServer {
             "Send RPC received"
         );
         // The signing payload is canonical-bytes, not prost-encoded.
-        let payload = quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(
-            &bundle,
-        )
-        .map_err(|e| Status::internal(format!("canonicalize: {e}")))?;
+        let payload =
+            quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(&bundle)
+                .map_err(|e| Status::internal(format!("canonicalize: {e}")))?;
         handler(req.domain, payload, req.authentication)
             .await
             .map_err(|e| Status::unauthenticated(format!("send rejected: {e}")))?;
@@ -443,68 +936,503 @@ impl NodeService for NodeRpcServer {
         }))
     }
 
-    async fn get_tokens_by_account(
+    async fn get_coin_witnesses(
         &self,
-        request: Request<node::GetTokensByAccountRequest>,
-    ) -> Result<Response<node::GetTokensByAccountResponse>, Status> {
-        let store = self.token_store.as_ref().ok_or_else(|| {
-            Status::unavailable(
-                "token store not available -- token shards may not yet be \
-                 unlocked, or node synchronization may still be in progress",
-            )
-        })?;
-
+        request: Request<node::GetCoinWitnessesRequest>,
+    ) -> Result<Response<node::GetCoinWitnessesResponse>, Status> {
         let req = request.into_inner();
-
-        // Legacy (pre-2.1) coins: 32-byte address, no domain or QUIL domain.
-        if (req.domain.is_empty() || req.domain == QUIL_TOKEN_ADDRESS)
-            && req.address.len() == 32
+        let domain: [u8; 32] = req
+            .domain
+            .try_into()
+            .map_err(|_| Status::invalid_argument("domain must be 32 bytes"))?;
+        if req.addresses.is_empty() || req.addresses.len() > 4 {
+            return Err(Status::invalid_argument(
+                "request must contain one to four addresses",
+            ));
+        }
+        let addresses: Vec<[u8; 32]> = req
+            .addresses
+            .into_iter()
+            .map(|address| {
+                address
+                    .try_into()
+                    .map_err(|_| Status::invalid_argument("coin address must be 32 bytes"))
+            })
+            .collect::<Result<_, _>>()?;
+        if addresses
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != addresses.len()
         {
-            let (frame_numbers, addresses, coins) = store
-                .get_coins_for_owner(&req.address)
-                .map_err(|e| Status::internal(format!("get coins: {e}")))?;
-
-            let legacy_coins: Vec<node::LegacyCoin> = coins
-                .into_iter()
-                .enumerate()
-                .map(|(i, coin)| node::LegacyCoin {
-                    coin: Some(coin),
-                    frame_number: frame_numbers[i],
-                    address: addresses[i].clone(),
-                })
-                .collect();
-
-            return Ok(Response::new(node::GetTokensByAccountResponse {
-                legacy_coins,
-                transactions: Vec::new(),
-                pending_transactions: Vec::new(),
-            }));
+            return Err(Status::invalid_argument("duplicate coin addresses"));
         }
-
-        if req.address.len() != 112 {
-            return Err(Status::invalid_argument("invalid address length"));
-        }
-
-        let domain = if req.domain.is_empty() {
-            QUIL_TOKEN_ADDRESS.to_vec()
-        } else if req.domain.len() == 32 {
-            req.domain
+        let expected = addresses.clone();
+        // Local when this node covers the application; otherwise a node that
+        // does. Either source faces the dimension and path checks below.
+        let result = if self.serves_application(&domain) {
+            let provider = self
+                .coin_witness_provider
+                .as_ref()
+                .ok_or_else(|| Status::unavailable("coin witness provider not available"))?
+                .clone();
+            let permit = coin_read_permit(&COIN_WITNESS_WORKERS, "coin witness").await?;
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                provider.coin_witnesses(&domain, &addresses)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("coin witness task: {e}")))?
+            .map_err(coin_witness_status)?
+            .ok_or_else(|| Status::unimplemented("coin witnesses are not enabled"))?
         } else {
-            return Err(Status::invalid_argument("invalid domain length"));
+            let remote = self
+                .remote_coin_witnesses
+                .as_ref()
+                .ok_or_else(|| self.coverage_error(&domain))?;
+            remote(domain, addresses).await.ok_or_else(|| {
+                Status::unavailable(format!(
+                    "no node serving application {} answered this node",
+                    hex::encode(domain)
+                ))
+            })?
         };
+        if !(1..=32).contains(&result.depth)
+            || result.root_record.len() != ROOT_RECORD_BYTES
+            || result.root_record.get(..8) != Some(b"QCT3RT\0\x02".as_slice())
+            || result.root_record.get(40) != Some(&result.depth)
+            || result.witnesses.len() != expected.len()
+        {
+            return Err(Status::internal("invalid coin witness dimensions"));
+        }
+        for (witness, address) in result.witnesses.iter().zip(&expected) {
+            let count = if witness.found {
+                usize::from(result.depth)
+            } else {
+                0
+            };
+            if &witness.address != address
+                || witness.siblings.len() != count
+                || witness.right.len() != count
+                || witness.siblings.iter().any(|node| node.len() != NODE_BYTES)
+            {
+                return Err(Status::internal("invalid coin witness path"));
+            }
+        }
+        let response = node::GetCoinWitnessesResponse {
+            network: result.network.to_vec(),
+            root_record: result.root_record,
+            witnesses: result
+                .witnesses
+                .into_iter()
+                .map(|witness| node::CoinWitness {
+                    address: witness.address.to_vec(),
+                    found: witness.found,
+                    siblings: witness.siblings,
+                    right: witness.right,
+                })
+                .collect(),
+        };
+        if prost::Message::encoded_len(&response) >= 1 << 20 {
+            return Err(Status::resource_exhausted(
+                "coin witness response exceeds size limit",
+            ));
+        }
+        Ok(Response::new(response))
+    }
 
-        let transactions = store
-            .get_transactions_for_owner(&domain, &req.address)
-            .map_err(|e| Status::internal(format!("get transactions: {e}")))?;
+    async fn list_escrows(
+        &self,
+        request: Request<node::ListCoinsRequest>,
+    ) -> Result<Response<node::ListEscrowsResponse>, Status> {
+        let req = request.into_inner();
+        let domain: [u8; 32] = req
+            .domain
+            .try_into()
+            .map_err(|_| Status::invalid_argument("domain must be 32 bytes"))?;
+        let optional_address = |bytes: Vec<u8>| -> Result<Option<[u8; 32]>, Status> {
+            if bytes.is_empty() {
+                Ok(None)
+            } else {
+                bytes.try_into().map(Some).map_err(|_| {
+                    Status::invalid_argument("scan identity and cursor must be empty or 32 bytes")
+                })
+            }
+        };
+        let snapshot_id = optional_address(req.snapshot_id)?;
+        let after = optional_address(req.after)?;
+        if after.is_some() && snapshot_id.is_none() {
+            return Err(Status::invalid_argument(
+                "continuation requires snapshot identity",
+            ));
+        }
+        let entries = quil_types::store::scan_page_entries(req.max_coins);
+        let page = if self.serves_application(&domain) {
+            let provider = self
+                .coin_witness_provider
+                .as_ref()
+                .ok_or_else(|| Status::unavailable("coin provider not available"))?
+                .clone();
+            let permit = coin_read_permit(&COIN_SCAN_WORKERS, "coin scan").await?;
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                gather_scan_page(entries, snapshot_id, after, |id, after| {
+                    provider.escrow_page(&domain, id, after)
+                })
+            })
+            .await
+            .map_err(|e| Status::internal(format!("escrow scan task: {e}")))?
+            .map_err(coin_witness_status)?
+            .ok_or_else(|| Status::unimplemented("escrow scan is not enabled"))?
+        } else {
+            let remote = self
+                .remote_escrow_page
+                .as_ref()
+                .ok_or_else(|| self.coverage_error(&domain))?;
+            // The clamped size: a peer allowing more would fail validation.
+            remote(domain, snapshot_id, after, entries as u32)
+                .await
+                .ok_or_else(|| {
+                    Status::unavailable(format!(
+                        "no node serving application {} answered this node",
+                        hex::encode(domain)
+                    ))
+                })?
+        };
+        if snapshot_id.is_some_and(|id| id != page.snapshot_id)
+            || page.escrows.len() > entries
+            || (page.has_more && (page.cursor.is_none() || page.cursor <= after))
+            || page.cursor < after
+        {
+            return Err(Status::internal("invalid coin scan page"));
+        }
+        let mut previous = after;
+        for (address, blob) in &page.escrows {
+            if previous.is_some_and(|old| *address <= old)
+                || page.cursor.is_none_or(|cursor| *address > cursor)
+                || blob.is_empty()
+                || blob.len() > 64 * 1024
+            {
+                return Err(Status::internal("invalid coin scan escrow"));
+            }
+            previous = Some(*address);
+        }
+        let response = node::ListEscrowsResponse {
+            network: page.network.to_vec(),
+            snapshot_id: page.snapshot_id.to_vec(),
+            escrows: page
+                .escrows
+                .into_iter()
+                .map(|(address, raw_data)| node::Escrow {
+                    address: address.to_vec(),
+                    raw_data,
+                })
+                .collect(),
+            cursor: page
+                .cursor
+                .map(|cursor| cursor.to_vec())
+                .unwrap_or_default(),
+            has_more: page.has_more,
+        };
+        if prost::Message::encoded_len(&response) > quil_types::store::scan_page_bytes(entries) {
+            return Err(Status::resource_exhausted(
+                "coin scan response exceeds size limit",
+            ));
+        }
+        Ok(Response::new(response))
+    }
 
-        let pending_transactions = store
-            .get_pending_transactions_for_owner(&domain, &req.address)
-            .map_err(|e| Status::internal(format!("get pending transactions: {e}")))?;
+    async fn list_coins(
+        &self,
+        request: Request<node::ListCoinsRequest>,
+    ) -> Result<Response<node::ListCoinsResponse>, Status> {
+        let req = request.into_inner();
+        let domain: [u8; 32] = req
+            .domain
+            .try_into()
+            .map_err(|_| Status::invalid_argument("domain must be 32 bytes"))?;
+        let optional_address = |bytes: Vec<u8>| -> Result<Option<[u8; 32]>, Status> {
+            if bytes.is_empty() {
+                Ok(None)
+            } else {
+                bytes.try_into().map(Some).map_err(|_| {
+                    Status::invalid_argument("scan identity and cursor must be empty or 32 bytes")
+                })
+            }
+        };
+        let snapshot_id = optional_address(req.snapshot_id)?;
+        let after = optional_address(req.after)?;
+        if after.is_some() && snapshot_id.is_none() {
+            return Err(Status::invalid_argument(
+                "continuation requires snapshot identity",
+            ));
+        }
+        let entries = quil_types::store::scan_page_entries(req.max_coins);
+        // Local when this node covers the application; otherwise a node that
+        // does. Either way the page is validated below before it is returned.
+        let page = if self.serves_application(&domain) {
+            let provider = self
+                .coin_witness_provider
+                .as_ref()
+                .ok_or_else(|| Status::unavailable("coin provider not available"))?
+                .clone();
+            let permit = coin_read_permit(&COIN_SCAN_WORKERS, "coin scan").await?;
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                gather_scan_page(entries, snapshot_id, after, |id, after| {
+                    provider.coin_page(&domain, id, after)
+                })
+            })
+            .await
+            .map_err(|e| Status::internal(format!("coin scan task: {e}")))?
+            .map_err(coin_witness_status)?
+            .ok_or_else(|| Status::unimplemented("coin scan is not enabled"))?
+        } else {
+            let remote = self
+                .remote_coin_page
+                .as_ref()
+                .ok_or_else(|| self.coverage_error(&domain))?;
+            // The peers' own reasons travel with the refusal, so the wallet
+            // learns why its node could not read the application. The peer is
+            // asked for the clamped size: one allowing more would fail below.
+            remote(domain, snapshot_id, after, entries as u32)
+                .await
+                .map_err(|reasons| {
+                    Status::unavailable(format!(
+                        "no node serving application {} answered this node: {reasons}",
+                        hex::encode(domain)
+                    ))
+                })?
+        };
+        // An empty root record answers a scan of an application without any
+        // coin root: no confidential coin exists in it yet. It is valid only
+        // as a fresh scan's single page, empty and final.
+        let root_valid = if page.root_record.is_empty() {
+            snapshot_id.is_none()
+                && page.coins.is_empty()
+                && !page.has_more
+                && page.cursor.is_none()
+        } else {
+            page.root_record.len() == ROOT_RECORD_BYTES
+                && page.root_record.get(..8) == Some(b"QCT3RT\0\x02".as_slice())
+                && page
+                    .root_record
+                    .get(40)
+                    .is_some_and(|depth| (1..=32).contains(depth))
+        };
+        if snapshot_id.is_some_and(|id| id != page.snapshot_id)
+            || !root_valid
+            || page.coins.len() > entries
+            || (page.has_more && (page.cursor.is_none() || page.cursor <= after))
+            || page.cursor < after
+        {
+            return Err(Status::internal("invalid coin scan page"));
+        }
+        let mut previous = after;
+        for coin in &page.coins {
+            if previous.is_some_and(|address| coin.address <= address)
+                || page.cursor.is_none_or(|cursor| coin.address > cursor)
+                || coin.owner.len() != IDENTITY_BYTES
+                || coin.commitment.len() != 10368
+                || coin.memo.len() != 1115
+            {
+                return Err(Status::internal("invalid coin scan coin"));
+            }
+            previous = Some(coin.address);
+        }
+        let response = node::ListCoinsResponse {
+            network: page.network.to_vec(),
+            snapshot_id: page.snapshot_id.to_vec(),
+            root_record: page.root_record,
+            coins: page
+                .coins
+                .into_iter()
+                .map(|coin| node::ConfidentialCoin {
+                    address: coin.address.to_vec(),
+                    frame_number: coin.frame_number,
+                    position: coin.position,
+                    owner: coin.owner,
+                    commitment: coin.commitment,
+                    memo: coin.memo,
+                })
+                .collect(),
+            cursor: page
+                .cursor
+                .map(|cursor| cursor.to_vec())
+                .unwrap_or_default(),
+            has_more: page.has_more,
+        };
+        if prost::Message::encoded_len(&response) > quil_types::store::scan_page_bytes(entries) {
+            return Err(Status::resource_exhausted(
+                "coin scan response exceeds size limit",
+            ));
+        }
+        Ok(Response::new(response))
+    }
 
-        Ok(Response::new(node::GetTokensByAccountResponse {
-            legacy_coins: Vec::new(),
-            transactions,
-            pending_transactions,
+    async fn list_legacy_coins(
+        &self,
+        request: Request<global::ListLegacyCoinsRequest>,
+    ) -> Result<Response<global::ListLegacyCoinsResponse>, Status> {
+        let (domain, owner, after) = legacy_coins_request(request.into_inner())?;
+        let page = match self.legacy_coins_local(domain, owner, after).await? {
+            Some(page) => page,
+            None => {
+                let remote = self.remote_legacy_coins.as_ref().ok_or_else(|| {
+                    Status::unavailable("this node keeps no legacy coin index; ask an archive")
+                })?;
+                remote(domain, owner, after)
+                    .await
+                    .ok_or_else(|| Status::unavailable("no archive answered for legacy coins"))?
+            }
+        };
+        Ok(Response::new(legacy_coins_response(page, after)?))
+    }
+
+    async fn get_mint_authorization_witness(
+        &self,
+        request: Request<node::GetMintAuthorizationWitnessRequest>,
+    ) -> Result<Response<node::GetMintAuthorizationWitnessResponse>, Status> {
+        let receipt: [u8; 32] = request
+            .into_inner()
+            .receipt
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("mint authorization receipt must be 32 bytes"))?;
+        let provider = self
+            .coin_witness_provider
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("coin witness provider not available"))?
+            .clone();
+        let witness =
+            tokio::task::spawn_blocking(move || provider.mint_authorization_witness(&receipt))
+                .await
+                .map_err(|_| Status::internal("mint authorization witness worker failed"))?
+                .map_err(|e| {
+                    if e.is_execution_unavailable() {
+                        Status::unavailable(format!("mint authorization witness: {e}"))
+                    } else {
+                        Status::internal(format!("mint authorization witness: {e}"))
+                    }
+                })?;
+        if witness.forest_proof.len() > 32 * 1024
+            || (witness.found && witness.global_root.len() != 32)
+        {
+            return Err(Status::internal(
+                "invalid mint authorization witness from provider",
+            ));
+        }
+        Ok(Response::new(node::GetMintAuthorizationWitnessResponse {
+            found: witness.found,
+            forest_proof: witness.forest_proof,
+            cited_frame: witness.cited_frame,
+            global_root: witness.global_root,
+        }))
+    }
+
+    async fn get_mint_authorization_status(
+        &self,
+        request: Request<node::GetMintAuthorizationStatusRequest>,
+    ) -> Result<Response<node::GetMintAuthorizationStatusResponse>, Status> {
+        let receipt: [u8; 32] = request
+            .into_inner()
+            .receipt
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("mint authorization receipt must be 32 bytes"))?;
+        let provider = self
+            .coin_witness_provider
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("coin witness provider not available"))?
+            .clone();
+        let permit = coin_read_permit(&MINT_STATUS_WORKER, "mint authorization status").await?;
+        let status = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            provider.mint_authorization_status(&receipt)
+        })
+        .await
+        .map_err(|_| Status::internal("mint authorization status worker failed"))?
+        .map_err(|e| {
+            if e.is_execution_unavailable() {
+                Status::unavailable(format!("mint authorization status: {e}"))
+            } else {
+                Status::internal(format!("mint authorization status: {e}"))
+            }
+        })?;
+        Ok(Response::new(node::GetMintAuthorizationStatusResponse {
+            state: status.state as i32,
+            found: status.found,
+            inclusion_frame: status.inclusion_frame,
+            inclusion_frame_earliest: status.inclusion_frame_earliest,
+            claim_cap: status.claim_cap,
+            cap_from_shard_anchor: status.cap_from_shard_anchor,
+            head_frame: status.head_frame,
+            searched_frame: status.searched_frame,
+            cited_frame: status.cited_frame,
+            first_root_frame: status.first_root_frame,
+            reason: status.reason,
+        }))
+    }
+
+    async fn get_retro_seniority(
+        &self,
+        request: Request<node::GetRetroSeniorityRequest>,
+    ) -> Result<Response<node::GetRetroSeniorityResponse>, Status> {
+        let keys = request.into_inner().public_keys;
+        if keys.len() > MAX_RETRO_SENIORITY_KEYS {
+            return Err(Status::invalid_argument(format!(
+                "at most {MAX_RETRO_SENIORITY_KEYS} keys per request"
+            )));
+        }
+        let _permit = RETRO_SENIORITY_WORKER
+            .acquire()
+            .await
+            .map_err(|_| Status::unavailable("retro seniority worker closed"))?;
+        let parts = tokio::task::spawn_blocking(move || {
+            keys.iter()
+                .map(|key| {
+                    quil_execution::global_intrinsic::seniority_succession::retro_parts(
+                        std::slice::from_ref(key),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|_| Status::internal("retro seniority worker failed"))?;
+        Ok(Response::new(node::GetRetroSeniorityResponse {
+            keys: parts
+                .into_iter()
+                .map(|parts| node::RetroSeniority {
+                    parts: parts.to_vec(),
+                })
+                .collect(),
+        }))
+    }
+
+    async fn get_prover_reward_witness(
+        &self,
+        request: Request<node::GetProverRewardWitnessRequest>,
+    ) -> Result<Response<node::GetProverRewardWitnessResponse>, Status> {
+        let provider = self
+            .coin_witness_provider
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("coin witness provider not available"))?;
+        let req = request.into_inner();
+        let w = provider
+            .prover_reward_witness(&req.domain, &req.owner_prover_address)
+            .map_err(|e| {
+                if e.is_execution_unavailable() {
+                    Status::unavailable(format!("prover reward witness: {e}"))
+                } else {
+                    Status::internal(format!("prover reward witness: {e}"))
+                }
+            })?;
+        Ok(Response::new(node::GetProverRewardWitnessResponse {
+            found: w.found,
+            forest_proof: w.forest_proof,
+            value: w.value.to_le_bytes().to_vec(),
+            cited_frame: w.cited_frame,
+            reward_root: w.reward_root,
         }))
     }
 
@@ -536,9 +1464,6 @@ impl NodeService for NodeRpcServer {
         &self,
         request: Request<node::GetVertexDataRequest>,
     ) -> Result<Response<node::GetVertexDataResponse>, Status> {
-        let store = self.hypergraph_store.as_ref().ok_or_else(|| {
-            Status::unavailable("hypergraph store not available")
-        })?;
         let req = request.into_inner();
         if req.address.len() != 64 {
             return Err(Status::invalid_argument(
@@ -557,12 +1482,56 @@ impl NodeService for NodeRpcServer {
                 l2
             },
         };
-        // Load the vertex's underlying sub-tree blob (Go-format). The
-        // blob is stored at `(vertex, adds, shard, vertex_id)`.
-        let raw = store
-            .load_vertex_underlying_raw("vertex", "adds", &shard, &req.address)
-            .map_err(|e| Status::internal(format!("load vertex underlying: {e}")))?;
+        // Both sources use the same response formatting. In particular a
+        // forwarded non-full read must enumerate the tree's entries too.
+        let raw = if !self.serves_application(app_address) {
+            let remote = self
+                .remote_vertex
+                .as_ref()
+                .ok_or_else(|| self.coverage_error(app_address))?;
+            let (present, blob) = remote(shard.l2, req.address[32..].to_vec())
+                .await
+                .ok_or_else(|| {
+                    Status::unavailable(format!(
+                        "no node serving application {} answered this node",
+                        hex::encode(app_address)
+                    ))
+                })?;
+            present.then_some(blob)
+        } else {
+            let mut stores = match &self.app_hypergraph_stores {
+                Some(resolve) => resolve(app_address)?,
+                None => Vec::new(),
+            };
+            if stores.is_empty() {
+                stores.push(
+                    self.hypergraph_store
+                        .as_ref()
+                        .ok_or_else(|| Status::unavailable("hypergraph store not available"))?
+                        .clone(),
+                );
+            }
+            // A spent marker or escrow can be in any local worker store. An
+            // arbitrary first store cannot establish absence. Conflicting
+            // replicas are retryable, never resolved by map iteration order.
+            let mut raw = None;
+            for store in stores {
+                if let Some(blob) = store
+                    .load_vertex_underlying_raw("vertex", "adds", &shard, &req.address)
+                    .map_err(|e| Status::internal(format!("load vertex underlying: {e}")))?
+                {
+                    if raw.as_ref().is_some_and(|previous| previous != &blob) {
+                        return Err(Status::unavailable(
+                            "local application stores disagree on vertex data; retry later",
+                        ));
+                    }
+                    raw = Some(blob);
+                }
+            }
+            raw
+        };
 
+        let present = Some(raw.is_some());
         let (entries, raw_data) = match raw {
             None => (Vec::new(), Vec::new()),
             Some(bytes) => {
@@ -574,9 +1543,8 @@ impl NodeService for NodeRpcServer {
                     // Parse the tree and enumerate canonical leaf
                     // indices (Go reads {0},{4},{8},{12},{16},{20},
                     // {24},{28},{0xff}).
-                    let root = quil_tries::deserialize_go_tree(&bytes).map_err(|e| {
-                        Status::internal(format!("deserialize vertex tree: {e}"))
-                    })?;
+                    let root = quil_tries::deserialize_go_tree(&bytes)
+                        .map_err(|e| Status::internal(format!("deserialize vertex tree: {e}")))?;
                     let tree = quil_tries::VectorCommitmentTree { root };
                     let mut entries = Vec::new();
                     for key in &[
@@ -602,6 +1570,7 @@ impl NodeService for NodeRpcServer {
             }
         };
         Ok(Response::new(node::GetVertexDataResponse {
+            present,
             entries,
             set_type: "vertex".into(),
             phase_type: "adds".into(),
@@ -615,9 +1584,10 @@ impl NodeService for NodeRpcServer {
         &self,
         request: Request<node::GetHyperedgeDataRequest>,
     ) -> Result<Response<node::GetHyperedgeDataResponse>, Status> {
-        let store = self.hypergraph_store.as_ref().ok_or_else(|| {
-            Status::unavailable("hypergraph store not available")
-        })?;
+        let store = self
+            .hypergraph_store
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("hypergraph store not available"))?;
         let req = request.into_inner();
         if req.address.len() != 64 {
             return Err(Status::invalid_argument(
@@ -636,12 +1606,24 @@ impl NodeService for NodeRpcServer {
         let raw = store
             .load_vertex_underlying_raw("hyperedge", "adds", &shard, &req.address)
             .map_err(|e| Status::internal(format!("load hyperedge underlying: {e}")))?;
+        // The serialized tree itself: a prover's hyperedge keys its
+        // allocations by 64-byte atom IDs, which the canonical entries below
+        // do not list.
+        if req.full_data {
+            return Ok(Response::new(node::GetHyperedgeDataResponse {
+                entries: Vec::new(),
+                set_type: "hyperedge".into(),
+                phase_type: "adds".into(),
+                shard_l1: shard.l1.to_vec(),
+                shard_l2: shard.l2.to_vec(),
+                raw_data: raw.unwrap_or_default(),
+            }));
+        }
         let entries = match raw {
             None => Vec::new(),
             Some(bytes) => {
-                let root = quil_tries::deserialize_go_tree(&bytes).map_err(|e| {
-                    Status::internal(format!("deserialize hyperedge tree: {e}"))
-                })?;
+                let root = quil_tries::deserialize_go_tree(&bytes)
+                    .map_err(|e| Status::internal(format!("deserialize hyperedge tree: {e}")))?;
                 let tree = quil_tries::VectorCommitmentTree { root };
                 let mut entries = Vec::new();
                 for key in &[
@@ -671,6 +1653,7 @@ impl NodeService for NodeRpcServer {
             phase_type: "adds".into(),
             shard_l1: shard.l1.to_vec(),
             shard_l2: shard.l2.to_vec(),
+            raw_data: Vec::new(),
         }))
     }
 
@@ -678,9 +1661,10 @@ impl NodeService for NodeRpcServer {
         &self,
         request: Request<node::CreateTraversalProofRequest>,
     ) -> Result<Response<node::CreateTraversalProofResponse>, Status> {
-        let generator = self.traversal_proof_generator.as_ref().ok_or_else(|| {
-            Status::unavailable("traversal proof generator not wired")
-        })?;
+        let generator = self
+            .traversal_proof_generator
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("traversal proof generator not wired"))?;
         let req = request.into_inner();
         if req.domain.len() != 32 {
             return Err(Status::invalid_argument("domain must be 32 bytes"));
@@ -702,35 +1686,129 @@ impl NodeService for NodeRpcServer {
         domain_arr.copy_from_slice(&req.domain);
         let bytes = generator(domain_arr, req.atom_type, req.phase_type, req.keys)
             .map_err(|e| Status::internal(format!("create proof: {e}")))?;
-        Ok(Response::new(node::CreateTraversalProofResponse { proof: bytes }))
+        Ok(Response::new(node::CreateTraversalProofResponse {
+            proof: bytes,
+        }))
+    }
+
+    async fn get_token_fee_quote(
+        &self,
+        request: Request<node::GetTokenFeeQuoteRequest>,
+    ) -> Result<Response<node::GetTokenFeeQuoteResponse>, Status> {
+        let req = request.into_inner();
+        let application: [u8; 32] = req
+            .application
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("application must be 32 bytes"))?;
+        // QUIL operations pay their own fee; any other application's writes
+        // are paid by a QUIL settlement sized from that application's venue.
+        if application == quil_execution::domains::GLOBAL {
+            return Err(Status::invalid_argument(
+                "the global intrinsic is not a fee venue",
+            ));
+        }
+        if req.max_payload_bytes == 0 || req.max_payload_bytes >= 1 << 20 {
+            return Err(Status::invalid_argument(
+                "payload bound must be positive and below 1 MiB",
+            ));
+        }
+        let provider = self
+            .token_fee_provider
+            .clone()
+            .ok_or_else(|| Status::unavailable("execution fee snapshot not available"))?;
+        let permit = TOKEN_FEE_WORKERS
+            .try_acquire()
+            .map_err(|_| Status::resource_exhausted("fee quote workers busy"))?;
+        let response = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let snapshot = provider(application, req.global_venue).map_err(coin_witness_status)?;
+            if req.global_venue && (!snapshot.global_execution || snapshot.fee_multiplier_vote != 1)
+            {
+                return Err(Status::internal(
+                    "global venue quote must use global execution pricing",
+                ));
+            }
+            let network =
+                quil_execution::pricing::network_selector(&snapshot.network).ok_or_else(|| {
+                    Status::internal("fee snapshot has an invalid network identifier")
+                })?;
+            let budget = quil_execution::pricing::fee_budget_for_payload_limit(
+                network,
+                snapshot.difficulty,
+                snapshot.world_state_bytes,
+                req.max_payload_bytes,
+                snapshot.fee_multiplier_vote,
+            )
+            .map_err(|_| Status::unavailable("fee snapshot exceeds supported pricing range"))?;
+            let (_, encoded) = budget.to_bytes_be();
+            if encoded.len() > 16 {
+                return Err(Status::failed_precondition(
+                    "fee budget exceeds token amount range",
+                ));
+            }
+            let mut fee_budget = vec![0; 16];
+            fee_budget[16 - encoded.len()..].copy_from_slice(&encoded);
+            Ok(node::GetTokenFeeQuoteResponse {
+                application: application.to_vec(),
+                network: snapshot.network.to_vec(),
+                observed_frame: snapshot.observed_frame,
+                global_execution: snapshot.global_execution,
+                difficulty: snapshot.difficulty,
+                world_state_bytes: snapshot.world_state_bytes,
+                fee_multiplier_vote: snapshot.fee_multiplier_vote,
+                max_payload_bytes: req.max_payload_bytes,
+                fee_budget,
+            })
+        })
+        .await
+        .map_err(|_| Status::internal("fee quote worker failed"))??;
+        Ok(Response::new(response))
     }
 
     async fn get_shard_info(
         &self,
         request: Request<node::GetShardInfoRequest>,
     ) -> Result<Response<node::GetShardInfoResponse>, Status> {
-        let provider = self.shard_info_provider.as_ref().ok_or_else(|| {
-            Status::unavailable("shard info not available")
-        })?;
+        let provider = self
+            .shard_info_provider
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("shard info not available"))?;
 
         let req = request.into_inner();
-        let (details, difficulty, basis, frame_number) = provider
+        let (details, difficulty, basis, frame_number, world_bytes) = provider
             .get_shard_info(req.include_all)
             .map_err(|e| Status::internal(format!("get shard info: {e}")))?;
 
-        use num_bigint::BigInt;
-        let mut world_bytes = BigInt::from(0);
+        let filters: Vec<_> = details.iter().map(|d| d.filter.clone()).collect();
+        let global_heads = provider.get_global_app_heads(&filters).unwrap_or_default();
         let mut shards = Vec::with_capacity(details.len());
-        for d in &details {
-            world_bytes += &d.shard_size;
+        for (i, d) in details.iter().enumerate() {
             shards.push(node::ShardRewardInfo {
+                frame_cadence: self
+                    .frame_cadence_provider
+                    .as_ref()
+                    .and_then(|p| p(&d.filter)),
+                allocation_reason: d.allocation_reason.clone(),
                 filter: d.filter.clone(),
                 active_provers: d.active_provers,
                 ring: d.ring,
+                ring_known: Some(d.ring_known),
                 shard_size: d.shard_size.to_signed_bytes_be(),
                 estimated_reward: d.estimated_reward.to_signed_bytes_be(),
                 is_allocated: d.is_allocated,
                 data_shards: d.data_shards,
+                materialized_frame: d.materialized_frame,
+                latest_frame: d.latest_frame,
+                global_head: global_heads.get(i).cloned().flatten(),
+                prover_counts: d.prover_counts.map(|c| node::ShardProverCounts {
+                    joining: c.joining,
+                    activating: c.activating,
+                    active: c.active,
+                    paused: c.paused,
+                    leaving: c.leaving,
+                    departing: c.departing,
+                }),
             });
         }
 
@@ -740,6 +1818,7 @@ impl NodeService for NodeRpcServer {
             pomw_basis: basis.to_signed_bytes_be(),
             world_state_bytes: world_bytes.to_signed_bytes_be(),
             frame_number,
+            allocation_scoring_strategy: provider.allocation_scoring_strategy().into(),
         }))
     }
 
@@ -747,9 +1826,10 @@ impl NodeService for NodeRpcServer {
         &self,
         request: Request<node::RequestJoinRequest>,
     ) -> Result<Response<node::RequestJoinResponse>, Status> {
-        let ctl = self.worker_control.as_ref().ok_or_else(|| {
-            Status::unavailable("worker control not wired")
-        })?;
+        let ctl = self
+            .worker_control
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("worker control not wired"))?;
         let req = request.into_inner();
         if req.filters.is_empty() {
             return Err(Status::invalid_argument("filters must be non-empty"));
@@ -779,13 +1859,18 @@ impl NodeService for NodeRpcServer {
         &self,
         request: Request<node::SetManuallyManagedRequest>,
     ) -> Result<Response<node::SetManuallyManagedResponse>, Status> {
-        let ctl = self.worker_control.as_ref().ok_or_else(|| {
-            Status::unavailable("worker control not wired")
-        })?;
+        let ctl = self
+            .worker_control
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("worker control not wired"))?;
         let req = request.into_inner();
         tracing::info!(
             core_id = req.core_id,
-            mode = if req.manually_managed { "manual" } else { "auto" },
+            mode = if req.manually_managed {
+                "manual"
+            } else {
+                "auto"
+            },
             "SetManuallyManaged RPC received"
         );
         ctl.set_manually_managed(req.core_id, req.manually_managed)
@@ -797,9 +1882,10 @@ impl NodeService for NodeRpcServer {
         &self,
         request: Request<global::GetGlobalFrameRequest>,
     ) -> Result<Response<global::GlobalFrameResponse>, Status> {
-        let store = self.clock_store.as_ref().ok_or_else(|| {
-            Status::unavailable("clock store not available")
-        })?;
+        let store = self
+            .clock_store
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("clock store not available"))?;
         let req = request.into_inner();
         let frame = if req.frame_number == 0 {
             store
@@ -822,16 +1908,16 @@ impl NodeService for NodeRpcServer {
         &self,
         request: Request<node::SubmitMessageRequest>,
     ) -> Result<Response<node::SubmitMessageResponse>, Status> {
-        let handler = self.submit_handler.as_ref().ok_or_else(|| {
-            Status::unavailable("submit not wired — node is read-only")
-        })?;
+        let handler = self
+            .submit_handler
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("submit not wired — node is read-only"))?;
         let req = request.into_inner();
         if req.data.is_empty() {
             return Err(Status::invalid_argument("empty message"));
         }
         tracing::info!(byte_len = req.data.len(), "SubmitMessage RPC received");
-        handler(req.data)
-            .map_err(|e| Status::invalid_argument(format!("submit rejected: {e}")))?;
+        handler(req.data).map_err(|e| Status::invalid_argument(format!("submit rejected: {e}")))?;
         Ok(Response::new(node::SubmitMessageResponse {}))
     }
 }
@@ -855,9 +1941,7 @@ fn describe_message_bundle(bundle: &global::MessageBundle) -> String {
             Some(R::Update(_)) => "Update",
             Some(R::TokenDeploy(_)) => "TokenDeploy",
             Some(R::TokenUpdate(_)) => "TokenUpdate",
-            Some(R::Transaction(_)) => "Transaction",
-            Some(R::PendingTransaction(_)) => "PendingTransaction",
-            Some(R::MintTransaction(_)) => "MintTransaction",
+            Some(R::TokenOperation(_)) => "TokenOperation",
             Some(R::HypergraphDeploy(_)) => "HypergraphDeploy",
             Some(R::HypergraphUpdate(_)) => "HypergraphUpdate",
             Some(R::VertexAdd(_)) => "VertexAdd",
@@ -874,7 +1958,1544 @@ fn describe_message_bundle(bundle: &global::MessageBundle) -> String {
             Some(R::SeniorityMerge(_)) => "SeniorityMerge",
             Some(R::ShardSplit(_)) => "ShardSplit",
             Some(R::ShardMerge(_)) => "ShardMerge",
+            Some(R::CommitteeHandoff(_)) => "CommitteeHandoff",
+            Some(R::PresenceReport(_)) => "PresenceReport",
+            Some(R::StorageEpochProof(_)) => "StorageEpochProof",
         });
     }
     tags.join(",")
+}
+
+#[cfg(test)]
+mod coin_witness_tests {
+    use super::*;
+    use quil_types::store::{CoinWitnessBundle, CoinWitnessProvider};
+    use std::sync::{Condvar, Mutex};
+
+    struct BlockingWitness {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    impl CoinWitnessProvider for BlockingWitness {
+        fn coin_witnesses(
+            &self,
+            _: &[u8; 32],
+            _: &[[u8; 32]],
+        ) -> quil_types::error::Result<Option<CoinWitnessBundle>> {
+            self.started.send(()).unwrap();
+            let (lock, ready) = &*self.gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = ready.wait(released).unwrap();
+            }
+            Err(quil_types::error::QuilError::NotFound(
+                "snapshot unavailable".into(),
+            ))
+        }
+    }
+
+    // Always unblock native workers, including on a failed assertion.
+    struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            *self.0 .0.lock().unwrap() = true;
+            self.0 .1.notify_all();
+        }
+    }
+
+    fn request() -> Request<node::GetCoinWitnessesRequest> {
+        Request::new(node::GetCoinWitnessesRequest {
+            domain: vec![1; 32],
+            addresses: vec![vec![2; 32]],
+        })
+    }
+
+    #[tokio::test]
+    async fn cancelled_rpc_keeps_worker_slot_until_rebuild_finishes() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = ReleaseOnDrop(gate.clone());
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let mut server = NodeRpcServer::default();
+        server.coin_witness_provider = Some(Arc::new(BlockingWitness { gate, started }));
+        let server = Arc::new(server);
+        let first_server = server.clone();
+        let first = tokio::spawn(async move { first_server.get_coin_witnesses(request()).await });
+        let second_server = server.clone();
+        let second = tokio::spawn(async move { second_server.get_coin_witnesses(request()).await });
+        for _ in 0..2 {
+            tokio::time::timeout(std::time::Duration::from_secs(5), starts.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        // The async runtime remains responsive while both providers block.
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let error = server.get_coin_witnesses(request()).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        drop(release);
+        let error = second.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+    }
+}
+
+#[cfg(test)]
+mod mint_authorization_witness_tests {
+    use super::*;
+    use quil_types::store::*;
+    struct Provider {
+        proof_len: usize,
+        root_len: usize,
+        fail: bool,
+        caller: std::thread::ThreadId,
+    }
+    impl CoinWitnessProvider for Provider {
+        fn mint_authorization_witness(
+            &self,
+            receipt: &[u8; 32],
+        ) -> quil_types::error::Result<MintAuthorizationWitnessData> {
+            assert_eq!(receipt, &[7; 32]);
+            assert_ne!(
+                std::thread::current().id(),
+                self.caller,
+                "store work must leave the async thread"
+            );
+            if self.fail {
+                return Err(quil_types::error::QuilError::ExecutionUnavailable(
+                    "history pruned".into(),
+                ));
+            }
+            Ok(MintAuthorizationWitnessData {
+                found: true,
+                cited_frame: 19,
+                forest_proof: vec![1; self.proof_len],
+                global_root: vec![2; self.root_len],
+            })
+        }
+    }
+    #[tokio::test]
+    async fn mint_authorization_rpc_bounds_and_failure_classification() {
+        let request = |len| {
+            Request::new(node::GetMintAuthorizationWitnessRequest {
+                receipt: vec![7; len],
+            })
+        };
+        let server = |proof_len, root_len, fail| {
+            NodeRpcServer::new().with_coin_witness_provider(Arc::new(Provider {
+                proof_len,
+                root_len,
+                fail,
+                caller: std::thread::current().id(),
+            }))
+        };
+        let valid = server(32 * 1024, 32, false);
+        assert_eq!(
+            valid
+                .get_mint_authorization_witness(request(31))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let response = valid
+            .get_mint_authorization_witness(request(32))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.found);
+        assert_eq!(response.cited_frame, 19);
+        assert_eq!(response.global_root, vec![2; 32]);
+        assert_eq!(response.forest_proof.len(), 32 * 1024);
+        for bad in [server(32 * 1024 + 1, 32, false), server(1, 31, false)] {
+            assert_eq!(
+                bad.get_mint_authorization_witness(request(32))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Internal
+            );
+        }
+        assert_eq!(
+            server(1, 32, true)
+                .get_mint_authorization_witness(request(32))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        assert_eq!(
+            NodeRpcServer::new()
+                .get_mint_authorization_witness(request(32))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+    }
+}
+
+#[cfg(test)]
+mod mint_authorization_status_tests {
+    use super::*;
+    use quil_types::store::*;
+    struct Provider {
+        fail: bool,
+    }
+    impl CoinWitnessProvider for Provider {
+        fn mint_authorization_status(
+            &self,
+            receipt: &[u8; 32],
+        ) -> quil_types::error::Result<MintAuthorizationStatusData> {
+            assert_eq!(receipt, &[7; 32]);
+            if self.fail {
+                return Err(quil_types::error::QuilError::ExecutionUnavailable(
+                    "history pruned".into(),
+                ));
+            }
+            Ok(MintAuthorizationStatusData {
+                state: node::MintAuthorizationState::AwaitingCitableRoot,
+                found: true,
+                inclusion_frame: 10,
+                inclusion_frame_earliest: 9,
+                claim_cap: 8,
+                cap_from_shard_anchor: true,
+                head_frame: 20,
+                searched_frame: 19,
+                cited_frame: 7,
+                first_root_frame: 11,
+                reason: "waiting".into(),
+            })
+        }
+    }
+    fn request(len: usize) -> Request<node::GetMintAuthorizationStatusRequest> {
+        Request::new(node::GetMintAuthorizationStatusRequest {
+            receipt: vec![7; len],
+        })
+    }
+    fn server(fail: bool) -> NodeRpcServer {
+        NodeRpcServer::new().with_coin_witness_provider(Arc::new(Provider { fail }))
+    }
+
+    #[tokio::test]
+    async fn status_rpc_carries_every_field_and_classifies_failures() {
+        assert_eq!(
+            server(false)
+                .get_mint_authorization_status(request(31))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let response = server(false)
+            .get_mint_authorization_status(request(32))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            node::GetMintAuthorizationStatusResponse {
+                state: node::MintAuthorizationState::AwaitingCitableRoot as i32,
+                found: true,
+                inclusion_frame: 10,
+                inclusion_frame_earliest: 9,
+                claim_cap: 8,
+                cap_from_shard_anchor: true,
+                head_frame: 20,
+                searched_frame: 19,
+                cited_frame: 7,
+                first_root_frame: 11,
+                reason: "waiting".into(),
+            }
+        );
+        assert_eq!(
+            server(true)
+                .get_mint_authorization_status(request(32))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        // The provider's default: a build that cannot answer says so.
+        struct Silent;
+        impl CoinWitnessProvider for Silent {}
+        assert_eq!(
+            NodeRpcServer::new()
+                .with_coin_witness_provider(Arc::new(Silent))
+                .get_mint_authorization_status(request(32))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    /// A node that does not hold an application must refuse a read for it
+    /// rather than answer empty: a wallet cannot tell "no coins" from "not
+    /// served here", and reads a token it owns as a zero balance.
+    #[tokio::test]
+    async fn a_read_for_an_unserved_application_is_refused_not_answered_empty() {
+        let served = [7u8; 32];
+        let server = NodeRpcServer::new().with_application_coverage({
+            let served = served.to_vec();
+            std::sync::Arc::new(move |app: &[u8]| app == served)
+        });
+        // Served: passes the gate (and then fails for want of a provider,
+        // which is a different, honest answer).
+        assert!(server.require_application_coverage(&served).is_ok());
+        // Not served: refused, and the message says where to look.
+        let status = server.require_application_coverage(&[9u8; 32]).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(
+            status.message().contains("does not serve"),
+            "{}",
+            status.message()
+        );
+        assert!(status.message().contains(&hex::encode([9u8; 32])));
+        // A vertex read for it is refused before any store lookup.
+        let mut address = vec![9u8; 32];
+        address.extend_from_slice(&[1u8; 32]);
+        let status = server
+            .get_vertex_data(tonic::Request::new(node::GetVertexDataRequest {
+                address,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        // With no coverage hook wired, every application is served as before.
+        assert!(NodeRpcServer::new()
+            .require_application_coverage(&[9u8; 32])
+            .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod witness_tests {
+    use super::*;
+    use quil_types::store::*;
+    struct Provider {
+        enabled: bool,
+        bad_path: bool,
+        bad_root: bool,
+    }
+    impl CoinWitnessProvider for Provider {
+        fn escrow_page(
+            &self,
+            _: &[u8; 32],
+            id: Option<&[u8; 32]>,
+            after: Option<&[u8; 32]>,
+        ) -> quil_types::error::Result<Option<EscrowPageData>> {
+            if !self.enabled {
+                return Ok(None);
+            }
+            Ok(Some(EscrowPageData {
+                network: [0; 32],
+                snapshot_id: if self.bad_root {
+                    [99; 32]
+                } else {
+                    id.copied().unwrap_or([7; 32])
+                },
+                escrows: if after.is_some() {
+                    vec![]
+                } else {
+                    vec![([1; 32], vec![1; if self.bad_path { 65_537 } else { 64 }])]
+                },
+                cursor: Some([1; 32]),
+                has_more: after.is_none(),
+            }))
+        }
+
+        fn coin_page(
+            &self,
+            _: &[u8; 32],
+            id: Option<&[u8; 32]>,
+            after: Option<&[u8; 32]>,
+        ) -> quil_types::error::Result<Option<quil_types::store::CoinPageData>> {
+            use quil_types::store::{CoinData, CoinPageData};
+            if !self.enabled {
+                return Ok(None);
+            }
+            let mut root_record = vec![0; ROOT_RECORD_BYTES];
+            root_record[..8].copy_from_slice(b"QCT3RT\0\x02");
+            root_record[40] = 1;
+            Ok(Some(CoinPageData {
+                network: [0; 32],
+                snapshot_id: if self.bad_root {
+                    [99; 32]
+                } else {
+                    id.copied().unwrap_or([7; 32])
+                },
+                root_record,
+                coins: if after.is_some() {
+                    Vec::new()
+                } else {
+                    (1..=8)
+                        .map(|i| CoinData {
+                            address: [i; 32],
+                            frame_number: 1,
+                            position: u64::from(i) - 1,
+                            owner: vec![
+                                0;
+                                if self.bad_path {
+                                    IDENTITY_BYTES - 1
+                                } else {
+                                    IDENTITY_BYTES
+                                }
+                            ],
+                            commitment: vec![0; 10368],
+                            memo: vec![0; 1115],
+                        })
+                        .collect()
+                },
+                cursor: if after.is_some() {
+                    Some([9; 32])
+                } else {
+                    Some([8; 32])
+                },
+                has_more: true,
+            }))
+        }
+        fn coin_witnesses(
+            &self,
+            _: &[u8; 32],
+            addresses: &[[u8; 32]],
+        ) -> quil_types::error::Result<Option<CoinWitnessBundle>> {
+            if !self.enabled {
+                return Ok(None);
+            }
+            let mut root_record = vec![0; ROOT_RECORD_BYTES];
+            root_record[..8].copy_from_slice(b"QCT3RT\0\x02");
+            root_record[40] = if self.bad_root { 1 } else { 32 };
+            Ok(Some(CoinWitnessBundle {
+                network: [0; 32],
+                root_record,
+                depth: 32,
+                witnesses: addresses
+                    .iter()
+                    .map(|address| CoinWitnessData {
+                        address: *address,
+                        found: true,
+                        siblings: vec![vec![0; if self.bad_path { 1 } else { NODE_BYTES }]; 32],
+                        right: vec![false; 32],
+                    })
+                    .collect(),
+            }))
+        }
+    }
+    #[test]
+    fn witness_index_unavailability_is_retryable() {
+        assert_eq!(
+            coin_witness_status(quil_types::error::QuilError::ExecutionUnavailable(
+                "index building".into()
+            ))
+            .code(),
+            tonic::Code::Unavailable
+        );
+        assert_eq!(
+            coin_witness_status(quil_types::error::QuilError::InvalidArgument(
+                "bad request".into()
+            ))
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            coin_witness_status(quil_types::error::QuilError::Store("disk failure".into())).code(),
+            tonic::Code::Internal
+        );
+    }
+
+    #[tokio::test]
+    async fn escrow_scan_bounds_and_continuation() {
+        let request = |id: Vec<u8>, after: Vec<u8>| {
+            Request::new(node::ListCoinsRequest {
+                domain: vec![0; 32],
+                snapshot_id: id,
+                after,
+                max_coins: 0,
+            })
+        };
+        let server = |enabled, bad_path, bad_root| {
+            NodeRpcServer::new().with_coin_witness_provider(Arc::new(Provider {
+                enabled,
+                bad_path,
+                bad_root,
+            }))
+        };
+        let valid = server(true, false, false);
+        assert_eq!(
+            valid
+                .list_escrows(request(vec![], vec![1; 32]))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            valid
+                .list_escrows(request(vec![1], vec![]))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let first = valid
+            .list_escrows(request(vec![], vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(first.escrows.len(), 1);
+        assert!(first.has_more);
+        let last = valid
+            .list_escrows(request(first.snapshot_id, first.cursor))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(last.escrows.is_empty() && !last.has_more);
+        assert_eq!(
+            server(true, true, false)
+                .list_escrows(request(vec![], vec![]))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Internal
+        );
+        assert_eq!(
+            server(true, false, true)
+                .list_escrows(request(vec![7; 32], vec![]))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Internal
+        );
+        assert_eq!(
+            server(false, false, false)
+                .list_escrows(request(vec![], vec![]))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unimplemented
+        );
+    }
+
+    #[tokio::test]
+    async fn witness_scan_bounds_and_continuation() {
+        let request = |snapshot_id: Vec<u8>, after: Vec<u8>| {
+            Request::new(node::ListCoinsRequest {
+                domain: vec![1; 32],
+                snapshot_id,
+                after,
+                max_coins: 0,
+            })
+        };
+        let empty = NodeRpcServer::new();
+        for (id, after) in [
+            (vec![], vec![1; 32]),
+            (vec![1; 31], vec![]),
+            (vec![1; 32], vec![1; 31]),
+        ] {
+            assert_eq!(
+                empty
+                    .list_coins(request(id, after))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+        let server = NodeRpcServer::new().with_coin_witness_provider(Arc::new(Provider {
+            enabled: true,
+            bad_path: false,
+            bad_root: false,
+        }));
+        let first = server
+            .list_coins(request(vec![], vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(first.coins.len(), 8);
+        assert!(prost::Message::encoded_len(&first) <= 256 * 1024);
+        let next = server
+            .list_coins(request(first.snapshot_id.clone(), first.cursor))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(next.snapshot_id, first.snapshot_id);
+        assert!(next.coins.is_empty());
+        assert!(next.has_more);
+        assert_eq!(next.cursor, vec![9; 32]);
+        for (bad_path, bad_root) in [(true, false), (false, true)] {
+            let server = NodeRpcServer::new().with_coin_witness_provider(Arc::new(Provider {
+                enabled: true,
+                bad_path,
+                bad_root,
+            }));
+            assert_eq!(
+                server
+                    .list_coins(request(vec![7; 32], vec![]))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Internal
+            );
+        }
+        let disabled = NodeRpcServer::new().with_coin_witness_provider(Arc::new(Provider {
+            enabled: false,
+            bad_path: false,
+            bad_root: false,
+        }));
+        assert_eq!(
+            disabled
+                .list_coins(request(vec![], vec![]))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unimplemented
+        );
+    }
+
+    /// QUIL before its first confidential coin has no root anywhere (#698):
+    /// the scan's one page is empty, final and rootless, and that is an
+    /// answer rather than a malformed page. Only there is a page rootless.
+    #[tokio::test]
+    async fn a_rootless_page_ends_a_fresh_scan_empty() {
+        struct Rootless {
+            coins: u8,
+            has_more: bool,
+        }
+        impl CoinWitnessProvider for Rootless {
+            fn coin_page(
+                &self,
+                _: &[u8; 32],
+                _: Option<&[u8; 32]>,
+                _: Option<&[u8; 32]>,
+            ) -> quil_types::error::Result<Option<CoinPageData>> {
+                Ok(Some(CoinPageData {
+                    network: [0; 32],
+                    snapshot_id: [7; 32],
+                    root_record: Vec::new(),
+                    coins: (1..=self.coins)
+                        .map(|i| CoinData {
+                            address: [i; 32],
+                            frame_number: 1,
+                            position: 0,
+                            owner: vec![0; IDENTITY_BYTES],
+                            commitment: vec![0; 10368],
+                            memo: vec![0; 1115],
+                        })
+                        .collect(),
+                    cursor: (self.coins > 0 || self.has_more).then_some([8; 32]),
+                    has_more: self.has_more,
+                }))
+            }
+        }
+        let request = |snapshot_id: Vec<u8>, after: Vec<u8>| {
+            Request::new(node::ListCoinsRequest {
+                domain: vec![1; 32],
+                snapshot_id,
+                after,
+                max_coins: 0,
+            })
+        };
+        let server = |coins, has_more| {
+            NodeRpcServer::new().with_coin_witness_provider(Arc::new(Rootless { coins, has_more }))
+        };
+        let page = server(0, false)
+            .list_coins(request(vec![], vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            page.root_record.is_empty()
+                && page.coins.is_empty()
+                && page.cursor.is_empty()
+                && !page.has_more
+        );
+        assert_eq!(page.snapshot_id, vec![7; 32]);
+        for (coins, has_more) in [(1, false), (0, true)] {
+            assert_eq!(
+                server(coins, has_more)
+                    .list_coins(request(vec![], vec![]))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Internal,
+                "coins={coins} has_more={has_more}"
+            );
+        }
+        assert_eq!(
+            server(0, false)
+                .list_coins(request(vec![7; 32], vec![9; 32]))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Internal,
+            "a continuation cannot lose its root"
+        );
+    }
+
+    /// A node that does not hold the application forwards the scan; when
+    /// every asked peer declines, their reasons reach the wallet (#698).
+    #[tokio::test]
+    async fn a_forwarded_scan_refusal_names_the_peers_reasons() {
+        let reasons = "4 peers declined: 4x Unavailable: coin scan: no root in snapshot";
+        let remote: RemoteCoinPage =
+            Arc::new(move |_, _, _, _| Box::pin(async move { Err(reasons.to_string()) }));
+        let server = NodeRpcServer::new()
+            .with_application_coverage(Arc::new(|_: &[u8]| false))
+            .with_remote_coin_page(remote);
+        let status = server
+            .list_coins(Request::new(node::ListCoinsRequest {
+                domain: vec![1; 32],
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(status.message().ends_with(reasons), "{}", status.message());
+    }
+
+    /// Serves `count` coins or escrows at addresses 1..=count, eight a page
+    /// as every provider does; `sparse` pages list none and pass over one
+    /// address each, as a run of stale index entries does.
+    struct Paged {
+        count: u16,
+        sparse: bool,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    fn paged_address(i: u16) -> [u8; 32] {
+        let mut address = [0; 32];
+        address[..2].copy_from_slice(&i.to_be_bytes());
+        address
+    }
+
+    impl Paged {
+        /// The addresses a page after `after` lists, its cursor and whether
+        /// the scan continues.
+        fn page(
+            &self,
+            id: Option<&[u8; 32]>,
+            after: Option<&[u8; 32]>,
+        ) -> (Vec<[u8; 32]>, Option<[u8; 32]>, bool) {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(id.is_none() || id == Some(&[7; 32]));
+            let next = after.map_or(1, |a| u16::from_be_bytes([a[0], a[1]]) + 1);
+            if self.sparse {
+                return (Vec::new(), Some(paged_address(next)), next < self.count);
+            }
+            let listed: Vec<_> = (next..=self.count).take(8).collect();
+            let last = listed.last().copied();
+            (
+                listed.into_iter().map(paged_address).collect(),
+                last.map(paged_address).or(after.copied()),
+                last.is_some_and(|last| last < self.count),
+            )
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl CoinWitnessProvider for Paged {
+        fn coin_page(
+            &self,
+            _: &[u8; 32],
+            id: Option<&[u8; 32]>,
+            after: Option<&[u8; 32]>,
+        ) -> quil_types::error::Result<Option<CoinPageData>> {
+            let (addresses, cursor, has_more) = self.page(id, after);
+            let mut root_record = vec![0; ROOT_RECORD_BYTES];
+            root_record[..8].copy_from_slice(b"QCT3RT\0\x02");
+            root_record[40] = 1;
+            Ok(Some(CoinPageData {
+                network: [0; 32],
+                snapshot_id: [7; 32],
+                root_record,
+                coins: addresses
+                    .into_iter()
+                    .map(|address| CoinData {
+                        address,
+                        frame_number: 1,
+                        position: 0,
+                        owner: vec![0; IDENTITY_BYTES],
+                        commitment: vec![0; 10368],
+                        memo: vec![0; 1115],
+                    })
+                    .collect(),
+                cursor,
+                has_more,
+            }))
+        }
+
+        fn escrow_page(
+            &self,
+            _: &[u8; 32],
+            id: Option<&[u8; 32]>,
+            after: Option<&[u8; 32]>,
+        ) -> quil_types::error::Result<Option<EscrowPageData>> {
+            let (addresses, cursor, has_more) = self.page(id, after);
+            Ok(Some(EscrowPageData {
+                network: [0; 32],
+                snapshot_id: [7; 32],
+                escrows: addresses
+                    .into_iter()
+                    .map(|address| (address, vec![1; 64]))
+                    .collect(),
+                cursor,
+                has_more,
+            }))
+        }
+    }
+
+    /// A wallet asking for pages of up to 64 coins gets the provider's pages
+    /// of eight gathered from one snapshot, in order; a request without
+    /// `max_coins` gets one provider page, as before. A run of pages that
+    /// list nothing costs at most as many provider pages as a full page.
+    #[tokio::test]
+    async fn a_scan_page_gathers_provider_pages_up_to_the_requested_size() {
+        let server = |count, sparse| {
+            let provider = Arc::new(Paged {
+                count,
+                sparse,
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            });
+            (
+                NodeRpcServer::new().with_coin_witness_provider(provider.clone()),
+                provider,
+            )
+        };
+        let request = |max_coins, snapshot_id: Vec<u8>, after: Vec<u8>| {
+            Request::new(node::ListCoinsRequest {
+                domain: vec![1; 32],
+                snapshot_id,
+                after,
+                max_coins,
+            })
+        };
+
+        let (old, provider) = server(100, false);
+        let page = old
+            .list_coins(request(0, vec![], vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((page.coins.len(), provider.reads()), (8, 1));
+        assert!(prost::Message::encoded_len(&page) <= 256 * 1024);
+
+        let (wide, provider) = server(100, false);
+        let first = wide
+            .list_coins(request(64, vec![], vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((first.coins.len(), provider.reads()), (64, 8));
+        assert!(first.has_more);
+        assert_eq!(first.cursor, paged_address(64).to_vec());
+        assert!(prost::Message::encoded_len(&first) <= scan_page_bytes(64));
+        let rest = wide
+            .list_coins(request(64, first.snapshot_id.clone(), first.cursor.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(rest.coins.len(), 36);
+        assert!(!rest.has_more);
+        let listed: Vec<_> = first
+            .coins
+            .iter()
+            .chain(&rest.coins)
+            .map(|coin| coin.address.clone())
+            .collect();
+        let expected: Vec<_> = (1..=100).map(|i| paged_address(i).to_vec()).collect();
+        assert_eq!(listed, expected);
+
+        let (capped, _) = server(1000, false);
+        let page = capped
+            .list_coins(request(u32::MAX, vec![], vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(page.coins.len(), MAX_SCAN_PAGE_ENTRIES);
+
+        let (sparse, provider) = server(1000, true);
+        let page = sparse
+            .list_coins(request(64, vec![], vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(page.coins.is_empty() && page.has_more);
+        assert_eq!(provider.reads(), 8);
+        assert_eq!(page.cursor, paged_address(8).to_vec());
+
+        let (escrows, provider) = server(100, false);
+        let page = escrows
+            .list_escrows(request(64, vec![], vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((page.escrows.len(), provider.reads()), (64, 8));
+        let (escrows, provider) = server(100, false);
+        let page = escrows
+            .list_escrows(request(0, vec![], vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((page.escrows.len(), provider.reads()), (8, 1));
+    }
+
+    fn request(addresses: Vec<Vec<u8>>) -> Request<node::GetCoinWitnessesRequest> {
+        Request::new(node::GetCoinWitnessesRequest {
+            domain: vec![1; 32],
+            addresses,
+        })
+    }
+    #[tokio::test]
+    async fn witness_request_validation_precedes_provider_work() {
+        let server = NodeRpcServer::new();
+        for addresses in [
+            vec![],
+            vec![vec![1; 31]],
+            vec![vec![1; 32]; 2],
+            (0..5).map(|i| vec![i; 32]).collect(),
+        ] {
+            let error = server
+                .get_coin_witnesses(request(addresses))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
+        let error = server
+            .get_coin_witnesses(Request::new(node::GetCoinWitnessesRequest {
+                domain: vec![],
+                addresses: vec![vec![1; 32]],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+    #[tokio::test]
+    async fn witness_transport_bounds_and_optional_provider() {
+        let server = NodeRpcServer::new().with_coin_witness_provider(Arc::new(Provider {
+            enabled: true,
+            bad_path: false,
+            bad_root: false,
+        }));
+        let response = server
+            .get_coin_witnesses(request((0..4).map(|i| vec![i; 32]).collect()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.witnesses.len(), 4);
+        assert_eq!(response.witnesses[3].address, vec![3; 32]);
+        assert_eq!(response.root_record.len(), ROOT_RECORD_BYTES);
+        assert!(prost::Message::encoded_len(&response) < 1 << 20);
+        let server = NodeRpcServer::new().with_coin_witness_provider(Arc::new(Provider {
+            enabled: true,
+            bad_path: true,
+            bad_root: false,
+        }));
+        assert_eq!(
+            server
+                .get_coin_witnesses(request(vec![vec![1; 32]]))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Internal
+        );
+        let server = NodeRpcServer::new().with_coin_witness_provider(Arc::new(Provider {
+            enabled: true,
+            bad_path: false,
+            bad_root: true,
+        }));
+        assert_eq!(
+            server
+                .get_coin_witnesses(request(vec![vec![1; 32]]))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Internal
+        );
+        let server = NodeRpcServer::new().with_coin_witness_provider(Arc::new(Provider {
+            enabled: false,
+            bad_path: false,
+            bad_root: false,
+        }));
+        assert_eq!(
+            server
+                .get_coin_witnesses(request(vec![vec![1; 32]]))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unimplemented
+        );
+    }
+}
+
+#[cfg(test)]
+mod token_fee_quote_tests {
+    use super::*;
+
+    /// The quote handler admits two concurrent workers process-wide; these
+    /// tests each issue several quotes and must not contend for them.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn request(limit: u64) -> Request<node::GetTokenFeeQuoteRequest> {
+        Request::new(node::GetTokenFeeQuoteRequest {
+            application: quil_execution::domains::QUIL_TOKEN.to_vec(),
+            max_payload_bytes: limit,
+            global_venue: false,
+        })
+    }
+    fn snapshot() -> TokenFeeSnapshot {
+        TokenFeeSnapshot {
+            network: [0; 32],
+            observed_frame: 42,
+            global_execution: false,
+            difficulty: 50_000,
+            world_state_bytes: 0,
+            fee_multiplier_vote: 7,
+        }
+    }
+
+    #[tokio::test]
+    async fn token_fee_quote_preserves_snapshot_and_covers_payload_bound() {
+        let _serial = SERIAL.lock().await;
+        let server = NodeRpcServer::new().with_token_fee_provider(Arc::new(|application, _| {
+            assert_eq!(application, quil_execution::domains::QUIL_TOKEN);
+            Ok(snapshot())
+        }));
+        let quote = server
+            .get_token_fee_quote(request(64))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(quote.network, vec![0; 32]);
+        assert_eq!(
+            quote.application,
+            quil_execution::domains::QUIL_TOKEN.to_vec()
+        );
+        assert_eq!(
+            (
+                quote.observed_frame,
+                quote.difficulty,
+                quote.world_state_bytes,
+                quote.fee_multiplier_vote,
+                quote.max_payload_bytes
+            ),
+            (42, 50_000, 0, 7, 64)
+        );
+        assert!(!quote.global_execution);
+        assert_eq!(quote.fee_budget.len(), 16);
+        let budget = u128::from_be_bytes(quote.fee_budget.try_into().unwrap());
+        for cost in 1..=64 {
+            assert!(budget >= cost * 7);
+        }
+        // No compiled floor: a zero vote prices the operation at zero.
+        let zero_vote = NodeRpcServer::new().with_token_fee_provider(Arc::new(|_, _| {
+            Ok(TokenFeeSnapshot {
+                fee_multiplier_vote: 0,
+                ..snapshot()
+            })
+        }));
+        let quote = zero_vote
+            .get_token_fee_quote(request(64))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(u128::from_be_bytes(quote.fee_budget.try_into().unwrap()), 0);
+    }
+
+    #[tokio::test]
+    async fn token_fee_quote_rejects_missing_invalid_or_unrepresentable_pricing() {
+        let _serial = SERIAL.lock().await;
+        let empty = NodeRpcServer::new();
+        assert_eq!(
+            empty
+                .get_token_fee_quote(request(64))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        for bound in [0, 1 << 20, u64::MAX] {
+            assert_eq!(
+                empty
+                    .get_token_fee_quote(request(bound))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+        let mut malformed = request(64).into_inner();
+        malformed.application.pop();
+        assert_eq!(
+            empty
+                .get_token_fee_quote(Request::new(malformed))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        // Any application is a fee venue (settlements are sized from its
+        // quote); the global intrinsic is not.
+        let mut custom = request(64).into_inner();
+        custom.application = vec![9; 32];
+        assert_eq!(
+            empty
+                .get_token_fee_quote(Request::new(custom))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        let mut global = request(64).into_inner();
+        global.application = vec![0xff; 32];
+        assert_eq!(
+            empty
+                .get_token_fee_quote(Request::new(global))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let overflow = NodeRpcServer::new().with_token_fee_provider(Arc::new(|_, _| {
+            Ok(TokenFeeSnapshot {
+                world_state_bytes: u64::MAX,
+                ..snapshot()
+            })
+        }));
+        assert_eq!(
+            overflow
+                .get_token_fee_quote(request(64))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        let excessive = NodeRpcServer::new().with_token_fee_provider(Arc::new(|_, _| {
+            Ok(TokenFeeSnapshot {
+                difficulty: 5_000,
+                world_state_bytes: 1,
+                ..snapshot()
+            })
+        }));
+        assert_eq!(
+            excessive
+                .get_token_fee_quote(request(64))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        let malformed_network = NodeRpcServer::new().with_token_fee_provider(Arc::new(|_, _| {
+            Ok(TokenFeeSnapshot {
+                network: [7; 32],
+                ..snapshot()
+            })
+        }));
+        assert_eq!(
+            malformed_network
+                .get_token_fee_quote(request(64))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Internal
+        );
+    }
+
+    /// Non-mainnet networks quote the fixed per-byte rate, so a young test
+    /// network's tiny world state does not make growth unaffordable.
+    #[tokio::test]
+    async fn token_fee_quote_uses_the_fixed_rate_off_mainnet() {
+        let _serial = SERIAL.lock().await;
+        let server = NodeRpcServer::new().with_token_fee_provider(Arc::new(|_, _| {
+            let mut network = [0u8; 32];
+            network[31] = 1;
+            Ok(TokenFeeSnapshot {
+                network,
+                difficulty: 5_000,
+                world_state_bytes: 1,
+                ..snapshot()
+            })
+        }));
+        let quote = server
+            .get_token_fee_quote(request(64))
+            .await
+            .unwrap()
+            .into_inner();
+        let budget = u128::from_be_bytes(quote.fee_budget.try_into().unwrap());
+        assert_eq!(
+            budget,
+            64 * quil_execution::pricing::NON_MAINNET_UNITS_PER_BYTE as u128 * 7
+        );
+    }
+}
+
+#[cfg(test)]
+mod worker_execution_tests {
+    use super::*;
+    use node::node_service_server::NodeService;
+    #[tokio::test]
+    async fn worker_rpc_preserves_zero_height_and_unsupported_telemetry() {
+        let observed = node::WorkerExecution {
+            state: "blocked".into(),
+            blocker: "checkpoint mismatch".into(),
+            materialized_frame: Some(0),
+            observed_unix_ms: 1234,
+            ..Default::default()
+        };
+        let server =
+            NodeRpcServer::new().with_workers_view(Arc::new(std::sync::RwLock::new(vec![
+                WorkerEntry {
+                    core_id: 1,
+                    filter: vec![1],
+                    available_storage: 0,
+                    total_storage: 0,
+                    manually_managed: false,
+                    allocated: true,
+                    execution: Some(observed.clone()),
+                    draining: false,
+                },
+                WorkerEntry {
+                    core_id: 2,
+                    filter: vec![2],
+                    available_storage: 0,
+                    total_storage: 0,
+                    manually_managed: false,
+                    allocated: true,
+                    execution: None,
+                    draining: true,
+                },
+            ])));
+        let response = server
+            .get_worker_info(Request::new(node::GetWorkerInfoRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.worker_info[0].execution, Some(observed));
+        assert!(response.worker_info[1].execution.is_none());
+        assert_eq!(
+            response
+                .worker_info
+                .iter()
+                .map(|w| w.draining)
+                .collect::<Vec<_>>(),
+            vec![false, true]
+        );
+    }
+}
+
+#[cfg(test)]
+mod shard_world_size_tests {
+    use super::*;
+    use num_bigint::BigInt;
+    use quil_types::consensus::ShardDetail;
+
+    struct Provider;
+    impl ShardInfoProvider for Provider {
+        fn get_global_app_heads(
+            &self,
+            filters: &[Vec<u8>],
+        ) -> quil_types::error::Result<Vec<Option<node::GlobalAppFrameHead>>> {
+            Ok(filters
+                .iter()
+                .map(|f| {
+                    if f == &[1] {
+                        Some(node::GlobalAppFrameHead {
+                            frame: 0,
+                            global_frame: 12,
+                            generation: 2,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect())
+        }
+        fn allocation_scoring_strategy(&self) -> &'static str {
+            "reward-greedy"
+        }
+        fn get_shard_info(
+            &self,
+            include_all: bool,
+        ) -> quil_types::error::Result<(Vec<ShardDetail>, u64, BigInt, u64, BigInt)> {
+            let count = if include_all { 2 } else { 1 };
+            let details = (1..=count)
+                .map(|id| ShardDetail {
+                    allocation_reason: Some("$".into()),
+                    filter: vec![id],
+                    shard_size: BigInt::from(1000 * u32::from(id)),
+                    active_provers: 8,
+                    ring: 0,
+                    ring_known: id == 1,
+                    estimated_reward: BigInt::from(7),
+                    is_allocated: id == 1,
+                    data_shards: 1,
+                    materialized_frame: 10,
+                    latest_frame: 10,
+                    prover_counts: None,
+                })
+                .collect();
+            Ok((details, 10000, BigInt::from(100), 10, BigInt::from(3000)))
+        }
+    }
+    #[tokio::test]
+    async fn owned_response_does_not_replace_world_size_with_row_subtotal() {
+        let server = NodeRpcServer::new()
+            .with_shard_info_provider(Arc::new(Provider))
+            .with_frame_cadence_provider(Arc::new(|filter| {
+                Some(node::FrameCadence {
+                    last_observed_unix_seconds: 1000,
+                    hour: Some(node::FrameWindow {
+                        window_seconds: 3600,
+                        observed_seconds: 600,
+                        advanced_frames: filter[0] as u64,
+                    }),
+                    day: None,
+                })
+            }));
+        for include_all in [false, true] {
+            let response = server
+                .get_shard_info(Request::new(node::GetShardInfoRequest { include_all }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(response.shards.len(), if include_all { 2 } else { 1 });
+            assert_eq!(response.allocation_scoring_strategy, "reward-greedy");
+            assert_eq!(response.shards[0].ring_known, Some(true));
+            assert_eq!(
+                response.shards[0]
+                    .frame_cadence
+                    .as_ref()
+                    .unwrap()
+                    .hour
+                    .as_ref()
+                    .unwrap()
+                    .advanced_frames,
+                response.shards[0].filter[0] as u64
+            );
+            let response = <node::GetShardInfoResponse as prost::Message>::decode(
+                prost::Message::encode_to_vec(&response).as_slice(),
+            )
+            .unwrap();
+            assert_eq!(response.shards[0].allocation_reason.as_deref(), Some("$"));
+            assert_eq!(
+                response.shards[0].global_head.as_ref().map(|head| (
+                    head.frame,
+                    head.global_frame,
+                    head.generation
+                )),
+                Some((0, 12, 2))
+            );
+            if include_all {
+                assert!(response.shards[1].global_head.is_none());
+            }
+            if include_all {
+                assert_eq!(response.shards[1].ring_known, Some(false));
+            }
+            assert_eq!(
+                BigInt::from_signed_bytes_be(&response.world_state_bytes),
+                BigInt::from(3000)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod legacy_coin_tests {
+    use super::*;
+    use quil_types::store::{CoinWitnessProvider, LegacyCoinData, LegacyCoinPageData};
+
+    struct Index(Option<LegacyCoinPageData>);
+    impl CoinWitnessProvider for Index {
+        fn legacy_coins(
+            &self,
+            _: &[u8; 32],
+            _: &[u8; 32],
+            _: Option<&[u8; 32]>,
+        ) -> quil_types::error::Result<Option<LegacyCoinPageData>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn coin(byte: u8) -> LegacyCoinData {
+        LegacyCoinData {
+            address: [byte; 32],
+            amount: u128::from(byte) * 10,
+            origin: [byte; 32],
+            shielded: byte % 2 == 0,
+        }
+    }
+
+    fn request(after: Vec<u8>) -> Request<global::ListLegacyCoinsRequest> {
+        Request::new(global::ListLegacyCoinsRequest {
+            domain: vec![1; 32],
+            owner: vec![2; 32],
+            after,
+        })
+    }
+
+    fn server(page: Option<LegacyCoinPageData>) -> NodeRpcServer {
+        let mut server = NodeRpcServer::default();
+        server.coin_witness_provider = Some(Arc::new(Index(page)));
+        server
+    }
+
+    #[tokio::test]
+    async fn legacy_pages_are_served_locally_forwarded_or_refused() {
+        let page = LegacyCoinPageData {
+            coins: vec![coin(3), coin(4)],
+            cursor: Some([4; 32]),
+            has_more: true,
+        };
+        let served = server(Some(page.clone()))
+            .list_legacy_coins(request(vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(served.coins.len(), 2);
+        assert_eq!(served.coins[1].amount, 40u128.to_le_bytes().to_vec());
+        assert!(served.coins[1].shielded && !served.coins[0].shielded);
+        assert_eq!((served.cursor, served.has_more), (vec![4; 32], true));
+
+        // A page that does not advance past the cursor, or is out of order, is refused.
+        let error = server(Some(page.clone()))
+            .list_legacy_coins(request(vec![3; 32]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Internal);
+        let reversed = LegacyCoinPageData {
+            coins: vec![coin(4), coin(3)],
+            cursor: Some([3; 32]),
+            has_more: false,
+        };
+        assert!(server(Some(reversed))
+            .list_legacy_coins(request(vec![]))
+            .await
+            .is_err());
+        let stalled = LegacyCoinPageData {
+            coins: vec![],
+            cursor: None,
+            has_more: true,
+        };
+        assert!(server(Some(stalled))
+            .list_legacy_coins(request(vec![]))
+            .await
+            .is_err());
+        assert_eq!(
+            server(Some(page.clone()))
+                .list_legacy_coins(request(vec![1; 5]))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+
+        // No local index: forwarded when a forwarder is configured, else unavailable.
+        assert_eq!(
+            server(None)
+                .list_legacy_coins(request(vec![]))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        let mut forwarding = server(None);
+        forwarding.remote_legacy_coins = Some(Arc::new(move |_, _, _| {
+            let page = page.clone();
+            Box::pin(async move { Some(page) })
+        }));
+        assert_eq!(
+            forwarding
+                .list_legacy_coins(request(vec![]))
+                .await
+                .unwrap()
+                .into_inner()
+                .coins
+                .len(),
+            2
+        );
+    }
+}
+
+#[cfg(test)]
+mod frame_cadence_rpc_tests {
+    use super::*;
+    #[tokio::test]
+    async fn node_status_exposes_provider_coverage_without_a_client_observation_history() {
+        let cadence = node::FrameCadence {
+            last_observed_unix_seconds: 1000,
+            hour: Some(node::FrameWindow {
+                window_seconds: 3600,
+                observed_seconds: 600,
+                advanced_frames: 30,
+            }),
+            day: None,
+        };
+        let expected = cadence.clone();
+        let server = NodeRpcServer::new().with_frame_cadence_provider(Arc::new(move |filter| {
+            assert!(filter.is_empty());
+            Some(cadence.clone())
+        }));
+        let response = server
+            .get_node_info(Request::new(node::GetNodeInfoRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.frame_cadence, Some(expected));
+        let legacy = NodeRpcServer::new()
+            .get_node_info(Request::new(node::GetNodeInfoRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(legacy.frame_cadence.is_none());
+    }
+}
+
+#[cfg(test)]
+mod retro_seniority_tests {
+    use super::*;
+    use node::node_service_server::NodeService;
+
+    #[tokio::test]
+    async fn answers_each_key_in_request_order() {
+        let keys = vec![vec![1u8; 57], vec![2u8; 57], vec![3u8; 10]];
+        let response = NodeRpcServer::new()
+            .get_retro_seniority(Request::new(node::GetRetroSeniorityRequest {
+                public_keys: keys.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let expected: Vec<Vec<u64>> = keys
+            .iter()
+            .map(|key| {
+                quil_execution::global_intrinsic::seniority_succession::retro_parts(
+                    std::slice::from_ref(key),
+                )
+                .to_vec()
+            })
+            .collect();
+        let parts: Vec<Vec<u64>> = response.keys.into_iter().map(|k| k.parts).collect();
+        assert_eq!(parts, expected);
+        assert!(parts.iter().all(|p| p.len() == 5));
+    }
+
+    #[tokio::test]
+    async fn refuses_more_keys_than_a_merge_names() {
+        let error = NodeRpcServer::new()
+            .get_retro_seniority(Request::new(node::GetRetroSeniorityRequest {
+                public_keys: vec![vec![1u8; 57]; MAX_RETRO_SENIORITY_KEYS + 1],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
 }

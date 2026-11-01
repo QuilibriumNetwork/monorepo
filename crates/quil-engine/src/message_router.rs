@@ -7,39 +7,34 @@
 //! This module exposes two layers:
 //!
 //! 1. Stateless classification helpers (`classify_message`,
-//!    `classify_inner_type`, `classify_consensus_message`) used by the
-//!    consensus engine to decide where a message should go once it has
-//!    been admitted.
+//! `classify_inner_type`, `classify_consensus_message`) used by the
+//! consensus engine to decide where a message should go once it has
+//! been admitted.
 //! 2. A stateful [`MessageRouter`] that holds per-bitmask validator
-//!    closures so malformed bytes are dropped before they reach a
-//!    queue. The Go reference (`node/consensus/global/message_router.go`)
-//!    achieves the same thing via `pubsub.RegisterValidator`; in Rust
-//!    the network plumbing isn't pubsub, so we run the validator from
-//!    inside [`MessageRouter::route`] before the dispatcher invokes the
-//!    real handler.
+//! closures so malformed bytes are dropped before they reach a
+//! queue. The Go reference (`node/consensus/global/message_router.go`)
+//! achieves the same thing via `pubsub.RegisterValidator`; in Rust
+//! the network plumbing isn't pubsub, so we run the validator from
+//! inside [`MessageRouter::route`] before the dispatcher invokes the
+//! real handler.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use tracing::debug;
-
 use quil_types::error::{QuilError, Result};
 
 use quil_execution::global_engine::{
-    TYPE_PROVER_JOIN, TYPE_PROVER_LEAVE,
-    TYPE_PROVER_PAUSE, TYPE_PROVER_RESUME, TYPE_PROVER_CONFIRM,
-    TYPE_PROVER_REJECT, TYPE_PROVER_KICK, TYPE_PROVER_UPDATE,
-    TYPE_FRAME_HEADER, TYPE_SENIORITY_MERGE, TYPE_SHARD_SPLIT,
-    TYPE_SHARD_MERGE,
+    TYPE_FRAME_HEADER, TYPE_PROVER_CONFIRM, TYPE_PROVER_JOIN, TYPE_PROVER_KICK, TYPE_PROVER_LEAVE,
+    TYPE_PROVER_PAUSE, TYPE_PROVER_REJECT, TYPE_PROVER_RESUME, TYPE_PROVER_UPDATE,
+    TYPE_SENIORITY_MERGE, TYPE_SHARD_MERGE, TYPE_SHARD_SPLIT,
 };
 use quil_execution::global_intrinsic::consensus_types::{
-    TYPE_GLOBAL_PROPOSAL, TYPE_APP_SHARD_PROPOSAL,
-    TYPE_QUORUM_CERTIFICATE, TYPE_TIMEOUT_STATE, TYPE_TIMEOUT_CERTIFICATE,
+    TYPE_APP_SHARD_PROPOSAL, TYPE_GLOBAL_PROPOSAL, TYPE_QUORUM_CERTIFICATE,
+    TYPE_TIMEOUT_CERTIFICATE, TYPE_TIMEOUT_STATE,
 };
 use quil_execution::hypergraph_engine::is_hypergraph_type_prefix;
 use quil_execution::message_envelope::{
-    CanonicalMessageRequest,
-    TYPE_MESSAGE_BUNDLE, TYPE_MESSAGE_REQUEST,
+    CanonicalMessageRequest, TYPE_MESSAGE_BUNDLE, TYPE_MESSAGE_REQUEST,
 };
 
 /// Classification of an incoming message for routing purposes.
@@ -101,19 +96,30 @@ pub fn classify_message(data: &[u8]) -> Result<MessageRoute> {
 
 fn classify_inner_type(tp: u32) -> Result<MessageRoute> {
     // Consensus messages
-    if matches!(tp,
-        TYPE_GLOBAL_PROPOSAL | TYPE_APP_SHARD_PROPOSAL |
-        TYPE_QUORUM_CERTIFICATE | TYPE_TIMEOUT_STATE |
-        TYPE_TIMEOUT_CERTIFICATE | TYPE_PROPOSAL_VOTE
+    if matches!(
+        tp,
+        TYPE_GLOBAL_PROPOSAL
+            | TYPE_APP_SHARD_PROPOSAL
+            | TYPE_QUORUM_CERTIFICATE
+            | TYPE_TIMEOUT_STATE
+            | TYPE_TIMEOUT_CERTIFICATE
+            | TYPE_PROPOSAL_VOTE
     ) {
         return Ok(MessageRoute::Consensus);
     }
 
     // Global prover ops
-    if matches!(tp,
-        TYPE_PROVER_JOIN | TYPE_PROVER_LEAVE | TYPE_PROVER_PAUSE |
-        TYPE_PROVER_RESUME | TYPE_PROVER_CONFIRM | TYPE_PROVER_REJECT |
-        TYPE_PROVER_KICK | TYPE_PROVER_UPDATE | TYPE_SENIORITY_MERGE
+    if matches!(
+        tp,
+        TYPE_PROVER_JOIN
+            | TYPE_PROVER_LEAVE
+            | TYPE_PROVER_PAUSE
+            | TYPE_PROVER_RESUME
+            | TYPE_PROVER_CONFIRM
+            | TYPE_PROVER_REJECT
+            | TYPE_PROVER_KICK
+            | TYPE_PROVER_UPDATE
+            | TYPE_SENIORITY_MERGE
     ) {
         return Ok(MessageRoute::GlobalProverOp);
     }
@@ -302,30 +308,32 @@ impl Default for MessageRouter {
 pub fn validator_global_peer_info() -> TopicValidator {
     use ValidationOutcome::{Accept, Reject};
     Arc::new(|data: &[u8]| -> ValidationOutcome {
+        // MESSAGE-VALIDATION LOOP: TIMESTAMP ONLY. This validator runs inline on
+        // the receive loop for every GLOBAL_PEER_INFO message. The canonical
+        // decode + signature verify (Falcon for PeerInfo, Ed448 cross-sig for
+        // KeyRegistry) are far too expensive to run here — at flood rates they
+        // starve the receive loop, which back-pressures the swarm's outbound
+        // path until the per-peer send queue overflows ("Send Queue full").
+        //
+        // They now run AFTER the message is retrieved — the GLOBAL_PEER_INFO
+        // handler runs the PeerInfo Falcon verify + peer_id↔pubkey binding
+        // before it caches/trusts the entry, and `SignerRegistry::update` runs
+        // the KeyRegistry cross-sig verify before it stores the binding — so an
+        // unverified entry is still never trusted. The only thing we can (and
+        // do) cheaply reject here is a stale/future TIMESTAMP (a pure byte peek,
+        // no allocation): 99%+ of production drops are `*_ts_too_old`, and
+        // dropping those pre-decode is the whole point.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
 
-        // Cheap pre-validate: peek the timestamp out of the raw bytes
-        // before doing the full canonical decode + Ed448 verify, which
-        // are by far the most expensive steps and dominate CPU when the
-        // mesh is forwarding millions of stale messages per hour.
-        // 99%+ of GLOBAL_PEER_INFO drops in production were
-        // `*_ts_too_old`, all of which the peek can identify without
-        // allocating or running the signature check. Peek failures
-        // (truncation / wrong type prefix) fall through to the
-        // existing full-decode error paths so genuine corruption still
-        // gets categorized correctly.
         if data.len() >= 4 {
             let tp = u32::from_be_bytes(data[..4].try_into().unwrap_or([0; 4]));
             if tp == quil_p2p::PEER_INFO_TYPE {
                 if let Some(ts) = quil_p2p::peek_peer_info_timestamp(data) {
                     if ts < now_ms - 60_000 {
                         return Reject("pi_ts_too_old");
-                    }
-                    if ts < now_ms - 1_000 {
-                        return Reject("pi_ts_stale");
                     }
                     if ts > now_ms + 300_000 {
                         return Reject("pi_ts_future");
@@ -336,85 +344,17 @@ pub fn validator_global_peer_info() -> TopicValidator {
                     if ts < now_ms - 60_000 {
                         return Reject("kr_ts_too_old");
                     }
-                    if ts < now_ms - 1_000 {
-                        return Reject("kr_ts_stale");
-                    }
                     if ts > now_ms + 5_000 {
                         return Reject("kr_ts_future");
                     }
                 }
+            } else {
+                // Neither PeerInfo nor KeyRegistry on this bitmask — cheap drop
+                // (type-prefix check, still no decode).
+                return Reject("pi_unknown_type");
             }
         }
-
-        match quil_p2p::classify_peer_info_message(data) {
-            Ok(quil_p2p::PeerInfoMessage::PeerInfo(info)) => {
-                if info.peer_id.is_empty() {
-                    return Reject("pi_empty_peer_id");
-                }
-                if info.public_key.len() != 57 {
-                    return Reject("pi_bad_pubkey_len");
-                }
-                if info.signature.len() != 114 {
-                    return Reject("pi_bad_sig_len");
-                }
-                // Re-check timestamps post-decode in case the peek was
-                // skipped (unknown type prefix path) or a malicious
-                // peer crafted a payload where peek and full decode
-                // disagree. Defense in depth — the costs at this point
-                // are already paid.
-                if info.timestamp < now_ms - 60_000 {
-                    return Reject("pi_ts_too_old");
-                }
-                if info.timestamp < now_ms - 1_000 {
-                    return Reject("pi_ts_stale");
-                }
-                if info.timestamp > now_ms + 300_000 {
-                    return Reject("pi_ts_future");
-                }
-                let signing_payload = quil_p2p::encode_canonical_peer_info(
-                    &info,
-                    &info.public_key,
-                    &[],
-                );
-                let pubkey = match ed448_rust::PublicKey::try_from(
-                    info.public_key.as_slice(),
-                ) {
-                    Ok(pk) => pk,
-                    Err(_) => return Reject("pi_pubkey_decode"),
-                };
-                if pubkey.verify(&signing_payload, &info.signature, None).is_ok() {
-                    Accept
-                } else {
-                    Reject("pi_sig_invalid")
-                }
-            }
-            Ok(quil_p2p::PeerInfoMessage::KeyRegistry) => {
-                match quil_p2p::decode_canonical_key_registry(data) {
-                    Ok(reg) => {
-                        if !reg.ed448_pubkey.is_empty() && reg.ed448_pubkey.len() != 57 {
-                            return Reject("kr_bad_ed448_len");
-                        }
-                        if !reg.bls_pubkey.is_empty() && reg.bls_pubkey.len() != 585 {
-                            return Reject("kr_bad_bls_len");
-                        }
-                        let ts = reg.last_updated_ms as i64;
-                        if ts < now_ms - 60_000 {
-                            return Reject("kr_ts_too_old");
-                        }
-                        if ts < now_ms - 1_000 {
-                            return Reject("kr_ts_stale");
-                        }
-                        if ts > now_ms + 5_000 {
-                            return Reject("kr_ts_future");
-                        }
-                        Accept
-                    }
-                    Err(_) => Reject("kr_decode_failed"),
-                }
-            }
-            Ok(quil_p2p::PeerInfoMessage::Unknown(_)) => Reject("pi_unknown_type"),
-            Err(_) => Reject("pi_classify_failed"),
-        }
+        Accept
     })
 }
 
@@ -498,7 +438,11 @@ pub fn validator_global_consensus() -> TopicValidator {
             cw::TIMEOUT_STATE_TYPE => cw::TimeoutState::from_canonical_bytes(data).is_ok(),
             _ => return Reject("cons_bad_type"),
         };
-        if decoded { Accept } else { Reject("cons_decode_failed") }
+        if decoded {
+            Accept
+        } else {
+            Reject("cons_decode_failed")
+        }
     })
 }
 
@@ -509,7 +453,10 @@ mod tests {
     #[test]
     fn classify_prover_join() {
         let bytes = TYPE_PROVER_JOIN.to_be_bytes();
-        assert_eq!(classify_message(&bytes).unwrap(), MessageRoute::GlobalProverOp);
+        assert_eq!(
+            classify_message(&bytes).unwrap(),
+            MessageRoute::GlobalProverOp
+        );
     }
 
     #[test]
@@ -527,13 +474,19 @@ mod tests {
     #[test]
     fn classify_frame_header() {
         let bytes = TYPE_FRAME_HEADER.to_be_bytes();
-        assert_eq!(classify_message(&bytes).unwrap(), MessageRoute::ShardManagement);
+        assert_eq!(
+            classify_message(&bytes).unwrap(),
+            MessageRoute::ShardManagement
+        );
     }
 
     #[test]
     fn classify_vertex_add() {
         let bytes = 0x0404u32.to_be_bytes(); // TYPE_VERTEX_ADD
-        assert_eq!(classify_message(&bytes).unwrap(), MessageRoute::HypergraphOp);
+        assert_eq!(
+            classify_message(&bytes).unwrap(),
+            MessageRoute::HypergraphOp
+        );
     }
 
     #[test]
@@ -610,7 +563,10 @@ mod tests {
             bitmasks::GLOBAL_PEER_INFO.to_vec(),
             validator_global_peer_info(),
         );
-        let outcome = r.route(bitmasks::GLOBAL_PEER_INFO, &[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00]);
+        let outcome = r.route(
+            bitmasks::GLOBAL_PEER_INFO,
+            &[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00],
+        );
         assert!(matches!(outcome, RouteOutcome::Rejected(_)));
         assert!(!outcome.should_dispatch());
     }
@@ -635,7 +591,7 @@ mod tests {
             ..Default::default()
         };
         let pubkey = vec![0xBB; 57]; // 57 == Ed448 pubkey length
-        let sig = vec![0xCC; 114];   // 114 == Ed448 signature length
+        let sig = vec![0xCC; 114]; // 114 == Ed448 signature length
         let bytes = quil_p2p::encode_canonical_peer_info(&info, &pubkey, &sig);
 
         let outcome = r.route(bitmasks::GLOBAL_PEER_INFO, &bytes);
@@ -658,7 +614,9 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
         let info = quil_p2p::CanonicalPeerInfo {
-            peer_id: vec![0xAA; 38],
+            // The validator requires peer_id to be derived from the signing
+            // pubkey (anti-spoofing gate), so an arbitrary id won't pass.
+            peer_id: quil_p2p::peer_id_from_ed448_pubkey(&pubkey_bytes),
             timestamp: now_ms,
             version: vec![2, 1, 0],
             patch_number: vec![20],
@@ -676,30 +634,39 @@ mod tests {
         let bytes = quil_p2p::encode_canonical_peer_info(&info, &pubkey_bytes, &sig);
 
         let outcome = r.route(bitmasks::GLOBAL_PEER_INFO, &bytes);
-        assert_eq!(outcome, RouteOutcome::Accepted, "well-formed PeerInfo must be accepted");
+        assert_eq!(
+            outcome,
+            RouteOutcome::Accepted,
+            "well-formed PeerInfo must be accepted"
+        );
         assert!(outcome.should_dispatch());
     }
 
     #[test]
-    fn router_validator_rejects_short_peer_info_payload() {
-        // A type prefix only — no body. Decoder should fail and
-        // validator should reject.
+    fn router_validator_is_timestamp_only() {
+        // The route validator now does TIMESTAMP-ONLY validation — the full
+        // decode + Falcon/Ed448 verify moved to the retrieval handler (running
+        // them inline here starved the recv loop and overflowed the send queue).
         let r = MessageRouter::new();
         r.register_validator(
             bitmasks::GLOBAL_PEER_INFO.to_vec(),
             validator_global_peer_info(),
         );
+        // A PeerInfo type prefix with no body can't be timestamp-peeked, so it
+        // is ACCEPTED here and rejected later by the handler's decode (structural
+        // validation is no longer the route gate's job).
         let outcome = r.route(bitmasks::GLOBAL_PEER_INFO, &[0x00, 0x00, 0x01, 0x01]);
+        assert!(matches!(outcome, RouteOutcome::Accepted));
+        // An unknown type prefix on this bitmask is still cheaply rejected
+        // (type-prefix check, no decode).
+        let outcome = r.route(bitmasks::GLOBAL_PEER_INFO, &[0xDE, 0xAD, 0xBE, 0xEF]);
         assert!(matches!(outcome, RouteOutcome::Rejected(_)));
     }
 
     #[test]
     fn router_global_prover_validator_accepts_known_op() {
         let r = MessageRouter::new();
-        r.register_validator(
-            bitmasks::GLOBAL_PROVER.to_vec(),
-            validator_global_prover(),
-        );
+        r.register_validator(bitmasks::GLOBAL_PROVER.to_vec(), validator_global_prover());
         // ProverJoin type prefix as the leading 4 bytes is enough for
         // the validator (it checks the prefix only, since the prover
         // op decoders live in another crate and we don't want to drag
@@ -712,10 +679,7 @@ mod tests {
     #[test]
     fn router_global_prover_validator_rejects_garbage() {
         let r = MessageRouter::new();
-        r.register_validator(
-            bitmasks::GLOBAL_PROVER.to_vec(),
-            validator_global_prover(),
-        );
+        r.register_validator(bitmasks::GLOBAL_PROVER.to_vec(), validator_global_prover());
         // 0xFFFFFFFF isn't any known prover op type.
         let outcome = r.route(bitmasks::GLOBAL_PROVER, &[0xFF, 0xFF, 0xFF, 0xFF]);
         assert!(matches!(outcome, RouteOutcome::Rejected(_)));

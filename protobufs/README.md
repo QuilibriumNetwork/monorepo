@@ -1,22 +1,9 @@
-The `protoc` compiler must be installed, currently version `3.21.12` is being used: 
-https://github.com/protocolbuffers/protobuf/releases/tag/v21.12
+The `*.proto` files in this folder are the wire definitions. The Rust crates
+generate their types from them at build time (for example
+`crates/quil-types/build.rs`), so there are no generated sources to commit.
 
-The versioning is rather confusing, described here: 
-https://protobuf.dev/support/version-support/
+The `protoc` compiler must be installed; the project image and
+`docker/Dockerfile.source` install protoc 25.1 from the upstream release page:
+https://github.com/protocolbuffers/protobuf/releases/tag/v25.1
 
-Most likely you want [https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-linux-x86_64.zip](https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-linux-x86_64.zip)
-
-You can try to install from `apt` on Ubuntu, but you have no control on what exact version you are getting:
-```shell
-sudo apt install protobuf-compiler
-```
-
-Also install the following `protoc` plugins:
-```shell
-go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.30.0
-go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.3.0
-go install github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-grpc-gateway@v2.18.0
-```
-
-In order to rebuild the protobuf interfaces, in case you make changes to any of
-the `*.proto` files, run `make` in this folder.
+To pick up a change to a `*.proto` file, rebuild the workspace with `cargo`.

@@ -1,0 +1,2259 @@
+//! Local engine observations, with no allocation or reward inference.
+use quil_types::proto::node::{SessionSeal, ShardRecovery, WorkerExecution};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use crate::prover_tree_syncer::{ArchiveGap, ReplayTurn, ShardRecoveryProgress};
+use crate::recovery_turns::{RecoveryKind, MAX_TURN_HOLD};
+
+tokio::task_local! {
+    /// The record of the worker whose archive recovery runs on this task.
+    static RECOVERING: SharedWorkerExecution;
+}
+
+/// Every phase a worker execution record names (`WorkerExecution.state`).
+/// Readers outside the engine map these literals, so add a new one here.
+pub const STATES: [&str; 9] = [
+    "starting", "waiting", "syncing", "serving", "closing", "handoff", "blocked", "stopped",
+    "unknown",
+];
+
+/// Every reason a record gives for its phase (`WorkerExecution.blocker`),
+/// besides none.
+pub const BLOCKERS: [&str; 14] = [
+    "waiting for transport",
+    "restarting consensus host",
+    "engine exited",
+    "awaiting successor",
+    "staging shard data",
+    "awaiting closing certificate",
+    "awaiting allocation activation",
+    "checkpoint mismatch",
+    "state unavailable",
+    "committee admission unavailable",
+    "consensus startup unavailable",
+    "session identity unavailable",
+    "session state unavailable",
+    STORAGE_WRITE_FAILED,
+];
+
+/// The blocker of a worker whose own store stopped writing: after a failed
+/// write, or below the free-space floor ([`with_store_state`]).
+pub const STORAGE_WRITE_FAILED: &str = "storage writes stopped";
+
+/// Every archive recovery phase (`ShardRecovery.phase`).
+pub const RECOVERY_PHASES: [&str; 6] = [
+    "idle",
+    "waiting_for_permit",
+    "replaying_frames",
+    "fetching_checkpoint",
+    "installing_leaves",
+    "installing_checkpoint",
+];
+
+/// Every class [`failure_class`] gives a failed recovery attempt.
+pub const FAILURE_CLASSES: [&str; 9] = [
+    NO_ARCHIVE,
+    GLOBAL_SYNC,
+    "connect",
+    "archive_request",
+    "archive_state",
+    "replay_mismatch",
+    "other",
+    PROOF_VERIFICATION,
+    ENGINE_BUSY,
+];
+
+/// A worker's execution report with its store's state: a worker whose own
+/// store refuses writes after a failed write reads as blocked by it, also
+/// while it runs no engine, since it cannot progress until the store is
+/// reopened, and as stopped by it while the node holds it stopped to reopen
+/// the store. `execution` is what its engine reports, if it runs one.
+pub fn with_store_state(
+    core_id: u32,
+    execution: Option<WorkerExecution>,
+) -> Option<WorkerExecution> {
+    let role = quil_forest::StoreRole::Worker(core_id);
+    let state = if quil_forest::storage_health::store_held(role) {
+        "stopped"
+    } else if quil_forest::storage_health::store_latched(role) {
+        "blocked"
+    } else {
+        return execution;
+    };
+    let mut execution = execution.unwrap_or_default();
+    execution.state = state.into();
+    execution.blocker = STORAGE_WRITE_FAILED.into();
+    execution.observed_unix_ms = now_ms();
+    Some(execution)
+}
+
+/// Whether worker `core_id`'s own store has stopped writing: latched after
+/// a failed write or below the free-space floor, or held stopped while the
+/// node reopens it. Its shard cannot be prepared and it hosts no new seat.
+pub fn store_stopped(core_id: u32) -> bool {
+    let role = quil_forest::StoreRole::Worker(core_id);
+    quil_forest::storage_health::store_held(role)
+        || quil_forest::storage_health::store_latched(role)
+}
+
+/// The report of a worker the node holds stopped to reopen its store, for
+/// the lifecycle: it cannot host its seat's session, so a long stop lets
+/// the seat lapse instead of renewing it for a worker that does not vote.
+pub fn held_store_execution(core_id: u32) -> Option<WorkerExecution> {
+    quil_forest::storage_health::store_held(quil_forest::StoreRole::Worker(core_id))
+        .then(|| with_store_state(core_id, None))
+        .flatten()
+}
+
+/// `executions` with a report for each bound worker `(core, filter)` the
+/// node holds stopped to reopen its store and that reports nothing itself,
+/// for the lifecycle's seat renewal ([`held_store_execution`]).
+pub fn with_held_stores(
+    mut executions: Vec<(u32, Vec<u8>, WorkerExecution)>,
+    bound: &[(u32, Vec<u8>)],
+) -> Vec<(u32, Vec<u8>, WorkerExecution)> {
+    for (core_id, filter) in bound {
+        if executions
+            .iter()
+            .any(|(id, reported, _)| id == core_id && reported == filter)
+        {
+            continue;
+        }
+        if let Some(held) = held_store_execution(*core_id) {
+            executions.push((*core_id, filter.clone(), held));
+        }
+    }
+    executions
+}
+
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SharedWorkerExecution {
+    record: Arc<Mutex<WorkerExecution>>,
+    /// This worker's successor session waits on the archive recovery of its
+    /// predecessor's state.
+    successor_blocked: Arc<AtomicBool>,
+    /// Failed recovery attempts by shard.
+    streaks: Arc<Mutex<HashMap<Vec<u8>, FailureStreak>>>,
+    /// This worker's shard owes a re-anchor whose requested attempt no
+    /// shard sync has taken yet.
+    reanchor_armed: Arc<AtomicBool>,
+    /// An attempt of the owed re-anchor handed its turn back, and the
+    /// engine has not yet requested the attempt again.
+    reanchor_yield: Arc<AtomicBool>,
+    /// The archive recovery turn this worker's recovery holds.
+    turn: Arc<Mutex<TurnHold>>,
+    /// This worker is a voting member of its shard's running committee
+    /// session whose materialized frame trails the session's committed tip.
+    lagging_voter: Arc<AtomicBool>,
+    /// This worker's seat departs, and its recovery is more than a gap fill.
+    departing: Arc<AtomicBool>,
+    /// The queue place of this worker's last replay, kept while it ended
+    /// behind its target: `(filter, ticket)`.
+    replay_ticket: Arc<Mutex<Option<(Vec<u8>, u64)>>>,
+    /// The pacing of recoveries whose attempts stop at a shard frame no
+    /// archive serves, by shard.
+    archive_gaps: Arc<Mutex<HashMap<Vec<u8>, ArchiveGapPacing>>>,
+}
+
+/// An archive recovery turn as its holder's recovery sees it
+/// ([`crate::recovery_turns`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TurnHold {
+    /// When it was granted; `None` while none is held.
+    pub(crate) since: Option<tokio::time::Instant>,
+    pub(crate) kind: RecoveryKind,
+    /// Its hold limit passed: the recovery hands it back at its next chunk
+    /// boundary ([`recovery_turn_spent`]).
+    pub(crate) yielding: bool,
+}
+
+/// What a tree sync returns when its recovery hands its turn back at the
+/// hold limit ([`recovery_turn_spent`]).
+pub const RECOVERY_TURN_SPENT: &str =
+    "archive recovery turn reached its hold limit; the installed leaves stay and the next turn resumes from them";
+
+/// The error a tree sync returns when its recovery hands its turn back.
+pub fn turn_spent_error() -> quil_types::error::QuilError {
+    quil_types::error::QuilError::ExecutionUnavailable(RECOVERY_TURN_SPENT.into())
+}
+
+/// Whether `error` is a turn handed back ([`turn_spent_error`]), not a failure.
+pub fn turn_spent(error: &quil_types::error::QuilError) -> bool {
+    matches!(error, quil_types::error::QuilError::ExecutionUnavailable(m) if m == RECOVERY_TURN_SPENT)
+}
+
+impl SharedWorkerExecution {
+    /// Whether this worker's successor session cannot start until archive
+    /// recovery brings its predecessor's state through the seal. Such a
+    /// worker takes the next recovery turn before others.
+    pub fn set_successor_blocked(&self, blocked: bool) {
+        self.successor_blocked.store(blocked, Ordering::Relaxed);
+    }
+
+    /// The flag behind [`Self::set_successor_blocked`], read by the recovery
+    /// turn queue each time it grants a turn.
+    pub(crate) fn successor_blocked_flag(&self) -> Arc<AtomicBool> {
+        self.successor_blocked.clone()
+    }
+
+    /// Whether this worker's shard owes a re-anchor whose requested attempt
+    /// waits for a shard sync to take it. That sync takes the next recovery
+    /// turn before others.
+    pub fn set_reanchor_armed(&self, armed: bool) {
+        self.reanchor_armed.store(armed, Ordering::Relaxed);
+    }
+
+    /// The flag behind [`Self::set_reanchor_armed`], read by the recovery
+    /// turn queue each time it grants a turn.
+    pub(crate) fn reanchor_armed_flag(&self) -> Arc<AtomicBool> {
+        self.reanchor_armed.clone()
+    }
+
+    /// An attempt of the owed re-anchor handed its turn back at the hold
+    /// limit: its recovery queues again first, and the engine requests the
+    /// attempt again when it next looks ([`Self::take_reanchor_yield`]). A
+    /// flag rather than a message, which a full mailbox would drop.
+    pub(crate) fn reanchor_yielded(&self) {
+        self.reanchor_yield.store(true, Ordering::Relaxed);
+        self.reanchor_armed.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a re-anchor attempt handed its turn back since the engine
+    /// last looked; clears it.
+    pub(crate) fn take_reanchor_yield(&self) -> bool {
+        self.reanchor_yield.swap(false, Ordering::Relaxed)
+    }
+
+    /// Whether a re-anchor attempt handed its turn back and the engine has
+    /// not looked since.
+    pub(crate) fn reanchor_yield_pending(&self) -> bool {
+        self.reanchor_yield.load(Ordering::Relaxed)
+    }
+
+    /// Whether this worker votes in its shard's running committee session
+    /// while its materialized frame trails the session's committed tip. Its
+    /// replays take the next recovery turn before others, and keep it for
+    /// further batches, as a blocked successor's do.
+    pub fn set_lagging_voter(&self, lagging: bool) {
+        self.lagging_voter.store(lagging, Ordering::Relaxed);
+    }
+
+    /// The flag behind [`Self::set_lagging_voter`], read by the recovery
+    /// turn queue each time it grants a turn.
+    pub(crate) fn lagging_voter_flag(&self) -> Arc<AtomicBool> {
+        self.lagging_voter.clone()
+    }
+
+    /// Whether this worker's seat departs (GLOBAL confirmed its leave, or
+    /// the seat ended) while its recovery needs more than a gap fill of
+    /// [`crate::recovery_turns::DEPARTING_GAP_FILL_FRAMES`]: its claims
+    /// wait while any seat the node keeps waits.
+    pub(crate) fn set_departing(&self, departing: bool) {
+        self.departing.store(departing, Ordering::Relaxed);
+    }
+
+    /// The flag behind [`Self::set_departing`], read by the recovery turn
+    /// queue each time it grants a turn.
+    pub(crate) fn departing_flag(&self) -> Arc<AtomicBool> {
+        self.departing.clone()
+    }
+
+    /// A replay of `filter` ended its turn behind its target: its next
+    /// recovery of the shard queues again at `ticket`, its place, rather
+    /// than behind every waiter.
+    pub(crate) fn keep_replay_ticket(&self, filter: &[u8], ticket: u64) {
+        *self
+            .replay_ticket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((filter.to_vec(), ticket));
+    }
+
+    /// The place [`Self::keep_replay_ticket`] kept for `filter`; clears it.
+    pub(crate) fn take_replay_ticket(&self, filter: &[u8]) -> Option<u64> {
+        self.replay_ticket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .filter(|(kept, _)| kept == filter)
+            .map(|(_, ticket)| ticket)
+    }
+
+    /// Whether a back-off paces `filter`'s recovery ([`ArchiveGapPacing`]).
+    pub(crate) fn archive_gap_holding(&self, filter: &[u8]) -> bool {
+        self.archive_gaps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(filter)
+            .is_some_and(ArchiveGapPacing::holding)
+    }
+
+    /// Whether `filter`'s recovery waits at `now`, its worker materialized
+    /// through `materialized` and GLOBAL's committed tip of the session
+    /// `committed` (`None`: unknown, which ends no hold). A hold whose frame
+    /// may be obtainable now ends, logged if its start was.
+    pub(crate) fn archive_gap_hold(
+        &self,
+        filter: &[u8],
+        materialized: u64,
+        committed: Option<u64>,
+        now: tokio::time::Instant,
+    ) -> bool {
+        let (held, ended) = {
+            let mut gaps = self
+                .archive_gaps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut slot = gaps.remove(filter);
+            let decided = ArchiveGapPacing::hold(&mut slot, materialized, committed, now);
+            if let Some(pacing) = slot {
+                gaps.insert(filter.to_vec(), pacing);
+            }
+            decided
+        };
+        if let Some(ended) = ended {
+            log_archive_gap(&hex::encode(filter), ended, None);
+        }
+        held
+    }
+
+    /// This worker's recovery holds a turn from `since`, to do `kind`.
+    pub(crate) fn hold_turn(&self, kind: RecoveryKind, since: tokio::time::Instant) {
+        *self
+            .turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = TurnHold {
+            since: Some(since),
+            kind,
+            yielding: false,
+        };
+    }
+
+    /// The turn this worker's recovery holds, if any.
+    pub(crate) fn turn(&self) -> TurnHold {
+        *self
+            .turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The turn was released: how it was held.
+    pub(crate) fn end_turn(&self) -> TurnHold {
+        std::mem::take(
+            &mut *self
+                .turn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    pub fn snapshot(&self) -> WorkerExecution {
+        self.record.lock().unwrap().clone()
+    }
+
+    pub fn state(&self, state: &str, blocker: &str) {
+        let mut s = self.record.lock().unwrap();
+        s.state = state.into();
+        s.blocker = blocker.into();
+        s.awaited_frame = None;
+        s.observed_unix_ms = now_ms();
+    }
+
+    /// A wait for `blocker` that committed GLOBAL state ends by `frame`.
+    pub fn waiting_until(&self, blocker: &str, frame: u64) {
+        let mut s = self.record.lock().unwrap();
+        s.state = "waiting".into();
+        s.blocker = blocker.into();
+        s.awaited_frame = Some(frame);
+        s.observed_unix_ms = now_ms();
+    }
+
+    /// Observed host phase, independent of frame progress or voting health.
+    /// A retained seal belongs only to its own session, not its successor.
+    pub fn consensus_phase(
+        &self,
+        ready: bool,
+        closing: bool,
+        session: Option<[u8; 32]>,
+        sealed: Option<[u8; 32]>,
+    ) {
+        let (state, reason) = if session.is_some() && session == sealed {
+            ("handoff", "awaiting successor")
+        } else if !ready {
+            ("syncing", "staging shard data")
+        } else if closing {
+            ("closing", "awaiting closing certificate")
+        } else {
+            ("serving", "")
+        };
+        self.state(state, reason);
+    }
+
+    pub fn restored(&self, height: u64) {
+        let mut s = self.record.lock().unwrap();
+        s.materialized_frame = Some(height);
+        s.last_advance_unix_ms = 0;
+        s.observed_unix_ms = now_ms();
+    }
+
+    pub fn materialized(&self, height: u64) {
+        let mut s = self.record.lock().unwrap();
+        let now = now_ms();
+        // Restoring the initial cursor is an observation, not an advance.
+        if s.materialized_frame.is_some_and(|old| height > old) {
+            s.last_advance_unix_ms = now;
+        }
+        s.materialized_frame = Some(height);
+        s.observed_unix_ms = now;
+    }
+
+    pub fn observe(&self) {
+        self.record.lock().unwrap().observed_unix_ms = now_ms();
+    }
+
+    /// The votes of the running session host (`WorkerExecution.own_votes`
+    /// and its companions).
+    pub(crate) fn votes(&self, votes: crate::own_votes::VotesReport) {
+        let mut s = self.record.lock().unwrap();
+        s.own_votes = votes.own;
+        s.peer_votes = votes.peer;
+        s.last_peer_vote_unix_ms = votes.last_peer_vote_unix_ms;
+        s.host_started_unix_ms = votes.host_started_unix_ms;
+        s.silent_ms = votes.silent_ms;
+    }
+
+    /// The engine this record belongs to started now
+    /// (`WorkerExecution.engine_started_unix_ms`).
+    pub fn engine_started(&self) {
+        self.record.lock().unwrap().engine_started_unix_ms = now_ms();
+    }
+
+    /// This member saw its session's terminal seal finalized.
+    pub fn sealed(&self, generation: u64, checkpoint: u64, view: u64) {
+        let mut s = self.record.lock().unwrap();
+        let now = now_ms();
+        s.seal = Some(SessionSeal {
+            generation,
+            checkpoint,
+            view,
+            finalized_unix_ms: now,
+            ..Default::default()
+        });
+        s.observed_unix_ms = now;
+    }
+
+    /// The seal was submitted, carrying `drain` (`app_handoff::DrainedSeal::reason`).
+    pub fn seal_submitted(&self, global_executed: u64, drain: &str, drain_headers: usize) {
+        let mut s = self.record.lock().unwrap();
+        let now = now_ms();
+        if let Some(seal) = s.seal.as_mut() {
+            seal.global_executed = global_executed;
+            seal.drain = drain.into();
+            seal.drain_headers = drain_headers as u32;
+            seal.last_submitted_unix_ms = now;
+            seal.submissions += 1;
+        }
+        s.observed_unix_ms = now;
+    }
+
+    /// A successor session runs: the last seal is history.
+    pub fn clear_seal(&self) {
+        let mut s = self.record.lock().unwrap();
+        s.seal = None;
+        s.observed_unix_ms = now_ms();
+    }
+
+    /// GLOBAL recorded the seal, in this node's view of it.
+    pub fn seal_recorded(&self) {
+        let mut s = self.record.lock().unwrap();
+        let now = now_ms();
+        if let Some(seal) = s.seal.as_mut().filter(|seal| seal.recorded_unix_ms == 0) {
+            seal.recorded_unix_ms = now;
+        }
+        s.observed_unix_ms = now;
+    }
+
+    fn recovery(&self, update: impl FnOnce(&mut ShardRecovery, u64)) {
+        let mut s = self.record.lock().unwrap();
+        let now = now_ms();
+        update(s.recovery.get_or_insert_with(Default::default), now);
+        s.observed_unix_ms = now;
+    }
+
+    /// Run one recovery attempt of `filter`, attributing the phases, source
+    /// and leaf progress reported on this task to this worker, then record
+    /// and log how it ended. A recovery that found nothing usable is an
+    /// error, not an outcome; one that handed its turn back at the hold limit
+    /// (`ShardRecoveryProgress::Yielded`) installed leaves, an outcome. A deferred one (`ShardRecoveryProgress::Deferred`)
+    /// attempted nothing: the record is left as it was, and neither the
+    /// shard's failure streak nor the node's archive state hears of it.
+    pub(crate) async fn recovering(
+        &self,
+        filter: &[u8],
+        attempt: impl std::future::Future<Output = quil_types::error::Result<ShardRecoveryProgress>>,
+    ) -> quil_types::error::Result<ShardRecoveryProgress> {
+        let before = self.record.lock().unwrap().recovery.clone();
+        self.recovery(|r, now| {
+            r.attempt_started_unix_ms = now;
+            r.permit_wait_ms = 0;
+            r.attempt_ms = 0;
+            r.attempt_installed_leaves = 0;
+            r.source.clear();
+        });
+        let result = RECOVERING.scope(self.clone(), attempt).await;
+        if let Ok(ShardRecoveryProgress::Deferred(reason)) = &result {
+            self.record.lock().unwrap().recovery = before;
+            tracing::debug!(filter = %hex::encode(filter), reason, "archive recovery deferred");
+            return result;
+        }
+        let failure = match &result {
+            Ok(ShardRecoveryProgress::NotReady(reason)) => Some((*reason).to_string()),
+            Ok(_) => None,
+            Err(error) => Some(error.to_string()),
+        };
+        let mut ended = ShardRecovery::default();
+        self.recovery(|r, now| {
+            match (&failure, &result) {
+                (Some(failure), _) => {
+                    r.last_error = failure.clone();
+                    r.last_error_unix_ms = now;
+                    if !expected_wait(failure_class(failure)) {
+                        r.consecutive_failures += 1;
+                    }
+                    let count = r
+                        .failures_by_class
+                        .entry(failure_class(failure).into())
+                        .or_default();
+                    *count = count.saturating_add(1);
+                }
+                (None, progress) => {
+                    r.last_outcome = progress
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default();
+                    r.last_outcome_unix_ms = now;
+                    r.consecutive_failures = 0;
+                }
+            }
+            enter(r, "idle", now);
+            r.attempts += 1;
+            r.attempt_ms = now
+                .saturating_sub(r.attempt_started_unix_ms)
+                .saturating_sub(r.permit_wait_ms);
+            ended = r.clone();
+        });
+        let now = Instant::now();
+        let source = if ended.source.is_empty() {
+            "none"
+        } else {
+            ended.source.as_str()
+        };
+        let class = failure.as_deref().map(failure_class);
+        // An attempt that waited for this node's GLOBAL state sync to finish
+        // installing failed nothing of an archive's: it neither extends nor
+        // ends the shard's failure streak, its gap pacing or the node's
+        // archive state, and the wait logged its start and end itself
+        // (`prover_tree_syncer::waiting_out_global_sync`).
+        if class == Some(GLOBAL_SYNC) {
+            tracing::debug!(filter = %hex::encode(filter), error = failure.as_deref().unwrap_or("none"),
+                attempt_secs = ended.attempt_ms / 1000,
+                "archive recovery attempt waited for this node's GLOBAL state sync; not counted as a failure");
+            return result;
+        }
+        // Likewise one whose frame waits for this node's proof verification,
+        // which the engine logs (`AppConsensusEngine::log_proof_wait`).
+        if class == Some(PROOF_VERIFICATION) {
+            tracing::debug!(filter = %hex::encode(filter), error = failure.as_deref().unwrap_or("none"),
+                attempt_secs = ended.attempt_ms / 1000,
+                "archive recovery attempt waited for this node's proof verification; not counted as a failure");
+            return result;
+        }
+        let (logged, classes, failed_before, first_failure) = {
+            let mut streaks = self
+                .streaks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let streak = streaks.entry(filter.to_vec()).or_default();
+            // The failures a success ends, warned about or not: one or two
+            // failures between successes never reach the warning.
+            let failed_before = match streak.failures {
+                0 => (0, "none".to_string()),
+                failures => (failures, streak.classes()),
+            };
+            // A node without any archive is one condition, summarized below
+            // for all its workers.
+            let logged = match class {
+                None => streak.succeeded(now),
+                Some(class) => streak.failed(
+                    class,
+                    now,
+                    if class == NO_ARCHIVE {
+                        u64::MAX
+                    } else {
+                        STREAK_WARN_AFTER
+                    },
+                ),
+            };
+            let first_failure = logged.is_none()
+                && class.is_some_and(|class| class != NO_ARCHIVE)
+                && streak.first_failure_due(now);
+            (logged, streak.classes(), failed_before, first_failure)
+        };
+        // An attempt stopped at a shard frame no archive serves backs off the
+        // next while it stops there again.
+        let (gap_log, held_back, retry_in) = {
+            let gap = failure
+                .as_deref()
+                .and_then(crate::prover_tree_syncer::archive_gap);
+            let mut gaps = self
+                .archive_gaps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut slot = gaps.remove(filter);
+            let logged = ArchiveGapPacing::attempted(
+                &mut slot,
+                gap,
+                failure.is_some(),
+                tokio::time::Instant::now(),
+            );
+            let (held, retry_in) = slot.as_ref().map_or((0, Duration::ZERO), |pacing| {
+                (pacing.held, pacing.retry_in())
+            });
+            if let Some(pacing) = slot {
+                gaps.insert(filter.to_vec(), pacing);
+            }
+            (logged, held, retry_in)
+        };
+        note_archive_known(filter, class != Some(NO_ARCHIVE), failure.as_deref(), now);
+        let filter = hex::encode(filter);
+        match failure {
+            None => {
+                let turn = match &result {
+                    Ok(ShardRecoveryProgress::Replayed { turn, .. }) => *turn,
+                    _ => ReplayTurn::default(),
+                };
+                tracing::info!(%filter, outcome = %ended.last_outcome, source,
+                    attempt_secs = ended.attempt_ms / 1000, permit_wait_secs = ended.permit_wait_ms / 1000,
+                    installed_leaves = ended.attempt_installed_leaves, frames = turn.frames, batches = turn.batches,
+                    fetch_ms = turn.fetch_ms, replay_ms = turn.replay_ms, failed_attempts = failed_before.0,
+                    failed_classes = %failed_before.1, "archive recovery batch complete");
+                if let Some(StreakLog::Ended { failures, duration }) = logged {
+                    tracing::info!(%filter, failures, failing_secs = duration.as_secs(), source,
+                        "archive recovery succeeded after a failure streak");
+                }
+                if let Some(gap_log) = gap_log {
+                    log_archive_gap(&filter, gap_log, None);
+                }
+            }
+            Some(error) => {
+                tracing::debug!(%filter, %error, source,
+                    attempt_secs = ended.attempt_ms / 1000, permit_wait_secs = ended.permit_wait_ms / 1000,
+                    installed_leaves = ended.attempt_installed_leaves, consecutive_failures = ended.consecutive_failures,
+                    "archive recovery attempt failed");
+                if let (true, Some(class)) = (first_failure, class) {
+                    let (scope, _) = failure_guidance(class);
+                    tracing::info!(%filter, %error, class, source,
+                        attempt_secs = ended.attempt_ms / 1000, permit_wait_secs = ended.permit_wait_ms / 1000,
+                        installed_leaves = ended.attempt_installed_leaves, warn_after = STREAK_WARN_AFTER, scope,
+                        "archive recovery attempt failed; it retries (installed leaves are kept) and warns if it \
+                        keeps failing");
+                }
+                if let (Some(StreakLog::Failing { failures, duration }), Some(class)) =
+                    (logged, class)
+                {
+                    let (scope, action) = failure_guidance(class);
+                    tracing::warn!(%filter, consecutive_failures = failures, failing_secs = duration.as_secs(),
+                        classes = %classes, last_class = class, last_error = %error, last_source = source,
+                        longest_permit_wait_secs = ended.longest_permit_wait_ms / 1000,
+                        held_back, retry_in_secs = retry_in.as_secs(),
+                        scope, action, "archive recovery failing; it retries (installed leaves are kept)");
+                }
+                if let Some(gap_log) = gap_log {
+                    log_archive_gap(&filter, gap_log, Some(error.as_str()));
+                }
+            }
+        }
+        result
+    }
+}
+
+/// Consecutive failed attempts of one shard before they are warned about:
+/// a failure between successes is retried, not yet an anomaly.
+const STREAK_WARN_AFTER: u64 = 3;
+
+/// How often failing recoveries of one shard, or of the node as a whole,
+/// warn again; across streaks too, so a flapping recovery stays bounded.
+const STREAK_REPEAT: Duration = Duration::from_secs(10 * 60);
+
+/// The class of a failure that found no archive at all.
+pub(crate) const NO_ARCHIVE: &str = "no_archive_known";
+
+/// The class of an attempt that stopped waiting for this node's own GLOBAL
+/// state sync to finish installing: committed GLOBAL state is withheld
+/// until its last chunk is in
+/// ([`quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS`]).
+/// An expected wait of this node, no archive's failure: it does not count
+/// toward the shard's failure streak.
+pub(crate) const GLOBAL_SYNC: &str = "global_sync";
+
+/// The class of an attempt whose replayed frame, authenticated and
+/// committed, waits for this node's proof verification
+/// ([`waits_for_proof_verification`]): an expected wait of this node, no
+/// archive's failure and no mismatch; it does not count toward the shard's
+/// failure streak. A replay meeting it defers its recovery
+/// (`prover_tree_syncer::PROOF_VERIFICATION_WAIT`), so it is recorded only
+/// where another path reports it.
+pub(crate) const PROOF_VERIFICATION: &str = "proof_verification";
+
+/// The class of an attempt this worker's shard engine did not answer in
+/// time ([`ENGINE_TIMEOUTS`]): this node's, busy with other work.
+pub(crate) const ENGINE_BUSY: &str = "engine_busy";
+
+/// Why an attempt that waited out this node's GLOBAL state sync within its
+/// budget (`prover_tree_syncer::waiting_out_global_sync`) installed
+/// nothing.
+pub(crate) const GLOBAL_SYNC_STILL_INSTALLING: &str =
+    "this node's GLOBAL state sync is still installing, which withholds the committed GLOBAL state \
+    the archive checkpoint is checked against";
+
+/// The first back-off of a recovery whose attempts stop again at the same
+/// shard frame no archive serves ([`ArchiveGapPacing`]); each later one
+/// waits twice as long, up to [`ARCHIVE_GAP_HOLD_MAX`].
+pub(crate) const ARCHIVE_GAP_HOLD: Duration = Duration::from_secs(30);
+
+/// The longest back-off between such attempts: about 6 an hour, where the
+/// engine's start retry made one every 10 to 25 s.
+pub(crate) const ARCHIVE_GAP_HOLD_MAX: Duration = Duration::from_secs(10 * 60);
+
+/// Paces the recovery of one shard whose attempts stop at a shard frame no
+/// archive serves and no GLOBAL frame searched carries the header of
+/// ([`ArchiveGap`]). A successor member below its predecessor's seal asks
+/// for recovery at every start retry of its engine; on 2026-10-27, 147
+/// seats on 12 nodes failed so on an unchanged frame 1,000 to 2,500 times
+/// in a row, one attempt every 10 to 25 s, each reading about 7 archive
+/// frames and taking one of its node's recovery turns. A first such failure
+/// is retried as before; once another stops at the same frame, the next
+/// attempt waits [`ARCHIVE_GAP_HOLD`], doubling to [`ARCHIVE_GAP_HOLD_MAX`],
+/// before it queues for a turn. The back-off ends as soon as its frame may
+/// be obtainable: the worker materialized it, GLOBAL's committed tip of the
+/// session moved (for a frame above that tip: reached it), or an attempt
+/// found a higher archive tip, stopped at another frame or ended otherwise.
+/// A frame above GLOBAL's committed tip waits for that tip, but still on the
+/// same schedule: an archive may serve it first, which only an attempt sees.
+#[derive(Debug)]
+pub(crate) struct ArchiveGapPacing {
+    gap: ArchiveGap,
+    /// The highest archive tip its attempts found: archives answer with
+    /// different tips, and only a higher one ends the back-off.
+    archive_tip: Option<u64>,
+    /// Consecutive attempts that stopped at it.
+    failures: u64,
+    /// Until when the next attempt waits, and that back-off's length.
+    hold: Option<(tokio::time::Instant, Duration)>,
+    /// Recovery requests held back since it began.
+    held: u64,
+    /// Its back-off was logged.
+    logged: bool,
+}
+
+/// What an [`ArchiveGapPacing`] change logs.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ArchiveGapLog {
+    /// The first back-off of an attempt streak stopped at `gap`.
+    Holding {
+        gap: ArchiveGap,
+        failures: u64,
+        retry_in: Duration,
+    },
+    /// The end of a logged back-off, for `reason`.
+    Ended {
+        gap: ArchiveGap,
+        failures: u64,
+        held: u64,
+        reason: &'static str,
+    },
+}
+
+impl ArchiveGapPacing {
+    fn new(gap: ArchiveGap) -> Self {
+        Self {
+            gap,
+            archive_tip: gap.archive_tip,
+            failures: 1,
+            hold: None,
+            held: 0,
+            logged: false,
+        }
+    }
+
+    /// Whether a back-off runs: the next attempt may have to wait.
+    fn holding(&self) -> bool {
+        self.hold.is_some()
+    }
+
+    /// The current back-off's length; zero while none runs.
+    fn retry_in(&self) -> Duration {
+        self.hold.map_or(Duration::ZERO, |(_, length)| length)
+    }
+
+    /// Whether GLOBAL's committed tip `committed` may have made its frame
+    /// obtainable: for a frame above the committed tip it read, once the
+    /// tip reached it; otherwise once the tip moved.
+    fn committed_moved(&self, committed: u64) -> Option<&'static str> {
+        match self.gap.frame > self.gap.committed {
+            true => {
+                (committed >= self.gap.frame).then_some("GLOBAL's committed tip reached the frame")
+            }
+            false => (committed != self.gap.committed)
+                .then_some("GLOBAL's committed tip of the session moved"),
+        }
+    }
+
+    fn ended(self, reason: &'static str) -> Option<ArchiveGapLog> {
+        self.logged.then_some(ArchiveGapLog::Ended {
+            gap: self.gap,
+            failures: self.failures,
+            held: self.held,
+            reason,
+        })
+    }
+
+    /// An attempt of the shard's recovery paced by `slot` ended at `now`,
+    /// stopped at `gap` (`None`: it ended otherwise, `failed` or not).
+    pub(crate) fn attempted(
+        slot: &mut Option<Self>,
+        gap: Option<ArchiveGap>,
+        failed: bool,
+        now: tokio::time::Instant,
+    ) -> Option<ArchiveGapLog> {
+        let Some(gap) = gap else {
+            let reason = match failed {
+                true => "an attempt failed otherwise",
+                false => "an attempt succeeded",
+            };
+            return slot.take().and_then(|pacing| pacing.ended(reason));
+        };
+        let Some(mut pacing) = slot.take() else {
+            *slot = Some(Self::new(gap));
+            return None;
+        };
+        let reason = if gap.frame != pacing.gap.frame {
+            Some("an attempt stopped at another frame")
+        } else if gap.archive_tip > pacing.archive_tip {
+            Some("an archive's tip advanced")
+        } else if gap.committed != pacing.gap.committed {
+            pacing.committed_moved(gap.committed)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            *slot = Some(Self::new(gap));
+            return pacing.ended(reason);
+        }
+        pacing.gap = gap;
+        pacing.failures += 1;
+        let length = pacing.hold.map_or(ARCHIVE_GAP_HOLD, |(_, length)| {
+            (length * 2).min(ARCHIVE_GAP_HOLD_MAX)
+        });
+        pacing.hold = Some((now + length, length));
+        let log =
+            (!std::mem::replace(&mut pacing.logged, true)).then_some(ArchiveGapLog::Holding {
+                gap,
+                failures: pacing.failures,
+                retry_in: length,
+            });
+        *slot = Some(pacing);
+        log
+    }
+
+    /// Whether the shard's next attempt, paced by `slot`, waits at `now`,
+    /// its worker materialized through `materialized` and GLOBAL's
+    /// committed tip `committed` (`None`: unknown); with the end of a
+    /// back-off whose frame may be obtainable now, if it was logged.
+    pub(crate) fn hold(
+        slot: &mut Option<Self>,
+        materialized: u64,
+        committed: Option<u64>,
+        now: tokio::time::Instant,
+    ) -> (bool, Option<ArchiveGapLog>) {
+        let Some(pacing) = slot.as_mut() else {
+            return (false, None);
+        };
+        let Some((until, _)) = pacing.hold else {
+            return (false, None);
+        };
+        let reason = match materialized >= pacing.gap.frame {
+            true => Some("this worker materialized the frame"),
+            false => committed.and_then(|committed| pacing.committed_moved(committed)),
+        };
+        if let Some(reason) = reason {
+            return (false, slot.take().and_then(|pacing| pacing.ended(reason)));
+        }
+        if now >= until {
+            return (false, None);
+        }
+        pacing.held += 1;
+        (true, None)
+    }
+}
+
+/// Log `log`, a change of the back-off of `filter`'s recovery; `error`: the
+/// failure of the attempt that started it.
+fn log_archive_gap(filter: &str, log: ArchiveGapLog, error: Option<&str>) {
+    match log {
+        ArchiveGapLog::Holding {
+            gap,
+            failures,
+            retry_in,
+        } => {
+            let archive_tip = gap
+                .archive_tip
+                .map_or_else(|| "none".to_string(), |tip| tip.to_string());
+            let action = match gap.frame > gap.committed {
+                true => "nothing to do on this node: GLOBAL has not executed this frame yet, so no GLOBAL \
+                    frame carries its header; the back-off ends once GLOBAL's committed tip reaches it, an \
+                    archive serves it or this worker materializes it",
+                false => "nothing to do on this node: an archive-side gap; the back-off ends once an archive \
+                    serves the frame, an archive's tip or GLOBAL's committed tip moves, or this worker \
+                    materializes it",
+            };
+            tracing::info!(%filter, missing_frame = gap.frame, %archive_tip, committed_tip = gap.committed,
+                failures, retry_in_secs = retry_in.as_secs(), max_retry_secs = ARCHIVE_GAP_HOLD_MAX.as_secs(),
+                last_error = error.unwrap_or("none"), scope = "archive", action,
+                "archive recovery backing off: its attempts stop at a shard frame no archive serves; it \
+                retries after the back-off, which doubles to its maximum, and takes no recovery turn meanwhile");
+        }
+        ArchiveGapLog::Ended {
+            gap,
+            failures,
+            held,
+            reason,
+        } => tracing::info!(%filter, missing_frame = gap.frame, failures, held_back = held, reason,
+            "archive recovery back-off for a shard frame no archive serves ended"),
+    }
+}
+
+/// A run of failed archive recovery attempts, from the first failure to the
+/// first success.
+#[derive(Debug, Default)]
+pub(crate) struct FailureStreak {
+    since: Option<Instant>,
+    /// When it, or an earlier streak, was last warned about.
+    warned: Option<Instant>,
+    /// This streak was warned about.
+    reported: bool,
+    failures: u64,
+    classes: BTreeMap<&'static str, u64>,
+    /// When a streak's first failure was last noted at info.
+    noted: Option<Instant>,
+}
+
+/// What a [`FailureStreak`] change logs.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StreakLog {
+    /// Once `warn_after` failures in a row, then at most every
+    /// [`STREAK_REPEAT`] while it lasts.
+    Failing { failures: u64, duration: Duration },
+    /// The success that ended a warned streak.
+    Ended { failures: u64, duration: Duration },
+}
+
+impl FailureStreak {
+    const fn new() -> Self {
+        Self {
+            since: None,
+            warned: None,
+            reported: false,
+            failures: 0,
+            classes: BTreeMap::new(),
+            noted: None,
+        }
+    }
+
+    /// An attempt failed with `class` at `now`.
+    pub(crate) fn failed(
+        &mut self,
+        class: &'static str,
+        now: Instant,
+        warn_after: u64,
+    ) -> Option<StreakLog> {
+        let since = *self.since.get_or_insert(now);
+        self.failures += 1;
+        *self.classes.entry(class).or_default() += 1;
+        if self.failures < warn_after
+            || self
+                .warned
+                .is_some_and(|at| now.saturating_duration_since(at) < STREAK_REPEAT)
+        {
+            return None;
+        }
+        self.warned = Some(now);
+        self.reported = true;
+        Some(StreakLog::Failing {
+            failures: self.failures,
+            duration: now.saturating_duration_since(since),
+        })
+    }
+
+    /// Whether the failure just counted, a streak's first, is noted at info
+    /// at `now`: at most once per [`STREAK_REPEAT`], so a flapping recovery
+    /// stays bounded.
+    pub(crate) fn first_failure_due(&mut self, now: Instant) -> bool {
+        if self.failures != 1
+            || self
+                .noted
+                .is_some_and(|at| now.saturating_duration_since(at) < STREAK_REPEAT)
+        {
+            return false;
+        }
+        self.noted = Some(now);
+        true
+    }
+
+    /// An attempt succeeded at `now`: the end of the streak, named if it
+    /// was warned about.
+    pub(crate) fn succeeded(&mut self, now: Instant) -> Option<StreakLog> {
+        let since = self.since.take()?;
+        let failures = std::mem::take(&mut self.failures);
+        self.classes.clear();
+        std::mem::take(&mut self.reported).then(|| StreakLog::Ended {
+            failures,
+            duration: now.saturating_duration_since(since),
+        })
+    }
+
+    /// The streak's failures by class, as `class=count` pairs.
+    pub(crate) fn classes(&self) -> String {
+        self.classes
+            .iter()
+            .map(|(class, n)| format!("{class}={n}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+/// This node's recoveries finding no archive at all, across its workers.
+#[derive(Debug)]
+pub(crate) struct NoArchive {
+    streak: FailureStreak,
+    shards: BTreeSet<Vec<u8>>,
+}
+
+impl NoArchive {
+    const fn new() -> Self {
+        Self {
+            streak: FailureStreak::new(),
+            shards: BTreeSet::new(),
+        }
+    }
+
+    /// A recovery of `filter` found no archive at `now`: warned at once,
+    /// then at most every [`STREAK_REPEAT`], with the shards affected.
+    pub(crate) fn failed(&mut self, filter: &[u8], now: Instant) -> Option<(StreakLog, usize)> {
+        self.shards.insert(filter.to_vec());
+        Some((self.streak.failed(NO_ARCHIVE, now, 1)?, self.shards.len()))
+    }
+
+    /// A recovery reached an archive at `now`, failing or not.
+    pub(crate) fn resolved(&mut self, now: Instant) -> Option<(StreakLog, usize)> {
+        let shards = std::mem::take(&mut self.shards).len();
+        Some((self.streak.succeeded(now)?, shards))
+    }
+}
+
+static NO_ARCHIVE_KNOWN: Mutex<NoArchive> = Mutex::new(NoArchive::new());
+
+/// Log the node-wide condition of recoveries finding no archive: a recovery
+/// of `filter` at `now` that did (`reached`) or did not reach one.
+fn note_archive_known(filter: &[u8], reached: bool, error: Option<&str>, now: Instant) {
+    let logged = {
+        let mut state = NO_ARCHIVE_KNOWN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reached {
+            state.resolved(now)
+        } else {
+            state.failed(filter, now)
+        }
+    };
+    match logged {
+        Some((StreakLog::Failing { failures, duration }, shards)) => {
+            let (scope, action) = failure_guidance(NO_ARCHIVE);
+            tracing::warn!(
+                failures,
+                shards,
+                failing_secs = duration.as_secs(),
+                last_error = error.unwrap_or("none"),
+                scope,
+                action,
+                "archive recovery finds no archive; recoveries retry"
+            );
+        }
+        Some((StreakLog::Ended { failures, duration }, shards)) => tracing::info!(
+            failures,
+            shards,
+            failing_secs = duration.as_secs(),
+            "archive recovery reaches an archive again"
+        ),
+        None => {}
+    }
+}
+
+/// The class of a failed recovery attempt, from its error or not-ready
+/// text: one of [`FAILURE_CLASSES`].
+///
+/// This node's GLOBAL state sync is matched first, as an error about an
+/// archive's frame or checkpoint can name its wait: read as the archive's,
+/// it told operators to report archives that had failed nothing (38 to 40
+/// "archive_state" failures in a row on 4 shards of a node restarted into
+/// its GLOBAL sync, 2026-10-29). So is this node's proof verification,
+/// and its shard engine not answering is matched before the replay
+/// mismatches: read as mismatches, a regular node's replays waiting for
+/// their proofs reported 24 peers' streaks of up to 908 "replay_mismatch"
+/// failures, and guidance promising a re-anchor (2026-10-31).
+/// "replay_mismatch" names only frames that do not apply to this worker's
+/// lineage: a pre-state, link, session or shard mismatch.
+pub fn failure_class(error: &str) -> &'static str {
+    use quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS;
+    if error.contains(GLOBAL_SYNC_IN_PROGRESS) || error.contains(GLOBAL_SYNC_STILL_INSTALLING) {
+        GLOBAL_SYNC
+    } else if waits_for_proof_verification(error) {
+        PROOF_VERIFICATION
+    } else if error.contains("no archive known")
+        || error.contains("discovered an archive")
+        || error.contains("archive discovery")
+    {
+        NO_ARCHIVE
+    } else if error.contains("archive connect") {
+        "connect"
+    } else if error.contains("get app-shard frame")
+        || error.contains("get_forest_head")
+        || error.contains("resolve shard subtree")
+    {
+        "archive_request"
+    } else if error.contains("is missing") || error.contains("the archive") {
+        "archive_state"
+    } else if ENGINE_TIMEOUTS
+        .iter()
+        .any(|timeout| error.contains(timeout))
+    {
+        ENGINE_BUSY
+    } else if REPLAY_MISMATCHES
+        .iter()
+        .any(|mismatch| error.contains(mismatch))
+    {
+        "replay_mismatch"
+    } else {
+        "other"
+    }
+}
+
+/// The texts of a shard engine request that got no answer within its limit
+/// (`app_engine::AppEngineHandle`).
+const ENGINE_TIMEOUTS: [&str; 4] = [
+    "archive replay timed out",
+    "shard sync validation timed out",
+    "base attestation timed out",
+    "origin lookup timed out",
+];
+
+/// The texts of an archive frame that does not apply to this worker's
+/// lineage: its pre-state roots, its link to the local predecessor
+/// (`app_engine::archive_bootstrap_predecessor_height_in`, named with the
+/// parent it names), the session it would open, its shard, or its number.
+const REPLAY_MISMATCHES: [&str; 6] = [
+    "pre-state mismatch",
+    "it names parent",
+    "would open generation",
+    "wrong-shard archive replay tip",
+    "belongs to another shard",
+    "would skip a materialization gap",
+];
+
+/// Whether `error` names a materialization waiting for this node's proof
+/// verification: its proofs verify in the background, or the proof worker
+/// refused them busy.
+pub(crate) fn waits_for_proof_verification(error: &str) -> bool {
+    use quil_execution::token_intrinsic::{PROOF_VERIFICATION_PENDING, PROOF_WORKER_BUSY};
+    error.contains(PROOF_VERIFICATION_PENDING) || error.contains(PROOF_WORKER_BUSY)
+}
+
+/// Whether a failure of `class` is an expected wait of this node, which
+/// does not count toward the shard's failure streak.
+fn expected_wait(class: &str) -> bool {
+    matches!(class, GLOBAL_SYNC | PROOF_VERIFICATION)
+}
+
+/// Whose problem a failure of `class` is, and what the operator can check.
+pub(crate) fn failure_guidance(class: &str) -> (&'static str, &'static str) {
+    match class {
+        NO_ARCHIVE => ("this node", "this node's master knows no reachable archive yet; \
+            check its 'archive endpoint added' lines and outbound connectivity; it retries"),
+        GLOBAL_SYNC => ("this node", "this node's GLOBAL state sync is installing; recovery resumes when \
+            it finishes — an expected wait, no action"),
+        "connect" => ("archive", "the archive refused or timed out the connection; \
+            check this node's outbound connectivity to it; the next attempt tries another archive"),
+        "archive_request" => ("archive", "the archive failed a read; the next attempt tries another archive; \
+            report it with this line if it persists"),
+        "replay_mismatch" => ("this node", "the archive's certified shard frames do not apply to this worker's \
+            lineage (its pre-state, link, session or shard); once one frame's pre-state has mismatched 10 times over \
+            30 minutes, while the shard runs no consensus and its current session continues this shard's chain, this \
+            worker re-anchors it at the frame GLOBAL committed above its head; report it with this line if it \
+            persists"),
+        PROOF_VERIFICATION => ("this node's proof worker", "the replayed frame is authenticated and committed and \
+            waits for this node to verify its confidential proofs; it materializes once they verify, and recovery \
+            resumes without fetching it again — an expected wait; if it lasts hours, check this node's CPU and \
+            proofWorker settings"),
+        ENGINE_BUSY => ("this node", "this worker's shard engine did not answer the recovery in time, busy with \
+            other work (an inline proof verification, a long materialization); the next attempt asks again; if it \
+            persists, check this worker's 'verifying inline' and stall lines"),
+        "archive_state" => ("archive", "no archive supplied the shard state this worker needs; \
+            it retries; report it with this line if it persists"),
+        _ => ("this node", "report it with this line if it persists"),
+    }
+}
+
+fn enter(r: &mut ShardRecovery, phase: &str, now: u64) {
+    if r.phase != phase {
+        if r.phase == "waiting_for_permit" {
+            r.permit_wait_ms = now.saturating_sub(r.phase_since_unix_ms);
+            r.longest_permit_wait_ms = r.longest_permit_wait_ms.max(r.permit_wait_ms);
+        }
+        r.phase = phase.into();
+        r.phase_since_unix_ms = now;
+    }
+}
+
+/// The archive the recovery on this task reads from now; elsewhere, or
+/// for an empty address, nothing.
+pub fn recovery_source(source: &str) {
+    if source.is_empty() {
+        return;
+    }
+    let _ = RECOVERING.try_with(|s| {
+        s.recovery(|r, _| {
+            if r.source != source {
+                r.source = source.into();
+            }
+        })
+    });
+}
+
+/// `leaves` more leaves installed durably by the recovery on this task;
+/// elsewhere nothing.
+pub fn recovery_installed(leaves: u64) {
+    let _ = RECOVERING.try_with(|s| s.recovery(|r, _| r.attempt_installed_leaves += leaves));
+}
+
+/// Enter `phase` of the recovery running on this task; elsewhere nothing.
+pub fn recovery_phase(phase: &'static str) {
+    let _ = RECOVERING.try_with(|s| s.recovery(|r, now| enter(r, phase, now)));
+}
+
+/// What the recovery on this task does with its turn, once it knows: a
+/// sync that takes an owed re-anchor's attempt re-anchors. Elsewhere
+/// nothing.
+pub(crate) fn recovery_kind(kind: RecoveryKind) {
+    let _ = RECOVERING.try_with(|s| {
+        s.turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .kind = kind
+    });
+}
+
+/// Whether the recovery on this task hands its archive recovery turn back
+/// now, at a chunk or phase boundary of its tree sync: it has held the turn
+/// for [`MAX_TURN_HOLD`] and installed leaves in it, so every turn makes
+/// progress and the next resumes from it. Elsewhere, or without a turn,
+/// false.
+pub fn recovery_turn_spent() -> bool {
+    RECOVERING
+        .try_with(|s| {
+            let installed = s
+                .record
+                .lock()
+                .unwrap()
+                .recovery
+                .as_ref()
+                .is_some_and(|r| r.attempt_installed_leaves > 0);
+            let mut turn = s
+                .turn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let spent = installed
+                && turn
+                    .since
+                    .is_some_and(|since| since.elapsed() >= MAX_TURN_HOLD);
+            turn.yielding |= spent;
+            spent
+        })
+        .unwrap_or(false)
+}
+
+/// Run `attempt` as the recovery of `execution`'s worker holding a turn
+/// granted `held` ago, with no leaves installed in it yet: a test of a tree
+/// sync in another crate sees [`recovery_turn_spent`] as a recovery would.
+#[doc(hidden)]
+pub async fn with_recovery_turn<T>(
+    execution: &SharedWorkerExecution,
+    held: Duration,
+    attempt: impl std::future::Future<Output = T>,
+) -> T {
+    let now = tokio::time::Instant::now();
+    execution.hold_turn(RecoveryKind::Install, now.checked_sub(held).unwrap_or(now));
+    execution.recovery(|r, _| r.attempt_installed_leaves = 0);
+    let result = RECOVERING.scope(execution.clone(), attempt).await;
+    execution.end_turn();
+    result
+}
+
+/// `installed` of the `planned` leaves of forest phase `tree_phase`, in the
+/// tree the recovery on this task is installing; elsewhere (prover-tree and
+/// archive syncs) nothing.
+pub fn recovery_leaves(tree_phase: u32, installed: u64, planned: u64) {
+    let _ = RECOVERING.try_with(|s| {
+        s.recovery(|r, now| {
+            r.tree_phase = tree_phase;
+            r.installed_leaves = installed;
+            r.planned_leaves = planned;
+            r.leaves_observed_unix_ms = now;
+        })
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A worker whose store latched reads as blocked by it, with or without
+    /// an engine; others keep their engine's report.
+    #[test]
+    fn a_worker_whose_store_refuses_writes_reads_as_blocked_by_it() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let core = 9_401;
+        assert!(db
+            .inner()
+            .register_store(quil_forest::StoreRole::Worker(core)));
+        let serving = WorkerExecution {
+            state: "serving".into(),
+            observed_unix_ms: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            with_store_state(core, Some(serving.clone())),
+            Some(serving.clone())
+        );
+        assert_eq!(with_store_state(core, None), None);
+        assert!(!store_stopped(core));
+        db.inner()
+            .refuse_writes("IO error: No space left on device");
+        assert!(store_stopped(core), "a latched store has stopped writing");
+        for execution in [Some(serving.clone()), None] {
+            let reported = with_store_state(core, execution).expect("a latched store is reported");
+            assert_eq!(
+                (reported.state.as_str(), reported.blocker.as_str()),
+                ("blocked", STORAGE_WRITE_FAILED)
+            );
+            assert!(reported.observed_unix_ms > 1);
+        }
+        assert_eq!(
+            with_store_state(core + 1, Some(serving.clone())),
+            Some(serving.clone())
+        );
+        assert_eq!(held_store_execution(core + 1), None);
+        quil_forest::storage_health::hold_store(quil_forest::StoreRole::Worker(core + 1));
+        let held = with_store_state(core + 1, Some(serving)).expect("a held store is reported");
+        assert_eq!(
+            (held.state.as_str(), held.blocker.as_str()),
+            ("stopped", STORAGE_WRITE_FAILED)
+        );
+        let for_lifecycle = held_store_execution(core + 1).expect("the lifecycle sees it too");
+        assert_eq!(for_lifecycle.state, "stopped");
+        let bound = [(core, vec![1]), (core + 1, vec![2])];
+        let running = vec![(
+            core,
+            vec![1],
+            WorkerExecution {
+                state: "serving".into(),
+                ..Default::default()
+            },
+        )];
+        let seen = with_held_stores(running.clone(), &bound);
+        assert_eq!(
+            seen.len(),
+            2,
+            "the held worker reads as unable to host: {seen:?}"
+        );
+        assert_eq!(
+            (seen[1].0, seen[1].1.clone(), seen[1].2.state.as_str()),
+            (core + 1, vec![2], "stopped")
+        );
+        assert_eq!(
+            with_held_stores(running.clone(), &bound[..1]),
+            running,
+            "an unbound worker adds nothing"
+        );
+        quil_forest::storage_health::release_store(quil_forest::StoreRole::Worker(core + 1));
+    }
+
+    #[test]
+    fn restoration_rewind_and_state_are_independent() {
+        let s = SharedWorkerExecution::default();
+        assert_eq!(s.snapshot().materialized_frame, None);
+        s.restored(42);
+        assert_eq!(s.snapshot().last_advance_unix_ms, 0);
+        s.state("blocked", "checkpoint mismatch");
+        s.materialized(43);
+        assert!(s.snapshot().last_advance_unix_ms > 0);
+        assert_eq!(s.snapshot().state, "blocked");
+        s.materialized(40);
+        assert_eq!(s.snapshot().materialized_frame, Some(40));
+        s.state("running", "");
+        assert!(s.snapshot().blocker.is_empty());
+        assert!(s.snapshot().observed_unix_ms > 0);
+        s.waiting_until("committee admission unavailable", 919_440);
+        assert_eq!(
+            (s.snapshot().state.as_str(), s.snapshot().awaited_frame),
+            ("waiting", Some(919_440))
+        );
+        s.state("serving", "");
+        assert_eq!(
+            s.snapshot().awaited_frame,
+            None,
+            "a later state ends the wait"
+        );
+    }
+
+    #[test]
+    fn consensus_phases_follow_readiness_and_the_current_session_seal() {
+        let execution = SharedWorkerExecution::default();
+        execution.restored(0);
+        execution.consensus_phase(false, false, Some([1; 32]), None);
+        assert_eq!(execution.snapshot().state, "syncing");
+        execution.consensus_phase(true, false, Some([1; 32]), None);
+        assert_eq!(execution.snapshot().state, "serving");
+        assert_eq!(
+            execution.snapshot().last_advance_unix_ms,
+            0,
+            "serving is not a progress claim"
+        );
+        execution.consensus_phase(true, true, Some([1; 32]), None);
+        assert_eq!(execution.snapshot().state, "closing");
+        execution.consensus_phase(false, true, Some([1; 32]), Some([1; 32]));
+        assert_eq!(execution.snapshot().state, "handoff");
+        execution.consensus_phase(true, false, Some([2; 32]), Some([1; 32]));
+        assert_eq!(
+            execution.snapshot().state,
+            "serving",
+            "an old seal must not label a successor as waiting"
+        );
+        assert!(execution.snapshot().blocker.is_empty());
+        execution.consensus_phase(true, false, None, None);
+        assert_eq!(
+            execution.snapshot().state,
+            "serving",
+            "legacy hosts have no session seal"
+        );
+    }
+
+    /// A recovery hands its turn back only once it has held it for the
+    /// limit and installed leaves in it; elsewhere nothing is spent.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_is_spent_after_the_hold_limit_and_an_installed_chunk() {
+        assert!(!recovery_turn_spent(), "no recovery runs on this task");
+        let worker = SharedWorkerExecution::default();
+        let result = worker
+            .recovering(&[7; 32], async {
+                assert!(!recovery_turn_spent(), "no turn is held");
+                worker.hold_turn(RecoveryKind::Install, tokio::time::Instant::now());
+                tokio::time::advance(MAX_TURN_HOLD).await;
+                assert!(!recovery_turn_spent(), "nothing installed in this turn yet");
+                assert!(!worker.turn().yielding);
+                recovery_installed(1_024);
+                assert!(recovery_turn_spent());
+                assert!(worker.turn().yielding);
+                recovery_kind(RecoveryKind::Reanchor);
+                assert_eq!(worker.turn().kind, RecoveryKind::Reanchor);
+                Ok(ShardRecoveryProgress::Yielded)
+            })
+            .await;
+        assert_eq!(result.unwrap(), ShardRecoveryProgress::Yielded);
+        let r = worker.snapshot().recovery.unwrap();
+        assert_eq!(
+            (r.consecutive_failures, r.last_outcome.as_str()),
+            (0, RECOVERY_TURN_SPENT),
+            "a handed-back turn is progress"
+        );
+        assert!(turn_spent(&turn_spent_error()));
+        assert!(!turn_spent(
+            &quil_types::error::QuilError::ExecutionUnavailable("archive connect: refused".into())
+        ));
+        assert!(worker.end_turn().yielding);
+        assert!(worker.turn().since.is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_is_reported_beside_the_execution_state_for_its_own_worker() {
+        let (worker, other) = (
+            SharedWorkerExecution::default(),
+            SharedWorkerExecution::default(),
+        );
+        recovery_phase("installing_leaves");
+        recovery_leaves(0, 1, 2);
+        assert!(
+            worker.snapshot().recovery.is_none(),
+            "no recovery runs on this task"
+        );
+        worker.state("blocked", "state unavailable");
+        let installed = worker
+            .recovering(&[7; 32], async {
+                recovery_phase("waiting_for_permit");
+                assert_eq!(
+                    worker.snapshot().recovery.unwrap().phase,
+                    "waiting_for_permit"
+                );
+                recovery_phase("installing_leaves");
+                recovery_source("198.51.100.7:8340");
+                recovery_source("");
+                recovery_leaves(2, 262_144, 2_517_449);
+                recovery_installed(1_024);
+                recovery_installed(1_024);
+                let r = worker.snapshot().recovery.unwrap();
+                assert_eq!(
+                    (
+                        r.phase.as_str(),
+                        r.tree_phase,
+                        r.installed_leaves,
+                        r.planned_leaves
+                    ),
+                    ("installing_leaves", 2, 262_144, 2_517_449)
+                );
+                assert!(r.phase_since_unix_ms > 0 && r.leaves_observed_unix_ms > 0);
+                Ok(ShardRecoveryProgress::Anchored { frame: 7 })
+            })
+            .await;
+        assert!(installed.is_ok());
+        assert!(other.snapshot().recovery.is_none());
+        let s = worker.snapshot();
+        assert_eq!(
+            (s.state.as_str(), s.blocker.as_str()),
+            ("blocked", "state unavailable")
+        );
+        let r = s.recovery.unwrap();
+        assert_eq!(r.phase, "idle");
+        assert!(r.last_outcome.contains("frame 7") && r.last_outcome_unix_ms > 0);
+        assert!(r.last_error.is_empty());
+        assert_eq!(
+            r.installed_leaves, 262_144,
+            "the last leaf counts stay visible"
+        );
+        assert_eq!(
+            (r.source.as_str(), r.attempt_installed_leaves),
+            ("198.51.100.7:8340", 2_048)
+        );
+        assert_eq!((r.attempts, r.consecutive_failures), (1, 0));
+        assert!(r.attempt_started_unix_ms > 0);
+
+        let _ = worker
+            .recovering(&[7; 32], async {
+                Ok(ShardRecoveryProgress::NotReady(
+                    "the archive checkpoint failed validation",
+                ))
+            })
+            .await;
+        let r = worker.snapshot().recovery.unwrap();
+        assert_eq!(r.last_error, "the archive checkpoint failed validation");
+        assert!(
+            r.last_outcome.contains("frame 7"),
+            "an error keeps the last outcome"
+        );
+        assert_eq!(
+            (
+                r.attempts,
+                r.consecutive_failures,
+                r.attempt_installed_leaves
+            ),
+            (2, 1, 0)
+        );
+        assert!(r.source.is_empty(), "each attempt names its own source");
+        let _ = worker
+            .recovering(&[7; 32], async {
+                Err(quil_types::error::QuilError::ExecutionUnavailable(
+                    "archive discovery timed out".into(),
+                ))
+            })
+            .await;
+        let r = worker.snapshot().recovery.unwrap();
+        assert!(r.last_error.contains("archive discovery timed out"));
+        assert_eq!(r.consecutive_failures, 2);
+        let classes: BTreeMap<String, u32> = r.failures_by_class.into_iter().collect();
+        assert_eq!(
+            classes,
+            BTreeMap::from([("archive_state".into(), 1), ("no_archive_known".into(), 1)]),
+            "failures are counted by class since the engine started"
+        );
+    }
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    /// A failure streak warns once it reaches the threshold, then only
+    /// every repeat interval with its count and duration, and its end is
+    /// named once.
+    #[test]
+    fn a_failure_streak_warns_after_the_threshold_and_then_at_a_bounded_rate() {
+        let start = Instant::now();
+        let mut streak = FailureStreak::default();
+        assert_eq!(streak.succeeded(start), None, "no streak, no end");
+        assert_eq!(streak.failed("connect", start, 3), None);
+        assert_eq!(streak.failed("connect", start, 3), None);
+        assert_eq!(
+            streak.failed("no_archive_known", start + MINUTE, 3),
+            Some(StreakLog::Failing {
+                failures: 3,
+                duration: MINUTE
+            })
+        );
+        for minute in 2..11 {
+            assert_eq!(
+                streak.failed("no_archive_known", start + MINUTE * minute, 3),
+                None
+            );
+        }
+        assert_eq!(
+            streak.failed("connect", start + MINUTE * 11, 3),
+            Some(StreakLog::Failing {
+                failures: 13,
+                duration: MINUTE * 11
+            })
+        );
+        assert_eq!(streak.classes(), "connect=3,no_archive_known=10");
+        assert_eq!(
+            streak.succeeded(start + MINUTE * 20),
+            Some(StreakLog::Ended {
+                failures: 13,
+                duration: MINUTE * 20
+            })
+        );
+        assert_eq!(streak.succeeded(start + MINUTE * 21), None);
+        assert_eq!(streak.classes(), "");
+    }
+
+    /// Failures between successes do not warn, and a flapping recovery
+    /// warns at most once per repeat interval; an unwarned streak's end is
+    /// not named.
+    #[test]
+    fn a_flapping_recovery_warns_at_most_once_per_interval() {
+        let start = Instant::now();
+        let mut streak = FailureStreak::default();
+        let mut warnings = 0;
+        for minute in 0..20 {
+            let at = start + MINUTE * minute;
+            if minute % 4 == 3 {
+                streak.succeeded(at);
+                continue;
+            }
+            warnings += usize::from(streak.failed("connect", at, 3).is_some());
+        }
+        assert_eq!(warnings, 2, "minutes 2 and 14");
+        for minute in 20..30 {
+            let at = start + MINUTE * minute;
+            assert_eq!(streak.failed("connect", at, 3), None);
+            assert_eq!(streak.succeeded(at), None);
+        }
+    }
+
+    /// A streak's first failure is noted at most once per repeat interval,
+    /// so failures between successes show without flooding.
+    #[test]
+    fn a_streaks_first_failure_is_noted_at_most_once_per_interval() {
+        let start = Instant::now();
+        let mut streak = FailureStreak::default();
+        streak.failed("connect", start, 3);
+        assert!(streak.first_failure_due(start));
+        streak.succeeded(start + MINUTE);
+        streak.failed("connect", start + MINUTE * 2, 3);
+        assert!(
+            !streak.first_failure_due(start + MINUTE * 2),
+            "within the interval"
+        );
+        streak.failed("connect", start + MINUTE * 3, 3);
+        assert!(
+            !streak.first_failure_due(start + MINUTE * 3),
+            "not a first failure"
+        );
+        streak.succeeded(start + MINUTE * 4);
+        streak.failed("connect", start + MINUTE * 12, 3);
+        assert!(streak.first_failure_due(start + MINUTE * 12));
+    }
+
+    /// Recoveries finding no archive warn once for the node, with the
+    /// shards affected, and end when any recovery reaches an archive.
+    #[test]
+    fn a_node_without_archives_warns_once_for_all_its_workers() {
+        let start = Instant::now();
+        let mut node = NoArchive::new();
+        assert_eq!(node.resolved(start), None);
+        assert_eq!(
+            node.failed(&[1; 32], start),
+            Some((
+                StreakLog::Failing {
+                    failures: 1,
+                    duration: Duration::ZERO
+                },
+                1
+            ))
+        );
+        for worker in 2..100u8 {
+            assert_eq!(node.failed(&[worker; 32], start + MINUTE), None);
+        }
+        assert_eq!(
+            node.failed(&[1; 32], start + MINUTE * 10),
+            Some((
+                StreakLog::Failing {
+                    failures: 100,
+                    duration: MINUTE * 10
+                },
+                99
+            ))
+        );
+        assert_eq!(
+            node.resolved(start + MINUTE * 11),
+            Some((
+                StreakLog::Ended {
+                    failures: 100,
+                    duration: MINUTE * 11
+                },
+                99
+            ))
+        );
+    }
+
+    /// A deferred sync attempted nothing: the record, the shard's streak
+    /// and its failure classes are as before it.
+    #[tokio::test]
+    async fn a_deferred_recovery_changes_no_record_or_streak() {
+        let worker = SharedWorkerExecution::default();
+        let _ = worker
+            .recovering(&[4; 32], async {
+                Err(quil_types::error::QuilError::Internal(
+                    "archive connect: refused".into(),
+                ))
+            })
+            .await;
+        let before = worker.snapshot().recovery.unwrap();
+        for _ in 0..5 {
+            let result = worker
+                .recovering(&[4; 32], async {
+                    recovery_phase("waiting_for_permit");
+                    Ok(ShardRecoveryProgress::Deferred(
+                        "a re-anchor at the session fence is owed and has its own attempt",
+                    ))
+                })
+                .await;
+            assert!(matches!(result, Ok(ShardRecoveryProgress::Deferred(_))));
+        }
+        assert_eq!(worker.snapshot().recovery.unwrap(), before);
+        let streaks = worker.streaks.lock().unwrap();
+        assert_eq!(
+            (
+                streaks[&vec![4; 32]].failures,
+                streaks[&vec![4; 32]].reported
+            ),
+            (1, false)
+        );
+    }
+
+    /// Each shard keeps its own streak: another shard's success does not
+    /// end it, and a node without archives leaves the worker's own warning
+    /// to the node's.
+    #[tokio::test]
+    async fn streaks_are_kept_per_shard() {
+        let worker = SharedWorkerExecution::default();
+        let fail = || async {
+            Err(quil_types::error::QuilError::Internal(
+                "archive connect: refused".into(),
+            ))
+        };
+        for _ in 0..2 {
+            let _ = worker.recovering(&[1; 32], fail()).await;
+        }
+        let _ = worker
+            .recovering(&[2; 32], async {
+                Ok(ShardRecoveryProgress::Anchored { frame: 3 })
+            })
+            .await;
+        let _ = worker.recovering(&[1; 32], fail()).await;
+        let streaks = worker.streaks.lock().unwrap();
+        assert_eq!(
+            streaks[&vec![1; 32]].failures,
+            3,
+            "the other shard's success must not reset it"
+        );
+        assert!(streaks[&vec![1; 32]].reported);
+        assert_eq!(streaks[&vec![2; 32]].failures, 0);
+    }
+
+    #[test]
+    fn failures_are_classed_by_whose_problem_they_are() {
+        for (error, class) in [
+            (
+                "execution unavailable: no archive known yet",
+                "no_archive_known",
+            ),
+            (
+                "internal error: archive connect: invalid endpoint: invalid URI",
+                "connect",
+            ),
+            (
+                "internal error: get app-shard frame: status: Unavailable",
+                "archive_request",
+            ),
+            (
+                "invalid argument: wrong-shard archive replay tip",
+                "replay_mismatch",
+            ),
+            (
+                "execution unavailable: archive replay pre-state mismatch at phase 0",
+                "replay_mismatch",
+            ),
+            ("the archive checkpoint failed validation", "archive_state"),
+            (
+                "execution unavailable: archive replay is missing shard frame 9",
+                "archive_state",
+            ),
+            ("actor rejected checkpoint", "other"),
+            (
+                "execution unavailable: archive replay of frame 9 waits for this node's proof \
+                    verification (token proofs of this frame are verifying in the background)",
+                PROOF_VERIFICATION,
+            ),
+            (
+                "execution unavailable: archive replay of frame 9 waits for this node's proof \
+                    verification (token proof worker: Busy)",
+                PROOF_VERIFICATION,
+            ),
+            (
+                "execution unavailable: archive replay timed out",
+                ENGINE_BUSY,
+            ),
+            (
+                "execution unavailable: shard sync validation timed out",
+                ENGINE_BUSY,
+            ),
+            (
+                "execution unavailable: archive replay materialization did not commit",
+                "other",
+            ),
+            (
+                "invalid argument: archive replay frame 8: anchor does not link to predecessor \
+                    (it names parent 99999999, its own certificate none; local frame 7 digest \
+                    0a0b0c0d; session genesis it may name none)",
+                "replay_mismatch",
+            ),
+            (
+                "invalid argument: archive replay frame 8: frame 8 would open generation 2 at \
+                    frame 7, but the certified frame 9 authenticating it is of generation 3",
+                "replay_mismatch",
+            ),
+            (
+                "invalid argument: archive replay frame belongs to another shard",
+                "replay_mismatch",
+            ),
+            (
+                "invalid signature: archive replay frame 8: certificate rejected",
+                "other",
+            ),
+        ] {
+            assert_eq!(failure_class(error), class, "{error}");
+        }
+        assert_eq!(failure_guidance("no_archive_known").0, "this node");
+        assert_eq!(failure_guidance("connect").0, "archive");
+        let (scope, action) = failure_guidance(PROOF_VERIFICATION);
+        assert_eq!(scope, "this node's proof worker");
+        assert!(action.contains("an expected wait"), "{action}");
+        assert!(!action.contains("re-anchor"), "{action}");
+        assert_eq!(failure_guidance(ENGINE_BUSY).0, "this node");
+        assert!(
+            failure_guidance("replay_mismatch")
+                .1
+                .contains("pre-state has mismatched"),
+            "only a pre-state mismatch counts toward a re-anchor"
+        );
+    }
+
+    /// A replay waiting for this node's proof verification, and a shard
+    /// engine that did not answer one, are no replay mismatch, whose
+    /// guidance tells operators the archive's frames do not replay onto
+    /// local state and promises a re-anchor: so read, a regular node's
+    /// replays waiting for their proofs, which every one of its 15 workers
+    /// met, reported streaks of up to 908 mismatches (2026-10-31). The texts
+    /// are those of the release base.
+    #[test]
+    fn a_replay_waiting_for_its_proofs_is_no_replay_mismatch() {
+        for error in [
+            "execution unavailable: archive replay materialization did not commit",
+            "execution unavailable: archive replay timed out",
+            "execution unavailable: token proofs of this frame are verifying in the background",
+            "execution unavailable: token proof worker: Busy",
+        ] {
+            let class = failure_class(error);
+            assert_ne!(
+                class,
+                "replay_mismatch",
+                "{error:?} is classed a replay mismatch, guided as: {}",
+                failure_guidance(class).1
+            );
+        }
+    }
+
+    /// An attempt whose replay waits for this node's proof verification is
+    /// recorded with its class, and counts toward no failure streak.
+    #[tokio::test]
+    async fn a_proof_verification_wait_counts_no_failure() {
+        let worker = SharedWorkerExecution::default();
+        for _ in 0..12 {
+            let _ = worker
+                .recovering(&[8; 32], async {
+                    Err(quil_types::error::QuilError::ExecutionUnavailable(
+                        "archive replay of frame 9 waits for this node's proof verification \
+                         (token proof worker: Busy)"
+                            .into(),
+                    ))
+                })
+                .await;
+        }
+        let r = worker.snapshot().recovery.unwrap();
+        assert_eq!(r.consecutive_failures, 0);
+        assert_eq!(failure_class(&r.last_error), PROOF_VERIFICATION);
+        assert_eq!(r.failures_by_class.get(PROOF_VERIFICATION), Some(&12));
+    }
+
+    /// This node's own GLOBAL state sync withholding committed GLOBAL state
+    /// is its own class, matched before the rules that name an archive:
+    /// the texts a node restarted into its GLOBAL sync logged, read as
+    /// "archive_state", told its operator an archive had failed
+    /// (2026-10-29). Real archive failures keep their classes.
+    #[test]
+    fn this_nodes_global_sync_is_not_read_as_an_archive_failure() {
+        for error in [
+            "execution unavailable: global state sync in progress",
+            "invalid argument: archive sync anchor frame 27200: execution unavailable: \
+                global state sync in progress",
+            "origin anchors unavailable: execution unavailable: global state sync in progress",
+            GLOBAL_SYNC_STILL_INSTALLING,
+        ] {
+            assert_eq!(failure_class(error), GLOBAL_SYNC, "{error}");
+        }
+        for (error, class) in [
+            ("the archive checkpoint failed validation", "archive_state"),
+            (
+                "the archive does not hold the session's certified base state, or its roots differ",
+                "archive_state",
+            ),
+            (
+                "execution unavailable: archive replay is missing shard frame 9",
+                "archive_state",
+            ),
+            (
+                "invalid argument: archive sync anchor frame 33228: invalid signature: \
+                    app session certificate: generation has no authorization",
+                "other",
+            ),
+        ] {
+            assert_eq!(failure_class(error), class, "{error}");
+        }
+        let (scope, action) = failure_guidance(GLOBAL_SYNC);
+        assert_eq!(scope, "this node");
+        assert!(action.contains("expected wait, no action"), "{action}");
+        assert!(!action.contains("report it"), "{action}");
+    }
+
+    /// An attempt that waited for this node's GLOBAL state sync is recorded
+    /// with its class, but neither counts toward the shard's failure streak
+    /// nor ends it: 40 of them in a row warn nothing, and the archive
+    /// failure before them still counts once.
+    #[tokio::test]
+    async fn a_global_sync_wait_counts_toward_no_failure_streak() {
+        let worker = SharedWorkerExecution::default();
+        let _ = worker
+            .recovering(&[6; 32], async {
+                Err(quil_types::error::QuilError::Internal(
+                    "archive connect: refused".into(),
+                ))
+            })
+            .await;
+        for _ in 0..40 {
+            let _ = worker
+                .recovering(&[6; 32], async {
+                    Ok(ShardRecoveryProgress::NotReady(
+                        GLOBAL_SYNC_STILL_INSTALLING,
+                    ))
+                })
+                .await;
+            let _ = worker
+                .recovering(&[6; 32], async {
+                    Err(quil_types::error::QuilError::ExecutionUnavailable(
+                        quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS.into(),
+                    ))
+                })
+                .await;
+        }
+        let r = worker.snapshot().recovery.unwrap();
+        assert_eq!((r.attempts, r.consecutive_failures), (81, 1));
+        assert_eq!(failure_class(&r.last_error), GLOBAL_SYNC);
+        let classes: BTreeMap<String, u32> = r.failures_by_class.into_iter().collect();
+        assert_eq!(
+            classes,
+            BTreeMap::from([("connect".into(), 1), (GLOBAL_SYNC.into(), 80)])
+        );
+        let streaks = worker.streaks.lock().unwrap();
+        assert_eq!(
+            (
+                streaks[&vec![6; 32]].failures,
+                streaks[&vec![6; 32]].reported
+            ),
+            (1, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn permit_wait_is_measured_apart_from_the_attempt() {
+        let worker = SharedWorkerExecution::default();
+        let _ = worker
+            .recovering(&[7; 32], async {
+                recovery_phase("waiting_for_permit");
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                recovery_phase("fetching_checkpoint");
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                Ok(ShardRecoveryProgress::Anchored { frame: 1 })
+            })
+            .await;
+        let r = worker.snapshot().recovery.unwrap();
+        assert!(r.permit_wait_ms >= 60, "{}", r.permit_wait_ms);
+        assert!(
+            r.attempt_ms >= 30 && r.attempt_ms < r.permit_wait_ms + 30,
+            "{} after {}",
+            r.attempt_ms,
+            r.permit_wait_ms
+        );
+        let longest = r.longest_permit_wait_ms;
+        assert_eq!(longest, r.permit_wait_ms);
+        let _ = worker
+            .recovering(&[7; 32], async {
+                recovery_phase("waiting_for_permit");
+                recovery_phase("fetching_checkpoint");
+                Ok(ShardRecoveryProgress::Anchored { frame: 2 })
+            })
+            .await;
+        let r = worker.snapshot().recovery.unwrap();
+        assert!(r.permit_wait_ms < longest);
+        assert_eq!(
+            r.longest_permit_wait_ms, longest,
+            "the longest wait outlasts a shorter one"
+        );
+    }
+
+    /// The text between `start` and the next `end` after it in `source`.
+    fn region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let from = source
+            .find(start)
+            .unwrap_or_else(|| panic!("{start} not found"));
+        let rest = &source[from + start.len()..];
+        &rest[..rest
+            .find(end)
+            .unwrap_or_else(|| panic!("{end} not found after {start}"))]
+    }
+
+    /// The string literals of each `open` … `close` in `source` that starts
+    /// with a literal, e.g. each `state("…", "…")` call. Whitespace after
+    /// `open` is skipped, so a line break inserted by rustfmt hides nothing.
+    fn literals<'a>(source: &'a str, open: &str, close: char) -> Vec<Vec<&'a str>> {
+        source
+            .match_indices(open)
+            .filter_map(|(at, _)| {
+                let rest = source[at + open.len()..].trim_start();
+                rest.starts_with('"').then(|| {
+                    rest[..rest.find(close).unwrap()]
+                        .split('"')
+                        .skip(1)
+                        .step_by(2)
+                        .collect()
+                })
+            })
+            .collect()
+    }
+
+    /// Every phase and reason the engine writes is listed in [`STATES`] and
+    /// [`BLOCKERS`], every recovery phase in [`RECOVERY_PHASES`], and every
+    /// listed one is written: readers outside the engine map the lists.
+    #[test]
+    fn the_lists_hold_every_literal_the_engine_writes() {
+        let engine = include_str!("app_engine.rs");
+        let thread = include_str!("thread_worker.rs");
+        let syncer = include_str!("prover_tree_syncer.rs");
+        let own = include_str!("worker_execution.rs");
+        let own = &own[..own
+            .find(
+                "#[cfg(test)]
+mod tests",
+            )
+            .unwrap()];
+        let phase = region(own, "pub fn consensus_phase", "self.state(state, reason)");
+        let chain = region(engine, "let blocker = ", ";");
+        let mut written: Vec<Vec<&str>> = [engine, thread]
+            .iter()
+            .flat_map(|s| literals(s, "state(", ')'))
+            .collect();
+        assert!(written.len() >= 10, "{written:?}");
+        written.extend(literals(phase, "(", ')'));
+        let chained = literals(chain, "{", '}');
+        assert_eq!(chained.len(), 4, "{chain}");
+        written.extend(
+            chained
+                .into_iter()
+                .map(|blocker| vec!["blocked", blocker[0]]),
+        );
+        // A store's state, which no engine writes (`with_store_state`).
+        written.push(vec!["blocked", STORAGE_WRITE_FAILED]);
+        let states: BTreeSet<&str> = written.iter().map(|args| args[0]).collect();
+        let blockers: BTreeSet<&str> = written
+            .iter()
+            .filter_map(|args| args.get(1).copied())
+            .filter(|b| !b.is_empty())
+            .collect();
+        assert_eq!(states, STATES.into_iter().collect::<BTreeSet<_>>());
+        assert_eq!(blockers, BLOCKERS.into_iter().collect::<BTreeSet<_>>());
+        let phases: BTreeSet<&str> = [thread, syncer]
+            .iter()
+            .flat_map(|s| literals(s, "recovery_phase(", ')'))
+            .chain(literals(own, "enter(r, ", ','))
+            .map(|args| args[0])
+            .collect();
+        assert_eq!(phases, RECOVERY_PHASES.into_iter().collect::<BTreeSet<_>>());
+    }
+
+    /// A recovery stopped again at the same frame no archive serves backs
+    /// off 30 s, doubling to 10 min, and logs that once per streak; another
+    /// archive's lower tip continues the streak. The back-off ends when the
+    /// worker materializes the frame, GLOBAL's committed tip moves, or an
+    /// attempt finds a higher archive tip or ends otherwise. A frame above
+    /// the committed tip waits for that tip to reach it, not merely move.
+    #[test]
+    fn an_archive_gap_backoff_doubles_to_its_maximum_and_ends_when_its_frame_may_be_obtainable() {
+        let start = tokio::time::Instant::now();
+        let secs = Duration::from_secs;
+        let gap = |frame, archive_tip, committed| ArchiveGap {
+            frame,
+            archive_tip,
+            committed,
+        };
+        let stopped = gap(170, Some(200), 200);
+        let mut slot = None;
+        assert_eq!(
+            ArchiveGapPacing::attempted(&mut slot, Some(stopped), true, start),
+            None
+        );
+        assert_eq!(
+            ArchiveGapPacing::hold(&mut slot, 169, Some(200), start),
+            (false, None),
+            "a first failure is retried as before"
+        );
+        let (mut at, mut lengths) = (start, Vec::new());
+        for _ in 0..7 {
+            let log = ArchiveGapPacing::attempted(&mut slot, Some(stopped), true, at);
+            let length = slot.as_ref().unwrap().retry_in();
+            match lengths.is_empty() {
+                true => assert_eq!(
+                    log,
+                    Some(ArchiveGapLog::Holding {
+                        gap: stopped,
+                        failures: 2,
+                        retry_in: secs(30)
+                    })
+                ),
+                false => assert_eq!(log, None, "logged once per streak"),
+            }
+            assert!(ArchiveGapPacing::hold(&mut slot, 169, Some(200), at + length - secs(1)).0);
+            assert!(
+                !ArchiveGapPacing::hold(&mut slot, 169, None, at + length).0,
+                "an unknown committed tip ends nothing; the back-off runs out"
+            );
+            lengths.push(length.as_secs());
+            at += length;
+        }
+        assert_eq!(lengths, [30, 60, 120, 240, 480, 600, 600]);
+        ArchiveGapPacing::attempted(&mut slot, Some(gap(170, Some(190), 200)), true, at);
+        assert_eq!(
+            slot.as_ref().unwrap().retry_in(),
+            secs(600),
+            "a lower archive tip"
+        );
+        assert_eq!(
+            ArchiveGapPacing::hold(&mut slot, 170, Some(200), at),
+            (
+                false,
+                Some(ArchiveGapLog::Ended {
+                    gap: gap(170, Some(190), 200),
+                    failures: 9,
+                    held: 7,
+                    reason: "this worker materialized the frame"
+                })
+            )
+        );
+        assert!(slot.is_none());
+
+        // GLOBAL's committed tip moves.
+        ArchiveGapPacing::attempted(&mut slot, Some(stopped), true, start);
+        ArchiveGapPacing::attempted(&mut slot, Some(stopped), true, start);
+        let (held, ended) = ArchiveGapPacing::hold(&mut slot, 169, Some(201), start);
+        assert!(!held && slot.is_none());
+        assert!(matches!(ended, Some(ArchiveGapLog::Ended { reason, .. })
+                if reason == "GLOBAL's committed tip of the session moved"));
+        // An attempt finds a higher archive tip: a new streak, not held.
+        ArchiveGapPacing::attempted(&mut slot, Some(stopped), true, start);
+        ArchiveGapPacing::attempted(&mut slot, Some(stopped), true, start);
+        let ended =
+            ArchiveGapPacing::attempted(&mut slot, Some(gap(170, Some(210), 200)), true, start);
+        assert!(matches!(ended, Some(ArchiveGapLog::Ended { reason, .. })
+                if reason == "an archive's tip advanced"));
+        assert!(!slot.as_ref().unwrap().holding());
+        // Another failure class or a success ends a streak; one not backed
+        // off yet logs nothing.
+        assert_eq!(
+            ArchiveGapPacing::attempted(&mut slot, None, true, start),
+            None
+        );
+        assert!(slot.is_none());
+
+        // A frame above GLOBAL's committed tip.
+        let above = gap(18393, Some(18400), 17781);
+        ArchiveGapPacing::attempted(&mut slot, Some(above), true, start);
+        ArchiveGapPacing::attempted(&mut slot, Some(above), true, start);
+        assert!(
+            ArchiveGapPacing::hold(&mut slot, 18392, Some(17790), start).0,
+            "the committed tip moved, still below the frame"
+        );
+        ArchiveGapPacing::attempted(&mut slot, Some(gap(18393, Some(18400), 17790)), true, start);
+        assert_eq!(
+            slot.as_ref().unwrap().retry_in(),
+            secs(60),
+            "the streak goes on"
+        );
+        let (held, ended) = ArchiveGapPacing::hold(&mut slot, 18392, Some(18393), start);
+        assert!(!held && slot.is_none());
+        assert!(
+            matches!(ended, Some(ArchiveGapLog::Ended { reason, failures: 3, .. })
+                if reason == "GLOBAL's committed tip reached the frame")
+        );
+    }
+}

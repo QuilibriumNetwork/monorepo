@@ -22,9 +22,9 @@ use crate::bls48581::big::BIG;
 use crate::bls48581::fp;
 use crate::bls48581::fp::FP;
 use crate::bls48581::fp2::FP2;
-use crate::rand::RAND;
 #[allow(unused_imports)]
 use crate::bls48581::rom;
+use crate::rand::RAND;
 
 #[derive(Copy, Clone)]
 pub struct FP4 {
@@ -32,13 +32,11 @@ pub struct FP4 {
     b: FP2,
 }
 
-
 impl std::fmt::Debug for FP4 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(formatter, "{}", self.tostring())
     }
 }
-
 
 impl std::fmt::Display for FP4 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -61,7 +59,7 @@ impl FP4 {
         f
     }
 
-    pub fn new_ints(a: isize,b: isize) -> FP4 {
+    pub fn new_ints(a: isize, b: isize) -> FP4 {
         let mut f = FP4::new();
         f.a.copy(&FP2::new_int(a));
         f.b.copy(&FP2::new_int(b));
@@ -97,7 +95,7 @@ impl FP4 {
     }
 
     pub fn new_rand(rng: &mut RAND) -> FP4 {
-       FP4::new_fp2s(&FP2::new_rand(rng),&FP2::new_rand(rng))
+        FP4::new_fp2s(&FP2::new_rand(rng), &FP2::new_rand(rng))
     }
 
     pub fn set_fp2s(&mut self, c: &FP2, d: &FP2) {
@@ -146,8 +144,8 @@ impl FP4 {
         if self.iszilch() {
             0
         } else {
-            let cmp=self.b.islarger();
-            if cmp!=0 {
+            let cmp = self.b.islarger();
+            if cmp != 0 {
                 cmp
             } else {
                 self.a.islarger()
@@ -155,34 +153,32 @@ impl FP4 {
         }
     }
 
-    pub fn tobytes(&self,bf: &mut [u8]) {
-        const MB:usize = 2*(big::MODBYTES as usize);
+    pub fn tobytes(&self, bf: &mut [u8]) {
+        const MB: usize = 2 * (big::MODBYTES as usize);
         let mut t: [u8; MB] = [0; MB];
         self.b.tobytes(&mut t);
         for i in 0..MB {
-            bf[i]=t[i];
+            bf[i] = t[i];
         }
         self.a.tobytes(&mut t);
         for i in 0..MB {
-            bf[i+MB]=t[i];
+            bf[i + MB] = t[i];
         }
     }
 
     pub fn frombytes(bf: &[u8]) -> FP4 {
-        const MB:usize = 2*(big::MODBYTES as usize);
+        const MB: usize = 2 * (big::MODBYTES as usize);
         let mut t: [u8; MB] = [0; MB];
         for i in 0..MB {
-            t[i]=bf[i];
+            t[i] = bf[i];
         }
-        let tb=FP2::frombytes(&t);
+        let tb = FP2::frombytes(&t);
         for i in 0..MB {
-            t[i]=bf[i+MB];
+            t[i] = bf[i + MB];
         }
-        let ta=FP2::frombytes(&t);
-        FP4::new_fp2s(&ta,&tb)
+        let ta = FP2::frombytes(&t);
+        FP4::new_fp2s(&ta, &tb)
     }
-
-
 
     /* test self=1 ? */
     pub fn isunity(&self) -> bool {
@@ -229,17 +225,17 @@ impl FP4 {
         self.b.zero();
     }
 
-    pub fn sign(&self)  -> isize {
-        let mut p1=self.a.sign();
-        let mut p2=self.b.sign();
+    pub fn sign(&self) -> isize {
+        let mut p1 = self.a.sign();
+        let mut p2 = self.b.sign();
         if fp::BIG_ENDIAN_SIGN {
-            let u=self.b.iszilch() as isize;
-	        p2^=(p1^p2)&u;
-	        p2
+            let u = self.b.iszilch() as isize;
+            p2 ^= (p1 ^ p2) & u;
+            p2
         } else {
-            let u=self.a.iszilch() as isize;
-	        p1^=(p1^p2)&u;
-	        p1
+            let u = self.a.iszilch() as isize;
+            p1 ^= (p1 ^ p2) & u;
+            p1
         }
     }
 
@@ -388,13 +384,13 @@ impl FP4 {
     }
 
     /* output to hex string */
-    
+
     pub fn tostring(&self) -> String {
         format!("[{},{}]", self.a.tostring(), self.b.tostring())
     }
 
     /* self=1/self */
-    pub fn inverse(&mut self,h:Option<&FP>) {
+    pub fn inverse(&mut self, h: Option<&FP>) {
         //self.norm();
 
         let mut t1 = FP2::new_copy(&self.a);
@@ -433,28 +429,28 @@ impl FP4 {
     }
 
     /* return this^e */
-/*
-    pub fn pow(&self, e: &BIG) -> FP4 {
-        let mut w = FP4::new_copy(self);
-        w.norm();
-        let mut z = BIG::new_copy(&e);
-        let mut r = FP4::new_int(1);
-        z.norm();
-        loop {
-            let bt = z.parity();
-            z.fshr(1);
-            if bt == 1 {
-                r.mul(&mut w)
-            };
-            if z.iszilch() {
-                break;
+    /*
+        pub fn pow(&self, e: &BIG) -> FP4 {
+            let mut w = FP4::new_copy(self);
+            w.norm();
+            let mut z = BIG::new_copy(&e);
+            let mut r = FP4::new_int(1);
+            z.norm();
+            loop {
+                let bt = z.parity();
+                z.fshr(1);
+                if bt == 1 {
+                    r.mul(&mut w)
+                };
+                if z.iszilch() {
+                    break;
+                }
+                w.sqr();
             }
-            w.sqr();
+            r.reduce();
+            r
         }
-        r.reduce();
-        r
-    }
-*/
+    */
     /* XTR xtr_a function */
     pub fn xtr_a(&mut self, w: &FP4, y: &FP4, z: &FP4) {
         let mut r = FP4::new_copy(w);
@@ -694,31 +690,31 @@ impl FP4 {
             self.norm();
         }
     }
-/*
-    pub fn pow(&mut self, e: &BIG) {
-        let mut w = FP4::new_copy(self);
-        let mut z = BIG::new_copy(&e);
-        let mut r = FP4::new_int(1);
-        loop {
-            let bt = z.parity();
-            z.fshr(1);
-            if bt == 1 {
-                r.mul(&mut w)
-            };
-            if z.iszilch() {
-                break;
+    /*
+        pub fn pow(&mut self, e: &BIG) {
+            let mut w = FP4::new_copy(self);
+            let mut z = BIG::new_copy(&e);
+            let mut r = FP4::new_int(1);
+            loop {
+                let bt = z.parity();
+                z.fshr(1);
+                if bt == 1 {
+                    r.mul(&mut w)
+                };
+                if z.iszilch() {
+                    break;
+                }
+                w.sqr();
             }
-            w.sqr();
+            r.reduce();
+            self.copy(&r);
         }
-        r.reduce();
-        self.copy(&r);
-    }
-*/
+    */
 
-/* */
+    /* */
 
-    pub fn qr(&mut self,h:Option<&mut FP>) -> isize {
-        let mut c=FP4::new_copy(self);
+    pub fn qr(&mut self, h: Option<&mut FP>) -> isize {
+        let mut c = FP4::new_copy(self);
         c.conj();
         c.mul(self);
         c.geta().qr(h)
@@ -726,7 +722,7 @@ impl FP4 {
 
     // sqrt(a+ib) = sqrt(a+sqrt(a*a-n*b*b)/2)+ib/(2*sqrt(a+sqrt(a*a-n*b*b)/2))
     // returns true if this is QR
-    pub fn sqrt(&mut self,h:Option<&FP>)  {
+    pub fn sqrt(&mut self, h: Option<&FP>) {
         if self.iszilch() {
             return;
         }
@@ -743,7 +739,8 @@ impl FP4 {
         s.norm();
         a.sub(&s);
 
-        s.copy(&a); s.norm();
+        s.copy(&a);
+        s.norm();
 
         s.sqrt(h);
 
@@ -752,33 +749,37 @@ impl FP4 {
         a.norm();
         a.div2();
 
+        b.copy(&self.b);
+        b.div2();
+        let qr = a.qr(Some(&mut hint));
 
-        b.copy(&self.b); b.div2();
-        let qr=a.qr(Some(&mut hint));
-
-
-// tweak hint - multiply old hint by Norm(1/Beta)^e where Beta is irreducible polynomial
+        // tweak hint - multiply old hint by Norm(1/Beta)^e where Beta is irreducible polynomial
         s.copy(&a);
         let mut twk = FP::new_big(&BIG::new_ints(&rom::TWK));
         twk.mul(&hint);
-        s.div_ip(); s.norm();
+        s.div_ip();
+        s.norm();
 
-        a.cmove(&s,1-qr);
-        hint.cmove(&twk,1-qr);
+        a.cmove(&s, 1 - qr);
+        hint.cmove(&twk, 1 - qr);
 
-        self.a.copy(&a); self.a.sqrt(Some(&hint));
-        s.copy(&a); s.inverse(Some(&hint));
+        self.a.copy(&a);
+        self.a.sqrt(Some(&hint));
+        s.copy(&a);
+        s.inverse(Some(&hint));
         s.mul(&self.a);
-        self.b.copy(&s); self.b.mul(&b);
+        self.b.copy(&s);
+        self.b.mul(&b);
         t.copy(&self.a);
 
-        self.a.cmove(&self.b,1-qr);
-        self.b.cmove(&t,1-qr);
+        self.a.cmove(&self.b, 1 - qr);
+        self.b.cmove(&t, 1 - qr);
 
-        let sgn=self.sign();
-        let mut nr=FP4::new_copy(&self);
-        nr.neg(); nr.norm();
-        self.cmove(&nr,sgn);
+        let sgn = self.sign();
+        let mut nr = FP4::new_copy(&self);
+        nr.neg();
+        nr.norm();
+        self.cmove(&nr, sgn);
     }
-/* */
+    /* */
 }

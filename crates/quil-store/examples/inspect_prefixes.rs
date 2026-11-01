@@ -7,8 +7,7 @@
 //!     /path/to/store
 //!
 //! Specifically targets the global prover tree's shard
-//! (l1=[0;3], l2=[0xff;32]) since that's the one the user is
-//! debugging.
+//! (l1=[0;3], l2=[0xff;32]).
 
 use std::path::Path;
 
@@ -19,16 +18,12 @@ fn main() {
         std::process::exit(2);
     }
     let primary = Path::new(&args[1]);
-    let scratch = std::env::temp_dir().join(format!(
-        "inspect-prefixes-{}",
-        std::process::id()
-    ));
+    let scratch = std::env::temp_dir().join(format!("inspect-prefixes-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).expect("scratch dir");
 
     let mut opts = rocksdb::Options::default();
     opts.set_max_open_files(64);
-    let db = rocksdb::DB::open_as_secondary(&opts, primary, &scratch)
-        .expect("open as secondary");
+    let db = rocksdb::DB::open_as_secondary(&opts, primary, &scratch).expect("open as secondary");
     let _ = db.try_catch_up_with_primary();
 
     // The global prover tree's shard key for the standard genesis
@@ -39,26 +34,38 @@ fn main() {
     let prefixes: Vec<(&'static str, Vec<u8>)> = vec![
         // Rust per-vertex keyspace for global vertex_adds.
         // [0x30, set=0, phase=0, l1, l2]
-        ("rust [0x30] per-vertex (vertex/adds, global shard)",
-            build_prefix(0x30, 0, 0, &l1, &l2)),
+        (
+            "rust [0x30] per-vertex (vertex/adds, global shard)",
+            build_prefix(0x30, 0, 0, &l1, &l2),
+        ),
         // Rust per-node tree by-key for global vertex_adds.
         // [0x33, set=0, phase=0, l1, l2]
-        ("rust [0x33] tree-node-by-key (vertex/adds, global shard)",
-            build_prefix(0x33, 0, 0, &l1, &l2)),
+        (
+            "rust [0x33] tree-node-by-key (vertex/adds, global shard)",
+            build_prefix(0x33, 0, 0, &l1, &l2),
+        ),
         // Rust per-node tree by-path for global vertex_adds.
         // [0x34, set=0, phase=0, l1, l2]
-        ("rust [0x34] tree-node-by-path (vertex/adds, global shard)",
-            build_prefix(0x34, 0, 0, &l1, &l2)),
+        (
+            "rust [0x34] tree-node-by-path (vertex/adds, global shard)",
+            build_prefix(0x34, 0, 0, &l1, &l2),
+        ),
         // Rust legacy whole-tree blob (in case the migrator wrote one).
-        ("rust [0x2F] whole-tree blob (vertex/adds, global shard)",
-            build_prefix(0x2F, 0, 0, &l1, &l2)),
+        (
+            "rust [0x2F] whole-tree blob (vertex/adds, global shard)",
+            build_prefix(0x2F, 0, 0, &l1, &l2),
+        ),
         // Go format orphans that should be GONE after migration.
         // [0x09, 0x02, l1, l2]
-        ("go [0x09 0x02] tree-node (vertex/adds, global shard)",
-            build_go_prefix(0x09, 0x02, &l1, &l2)),
+        (
+            "go [0x09 0x02] tree-node (vertex/adds, global shard)",
+            build_go_prefix(0x09, 0x02, &l1, &l2),
+        ),
         // [0x09, 0x22, l1, l2]
-        ("go [0x09 0x22] tree-node-by-path (vertex/adds, global shard)",
-            build_go_prefix(0x09, 0x22, &l1, &l2)),
+        (
+            "go [0x09 0x22] tree-node-by-path (vertex/adds, global shard)",
+            build_go_prefix(0x09, 0x22, &l1, &l2),
+        ),
     ];
 
     let mut grand_first: Option<u8> = None;
@@ -80,7 +87,10 @@ fn main() {
     println!("--- leading byte distribution (whole DB) ---");
     for b in 0..=255u16 {
         if grand_byte_counts[b as usize] > 0 {
-            println!("  0x{:02X}: {} entries", b as u8, grand_byte_counts[b as usize]);
+            println!(
+                "  0x{:02X}: {} entries",
+                b as u8, grand_byte_counts[b as usize]
+            );
         }
     }
 
@@ -117,7 +127,9 @@ fn main() {
         let root = match quil_tries::deserialize_go_tree(&v) {
             Ok(Some(r)) => r,
             Ok(None) => {
-                *classified.entry("deserialize_returned_None".into()).or_insert(0) += 1;
+                *classified
+                    .entry("deserialize_returned_None".into())
+                    .or_insert(0) += 1;
                 continue;
             }
             Err(e) => {

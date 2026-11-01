@@ -58,6 +58,18 @@ message ShardAllocationInfo {
   uint64 join_confirm_frame_number = 4;
   uint64 leave_frame_number = 5;
   uint64 last_active_frame_number = 6;
+  // The storage epoch this allocation was last confirmed for (the highest
+  // epoch it has registered leaf roots for). Data-shard (non-empty filter)
+  // Active allocations are epoch-bound: an `epoch` older than the current
+  // epoch means the prover missed its per-epoch re-confirm and reads as
+  // effectively ExpiredEpoch. `0` is the genesis/grandfather sentinel.
+  uint64 epoch = 7;
+  // The frame at which a leave was confirmed. With epoch-aligned lifecycle a
+  // leave confirmed in epoch E+1 departs at the E+2 boundary
+  // (DeactivationEpoch = epoch_for_frame(leave_confirm_frame_number)+1); the
+  // client needs this to distinguish Leaving (serving notice) from a departed
+  // allocation.
+  uint64 leave_confirm_frame_number = 8;
 }
 
 message NodeInfoResponse {
@@ -72,6 +84,50 @@ message NodeInfoResponse {
   uint64 last_global_head_frame = 9;
   bool reachable = 10;
   repeated ShardAllocationInfo shard_allocations = 11;
+  // The epoch the node is currently in (epoch_for_frame(last_global_head_frame)).
+  // Provided so clients don't have to assume an epoch length.
+  uint64 current_epoch = 12;
+  // Number of frames per epoch (720 mainnet / 60 testnet; a node consensus
+  // parameter). Clients mirror the node's epoch-aligned lifecycle timing with
+  // this rather than hardcoding a value.
+  uint64 epoch_length_frames = 13;
+  // The configured worker count: how many allocations this node may hold.
+  // Workers above it drain (`WorkerInfo.draining`). 0 on older nodes.
+  uint32 worker_capacity = 16;
+  FrameCadence frame_cadence = 14;
+  // The master process's gossip traffic since it started. Standalone
+  // workers report theirs in `WorkerExecution.gossip_traffic`. Absent on
+  // older nodes.
+  GossipTraffic gossip_traffic = 15;
+}
+
+// One process's gossip messages by bitmask class, since the process started.
+// Sizes are encoded message bytes (payload, signature, key and header),
+// without control messages and transport overhead.
+message GossipTraffic {
+  // Time the counts cover: the process's uptime.
+  uint64 uptime_ms = 1;
+  repeated GossipClassTraffic classes = 2;
+}
+
+message GossipClassTraffic {
+  // "shard_consensus" (shard CW certificates, resolver and blocks),
+  // "shard_frames", "votes" (shard CW votes and the shard vote and timeout
+  // topic), "global" (every GLOBAL topic but peer info), "peer_info" or
+  // "other" (shard prover and dispatch topics, and any other).
+  string class = 1;
+  // Every copy received from a peer, before duplicates are dropped.
+  uint64 received_messages = 2;
+  uint64 received_bytes = 3;
+  // The first copy of each message.
+  uint64 unique_messages = 4;
+  uint64 unique_bytes = 5;
+  // Every copy sent to a peer: this process's publishes and forwards.
+  uint64 sent_messages = 6;
+  uint64 sent_bytes = 7;
+  // Messages this process published, once each.
+  uint64 published_messages = 8;
+  uint64 published_bytes = 9;
 }
 
 message WorkerInfo {
@@ -80,6 +136,146 @@ message WorkerInfo {
   uint64 available_storage = 3;
   uint64 total_storage = 4;
   bool manually_managed = 5;
+  // Absent on older nodes and worker implementations without local telemetry.
+  WorkerExecution execution = 6;
+  // Above the configured worker count: the worker takes no new seat or
+  // join, its seat leaves through the surplus leave, and it stops once it
+  // holds none. False on older nodes.
+  bool draining = 7;
+}
+
+// Local engine observations; independent of allocation and remote shard data.
+// Three conditions are separate and none implies another: an active
+// allocation (the prover registry assigns the filter to this worker), a
+// running consensus host (`state`), and advancing app frames
+// (`materialized_frame`, `last_advance_unix_ms`). A worker can be running
+// with no frame materialized, and can recover data (`recovery`) in any state.
+message WorkerExecution {
+  // Consensus host startup: "starting", "running" (the host started; frames
+  // need not advance), "blocked" (startup failed, see `blocker`) or "stopped".
+  string state = 1;
+  string blocker = 2;
+  optional uint64 materialized_frame = 3;
+  // When `materialized_frame` last increased; 0 when it has not since the
+  // engine started.
+  uint64 last_advance_unix_ms = 4;
+  uint64 observed_unix_ms = 5;
+  // Archive recovery of the shard's data. Absent before the first recovery
+  // attempt and on older nodes.
+  ShardRecovery recovery = 6;
+  // The committee session's terminal seal, once this member saw it
+  // finalized, and its submission to GLOBAL. Absent while the session runs
+  // and on older nodes.
+  SessionSeal seal = 7;
+  // While `state` is "waiting" on committed GLOBAL state: the GLOBAL frame
+  // by which the awaited event happens (e.g. the epoch boundary whose
+  // session pass seats this worker). Absent otherwise and on older nodes.
+  optional uint64 awaited_frame = 8;
+  // Votes in the running committee session's consensus host, since that
+  // host started: the votes this member signed and handed to the shard
+  // transport (`own_votes`, retransmissions included), and those received
+  // from the session's other members (`peer_votes`, retransmissions
+  // included; `last_peer_vote_unix_ms` 0 until one arrives). A present
+  // member casts at least a nullify vote each time a view times out. A vote
+  // counts once handed to the node to publish, whether or not the network
+  // carries it. `own_votes` is absent while no session host runs and on
+  // older builds, which says nothing about voting.
+  optional uint64 own_votes = 9;
+  uint64 peer_votes = 10;
+  uint64 last_peer_vote_unix_ms = 11;
+  // When the running session host started, and when the engine started
+  // (`engine_started_unix_ms`), on the worker's own clock. They name the
+  // host and the engine: a reader compares them with earlier reports of the
+  // same worker and never moves them onto its own clock. 0 on older builds,
+  // and for the host while none runs.
+  uint64 host_started_unix_ms = 12;
+  // How long the running host has sent no vote while another member's vote
+  // had arrived within the last two minutes; time while none arrive is not
+  // counted.
+  uint64 silent_ms = 13;
+  uint64 engine_started_unix_ms = 14;
+  // The worker process's gossip traffic since it started; set by standalone
+  // workers, which run their own swarm. Absent for workers that share the
+  // master's and on older builds.
+  GossipTraffic gossip_traffic = 15;
+}
+
+// A finalized terminal seal and its submission to GLOBAL. GLOBAL accepts a
+// seal only once it has executed the session through the sealed checkpoint;
+// each submission brings the session frames GLOBAL lacks ("drain"), and the
+// closing committee resubmits about once a minute until GLOBAL records it.
+message SessionSeal {
+  uint64 generation = 1;
+  // The sealed data frame, and the seal's own view.
+  uint64 checkpoint = 2;
+  uint64 view = 3;
+  // The session frame GLOBAL had executed through at the last submission,
+  // in this node's view of GLOBAL (a regular node's view can trail by its
+  // registry sync interval).
+  uint64 global_executed = 4;
+  // What the last submission carried: "attached" (the missing frames),
+  // "partial" (the next eight of more missing frames; a later submission
+  // brings the rest), "executed" (GLOBAL had the checkpoint already),
+  // "inactive" (before drains activate), "too_many" (more missing than one
+  // submission carries, before partial drains activate: GLOBAL fences the
+  // session at its executed frame instead), or "unavailable" (the stored
+  // frames could not be read; the seal went alone).
+  string drain = 5;
+  uint32 drain_headers = 6;
+  uint64 finalized_unix_ms = 7;
+  uint64 last_submitted_unix_ms = 8;
+  uint32 submissions = 9;
+  // When this node's view of GLOBAL first showed the seal recorded; 0 until
+  // then.
+  uint64 recorded_unix_ms = 10;
+}
+
+// Archive recovery of a worker's shard data, independent of `state`.
+message ShardRecovery {
+  // "waiting_for_permit" (queued: a node recovers a few shards at a time),
+  // "replaying_frames" (fetching and executing certified frames),
+  // "fetching_checkpoint" (reading and validating an archive's latest frame),
+  // "installing_leaves" (downloading the shard's authenticated tree data),
+  // "installing_checkpoint" (the engine adopts the installed checkpoint), or
+  // "idle" (no attempt running; see the last outcome and error).
+  string phase = 1;
+  uint64 phase_since_unix_ms = 2;
+  // Leaves of the tree being installed, for one forest phase (0-3): the
+  // counts restart with each phase, sub-shard and rebase onto local commits,
+  // and an interrupted download resumes with fewer planned leaves.
+  uint32 tree_phase = 3;
+  uint64 installed_leaves = 4;
+  uint64 planned_leaves = 5;
+  uint64 leaves_observed_unix_ms = 6;
+  // Each finished attempt sets its outcome or its error; neither clears the
+  // other, so compare their times.
+  string last_outcome = 7;
+  uint64 last_outcome_unix_ms = 8;
+  string last_error = 9;
+  uint64 last_error_unix_ms = 10;
+  // The archive the current or last attempt read from most recently. Each
+  // attempt picks the next known archive, passing over one that failed a
+  // recovery read in the last two minutes while another is known.
+  string source = 11;
+  // Attempts finished since the engine started, and how many of the latest
+  // failed in a row.
+  uint32 attempts = 12;
+  uint32 consecutive_failures = 13;
+  // The current or last attempt: when it started, how long it waited for a
+  // recovery permit, how long it ran after that (0 while it runs), and the
+  // leaves it installed. Installed leaves are durable: a retry keeps them
+  // and downloads only the rest, so a failed attempt with installed leaves
+  // still made progress.
+  uint64 attempt_started_unix_ms = 14;
+  uint64 permit_wait_ms = 15;
+  uint64 attempt_ms = 16;
+  uint64 attempt_installed_leaves = 17;
+  // Failed attempts since the engine started, by class: "no_archive_known",
+  // "connect", "archive_request", "archive_state", "replay_mismatch" or
+  // "other".
+  map<string, uint32> failures_by_class = 18;
+  // The longest wait for a recovery permit since the engine started.
+  uint64 longest_permit_wait_ms = 19;
 }
 
 message WorkerInfoResponse {
@@ -169,12 +365,6 @@ message Coin {
   AccountRef owner = 3;
 }
 
-message LegacyCoin {
-  Coin coin = 1;
-  uint64 frame_number = 2;
-  bytes address = 3;
-}
-
 message MaterializedTransaction {
   bytes address = 1;
   bytes raw_balance = 2;
@@ -216,17 +406,6 @@ message GetMetricsResponse {
   bytes metrics = 1;
 }
 
-message GetTokensByAccountRequest {
-  bytes address = 1;
-  bytes domain = 2;
-}
-
-message GetTokensByAccountResponse {
-  repeated LegacyCoin legacy_coins = 1;
-  repeated MaterializedTransaction transactions = 2;
-  repeated MaterializedPendingTransaction pending_transactions = 3;
-}
-
 message GetVertexDataRequest {
   bytes address = 1;  // 64-byte vertex ID (32-byte app address + 32-byte data address)
   bool full_data = 2; // When true, return serialized tree in raw_data
@@ -244,10 +423,12 @@ message GetVertexDataResponse {
   bytes shard_l1 = 4;     // ShardKey.L1 (3 bytes)
   bytes shard_l2 = 5;     // ShardKey.L2 (32 bytes)
   bytes raw_data = 6;     // Serialized VectorCommitmentTree when full_data requested
+  optional bool present = 7; // Distinguishes absent storage from an occupied empty blob.
 }
 
 message GetHyperedgeDataRequest {
   bytes address = 1;  // 64-byte hyperedge ID (32-byte app address + 32-byte data address)
+  bool full_data = 2; // When true, return the serialized tree in raw_data
 }
 
 message GetHyperedgeDataResponse {
@@ -256,6 +437,7 @@ message GetHyperedgeDataResponse {
   string phase_type = 3;  // "adds"
   bytes shard_l1 = 4;     // ShardKey.L1 (3 bytes)
   bytes shard_l2 = 5;     // ShardKey.L2 (32 bytes)
+  bytes raw_data = 6;     // Serialized tree when full_data requested
 }
 
 message CreateTraversalProofRequest {
@@ -269,6 +451,26 @@ message CreateTraversalProofResponse {
   bytes proof = 1;  // serialized TraversalProof (via ToBytes())
 }
 
+// Node observations, independent of client lifetime. Gaps are excluded.
+// Coverage can be less than the requested window; zero advances is observed zero.
+message FrameWindow {
+  uint64 window_seconds = 1;
+  uint64 observed_seconds = 2;
+  uint64 advanced_frames = 3;
+}
+message FrameCadence {
+  uint64 last_observed_unix_seconds = 1;
+  FrameWindow hour = 2;
+  FrameWindow day = 3;
+}
+
+// A shard cursor from this node's committed GLOBAL state, independent of peer metadata.
+message GlobalAppFrameHead {
+  uint64 frame = 1;
+  uint64 global_frame = 2;
+  uint64 generation = 3;
+}
+
 message ShardRewardInfo {
   bytes filter = 1;
   uint32 active_provers = 2;
@@ -277,6 +479,28 @@ message ShardRewardInfo {
   bytes estimated_reward = 5;
   bool is_allocated = 6;
   uint64 data_shards = 7;
+  uint64 materialized_frame = 8;
+  uint64 latest_frame = 9;
+  // Absent on older servers; false means ring/reward are unavailable.
+  optional bool ring_known = 10;
+  GlobalAppFrameHead global_head = 11;
+  // Recorded local proposal intent; absent on older servers or without history.
+  optional string allocation_reason = 14;
+  FrameCadence frame_cadence = 15;
+  // The shard's provers by lifecycle phase at frame_number; absent on older
+  // servers.
+  ShardProverCounts prover_counts = 16;
+}
+
+// Provers of a shard by effective lifecycle phase: a confirmed join counts as
+// activating until the next epoch boundary, a confirmed leave as departing.
+message ShardProverCounts {
+  uint32 joining = 1;
+  uint32 activating = 2;
+  uint32 active = 3;
+  uint32 paused = 4;
+  uint32 leaving = 5;
+  uint32 departing = 6;
 }
 
 message GetShardInfoRequest {
@@ -289,6 +513,32 @@ message GetShardInfoResponse {
   bytes pomw_basis = 3;
   bytes world_state_bytes = 4;
   uint64 frame_number = 5;
+  // Local lifecycle scoring strategy; empty on older servers.
+  string allocation_scoring_strategy = 6;
+}
+
+// Advisory budget for one standalone QUIL operation, not a reservation or a
+// promise of inclusion. The node must have the execution venue's pricing state.
+message GetTokenFeeQuoteRequest {
+  bytes application = 1;
+  uint64 max_payload_bytes = 2;
+  // Quote the global execution venue (the global frame materializer) rather
+  // than the venue currently executing the application's transactions. Reward
+  // mints always execute there, whatever the QUIL shard's coverage.
+  bool global_venue = 3;
+}
+message GetTokenFeeQuoteResponse {
+  bytes application = 1;
+  bytes network = 2;
+  uint64 observed_frame = 3;
+  bool global_execution = 4;
+  uint64 difficulty = 5;
+  uint64 world_state_bytes = 6;
+  uint64 fee_multiplier_vote = 7;
+  uint64 max_payload_bytes = 8;
+  // Unsigned, exactly 16-byte big-endian QUIL base units. This is a budget,
+  // not an authorization to spend; pricing may change before inclusion.
+  bytes fee_budget = 9;
 }
 
 message RequestJoinRequest {
@@ -326,19 +576,100 @@ service NodeService {
   rpc GetNodeInfo(GetNodeInfoRequest) returns (NodeInfoResponse);
   rpc GetWorkerInfo(GetWorkerInfoRequest) returns (WorkerInfoResponse);
   rpc Send(SendRequest) returns (SendResponse);
-  rpc GetTokensByAccount(GetTokensByAccountRequest)
-    returns (GetTokensByAccountResponse);
   rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
   rpc GetVertexData(GetVertexDataRequest) returns (GetVertexDataResponse);
   rpc GetHyperedgeData(GetHyperedgeDataRequest) returns (GetHyperedgeDataResponse);
   rpc CreateTraversalProof(CreateTraversalProofRequest)
     returns (CreateTraversalProofResponse);
   rpc GetShardInfo(GetShardInfoRequest) returns (GetShardInfoResponse);
+  rpc GetTokenFeeQuote(GetTokenFeeQuoteRequest) returns (GetTokenFeeQuoteResponse);
   rpc RequestJoin(RequestJoinRequest) returns (RequestJoinResponse);
   rpc SetManuallyManaged(SetManuallyManagedRequest) returns (SetManuallyManagedResponse);
   rpc GetLatestFrame(quilibrium.node.global.pb.GetGlobalFrameRequest)
     returns (quilibrium.node.global.pb.GlobalFrameResponse);
   rpc SubmitMessage(SubmitMessageRequest) returns (SubmitMessageResponse);
+  // QCT3 wallet witnesses and paginated discovery.
+  rpc GetCoinWitnesses(GetCoinWitnessesRequest)
+    returns (GetCoinWitnessesResponse);
+  rpc ListEscrows(ListCoinsRequest) returns (ListEscrowsResponse);
+  rpc ListCoins(ListCoinsRequest) returns (ListCoinsResponse);
+  rpc ListLegacyCoins(quilibrium.node.global.pb.ListLegacyCoinsRequest) returns (quilibrium.node.global.pb.ListLegacyCoinsResponse);
+  rpc GetProverRewardWitness(GetProverRewardWitnessRequest) returns (GetProverRewardWitnessResponse);
+  rpc GetMintAuthorizationWitness(GetMintAuthorizationWitnessRequest) returns (GetMintAuthorizationWitnessResponse);
+  // Read-only: whether a mint authorization is included and claimable here.
+  rpc GetMintAuthorizationStatus(GetMintAuthorizationStatusRequest) returns (GetMintAuthorizationStatusResponse);
+  rpc GetRetroSeniority(GetRetroSeniorityRequest) returns (GetRetroSeniorityResponse);
+}
+
+// The premainnet retro seniority of Ed448 peer public keys, from the tables
+// the node's GLOBAL execution uses, so a client need not carry them.
+message GetRetroSeniorityRequest {
+  repeated bytes public_keys = 1; // 57-byte Ed448 peer keys, at most 64
+}
+message RetroSeniority {
+  // The key's value in each of the four retro epochs, then in the mainnet
+  // snapshot at frame 244200; zero where it has none.
+  repeated uint64 parts = 1;
+}
+message GetRetroSeniorityResponse {
+  repeated RetroSeniority keys = 1; // in request order
+}
+
+message GetProverRewardWitnessRequest {
+  bytes domain = 1;               // token domain (QUIL for the reward mint)
+  bytes owner_prover_address = 2; // poseidon(prover Falcon pubkey)
+}
+message GetMintAuthorizationWitnessRequest {
+  bytes receipt = 1; // 32-byte authorization identity derived from the original mint
+}
+message GetMintAuthorizationWitnessResponse {
+  bool found = 1;
+  bytes forest_proof = 2; // bounded membership witness; caller checks authorization fields
+  uint64 cited_frame = 3;
+  bytes global_root = 4; // root in the cited canonical global header
+}
+enum MintAuthorizationState {
+  MINT_AUTHORIZATION_STATE_UNSPECIFIED = 0;
+  // In the newest retained global root at or below the claim cap. Says nothing
+  // about whether the claim was already made: the app shard records that.
+  MINT_AUTHORIZATION_STATE_CLAIMABLE = 1;
+  // Included, but the newest retained root at or below the cap predates it.
+  MINT_AUTHORIZATION_STATE_AWAITING_CITABLE_ROOT = 2;
+  // Absent from the newest retained root: not yet included, or rejected.
+  MINT_AUTHORIZATION_STATE_NOT_INCLUDED = 3;
+  // Included, but this node retains no global root at or below the cap.
+  MINT_AUTHORIZATION_STATE_NO_CITABLE_ROOT = 4;
+  // This node retains no recent global root: nothing can be said.
+  MINT_AUTHORIZATION_STATE_NO_RETAINED_ROOT = 5;
+}
+message GetMintAuthorizationStatusRequest {
+  bytes receipt = 1; // 32-byte authorization identity derived from the original mint
+}
+message GetMintAuthorizationStatusResponse {
+  MintAuthorizationState state = 1;
+  bool found = 2; // the receipt is in a retained global root
+  // A frame's header carries the root of its parent, so a receipt first seen
+  // in the root of frame F was included at frame F-1 or earlier. Retained roots
+  // can be sparse: inclusion lies in this range, one frame when the two are
+  // equal; earliest is 0 when no older retained root lacks the receipt.
+  uint64 inclusion_frame = 3;
+  uint64 inclusion_frame_earliest = 4;
+  uint64 claim_cap = 5; // newest global frame a claim through this node may cite
+  // The cap is the slowest live QUIL worker anchor, else the head minus a lag.
+  bool cap_from_shard_anchor = 6;
+  uint64 head_frame = 7;     // this node's latest global frame
+  uint64 searched_frame = 8; // newest retained root checked, at or below the head
+  uint64 cited_frame = 9;    // newest retained root at or below the cap; 0 if none
+  // First retained root holding the receipt: a claim must cite it or a later one.
+  uint64 first_root_frame = 10;
+  string reason = 11; // one line: why it is not claimable and what ends the wait
+}
+message GetProverRewardWitnessResponse {
+  bool found = 1;
+  bytes forest_proof = 2;  // quil_forest MembershipProof bytes
+  bytes value = 3;         // claimable reward Balance, 16-byte LE u128
+  uint64 cited_frame = 4;  // global frame whose prover_tree_commitment is the reward root
+  bytes reward_root = 5;   // checked 32-byte QUIL root; empty for unavailable/legacy providers
 }
 
 message ConnectivityTestRequest {
@@ -361,6 +692,11 @@ message RespawnRequest {
 }
 
 message RespawnResponse {
+  // The worker is starting: it applies the Respawn once its initial
+  // prover-tree sync completes.
+  bool deferred = 1;
+  // The worker already ran the filter and kept its engine.
+  bool kept = 2;
 }
 
 message CreateJoinProofRequest {
@@ -381,7 +717,18 @@ message SetHaltedRequest {
 message SetHaltedResponse {
 }
 
+message GetAppFeeSnapshotRequest { bytes application = 1; }
+message GetAppFeeSnapshotResponse {
+  bytes application = 1;
+  uint64 frame_number = 2;
+  uint64 global_frame_number = 3;
+  uint64 difficulty = 4;
+  uint64 world_state_bytes = 5;
+  uint64 fee_multiplier_vote = 6;
+}
+
 service DataIPCService {
+  rpc GetAppFeeSnapshot(GetAppFeeSnapshotRequest) returns (GetAppFeeSnapshotResponse);
   rpc Respawn(RespawnRequest) returns (RespawnResponse);
   rpc CreateJoinProof(CreateJoinProofRequest) returns (CreateJoinProofResponse);
   // SetHalted broadcasts the master's coverage-halt verdict to a
@@ -389,4 +736,194 @@ service DataIPCService {
   // local engine so prove_next_state and consensus-message handlers
   // short-circuit while halted. Idempotent — same value is a no-op.
   rpc SetHalted(SetHaltedRequest) returns (SetHaltedResponse);
+  // PrepareStorageConfirm asks the standalone worker bound to `filter` to
+  // encode the next epoch's replicas from its own store and return their leaf
+  // roots for the master's ProverConfirm. Only that worker holds the shard's
+  // data and proves from those replicas.
+  rpc PrepareStorageConfirm(PrepareStorageConfirmRequest) returns (PrepareStorageConfirmResponse);
+  // A shard consensus message a committee member sent the master directly,
+  // for the shard this worker runs. `from` is the sender's committee key.
+  rpc DeliverShardConsensus(DeliverShardConsensusRequest) returns (DeliverShardConsensusResponse);
+  // The engine this worker runs and its latest execution report. The master
+  // renews a seat only while its worker hosts the committee session that
+  // counts it, and shows the report to operators.
+  rpc GetWorkerExecution(GetWorkerExecutionRequest) returns (GetWorkerExecutionResponse);
+  // EvictPayload asks a standalone worker to remove the payload, forest and
+  // consensus storage its own store keeps outside the shard filters in
+  // `keep`, as a thread worker does. The worker revalidates its binding and
+  // runs the removal after answering.
+  rpc EvictPayload(EvictPayloadRequest) returns (EvictPayloadResponse);
+  // ExportLogs streams this worker's own log lines (its worker-N.log and
+  // that file's rotations) of a window to the master, which redacts them
+  // with its own lines into a diagnostics log bundle. The first message
+  // carries the summary; the lines follow, oldest first.
+  rpc ExportLogs(ExportWorkerLogsRequest) returns (stream ExportWorkerLogsChunk);
+}
+
+message ExportWorkerLogsRequest {
+  // UTC Unix seconds, inclusive; at most a day apart.
+  uint64 since_unix = 1;
+  uint64 until_unix = 2;
+  // Full shard filters: lines mentioning none of them are left out, except
+  // warnings and errors. Empty keeps every line.
+  repeated bytes filters = 3;
+  // Texts a kept line must contain, except warnings and errors.
+  repeated string matches = 4;
+  // Lowest level rank kept: 0 trace, 1 debug, 2 info, 3 warn, 4 error.
+  uint32 min_level = 5;
+  // The most line bytes to send: past it, the oldest records are left out.
+  uint64 max_bytes = 6;
+  // SHA-256 of the first line of the master's own worker-N.log of this
+  // core, when it has one. A worker whose own file starts with the same
+  // line writes the master's log directory: it answers same_files and sends
+  // no lines.
+  bytes master_head = 7;
+}
+
+message ExportWorkerLogsSummary {
+  // The worker writes the master's log directory (see master_head).
+  bool same_files = 1;
+  // The worker writes no log files (logger.path is none).
+  bool no_log_files = 2;
+  // The log files read, and those that failed (`<name>: <error>`).
+  repeated string files = 3;
+  repeated string read_errors = 4;
+  uint64 lines_read = 5;
+  uint64 records_read = 6;
+  // Records sent, and the selected records left out as the oldest past
+  // max_bytes, with their bytes.
+  uint64 records_kept = 7;
+  uint64 records_dropped = 8;
+  uint64 bytes_dropped = 9;
+  // Line bytes that follow.
+  uint64 line_bytes = 10;
+  // The worker host's name and its users' names, for the master to
+  // tokenize in these lines as it does its own.
+  repeated string hosts = 11;
+  repeated string users = 12;
+}
+
+message ExportWorkerLogsChunk {
+  // Set on the first message only.
+  ExportWorkerLogsSummary summary = 1;
+  // Newline-separated log lines; a line may continue in the next message.
+  bytes lines = 2;
+}
+
+message EvictPayloadRequest {
+  // The worker's binding and the shards a staged split or merge of its
+  // application creates.
+  repeated bytes keep = 1;
+}
+
+message EvictPayloadResponse {
+  // The worker started its removal passes.
+  bool started = 1;
+  // Why it did not, when it did not.
+  string deferred = 2;
+}
+
+message GetWorkerExecutionRequest {}
+
+message GetWorkerExecutionResponse {
+  // The filter of the engine this worker runs, or of the Respawn it is
+  // applying; empty when it runs none or its engine has exited.
+  bytes filter = 1;
+  WorkerExecution execution = 2;
+  // The worker's clock when it answered, so the master can rebase the
+  // report's timestamps onto its own clock.
+  uint64 now_unix_ms = 3;
+}
+
+message DeliverShardConsensusRequest {
+  bytes filter = 1;
+  uint64 channel = 2;
+  bytes data = 3;
+  bytes from = 4;
+}
+
+message DeliverShardConsensusResponse {
+  // The worker runs this shard's engine and handed it the message.
+  bool accepted = 1;
+}
+
+message PrepareStorageConfirmRequest {
+  bytes filter = 1;
+  uint64 frame_number = 2;
+  // Shards a recorded split or merge creates from `filter` when it applies
+  // next epoch. The worker also encodes and returns their leaves from its
+  // own store, so its prover is registered for the shard it then holds.
+  repeated bytes targets = 3;
+  // Hash storage proofs: each shard's snapshot sources, as the master
+  // resolved them from GLOBAL's records (`storage_snapshot::encode_plan`).
+  // The worker takes a snapshot it has not encoded from them.
+  bytes snapshot_sources = 4;
+}
+
+message PrepareStorageConfirmResponse {
+  repeated quilibrium.node.global.pb.ConfirmLeafRoots leaf_roots = 1;
+}
+
+// QCT3 token suite. The serving node chooses its network context.
+message GetCoinWitnessesRequest {
+  bytes domain = 1; // Exactly 32 bytes; no implicit token domain.
+  repeated bytes addresses = 2; // Unique 32-byte coin addresses.
+}
+message CoinWitness {
+  bytes address = 1;
+  bool found = 2;
+  repeated bytes siblings = 3;
+  repeated bool right = 4;
+}
+message GetCoinWitnessesResponse {
+  bytes network = 1; // 32-byte network identifier selected by the node.
+  bytes root_record = 2; // Canonical QCT3RT record, including context and depth.
+  repeated CoinWitness witnesses = 3;
+}
+
+// Empty snapshot_id and after start a scan; continuation must repeat snapshot_id.
+message ListCoinsRequest {
+  bytes domain = 1;
+  bytes snapshot_id = 2;
+  bytes after = 3;
+  // The most coins a page may carry (escrows, for ListEscrows). Unset, zero
+  // and values below eight ask for pages of eight, the page every node and
+  // wallet used before this field; a node clamps larger values to its own
+  // maximum (64). A node without the field always answers pages of eight.
+  uint32 max_coins = 4;
+}
+message ConfidentialCoin {
+  bytes address = 1;
+  uint64 frame_number = 2;
+  bytes owner = 3;
+  bytes commitment = 4;
+  bytes memo = 5;
+  // Leaf index in the application's coin accumulator; part of the coin's
+  // committed content address.
+  uint64 position = 6;
+}
+// An empty root_record answers a fresh scan of an application that has no
+// coin root: no confidential coin exists in it yet. Such a page has no
+// coins, no cursor and has_more false; every other page carries the root.
+message ListCoinsResponse {
+  bytes network = 1;
+  bytes snapshot_id = 2;
+  bytes root_record = 3;
+  repeated ConfidentialCoin coins = 4;
+  bytes cursor = 5;
+  bool has_more = 6;
+}
+
+// Snapshot enumeration of public encrypted records; consumption is checked
+// separately and the server never receives the wallet's recovery keys.
+message Escrow {
+  bytes address = 1;
+  bytes raw_data = 2;
+}
+message ListEscrowsResponse {
+  bytes network = 1;
+  bytes snapshot_id = 2;
+  repeated Escrow escrows = 3;
+  bytes cursor = 4;
+  bool has_more = 5;
 }

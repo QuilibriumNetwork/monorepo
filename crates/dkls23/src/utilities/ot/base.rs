@@ -15,6 +15,11 @@
 //! Phase 1. It saves some values that can be reused if the protocol is applied
 //! several times. As this will be our case for the OT extension, there are
 //! "batch" variants for each of the phases.
+//!
+//! The receiver's point `h` is derived from its seed with a random oracle
+//! into the group (hash-to-curve, see [`derive_h`]). Its discrete logarithm
+//! must stay unknown: otherwise the receiver can compute both messages and
+//! the sender can read the choice bit.
 
 use elliptic_curve::bigint::U256;
 use elliptic_curve::group::{Curve as _, GroupEncoding};
@@ -53,6 +58,35 @@ pub type Seed = [u8; SECURITY as usize];
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OTReceiver {
     pub seed: Seed,
+}
+
+/// Domain separation tag for hashing the receiver's seed to `h`.
+const H_DST: &[u8] = b"DKLs23-BaseOT-h-V01-XMD:SHA-256_SSWU_RO_";
+
+/// Derives the receiver's point `h` from its seed and the session id.
+///
+/// The paper takes `h` from a random oracle into the group, so we hash to
+/// the curve. Nobody, including the receiver who picks the seed, knows the
+/// discrete logarithm of `h` with respect to the generator.
+#[must_use]
+pub fn derive_h<C: DklsCurve>(session_id: &[u8], seed: &Seed) -> C::AffinePoint {
+    // The seed and the label have fixed lengths, so this encoding is
+    // unambiguous.
+    let msgs: [&[u8]; 3] = [seed, b"Receiver", session_id];
+    C::hash_to_curve(&msgs, H_DST)
+}
+
+/// The point `h` as derived before hash-to-curve: the generator times a
+/// hash of the seed. Its discrete logarithm is public, so it only serves to
+/// recognise a counterparty that still runs the old derivation.
+fn legacy_h<C: DklsCurve>(session_id: &[u8], seed: &Seed) -> C::AffinePoint
+where
+    C::Scalar: Reduce<U256>,
+{
+    let generator: C::AffinePoint = crate::generator::<C>();
+    let msg_for_h = ["Receiver".as_bytes(), seed].concat();
+    let log_h = hash_as_scalar::<C>(&msg_for_h, session_id);
+    (C::ProjectivePoint::from(generator) * log_h).to_affine()
 }
 
 impl<C: DklsCurve> OTSender<C>
@@ -111,20 +145,23 @@ where
         enc_proof: &EncProof<C>,
     ) -> Result<(HashOutput, HashOutput), ErrorOT> {
         // We reconstruct h from the seed (as in the paper).
-        // Instead of using a real identifier for the receiver,
-        // we just take the word 'Receiver' for simplicity.
-        // I guess we could omit it, but we leave it to "change the oracle".
-        let generator: C::AffinePoint = crate::generator::<C>();
-        let msg_for_h = ["Receiver".as_bytes(), seed].concat();
-        let h = (C::ProjectivePoint::from(generator) * hash_as_scalar::<C>(&msg_for_h, session_id))
-            .to_affine();
+        let h = derive_h::<C>(session_id, seed);
+
+        // h is already in enc_proof, but we check if the values agree.
+        if h != enc_proof.proof0.base_h {
+            if enc_proof.proof0.base_h == legacy_h::<C>(session_id, seed) {
+                return Err(ErrorOT::new(
+                    "Receiver uses the legacy base OT derivation of h: every party must upgrade!",
+                ));
+            }
+            return Err(ErrorOT::new(
+                "Receiver cheated in OT: Encryption proof failed!",
+            ));
+        }
 
         // We verify the proof.
         let current_sid = [session_id, "EncProof".as_bytes()].concat();
-        let verification = enc_proof.verify(&current_sid);
-
-        // h is already in enc_proof, but we check if the values agree.
-        if !verification || (h != enc_proof.proof0.base_h) {
+        if !enc_proof.verify(&current_sid) {
             return Err(ErrorOT::new(
                 "Receiver cheated in OT: Encryption proof failed!",
             ));
@@ -199,11 +236,7 @@ impl OTReceiver {
     /// Given a choice bit, returns a secret scalar (to be kept)
     /// and an encryption proof (to be sent to the sender).
     #[must_use]
-    pub fn run_phase1<C: DklsCurve>(
-        &self,
-        session_id: &[u8],
-        bit: bool,
-    ) -> (C::Scalar, EncProof<C>)
+    pub fn run_phase1<C: DklsCurve>(&self, session_id: &[u8], bit: bool) -> (C::Scalar, EncProof<C>)
     where
         C::Scalar: Reduce<U256> + PrimeField,
         C::AffinePoint: GroupEncoding,
@@ -212,13 +245,7 @@ impl OTReceiver {
         let r = C::Scalar::random(rng::get_rng());
 
         // We compute h as in the paper.
-        // Instead of using a real identifier for the receiver,
-        // we just take the word 'Receiver' for simplicity.
-        // I guess we could omit it, but we leave it to "change the oracle".
-        let generator: C::AffinePoint = crate::generator::<C>();
-        let msg_for_h = ["Receiver".as_bytes(), &self.seed].concat();
-        let h = (C::ProjectivePoint::from(generator) * hash_as_scalar::<C>(&msg_for_h, session_id))
-            .to_affine();
+        let h = derive_h::<C>(session_id, &self.seed);
 
         // We prove our data.
         // In the paper, different protocols use different random oracles.
@@ -369,6 +396,8 @@ mod tests {
     use super::*;
 
     type C = k256::Secp256k1;
+    type Scalar = <C as CurveArithmetic>::Scalar;
+    type ProjectivePoint = <C as CurveArithmetic>::ProjectivePoint;
 
     /// Tests if the outputs for the OT base protocol
     /// satisfy the relations they are supposed to satisfy.
@@ -419,13 +448,82 @@ mod tests {
         }
     }
 
+    /// Reproduces a base OT point `h` whose discrete logarithm is public.
+    ///
+    /// The attacker takes `t = hash_as_scalar("Receiver" || seed, sid)`,
+    /// which anybody can compute from the public seed. If `h = t * G`, the
+    /// sender reads the choice bit (`u = r * h` gives `r * G = u / t`, and
+    /// `v - r * G = bit * h`), and the receiver computes the message it did
+    /// not choose (`m1 = H((r - t) * z)`, `m0 = H((r + t) * z)`).
+    #[test]
+    fn reproduces_public_discrete_log_of_base_ot_h() {
+        type Point = <C as CurveArithmetic>::ProjectivePoint;
+
+        for bit in [false, true] {
+            let session_id = rng::get_rng().gen::<[u8; 32]>();
+            let sender = OTSender::<C>::init(&session_id);
+            let receiver = OTReceiver::init();
+
+            let dlog_proof = sender.run_phase1();
+            let (r, enc_proof) = receiver.run_phase1::<C>(&session_id, bit);
+            let (m0, m1) = sender
+                .run_phase2(&session_id, &receiver.seed, &enc_proof)
+                .expect("the sender must accept an honest receiver");
+            let z = receiver
+                .run_phase2_step1::<C>(&session_id, &dlog_proof)
+                .expect("the receiver must accept an honest sender");
+
+            let msg_for_h = ["Receiver".as_bytes(), &receiver.seed].concat();
+            let t = hash_as_scalar::<C>(&msg_for_h, &session_id);
+
+            // The sender's view: u, v and h from the encryption proof.
+            let (u, v) = enc_proof.get_u_and_v();
+            let v = Point::from(v);
+            let h = Point::from(enc_proof.proof0.base_h);
+            let r_g = Point::from(u) * t.invert().unwrap();
+            let read_bit = if v == r_g {
+                Some(false)
+            } else if v - h == r_g {
+                Some(true)
+            } else {
+                None
+            };
+            assert!(
+                read_bit.is_none(),
+                "the OT sender recovered the receiver's choice bit ({bit}) from its own transcript"
+            );
+
+            // The receiver's view: r, z and the public seed.
+            let (r_other, m_other) = if bit { (r + t, m0) } else { (r - t, m1) };
+            let guess = receiver.run_phase2_step2::<C>(&session_id, &r_other, &z);
+            assert!(
+                guess != m_other,
+                "the OT receiver computed the message it did not choose (choice bit {bit})"
+            );
+        }
+    }
+
     /// Batch version for [`test_ot_base`].
     #[test]
     fn test_ot_base_batch() {
+        ot_base_batch_round_trip::<C>();
+    }
+
+    /// [`test_ot_base_batch`] on P-256.
+    #[test]
+    fn test_ot_base_batch_p256() {
+        ot_base_batch_round_trip::<p256::NistP256>();
+    }
+
+    fn ot_base_batch_round_trip<Crv: DklsCurve>()
+    where
+        Crv::Scalar: Reduce<U256> + PrimeField,
+        Crv::AffinePoint: GroupEncoding,
+    {
         let session_id = rng::get_rng().gen::<[u8; 32]>();
 
         // Initialization (unique)
-        let sender = OTSender::<C>::init(&session_id);
+        let sender = OTSender::<Crv>::init(&session_id);
         let receiver = OTReceiver::init();
 
         let batch_size = 256;
@@ -439,7 +537,7 @@ mod tests {
             bits.push(rng::get_rng().gen());
         }
 
-        let (vec_r, enc_proofs) = receiver.run_phase1_batch::<C>(&session_id, &bits);
+        let (vec_r, enc_proofs) = receiver.run_phase1_batch::<Crv>(&session_id, &bits);
 
         // Communication round - The parties exchange the proofs.
         // The receiver also sends his seed.
@@ -455,7 +553,7 @@ mod tests {
         let (vec_m0, vec_m1) = result_sender.unwrap();
 
         // Phase 2 - Receiver
-        let result_receiver = receiver.run_phase2_batch::<C>(&session_id, &vec_r, &dlog_proof);
+        let result_receiver = receiver.run_phase2_batch::<Crv>(&session_id, &vec_r, &dlog_proof);
 
         if let Err(error) = result_receiver {
             panic!("OT error: {:?}", error.description);
@@ -472,5 +570,93 @@ mod tests {
                 assert_eq!(vec_m0[i], vec_mb[i]);
             }
         }
+    }
+
+    /// The discrete logarithm the receiver would know if `h` were the
+    /// generator times a hash of its seed.
+    fn hashed_log_h(session_id: &[u8], seed: &Seed) -> Scalar {
+        let msg_for_h = ["Receiver".as_bytes(), seed].concat();
+        hash_as_scalar::<C>(&msg_for_h, session_id)
+    }
+
+    /// The receiver's `h` must not be the generator times a hash of its
+    /// seed: anybody could compute its discrete logarithm.
+    #[test]
+    fn test_ot_base_h_is_not_a_hashed_multiple_of_generator() {
+        let session_id = rng::get_rng().gen::<[u8; 32]>();
+        let receiver = OTReceiver::init();
+        let (_, enc_proof) = receiver.run_phase1::<C>(&session_id, false);
+
+        let log_h = hashed_log_h(&session_id, &receiver.seed);
+        let multiple = (ProjectivePoint::from(crate::generator::<C>()) * log_h).to_affine();
+
+        assert_ne!(enc_proof.proof0.base_h, multiple);
+    }
+
+    /// The receiver must not be able to compute the message it did not
+    /// choose. With a known `t = log(h)`, it could: `m1 = H((r - t) * z)`
+    /// for the bit 0 and `m0 = H((r + t) * z)` for the bit 1.
+    #[test]
+    fn test_ot_base_receiver_cannot_compute_other_message() {
+        for bit in [false, true] {
+            let session_id = rng::get_rng().gen::<[u8; 32]>();
+            let sender = OTSender::<C>::init(&session_id);
+            let receiver = OTReceiver::init();
+
+            let dlog_proof = sender.run_phase1();
+            let (r, enc_proof) = receiver.run_phase1::<C>(&session_id, bit);
+            let (m0, m1) = sender
+                .run_phase2(&session_id, &receiver.seed, &enc_proof)
+                .unwrap();
+            let z = receiver
+                .run_phase2_step1::<C>(&session_id, &dlog_proof)
+                .unwrap();
+
+            let t = hashed_log_h(&session_id, &receiver.seed);
+            let (r_other, m_other) = if bit { (r + t, m0) } else { (r - t, m1) };
+            let guess = receiver.run_phase2_step2::<C>(&session_id, &r_other, &z);
+
+            assert_ne!(guess, m_other);
+        }
+    }
+
+    /// The sender must not learn the choice bit. With a known `t = log(h)`,
+    /// it could: `u = r * h` gives `r * G = u / t`, and `v - r * G = bit * h`.
+    #[test]
+    fn test_ot_base_sender_cannot_read_choice_bit() {
+        for bit in [false, true] {
+            let session_id = rng::get_rng().gen::<[u8; 32]>();
+            let receiver = OTReceiver::init();
+            let (_, enc_proof) = receiver.run_phase1::<C>(&session_id, bit);
+
+            let (u, v) = enc_proof.get_u_and_v();
+            let v = ProjectivePoint::from(v);
+            let h = ProjectivePoint::from(enc_proof.proof0.base_h);
+            let t = hashed_log_h(&session_id, &receiver.seed);
+            let r_g = ProjectivePoint::from(u) * t.invert().unwrap();
+
+            assert_ne!(v, r_g);
+            assert_ne!(v - h, r_g);
+        }
+    }
+
+    /// A sender rejects a receiver that still derives `h` the old way, with
+    /// an error that names the cause.
+    #[test]
+    fn test_ot_base_rejects_legacy_h() {
+        let session_id = rng::get_rng().gen::<[u8; 32]>();
+        let sender = OTSender::<C>::init(&session_id);
+        let receiver = OTReceiver::init();
+
+        let log_h = hashed_log_h(&session_id, &receiver.seed);
+        let legacy = (ProjectivePoint::from(crate::generator::<C>()) * log_h).to_affine();
+        let r = Scalar::random(rng::get_rng());
+        let current_sid = [session_id.as_slice(), "EncProof".as_bytes()].concat();
+        let enc_proof = EncProof::<C>::prove(&current_sid, &legacy, &r, false);
+
+        let error = sender
+            .run_phase2(&session_id, &receiver.seed, &enc_proof)
+            .expect_err("a receiver on the old derivation of h must be rejected");
+        assert!(error.description.contains("legacy"));
     }
 }

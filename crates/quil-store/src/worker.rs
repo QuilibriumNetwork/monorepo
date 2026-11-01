@@ -4,18 +4,16 @@
 //! node restarts.
 //!
 //! Layout:
-//!   * `[WORKER, WORKER_BY_CORE, core_id_be_u64]` → encoded
-//!     `PersistedWorkerInfo`
-//!   * `[WORKER, WORKER_BY_FILTER, filter…]` → 8-byte BE core_id
-//!     (secondary index; lets Go-style lookups by filter resolve
-//!     to the primary record)
+//! * `[WORKER, WORKER_BY_CORE, core_id_be_u64]` → encoded
+//! `PersistedWorkerInfo`
+//! * `[WORKER, WORKER_BY_FILTER, filter…]` → 8-byte BE core_id
+//! (secondary index; lets Go-style lookups by filter resolve
+//! to the primary record)
 //!
 //! Encoding mirrors Go's `encodeWorkerInfo` field order so a
 //! Rust-written record could in principle be read by Go and vice
 //! versa, modulo the listen-multiaddr fields which we don't track
 //! (they're empty strings in the encoding — same on-disk shape).
-
-use std::sync::Arc;
 
 use quil_types::error::{QuilError, Result};
 use quil_types::store::{PersistedWorkerInfo, WorkerStore};
@@ -23,11 +21,11 @@ use quil_types::store::{PersistedWorkerInfo, WorkerStore};
 use crate::encoding::{WORKER, WORKER_BY_CORE, WORKER_BY_FILTER};
 
 pub struct RocksWorkerStore {
-    db: Arc<rocksdb::DB>,
+    db: quil_forest::CoordinatedDb,
 }
 
 impl RocksWorkerStore {
-    pub fn new(db: Arc<rocksdb::DB>) -> Self {
+    pub fn new(db: quil_forest::CoordinatedDb) -> Self {
         Self { db }
     }
 }
@@ -183,15 +181,27 @@ impl WorkerStore for RocksWorkerStore {
 
     fn range_workers(&self) -> Result<Vec<PersistedWorkerInfo>> {
         let lower = [WORKER, WORKER_BY_CORE, 0x00, 0, 0, 0, 0, 0, 0, 0];
-        let upper = [WORKER, WORKER_BY_CORE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let upper = [
+            WORKER,
+            WORKER_BY_CORE,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+        ];
         let mut read_opts = rocksdb::ReadOptions::default();
         read_opts.set_iterate_lower_bound(lower.to_vec());
         read_opts.set_iterate_upper_bound(upper.to_vec());
-        let iter = self.db.iterator_opt(rocksdb::IteratorMode::Start, read_opts);
+        let iter = self
+            .db
+            .iterator_opt(rocksdb::IteratorMode::Start, read_opts);
         let mut out = Vec::new();
         for item in iter {
-            let (_k, v) = item
-                .map_err(|e| QuilError::Store(format!("range_workers: {}", e)))?;
+            let (_k, v) = item.map_err(|e| QuilError::Store(format!("range_workers: {}", e)))?;
             out.push(decode(&v)?);
         }
         out.sort_by_key(|w| w.core_id);

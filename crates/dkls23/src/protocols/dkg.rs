@@ -578,8 +578,7 @@ where
         ]
         .concat();
 
-        let (ot_sender, dlog_proof, nonce) =
-            MulReceiver::<C>::init_phase1(&mul_sid_receiver);
+        let (ot_sender, dlog_proof, nonce) = MulReceiver::<C>::init_phase1(&mul_sid_receiver);
 
         // SENDER
         // We are the sender and i = receiver.
@@ -960,9 +959,7 @@ where
                 .chars()
                 .enumerate()
                 .map(|(i, c)| {
-                    if c.is_alphabetic()
-                        && (hash_bytes[i / 2] >> (4 * (1 - i % 2)) & 0x0f) >= 8
-                    {
+                    if c.is_alphabetic() && (hash_bytes[i / 2] >> (4 * (1 - i % 2)) & 0x0f) >= 8 {
                         c.to_ascii_uppercase()
                     } else {
                         c
@@ -1254,8 +1251,7 @@ mod tests {
         let mut proofs_commitments: Vec<ProofCommitment<C>> =
             Vec::with_capacity(parameters.share_count as usize);
         for i in 0..parameters.share_count {
-            let party_i_phase2 =
-                step3::<C>(i + 1, &session_id, &poly_fragments[i as usize]);
+            let party_i_phase2 = step3::<C>(i + 1, &session_id, &poly_fragments[i as usize]);
             let (_, party_i_proof_commitment) = party_i_phase2;
             proofs_commitments.push(party_i_proof_commitment);
         }
@@ -1272,8 +1268,7 @@ mod tests {
             ));
         }
 
-        let mut public_keys: Vec<AffinePoint> =
-            Vec::with_capacity(parameters.share_count as usize);
+        let mut public_keys: Vec<AffinePoint> = Vec::with_capacity(parameters.share_count as usize);
         for result in results {
             match result {
                 Ok(pk) => {
@@ -1457,8 +1452,7 @@ mod tests {
         // In practice, the messages received should be grouped into a BTreeMap.
 
         // Phase 4
-        let mut parties: Vec<Party<C>> =
-            Vec::with_capacity((parameters.share_count) as usize);
+        let mut parties: Vec<Party<C>> = Vec::with_capacity((parameters.share_count) as usize);
         for i in 0..parameters.share_count {
             let result = phase4::<C>(
                 &all_data[i as usize],

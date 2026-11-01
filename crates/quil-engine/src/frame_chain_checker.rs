@@ -15,7 +15,7 @@ use tracing::debug;
 
 use quil_consensus::models::Identity;
 use quil_types::error::QuilError;
-use quil_types::proto::global::{GlobalProposal, GlobalFrame};
+use quil_types::proto::global::{GlobalFrame, GlobalProposal};
 use quil_types::store::ClockStore;
 
 /// Compute the canonical identity of a `GlobalFrame`. Mirror of Go's
@@ -38,7 +38,7 @@ fn global_frame_identity(frame: &GlobalFrame) -> Vec<u8> {
 /// - proposal has no header / no parent_selector
 /// - the proposal claims frame number 0 (genesis is never a child)
 /// - we hit a frame number the store can't resolve and which doesn't
-///   match the finalized state
+/// match the finalized state
 /// - a candidate has a mismatched `frame_number`
 ///
 /// `finalized_state` mirrors Go's `*models.State[*GlobalFrame]` —
@@ -100,10 +100,7 @@ pub fn can_process_sequential_chain_proposal(
                 let candidate_header = match candidate.header.as_ref() {
                     Some(h) => h,
                     None => {
-                        debug!(
-                            frame_number,
-                            "candidate frame had no header",
-                        );
+                        debug!(frame_number, "candidate frame had no header",);
                         return false;
                     }
                 };
@@ -205,6 +202,8 @@ mod tests {
                 parent_selector,
                 global_commitments: Vec::new(),
                 prover_tree_commitment: Vec::new(),
+                prover_tree_aux_roots: Vec::new(),
+                world_state_size: 0,
                 requests_root: Vec::new(),
                 prover: Vec::new(),
                 public_key_signature_bls48581: None,
@@ -226,7 +225,10 @@ mod tests {
     }
 
     impl ClockStore for InMemoryGlobalStore {
-        fn new_transaction(&self, _: bool) -> quil_types::error::Result<Box<dyn quil_types::store::Transaction>> {
+        fn new_transaction(
+            &self,
+            _: bool,
+        ) -> quil_types::error::Result<Box<dyn quil_types::store::Transaction>> {
             Err(QuilError::NotFound("stub".into()))
         }
         fn get_latest_global_clock_frame(&self) -> quil_types::error::Result<GlobalFrame> {
@@ -241,47 +243,242 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| QuilError::NotFound(format!("sealed {}", n)))
         }
-        fn put_global_clock_frame(&self, _: &GlobalFrame, _: &dyn quil_types::store::Transaction) -> quil_types::error::Result<()> { Ok(()) }
-        fn put_global_clock_frame_candidate(&self, _: &GlobalFrame, _: &dyn quil_types::store::Transaction) -> quil_types::error::Result<()> { Ok(()) }
-        fn get_global_clock_frame_candidate(&self, n: u64, sel: &[u8]) -> quil_types::error::Result<GlobalFrame> {
+        fn put_global_clock_frame(
+            &self,
+            _: &GlobalFrame,
+            _: &dyn quil_types::store::Transaction,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn put_global_clock_frame_candidate(
+            &self,
+            _: &GlobalFrame,
+            _: &dyn quil_types::store::Transaction,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn get_global_clock_frame_candidate(
+            &self,
+            n: u64,
+            sel: &[u8],
+        ) -> quil_types::error::Result<GlobalFrame> {
             self.candidates
                 .get(&(n, sel.to_vec()))
                 .cloned()
                 .ok_or_else(|| QuilError::NotFound(format!("candidate {}", n)))
         }
-        fn delete_global_clock_frame_range(&self, _: u64, _: u64) -> quil_types::error::Result<()> { Ok(()) }
-        fn reset_global_clock_frames(&self) -> quil_types::error::Result<()> { Ok(()) }
-        fn get_latest_certified_global_state(&self) -> quil_types::error::Result<GlobalProposal> { Err(QuilError::NotFound("stub".into())) }
-        fn get_earliest_certified_global_state(&self) -> quil_types::error::Result<GlobalProposal> { Err(QuilError::NotFound("stub".into())) }
-        fn get_certified_global_state(&self, _: u64) -> quil_types::error::Result<GlobalProposal> { Err(QuilError::NotFound("stub".into())) }
-        fn put_certified_global_state(&self, _: &GlobalProposal, _: &dyn quil_types::store::Transaction) -> quil_types::error::Result<()> { Ok(()) }
-        fn get_latest_quorum_certificate(&self, _: &[u8]) -> quil_types::error::Result<quil_types::proto::global::QuorumCertificate> { Err(QuilError::NotFound("stub".into())) }
-        fn get_quorum_certificate(&self, _: &[u8], _: u64) -> quil_types::error::Result<quil_types::proto::global::QuorumCertificate> { Err(QuilError::NotFound("stub".into())) }
-        fn put_quorum_certificate(&self, _: &quil_types::proto::global::QuorumCertificate, _: &dyn quil_types::store::Transaction) -> quil_types::error::Result<()> { Ok(()) }
-        fn get_latest_timeout_certificate(&self, _: &[u8]) -> quil_types::error::Result<quil_types::proto::global::TimeoutCertificate> { Err(QuilError::NotFound("stub".into())) }
-        fn get_timeout_certificate(&self, _: &[u8], _: u64) -> quil_types::error::Result<quil_types::proto::global::TimeoutCertificate> { Err(QuilError::NotFound("stub".into())) }
-        fn put_timeout_certificate(&self, _: &quil_types::proto::global::TimeoutCertificate, _: &dyn quil_types::store::Transaction) -> quil_types::error::Result<()> { Ok(()) }
-        fn get_latest_shard_clock_frame(&self, _: &[u8]) -> quil_types::error::Result<quil_types::proto::global::AppShardFrame> { Err(QuilError::NotFound("stub".into())) }
-        fn get_shard_clock_frame(&self, _: &[u8], _: u64, _: bool) -> quil_types::error::Result<quil_types::proto::global::AppShardFrame> { Err(QuilError::NotFound("stub".into())) }
-        fn commit_shard_clock_frame(&self, _: &[u8], _: u64, _: &[u8], _: &dyn quil_types::store::Transaction, _: bool) -> quil_types::error::Result<()> { Ok(()) }
-        fn stage_shard_clock_frame(&self, _: &[u8], _: &quil_types::proto::global::AppShardFrame, _: &dyn quil_types::store::Transaction) -> quil_types::error::Result<()> { Ok(()) }
-        fn get_staged_shard_clock_frame(&self, _: &[u8], _: u64, _: &[u8], _: bool) -> quil_types::error::Result<quil_types::proto::global::AppShardFrame> { Err(QuilError::NotFound("stub".into())) }
-        fn set_latest_shard_clock_frame_number(&self, _: &[u8], _: u64) -> quil_types::error::Result<()> { Ok(()) }
-        fn delete_shard_clock_frame_range(&self, _: &[u8], _: u64, _: u64) -> quil_types::error::Result<()> { Ok(()) }
-        fn reset_shard_clock_frames(&self, _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
-        fn get_latest_certified_app_shard_state(&self, _: &[u8]) -> quil_types::error::Result<quil_types::proto::global::AppShardProposal> { Err(QuilError::NotFound("stub".into())) }
-        fn put_certified_app_shard_state(&self, _: &quil_types::proto::global::AppShardProposal, _: &dyn quil_types::store::Transaction) -> quil_types::error::Result<()> { Ok(()) }
-        fn put_proposal_vote(&self, _: &dyn quil_types::store::Transaction, _: &quil_types::proto::global::ProposalVote) -> quil_types::error::Result<()> { Ok(()) }
-        fn get_proposal_vote(&self, _: &[u8], _: u64, _: &[u8]) -> quil_types::error::Result<quil_types::proto::global::ProposalVote> { Err(QuilError::NotFound("stub".into())) }
-        fn get_proposal_votes(&self, _: &[u8], _: u64) -> quil_types::error::Result<Vec<quil_types::proto::global::ProposalVote>> { Ok(vec![]) }
-        fn put_timeout_vote(&self, _: &dyn quil_types::store::Transaction, _: &quil_types::proto::global::TimeoutState) -> quil_types::error::Result<()> { Ok(()) }
-        fn get_timeout_vote(&self, _: &[u8], _: u64, _: &[u8]) -> quil_types::error::Result<quil_types::proto::global::TimeoutState> { Err(QuilError::NotFound("stub".into())) }
-        fn get_timeout_votes(&self, _: &[u8], _: u64) -> quil_types::error::Result<Vec<quil_types::proto::global::TimeoutState>> { Ok(vec![]) }
-        fn get_total_distance(&self, _: &[u8], _: u64, _: &[u8]) -> quil_types::error::Result<num_bigint::BigInt> { Err(QuilError::NotFound("stub".into())) }
-        fn set_total_distance(&self, _: &[u8], _: u64, _: &[u8], _: &num_bigint::BigInt) -> quil_types::error::Result<()> { Ok(()) }
-        fn get_peer_seniority_map(&self, _: &[u8]) -> quil_types::error::Result<std::collections::HashMap<String, u64>> { Ok(std::collections::HashMap::new()) }
-        fn put_peer_seniority_map(&self, _: &dyn quil_types::store::Transaction, _: &[u8], _: &std::collections::HashMap<String, u64>) -> quil_types::error::Result<()> { Ok(()) }
-        fn compact_data(&self, _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
+        fn delete_global_clock_frame_range(&self, _: u64, _: u64) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn reset_global_clock_frames(&self) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn get_latest_certified_global_state(&self) -> quil_types::error::Result<GlobalProposal> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn get_earliest_certified_global_state(&self) -> quil_types::error::Result<GlobalProposal> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn get_certified_global_state(&self, _: u64) -> quil_types::error::Result<GlobalProposal> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn put_certified_global_state(
+            &self,
+            _: &GlobalProposal,
+            _: &dyn quil_types::store::Transaction,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn get_latest_quorum_certificate(
+            &self,
+            _: &[u8],
+        ) -> quil_types::error::Result<quil_types::proto::global::QuorumCertificate> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn get_quorum_certificate(
+            &self,
+            _: &[u8],
+            _: u64,
+        ) -> quil_types::error::Result<quil_types::proto::global::QuorumCertificate> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn put_quorum_certificate(
+            &self,
+            _: &quil_types::proto::global::QuorumCertificate,
+            _: &dyn quil_types::store::Transaction,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn get_latest_timeout_certificate(
+            &self,
+            _: &[u8],
+        ) -> quil_types::error::Result<quil_types::proto::global::TimeoutCertificate> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn get_timeout_certificate(
+            &self,
+            _: &[u8],
+            _: u64,
+        ) -> quil_types::error::Result<quil_types::proto::global::TimeoutCertificate> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn put_timeout_certificate(
+            &self,
+            _: &quil_types::proto::global::TimeoutCertificate,
+            _: &dyn quil_types::store::Transaction,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn get_latest_shard_clock_frame(
+            &self,
+            _: &[u8],
+        ) -> quil_types::error::Result<quil_types::proto::global::AppShardFrame> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn get_shard_clock_frame(
+            &self,
+            _: &[u8],
+            _: u64,
+            _: bool,
+        ) -> quil_types::error::Result<quil_types::proto::global::AppShardFrame> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn commit_shard_clock_frame(
+            &self,
+            _: &[u8],
+            _: u64,
+            _: &[u8],
+            _: &dyn quil_types::store::Transaction,
+            _: bool,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn stage_shard_clock_frame(
+            &self,
+            _: &[u8],
+            _: &quil_types::proto::global::AppShardFrame,
+            _: &dyn quil_types::store::Transaction,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn get_staged_shard_clock_frame(
+            &self,
+            _: &[u8],
+            _: u64,
+            _: &[u8],
+            _: bool,
+        ) -> quil_types::error::Result<quil_types::proto::global::AppShardFrame> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn set_latest_shard_clock_frame_number(
+            &self,
+            _: &[u8],
+            _: u64,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn delete_shard_clock_frame_range(
+            &self,
+            _: &[u8],
+            _: u64,
+            _: u64,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn reset_shard_clock_frames(&self, _: &[u8]) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn get_latest_certified_app_shard_state(
+            &self,
+            _: &[u8],
+        ) -> quil_types::error::Result<quil_types::proto::global::AppShardProposal> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn put_certified_app_shard_state(
+            &self,
+            _: &quil_types::proto::global::AppShardProposal,
+            _: &dyn quil_types::store::Transaction,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn put_proposal_vote(
+            &self,
+            _: &dyn quil_types::store::Transaction,
+            _: &quil_types::proto::global::ProposalVote,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn get_proposal_vote(
+            &self,
+            _: &[u8],
+            _: u64,
+            _: &[u8],
+        ) -> quil_types::error::Result<quil_types::proto::global::ProposalVote> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn get_proposal_votes(
+            &self,
+            _: &[u8],
+            _: u64,
+        ) -> quil_types::error::Result<Vec<quil_types::proto::global::ProposalVote>> {
+            Ok(vec![])
+        }
+        fn put_timeout_vote(
+            &self,
+            _: &dyn quil_types::store::Transaction,
+            _: &quil_types::proto::global::TimeoutState,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn get_timeout_vote(
+            &self,
+            _: &[u8],
+            _: u64,
+            _: &[u8],
+        ) -> quil_types::error::Result<quil_types::proto::global::TimeoutState> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn get_timeout_votes(
+            &self,
+            _: &[u8],
+            _: u64,
+        ) -> quil_types::error::Result<Vec<quil_types::proto::global::TimeoutState>> {
+            Ok(vec![])
+        }
+        fn get_total_distance(
+            &self,
+            _: &[u8],
+            _: u64,
+            _: &[u8],
+        ) -> quil_types::error::Result<num_bigint::BigInt> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn set_total_distance(
+            &self,
+            _: &[u8],
+            _: u64,
+            _: &[u8],
+            _: &num_bigint::BigInt,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn get_peer_seniority_map(
+            &self,
+            _: &[u8],
+        ) -> quil_types::error::Result<std::collections::HashMap<String, u64>> {
+            Ok(std::collections::HashMap::new())
+        }
+        fn put_peer_seniority_map(
+            &self,
+            _: &dyn quil_types::store::Transaction,
+            _: &[u8],
+            _: &std::collections::HashMap<String, u64>,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn compact_data(&self, _: &[u8]) -> quil_types::error::Result<()> {
+            Ok(())
+        }
     }
 
     fn output_for_n(n: u64) -> Vec<u8> {
@@ -295,7 +492,12 @@ mod tests {
     #[test]
     fn proposal_with_no_state_returns_false() {
         let store = InMemoryGlobalStore::new();
-        let prop = GlobalProposal { state: None, parent_quorum_certificate: None, prior_rank_timeout_certificate: None, vote: None };
+        let prop = GlobalProposal {
+            state: None,
+            parent_quorum_certificate: None,
+            prior_rank_timeout_certificate: None,
+            vote: None,
+        };
         assert!(!can_process_sequential_chain_proposal(&store, &prop, None));
     }
 
