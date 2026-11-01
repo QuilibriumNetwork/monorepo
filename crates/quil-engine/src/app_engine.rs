@@ -12377,7 +12377,7 @@ fn lagging_tip(
 /// rejected, its join expired). The worker stays only to vote until the
 /// seat departs. A seat joining, activating, active, paused, leaving
 /// unconfirmed, lapsed or reassigned does not depart.
-fn seat_departs(
+pub(crate) fn seat_departs(
     allocations: &[quil_types::consensus::ProverAllocationInfo],
     filter: &[u8],
     frame: u64,

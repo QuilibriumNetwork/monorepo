@@ -66,7 +66,9 @@ pub(crate) const MAX_TURN_HOLD: Duration = Duration::from_secs(10 * 60);
 /// committee's quorum may need. A longer catch-up or a checkpoint install
 /// waits while any kept seat waits: on an operator's node every turn for
 /// 2.5 hours went to departing seats installing 0.2 to 2.5 million leaves
-/// while the one seat it kept waited.
+/// while the one seat it kept waited. A thread worker holding no frame of
+/// a departing seat's shard installs none of it
+/// (`WorkerAllocator::departing_install`).
 pub(crate) const DEPARTING_GAP_FILL_FRAMES: u64 = 32;
 
 /// How long a worker waits for a turn before the queue counts as saturated.
