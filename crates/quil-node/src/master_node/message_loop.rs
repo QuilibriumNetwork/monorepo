@@ -774,6 +774,12 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         replica_leaf_cache_mb = %crate::mem_stats::fmt_mb(
                             quil_store::replica_store::leaf_cache_bytes() as u64
                         ),
+                        // The block cache this process's stores share
+                        // (archives keep their own): used and capacity.
+                        rocksdb_shared_cache_mb = quil_store::shared_block_cache_memory()
+                            .map(|(used, _)| crate::mem_stats::fmt_mb(used)),
+                        rocksdb_shared_cache_capacity_mb = quil_store::shared_block_cache_memory()
+                            .map(|(_, capacity)| crate::mem_stats::fmt_mb(capacity)),
                         "memory snapshot"
                     );
                     if let Some(h) = host_mem {

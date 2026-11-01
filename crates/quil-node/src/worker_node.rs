@@ -661,6 +661,8 @@ pub(crate) async fn start(
                                 rocksdb_mb = %crate::mem_stats::fmt_mb(dbm.total()),
                                 replica_loads_mb = %replica_loads,
                                 replica_loads_peak_mb = %replica_loads_peak,
+                                rocksdb_shared_cache_mb = quil_store::shared_block_cache_memory()
+                                    .map(|(used, _)| crate::mem_stats::fmt_mb(used)),
                                 "worker process memory",
                             );
                             let br = crate::mem_stats::jemalloc_size_classes();
@@ -676,6 +678,8 @@ pub(crate) async fn start(
                                 rocksdb_mb = %crate::mem_stats::fmt_mb(dbm.total()),
                                 replica_loads_mb = %replica_loads,
                                 replica_loads_peak_mb = %replica_loads_peak,
+                                rocksdb_shared_cache_mb = quil_store::shared_block_cache_memory()
+                                    .map(|(used, _)| crate::mem_stats::fmt_mb(used)),
                                 "worker process memory",
                             );
                         }
