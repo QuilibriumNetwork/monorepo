@@ -152,6 +152,13 @@ pub struct ShardBodyNeed {
 /// the shard's cursor through it), `None` when a body is not held.
 pub type ShardBodyAvailability = Arc<dyn Fn(&[ShardBodyNeed]) -> Vec<Option<u64>> + Send + Sync>;
 
+/// Whether this GLOBAL prover holds a shard's header back while archives
+/// verify the expensive confidential operations of the frames it would make
+/// them materialize, `(address, cursor, through)`, so GLOBAL does not wait
+/// for those proofs ([`GlobalLeaderProvider::with_proof_settlement`],
+/// `crate::archive_preverify::ProofSettlement`). Every hold ends.
+pub type ShardProofSettlement = Arc<dyn Fn(&[u8], u64, u64) -> bool + Send + Sync>;
+
 /// Application frames the shard headers one GLOBAL proposal carries make
 /// archives materialize, at most, beyond the one header furthest behind of
 /// those that do not fit ([`hold_back_unavailable_shard_proofs`]).
@@ -208,6 +215,9 @@ pub(crate) struct ShardProofSelection {
     pub ready: Vec<Vec<u8>>,
     /// The needs whose bodies are not held.
     pub missing: Vec<ShardBodyNeed>,
+    /// Proofs whose bodies are held, left in the mempool while archives
+    /// verify the expensive confidential operations they would sequence.
+    pub settling: usize,
     /// Application frames the proofs that ride make archives materialize.
     pub frames: u64,
     /// Proofs whose bodies are held, left for a later proposal by the budget.
@@ -261,9 +271,15 @@ pub(crate) struct HeldShard {
 /// first, so each rides within `d + 1` GLOBAL frames, and a backlog of `n`
 /// shards drains furthest behind first within `n`. A proposal then makes
 /// archives materialize at most the budget plus `(d + 1)·r` frames.
+///
+/// Before the budget, a proof of a shard that `settling` reports still
+/// settling (`(address, cursor, through)`) stays in the mempool too, and
+/// counts against no budget: archives are verifying the expensive proofs its
+/// frames carry, and GLOBAL would wait for them.
 pub(crate) fn hold_back_unavailable_shard_proofs(
     proofs: Vec<Vec<u8>>,
     available: &dyn Fn(&[ShardBodyNeed]) -> Vec<Option<u64>>,
+    settling: Option<&dyn Fn(&[u8], u64, u64) -> bool>,
     budget: u64,
 ) -> ShardProofSelection {
     let needs: Vec<Vec<ShardBodyNeed>> = proofs.iter().map(|raw| shard_body_needs(raw)).collect();
@@ -298,6 +314,18 @@ pub(crate) fn hold_back_unavailable_shard_proofs(
             }
         }
         if selection.missing.len() == before {
+            if settling.is_some_and(|settling| {
+                shards.iter().any(|shard| {
+                    settling(
+                        &shard.address,
+                        shard.cursor,
+                        shard.cursor.saturating_add(shard.frames),
+                    )
+                })
+            }) {
+                selection.settling += 1;
+                continue;
+            }
             let frames = shards
                 .iter()
                 .fold(0u64, |sum, shard| sum.saturating_add(shard.frames));
@@ -405,6 +433,10 @@ pub struct GlobalLeaderProvider {
     /// headers need ([`ShardBodyAvailability`]). `None` proposes every
     /// verified proof, as a node without an archive ingest does.
     body_availability: Option<ShardBodyAvailability>,
+    /// Whether a shard's header waits for archives to verify the expensive
+    /// proofs it would sequence ([`ShardProofSettlement`]). `None` never
+    /// waits.
+    proof_settlement: Option<ShardProofSettlement>,
 }
 
 impl GlobalLeaderProvider {
@@ -484,6 +516,7 @@ impl GlobalLeaderProvider {
         );
         leader.rejected = self.rejected.clone();
         leader.body_availability = self.body_availability.clone();
+        leader.proof_settlement = self.proof_settlement.clone();
         Ok(leader)
     }
 
@@ -514,6 +547,7 @@ impl GlobalLeaderProvider {
             rejected: Default::default(),
             hypergraph,
             body_availability: None,
+            proof_settlement: None,
         }
     }
 
@@ -524,6 +558,17 @@ impl GlobalLeaderProvider {
     /// `None` proposes every verified proof.
     pub fn with_body_availability(mut self, available: Option<ShardBodyAvailability>) -> Self {
         self.body_availability = available;
+        self
+    }
+
+    /// Hold a shard's header back while `settlement` reports archives still
+    /// verifying the expensive confidential operations it would sequence:
+    /// each archive verifies them before it executes the GLOBAL frame
+    /// carrying the header, and GLOBAL waits for the third of four. A header
+    /// with bodies held but not reported settled stays in the mempool.
+    /// `None` never holds.
+    pub fn with_proof_settlement(mut self, settlement: Option<ShardProofSettlement>) -> Self {
+        self.proof_settlement = settlement;
         self
     }
 
@@ -1365,9 +1410,15 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     let kept = std::mem::take(&mut tips.kept);
                     let offered = kept.len();
                     let budget = proposal_app_frame_budget();
-                    let selection = hold_back_unavailable_shard_proofs(kept, &**available, budget);
+                    let settling = self
+                        .proof_settlement
+                        .as_ref()
+                        .map(|settling| &**settling as &dyn Fn(&[u8], u64, u64) -> bool);
+                    let selection =
+                        hold_back_unavailable_shard_proofs(kept, &**available, settling, budget);
                     tips.kept = selection.ready;
-                    let held_back = offered - tips.kept.len() - selection.deferred;
+                    let held_back =
+                        offered - tips.kept.len() - selection.deferred - selection.settling;
                     let first = selection.missing.first();
                     // Counted into one summary line per interval
                     // ([`crate::inclusion_summary`]), not logged per proposal.
@@ -1398,6 +1449,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         deferred = selection.deferred,
                         deferred_app_frames = selection.deferred_frames,
                         largest_deferred_gap = selection.largest_deferred,
+                        settling = selection.settling,
                         budget,
                         "shard tips selected for this GLOBAL proposal: those whose application frame bodies this \
                          archive holds, smallest gap first within the application frame budget, and the furthest \
@@ -2514,7 +2566,7 @@ mod tests {
         assert_eq!(superseded.len(), 1);
         let ShardProofSelection {
             mut ready, missing, ..
-        } = hold_back_unavailable_shard_proofs(kept, &available, u64::MAX);
+        } = hold_back_unavailable_shard_proofs(kept, &available, None, u64::MAX);
         ready.sort();
         let mut want = vec![held, junk];
         want.sort();
@@ -2539,7 +2591,7 @@ mod tests {
         // Nothing held: every proof with a shard header stays back.
         let none_held = |needs: &[ShardBodyNeed]| vec![None; needs.len()];
         let ShardProofSelection { ready, missing, .. } =
-            hold_back_unavailable_shard_proofs(vec![withheld], &none_held, u64::MAX);
+            hold_back_unavailable_shard_proofs(vec![withheld], &none_held, None, u64::MAX);
         assert!(ready.is_empty());
         assert_eq!(missing, vec![need(0x22, 9)]);
     }
@@ -2567,7 +2619,7 @@ mod tests {
         // Budget 100: 10 + 20 + 30 = 60 fit, 200 does not; of 200, 480 and
         // 640, the furthest behind rides and the others wait. 0x05 is held
         // back for its body.
-        let selection = hold_back_unavailable_shard_proofs(with_junk, &available, 100);
+        let selection = hold_back_unavailable_shard_proofs(with_junk, &available, None, 100);
         assert_eq!(
             selection.ready,
             vec![
@@ -2621,16 +2673,68 @@ mod tests {
         let selection = hold_back_unavailable_shard_proofs(
             vec![proofs[5].clone(), proofs[0].clone()],
             &available,
+            None,
             100,
         );
         assert_eq!(selection.ready, vec![proofs[5].clone()]);
         assert_eq!((selection.deferred, selection.largest_deferred), (1, 480));
 
         // Within the budget everything rides and nothing is deferred.
-        let selection = hold_back_unavailable_shard_proofs(proofs.clone(), &available, u64::MAX);
+        let selection =
+            hold_back_unavailable_shard_proofs(proofs.clone(), &available, None, u64::MAX);
         assert_eq!(selection.ready.len(), proofs.len() - 1);
         assert_eq!(selection.deferred, 0);
         assert_eq!(selection.furthest, None);
+    }
+
+    /// A shard whose frames still settle stays in the mempool, is not
+    /// counted as a missing body and takes no budget; once it settles it
+    /// rides. Without a settlement every held proof rides.
+    #[test]
+    fn a_shard_tip_waits_in_the_mempool_while_its_expensive_proofs_settle() {
+        // Shard `addr` is `addr` frames behind.
+        let available = |needs: &[ShardBodyNeed]| -> Vec<Option<u64>> {
+            needs.iter().map(|n| Some(n.address[0] as u64)).collect()
+        };
+        let proofs: Vec<Vec<u8>> = [0x02u8, 0x03, 0x04]
+            .iter()
+            .map(|&a| make_shard_frame(a, 7))
+            .collect();
+        let asked = std::sync::Mutex::new(Vec::new());
+        let settled = std::sync::atomic::AtomicBool::new(false);
+        let settling = |address: &[u8], cursor: u64, through: u64| {
+            asked.lock().unwrap().push((address[0], cursor, through));
+            address[0] == 0x03 && !settled.load(std::sync::atomic::Ordering::SeqCst)
+        };
+        // Budget 6: 0x02 and 0x04 fit; 0x03 would not, but it settles and
+        // takes none of it.
+        let selection =
+            hold_back_unavailable_shard_proofs(proofs.clone(), &available, Some(&settling), 6);
+        assert_eq!(selection.ready, vec![proofs[0].clone(), proofs[2].clone()]);
+        assert_eq!(
+            (selection.settling, selection.deferred, selection.frames),
+            (1, 0, 6)
+        );
+        assert!(
+            selection.missing.is_empty(),
+            "settling is not a missing body"
+        );
+        assert!(selection
+            .shards
+            .iter()
+            .all(|shard| shard.address[0] != 0x03));
+        assert!(
+            asked.lock().unwrap().contains(&(0x03, 7 - 3, 7)),
+            "asked with the shard's cursor and the header's frame"
+        );
+        settled.store(true, std::sync::atomic::Ordering::SeqCst);
+        let selection =
+            hold_back_unavailable_shard_proofs(proofs.clone(), &available, Some(&settling), 9);
+        assert_eq!(selection.ready, proofs, "once settled it rides");
+        assert_eq!(selection.settling, 0);
+        settled.store(false, std::sync::atomic::Ordering::SeqCst);
+        let selection = hold_back_unavailable_shard_proofs(proofs.clone(), &available, None, 9);
+        assert_eq!(selection.ready, proofs);
     }
 
     /// What [`drive_budget`] saw.
@@ -2689,7 +2793,7 @@ mod tests {
                     .map(|need| Some(now[need.address[0] as usize - 1]))
                     .collect()
             };
-            let selection = hold_back_unavailable_shard_proofs(offered, &available, budget);
+            let selection = hold_back_unavailable_shard_proofs(offered, &available, None, budget);
             if proposal >= settle {
                 run.most_behind = run
                     .most_behind
