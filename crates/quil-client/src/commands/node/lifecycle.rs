@@ -97,14 +97,33 @@ pub fn uninstall() -> anyhow::Result<()> {
 const CRON_MARKER: &str = "# quilibrium-auto-update";
 
 /// `node auto-update [enable|disable|status]` — manage a cron job that runs
-/// `qclient node update --restart` every 10 minutes.
+/// `qclient node update --restart` every 10 minutes. The job lives in
+/// root's crontab, so each action needs root.
 pub fn auto_update(action: &str) -> anyhow::Result<()> {
-    match action {
-        "enable" => cron_enable(),
-        "disable" => cron_disable(),
-        "status" => cron_status(),
+    let run: fn() -> anyhow::Result<()> = match action {
+        "enable" => cron_enable,
+        "disable" => cron_disable,
+        "status" => cron_status,
         other => anyhow::bail!("must specify 'enable', 'disable', or 'status' (got {other:?})"),
+    };
+    require_root(action, system::is_root())?;
+    run()
+}
+
+/// Fail unless `is_root`. The job installs node releases and restarts the
+/// service, which needs root, so it lives in root's crontab; without root,
+/// `crontab` would edit or read the invoking user's, whose job fails on
+/// every run.
+fn require_root(action: &str, is_root: bool) -> anyhow::Result<()> {
+    if !is_root {
+        anyhow::bail!(
+            "auto-update {action} needs root: the job installs node releases under {} and \
+             restarts the node service, so it runs from root's crontab; run 'sudo qclient \
+             node auto-update {action}'",
+            system::BINARY_PATH
+        );
     }
+    Ok(())
 }
 
 fn current_crontab() -> String {
@@ -285,6 +304,20 @@ fn latest_version_in(data: &Path) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without root, `auto-update enable` wrote the invoking user's
+    /// crontab, whose `node update --restart` then failed on every run.
+    #[test]
+    fn auto_update_needs_root() {
+        for action in ["enable", "disable", "status"] {
+            let err = require_root(action, false).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("run 'sudo qclient node auto-update {action}'")),
+                "{err}"
+            );
+        }
+        require_root("enable", true).unwrap();
+    }
 
     #[test]
     fn cron_entry_runs_the_installed_qclient() {
