@@ -4201,6 +4201,7 @@ fn health_inputs(
         master_store_write_failed,
         // The configured count is the worker manager's; the source sets it.
         worker_capacity: 0,
+        store_io: quil_forest::store_io::latest().map(|report| report.to_proto()),
     }
 }
 

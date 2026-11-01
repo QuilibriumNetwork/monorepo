@@ -873,6 +873,7 @@ impl NodeService for NodeRpcServer {
                 .gossip_traffic
                 .as_ref()
                 .map(|traffic| traffic.snapshot().to_proto()),
+            store_io: quil_forest::store_io::latest().map(|report| report.to_proto()),
         }))
     }
 

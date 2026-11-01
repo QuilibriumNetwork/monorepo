@@ -39,6 +39,7 @@ mod overlay;
 mod scope;
 pub mod storage_health;
 mod store;
+pub mod store_io;
 // Efficient JMT Merkle-diff sync — enabled via the vendored jmt visibility patch
 // (crates/jmt: gen_child_node_key + NibblePath::new made pub).
 pub mod subtree_proof;
