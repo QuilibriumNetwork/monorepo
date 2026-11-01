@@ -2752,6 +2752,57 @@ fn parse_recipient(value: &str, context: &[u8; 32]) -> anyhow::Result<RecipientA
     .map_err(|e| anyhow::anyhow!("recipient address: {e:?}"))
 }
 
+/// Short public fingerprint of a confidential address: 12 hex digits of a
+/// domain-separated hash. Names a recipient in output without printing the
+/// full address.
+pub(super) fn address_fingerprint(address: &RecipientAddress) -> String {
+    let mut hash = Shake256::default();
+    hash.update(b"quil/client/address-fingerprint/v1\0");
+    hash.update(&address.encode());
+    let mut out = [0u8; 6];
+    hash.finalize_xof().read(&mut out);
+    hex::encode(out)
+}
+
+/// Who a shield pays: the `--recipient` address, or this wallet.
+pub(super) struct ShieldRecipient {
+    pub(super) address: RecipientAddress,
+    /// Output label: names the recipient by fingerprint only.
+    pub(super) label: String,
+}
+
+/// Resolve `--recipient` for a shield. The address must decode under this
+/// node's network and token context; any failure is returned before a proof
+/// is made. `None` pays `wallet`. The error never echoes the input.
+pub(super) fn shield_recipient(
+    wallet: &RecipientWallet,
+    value: Option<&str>,
+) -> anyhow::Result<ShieldRecipient> {
+    use quil_lattice_ct::confidential::address::AddressError;
+    let Some(value) = value else {
+        let address = wallet.address().clone();
+        let label = format!("this wallet ({})", address_fingerprint(&address));
+        return Ok(ShieldRecipient { address, label });
+    };
+    let value = value.trim();
+    let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(value)).map_err(|_| {
+        anyhow::anyhow!(
+            "--recipient must be the hexadecimal address printed by `token confidential-address`"
+        )
+    })?;
+    let address = RecipientAddress::decode(&bytes, &wallet.context).map_err(|e| match e {
+        AddressError::Context => anyhow::anyhow!(
+            "--recipient is an address for a different network or token than this node"
+        ),
+        AddressError::Version => anyhow::anyhow!("--recipient is not a confidential address"),
+        AddressError::Length => {
+            anyhow::anyhow!("--recipient has the wrong length for a confidential address")
+        }
+    })?;
+    let label = format!("recipient {}", address_fingerprint(&address));
+    Ok(ShieldRecipient { address, label })
+}
+
 /// The keystore Falcon key used as escrow and reward authority.
 fn falcon_signer(tc: &TokenCtx) -> anyhow::Result<std::sync::Arc<quil_crypto::FalconSigner>> {
     let secret = Zeroizing::new(tc.key_manager.get_secret_key_bytes_by_id("q-prover-key")?);
@@ -4130,8 +4181,8 @@ pub(super) async fn run_mint(
     Ok(())
 }
 
-/// Shield one transparent (legacy-owned) coin into confidential coins owned by
-/// this wallet. Admission authenticates the source's value and owner.
+/// Shield one transparent (legacy-owned) coin into a confidential coin owned by
+/// `recipient` (default: this wallet). Admission authenticates the source's value and owner.
 #[cfg(feature = "native-proof")]
 pub(super) async fn run_shield(
     tc: &TokenCtx,
@@ -4139,6 +4190,7 @@ pub(super) async fn run_shield(
     source: &str,
     amount: u128,
     fee: u128,
+    recipient: Option<&str>,
 ) -> anyhow::Result<()> {
     let application = identifier(application)?;
     let source = identifier(source)?;
@@ -4153,6 +4205,7 @@ pub(super) async fn run_shield(
     let network =
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &application)?);
+    let payee = shield_recipient(&wallet, recipient)?;
     let owner = legacy_owner_signer(tc)?;
     let mut client = tc.connect().await?;
     super::legacy::ensure_shields_active(&client, tc.node_config.p2p.network, false).await?;
@@ -4162,14 +4215,14 @@ pub(super) async fn run_shield(
             source,
             amount,
             owner,
-            vec![(wallet.address().clone(), shielded)],
+            vec![(payee.address, shielded)],
             fee,
             1,
             native_budget(),
         )
         .await?;
     submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential shield submitted. Finalized inclusion is not yet confirmed.");
+    println!("Confidential shield of {shielded} base units to {} submitted. Finalized inclusion is not yet confirmed.", payee.label);
     Ok(())
 }
 
@@ -4251,12 +4304,14 @@ fn record_shielded(
 }
 
 /// Shield every unshielded legacy coin of this identity in batches of at most
-/// `max_per_batch`, one shard per batch, each into one coin of this wallet.
+/// `max_per_batch`, one shard per batch, each into one coin of the recipient
+/// (default: this wallet).
 #[cfg(feature = "native-proof")]
 pub(super) async fn run_shield_all(
     tc: &TokenCtx,
     application: &str,
     max_per_batch: usize,
+    recipient: Option<&str>,
 ) -> anyhow::Result<()> {
     use quil_execution::token_intrinsic::cost::Shape;
     use quil_lattice_ct::confidential::shield::MAX_SHIELD_SOURCES;
@@ -4272,6 +4327,7 @@ pub(super) async fn run_shield_all(
     let network =
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &application)?);
+    let payee = shield_recipient(&wallet, recipient)?;
     let owner = legacy_owner_signer(tc)?;
     let mut client = tc.connect().await?;
     let pending = recently_shielded(tc);
@@ -4302,6 +4358,11 @@ pub(super) async fn run_shield_all(
         );
     }
     let count = batches.len();
+    println!(
+        "Plan: {} legacy coins in {count} batches, paid to {}.",
+        batches.iter().map(Vec::len).sum::<usize>(),
+        payee.label
+    );
     for (index, sources) in batches.into_iter().enumerate() {
         let total = sources
             .iter()
@@ -4328,7 +4389,7 @@ pub(super) async fn run_shield_all(
             .create_batch_shield(
                 sources.clone(),
                 owner.clone(),
-                vec![(wallet.address().clone(), total - fee)],
+                vec![(payee.address.clone(), total - fee)],
                 fee,
                 1,
                 native_budget(),
@@ -4336,8 +4397,8 @@ pub(super) async fn run_shield_all(
             .await?;
         submit_operation(tc, &wallet, &mut client, bytes).await?;
         record_shielded(tc, &sources)?;
-        println!("Batch {}/{count}: {} legacy coins, {} base units shielded (fee {fee}). Submitted; finalized inclusion is not yet confirmed.",
-            index + 1, sources.len(), total - fee);
+        println!("Batch {}/{count}: {} legacy coins, {} base units shielded to {} (fee {fee}). Submitted; finalized inclusion is not yet confirmed.",
+            index + 1, sources.len(), total - fee, payee.label);
     }
     Ok(())
 }
@@ -5512,6 +5573,100 @@ mod tests {
             &changed.context_bytes().unwrap(),
             &signature
         ));
+    }
+
+    fn shield_test_wallet(network: [u8; 32]) -> RecipientWallet {
+        let keys = sntrup761::Sntrup761KeyPair::generate();
+        RecipientWallet::from_keys(
+            &network,
+            &[2; 32],
+            &keys.public,
+            Zeroizing::new(keys.secret),
+        )
+        .unwrap()
+    }
+
+    fn address_hex(wallet: &RecipientWallet) -> String {
+        format!("0x{}", hex::encode(wallet.address().encode()))
+    }
+
+    /// `--recipient` pays the named wallet: the shielded coin opens with the
+    /// recipient's keys and not with the sender's.
+    #[test]
+    fn shield_recipient_coin_opens_for_the_recipient_only() {
+        let sender = shield_test_wallet([1; 32]);
+        let recipient = shield_test_wallet([1; 32]);
+        let payee = shield_recipient(&sender, Some(&address_hex(&recipient))).unwrap();
+        assert_eq!(&payee.address, recipient.address());
+        assert_ne!(&payee.address, sender.address());
+        let public = quil_crypto::Ed448Signer::derive_public(&[3; 57]).unwrap();
+        let signer = quil_crypto::Ed448Signer::from_bytes(&[3; 57], &public).unwrap();
+        let (statement, _, relation) = sender
+            .prepare_shield([4; 32], 102, &signer, &[(payee.address, 100)], 2, 1)
+            .unwrap();
+        assert!(relation.validate_local_witness());
+        assert_eq!(recipient.open(&statement.outputs[0]).unwrap().amount, 100);
+        assert!(sender.open(&statement.outputs[0]).is_err());
+    }
+
+    /// Output names the recipient by a short fingerprint, never the address.
+    #[test]
+    fn shield_recipient_is_named_by_a_short_fingerprint() {
+        let sender = shield_test_wallet([1; 32]);
+        let recipient = shield_test_wallet([1; 32]);
+        let full = address_hex(&recipient);
+        let payee = shield_recipient(&sender, Some(&full)).unwrap();
+        let fingerprint = address_fingerprint(recipient.address());
+        assert_eq!(fingerprint.len(), 12);
+        assert_eq!(payee.label, format!("recipient {fingerprint}"));
+        assert!(payee.label.len() < 40);
+        assert!(!payee.label.contains(&full[2..40]));
+        assert_ne!(fingerprint, address_fingerprint(sender.address()));
+    }
+
+    /// A malformed, truncated, foreign-network or non-address `--recipient`
+    /// is refused without echoing it, before any proof is prepared.
+    #[test]
+    fn shield_recipient_refuses_bad_addresses() {
+        let sender = shield_test_wallet([1; 32]);
+        let good = address_hex(&sender);
+        let foreign = address_hex(&shield_test_wallet([9; 32]));
+        let mut versioned = hex::decode(&good[2..]).unwrap();
+        versioned[0] ^= 1;
+        let cases = [
+            ("not hex".to_string(), "hexadecimal"),
+            (String::new(), "wrong length"),
+            (good[..good.len() - 2].to_string(), "wrong length"),
+            (format!("{good}00"), "wrong length"),
+            (hex::encode(versioned), "not a confidential address"),
+            (foreign, "different network"),
+        ];
+        for (value, expected) in cases {
+            let error = match shield_recipient(&sender, Some(&value)) {
+                Ok(_) => panic!("accepted {expected} case"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(expected), "{error}");
+            assert!(value.len() < 16 || !error.contains(&value[..16]), "{error}");
+        }
+    }
+
+    /// Without `--recipient` a shield still pays this wallet.
+    #[test]
+    fn shield_recipient_defaults_to_this_wallet() {
+        let sender = shield_test_wallet([1; 32]);
+        let payee = shield_recipient(&sender, None).unwrap();
+        assert_eq!(&payee.address, sender.address());
+        assert_eq!(
+            payee.label,
+            format!("this wallet ({})", address_fingerprint(sender.address()))
+        );
+        assert_eq!(
+            shield_recipient(&sender, Some(&address_hex(&sender)))
+                .unwrap()
+                .address,
+            payee.address
+        );
     }
 
     #[test]
