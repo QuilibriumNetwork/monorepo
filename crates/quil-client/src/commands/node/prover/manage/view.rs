@@ -3127,6 +3127,23 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
             ),
         ));
     }
+    if let Some(io) = m
+        .cached_node_info
+        .as_ref()
+        .and_then(|info| info.store_io.as_ref())
+        .filter(|io| io.verdict() == quil_types::proto::diagnostics::StoreIoVerdict::Slow)
+    {
+        let figures = crate::commands::node::diagnostics::store_io_figures(io);
+        notices.push((
+            "store-io-slow",
+            NoticeSeverity::Warning,
+            if figures.is_empty() {
+                "Store reads slow (this node's disk).".to_string()
+            } else {
+                format!("Store reads slow (this node's disk): {figures}.")
+            },
+        ));
+    }
     notices
 }
 
@@ -4061,6 +4078,7 @@ fn help_items() -> Vec<HelpItem> {
         item("`Local execution blocked or stopped`: staffed earning allocations whose Execution is `blocked` or `stopped`, of those with fresh observations; the row footer names the blocker"),
         item("`Allocation epoch stale (re-confirm!)`: allocations whose epoch is older than the current one. The node reconfirms each allocation during every epoch, so its reconfirm has not been recorded; check the node's prover confirmation log lines"),
         item("`Last recovery attempt failed`: workers whose latest archive recovery attempt failed, of workers with fresh observations; the Recovery footer gives the error and the failure streak"),
+        kv("Store notice", "`Store reads slow (this node's disk)`: the node reads one entry of its master store a second (the canary) and, on Linux, times its disk's reads and writes. Shown once a minute's canary p99 reaches 50ms, a read stays unfinished 1s, or the disk takes 20ms a read or 100ms a write (of 20+), two minutes in a row; it clears after three minutes under all of them. Work that reads the store falls behind and allocations may lapse. The cause is this node's disk: check that TRIM runs (fstrim.timer or the discard mount option), the disk's health (SMART) and other I/O load on it. `qclient node diagnostics health --self` and the node's `store i/o` log lines give the figures"),
         kv("Command legends", "Compact mode shows applicable UI/worker commands only; expanded mode also shows disabled commands. Usable commands share one highlight; labels show colors on/off and relative/absolute thresholds. `filter*` means a column filter is active"),
         kv("Scroll hints", "Bottom border counts hidden rows `↑`/`↓` and columns `←`/`→`"),
         kv("Colors", "What the main view's colors mean:"),
@@ -4462,6 +4480,69 @@ mod tests {
         assert!(lines.iter().all(|l| !l.ends_with(' ')));
         assert!(lines.iter().any(|l| l.contains("Select Filter")), "{text}");
         assert!(!text.contains('\u{1b}'), "no escape sequences");
+    }
+
+    /// A slow store verdict in fresh node status shows one warning naming
+    /// this node's disk and the figures, in the drawn frame too; an ok or
+    /// absent verdict, or stale status, shows none.
+    #[test]
+    fn a_slow_store_shows_one_notice_with_its_figures() {
+        use quil_types::proto::diagnostics::{StoreIoHealth, StoreIoVerdict};
+        use quil_types::proto::node::NodeInfoResponse;
+        use std::time::{Duration, Instant};
+        let mut io = StoreIoHealth {
+            slow_secs: 300,
+            interval_secs: 60,
+            canary_reads: 58,
+            canary_p99_us: 412_000,
+            disk_read_await_us: Some(25_400),
+            disk_write_await_us: Some(3_100),
+            ..Default::default()
+        };
+        io.set_verdict(StoreIoVerdict::Slow);
+        let mut m = Model::new();
+        m.compact_actions = false;
+        m.data_loaded = true;
+        m.allocations = joining_table();
+        m.last_fetch_success = Some(Instant::now());
+        m.cached_node_info = Some(NodeInfoResponse {
+            store_io: Some(io.clone()),
+            ..Default::default()
+        });
+        let store = |m: &Model| {
+            condition_notices(m)
+                .into_iter()
+                .filter(|(key, ..)| *key == "store-io-slow")
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            store(&m),
+            vec![(
+                "store-io-slow",
+                NoticeSeverity::Warning,
+                "Store reads slow (this node's disk): canary p99 412ms of 58 reads in 60s, \
+                 disk read 25ms/op, write 3.1ms/op."
+                    .to_string()
+            )]
+        );
+        update_message_lifetime(&mut m);
+        let text = render_text(&mut m, 160, 30);
+        println!("{text}");
+        assert!(
+            text.contains("Store reads slow (this node's disk): canary p99 412ms"),
+            "{text}"
+        );
+        m.last_fetch_success = Some(Instant::now() - Duration::from_secs(3600));
+        assert!(store(&m).is_empty(), "stale status establishes nothing");
+        m.last_fetch_success = Some(Instant::now());
+        io.set_verdict(StoreIoVerdict::Ok);
+        m.cached_node_info = Some(NodeInfoResponse {
+            store_io: Some(io),
+            ..Default::default()
+        });
+        assert!(store(&m).is_empty());
+        m.cached_node_info = Some(NodeInfoResponse::default());
+        assert!(store(&m).is_empty());
     }
 
     /// The help as text keeps every section heading and has no styling.
@@ -7468,6 +7549,7 @@ mod tests {
             "Global app notice",
             "Reward notice",
             "Allocation notices",
+            "Store notice",
             "Command legends",
             "Scroll hints",
             "Colors",
