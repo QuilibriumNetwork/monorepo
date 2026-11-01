@@ -1207,6 +1207,109 @@ pub fn set_storage_kick_suspension_epoch_for_thread(epoch: Option<u64>) {
     STORAGE_KICK_SUSPENSION_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
+/// The epoch from which a member's replica key no longer depends on the
+/// epoch (`quil_crypto::sdr::replica_key`): a registration for this epoch or
+/// a later one is labelled under a key of the member and the leaf alone, so
+/// a leaf whose node count stays inside its padding band keeps its labels
+/// across epochs and is relabelled only when its count or id changes
+/// (issue #749: relabelling every leaf every epoch took about 18.6 h per
+/// 2 h epoch on a 15-seat node). Each epoch's proofs stay bound to it: the
+/// seal challenges, the opening indices and the epoch STARK's transcript
+/// all hash the epoch and a beacon fixed after the registration. Labels for
+/// this epoch are made ahead two epochs before it and sealed in the epoch
+/// before it. Consensus-affecting (seal verification in every GLOBAL
+/// execution): every node must run a build carrying the epoch before the
+/// epoch two before it begins. Mainnet: not set until decided;
+/// `QUIL_STABLE_REPLICA_KEY_EPOCH` elsewhere, never by default.
+pub const MAINNET_STABLE_REPLICA_KEY_EPOCH: Option<u64> = None;
+
+static STABLE_REPLICA_KEY_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static STABLE_REPLICA_KEY_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn stable_replica_key_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_STABLE_REPLICA_KEY_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// [`stable_replica_key_epoch_for`], never before the hash storage proof
+/// epoch `hash_epoch`: before it registrations are KZG ones, which the
+/// stable key was never meant for.
+fn stable_replica_key_epoch_from(network: u8, setting: Option<&str>, hash_epoch: u64) -> u64 {
+    match stable_replica_key_epoch_for(network, setting) {
+        u64::MAX => u64::MAX,
+        epoch => epoch.max(hash_epoch),
+    }
+}
+
+/// Fix this process's stable replica key epoch from its network, and return
+/// it: never before the hash storage proof epoch, so call it after
+/// [`init_hash_storage_proof_epoch`]. Called at startup before any frame is
+/// processed; the first call decides.
+pub fn init_stable_replica_key_epoch(network: u8) -> u64 {
+    init_stable_replica_key_epoch_from(
+        network,
+        std::env::var("QUIL_STABLE_REPLICA_KEY_EPOCH")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`init_stable_replica_key_epoch`] from `setting` instead of the
+/// environment. Mainnet ignores `setting`.
+fn init_stable_replica_key_epoch_from(network: u8, setting: Option<&str>) -> u64 {
+    *STABLE_REPLICA_KEY_EPOCH
+        .get_or_init(|| stable_replica_key_epoch_from(network, setting, hash_storage_proof_epoch()))
+}
+
+/// The epoch fixed by [`init_stable_replica_key_epoch`]; `u64::MAX` when the
+/// network has none. A read before it is the mainnet epoch, reported once on
+/// standard error and not kept, so the later initialization still decides
+/// and the setting cannot reach mainnet.
+pub fn stable_replica_key_epoch() -> u64 {
+    if let Some(epoch) = STABLE_REPLICA_KEY_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    if let Some(epoch) = STABLE_REPLICA_KEY_EPOCH.get() {
+        return *epoch;
+    }
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "stable replica key epoch read before init_stable_replica_key_epoch: the mainnet \
+             value until it is initialized"
+        );
+    }
+    stable_replica_key_epoch_for(0, None)
+}
+
+/// Whether registrations for `epoch` use the stable replica key
+/// ([`MAINNET_STABLE_REPLICA_KEY_EPOCH`]). Never without the epoch, not even
+/// for epoch `u64::MAX`.
+pub fn stable_replica_keys_at(epoch: u64) -> bool {
+    let from = stable_replica_key_epoch();
+    from != u64::MAX && epoch >= from
+}
+
+/// Set the stable replica key epoch for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+/// Storage jobs pass it on to the threads they run work on
+/// (`quil_engine::storage_jobs::for_each_parallel`).
+pub fn set_stable_replica_key_epoch_for_thread(epoch: Option<u64>) {
+    STABLE_REPLICA_KEY_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
+/// The calling thread's override ([`set_stable_replica_key_epoch_for_thread`]).
+pub fn stable_replica_key_epoch_thread_override() -> Option<u64> {
+    STABLE_REPLICA_KEY_OVERRIDE.with(|cell| cell.get())
+}
+
 /// The GLOBAL frame that gives back the seniority storage epoch proof kicks
 /// took before [`MAINNET_STORAGE_KICK_SUSPENSION_EPOCH`]. Such a kick set the
 /// prover's `Seniority` to 0, and a prover kicked more than once lost it at
@@ -1656,6 +1759,56 @@ mod exact_state_size_epoch_tests {
         assert_eq!(super::storage_kick_suspension_epoch(), 1342);
         assert!(!super::storage_kicks_suspended(966_239));
         assert!(super::storage_kicks_suspended(966_240));
+    }
+
+    /// Mainnet has no stable replica key epoch, whatever the setting says:
+    /// every epoch keeps the epoch-bound key. Other networks take the
+    /// setting, and none without it.
+    #[test]
+    fn stable_replica_keys_are_inert_on_mainnet() {
+        assert_eq!(super::MAINNET_STABLE_REPLICA_KEY_EPOCH, None);
+        assert_eq!(super::stable_replica_key_epoch_for(0, Some("5")), u64::MAX);
+        assert_eq!(super::stable_replica_key_epoch_for(0, None), u64::MAX);
+        assert_eq!(super::stable_replica_key_epoch_for(1, Some("5")), 5);
+        assert_eq!(
+            super::stable_replica_key_epoch_for(1, Some("bad")),
+            u64::MAX
+        );
+        assert_eq!(super::stable_replica_key_epoch_for(1, None), u64::MAX);
+        super::set_stable_replica_key_epoch_for_thread(None);
+        assert_eq!(super::stable_replica_key_epoch(), u64::MAX);
+        assert!(!super::stable_replica_keys_at(0));
+        assert!(!super::stable_replica_keys_at(u64::MAX - 1));
+        assert!(!super::stable_replica_keys_at(u64::MAX));
+        super::set_stable_replica_key_epoch_for_thread(Some(9));
+        assert!(!super::stable_replica_keys_at(8));
+        assert!(super::stable_replica_keys_at(9));
+        assert_eq!(super::stable_replica_key_epoch_thread_override(), Some(9));
+        super::set_stable_replica_key_epoch_for_thread(None);
+        // Never before the hash storage proof epoch; mainnet's must not be.
+        assert_eq!(super::stable_replica_key_epoch_from(1, Some("5"), 3), 5);
+        assert_eq!(super::stable_replica_key_epoch_from(1, Some("5"), 8), 8);
+        assert_eq!(super::stable_replica_key_epoch_from(1, None, 8), u64::MAX);
+        if let (Some(stable), Some(hash)) = (
+            super::MAINNET_STABLE_REPLICA_KEY_EPOCH,
+            super::MAINNET_HASH_STORAGE_PROOF_EPOCH,
+        ) {
+            assert!(stable >= hash);
+        }
+    }
+
+    /// A read before initialization does not fix the epoch: the
+    /// initialization after it still decides.
+    #[test]
+    fn a_stable_replica_key_epoch_read_before_init_does_not_fix_it() {
+        if super::STABLE_REPLICA_KEY_EPOCH.get().is_some() {
+            return; // another test in this process initialized it
+        }
+        assert_eq!(super::stable_replica_key_epoch(), u64::MAX);
+        assert!(
+            super::STABLE_REPLICA_KEY_EPOCH.get().is_none(),
+            "a read fixed it"
+        );
     }
 
     /// Mainnet's rule starts at GLOBAL frame 943,920, with the other gates
