@@ -110,7 +110,12 @@ jobs:
           # every merge group then built from nothing.
           save-if: ${{ github.event_name == 'push' }}
 
+      # Warnings fail the check: the workspace builds without any, and
+      # a new one would otherwise land unnoticed. Only this job sets
+      # RUSTFLAGS, so the test jobs' cache is untouched.
       - name: cargo check --workspace --all-targets
+        env:
+          RUSTFLAGS: -D warnings
         run: cargo check --workspace --locked --all-targets
 
   # -----------------------------------------------------------------
