@@ -842,10 +842,46 @@ fn invalid(message: &str) -> QuilError {
 /// verdict depends on (network, application, limits, native budget and the
 /// exact operation bytes). A verdict is a pure function of that key, so a
 /// pre-pass can verify a frame's operations concurrently and the sequential
-/// materialization loop consumes the results. Bounded; cleared when full.
-static VERDICTS: std::sync::Mutex<Option<std::collections::HashMap<[u8; 32], bool>>> =
-    std::sync::Mutex::new(None);
+/// materialization loop consumes the results. Accepted and rejected verdicts
+/// are kept apart, each bounded by [`VERDICT_CACHE_ENTRIES`] and evicting its
+/// oldest entry when full: rejections never displace an accepted verdict a
+/// proposal or frame still needs (one took minutes to compute), and a full
+/// cache never forgets everything at once.
+static VERDICTS: std::sync::Mutex<Option<Verdicts>> = std::sync::Mutex::new(None);
 const VERDICT_CACHE_ENTRIES: usize = 4096;
+
+/// One side of the verdict cache: keys in insertion order.
+#[derive(Default)]
+struct VerdictSet {
+    keys: std::collections::HashSet<[u8; 32]>,
+    order: std::collections::VecDeque<[u8; 32]>,
+}
+
+impl VerdictSet {
+    fn insert(&mut self, key: [u8; 32], capacity: usize) {
+        if !self.keys.insert(key) {
+            return;
+        }
+        self.order.push_back(key);
+        while self.order.len() > capacity.max(1) {
+            if let Some(oldest) = self.order.pop_front() {
+                self.keys.remove(&oldest);
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &[u8; 32]) {
+        if self.keys.remove(key) {
+            self.order.retain(|held| held != key);
+        }
+    }
+}
+
+#[derive(Default)]
+struct Verdicts {
+    accepted: VerdictSet,
+    rejected: VerdictSet,
+}
 /// Exponentially weighted mean of one worker verification's wall time, in
 /// microseconds; seeds at 8 s until measured.
 static VERIFY_EWMA_MICROS: std::sync::atomic::AtomicU64 =
@@ -965,16 +1001,27 @@ fn verdict_key(
 }
 
 fn cached_verdict(key: &[u8; 32]) -> Option<bool> {
-    VERDICTS.lock().ok()?.as_ref()?.get(key).copied()
+    let cache = VERDICTS.lock().ok()?;
+    let verdicts = cache.as_ref()?;
+    if verdicts.accepted.keys.contains(key) {
+        Some(true)
+    } else if verdicts.rejected.keys.contains(key) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn record_verdict(key: [u8; 32], accepted: bool) {
     if let Ok(mut cache) = VERDICTS.lock() {
-        let map = cache.get_or_insert_with(std::collections::HashMap::new);
-        if map.len() >= VERDICT_CACHE_ENTRIES {
-            map.clear();
-        }
-        map.insert(key, accepted);
+        let verdicts = cache.get_or_insert_with(Verdicts::default);
+        let (into, other) = if accepted {
+            (&mut verdicts.accepted, &mut verdicts.rejected)
+        } else {
+            (&mut verdicts.rejected, &mut verdicts.accepted)
+        };
+        other.remove(&key);
+        into.insert(key, VERDICT_CACHE_ENTRIES);
     }
 }
 
@@ -1208,7 +1255,8 @@ pub enum Preverified {
     Busy,
     /// The worker failed (timeout, crash, resource cap); nothing cached.
     Unavailable,
-    /// No worker proof to verify (mint claims, unknown types).
+    /// No worker proof to verify (mint claims, unknown types, operations
+    /// dispatch refuses before native work).
     NotApplicable,
 }
 
@@ -1247,9 +1295,16 @@ impl TokenPolicy {
     }
 
     /// Whether one confidential operation needs no worker verification
-    /// before it executes: its verdict is cached, or it carries no worker
-    /// proof (mint claims, unknown types).
+    /// before it executes: its verdict is cached, it carries no worker proof
+    /// (mint claims, unknown types), or dispatch refuses it before native
+    /// work ([`Self::preflight`]: encoding, context, dimensions, fee).
     pub fn verdict_cached(&self, address: &[u8], bytes: &[u8], tp: u32) -> bool {
+        self.verdict_known(address, bytes, tp) || self.preflight(address, bytes, tp).is_err()
+    }
+
+    /// Whether one confidential operation's verdict is cached, or it carries
+    /// no worker proof.
+    pub(crate) fn verdict_known(&self, address: &[u8], bytes: &[u8], tp: u32) -> bool {
         let Some((application, limits)) = self.worker_request_shape(address, tp) else {
             return true;
         };
@@ -1286,6 +1341,10 @@ impl TokenPolicy {
         );
         if cached_verdict(&key).is_some() {
             return Preverified::Cached;
+        }
+        // Dispatch refuses it before native work: nothing to verify.
+        if self.preflight(address, bytes, tp).is_err() {
+            return Preverified::NotApplicable;
         }
         match verdict_once(key, || {
             worker_verdict(
@@ -1645,3 +1704,7 @@ impl TokenPolicy {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "dispatch_admission_tests.rs"]
+mod admission_tests;

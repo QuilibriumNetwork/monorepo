@@ -62,6 +62,12 @@ const FAILURE_ENTRIES: usize = 1024;
 const BUSY_PAUSE: Duration = Duration::from_secs(1);
 /// How often the queue logs what it did.
 const SUMMARY_INTERVAL: Duration = Duration::from_secs(600);
+/// Arrivals ([`offer_arrival`]) are verified up to the queue's threads times
+/// this much estimated worker time per this window: at most what the queue
+/// verifies meanwhile, so arrivals never queue more work than it finishes in
+/// one window ahead of the proposals and frames that offer theirs. Past it
+/// an arrival is not queued; a proposal or frame needing it verifies it.
+const ARRIVAL_WINDOW: Duration = Duration::from_secs(600);
 /// The proof worker admits at most this many verifications at once.
 const MAX_THREADS: usize = 64;
 
@@ -90,6 +96,15 @@ pub struct AdmissionStats {
     /// Submissions that reached [`MAX_FAILURES`].
     pub released: usize,
     pub counts: PreverifyCounts,
+    /// Arrivals not queued because they need no verification: the collector
+    /// already held them or a finalized frame consumed them, they fail
+    /// dispatch's checks before native work, or the global commit decided
+    /// them ([`note_arrival_skipped`](AdmissionQueue::note_arrival_skipped)).
+    pub arrival_skipped: usize,
+    /// Arrivals not queued past the [`ARRIVAL_WINDOW`] budget.
+    pub arrival_over_budget: usize,
+    /// Estimated worker-seconds of the arrivals admitted.
+    pub arrival_secs: u64,
 }
 
 #[derive(Default)]
@@ -107,6 +122,10 @@ struct State {
     target_threads: usize,
     window: AdmissionStats,
     summarized: Option<Instant>,
+    /// Estimated worker-seconds arrivals may still take, and when it was
+    /// last refilled (`None`: full).
+    arrival_credit: f64,
+    arrival_refilled: Option<Instant>,
     /// Digest → verifications of it that failed in the worker, oldest first.
     failures: std::collections::HashMap<[u8; 32], u8>,
     failure_order: VecDeque<[u8; 32]>,
@@ -192,6 +211,62 @@ impl AdmissionQueue {
             failure_entries,
             spawn,
         })
+    }
+
+    /// Admit an arrival estimated at `cost_secs` worker-seconds under the
+    /// [`ARRIVAL_WINDOW`] budget: the queue's threads times the window,
+    /// refilled at one second per thread per second. One is admitted while
+    /// any credit is left, so the work admitted per window exceeds the
+    /// budget by at most one arrival. False (counted) past it.
+    pub fn admit_arrival(&self, cost_secs: f64, now: Instant) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let threads = state.target_threads.max(1) as f64;
+        let capacity = threads * ARRIVAL_WINDOW.as_secs_f64();
+        let credit = match state.arrival_refilled {
+            None => capacity,
+            Some(at) => (state.arrival_credit
+                + now.saturating_duration_since(at).as_secs_f64() * threads)
+                .min(capacity),
+        };
+        state.arrival_refilled = Some(now);
+        let admitted = credit > 0.0;
+        if admitted {
+            let cost = if cost_secs.is_finite() {
+                cost_secs.max(0.0)
+            } else {
+                capacity
+            };
+            state.arrival_credit = credit - cost;
+            state.window.arrival_secs = state
+                .window
+                .arrival_secs
+                .saturating_add(cost.round() as u64);
+        } else {
+            state.arrival_credit = credit;
+            state.window.arrival_over_budget += 1;
+        }
+        Self::summarize(&mut state);
+        admitted
+    }
+
+    /// Give back an admitted arrival's credit when it was not queued.
+    pub fn refund_arrival(&self, cost_secs: f64) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.arrival_refilled.is_some() && cost_secs.is_finite() {
+            let capacity = state.target_threads.max(1) as f64 * ARRIVAL_WINDOW.as_secs_f64();
+            state.arrival_credit = (state.arrival_credit + cost_secs.max(0.0)).min(capacity);
+            state.window.arrival_secs = state
+                .window
+                .arrival_secs
+                .saturating_sub(cost_secs.max(0.0).round() as u64);
+        }
+    }
+
+    /// Count an arrival not queued because it needs no verification.
+    pub fn note_arrival_skipped(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.window.arrival_skipped += 1;
+        Self::summarize(&mut state);
     }
 
     /// Run up to `threads` verifications at once ([`background_threads`]);
@@ -471,9 +546,15 @@ impl AdmissionQueue {
             pending = state.queue.len(),
             frames_waiting = state.wanted_queued(),
             threads = state.threads,
+            arrival_skipped = window.arrival_skipped,
+            arrival_over_budget = window.arrival_over_budget,
+            arrival_secs = window.arrival_secs,
+            arrival_budget_secs =
+                (state.target_threads.max(1) as u64).saturating_mul(ARRIVAL_WINDOW.as_secs()),
             interval_secs = SUMMARY_INTERVAL.as_secs(),
             "confidential proof admission summary: proofs of arriving submissions verified before a frame \
-             carries them, those frames wait on first; dropped ones verify when a proposal or frame needs them"
+             carries them, those frames wait on first; dropped ones, and arrivals past the budget or needing \
+             no verification (skipped), verify when a proposal or frame needs them"
         );
     }
 }
@@ -537,6 +618,40 @@ pub fn offer_submission(
         )
     });
     queue.offer(digest, canonical.len(), operations, job, front) || queue.pending(&digest)
+}
+
+/// Queue an arriving canonical submission's verification
+/// ([`offer_submission`], at the back) under the [`ARRIVAL_WINDOW`] budget.
+/// `sizes`: the bytes of each of its confidential operations still to
+/// verify (`ExecutionEngineManager::arrival_operations`), charged at their
+/// estimated verification time. True when it is queued or verifying now.
+pub fn offer_arrival(
+    queue: &Arc<AdmissionQueue>,
+    exec: &Arc<quil_execution::ExecutionEngineManager>,
+    application: &[u8],
+    canonical: &[u8],
+    sizes: &[usize],
+    now: Instant,
+) -> bool {
+    if sizes.is_empty() {
+        queue.note_arrival_skipped();
+        return false;
+    }
+    if queue.pending(&digest(canonical)) {
+        return true;
+    }
+    let cost: f64 = sizes
+        .iter()
+        .map(|bytes| quil_execution::ExecutionEngineManager::estimated_verify_secs(*bytes))
+        .sum();
+    if !queue.admit_arrival(cost, now) {
+        return false;
+    }
+    let queued = offer_submission(queue, exec, application, canonical, false);
+    if !queued {
+        queue.refund_arrival(cost);
+    }
+    queued
 }
 
 #[cfg(test)]
@@ -785,5 +900,52 @@ mod tests {
         }
         assert!(!queue.pending(&[9; 32]));
         assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// Arrivals take at most the queue's threads times the window of
+    /// estimated verification time, refilled as time passes, one arrival
+    /// past the last credit at most; refused ones are counted, and a refund
+    /// gives credit back.
+    #[test]
+    fn arrivals_are_admitted_within_their_budget_and_refilled_over_time() {
+        let queue = AdmissionQueue::new(8, 1 << 20, false);
+        let start = Instant::now();
+        let window = ARRIVAL_WINDOW.as_secs_f64();
+        // One thread: the window's seconds, then one more past the last credit.
+        let mut admitted = 0;
+        while queue.admit_arrival(100.0, start) {
+            admitted += 1;
+            assert!(admitted < 1000, "the budget never ran out");
+        }
+        assert_eq!(admitted, (window / 100.0).ceil() as usize);
+        assert_eq!(queue.stats().arrival_over_budget, 1);
+        // Refilled at one second per thread per second: one second's credit
+        // admits one more, which overdraws it.
+        assert!(queue.admit_arrival(100.0, start + Duration::from_secs(1)));
+        assert!(!queue.admit_arrival(1.0, start + Duration::from_secs(1)));
+        assert!(queue.admit_arrival(100.0, start + Duration::from_secs(200)));
+        assert!(!queue.admit_arrival(100.0, start + Duration::from_secs(200)));
+        // A refund gives the credit back.
+        queue.refund_arrival(150.0);
+        assert!(queue.admit_arrival(100.0, start + Duration::from_secs(200)));
+        // Never more than one window ahead, however long it was idle.
+        let later = start + Duration::from_secs(100_000);
+        let mut admitted = 0;
+        while queue.admit_arrival(100.0, later) {
+            admitted += 1;
+        }
+        assert_eq!(admitted, (window / 100.0).ceil() as usize);
+        // More threads, more budget.
+        let queue = AdmissionQueue::new(8, 1 << 20, false);
+        queue.set_threads(3);
+        let mut admitted = 0;
+        while queue.admit_arrival(100.0, start) {
+            admitted += 1;
+        }
+        assert_eq!(admitted, (3.0 * window / 100.0).ceil() as usize);
+        // A non-finite estimate takes the whole budget.
+        let queue = AdmissionQueue::new(8, 1 << 20, false);
+        assert!(queue.admit_arrival(f64::INFINITY, start));
+        assert!(!queue.admit_arrival(1.0, start));
     }
 }
