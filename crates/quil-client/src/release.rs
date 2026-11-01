@@ -152,16 +152,51 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
 }
 
 /// The version of the release binary `symlink` points to, when it points to
-/// a `<release_type>-<version>-<os>-<arch>` file.
+/// a `<release_type>-<version>-<os>-<arch>` file, directly or at the end of
+/// a chain of links (an operator's own link to a release file).
 pub fn linked_version(symlink: &Path, release_type: &str) -> Option<String> {
     let target = std::fs::read_link(symlink).ok()?;
-    let rest = target
+    named_version(&target, release_type)
+        .or_else(|| named_version(&std::fs::canonicalize(symlink).ok()?, release_type))
+}
+
+/// The version in a `<release_type>-<version>-<os>-<arch>` file name.
+fn named_version(path: &Path, release_type: &str) -> Option<String> {
+    let rest = path
         .file_name()?
         .to_str()?
         .strip_prefix(release_type)?
         .strip_prefix('-')?;
     let version = rest.split('-').next()?;
     is_release_version(version).then(|| version.to_string())
+}
+
+/// Refuse to replace `symlink` with the release `target` unless
+/// `allow_downgrade` when it holds a binary whose version
+/// [`linked_version`] cannot read, such as a link to an operator's own
+/// build or a copied file: that binary may be newer than `target`.
+pub fn check_unversioned_link(
+    symlink: &Path,
+    release_type: &str,
+    target: &str,
+    allow_downgrade: bool,
+) -> anyhow::Result<()> {
+    if allow_downgrade || linked_version(symlink, release_type).is_some() {
+        return Ok(());
+    }
+    let held = match std::fs::read_link(symlink) {
+        Ok(to) => format!("links {}", to.display()),
+        Err(_) => match std::fs::symlink_metadata(symlink) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => anyhow::bail!("stat {}: {e}", symlink.display()),
+            Ok(_) => "is not a symlink".to_string(),
+        },
+    };
+    anyhow::bail!(
+        "refusing to replace {}, which {held}: it names no {release_type} release version, so \
+         {target} may be older; pass --allow-downgrade to replace it on purpose",
+        symlink.display()
+    )
 }
 
 /// Refuse to replace `installed` with the older `target` unless
@@ -491,9 +526,9 @@ pub struct Installed {
 /// `symlink` to it. Shared by `qclient update` and `node install`/`update`.
 /// Install paths require root.
 ///
-/// Refuses a `version` older than the one `symlink` points to unless
-/// `allow_downgrade`, and leaves an already linked, verified release as it
-/// is.
+/// Refuses a `version` older than the one `symlink` points to, or to
+/// replace a `symlink` naming no release version, unless `allow_downgrade`,
+/// and leaves an already linked, verified release as it is.
 pub async fn download_and_install(
     release_type: &str,
     version: &str,
@@ -503,6 +538,7 @@ pub async fn download_and_install(
     let base = release_filename(release_type, version)?;
     let installed = linked_version(symlink, release_type);
     check_downgrade(installed.as_deref(), version, allow_downgrade)?;
+    check_unversioned_link(symlink, release_type, version, allow_downgrade)?;
     let dest_dir = Path::new(system::BINARY_PATH)
         .join(release_type)
         .join(version);
@@ -968,5 +1004,52 @@ mod tests {
             result.is_err() && !dest.join(BASE).exists(),
             "older signed release node-2.1.0.24 installed as {BASE}: {result:?}"
         );
+    }
+
+    /// A link to a binary whose version qclient cannot read (an operator's
+    /// own build, a copied file) is not replaced without the flag; a link
+    /// chain ending at a release file compares by that file's version.
+    #[cfg(unix)]
+    #[test]
+    fn unversioned_link_needs_the_flag() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (bin, opt) = (tmp.path().join("bin"), tmp.path().join("opt"));
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&opt).unwrap();
+        let link = bin.join("quilibrium-node");
+        // A fresh install.
+        check_unversioned_link(&link, "node", "2.1.0.24", false).unwrap();
+
+        let own = opt.join("quil-node");
+        std::fs::write(&own, b"bin").unwrap();
+        symlink(&own, &link).unwrap();
+        let err = check_unversioned_link(&link, "node", "2.1.0.24", false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("quil-node") && err.contains("--allow-downgrade"),
+            "{err}"
+        );
+        check_unversioned_link(&link, "node", "2.1.0.24", true).unwrap();
+
+        let copied = bin.join("qclient");
+        std::fs::write(&copied, b"bin").unwrap();
+        let err = check_unversioned_link(&copied, "qclient", "2.1.0.23", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not a symlink"), "{err}");
+
+        // bin/quilibrium-node -> opt/quilibrium-node -> opt/node-2.1.0.25-*
+        let release = opt.join("node-2.1.0.25-linux-amd64");
+        std::fs::write(&release, b"bin").unwrap();
+        let own_link = opt.join("quilibrium-node");
+        symlink(&release, &own_link).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        symlink(&own_link, &link).unwrap();
+        assert_eq!(linked_version(&link, "node").as_deref(), Some("2.1.0.25"));
+        check_unversioned_link(&link, "node", "2.1.0.24", false).unwrap();
+        let installed = linked_version(&link, "node");
+        assert!(check_downgrade(installed.as_deref(), "2.1.0.24", false).is_err());
     }
 }
