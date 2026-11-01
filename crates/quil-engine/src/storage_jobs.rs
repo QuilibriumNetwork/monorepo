@@ -25,13 +25,21 @@
 //! 54-minute grace); smallest first, the seats with small leaves register.
 //!
 //! Work done ahead of when it is needed ([`reserve_ahead`]) gives its memory
-//! back while work due now waits for memory ([`Reservation::yield_requested`],
-//! looked at every few milliseconds of its labelling): a renewal's snapshot
-//! waited 40 minutes behind one leaf labelled ahead (2026-10-28). It asks for
-//! its memory again at once, behind the work due now, and starts again as
-//! soon as it fits beside it: waiting instead until no work due now had held
-//! memory for a minute, it waited through every seat's snapshot, whose
-//! labelling takes most of an hour, while the memory was there (2026-11-01).
+//! back while more urgent work waits for memory that it holds
+//! ([`Reservation::yield_requested`], looked at every few milliseconds of its
+//! labelling): a renewal's snapshot waited 40 minutes behind one leaf
+//! labelled ahead (2026-10-28). Only as much of it as that work lacks is
+//! asked to, the least advanced first: asking all of it whenever any work due
+//! now waited gave up 13 leaves' labelling, about 7,800 core-seconds, for
+//! epoch proof parts of a few GB each (2026-11-01). Work ahead waits in its
+//! own order ([`AheadOrder`]): leaves that cannot be labelled within their
+//! renewal's grace first, a seat's together, those of seats needing fewer
+//! first, so the memory finishes whole seats; leaves that can fill what is
+//! left, and give it back to those. Work that gave its memory back asks for
+//! it again at once, in its place, and starts again as soon as it fits:
+//! waiting instead until no work due now had held memory for a minute, it
+//! waited through every seat's snapshot while the memory was there
+//! (2026-11-01).
 //!
 //! A stopping node stops its jobs ([`shut_down`]) before it exits: they use
 //! its stores, which exit tears down under a thread still using them.
@@ -300,13 +308,51 @@ pub fn reserve_until(bytes: u64, expired: &dyn Fn() -> bool) -> Option<Reservati
 
 /// Reserve `bytes` for work done ahead of when it is needed (labelling a
 /// later epoch's leaves, `crate::storage_labels`): like [`reserve`], behind
-/// every reservation asked for work due now, whenever asked. Once granted,
-/// the work gives the memory back while work due now waits for memory
-/// ([`Reservation::yield_requested`]), so a renewal's snapshot never waits
-/// for it for long. `None` once `expired` says the work is of no use any
-/// more while it waits ([`reserve_until`]).
-pub fn reserve_ahead(bytes: u64, expired: &dyn Fn() -> bool) -> Option<Reservation> {
-    admission().reserve_until(bytes, Urgency::Ahead, expired)
+/// every reservation asked for work due now, whenever asked, and among work
+/// ahead in its `order`. Once granted, the work gives the memory back while
+/// more urgent work waits for it ([`Reservation::yield_requested`]), so a
+/// renewal's snapshot never waits for it for long. `None` once `expired`
+/// says the work is of no use any more while it waits ([`reserve_until`]).
+pub fn reserve_ahead(
+    bytes: u64,
+    order: AheadOrder,
+    expired: &dyn Fn() -> bool,
+) -> Option<Reservation> {
+    admission().reserve_ordered(bytes, Urgency::Ahead, Some(order), true, expired)
+}
+
+/// [`reserve_ahead`] for work that holds its memory briefly and is never
+/// asked to give it back (reading a leaf's data).
+pub fn reserve_ahead_brief(
+    bytes: u64,
+    order: AheadOrder,
+    expired: &dyn Fn() -> bool,
+) -> Option<Reservation> {
+    admission().reserve_ordered(bytes, Urgency::Ahead, Some(order), false, expired)
+}
+
+/// A place for a seat's work ahead ([`AheadOrder::seat`]): seats asking
+/// later go later.
+pub fn ahead_place() -> u64 {
+    admission().next_ticket()
+}
+
+/// Where work ahead waits among other work ahead ([`reserve_ahead`]), first
+/// lowest, and which work ahead gives its memory back to which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AheadOrder {
+    /// Whether the work could also be done when it is needed (a leaf its
+    /// snapshot labels within the renewal's grace): such work goes after all
+    /// that could not, and gives its memory back to it while that waits.
+    pub deferrable: bool,
+    /// How many leaves of its seat could not: seats needing fewer go first,
+    /// so the memory finishes whole seats.
+    pub seat_leaves: u32,
+    /// Its seat's place ([`ahead_place`]): a seat's leaves go together, in
+    /// the order the seats asked.
+    pub seat: u64,
+    /// Its leaf's place in its seat.
+    pub leaf: u64,
 }
 
 /// Reserve `bytes` for a storage settlement's work (its held replicas, or
@@ -477,7 +523,7 @@ fn available_memory() -> Option<u64> {
 pub struct Reservation {
     admission: &'static Admission,
     bytes: u64,
-    urgency: Urgency,
+    ticket: u64,
 }
 
 impl Reservation {
@@ -490,6 +536,9 @@ impl Reservation {
             .saturating_sub(self.bytes)
             .saturating_add(bytes);
         self.bytes = bytes;
+        if let Some(yielding) = state.yielding.get_mut(&self.ticket) {
+            yielding.bytes = bytes;
+        }
         state.stale = true;
         drop(state);
         self.admission.changed.notify_all();
@@ -497,10 +546,25 @@ impl Reservation {
 
     /// Whether work ahead holding this reservation ([`reserve_ahead`])
     /// should give it back, dropping it, and ask for it again, granted once
-    /// it fits beside the work due now: a reservation for work due now waits
-    /// for memory. Never for work due now.
+    /// it fits: more urgent work waits for memory this holds
+    /// ([`Admission::ask_yields`]). Never for work due now, nor for a brief
+    /// reservation ([`reserve_ahead_brief`]).
     pub fn yield_requested(&self) -> bool {
-        self.urgency == Urgency::Ahead && self.admission.state().due_waiting > 0
+        self.admission
+            .state()
+            .yielding
+            .get(&self.ticket)
+            .is_some_and(|yielding| yielding.asked)
+    }
+
+    /// Note that the work holding this reservation has done `done` of `of`
+    /// parts: of work asked to give memory back, the least advanced is asked
+    /// first, losing the least.
+    pub fn progress(&self, done: u64, of: u64) {
+        let millionths = u128::from(done.min(of)) * 1_000_000 / u128::from(of.max(1));
+        if let Some(yielding) = self.admission.state().yielding.get_mut(&self.ticket) {
+            yielding.millionths = millionths as u32;
+        }
     }
 }
 
@@ -509,6 +573,7 @@ impl Drop for Reservation {
         let mut state = self.admission.state();
         state.reserved = state.reserved.saturating_sub(self.bytes);
         state.holders = state.holders.saturating_sub(1);
+        state.yielding.remove(&self.ticket);
         state.stale = true;
         drop(state);
         self.admission.changed.notify_all();
@@ -516,8 +581,8 @@ impl Drop for Reservation {
 }
 
 /// Grants the jobs' reservations ([`reserve`]): those for work due now
-/// smallest first, then those for work ahead in the order asked, each once
-/// it fits ([`Admission::admit_waiting`]).
+/// smallest first, then those for work ahead in their order
+/// ([`AheadOrder`]), each once it fits ([`Admission::admit_waiting`]).
 pub struct Admission {
     state: Mutex<State>,
     /// [`PASS_WINDOW`], shorter in tests.
@@ -535,11 +600,9 @@ struct State {
     reserved: u64,
     /// Reservations held.
     holders: usize,
-    /// Tickets of the reservations waiting, with their urgency and bytes, in
-    /// the order looked at ([`Admission::admit_waiting`]): those due now
-    /// smallest first, then in the order asked, then those ahead in the order
-    /// asked.
-    waiting: VecDeque<(u64, Urgency, u64)>,
+    /// The reservations waiting, in the order looked at
+    /// ([`Admission::admit_waiting`], [`Waiting::place`]).
+    waiting: VecDeque<Waiting>,
     next_ticket: u64,
     /// Memory available when the last reservation granted to no others was,
     /// raised to what is available beside the ones held whenever that is
@@ -551,10 +614,9 @@ struct State {
     looks: VecDeque<(Instant, u64)>,
     /// The latest look at the memory beside reservations held.
     last_look: Option<Look>,
-    /// Reservations for work due now waiting, once they found they do not
-    /// fit or are not first in line: what work ahead gives its memory back
-    /// for ([`Reservation::yield_requested`]).
-    due_waiting: usize,
+    /// Reservations held for work ahead that gives its memory back when
+    /// asked ([`Reservation::yield_requested`]), by ticket.
+    yielding: HashMap<u64, Yielding>,
     /// Tickets granted by a pass over the waiting reservations
     /// ([`Admission::admit_waiting`]) that their jobs have not taken up yet:
     /// counted as held.
@@ -566,6 +628,40 @@ struct State {
     stale: bool,
     /// When the last pass was.
     last_pass: Option<Instant>,
+}
+
+/// A reservation waiting ([`State::waiting`]).
+#[derive(Debug, Clone, Copy)]
+struct Waiting {
+    ticket: u64,
+    urgency: Urgency,
+    bytes: u64,
+    /// Its place in line, first lowest: work due now smallest first, those
+    /// of one size in the order asked; then work ahead in its order
+    /// ([`AheadOrder`]), in the order asked within one.
+    place: (u8, u64, u64, u64, u64),
+    /// Whether, granted, it gives its memory back when asked.
+    yields: bool,
+}
+
+impl Waiting {
+    /// How urgent it is, most first: work due now, work ahead that could not
+    /// be done when needed, work ahead that could.
+    fn rank(&self) -> u8 {
+        self.place.0
+    }
+}
+
+/// A reservation held for work ahead that gives its memory back when asked
+/// ([`State::yielding`]).
+#[derive(Debug, Clone, Copy)]
+struct Yielding {
+    rank: u8,
+    bytes: u64,
+    /// Its work's progress ([`Reservation::progress`]), in millionths.
+    millionths: u32,
+    /// Whether it was asked to give its memory back.
+    asked: bool,
 }
 
 /// How a waiting reservation was passed by later ones that fit while it did
@@ -610,7 +706,8 @@ impl Admission {
         self.reserve_with(bytes, Urgency::Due)
     }
 
-    /// Reserve `bytes` for work of `urgency` ([`reserve`], [`reserve_ahead`]).
+    /// Reserve `bytes` for work of `urgency` ([`reserve`], [`reserve_ahead`]):
+    /// work ahead in the order asked, giving its memory back when asked.
     pub fn reserve_with(&'static self, bytes: u64, urgency: Urgency) -> Reservation {
         let Some(reservation) = self.reserve_until(bytes, urgency, &|| false) else {
             unreachable!("a reservation whose work never expires does not leave the queue")
@@ -620,11 +717,33 @@ impl Admission {
 
     /// Reserve `bytes` for work of `urgency`, or `None` once `expired` says
     /// its work is of no use any more while it waits, looked at whenever it
-    /// looks at the memory again ([`reserve_until`]).
+    /// looks at the memory again ([`reserve_until`]): work ahead in the
+    /// order asked, giving its memory back when asked.
     pub fn reserve_until(
         &'static self,
         bytes: u64,
         urgency: Urgency,
+        expired: &dyn Fn() -> bool,
+    ) -> Option<Reservation> {
+        self.reserve_ordered(bytes, urgency, None, true, expired)
+    }
+
+    /// A ticket: the order reservations and seats ([`ahead_place`]) asked.
+    fn next_ticket(&self) -> u64 {
+        let mut state = self.state();
+        let ticket = state.next_ticket;
+        state.next_ticket += 1;
+        ticket
+    }
+
+    /// [`Self::reserve_until`], work ahead waiting in `order` (the order
+    /// asked if none) and giving its memory back when asked if it `yields`.
+    pub fn reserve_ordered(
+        &'static self,
+        bytes: u64,
+        urgency: Urgency,
+        order: Option<AheadOrder>,
+        yields: bool,
         expired: &dyn Fn() -> bool,
     ) -> Option<Reservation> {
         let mut state = self.state();
@@ -632,24 +751,45 @@ impl Admission {
         state.next_ticket += 1;
         // Work due now goes before every reservation for work ahead, and
         // before larger ones for work due now: the shortest ends first.
-        let position = match urgency {
-            Urgency::Due => state
-                .waiting
-                .iter()
-                .position(|&(_, waiting, asked)| waiting == Urgency::Ahead || asked > bytes)
-                .unwrap_or(state.waiting.len()),
-            Urgency::Ahead => state.waiting.len(),
+        let place = match urgency {
+            Urgency::Due => (0, bytes, ticket, 0, 0),
+            Urgency::Ahead => {
+                let order = order.unwrap_or(AheadOrder {
+                    deferrable: false,
+                    seat_leaves: 0,
+                    seat: ticket,
+                    leaf: 0,
+                });
+                (
+                    1 + u8::from(order.deferrable),
+                    u64::from(order.seat_leaves),
+                    order.seat,
+                    order.leaf,
+                    ticket,
+                )
+            }
         };
-        state.waiting.insert(position, (ticket, urgency, bytes));
+        let position = state
+            .waiting
+            .iter()
+            .position(|waiting| waiting.place > place)
+            .unwrap_or(state.waiting.len());
+        state.waiting.insert(
+            position,
+            Waiting {
+                ticket,
+                urgency,
+                bytes,
+                place,
+                yields: yields && urgency == Urgency::Ahead,
+            },
+        );
         state.stale = true;
         let started = Instant::now();
         let mut waited = false;
         while !self.take_grant(&mut state, ticket) {
             if !waited {
                 waited = true;
-                if urgency == Urgency::Due {
-                    state.due_waiting += 1;
-                }
                 let look = state.last_look;
                 info!(
                     bytes,
@@ -662,7 +802,7 @@ impl Admission {
                     ahead = state
                         .waiting
                         .iter()
-                        .position(|&(waiting, _, _)| waiting == ticket)
+                        .position(|waiting| waiting.ticket == ticket)
                         .unwrap_or(0),
                     due = urgency == Urgency::Due,
                     "storage job waits for memory"
@@ -682,9 +822,6 @@ impl Admission {
                 return None;
             }
         }
-        if urgency == Urgency::Due && waited {
-            state.due_waiting = state.due_waiting.saturating_sub(1);
-        }
         let jobs = state.holders;
         drop(state);
         if waited {
@@ -701,7 +838,7 @@ impl Admission {
         Some(Reservation {
             admission: self,
             bytes,
-            urgency,
+            ticket,
         })
     }
 
@@ -724,28 +861,57 @@ impl Admission {
     /// that do pass it, except that
     /// - work ahead never passes work due now: granted, it would be asked to
     ///   give its memory back at once ([`Reservation::yield_requested`]);
-    /// - nothing passes one passed [`PASS_LIMIT`] times, or first passed
-    ///   [`PASS_WINDOW`] ago. It holds its place until it fits beside the
-    ///   jobs holding memory, at the latest once they end and it runs alone.
+    /// - work ahead that could be done when needed passes work ahead that
+    ///   could not only while none is asked to give memory back to it, and
+    ///   counts as no pass of it: it fills the memory the other cannot use,
+    ///   and gives it back once the other would fit;
+    /// - nothing of its rank passes one passed [`PASS_LIMIT`] times by its
+    ///   rank, or first passed [`PASS_WINDOW`] ago. It holds its place until
+    ///   it fits beside the jobs holding memory, at the latest once they end
+    ///   and it runs alone.
+    ///
+    /// Then asks work ahead holding memory to give it back, as much as the
+    /// first in line lack ([`Self::ask_yields`]).
     fn admit_waiting(&self, state: &mut State) {
         state.stale = false;
         state.last_pass = Some(Instant::now());
-        let mut skipped: Vec<u64> = Vec::new();
-        let mut due_skipped = false;
+        self.ask_yields(state);
+        let asked = state.yielding.values().any(|yielding| yielding.asked);
+        let mut skipped: Vec<(u64, u8)> = Vec::new();
+        // The rank of one holding its place: nothing of its rank passes it.
+        let mut holding: Option<u8> = None;
         let mut granted = false;
         let mut index = 0;
         while index < state.waiting.len() && state.holders < self.slots {
-            let (ticket, urgency, bytes) = state.waiting[index];
-            if urgency == Urgency::Ahead && due_skipped {
+            let waiting = state.waiting[index];
+            let rank = waiting.rank();
+            let most_urgent_skipped = skipped.iter().map(|&(_, rank)| rank).min();
+            if most_urgent_skipped.is_some_and(|skipped| skipped < rank && (skipped == 0 || asked))
+            {
                 break;
             }
-            if self.fits(state, bytes) {
+            if holding == Some(rank) {
+                index += 1;
+                continue;
+            }
+            if self.fits(state, waiting.bytes) {
                 state.waiting.remove(index);
-                state.reserved = state.reserved.saturating_add(bytes);
+                state.reserved = state.reserved.saturating_add(waiting.bytes);
                 state.holders += 1;
-                state.granted.insert(ticket);
+                state.granted.insert(waiting.ticket);
+                if waiting.yields {
+                    state.yielding.insert(
+                        waiting.ticket,
+                        Yielding {
+                            rank,
+                            bytes: waiting.bytes,
+                            millionths: 0,
+                            asked: false,
+                        },
+                    );
+                }
                 let now = Instant::now();
-                for &passed in &skipped {
+                for &(passed, _) in skipped.iter().filter(|&&(_, skipped)| skipped == rank) {
                     let entry = state.passed.entry(passed).or_insert(Passed {
                         times: 0,
                         first: now,
@@ -756,16 +922,109 @@ impl Admission {
                 granted = true;
                 continue;
             }
-            if self.holds_place(state, ticket, urgency, bytes) {
-                break;
+            if self.holds_place(state, waiting.ticket, waiting.urgency, waiting.bytes) {
+                holding = Some(rank);
             }
-            skipped.push(ticket);
-            due_skipped |= urgency == Urgency::Due;
+            skipped.push((waiting.ticket, rank));
             index += 1;
         }
         if granted {
+            self.ask_yields(state);
             self.changed.notify_all();
         }
+    }
+
+    /// Ask work ahead holding memory ([`State::yielding`]) less urgent than
+    /// the first in line to give it back, as much as those of that rank
+    /// lack: the least urgent first, of those the least advanced
+    /// ([`Reservation::progress`]), until as many of them as can fit would.
+    /// None when even all of it would not let the first fit (work due now
+    /// holds the rest): it would give its memory back for nothing.
+    fn ask_yields(&self, state: &mut State) {
+        let Some(head) = state.waiting.front().map(Waiting::rank) else {
+            return;
+        };
+        let mut candidates: Vec<(u64, Yielding)> = state
+            .yielding
+            .iter()
+            .filter(|(_, yielding)| yielding.rank > head)
+            .map(|(&ticket, &yielding)| (ticket, yielding))
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        // Those asked already first: they are leaving.
+        candidates.sort_by_key(|&(ticket, yielding)| {
+            (
+                !yielding.asked,
+                std::cmp::Reverse(yielding.rank),
+                yielding.millionths,
+                std::cmp::Reverse(ticket),
+            )
+        });
+        let wanted: Vec<u64> = state
+            .waiting
+            .iter()
+            .take_while(|waiting| waiting.rank() == head)
+            .map(|waiting| waiting.bytes)
+            .collect();
+        let share = self.share(state);
+        let (holders, reserved, slots) = (state.holders, state.reserved, self.slots);
+        // Whether the first `count` wanted fit once `freed` bytes of `jobs`
+        // holders are given back.
+        let fit = |jobs: usize, freed: u64, count: usize| {
+            let wanted = wanted[..count]
+                .iter()
+                .fold(0u128, |sum, &b| sum + u128::from(b));
+            let holders = holders.saturating_sub(jobs);
+            let reserved = u128::from(reserved.saturating_sub(freed));
+            if holders == 0 {
+                return count == 1
+                    || (count <= slots && share.is_some_and(|share| wanted <= u128::from(share)));
+            }
+            holders + count <= slots
+                && share.is_some_and(|share| reserved + wanted <= u128::from(share))
+        };
+        let all = candidates.iter().map(|(_, yielding)| yielding.bytes).sum();
+        let Some(count) = (1..=wanted.len())
+            .rev()
+            .find(|&count| fit(candidates.len(), all, count))
+        else {
+            return;
+        };
+        let (mut jobs, mut freed) = (0, 0u64);
+        let mut newly: Vec<u64> = Vec::new();
+        for &(ticket, yielding) in &candidates {
+            if fit(jobs, freed, count) {
+                break;
+            }
+            jobs += 1;
+            freed = freed.saturating_add(yielding.bytes);
+            if !yielding.asked {
+                newly.push(ticket);
+            }
+        }
+        if newly.is_empty() {
+            return;
+        }
+        let mut bytes = 0u64;
+        for ticket in &newly {
+            if let Some(yielding) = state.yielding.get_mut(ticket) {
+                yielding.asked = true;
+                bytes = bytes.saturating_add(yielding.bytes);
+            }
+        }
+        info!(
+            asked = newly.len(),
+            bytes,
+            holding = candidates.len(),
+            waiting = count,
+            waiting_bytes = wanted[..count].iter().fold(0u64, |sum, &b| sum.saturating_add(b)),
+            due = head == 0,
+            reserved,
+            share,
+            "storage jobs ahead asked to give their memory back: more urgent work waits for              it; the least advanced go first, only as many as it lacks, and each asks for its              memory again at once in its place: an expected wait"
+        );
     }
 
     /// Whether the waiting reservation `ticket`, which does not fit, holds
@@ -808,17 +1067,18 @@ impl Admission {
         bytes: u64,
         started: Instant,
     ) {
-        if let Some(index) = state.waiting.iter().position(|&(t, _, _)| t == ticket) {
+        if let Some(index) = state
+            .waiting
+            .iter()
+            .position(|waiting| waiting.ticket == ticket)
+        {
             state.waiting.remove(index);
         } else if state.granted.remove(&ticket) {
             state.reserved = state.reserved.saturating_sub(bytes);
             state.holders = state.holders.saturating_sub(1);
+            state.yielding.remove(&ticket);
         }
         state.passed.remove(&ticket);
-        if urgency == Urgency::Due {
-            // It waited: its window is looked at only after a wait.
-            state.due_waiting = state.due_waiting.saturating_sub(1);
-        }
         state.stale = true;
         let (waiting, jobs) = (state.waiting.len(), state.holders);
         drop(state);
@@ -838,6 +1098,8 @@ impl Admission {
     /// Reserve `bytes` for a settlement ([`reserve_settlement`]).
     pub fn reserve_settlement(&'static self, bytes: u64) -> Reservation {
         let mut state = self.state();
+        let ticket = state.next_ticket;
+        state.next_ticket += 1;
         let now = (self.available)();
         let headroom =
             now.map(|now| u128::from(now) * u128::from(100 - MEMORY_SHARE_PERCENT) / 100);
@@ -855,7 +1117,7 @@ impl Admission {
         Reservation {
             admission: self,
             bytes,
-            urgency: Urgency::Due,
+            ticket,
         }
     }
 
@@ -891,9 +1153,16 @@ impl Admission {
         if state.holders >= self.slots {
             return false;
         }
-        let Some(available) = (self.available)() else {
-            return false;
-        };
+        self.share(state).is_some_and(|share| {
+            u128::from(state.reserved) + u128::from(bytes) <= u128::from(share)
+        })
+    }
+
+    /// The jobs' share beside reservations held ([`Self::fits`]), looked at
+    /// now; `None` when the memory available cannot be told.
+    fn share(&self, state: &mut State) -> Option<u64> {
+        let now = Instant::now();
+        let available = (self.available)()?;
         let idle = state
             .idle_available
             .map_or(available, |idle| idle.max(available));
@@ -915,13 +1184,14 @@ impl Admission {
         let window_low = state.looks.front().map_or(bound, |&(_, low)| low);
         let could = idle.min(window_low).max(available);
         let share = u128::from(could) * u128::from(MEMORY_SHARE_PERCENT) / 100;
+        let share = u64::try_from(share).unwrap_or(u64::MAX);
         state.last_look = Some(Look {
             available,
             idle_available: idle,
             window_low,
-            share: u64::try_from(share).unwrap_or(u64::MAX),
+            share,
         });
-        u128::from(state.reserved) + u128::from(bytes) <= share
+        Some(share)
     }
 }
 
@@ -1061,7 +1331,7 @@ mod tests {
                 .state()
                 .waiting
                 .iter()
-                .map(|&(_, urgency, _)| urgency)
+                .map(|waiting| waiting.urgency)
                 .collect::<Vec<_>>(),
             vec![Urgency::Due, Urgency::Ahead, Urgency::Ahead],
             "the due reservation waits first in line"
@@ -1105,6 +1375,261 @@ mod tests {
         assert!(!next.yield_requested(), "nothing due waits any more");
         drop(small.release);
         drop(due.release);
+    }
+
+    fn ahead(deferrable: bool, seat: u64, leaf: u64) -> AheadOrder {
+        AheadOrder {
+            deferrable,
+            seat_leaves: 1,
+            seat,
+            leaf,
+        }
+    }
+
+    /// Reserve `bytes` for work ahead in `order` on this thread: it fits now.
+    fn reserve_now(admission: &'static Admission, bytes: u64, order: AheadOrder) -> Reservation {
+        admission
+            .reserve_ordered(bytes, Urgency::Ahead, Some(order), true, &|| false)
+            .expect("a reservation that never expires")
+    }
+
+    /// Work ahead in `order` holding `bytes` on a thread of its own, giving
+    /// them back once asked to ([`Reservation::yield_requested`]): `yielded`
+    /// hears when it does.
+    struct Yielder {
+        granted: mpsc::Receiver<()>,
+        yielded: mpsc::Receiver<()>,
+        release: mpsc::Sender<()>,
+    }
+
+    fn hold_yielding(admission: &'static Admission, bytes: u64, order: AheadOrder) -> Yielder {
+        let (granted_tx, granted) = mpsc::channel();
+        let (yielded_tx, yielded) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let reservation = admission
+                .reserve_ordered(bytes, Urgency::Ahead, Some(order), true, &|| false)
+                .unwrap();
+            granted_tx.send(()).unwrap();
+            loop {
+                if reservation.yield_requested() {
+                    drop(reservation);
+                    let _ = yielded_tx.send(());
+                    return;
+                }
+                match released.recv_timeout(Duration::from_millis(5)) {
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    _ => return,
+                }
+            }
+        });
+        Yielder {
+            granted,
+            yielded,
+            release,
+        }
+    }
+
+    /// Work due now waiting for memory asks only as much work ahead to give
+    /// its memory back as it lacks, the least advanced first, and none while
+    /// even all of it would not let the work fit (2026-11-01: every leaf
+    /// labelled ahead gave its memory back whenever any work due now waited,
+    /// 13 of them for epoch proof parts of a few GB).
+    #[test]
+    fn work_due_now_asks_only_the_least_advanced_work_ahead_it_needs_to_yield() {
+        // 40 GiB available: the jobs share 30.
+        let (admission, _) = admission(8, 40 * GIB);
+        let [a, b, c] =
+            [0, 1, 2].map(|leaf| reserve_now(admission, 10 * GIB, ahead(false, 1, leaf)));
+        a.progress(5, 10);
+        b.progress(1, 10);
+        c.progress(9, 10);
+        let due = hold(admission, 5 * GIB);
+        until_waiting(admission, 1);
+        let deadline = Instant::now() + SOON;
+        while !b.yield_requested() {
+            assert!(
+                Instant::now() < deadline,
+                "the least advanced is asked to yield"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !a.yield_requested() && !c.yield_requested(),
+            "35 GiB less one of 10 fit in 30: only one is asked"
+        );
+        drop(b);
+        assert!(
+            granted(&due),
+            "it runs once the one asked gives its memory back"
+        );
+        // 25 GiB held, 5 of them due now: 31 do not fit even once the work
+        // ahead gives all of its memory back.
+        let large = hold(admission, 26 * GIB);
+        until_waiting(admission, 1);
+        assert!(still_waiting(&large));
+        assert!(
+            !a.yield_requested() && !c.yield_requested(),
+            "work ahead is not asked to yield for nothing"
+        );
+        drop(due.release);
+        let deadline = Instant::now() + SOON;
+        while !(a.yield_requested() && c.yield_requested()) {
+            assert!(
+                Instant::now() < deadline,
+                "alone it fits once all of it yields"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop((a, c));
+        assert!(granted(&large));
+        drop(large.release);
+    }
+
+    /// Work ahead that gave its memory back asks for it again in its place
+    /// in line, not behind work ahead asked for after it.
+    #[test]
+    fn work_ahead_that_yielded_keeps_its_place_in_line() {
+        let (admission, _) = admission(8, 40 * GIB);
+        let first = reserve_now(admission, 15 * GIB, ahead(false, 1, 0));
+        let other = reserve_now(admission, 15 * GIB, ahead(false, 3, 0));
+        other.progress(9, 10);
+        let (later_tx, later) = mpsc::channel();
+        std::thread::spawn(move || {
+            let reservation = admission
+                .reserve_ordered(
+                    15 * GIB,
+                    Urgency::Ahead,
+                    Some(ahead(false, 4, 0)),
+                    true,
+                    &|| false,
+                )
+                .unwrap();
+            later_tx.send(()).unwrap();
+            drop(reservation);
+        });
+        until_waiting(admission, 1);
+        let due = hold(admission, 5 * GIB);
+        until_waiting(admission, 2);
+        let deadline = Instant::now() + SOON;
+        while !first.yield_requested() {
+            assert!(
+                Instant::now() < deadline,
+                "the least advanced is asked to yield"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!other.yield_requested());
+        drop(first);
+        assert!(granted(&due));
+        // It asks again for its memory at once, as labelling ahead does.
+        let again = hold_yielding(admission, 15 * GIB, ahead(false, 1, 0));
+        until_waiting(admission, 2);
+        assert_eq!(
+            admission
+                .state()
+                .waiting
+                .front()
+                .map(|waiting| waiting.place.2),
+            Some(1),
+            "it waits before work ahead asked for after it"
+        );
+        drop(other);
+        assert!(again.granted.recv_timeout(SOON).is_ok(), "20 GiB fit in 30");
+        assert!(
+            later.recv_timeout(NOT_YET).is_err(),
+            "35 GiB do not: the one asked for later waits"
+        );
+        drop(again.release);
+        drop(due.release);
+        assert!(later.recv_timeout(SOON).is_ok());
+    }
+
+    /// Work ahead waits in its order whenever asked: what could not be done
+    /// when needed first, a seat's together, seats needing fewer first.
+    #[test]
+    fn work_ahead_waits_in_its_order() {
+        let (admission, _) = admission(8, 40 * GIB);
+        let first = reserve_now(admission, 20 * GIB, ahead(false, 1, 0));
+        let orders = [
+            ahead(true, 1, 0),
+            AheadOrder {
+                seat_leaves: 2,
+                ..ahead(false, 2, 0)
+            },
+            ahead(false, 3, 1),
+            ahead(false, 3, 0),
+        ];
+        let (tx, rx) = mpsc::channel();
+        for (index, order) in orders.into_iter().enumerate() {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let reservation =
+                    admission
+                        .reserve_ordered(40 * GIB, Urgency::Ahead, Some(order), true, &|| false);
+                let _ = tx.send(index);
+                drop(reservation);
+            });
+            until_waiting(admission, index + 1);
+        }
+        let places: Vec<_> = admission
+            .state()
+            .waiting
+            .iter()
+            .map(|waiting| {
+                (
+                    waiting.place.0,
+                    waiting.place.1,
+                    waiting.place.2,
+                    waiting.place.3,
+                )
+            })
+            .collect();
+        assert_eq!(
+            places,
+            vec![(1, 1, 3, 0), (1, 1, 3, 1), (1, 2, 2, 0), (2, 1, 1, 0)],
+            "work that could not wait first, a seat's together, seats needing fewer first"
+        );
+        drop(rx);
+        drop(first);
+    }
+
+    /// Work ahead that could be done when needed passes work ahead that
+    /// could not when only it fits, and gives its memory back once that
+    /// would fit.
+    #[test]
+    fn work_ahead_that_could_wait_fills_what_is_left_and_gives_it_back() {
+        let (admission, _) = admission(8, 40 * GIB);
+        let first = reserve_now(admission, 20 * GIB, ahead(false, 1, 0));
+        let (large_tx, large) = mpsc::channel();
+        std::thread::spawn(move || {
+            let reservation = admission
+                .reserve_ordered(
+                    25 * GIB,
+                    Urgency::Ahead,
+                    Some(ahead(false, 2, 0)),
+                    true,
+                    &|| false,
+                )
+                .unwrap();
+            large_tx.send(()).unwrap();
+            std::thread::sleep(NOT_YET);
+            drop(reservation);
+        });
+        until_waiting(admission, 1);
+        let small = hold_yielding(admission, 8 * GIB, ahead(true, 3, 0));
+        assert!(
+            small.granted.recv_timeout(SOON).is_ok(),
+            "28 GiB fit in 30, and yielding would not let the large one fit beside the first"
+        );
+        assert!(small.yielded.recv_timeout(NOT_YET).is_err());
+        drop(first);
+        assert!(
+            small.yielded.recv_timeout(SOON).is_ok(),
+            "33 GiB do not fit in 30: the small one gives its memory back"
+        );
+        assert!(large.recv_timeout(SOON).is_ok());
+        drop(small.release);
     }
 
     #[test]
@@ -1163,7 +1688,7 @@ mod tests {
                 .state()
                 .waiting
                 .iter()
-                .map(|&(_, urgency, bytes)| (urgency, bytes / GIB))
+                .map(|waiting| (waiting.urgency, waiting.bytes / GIB))
                 .collect::<Vec<_>>(),
             vec![(Urgency::Due, 8), (Urgency::Ahead, 4), (Urgency::Ahead, 1)]
         );
@@ -1330,7 +1855,6 @@ mod tests {
             "it leaves the queue without memory"
         );
         assert!(granted(&ahead), "25 GiB fit in 30 once it left");
-        assert_eq!(admission.state().due_waiting, 0, "no work due now waits");
         assert_eq!(waiting(admission), 0);
         drop(first.release);
         drop(ahead.release);

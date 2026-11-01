@@ -423,8 +423,9 @@ pub enum LeafWork {
 pub enum LeafOutcome {
     /// Labelled or encoded to its end.
     Completed,
-    /// Labelling ahead gave its memory back to work due now, to label the
-    /// leaf again from its start once that work is done.
+    /// Labelling ahead gave its memory back to more urgent work, keeping
+    /// the whole layers it labelled, to go on from them once its memory fits
+    /// again.
     Yielded,
     /// Labelling ahead gave up: GLOBAL reached its epoch's snapshot frame.
     Expired,
@@ -491,6 +492,18 @@ fn misses_grace(epoch: u64, nodes: u64, frame: u64) -> Option<u64> {
     (label_estimate(nodes).as_millis() > u128::from(left) * frame_millis).then_some(left)
 }
 
+/// Whether a leaf of `nodes` nodes labelled from `epoch`'s snapshot frame
+/// would end by the renewal's grace frame by its estimate ([`misses_grace`]):
+/// one that would not registers only from labels computed ahead.
+pub(crate) fn labels_within_grace(epoch: u64, nodes: u64) -> bool {
+    misses_grace(
+        epoch,
+        nodes,
+        quil_types::consensus::storage_snapshot_frame(epoch),
+    )
+    .is_none()
+}
+
 /// A leaf being labelled or encoded.
 struct RunningLeaf {
     epoch: u64,
@@ -500,6 +513,9 @@ struct RunningLeaf {
     started: std::time::Instant,
     /// Its labelling's estimate; none when its labels were kept ahead.
     estimate: Option<std::time::Duration>,
+    /// Its layers labelled when it started, now, and of how many
+    /// ([`LeafProgress::layers`]); none when not reported.
+    layers: Option<(usize, usize, usize)>,
     /// Whether its start was logged, or it was reported running long: its
     /// end is logged then.
     logged: bool,
@@ -547,6 +563,47 @@ impl LeafProgress {
     pub fn end(mut self, outcome: LeafOutcome) {
         self.outcome = Some(outcome);
     }
+
+    /// Note that `done` of the leaf's `of` layers are labelled. The first
+    /// note says where its work starts (an attempt that gave up kept the
+    /// layers before), and its estimate counts only the layers left.
+    pub fn layers(&self, done: usize, of: usize) {
+        if let Some(leaf) = running_leaves().leaves.get_mut(&self.id) {
+            let from = match leaf.layers {
+                Some((from, _, _)) => from,
+                None => {
+                    leaf.estimate = leaf.estimate.map(|estimate| {
+                        estimate.mul_f64((of.saturating_sub(done)) as f64 / of.max(1) as f64)
+                    });
+                    done
+                }
+            };
+            leaf.layers = Some((from, done, of));
+        }
+    }
+}
+
+/// How long a leaf labelled ahead has still to run: at the pace of its
+/// layers labelled since it started, or by its estimate before its first.
+fn remaining_ahead(leaf: &RunningLeaf) -> std::time::Duration {
+    let elapsed = leaf.started.elapsed();
+    match leaf.layers {
+        Some((from, done, of)) if done > from => {
+            elapsed.mul_f64(of.saturating_sub(done) as f64 / (done - from) as f64)
+        }
+        _ => leaf.estimate.unwrap_or_default().saturating_sub(elapsed),
+    }
+}
+
+/// How long until GLOBAL reaches `epoch`'s snapshot frame, from which
+/// labelling ahead for it is of no use (`crate::storage_labels`); `None`
+/// while this process has seen no GLOBAL frame.
+fn until_snapshot_frame(epoch: u64) -> Option<std::time::Duration> {
+    let frame = global_frame()?;
+    let frames = quil_types::consensus::storage_snapshot_frame(epoch).saturating_sub(frame);
+    Some(std::time::Duration::from_millis(frames.saturating_mul(
+        quil_types::consensus::ideal_frame_time_ms_at(frame),
+    )))
 }
 
 /// Track `member`'s leaf `leaf_id` of shard `filter` for `epoch`, of `nodes`
@@ -579,6 +636,7 @@ pub fn leaf_started(
             work,
             started: std::time::Instant::now(),
             estimate,
+            layers: None,
             logged,
         },
     );
@@ -650,6 +708,8 @@ fn report_long_leaves() {
             nodes: u64,
             longest: std::time::Duration,
             estimate: Option<std::time::Duration>,
+            /// Of leaves labelled ahead, the most any has still to run.
+            remaining: std::time::Duration,
         }
         let mut seats: std::collections::BTreeMap<(u64, Vec<u8>, LeafWork), Seat> =
             Default::default();
@@ -678,6 +738,9 @@ fn report_long_leaves() {
                     seat.longest = elapsed;
                     seat.estimate = leaf.estimate;
                 }
+                if leaf.work == LeafWork::LabellingAhead {
+                    seat.remaining = seat.remaining.max(remaining_ahead(leaf));
+                }
             }
             let now = std::time::Instant::now();
             reported.retain(|_, at| at.elapsed() < LEAF_PROGRESS_INTERVAL * 2);
@@ -693,17 +756,34 @@ fn report_long_leaves() {
             let overrun = seat.estimate.is_some_and(|e| seat.longest > e);
             let grace_frame = quil_types::consensus::storage_snapshot_frame(epoch)
                 .saturating_add(crate::app_shard_metadata::storage_snapshot_grace());
+            // Labelling ahead runs past its estimate on a busy node without
+            // harm; it matters only once it would end past the snapshot
+            // frame, where it is given up.
+            let left = until_snapshot_frame(epoch);
+            let late = left.is_some_and(|left| seat.remaining > left);
+            let (remaining, left) = (
+                seat.remaining.as_secs() / 60,
+                left.map_or_else(
+                    || "unknown".to_string(),
+                    |left| (left.as_secs() / 60).to_string(),
+                ),
+            );
             match work {
-                LeafWork::LabellingAhead if !overrun => info!(epoch, filter = %filter,
+                LeafWork::LabellingAhead if !late => info!(epoch, filter = %filter,
                     leaves = seat.leaves, nodes = seat.nodes, longest_minutes = longest,
-                    estimated_minutes = %estimated, work = work.name(), scope = "local",
+                    estimated_minutes = %estimated, remaining_minutes = remaining,
+                    minutes_to_snapshot_frame = %left, work = work.name(), scope = "local",
                     "storage labels for a later epoch's snapshot still being computed ahead; \
                      nothing waits for them yet"),
                 LeafWork::LabellingAhead => warn!(epoch, filter = %filter,
                     leaves = seat.leaves, nodes = seat.nodes, longest_minutes = longest,
-                    estimated_minutes = %estimated, work = work.name(), scope = "local",
-                    action = "check this node's CPU load: the labelling runs past its estimate",
-                    "storage labels for a later epoch's snapshot still being computed ahead, past their estimate"),
+                    estimated_minutes = %estimated, remaining_minutes = remaining,
+                    minutes_to_snapshot_frame = %left, work = work.name(), scope = "local",
+                    action = "check this node's CPU load and how many large leaves it labels \
+                              at once: at its pace the labelling ends after the epoch's snapshot \
+                              frame, where it is given up, and a leaf its snapshot cannot label \
+                              within the renewal's grace then renews without a registration",
+                    "storage labels for a later epoch's snapshot would end past its snapshot frame"),
                 // Within its estimate (or with none, from labels kept
                 // ahead) this is the expected wait of a renewal.
                 _ if !overrun => info!(epoch, filter = %filter, leaves = seat.leaves,

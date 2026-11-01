@@ -786,3 +786,81 @@ fn labelling_stops_when_told_and_is_unchanged_otherwise() {
         "it stops at the first look that says so"
     );
 }
+
+/// Labelling resumed from the whole layers a stopped attempt handed on
+/// gives the leaf's labels, column digests and column commitment as
+/// labelling it at once does, handing on only the layers after them; one
+/// whose kept layers cannot be read gives nothing.
+#[test]
+fn labelling_resumed_from_kept_layers_is_the_leaf_labelled_at_once() {
+    use std::cell::Cell;
+    let n = STOP_CHECK_NODES as u64 + 7;
+    let key = b"resume-key";
+    let mut whole_layers = Vec::new();
+    let (last, columns) = label_leaf(n, key, &params(), &mut |_, layer| {
+        whole_layers.push(layer.to_vec())
+    });
+    let comm_c =
+        |columns: Vec<hash::Digest>| MerkleTree::from_digests(columns).commitment(Tree::Column);
+    let expected = comm_c(columns.clone());
+    // Stopped within the fourth layer: three whole layers handed on.
+    let looks = Cell::new(0usize);
+    let checks_per_layer = (n as usize).div_ceil(STOP_CHECK_NODES);
+    let mut kept = Vec::new();
+    let stopped = label_leaf_until(
+        n,
+        key,
+        &params(),
+        &mut |_, layer| kept.push(layer.to_vec()),
+        &|| {
+            looks.set(looks.get() + 1);
+            looks.get() > 3 * checks_per_layer + 1
+        },
+    );
+    assert!(stopped.is_none());
+    assert_eq!(kept.len(), 3);
+    for from in [kept.len(), 1, params().layers - 1, params().layers] {
+        let source = if from <= kept.len() {
+            &kept
+        } else {
+            &whole_layers
+        };
+        let mut read = Vec::new();
+        let mut handed = Vec::new();
+        let resumed = label_leaf_resume(
+            n,
+            key,
+            &params(),
+            from,
+            &mut |index, into| {
+                read.push(index);
+                into.copy_from_slice(&source[index]);
+                true
+            },
+            &mut |index, layer| {
+                assert_eq!(layer, whole_layers[index].as_slice(), "layer {index}");
+                handed.push(index);
+            },
+            &|| false,
+        );
+        let (resumed_last, resumed_columns) = resumed.expect("resumed to the end");
+        assert_eq!(resumed_last, last, "the last layer, from layer {from}");
+        assert_eq!(
+            resumed_columns, columns,
+            "the column digests, from layer {from}"
+        );
+        assert_eq!(comm_c(resumed_columns), expected);
+        assert_eq!(read, (0..from).collect::<Vec<_>>());
+        assert_eq!(handed, (from..params().layers).collect::<Vec<_>>());
+    }
+    let unreadable = label_leaf_resume(
+        n,
+        key,
+        &params(),
+        3,
+        &mut |index, _| index < 2,
+        &mut |_, _| panic!("no layer is labelled past an unreadable one"),
+        &|| false,
+    );
+    assert!(unreadable.is_none());
+}
