@@ -11,8 +11,11 @@
 //! - `D`: the leaf's canonical data, 30 bytes per node packed into 8 field
 //!   elements ([`data_nodes`]);
 //! - labels: the stacked depth-robust labelling over [`crate::sdr`]'s graph,
-//!   keyed by [`sdr::replica_key`]`(member, leaf_id, epoch)`;
-//! - `R = D + labels[L-1]` element-wise, unique to the member, leaf and epoch;
+//!   keyed by [`sdr::replica_key`]`(member, leaf_id, epoch)`, which from the
+//!   stable replica key epoch no longer depends on the epoch: a leaf's labels
+//!   then depend on the member, the leaf and its node count alone;
+//! - `R = D + labels[L-1]` element-wise, unique to the member and leaf (and,
+//!   before that epoch, the epoch);
 //! - `comm_D`, `comm_C`, `comm_R`: Merkle commitments over `D`, over the column
 //!   digests (each node's labels on every layer, chained) and over `R`. The
 //!   member registers all three.
@@ -23,7 +26,10 @@
 //! node's labels with the member's own key. A replica copied from another
 //! member, shared between identities or filled with cheap junk does not pass.
 //! Each frame a member then opens one beacon-chosen node of `R` per query,
-//! against its registered `comm_R`.
+//! against its registered `comm_R`. Both bind the epoch ([`seal_challenges`],
+//! [`opening_index`]): with a stable key an unchanged leaf registers the same
+//! commitments every epoch, and only the epoch and the beacon set one epoch's
+//! proofs apart from another's.
 //!
 //! A node serializes as 32 bytes ([`NODE_BYTES`]): its 8 elements as
 //! little-endian canonical `u32`s.

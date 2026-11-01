@@ -415,9 +415,12 @@ pub fn for_each_parallel<T: Sync, R: Send>(
     let failed = AtomicBool::new(false);
     let results: Mutex<Vec<Option<Result<R>>>> =
         Mutex::new((0..items.len()).map(|_| None).collect());
+    // A test's stable replica key epoch, for the work's threads too.
+    let stable_key = quil_types::consensus::stable_replica_key_epoch_thread_override();
     std::thread::scope(|scope| {
         for _ in 0..job_slots().min(items.len()) {
             scope.spawn(|| {
+                quil_types::consensus::set_stable_replica_key_epoch_for_thread(stable_key);
                 on_process_cpus();
                 loop {
                     let index = next.fetch_add(1, Ordering::Relaxed);

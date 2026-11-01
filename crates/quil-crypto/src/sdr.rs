@@ -3,7 +3,9 @@
 //!
 //! A leaf's public data is encoded into a member-unique replica
 //! `R = data ⊕ labels_L`, where `labels_L` is the final layer of a stacked
-//! depth-robust labeling keyed by `key = H(member_id ‖ shard ‖ epoch)`:
+//! depth-robust labeling keyed by `key = H(member_id ‖ shard ‖ epoch)`, or
+//! `H(member_id ‖ shard)` for a registration from the stable replica key
+//! epoch on ([`replica_key`]):
 //! - the graph (each node's parents) is **fixed** and key-independent — DRSample
 //! back-edges within a layer + a bipartite expander from the prior layer;
 //! - the labels are keyed, so two members get replicas that differ in every node
@@ -471,8 +473,24 @@ pub fn build_leaf_replica(
     (replica, leaf)
 }
 
-/// Derive a member's replica key from its identity, shard, and epoch.
+/// A member's replica key for its registration of a leaf (`shard_id`, the
+/// leaf id) for `epoch`. Before the stable replica key epoch
+/// (`quil_types::consensus::stable_replica_keys_at`) it binds the epoch, so
+/// every epoch's labels differ; from it, it binds the member and the leaf
+/// alone ([`stable_replica_key`]), and a leaf keeps its labels across epochs.
+/// Each epoch's proofs stay bound to their epoch either way: the seal
+/// challenges, the opening indices and the epoch STARK's transcript hash it.
 pub fn replica_key(member_id: &[u8], shard_id: &[u8], epoch: u64) -> [u8; 32] {
+    if quil_types::consensus::stable_replica_keys_at(epoch) {
+        stable_replica_key(member_id, shard_id)
+    } else {
+        epoch_replica_key(member_id, shard_id, epoch)
+    }
+}
+
+/// The replica key of a registration before the stable replica key epoch:
+/// the member, the leaf and the epoch.
+fn epoch_replica_key(member_id: &[u8], shard_id: &[u8], epoch: u64) -> [u8; 32] {
     let mut h = Sha3_256::new();
     h.update(b"quil/porep/replica-key/v1");
     h.update((member_id.len() as u32).to_be_bytes());
@@ -480,6 +498,19 @@ pub fn replica_key(member_id: &[u8], shard_id: &[u8], epoch: u64) -> [u8; 32] {
     h.update((shard_id.len() as u32).to_be_bytes());
     h.update(shard_id);
     h.update(epoch.to_be_bytes());
+    h.finalize().into()
+}
+
+/// The replica key of a registration from the stable replica key epoch on:
+/// the member and the leaf, under a tag of its own, so it equals no
+/// epoch-bound key.
+pub fn stable_replica_key(member_id: &[u8], shard_id: &[u8]) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(b"quil/porep/replica-key/v2");
+    h.update((member_id.len() as u32).to_be_bytes());
+    h.update(member_id);
+    h.update((shard_id.len() as u32).to_be_bytes());
+    h.update(shard_id);
     h.finalize().into()
 }
 
@@ -527,6 +558,59 @@ mod tests {
             sdr_encode(&d, &key, &p),
             "encode must be deterministic"
         );
+    }
+
+    /// Without a stable replica key epoch (mainnet's `None`) every epoch's
+    /// key is the epoch-bound one, byte for byte as before it existed.
+    #[test]
+    fn replica_keys_are_unchanged_without_a_stable_key_epoch() {
+        use quil_types::consensus::set_stable_replica_key_epoch_for_thread;
+        set_stable_replica_key_epoch_for_thread(None);
+        assert_eq!(
+            hex::encode(replica_key(b"member0", b"shardA", 7)),
+            "6bb19f89de49aae3f6a086f27c8d452efa333075960d9d8f944a7d200836f1dd"
+        );
+        assert_eq!(
+            hex::encode(replica_key(b"member0", b"shardA", 1400)),
+            "97530b0fb4ebd6e8ca5a29d3eb2723662b3eade08c417b1abe9d4b492934c01d"
+        );
+        for epoch in (0..4_000).chain([u64::MAX - 1, u64::MAX]) {
+            assert_eq!(
+                replica_key(b"member0", b"shardA", epoch),
+                epoch_replica_key(b"member0", b"shardA", epoch),
+                "epoch {epoch}"
+            );
+        }
+    }
+
+    /// From the stable replica key epoch a registration's key is the
+    /// member's and the leaf's alone: the same for every later epoch, still
+    /// distinct per member and leaf, and equal to no epoch-bound key. Before
+    /// it, keys are as without the epoch.
+    #[test]
+    fn replica_keys_are_stable_from_their_epoch() {
+        use quil_types::consensus::set_stable_replica_key_epoch_for_thread;
+        set_stable_replica_key_epoch_for_thread(Some(1400));
+        assert_eq!(
+            hex::encode(replica_key(b"member0", b"shardA", 1400)),
+            "5a32fc2e420130476d5c47cd7903350863ed2518f379e3525bb77ee4cc808f88"
+        );
+        let stable = stable_replica_key(b"member0", b"shardA");
+        for epoch in [1400, 1401, 1500, u64::MAX - 1] {
+            assert_eq!(replica_key(b"member0", b"shardA", epoch), stable);
+        }
+        for epoch in [0, 7, 1399] {
+            assert_eq!(
+                replica_key(b"member0", b"shardA", epoch),
+                epoch_replica_key(b"member0", b"shardA", epoch)
+            );
+        }
+        assert_ne!(stable, stable_replica_key(b"member1", b"shardA"));
+        assert_ne!(stable, stable_replica_key(b"member0", b"shardB"));
+        for epoch in 0..4_000 {
+            assert_ne!(stable, epoch_replica_key(b"member0", b"shardA", epoch));
+        }
+        set_stable_replica_key_epoch_for_thread(None);
     }
 
     #[test]

@@ -18899,6 +18899,80 @@ mod tests {
         );
     }
 
+    /// From the stable replica key epoch, the next epoch's sealed
+    /// registration frees no labels: the leaf's labels, kept once for every
+    /// epoch from it, are the ones the epoch after next registers from
+    /// (#749 review: `forget` wiped them every frame once the next epoch
+    /// was sealed).
+    #[tokio::test]
+    async fn a_sealed_next_epoch_keeps_the_stable_labels_of_the_epoch_after() {
+        use quil_types::consensus::{
+            epoch_start_frame, set_hash_storage_proof_epoch_for_thread,
+            set_stable_replica_key_epoch_for_thread,
+        };
+        set_hash_storage_proof_epoch_for_thread(Some(0));
+        set_stable_replica_key_epoch_for_thread(Some(6));
+        let dir =
+            std::env::temp_dir().join(format!("quil-labels-sealed-next-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::storage_labels::install_with_space(
+            dir.clone(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry.clone());
+        engine.kv_db = Some(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        engine.hypergraph = Some(crdt);
+        let member = [1u8; 32];
+        let current = 7;
+        let prefix = vec![0u32];
+        let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&engine.filter, &prefix);
+        let kept = store
+            .admit(
+                current + 2,
+                &member,
+                &leaf_id,
+                64,
+                crate::storage_labels::Stage::Ahead,
+            )
+            .unwrap()
+            .label(&quil_crypto::sdr::SdrParams::default())
+            .unwrap();
+        assert!(kept.kept);
+        registry.set_storage_seat_slot(
+            &member,
+            &engine.filter,
+            quil_types::consensus::StorageSeatSlot {
+                epoch: current + 1,
+                leaves: vec![prefix.clone()],
+                registered_at: 1,
+                sealed_at: Some(2),
+                frames: 0,
+                accumulator: [0; 32],
+                chained: vec![],
+                open: true,
+            },
+        );
+        for frame in [20, 21] {
+            engine.label_storage_ahead(epoch_start_frame(current) + frame);
+        }
+        assert!(
+            store
+                .find(current + 2, &member, &leaf_id, |n| n == 64)
+                .is_some(),
+            "the labels the epoch after next registers from"
+        );
+        set_stable_replica_key_epoch_for_thread(None);
+        set_hash_storage_proof_epoch_for_thread(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A settlement due when its job was queued, whose window closed and
     /// replicas were evicted before the job ran (behind another job in its
     /// lane): the job drops it and withdraws the part it announced, with a
