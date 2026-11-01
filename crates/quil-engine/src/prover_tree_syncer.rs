@@ -3028,7 +3028,9 @@ mod tests {
         };
         let held = turns.acquire(claim(9)).await;
         // The worker on core 1 queues for its shard, another worker's replay
-        // behind it; then core 1's engine stops.
+        // behind it; then core 1's engine stops. The second arm hands out
+        // the other worker's task, awaited below.
+        #[allow(clippy::async_yields_async)]
         let (withdrawn, other) = tokio::join!(
             recover_in_turns(
                 turns,
