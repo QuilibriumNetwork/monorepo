@@ -480,6 +480,55 @@ impl ExecutionEngineManager {
         }
     }
 
+    /// Byte sizes of the confidential token operations in `(address,
+    /// canonical bundle bytes)` pairs, each as a pre-verification pass would
+    /// verify it (none without the native proof feature).
+    pub fn confidential_operation_sizes(bundles: &[(Vec<u8>, Vec<u8>)]) -> Vec<usize> {
+        #[cfg(feature = "native-proof")]
+        {
+            return TokenExecutionEngine::confidential_operations(bundles)
+                .into_iter()
+                .map(|(_, bytes, _)| bytes.len())
+                .collect();
+        }
+        #[cfg(not(feature = "native-proof"))]
+        {
+            let _ = bundles;
+            Vec::new()
+        }
+    }
+
+    /// Proof-verification seconds a frame may spend per verifier slot (the
+    /// per-frame verification budget; 0 without the native prover).
+    pub fn frame_verification_budget_secs() -> f64 {
+        #[cfg(feature = "native-proof")]
+        {
+            return crate::token_intrinsic::dispatch::verification_budget_secs();
+        }
+        #[cfg(not(feature = "native-proof"))]
+        0.0
+    }
+
+    /// Verifier slots of this node's proof worker: confidential operations it
+    /// verifies at once; 1 without a worker.
+    pub fn proof_verifier_slots(&self) -> usize {
+        #[cfg(feature = "native-proof")]
+        {
+            let worker = self.engines.read().ok().and_then(|engines| {
+                engines
+                    .get("token")
+                    .and_then(|e| e.as_any())
+                    .and_then(|e| e.downcast_ref::<TokenExecutionEngine>())
+                    .and_then(TokenExecutionEngine::token_verifier)
+                    .map(|(_, worker)| worker.concurrency())
+            });
+            if let Some(slots) = worker {
+                return slots.max(1);
+            }
+        }
+        1
+    }
+
     /// The legacy coin the first shield of a canonical bundle consumes. Only
     /// the shard holding that coin can verify the shield (its source check
     /// reads the shard's own store), so the bundle is routed there.

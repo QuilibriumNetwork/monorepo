@@ -550,12 +550,15 @@ impl ArchiveAppShardIngest {
     /// A sequenced ingest also verifies the confidential proofs of the frames
     /// it admits in the background ([`crate::archive_preverify::ProofPrewarm`]):
     /// they are materialized only once a GLOBAL frame carries their headers,
-    /// and verified then, under this ingest, a backlog held it for hours.
+    /// and verified then, under this ingest, a backlog held it for hours. It
+    /// verifies one frame per verifier slot of the execution manager's worker.
     pub fn sequenced(mut self) -> Self {
         self.sequenced = true;
-        self.prewarm = Some(crate::archive_preverify::ProofPrewarm::new(
-            self.proof_verifier.clone(),
-        ));
+        let manager = self.execution_manager.clone();
+        self.prewarm = Some(
+            crate::archive_preverify::ProofPrewarm::new(self.proof_verifier.clone())
+                .with_lanes(Arc::new(move || manager.proof_verifier_slots())),
+        );
         self
     }
 
@@ -567,7 +570,15 @@ impl ArchiveAppShardIngest {
     ) -> Self {
         self.proof_verifier = verifier.clone();
         if self.prewarm.is_some() {
-            self.prewarm = Some(crate::archive_preverify::ProofPrewarm::new(verifier));
+            // Every bundle counts as one operation, none expensive.
+            let classify = |pairs: &[(Vec<u8>, Vec<u8>)]| crate::archive_preverify::OperationCost {
+                operations: pairs.len(),
+                expensive: 0,
+            };
+            self.prewarm = Some(
+                crate::archive_preverify::ProofPrewarm::new(verifier)
+                    .with_classifier(Arc::new(classify)),
+            );
         }
         self
     }
@@ -1137,7 +1148,7 @@ impl ArchiveAppShardIngest {
             .map(|_| frame.requests.clone());
         self.admit(&address, frame, certified);
         if let (Some(prewarm), Some(requests)) = (self.prewarm.as_ref(), prewarm) {
-            prewarm.offer(&address, &requests);
+            prewarm.offer(&address, frame_number, &requests);
         }
         if !self.sequenced {
             self.try_materialize(&address);
@@ -4941,7 +4952,7 @@ mod tests {
                 .collect()
         };
         let proof = shard_header_proof(filter, number);
-        hold_back_unavailable_shard_proofs(vec![proof.clone()], &available, 256).ready
+        hold_back_unavailable_shard_proofs(vec![proof.clone()], &available, None, 256).ready
             == vec![proof]
     }
 

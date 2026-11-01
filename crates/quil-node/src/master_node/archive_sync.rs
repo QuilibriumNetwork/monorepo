@@ -1848,6 +1848,44 @@ fn shard_body_availability(
     })
 }
 
+/// Whether a GLOBAL proposal holds a shard's header back while this archive's
+/// ingest has not verified the expensive confidential operations of the
+/// frames it would sequence ([`quil_engine::archive_preverify::ProofSettlement`]).
+/// Every archive verifies them before it executes the GLOBAL frame carrying
+/// the header, and GLOBAL waits for the third of four: a batch shield took
+/// 40-114 s, and GLOBAL lost about 30 s per such operation (2026-10-29) and
+/// hours during a flood (2026-10-30). The handle is taken once without
+/// waiting for the ingest, as [`shard_body_availability`] takes its own;
+/// until it is, nothing is held.
+fn shard_proof_settlement(
+    cell: AppIngestCell,
+) -> quil_engine::leader_provider::ShardProofSettlement {
+    use quil_engine::archive_preverify::ProofSettlement;
+    use std::sync::TryLockError;
+    let handle: std::sync::OnceLock<Option<ProofSettlement>> = std::sync::OnceLock::new();
+    Arc::new(move |address: &[u8], cursor: u64, through: u64| {
+        let Some(ingest) = cell.get() else {
+            return false;
+        };
+        let settlement = match handle.get() {
+            Some(settlement) => settlement,
+            None => match ingest.try_lock() {
+                Ok(guard) => handle.get_or_init(|| guard.proof_prewarm().map(|p| p.settlement())),
+                Err(TryLockError::Poisoned(poisoned)) => handle.get_or_init(|| {
+                    poisoned
+                        .into_inner()
+                        .proof_prewarm()
+                        .map(|p| p.settlement())
+                }),
+                Err(TryLockError::WouldBlock) => return false,
+            },
+        };
+        settlement
+            .as_ref()
+            .is_some_and(|settlement| settlement.check(address, cursor, through).holds())
+    })
+}
+
 /// Per shard, the highest frame the stored GLOBAL frames after `frame`, at most
 /// `count` of them, carry a header for: certified ones, or a candidate where
 /// none is. A hint for prefetching only, not verified: the state their
@@ -1945,6 +1983,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
     // that sequenced ingest waits for.
     let body_availability =
         archive_mode.then(|| shard_body_availability(app_ingest.clone(), network));
+    // ... and holds it back while archives verify the expensive proofs its
+    // frames carry, which GLOBAL execution would otherwise wait for.
+    let proof_settlement = archive_mode.then(|| shard_proof_settlement(app_ingest.clone()));
 
     // The archive-sync transport identity is the FALCON network key (all
     // outbound :8340 dials below use it). `mtls_seed` (Ed448) presence still
@@ -2606,6 +2647,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             let sync_finalization = global_finalization.clone();
             let sync_ingest = sequenced_ingest.clone();
             let sync_bodies = body_availability.clone();
+            let sync_settlement = proof_settlement.clone();
             let sync_archive_mode = archive_mode;
             // Committee endpoints for the direct global-consensus publisher.
             let sync_archive_pool = archive_pool.clone();
@@ -4094,7 +4136,8 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     // binds into each frame header + VDF challenge.
                                                     Some(sync_crdt.clone()),
                                                 )
-                                                .with_body_availability(sync_bodies.clone());
+                                                .with_body_availability(sync_bodies.clone())
+                                                .with_proof_settlement(sync_settlement.clone());
                                             let leader_provider = Arc::new(leader_provider);
 
                                             let selected_parent_execution = sync_mat.as_ref().map(|materializer| {
