@@ -5960,7 +5960,8 @@ impl AppConsensusEngine {
         {
             return;
         }
-        let refusal = classify_start_refusal(error, &self.start_context);
+        let refusal = classify_start_refusal(error, &self.start_context)
+            .naming_withheld_renewal(self.renewal_withheld());
         let Some(log) = self.start_block.observe(now, &refusal) else {
             return;
         };
@@ -6006,6 +6007,19 @@ impl AppConsensusEngine {
             info!(core_id = self.core_id, filter = hex::encode(&self.filter), session_generation = %generation,
                 blocked_secs = secs, "app consensus started after {secs}s blocked");
         }
+    }
+
+    /// Why this node's lifecycle withheld the renewal of this worker's
+    /// lapsed seat, when the start context holds one
+    /// (`provers::session_hosting::renewal_withheld`).
+    fn renewal_withheld(&self) -> Option<crate::provers::session_hosting::RenewalWithheld> {
+        let seat = self.start_context.not_seated.as_ref()?;
+        seat.allocations
+            .contains(&quil_types::consensus::EffectiveStatus::ExpiredEpoch)
+            .then(|| {
+                crate::provers::session_hosting::renewal_withheld(&self.filter, seat.global_frame)
+            })
+            .flatten()
     }
 
     /// This prover's allocations for the shard at the latest GLOBAL frame,
@@ -14666,6 +14680,51 @@ struct StartRefusal {
     repeats: bool,
 }
 
+/// The advice for a worker whose seat lapsed to `ExpiredEpoch`, unless this
+/// node withheld its renewal ([`StartRefusal::naming_withheld_renewal`]).
+const MISSED_RECONFIRM: &str = "this worker's allocation missed its epoch reconfirm: check this worker's \
+    prover confirmation (dispatch and publish in the master log); it starts only once a later session seats it";
+
+impl StartRefusal {
+    /// This refusal, when it advises a missed reconfirm ([`MISSED_RECONFIRM`])
+    /// and this node's lifecycle withheld the seat's renewal on purpose
+    /// (`withheld`): no confirmation failed, so it names that decision, what
+    /// renews the seat, and the first GLOBAL session pass of the next epoch,
+    /// which seats it once renewed. Its key is unchanged.
+    fn naming_withheld_renewal(
+        mut self,
+        withheld: Option<crate::provers::session_hosting::RenewalWithheld>,
+    ) -> Self {
+        let Some(withheld) = withheld.filter(|_| self.action == MISSED_RECONFIRM) else {
+            return self;
+        };
+        let frame = self
+            .reason
+            .split("at GLOBAL frame ")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .and_then(|frame| frame.parse::<u64>().ok());
+        let pass = frame.map_or_else(String::new, |frame| {
+            let epoch = quil_types::consensus::epoch_for_frame(frame) + 1;
+            format!(
+                ", and once it renews, the first GLOBAL session pass of epoch {epoch}, at GLOBAL \
+                 frame {}, seats it",
+                quil_types::consensus::epoch_start_frame(epoch)
+            )
+        });
+        self.reason = self.reason.replacen(
+            "); start refused with: ",
+            &format!(
+                "); this node withheld its renewal: {}{pass}; start refused with: ",
+                withheld.reason()
+            ),
+            1,
+        );
+        self.action = withheld.action();
+        self
+    }
+}
+
 fn refusal_key(reason: &str) -> String {
     let mut key = String::with_capacity(reason.len());
     let mut digits = false;
@@ -14770,8 +14829,7 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
             "the prover registry holds no allocation of this prover for the shard: check this worker's \
                 allocation (join and confirm); it starts only once a committee session seats it"
         } else if seat.allocations.contains(&EffectiveStatus::ExpiredEpoch) {
-            "this worker's allocation missed its epoch reconfirm: check this worker's prover confirmation \
-                (dispatch and publish in the master log); it starts only once a later session seats it"
+            MISSED_RECONFIRM
         } else {
             "this worker is not a member of the shard's committee session: check the reconfirm and renewal \
                 of this worker's allocation; it starts only once a later session seats it"
@@ -15364,6 +15422,49 @@ mod start_block_tests {
             lapsed.action.contains("missed its epoch reconfirm"),
             "{}",
             lapsed.action
+        );
+        assert_eq!(
+            lapsed.clone().naming_withheld_renewal(None),
+            lapsed,
+            "nothing withheld: unchanged"
+        );
+        // This node's lifecycle withheld the renewal: no confirmation
+        // failed, and the next epoch's first session pass is named.
+        use crate::provers::session_hosting::RenewalWithheld;
+        let epoch = quil_types::consensus::epoch_for_frame(918_900) + 1;
+        let pass = quil_types::consensus::epoch_start_frame(epoch);
+        for why in [RenewalWithheld::Unhosted, RenewalWithheld::Unvoted] {
+            let withheld = lapsed.clone().naming_withheld_renewal(Some(why));
+            assert_eq!(withheld.scope, StartScope::ThisNode);
+            assert_eq!(withheld.key, lapsed.key, "one refusal for the lapsed seat");
+            assert!(
+                !withheld.action.contains("missed its epoch reconfirm")
+                    && withheld
+                        .action
+                        .contains("withheld the seat's renewal on purpose"),
+                "{}",
+                withheld.action
+            );
+            assert!(
+                withheld.reason.contains(why.reason())
+                    && withheld.reason.contains(&format!(
+                        "first GLOBAL session pass of epoch {epoch}, at GLOBAL frame {pass}, seats it"
+                    ))
+                    && withheld.reason.contains("; start refused with: "),
+                "{}",
+                withheld.reason
+            );
+        }
+        // Withholding names nothing for a refusal that is not a lapse.
+        let active = classify_start_refusal(
+            &committee_build_failed(),
+            &seat(vec![EffectiveStatus::Active], None),
+        );
+        assert_eq!(
+            active
+                .clone()
+                .naming_withheld_renewal(Some(RenewalWithheld::Unhosted)),
+            active
         );
         let unread = classify_start_refusal(
             &committee_build_failed(),
