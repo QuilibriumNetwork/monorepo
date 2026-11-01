@@ -2910,6 +2910,9 @@ pub struct AppConsensusEngine {
     discarded_records_dropped: bool,
     /// When the passive retry next tries a start an expected wait refused.
     start_pace: StartPace,
+    /// A read of this shard's dropped-lineage record under the forest write
+    /// barrier found none ([`Self::dropped_lineage_record`]).
+    lineage_record_absent: bool,
 
     // Identity
     local_prover_address: Vec<u8>,
@@ -3174,6 +3177,7 @@ impl AppConsensusEngine {
             history_discarded: std::sync::OnceLock::new(),
             discarded_records_dropped: false,
             start_pace: StartPace::default(),
+            lineage_record_absent: false,
             local_prover_address: deps.local_prover_address,
             local_bls_pubkey: deps.local_bls_pubkey,
             halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -4174,8 +4178,18 @@ impl AppConsensusEngine {
         if let Some(marker) = self.fence_reanchor.marker {
             return Ok(marker);
         }
-        let (marker, malformed) =
+        let loaded =
             crate::app_handoff::load_reanchor_marker(self.clock_store.as_ref(), &self.filter)?;
+        Ok(self.adopt_reanchor_marker(loaded))
+    }
+
+    /// Keep the re-anchor marker read from the store
+    /// ([`crate::app_handoff::load_reanchor_marker`]), warning once about a
+    /// malformed one, which the read cleared.
+    fn adopt_reanchor_marker(
+        &mut self,
+        (marker, malformed): (Option<crate::app_handoff::ReanchorMarker>, Option<usize>),
+    ) -> Option<crate::app_handoff::ReanchorMarker> {
         if let Some(bytes) = malformed {
             warn!(core_id = self.core_id, filter = hex::encode(&self.filter), bytes, scope = "this node",
                 action = "the marker was cleared; if the shard head still lies past its session fence the next \
@@ -4183,7 +4197,7 @@ impl AppConsensusEngine {
                 "shard re-anchor marker malformed; cleared");
         }
         self.fence_reanchor.marker = Some(marker);
-        Ok(marker)
+        marker
     }
 
     fn reanchor_gate(
@@ -4276,6 +4290,7 @@ impl AppConsensusEngine {
     fn clear_stale_reanchor(&mut self, marker: &crate::app_handoff::ReanchorMarker) -> Result<()> {
         crate::app_handoff::clear_reanchor_marker(self.clock_store.as_ref(), &self.filter)?;
         crate::app_handoff::clear_dropped_lineage(self.clock_store.as_ref(), &self.filter)?;
+        self.lineage_record_absent = true;
         self.fence_reanchor.evicted = false;
         let owed = self
             .finish_reanchor(std::time::Instant::now())
@@ -4393,15 +4408,103 @@ impl AppConsensusEngine {
             if !self.fence_reanchor.evicted
                 && marker.cause() == crate::app_handoff::ReanchorCause::ReplayMismatch
             {
-                self.fence_reanchor.evicted = crate::app_handoff::dropped_lineage(
-                    &shard,
-                    self.clock_store.as_ref(),
-                    &self.filter,
-                )? == Some(marker.from_cursor);
+                self.fence_reanchor.evicted =
+                    self.dropped_lineage_record(&shard)? == Some(marker.from_cursor);
             }
             return Ok(None);
         }
-        crate::app_handoff::dropped_lineage(&shard, self.clock_store.as_ref(), &self.filter)
+        self.dropped_lineage_record(&shard)
+    }
+
+    /// [`crate::app_handoff::dropped_lineage`] of this engine's shard, read
+    /// under the forest write barrier, until a read finds no record. The
+    /// eviction passes write one only for a shard their binding no longer
+    /// serves, and once this worker was rebound they stop before writing
+    /// ([`Self::check_evicted_lineage`]): after this engine's first look
+    /// none appears for its shard, so the consensus starts and retries that
+    /// follow read nothing. A record found is read at each check, as a shard
+    /// sync may move the cursor that keeps it current.
+    fn dropped_lineage_record(
+        &mut self,
+        shard: &quil_hypergraph::HypergraphCrdt,
+    ) -> Result<Option<u64>> {
+        if self.lineage_record_absent {
+            return Ok(None);
+        }
+        let found =
+            crate::app_handoff::dropped_lineage(shard, self.clock_store.as_ref(), &self.filter)?;
+        self.lineage_record_absent = found.is_none();
+        Ok(found)
+    }
+
+    /// Read the records the start checks consult, once per engine and off
+    /// the worker thread: the legacy history discard
+    /// ([`Self::legacy_history_discarded`]), the re-anchor marker
+    /// ([`Self::recorded_reanchor`]) and, under the forest write barrier,
+    /// the dropped-lineage record ([`Self::dropped_lineage_record`]). Each
+    /// is a point read of a consensus key, and those sort just below the
+    /// storage replicas: while a replica an earlier build stored whole (one
+    /// data block of up to 1 GB, no bloom filter to skip it) shares their
+    /// table block, each read copies the block. On a regular node of 47
+    /// workers starting together that took 7 to 14 s a read, up to 42 s per
+    /// worker thread, which runs that worker's other tasks too
+    /// (2026-11-01). What the reads find fills the engine's caches; what
+    /// they leave open (a read error, a dropped-lineage record found) the
+    /// checks read again themselves.
+    async fn prefetch_start_records(&mut self) {
+        use quil_types::consensus::LegacyHistory;
+        let history = self.history_discarded.get().is_none()
+            && quil_types::consensus::committee_handoff_policy()
+                .is_some_and(|policy| policy.legacy_history == LegacyHistory::Discard);
+        let marker = self.fence_reanchor.marker.is_none();
+        let shard = self
+            .execution_engine
+            .as_ref()
+            .filter(|_| !self.lineage_record_absent)
+            .map(|manager| manager.crdt());
+        if !history && !marker && shard.is_none() {
+            return;
+        }
+        let clock = self.clock_store.clone();
+        let filter = self.filter.clone();
+        let started = std::time::Instant::now();
+        let read = tokio::task::spawn_blocking(move || {
+            let history = history.then(|| clock.app_frame_history_discarded());
+            let marker =
+                marker.then(|| crate::app_handoff::load_reanchor_marker(clock.as_ref(), &filter));
+            let lineage = shard.map(|shard| {
+                let _barrier = shard.lock_forest_writes();
+                crate::app_handoff::dropped_lineage(&shard, clock.as_ref(), &filter)
+            });
+            (history, marker, lineage)
+        })
+        .await;
+        let (history, marker, lineage) = match read {
+            Ok(read) => read,
+            Err(error) => {
+                debug!(core_id = self.core_id, %error, "start record reads ended early; the start checks read them");
+                return;
+            }
+        };
+        if let Some(Ok(Some(frame))) = history {
+            let _ = self.history_discarded.set(frame);
+        }
+        if let Some(Ok(loaded)) = marker {
+            if self.fence_reanchor.marker.is_none() {
+                self.adopt_reanchor_marker(loaded);
+            }
+        }
+        if let Some(Ok(None)) = lineage {
+            self.lineage_record_absent = true;
+        }
+        let took = started.elapsed();
+        if took >= START_RECORDS_SLOW {
+            info!(core_id = self.core_id, filter = hex::encode(&self.filter), ms = took.as_millis() as u64,
+                scope = "this node",
+                action = "no action needed: read off the worker thread; expected while this worker's store holds a \
+                    storage replica an earlier build stored whole, until its conversion compacts it away",
+                "shard start records read slowly");
+        }
     }
 
     /// Record the re-anchor a shard owes at once when this worker's store
@@ -6521,6 +6624,7 @@ impl AppConsensusEngine {
         // leaves cursor < clock height, healed by gossip replay of the
         // missing full frame or a shard sync).
         // Early: a shard layout not loaded yet defers the check to consensus start.
+        self.prefetch_start_records().await;
         match self.rewind_past_fence() {
             Err(error @ QuilError::ExecutionUnavailable(_)) => {
                 debug!(core_id = self.core_id, %error, "fence rewind check deferred to consensus start");
@@ -8731,6 +8835,7 @@ impl AppConsensusEngine {
         let app_address = self.app_address.clone();
         self.start_context = StartContext::default();
         self.history_walk.clear();
+        self.prefetch_start_records().await;
         self.discard_legacy_history_if_due().await?;
         self.drop_discarded_finalized_records()?;
         self.rewind_past_fence()?;
@@ -14104,6 +14209,10 @@ const PREDECESSOR_BLOCKED_REPEAT: Duration = Duration::from_secs(30 * 60);
 /// ([`paced_start_wait`]), unless the materialized cursor moves first.
 const START_WAIT_RETRY: Duration = Duration::from_secs(60);
 
+/// A read of an engine's start records
+/// ([`AppConsensusEngine::prefetch_start_records`]) this slow is logged.
+const START_RECORDS_SLOW: Duration = Duration::from_secs(2);
+
 /// An expected wait the passive retry paces ([`paced_start_wait`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PacedWait {
@@ -17565,6 +17674,13 @@ mod fence_reanchor_tests {
         assert_eq!(
             engine.evicted_lineage().unwrap(),
             None,
+            "an engine that found none does not look again"
+        );
+        // As a later engine on this store would.
+        engine.lineage_record_absent = false;
+        assert_eq!(
+            engine.evicted_lineage().unwrap(),
+            None,
             "the cursor is not the dropped one"
         );
         assert_eq!(
@@ -17574,7 +17690,18 @@ mod fence_reanchor_tests {
         );
 
         write_dropped_lineage(&engine, 1);
+        engine.lineage_record_absent = false;
+        engine.prefetch_start_records().await;
+        assert!(
+            !engine.lineage_record_absent,
+            "a record found is not taken for none"
+        );
         assert_eq!(engine.evicted_lineage().unwrap(), Some(1));
+        assert_eq!(
+            engine.evicted_lineage().unwrap(),
+            Some(1),
+            "a record found is read at each check"
+        );
         let now = std::time::Instant::now();
         assert!(
             !engine
