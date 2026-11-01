@@ -412,6 +412,62 @@ pub fn is_decided(
     .is_some())
 }
 
+/// The global commit's decision on one operation, as its GLOBAL record at
+/// [`decision_address`] holds it. Either is final.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Committed { frame: u64 },
+    Rejected { frame: u64, reason: String },
+}
+
+fn decision_fields(decision: &Decision) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let (committed, frame, reason) = match decision {
+        Decision::Committed { frame } => (1, frame, ""),
+        Decision::Rejected { frame, reason } => (0, frame, reason.as_str()),
+    };
+    Ok(vec![
+        kind_field(KIND_DECISION)?,
+        (vec![0], vec![committed]),
+        (vec![4], frame.to_be_bytes().to_vec()),
+        (vec![8], reason.as_bytes().to_vec()),
+    ])
+}
+
+/// The blob of a decision record, exactly as the commit stores it.
+pub fn encode_decision_record(decision: &Decision) -> Result<Vec<u8>> {
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    for (key, value) in decision_fields(decision)? {
+        tree.insert(&key, &value, &[], &num_bigint::BigInt::from(value.len()))?;
+    }
+    quil_tries::serialize_go_tree(tree.root.as_ref())
+        .map_err(|_| invalid("cannot encode decision record"))
+}
+
+/// Decode a decision record's stored bytes, as a node's vertex read of
+/// [`decision_address`] returns them: `None` for an empty blob (undecided).
+pub fn decode_decision(blob: &[u8]) -> Result<Option<Decision>> {
+    let Some(fields) =
+        records::decode_record(blob, &records::kind(KIND_DECISION)?, &[&[0], &[4], &[8]])?
+    else {
+        return Ok(None);
+    };
+    let [Some(committed), Some(frame), reason] = fields.as_slice() else {
+        return Err(invalid("decision record missing a field"));
+    };
+    let frame = u64::from_be_bytes(fixed(frame)?);
+    match committed.as_slice() {
+        [1] => Ok(Some(Decision::Committed { frame })),
+        [0] => Ok(Some(Decision::Rejected {
+            frame,
+            reason: reason
+                .as_deref()
+                .map(|reason| String::from_utf8_lossy(reason).into_owned())
+                .unwrap_or_default(),
+        })),
+        _ => Err(invalid("malformed decision")),
+    }
+}
+
 /// Whether `marker` is consumed in `application`.
 pub fn is_consumed(
     state: &HypergraphState,
@@ -1168,12 +1224,10 @@ pub fn commit_entry(
             state,
             frame,
             &decision,
-            &[
-                kind_field(KIND_DECISION)?,
-                (vec![0], vec![0]),
-                (vec![4], frame.to_be_bytes().to_vec()),
-                (vec![8], reason.as_bytes().to_vec()),
-            ],
+            &decision_fields(&Decision::Rejected {
+                frame,
+                reason: reason.into(),
+            })?,
         )?;
         Ok(Outcome::Rejected(reason))
     };
@@ -1363,12 +1417,7 @@ pub fn commit_entry(
         state,
         frame,
         &decision,
-        &[
-            kind_field(KIND_DECISION)?,
-            (vec![0], vec![1]),
-            (vec![4], frame.to_be_bytes().to_vec()),
-            (vec![8], Vec::new()),
-        ],
+        &decision_fields(&Decision::Committed { frame })?,
     )?;
     Ok(Outcome::Committed {
         fee: entry.fee,
@@ -1887,6 +1936,56 @@ mod tests {
             commit_entry(&state, 104, &[6; 32], &entry(3, &[20], &[4]), SHARD).unwrap(),
             Outcome::Committed { .. }
         ));
+    }
+
+    /// A wallet reads the decision through a node's vertex read: the stored
+    /// bytes decode to the outcome and the GLOBAL frame that decided it.
+    #[test]
+    fn a_decision_record_decodes_from_its_stored_bytes() {
+        let state = mem_state();
+        let stored = |address: [u8; 32]| {
+            state
+                .get(
+                    &crate::global_schema::GLOBAL_INTRINSIC_ADDRESS,
+                    &address,
+                    &crate::hypergraph_state::vertex_adds_discriminator().unwrap(),
+                )
+                .unwrap()
+        };
+        let decision = |tx: u8| stored(decision_address(&APP, &[tx; 32]).unwrap());
+        assert_eq!(decision(1), None);
+        assert_eq!(
+            decode_decision(&[]).unwrap(),
+            None,
+            "an empty blob is undecided"
+        );
+        commit_entry(&state, 100, &APP, &entry(1, &[20, 21], &[1, 2]), SHARD).unwrap();
+        let committed = Decision::Committed { frame: 100 };
+        assert_eq!(
+            decode_decision(&decision(1).unwrap()).unwrap(),
+            Some(committed.clone())
+        );
+        assert_eq!(
+            encode_decision_record(&committed).unwrap(),
+            decision(1).unwrap()
+        );
+        commit_entry(&state, 107, &APP, &entry(2, &[21, 22], &[3]), SHARD).unwrap();
+        let rejected = Decision::Rejected {
+            frame: 107,
+            reason: "already consumed".into(),
+        };
+        assert_eq!(
+            decode_decision(&decision(2).unwrap()).unwrap(),
+            Some(rejected.clone())
+        );
+        assert_eq!(
+            encode_decision_record(&rejected).unwrap(),
+            decision(2).unwrap()
+        );
+        // Another record kind at the address is not a decision.
+        let consumed = stored(consumed_address(&APP, &[20; 32]).unwrap()).unwrap();
+        assert!(decode_decision(&consumed).is_err());
+        assert!(decode_decision(&[1, 2, 3]).is_err(), "malformed bytes");
     }
 
     #[test]
