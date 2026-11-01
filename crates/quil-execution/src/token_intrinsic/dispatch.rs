@@ -204,6 +204,52 @@ mod tests {
         assert!(!known_to_fit(300_000_000, 12.0));
     }
 
+    /// An operation of [`BACKGROUND_VERIFY_BYTES`] or more, or a batch
+    /// shield, is never known to fit a budget, however fast its size class
+    /// measured; its estimate is at least its structure's floor.
+    #[test]
+    fn large_operations_and_batch_shields_never_fit_by_measurement() {
+        record_duration(2048, std::time::Duration::from_secs(1));
+        assert!(operation_known_to_fit(2048, 0.0, 12.0));
+        assert!(
+            !operation_known_to_fit(2048, 13.0, 12.0),
+            "a floor above the budget never fits"
+        );
+        assert_eq!(estimated_operation_secs(2048, 30.0), 30.0);
+        assert_eq!(
+            estimated_operation_secs(2048, 0.0),
+            estimated_verify_secs(2048)
+        );
+        let large = BACKGROUND_VERIFY_BYTES << 3;
+        record_duration(large, std::time::Duration::from_secs(1));
+        assert!(verification_known_to_fit(large, 12.0));
+        assert!(
+            !operation_known_to_fit(large, 0.0, 12.0),
+            "a large operation fits by measurement"
+        );
+        // A batch shield by its tags; a single shield or a transfer has no
+        // floor.
+        let tagged = |version: &[u8]| {
+            let mut bytes = TYPE_LATTICE_SHIELD.to_be_bytes().to_vec();
+            bytes.extend_from_slice(version);
+            bytes.resize(76, 0);
+            bytes
+        };
+        let batch = tagged(b"QCT3SH\0\x03");
+        let single = tagged(b"QCT3SH\0\x02");
+        assert_eq!(
+            verify_floor_secs(&batch, TYPE_LATTICE_SHIELD),
+            BATCH_SHIELD_FLOOR_SECS
+        );
+        assert_eq!(verify_floor_secs(&single, TYPE_LATTICE_SHIELD), 0.0);
+        assert_eq!(verify_floor_secs(&batch, TYPE_LATTICE_TRANSACTION), 0.0);
+        assert!(!operation_known_to_fit(
+            2048,
+            verify_floor_secs(&batch, TYPE_LATTICE_SHIELD),
+            24.0
+        ));
+    }
+
     /// A refused admission reads as `PROOF_WORKER_BUSY`, which callers tell
     /// apart from other worker failures.
     #[test]
@@ -929,6 +975,45 @@ fn known_to_fit(class_micros: u64, budget_secs: f64) -> bool {
     class_micros > 0 && class_micros as f64 / 1e6 <= budget_secs
 }
 
+/// Operations of at least this many bytes verify in the background before
+/// a frame carries them, whatever this node measured: batch shields are
+/// about 170-210 KiB and verified for 95-470 s (mainnet and devnet,
+/// 2026-10-29..31); proofs of the other operations are tens of KiB.
+pub const BACKGROUND_VERIFY_BYTES: usize = 128 << 10;
+/// Least worker time a batch shield takes to verify, whatever its size:
+/// 95-470 s measured (mainnet and devnet, 2026-10-29..31). Its proof does
+/// not grow with its sources.
+const BATCH_SHIELD_FLOOR_SECS: f64 = 60.0;
+
+/// The least worker time verifying one confidential operation of type `tp`
+/// takes by its structure, which no measurement lowers:
+/// [`BATCH_SHIELD_FLOOR_SECS`] for a batch shield (read from its type and
+/// version tags), zero for the others, whose dimensions the policy bounds.
+pub fn verify_floor_secs(bytes: &[u8], tp: u32) -> f64 {
+    if tp == TYPE_LATTICE_SHIELD && quil_lattice_ct::confidential::shield::is_batch(bytes) {
+        BATCH_SHIELD_FLOOR_SECS
+    } else {
+        0.0
+    }
+}
+
+/// Whether verifying one confidential operation of `operation_bytes` bytes,
+/// taking at least `floor_secs` by its structure ([`verify_floor_secs`]),
+/// is known to take at most `budget_secs`: it is smaller than
+/// [`BACKGROUND_VERIFY_BYTES`], its floor fits, and its size class was
+/// measured and fits ([`verification_known_to_fit`]).
+pub fn operation_known_to_fit(operation_bytes: usize, floor_secs: f64, budget_secs: f64) -> bool {
+    operation_bytes < BACKGROUND_VERIFY_BYTES
+        && floor_secs <= budget_secs
+        && verification_known_to_fit(operation_bytes, budget_secs)
+}
+
+/// Estimated wall time of verifying one confidential operation of
+/// `operation_bytes` bytes taking at least `floor_secs` by its structure.
+pub fn estimated_operation_secs(operation_bytes: usize, floor_secs: f64) -> f64 {
+    estimated_verify_secs(operation_bytes).max(floor_secs)
+}
+
 /// The next exponentially weighted mean after `micros`, 1/4 weight on the
 /// newest; the first measurement (`previous` 0) is taken as is.
 fn ewma_next(previous: u64, micros: u64) -> u64 {
@@ -1174,7 +1259,12 @@ pub(crate) fn verify_in_worker(
     Ok(())
 }
 
-/// One worker verification, its wall time recorded.
+/// One worker verification; the wall time of an accepted one is recorded.
+/// Only accepted verdicts teach the estimates: a rejected operation may stop
+/// at any point of its verification (a decoding failure ends it in
+/// milliseconds), so its time says nothing of what a valid operation of its
+/// size takes, and a few such samples priced a class verifying for minutes
+/// as fitting the frame budget.
 fn worker_verdict(
     worker: &WorkerVerifier,
     network: &[u8; 32],
@@ -1193,9 +1283,15 @@ fn worker_verdict(
             transaction: bytes,
         })
     })?;
-    record_duration(bytes.len(), start.elapsed());
+    if accepted {
+        record_duration(bytes.len(), start.elapsed());
+    }
     Ok(accepted)
 }
+
+#[cfg(test)]
+#[path = "dispatch_estimate_tests.rs"]
+mod estimate_tests;
 
 /// What [`TokenPolicy::preverify`] made of one operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

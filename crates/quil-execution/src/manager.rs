@@ -109,6 +109,15 @@ impl PreverifyCounts {
     }
 }
 
+/// One confidential operation as its verification estimate sees it: its
+/// bytes, and the least time its verification takes by its structure (a
+/// shield's sources), which no measurement lowers.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct OperationEstimate {
+    pub bytes: usize,
+    pub floor_secs: f64,
+}
+
 /// How a pre-verification pass runs: at most `parallelism` operations at once
 /// (default: the worker's slots), each finished one counted into `done`, and
 /// none started while `pause` returns true.
@@ -375,10 +384,14 @@ impl ExecutionEngineManager {
         }
     }
 
-    /// Byte sizes of the confidential token operations in `bundles` whose
-    /// verdicts are not cached yet: what materializing them would still
-    /// verify. Empty when every proof is verified, and without a worker.
-    pub fn unverified_confidential_operations(&self, bundles: &[(Vec<u8>, Vec<u8>)]) -> Vec<usize> {
+    /// The confidential token operations in `bundles` whose verdicts are not
+    /// cached yet, as their verification is estimated: what materializing
+    /// them would still verify. Empty when every proof is verified, and
+    /// without a worker.
+    pub fn unverified_confidential_operations(
+        &self,
+        bundles: &[(Vec<u8>, Vec<u8>)],
+    ) -> Vec<OperationEstimate> {
         #[cfg(feature = "native-proof")]
         {
             let routed: Vec<(Vec<u8>, Vec<u8>)> = bundles
@@ -403,7 +416,9 @@ impl ExecutionEngineManager {
                 Err(_) => None,
             };
             match policy {
-                Some(policy) => TokenExecutionEngine::unverified_operation_sizes(&policy, &routed),
+                Some(policy) => {
+                    TokenExecutionEngine::unverified_operation_estimates(&policy, &routed)
+                }
                 None => Vec::new(),
             }
         }
@@ -445,6 +460,45 @@ impl ExecutionEngineManager {
         {
             let _ = (operation_bytes, budget_secs);
             true
+        }
+    }
+
+    /// Whether verifying confidential operation `operation` is known to take
+    /// at most `budget_secs` on this node: it is below the size verified in
+    /// the background whatever was measured, its structure's floor fits, and
+    /// its size class was measured from accepted verdicts and fits. Always
+    /// without the native prover.
+    pub fn operation_known_to_fit(operation: &OperationEstimate, budget_secs: f64) -> bool {
+        #[cfg(feature = "native-proof")]
+        {
+            return crate::token_intrinsic::dispatch::operation_known_to_fit(
+                operation.bytes,
+                operation.floor_secs,
+                budget_secs,
+            );
+        }
+        #[cfg(not(feature = "native-proof"))]
+        {
+            let _ = (operation, budget_secs);
+            true
+        }
+    }
+
+    /// Estimated wall time of verifying confidential operation `operation`
+    /// on this node: its size class's measured mean, at least its
+    /// structure's floor.
+    pub fn estimated_operation_secs(operation: &OperationEstimate) -> f64 {
+        #[cfg(feature = "native-proof")]
+        {
+            return crate::token_intrinsic::dispatch::estimated_operation_secs(
+                operation.bytes,
+                operation.floor_secs,
+            );
+        }
+        #[cfg(not(feature = "native-proof"))]
+        {
+            let _ = operation;
+            0.0
         }
     }
 
