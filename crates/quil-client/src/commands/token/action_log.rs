@@ -1,7 +1,8 @@
 //! The private action log: `<config_dir>/wallet/actions.jsonl`, one JSON
 //! record per step of a wallet action (a shield's start, each batch, its
-//! outcome) with the details the operator log leaves out: amounts, fees,
-//! the recipient and the coin addresses. It is for the owner to consult and
+//! outcome; a mint's or a transfer's start and outcome) with the details
+//! the operator log leaves out: amounts, fees, the recipient and the coin
+//! or escrow addresses. It is for the owner to consult and
 //! share selectively, so it stays on this machine, readable by its owner
 //! only: the directory is created 0700 and the file 0600, and a wider mode
 //! or a link in their place refuses the write. It lies outside the node's
@@ -255,26 +256,252 @@ mod private {
     }
 }
 
-/// A shield run's records, shared by `token shield-all` and the node
-/// manager: the plan at the start, each batch submitted or skipped, and the
-/// outcome. After a failed write it writes nothing more and reports the
-/// reason once.
+/// One action's records: each stamped with its `kind` and `source`, the
+/// last with the outcome and the duration. After a failed write it writes
+/// nothing more and reports the reason once.
 #[cfg(feature = "native-proof")]
-pub(crate) struct ShieldRecorder {
+pub(crate) struct ActionRecorder {
     log: Option<ActionLog>,
-    /// `cli` or `manager`: the program that ran the shield.
+    /// `shield`, `mint`, `transfer`, ...: the action.
+    kind: &'static str,
+    /// `cli` or `manager`: the program that ran it.
     source: &'static str,
     started: std::time::Instant,
 }
 
 #[cfg(feature = "native-proof")]
-impl ShieldRecorder {
-    pub(crate) fn new(log: Option<ActionLog>, source: &'static str) -> Self {
+impl ActionRecorder {
+    pub(crate) fn new(log: Option<ActionLog>, kind: &'static str, source: &'static str) -> Self {
         Self {
             log,
+            kind,
             source,
             started: std::time::Instant::now(),
         }
+    }
+
+    /// The action's outcome and duration.
+    pub(crate) fn outcome(&mut self, result: &Result<(), String>) -> Option<String> {
+        let took = self.started.elapsed().as_secs();
+        self.write(
+            "outcome",
+            match result {
+                Ok(()) => serde_json::json!({ "outcome": "ok", "duration_s": took }),
+                Err(error) => {
+                    serde_json::json!({ "outcome": "failed", "error": error, "duration_s": took })
+                }
+            },
+        )
+    }
+
+    /// One record of `phase` with `fields` (an object); why it was not
+    /// written, the first time a write fails.
+    pub(crate) fn write(&mut self, phase: &str, mut fields: serde_json::Value) -> Option<String> {
+        let log = self.log.as_ref()?;
+        if let Some(fields) = fields.as_object_mut() {
+            fields.insert("source".into(), self.source.into());
+        }
+        let error = log.append(self.kind, phase, fields).err()?;
+        self.log = None;
+        Some(format!("{error:#}"))
+    }
+}
+
+/// The operator log's target: `RUST_LOG=qclient::action=info` shows its
+/// lines on stderr; redirect it to a file while the node manager draws.
+pub(crate) const LOG_TARGET: &str = "qclient::action";
+
+/// What went wrong, as the operator log names it: a fixed class and its
+/// fixed reason. The error text itself can carry the node's address, a
+/// config path or amounts, so it stays on screen and in the private log.
+pub(crate) fn error_class(error: &str) -> (&'static str, &'static str) {
+    let has = |part: &str| error.contains(part);
+    if has("--max-fee") || has("automatic fee limit") {
+        ("fee_cap", "a fee quote exceeds --max-fee")
+    } else if has("plan changed") {
+        ("plan_changed", "the coins changed since the confirmation")
+    } else if has("reward changed") {
+        (
+            "reward_changed",
+            "the reward changed since the confirmation",
+        )
+    } else if has("not finalized") {
+        ("not_finalized", "GLOBAL holds no witness for it yet")
+    } else if has("accepts only submissions signed") {
+        ("identity", "the signing config is not the node's")
+    } else if has("shields") && has("open") {
+        ("not_open", "shields are not admitted yet")
+    } else if has("prov") || has("budget") {
+        ("proving", "a proof failed")
+    } else if has("transport") || has("status:") || has("connect") || has("deadline") {
+        ("rpc", "a node request failed")
+    } else if has("no node config") {
+        ("config", "the node config did not load")
+    } else {
+        (
+            "other",
+            "unclassified; the error is on screen and in the private log",
+        )
+    }
+}
+
+/// A wallet command run from the CLI (`token mint`, ...): its private
+/// records (the command's inputs at the start, its steps, the outcome) and
+/// its two operator lines on [`LOG_TARGET`], which carry the action, the
+/// outcome, an error class and the duration, never an input. A refused
+/// write is said once on stderr; the command runs on.
+#[cfg(feature = "native-proof")]
+pub(crate) struct CliAction {
+    record: ActionRecorder,
+    kind: &'static str,
+    started: std::time::Instant,
+}
+
+#[cfg(feature = "native-proof")]
+impl CliAction {
+    /// `command`'s action, recorded under `config_dir` unless the qclient
+    /// config turns the log off; `None` for a command that is not one.
+    pub(crate) fn start(config_dir: &Path, command: &super::TokenCommand) -> Option<Self> {
+        Self::with_log(ActionLog::enabled(config_dir, false), command)
+    }
+
+    pub(crate) fn with_log(log: Option<ActionLog>, command: &super::TokenCommand) -> Option<Self> {
+        let (kind, fields) = cli_action(command)?;
+        let mut action = Self {
+            record: ActionRecorder::new(log, kind, "cli"),
+            kind,
+            started: std::time::Instant::now(),
+        };
+        tracing::info!(
+            target: LOG_TARGET,
+            kind,
+            phase = "start",
+            source = "cli",
+            "wallet action started"
+        );
+        action.step("start", fields);
+        Some(action)
+    }
+
+    /// One record of `phase` with `fields`.
+    pub(crate) fn step(&mut self, phase: &str, fields: serde_json::Value) {
+        if let Some(why) = self.record.write(phase, fields) {
+            eprintln!(
+                "Action log: not written ({why}); the {} is unaffected.",
+                self.kind.replace('_', " ")
+            );
+        }
+    }
+
+    /// [`Self::finish`] for an action that may not be recorded.
+    pub(crate) fn close<T>(action: Option<Self>, result: anyhow::Result<T>) -> anyhow::Result<T> {
+        match action {
+            Some(action) => action.finish(result),
+            None => result,
+        }
+    }
+
+    /// The outcome record and operator line; `result` passes through.
+    pub(crate) fn finish<T>(mut self, result: anyhow::Result<T>) -> anyhow::Result<T> {
+        let outcome = result.as_ref().map(|_| ()).map_err(|e| format!("{e:#}"));
+        if let Some(why) = self.record.outcome(&outcome) {
+            eprintln!(
+                "Action log: not written ({why}); the {} is unaffected.",
+                self.kind.replace('_', " ")
+            );
+        }
+        let (name, (class, reason)) = match &outcome {
+            Ok(()) => ("ok", ("none", "")),
+            Err(error) => ("failed", error_class(error)),
+        };
+        tracing::info!(
+            target: LOG_TARGET,
+            kind = self.kind,
+            phase = "outcome",
+            source = "cli",
+            outcome = name,
+            error_class = class,
+            reason,
+            fee_cap_hit = class == "fee_cap",
+            duration_s = self.started.elapsed().as_secs(),
+            "wallet action finished"
+        );
+        result
+    }
+}
+
+/// The recorded action of a CLI command and its inputs as given (amounts
+/// in base units, fees as given or quoted later), or `None` for a command
+/// that is none.
+#[cfg(feature = "native-proof")]
+fn cli_action(command: &super::TokenCommand) -> Option<(&'static str, serde_json::Value)> {
+    use super::TokenCommand;
+    let fee = |fee: &Option<u128>| fee.map(|fee| fee.to_string());
+    Some(match command {
+        TokenCommand::Mint {
+            recipient,
+            fee: given,
+            claim: None,
+        } => (
+            "mint",
+            serde_json::json!({ "recipient": recipient, "fee": fee(given) }),
+        ),
+        TokenCommand::Transfer {
+            recipient,
+            amount,
+            fee: given,
+        } => (
+            "transfer",
+            serde_json::json!({ "recipient": recipient, "amount": amount, "fee": fee(given) }),
+        ),
+        TokenCommand::PendingTransfer {
+            recipient,
+            amount,
+            expiration,
+            fee: given,
+        } => (
+            "pending_transfer",
+            serde_json::json!({
+                "recipient": recipient,
+                "amount": amount,
+                "refund_after": expiration,
+                "fee": fee(given),
+            }),
+        ),
+        TokenCommand::Accept { escrow, fee: given } => (
+            "accept",
+            serde_json::json!({ "escrow": escrow, "fee": fee(given) }),
+        ),
+        TokenCommand::Reject { escrow, fee: given } => (
+            "refund",
+            serde_json::json!({ "escrow": escrow, "fee": fee(given) }),
+        ),
+        TokenCommand::Merge { coins, fee: given } => (
+            "merge",
+            serde_json::json!({ "coins": coins, "fee": fee(given) }),
+        ),
+        TokenCommand::Mint {
+            claim: Some(path), ..
+        } => (
+            "mint_claim",
+            serde_json::json!({
+                "file": path.file_name().map(|name| name.to_string_lossy().into_owned()),
+            }),
+        ),
+        _ => return None,
+    })
+}
+
+/// A shield run's records, shared by `token shield-all` and the node
+/// manager: the plan at the start, each batch submitted or skipped, and the
+/// outcome.
+#[cfg(feature = "native-proof")]
+pub(crate) struct ShieldRecorder(ActionRecorder);
+
+#[cfg(feature = "native-proof")]
+impl ShieldRecorder {
+    pub(crate) fn new(log: Option<ActionLog>, source: &'static str) -> Self {
+        Self(ActionRecorder::new(log, "shield", source))
     }
 
     /// The plan about to run, and the fee cap.
@@ -284,7 +511,7 @@ impl ShieldRecorder {
         max_fee: u128,
     ) -> Option<String> {
         let (coins, units) = plan.totals().unwrap_or_default();
-        self.write(
+        self.0.write(
             "start",
             serde_json::json!({
                 "batches": plan.batches.len(),
@@ -311,7 +538,7 @@ impl ShieldRecorder {
                 addresses,
                 shielded,
                 fee,
-            } => self.write(
+            } => self.0.write(
                 "submitted",
                 serde_json::json!({
                     "batch": index,
@@ -327,7 +554,7 @@ impl ShieldRecorder {
                 coins,
                 total,
                 fee,
-            } => self.write(
+            } => self.0.write(
                 "skipped",
                 serde_json::json!({
                     "batch": index,
@@ -345,26 +572,7 @@ impl ShieldRecorder {
 
     /// The run's outcome and duration.
     pub(crate) fn outcome(&mut self, result: &Result<(), String>) -> Option<String> {
-        let took = self.started.elapsed().as_secs();
-        self.write(
-            "outcome",
-            match result {
-                Ok(()) => serde_json::json!({ "outcome": "ok", "duration_s": took }),
-                Err(error) => {
-                    serde_json::json!({ "outcome": "failed", "error": error, "duration_s": took })
-                }
-            },
-        )
-    }
-
-    fn write(&mut self, phase: &str, mut fields: serde_json::Value) -> Option<String> {
-        let log = self.log.as_ref()?;
-        if let Some(fields) = fields.as_object_mut() {
-            fields.insert("source".into(), self.source.into());
-        }
-        let error = log.append("shield", phase, fields).err()?;
-        self.log = None;
-        Some(format!("{error:#}"))
+        self.0.outcome(result)
     }
 }
 
@@ -436,6 +644,196 @@ mod tests {
         let error = log.append("shield", "x", fields()).unwrap_err().to_string();
         assert_eq!(error, "wallet/actions.jsonl is not a regular file");
         assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "");
+    }
+
+    /// A recorder stamps each record with its kind and source and ends with
+    /// the outcome; after a refused write it writes nothing more and says
+    /// why once.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn a_recorder_stamps_its_records_and_stops_after_a_refused_write() {
+        let config = tempfile::tempdir().unwrap();
+        let log = ActionLog::new(config.path());
+        let mut record = ActionRecorder::new(Some(log.clone()), "transfer", "manager");
+        assert_eq!(
+            record.write("start", serde_json::json!({ "amount": "5" })),
+            None
+        );
+        assert_eq!(record.outcome(&Err("fee changed".into())), None);
+        let written = records(&log);
+        assert_eq!(written.len(), 2);
+        assert!(written
+            .iter()
+            .all(|r| r["kind"] == "transfer" && r["source"] == "manager"));
+        assert_eq!(written[0]["amount"], "5");
+        assert_eq!(
+            (&written[1]["outcome"], &written[1]["error"]),
+            (
+                &serde_json::json!("failed"),
+                &serde_json::json!("fee changed")
+            )
+        );
+        std::fs::set_permissions(log.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut record = ActionRecorder::new(Some(log.clone()), "mint", "manager");
+        assert_eq!(
+            record.write("start", serde_json::json!({})).as_deref(),
+            Some("wallet/actions.jsonl has mode 644; the action log needs 600 (owner only)")
+        );
+        assert_eq!(record.outcome(&Ok(())), None);
+        assert_eq!(records(&log).len(), 2);
+        // Off: nothing is written and nothing is said.
+        let mut record = ActionRecorder::new(None, "mint", "manager");
+        assert_eq!(record.write("start", serde_json::json!({})), None);
+    }
+
+    /// The operator log's lines `work` writes.
+    #[cfg(feature = "native-proof")]
+    fn operator_log(work: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let capture = Capture::default();
+        let sink = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, work);
+        let bytes = capture.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// The CLI's wallet commands, each with private inputs, and the action
+    /// each records.
+    #[cfg(feature = "native-proof")]
+    fn cli_commands() -> Vec<(Vec<String>, &'static str)> {
+        let recipient = format!("0x{}", "c3".repeat(60));
+        let file = "/home/operator/.config/mint-1201.bin".to_string();
+        let s = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        vec![
+            (s(&["mint", &recipient, "--fee", "98765"]), "mint"),
+            (s(&["mint", "--claim", &file]), "mint_claim"),
+            (s(&["transfer", &recipient, "123456789"]), "transfer"),
+            (
+                s(&[
+                    "pending-transfer",
+                    &recipient,
+                    "123456789",
+                    "--expiration",
+                    "4321",
+                ]),
+                "pending_transfer",
+            ),
+            (s(&["accept", &"ab".repeat(32)]), "accept"),
+            (s(&["reject", &"ab".repeat(32), "--fee", "98765"]), "refund"),
+            (s(&["merge", &"ab".repeat(32), &"cd".repeat(32)]), "merge"),
+        ]
+    }
+
+    /// Each CLI wallet command records its inputs and outcome in the
+    /// private log; its operator lines name the action, the outcome and an
+    /// error class, never an input or the error's text.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn cli_actions_record_privately_and_log_no_input() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            token: super::super::TokenArgs,
+        }
+        for (arguments, kind) in cli_commands() {
+            let config = tempfile::tempdir().unwrap();
+            let log = ActionLog::new(config.path());
+            let command =
+                Cli::try_parse_from([&["token".to_string()][..], &arguments[..]].concat())
+                    .unwrap()
+                    .token
+                    .command;
+            let text = operator_log(|| {
+                let action = CliAction::with_log(Some(log.clone()), &command)
+                    .unwrap_or_else(|| panic!("{kind} is not recorded"));
+                let failed: anyhow::Result<()> = Err(anyhow::anyhow!(
+                    "the estimated fee of 98765 base units exceeds the automatic fee limit for \
+                     {} at 10.1.2.3:8337 (/home/operator/.config); raise --max-fee",
+                    arguments.join(" ")
+                ));
+                assert!(action.finish(failed).is_err());
+            });
+            let written = records(&log);
+            let phases: Vec<&str> = written
+                .iter()
+                .map(|r| r["phase"].as_str().unwrap())
+                .collect();
+            assert_eq!(phases, ["start", "outcome"], "{kind}");
+            assert!(
+                written
+                    .iter()
+                    .all(|r| r["kind"] == kind && r["source"] == "cli"),
+                "{kind}: {written:?}"
+            );
+            assert_eq!(written[1]["outcome"], "failed", "{kind}");
+            let recorded = written[0].to_string();
+            let inputs: Vec<&String> = arguments
+                .iter()
+                .filter(|a| !a.starts_with("--") && a.len() > 5)
+                .collect();
+            assert!(
+                inputs
+                    .iter()
+                    .any(|input| recorded
+                        .contains(input.trim_start_matches("/home/operator/.config/"))),
+                "{kind}: no input recorded in {recorded}"
+            );
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(lines.len(), 2, "{kind}: {text}");
+            let name = format!("kind=\"{kind}\"");
+            for part in [&name, r#"source="cli""#, r#"phase="start""#] {
+                assert!(lines[0].contains(part), "{part}: {}", lines[0]);
+            }
+            for part in [
+                &name,
+                r#"phase="outcome""#,
+                r#"outcome="failed""#,
+                r#"error_class="fee_cap""#,
+                "fee_cap_hit=true",
+                "duration_s=",
+            ] {
+                assert!(lines[1].contains(part), "{part}: {}", lines[1]);
+            }
+            for private in [
+                "c3c3",
+                "98765",
+                "10.1.2.3",
+                "/home/",
+                "mint-1201",
+                "abab",
+                "cdcd",
+                "4321",
+                "123456789",
+            ] {
+                assert!(
+                    !text.contains(private),
+                    "{kind}: {private} reached the log:\n{text}"
+                );
+            }
+        }
+        // Not a wallet action: nothing recorded.
+        let command = Cli::try_parse_from(["token", "balance"])
+            .unwrap()
+            .token
+            .command;
+        assert!(CliAction::with_log(None, &command).is_none());
     }
 
     /// Past the size bound the oldest records go, down to half of it;

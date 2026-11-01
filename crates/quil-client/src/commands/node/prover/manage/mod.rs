@@ -17,10 +17,12 @@ mod actions;
 mod cadence;
 mod coins;
 mod filter;
+mod mint;
 mod model;
 mod msg;
 mod settings;
 mod shield;
+mod transfer;
 mod update;
 mod util;
 mod view;
@@ -100,9 +102,10 @@ pub struct ManageArgs {
     /// defaults, then start.
     #[arg(long)]
     pub reset_ui: bool,
-    /// Largest fee in base units a shield batch pays from the node's quote
-    /// (default: 0.1 QUIL); a larger quote stops the run, as in `qclient
-    /// token`.
+    /// Largest fee in base units one shield batch, mint or transfer action
+    /// (transfer, pending transfer, accept, refund, merge) pays from the
+    /// node's quote (default: 0.1 QUIL); a larger quote stops a shield run
+    /// and refuses the others, as in `qclient token`.
     #[arg(
         long,
         env = "QUILIBRIUM_MAX_FEE",
@@ -342,6 +345,11 @@ async fn render(
                 Cmd::Fetch => continue,
                 Cmd::FetchLegacy => |msg| matches!(msg, Msg::LegacyRefresh { .. }),
                 Cmd::ShieldPrepare => |msg| matches!(msg, Msg::ShieldPreview(_)),
+                Cmd::MintPrepare | Cmd::ClaimPrepare(..) => {
+                    |msg| matches!(msg, Msg::MintPreview(_))
+                }
+                Cmd::FetchShielded => |msg| matches!(msg, Msg::Shielded(_)),
+                Cmd::TransferPrepare(_) => |msg| matches!(msg, Msg::TransferPreview(_)),
                 other => {
                     dropped.push(other);
                     continue;
@@ -451,6 +459,12 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::FetchLegacy => "legacy read",
         Cmd::ShieldPrepare => "shield reads and quotes",
         Cmd::ShieldRun(_) => "shield",
+        Cmd::MintPrepare => "mint reads and quote",
+        Cmd::ClaimPrepare(..) => "mint claim reads",
+        Cmd::MintRun(_) => "mint",
+        Cmd::FetchShielded => "shielded coins read",
+        Cmd::TransferPrepare(_) => "transfer reads and quote",
+        Cmd::TransferRun(_) => "transfer action",
         Cmd::Join(_) => "join",
         Cmd::Lifecycle { .. } => "lifecycle operation",
         Cmd::ToggleManual { .. } | Cmd::MarkManual(_) => "worker mode change",
@@ -471,7 +485,8 @@ struct RefreshState {
     /// What the shield action loads `qclient token`'s context from, and
     /// its `--max-fee`.
     token: Option<(GlobalArgs, u128)>,
-    /// The private action log a shield records itself in, unless off.
+    /// The private action log a shield, a mint or a transfer action
+    /// records itself in, unless off.
     action_log: Option<crate::commands::token::action_log::ActionLog>,
 }
 
@@ -577,6 +592,46 @@ fn spawn_action(
             let token = refresh.token.clone();
             tokio::spawn(async move {
                 let _ = tx.send(actions::shield_prepare(token).await);
+            });
+        }
+        Cmd::FetchShielded => {
+            let token = refresh.token.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(actions::fetch_shielded(token).await);
+            });
+        }
+        Cmd::TransferPrepare(kind) => {
+            let token = refresh.token.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(actions::transfer_prepare(token, kind).await);
+            });
+        }
+        Cmd::TransferRun(preview) => {
+            let token = refresh.token.clone();
+            let log = refresh.action_log.clone();
+            tokio::spawn(async move {
+                let progress = tx.clone();
+                let _ = tx.send(actions::transfer_run(token, preview, progress, log).await);
+            });
+        }
+        Cmd::MintPrepare => {
+            let token = refresh.token.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(actions::mint_prepare(token).await);
+            });
+        }
+        Cmd::ClaimPrepare(path, cited_frame) => {
+            let token = refresh.token.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(actions::claim_prepare(token, path, cited_frame).await);
+            });
+        }
+        Cmd::MintRun(preview) => {
+            let token = refresh.token.clone();
+            let log = refresh.action_log.clone();
+            tokio::spawn(async move {
+                let progress = tx.clone();
+                let _ = tx.send(actions::mint_run(token, preview, progress, log).await);
             });
         }
         Cmd::ShieldRun(preview) => {

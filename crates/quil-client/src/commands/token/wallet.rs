@@ -239,7 +239,9 @@ where
                 ) =>
             {
                 if !reported {
-                    eprintln!("Waiting for the node to prepare spend witnesses...");
+                    super::output::err_line(
+                        "Waiting for the node to prepare spend witnesses...".into(),
+                    );
                     reported = true;
                 }
                 tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
@@ -717,10 +719,7 @@ impl RecipientWallet {
         // The saved authorization carries the claimed rewards and the fee in
         // the clear: the amount being claimed needs no decryption.
         if let Ok(reward) = mint.statement.total() {
-            println!(
-                "{}",
-                mint_amounts_line("Claiming", reward, mint.statement.fee)
-            );
+            super::output::line(mint_amounts_line("Claiming", reward, mint.statement.fee));
         }
         let receipt = receipt_address(&mint.statement)?;
         let response = client
@@ -734,7 +733,10 @@ impl RecipientWallet {
             .await?
             .into_inner();
         if response.found {
-            println!("Mint claim cites global frame {}.", response.cited_frame);
+            super::output::line(format!(
+                "Mint claim cites global frame {}.",
+                response.cited_frame
+            ));
         }
         let claim = claim_from_witness(
             &mint.statement,
@@ -2951,12 +2953,71 @@ pub(super) async fn run_balance(
     Ok(())
 }
 
-pub(super) async fn run_escrows(
+/// Check `recipient` as `token transfer` (`escrow` false) or `token
+/// pending-transfer` (`escrow` true) parses it, without building anything.
+pub(crate) fn check_recipient(tc: &TokenCtx, recipient: &str, escrow: bool) -> anyhow::Result<()> {
+    let network =
+        quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let wallet = RecipientWallet::load(tc, &network, &quil_execution::domains::QUIL_TOKEN)?;
+    if escrow {
+        parse_escrow_address(recipient, &wallet.context).map(|_| ())
+    } else {
+        parse_recipient(recipient, &wallet.context).map(|_| ())
+    }
+}
+
+/// The coins `token merge all` would merge and their total: a wallet scan
+/// with `token`'s default bounds.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn merge_preview(tc: &TokenCtx) -> anyhow::Result<(usize, u128)> {
+    let network =
+        quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let wallet = std::sync::Arc::new(RecipientWallet::load(
+        tc,
+        &network,
+        &quil_execution::domains::QUIL_TOKEN,
+    )?);
+    let client = tc.connect().await?;
+    let owned = wallet
+        .scan_unspent(&client, super::SCAN_MAX_PAGES, super::SCAN_MAX_COINS)
+        .await?;
+    let (selected, total) = merge_selection(owned, &[], compile_limits().max_inputs)?;
+    Ok((selected.len(), total))
+}
+
+/// A pending transfer this wallet can act on, as `token escrows` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Escrow {
+    pub address: [u8; 32],
+    pub amount: u128,
+    /// This wallet funded it and holds the refund branch; otherwise it is
+    /// the recipient.
+    pub refund: bool,
+    /// The GLOBAL frame from which the refund branch is admitted.
+    pub refund_after: u64,
+}
+
+impl Escrow {
+    /// Its line in `token escrows`.
+    pub(crate) fn cli_line(&self) -> String {
+        format!(
+            "0x{} {} branch={} refund_after_global_frame={}",
+            hex::encode(self.address),
+            self.amount,
+            if self.refund { "refund" } else { "recipient" },
+            self.refund_after
+        )
+    }
+}
+
+/// The unconsumed escrows whose recipient or refund authority is this
+/// wallet's prover key: a scan of every escrow, with trial decryption.
+pub(crate) async fn list_escrows(
     tc: &TokenCtx,
     application: &str,
     max_pages: usize,
     max_escrows: usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<Escrow>> {
     let network =
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let wallet = std::sync::Arc::new(RecipientWallet::load(
@@ -2966,21 +3027,63 @@ pub(super) async fn run_escrows(
     )?);
     let authority = tc.key_manager.get_public_key_bytes_by_id("q-prover-key")?;
     let client = tc.connect().await?;
-    let escrows = wallet
+    Ok(wallet
         .scan_escrows(&client, authority, max_pages, max_escrows)
+        .await?
+        .into_iter()
+        .map(|(address, amount, refund, refund_after)| Escrow {
+            address,
+            amount: *amount,
+            refund,
+            refund_after,
+        })
+        .collect())
+}
+
+/// This wallet's unspent confidential QUIL coins and their total, as
+/// `token balance` counts them: a full scan of the coins, recovered here,
+/// each recovered coin's spent marker read from the configured node's
+/// GLOBAL state. `None` while the application holds no coin at all.
+pub(crate) async fn confidential_balance(
+    tc: &TokenCtx,
+    max_pages: usize,
+    max_coins: usize,
+) -> anyhow::Result<Option<(usize, u128)>> {
+    let network =
+        quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let wallet = std::sync::Arc::new(RecipientWallet::load(
+        tc,
+        &network,
+        &quil_execution::domains::QUIL_TOKEN,
+    )?);
+    let client = tc.connect().await?;
+    let coins = wallet
+        .scan_unspent_or_rootless(&client, max_pages, max_coins, &mut ScanReport::default())
         .await?;
+    coins
+        .map(|coins| {
+            let total = coins
+                .iter()
+                .try_fold(0u128, |sum, coin| sum.checked_add(*coin.amount))
+                .ok_or_else(|| anyhow::anyhow!("balance overflows u128"))?;
+            Ok((coins.len(), total))
+        })
+        .transpose()
+}
+
+pub(super) async fn run_escrows(
+    tc: &TokenCtx,
+    application: &str,
+    max_pages: usize,
+    max_escrows: usize,
+) -> anyhow::Result<()> {
+    let escrows = list_escrows(tc, application, max_pages, max_escrows).await?;
     println!(
         "{} recovered escrow authorities reported unconsumed by the configured node:",
         escrows.len()
     );
-    for (address, amount, refund, deadline) in escrows {
-        println!(
-            "0x{} {} branch={} refund_after_global_frame={}",
-            hex::encode(address),
-            *amount,
-            if refund { "refund" } else { "recipient" },
-            deadline
-        );
+    for escrow in escrows {
+        println!("{}", escrow.cli_line());
     }
     Ok(())
 }
@@ -3018,7 +3121,7 @@ pub(super) async fn run_coins(
 /// headroom covers a small move; a larger one is answered with the price the
 /// refresh just reported, by re-quoting and rebuilding rather than making the
 /// caller retry by hand. An explicit fee is exact by contract, never re-quoted.
-pub(super) async fn run_transfer(
+pub(crate) async fn run_transfer(
     tc: &TokenCtx,
     application: &str,
     recipient: &str,
@@ -3070,20 +3173,22 @@ pub(super) async fn run_transfer(
         match refresh_submission_fee(tc, &mut client, &bytes).await {
             Ok(()) => break bytes,
             Err(error) if requested_fee.is_none() && attempt < FEE_REBUILDS => {
-                println!("The fee moved while preparing the transfer ({error}); re-quoting and rebuilding.");
+                super::output::line(format!("The fee moved while preparing the transfer ({error}); re-quoting and rebuilding."));
             }
             Err(error) => return Err(error),
         }
     };
     submit_refreshed_operation(tc, &wallet, bytes).await?;
-    println!("Confidential transfer submitted. Finalized inclusion is not yet confirmed.");
+    super::output::line(
+        "Confidential transfer submitted. Finalized inclusion is not yet confirmed.".into(),
+    );
     Ok(())
 }
 
 /// The fee a transfer pays: the caller's, or a quote for two coins and the
 /// input limit's markers. Custom-token outflow carries no QUIL fee.
 #[cfg(feature = "native-proof")]
-async fn transfer_fee(
+pub(crate) async fn transfer_fee(
     tc: &TokenCtx,
     application: &[u8; 32],
     explicit: Option<u128>,
@@ -3929,7 +4034,7 @@ pub(super) async fn run_split(
 /// Merge the named coins (or the largest unspent coins) into one coin owned by
 /// this wallet. One transaction consumes at most the circuit's input count.
 #[cfg(feature = "native-proof")]
-pub(super) async fn run_merge(
+pub(crate) async fn run_merge(
     tc: &TokenCtx,
     application: &str,
     coins: &[String],
@@ -3976,7 +4081,9 @@ pub(super) async fn run_merge(
         )
         .await?;
     submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential merge submitted. Finalized inclusion is not yet confirmed.");
+    super::output::line(
+        "Confidential merge submitted. Finalized inclusion is not yet confirmed.".into(),
+    );
     Ok(())
 }
 
@@ -3984,7 +4091,7 @@ pub(super) async fn run_merge(
 /// Falcon key is the refund authority; the refund frame defaults to the node's
 /// current global head plus about one day. Delivery is not finality.
 #[cfg(feature = "native-proof")]
-pub(super) async fn run_pending_create(
+pub(crate) async fn run_pending_create(
     tc: &TokenCtx,
     application: &str,
     recipient: &str,
@@ -4058,7 +4165,7 @@ pub(super) async fn run_pending_create(
         )
         .await?;
     submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential escrow funding submitted; refund authority becomes eligible at global frame {refund_after_global_frame}. Finalized inclusion is not yet confirmed.");
+    super::output::line(format!("Confidential escrow funding submitted; refund authority becomes eligible at global frame {refund_after_global_frame}. Finalized inclusion is not yet confirmed."));
     Ok(())
 }
 
@@ -4074,51 +4181,147 @@ fn mint_amounts_line(verb: &str, reward: u128, fee: u128) -> String {
     )
 }
 
-/// Two-stage QUIL reward mint. Without `--claim`, discover this prover's reward,
-/// prove and submit the global authorization, and save its bytes for the claim
-/// stage. With `--claim <file>`, build the application claim from the finalized
-/// authorization and submit it. Delivery is not finality at either stage.
+/// What a reward mint reports as it goes. The CLI prints
+/// [`MintEvent::cli_line`]; the node manager shows the events itself.
 #[cfg(feature = "native-proof")]
-pub(super) async fn run_mint(
-    tc: &TokenCtx,
-    recipient: Option<&str>,
-    fee: u128,
-    claim: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
-    use quil_types::crypto::Signer;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MintEvent {
+    /// The authorization's reward and fee.
+    Amounts { reward: u128, fee: u128 },
+    /// Proving the authorization.
+    Proving,
+    /// The authorization was delivered and its bytes saved for the claim.
+    Submitted {
+        cited_frame: u64,
+        saved: std::path::PathBuf,
+    },
+    /// A claim was delivered.
+    Claimed,
+}
+
+#[cfg(feature = "native-proof")]
+impl MintEvent {
+    /// The line `token mint` prints for the event, if any.
+    pub(crate) fn cli_line(&self) -> Option<String> {
+        Some(match self {
+            Self::Amounts { reward, fee } => mint_amounts_line("Minting", *reward, *fee),
+            Self::Proving => return None,
+            Self::Submitted { cited_frame, saved } => format!(
+                "Confidential reward mint authorization submitted for global frame {cited_frame}. Once it is finalized, run `token mint --claim {}` to create the coins.",
+                saved.display()
+            ),
+            Self::Claimed => {
+                "Confidential mint claim submitted. Finalized inclusion is not yet confirmed."
+                    .into()
+            }
+        })
+    }
+}
+
+/// The fee a reward mint pays out of the minted amount: `explicit`, or the
+/// global venue's quote for one coin and the receipt marker.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn reward_mint_fee(tc: &TokenCtx, explicit: Option<u128>) -> anyhow::Result<u128> {
+    // Reward mints execute in the global venue: quote its pricing.
+    quoted_quil_fee(
+        tc,
+        explicit,
+        quil_execution::token_intrinsic::cost::Shape {
+            coins: 1,
+            markers: 1,
+            escrow: false,
+        },
+        true,
+    )
+    .await
+}
+
+/// This prover's reward, read and checked against its GLOBAL root, ready
+/// to authorize as one mint less `fee`.
+#[cfg(feature = "native-proof")]
+pub(crate) struct MintPlan {
+    pub cited_frame: u64,
+    pub reward: u128,
+    pub fee: u128,
+    reward_root: [u8; 32],
+    claim: quil_lattice_ct::confidential::mint::RewardClaim,
+    signer: std::sync::Arc<quil_crypto::FalconSigner>,
+    wallet: std::sync::Arc<RecipientWallet>,
+    client:
+        quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
+}
+
+#[cfg(feature = "native-proof")]
+impl MintPlan {
+    /// The wallet address the mint pays by default, in hex.
+    pub(crate) fn own_address(&self) -> String {
+        format!("0x{}", hex::encode(self.wallet.address().encode()))
+    }
+}
+
+/// Read this prover's claimable reward for a mint paying `fee`.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn plan_mint(tc: &TokenCtx, fee: u128) -> anyhow::Result<MintPlan> {
     let application = quil_execution::domains::QUIL_TOKEN;
     let network =
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &application)?);
-    let mut client = tc.connect().await?;
-    if let Some(path) = claim {
-        let mint_bytes = std::fs::read(path)?;
-        let bytes = wallet.create_mint_claim(&client, &mint_bytes).await?;
-        submit_operation(tc, &wallet, &mut client, bytes).await?;
-        println!("Confidential mint claim submitted. Finalized inclusion is not yet confirmed.");
-        return Ok(());
-    }
+    let client = tc.connect().await?;
     let signer = falcon_signer(tc)?;
-    let (cited_frame, reward_root, reward) = wallet.reward_claim(&client, signer.as_ref()).await?;
-    let value = reward
+    let (cited_frame, reward_root, claim) = wallet.reward_claim(&client, signer.as_ref()).await?;
+    claim
         .value
         .checked_sub(fee)
         .filter(|value| *value > 0)
         .ok_or_else(|| anyhow::anyhow!("claimable reward must exceed the fee"))?;
-    println!("{}", mint_amounts_line("Minting", reward.value, fee));
+    Ok(MintPlan {
+        cited_frame,
+        reward: claim.value,
+        fee,
+        reward_root,
+        claim,
+        signer,
+        wallet,
+        client,
+    })
+}
+
+/// Prove and submit `plan`'s authorization to `recipient` (default: this
+/// wallet), saving its bytes for the claim stage as
+/// `mint-<cited frame>.bin` in the config directory.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn execute_mint(
+    tc: &TokenCtx,
+    plan: MintPlan,
+    recipient: Option<&str>,
+    mut on_event: impl FnMut(MintEvent),
+) -> anyhow::Result<()> {
+    use quil_types::crypto::Signer;
+    let MintPlan {
+        cited_frame,
+        reward,
+        fee,
+        reward_root,
+        claim,
+        signer,
+        wallet,
+        mut client,
+    } = plan;
+    on_event(MintEvent::Amounts { reward, fee });
     let recipient = match recipient {
         Some(recipient) => parse_recipient(recipient, &wallet.context)?,
         None => wallet.address().clone(),
     };
     let signer: std::sync::Arc<dyn Signer> = signer;
+    on_event(MintEvent::Proving);
     let bytes = wallet
         .clone()
         .create_mint(
             cited_frame,
             reward_root,
-            vec![reward],
+            vec![claim],
             vec![signer],
-            vec![(recipient, value)],
+            vec![(recipient, reward - fee)],
             fee,
             1,
             1,
@@ -4128,8 +4331,151 @@ pub(super) async fn run_mint(
     let saved = tc.config_dir.join(format!("mint-{cited_frame}.bin"));
     std::fs::write(&saved, &bytes)?;
     submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential reward mint authorization submitted for global frame {cited_frame}. Once it is finalized, run `token mint --claim {}` to create the coins.", saved.display());
+    on_event(MintEvent::Submitted { cited_frame, saved });
     Ok(())
+}
+
+/// Build the claim of the authorization saved at `path` from its
+/// finalized GLOBAL witness and submit it.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn execute_mint_claim(
+    tc: &TokenCtx,
+    path: &std::path::Path,
+    mut on_event: impl FnMut(MintEvent),
+) -> anyhow::Result<()> {
+    let application = quil_execution::domains::QUIL_TOKEN;
+    let network =
+        quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &application)?);
+    let mut client = tc.connect().await?;
+    let mint_bytes = std::fs::read(path)?;
+    let bytes = wallet.create_mint_claim(&client, &mint_bytes).await?;
+    submit_operation(tc, &wallet, &mut client, bytes).await?;
+    on_event(MintEvent::Claimed);
+    Ok(())
+}
+
+/// A saved reward-mint authorization in the config directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SavedMint {
+    pub path: std::path::PathBuf,
+    /// The GLOBAL frame the authorization cites (its file name).
+    pub cited_frame: u64,
+    /// Its reward and fee in base units; `None` when the file does not
+    /// decode as a mint of this network.
+    pub amounts: Option<(u128, u128)>,
+}
+
+/// The `mint-<frame>.bin` authorizations `token mint` saved in `dir`,
+/// newest first.
+pub(crate) fn saved_mints(dir: &std::path::Path, network: u8) -> Vec<SavedMint> {
+    let network = quil_lattice_ct::confidential::transfer::network_identifier(network);
+    let mut saved: Vec<SavedMint> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let cited_frame = name
+                .strip_prefix("mint-")?
+                .strip_suffix(".bin")?
+                .parse()
+                .ok()?;
+            let amounts = std::fs::read(entry.path()).ok().and_then(|bytes| {
+                let mint = quil_lattice_ct::confidential::mint::Mint::decode(
+                    &bytes,
+                    &network,
+                    &quil_execution::domains::QUIL_TOKEN,
+                )
+                .ok()?;
+                Some((mint.statement.total().ok()?, mint.statement.fee))
+            });
+            Some(SavedMint {
+                path: entry.path(),
+                cited_frame,
+                amounts,
+            })
+        })
+        .collect();
+    saved.sort_by(|a, b| b.cited_frame.cmp(&a.cited_frame));
+    saved
+}
+
+/// Whether GLOBAL has finalized the saved authorization `mint_bytes`: the
+/// frame its witness cites, or `None` while no witness exists yet. The
+/// claim needs that witness.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn mint_claim_witness(
+    tc: &TokenCtx,
+    mint_bytes: &[u8],
+) -> anyhow::Result<Option<u64>> {
+    use quil_execution::token_intrinsic::mint_authorization::receipt_address;
+    let network =
+        quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let mint = quil_lattice_ct::confidential::mint::Mint::decode(
+        mint_bytes,
+        &network,
+        &quil_execution::domains::QUIL_TOKEN,
+    )
+    .map_err(|e| anyhow::anyhow!("invalid original mint: {e:?}"))?;
+    let response = tc
+        .connect()
+        .await?
+        .max_decoding_message_size(64 * 1024)
+        .get_mint_authorization_witness(
+            quil_types::proto::node::GetMintAuthorizationWitnessRequest {
+                receipt: receipt_address(&mint.statement)?.to_vec(),
+            },
+        )
+        .await?
+        .into_inner();
+    Ok(response.found.then_some(response.cited_frame))
+}
+
+/// Two-stage QUIL reward mint. Without `--claim`, discover this prover's reward,
+/// prove and submit the global authorization, and save its bytes for the claim
+/// stage. With `--claim <file>`, build the application claim from the finalized
+/// authorization and submit it. Delivery is not finality at either stage.
+/// `record` keeps the amounts and the submission in the private action log.
+#[cfg(feature = "native-proof")]
+pub(super) async fn run_mint(
+    tc: &TokenCtx,
+    recipient: Option<&str>,
+    fee: u128,
+    claim: Option<&std::path::Path>,
+    mut record: Option<&mut super::action_log::CliAction>,
+) -> anyhow::Result<()> {
+    let print = move |event: MintEvent| {
+        if let Some(record) = record.as_deref_mut() {
+            match &event {
+                MintEvent::Amounts { reward, fee } => record.step(
+                    "amounts",
+                    serde_json::json!({
+                        "reward": reward.to_string(),
+                        "fee": fee.to_string(),
+                        "minted": reward.saturating_sub(*fee).to_string(),
+                    }),
+                ),
+                MintEvent::Submitted { cited_frame, saved } => record.step(
+                    "submitted",
+                    serde_json::json!({
+                        "cited_frame": cited_frame,
+                        "file": saved.file_name().map(|n| n.to_string_lossy().into_owned()),
+                    }),
+                ),
+                MintEvent::Claimed => record.step("claimed", serde_json::json!({})),
+                MintEvent::Proving => {}
+            }
+        }
+        if let Some(line) = event.cli_line() {
+            println!("{line}");
+        }
+    };
+    if let Some(path) = claim {
+        return execute_mint_claim(tc, path, print).await;
+    }
+    let plan = plan_mint(tc, fee).await?;
+    execute_mint(tc, plan, recipient, print).await
 }
 
 /// Shield one transparent (legacy-owned) coin into confidential coins owned by
@@ -4543,7 +4889,7 @@ pub(super) async fn run_shield_all(
 
 /// Explicit CLI submission; a successful RPC response is delivery, not finality.
 #[cfg(feature = "native-proof")]
-pub(super) async fn run_claim(
+pub(crate) async fn run_claim(
     tc: &TokenCtx,
     application: &str,
     escrow: &str,
@@ -4620,7 +4966,9 @@ pub(super) async fn run_claim(
         )
         .await?;
     submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential escrow claim submitted. Finalized inclusion is not yet confirmed.");
+    super::output::line(
+        "Confidential escrow claim submitted. Finalized inclusion is not yet confirmed.".into(),
+    );
     Ok(())
 }
 
@@ -6317,6 +6665,59 @@ mod tests {
 #[cfg(all(test, feature = "native-proof"))]
 mod shield_all_cli_tests {
     use super::*;
+
+    /// The lines `token mint` printed before its events existed.
+    #[test]
+    fn mint_prints_what_it_printed_before() {
+        let lines: Vec<Option<String>> = [
+            MintEvent::Amounts {
+                reward: 100_000_000_000,
+                fee: 2_000_000_000,
+            },
+            MintEvent::Proving,
+            MintEvent::Submitted {
+                cited_frame: 42,
+                saved: "/cfg/mint-42.bin".into(),
+            },
+            MintEvent::Claimed,
+        ]
+        .iter()
+        .map(MintEvent::cli_line)
+        .collect();
+        assert_eq!(
+            lines,
+            [
+                Some(mint_amounts_line("Minting", 100_000_000_000, 2_000_000_000)),
+                None,
+                Some(
+                    "Confidential reward mint authorization submitted for global frame 42. \
+                     Once it is finalized, run `token mint --claim /cfg/mint-42.bin` to create \
+                     the coins."
+                        .into()
+                ),
+                Some(
+                    "Confidential mint claim submitted. Finalized inclusion is not yet confirmed."
+                        .into()
+                ),
+            ]
+        );
+    }
+
+    /// Saved authorizations are found by name, newest first; a file that
+    /// is not a mint lists without amounts.
+    #[test]
+    fn saved_mints_list_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["mint-7.bin", "mint-12.bin", "mint-x.bin", "other.bin"] {
+            std::fs::write(dir.path().join(name), b"not a mint").unwrap();
+        }
+        let saved = saved_mints(dir.path(), 0);
+        assert_eq!(
+            saved.iter().map(|s| s.cited_frame).collect::<Vec<_>>(),
+            [12, 7]
+        );
+        assert!(saved.iter().all(|s| s.amounts.is_none()));
+    }
 
     /// The node manager's Shield plan rows are shield-all's own batches.
     #[test]

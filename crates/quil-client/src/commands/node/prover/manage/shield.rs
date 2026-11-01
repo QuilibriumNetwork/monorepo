@@ -119,33 +119,9 @@ pub struct Shield {
     pub log_failed: Option<String>,
 }
 
-/// The operator log's target: `RUST_LOG=qclient::action=info` shows its
-/// lines on stderr; redirect it to a file while the manager draws.
-pub const LOG_TARGET: &str = "qclient::action";
-
-/// What went wrong, as the operator log names it: a fixed class and its
-/// fixed reason. The error text itself can carry the node's address, a
-/// config path or amounts, so it stays on screen and in the private log.
-pub fn error_class(error: &str) -> (&'static str, &'static str) {
-    let has = |part: &str| error.contains(part);
-    if has("--max-fee") || has("automatic fee limit") {
-        ("fee_cap", "a fee quote exceeds --max-fee")
-    } else if has("plan changed") {
-        ("plan_changed", "the coins changed since the confirmation")
-    } else if has("accepts only submissions signed") {
-        ("identity", "the signing config is not the node's")
-    } else if has("shields") && has("open") {
-        ("not_open", "shields are not admitted yet")
-    } else if has("prov") || has("budget") {
-        ("proving", "a batch proof failed")
-    } else if has("transport") || has("status:") || has("connect") || has("deadline") {
-        ("rpc", "a node request failed")
-    } else if has("no node config") {
-        ("config", "the node config did not load")
-    } else {
-        ("other", "unclassified; the manager shows the error")
-    }
-}
+/// The operator log's target and error classes, shared with the CLI's
+/// wallet commands.
+pub(crate) use crate::commands::token::action_log::{error_class, LOG_TARGET};
 
 /// The operator log's start line.
 fn log_start(run: &Run) {
@@ -216,8 +192,13 @@ pub fn running(m: &Model) -> bool {
 /// Why `S` cannot start now, as the line pressing it shows; `None` when
 /// there is something to shield and nothing else runs.
 pub fn refusal(m: &Model) -> Option<String> {
-    let why = if running(m) {
-        "a run is in progress; one action at a time.".to_string()
+    let why = if running(m)
+        || super::mint::running(m)
+        || super::transfer::running(m)
+        || m.coins.mint.dialog.is_some()
+        || m.coins.transfer.dialog.is_some()
+    {
+        "another action is in progress; one action at a time.".to_string()
     } else if m.coins.shield.dialog.is_some() {
         "the shield is being prepared; ‹esc› cancels it.".to_string()
     } else {
@@ -311,10 +292,10 @@ pub fn quit_guard(m: &mut Model, ev: &KeyEvent, quit: bool) -> Option<Vec<Cmd>> 
         m.status_is_error = false;
         return Some(vec![]);
     }
-    if quit && running(m) {
+    if quit && (running(m) || super::mint::running(m) || super::transfer::running(m)) {
         m.coins.shield.quit_pending = true;
-        m.status_msg = "A shield submission is in progress: ‹y› quits and abandons the batch \
-                        being proved; any other key keeps it running."
+        m.status_msg = "A submission is in progress: ‹y› quits and abandons what is being \
+                        proved; any other key keeps it running."
             .into();
         m.status_is_error = true;
         return Some(vec![]);
@@ -618,11 +599,14 @@ pub(crate) mod shield_tests {
         // One action at a time.
         assert!(request(&mut m).is_empty());
         assert!(m.status_msg.contains("one action at a time"));
+        // Nor a mint beside it.
+        m.claimable_reward = Some((5, 1));
+        assert!(super::super::mint::request_mint(&mut m).is_empty());
     }
 
     /// A sink for the operator log's formatted lines.
     #[derive(Clone, Default)]
-    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    pub(crate) struct Capture(pub(crate) std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
     impl std::io::Write for Capture {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -633,6 +617,21 @@ pub(crate) mod shield_tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// The operator log's lines `work` writes, formatted as on stderr.
+    pub(crate) fn operator_log(work: impl FnOnce()) -> String {
+        let capture = Capture::default();
+        let sink = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, work);
+        let bytes = capture.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
     }
 
     /// The operator log gets one line at the start and one at the outcome,
@@ -745,6 +744,16 @@ pub(crate) mod shield_tests {
                 "plan_changed",
             ),
             ("transport error", "rpc"),
+            (
+                "the reward changed since it was confirmed (f43, 1001 base units now); \
+                 press ‹M› again",
+                "reward_changed",
+            ),
+            (
+                "the authorization citing f42 is not finalized: GLOBAL holds no witness for \
+                 it yet",
+                "not_finalized",
+            ),
             ("something new", "other"),
         ] {
             assert_eq!(error_class(error).0, class, "{error}");

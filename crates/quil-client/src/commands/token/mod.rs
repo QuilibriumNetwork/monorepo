@@ -22,8 +22,74 @@ pub(crate) mod legacy;
 pub(crate) mod output;
 #[cfg(feature = "confidential-tokens")]
 mod wallet;
+#[cfg(feature = "confidential-tokens")]
+pub(crate) use wallet::{check_recipient, confidential_balance, list_escrows, saved_mints};
+
+/// Default scan bounds of `qclient token` (`--max-pages`, `--max-coins`).
+pub(crate) const SCAN_MAX_PAGES: usize = 2048;
+pub(crate) const SCAN_MAX_COINS: usize = 1024;
 #[cfg(feature = "native-proof")]
-pub(crate) use wallet::{execute_shield_all, plan_shield_all, shield_batch_fee, ShieldEvent};
+pub(crate) use wallet::{
+    execute_mint, execute_mint_claim, execute_shield_all, merge_preview, mint_claim_witness,
+    plan_mint, plan_shield_all, reward_mint_fee, run_claim, run_merge, run_pending_create,
+    run_transfer, shield_batch_fee, transfer_fee, MintEvent, MintPlan, ShieldEvent,
+};
+
+/// The input limit of one confidential spend on this network.
+#[cfg(feature = "native-proof")]
+pub(crate) fn max_inputs(tc: &TokenCtx) -> usize {
+    quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(tc.node_config.p2p.network)
+        .limits
+        .max_inputs
+}
+
+/// The fee `token merge` pays: `explicit`, or a quote for one coin and the
+/// input limit's markers.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn merge_fee(
+    tc: &TokenCtx,
+    application: &str,
+    explicit: Option<u128>,
+) -> anyhow::Result<u128> {
+    let shape = quil_execution::token_intrinsic::cost::Shape {
+        coins: 1,
+        markers: max_inputs(tc),
+        escrow: false,
+    };
+    operation_fee(tc, application, explicit, shape).await
+}
+
+/// The fee `token pending-transfer` pays: `explicit`, or a quote for one
+/// escrow coin and the input limit's markers.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn pending_fee(
+    tc: &TokenCtx,
+    application: &str,
+    explicit: Option<u128>,
+) -> anyhow::Result<u128> {
+    let shape = quil_execution::token_intrinsic::cost::Shape {
+        coins: 1,
+        markers: max_inputs(tc),
+        escrow: true,
+    };
+    operation_fee(tc, application, explicit, shape).await
+}
+
+/// The fee `token accept` and `token reject` pay: `explicit`, or a quote
+/// for one coin and one marker.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn claim_fee(
+    tc: &TokenCtx,
+    application: &str,
+    explicit: Option<u128>,
+) -> anyhow::Result<u128> {
+    let shape = quil_execution::token_intrinsic::cost::Shape {
+        coins: 1,
+        markers: 1,
+        escrow: false,
+    };
+    operation_fee(tc, application, explicit, shape).await
+}
 
 /// Flags shared by every `token` subcommand (Go `TokenCmd` persistent
 /// flags).
@@ -324,10 +390,10 @@ pub struct TokenArgs {
     /// Maximum discovery pages (up to 64 confidential coins or escrows each,
     /// 8 from older nodes); exhaustion fails rather than returning a partial
     /// balance.
-    #[arg(long, global = true, default_value_t = 2048)]
+    #[arg(long, global = true, default_value_t = SCAN_MAX_PAGES)]
     pub max_pages: usize,
     /// Maximum recovered unspent coins retained during discovery.
-    #[arg(long, global = true, default_value_t = 1024)]
+    #[arg(long, global = true, default_value_t = SCAN_MAX_COINS)]
     pub max_coins: usize,
     #[command(subcommand)]
     pub command: TokenCommand,
@@ -921,43 +987,44 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                 .map_err(|_| anyhow::anyhow!("{value:?} must be exactly 32 bytes of hex"))
         };
         use quil_execution::token_intrinsic::cost::Shape;
-        let max_inputs = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(
-            tc.node_config.p2p.network,
-        )
-        .limits
-        .max_inputs;
-        let spend = |coins: usize| Shape {
-            coins,
-            markers: max_inputs,
-            escrow: false,
-        };
         match &args.command {
             TokenCommand::Transfer {
                 recipient,
                 amount,
                 fee,
             } => {
-                return wallet::run_transfer(
-                    &tc,
-                    &application,
-                    recipient,
-                    parse_amount(amount)?,
-                    *fee,
-                    args.max_pages,
-                    args.max_coins,
-                )
-                .await
+                // Recorded in the private action log, with the operator lines.
+                let action = action_log::CliAction::start(&tc.config_dir, &args.command);
+                let result = async {
+                    wallet::run_transfer(
+                        &tc,
+                        &application,
+                        recipient,
+                        parse_amount(amount)?,
+                        *fee,
+                        args.max_pages,
+                        args.max_coins,
+                    )
+                    .await
+                }
+                .await;
+                return action_log::CliAction::close(action, result);
             }
             TokenCommand::Merge { coins, fee } => {
-                return wallet::run_merge(
-                    &tc,
-                    &application,
-                    coins,
-                    operation_fee(&tc, &application, *fee, spend(1)).await?,
-                    args.max_pages,
-                    args.max_coins,
-                )
-                .await
+                let action = action_log::CliAction::start(&tc.config_dir, &args.command);
+                let result = async {
+                    wallet::run_merge(
+                        &tc,
+                        &application,
+                        coins,
+                        merge_fee(&tc, &application, *fee).await?,
+                        args.max_pages,
+                        args.max_coins,
+                    )
+                    .await
+                }
+                .await;
+                return action_log::CliAction::close(action, result);
             }
             TokenCommand::Split {
                 coin,
@@ -1004,67 +1071,38 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                 expiration,
                 fee,
             } => {
-                return wallet::run_pending_create(
-                    &tc,
-                    &application,
-                    recipient,
-                    parse_amount(amount)?,
-                    operation_fee(
+                let action = action_log::CliAction::start(&tc.config_dir, &args.command);
+                let result = async {
+                    wallet::run_pending_create(
                         &tc,
                         &application,
-                        *fee,
-                        Shape {
-                            coins: 1,
-                            markers: max_inputs,
-                            escrow: true,
-                        },
+                        recipient,
+                        parse_amount(amount)?,
+                        pending_fee(&tc, &application, *fee).await?,
+                        *expiration,
+                        args.max_pages,
+                        args.max_coins,
                     )
-                    .await?,
-                    *expiration,
-                    args.max_pages,
-                    args.max_coins,
-                )
-                .await
+                    .await
+                }
+                .await;
+                return action_log::CliAction::close(action, result);
             }
-            TokenCommand::Accept { escrow, fee } => {
-                return wallet::run_claim(
-                    &tc,
-                    &application,
-                    escrow,
-                    operation_fee(
+            TokenCommand::Accept { escrow, fee } | TokenCommand::Reject { escrow, fee } => {
+                let refund = matches!(args.command, TokenCommand::Reject { .. });
+                let action = action_log::CliAction::start(&tc.config_dir, &args.command);
+                let result = async {
+                    wallet::run_claim(
                         &tc,
                         &application,
-                        *fee,
-                        Shape {
-                            coins: 1,
-                            markers: 1,
-                            escrow: false,
-                        },
+                        escrow,
+                        claim_fee(&tc, &application, *fee).await?,
+                        refund,
                     )
-                    .await?,
-                    false,
-                )
-                .await
-            }
-            TokenCommand::Reject { escrow, fee } => {
-                return wallet::run_claim(
-                    &tc,
-                    &application,
-                    escrow,
-                    operation_fee(
-                        &tc,
-                        &application,
-                        *fee,
-                        Shape {
-                            coins: 1,
-                            markers: 1,
-                            escrow: false,
-                        },
-                    )
-                    .await?,
-                    true,
-                )
-                .await
+                    .await
+                }
+                .await;
+                return action_log::CliAction::close(action, result);
             }
             TokenCommand::Mint {
                 recipient,
@@ -1075,26 +1113,30 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                     decoded == quil_execution::domains::QUIL_TOKEN,
                     "reward mint requires the QUIL application; use custom-mint for custom tokens"
                 );
-                // The mint pays its own state-growth charge (one coin and the
-                // receipt marker) out of the minted amount.
-                let mint_fee = if claim.is_some() {
-                    0
-                } else {
-                    // Reward mints execute in the global venue: quote its pricing.
-                    wallet::quoted_quil_fee(
+                // Recorded in the private action log, with the operator lines.
+                let mut action = action_log::CliAction::start(&tc.config_dir, &args.command);
+                let result = async {
+                    // The mint pays its own state-growth charge (one coin and
+                    // the receipt marker) out of the minted amount.
+                    let mint_fee = if claim.is_some() {
+                        0
+                    } else {
+                        wallet::reward_mint_fee(&tc, *fee).await?
+                    };
+                    wallet::run_mint(
                         &tc,
-                        *fee,
-                        Shape {
-                            coins: 1,
-                            markers: 1,
-                            escrow: false,
-                        },
-                        true,
+                        recipient.as_deref(),
+                        mint_fee,
+                        claim.as_deref(),
+                        action.as_mut(),
                     )
-                    .await?
+                    .await
+                }
+                .await;
+                return match action {
+                    Some(action) => action.finish(result),
+                    None => result,
                 };
-                return wallet::run_mint(&tc, recipient.as_deref(), mint_fee, claim.as_deref())
-                    .await;
             }
             TokenCommand::ShieldAll { max_per_batch } => {
                 return wallet::run_shield_all(&tc, &application, *max_per_batch).await
