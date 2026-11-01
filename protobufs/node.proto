@@ -83,6 +83,9 @@ message NodeInfoResponse {
   uint64 last_received_frame = 8;
   uint64 last_global_head_frame = 9;
   bool reachable = 10;
+  // This node's own reachability: its p2p listeners, AutoNAT's view and the
+  // addresses its PeerInfo announces. Absent on older nodes.
+  NodeReachability node_reachability = 18;
   repeated ShardAllocationInfo shard_allocations = 11;
   // The epoch the node is currently in (epoch_for_frame(last_global_head_frame)).
   // Provided so clients don't have to assume an epoch length.
@@ -128,6 +131,41 @@ message GossipClassTraffic {
   // Messages this process published, once each.
   uint64 published_messages = 8;
   uint64 published_bytes = 9;
+}
+
+// This node's reachability, as its p2p listeners, AutoNAT probes and PeerInfo
+// publisher see it.
+message NodeReachability {
+  // The p2p listeners' addresses, one per bound interface address (a
+  // wildcard listener reports each interface's address).
+  repeated string listen_multiaddrs = 1;
+  // AutoNAT's status of this node: `public`, `private` or `unknown`.
+  string nat_status = 2;
+  // AutoNAT-confirmed external addresses: at most one per transport, most
+  // recently accepted first.
+  repeated string confirmed_multiaddrs = 3;
+  // The current run of AutoNAT probes without a dial-back; absent while the
+  // latest probe brought one, or before any failed.
+  AutonatProbeFailure probe_failure = 4;
+  // Whether this node has published its PeerInfo since it started.
+  bool announced = 5;
+  // The master's addresses in the last PeerInfo it published.
+  repeated string announced_pubsub_multiaddrs = 6;
+  repeated string announced_stream_multiaddrs = 7;
+}
+
+// A run of AutoNAT probes of this node without a dial-back.
+message AutonatProbeFailure {
+  // The run's most frequent failure class (`timeout`, `dial_error`, ...).
+  string class = 1;
+  // Probes in the run.
+  uint32 probes = 2;
+  // Seconds since the run began.
+  uint64 failing_secs = 3;
+  // Servers on distinct IPs could not dial this node back, or not within
+  // AutoNAT's timeout: the node is unreachable, as opposed to probes that
+  // fail for other reasons.
+  bool unreachable = 4;
 }
 
 message WorkerInfo {

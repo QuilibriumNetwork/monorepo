@@ -36,6 +36,44 @@ pub(crate) struct PeerInfoPublisherArgs {
     /// Whether the node runs the live onion relay (advertises `PROTOCOL_ROUTING`
     /// so peers may build circuits through it). Off when `p2p.disableOnionRouting`.
     pub onion_routing_enabled: bool,
+    /// Receives the master's addresses of each PeerInfo published.
+    pub announced: watch::Sender<AnnouncedAddrs>,
+}
+
+/// The master's addresses in the last PeerInfo this node published.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AnnouncedAddrs {
+    /// Whether a PeerInfo was published since start.
+    pub published: bool,
+    pub pubsub: Vec<String>,
+    pub stream: Vec<String>,
+}
+
+/// This node's reachability for `get_node_info`: `listen` are the p2p
+/// listeners' addresses, `ext` the AutoNAT-confirmed addresses with
+/// AutoNAT's view, `announced` the last PeerInfo's master addresses.
+pub(crate) fn node_reachability(
+    listen: Vec<String>,
+    ext: &ConfirmedExternalAddrs,
+    announced: &AnnouncedAddrs,
+    now: std::time::Instant,
+) -> quil_types::proto::node::NodeReachability {
+    quil_types::proto::node::NodeReachability {
+        listen_multiaddrs: listen,
+        nat_status: ext.autonat.nat_status.to_string(),
+        confirmed_multiaddrs: ext.addrs.clone(),
+        probe_failure: ext.autonat.probe_failure.as_ref().map(|run| {
+            quil_types::proto::node::AutonatProbeFailure {
+                class: run.class.to_string(),
+                probes: run.probes,
+                failing_secs: now.saturating_duration_since(run.since).as_secs(),
+                unreachable: run.unreachable,
+            }
+        }),
+        announced: announced.published,
+        announced_pubsub_multiaddrs: announced.pubsub.clone(),
+        announced_stream_multiaddrs: announced.stream.clone(),
+    }
 }
 
 /// How long to wait for a peer to appear on the PeerInfo topic before
@@ -461,6 +499,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
         archive_mode,
         network,
         onion_routing_enabled,
+        announced,
     } = args;
 
     let pi_handle = p2p_handle.clone();
@@ -722,6 +761,11 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
             published_addr = Some(pubsub_addr.clone());
             published_carried = Some(carried);
 
+            let master_addrs = AnnouncedAddrs {
+                published: true,
+                pubsub: reachability[0].pubsub_multiaddrs.clone(),
+                stream: reachability[0].stream_multiaddrs.clone(),
+            };
             let info = quil_p2p::CanonicalPeerInfo {
                 peer_id: pi_peer_id_bytes.clone(),
                 reachability,
@@ -773,6 +817,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
             if let Err(e) = pi_handle.publish(bitmask.clone(), encoded).await {
                 warn!(error = %e, "failed to publish PeerInfo");
             } else {
+                announced.send_replace(master_addrs);
                 debug!(
                     capabilities = pi_caps.len(),
                     signed = !pi_falcon_pubkey.is_empty(),
@@ -1421,5 +1466,64 @@ mod tests {
 
         assert_eq!(peers, 0);
         assert_eq!(started.elapsed(), max_wait);
+    }
+}
+
+#[cfg(test)]
+mod reachability_tests {
+    use super::*;
+    use quil_p2p::external_addr::ProbeFailureSummary;
+
+    #[test]
+    fn node_reachability_reports_autonat_view_and_announced_addresses() {
+        let since = std::time::Instant::now();
+        let ext = ConfirmedExternalAddrs {
+            addrs: vec!["/ip4/203.0.113.7/tcp/8336".to_string()],
+            last_change: None,
+            autonat: AutonatSummary {
+                nat_status: "private",
+                probe_failure: Some(ProbeFailureSummary {
+                    class: "dial_error",
+                    probes: 14,
+                    since,
+                    unreachable: true,
+                }),
+            },
+        };
+        let announced = AnnouncedAddrs {
+            published: true,
+            pubsub: vec!["/ip4/203.0.113.7/tcp/8336".to_string()],
+            stream: vec!["/ip4/203.0.113.7/tcp/8340".to_string()],
+        };
+        let listen = vec!["/ip4/203.0.113.7/tcp/8336".to_string()];
+        let now = since + Duration::from_secs(1_920);
+        let r = node_reachability(listen.clone(), &ext, &announced, now);
+        assert_eq!(r.listen_multiaddrs, listen);
+        assert_eq!(r.nat_status, "private");
+        assert_eq!(r.confirmed_multiaddrs, ext.addrs);
+        let run = r.probe_failure.expect("a failing run");
+        assert_eq!(
+            (
+                run.class.as_str(),
+                run.probes,
+                run.failing_secs,
+                run.unreachable
+            ),
+            ("dial_error", 14, 1_920, true)
+        );
+        assert!(r.announced);
+        assert_eq!(r.announced_pubsub_multiaddrs, announced.pubsub);
+        assert_eq!(r.announced_stream_multiaddrs, announced.stream);
+
+        // Before the first probe and publish.
+        let r = node_reachability(
+            Vec::new(),
+            &ConfirmedExternalAddrs::default(),
+            &AnnouncedAddrs::default(),
+            now,
+        );
+        assert_eq!(r.nat_status, "unknown");
+        assert!(r.probe_failure.is_none());
+        assert!(!r.announced && r.announced_pubsub_multiaddrs.is_empty());
     }
 }

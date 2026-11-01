@@ -12,7 +12,7 @@
 //! `approve`, `deny`) are in [`super::diagnostics_logs`].
 
 use std::fmt::Write as _;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 use clap::{Args, Subcommand};
@@ -345,8 +345,16 @@ pub(crate) fn address_reach(multiaddr: &str) -> Reach {
     let parts: Vec<&str> = multiaddr.trim_matches('/').split('/').collect();
     for pair in parts.chunks(2) {
         match pair {
-            ["ip4", host] => return host.parse().map_or(Reach::Unknown, ipv4_reach),
-            ["ip6", host] => return host.parse().map_or(Reach::Unknown, ipv6_reach),
+            ["ip4", host] => {
+                return host
+                    .parse::<Ipv4Addr>()
+                    .map_or(Reach::Unknown, |ip| ip_reach(ip.into()))
+            }
+            ["ip6", host] => {
+                return host
+                    .parse::<Ipv6Addr>()
+                    .map_or(Reach::Unknown, |ip| ip_reach(ip.into()))
+            }
             ["dns" | "dns4" | "dns6" | "dnsaddr", _] => return Reach::Unknown,
             _ => {}
         }
@@ -354,26 +362,52 @@ pub(crate) fn address_reach(multiaddr: &str) -> Reach {
     Reach::Unknown
 }
 
-fn ipv4_reach(ip: Ipv4Addr) -> Reach {
-    // 100.64.0.0/10 is shared address space for carrier-grade NAT (RFC
-    // 6598); `Ipv4Addr::is_shared` is not stable.
-    let shared = ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 0x40;
-    if ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || shared {
-        Reach::Private
-    } else {
-        Reach::Public
+/// What kind of network an IP address belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IpClass {
+    /// Globally routable (documentation ranges included).
+    Public,
+    /// A private network behind a NAT: RFC 1918 IPv4, unique-local IPv6.
+    Private,
+    /// Shared address space for carrier-grade NAT, 100.64.0.0/10 (RFC
+    /// 6598): the ISP's NAT, which the operator cannot forward ports on.
+    Shared,
+    /// Loopback, link-local or unspecified: this host or link only.
+    Local,
+}
+
+pub(crate) fn ip_class(ip: IpAddr) -> IpClass {
+    match ip {
+        IpAddr::V4(v4) => ipv4_class(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => ipv4_class(v4),
+            None if v6.is_loopback() || v6.is_unspecified() || v6.is_unicast_link_local() => {
+                IpClass::Local
+            }
+            None if v6.is_unique_local() => IpClass::Private,
+            None => IpClass::Public,
+        },
     }
 }
 
-fn ipv6_reach(ip: Ipv6Addr) -> Reach {
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return ipv4_reach(v4);
-    }
-    if ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local() || ip.is_unicast_link_local()
-    {
-        Reach::Private
+fn ipv4_class(ip: Ipv4Addr) -> IpClass {
+    // `Ipv4Addr::is_shared` is not stable.
+    let shared = ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 0x40;
+    if ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() {
+        IpClass::Local
+    } else if ip.is_private() {
+        IpClass::Private
+    } else if shared {
+        IpClass::Shared
     } else {
-        Reach::Public
+        IpClass::Public
+    }
+}
+
+fn ip_reach(ip: IpAddr) -> Reach {
+    match ip_class(ip) {
+        IpClass::Public => Reach::Public,
+        IpClass::Private | IpClass::Shared | IpClass::Local => Reach::Private,
     }
 }
 
