@@ -3016,6 +3016,9 @@ pub struct AppConsensusEngine {
     /// Which members of the running session were heard, to name those that
     /// never voted while it lacks a quorum ([`Self::log_silent_members`]).
     session_silent: SilentMembers,
+    /// When the running session host last finalized a view, to log a
+    /// stall ([`Self::watch_view_stall`]).
+    view_stall: crate::app_stall::ViewStall,
     /// This member's own votes in the running session host against the
     /// other members' ([`Self::track_own_votes`]).
     own_votes: crate::own_votes::OwnVotes,
@@ -3230,6 +3233,7 @@ impl AppConsensusEngine {
             ancestor_sync: AncestorSyncPacing::default(),
             lagging_voter: LaggingVoter::default(),
             session_silent: SilentMembers::default(),
+            view_stall: crate::app_stall::ViewStall::default(),
             own_votes: Default::default(),
             private_parents: None,
             sealed_session: None,
@@ -7708,6 +7712,7 @@ impl AppConsensusEngine {
     /// `blocked` counts messages consensus discarded as invalid.
     fn log_session_liveness(&mut self) {
         let _probe = probe::section(probe::Section::SessionLiveness);
+        self.watch_view_stall();
         let (Some(liveness), Some(session)) =
             (self.session_liveness.as_ref(), self.cw_session.as_ref())
         else {
@@ -7794,6 +7799,140 @@ impl AppConsensusEngine {
             inbound_from_nonmembers = self.cw_nonmember,
             "app session liveness");
         self.log_silent_members(&seen, best_signers, quorum);
+    }
+
+    /// While the running session host finalizes nothing, say so
+    /// ([`crate::app_stall`]): once past [`crate::app_stall::STALL_AFTER`],
+    /// again every [`crate::app_stall::STALL_REPEAT`], and when a view
+    /// finalizes. Each line names the members by their vote in the stalled
+    /// view closest to a quorum and counts this member's own refusals and
+    /// declined turns since the last finalization, by reason. Runs on every
+    /// retry tick from the tallies the session's liveness already keeps.
+    fn watch_view_stall(&mut self) {
+        use crate::app_stall::{indices, stall_votes, Look, StallCause, StallLog};
+        let now = std::time::Instant::now();
+        let hosting = self.cw_handle.as_ref().is_some_and(|host| !host.is_dead())
+            && self.sealed_session.is_none()
+            && !self.halted.load(std::sync::atomic::Ordering::Relaxed);
+        let (liveness, generation) = match (
+            hosting,
+            self.session_liveness.clone(),
+            self.cw_session.as_ref(),
+        ) {
+            (true, Some(liveness), Some(session)) => (Some(liveness), session.generation),
+            _ => (None, 0),
+        };
+        let seen = liveness.as_ref().map(|liveness| liveness.snapshot());
+        let decided = liveness
+            .as_ref()
+            .map(|liveness| liveness.decisions())
+            .unwrap_or_default();
+        let look = seen.map(|seen| Look {
+            host: (generation, self.cw_host_epoch),
+            finalized: seen.finalized,
+            decided: &decided,
+        });
+        let Some(log) = self.view_stall.check(now, look) else {
+            return;
+        };
+        let filter = hex::encode(&self.filter);
+        let materialized = self.last_materialized_frame;
+        let head = materialized.max(self.lagging_voter.known_tip.unwrap_or(0));
+        let (stalled, repeat, since_view, own) = match log {
+            StallLog::Ended { stalled, how } => {
+                info!(core_id = self.core_id, filter = %filter, generation, frame = head, materialized,
+                    finalized_view = seen.map_or(0, |seen| seen.finalized), stalled_secs = stalled.as_secs(), how,
+                    "app shard consensus stall ended");
+                return;
+            }
+            StallLog::Stalled {
+                stalled,
+                repeat,
+                since_view,
+                own,
+            } => (stalled, repeat, since_view, own),
+        };
+        let (Some(liveness), Some(seen), Some(session)) =
+            (liveness, seen, self.cw_session.as_ref())
+        else {
+            return;
+        };
+        let members = session.members.len();
+        let quorum = members - members.saturating_sub(1) / 3;
+        let votes = stall_votes(members, since_view, seen.view, |view| {
+            liveness.view_signers(view)
+        });
+        let me = self.session_silent.me;
+        let cause = StallCause::of(
+            &votes,
+            quorum,
+            me.and_then(|me| u32::try_from(me).ok()),
+            &own,
+        );
+        let held: Vec<(usize, &'static str)> = votes
+            .nullified
+            .iter()
+            .map(|&member| (member as usize, "nullified"))
+            .chain(
+                votes
+                    .silent
+                    .iter()
+                    .map(|&member| (member as usize, "no vote")),
+            )
+            .collect();
+        let holding_back = list_missing(&session.members, &held, me);
+        let in_stall = |outcome: &Option<quil_cw_consensus::adapters::Outcome>| {
+            outcome
+                .as_ref()
+                .filter(|outcome| outcome.view > since_view)
+                .map_or_else(String::new, |o| {
+                    format!("view {}: {} ({})", o.view, o.reason, o.detail)
+                })
+        };
+        let (scope, action, message) = match cause {
+            StallCause::NoProposal => (
+                "network",
+                "its leaders did not propose, or their proposals did not reach this node; own_declined and \
+                 last_declined say why this node skipped its own turns ('leader not ready to build on the parent' \
+                 waits for the parent frame or for the GLOBAL head to advance); check that GLOBAL advances; ends when \
+                 a view finalizes (logged)",
+                "app shard consensus stalled: no proposal drew a vote in its recent views",
+            ),
+            StallCause::NotFinalizing => (
+                "network",
+                "the members' finalize votes fall short of the quorum or do not reach this node; check this node's \
+                 transport warnings; if it persists, report this line with its shard to the maintainer",
+                "app shard consensus stalled although a proposal drew a quorum of notarize votes",
+            ),
+            StallCause::ThisNode => (
+                "this node",
+                "own_refused says why: 'not at the parent frame' and 'anchored GLOBAL frame missing' mean this worker \
+                 has not applied the parent frame or its GLOBAL anchor yet (check its proof verification and catch-up \
+                 lines); other reasons name the proposal's contents: report this line with its shard to the \
+                 maintainer; holding_back also names the other members that hold back",
+                "app shard consensus stalled, and this worker refuses its proposals",
+            ),
+            StallCause::Members => (
+                "peer",
+                "nothing to fix on this node; holding_back names the members that nullified (a nullify vote carries no \
+                 reason: most often the member has not applied the parent frame yet, as while it verifies a proof, or \
+                 runs another build) and those whose votes did not reach this node; ends when enough of them vote for \
+                 a proposal (logged); if it persists, report this line with its shard to the maintainer",
+                "app shard consensus stalled: too few members notarize the proposals this worker accepted",
+            ),
+        };
+        warn!(core_id = self.core_id, filter = %filter, generation, frame = head + 1, materialized, view = seen.view,
+            stalled_secs = stalled.as_secs(), repeat, members, quorum,
+            best_view = %votes.view.map_or_else(|| "none".to_string(), |view| view.to_string()),
+            notarized = votes.notarized.len(), nullified = votes.nullified.len(), silent = votes.silent.len(),
+            notarized_members = %indices(&votes.notarized), nullified_members = %indices(&votes.nullified),
+            silent_members = %indices(&votes.silent),
+            member = %me.map_or_else(|| "none".to_string(), |me| me.to_string()), holding_back = %holding_back,
+            views = votes.views, proposed_views = votes.proposed_views, own_accepted = own.accepted,
+            own_refused = %by_reason(&own.refused), own_proposed = own.proposed,
+            own_declined = %by_reason(&own.declined), last_refused = %in_stall(&decided.last_refused),
+            last_declined = %in_stall(&decided.last_declined), cause = cause.label(), scope, action,
+            "{message}");
     }
 
     /// Publish whether this worker is a lagging voter ([`LaggingVoter`]): a
