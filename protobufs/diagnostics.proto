@@ -170,6 +170,61 @@ message HealthReport {
   bool master_store_write_failed = 10;
   // The configured worker count; 0 from nodes that predate it.
   uint32 worker_capacity = 11;
+  // How fast the master store's reads and the disk under it are; absent
+  // from nodes that predate it or before the first interval closes.
+  StoreIoHealth store_io = 12;
+}
+
+// Whether the master store's reads and its disk are fast enough
+// (`StoreIoHealth.verdict`).
+enum StoreIoVerdict {
+  // Nothing measured: no canary read and no disk counters.
+  STORE_IO_VERDICT_UNSPECIFIED = 0;
+  STORE_IO_VERDICT_OK = 1;
+  // Over a slow threshold for 2 intervals in a row, until 3 intervals in a
+  // row are under every threshold: this node's disk is too slow.
+  STORE_IO_VERDICT_SLOW = 2;
+}
+
+// The slow threshold an interval crossed (`StoreIoHealth.slow_reason`).
+enum StoreIoReason {
+  STORE_IO_REASON_NONE = 0;
+  // Canary reads' p99 at or over 50 ms.
+  STORE_IO_REASON_CANARY_P99 = 1;
+  // A canary read unfinished for 1 s or more at the interval's end.
+  STORE_IO_REASON_CANARY_PENDING = 2;
+  // Disk await at or over 20 ms a read or 100 ms a write, of 20 or more.
+  STORE_IO_REASON_DISK_READ_AWAIT = 3;
+  STORE_IO_REASON_DISK_WRITE_AWAIT = 4;
+}
+
+// The master store's latest summary interval (60 s): a canary that reads
+// one entry of the store a second at a random position, bypassing its
+// block cache, and on Linux the device under the store in /proc/diskstats.
+message StoreIoHealth {
+  StoreIoVerdict verdict = 1;
+  // How long the verdict has been SLOW; 0 while it is not.
+  uint64 slow_secs = 2;
+  uint32 interval_secs = 3;
+  uint64 ended_unix_ms = 4;
+  // Canary reads finished in the interval and their latency.
+  uint32 canary_reads = 5;
+  uint64 canary_p50_us = 6;
+  uint64 canary_p99_us = 7;
+  uint64 canary_max_us = 8;
+  // How long a canary read unfinished at the interval's end had run; 0
+  // without one.
+  uint64 canary_pending_us = 9;
+  // The device's completed reads and writes and the mean time each took,
+  // queueing included, and the share of the interval it was busy; unset
+  // off Linux or when the device is unresolved (an await also without
+  // operations).
+  optional uint64 disk_reads = 10;
+  optional uint64 disk_writes = 11;
+  optional uint64 disk_read_await_us = 12;
+  optional uint64 disk_write_await_us = 13;
+  optional uint32 disk_busy_pct = 14;
+  StoreIoReason slow_reason = 15;
 }
 
 message GetHealthReportRequest {}

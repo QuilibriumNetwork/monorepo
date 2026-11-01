@@ -5,6 +5,7 @@ package quilibrium.node.node.pb;
 option go_package = "source.quilibrium.com/quilibrium/monorepo/node/protobufs";
 
 import "channel.proto";
+import "diagnostics.proto";
 import "global.proto";
 import "google/protobuf/wrappers.proto";
 
@@ -99,6 +100,9 @@ message NodeInfoResponse {
   // workers report theirs in `WorkerExecution.gossip_traffic`. Absent on
   // older nodes.
   GossipTraffic gossip_traffic = 15;
+  // How fast the master store's reads and the disk under it are, over the
+  // latest interval; absent from older nodes and before the first interval.
+  quilibrium.node.diagnostics.pb.StoreIoHealth store_io = 17;
 }
 
 // One process's gossip messages by bitmask class, since the process started.

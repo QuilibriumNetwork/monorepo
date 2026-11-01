@@ -80,6 +80,8 @@ pub(crate) fn init(
     db_arc
         .inner()
         .register_store(quil_forest::StoreRole::Master);
+    // Off every lock the commit path takes: a canary read a second.
+    quil_forest::store_io::start_master(&db_arc.inner());
     quil_store::large_vertex_index::start(&db_arc.inner(), "master".into());
     info!(
         path = %db_path.display(),
