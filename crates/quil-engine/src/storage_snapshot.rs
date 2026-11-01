@@ -516,6 +516,8 @@ struct RunningLeaf {
     /// Its layers labelled when it started, now, and of how many
     /// ([`LeafProgress::layers`]); none when not reported.
     layers: Option<(usize, usize, usize)>,
+    /// How long it paused ([`LeafProgress::paused`]).
+    paused: std::time::Duration,
     /// Whether its start was logged, or it was reported running long: its
     /// end is logged then.
     logged: bool,
@@ -581,12 +583,23 @@ impl LeafProgress {
             leaf.layers = Some((from, done, of));
         }
     }
+
+    /// Note that the leaf's work paused for `paused` (labelling ahead beside
+    /// a leaf labelled now,
+    /// `crate::storage_jobs::Reservation::wait_while_paused`): its pace
+    /// counts only the time it ran.
+    pub fn paused(&self, paused: std::time::Duration) {
+        if let Some(leaf) = running_leaves().leaves.get_mut(&self.id) {
+            leaf.paused += paused;
+        }
+    }
 }
 
 /// How long a leaf labelled ahead has still to run: at the pace of its
-/// layers labelled since it started, or by its estimate before its first.
+/// layers labelled since it started, or by its estimate before its first,
+/// not counting the time it paused.
 fn remaining_ahead(leaf: &RunningLeaf) -> std::time::Duration {
-    let elapsed = leaf.started.elapsed();
+    let elapsed = leaf.started.elapsed().saturating_sub(leaf.paused);
     match leaf.layers {
         Some((from, done, of)) if done > from => {
             elapsed.mul_f64(of.saturating_sub(done) as f64 / (done - from) as f64)
@@ -637,6 +650,7 @@ pub fn leaf_started(
             started: std::time::Instant::now(),
             estimate,
             layers: None,
+            paused: std::time::Duration::ZERO,
             logged,
         },
     );
@@ -909,6 +923,11 @@ fn encode_member_until(
             quil_crypto::storage_proof::encode_with_labels(&data, kept.n, &last, kept.comm_c).ok()
         });
         let ahead = from_kept.is_some();
+        if !ahead {
+            // Labelled now: labelling ahead beside it pauses but for
+            // `crate::storage_jobs::AHEAD_JOBS_BESIDE_DUE` of it.
+            memory.labelling_now();
+        }
         // Labelled now and kept when there is room; otherwise encoded as by a
         // process that keeps no labels, and its seal labels it again.
         let labelled = match (&from_kept, store) {
@@ -3086,6 +3105,109 @@ pub(crate) mod tests {
             vec![LeafOutcome::Yielded, LeafOutcome::Completed]
         );
         drop(second_release);
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::storage_jobs::set_available_for_test(None);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// A renewal's leaf labelled now pauses labelling ahead beside it but for
+    /// one leaf, the most urgent, which goes on
+    /// (`crate::storage_jobs::AHEAD_JOBS_BESIDE_DUE`); the paused leaf keeps
+    /// its memory and labels on to its end once the leaf labelled now has
+    /// ended (2026-11-01: beside three or four leaves labelled ahead, a
+    /// renewal's leaf estimated at 37 minutes was still labelled at its
+    /// grace, 3,137 s in).
+    #[test]
+    fn labelling_ahead_pauses_while_a_renewals_leaf_is_labelled_now() {
+        use crate::storage_labels::{ample_space, LabelStore};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        const GIB: u64 = 1 << 30;
+        crate::storage_jobs::set_available_for_test(Some(40 * GIB));
+        let (app, member, epoch) = ([0x87u8; 32], [0x6Eu8; 32], 6);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let (crdt, leaf_id) = one_long_leaf(app, epoch);
+        // A renewal's shard of one small leaf, which its snapshot labels now.
+        let renewal = [0x88u8; 32];
+        let shard = test_crdt();
+        for d in 0..30u8 {
+            shard
+                .add_vertex(
+                    &Location {
+                        app_address: renewal,
+                        data_address: address(d.wrapping_mul(7), d),
+                    },
+                    &vec![d; 300],
+                )
+                .unwrap();
+        }
+        shard.commit(1).unwrap();
+        let captured = capture_at(
+            &shard,
+            &renewal,
+            epoch,
+            &[current_source(&shard, &renewal, epoch)],
+        )
+        .unwrap();
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let dir = std::env::temp_dir().join(format!("quil-labels-pause-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store: &'static LabelStore =
+            Box::leak(Box::new(LabelStore::with_space(dir.clone(), ample_space())));
+        // A leaf only labelling ahead registers: more urgent than the one
+        // labelled below, which its snapshot could label within the grace.
+        let urgent = crate::storage_jobs::reserve_ahead(
+            GIB,
+            crate::storage_jobs::AheadOrder {
+                deferrable: false,
+                seat_leaves: 1,
+                seat: 0,
+                leaf: 0,
+            },
+            &|| false,
+        )
+        .expect("it fits");
+        let labelling = label_ahead_in_background(store, &crdt, member, app, epoch);
+        let (looked, paused, urgent_paused) = (
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+        );
+        // Looked at while the renewal's leaf is labelled now.
+        let stop = || {
+            if crate::storage_jobs::labelling_now_count() > 0
+                && !looked.swap(true, Ordering::SeqCst)
+            {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while crate::storage_jobs::pausing_count() == 0 && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                paused.store(crate::storage_jobs::pausing_count() > 0, Ordering::SeqCst);
+                urgent_paused.store(urgent.paused(), Ordering::SeqCst);
+            }
+            false
+        };
+        encode_member_until(&captured, &[0x64; 32], &replicas, None, &stop).unwrap();
+        assert!(
+            paused.load(Ordering::SeqCst),
+            "labelling ahead paused while the renewal's leaf was labelled now"
+        );
+        assert!(
+            !urgent_paused.load(Ordering::SeqCst),
+            "the most urgent leaf labelled ahead went on beside it"
+        );
+        labelling.ended(&crdt).unwrap();
+        assert!(
+            store.find(epoch, &member, &leaf_id, |_| true).is_some(),
+            "the paused leaf labelled on to its end"
+        );
+        assert_eq!(
+            outcomes(epoch, &app, LeafWork::LabellingAhead),
+            vec![LeafOutcome::Completed],
+            "it paused rather than gave its memory back"
+        );
+        assert_eq!(crate::storage_jobs::pausing_count(), 0);
+        drop(urgent);
         let _ = std::fs::remove_dir_all(&dir);
         crate::storage_jobs::set_available_for_test(None);
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);

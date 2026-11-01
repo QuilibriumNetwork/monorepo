@@ -29,7 +29,11 @@
 //! window labelling ahead has, so labelling it again from its start after
 //! each yield never ended (2026-11-01). The leaves wait for memory in an
 //! order (`crate::storage_jobs::AheadOrder`): those its snapshot could not
-//! label within the renewal's grace first ([`ahead_orders`]).
+//! label within the renewal's grace first ([`ahead_orders`]). Only two are
+//! labelled at once (`crate::storage_jobs::AHEAD_JOBS`), and while a
+//! renewal's leaf is labelled now only one goes on beside it; the other
+//! pauses, keeping its memory and layers, until that labelling ends
+//! (`crate::storage_jobs::Reservation::wait_while_paused`).
 //!
 //! Labelling ahead for an epoch gives up once GLOBAL reaches the epoch's
 //! snapshot frame ([`expired`]): the snapshot labels what is left itself, and
@@ -1159,9 +1163,36 @@ fn label_leaf_ahead(
         );
         progress.layers(from, layers);
         let started = Instant::now();
+        // Beside a renewal's leaf labelled now it may pause, keeping its
+        // memory and layers (`crate::storage_jobs::AHEAD_JOBS_BESIDE_DUE`).
+        let pause = || {
+            if !memory.paused() {
+                return;
+            }
+            info!(epoch, filter = %hex::encode(filter), leaf = %hex::encode(leaf_id), nodes = n,
+                from_layer = from, layers, scope = "local",
+                "storage labels computed ahead pause while a renewal's leaf is labelled now: they \
+                 keep their memory and the layers labelled and go on once that labelling ends, \
+                 which has this node's cores meanwhile: an expected wait");
+            let paused = memory.wait_while_paused(&gone);
+            progress.paused(paused);
+            let then = if memory.yield_requested() {
+                "giving their memory back to more urgent work"
+            } else if gone() {
+                "stopping"
+            } else {
+                "going on"
+            };
+            info!(epoch, filter = %hex::encode(filter), leaf = %hex::encode(leaf_id), nodes = n,
+                paused_seconds = paused.as_secs(), then, scope = "local",
+                "storage labels computed ahead pause ends");
+        };
         let labelled = admitted.label_ahead(
             params,
-            &|| memory.yield_requested() || crate::storage_jobs::stopping() || expired(epoch),
+            &|| {
+                pause();
+                memory.yield_requested() || gone()
+            },
             &|done| {
                 memory.progress(done as u64, layers as u64);
                 progress.layers(done, layers);

@@ -41,6 +41,17 @@
 //! waited through every seat's snapshot while the memory was there
 //! (2026-11-01).
 //!
+//! At most [`AHEAD_JOBS`] leaves are labelled ahead at once, whatever the
+//! memory lets: four of about 4.5 GB each held 17.9 GB of a 32 GB node's
+//! 20.5 GB (2026-11-01), and each takes a core. While a renewal's leaf is
+//! labelled now ([`Reservation::labelling_now`]), only
+//! [`AHEAD_JOBS_BESIDE_DUE`] goes on beside it; the others pause, keeping
+//! their memory and layers, and go on once it ends
+//! ([`Reservation::wait_while_paused`]): beside three or four leaves
+//! labelled ahead, a renewal's leaf ran at under 70% of its estimated pace
+//! and missed its grace, where three leaves at a time ran at 85 to 94%
+//! (2026-11-01).
+//!
 //! A stopping node stops its jobs ([`shut_down`]) before it exits: they use
 //! its stores, which exit tears down under a thread still using them.
 
@@ -58,6 +69,27 @@ pub const EPOCH_PROOF_LANE: &[u8] = b"epoch proofs";
 /// Percent of the memory available to the node the jobs may hold together;
 /// the rest is headroom for the node and for the estimates' error.
 pub const MEMORY_SHARE_PERCENT: u64 = 75;
+
+/// Leaves labelled ahead at once ([`reserve_ahead`]), whatever the memory
+/// lets: each takes a core and about 152 bytes a node, 4.9 GB for a leaf of
+/// 32 million nodes. One asking beyond them waits in its order and starts
+/// once one of them ends: labelled, given back to more urgent work, or given
+/// up at its epoch's snapshot frame (`crate::storage_labels`).
+pub const AHEAD_JOBS: usize = 2;
+
+/// Leaves labelled ahead that go on while a renewal's leaf is labelled now
+/// ([`Reservation::labelling_now`]): the most urgent, then the most
+/// advanced. The others pause until no leaf is labelled now
+/// ([`Reservation::wait_while_paused`]), at the latest at the renewal's
+/// grace frame, where its snapshot stops. With none, a leaf of 32 million
+/// nodes could not be labelled ahead in what the window has left after a
+/// grace; one keeps one such leaf going.
+pub const AHEAD_JOBS_BESIDE_DUE: usize = 1;
+
+/// How often labelling ahead that pauses ([`Reservation::wait_while_paused`])
+/// looks whether its work is still of use, besides whenever a reservation
+/// changes.
+const PAUSE_RECHECK: Duration = Duration::from_secs(1);
 
 /// How often a reservation that does not fit looks at the memory again,
 /// besides whenever another one changes.
@@ -497,6 +529,19 @@ pub(crate) fn set_available_for_test(bytes: Option<u64>) {
     TEST_AVAILABLE.store(bytes.unwrap_or(0), Ordering::SeqCst);
 }
 
+/// Leaves the node labels now ([`Reservation::labelling_now`]), for tests.
+#[cfg(test)]
+pub(crate) fn labelling_now_count() -> usize {
+    admission().state().labelling_now
+}
+
+/// Leaves labelled ahead that pause now ([`Reservation::wait_while_paused`]),
+/// for tests.
+#[cfg(test)]
+pub(crate) fn pausing_count() -> usize {
+    admission().state().pausing
+}
+
 /// Bytes of memory available to the node now: the host's, or less within
 /// its container's limit, page cache counted available as the host counts
 /// it. `None` when the host does not say.
@@ -524,6 +569,8 @@ pub struct Reservation {
     admission: &'static Admission,
     bytes: u64,
     ticket: u64,
+    /// Whether it labels a leaf now ([`Self::labelling_now`]).
+    labelling: bool,
 }
 
 impl Reservation {
@@ -557,6 +604,62 @@ impl Reservation {
             .is_some_and(|yielding| yielding.asked)
     }
 
+    /// Mark this reservation, for work due now, as labelling a leaf now (a
+    /// renewal's snapshot without labels kept ahead for it): while it is
+    /// held, labelling ahead beyond [`AHEAD_JOBS_BESIDE_DUE`] pauses and
+    /// none more starts, so the leaf has the node's cores (2026-11-01: beside
+    /// three or four leaves labelled ahead, a renewal's leaf of 15 million
+    /// nodes estimated at 37 minutes was still labelled after 3,137 s, at its
+    /// grace).
+    pub fn labelling_now(&mut self) {
+        if std::mem::replace(&mut self.labelling, true) {
+            return;
+        }
+        let mut state = self.admission.state();
+        state.labelling_now += 1;
+        state.stale = true;
+        drop(state);
+        self.admission.changed.notify_all();
+    }
+
+    /// Whether labelling ahead holding this reservation pauses now: a leaf
+    /// is labelled now, and [`AHEAD_JOBS_BESIDE_DUE`] leaves labelled ahead
+    /// more urgent or more advanced go on beside it.
+    pub fn paused(&self) -> bool {
+        self.admission.pauses(&self.admission.state(), self.ticket)
+    }
+
+    /// Pause, holding the memory, while [`Self::paused`] says so: until no
+    /// leaf is labelled now or this goes on beside it, it is asked to give
+    /// its memory back ([`Self::yield_requested`]), or `gone` says its work
+    /// is of no use any more, looked at every [`PAUSE_RECHECK`]. Returns how
+    /// long it paused.
+    pub fn wait_while_paused(&self, gone: &dyn Fn() -> bool) -> Duration {
+        let started = Instant::now();
+        let mut state = self.admission.state();
+        if !self.admission.pauses(&state, self.ticket) {
+            return Duration::ZERO;
+        }
+        state.pausing += 1;
+        while self.admission.pauses(&state, self.ticket) {
+            state = self
+                .admission
+                .changed
+                .wait_timeout(state, PAUSE_RECHECK)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+            // Not under the lock: the caller's look may take its own.
+            drop(state);
+            let gone = gone();
+            state = self.admission.state();
+            if gone {
+                break;
+            }
+        }
+        state.pausing = state.pausing.saturating_sub(1);
+        started.elapsed()
+    }
+
     /// Note that the work holding this reservation has done `done` of `of`
     /// parts: of work asked to give memory back, the least advanced is asked
     /// first, losing the least.
@@ -574,6 +677,9 @@ impl Drop for Reservation {
         state.reserved = state.reserved.saturating_sub(self.bytes);
         state.holders = state.holders.saturating_sub(1);
         state.yielding.remove(&self.ticket);
+        if self.labelling {
+            state.labelling_now = state.labelling_now.saturating_sub(1);
+        }
         state.stale = true;
         drop(state);
         self.admission.changed.notify_all();
@@ -589,6 +695,8 @@ pub struct Admission {
     pass_window: Duration,
     changed: Condvar,
     slots: usize,
+    /// [`AHEAD_JOBS`]; more in tests of the memory alone.
+    ahead_jobs: usize,
     available: Box<dyn Fn() -> Option<u64> + Send + Sync>,
     /// [`LOOK_WINDOW`], shorter in tests.
     window: Duration,
@@ -628,6 +736,11 @@ struct State {
     stale: bool,
     /// When the last pass was.
     last_pass: Option<Instant>,
+    /// Reservations held for leaves labelled now
+    /// ([`Reservation::labelling_now`]).
+    labelling_now: usize,
+    /// Labelling ahead pausing ([`Reservation::wait_while_paused`]).
+    pausing: usize,
 }
 
 /// A reservation waiting ([`State::waiting`]).
@@ -692,6 +805,7 @@ impl Admission {
             pass_window: PASS_WINDOW,
             changed: Condvar::new(),
             slots: slots.max(1),
+            ahead_jobs: AHEAD_JOBS,
             available,
             window: LOOK_WINDOW,
         }
@@ -790,23 +904,37 @@ impl Admission {
         while !self.take_grant(&mut state, ticket) {
             if !waited {
                 waited = true;
+                let (labelling, cap) = (state.yielding.len(), self.ahead_cap(&state));
                 let look = state.last_look;
-                info!(
-                    bytes,
-                    reserved = state.reserved,
-                    jobs = state.holders,
-                    available = look.map(|look| look.available),
-                    idle_available = look.map(|look| look.idle_available),
-                    window_low = look.map(|look| look.window_low),
-                    share = look.map(|look| look.share),
-                    ahead = state
-                        .waiting
-                        .iter()
-                        .position(|waiting| waiting.ticket == ticket)
-                        .unwrap_or(0),
-                    due = urgency == Urgency::Due,
-                    "storage job waits for memory"
-                );
+                if yields && urgency == Urgency::Ahead && labelling >= cap {
+                    info!(
+                        bytes,
+                        labelling_ahead = labelling,
+                        cap,
+                        labelling_now = state.labelling_now,
+                        "storage job ahead waits for a labelling slot: only cap leaves are \
+                         labelled ahead at once, fewer while a renewal's leaf is labelled now, \
+                         for the memory and cores that work takes; it starts in its order once \
+                         one of them ends: an expected wait"
+                    );
+                } else {
+                    info!(
+                        bytes,
+                        reserved = state.reserved,
+                        jobs = state.holders,
+                        available = look.map(|look| look.available),
+                        idle_available = look.map(|look| look.idle_available),
+                        window_low = look.map(|look| look.window_low),
+                        share = look.map(|look| look.share),
+                        ahead = state
+                            .waiting
+                            .iter()
+                            .position(|waiting| waiting.ticket == ticket)
+                            .unwrap_or(0),
+                        due = urgency == Urgency::Due,
+                        "storage job waits for memory"
+                    );
+                }
             }
             state = self
                 .changed
@@ -839,6 +967,7 @@ impl Admission {
             admission: self,
             bytes,
             ticket,
+            labelling: false,
         })
     }
 
@@ -865,6 +994,9 @@ impl Admission {
     ///   could not only while none is asked to give memory back to it, and
     ///   counts as no pass of it: it fills the memory the other cannot use,
     ///   and gives it back once the other would fit;
+    /// - labelling ahead waits while as many leaves are labelled ahead as
+    ///   may be ([`Self::ahead_cap`]), whatever the memory, and is not
+    ///   counted as passed meanwhile;
     /// - nothing of its rank passes one passed [`PASS_LIMIT`] times by its
     ///   rank, or first passed [`PASS_WINDOW`] ago. It holds its place until
     ///   it fits beside the jobs holding memory, at the latest once they end
@@ -891,6 +1023,10 @@ impl Admission {
                 break;
             }
             if holding == Some(rank) {
+                index += 1;
+                continue;
+            }
+            if waiting.yields && state.yielding.len() >= self.ahead_cap(state) {
                 index += 1;
                 continue;
             }
@@ -962,20 +1098,29 @@ impl Admission {
                 std::cmp::Reverse(ticket),
             )
         });
-        let wanted: Vec<u64> = state
+        let wanted: Vec<(u64, bool)> = state
             .waiting
             .iter()
             .take_while(|waiting| waiting.rank() == head)
-            .map(|waiting| waiting.bytes)
+            .map(|waiting| (waiting.bytes, waiting.yields))
             .collect();
         let share = self.share(state);
         let (holders, reserved, slots) = (state.holders, state.reserved, self.slots);
+        let (labelling, cap) = (state.yielding.len(), self.ahead_cap(state));
         // Whether the first `count` wanted fit once `freed` bytes of `jobs`
-        // holders are given back.
+        // holders are given back. Labelling ahead wanted beyond its cap
+        // also needs places given back: each holder that yields gives one.
         let fit = |jobs: usize, freed: u64, count: usize| {
+            let labelling_wanted = wanted[..count]
+                .iter()
+                .filter(|&&(_, yields)| yields)
+                .count();
+            if labelling_wanted > 0 && labelling.saturating_sub(jobs) + labelling_wanted > cap {
+                return false;
+            }
             let wanted = wanted[..count]
                 .iter()
-                .fold(0u128, |sum, &b| sum + u128::from(b));
+                .fold(0u128, |sum, &(b, _)| sum + u128::from(b));
             let holders = holders.saturating_sub(jobs);
             let reserved = u128::from(reserved.saturating_sub(freed));
             if holders == 0 {
@@ -1019,12 +1164,51 @@ impl Admission {
             bytes,
             holding = candidates.len(),
             waiting = count,
-            waiting_bytes = wanted[..count].iter().fold(0u64, |sum, &b| sum.saturating_add(b)),
+            waiting_bytes = wanted[..count]
+                .iter()
+                .fold(0u64, |sum, &(b, _)| sum.saturating_add(b)),
             due = head == 0,
             reserved,
             share,
-            "storage jobs ahead asked to give their memory back: more urgent work waits for              it; the least advanced go first, only as many as it lacks, and each asks for its              memory again at once in its place: an expected wait"
+            "storage jobs ahead asked to give their memory back: more urgent work waits for \
+             it; the least advanced go first, only as many as it lacks, and each asks for its \
+             memory again at once in its place: an expected wait"
         );
+    }
+
+    /// How many leaves labelled ahead may hold memory at once
+    /// ([`AHEAD_JOBS`]): [`AHEAD_JOBS_BESIDE_DUE`] while a leaf is labelled
+    /// now ([`Reservation::labelling_now`]).
+    fn ahead_cap(&self, state: &State) -> usize {
+        if state.labelling_now > 0 {
+            self.ahead_jobs.min(AHEAD_JOBS_BESIDE_DUE)
+        } else {
+            self.ahead_jobs
+        }
+    }
+
+    /// Whether the labelling ahead holding `ticket` pauses
+    /// ([`Reservation::wait_while_paused`]): a leaf is labelled now and
+    /// [`AHEAD_JOBS_BESIDE_DUE`] leaves labelled ahead go on before it, the
+    /// more urgent first, then the more advanced
+    /// ([`Reservation::progress`]). Never one asked to give its memory back:
+    /// it is leaving.
+    fn pauses(&self, state: &State, ticket: u64) -> bool {
+        if state.labelling_now == 0 {
+            return false;
+        }
+        let Some(own) = state.yielding.get(&ticket).filter(|own| !own.asked) else {
+            return false;
+        };
+        let key =
+            |ticket: u64, held: &Yielding| (held.rank, std::cmp::Reverse(held.millionths), ticket);
+        let own = key(ticket, own);
+        state
+            .yielding
+            .iter()
+            .filter(|&(&other, held)| !held.asked && key(other, held) < own)
+            .count()
+            >= AHEAD_JOBS_BESIDE_DUE
     }
 
     /// Whether the waiting reservation `ticket`, which does not fit, holds
@@ -1118,6 +1302,7 @@ impl Admission {
             admission: self,
             bytes,
             ticket,
+            labelling: false,
         }
     }
 
@@ -1205,6 +1390,9 @@ mod tests {
     const SOON: Duration = Duration::from_secs(10);
     const NOT_YET: Duration = Duration::from_millis(300);
 
+    /// An admission of `slots` jobs sharing what the returned bytes say is
+    /// available, its memory alone: without the cap on labelling ahead
+    /// ([`AHEAD_JOBS`]), which [`admission_capped`]'s tests hold.
     fn admission(slots: usize, available: u64) -> (&'static Admission, Arc<AtomicU64>) {
         admission_looking(slots, available, Duration::from_secs(1))
     }
@@ -1222,7 +1410,17 @@ mod tests {
             Box::new(move || Some(probe.load(Ordering::SeqCst)).filter(|&bytes| bytes > 0)),
         );
         admission.window = window;
+        admission.ahead_jobs = usize::MAX;
         (Box::leak(Box::new(admission)), memory)
+    }
+
+    /// An admission of `slots` jobs sharing a constant `available`, with the
+    /// node's cap on labelling ahead ([`AHEAD_JOBS`]).
+    fn admission_capped(slots: usize, available: u64) -> &'static Admission {
+        Box::leak(Box::new(Admission::new(
+            slots,
+            Box::new(move || Some(available)),
+        )))
     }
 
     /// A reservation held on a thread of its own: `granted` hears when it is,
@@ -1632,6 +1830,218 @@ mod tests {
         drop(small.release);
     }
 
+    /// Reserve `bytes` for work due now on this thread, labelling a leaf
+    /// now ([`Reservation::labelling_now`]): it fits now.
+    fn labelling_now(admission: &'static Admission, bytes: u64) -> Reservation {
+        let mut due = admission.reserve(bytes);
+        due.labelling_now();
+        due
+    }
+
+    /// A reservation for work ahead in `order` that is never asked to give
+    /// its memory back (reading a leaf), held on a thread of its own.
+    fn hold_brief(admission: &'static Admission, bytes: u64, order: AheadOrder) -> Held {
+        let (granted_tx, granted) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _reservation = admission
+                .reserve_ordered(bytes, Urgency::Ahead, Some(order), false, &|| false)
+                .unwrap();
+            granted_tx.send(()).unwrap();
+            let _ = released.recv();
+        });
+        Held { granted, release }
+    }
+
+    /// At most [`AHEAD_JOBS`] leaves are labelled ahead at once whatever the
+    /// memory and slots let, and one asking beyond them starts once one of
+    /// them ends; reading a leaf ahead and work due now do not wait for them
+    /// (2026-11-01: four leaves labelled ahead held 17.9 GB of a 32 GB
+    /// node's 20.5 GB).
+    #[test]
+    fn at_most_two_leaves_are_labelled_ahead_at_once() {
+        assert_eq!(AHEAD_JOBS, 2);
+        let admission = admission_capped(8, 1 << 50);
+        let first = reserve_now(admission, GIB, ahead(false, 1, 0));
+        let second = reserve_now(admission, GIB, ahead(false, 1, 1));
+        let third = hold_yielding(admission, GIB, ahead(false, 1, 2));
+        assert!(
+            third.granted.recv_timeout(NOT_YET).is_err(),
+            "a third leaf waits though memory and slots are free"
+        );
+        let read = hold_brief(admission, GIB, ahead(false, 1, 3));
+        assert!(
+            granted(&read),
+            "reading a leaf ahead does not wait for them"
+        );
+        let due = hold(admission, GIB);
+        assert!(granted(&due), "work due now does not wait for them");
+        drop(second);
+        assert!(
+            third.granted.recv_timeout(SOON).is_ok(),
+            "it starts once one of them ends"
+        );
+        assert!(!first.yield_requested());
+        drop((first, third.release, read.release, due.release));
+    }
+
+    /// While a renewal's leaf is labelled now, labelling ahead goes on beside
+    /// it for [`AHEAD_JOBS_BESIDE_DUE`] leaf only, the most urgent, then the
+    /// most advanced; the others pause, holding their memory, and go on once
+    /// it ends. Work due now that labels nothing pauses nothing (2026-11-01:
+    /// beside three or four leaves labelled ahead, a renewal's leaf estimated
+    /// at 37 minutes was still labelled at its grace, 3,137 s in).
+    #[test]
+    fn labelling_ahead_pauses_beside_a_leaf_labelled_now_and_goes_on_after() {
+        assert_eq!(AHEAD_JOBS_BESIDE_DUE, 1);
+        let admission = admission_capped(8, 1 << 50);
+        let advanced = reserve_now(admission, GIB, ahead(false, 1, 0));
+        advanced.progress(5, 10);
+        let behind = reserve_now(admission, GIB, ahead(false, 1, 1));
+        behind.progress(2, 10);
+        let encode = admission.reserve(GIB);
+        assert!(
+            !advanced.paused() && !behind.paused(),
+            "work due now that labels nothing pauses nothing"
+        );
+        drop(encode);
+        let due = labelling_now(admission, GIB);
+        assert!(!advanced.paused(), "the most advanced goes on beside it");
+        assert!(behind.paused(), "the other pauses");
+        let (resumed_tx, resumed) = mpsc::channel();
+        let pausing = std::thread::spawn(move || {
+            let paused = behind.wait_while_paused(&|| false);
+            resumed_tx.send(paused).unwrap();
+            behind
+        });
+        // Once it pauses, it stays paused while the leaf is labelled now:
+        // held for NOT_YET from then, it paused for at least that long.
+        let deadline = Instant::now() + SOON;
+        while admission.state().pausing == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "it pauses while the leaf is labelled now"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            resumed.recv_timeout(NOT_YET).is_err(),
+            "it stays paused while the leaf is labelled now"
+        );
+        assert_eq!(admission.state().pausing, 1);
+        drop(due);
+        let paused = resumed
+            .recv_timeout(SOON)
+            .expect("it goes on once the leaf labelled now ends");
+        assert!(paused >= NOT_YET, "it paused for {paused:?}");
+        let behind = pausing.join().unwrap();
+        assert!(!behind.paused());
+        assert_eq!(admission.state().pausing, 0);
+        drop((advanced, behind));
+        // The more urgent goes on before the more advanced.
+        let could_wait = reserve_now(admission, GIB, ahead(true, 3, 0));
+        could_wait.progress(9, 10);
+        let could_not = reserve_now(admission, GIB, ahead(false, 4, 0));
+        could_not.progress(1, 10);
+        let due = labelling_now(admission, GIB);
+        assert!(
+            could_wait.paused() && !could_not.paused(),
+            "work ahead that could not be done when needed goes on"
+        );
+        drop(due);
+        assert!(!could_wait.paused());
+    }
+
+    /// Labelling ahead that pauses beside a leaf labelled now still gives its
+    /// memory back to work due now waiting for it, and stops pausing to.
+    #[test]
+    fn labelling_ahead_that_pauses_gives_its_memory_back_when_asked() {
+        // 8 GiB available: the jobs share 6.
+        let admission = admission_capped(8, 8 * GIB);
+        let advanced = reserve_now(admission, 2 * GIB, ahead(false, 1, 0));
+        advanced.progress(5, 10);
+        let behind = reserve_now(admission, 2 * GIB, ahead(false, 1, 1));
+        let due = labelling_now(admission, GIB);
+        assert!(behind.paused());
+        let (resumed_tx, resumed) = mpsc::channel();
+        std::thread::spawn(move || {
+            behind.wait_while_paused(&|| false);
+            resumed_tx.send(behind.yield_requested()).unwrap();
+        });
+        assert!(resumed.recv_timeout(NOT_YET).is_err());
+        let more = hold(admission, 2 * GIB);
+        until_waiting(admission, 1);
+        assert_eq!(
+            resumed.recv_timeout(SOON),
+            Ok(true),
+            "asked to give its memory back to the 2 GiB waiting, it stops pausing"
+        );
+        assert!(granted(&more), "7 GiB less 2 fit in 6");
+        drop((advanced, due, more.release));
+    }
+
+    /// While a leaf is labelled now, no more labelling ahead starts than may
+    /// go on beside it ([`AHEAD_JOBS_BESIDE_DUE`]); once it ends,
+    /// [`AHEAD_JOBS`] again.
+    #[test]
+    fn beside_a_leaf_labelled_now_no_more_labelling_ahead_starts_than_goes_on() {
+        let admission = admission_capped(8, 1 << 50);
+        let due = labelling_now(admission, GIB);
+        let first = reserve_now(admission, GIB, ahead(false, 1, 0));
+        assert!(!first.paused(), "one goes on beside it");
+        let second = hold_yielding(admission, GIB, ahead(false, 1, 1));
+        assert!(
+            second.granted.recv_timeout(NOT_YET).is_err(),
+            "a second waits rather than start to pause"
+        );
+        drop(due);
+        assert!(
+            second.granted.recv_timeout(SOON).is_ok(),
+            "it starts once the leaf labelled now ends"
+        );
+        drop((first, second.release));
+    }
+
+    /// Labelling ahead that could be done when needed gives its place to
+    /// labelling that could not as it gives its memory ([`AHEAD_JOBS`]):
+    /// the least advanced, only as many as lack a place.
+    #[test]
+    fn labelling_ahead_that_could_wait_gives_its_place_to_labelling_that_could_not() {
+        let admission = admission_capped(8, 1 << 50);
+        let first = hold_yielding(admission, GIB, ahead(true, 1, 0));
+        assert!(first.granted.recv_timeout(SOON).is_ok());
+        let second = hold_yielding(admission, GIB, ahead(true, 1, 1));
+        assert!(second.granted.recv_timeout(SOON).is_ok());
+        let urgent = hold_with_order(admission, GIB, ahead(false, 2, 0));
+        assert!(
+            second.yielded.recv_timeout(SOON).is_ok(),
+            "the one asked last gives its place"
+        );
+        assert!(
+            granted(&urgent),
+            "the leaf only labelling ahead registers starts"
+        );
+        assert!(
+            first.yielded.recv_timeout(NOT_YET).is_err(),
+            "only as many as lack a place"
+        );
+        drop((first.release, urgent.release));
+    }
+
+    /// Labelling ahead in `order` held on a thread of its own.
+    fn hold_with_order(admission: &'static Admission, bytes: u64, order: AheadOrder) -> Held {
+        let (granted_tx, granted) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _reservation = admission
+                .reserve_ordered(bytes, Urgency::Ahead, Some(order), true, &|| false)
+                .unwrap();
+            granted_tx.send(()).unwrap();
+            let _ = released.recv();
+        });
+        Held { granted, release }
+    }
+
     #[test]
     fn a_job_larger_than_the_share_runs_alone() {
         let (admission, _) = admission(8, 8 * GIB);
@@ -1720,6 +2130,7 @@ mod tests {
             Box::new(move || Some(available)),
         )));
         admission.pass_window = window;
+        admission.ahead_jobs = usize::MAX;
         admission
     }
 
