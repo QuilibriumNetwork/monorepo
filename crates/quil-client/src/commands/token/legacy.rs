@@ -819,7 +819,7 @@ async fn global_head(client: &Client) -> Result<u64, String> {
 
 /// Refuse to prove shields that admission would refuse at the node's GLOBAL
 /// head: the proving is wasted, and a refused batch also keeps its coins out
-/// of the next run for an hour. Without a known rule or head, go ahead.
+/// of the next run for two hours. Without a known rule or head, go ahead.
 #[cfg(feature = "native-proof")]
 pub(crate) async fn ensure_shields_active(
     client: &Client,
@@ -849,11 +849,12 @@ pub(crate) async fn ensure_shields_active(
     Ok(())
 }
 
-/// The bit paths of `application`'s live shards (any active prover).
-pub(crate) async fn live_shard_paths(
+/// The filters and bit paths of `application`'s live shards (any active
+/// prover).
+pub(crate) async fn live_shards(
     client: &Client,
     application: &[u8; 32],
-) -> anyhow::Result<Vec<Vec<bool>>> {
+) -> anyhow::Result<Vec<(Vec<u8>, Vec<bool>)>> {
     let shards = client
         .clone()
         .get_shard_info(quil_types::proto::node::GetShardInfoRequest { include_all: true })
@@ -862,11 +863,25 @@ pub(crate) async fn live_shard_paths(
         .into_inner()
         .shards;
     Ok(shards
-        .iter()
+        .into_iter()
         .filter(|shard| shard.filter.starts_with(application) && shard.active_provers > 0)
         .filter_map(|shard| {
-            quil_forest::decode_shard_filter_or_root(&shard.filter, 32).map(|(_, bits)| bits)
+            let bits = quil_forest::decode_shard_filter_or_root(&shard.filter, 32)
+                .map(|(_, bits)| bits)?;
+            Some((shard.filter, bits))
         })
+        .collect())
+}
+
+/// The bit paths of `application`'s live shards (any active prover).
+pub(crate) async fn live_shard_paths(
+    client: &Client,
+    application: &[u8; 32],
+) -> anyhow::Result<Vec<Vec<bool>>> {
+    Ok(live_shards(client, application)
+        .await?
+        .into_iter()
+        .map(|(_, path)| path)
         .collect())
 }
 
