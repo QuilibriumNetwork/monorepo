@@ -484,9 +484,14 @@ impl GlobalSeamProposer {
     /// Build peer ingress without capturing the validated parent-height index.
     /// Peer bytes are candidates until consensus verifies them; the digest does
     /// not authenticate a claimed height. Only validated or recovered frames
-    /// may populate `block_meta`.
-    fn peer_ingress(self: &Arc<Self>, store: BlockStore) -> Arc<dyn Fn(Vec<u8>) + Send + Sync> {
-        Arc::new(move |bytes: Vec<u8>| {
+    /// may populate `block_meta`. `name` labels a sender in logs.
+    fn peer_ingress(
+        self: &Arc<Self>,
+        store: BlockStore,
+        name: impl Fn(&FalconPublicKey) -> String + Send + Sync + 'static,
+    ) -> Arc<dyn Fn(&FalconPublicKey, Vec<u8>) + Send + Sync> {
+        let finalizer = self.finalizer.clone();
+        Arc::new(move |from: &FalconPublicKey, bytes: Vec<u8>| {
             let Ok(frame) = decode_global_frame(&bytes) else {
                 tracing::debug!("cw block ingress: undecodable frame, dropping");
                 return;
@@ -497,9 +502,16 @@ impl GlobalSeamProposer {
             let Some(digest) = frame_digest(header) else {
                 return;
             };
-            let frame_number = header.frame_number;
+            let (frame_number, len) = (header.frame_number, bytes.len());
             store.put(digest, bytes);
-            tracing::debug!(frame = frame_number, "cw block ingress: stored peer frame");
+            tracing::debug!(
+                frame = frame_number,
+                bytes = len,
+                "cw block ingress: stored peer frame"
+            );
+            if let Some(finalizer) = &finalizer {
+                finalizer.body_arrived(&digest, len, || name(from));
+            }
         })
     }
 
@@ -1408,6 +1420,9 @@ pub struct GlobalSeamFinalizer {
     /// Finalizations reported without their body
     /// ([`Self::await_unheld`]).
     unheld: Mutex<crate::unheld_finalization::UnheldFinalizations>,
+    /// Those finalizations and their bodies that arrived later, for the
+    /// summary line ([`Self::report_late_bodies`]).
+    late_bodies: Mutex<crate::unheld_finalization::LateBodies>,
 }
 
 impl GlobalSeamFinalizer {
@@ -1428,6 +1443,7 @@ impl GlobalSeamFinalizer {
             ),
             pipeline: None,
             unheld: Mutex::default(),
+            late_bodies: Mutex::default(),
         }
     }
 
@@ -1478,6 +1494,8 @@ impl FrameFinalizer for GlobalSeamFinalizer {
         cert: Option<Vec<u8>>,
         _locally_verified: bool,
     ) {
+        let now = std::time::Instant::now();
+        self.report_late_bodies(now);
         // Certificate-only replicas may not have locally verified these bytes,
         // so retain the context-free body re-bind check below at the persistence
         // boundary regardless of `_locally_verified`.
@@ -1488,7 +1506,10 @@ impl FrameFinalizer for GlobalSeamFinalizer {
             );
             // Proposals and votes above it wait for its body or publication.
             if let Ok(mut unheld) = self.unheld.lock() {
-                unheld.note(view, digest, cert, std::time::Instant::now());
+                unheld.note(view, digest, cert, now);
+            }
+            if let Ok(mut late) = self.late_bodies.lock() {
+                late.unheld(now);
             }
             return;
         };
@@ -1497,6 +1518,46 @@ impl FrameFinalizer for GlobalSeamFinalizer {
 }
 
 impl GlobalSeamFinalizer {
+    /// A body of `digest`, `bytes` long, arrived over the block channel from
+    /// the sender `name` labels: counted if its finalization was reported
+    /// without it.
+    fn body_arrived(&self, digest: &Digest, bytes: usize, name: impl FnOnce() -> String) {
+        let now = std::time::Instant::now();
+        let lag = self
+            .unheld
+            .lock()
+            .ok()
+            .and_then(|mut unheld| unheld.body_arrived(digest, now));
+        if let (Some(lag), Ok(mut late)) = (lag, self.late_bodies.lock()) {
+            late.arrived(&name(), lag, bytes, now);
+        }
+    }
+
+    /// Log the summary of late bodies once its interval has passed.
+    fn report_late_bodies(&self, now: std::time::Instant) {
+        let Some(summary) = self
+            .late_bodies
+            .lock()
+            .ok()
+            .and_then(|mut late| late.due(now))
+        else {
+            return;
+        };
+        tracing::info!(
+            interval_s = summary.interval.as_secs(),
+            finalized_without_body = summary.unheld,
+            late_bodies = summary.late,
+            senders = %summary.senders,
+            scope = "link",
+            action = "check",
+            check = "each sender's blocks reached this node only after the committee finalized \
+                     them from votes; a sender with many, or with lags of seconds, has a slow link \
+                     to this node: check the round trip and the sender's uplink to it; a finalized \
+                     frame whose body did not arrive came from its publication",
+            "GLOBAL block bodies arrived after this node finalized their frame"
+        );
+    }
+
     /// Take the finalized body `bytes` of `digest` at `view`: queue it for
     /// atomic publication or write it canonically. False when it is refused
     /// (it does not decode or does not match the finalized proposal).
@@ -1747,7 +1808,8 @@ pub trait GlobalConsensusTransport: Send + Sync + 'static {
 /// The node's handle to the running simplex-backed global consensus. On each
 /// inbound `:8340` message the node demuxes the channel id:
 /// - channels 0/1/2 (vote/cert/resolver) → `inbound[channel].send(...)`;
-/// - channel 3 (block) → `ingest_block(bytes)` (feeds the shared `BlockStore`).
+/// - channel 3 (block) → `ingest_block(sender, bytes)` (feeds the shared
+///   `BlockStore`).
 pub struct GlobalConsensusCwHandle {
     pub inbound: [tokio::sync::mpsc::UnboundedSender<
         quil_cw_consensus::p2p_bridge::Message<FalconPublicKey>,
@@ -1755,7 +1817,8 @@ pub struct GlobalConsensusCwHandle {
     /// Feed a peer-delivered frame's canonical bytes into the engine's
     /// `BlockStore` (so `verify` finds the block behind a proposed digest) and
     /// leave its parent-height metadata untouched. Drops malformed bytes.
-    pub ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+    /// Takes the sender's committee key and the bytes.
+    pub ingest_block: Arc<dyn Fn(&FalconPublicKey, Vec<u8>) + Send + Sync>,
     /// Record each inbound consensus message's sender here, for the GLOBAL
     /// stall watch ([`crate::global_stall`]).
     pub contact: Arc<crate::global_stall::GlobalContact>,
@@ -1805,6 +1868,13 @@ pub fn activate_global_consensus_cw(
     // ID tail; a member without one is named by its key's tail.
     member_labels: Vec<String>,
 ) -> quil_types::error::Result<GlobalConsensusCwHandle> {
+    // How the block ingress names a sender: by its label, as the stall watch
+    // names it.
+    let member_names: Vec<(FalconPublicKey, String)> = peers
+        .iter()
+        .cloned()
+        .zip(member_labels.iter().cloned())
+        .collect();
     // Operator signals: the GLOBAL stall watch reads the votes consensus
     // reports and when each member was last heard. Logging state only.
     let liveness = Arc::new(quil_cw_consensus::adapters::Liveness::default());
@@ -1946,7 +2016,13 @@ pub fn activate_global_consensus_cw(
     });
 
     // Peer ingress can store candidates, but cannot change trusted heights.
-    let ingest_block = proposer.peer_ingress(store.clone());
+    let ingest_block = proposer.peer_ingress(store.clone(), move |sender| {
+        member_names
+            .iter()
+            .find(|(member, _)| member == sender)
+            .map(|(_, name)| name.clone())
+            .unwrap_or_else(|| crate::global_stall::tail(&hex::encode(sender)))
+    });
 
     Ok(GlobalConsensusCwHandle {
         inbound,
@@ -1990,7 +2066,11 @@ mod ingress_tests {
             None,
         ));
         let store = BlockStore::new();
-        let ingress = proposer.peer_ingress(store.clone());
+        let ingress = {
+            let ingress = proposer.peer_ingress(store.clone(), |_| "…peer".into());
+            let sender = FalconPublicKey::from_bytes(&[7; 897]).unwrap();
+            move |bytes: Vec<u8>| ingress(&sender, bytes)
+        };
         let mut frame = GlobalFrame {
             header: Some(GlobalFrameHeader {
                 frame_number: 7,
@@ -2019,5 +2099,63 @@ mod ingress_tests {
         let unknown = frame_digest(frame.header.as_ref().unwrap()).unwrap();
         ingress(encode_global_frame(&frame).unwrap());
         assert_eq!(proposer.selected_parent_number(unknown), None);
+    }
+
+    /// A block arriving after its frame finalized from votes alone is
+    /// counted once, for its sender, with its lag.
+    #[test]
+    fn a_block_arriving_after_its_finalization_is_counted_for_its_sender() {
+        use crate::unheld_finalization::LATE_BODY_SUMMARY_INTERVAL;
+        let (mat_job_tx, _jobs) = tokio::sync::mpsc::unbounded_channel();
+        let finalizer = Arc::new(GlobalSeamFinalizer::new(
+            Arc::new(quil_store::testing::InMemoryClockStore::new()),
+            mat_job_tx,
+            Arc::new(|_, _| {}),
+            None,
+            vec![],
+        ));
+        let proposer = Arc::new(
+            GlobalSeamProposer::new(
+                Arc::new(NoProposal),
+                Arc::new(GlobalFrameVerifier::new(Arc::new(
+                    quil_crypto::WesolowskiFrameProver::new(2048),
+                ))),
+                vec![],
+                Arc::new(quil_store::testing::InMemoryClockStore::new()),
+                None,
+            )
+            .with_finalizer(finalizer.clone()),
+        );
+        let sender = FalconPublicKey::from_bytes(&[7; 897]).unwrap();
+        let ingress = proposer.peer_ingress(BlockStore::new(), |_| "…erXRHA".into());
+        let frame = GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: 7,
+                rank: 7,
+                output: vec![3; 516],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let digest = frame_digest(frame.header.as_ref().unwrap()).unwrap();
+        let bytes = encode_global_frame(&frame).unwrap();
+
+        ingress(&sender, bytes.clone());
+        finalizer.on_finalized(7, digest, None, None, false);
+        ingress(&sender, bytes.clone());
+        ingress(&sender, bytes);
+
+        let summary = finalizer
+            .late_bodies
+            .lock()
+            .unwrap()
+            .due(std::time::Instant::now() + LATE_BODY_SUMMARY_INTERVAL)
+            .expect("a summary is due");
+        assert_eq!((summary.unheld, summary.late), (1, 1));
+        assert!(
+            summary.senders.starts_with("…erXRHA 1 max_lag="),
+            "{}",
+            summary.senders
+        );
     }
 }

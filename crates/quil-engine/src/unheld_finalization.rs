@@ -15,6 +15,10 @@
 //! for the publication, at most [`UNHELD_PATIENCE`] after the finalization.
 //! Then it proceeds as before: a body that never arrives costs that delay
 //! once, never a refusal.
+//!
+//! [`LateBodies`] counts the bodies that arrived after their finalization,
+//! per sender, for one summary line per interval: a sender whose blocks keep
+//! arriving late has a slow link to this node.
 
 use quil_cw_consensus::adapters::Digest;
 use std::collections::BTreeMap;
@@ -25,6 +29,9 @@ use std::time::{Duration, Instant};
 /// proposal retries for 20 s and a vote defers for 20 s; executing and proving
 /// the parent takes most of the rest.
 pub(crate) const UNHELD_PATIENCE: Duration = Duration::from_secs(10);
+
+/// Shortest interval between two summaries of [`LateBodies`].
+pub(crate) const LATE_BODY_SUMMARY_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Finalizations remembered at most. Each is either published within a few
 /// views or past its patience; the oldest goes first.
@@ -41,6 +48,8 @@ struct Entry {
     waited: bool,
     /// Its patience ran out: logged once.
     overran: bool,
+    /// Its body came over the block channel: counted once.
+    arrived: bool,
 }
 
 /// A finalization whose body has arrived, to hand to the finalizer.
@@ -89,6 +98,7 @@ impl UnheldFinalizations {
             refused: None,
             waited: false,
             overran: false,
+            arrived: false,
         });
         while self.entries.len() > UNHELD_KEPT {
             self.entries.pop_first();
@@ -147,6 +157,17 @@ impl UnheldFinalizations {
             .collect()
     }
 
+    /// A body of `digest` arrived over the block channel: how long after its
+    /// finalization was reported, the first time for a pending one.
+    pub(crate) fn body_arrived(&mut self, digest: &Digest, now: Instant) -> Option<Duration> {
+        let entry = self
+            .entries
+            .values_mut()
+            .find(|entry| entry.digest == *digest && !entry.arrived)?;
+        entry.arrived = true;
+        Some(now.saturating_duration_since(entry.since))
+    }
+
     /// The finalizer took the body of the finalization at `view`.
     pub(crate) fn taken(&mut self, view: u64, now: Instant) -> Option<Ended> {
         let entry = self.entries.remove(&view)?;
@@ -188,6 +209,77 @@ impl UnheldFinalizations {
             }
         }
         (decision, overran)
+    }
+}
+
+/// Finalizations reported without their body, and the bodies that arrived
+/// later, per sender, since the interval began with the first of them.
+#[derive(Default)]
+pub(crate) struct LateBodies {
+    since: Option<Instant>,
+    unheld: u64,
+    /// Bodies, their longest lag and their largest size, per sender's
+    /// label. Only committee members deliver blocks, so it holds a
+    /// committee's labels at most.
+    senders: BTreeMap<String, (u64, Duration, usize)>,
+}
+
+/// One interval of [`LateBodies`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LateBodySummary {
+    pub interval: Duration,
+    /// Finalizations reported without their body.
+    pub unheld: u64,
+    /// Bodies that arrived after their finalization.
+    pub late: u64,
+    /// `label count max_lag max_bytes`, per sender, the most bodies first.
+    pub senders: String,
+}
+
+impl LateBodies {
+    /// A finalization was reported without its body.
+    pub(crate) fn unheld(&mut self, now: Instant) {
+        self.since.get_or_insert(now);
+        self.unheld += 1;
+    }
+
+    /// The body of one, `bytes` long, arrived from `sender`, `lag` after
+    /// the finalization.
+    pub(crate) fn arrived(&mut self, sender: &str, lag: Duration, bytes: usize, now: Instant) {
+        self.since.get_or_insert(now);
+        let (count, max_lag, max_bytes) = self.senders.entry(sender.to_owned()).or_default();
+        *count += 1;
+        *max_lag = (*max_lag).max(lag);
+        *max_bytes = (*max_bytes).max(bytes);
+    }
+
+    /// The summary once the interval is [`LATE_BODY_SUMMARY_INTERVAL`] old;
+    /// the next interval begins with the next count.
+    pub(crate) fn due(&mut self, now: Instant) -> Option<LateBodySummary> {
+        let interval = now.saturating_duration_since(self.since?);
+        if interval < LATE_BODY_SUMMARY_INTERVAL {
+            return None;
+        }
+        let LateBodies {
+            unheld, senders, ..
+        } = std::mem::take(self);
+        let mut senders: Vec<_> = senders.into_iter().collect();
+        senders.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        Some(LateBodySummary {
+            interval,
+            unheld,
+            late: senders.iter().map(|(_, (count, ..))| count).sum(),
+            senders: senders
+                .iter()
+                .map(|(label, (count, lag, bytes))| {
+                    format!(
+                        "{label} {count} max_lag={}ms max_bytes={bytes}",
+                        lag.as_millis()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        })
     }
 }
 
@@ -333,5 +425,68 @@ mod tests {
         }
         assert_eq!(unheld.entries.len(), UNHELD_KEPT);
         assert_eq!(unheld.entries.first_key_value().map(|(v, _)| *v), Some(4));
+    }
+
+    /// A body arriving for a pending finalization reports its lag once; a
+    /// repeat, or a body no finalization waits for, reports none.
+    #[test]
+    fn a_late_body_reports_its_lag_once() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut unheld = UnheldFinalizations::default();
+        unheld.note(10, digest(1), None, at(0));
+        unheld.note(11, digest(2), None, at(100));
+        assert_eq!(unheld.body_arrived(&digest(3), at(200)), None);
+        assert_eq!(
+            unheld.body_arrived(&digest(2), at(400)),
+            Some(Duration::from_millis(300))
+        );
+        assert_eq!(unheld.body_arrived(&digest(2), at(500)), None, "repeat");
+        assert_eq!(
+            unheld.body_arrived(&digest(1), at(900)),
+            Some(Duration::from_millis(900))
+        );
+        let _ = unheld.published_through(11, at(1000));
+        assert_eq!(unheld.body_arrived(&digest(1), at(1100)), None, "published");
+    }
+
+    /// Late bodies are summarised per sender, the most first, once per
+    /// interval that saw any; a quiet interval logs nothing.
+    #[test]
+    fn late_bodies_are_summarised_per_sender_once_per_interval() {
+        let start = Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+        let interval = LATE_BODY_SUMMARY_INTERVAL.as_secs();
+        let mut late = LateBodies::default();
+        assert_eq!(late.due(at(interval * 5)), None, "nothing counted");
+        late.unheld(at(10));
+        late.unheld(at(20));
+        late.unheld(at(30));
+        late.arrived("…mAiodC", Duration::from_millis(900), 2_000_000, at(11));
+        late.arrived("…erXRHA", Duration::from_millis(1200), 3_000_000, at(21));
+        late.arrived("…erXRHA", Duration::from_millis(2500), 1_000_000, at(31));
+        assert_eq!(late.due(at(interval)), None, "within the interval");
+        assert_eq!(
+            late.due(at(10 + interval)),
+            Some(LateBodySummary {
+                interval: LATE_BODY_SUMMARY_INTERVAL,
+                unheld: 3,
+                late: 3,
+                senders: "…erXRHA 2 max_lag=2500ms max_bytes=3000000, …mAiodC 1 max_lag=900ms max_bytes=2000000"
+                    .into(),
+            })
+        );
+        assert_eq!(late.due(at(10 + interval * 3)), None, "once");
+        late.unheld(at(interval * 4));
+        assert_eq!(
+            late.due(at(interval * 5)),
+            Some(LateBodySummary {
+                interval: LATE_BODY_SUMMARY_INTERVAL,
+                unheld: 1,
+                late: 0,
+                senders: String::new(),
+            }),
+            "a body that never arrived is counted too"
+        );
     }
 }

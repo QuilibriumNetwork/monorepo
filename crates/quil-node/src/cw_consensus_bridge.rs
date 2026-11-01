@@ -55,8 +55,8 @@ impl GlobalConsensusTransport for Cw8340Transport {
 pub struct CwInboundRouter {
     inbound: [tokio::sync::mpsc::UnboundedSender<Message<FalconPublicKey>>; 3],
     /// Feed a committee member's frame bytes into the engine's `BlockStore`
-    /// (channel 3).
-    ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+    /// (channel 3), with the member's key.
+    ingest_block: Arc<dyn Fn(&FalconPublicKey, Vec<u8>) + Send + Sync>,
     resolve_peer: PeerResolver,
     /// Our own committee Falcon key — the attributed sender for locally-injected
     /// certificates (see [`Self::feed_finalization_cert`]).
@@ -164,7 +164,7 @@ impl CwInboundRouter {
             return true;
         };
         if channel == 3 {
-            (self.ingest_block)(data);
+            (self.ingest_block)(&from_pk, data);
             return true;
         }
         self.contact.heard(&from_pk);
@@ -314,7 +314,9 @@ mod tests {
         let inbound = [(); 3].map(|_| tokio::sync::mpsc::unbounded_channel().0);
         CwInboundRouter {
             inbound,
-            ingest_block: Arc::new(move |bytes: Vec<u8>| ingested.lock().unwrap().push(bytes)),
+            ingest_block: Arc::new(move |_: &FalconPublicKey, bytes: Vec<u8>| {
+                ingested.lock().unwrap().push(bytes)
+            }),
             resolve_peer: Arc::new(move |from: &[u8]| {
                 (from == b"member").then(|| resolved.clone())
             }),

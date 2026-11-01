@@ -4052,7 +4052,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                     yield Ok::<_, std::io::Error>(tls);
                 }
             };
-            let mut builder = tonic::transport::Server::builder()
+            let mut builder = quil_rpc::pqnoise_channel::peer_server()
                 // h2 PING-based reaping of dead peers. This server faces
                 // the whole network; without keepalive every peer that
                 // disappears without FIN (crash, NAT timeout) leaks one
@@ -4306,7 +4306,7 @@ mod onion_exit_tests {
             1
         );
         assert_eq!(source.matches("DiagnosticsServer::new").count(), 1);
-        let peer = at("let mut builder = tonic::transport::Server::builder()");
+        let peer = at("let mut builder = quil_rpc::pqnoise_channel::peer_server()");
         let added = at(".add_service(diagnostics_service)");
         let served = peer
             + source[peer..]
