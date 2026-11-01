@@ -339,6 +339,101 @@ pub fn fold_sparse(
     })
 }
 
+/// One subtree's root and the in-subtree paths of some of its leaves, from
+/// that subtree's leaves alone. The subtree sits `level` levels above its
+/// leaves; `leaves` are `(local index, leaf)` sorted by index without repeats,
+/// every index below `1 << level`, and absent indices are zero leaves. Every
+/// target must be one of the leaves; each returned path has `level` siblings,
+/// leaf to subtree root, so a fold path from the subtree's own position
+/// continues it to the application root.
+///
+/// Only non-empty nodes are hashed and only O(`level`) nodes are kept besides
+/// the inputs and the paths, so a wallet can rebuild the subtree its coin sits
+/// in from a full coin scan without building the whole accumulator.
+pub fn subtree_paths(
+    context: &[u8; 32],
+    level: usize,
+    leaves: &[(u64, Node)],
+    targets: &[u64],
+) -> Result<(Node, Vec<AuthPath>), TreeError> {
+    if level > MAX_DEPTH {
+        return Err(TreeError::Depth);
+    }
+    if leaves.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+        || leaves.last().is_some_and(|(index, _)| *index >> level != 0)
+    {
+        return Err(TreeError::Position);
+    }
+    if targets
+        .iter()
+        .any(|target| leaves.binary_search_by_key(target, |(at, _)| *at).is_err())
+    {
+        return Err(TreeError::MissingCoin);
+    }
+    let key = MembershipKey::derive(context);
+    let zeros = zero_nodes(&key, level);
+    let mut paths: Vec<AuthPath> = targets
+        .iter()
+        .map(|_| AuthPath {
+            siblings: vec![Node::zero(); level],
+            right: vec![false; level],
+        })
+        .collect();
+    let root = fold_range(&key, &zeros, leaves, level, 0, targets, &mut paths);
+    Ok((root, paths))
+}
+
+/// The node `level` levels up whose leaves start at `base`, recording each
+/// target's sibling at the level below on the way back up.
+fn fold_range(
+    key: &MembershipKey,
+    zeros: &[Node],
+    leaves: &[(u64, Node)],
+    level: usize,
+    base: u64,
+    targets: &[u64],
+    paths: &mut [AuthPath],
+) -> Node {
+    if leaves.is_empty() {
+        return zeros[level].clone();
+    }
+    if level == 0 {
+        return leaves[0].1.clone();
+    }
+    let middle = base + (1u64 << (level - 1));
+    let split = leaves.partition_point(|(index, _)| *index < middle);
+    let left = fold_range(
+        key,
+        zeros,
+        &leaves[..split],
+        level - 1,
+        base,
+        targets,
+        paths,
+    );
+    let right = fold_range(
+        key,
+        zeros,
+        &leaves[split..],
+        level - 1,
+        middle,
+        targets,
+        paths,
+    );
+    for (target, path) in targets.iter().zip(paths.iter_mut()) {
+        if *target >= base && *target - base < (1u64 << level) {
+            let is_right = *target >= middle;
+            path.right[level - 1] = is_right;
+            path.siblings[level - 1] = if is_right {
+                left.clone()
+            } else {
+                right.clone()
+            };
+        }
+    }
+    key.parent(&left, &right)
+}
+
 /// The whole application's tree, built from every shard's coins. Used by a
 /// node that holds all of them (an archive) and by the tests that pin the
 /// fold against a direct build.
@@ -809,5 +904,111 @@ mod tests {
             fold_sparse_auth_path(&context, top, &nodes, (5, 2)),
             Err(TreeError::MissingCoin)
         ));
+    }
+
+    /// A subtree rebuilt from its own coins alone gives its root and the low
+    /// levels of each coin's whole-tree path, so the public fold above it
+    /// completes the path. This is what a wallet rebuilds from a full scan.
+    #[test]
+    fn a_subtree_rebuilt_from_its_coins_gives_the_whole_tree_paths() {
+        let context = [13u8; 32];
+        let shape = Shape {
+            shard_bits: 3,
+            subtree_bits: 4,
+        };
+        let key = MembershipKey::derive(&context);
+        let placed = [(1u64, 0u64), (1, 1), (1, 5), (1, 15), (4, 0), (6, 3)];
+        let all: Vec<CoinRecord> = placed
+            .iter()
+            .enumerate()
+            .map(|(i, (shard, local))| {
+                coin(
+                    &context,
+                    i as u8 + 1,
+                    position_of(*shard, *local, shape.subtree_bits).unwrap(),
+                )
+            })
+            .collect();
+        let whole = ShardedCoinTree::build(&context, shape, &all).unwrap();
+        let leaf =
+            |c: &CoinRecord| key.leaf(&Node::from_identity_bytes(&c.owner).unwrap(), &c.commitment);
+
+        // The whole tree as one subtree: every path is the whole-tree path.
+        let leaves: Vec<(u64, Node)> = all.iter().map(|c| (c.position, leaf(c))).collect();
+        let targets: Vec<u64> = all.iter().map(|c| c.position).collect();
+        let (root, paths) = subtree_paths(&context, shape.depth(), &leaves, &targets).unwrap();
+        assert!(root == whole.root(), "whole-tree root differs");
+        for (c, path) in all.iter().zip(&paths) {
+            let expected = whole.auth_path(&c.address).unwrap();
+            assert!(
+                path.siblings == expected.siblings && path.right == expected.right,
+                "whole-tree path of position {} differs",
+                c.position
+            );
+        }
+
+        // Shard 1's subtree from its own coins: the shard's root, and the
+        // whole-tree paths' first `subtree_bits` levels, for targets in any
+        // order.
+        let mine: Vec<&CoinRecord> = all
+            .iter()
+            .filter(|c| split_position(c.position, shape.subtree_bits).0 == 1)
+            .collect();
+        let leaves: Vec<(u64, Node)> = mine
+            .iter()
+            .map(|c| (split_position(c.position, shape.subtree_bits).1, leaf(c)))
+            .collect();
+        let chosen = [2usize, 0, 3];
+        let targets: Vec<u64> = chosen.iter().map(|&i| leaves[i].0).collect();
+        let levels = usize::from(shape.subtree_bits);
+        let (root, paths) = subtree_paths(&context, levels, &leaves, &targets).unwrap();
+        let fresh: Vec<CoinRecord> = placed[..4]
+            .iter()
+            .enumerate()
+            .map(|(i, (shard, local))| {
+                coin(
+                    &context,
+                    i as u8 + 1,
+                    position_of(*shard, *local, shape.subtree_bits).unwrap(),
+                )
+            })
+            .collect();
+        assert!(
+            root == subtree_root(&context, shape, &fresh).unwrap(),
+            "shard root differs"
+        );
+        for (&i, path) in chosen.iter().zip(&paths) {
+            let expected = whole.auth_path(&mine[i].address).unwrap();
+            assert_eq!(path.siblings.len(), levels);
+            assert!(
+                path.siblings[..] == expected.siblings[..levels]
+                    && path.right[..] == expected.right[..levels],
+                "shard path of local {} differs",
+                leaves[i].0
+            );
+        }
+
+        // Malformed inputs are refused, never answered.
+        assert_eq!(
+            subtree_paths(&context, levels, &leaves, &[9]).err(),
+            Some(TreeError::MissingCoin)
+        );
+        let mut unsorted = leaves.clone();
+        unsorted.swap(0, 1);
+        assert_eq!(
+            subtree_paths(&context, levels, &unsorted, &[]).err(),
+            Some(TreeError::Position)
+        );
+        assert_eq!(
+            subtree_paths(&context, 3, &leaves, &[]).err(),
+            Some(TreeError::Position),
+            "local 15 lies outside a three-level subtree"
+        );
+        assert_eq!(
+            subtree_paths(&context, MAX_DEPTH + 1, &[], &[]).err(),
+            Some(TreeError::Depth)
+        );
+        let (empty, none) = subtree_paths(&context, levels, &[], &[]).unwrap();
+        assert!(empty == zero_nodes(&key, levels)[levels] && none.is_empty());
     }
 }

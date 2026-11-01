@@ -164,11 +164,21 @@ pub(crate) fn read_record(
     let Some(blob) = state.get(&GLOBAL_INTRINSIC_ADDRESS, address, &disc)? else {
         return Ok(None);
     };
+    decode_record(&blob, expected_kind, keys)
+}
+
+/// A record's fields from its stored blob, checking its kind. `None` when the
+/// blob is empty (a cleared record).
+fn decode_record(
+    blob: &[u8],
+    expected_kind: &[u8; 32],
+    keys: &[&[u8]],
+) -> Result<Option<Vec<Vec<u8>>>> {
     if blob.is_empty() {
         return Ok(None);
     }
     let tree = quil_tries::VectorCommitmentTree {
-        root: quil_tries::deserialize_go_tree(&blob).map_err(|_| invalid("malformed record"))?,
+        root: quil_tries::deserialize_go_tree(blob).map_err(|_| invalid("malformed record"))?,
     };
     if tree.get(&[0xff; 32]) != Some(expected_kind.as_slice()) {
         return Err(invalid("record of another kind at an accumulator address"));
@@ -188,22 +198,31 @@ struct Subtree {
     root: Node,
 }
 
+const SUBTREE_KIND: &str = "quil/accumulator/subtree-record/v1\0";
+const SUBTREE_FIELDS: &[&[u8]] = &[&[4], &[8]];
+const INDEX_KIND: &str = "quil/accumulator/index-record/v1\0";
+const INDEX_FIELDS: &[&[u8]] = &[&[0], &[4]];
+const ROOT_HISTORY_KIND: &str = "quil/accumulator/root-history-record/v1\0";
+
 fn read_subtree(
     state: &HypergraphState,
     application: &[u8; 32],
     width: u8,
     shard: &[bool],
 ) -> Result<Option<Subtree>> {
-    let kind = kind("quil/accumulator/subtree-record/v1\0")?;
     let Some(fields) = read_record(
         state,
         &subtree_address(application, width, shard)?,
-        &kind,
-        &[&[4], &[8]],
+        &kind(SUBTREE_KIND)?,
+        SUBTREE_FIELDS,
     )?
     else {
         return Ok(None);
     };
+    parse_subtree(&fields).map(Some)
+}
+
+fn parse_subtree(fields: &[Vec<u8>]) -> Result<Subtree> {
     let coins = u64::from_be_bytes(
         fields[0]
             .as_slice()
@@ -214,7 +233,7 @@ fn read_subtree(
         return Err(invalid("malformed root"));
     }
     let root = Node::from_bytes(&fields[1]).map_err(|_| invalid("malformed root"))?;
-    Ok(Some(Subtree { coins, root }))
+    Ok(Subtree { coins, root })
 }
 
 type Index = Vec<(u8, Vec<bool>)>;
@@ -239,15 +258,49 @@ pub fn subtrees(
     Ok(subtrees)
 }
 
+/// The accumulator records as a wallet reads them by address, without
+/// GLOBAL state: each decodes the stored blob of [`index_address`],
+/// [`subtree_address`] or [`root_history_address`]. `None` for an empty
+/// (cleared) blob. Reading all of them names no coin, which is what lets a
+/// wallet rebuild a spend's path without telling a node which coin it spends.
+pub fn decode_index_record(blob: &[u8]) -> Result<Option<([u8; 32], Vec<(u8, Vec<bool>)>)>> {
+    decode_record(blob, &kind(INDEX_KIND)?, INDEX_FIELDS)?
+        .map(|fields| parse_index(&fields))
+        .transpose()
+}
+
+/// See [`decode_index_record`]: a subtree record's `(coins, root)`.
+pub fn decode_subtree_record(blob: &[u8]) -> Result<Option<(u64, Node)>> {
+    decode_record(blob, &kind(SUBTREE_KIND)?, SUBTREE_FIELDS)?
+        .map(|fields| parse_subtree(&fields).map(|subtree| (subtree.coins, subtree.root)))
+        .transpose()
+}
+
+/// See [`decode_index_record`]: the root history's current root. The history
+/// is the one spend admission checks a root against.
+pub fn decode_root_history_record(blob: &[u8], context: &[u8; 32]) -> Result<Option<RootRecord>> {
+    decode_record(blob, &kind(ROOT_HISTORY_KIND)?, &[&[0]])?
+        .map(|fields| roots::decode_current(&fields[0], context))
+        .transpose()
+}
+
 pub(crate) fn read_index(
     state: &HypergraphState,
     application: &[u8; 32],
 ) -> Result<Option<([u8; 32], Index)>> {
-    let kind = kind("quil/accumulator/index-record/v1\0")?;
-    let Some(fields) = read_record(state, &index_address(application)?, &kind, &[&[0], &[4]])?
+    let Some(fields) = read_record(
+        state,
+        &index_address(application)?,
+        &kind(INDEX_KIND)?,
+        INDEX_FIELDS,
+    )?
     else {
         return Ok(None);
     };
+    parse_index(&fields).map(Some)
+}
+
+fn parse_index(fields: &[Vec<u8>]) -> Result<([u8; 32], Index)> {
     let context: [u8; 32] = fields[0]
         .as_slice()
         .try_into()
@@ -267,7 +320,7 @@ pub(crate) fn read_index(
             )
         })
         .collect();
-    Ok(Some((context, index)))
+    Ok((context, index))
 }
 
 /// The application's canonical current root and its encoded history, if any
@@ -276,11 +329,13 @@ pub fn read_root_history(
     state: &HypergraphState,
     application: &[u8; 32],
 ) -> Result<Option<Vec<u8>>> {
-    let kind = kind("quil/accumulator/root-history-record/v1\0")?;
-    Ok(
-        read_record(state, &root_history_address(application)?, &kind, &[&[0]])?
-            .map(|mut fields| fields.remove(0)),
-    )
+    Ok(read_record(
+        state,
+        &root_history_address(application)?,
+        &kind(ROOT_HISTORY_KIND)?,
+        &[&[0]],
+    )?
+    .map(|mut fields| fields.remove(0)))
 }
 
 /// Whether the application's canonical root history retains `root`.
@@ -373,7 +428,7 @@ pub fn materialize_report(
         None => (report.context, Vec::new()),
     };
 
-    let subtree_kind = kind("quil/accumulator/subtree-record/v1\0")?;
+    let subtree_kind = kind(SUBTREE_KIND)?;
     // Widths below the placement width receive no further coins: their blocks
     // are frozen. A recorded ancestor's subtree of a frozen width therefore
     // already holds everything a deeper shard could report for it, and it
@@ -444,10 +499,7 @@ pub fn materialize_report(
         frame,
         &index_address(&application)?,
         &[
-            (
-                vec![0xff; 32],
-                kind("quil/accumulator/index-record/v1\0")?.to_vec(),
-            ),
+            (vec![0xff; 32], kind(INDEX_KIND)?.to_vec()),
             (vec![0], context.to_vec()),
             (vec![4], entries),
         ],
@@ -488,10 +540,7 @@ pub fn materialize_report(
         frame,
         &root_history_address(&application)?,
         &[
-            (
-                vec![0xff; 32],
-                kind("quil/accumulator/root-history-record/v1\0")?.to_vec(),
-            ),
+            (vec![0xff; 32], kind(ROOT_HISTORY_KIND)?.to_vec()),
             (vec![0], history),
         ],
     )?;

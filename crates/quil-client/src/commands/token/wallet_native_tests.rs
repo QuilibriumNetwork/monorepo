@@ -1436,14 +1436,16 @@ async fn wallet_rpc_proves_settlement() {
         })
         .collect();
     let tree = CoinTree::build(&payer.context, &records, 1, 8).unwrap();
-    let server = quil_rpc::node_service::NodeRpcServer::new().with_coin_witness_provider(Arc::new(
-        WitnessProvider {
+    // An empty GLOBAL store: no accumulator index, so the wallet rebuilds the
+    // whole one-level tree from its scan.
+    let server = quil_rpc::node_service::NodeRpcServer::new()
+        .with_hypergraph_store(Arc::new(quil_hypergraph::testing::MemStore::new()))
+        .with_coin_witness_provider(Arc::new(WitnessProvider {
             tree,
             network: payer.network,
             application: payer.application,
             coins: coins.clone(),
-        },
-    ));
+        }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let incoming = futures::stream::unfold(listener, |listener| async {

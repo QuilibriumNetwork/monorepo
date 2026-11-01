@@ -35,6 +35,12 @@ pub(super) struct RecipientWallet {
     kem_secret: Zeroizing<Vec<u8>>,
     recipient: RecipientSecret,
     address: RecipientAddress,
+    /// Page budget of the full scan a spend's witness rebuild makes: the last
+    /// balance scan's, else the CLI default.
+    scan_pages: std::sync::atomic::AtomicUsize,
+    /// What the last spend scan kept for its witnesses; the next witness
+    /// rebuild takes it, so a spend lists the coins once.
+    prepared: std::sync::Mutex<Option<SpendScan>>,
 }
 
 /// What a settlement binds: the bundle it funds, or — when the payer does not
@@ -154,6 +160,317 @@ fn select_coins(
 /// `max_coins` answers pages of eight, which the page checks accept too.
 const SCAN_PAGE_ENTRIES: usize = quil_types::store::MAX_SCAN_PAGE_ENTRIES;
 
+/// Page budget of a witness rebuild's scan until a balance scan sets one: the
+/// `--max-pages` default.
+const DEFAULT_SCAN_PAGES: usize = 2048;
+/// Most coins a witness rebuild keeps: those under the subtrees the selected
+/// coins' addresses can sit in. One full block holds 65,536.
+const MAX_WITNESS_SUBTREE_COINS: usize = 1 << 16;
+/// Rebuilds a spend tries while the scanned snapshot and the accumulator
+/// records it reads are out of step, and the wait between them.
+const WITNESS_ATTEMPTS: usize = 3;
+#[cfg(not(test))]
+const WITNESS_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const WITNESS_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// A witness rebuild that a later scan or accumulator read may complete.
+#[derive(Debug)]
+struct StaleWitness(String);
+
+impl std::fmt::Display for StaleWitness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StaleWitness {}
+
+/// One subtree GLOBAL recorded from a shard's report, at its tree position.
+struct ReportedSubtree {
+    level: usize,
+    index: u64,
+    coins: u64,
+    root: quil_lattice_ct::confidential::relation::membership::Node,
+}
+
+impl ReportedSubtree {
+    /// Whether a coin at `address` can sit under this subtree. A shard's
+    /// subtree holds only blocks on its own bit path, and a block's path is
+    /// its coins' leading address bits, so the subtree's coins all start with
+    /// the shard path its sentinel-encoded index carries.
+    fn may_hold(&self, address: &[u8; 32]) -> bool {
+        if self.index == 0 {
+            return true;
+        }
+        let depth = 63 - self.index.leading_zeros();
+        let path = self.index ^ (1u64 << depth);
+        let leading = u64::from_be_bytes(address[..8].try_into().expect("eight bytes"));
+        depth == 0 || leading >> (64 - depth) == path
+    }
+}
+
+/// The canonical accumulator as GLOBAL records it: every reported subtree
+/// and the root they fold to, which is the root history's current entry.
+struct Accumulator {
+    subtrees: Vec<ReportedSubtree>,
+    root: quil_lattice_ct::confidential::coin_tree::RootRecord,
+}
+
+impl Accumulator {
+    fn lookup(&self) -> SubtreeLookup {
+        let mut by_level: std::collections::BTreeMap<usize, std::collections::HashMap<u64, usize>> =
+            Default::default();
+        for (i, subtree) in self.subtrees.iter().enumerate() {
+            by_level
+                .entry(subtree.level)
+                .or_default()
+                .insert(subtree.index, i);
+        }
+        SubtreeLookup {
+            by_level: by_level.into_iter().collect(),
+        }
+    }
+}
+
+/// Which reported subtree a position sits under. Reports are prefix-free, so
+/// at most one level matches.
+struct SubtreeLookup {
+    by_level: Vec<(usize, std::collections::HashMap<u64, usize>)>,
+}
+
+impl SubtreeLookup {
+    fn find(&self, position: u64) -> Option<usize> {
+        self.by_level
+            .iter()
+            .find_map(|(level, at)| at.get(&(position >> level)).copied())
+    }
+}
+
+/// A scanned coin under a subtree a witness rebuild needs: its packed leaf
+/// and what places it.
+#[derive(Clone)]
+struct KeptCoin {
+    subtree: usize,
+    position: u64,
+    frame: u64,
+    leaf: [u8; quil_lattice_ct::confidential::relation::membership::NODE_BYTES],
+}
+
+/// The coins a subtree's report covers, from the scanned coins under it.
+/// Positions only append, and a report covers every coin its shard held at
+/// the frame it reported, so the covered coins are the earliest `count` by
+/// creation frame. Too few coins, or a cut inside one frame, means the scan
+/// and the report disagree: retry rather than guess. The rebuilt root is
+/// checked against the report either way.
+fn covered_coins(mut coins: Vec<KeptCoin>, count: u64) -> anyhow::Result<Vec<KeptCoin>> {
+    let count =
+        usize::try_from(count).map_err(|_| anyhow::anyhow!("subtree coin count overflow"))?;
+    if coins.len() < count {
+        return Err(StaleWitness(
+            "the scanned snapshot holds fewer coins than a subtree's report".into(),
+        )
+        .into());
+    }
+    if coins.len() > count {
+        coins.sort_by_key(|coin| (coin.frame, coin.position));
+        if count > 0 && coins[count - 1].frame == coins[count].frame {
+            return Err(StaleWitness(
+                "a subtree's report ends inside one frame of scanned coins".into(),
+            )
+            .into());
+        }
+        coins.truncate(count);
+    }
+    coins.sort_by_key(|coin| coin.position);
+    Ok(coins)
+}
+
+/// A scanned coin with the accumulator position and creation frame its page
+/// carried.
+struct ScannedCoin {
+    address: [u8; 32],
+    output: Output,
+    position: u64,
+    frame: u64,
+}
+
+/// Most coins (about 11 KB each) a spend scan holds unhashed in a subtree
+/// where it has met no coin of this wallet yet. Past it the subtree's coins
+/// are hashed as they come, and dropped with it if it holds none of ours.
+#[cfg(not(test))]
+const SPEND_SCAN_PENDING_COINS: usize = 1024;
+#[cfg(test)]
+const SPEND_SCAN_PENDING_COINS: usize = 1;
+
+/// What a spend's own coin scan keeps so that its witnesses need no second
+/// scan: GLOBAL's accumulator, read before the scan, each unspent coin of
+/// this wallet's position, and the leaf of every coin under a subtree that
+/// holds one of them. It names no coin to the node: the scan is the one the
+/// balance already makes.
+struct SpendScan {
+    accumulator: Option<Accumulator>,
+    lookup: Option<SubtreeLookup>,
+    root: Option<quil_lattice_ct::confidential::coin_tree::RootRecord>,
+    owned: std::collections::HashMap<[u8; 32], u64>,
+    kept: Vec<KeptCoin>,
+}
+
+/// The subtree a spend scan is listing: whether it holds a coin of ours,
+/// whether its coins spilled past the pending bound, and those not yet hashed.
+struct OpenSubtree {
+    at: usize,
+    needed: bool,
+    spilled: bool,
+    pending: Vec<ScannedCoin>,
+}
+
+/// Builds a [`SpendScan`] page by page. Coins under one subtree share its
+/// shard's leading address bits, so a scan in address order lists them
+/// together: the open subtree's coins wait, unhashed, until a coin of this
+/// wallet shows the subtree is needed, and are dropped if the scan leaves it
+/// first. A subtree listed in two runs, or more kept coins than a rebuild
+/// takes, leaves the spend to rescan instead.
+struct SpendScanCollector {
+    scan: SpendScan,
+    key: std::sync::Arc<quil_lattice_ct::confidential::relation::membership::MembershipKey>,
+    open: Option<OpenSubtree>,
+    listed: std::collections::HashSet<usize>,
+    unusable: Option<&'static str>,
+}
+
+impl SpendScanCollector {
+    fn new(accumulator: Option<Accumulator>, context: &[u8; 32]) -> Self {
+        Self {
+            scan: SpendScan {
+                lookup: accumulator.as_ref().map(Accumulator::lookup),
+                accumulator,
+                root: None,
+                owned: Default::default(),
+                kept: Vec::new(),
+            },
+            key: std::sync::Arc::new(
+                quil_lattice_ct::confidential::relation::membership::MembershipKey::derive(context),
+            ),
+            open: None,
+            listed: Default::default(),
+            unusable: None,
+        }
+    }
+
+    /// Take one scanned page; `ours` names the coins in it this wallet owns
+    /// unspent. Returns the coins to hash now, with their subtrees.
+    fn take_page(
+        &mut self,
+        page: Vec<ScannedCoin>,
+        ours: &std::collections::HashSet<[u8; 32]>,
+    ) -> Vec<(usize, ScannedCoin)> {
+        let mut hash = Vec::new();
+        if self.unusable.is_some() {
+            return hash;
+        }
+        for coin in page {
+            let mine = ours.contains(&coin.address);
+            if mine {
+                self.scan.owned.insert(coin.address, coin.position);
+            }
+            let subtree = match &self.scan.lookup {
+                Some(lookup) => match lookup.find(coin.position) {
+                    Some(subtree) => subtree,
+                    // Under no report: no path can be built for it yet.
+                    None => continue,
+                },
+                // No index: the whole application is one tree.
+                None => 0,
+            };
+            if self.open.as_ref().map(|open| open.at) != Some(subtree) {
+                self.close(&mut hash);
+                if !self.listed.insert(subtree) {
+                    self.abandon("the scan listed one subtree's coins apart");
+                    return Vec::new();
+                }
+                self.open = Some(OpenSubtree {
+                    at: subtree,
+                    needed: false,
+                    spilled: false,
+                    pending: Vec::new(),
+                });
+            }
+            let open = self.open.as_mut().expect("opened above");
+            open.needed |= mine;
+            open.pending.push(coin);
+            if open.needed || open.pending.len() > SPEND_SCAN_PENDING_COINS {
+                open.spilled |= !open.needed;
+                let at = open.at;
+                hash.extend(open.pending.drain(..).map(|coin| (at, coin)));
+            }
+        }
+        if self.scan.kept.len() + hash.len() > MAX_WITNESS_SUBTREE_COINS {
+            self.abandon("the wallet's subtrees hold too many coins to keep");
+            return Vec::new();
+        }
+        hash
+    }
+
+    /// Leave the open subtree: hash its coins if one of ours is among them,
+    /// else drop them, with any already hashed.
+    fn close(&mut self, hash: &mut Vec<(usize, ScannedCoin)>) {
+        let Some(open) = self.open.take() else {
+            return;
+        };
+        let at = open.at;
+        if open.needed {
+            hash.extend(open.pending.into_iter().map(|coin| (at, coin)));
+        } else if open.spilled {
+            self.scan.kept.retain(|coin| coin.subtree != at);
+            hash.retain(|(subtree, _)| *subtree != at);
+        }
+    }
+
+    fn abandon(&mut self, reason: &'static str) {
+        self.unusable = Some(reason);
+        self.open = None;
+        self.scan.kept = Vec::new();
+    }
+
+    /// The scan ended: the last subtree's coins to hash.
+    fn finish(&mut self) -> Vec<(usize, ScannedCoin)> {
+        let mut hash = Vec::new();
+        if self.unusable.is_none() {
+            self.close(&mut hash);
+        }
+        hash
+    }
+}
+
+/// Each coin's leaf, off the async runtime: the hash a witness rebuild
+/// places it by.
+async fn hash_kept(
+    key: std::sync::Arc<quil_lattice_ct::confidential::relation::membership::MembershipKey>,
+    batch: Vec<(usize, ScannedCoin)>,
+) -> anyhow::Result<Vec<KeptCoin>> {
+    use quil_lattice_ct::confidential::relation::membership::Node;
+    if batch.is_empty() {
+        return Ok(Vec::new());
+    }
+    tokio::task::spawn_blocking(move || {
+        batch
+            .into_iter()
+            .map(|(subtree, coin)| {
+                let owner = Node::from_identity_bytes(&coin.output.owner)
+                    .map_err(|e| anyhow::anyhow!("scanned owner: {e:?}"))?;
+                Ok(KeptCoin {
+                    subtree,
+                    position: coin.position,
+                    frame: coin.frame,
+                    leaf: key.leaf(&owner, &coin.output.commitment).to_bytes(),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+    })
+    .await?
+}
+
 /// Bounded scan state. A failed page leaves it unchanged; an expired snapshot
 /// requires a fresh scan, never an implicit jump to a new database generation.
 pub(super) struct CoinScan {
@@ -205,54 +522,6 @@ impl CoinScan {
     }
     pub(super) fn finished(&self) -> bool {
         self.finished
-    }
-}
-
-/// Cold witness indexes may need synchronization before a spend can be
-/// prepared. Retry only explicit transient responses, with an overall deadline
-/// that includes individual RPC calls and capped exponential backoff.
-async fn retry_witness_request<T, F, Fut>(
-    timeout: std::time::Duration,
-    mut request: F,
-) -> Result<T, tonic::Status>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, tonic::Status>>,
-{
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut delay = std::time::Duration::from_millis(250);
-    let mut reported = false;
-    loop {
-        let result = tokio::time::timeout_at(deadline, request())
-            .await
-            .map_err(|_| {
-                tonic::Status::deadline_exceeded(
-                    "witness preparation deadline exceeded; retry after synchronization",
-                )
-            })?;
-        match result {
-            Ok(value) => return Ok(value),
-            Err(error)
-                if matches!(
-                    error.code(),
-                    tonic::Code::Unavailable | tonic::Code::ResourceExhausted
-                ) =>
-            {
-                if !reported {
-                    eprintln!("Waiting for the node to prepare spend witnesses...");
-                    reported = true;
-                }
-                tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
-                    .await
-                    .map_err(|_| {
-                        tonic::Status::deadline_exceeded(
-                            "witness preparation deadline exceeded; retry after synchronization",
-                        )
-                    })?;
-                delay = (delay * 2).min(std::time::Duration::from_secs(5));
-            }
-            Err(error) => return Err(error),
-        }
     }
 }
 
@@ -1887,18 +2156,31 @@ impl RecipientWallet {
         Ok((statement, relation, refund_recovery))
     }
 
-    pub(super) async fn scan_next(
+    /// The scan's next page, each coin with the position and creation frame
+    /// a private witness rebuild places it by.
+    async fn scan_next_records(
         &self,
         client: &quil_types::proto::node::node_service_client::NodeServiceClient<
             tonic::transport::Channel,
         >,
         scan: &mut CoinScan,
-    ) -> anyhow::Result<Vec<([u8; 32], Output)>> {
+    ) -> anyhow::Result<Vec<ScannedCoin>> {
+        let response = self.list_coins_page(client, scan).await?;
+        self.decode_scan_records(scan, response)
+    }
+
+    async fn list_coins_page(
+        &self,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+            tonic::transport::Channel,
+        >,
+        scan: &CoinScan,
+    ) -> anyhow::Result<quil_types::proto::node::ListCoinsResponse> {
         anyhow::ensure!(
             !scan.finished && scan.remaining_pages > 0,
             "scan ended or page budget exhausted"
         );
-        let response = client
+        Ok(client
             .clone()
             .max_decoding_message_size(quil_types::store::scan_page_bytes(SCAN_PAGE_ENTRIES))
             .list_coins(quil_types::proto::node::ListCoinsRequest {
@@ -1908,8 +2190,7 @@ impl RecipientWallet {
                 max_coins: SCAN_PAGE_ENTRIES as u32,
             })
             .await?
-            .into_inner();
-        self.decode_scan_page(scan, response)
+            .into_inner())
     }
 
     fn recover_page(&self, page: Vec<([u8; 32], Output)>) -> anyhow::Result<Vec<OwnedCoin>> {
@@ -1965,16 +2246,79 @@ impl RecipientWallet {
         max_owned: usize,
         report: &mut ScanReport,
     ) -> anyhow::Result<Option<Vec<OwnedCoin>>> {
+        self.scan_owned(client, max_pages, max_owned, report, None)
+            .await
+    }
+
+    /// [`Self::scan_unspent`] for a spend: the same single scan also keeps
+    /// what the spend's witnesses need ([`SpendScan`]), so they take no
+    /// second scan. GLOBAL's accumulator is read first; if that read fails,
+    /// the witnesses rescan instead.
+    pub(super) async fn scan_spendable(
+        self: std::sync::Arc<Self>,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+            tonic::transport::Channel,
+        >,
+        max_pages: usize,
+        max_owned: usize,
+    ) -> anyhow::Result<Vec<OwnedCoin>> {
+        *self.prepared.lock().expect("spend scan lock") = None;
+        let collector = match self.read_accumulator(client).await {
+            Ok(accumulator) => Some(SpendScanCollector::new(accumulator, &self.context)),
+            Err(error) => {
+                println!("Spend witnesses will need a second coin scan: {error}.");
+                None
+            }
+        };
+        Ok(self
+            .scan_owned(
+                client,
+                max_pages,
+                max_owned,
+                &mut ScanReport::default(),
+                collector,
+            )
+            .await?
+            .unwrap_or_default())
+    }
+
+    async fn scan_owned(
+        self: std::sync::Arc<Self>,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+            tonic::transport::Channel,
+        >,
+        max_pages: usize,
+        max_owned: usize,
+        report: &mut ScanReport,
+        mut collector: Option<SpendScanCollector>,
+    ) -> anyhow::Result<Option<Vec<OwnedCoin>>> {
         anyhow::ensure!(max_owned > 0, "owned coin limit must be positive");
         let mut scan = CoinScan::new(max_pages)?;
+        // A spend's witness rebuild that must rescan uses the same budget.
+        self.scan_pages
+            .store(max_pages, std::sync::atomic::Ordering::Relaxed);
         let mut unspent = Vec::new();
         while !scan.finished() {
-            let page = self.scan_next(client, &mut scan).await?;
+            let records = self.scan_next_records(client, &mut scan).await?;
             report.pages += 1;
-            report.coins += page.len();
-            report.opened += page.len();
+            report.coins += records.len();
+            report.opened += records.len();
+            let (page, records): (Vec<_>, _) = if collector.is_some() {
+                let page = records
+                    .iter()
+                    .map(|coin| (coin.address, coin.output.clone()))
+                    .collect();
+                (page, Some(records))
+            } else {
+                let page = records
+                    .into_iter()
+                    .map(|coin| (coin.address, coin.output))
+                    .collect();
+                (page, None)
+            };
             let wallet = self.clone();
             let owned = tokio::task::spawn_blocking(move || wallet.recover_page(page)).await??;
+            let mut ours = std::collections::HashSet::new();
             for coin in owned {
                 report.spent_checks += 1;
                 if self.is_unspent_hint(client, &coin.image).await? {
@@ -1982,7 +2326,25 @@ impl RecipientWallet {
                         unspent.len() < max_owned,
                         "owned coin limit exceeded; scan incomplete"
                     );
+                    ours.insert(coin.address);
                     unspent.push(coin);
+                }
+            }
+            if let (Some(collector), Some(records)) = (collector.as_mut(), records) {
+                let batch = collector.take_page(records, &ours);
+                let leaves = hash_kept(collector.key.clone(), batch).await?;
+                collector.scan.kept.extend(leaves);
+            }
+        }
+        if let Some(mut collector) = collector.filter(|_| !scan.rootless) {
+            let batch = collector.finish();
+            let leaves = hash_kept(collector.key.clone(), batch).await?;
+            match collector.unusable {
+                Some(reason) => println!("Spend witnesses will need a second coin scan: {reason}."),
+                None => {
+                    collector.scan.kept.extend(leaves);
+                    collector.scan.root = scan.root.clone();
+                    *self.prepared.lock().expect("spend scan lock") = Some(collector.scan);
                 }
             }
         }
@@ -2160,11 +2522,25 @@ impl RecipientWallet {
         Ok(owned)
     }
 
+    /// A page's coins without their placement, as the scan tests check them.
+    #[cfg(test)]
     fn decode_scan_page(
         &self,
         scan: &mut CoinScan,
         response: quil_types::proto::node::ListCoinsResponse,
     ) -> anyhow::Result<Vec<([u8; 32], Output)>> {
+        Ok(self
+            .decode_scan_records(scan, response)?
+            .into_iter()
+            .map(|coin| (coin.address, coin.output))
+            .collect())
+    }
+
+    fn decode_scan_records(
+        &self,
+        scan: &mut CoinScan,
+        response: quil_types::proto::node::ListCoinsResponse,
+    ) -> anyhow::Result<Vec<ScannedCoin>> {
         use quil_lattice_ct::confidential::{coin_tree::RootRecord, AmountCommitment};
         anyhow::ensure!(
             !scan.finished && scan.remaining_pages > 0,
@@ -2274,7 +2650,12 @@ impl RecipientWallet {
                     "scanned coin position does not belong to its address"
                 );
             }
-            coins.push((address, output));
+            coins.push(ScannedCoin {
+                address,
+                output,
+                position: coin.position,
+                frame: coin.frame_number,
+            });
             previous = Some(address);
         }
         scan.snapshot_id = Some(id);
@@ -2346,6 +2727,8 @@ impl RecipientWallet {
             kem_secret: secret,
             recipient,
             address,
+            scan_pages: std::sync::atomic::AtomicUsize::new(DEFAULT_SCAN_PAGES),
+            prepared: std::sync::Mutex::new(None),
         })
     }
 
@@ -2356,9 +2739,13 @@ impl RecipientWallet {
             .unwrap_or(0)
     }
 
-    /// Fetch paths for selected public coin records through a bounded RPC and
-    /// check their canonical representation and membership in the returned root.
-    /// Admission still decides whether that root is retained by the network.
+    /// Membership paths for the selected coins against the application's
+    /// canonical root, rebuilt here from public data that names none of them:
+    /// GLOBAL's accumulator records (every reported subtree, read whole) and a
+    /// full coin scan. A node that forwards reads therefore never learns which
+    /// coins a spend consumes. The paths are checked against the root before
+    /// they are returned; admission still decides whether the network retains
+    /// that root.
     pub(super) async fn witnesses(
         &self,
         client: &quil_types::proto::node::node_service_client::NodeServiceClient<
@@ -2382,70 +2769,401 @@ impl RecipientWallet {
                 == coins.len(),
             "duplicate selected coins"
         );
-        let client = client.clone().max_decoding_message_size((1 << 20) - 1);
-        let request = quil_types::proto::node::GetCoinWitnessesRequest {
-            domain: self.application.to_vec(),
-            addresses: coins.iter().map(|(address, _)| address.to_vec()).collect(),
-        };
-        let response = retry_witness_request(std::time::Duration::from_secs(1800), || {
-            let mut client = client.clone();
-            let request = request.clone();
-            async move {
-                client
-                    .get_coin_witnesses(request)
+        let prepared = self.prepared.lock().expect("spend scan lock").take();
+        if let Some(prepared) = prepared {
+            let positions: Vec<Option<u64>> = coins
+                .iter()
+                .map(|(address, _)| prepared.owned.get(address).copied())
+                .collect();
+            if positions.iter().all(Option::is_some) {
+                let (started, kept) = (std::time::Instant::now(), prepared.kept.len());
+                match self
+                    .paths_from_scan(
+                        coins,
+                        positions,
+                        prepared.accumulator,
+                        prepared.lookup,
+                        prepared.root,
+                        prepared.kept,
+                    )
                     .await
-                    .map(tonic::Response::into_inner)
+                {
+                    Ok((root, paths)) => {
+                        self.verify_paths(coins, &root, &paths)?;
+                        println!(
+                            "Spend witnesses rebuilt from the selection scan ({kept} coins under the wallet's subtrees, {:.1} s); the node was not told which coins this spends.",
+                            started.elapsed().as_secs_f64()
+                        );
+                        return Ok((root, paths));
+                    }
+                    Err(error) if error.downcast_ref::<StaleWitness>().is_some() => {
+                        println!("Spend witnesses from the selection scan not ready ({error}).");
+                    }
+                    Err(error) => return Err(error),
+                }
             }
-        })
-        .await?;
-        self.decode_witnesses(coins, response)
+        }
+        println!(
+            "Rebuilding spend witnesses from a full coin scan; the node is not told which coins this spends."
+        );
+        let mut attempt = 1;
+        loop {
+            match self.rebuild_witnesses(client, coins).await {
+                Ok((root, paths)) => {
+                    self.verify_paths(coins, &root, &paths)?;
+                    return Ok((root, paths));
+                }
+                Err(error)
+                    if attempt < WITNESS_ATTEMPTS
+                        && error.downcast_ref::<StaleWitness>().is_some() =>
+                {
+                    println!(
+                        "Spend witnesses not ready ({error}); rescanning, attempt {} of {WITNESS_ATTEMPTS}.",
+                        attempt + 1
+                    );
+                    tokio::time::sleep(WITNESS_RETRY_DELAY).await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
-    fn decode_witnesses(
+    /// GLOBAL's accumulator: every reported subtree at its tree position and
+    /// the canonical root they fold to, read by address without naming a coin.
+    /// `None` when the application has no index (it has never reported, e.g.
+    /// one executed in the global venue).
+    async fn read_accumulator(
         &self,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+            tonic::transport::Channel,
+        >,
+    ) -> anyhow::Result<Option<Accumulator>> {
+        use quil_execution::token_intrinsic::{
+            coin_blocks, global_accumulator as records, shard_accumulator,
+        };
+        use quil_lattice_ct::confidential::coin_tree::RootRecord;
+        let (present, blob) = self
+            .global_record(client, &records::index_address(&self.application)?)
+            .await?;
+        let Some((context, index)) = present
+            .then(|| records::decode_index_record(&blob))
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            context == self.context,
+            "accumulator index context mismatch"
+        );
+        let mut subtrees = Vec::with_capacity(index.len());
+        let mut placed = Vec::with_capacity(index.len());
+        for (width, shard) in index {
+            let (present, blob) = self
+                .global_record(
+                    client,
+                    &records::subtree_address(&self.application, width, &shard)?,
+                )
+                .await?;
+            let Some((coins, root)) = present
+                .then(|| records::decode_subtree_record(&blob))
+                .transpose()?
+                .flatten()
+            else {
+                return Err(
+                    StaleWitness("an indexed accumulator subtree has no record".into()).into(),
+                );
+            };
+            let (level, index) = shard_accumulator::subtree_position(width, &shard)?;
+            placed.push((width, shard, root.clone()));
+            subtrees.push(ReportedSubtree {
+                level,
+                index,
+                coins,
+                root,
+            });
+        }
+        let (present, blob) = self
+            .global_record(client, &records::root_history_address(&self.application)?)
+            .await?;
+        let current = present
+            .then(|| records::decode_root_history_record(&blob, &self.context))
+            .transpose()?
+            .flatten()
+            .ok_or_else(|| StaleWitness("the accumulator has no published root yet".into()))?;
+        let coins = subtrees
+            .iter()
+            .try_fold(0u64, |total, subtree| total.checked_add(subtree.coins))
+            .ok_or_else(|| anyhow::anyhow!("accumulator coin count overflow"))?;
+        let root = RootRecord {
+            context: self.context,
+            depth: coin_blocks::DEPTH,
+            coins,
+            root: shard_accumulator::fold_application_root(&self.context, &placed)?,
+        };
+        // The records were read one at a time; a report materialized between
+        // reads shows here as a fold that is not the published root.
+        if root != current {
+            return Err(
+                StaleWitness("the accumulator records changed while being read".into()).into(),
+            );
+        }
+        Ok(Some(Accumulator { subtrees, root }))
+    }
+
+    /// One rebuild: read the accumulator, then scan every coin, keeping only
+    /// those under a subtree some selected coin's address could sit in, and
+    /// rebuild each selected coin's subtree from the coins its report covers.
+    async fn rebuild_witnesses(
+        &self,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+            tonic::transport::Channel,
+        >,
         coins: &[([u8; 32], &Output)],
-        response: quil_types::proto::node::GetCoinWitnessesResponse,
     ) -> anyhow::Result<(
         quil_lattice_ct::confidential::coin_tree::RootRecord,
         Vec<quil_lattice_ct::confidential::coin_tree::AuthPath>,
     )> {
-        use quil_lattice_ct::confidential::{
-            coin_tree::{AuthPath, RootRecord},
-            relation::membership::{MembershipKey, Node},
-        };
-        anyhow::ensure!(
-            response.network.as_slice() == self.network.as_slice(),
-            "witness network mismatch"
-        );
-        let root = RootRecord::decode(&response.root_record, &self.context)
-            .map_err(|e| anyhow::anyhow!("witness root: {e:?}"))?;
-        anyhow::ensure!(
-            response.witnesses.len() == coins.len(),
-            "witness count mismatch"
-        );
-        let key = MembershipKey::derive(&self.context);
-        let mut paths = Vec::with_capacity(coins.len());
-        for ((address, output), witness) in coins.iter().zip(response.witnesses) {
+        use quil_lattice_ct::confidential::relation::membership::MembershipKey;
+        let started = std::time::Instant::now();
+        // Read before the scan, so the scanned snapshot holds every coin these
+        // reports cover; a scan answered from an older snapshot is retried.
+        let accumulator = self.read_accumulator(client).await?;
+        let lookup = accumulator.as_ref().map(Accumulator::lookup);
+        let candidates: std::collections::BTreeSet<usize> = accumulator
+            .as_ref()
+            .map(|accumulator| {
+                (0..accumulator.subtrees.len())
+                    .filter(|&i| {
+                        coins
+                            .iter()
+                            .any(|(address, _)| accumulator.subtrees[i].may_hold(address))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let key = std::sync::Arc::new(MembershipKey::derive(&self.context));
+        let mut scan = CoinScan::new(self.scan_pages.load(std::sync::atomic::Ordering::Relaxed))?;
+        let mut found: Vec<Option<(u64, u64)>> = vec![None; coins.len()];
+        let mut kept: Vec<KeptCoin> = Vec::new();
+        let (mut pages, mut scanned) = (0usize, 0usize);
+        while !scan.finished() {
+            let page = self.scan_next_records(client, &mut scan).await?;
+            pages += 1;
+            scanned += page.len();
+            let mut batch = Vec::new();
+            for coin in page {
+                if let Some(i) = coins
+                    .iter()
+                    .position(|(address, _)| *address == coin.address)
+                {
+                    let output = coins[i].1;
+                    anyhow::ensure!(
+                        coin.output.owner == output.owner
+                            && coin.output.commitment == output.commitment,
+                        "the scan's record of a selected coin differs from the wallet's"
+                    );
+                    found[i] = Some((coin.position, coin.frame));
+                }
+                let subtree = match &lookup {
+                    Some(lookup) => match lookup.find(coin.position) {
+                        Some(subtree) if candidates.contains(&subtree) => subtree,
+                        _ => continue,
+                    },
+                    // No index: the whole application is one tree.
+                    None => 0,
+                };
+                batch.push((subtree, coin));
+            }
             anyhow::ensure!(
-                witness.address.as_slice() == address.as_slice() && witness.found,
-                "selected coin missing or mismatched"
+                kept.len() + batch.len() <= MAX_WITNESS_SUBTREE_COINS,
+                "the selected coins' subtrees hold more than {MAX_WITNESS_SUBTREE_COINS} coins"
             );
+            kept.extend(hash_kept(key.clone(), batch).await?);
+        }
+        anyhow::ensure!(!scan.rootless, "the application holds no confidential coin");
+        let kept_coins = kept.len();
+        let (root, paths) = self
+            .paths_from_scan(
+                coins,
+                found
+                    .into_iter()
+                    .map(|found| found.map(|(position, _)| position))
+                    .collect(),
+                accumulator,
+                lookup,
+                scan.root.clone(),
+                kept,
+            )
+            .await?;
+        println!(
+            "spend witnesses: {pages} scan pages, {scanned} coins, {kept_coins} under the inputs' subtrees, {:.1} s",
+            started.elapsed().as_secs_f64()
+        );
+        Ok((root, paths))
+    }
+
+    /// The selected coins' paths from a scan's kept coins: rebuild each
+    /// selected coin's subtree from the coins its report covers, check it
+    /// against the report, and append the fold over the other reports.
+    /// `positions` holds each selected coin's scanned position; without an
+    /// accumulator the scan's root covers one tree of every kept coin.
+    async fn paths_from_scan(
+        &self,
+        coins: &[([u8; 32], &Output)],
+        positions: Vec<Option<u64>>,
+        accumulator: Option<Accumulator>,
+        lookup: Option<SubtreeLookup>,
+        scan_root: Option<quil_lattice_ct::confidential::coin_tree::RootRecord>,
+        kept: Vec<KeptCoin>,
+    ) -> anyhow::Result<(
+        quil_lattice_ct::confidential::coin_tree::RootRecord,
+        Vec<quil_lattice_ct::confidential::coin_tree::AuthPath>,
+    )> {
+        use quil_execution::token_intrinsic::coin_blocks;
+        use quil_lattice_ct::confidential::{
+            coin_tree::AuthPath, relation::membership::Node, sharded_tree,
+        };
+        let mut placed = Vec::with_capacity(coins.len());
+        for (i, found) in positions.into_iter().enumerate() {
+            let Some(position) = found else {
+                return Err(StaleWitness(format!(
+                    "selected coin {} is not in the scanned snapshot",
+                    hex::encode(coins[i].0)
+                ))
+                .into());
+            };
+            let subtree = match &lookup {
+                Some(lookup) => lookup.find(position).ok_or_else(|| {
+                    StaleWitness("no shard has reported the subtree a selected coin is in".into())
+                })?,
+                None => 0,
+            };
+            placed.push((subtree, position));
+        }
+        let whole_tree = accumulator.is_none();
+        let (root, subtrees) = match accumulator {
+            Some(accumulator) => (accumulator.root, accumulator.subtrees),
+            None => {
+                let root = scan_root.ok_or_else(|| anyhow::anyhow!("the scan carried no root"))?;
+                let whole = ReportedSubtree {
+                    level: usize::from(root.depth),
+                    index: 0,
+                    coins: root.coins,
+                    root: root.root.clone(),
+                };
+                (root, vec![whole])
+            }
+        };
+        let context = self.context;
+        let paths = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<AuthPath>> {
+            let fold_nodes: Vec<_> = subtrees
+                .iter()
+                .map(|subtree| (subtree.level, subtree.index, subtree.root.clone()))
+                .collect();
+            let mut paths: Vec<Option<AuthPath>> = placed.iter().map(|_| None).collect();
+            let wanted: std::collections::BTreeSet<usize> =
+                placed.iter().map(|(subtree, _)| *subtree).collect();
+            for subtree_at in wanted {
+                let subtree = &subtrees[subtree_at];
+                let mask = (1u64 << subtree.level) - 1;
+                let members: Vec<KeptCoin> = kept
+                    .iter()
+                    .filter(|coin| coin.subtree == subtree_at)
+                    .cloned()
+                    .collect();
+                let covered = covered_coins(members, subtree.coins)?;
+                let leaves = covered
+                    .iter()
+                    .map(|coin| {
+                        Node::from_bytes(&coin.leaf)
+                            .map(|leaf| (coin.position & mask, leaf))
+                            .map_err(|e| anyhow::anyhow!("kept leaf: {e:?}"))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let targets: Vec<(usize, u64)> = placed
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (at, _))| *at == subtree_at)
+                    .map(|(i, (_, position))| (i, position & mask))
+                    .collect();
+                if targets
+                    .iter()
+                    .any(|(_, local)| leaves.binary_search_by_key(local, |(at, _)| *at).is_err())
+                {
+                    return Err(StaleWitness(
+                        "a selected coin is newer than its subtree's report".into(),
+                    )
+                    .into());
+                }
+                let locals: Vec<u64> = targets.iter().map(|(_, local)| *local).collect();
+                let (rebuilt, inner) =
+                    sharded_tree::subtree_paths(&context, subtree.level, &leaves, &locals)
+                        .map_err(|e| anyhow::anyhow!("subtree rebuild: {e:?}"))?;
+                if rebuilt != subtree.root {
+                    return Err(StaleWitness(
+                        "the scanned coins do not rebuild their subtree's reported root".into(),
+                    )
+                    .into());
+                }
+                // The whole application rebuilt as one tree needs no fold.
+                let fold = if whole_tree {
+                    AuthPath {
+                        siblings: Vec::new(),
+                        right: Vec::new(),
+                    }
+                } else {
+                    sharded_tree::fold_sparse_auth_path(
+                        &context,
+                        usize::from(coin_blocks::DEPTH),
+                        &fold_nodes,
+                        (subtree.level, subtree.index),
+                    )
+                    .map_err(|e| anyhow::anyhow!("fold path: {e:?}"))?
+                };
+                for ((i, _), mut path) in targets.into_iter().zip(inner) {
+                    path.siblings.extend(fold.siblings.iter().cloned());
+                    path.right.extend(fold.right.iter().copied());
+                    paths[i] = Some(path);
+                }
+            }
+            paths
+                .into_iter()
+                .map(|path| {
+                    path.ok_or_else(|| anyhow::anyhow!("selected coin left without a path"))
+                })
+                .collect()
+        })
+        .await??;
+        Ok((root, paths))
+    }
+
+    /// Check each selected coin's path leads from its committed leaf to `root`
+    /// at the root's depth.
+    fn verify_paths(
+        &self,
+        coins: &[([u8; 32], &Output)],
+        root: &quil_lattice_ct::confidential::coin_tree::RootRecord,
+        paths: &[quil_lattice_ct::confidential::coin_tree::AuthPath],
+    ) -> anyhow::Result<()> {
+        use quil_lattice_ct::confidential::relation::membership::{MembershipKey, Node};
+        anyhow::ensure!(
+            root.context == self.context,
+            "witness root context mismatch"
+        );
+        anyhow::ensure!(paths.len() == coins.len(), "witness count mismatch");
+        let key = MembershipKey::derive(&self.context);
+        for ((_, output), path) in coins.iter().zip(paths) {
             anyhow::ensure!(
-                witness.siblings.len() == usize::from(root.depth)
-                    && witness.right.len() == usize::from(root.depth),
+                path.siblings.len() == usize::from(root.depth)
+                    && path.right.len() == usize::from(root.depth),
                 "witness depth mismatch"
             );
-            let siblings = witness
-                .siblings
-                .iter()
-                .map(|bytes| {
-                    Node::from_bytes(bytes).map_err(|e| anyhow::anyhow!("witness node: {e:?}"))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
             let owner = Node::from_identity_bytes(&output.owner)
                 .map_err(|e| anyhow::anyhow!("coin owner: {e:?}"))?;
             let mut node = key.leaf(&owner, &output.commitment);
-            for (sibling, &right) in siblings.iter().zip(&witness.right) {
+            for (sibling, &right) in path.siblings.iter().zip(&path.right) {
                 node = if right {
                     key.parent(sibling, &node)
                 } else {
@@ -2456,12 +3174,8 @@ impl RecipientWallet {
                 node == root.root,
                 "witness does not authenticate selected coin"
             );
-            paths.push(AuthPath {
-                siblings,
-                right: witness.right,
-            });
         }
-        Ok((root, paths))
+        Ok(())
     }
 
     pub(super) fn address(&self) -> &RecipientAddress {
@@ -3091,7 +3805,7 @@ pub(super) async fn run_transfer(
         let fee = transfer_fee(tc, &application, requested_fee, limits.max_inputs).await?;
         let coins = wallet
             .clone()
-            .scan_unspent(&client, max_pages, max_coins)
+            .scan_spendable(&client, max_pages, max_coins)
             .await?;
         let (selected, change) = select_coins(coins, amount, fee, limits.max_inputs)?;
         let mut destinations = vec![(recipient.clone(), amount)];
@@ -3215,7 +3929,7 @@ pub(super) async fn run_pay(
                 .ok_or_else(|| anyhow::anyhow!("payment exceeds the token amount range"))?;
             let coins = wallet
                 .clone()
-                .scan_unspent(&client, max_pages, max_coins)
+                .scan_spendable(&client, max_pages, max_coins)
                 .await?;
             let (selected, change) =
                 select_coins(coins, amount, fee_and_payment, limits.max_inputs)?;
@@ -3944,7 +4658,7 @@ pub(super) async fn run_split(
     let mut client = tc.connect().await?;
     let coins = wallet
         .clone()
-        .scan_unspent(&client, max_pages, max_coins)
+        .scan_spendable(&client, max_pages, max_coins)
         .await?;
     let source = coins
         .into_iter()
@@ -3999,7 +4713,7 @@ pub(super) async fn run_merge(
     let mut client = tc.connect().await?;
     let owned = wallet
         .clone()
-        .scan_unspent(&client, max_pages, max_coins)
+        .scan_spendable(&client, max_pages, max_coins)
         .await?;
     let (selected, total) = merge_selection(owned, &requested, limits.max_inputs)?;
     let merged = total
@@ -4067,7 +4781,7 @@ pub(super) async fn run_pending_create(
     };
     let coins = wallet
         .clone()
-        .scan_unspent(&client, max_pages, max_coins)
+        .scan_spendable(&client, max_pages, max_coins)
         .await?;
     let (selected, change) = select_coins(coins, amount, fee, limits.max_inputs)?;
     let escrow = EscrowDestination {
@@ -4890,46 +5604,6 @@ mod tests {
             mint_amounts_line("Claiming", 8, 0),
             "Claiming 0.000000001000 QUIL (reward 0.000000001000 QUIL less fee 0.000000000000 QUIL)."
         );
-    }
-
-    #[cfg(feature = "native-proof")]
-    #[tokio::test]
-    async fn witness_retry_handles_transience_and_bounds_hung_requests() {
-        let mut attempts = 0;
-        let value = retry_witness_request(std::time::Duration::from_secs(5), || {
-            attempts += 1;
-            let attempt = attempts;
-            async move {
-                match attempt {
-                    1 => Err(tonic::Status::unavailable("index building")),
-                    2 => Err(tonic::Status::resource_exhausted("busy")),
-                    _ => Ok(7),
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!((value, attempts), (7, 3));
-        let mut attempts = 0;
-        let error = retry_witness_request(std::time::Duration::from_secs(5), || {
-            attempts += 1;
-            async { Err::<(), _>(tonic::Status::invalid_argument("bad request")) }
-        })
-        .await
-        .unwrap_err();
-        assert_eq!((error.code(), attempts), (tonic::Code::InvalidArgument, 1));
-        let error = retry_witness_request(std::time::Duration::from_millis(10), || {
-            std::future::pending::<Result<(), tonic::Status>>()
-        })
-        .await
-        .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
-        let error = retry_witness_request(std::time::Duration::from_millis(10), || async {
-            Err::<(), _>(tonic::Status::unavailable("building"))
-        })
-        .await
-        .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
     }
 
     #[test]
@@ -6240,12 +6914,11 @@ mod tests {
         }
     }
     #[test]
-    fn wallet_checks_rpc_paths_against_selected_coin_and_context() {
+    fn wallet_checks_rebuilt_paths_against_selected_coin_and_context() {
         use quil_lattice_ct::confidential::{
-            coin_tree::{CoinRecord, CoinTree},
+            coin_tree::{AuthPath, CoinRecord, CoinTree},
             relation::membership::Node,
         };
-        use quil_types::proto::node::{CoinWitness, GetCoinWitnessesResponse};
         let key = sntrup761::Sntrup761KeyPair::generate();
         let wallet =
             RecipientWallet::from_keys(&[1; 32], &[2; 32], &key.public, Zeroizing::new(key.secret))
@@ -6267,46 +6940,31 @@ mod tests {
         )
         .unwrap();
         let root = tree.root_at_depth(1).unwrap();
-        let path = tree.auth_path(&address, 1).unwrap();
-        let response = GetCoinWitnessesResponse {
-            network: vec![1; 32],
-            root_record: root.encode().unwrap().to_vec(),
-            witnesses: vec![CoinWitness {
-                address: address.to_vec(),
-                found: true,
-                siblings: path
-                    .siblings
-                    .iter()
-                    .map(|node| node.to_bytes().to_vec())
-                    .collect(),
-                right: path.right,
-            }],
+        let path = || tree.auth_path(&address, 1).unwrap();
+        let coins = [(address, &output)];
+        wallet.verify_paths(&coins, &root, &[path()]).unwrap();
+        let mut bad = root.clone();
+        bad.context[0] ^= 1;
+        assert!(wallet.verify_paths(&coins, &bad, &[path()]).is_err());
+        let mut bad = root.clone();
+        bad.depth = 2;
+        assert!(wallet.verify_paths(&coins, &bad, &[path()]).is_err());
+        let mut bad = path();
+        bad.right[0] = !bad.right[0];
+        assert!(wallet.verify_paths(&coins, &root, &[bad]).is_err());
+        let mut bad = path();
+        bad.siblings[0] = Node::from_identity_bytes(&[7; IDENTITY_BYTES]).unwrap();
+        assert!(wallet.verify_paths(&coins, &root, &[bad]).is_err());
+        let empty = AuthPath {
+            siblings: Vec::new(),
+            right: Vec::new(),
         };
-        assert!(wallet
-            .decode_witnesses(&[(address, &output)], response.clone())
-            .is_ok());
-        let mut bad = response.clone();
-        bad.network[0] ^= 1;
-        assert!(wallet.decode_witnesses(&[(address, &output)], bad).is_err());
-        let mut bad = response.clone();
-        bad.root_record[8] ^= 1;
-        assert!(wallet.decode_witnesses(&[(address, &output)], bad).is_err());
-        let mut bad = response.clone();
-        bad.witnesses[0].right[0] = !bad.witnesses[0].right[0];
-        assert!(wallet.decode_witnesses(&[(address, &output)], bad).is_err());
-        let mut bad = response.clone();
-        bad.witnesses[0].siblings[0] = Node::from_identity_bytes(&[7; IDENTITY_BYTES])
-            .unwrap()
-            .to_bytes()
-            .to_vec();
-        assert!(wallet.decode_witnesses(&[(address, &output)], bad).is_err());
-        let mut bad = response.clone();
-        bad.witnesses[0].found = false;
-        assert!(wallet.decode_witnesses(&[(address, &output)], bad).is_err());
+        assert!(wallet.verify_paths(&coins, &root, &[empty]).is_err());
+        assert!(wallet.verify_paths(&coins, &root, &[]).is_err());
         let mut other = output.clone();
         other.owner[0] ^= 1;
         assert!(wallet
-            .decode_witnesses(&[(address, &other)], response)
+            .verify_paths(&[(address, &other)], &root, &[path()])
             .is_err());
     }
 
