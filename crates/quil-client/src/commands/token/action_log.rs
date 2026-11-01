@@ -393,6 +393,14 @@ impl CliAction {
         }
     }
 
+    /// [`Self::finish`] for an action that may not be recorded.
+    pub(crate) fn close<T>(action: Option<Self>, result: anyhow::Result<T>) -> anyhow::Result<T> {
+        match action {
+            Some(action) => action.finish(result),
+            None => result,
+        }
+    }
+
     /// The outcome record and operator line; `result` passes through.
     pub(crate) fn finish<T>(mut self, result: anyhow::Result<T>) -> anyhow::Result<T> {
         let outcome = result.as_ref().map(|_| ()).map_err(|e| format!("{e:#}"));
@@ -422,8 +430,9 @@ impl CliAction {
     }
 }
 
-/// The recorded action of a CLI command and its inputs as given, or `None`
-/// for a command that is none.
+/// The recorded action of a CLI command and its inputs as given (amounts
+/// in base units, fees as given or quoted later), or `None` for a command
+/// that is none.
 #[cfg(feature = "native-proof")]
 fn cli_action(command: &super::TokenCommand) -> Option<(&'static str, serde_json::Value)> {
     use super::TokenCommand;
@@ -436,6 +445,40 @@ fn cli_action(command: &super::TokenCommand) -> Option<(&'static str, serde_json
         } => (
             "mint",
             serde_json::json!({ "recipient": recipient, "fee": fee(given) }),
+        ),
+        TokenCommand::Transfer {
+            recipient,
+            amount,
+            fee: given,
+        } => (
+            "transfer",
+            serde_json::json!({ "recipient": recipient, "amount": amount, "fee": fee(given) }),
+        ),
+        TokenCommand::PendingTransfer {
+            recipient,
+            amount,
+            expiration,
+            fee: given,
+        } => (
+            "pending_transfer",
+            serde_json::json!({
+                "recipient": recipient,
+                "amount": amount,
+                "refund_after": expiration,
+                "fee": fee(given),
+            }),
+        ),
+        TokenCommand::Accept { escrow, fee: given } => (
+            "accept",
+            serde_json::json!({ "escrow": escrow, "fee": fee(given) }),
+        ),
+        TokenCommand::Reject { escrow, fee: given } => (
+            "refund",
+            serde_json::json!({ "escrow": escrow, "fee": fee(given) }),
+        ),
+        TokenCommand::Merge { coins, fee: given } => (
+            "merge",
+            serde_json::json!({ "coins": coins, "fee": fee(given) }),
         ),
         TokenCommand::Mint {
             claim: Some(path), ..
@@ -680,6 +723,20 @@ mod tests {
         vec![
             (s(&["mint", &recipient, "--fee", "98765"]), "mint"),
             (s(&["mint", "--claim", &file]), "mint_claim"),
+            (s(&["transfer", &recipient, "123456789"]), "transfer"),
+            (
+                s(&[
+                    "pending-transfer",
+                    &recipient,
+                    "123456789",
+                    "--expiration",
+                    "4321",
+                ]),
+                "pending_transfer",
+            ),
+            (s(&["accept", &"ab".repeat(32)]), "accept"),
+            (s(&["reject", &"ab".repeat(32), "--fee", "98765"]), "refund"),
+            (s(&["merge", &"ab".repeat(32), &"cd".repeat(32)]), "merge"),
         ]
     }
 
@@ -761,7 +818,9 @@ mod tests {
                 "/home/",
                 "mint-1201",
                 "abab",
+                "cdcd",
                 "4321",
+                "123456789",
             ] {
                 assert!(
                     !text.contains(private),

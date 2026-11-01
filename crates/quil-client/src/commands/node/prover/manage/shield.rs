@@ -192,7 +192,12 @@ pub fn running(m: &Model) -> bool {
 /// Why `S` cannot start now, as the line pressing it shows; `None` when
 /// there is something to shield and nothing else runs.
 pub fn refusal(m: &Model) -> Option<String> {
-    let why = if running(m) || super::mint::running(m) || m.coins.mint.dialog.is_some() {
+    let why = if running(m)
+        || super::mint::running(m)
+        || super::transfer::running(m)
+        || m.coins.mint.dialog.is_some()
+        || m.coins.transfer.dialog.is_some()
+    {
         "another action is in progress; one action at a time.".to_string()
     } else if m.coins.shield.dialog.is_some() {
         "the shield is being prepared; ‹esc› cancels it.".to_string()
@@ -287,7 +292,7 @@ pub fn quit_guard(m: &mut Model, ev: &KeyEvent, quit: bool) -> Option<Vec<Cmd>> 
         m.status_is_error = false;
         return Some(vec![]);
     }
-    if quit && (running(m) || super::mint::running(m)) {
+    if quit && (running(m) || super::mint::running(m) || super::transfer::running(m)) {
         m.coins.shield.quit_pending = true;
         m.status_msg = "A submission is in progress: ‹y› quits and abandons what is being \
                         proved; any other key keeps it running."

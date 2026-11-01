@@ -239,7 +239,9 @@ where
                 ) =>
             {
                 if !reported {
-                    eprintln!("Waiting for the node to prepare spend witnesses...");
+                    super::output::err_line(
+                        "Waiting for the node to prepare spend witnesses...".into(),
+                    );
                     reported = true;
                 }
                 tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
@@ -2951,12 +2953,71 @@ pub(super) async fn run_balance(
     Ok(())
 }
 
-pub(super) async fn run_escrows(
+/// Check `recipient` as `token transfer` (`escrow` false) or `token
+/// pending-transfer` (`escrow` true) parses it, without building anything.
+pub(crate) fn check_recipient(tc: &TokenCtx, recipient: &str, escrow: bool) -> anyhow::Result<()> {
+    let network =
+        quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let wallet = RecipientWallet::load(tc, &network, &quil_execution::domains::QUIL_TOKEN)?;
+    if escrow {
+        parse_escrow_address(recipient, &wallet.context).map(|_| ())
+    } else {
+        parse_recipient(recipient, &wallet.context).map(|_| ())
+    }
+}
+
+/// The coins `token merge all` would merge and their total: a wallet scan
+/// with `token`'s default bounds.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn merge_preview(tc: &TokenCtx) -> anyhow::Result<(usize, u128)> {
+    let network =
+        quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let wallet = std::sync::Arc::new(RecipientWallet::load(
+        tc,
+        &network,
+        &quil_execution::domains::QUIL_TOKEN,
+    )?);
+    let client = tc.connect().await?;
+    let owned = wallet
+        .scan_unspent(&client, super::SCAN_MAX_PAGES, super::SCAN_MAX_COINS)
+        .await?;
+    let (selected, total) = merge_selection(owned, &[], compile_limits().max_inputs)?;
+    Ok((selected.len(), total))
+}
+
+/// A pending transfer this wallet can act on, as `token escrows` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Escrow {
+    pub address: [u8; 32],
+    pub amount: u128,
+    /// This wallet funded it and holds the refund branch; otherwise it is
+    /// the recipient.
+    pub refund: bool,
+    /// The GLOBAL frame from which the refund branch is admitted.
+    pub refund_after: u64,
+}
+
+impl Escrow {
+    /// Its line in `token escrows`.
+    pub(crate) fn cli_line(&self) -> String {
+        format!(
+            "0x{} {} branch={} refund_after_global_frame={}",
+            hex::encode(self.address),
+            self.amount,
+            if self.refund { "refund" } else { "recipient" },
+            self.refund_after
+        )
+    }
+}
+
+/// The unconsumed escrows whose recipient or refund authority is this
+/// wallet's prover key: a scan of every escrow, with trial decryption.
+pub(crate) async fn list_escrows(
     tc: &TokenCtx,
     application: &str,
     max_pages: usize,
     max_escrows: usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<Escrow>> {
     let network =
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let wallet = std::sync::Arc::new(RecipientWallet::load(
@@ -2966,21 +3027,63 @@ pub(super) async fn run_escrows(
     )?);
     let authority = tc.key_manager.get_public_key_bytes_by_id("q-prover-key")?;
     let client = tc.connect().await?;
-    let escrows = wallet
+    Ok(wallet
         .scan_escrows(&client, authority, max_pages, max_escrows)
+        .await?
+        .into_iter()
+        .map(|(address, amount, refund, refund_after)| Escrow {
+            address,
+            amount: *amount,
+            refund,
+            refund_after,
+        })
+        .collect())
+}
+
+/// This wallet's unspent confidential QUIL coins and their total, as
+/// `token balance` counts them: a full scan of the coins, recovered here,
+/// each recovered coin's spent marker read from the configured node's
+/// GLOBAL state. `None` while the application holds no coin at all.
+pub(crate) async fn confidential_balance(
+    tc: &TokenCtx,
+    max_pages: usize,
+    max_coins: usize,
+) -> anyhow::Result<Option<(usize, u128)>> {
+    let network =
+        quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let wallet = std::sync::Arc::new(RecipientWallet::load(
+        tc,
+        &network,
+        &quil_execution::domains::QUIL_TOKEN,
+    )?);
+    let client = tc.connect().await?;
+    let coins = wallet
+        .scan_unspent_or_rootless(&client, max_pages, max_coins, &mut ScanReport::default())
         .await?;
+    coins
+        .map(|coins| {
+            let total = coins
+                .iter()
+                .try_fold(0u128, |sum, coin| sum.checked_add(*coin.amount))
+                .ok_or_else(|| anyhow::anyhow!("balance overflows u128"))?;
+            Ok((coins.len(), total))
+        })
+        .transpose()
+}
+
+pub(super) async fn run_escrows(
+    tc: &TokenCtx,
+    application: &str,
+    max_pages: usize,
+    max_escrows: usize,
+) -> anyhow::Result<()> {
+    let escrows = list_escrows(tc, application, max_pages, max_escrows).await?;
     println!(
         "{} recovered escrow authorities reported unconsumed by the configured node:",
         escrows.len()
     );
-    for (address, amount, refund, deadline) in escrows {
-        println!(
-            "0x{} {} branch={} refund_after_global_frame={}",
-            hex::encode(address),
-            *amount,
-            if refund { "refund" } else { "recipient" },
-            deadline
-        );
+    for escrow in escrows {
+        println!("{}", escrow.cli_line());
     }
     Ok(())
 }
@@ -3018,7 +3121,7 @@ pub(super) async fn run_coins(
 /// headroom covers a small move; a larger one is answered with the price the
 /// refresh just reported, by re-quoting and rebuilding rather than making the
 /// caller retry by hand. An explicit fee is exact by contract, never re-quoted.
-pub(super) async fn run_transfer(
+pub(crate) async fn run_transfer(
     tc: &TokenCtx,
     application: &str,
     recipient: &str,
@@ -3070,20 +3173,22 @@ pub(super) async fn run_transfer(
         match refresh_submission_fee(tc, &mut client, &bytes).await {
             Ok(()) => break bytes,
             Err(error) if requested_fee.is_none() && attempt < FEE_REBUILDS => {
-                println!("The fee moved while preparing the transfer ({error}); re-quoting and rebuilding.");
+                super::output::line(format!("The fee moved while preparing the transfer ({error}); re-quoting and rebuilding."));
             }
             Err(error) => return Err(error),
         }
     };
     submit_refreshed_operation(tc, &wallet, bytes).await?;
-    println!("Confidential transfer submitted. Finalized inclusion is not yet confirmed.");
+    super::output::line(
+        "Confidential transfer submitted. Finalized inclusion is not yet confirmed.".into(),
+    );
     Ok(())
 }
 
 /// The fee a transfer pays: the caller's, or a quote for two coins and the
 /// input limit's markers. Custom-token outflow carries no QUIL fee.
 #[cfg(feature = "native-proof")]
-async fn transfer_fee(
+pub(crate) async fn transfer_fee(
     tc: &TokenCtx,
     application: &[u8; 32],
     explicit: Option<u128>,
@@ -3929,7 +4034,7 @@ pub(super) async fn run_split(
 /// Merge the named coins (or the largest unspent coins) into one coin owned by
 /// this wallet. One transaction consumes at most the circuit's input count.
 #[cfg(feature = "native-proof")]
-pub(super) async fn run_merge(
+pub(crate) async fn run_merge(
     tc: &TokenCtx,
     application: &str,
     coins: &[String],
@@ -3976,7 +4081,9 @@ pub(super) async fn run_merge(
         )
         .await?;
     submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential merge submitted. Finalized inclusion is not yet confirmed.");
+    super::output::line(
+        "Confidential merge submitted. Finalized inclusion is not yet confirmed.".into(),
+    );
     Ok(())
 }
 
@@ -3984,7 +4091,7 @@ pub(super) async fn run_merge(
 /// Falcon key is the refund authority; the refund frame defaults to the node's
 /// current global head plus about one day. Delivery is not finality.
 #[cfg(feature = "native-proof")]
-pub(super) async fn run_pending_create(
+pub(crate) async fn run_pending_create(
     tc: &TokenCtx,
     application: &str,
     recipient: &str,
@@ -4058,7 +4165,7 @@ pub(super) async fn run_pending_create(
         )
         .await?;
     submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential escrow funding submitted; refund authority becomes eligible at global frame {refund_after_global_frame}. Finalized inclusion is not yet confirmed.");
+    super::output::line(format!("Confidential escrow funding submitted; refund authority becomes eligible at global frame {refund_after_global_frame}. Finalized inclusion is not yet confirmed."));
     Ok(())
 }
 
@@ -4782,7 +4889,7 @@ pub(super) async fn run_shield_all(
 
 /// Explicit CLI submission; a successful RPC response is delivery, not finality.
 #[cfg(feature = "native-proof")]
-pub(super) async fn run_claim(
+pub(crate) async fn run_claim(
     tc: &TokenCtx,
     application: &str,
     escrow: &str,
@@ -4859,7 +4966,9 @@ pub(super) async fn run_claim(
         )
         .await?;
     submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential escrow claim submitted. Finalized inclusion is not yet confirmed.");
+    super::output::line(
+        "Confidential escrow claim submitted. Finalized inclusion is not yet confirmed.".into(),
+    );
     Ok(())
 }
 

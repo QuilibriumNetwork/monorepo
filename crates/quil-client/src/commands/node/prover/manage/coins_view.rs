@@ -8,6 +8,10 @@ use super::super::mint::{
     Dialog as MintDialog, Preview as MintPreview, Stage as MintStage, Status as MintStatus,
 };
 use super::super::shield::{Dialog, Preview};
+use super::super::transfer::{
+    Dialog as TransferDialog, Form as TransferForm, Kind as TransferKind,
+    Preview as TransferPreview,
+};
 use super::coins::{self, CoinsFocus, Middle, ATTENTION};
 use super::*;
 
@@ -122,8 +126,91 @@ fn legacy_row(m: &Model) -> [Cell; 5] {
     ]
 }
 
+/// This wallet's confidential coins, from the last `E` read; their amount
+/// is masked in a render.
+fn shielded_row(m: &Model) -> [Cell; 5] {
+    let transfers = &m.coins.transfer;
+    let reading = transfers.reading.map(|_| spinner(m).to_string());
+    let Some(Ok((read, at))) = &transfers.read else {
+        let state = match &transfers.read {
+            Some(Err(_)) => unavailable(m),
+            _ if reading.is_some() => plain("reading"),
+            _ => plain("not read"),
+        };
+        return [
+            plain("shielded"),
+            plain("-"),
+            plain("-"),
+            state,
+            plain(reading.unwrap_or_else(|| "-".into())),
+        ];
+    };
+    let as_of = match &reading {
+        Some(spin) => format!("{} {spin}", coins::utc_hm(*at)),
+        None => coins::utc_hm(*at),
+    };
+    let incoming = read.escrows.iter().any(|e| !e.outgoing);
+    let refundable = read
+        .escrows
+        .iter()
+        .any(|e| e.outgoing && m.last_global_head >= e.refund_after);
+    let state = if super::super::transfer::running(m) {
+        ("in progress".into(), Some(PRIMARY))
+    } else if incoming {
+        attention("incoming")
+    } else if refundable {
+        attention("refundable")
+    } else if read.coins.is_some_and(|(count, _)| count > 0) {
+        plain("held")
+    } else {
+        plain("none")
+    };
+    let (count, total) = read.coins.unwrap_or((0, 0));
+    let amount = if m.mask_private {
+        plain("hidden")
+    } else {
+        plain(fmt_claimable(total))
+    };
+    [
+        plain("shielded"),
+        plain(count.to_string()),
+        amount,
+        state,
+        plain(as_of),
+    ]
+}
+
+/// The shielded row's detail.
+fn shielded_detail(m: &Model) -> String {
+    let transfers = &m.coins.transfer;
+    if transfers.reading.is_some() {
+        return "Shielded coins: reading the coins and pending transfers now (full scans matched \
+                on this machine, about a minute)."
+            .into();
+    }
+    match &transfers.read {
+        None => "Shielded coins: not read yet; ‹E› reads them with full scans of the coins and \
+                 pending transfers, matched on this machine (about a minute)."
+            .into(),
+        Some(Err(error)) => format!("Shielded coins: read failed ({error}); ‹E› reads them again."),
+        Some(Ok((read, at))) => {
+            let incoming = read.escrows.iter().filter(|e| !e.outgoing).count();
+            format!(
+                "Shielded coins: {} unspent; pending transfers {incoming} incoming, {} outgoing; \
+                 read {} with full scans matched on this machine; ‹E› reads again.",
+                read.coins.map_or(0, |(count, _)| count),
+                read.escrows.len() - incoming,
+                coins::utc_hm(*at)
+            )
+        }
+    }
+}
+
 /// The cursor row's detail.
 fn detail(m: &Model) -> String {
+    if m.coins.cursor == 2 {
+        return shielded_detail(m);
+    }
     if m.coins.cursor == 0 {
         return match m.claimable_reward {
             Some((_, frame)) => format!(
@@ -179,7 +266,7 @@ fn detail(m: &Model) -> String {
 /// The Balances table, its rows padded to shared column widths, for a
 /// panel `inner` columns wide.
 fn table_lines(m: &Model, inner: u16) -> Vec<Line<'static>> {
-    let rows = [claimable_row(m), legacy_row(m)];
+    let rows = [claimable_row(m), legacy_row(m), shielded_row(m)];
     let mut widths = COLUMNS.map(|name| name.chars().count());
     for row in &rows {
         for (width, (text, _)) in widths.iter_mut().zip(row) {
@@ -559,6 +646,32 @@ fn saved_lines(m: &Model, width: u16, rows: usize) -> Vec<Line<'static>> {
 /// The middle panel's title and lines: a confirmation while one is open;
 /// else the selected Balances row's panel ([`Middle`]).
 fn middle_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'static>>, Scroll) {
+    match &m.coins.transfer.dialog {
+        Some(TransferDialog::Form(form)) => {
+            let title = if form.pending {
+                "Pending transfer"
+            } else {
+                "Transfer"
+            };
+            return (title.into(), form_lines(form, width, m.mask_private), None);
+        }
+        Some(TransferDialog::Confirm(preview)) => {
+            let title = format!("Confirm {}", preview.kind.name().to_lowercase());
+            let lines = transfer_confirm_lines(preview, width, m.mask_private);
+            return (title, lines, None);
+        }
+        Some(TransferDialog::Preparing(_)) => {
+            return (
+                Middle::Transfers.title().into(),
+                vec![Line::from(Span::styled(
+                    format!("{} Checking the inputs and quoting the fee…", spinner(m)),
+                    Style::new().fg(PRIMARY),
+                ))],
+                None,
+            );
+        }
+        None => {}
+    }
     match &m.coins.mint.dialog {
         Some(MintDialog::Confirm(preview)) => {
             let title = match preview.stage {
@@ -585,11 +698,352 @@ fn middle_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'st
         }
         None => {}
     }
-    if coins::middle(m) == Middle::Claim {
-        let lines = claim_lines(m, width, height);
-        return (Middle::Claim.title().into(), lines, None);
+    match coins::middle(m) {
+        Middle::Claim => {
+            let lines = claim_lines(m, width, height);
+            (Middle::Claim.title().into(), lines, None)
+        }
+        Middle::Transfers => {
+            let lines = transfer_lines(m, width, height);
+            (Middle::Transfers.title().into(), lines, None)
+        }
+        Middle::ShieldPlan => plan_lines(m, width, height),
     }
-    plan_lines(m, width, height)
+}
+
+/// An escrow address in the panel: `…` and its last six characters, or in
+/// full in expanded mode (‹n›); hidden in a render.
+fn escrow_label(m: &Model, address: &[u8; 32]) -> String {
+    let hex = hex::encode(address);
+    if m.mask_private {
+        "hidden".into()
+    } else if m.compact_actions {
+        format!("…{}", &hex[hex.len() - 6..])
+    } else {
+        format!("0x{hex}")
+    }
+}
+
+/// The Transfers panel: one row per pending transfer this wallet can act
+/// on, under the panel's cursor, in `height` rows.
+fn transfer_lines(m: &Model, width: u16, height: u16) -> Vec<Line<'static>> {
+    let help = Style::new().fg(HELP);
+    let transfers = &m.coins.transfer;
+    let note =
+        |text: String, style: Style| wrap_message(Line::from(Span::styled(text, style)), width);
+    let actions = "‹T› transfers, ‹P› makes a pending transfer, ‹J› merges coins.";
+    let rows = match &transfers.read {
+        None if transfers.reading.is_some() => {
+            return note(
+                format!(
+                    "{} Reading the shielded coins and pending transfers (full scans, about a \
+                     minute)…",
+                    spinner(m)
+                ),
+                Style::new().fg(PRIMARY),
+            );
+        }
+        None => {
+            return note(
+                format!(
+                    "Pending transfers are not read yet; ‹E› reads them with the shielded coins \
+                     (full scans matched on this machine, about a minute). {actions}"
+                ),
+                help,
+            );
+        }
+        Some(Err(error)) => {
+            return note(
+                format!("Shielded coins: read failed ({error}); ‹E› reads them again."),
+                Style::new().fg(WARNING),
+            );
+        }
+        Some(Ok((read, _))) if read.escrows.is_empty() => {
+            return note(format!("No pending transfers to act on. {actions}"), help);
+        }
+        Some(Ok((read, _))) => &read.escrows,
+    };
+    let cells: Vec<[String; 4]> = rows
+        .iter()
+        .map(|escrow| {
+            [
+                escrow_label(m, &escrow.address),
+                if escrow.outgoing { "out" } else { "in" }.to_string(),
+                if m.mask_private {
+                    "hidden".into()
+                } else {
+                    fixed_amount(escrow.amount)
+                },
+                if !escrow.outgoing {
+                    "-".to_string()
+                } else if m.last_global_head >= escrow.refund_after {
+                    format!("f{} (open)", escrow.refund_after)
+                } else {
+                    format!("f{}", escrow.refund_after)
+                },
+            ]
+        })
+        .collect();
+    let headers = ["Escrow", "Direction", "Amount [Q]", "Refund after"];
+    let mut widths = headers.map(str::len);
+    for row in &cells {
+        for (width, text) in widths.iter_mut().zip(row) {
+            *width = (*width).max(text.chars().count());
+        }
+    }
+    let line = |c: [&str; 4]| {
+        format!(
+            "{:<w0$}  {:<w1$}  {:>w2$}  {:<w3$}",
+            c[0],
+            c[1],
+            c[2],
+            c[3],
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+            w3 = widths[3]
+        )
+    };
+    let as_of = match &transfers.read {
+        Some(Ok((_, at))) => coins::utc_hm(*at),
+        _ => String::new(),
+    };
+    let footer = note(
+        format!(
+            "As of {as_of}. ‹A› accepts an incoming one; ‹R› refunds an outgoing one once its \
+             refund frame passes; ‹E› reads again."
+        ),
+        help,
+    );
+    let mut lines = vec![Line::from(Span::styled(
+        line(headers),
+        Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+    ))];
+    let visible = usize::from(height).saturating_sub(1 + footer.len()).max(1);
+    let focused = m.coins.focus == CoinsFocus::Middle;
+    let first = transfers.cursor.saturating_sub(visible - 1);
+    for (i, row) in cells.iter().enumerate().skip(first).take(visible) {
+        let mut style = Style::new().fg(TEXT);
+        if i == transfers.cursor {
+            style = style.bg(if focused {
+                CURSOR_BG
+            } else {
+                INACTIVE_CURSOR_BG
+            });
+        }
+        lines.push(Line::from(Span::styled(
+            line([&row[0], &row[1], &row[2], &row[3]]),
+            style,
+        )));
+    }
+    lines.extend(footer);
+    lines
+}
+
+/// A long address by its ends and length; the form and confirmation keep
+/// it whole for the action.
+fn address_text(address: &str) -> String {
+    let hex = address.strip_prefix("0x").unwrap_or(address);
+    if hex.len() <= 40 {
+        return address.to_string();
+    }
+    format!(
+        "0x{}…{} ({} bytes)",
+        &hex[..12],
+        &hex[hex.len() - 12..],
+        hex.len() / 2
+    )
+}
+
+/// The transfer form: one line per field, the cursor field marked; `mask`
+/// hides what was typed.
+fn form_lines(form: &TransferForm, width: u16, mask: bool) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        if form.pending {
+            "Pending transfer, as `qclient token pending-transfer` makes one:"
+        } else {
+            "Transfer, as `qclient token transfer` makes one:"
+        },
+        Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD),
+    ))];
+    for (i, label) in form.labels().iter().enumerate() {
+        let value = &form.fields[i];
+        let marker = if i == form.field { "▶ " } else { "  " };
+        let shown = match (i, value.is_empty()) {
+            (0, true) => "paste the address".to_string(),
+            (2, true) => "empty: the GLOBAL head plus about a day".to_string(),
+            (0 | 1, false) if mask => MASKED.to_string(),
+            (0, false) => address_text(value),
+            _ => value.clone(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{marker}{label}: "),
+                Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                shown,
+                Style::new().fg(if value.is_empty() { HELP } else { TEXT }),
+            ),
+        ]));
+    }
+    if let Some(error) = &form.error {
+        lines.push(Line::from(Span::styled(
+            format!("Not ready: {error}."),
+            Style::new().fg(WARNING),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "Amounts are in Q (1 Q = 8000000000 base units). ‹tab› moves between fields, \
+         ‹enter› checks them and quotes the fee, ‹esc› cancels.",
+        Style::new().fg(HELP),
+    )));
+    lines
+        .into_iter()
+        .flat_map(|line| wrap_message(line, width))
+        .collect()
+}
+
+/// A transfer action's confirmation: what it does and its exact inputs;
+/// `mask` hides the amounts, the escrow and the recipient.
+fn transfer_confirm_lines(preview: &TransferPreview, width: u16, mask: bool) -> Vec<Line<'static>> {
+    let row = |label: &str, text: String| {
+        Line::from(vec![
+            Span::styled(
+                format!("{label}: "),
+                Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(text, Style::new().fg(TEXT)),
+        ])
+    };
+    let amount = |units: u128| {
+        if mask {
+            MASKED.to_string()
+        } else {
+            format!("{} Q ({units} base units)", exact_amount(units))
+        }
+    };
+    let escrow = |address: &[u8; 32]| {
+        if mask {
+            MASKED.to_string()
+        } else {
+            format!("0x{}", hex::encode(address))
+        }
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        match &preview.kind {
+            TransferKind::Transfer { .. } => "Transfer, as `qclient token transfer` does:",
+            TransferKind::Pending { .. } => {
+                "Pending transfer, as `qclient token pending-transfer` does:"
+            }
+            TransferKind::Accept { .. } => {
+                "Accept a pending transfer, as `qclient token accept` does:"
+            }
+            TransferKind::Refund { .. } => {
+                "Refund a pending transfer, as `qclient token reject` does:"
+            }
+            TransferKind::Merge => "Merge coins, as `qclient token merge all` does:",
+        },
+        Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD),
+    ))];
+    match &preview.kind {
+        TransferKind::Transfer { amount: units, .. } => {
+            lines.push(row("Amount", amount(*units)));
+        }
+        TransferKind::Pending {
+            amount: units,
+            refund_after,
+            ..
+        } => {
+            lines.push(row("Amount", amount(*units)));
+            lines.push(row(
+                "Refund after",
+                match refund_after {
+                    Some(frame) => format!("f{frame}: from then you may take it back if unclaimed"),
+                    None => "the GLOBAL head plus about a day".into(),
+                },
+            ));
+        }
+        TransferKind::Accept {
+            escrow: address,
+            amount: units,
+        } => {
+            lines.push(row("Escrow", escrow(address)));
+            lines.push(row("Amount", amount(*units)));
+        }
+        TransferKind::Refund {
+            escrow: address,
+            amount: units,
+        } => {
+            lines.push(row("Escrow", escrow(address)));
+            lines.push(row(
+                "Amount",
+                if mask {
+                    MASKED.to_string()
+                } else {
+                    format!("{} back to this wallet", amount(*units))
+                },
+            ));
+        }
+        TransferKind::Merge => {
+            if let Some((coins, total)) = preview.merge {
+                lines.push(row(
+                    "Coins",
+                    if mask {
+                        format!("{coins}, into one coin of this wallet; their total {MASKED}")
+                    } else {
+                        format!(
+                            "{coins}, together {}, into one coin of this wallet",
+                            amount(total)
+                        )
+                    },
+                ));
+            }
+        }
+    }
+    lines.push(row(
+        "Fee",
+        format!(
+            "{} base units ({} Q) as quoted now{}",
+            preview.fee,
+            exact_amount(preview.fee),
+            if matches!(preview.kind, TransferKind::Transfer { .. }) {
+                "; quoted again before submission"
+            } else {
+                ""
+            }
+        ),
+    ));
+    lines.push(row(
+        "Cap",
+        format!(
+            "{} Q (--max-fee); a higher quote is refused",
+            fmt_claimable(preview.max_fee)
+        ),
+    ));
+    lines.push(Line::from(Span::styled(
+        "It is proved here and submitted to this node; it cannot be undone once included.",
+        Style::new().fg(HELP),
+    )));
+    // The recipient in full, last: a confidential address runs to
+    // thousands of characters.
+    if let TransferKind::Transfer { recipient, .. } | TransferKind::Pending { recipient, .. } =
+        &preview.kind
+    {
+        let bytes = recipient.trim_start_matches("0x").len() / 2;
+        lines.push(row(
+            "Recipient",
+            if mask {
+                format!("{bytes} bytes, {MASKED}")
+            } else {
+                format!("{bytes} bytes, in full: {recipient}")
+            },
+        ));
+    }
+    lines
+        .into_iter()
+        .flat_map(|line| wrap_message(line, width))
+        .collect()
 }
 
 /// The Shield plan panel's title and lines: the confirmation while it is
@@ -830,6 +1284,24 @@ fn mint_confirm_lines(preview: &MintPreview, width: u16, mask: bool) -> Vec<Line
 
 /// The UI key row of the Coins tab, or the collapsed row.
 fn key_rows(m: &Model, width: u16) -> Vec<Line<'static>> {
+    match &m.coins.transfer.dialog {
+        Some(TransferDialog::Confirm(preview)) => {
+            return vec![Line::from(Span::styled(
+                format!(
+                    "Confirm: ‹y› {}  any other key cancels",
+                    preview.kind.name().to_lowercase()
+                ),
+                Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD),
+            ))];
+        }
+        Some(TransferDialog::Form(_)) => {
+            return vec![Line::from(Span::styled(
+                "Form: ‹tab› next field  ‹enter› check and quote  ‹esc› cancel  ‹Ctrl+C› quit",
+                Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD),
+            ))];
+        }
+        _ => {}
+    }
     if let Some(MintDialog::Confirm(preview)) = &m.coins.mint.dialog {
         return vec![Line::from(Span::styled(
             match preview.stage {
@@ -867,6 +1339,12 @@ fn key_rows(m: &Model, width: u16) -> Vec<Line<'static>> {
         ("S", "shield"),
         ("M", "mint"),
         ("C", "claim"),
+        ("E", "read shielded"),
+        ("T", "transfer"),
+        ("P", "pending transfer"),
+        ("A", "accept"),
+        ("R", "refund"),
+        ("J", "merge"),
         ("n", compact),
         ("c", colors),
         ("v", "notice level"),
@@ -938,7 +1416,11 @@ pub(super) fn render(f: &mut Frame, m: &mut Model, area: Rect) {
         plan_area.height.saturating_sub(2),
     );
     let dialog = matches!(m.coins.shield.dialog, Some(Dialog::Confirm(_)))
-        || matches!(m.coins.mint.dialog, Some(MintDialog::Confirm(_)));
+        || matches!(m.coins.mint.dialog, Some(MintDialog::Confirm(_)))
+        || matches!(
+            m.coins.transfer.dialog,
+            Some(TransferDialog::Confirm(_) | TransferDialog::Form(_))
+        );
     let block = bordered(title, dialog || m.coins.focus == CoinsFocus::Middle);
     let inner = block.inner(plan_area);
     f.render_widget(block, plan_area);
@@ -1015,6 +1497,8 @@ mod coins_render_tests {
         let legacy = row("legacy");
         assert!(legacy.contains("4 unshielded · 6 shielded"), "{legacy}");
         assert!(legacy.contains("◆ unshielded"), "{legacy}");
+        let shielded = row("shielded");
+        assert!(shielded.contains("not read"), "{shielded}");
         assert!(
             text.contains("◆ Legacy coins: 4 unshielded, 6 shielded; 2 batches; ‹S› shields the"),
             "{text}"
@@ -1278,6 +1762,51 @@ mod coins_render_tests {
         );
         m.coins.focus = CoinsFocus::Balances;
         m.coins.mint.saved.clear();
+        // The transfer keys with the shielded row or the Transfers panel;
+        // `A` and `R` in the panel, on a row they apply to.
+        let transfer_keys = [
+            "read shielded",
+            "‹T› transfer",
+            "pending transfer",
+            "‹J› merge",
+        ];
+        m.coins.cursor = 0;
+        m.compact_actions = true;
+        let text = keys(&mut m, 120);
+        assert!(transfer_keys.iter().all(|k| !text.contains(k)), "{text}");
+        m.compact_actions = false;
+        let text = keys(&mut m, 120);
+        assert!(
+            text.contains("(T) transfer") && text.contains("(E) read shielded"),
+            "{text}"
+        );
+        m.coins.cursor = 2;
+        for compact in [true, false] {
+            m.compact_actions = compact;
+            let text = keys(&mut m, 120);
+            assert!(transfer_keys.iter().all(|k| text.contains(k)), "{text}");
+            assert!(!text.contains("‹A› accept"), "{text}");
+        }
+        super::super::super::transfer::apply_read(
+            &mut m,
+            Ok(super::super::super::transfer::Read {
+                coins: Some((1, 5)),
+                escrows: vec![super::super::super::transfer::Escrow {
+                    address: [1; 32],
+                    amount: 5,
+                    outgoing: false,
+                    refund_after: 0,
+                }],
+            }),
+        );
+        m.coins.focus = CoinsFocus::Middle;
+        let text = keys(&mut m, 120);
+        assert!(
+            text.contains("‹A› accept") && text.contains("(R) refund"),
+            "{text}"
+        );
+        m.coins.focus = CoinsFocus::Balances;
+        m.coins.transfer.read = None;
         m.coins.cursor = 0;
         m.color_coding = true;
         let text = keys(&mut m, 120);
@@ -1478,6 +2007,185 @@ mod coins_render_tests {
             "{text}"
         );
         assert!(!text.contains("/cfg/"), "{text}");
+    }
+
+    /// The shielded row and the Transfers panel, a form and a confirmation
+    /// as they draw, and what a render hides of them; with
+    /// `QCLIENT_RENDER_DIR` set, each frame is also written there.
+    #[test]
+    fn shielded_coins_transfers_form_and_confirmation_draw() {
+        use super::super::super::transfer::{self, Dialog, Escrow, Kind, Preview, Read};
+        let dump = |name: &str, text: &str| {
+            if let Ok(dir) = std::env::var("QCLIENT_RENDER_DIR") {
+                std::fs::write(format!("{dir}/{name}.txt"), text).unwrap();
+            }
+        };
+        // A drawn row's cells, from the first row starting with `first`.
+        let cells = |text: &str, first: &str| -> Vec<String> {
+            text.lines()
+                .map(|line| line.trim_matches('│').trim())
+                .find(|line| line.starts_with(first))
+                .unwrap_or_else(|| panic!("no {first} row in\n{text}"))
+                .split_whitespace()
+                .map(String::from)
+                .collect()
+        };
+        let mut m = loaded();
+        m.color_coding = false;
+        m.last_global_head = 2000;
+        m.coins.cursor = 2;
+        let text = render_text(&mut m, 120, 40);
+        assert!(text.contains("╭ Transfers"), "{text}");
+        assert!(
+            text.contains("Pending transfers are not read yet; ‹E› reads them"),
+            "{text}"
+        );
+        transfer::apply_read(
+            &mut m,
+            Ok(Read {
+                coins: Some((4, 24_000_000_000)),
+                escrows: vec![
+                    Escrow {
+                        address: [0xab; 32],
+                        amount: 16_000_000_000,
+                        outgoing: false,
+                        refund_after: 3000,
+                    },
+                    Escrow {
+                        address: [0xcd; 32],
+                        amount: 8_000_000_000,
+                        outgoing: true,
+                        refund_after: 1900,
+                    },
+                ],
+            }),
+        );
+        for width in [80, 120] {
+            let text = render_text(&mut m, width, 40);
+            dump(&format!("offline-transfers-panel-{width}x40"), &text);
+            assert_eq!(
+                cells(&text, "shielded")[..5],
+                ["shielded", "4", "3", "◆", "incoming"],
+                "{text}"
+            );
+            assert!(
+                text.contains(
+                    "Shielded coins: 4 unspent; pending transfers 1 incoming, 1 outgoing"
+                ),
+                "{text}"
+            );
+            assert!(
+                text.contains("Escrow   Direction  Amount [Q]  Refund after"),
+                "{text}"
+            );
+            assert!(text.contains("…ababab  in            2.00000  -"), "{text}");
+            assert!(
+                text.contains("…cdcdcd  out           1.00000  f1900 (open)"),
+                "{text}"
+            );
+            assert!(
+                text.contains("◆ Pending transfers: 1 incoming (2 Q)"),
+                "{text}"
+            );
+        }
+        // A render hides the amounts and the escrows.
+        m.mask_private = true;
+        let text = render_text(&mut m, 120, 40);
+        dump("offline-transfers-panel-masked-120x40", &text);
+        assert_eq!(cells(&text, "hidden"), ["hidden", "in", "hidden", "-"]);
+        assert_eq!(
+            cells(&text, "shielded")[..5],
+            ["shielded", "4", "hidden", "◆", "incoming"]
+        );
+        assert!(
+            text.contains("◆ Pending transfers: 1 incoming; ‹A›"),
+            "{text}"
+        );
+        for private in ["ababab", "cdcdcd", "2.00000", "1.00000", "(2 Q)"] {
+            assert!(!text.contains(private), "{private}\n{text}");
+        }
+        m.mask_private = false;
+        transfer::request_form(&mut m, false);
+        let text = render_text(&mut m, 120, 40);
+        dump("offline-transfer-form-120x40", &text);
+        assert!(
+            text.contains("▶ Recipient address: paste the address"),
+            "{text}"
+        );
+        assert!(text.contains("Form: ‹tab› next field"), "{text}");
+        assert!(
+            text.contains("Amounts are in Q (1 Q = 8000000000 base units)."),
+            "{text}"
+        );
+        let recipient = format!("0x{}", "ef".repeat(60));
+        let confirm = |kind| {
+            Some(Dialog::Confirm(Preview {
+                kind,
+                fee: 4_000,
+                max_fee: 800_000_000,
+                merge: None,
+            }))
+        };
+        m.coins.cursor = 0;
+        m.coins.transfer.dialog = confirm(Kind::Transfer {
+            recipient: recipient.clone(),
+            amount: 12_000_000_000,
+        });
+        let text = render_text(&mut m, 120, 40);
+        dump("offline-transfer-confirm-120x40", &text);
+        for line in [
+            "Confirm transfer",
+            "Amount: 1.500000000000 Q (12000000000 base units)",
+            "Fee: 4000 base units (0.000000500000 Q) as quoted now; quoted again before submission",
+            "Cap: 0.1 Q (--max-fee); a higher quote is refused",
+            "Recipient: 60 bytes, in full:",
+            "0xefefefefefefefef",
+            "Confirm: ‹y› transfer  any other key cancels",
+        ] {
+            assert!(text.contains(line), "{line}\n{text}");
+        }
+        m.mask_private = true;
+        let text = render_text(&mut m, 120, 40);
+        dump("offline-transfer-confirm-masked-120x40", &text);
+        for line in [
+            "Amount: hidden in this render (--reveal shows it)",
+            "Recipient: 60 bytes, hidden in this render (--reveal shows it)",
+            "Fee: 4000 base units",
+        ] {
+            assert!(text.contains(line), "{line}\n{text}");
+        }
+        for private in ["efefef", "1.500000000000", "12000000000"] {
+            assert!(!text.contains(private), "{private}\n{text}");
+        }
+        m.coins.transfer.dialog = confirm(Kind::Accept {
+            escrow: [0xab; 32],
+            amount: 16_000_000_000,
+        });
+        let text = render_text(&mut m, 120, 40);
+        assert!(
+            text.contains("Escrow: hidden in this render (--reveal shows it)"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("abab") && !text.contains("2.000000000000"),
+            "{text}"
+        );
+        // A typed recipient and amount are hidden too.
+        m.coins.transfer.dialog = None;
+        transfer::request_form(&mut m, true);
+        if let Some(Dialog::Form(form)) = m.coins.transfer.dialog.as_mut() {
+            form.fields = vec![recipient.clone(), "7.125".into(), String::new()];
+        }
+        let text = render_text(&mut m, 120, 40);
+        assert!(
+            text.contains("▶ Recipient escrow address: hidden in this render"),
+            "{text}"
+        );
+        assert!(text.contains("Amount [Q]: hidden in this render"), "{text}");
+        assert!(
+            !text.contains("efefef") && !text.contains("7.125"),
+            "{text}"
+        );
     }
 
     /// The Provers rows follow the same rule, and pressing a key that does

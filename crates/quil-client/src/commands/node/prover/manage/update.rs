@@ -15,6 +15,7 @@ use super::model::{
 use super::msg::Msg;
 use super::settings;
 use super::shield;
+use super::transfer;
 
 const MAX_AWAIT_RETRIES: u32 = 3;
 
@@ -34,6 +35,13 @@ pub enum Cmd {
     ClaimPrepare(std::path::PathBuf, u64),
     /// Prove and submit the confirmed mint, or submit the claim.
     MintRun(super::mint::Preview),
+    /// Read this wallet's shielded coins and the pending transfers it can
+    /// act on.
+    FetchShielded,
+    /// Check and quote a transfer action for its confirmation.
+    TransferPrepare(super::transfer::Kind),
+    /// Run the confirmed transfer action.
+    TransferRun(super::transfer::Preview),
     Join(Vec<Vec<u8>>),
     Lifecycle {
         action: String,
@@ -77,6 +85,18 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
         }
         Msg::Mint(progress) => {
             mint::apply_progress(m, progress);
+            vec![]
+        }
+        Msg::Shielded(read) => {
+            transfer::apply_read(m, read);
+            vec![]
+        }
+        Msg::TransferPreview(preview) => {
+            transfer::apply_preview(m, preview);
+            vec![]
+        }
+        Msg::Transfer(progress) => {
+            transfer::apply_progress(m, progress);
             vec![]
         }
         Msg::ShieldPreview(preview) => {
@@ -577,6 +597,16 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         }
         if matches!(m.coins.mint.dialog, Some(mint::Dialog::Confirm(_))) {
             return mint::dialog_key(m, ev);
+        }
+        // A form takes every key as text but Ctrl+C, which quits.
+        if matches!(m.coins.transfer.dialog, Some(transfer::Dialog::Form(_))) {
+            if ev.code == KeyCode::Char('c') && ev.modifiers.contains(KeyModifiers::CONTROL) {
+                return vec![Cmd::Quit];
+            }
+            return transfer::form_key(m, ev);
+        }
+        if matches!(m.coins.transfer.dialog, Some(transfer::Dialog::Confirm(_))) {
+            return transfer::dialog_key(m, ev);
         }
         if m.show_help {
             return handle_help_key(m, ev);

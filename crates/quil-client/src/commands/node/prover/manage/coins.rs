@@ -1,10 +1,11 @@
-//! The Coins tab: this node's claimable rewards and legacy coins, read
-//! only. Claimable rewards come with each Provers refresh; legacy coins
-//! are read in the background once when the manager starts, so the tab
-//! bar counts their conditions from either tab, then every
+//! The Coins tab: this node's claimable rewards, legacy coins and
+//! shielded coins. Claimable rewards come with each Provers refresh;
+//! legacy coins are read in the background once when the manager starts,
+//! so the tab bar counts their conditions from either tab, then every
 //! [`LEGACY_REFRESH`] while the Coins tab is open, and on `r`. A read
 //! lists both owner forms through `token legacy`'s own functions, so the
-//! figures match `qclient token legacy`.
+//! figures match `qclient token legacy`. Shielded coins are read on `E`
+//! only ([`super::transfer`]).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -20,8 +21,9 @@ use super::update::Cmd;
 /// a regular node).
 pub const LEGACY_REFRESH: Duration = Duration::from_secs(600);
 
-/// Rows of the Balances panel, top to bottom.
-pub const BALANCE_ROWS: usize = 2;
+/// Rows of the Balances panel, top to bottom: claimable, legacy,
+/// shielded.
+pub const BALANCE_ROWS: usize = 3;
 
 /// Panels of the tab, top to bottom: Balances, the panel of the Balances
 /// row under the cursor ([`Middle`]), Notifications. `[`/`]` and `{`/`}`
@@ -42,8 +44,8 @@ pub enum CoinsFocus {
 }
 
 /// What the middle panel shows: it follows the Balances row under the
-/// cursor, and a shield's or a mint's preparation or confirmation while it
-/// is open.
+/// cursor, and an action's form, preparation or confirmation while it is
+/// open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Middle {
     /// The claimable reward: its amount, frame and mint, and the
@@ -51,6 +53,9 @@ pub enum Middle {
     Claim,
     /// `token shield-all`'s batches of the legacy coins.
     ShieldPlan,
+    /// The pending transfers of the shielded coins, and the transfer
+    /// actions.
+    Transfers,
 }
 
 impl Middle {
@@ -59,6 +64,7 @@ impl Middle {
         match self {
             Self::Claim => "Claim status",
             Self::ShieldPlan => "Shield plan",
+            Self::Transfers => "Transfers",
         }
     }
 }
@@ -71,9 +77,13 @@ pub fn middle(m: &Model) -> Middle {
     if m.coins.mint.dialog.is_some() {
         return Middle::Claim;
     }
+    if m.coins.transfer.dialog.is_some() {
+        return Middle::Transfers;
+    }
     match m.coins.cursor {
         0 => Middle::Claim,
-        _ => Middle::ShieldPlan,
+        1 => Middle::ShieldPlan,
+        _ => Middle::Transfers,
     }
 }
 
@@ -86,22 +96,30 @@ pub enum Selection {
     Claimable,
     /// The legacy-coins row of Balances.
     Legacy,
+    /// The shielded-coins row of Balances.
+    Shielded,
     /// A batch of the Shield plan: legacy coins too.
     Plan,
     /// The Claim status panel: the claimable reward and the saved
     /// authorizations.
     Claim,
+    /// The Transfers panel: the pending transfers of the shielded coins.
+    Transfers,
     Notifications,
 }
 
 /// The current [`Selection`].
 pub fn selection(m: &Model) -> Selection {
     match m.coins.focus {
-        CoinsFocus::Balances if m.coins.cursor == 0 => Selection::Claimable,
-        CoinsFocus::Balances => Selection::Legacy,
+        CoinsFocus::Balances => match m.coins.cursor {
+            0 => Selection::Claimable,
+            1 => Selection::Legacy,
+            _ => Selection::Shielded,
+        },
         CoinsFocus::Middle => match middle(m) {
             Middle::Claim => Selection::Claim,
             Middle::ShieldPlan => Selection::Plan,
+            Middle::Transfers => Selection::Transfers,
         },
         CoinsFocus::Notifications => Selection::Notifications,
     }
@@ -192,6 +210,11 @@ fn cursor_rows(m: &Model) -> (usize, usize, &'static str) {
                 Middle::Claim.title(),
             ),
             Middle::ShieldPlan => (m.coins.plan_cursor, plan_rows(m), "Shield plan"),
+            Middle::Transfers => (
+                m.coins.transfer.cursor,
+                super::transfer::escrows(m).len().max(1),
+                Middle::Transfers.title(),
+            ),
         },
         CoinsFocus::Notifications => (
             m.notice_offset,
@@ -249,6 +272,21 @@ pub fn key_refusal(m: &Model, key: &str) -> Option<String> {
             Some("Mint: ‹C› claims a saved authorization; select it in the Claim status.".into())
         }
         "C" => super::mint::claim_refusal(m),
+        "E" | "T" | "P" | "J"
+            if !matches!(selection(m), Selection::Shielded | Selection::Transfers) =>
+        {
+            Some(format!(
+                "Transfers: ‹{key}› acts on shielded coins; select the shielded row or the \
+                 Transfers panel."
+            ))
+        }
+        "A" | "R" if selection(m) != Selection::Transfers => Some(format!(
+            "Transfers: ‹{key}› acts on the pending transfer under the cursor; select it in the \
+             Transfers panel."
+        )),
+        "E" | "T" | "P" | "A" | "R" | "J" => {
+            super::transfer::refusal(m, key.chars().next().unwrap_or(' '))
+        }
         "[/] {/}" => ['[', ']', '{', '}']
             .iter()
             .all(|&key| edge_move(m, key).is_err())
@@ -283,7 +321,8 @@ pub struct Legacy {
 #[derive(Debug, Default)]
 pub struct Coins {
     pub focus: CoinsFocus,
-    /// The Balances row under the cursor: 0 claimable, 1 legacy.
+    /// The Balances row under the cursor: 0 claimable, 1 legacy, 2
+    /// shielded.
     pub cursor: usize,
     pub legacy: Legacy,
     /// The Shield plan row under the cursor, and its first row on screen.
@@ -293,6 +332,9 @@ pub struct Coins {
     pub shield: super::shield::Shield,
     /// The reward mint and its saved authorizations.
     pub mint: super::mint::Mint,
+    /// The shielded coins, their pending transfers and the transfer
+    /// actions.
+    pub transfer: super::transfer::Transfers,
     /// When each current notice was first shown, by its key.
     pub notice_since: HashMap<&'static str, SystemTime>,
     /// How far each edge is moved from its default, in rows (kept between
@@ -362,6 +404,7 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     let notices = m.coins.focus == CoinsFocus::Notifications;
     let plan = selection(m) == Selection::Plan;
     let claim = selection(m) == Selection::Claim;
+    let transfers = selection(m) == Selection::Transfers;
     let plan_rows = plan_rows(m);
     let hint = match ev.code {
         KeyCode::Up | KeyCode::Char('k') => Some("↑/k"),
@@ -370,6 +413,12 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         KeyCode::Char('S') => Some("S"),
         KeyCode::Char('M') => Some("M"),
         KeyCode::Char('C') => Some("C"),
+        KeyCode::Char('E') => Some("E"),
+        KeyCode::Char('T') => Some("T"),
+        KeyCode::Char('P') => Some("P"),
+        KeyCode::Char('A') => Some("A"),
+        KeyCode::Char('R') => Some("R"),
+        KeyCode::Char('J') => Some("J"),
         _ => None,
     };
     if let Some(why) = hint.and_then(|key| key_refusal(m, key)) {
@@ -384,8 +433,18 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             m.notice_offset = 0;
             m.coins.shield.dialog = None;
             m.coins.mint.dialog = None;
+            m.coins.transfer.dialog = None;
         }
         KeyCode::Char('S') => return super::shield::request(m),
+        KeyCode::Char('E') => return super::transfer::request_read(m),
+        KeyCode::Char('T') => return super::transfer::request_form(m, false),
+        KeyCode::Char('P') => return super::transfer::request_form(m, true),
+        KeyCode::Char(key @ ('A' | 'R' | 'J')) => return super::transfer::request(m, key),
+        KeyCode::Esc if m.coins.transfer.dialog.is_some() => {
+            m.coins.transfer.dialog = None;
+            m.status_msg = "Transfers: cancelled; nothing was submitted.".into();
+            m.status_is_error = false;
+        }
         KeyCode::Char('M') => return super::mint::request_mint(m),
         KeyCode::Char('C') => return super::mint::request_claim(m),
         KeyCode::Esc if m.coins.mint.dialog.is_some() => {
@@ -419,6 +478,13 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         KeyCode::Down | KeyCode::Char('j') if claim => {
             m.coins.mint.cursor =
                 (m.coins.mint.cursor + 1).min(m.coins.mint.saved.len().saturating_sub(1));
+        }
+        KeyCode::Up | KeyCode::Char('k') if transfers => {
+            m.coins.transfer.cursor = m.coins.transfer.cursor.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') if transfers => {
+            let rows = super::transfer::escrows(m).len();
+            m.coins.transfer.cursor = (m.coins.transfer.cursor + 1).min(rows.saturating_sub(1));
         }
         KeyCode::Up | KeyCode::Char('k') if plan => {
             m.coins.plan_cursor = m.coins.plan_cursor.saturating_sub(1);
@@ -505,6 +571,7 @@ pub fn shields_open_at(snapshot: &Snapshot) -> Option<(u64, u64)> {
 pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
     let mut out = super::shield::notices(m, &fmt_amount);
     out.extend(super::mint::notices(m, &fmt_amount));
+    out.extend(super::transfer::notices(m, &fmt_amount));
     let busy = m.coins.shield.dialog.is_some() || super::shield::running(m);
     let mut push = |key, severity, attention, text: String| {
         out.push(Notice {
@@ -815,6 +882,17 @@ mod coins_tests {
         assert_eq!((m.coins.cursor, middle(&m)), (1, Middle::Claim));
         m.coins.mint.dialog = None;
         assert_eq!(middle(&m), Middle::ShieldPlan);
+        // The shielded row shows the Transfers panel, and so does an open
+        // transfer form whichever row is selected.
+        handle_key(&mut m, key('j'));
+        assert_eq!(
+            (middle(&m), selection(&m)),
+            (Middle::Transfers, Selection::Shielded)
+        );
+        handle_key(&mut m, key('k'));
+        m.coins.transfer.dialog = Some(super::super::transfer::Dialog::Preparing(Instant::now()));
+        assert_eq!((m.coins.cursor, middle(&m)), (1, Middle::Transfers));
+        m.coins.transfer.dialog = None;
     }
 
     /// `M` acts with the claimable row or its Claim status selected, `C` in
@@ -938,6 +1016,115 @@ mod coins_tests {
         assert_eq!(place_edges(&mut m, [2, 2, 2]), [2, 2, 2]);
     }
 
+    /// `E`, `T`, `P` and `J` act with the shielded row or the Transfers
+    /// panel selected, `A` and `R` in the panel on the row under its
+    /// cursor: `A` an incoming transfer, `R` an outgoing one past its refund
+    /// frame. Elsewhere each does nothing but say why.
+    #[test]
+    fn transfer_keys_act_only_on_shielded_coins() {
+        use super::super::transfer::{Escrow, Read};
+        let mut m = Model::new();
+        open(&mut m);
+        apply_legacy(&mut m, Ok(None), Duration::from_secs(6));
+        m.last_global_head = 500;
+        let escrow = |outgoing, refund_after| Escrow {
+            address: [7; 32],
+            amount: 9,
+            outgoing,
+            refund_after,
+        };
+        super::super::transfer::apply_read(
+            &mut m,
+            Ok(Read {
+                coins: Some((2, 90)),
+                escrows: vec![escrow(false, 0), escrow(true, 400), escrow(true, 900)],
+            }),
+        );
+        for c in ['E', 'T', 'P', 'A', 'R', 'J'] {
+            for (focus, cursor) in [
+                (CoinsFocus::Balances, 0),
+                (CoinsFocus::Balances, 1),
+                (CoinsFocus::Middle, 0),
+                (CoinsFocus::Middle, 1),
+                (CoinsFocus::Notifications, 2),
+            ] {
+                m.coins.focus = focus;
+                m.coins.cursor = cursor;
+                assert!(handle_key(&mut m, key(c)).is_empty(), "{c}");
+                let why = if matches!(c, 'A' | 'R') {
+                    format!(
+                        "Transfers: ‹{c}› acts on the pending transfer under the cursor; select \
+                         it in the Transfers panel."
+                    )
+                } else {
+                    format!(
+                        "Transfers: ‹{c}› acts on shielded coins; select the shielded row or \
+                         the Transfers panel."
+                    )
+                };
+                assert_eq!(m.status_msg, why, "{c} {focus:?} {cursor}");
+                assert!(m.coins.transfer.dialog.is_none() && m.coins.transfer.reading.is_none());
+            }
+        }
+        // The shielded row: `A` and `R` still want the panel.
+        m.coins.focus = CoinsFocus::Balances;
+        m.coins.cursor = 2;
+        assert!(handle_key(&mut m, key('A')).is_empty());
+        assert!(m.status_msg.contains("select it in the Transfers panel"));
+        assert!(matches!(
+            handle_key(&mut m, key('J')).as_slice(),
+            [Cmd::TransferPrepare(_)]
+        ));
+        m.coins.transfer.dialog = None;
+        m.coins.focus = CoinsFocus::Middle;
+        assert_eq!(selection(&m), Selection::Transfers);
+        let row = |m: &mut Model, cursor, c| {
+            m.coins.transfer.cursor = cursor;
+            m.coins.transfer.dialog = None;
+            m.status_msg.clear();
+            handle_key(m, key(c))
+        };
+        assert!(matches!(
+            row(&mut m, 0, 'A').as_slice(),
+            [Cmd::TransferPrepare(_)]
+        ));
+        assert!(row(&mut m, 0, 'R').is_empty());
+        assert_eq!(
+            m.status_msg,
+            "Transfers: an incoming transfer is accepted with ‹A›."
+        );
+        assert!(row(&mut m, 1, 'A').is_empty());
+        assert!(m.status_msg.contains("‹R› refunds it"));
+        assert!(matches!(
+            row(&mut m, 1, 'R').as_slice(),
+            [Cmd::TransferPrepare(_)]
+        ));
+        assert!(row(&mut m, 2, 'R').is_empty());
+        assert_eq!(
+            m.status_msg,
+            "Transfers: its refund opens at f900, in 400 frames."
+        );
+        // The cursor keys move over the pending transfers.
+        m.coins.transfer.cursor = 0;
+        handle_key(&mut m, key('j'));
+        handle_key(&mut m, key('j'));
+        assert_eq!((m.coins.cursor, m.coins.transfer.cursor), (2, 2));
+        assert!(handle_key(&mut m, key('j')).is_empty());
+        assert_eq!(m.status_msg, "Transfers: already at the last row.");
+        assert!(row(&mut m, 2, 'T').is_empty());
+        assert!(matches!(
+            m.coins.transfer.dialog,
+            Some(super::super::transfer::Dialog::Form(_))
+        ));
+        m.coins.transfer.dialog = None;
+        assert!(matches!(
+            row(&mut m, 2, 'E').as_slice(),
+            [Cmd::FetchShielded]
+        ));
+        assert!(row(&mut m, 2, 'E').is_empty());
+        assert_eq!(m.status_msg, "Transfers: a read is already in progress.");
+    }
+
     /// At a panel's first or last row the cursor keys say so.
     #[test]
     fn cursor_keys_at_a_panel_edge_say_so() {
@@ -948,7 +1135,9 @@ mod coins_tests {
         handle_key(&mut m, key('j'));
         assert_eq!(m.coins.cursor, 1);
         handle_key(&mut m, key('j'));
-        assert_eq!(m.coins.cursor, 1);
+        assert_eq!(m.coins.cursor, 2);
+        handle_key(&mut m, key('j'));
+        assert_eq!(m.coins.cursor, 2);
         assert_eq!(m.status_msg, "Balances: already at the last row.");
     }
 
