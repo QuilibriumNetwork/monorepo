@@ -1682,7 +1682,8 @@ impl Forest {
     /// One bounded batch of [`Self::prune_shard_phase`]: at most
     /// `max_records` stale records from `from` on (see
     /// [`crate::RocksTreeStore::prune_batch`]). Returns the nodes reclaimed
-    /// and where the next batch starts, if any. An in-memory forest prunes
+    /// and where the next batch starts, if any; the batch also ends once
+    /// `stop` says so, checked after each record. An in-memory forest prunes
     /// the whole tree at once.
     pub fn prune_shard_phase_batch(
         &self,
@@ -1691,9 +1692,12 @@ impl Forest {
         min_readable_version: u64,
         from: Option<&[u8]>,
         max_records: usize,
+        stop: &dyn Fn() -> bool,
     ) -> Result<(usize, Option<Vec<u8>>)> {
         match self.store(&TreeId::shard_phase(shard_id, phase)) {
-            TreeStore::Rocks(store) => store.prune_batch(min_readable_version, from, max_records),
+            TreeStore::Rocks(store) => {
+                store.prune_batch_until(min_readable_version, from, max_records, stop)
+            }
             TreeStore::Mem(store) => Ok((store.prune(min_readable_version)?, None)),
         }
     }
@@ -1717,7 +1721,8 @@ impl Forest {
 
     /// Delete the superseded leaf values of `key_hashes` in one shard/phase
     /// tree below its retention watermark (see
-    /// [`crate::RocksTreeStore::prune_values_of`]).
+    /// [`crate::RocksTreeStore::prune_values_of`]): the number deleted and
+    /// the number of `key_hashes` judged before `stop` said so.
     pub fn prune_shard_phase_values_of(
         &self,
         shard_id: &[u8],
@@ -1725,12 +1730,13 @@ impl Forest {
         min_readable_version: u64,
         key_hashes: &[[u8; 32]],
         budget: &mut usize,
-    ) -> Result<usize> {
+        stop: &dyn Fn() -> bool,
+    ) -> Result<(usize, usize)> {
         match self.store(&TreeId::shard_phase(shard_id, phase)) {
             TreeStore::Rocks(store) => {
-                store.prune_values_of(min_readable_version, key_hashes, budget)
+                store.prune_values_of(min_readable_version, key_hashes, budget, stop)
             }
-            TreeStore::Mem(_) => Ok(0),
+            TreeStore::Mem(_) => Ok((0, key_hashes.len())),
         }
     }
 }

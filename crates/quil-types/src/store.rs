@@ -1448,15 +1448,18 @@ pub trait HypergraphStore: Send + Sync {
     /// `keyspace` below its newest one at or below the keyspace's watermark,
     /// as the store holds them now, at most `budget` (decremented). The
     /// watermark must come from a [`Self::retention_replan`] under the same
-    /// commit lock. Returns the number staged.
+    /// commit lock. Once `stop` says so, checked after each vertex (at least
+    /// one is judged), the rest are left for a later call. Returns the number
+    /// staged and the number of `vertices` judged.
     fn retention_prune_vertices(
         &self,
         _txn: &dyn Transaction,
         _keyspace: &RetentionKeyspace,
-        _vertices: &[Vec<u8>],
+        vertices: &[Vec<u8>],
         _budget: &mut usize,
-    ) -> Result<usize> {
-        Ok(0)
+        _stop: &dyn Fn() -> bool,
+    ) -> Result<(usize, usize)> {
+        Ok((0, vertices.len()))
     }
 
     fn apply_snapshot(&self, db_path: &str) -> Result<()>;
