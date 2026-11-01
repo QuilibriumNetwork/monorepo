@@ -506,6 +506,15 @@ pub fn labelling_peak_bytes(n: u64, params: &SdrParams) -> u64 {
     n.saturating_mul((6 * NODE_BYTES + parents) as u64)
 }
 
+/// Bytes [`label_leaf`] holds at its peak for a leaf of `n` nodes: two label
+/// layers, the column digests and the parent table. The leaf's data, its
+/// replica and their trees, which [`labelling_peak_bytes`] counts, are not
+/// its.
+pub fn label_leaf_peak_bytes(n: u64, params: &SdrParams) -> u64 {
+    let parents = 4 * (params.drg_degree.max(1) + params.expander_degree);
+    n.saturating_mul((3 * NODE_BYTES + parents) as u64)
+}
+
 /// Nodes a registration may pad a leaf's data with, with zeros, beyond its
 /// own ([`data_node_count`]): an eighth of them and this many more. A member
 /// labels a leaf ahead of its snapshot ([`label_leaf`]) at a count it picks

@@ -69,6 +69,34 @@ pub fn disk_floor(total_bytes: u64) -> u64 {
     (total_bytes / 100 * DISK_FLOOR_PERCENT).max(DISK_FLOOR_MIN_BYTES)
 }
 
+/// Bytes of the buffer a leaf's layers are written through.
+const WRITE_BUFFER_BYTES: usize = 1 << 22;
+
+/// Percent [`label_ahead_bytes`] adds to what labelling holds, for the
+/// allocator: jemalloc rounds a large allocation up to its size class (it
+/// counted 157.8 bytes a node allocated for 152.2 resident, 2026-11-01), and
+/// keeps freed pages a while before it returns them, so a leaf labelled
+/// again soon after it gave its memory back may still find them held.
+const LABEL_AHEAD_MARGIN_PERCENT: u64 = 10;
+
+/// Bytes labelling a leaf of `n` nodes ahead reserves
+/// (`crate::storage_jobs::reserve_ahead`): what the labelling holds at its
+/// peak (`quil_crypto::storage_proof::label_leaf_peak_bytes`, 152 bytes a
+/// node) and [`LABEL_AHEAD_MARGIN_PERCENT`] more, and its write buffer.
+/// Measured on 2026-11-01 through this path under the node's allocator, a
+/// synthetic leaf of 32,339,852 nodes held 4,920,782,848 bytes resident
+/// above the process's baseline at its peak (152.2 a node); this reserves
+/// 5,411,417,558 for it. The snapshot's reservation
+/// (`crate::storage_snapshot::encoding_bytes`, 248 bytes a node, 8.0 GB
+/// there) also holds the leaf's data, replica and trees, which labelling
+/// ahead does not: with it, a node sharing 19.8 GB labelled two leaves of 32
+/// million nodes at a time, not three.
+pub(crate) fn label_ahead_bytes(n: u64) -> u64 {
+    let peak = quil_crypto::storage_proof::label_leaf_peak_bytes(n, &SdrParams::default());
+    peak.saturating_add(peak / 100 * LABEL_AHEAD_MARGIN_PERCENT)
+        .saturating_add(WRITE_BUFFER_BYTES as u64)
+}
+
 /// Bytes a leaf's labels at `n` nodes take on disk: every layer, and a
 /// column digest per node.
 pub fn label_bytes(n: u64) -> u64 {
@@ -489,7 +517,7 @@ impl Admitted<'_> {
         let [layers_path, columns_path, ready_path] = paths;
         fs::create_dir_all(&self.dir).map_err(|e| io("create", &self.dir, e))?;
         let file = File::create(layers_path).map_err(|e| io("create", layers_path, e))?;
-        let mut writer = Some(BufWriter::with_capacity(1 << 22, file));
+        let mut writer = Some(BufWriter::with_capacity(WRITE_BUFFER_BYTES, file));
         let (mut failure, mut shortfall) = (None, None);
         let key = quil_crypto::sdr::replica_key(&self.member, &self.leaf_id, self.epoch);
         let labelled = quil_crypto::storage_proof::label_leaf_until(
@@ -546,7 +574,7 @@ impl Admitted<'_> {
             }));
         }
         let mut writer = BufWriter::with_capacity(
-            1 << 22,
+            WRITE_BUFFER_BYTES,
             File::create(columns_path).map_err(|e| io("create", columns_path, e))?,
         );
         write_digests(&mut writer, &columns).map_err(|e| io("write", columns_path, e))?;
@@ -797,7 +825,7 @@ fn label_leaf_ahead(
     // When the leaf last gave its memory back to work due now.
     let mut yielded: Option<Instant> = None;
     loop {
-        let bytes = crate::storage_snapshot::encoding_bytes(n);
+        let bytes = label_ahead_bytes(n);
         let gone = || expired(epoch) || crate::storage_jobs::stopping();
         let memory = crate::storage_jobs::reserve_ahead(bytes, &gone).filter(|_| !gone());
         let Some(memory) = memory else {
@@ -894,6 +922,29 @@ mod tests {
         let labelled = admitted.label(&SdrParams::default()).unwrap();
         assert!(labelled.kept);
         labelled
+    }
+
+    /// Labelling a leaf ahead holds no more than it reserves
+    /// ([`label_ahead_bytes`]), and reserves no more than its margin above
+    /// it ([`LABEL_AHEAD_MARGIN_PERCENT`]): reserving the snapshot's encode
+    /// instead (`crate::storage_snapshot::encoding_bytes`) labelled two large
+    /// leaves ahead at a time where the memory allowed three (2026-11-01).
+    #[test]
+    fn labelling_ahead_reserves_what_it_holds() {
+        let dir = temp_dir("peak");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let n = 20_000u64;
+        let admitted = store
+            .admit(9, &[8u8; 32], b"peak", n, Stage::Ahead)
+            .unwrap();
+        let (labelled, peak) = crate::test_alloc::peak_by(|| admitted.label(&SdrParams::default()));
+        assert!(labelled.unwrap().kept);
+        let (peak, reserved) = (peak as u64, label_ahead_bytes(n));
+        assert!(
+            peak <= reserved && reserved <= peak + peak / 100 * LABEL_AHEAD_MARGIN_PERCENT,
+            "labelling {n} nodes ahead held {peak} bytes at its peak and reserves {reserved}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
