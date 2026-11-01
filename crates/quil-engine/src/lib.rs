@@ -5,6 +5,7 @@ pub mod app_handoff;
 mod app_history_recovery;
 pub mod app_shard_cache;
 pub mod app_shard_metadata;
+mod app_stall;
 pub mod app_types;
 pub mod archive_ingest;
 pub mod archive_preverify;
