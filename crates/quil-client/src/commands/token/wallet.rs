@@ -4212,8 +4212,9 @@ pub(super) fn shield_batches(
     (batches, uncovered)
 }
 
-/// Legacy coins this wallet submitted in a batch shield within the last hour:
-/// a resumed run leaves them for their batch to commit.
+/// Legacy coins this wallet submitted in a batch shield within the last two
+/// hours (`shield_pacing::SUBMITTED_EXCLUSION_SECS`): a resumed run leaves
+/// them for their batch to commit.
 #[cfg(feature = "native-proof")]
 fn recently_shielded(tc: &TokenCtx) -> std::collections::BTreeSet<[u8; 32]> {
     let now = std::time::SystemTime::now()
@@ -4226,7 +4227,8 @@ fn recently_shielded(tc: &TokenCtx) -> std::collections::BTreeSet<[u8; 32]> {
             let (at, address) = line.split_once(' ')?;
             let at: u64 = at.parse().ok()?;
             let address: [u8; 32] = hex::decode(address).ok()?.try_into().ok()?;
-            (now.saturating_sub(at) < 3_600).then_some(address)
+            (now.saturating_sub(at) < super::shield_pacing::SUBMITTED_EXCLUSION_SECS)
+                .then_some(address)
         })
         .collect()
 }
@@ -4252,13 +4254,142 @@ fn record_shielded(
 
 /// Shield every unshielded legacy coin of this identity in batches of at most
 /// `max_per_batch`, one shard per batch, each into one coin of this wallet.
+/// Batches are paced (see `shield_pacing`) and printed as they progress.
 #[cfg(feature = "native-proof")]
 pub(super) async fn run_shield_all(
     tc: &TokenCtx,
     application: &str,
     max_per_batch: usize,
+    pacing: super::shield_pacing::Pacing,
 ) -> anyhow::Result<()> {
-    use quil_execution::token_intrinsic::cost::Shape;
+    run_shield_all_observed(tc, application, max_per_batch, pacing, &mut |event| {
+        println!("{}", event.line())
+    })
+    .await
+}
+
+/// The reads, proofs and submissions of one paced `shield-all` run.
+#[cfg(feature = "native-proof")]
+struct ShieldAllIo<'a> {
+    tc: &'a TokenCtx,
+    application: [u8; 32],
+    wallet: std::sync::Arc<RecipientWallet>,
+    owner: std::sync::Arc<dyn quil_types::crypto::Signer>,
+    client:
+        quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
+    batches: Vec<Vec<quil_lattice_ct::confidential::shield::ShieldSource>>,
+    /// Each batch's shard, short form.
+    shards: Vec<String>,
+    started: std::time::Instant,
+    observer: &'a mut dyn FnMut(&super::shield_pacing::ShieldEvent),
+}
+
+#[cfg(feature = "native-proof")]
+impl super::shield_pacing::ShieldIo for ShieldAllIo<'_> {
+    type Proof = Vec<u8>;
+
+    fn now(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+
+    fn unix(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    }
+
+    async fn sleep(&mut self, secs: u64) {
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+    }
+
+    async fn head(&mut self) -> anyhow::Result<u64> {
+        Ok(self
+            .client
+            .get_node_info(quil_types::proto::node::GetNodeInfoRequest::default())
+            .await?
+            .into_inner()
+            .last_global_head_frame)
+    }
+
+    fn coins(&self, index: usize) -> usize {
+        self.batches[index].len()
+    }
+
+    fn shard(&self, index: usize) -> String {
+        self.shards[index].clone()
+    }
+
+    async fn prove(&mut self, index: usize) -> anyhow::Result<Option<Vec<u8>>> {
+        use quil_execution::token_intrinsic::cost::Shape;
+        let sources = &self.batches[index];
+        let total = sources
+            .iter()
+            .try_fold(0u128, |sum, source| sum.checked_add(source.amount))
+            .ok_or_else(|| anyhow::anyhow!("legacy sources overflow u128"))?;
+        let fee = quoted_quil_fee(
+            self.tc,
+            None,
+            Shape {
+                coins: 1,
+                markers: sources.len(),
+                escrow: false,
+            },
+            false,
+        )
+        .await?;
+        if fee >= total {
+            (self.observer)(&super::shield_pacing::ShieldEvent::Skipped {
+                index,
+                total: self.batches.len(),
+                coins: sources.len(),
+                total_units: total,
+                fee,
+            });
+            return Ok(None);
+        }
+        let bytes = self
+            .wallet
+            .clone()
+            .create_batch_shield(
+                sources.clone(),
+                self.owner.clone(),
+                vec![(self.wallet.address().clone(), total - fee)],
+                fee,
+                1,
+                native_budget(),
+            )
+            .await?;
+        Ok(Some(bytes))
+    }
+
+    async fn submit(&mut self, index: usize, bytes: Vec<u8>) -> anyhow::Result<()> {
+        submit_operation(self.tc, &self.wallet, &mut self.client, bytes).await?;
+        record_shielded(self.tc, &self.batches[index])
+    }
+
+    async fn included(&mut self, index: usize) -> anyhow::Result<bool> {
+        let batch = &self.batches[index];
+        let coins = super::legacy::list(self.tc, &self.client, &self.application).await?;
+        Ok(!coins.iter().any(|coin| {
+            !coin.shielded && batch.iter().any(|source| source.address == coin.address)
+        }))
+    }
+
+    fn event(&mut self, event: &super::shield_pacing::ShieldEvent) {
+        (self.observer)(event);
+    }
+}
+
+/// [`run_shield_all`] reporting each [`ShieldEvent`](super::shield_pacing::ShieldEvent)
+/// to `observer`, for a caller that renders progress itself.
+#[cfg(feature = "native-proof")]
+pub(super) async fn run_shield_all_observed(
+    tc: &TokenCtx,
+    application: &str,
+    max_per_batch: usize,
+    pacing: super::shield_pacing::Pacing,
+    observer: &mut dyn FnMut(&super::shield_pacing::ShieldEvent),
+) -> anyhow::Result<()> {
     use quil_lattice_ct::confidential::shield::MAX_SHIELD_SOURCES;
     anyhow::ensure!(
         (1..=MAX_SHIELD_SOURCES).contains(&max_per_batch),
@@ -4273,7 +4404,7 @@ pub(super) async fn run_shield_all(
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &application)?);
     let owner = legacy_owner_signer(tc)?;
-    let mut client = tc.connect().await?;
+    let client = tc.connect().await?;
     let pending = recently_shielded(tc);
     let coins: Vec<([u8; 32], u128)> = super::legacy::list(tc, &client, &application)
         .await?
@@ -4287,14 +4418,28 @@ pub(super) async fn run_shield_all(
             if pending.is_empty() {
                 ""
             } else {
-                " (some submitted within the last hour are awaiting their batch)"
+                " (some submitted within the last two hours are awaiting their batch)"
             }
         );
         return Ok(());
     }
     super::legacy::ensure_shields_active(&client, tc.node_config.p2p.network, true).await?;
-    let shards = super::legacy::live_shard_paths(&client, &application).await?;
-    let (batches, uncovered) = shield_batches(coins, &shards, max_per_batch);
+    let live = super::legacy::live_shards(&client, &application).await?;
+    let paths: Vec<Vec<bool>> = live.iter().map(|(_, path)| path.clone()).collect();
+    let (batches, uncovered) = shield_batches(coins, &paths, max_per_batch);
+    let shards = batches
+        .iter()
+        .map(|batch| {
+            batch
+                .first()
+                .and_then(|source| super::legacy::deepest_shard(&paths, &source.address))
+                .and_then(|path| live.iter().find(|(_, live_path)| live_path == path))
+                .map_or_else(
+                    || "unknown".to_owned(),
+                    |(filter, _)| super::shield_pacing::shard_label(filter),
+                )
+        })
+        .collect();
     if !uncovered.is_empty() {
         println!(
             "{} legacy coins lie in no live shard and are left for a later run.",
@@ -4302,43 +4447,19 @@ pub(super) async fn run_shield_all(
         );
     }
     let count = batches.len();
-    for (index, sources) in batches.into_iter().enumerate() {
-        let total = sources
-            .iter()
-            .try_fold(0u128, |sum, source| sum.checked_add(source.amount))
-            .ok_or_else(|| anyhow::anyhow!("legacy sources overflow u128"))?;
-        let fee = quoted_quil_fee(
-            tc,
-            None,
-            Shape {
-                coins: 1,
-                markers: sources.len(),
-                escrow: false,
-            },
-            false,
-        )
-        .await?;
-        if fee >= total {
-            println!("Batch {}/{count}: {} legacy coins worth {total} base units do not cover the fee {fee}; skipped.",
-                index + 1, sources.len());
-            continue;
-        }
-        let bytes = wallet
-            .clone()
-            .create_batch_shield(
-                sources.clone(),
-                owner.clone(),
-                vec![(wallet.address().clone(), total - fee)],
-                fee,
-                1,
-                native_budget(),
-            )
-            .await?;
-        submit_operation(tc, &wallet, &mut client, bytes).await?;
-        record_shielded(tc, &sources)?;
-        println!("Batch {}/{count}: {} legacy coins, {} base units shielded (fee {fee}). Submitted; finalized inclusion is not yet confirmed.",
-            index + 1, sources.len(), total - fee);
-    }
+    let mut io = ShieldAllIo {
+        tc,
+        application,
+        wallet,
+        owner,
+        client,
+        batches,
+        shards,
+        started: std::time::Instant::now(),
+        observer,
+    };
+    let submitted = super::shield_pacing::run(&mut io, count, pacing).await?;
+    println!("Done: {submitted} of {count} batches submitted and included.");
     Ok(())
 }
 
