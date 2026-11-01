@@ -28,3 +28,6 @@ uuid = { version = "1", features = ["v4"] }
 subtle = "2"
 anyhow = "1"
 thiserror = "2"
+
+[lints]
+workspace = true

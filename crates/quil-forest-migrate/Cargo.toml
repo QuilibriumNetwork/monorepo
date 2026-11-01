@@ -32,3 +32,6 @@ tempfile = "3"
 # Verify forest inclusion proofs in tests (quil-forest returns jmt proof types).
 jmt = "0.11"
 sha2 = "0.10"
+
+[lints]
+workspace = true

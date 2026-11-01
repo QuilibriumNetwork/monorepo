@@ -35,3 +35,6 @@ quil-forest = { path = "../quil-forest" }
 quil-tries = { path = "../quil-tries" }
 quil-execution = { path = "../quil-execution" }
 sha3 = "0.10"
+
+[lints]
+workspace = true

@@ -54,3 +54,6 @@ required-features = ["test-utils"]
 [[test]]
 name = "unified_tree_commit"
 required-features = ["test-utils"]
+
+[lints]
+workspace = true
