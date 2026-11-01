@@ -2462,6 +2462,155 @@ pub(crate) mod tests {
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 
+    /// From the stable replica key epoch (set for this thread, which the
+    /// storage jobs pass on to the threads a snapshot's leaves encode on) a
+    /// leaf labelled ahead for one epoch registers and seals
+    /// the next epoch from the same labels, with no labelling: the next
+    /// epoch's labelling ahead finds them, its snapshot encodes from them and
+    /// its seal opens them. Each epoch's proof verifies for that epoch alone.
+    /// A leaf whose data outgrows its count is labelled again, at a new one,
+    /// and the old count goes at the next sweep.
+    #[test]
+    fn a_leaf_keeps_its_labels_across_epochs_from_the_stable_key_epoch() {
+        use crate::storage_epoch_batch::PreparedSeat;
+        use quil_crypto::storage_proof::{data_node_count, padded_nodes_allowed};
+        use quil_execution::global_intrinsic::storage_epoch_proof::{
+            EpochClaim, StorageEpochProof,
+        };
+        let first = 6u64;
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(first));
+        let dir = std::env::temp_dir().join(format!("quil-labels-stable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::storage_labels::install_with_space(
+            dir.clone(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let crdt = test_crdt();
+        let app = [0x7Cu8; 32];
+        let add = |from: u16, to: u16| {
+            for d in from..to {
+                crdt.add_vertex(
+                    &Location {
+                        app_address: app,
+                        data_address: address((d % 251) as u8, (d / 251) as u8 + 1),
+                    },
+                    &vec![d as u8; 300],
+                )
+                .unwrap();
+            }
+        };
+        add(0, 30);
+        crdt.commit(1).unwrap();
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(first - 2));
+        let member = [0x5Eu8; 32];
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let ready = || {
+            crate::storage_labels::files_under(&dir)
+                .into_iter()
+                .filter(|path| path.extension().is_some_and(|ext| ext == "ready"))
+                .collect::<Vec<_>>()
+        };
+        // An epoch's labelling ahead, snapshot and seal, as a member's node
+        // runs them; returns the stored replica, the proof and its claim.
+        let epoch_of = |epoch: u64, beacon: u8| {
+            crate::storage_labels::precompute(store, &crdt, &member, &app, epoch).unwrap();
+            let captured =
+                capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
+            assert_eq!(captured.prefixes.len(), 1);
+            let prefix = captured.prefixes[0].clone();
+            let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&app, &prefix);
+            encode_member(&captured, &member, &replicas).unwrap();
+            let stored = replicas.get_hash(epoch, &leaf_id).unwrap().unwrap();
+            let sealing = quil_types::consensus::StorageSeatSlot {
+                epoch,
+                leaves: vec![prefix.clone()],
+                registered_at: 900,
+                sealed_at: None,
+                frames: 0,
+                accumulator: [0; 32],
+                chained: vec![],
+                open: true,
+            };
+            let beacon_output = vec![beacon; 516];
+            let seat = prepare_member_seat(
+                &replicas,
+                &member,
+                &app,
+                epoch - 2,
+                Some((&sealing, &beacon_output, &captured)),
+                None,
+            )
+            .unwrap();
+            let seat = PreparedSeat::from_bytes(&seat.to_bytes()).unwrap();
+            let claim = EpochClaim {
+                member,
+                seats: vec![seat.claim.clone()],
+            };
+            let bytes = crate::storage_epoch_batch::prove(vec![seat]).unwrap();
+            let proof = StorageEpochProof::from_canonical_bytes(&bytes)
+                .unwrap()
+                .proof;
+            (leaf_id, stored, proof, claim)
+        };
+
+        let (leaf_id, this, proof, claim) = epoch_of(first, 0x71);
+        assert_eq!(claim.verify(&proof), Ok(()));
+        let labelled = ready();
+        assert_eq!(labelled.len(), 1, "one count labelled for {first}");
+        let modified = std::fs::metadata(&labelled[0]).unwrap().modified().unwrap();
+        store.sweep(first);
+
+        let (_, next, next_proof, next_claim) = epoch_of(first + 1, 0x72);
+        assert_eq!(next_claim.verify(&next_proof), Ok(()));
+        assert_eq!(
+            next.registration_root, this.registration_root,
+            "the unchanged leaf registers the same replica"
+        );
+        assert_eq!(ready(), labelled, "no count labelled for the next epoch");
+        assert_eq!(
+            std::fs::metadata(&labelled[0]).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(
+            outcomes(first + 1, &app, LeafWork::FromLabelsAhead),
+            vec![LeafOutcome::Completed]
+        );
+        assert!(outcomes(first + 1, &app, LeafWork::LabellingNow).is_empty());
+        assert!(
+            next_claim.verify(&proof).is_err(),
+            "an epoch's proof replayed for the next"
+        );
+        assert!(claim.verify(&next_proof).is_err());
+        store.sweep(first + 1);
+        assert_eq!(ready(), labelled, "the labels serve the next epochs");
+
+        // The data outgrows the count labelled: labelled again, at another.
+        add(30, 330);
+        crdt.commit(2).unwrap();
+        let grown = first + 2;
+        crate::storage_labels::precompute(store, &crdt, &member, &app, grown).unwrap();
+        let captured =
+            capture_at(&crdt, &app, grown, &[current_source(&crdt, &app, grown)]).unwrap();
+        let exact =
+            data_node_count(captured.leaf_data(&captured.prefixes[0]).unwrap().len() as u64);
+        let old = store.find(first, &member, &leaf_id, |_| true).unwrap().n;
+        assert!(!padded_nodes_allowed(exact, old));
+        assert_eq!(ready().len(), 2, "a new count labelled");
+        encode_member(&captured, &member, &replicas).unwrap();
+        assert_eq!(
+            outcomes(grown, &app, LeafWork::FromLabelsAhead),
+            vec![LeafOutcome::Completed]
+        );
+        store.sweep(grown);
+        let left = ready();
+        assert_eq!(left.len(), 1, "the old count went at the sweep");
+        assert_ne!(left, labelled);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An epoch proof is not sent again until GLOBAL had
     /// [`seal_retry_frames`] to record it from when it went out: a part
     /// claimed long before (a seal relabelling, the node's batch waiting)
