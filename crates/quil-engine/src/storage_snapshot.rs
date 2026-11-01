@@ -2822,9 +2822,18 @@ pub(crate) mod tests {
         /// the store while the process exits, which aborts the process
         /// ("pthread lock: Invalid argument"; CI 2026-10-31).
         fn ended(self, crdt: &Arc<HypergraphCrdt>) -> Result<()> {
+            self.ended_within(crdt, std::time::Duration::from_secs(60))
+        }
+
+        /// [`Self::ended`], waiting up to `timeout` for the labelling to end.
+        fn ended_within(
+            self,
+            crdt: &Arc<HypergraphCrdt>,
+            timeout: std::time::Duration,
+        ) -> Result<()> {
             let result = self
                 .done
-                .recv_timeout(std::time::Duration::from_secs(60))
+                .recv_timeout(timeout)
                 .expect("the labelling ahead ends");
             self.thread.join().expect("the labelling ahead's thread");
             assert_eq!(
@@ -2934,6 +2943,71 @@ pub(crate) mod tests {
         );
         assert_eq!(files_under(&dir), Vec::<std::path::PathBuf>::new());
         let _ = std::fs::remove_dir_all(&dir);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// Labelling ahead that gave its memory back to work due now labels its
+    /// leaf again as soon as its memory fits beside that work, while the work
+    /// still holds its own (2026-11-01: labelling ahead waited until no work
+    /// due now had held memory for a minute, through every seat's snapshot,
+    /// and no large leaf was labelled ahead).
+    #[test]
+    fn labelling_ahead_that_yielded_resumes_beside_work_due_now_once_it_fits() {
+        use crate::storage_labels::{ample_space, LabelStore};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        const GIB: u64 = 1 << 30;
+        // Work due now holding memory until its release is dropped.
+        let hold = |bytes: u64| {
+            let (granted_tx, granted) = mpsc::channel();
+            let (release, released) = mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                let _memory = crate::storage_jobs::reserve(bytes);
+                granted_tx.send(()).unwrap();
+                let _ = released.recv();
+            });
+            (granted, release)
+        };
+        assert!(
+            crate::storage_jobs::job_slots() >= 2,
+            "two jobs hold memory side by side"
+        );
+        // 40 GiB available: the jobs share 30.
+        crate::storage_jobs::set_available_for_test(Some(40 * GIB));
+        let (app, member, epoch) = ([0x86u8; 32], [0x6Du8; 32], 6);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let (crdt, leaf_id) = one_long_leaf(app, epoch);
+        let dir = std::env::temp_dir().join(format!("quil-labels-beside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store: &'static LabelStore =
+            Box::leak(Box::new(LabelStore::with_space(dir.clone(), ample_space())));
+        let (first, first_release) = hold(20 * GIB);
+        first
+            .recv_timeout(Duration::from_secs(10))
+            .expect("alone, it runs");
+        let labelling = label_ahead_in_background(store, &crdt, member, app, epoch);
+        // 10 GiB more fit beside the first only once the leaf gives its
+        // memory back.
+        let (second, second_release) = hold(10 * GIB);
+        second
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the labelling ahead gives its memory back to work due now");
+        // Once the first ends, the leaf's memory fits beside the second.
+        drop(first_release);
+        labelling
+            .ended_within(&crdt, Duration::from_secs(300))
+            .unwrap();
+        assert!(
+            store.find(epoch, &member, &leaf_id, |_| true).is_some(),
+            "the leaf is labelled ahead beside the work due now"
+        );
+        assert_eq!(
+            outcomes(epoch, &app, LeafWork::LabellingAhead),
+            vec![LeafOutcome::Yielded, LeafOutcome::Completed]
+        );
+        drop(second_release);
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::storage_jobs::set_available_for_test(None);
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 

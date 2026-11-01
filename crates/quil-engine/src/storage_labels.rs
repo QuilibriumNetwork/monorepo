@@ -22,9 +22,9 @@
 //!
 //! Labelling ahead gives its memory back while work due now waits for memory
 //! (`crate::storage_jobs::Reservation::yield_requested`): the leaf being
-//! labelled is given up, and labelled again from its start once that work is
-//! done (`crate::storage_jobs::wait_for_due_work`), unless its snapshot has
-//! labelled it meanwhile.
+//! labelled is given up, and labelled again from its start as soon as its
+//! memory fits beside that work, unless its snapshot has labelled it
+//! meanwhile.
 //!
 //! Labelling ahead for an epoch gives up once GLOBAL reaches the epoch's
 //! snapshot frame ([`expired`]): the snapshot labels what is left itself, and
@@ -682,7 +682,7 @@ fn log_expired(epoch: u64, filter: &[u8], leaf_id: &[u8], at: &'static str) {
 /// (`storage_jobs::for_each_parallel`). A leaf already labelled at a count
 /// its data allows is left, and one its filesystem has no room for is not
 /// labelled ([`LabelStore::admit`]). A leaf whose memory work due now waits
-/// for is given up and labelled again once that work is done
+/// for is given up and labelled again once its memory fits beside that work
 /// ([`label_leaf_ahead`]). Nothing is labelled once GLOBAL reached the
 /// epoch's snapshot frame ([`expired`]). Removes the labels of epochs that
 /// have begun.
@@ -775,12 +775,12 @@ pub fn precompute(
 /// was labelled and kept at (0 when it was labelled meanwhile, or given up),
 /// `None` when refused room. While work due now waits for memory
 /// (`crate::storage_jobs::Reservation::yield_requested`) the labelling gives
-/// up the leaf and its memory, waits until that work is done
-/// (`crate::storage_jobs::wait_for_due_work`), and labels it again from its
-/// start, unless the epoch's snapshot of the shard labelled it meanwhile.
-/// Once GLOBAL reaches the epoch's snapshot frame ([`expired`]), looked at
-/// while the leaf waits for its memory and once it has it, while it is
-/// labelled and once work due now is done, the leaf is given up.
+/// up the leaf and its memory, asks for the memory again at once, behind
+/// that work (`crate::storage_jobs::reserve_ahead`), and labels the leaf
+/// again from its start once it fits, unless the epoch's snapshot of the
+/// shard labelled it meanwhile. Once GLOBAL reaches the epoch's snapshot
+/// frame ([`expired`]), looked at while the leaf waits for its memory and
+/// once it has it, and while it is labelled, the leaf is given up.
 fn label_leaf_ahead(
     store: &LabelStore,
     member: &[u8],
@@ -794,14 +794,16 @@ fn label_leaf_ahead(
     use quil_crypto::storage_proof::{padded_nodes_allowed, precompute_nodes};
     let stopping = || QuilError::ExecutionUnavailable("the node is stopping".into());
     let n = precompute_nodes(exact);
+    // When the leaf last gave its memory back to work due now.
+    let mut yielded: Option<Instant> = None;
     loop {
-        let Some(admitted) = store.admit(epoch, member, leaf_id, n, Stage::Ahead) else {
-            return Ok(None);
-        };
         let bytes = crate::storage_snapshot::encoding_bytes(n);
-        let memory = crate::storage_jobs::reserve_ahead(bytes, &|| expired(epoch))
-            .filter(|_| !expired(epoch));
+        let gone = || expired(epoch) || crate::storage_jobs::stopping();
+        let memory = crate::storage_jobs::reserve_ahead(bytes, &gone).filter(|_| !gone());
         let Some(memory) = memory else {
+            if crate::storage_jobs::stopping() {
+                return Err(stopping());
+            }
             log_expired(
                 epoch,
                 filter,
@@ -809,6 +811,22 @@ fn label_leaf_ahead(
                 "waiting for memory to label the leaf",
             );
             return Ok(Some(0));
+        };
+        if let Some(at) = yielded.take() {
+            let done = store
+                .find(epoch, member, leaf_id, |n| padded_nodes_allowed(exact, n))
+                .is_some()
+                || crate::storage_snapshot::snapshot_encoded(filter, epoch);
+            info!(epoch, filter = %hex::encode(filter), leaf = %hex::encode(leaf_id), nodes = n,
+                waited_seconds = at.elapsed().as_secs(), labelled_meanwhile = done,
+                scope = "local",
+                "storage labels computed ahead resume: their memory fits beside the work due now");
+            if done {
+                return Ok(Some(0));
+            }
+        }
+        let Some(admitted) = store.admit(epoch, member, leaf_id, n, Stage::Ahead) else {
+            return Ok(None);
         };
         let progress = crate::storage_snapshot::leaf_started(
             epoch,
@@ -839,27 +857,10 @@ fn label_leaf_ahead(
             seconds = started.elapsed().as_secs(), scope = "local",
             "storage labels computed ahead give their memory back to work due now (a renewal's \
              snapshot or an epoch proof) waiting for it; this leaf is labelled ahead again from its \
-             start once that work is done, unless GLOBAL reaches the epoch's snapshot frame first: \
-             an expected wait");
+             start once its memory fits beside that work, unless GLOBAL reaches the epoch's \
+             snapshot frame first: an expected wait");
         progress.end(LeafOutcome::Yielded);
-        let yielded = Instant::now();
-        if !crate::storage_jobs::wait_for_due_work() {
-            return Err(stopping());
-        }
-        if expired(epoch) {
-            log_expired(epoch, filter, leaf_id, "waiting for work due now to end");
-            return Ok(Some(0));
-        }
-        let done = store
-            .find(epoch, member, leaf_id, |n| padded_nodes_allowed(exact, n))
-            .is_some()
-            || crate::storage_snapshot::snapshot_encoded(filter, epoch);
-        info!(epoch, filter = %hex::encode(filter), leaf = %hex::encode(leaf_id), nodes = n,
-            waited_seconds = yielded.elapsed().as_secs(), labelled_meanwhile = done, scope = "local",
-            "storage labels computed ahead resume: no work due now waits for memory");
-        if done {
-            return Ok(Some(0));
-        }
+        yielded = Some(Instant::now());
     }
 }
 
