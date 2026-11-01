@@ -208,6 +208,18 @@ extern "C" {
     fn libc_geteuid() -> u32;
 }
 
+/// Whether this process runs as root (effective user id 0).
+#[cfg(unix)]
+pub fn is_root() -> bool {
+    unsafe { libc_geteuid() == 0 }
+}
+
+/// Whether this process runs as root: never off unix.
+#[cfg(not(unix))]
+pub fn is_root() -> bool {
+    false
+}
+
 /// Whether a file/dir exists (`client/utils/fileUtils.go` `FileExists`).
 pub fn file_exists<P: AsRef<Path>>(p: P) -> bool {
     p.as_ref().exists()
