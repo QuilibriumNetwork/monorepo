@@ -423,8 +423,9 @@ pub enum LeafWork {
 pub enum LeafOutcome {
     /// Labelled or encoded to its end.
     Completed,
-    /// Labelling ahead gave its memory back to work due now, to label the
-    /// leaf again from its start once that work is done.
+    /// Labelling ahead gave its memory back to more urgent work, keeping
+    /// the whole layers it labelled, to go on from them once its memory fits
+    /// again.
     Yielded,
     /// Labelling ahead gave up: GLOBAL reached its epoch's snapshot frame.
     Expired,
@@ -477,18 +478,41 @@ pub fn label_estimate(nodes: u64) -> std::time::Duration {
     std::time::Duration::from_secs(u64::try_from(seconds).unwrap_or(u64::MAX))
 }
 
+/// [`label_estimate`] for the layers left of a leaf of `nodes` nodes, `kept`
+/// of them kept on disk (`crate::storage_labels::LabelStore::resumable`).
+fn label_estimate_from(nodes: u64, kept: usize) -> std::time::Duration {
+    let layers = quil_crypto::sdr::SdrParams::default().layers;
+    let left = u32::try_from(layers.saturating_sub(kept)).unwrap_or(u32::MAX);
+    label_estimate(nodes) * left / u32::try_from(layers).unwrap_or(u32::MAX).max(1)
+}
+
 /// The frames left at GLOBAL frame `frame` to the renewal's grace frame for
 /// `epoch` (`crate::app_shard_metadata::storage_snapshot_grace`) when
-/// labelling a leaf of `nodes` nodes now would end past it by its estimate
-/// ([`label_estimate`]), a frame taking the interval at `frame`
+/// labelling a leaf of `nodes` nodes now, `kept` of its layers kept on disk,
+/// would end past it by its estimate ([`label_estimate_from`]), a frame
+/// taking the interval at `frame`
 /// ([`quil_types::consensus::ideal_frame_time_ms_at`]) up to the grace frame;
 /// `None` when it would end in time.
-fn misses_grace(epoch: u64, nodes: u64, frame: u64) -> Option<u64> {
+fn misses_grace(epoch: u64, nodes: u64, kept: usize, frame: u64) -> Option<u64> {
     let grace = quil_types::consensus::storage_snapshot_frame(epoch)
         .saturating_add(crate::app_shard_metadata::storage_snapshot_grace());
     let left = grace.saturating_sub(frame);
     let frame_millis = u128::from(quil_types::consensus::ideal_frame_time_ms_at(frame));
-    (label_estimate(nodes).as_millis() > u128::from(left) * frame_millis).then_some(left)
+    let estimate = label_estimate_from(nodes, kept);
+    (estimate.as_millis() > u128::from(left) * frame_millis).then_some(left)
+}
+
+/// Whether a leaf of `nodes` nodes labelled from `epoch`'s snapshot frame
+/// would end by the renewal's grace frame by its estimate ([`misses_grace`]):
+/// one that would not registers only from labels computed ahead.
+pub(crate) fn labels_within_grace(epoch: u64, nodes: u64) -> bool {
+    misses_grace(
+        epoch,
+        nodes,
+        0,
+        quil_types::consensus::storage_snapshot_frame(epoch),
+    )
+    .is_none()
 }
 
 /// A leaf being labelled or encoded.
@@ -500,6 +524,11 @@ struct RunningLeaf {
     started: std::time::Instant,
     /// Its labelling's estimate; none when its labels were kept ahead.
     estimate: Option<std::time::Duration>,
+    /// Its layers labelled when it started, now, and of how many
+    /// ([`LeafProgress::layers`]); none when not reported.
+    layers: Option<(usize, usize, usize)>,
+    /// How long it paused ([`LeafProgress::paused`]).
+    paused: std::time::Duration,
     /// Whether its start was logged, or it was reported running long: its
     /// end is logged then.
     logged: bool,
@@ -547,6 +576,58 @@ impl LeafProgress {
     pub fn end(mut self, outcome: LeafOutcome) {
         self.outcome = Some(outcome);
     }
+
+    /// Note that `done` of the leaf's `of` layers are labelled. The first
+    /// note says where its work starts (an attempt that gave up kept the
+    /// layers before), and its estimate counts only the layers left.
+    pub fn layers(&self, done: usize, of: usize) {
+        if let Some(leaf) = running_leaves().leaves.get_mut(&self.id) {
+            let from = match leaf.layers {
+                Some((from, _, _)) => from,
+                None => {
+                    leaf.estimate = leaf.estimate.map(|estimate| {
+                        estimate.mul_f64((of.saturating_sub(done)) as f64 / of.max(1) as f64)
+                    });
+                    done
+                }
+            };
+            leaf.layers = Some((from, done, of));
+        }
+    }
+
+    /// Note that the leaf's work paused for `paused` (labelling ahead beside
+    /// a leaf labelled now,
+    /// `crate::storage_jobs::Reservation::wait_while_paused`): its pace
+    /// counts only the time it ran.
+    pub fn paused(&self, paused: std::time::Duration) {
+        if let Some(leaf) = running_leaves().leaves.get_mut(&self.id) {
+            leaf.paused += paused;
+        }
+    }
+}
+
+/// How long a leaf labelled ahead has still to run: at the pace of its
+/// layers labelled since it started, or by its estimate before its first,
+/// not counting the time it paused.
+fn remaining_ahead(leaf: &RunningLeaf) -> std::time::Duration {
+    let elapsed = leaf.started.elapsed().saturating_sub(leaf.paused);
+    match leaf.layers {
+        Some((from, done, of)) if done > from => {
+            elapsed.mul_f64(of.saturating_sub(done) as f64 / (done - from) as f64)
+        }
+        _ => leaf.estimate.unwrap_or_default().saturating_sub(elapsed),
+    }
+}
+
+/// How long until GLOBAL reaches `epoch`'s snapshot frame, from which
+/// labelling ahead for it is of no use (`crate::storage_labels`); `None`
+/// while this process has seen no GLOBAL frame.
+fn until_snapshot_frame(epoch: u64) -> Option<std::time::Duration> {
+    let frame = global_frame()?;
+    let frames = quil_types::consensus::storage_snapshot_frame(epoch).saturating_sub(frame);
+    Some(std::time::Duration::from_millis(frames.saturating_mul(
+        quil_types::consensus::ideal_frame_time_ms_at(frame),
+    )))
 }
 
 /// Track `member`'s leaf `leaf_id` of shard `filter` for `epoch`, of `nodes`
@@ -579,6 +660,8 @@ pub fn leaf_started(
             work,
             started: std::time::Instant::now(),
             estimate,
+            layers: None,
+            paused: std::time::Duration::ZERO,
             logged,
         },
     );
@@ -650,6 +733,8 @@ fn report_long_leaves() {
             nodes: u64,
             longest: std::time::Duration,
             estimate: Option<std::time::Duration>,
+            /// Of leaves labelled ahead, the most any has still to run.
+            remaining: std::time::Duration,
         }
         let mut seats: std::collections::BTreeMap<(u64, Vec<u8>, LeafWork), Seat> =
             Default::default();
@@ -678,6 +763,9 @@ fn report_long_leaves() {
                     seat.longest = elapsed;
                     seat.estimate = leaf.estimate;
                 }
+                if leaf.work == LeafWork::LabellingAhead {
+                    seat.remaining = seat.remaining.max(remaining_ahead(leaf));
+                }
             }
             let now = std::time::Instant::now();
             reported.retain(|_, at| at.elapsed() < LEAF_PROGRESS_INTERVAL * 2);
@@ -693,17 +781,34 @@ fn report_long_leaves() {
             let overrun = seat.estimate.is_some_and(|e| seat.longest > e);
             let grace_frame = quil_types::consensus::storage_snapshot_frame(epoch)
                 .saturating_add(crate::app_shard_metadata::storage_snapshot_grace());
+            // Labelling ahead runs past its estimate on a busy node without
+            // harm; it matters only once it would end past the snapshot
+            // frame, where it is given up.
+            let left = until_snapshot_frame(epoch);
+            let late = left.is_some_and(|left| seat.remaining > left);
+            let (remaining, left) = (
+                seat.remaining.as_secs() / 60,
+                left.map_or_else(
+                    || "unknown".to_string(),
+                    |left| (left.as_secs() / 60).to_string(),
+                ),
+            );
             match work {
-                LeafWork::LabellingAhead if !overrun => info!(epoch, filter = %filter,
+                LeafWork::LabellingAhead if !late => info!(epoch, filter = %filter,
                     leaves = seat.leaves, nodes = seat.nodes, longest_minutes = longest,
-                    estimated_minutes = %estimated, work = work.name(), scope = "local",
+                    estimated_minutes = %estimated, remaining_minutes = remaining,
+                    minutes_to_snapshot_frame = %left, work = work.name(), scope = "local",
                     "storage labels for a later epoch's snapshot still being computed ahead; \
                      nothing waits for them yet"),
                 LeafWork::LabellingAhead => warn!(epoch, filter = %filter,
                     leaves = seat.leaves, nodes = seat.nodes, longest_minutes = longest,
-                    estimated_minutes = %estimated, work = work.name(), scope = "local",
-                    action = "check this node's CPU load: the labelling runs past its estimate",
-                    "storage labels for a later epoch's snapshot still being computed ahead, past their estimate"),
+                    estimated_minutes = %estimated, remaining_minutes = remaining,
+                    minutes_to_snapshot_frame = %left, work = work.name(), scope = "local",
+                    action = "check this node's CPU load and how many large leaves it labels \
+                              at once: at its pace the labelling ends after the epoch's snapshot \
+                              frame, where it is given up, and a leaf its snapshot cannot label \
+                              within the renewal's grace then renews without a registration",
+                    "storage labels for a later epoch's snapshot would end past its snapshot frame"),
                 // Within its estimate (or with none, from labels kept
                 // ahead) this is the expected wait of a renewal.
                 _ if !overrun => info!(epoch, filter = %filter, leaves = seat.leaves,
@@ -729,8 +834,10 @@ fn report_long_leaves() {
 /// epoch's leaves ready for the renewal to register. The leaves encode side by
 /// side, each once the memory it takes is free (`crate::storage_jobs`), from
 /// the labels kept ahead for it when they fit its data (`crate::storage_labels`):
-/// otherwise it is labelled now, its labels kept for its seal when their
-/// filesystem has room for them.
+/// otherwise it is labelled now, going on from the whole layers kept on disk
+/// at a count its data may register (labelled ahead, or by this snapshot
+/// before a restart), its labels kept for its seal when their filesystem has
+/// room for them.
 pub fn encode_member(captured: &Captured, member: &[u8], replicas: &ReplicaStore) -> Result<()> {
     encode_member_with(
         captured,
@@ -752,7 +859,9 @@ fn encode_member_with(
 
 /// [`encode_member_with`], given up once `stop` says so: looked at before
 /// each leaf, while it waits for its memory and once it has it, and while it
-/// is labelled.
+/// is labelled. A leaf given up keeps the whole layers it labelled for the
+/// next attempt, after a restart say, unless the renewal's grace passed or
+/// the seat was given up. Removes the labels of earlier epochs first.
 fn encode_member_until(
     captured: &Captured,
     member: &[u8],
@@ -760,22 +869,54 @@ fn encode_member_until(
     store: Option<&crate::storage_labels::LabelStore>,
     stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<()> {
-    use crate::storage_labels::Stage;
+    use crate::storage_labels::{Labelling, Stage};
     use quil_crypto::storage_proof::{data_node_count, padded_nodes_allowed};
     let params = quil_crypto::sdr::SdrParams::default();
     let started = std::time::Instant::now();
     let stopped = || unavailable("the storage snapshot's encode was stopped".into());
+    if let Some(store) = store {
+        store.sweep(captured.epoch);
+    }
     let encoded = crate::storage_jobs::for_each_parallel(&captured.prefixes, |prefix| {
         let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&captured.filter, prefix);
         if stop() {
             return Err(stopped());
         }
+        let size = captured.leaf_size(prefix)?;
+        // A leaf's data is at least its values (`Captured::leaf_size`), so a
+        // leaf with no labels kept at that many nodes or more is labelled now
+        // at no fewer. When even that many cannot be labelled by the
+        // renewal's grace frame, its seat is given up before the leaf asks
+        // for memory: waiting for it, the leaf would hold its place before
+        // other seats' leaves and make labelling ahead give its memory back,
+        // for nothing (2026-11-01: ten seats' large leaves waited for memory
+        // through the grace each epoch, and none was labelled ahead).
+        let least = data_node_count(u64::try_from(size).unwrap_or(u64::MAX));
+        let may_be_kept = store.is_some_and(|store| {
+            store
+                .find(captured.epoch, member, &leaf_id, |n| n >= least)
+                .is_some()
+        });
+        // Whole layers kept on disk shorten what is left to label.
+        let kept_least = store
+            .and_then(|store| store.resumable(captured.epoch, member, &leaf_id, |n| n >= least))
+            .map_or(0, |(_, layers)| layers);
+        if !may_be_kept
+            && gives_up_late_leaf(
+                captured,
+                member,
+                &leaf_id,
+                least,
+                kept_least,
+                LeafCount::Least,
+            )
+        {
+            return Err(stopped());
+        }
         // A leaf whose seat's renewal is past its grace leaves the queue for
         // memory, where it would hold its place before other seats' leaves.
         let memory = crate::storage_jobs::reserve_until(
-            encoding_bytes(data_node_count(estimated_leaf_bytes(
-                captured.leaf_size(prefix)?,
-            ))),
+            encoding_bytes(data_node_count(estimated_leaf_bytes(size))),
             stop,
         );
         let Some(mut memory) = memory.filter(|_| !stop()) else {
@@ -788,30 +929,30 @@ fn encode_member_until(
                 padded_nodes_allowed(exact, n)
             })
         });
-        memory.resize(encoding_bytes(ahead.as_ref().map_or(exact, |kept| kept.n)));
+        // Else the leaf is labelled at the count its data may register
+        // with the most whole layers kept on disk, or at its own.
+        let (count, kept) = match (&ahead, store) {
+            (None, Some(store)) => store
+                .resumable(captured.epoch, member, &leaf_id, |n| {
+                    padded_nodes_allowed(exact, n)
+                })
+                .unwrap_or((exact, 0)),
+            _ => (exact, 0),
+        };
+        let nodes = ahead.as_ref().map_or(count, |kept| kept.n);
+        memory.resize(encoding_bytes(nodes));
         // A leaf to label now that cannot end by the renewal's grace frame
         // would hold its memory for nothing: its seat renews without it.
-        let frame = global_frame().filter(|_| ahead.is_none());
-        let late = frame.and_then(|frame| misses_grace(captured.epoch, exact, frame));
-        if let (Some(frame), Some(frames_left)) = (frame, late) {
-            if give_up_snapshot(member, &captured.filter, captured.epoch) {
-                warn!(epoch = captured.epoch, filter = %hex::encode(&captured.filter),
-                    leaf = %hex::encode(&leaf_id), nodes = exact,
-                    estimated_minutes = label_estimate(exact).as_secs() / 60, frames_left,
-                    global_frame = frame, scope = "local",
-                    action = "check this node's CPU headroom and how many seats it labels at \
-                              once; the next epoch's snapshot starts again",
-                    "storage snapshot given up: this node would finish a seat's storage proof data \
-                     after the renewal's grace frame, so the seat renews without a storage \
-                     registration and earns no storage share on its shard this epoch");
-            }
+        if ahead.is_none()
+            && gives_up_late_leaf(captured, member, &leaf_id, count, kept, LeafCount::Exact)
+        {
             return Err(stopped());
         }
         let progress = leaf_started(
             captured.epoch,
             &captured.filter,
             &leaf_id,
-            ahead.as_ref().map_or(exact, |kept| kept.n),
+            nodes,
             if ahead.is_some() {
                 LeafWork::FromLabelsAhead
             } else {
@@ -824,18 +965,50 @@ fn encode_member_until(
             quil_crypto::storage_proof::encode_with_labels(&data, kept.n, &last, kept.comm_c).ok()
         });
         let ahead = from_kept.is_some();
+        if !ahead {
+            // Labelled now: labelling ahead beside it pauses but for
+            // `crate::storage_jobs::AHEAD_JOBS_BESIDE_DUE` of it.
+            memory.labelling_now();
+        }
         // Labelled now and kept when there is room; otherwise encoded as by a
         // process that keeps no labels, and its seal labels it again.
+        let mut resumed = 0;
         let labelled = match (&from_kept, store) {
             (None, Some(store)) => {
-                match store.admit(captured.epoch, member, &leaf_id, exact, Stage::Snapshot) {
-                    Some(admitted) => match admitted.label_until(&params, stop)? {
-                        Some(labelled) => Some(labelled),
-                        None => {
-                            progress.end(stop_outcome());
-                            return Err(stopped());
+                match store.admit(captured.epoch, member, &leaf_id, count, Stage::Snapshot) {
+                    Some(admitted) => {
+                        let layers = params.layers;
+                        if let Some(kept) = admitted.resumed() {
+                            resumed = kept.layers;
+                            info!(epoch = captured.epoch,
+                                filter = %hex::encode(&captured.filter),
+                                leaf = %hex::encode(&leaf_id), nodes = count,
+                                layers_reused = kept.layers, layers,
+                                verified_bytes = kept.bytes,
+                                verify_seconds = kept.took.as_secs_f64(),
+                                kept_by = kept.kept_by.name(), scope = "local",
+                                "storage snapshot goes on labelling a leaf from the whole layers \
+                                 kept on disk, each checked against its digest: labelled ahead, \
+                                 or by this snapshot before a restart");
                         }
-                    },
+                        progress.layers(admitted.resumes_from(), layers);
+                        let labelling = admitted
+                            .label_kept(&params, stop, &|done| progress.layers(done, layers))?;
+                        match labelling {
+                            Labelling::Labelled(labelled) => Some((count, labelled)),
+                            Labelling::Stopped { .. } => {
+                                // Kept for the next attempt unless the seat
+                                // renews without them.
+                                if grace_passed(member, captured.epoch)
+                                    || snapshot_given_up(member, &captured.filter, captured.epoch)
+                                {
+                                    store.discard(captured.epoch, member, &leaf_id, count);
+                                }
+                                progress.end(stop_outcome());
+                                return Err(stopped());
+                            }
+                        }
+                    }
                     None => None,
                 }
             }
@@ -844,8 +1017,8 @@ fn encode_member_until(
         let encoded = match from_kept {
             Some(encoded) => encoded,
             None => {
-                let (last, comm_c) = match labelled {
-                    Some(labelled) => (labelled.last, labelled.comm_c),
+                let (n, last, comm_c) = match labelled {
+                    Some((n, labelled)) => (n, labelled.last, labelled.comm_c),
                     None => {
                         // As by a process that keeps no labels
                         // (`quil_crypto::storage_proof::encode_leaf`).
@@ -861,14 +1034,18 @@ fn encode_member_until(
                         };
                         let comm_c = quil_crypto::storage_proof::MerkleTree::from_digests(columns)
                             .commitment(quil_crypto::storage_proof::Tree::Column);
-                        (last, comm_c)
+                        (exact, last, comm_c)
                     }
                 };
-                quil_crypto::storage_proof::encode_with_labels(&data, exact, &last, comm_c)
+                quil_crypto::storage_proof::encode_with_labels(&data, n, &last, comm_c)
                     .map_err(QuilError::Internal)?
             }
         };
         drop(data);
+        // Layers kept at other counts are of no use any more.
+        if let Some(store) = store {
+            store.discard_others(captured.epoch, member, &leaf_id, encoded.n);
+        }
         replicas.put_hash(
             captured.epoch,
             &leaf_id,
@@ -877,13 +1054,14 @@ fn encode_member_until(
             &encoded.registration_root(),
         )?;
         progress.end(LeafOutcome::Completed);
-        Ok((encoded.n, ahead))
+        Ok((encoded.n, ahead, resumed))
     })?;
     info!(epoch = captured.epoch, filter = %hex::encode(&captured.filter), leaves = encoded.len(),
-        labelled_ahead = encoded.iter().filter(|(_, ahead)| *ahead).count(),
-        nodes = encoded.iter().map(|(n, _)| n).sum::<u64>(), seconds = started.elapsed().as_secs(),
+        labelled_ahead = encoded.iter().filter(|(_, ahead, _)| *ahead).count(),
+        layers_resumed = encoded.iter().map(|(.., resumed)| resumed).sum::<usize>(),
+        nodes = encoded.iter().map(|(n, ..)| n).sum::<u64>(), seconds = started.elapsed().as_secs(),
         "storage snapshot leaves encoded");
-    let nodes: Vec<u64> = encoded.iter().map(|(n, _)| *n).collect();
+    let nodes: Vec<u64> = encoded.iter().map(|(n, ..)| *n).collect();
     let plan = quil_execution::global_intrinsic::storage_snapshot::encode_plan(&[(
         captured.filter.clone(),
         captured.plan.clone(),
@@ -891,6 +1069,52 @@ fn encode_member_until(
     replicas.put_snapshot_sources(captured.epoch, &captured.filter, &plan)?;
     replicas.put_leaf_nodes(captured.epoch, &captured.filter, &nodes)?;
     replicas.put_partition(captured.epoch, &captured.filter, &captured.prefixes)
+}
+
+/// How a leaf's nodes were counted for [`gives_up_late_leaf`].
+#[derive(Debug, Clone, Copy)]
+enum LeafCount {
+    /// From its values, before its data is read: the fewest it can take.
+    Least,
+    /// From its data.
+    Exact,
+}
+
+/// Give up `member`'s snapshot of `captured` when labelling its leaf
+/// `leaf_id` of `nodes` nodes now would end past the renewal's grace frame by
+/// its estimate ([`misses_grace`]): true when it is given up, warned once a
+/// seat ([`give_up_snapshot`]). False while this process has seen no GLOBAL
+/// frame.
+fn gives_up_late_leaf(
+    captured: &Captured,
+    member: &[u8],
+    leaf_id: &[u8],
+    nodes: u64,
+    kept: usize,
+    counted: LeafCount,
+) -> bool {
+    let Some(frame) = global_frame() else {
+        return false;
+    };
+    let Some(frames_left) = misses_grace(captured.epoch, nodes, kept, frame) else {
+        return false;
+    };
+    if give_up_snapshot(member, &captured.filter, captured.epoch) {
+        let counted = match counted {
+            LeafCount::Least => "at least, from its values before its data is read",
+            LeafCount::Exact => "from its data",
+        };
+        warn!(epoch = captured.epoch, filter = %hex::encode(&captured.filter),
+            leaf = %hex::encode(leaf_id), nodes, counted, layers_kept = kept,
+            estimated_minutes = label_estimate_from(nodes, kept).as_secs() / 60, frames_left,
+            global_frame = frame, scope = "local",
+            action = "check this node's CPU headroom and how many seats it labels at \
+                      once; the next epoch's snapshot starts again",
+            "storage snapshot given up: this node would finish a seat's storage proof data \
+             after the renewal's grace frame, so the seat renews without a storage \
+             registration and earns no storage share on its shard this epoch");
+    }
+    true
 }
 
 /// Snapshots this process's members encoded, kept for their seals' bindings
@@ -2739,8 +2963,13 @@ pub(crate) mod tests {
     /// A shard of `app` whose data is one leaf, long enough to label that a
     /// test sees it labelled: the shard's store and the leaf's id.
     fn one_long_leaf(app: [u8; 32], epoch: u64) -> (Arc<HypergraphCrdt>, Vec<u8>) {
+        leaf_of(app, epoch, 12)
+    }
+
+    /// [`one_long_leaf`] of `values` values of 16 KiB.
+    fn leaf_of(app: [u8; 32], epoch: u64, values: u8) -> (Arc<HypergraphCrdt>, Vec<u8>) {
         let crdt = test_crdt();
-        for d in 0..12u8 {
+        for d in 0..values {
             crdt.add_vertex(
                 &Location {
                     app_address: app,
@@ -2772,9 +3001,18 @@ pub(crate) mod tests {
         /// the store while the process exits, which aborts the process
         /// ("pthread lock: Invalid argument"; CI 2026-10-31).
         fn ended(self, crdt: &Arc<HypergraphCrdt>) -> Result<()> {
+            self.ended_within(crdt, std::time::Duration::from_secs(60))
+        }
+
+        /// [`Self::ended`], waiting up to `timeout` for the labelling to end.
+        fn ended_within(
+            self,
+            crdt: &Arc<HypergraphCrdt>,
+            timeout: std::time::Duration,
+        ) -> Result<()> {
             let result = self
                 .done
-                .recv_timeout(std::time::Duration::from_secs(60))
+                .recv_timeout(timeout)
                 .expect("the labelling ahead ends");
             self.thread.join().expect("the labelling ahead's thread");
             assert_eq!(
@@ -2820,11 +3058,216 @@ pub(crate) mod tests {
         LabellingAhead { done, thread, held }
     }
 
-    /// A leaf being labelled ahead is given up, leaving no labels, once
-    /// GLOBAL reaches its epoch's snapshot frame.
+    /// Whatever `dir` holds is whole layers labelled ahead and their
+    /// manifest, for the snapshot to go on from: no labels complete.
+    fn only_whole_layers_kept(dir: &std::path::Path) {
+        for file in crate::storage_labels::files_under(dir) {
+            let kind = file.extension().and_then(|kind| kind.to_str());
+            assert!(
+                matches!(kind, Some("layers" | "kept")),
+                "{} left",
+                file.display()
+            );
+        }
+    }
+
+    /// Layers labelled so far of the leaf of `app` doing `work`, if one runs.
+    fn layers_done(app: &[u8], work: LeafWork) -> Option<usize> {
+        running_leaves()
+            .leaves
+            .values()
+            .find(|leaf| leaf.filter == app && leaf.work == work)
+            .and_then(|leaf| leaf.layers)
+            .map(|(_, done, _)| done)
+    }
+
+    /// A snapshot's leaf labelled now and given up (the node stopping, say)
+    /// keeps its whole layers on disk, and the next process's encode goes
+    /// on from them, each checked against its digest: a restart costs at
+    /// most the layer it was labelling, and the replica is the one encoded
+    /// at once (2026-11-01: a restart while a seat's leaf was labelled at
+    /// its snapshot labelled it again from its first layer). Past the
+    /// renewal's grace what it kept goes, and the encode removes earlier
+    /// epochs' labels first.
+    #[test]
+    fn a_snapshot_encode_given_up_goes_on_after_a_restart_from_its_whole_layers() {
+        use crate::storage_labels::{ample_space, files_under, LabelStore};
+        let (app, member, epoch) = ([0x84u8; 32], [0x6Bu8; 32], 6);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let (crdt, leaf_id) = one_long_leaf(app, epoch);
+        let captured =
+            capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
+        let exact = quil_crypto::storage_proof::data_node_count(
+            captured.leaf_data(&captured.prefixes[0]).unwrap().len() as u64,
+        );
+        let replicas =
+            || ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let dir = std::env::temp_dir().join(format!("quil-labels-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Labels of an earlier epoch a crash left.
+        let stale = dir.join((epoch - 1).to_string()).join("leaf");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("64.layers"), [1u8; 64]).unwrap();
+
+        let before = LabelStore::with_space(dir.clone(), ample_space());
+        let stopped = replicas();
+        let stop = || layers_done(&app, LeafWork::LabellingNow).is_some_and(|done| done >= 3);
+        assert!(encode_member_until(&captured, &member, &stopped, Some(&before), &stop).is_err());
+        assert_eq!(stopped.get_partition(epoch, &app).unwrap(), None);
+        assert!(
+            !dir.join((epoch - 1).to_string()).exists(),
+            "earlier epochs' labels go first"
+        );
+        drop(before);
+        // A crash midway through writing the fourth layer left part of it.
+        let layers = files_under(&dir)
+            .into_iter()
+            .find(|file| file.extension().is_some_and(|kind| kind == "layers"))
+            .expect("whole layers kept");
+        let layer = exact * quil_crypto::storage_proof::NODE_BYTES as u64;
+        assert_eq!(std::fs::metadata(&layers).unwrap().len(), 3 * layer);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&layers)
+            .unwrap();
+        std::io::Write::write_all(&mut file, &[0xAB; 1000]).unwrap();
+        drop(file);
+
+        // The next process.
+        let after = LabelStore::with_space(dir.clone(), ample_space());
+        assert_eq!(
+            after.resumable(epoch, &member, &leaf_id, |_| true),
+            Some((exact, 3))
+        );
+        let resumed = replicas();
+        encode_member_until(&captured, &member, &resumed, Some(&after), &|| false).unwrap();
+        assert_eq!(after.resumed(), vec![(leaf_id.clone(), exact, 3)]);
+        let at_once = replicas();
+        encode_member_with(&captured, &member, &at_once, None).unwrap();
+        let stored = resumed.get_hash(epoch, &leaf_id).unwrap();
+        assert!(stored.is_some());
+        assert_eq!(stored, at_once.get_hash(epoch, &leaf_id).unwrap());
+        assert_eq!(
+            resumed.get_partition(epoch, &app).unwrap(),
+            at_once.get_partition(epoch, &app).unwrap()
+        );
+        assert!(
+            after
+                .find(epoch, &member, &leaf_id, |n| n == exact)
+                .is_some(),
+            "kept for the seal"
+        );
+        assert!(
+            files_under(&dir)
+                .iter()
+                .all(|file| file.extension().is_none_or(|kind| kind != "kept")),
+            "complete, no manifest is left"
+        );
+
+        // Past the renewal's grace, a leaf given up keeps nothing.
+        let late = [0x6Cu8; 32];
+        let given_up = LabelStore::with_space(dir.clone(), ample_space());
+        let stop = || {
+            let done = layers_done(&app, LeafWork::LabellingNow).is_some_and(|done| done >= 2);
+            if done {
+                note_grace_passed(&late, epoch);
+            }
+            done
+        };
+        assert!(
+            encode_member_until(&captured, &late, &replicas(), Some(&given_up), &stop).is_err()
+        );
+        assert_eq!(given_up.resumable(epoch, &late, &leaf_id, |_| true), None);
+        assert_eq!(
+            files_under(&dir)
+                .iter()
+                .filter(|file| file.extension().is_some_and(|kind| kind == "layers"))
+                .count(),
+            1,
+            "only the first member's labels"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// Labelling ahead given up at its epoch's snapshot frame keeps its
+    /// whole layers, and the snapshot goes on from them at the count they
+    /// were labelled at, which its data may register: the replica is the
+    /// leaf encoded at once at that count (2026-11-01: labelling ahead
+    /// dropped a leaf of 15 million nodes' layers at the snapshot frame, and
+    /// the snapshot, labelling it from its first layer, missed the renewal's
+    /// grace).
+    #[test]
+    fn a_snapshot_goes_on_from_the_layers_labelled_ahead_by_its_snapshot_frame() {
+        use crate::storage_labels::{ample_space, files_under, LabelStore};
+        use quil_crypto::storage_proof::{data_node_count, precompute_nodes};
+        use std::time::{Duration, Instant};
+        let (app, member, epoch) = ([0x85u8; 32], [0x6Du8; 32], 6);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let (crdt, leaf_id) = leaf_of(app, epoch, 32);
+        let dir =
+            std::env::temp_dir().join(format!("quil-labels-ahead-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store: &'static LabelStore =
+            Box::leak(Box::new(LabelStore::with_space(dir.clone(), ample_space())));
+        let labelling = label_ahead_in_background(store, &crdt, member, app, epoch);
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !layers_done(&app, LeafWork::LabellingAhead).is_some_and(|done| done >= 1) {
+            assert!(Instant::now() < deadline, "a layer is labelled ahead");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        note_global_frame(quil_types::consensus::storage_snapshot_frame(epoch));
+        labelling.ended(&crdt).unwrap();
+        assert_eq!(
+            outcomes(epoch, &app, LeafWork::LabellingAhead),
+            vec![LeafOutcome::Expired],
+            "given up before its last layer"
+        );
+        only_whole_layers_kept(&dir);
+        let captured =
+            capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
+        let data = captured.leaf_data(&captured.prefixes[0]).unwrap();
+        let ahead = precompute_nodes(data_node_count(data.len() as u64));
+        let (count, kept) = store
+            .resumable(epoch, &member, &leaf_id, |_| true)
+            .expect("its whole layers kept");
+        assert_eq!(count, ahead);
+        assert!(kept >= 1, "{kept} layers kept");
+
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        encode_member_until(&captured, &member, &replicas, Some(store), &|| false).unwrap();
+        assert_eq!(store.resumed(), vec![(leaf_id.clone(), ahead, kept)]);
+        let expected = quil_crypto::storage_proof::encode_leaf_at(
+            &data,
+            &quil_crypto::sdr::replica_key(&member, &leaf_id, epoch),
+            &quil_crypto::sdr::SdrParams::default(),
+            ahead,
+            &mut |_, _| {},
+        );
+        let stored = replicas.get_hash(epoch, &leaf_id).unwrap().unwrap();
+        assert_eq!(stored.registration_root, expected.registration_root());
+        assert_eq!(stored.cap, expected.replica_cap.to_bytes());
+        assert!(store
+            .find(epoch, &member, &leaf_id, |n| n == ahead)
+            .is_some());
+        let mut kinds: Vec<String> = files_under(&dir)
+            .iter()
+            .filter_map(|file| file.file_name()?.to_str().map(str::to_string))
+            .collect();
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            ["columns", "layers", "ready"].map(|kind| format!("{ahead}.{kind}"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// A leaf being labelled ahead is given up, keeping no more than its
+    /// whole layers, once GLOBAL reaches its epoch's snapshot frame.
     #[test]
     fn labelling_ahead_stops_at_its_snapshot_frame() {
-        use crate::storage_labels::{ample_space, files_under, LabelStore};
+        use crate::storage_labels::{ample_space, LabelStore};
         let (app, member, epoch) = ([0x81u8; 32], [0x68u8; 32], 6);
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
         let (crdt, leaf_id) = one_long_leaf(app, epoch);
@@ -2843,7 +3286,7 @@ pub(crate) mod tests {
             outcomes(epoch, &app, LeafWork::LabellingAhead),
             vec![LeafOutcome::Expired]
         );
-        assert_eq!(files_under(&dir), Vec::<std::path::PathBuf>::new());
+        only_whole_layers_kept(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
@@ -2854,7 +3297,7 @@ pub(crate) mod tests {
     /// epoch's leaf ahead again after that epoch's renewal's grace).
     #[test]
     fn labelling_ahead_that_yielded_past_its_snapshot_frame_gives_up() {
-        use crate::storage_labels::{ample_space, files_under, LabelStore};
+        use crate::storage_labels::{ample_space, LabelStore};
         let (app, member, epoch) = ([0x82u8; 32], [0x69u8; 32], 6);
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
         let (crdt, leaf_id) = one_long_leaf(app, epoch);
@@ -2882,8 +3325,176 @@ pub(crate) mod tests {
             ),
             "{ended:?}"
         );
-        assert_eq!(files_under(&dir), Vec::<std::path::PathBuf>::new());
+        only_whole_layers_kept(&dir);
         let _ = std::fs::remove_dir_all(&dir);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// Labelling ahead that gave its memory back to work due now labels its
+    /// leaf again as soon as its memory fits beside that work, while the work
+    /// still holds its own (2026-11-01: labelling ahead waited until no work
+    /// due now had held memory for a minute, through every seat's snapshot,
+    /// and no large leaf was labelled ahead).
+    #[test]
+    fn labelling_ahead_that_yielded_resumes_beside_work_due_now_once_it_fits() {
+        use crate::storage_labels::{ample_space, LabelStore};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        const GIB: u64 = 1 << 30;
+        // Work due now holding memory until its release is dropped.
+        let hold = |bytes: u64| {
+            let (granted_tx, granted) = mpsc::channel();
+            let (release, released) = mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                let _memory = crate::storage_jobs::reserve(bytes);
+                granted_tx.send(()).unwrap();
+                let _ = released.recv();
+            });
+            (granted, release)
+        };
+        assert!(
+            crate::storage_jobs::job_slots() >= 2,
+            "two jobs hold memory side by side"
+        );
+        // 40 GiB available: the jobs share 30.
+        crate::storage_jobs::set_available_for_test(Some(40 * GIB));
+        let (app, member, epoch) = ([0x86u8; 32], [0x6Du8; 32], 6);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let (crdt, leaf_id) = one_long_leaf(app, epoch);
+        let dir = std::env::temp_dir().join(format!("quil-labels-beside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store: &'static LabelStore =
+            Box::leak(Box::new(LabelStore::with_space(dir.clone(), ample_space())));
+        let (first, first_release) = hold(20 * GIB);
+        first
+            .recv_timeout(Duration::from_secs(10))
+            .expect("alone, it runs");
+        let labelling = label_ahead_in_background(store, &crdt, member, app, epoch);
+        // 10 GiB more fit beside the first only once the leaf gives its
+        // memory back.
+        let (second, second_release) = hold(10 * GIB);
+        second
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the labelling ahead gives its memory back to work due now");
+        // Once the first ends, the leaf's memory fits beside the second.
+        drop(first_release);
+        labelling
+            .ended_within(&crdt, Duration::from_secs(300))
+            .unwrap();
+        assert!(
+            store.find(epoch, &member, &leaf_id, |_| true).is_some(),
+            "the leaf is labelled ahead beside the work due now"
+        );
+        assert_eq!(
+            outcomes(epoch, &app, LeafWork::LabellingAhead),
+            vec![LeafOutcome::Yielded, LeafOutcome::Completed]
+        );
+        drop(second_release);
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::storage_jobs::set_available_for_test(None);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// A renewal's leaf labelled now pauses labelling ahead beside it but for
+    /// one leaf, the most urgent, which goes on
+    /// (`crate::storage_jobs::AHEAD_JOBS_BESIDE_DUE`); the paused leaf keeps
+    /// its memory and labels on to its end once the leaf labelled now has
+    /// ended (2026-11-01: beside three or four leaves labelled ahead, a
+    /// renewal's leaf estimated at 37 minutes was still labelled at its
+    /// grace, 3,137 s in).
+    #[test]
+    fn labelling_ahead_pauses_while_a_renewals_leaf_is_labelled_now() {
+        use crate::storage_labels::{ample_space, LabelStore};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        const GIB: u64 = 1 << 30;
+        crate::storage_jobs::set_available_for_test(Some(40 * GIB));
+        let (app, member, epoch) = ([0x87u8; 32], [0x6Eu8; 32], 6);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let (crdt, leaf_id) = one_long_leaf(app, epoch);
+        // A renewal's shard of one small leaf, which its snapshot labels now.
+        let renewal = [0x88u8; 32];
+        let shard = test_crdt();
+        for d in 0..30u8 {
+            shard
+                .add_vertex(
+                    &Location {
+                        app_address: renewal,
+                        data_address: address(d.wrapping_mul(7), d),
+                    },
+                    &vec![d; 300],
+                )
+                .unwrap();
+        }
+        shard.commit(1).unwrap();
+        let captured = capture_at(
+            &shard,
+            &renewal,
+            epoch,
+            &[current_source(&shard, &renewal, epoch)],
+        )
+        .unwrap();
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let dir = std::env::temp_dir().join(format!("quil-labels-pause-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store: &'static LabelStore =
+            Box::leak(Box::new(LabelStore::with_space(dir.clone(), ample_space())));
+        // A leaf only labelling ahead registers: more urgent than the one
+        // labelled below, which its snapshot could label within the grace.
+        let urgent = crate::storage_jobs::reserve_ahead(
+            GIB,
+            crate::storage_jobs::AheadOrder {
+                deferrable: false,
+                seat_leaves: 1,
+                seat: 0,
+                leaf: 0,
+            },
+            &|| false,
+        )
+        .expect("it fits");
+        let labelling = label_ahead_in_background(store, &crdt, member, app, epoch);
+        let (looked, paused, urgent_paused) = (
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+        );
+        // Looked at while the renewal's leaf is labelled now.
+        let stop = || {
+            if crate::storage_jobs::labelling_now_count() > 0
+                && !looked.swap(true, Ordering::SeqCst)
+            {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while crate::storage_jobs::pausing_count() == 0 && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                paused.store(crate::storage_jobs::pausing_count() > 0, Ordering::SeqCst);
+                urgent_paused.store(urgent.paused(), Ordering::SeqCst);
+            }
+            false
+        };
+        encode_member_until(&captured, &[0x64; 32], &replicas, None, &stop).unwrap();
+        assert!(
+            paused.load(Ordering::SeqCst),
+            "labelling ahead paused while the renewal's leaf was labelled now"
+        );
+        assert!(
+            !urgent_paused.load(Ordering::SeqCst),
+            "the most urgent leaf labelled ahead went on beside it"
+        );
+        labelling.ended(&crdt).unwrap();
+        assert!(
+            store.find(epoch, &member, &leaf_id, |_| true).is_some(),
+            "the paused leaf labelled on to its end"
+        );
+        assert_eq!(
+            outcomes(epoch, &app, LeafWork::LabellingAhead),
+            vec![LeafOutcome::Completed],
+            "it paused rather than gave its memory back"
+        );
+        assert_eq!(crate::storage_jobs::pausing_count(), 0);
+        drop(urgent);
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::storage_jobs::set_available_for_test(None);
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 
@@ -2897,12 +3508,12 @@ pub(crate) mod tests {
         let grace = snapshot + crate::app_shard_metadata::storage_snapshot_grace();
         assert_eq!((snapshot, grace), (947_536, 947_856));
         // About 75 minutes against 320 frames of 10 s.
-        assert_eq!(misses_grace(epoch, 30_000_000, snapshot), Some(320));
+        assert_eq!(misses_grace(epoch, 30_000_000, 0, snapshot), Some(320));
         // Measured at 2,406 s: it ends within 320 frames, not 200.
-        assert_eq!(misses_grace(epoch, 16_182_813, snapshot), None);
-        assert_eq!(misses_grace(epoch, 16_182_813, grace - 200), Some(200));
-        assert_eq!(misses_grace(epoch, 1_000, grace - 1), None);
-        assert_eq!(misses_grace(epoch, 1_000_000, grace), Some(0));
+        assert_eq!(misses_grace(epoch, 16_182_813, 0, snapshot), None);
+        assert_eq!(misses_grace(epoch, 16_182_813, 0, grace - 200), Some(200));
+        assert_eq!(misses_grace(epoch, 1_000, 0, grace - 1), None);
+        assert_eq!(misses_grace(epoch, 1_000_000, 0, grace), Some(0));
     }
 
     /// A seat's snapshot whose leaf cannot be labelled by the renewal's grace
@@ -2959,6 +3570,80 @@ pub(crate) mod tests {
         )
         .expect("a seat whose snapshot was given up does not wait for it");
         assert!(roots[0].entries.is_empty());
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// A seat whose leaf cannot be labelled by the renewal's grace frame even
+    /// at the fewest nodes its values allow is given up before the leaf asks
+    /// for memory, so it neither waits for memory other work holds nor takes
+    /// a place before other seats' leaves; a seat whose leaf could still end
+    /// by then asks for its memory and waits as before (2026-11-01: ten seats'
+    /// large leaves waited for memory through the grace each epoch, and work
+    /// labelled ahead gave its memory back to them).
+    #[test]
+    fn a_seat_certain_to_miss_its_grace_is_given_up_before_it_asks_for_memory() {
+        use std::time::Duration;
+        let crdt = test_crdt();
+        let app = [0x85u8; 32];
+        for d in 0..12u8 {
+            crdt.add_vertex(
+                &Location {
+                    app_address: app,
+                    data_address: address(d.wrapping_mul(3), d),
+                },
+                &vec![d; 64 << 10],
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let epoch = 6;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let snapshot_frame = quil_types::consensus::storage_snapshot_frame(epoch);
+        let grace_frame = snapshot_frame + crate::app_shard_metadata::storage_snapshot_grace();
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let ask = |member: &[u8], lane: &[u8]| {
+            request_member(
+                crdt.clone(),
+                replicas.clone(),
+                member.to_vec(),
+                lane,
+                app.to_vec(),
+                epoch,
+                vec![current_source(&crdt, &app, epoch)],
+            )
+        };
+        // Other work holds all the memory: a leaf that asks for it waits.
+        let held = crate::storage_jobs::reserve(u64::MAX / 4);
+        let (early, late) = ([0x6Bu8; 32], [0x6Cu8; 32]);
+        let (early_lane, late_lane) = (
+            b"test lane: may end".to_vec(),
+            b"test lane: cannot".to_vec(),
+        );
+        // At the snapshot frame the leaf could end by the grace frame.
+        note_global_frame(snapshot_frame);
+        ask(&early, &early_lane);
+        assert!(
+            !crate::storage_jobs::wait_lane_idle(&early_lane, Duration::from_millis(500)),
+            "a leaf that could end by the grace frame asks for its memory and waits for it"
+        );
+        assert!(!snapshot_given_up(&early, &app, epoch));
+        // At the grace frame none can.
+        note_global_frame(grace_frame);
+        ask(&late, &late_lane);
+        assert!(
+            crate::storage_jobs::wait_lane_idle(&late_lane, Duration::from_secs(30)),
+            "a seat certain to miss its grace waited for memory"
+        );
+        assert!(snapshot_given_up(&late, &app, epoch));
+        // The seat asked earlier gets its memory once the other work ends,
+        // reads its leaf, and is given up then, as before.
+        drop(held);
+        assert!(crate::storage_jobs::wait_lane_idle(
+            &early_lane,
+            Duration::from_secs(60)
+        ));
+        assert!(snapshot_given_up(&early, &app, epoch));
+        assert_eq!(replicas.get_partition(epoch, &app).unwrap(), None);
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 
