@@ -4,6 +4,7 @@
 //! `launchctl` (macOS) and generates the systemd unit / launchd plist.
 //! These operations require root (invoked via `sudo`).
 
+use std::path::Path;
 use std::process::Command;
 
 use crate::system;
@@ -75,6 +76,7 @@ fn install() -> anyhow::Result<()> {
 }
 
 fn install_systemd() -> anyhow::Result<()> {
+    let user = system::current_user_name()?;
     let config_default = system::node_config_home_dir()?.join("default");
     let env_path = system::node_env_path();
     let node_bin = system::default_node_symlink_path();
@@ -85,35 +87,17 @@ fn install_systemd() -> anyhow::Result<()> {
         "# Quilibrium Node Environment\n",
     )?;
 
-    let unit = format!(
-        "[Unit]\n\
-         Description=Quilibrium Node Service\n\
-         After=network.target\n\
-         Wants=network-online.target\n\n\
-         [Service]\n\
-         Type=simple\n\
-         User=quilibrium\n\
-         EnvironmentFile={env}\n\
-         ExecStart={bin} --config {cfg}\n\
-         Restart=always\n\
-         RestartSec=10\n\
-         ExecStop=/bin/kill -s SIGINT $MAINPID\n\
-         KillSignal=SIGINT\n\
-         FinalKillSignal=SIGKILL\n\
-         TimeoutStopSec=240\n\
-         LimitNOFILE=65535\n\n\
-         [Install]\n\
-         WantedBy=multi-user.target\n",
-        env = env_path.display(),
-        bin = node_bin.display(),
-        cfg = config_default.display(),
-    );
+    let unit = systemd_unit(&user, &env_path, &node_bin, &config_default);
     write_root_file(SYSTEMD_UNIT_PATH, &unit)?;
 
     let _ = Command::new("sudo")
         .args(["systemctl", "daemon-reload"])
         .status();
-    println!("Created systemd service file at {SYSTEMD_UNIT_PATH}");
+    println!(
+        "Created systemd service file at {SYSTEMD_UNIT_PATH}: the node runs as {user} \
+         with config {}",
+        config_default.display()
+    );
     Ok(())
 }
 
@@ -196,4 +180,64 @@ fn write_root_file(path: &str, contents: &str) -> anyhow::Result<()> {
         anyhow::bail!("failed writing {path}");
     }
     Ok(())
+}
+
+/// The systemd unit of the node service. It runs as `user`, the operator
+/// whose `~/.quilibrium` holds the config `cfg`: the installer creates no
+/// account for the node.
+fn systemd_unit(user: &str, env: &Path, bin: &Path, cfg: &Path) -> String {
+    format!(
+        "[Unit]\n\
+         Description=Quilibrium Node Service\n\
+         After=network.target\n\
+         Wants=network-online.target\n\n\
+         [Service]\n\
+         Type=simple\n\
+         User={user}\n\
+         EnvironmentFile={env}\n\
+         ExecStart={bin} --config {cfg}\n\
+         Restart=always\n\
+         RestartSec=10\n\
+         ExecStop=/bin/kill -s SIGINT $MAINPID\n\
+         KillSignal=SIGINT\n\
+         FinalKillSignal=SIGKILL\n\
+         TimeoutStopSec=240\n\
+         LimitNOFILE=65535\n\n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        env = env.display(),
+        bin = bin.display(),
+        cfg = cfg.display(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The unit runs as the given user, whose config it names: systemd
+    /// refuses to start a unit whose user does not exist.
+    #[test]
+    fn unit_runs_as_the_given_user() {
+        let unit = systemd_unit(
+            "op",
+            Path::new("/var/quilibrium/quilibrium.env"),
+            Path::new("/usr/local/bin/quilibrium-node"),
+            Path::new("/home/op/.quilibrium/configs/default"),
+        );
+        let lines: Vec<&str> = unit.lines().collect();
+        let users: Vec<&&str> = lines.iter().filter(|l| l.starts_with("User=")).collect();
+        assert_eq!(users, [&"User=op"], "{unit}");
+        assert!(
+            lines.contains(
+                &"ExecStart=/usr/local/bin/quilibrium-node --config \
+                  /home/op/.quilibrium/configs/default"
+            ),
+            "{unit}"
+        );
+        assert!(
+            lines.contains(&"EnvironmentFile=/var/quilibrium/quilibrium.env"),
+            "{unit}"
+        );
+    }
 }

@@ -117,6 +117,41 @@ pub fn current_user_home() -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("could not determine home directory ($HOME unset)"))
 }
 
+/// The name of the invoking (sudo-aware) user, by the rule of
+/// [`current_user_home`]: `$SUDO_USER` when root runs under sudo for a
+/// user listed in `/etc/passwd`, else the effective user.
+#[cfg(unix)]
+pub fn current_user_name() -> anyhow::Result<String> {
+    let euid = unsafe { libc_geteuid() };
+    let passwd = std::fs::read_to_string("/etc/passwd")
+        .map_err(|e| anyhow::anyhow!("read /etc/passwd: {e}"))?;
+    let sudo_user = std::env::var("SUDO_USER").ok();
+    user_name_for(euid, sudo_user.as_deref(), &passwd)
+        .ok_or_else(|| anyhow::anyhow!("no /etc/passwd entry for user id {euid}"))
+}
+
+#[cfg(not(unix))]
+pub fn current_user_name() -> anyhow::Result<String> {
+    anyhow::bail!("no user database on this platform")
+}
+
+/// [`current_user_name`] for the effective user id `euid`, `$SUDO_USER`
+/// `sudo_user` and the `/etc/passwd` text `passwd`.
+#[cfg(unix)]
+fn user_name_for(euid: u32, sudo_user: Option<&str>, passwd: &str) -> Option<String> {
+    match sudo_user {
+        Some(user)
+            if euid == 0
+                && !user.is_empty()
+                && user != "root"
+                && passwd_home(passwd, user).is_some() =>
+        {
+            Some(user.to_string())
+        }
+        _ => passwd_name(passwd, euid),
+    }
+}
+
 /// `~/.quilibrium` for the invoking (sudo-aware) user.
 pub fn user_quilibrium_dir() -> anyhow::Result<PathBuf> {
     Ok(current_user_home()?.join(".quilibrium"))
@@ -133,15 +168,33 @@ pub fn node_config_home_dir() -> anyhow::Result<PathBuf> {
 #[cfg(unix)]
 fn home_of_user(username: &str) -> Option<PathBuf> {
     let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
-    for line in passwd.lines() {
-        let mut fields = line.split(':');
-        if fields.next() == Some(username) {
-            // fields: passwd, uid, gid, gecos, home, shell
-            let home = fields.nth(3)?; // 4th field after name = index 3
-            return Some(PathBuf::from(home));
-        }
-    }
-    None
+    passwd_home(&passwd, username)
+}
+
+/// The fields of each well-formed `/etc/passwd` line:
+/// `name:password:uid:gid:gecos:home:shell`.
+#[cfg(unix)]
+fn passwd_entries(passwd: &str) -> impl Iterator<Item = Vec<&str>> {
+    passwd
+        .lines()
+        .map(|line| line.split(':').collect::<Vec<_>>())
+        .filter(|fields| fields.len() == 7)
+}
+
+/// The home directory of `username` in the `/etc/passwd` text `passwd`.
+#[cfg(unix)]
+fn passwd_home(passwd: &str, username: &str) -> Option<PathBuf> {
+    passwd_entries(passwd)
+        .find(|fields| fields[0] == username)
+        .map(|fields| PathBuf::from(fields[5]))
+}
+
+/// The name of the user with id `uid` in the `/etc/passwd` text `passwd`.
+#[cfg(unix)]
+fn passwd_name(passwd: &str, uid: u32) -> Option<String> {
+    passwd_entries(passwd)
+        .find(|fields| fields[2].parse() == Ok(uid))
+        .map(|fields| fields[0].to_string())
 }
 
 #[cfg(not(unix))]
@@ -410,5 +463,48 @@ mod tests {
         assert!(err.contains("node-<version>-linux-amd64"), "{err}");
         assert!(err.contains("qclient node link"), "{err}");
         assert!(err.contains("from the node directory"), "{err}");
+    }
+
+    #[cfg(unix)]
+    const PASSWD: &str = "root:x:0:0:root:/root:/bin/bash\n\
+        daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n\
+        op:x:1000:1000:Node Operator,,,:/home/op:/bin/bash\n\
+        bare:x:1001:1001::/srv/bare:/bin/sh\n";
+
+    /// The home directory is the sixth field, not the comment (GECOS)
+    /// field before it.
+    #[cfg(unix)]
+    #[test]
+    fn passwd_home_is_the_home_field() {
+        assert_eq!(passwd_home(PASSWD, "op"), Some(PathBuf::from("/home/op")));
+        assert_eq!(
+            passwd_home(PASSWD, "bare"),
+            Some(PathBuf::from("/srv/bare"))
+        );
+        assert_eq!(passwd_home(PASSWD, "root"), Some(PathBuf::from("/root")));
+        assert_eq!(passwd_home(PASSWD, "nobody"), None);
+    }
+
+    /// The service user is the operator who ran `sudo`, else the effective
+    /// user; never a user the passwd file lacks.
+    #[cfg(unix)]
+    #[test]
+    fn invoking_user_name_is_the_sudo_user_or_the_effective_user() {
+        assert_eq!(user_name_for(0, Some("op"), PASSWD).as_deref(), Some("op"));
+        assert_eq!(user_name_for(0, None, PASSWD).as_deref(), Some("root"));
+        assert_eq!(
+            user_name_for(0, Some("root"), PASSWD).as_deref(),
+            Some("root")
+        );
+        assert_eq!(
+            user_name_for(0, Some("ghost"), PASSWD).as_deref(),
+            Some("root")
+        );
+        assert_eq!(
+            user_name_for(1000, Some("bare"), PASSWD).as_deref(),
+            Some("op")
+        );
+        assert_eq!(user_name_for(1001, None, PASSWD).as_deref(), Some("bare"));
+        assert_eq!(user_name_for(4242, None, PASSWD), None);
     }
 }
