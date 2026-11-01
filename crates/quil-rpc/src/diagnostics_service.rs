@@ -114,7 +114,7 @@ const RECOVERY_PHASES: [(&str, RecoveryPhase); 6] = [
     ("installing_checkpoint", RecoveryPhase::InstallingCheckpoint),
 ];
 
-const FAILURES: [(&str, RecoveryFailure); 7] = [
+const FAILURES: [(&str, RecoveryFailure); 9] = [
     ("no_archive_known", RecoveryFailure::NoArchiveKnown),
     ("global_sync", RecoveryFailure::GlobalSync),
     ("connect", RecoveryFailure::Connect),
@@ -122,6 +122,8 @@ const FAILURES: [(&str, RecoveryFailure); 7] = [
     ("archive_state", RecoveryFailure::ArchiveState),
     ("replay_mismatch", RecoveryFailure::ReplayMismatch),
     ("other", RecoveryFailure::Other),
+    ("proof_verification", RecoveryFailure::ProofVerification),
+    ("engine_busy", RecoveryFailure::EngineBusy),
 ];
 
 fn lookup<T: Copy + PartialEq>(table: &[(&'static str, T)], text: &str) -> Option<T> {

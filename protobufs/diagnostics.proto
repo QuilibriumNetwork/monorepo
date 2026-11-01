@@ -85,12 +85,18 @@ enum RecoveryFailure {
   RECOVERY_FAILURE_ARCHIVE_REQUEST = 3;
   // No archive supplied the shard state the worker needs.
   RECOVERY_FAILURE_ARCHIVE_STATE = 4;
-  // The archive's frames do not replay onto the worker's local state.
+  // The archive's frames do not apply to the worker's lineage (pre-state,
+  // link, session or shard).
   RECOVERY_FAILURE_REPLAY_MISMATCH = 5;
   RECOVERY_FAILURE_OTHER = 6;
   // This node's own GLOBAL state sync was installing and withheld committed
   // GLOBAL state: an expected wait, no archive's failure.
   RECOVERY_FAILURE_GLOBAL_SYNC = 7;
+  // A replayed frame waits for this node's proof verification: an expected
+  // wait, no archive's failure.
+  RECOVERY_FAILURE_PROOF_VERIFICATION = 8;
+  // This worker's shard engine did not answer the recovery in time.
+  RECOVERY_FAILURE_ENGINE_BUSY = 9;
 }
 
 message FailureCount {

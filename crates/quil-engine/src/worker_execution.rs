@@ -54,7 +54,7 @@ pub const RECOVERY_PHASES: [&str; 6] = [
 ];
 
 /// Every class [`failure_class`] gives a failed recovery attempt.
-pub const FAILURE_CLASSES: [&str; 7] = [
+pub const FAILURE_CLASSES: [&str; 9] = [
     NO_ARCHIVE,
     GLOBAL_SYNC,
     "connect",
@@ -62,6 +62,8 @@ pub const FAILURE_CLASSES: [&str; 7] = [
     "archive_state",
     "replay_mismatch",
     "other",
+    PROOF_VERIFICATION,
+    ENGINE_BUSY,
 ];
 
 /// A worker's execution report with its store's state: a worker whose own
@@ -524,7 +526,7 @@ impl SharedWorkerExecution {
                 (Some(failure), _) => {
                     r.last_error = failure.clone();
                     r.last_error_unix_ms = now;
-                    if failure_class(failure) != GLOBAL_SYNC {
+                    if !expected_wait(failure_class(failure)) {
                         r.consecutive_failures += 1;
                     }
                     let count = r
@@ -565,6 +567,14 @@ impl SharedWorkerExecution {
             tracing::debug!(filter = %hex::encode(filter), error = failure.as_deref().unwrap_or("none"),
                 attempt_secs = ended.attempt_ms / 1000,
                 "archive recovery attempt waited for this node's GLOBAL state sync; not counted as a failure");
+            return result;
+        }
+        // Likewise one whose frame waits for this node's proof verification,
+        // which the engine logs (`AppConsensusEngine::log_proof_wait`).
+        if class == Some(PROOF_VERIFICATION) {
+            tracing::debug!(filter = %hex::encode(filter), error = failure.as_deref().unwrap_or("none"),
+                attempt_secs = ended.attempt_ms / 1000,
+                "archive recovery attempt waited for this node's proof verification; not counted as a failure");
             return result;
         }
         let (logged, classes, failed_before, first_failure) = {
@@ -694,6 +704,19 @@ pub(crate) const NO_ARCHIVE: &str = "no_archive_known";
 /// An expected wait of this node, no archive's failure: it does not count
 /// toward the shard's failure streak.
 pub(crate) const GLOBAL_SYNC: &str = "global_sync";
+
+/// The class of an attempt whose replayed frame, authenticated and
+/// committed, waits for this node's proof verification
+/// ([`waits_for_proof_verification`]): an expected wait of this node, no
+/// archive's failure and no mismatch; it does not count toward the shard's
+/// failure streak. A replay meeting it defers its recovery
+/// (`prover_tree_syncer::PROOF_VERIFICATION_WAIT`), so it is recorded only
+/// where another path reports it.
+pub(crate) const PROOF_VERIFICATION: &str = "proof_verification";
+
+/// The class of an attempt this worker's shard engine did not answer in
+/// time ([`ENGINE_TIMEOUTS`]): this node's, busy with other work.
+pub(crate) const ENGINE_BUSY: &str = "engine_busy";
 
 /// Why an attempt that waited out this node's GLOBAL state sync within its
 /// budget (`prover_tree_syncer::waiting_out_global_sync`) installed
@@ -1092,11 +1115,19 @@ fn note_archive_known(filter: &[u8], reached: bool, error: Option<&str>, now: In
 /// archive's frame or checkpoint can name its wait: read as the archive's,
 /// it told operators to report archives that had failed nothing (38 to 40
 /// "archive_state" failures in a row on 4 shards of a node restarted into
-/// its GLOBAL sync, 2026-10-29).
+/// its GLOBAL sync, 2026-10-29). So is this node's proof verification,
+/// and its shard engine not answering is matched before the replay
+/// mismatches: read as mismatches, a regular node's replays waiting for
+/// their proofs reported 24 peers' streaks of up to 908 "replay_mismatch"
+/// failures, and guidance promising a re-anchor (2026-10-31).
+/// "replay_mismatch" names only frames that do not apply to this worker's
+/// lineage: a pre-state, link, session or shard mismatch.
 pub fn failure_class(error: &str) -> &'static str {
     use quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS;
     if error.contains(GLOBAL_SYNC_IN_PROGRESS) || error.contains(GLOBAL_SYNC_STILL_INSTALLING) {
         GLOBAL_SYNC
+    } else if waits_for_proof_verification(error) {
+        PROOF_VERIFICATION
     } else if error.contains("no archive known")
         || error.contains("discovered an archive")
         || error.contains("archive discovery")
@@ -1111,11 +1142,55 @@ pub fn failure_class(error: &str) -> &'static str {
         "archive_request"
     } else if error.contains("is missing") || error.contains("the archive") {
         "archive_state"
-    } else if error.contains("replay") {
+    } else if ENGINE_TIMEOUTS
+        .iter()
+        .any(|timeout| error.contains(timeout))
+    {
+        ENGINE_BUSY
+    } else if REPLAY_MISMATCHES
+        .iter()
+        .any(|mismatch| error.contains(mismatch))
+    {
         "replay_mismatch"
     } else {
         "other"
     }
+}
+
+/// The texts of a shard engine request that got no answer within its limit
+/// (`app_engine::AppEngineHandle`).
+const ENGINE_TIMEOUTS: [&str; 4] = [
+    "archive replay timed out",
+    "shard sync validation timed out",
+    "base attestation timed out",
+    "origin lookup timed out",
+];
+
+/// The texts of an archive frame that does not apply to this worker's
+/// lineage: its pre-state roots, its link to the local predecessor
+/// (`app_engine::archive_bootstrap_predecessor_height_in`, named with the
+/// parent it names), the session it would open, its shard, or its number.
+const REPLAY_MISMATCHES: [&str; 6] = [
+    "pre-state mismatch",
+    "it names parent",
+    "would open generation",
+    "wrong-shard archive replay tip",
+    "belongs to another shard",
+    "would skip a materialization gap",
+];
+
+/// Whether `error` names a materialization waiting for this node's proof
+/// verification: its proofs verify in the background, or the proof worker
+/// refused them busy.
+pub(crate) fn waits_for_proof_verification(error: &str) -> bool {
+    use quil_execution::token_intrinsic::{PROOF_VERIFICATION_PENDING, PROOF_WORKER_BUSY};
+    error.contains(PROOF_VERIFICATION_PENDING) || error.contains(PROOF_WORKER_BUSY)
+}
+
+/// Whether a failure of `class` is an expected wait of this node, which
+/// does not count toward the shard's failure streak.
+fn expected_wait(class: &str) -> bool {
+    matches!(class, GLOBAL_SYNC | PROOF_VERIFICATION)
 }
 
 /// Whose problem a failure of `class` is, and what the operator can check.
@@ -1129,10 +1204,18 @@ pub(crate) fn failure_guidance(class: &str) -> (&'static str, &'static str) {
             check this node's outbound connectivity to it; the next attempt tries another archive"),
         "archive_request" => ("archive", "the archive failed a read; the next attempt tries another archive; \
             report it with this line if it persists"),
-        "replay_mismatch" => ("this node", "the archive's certified shard frames do not replay onto this worker's \
-            local state; once one frame has failed so 10 times over 30 minutes, while the shard runs no consensus and \
-            its current session continues this shard's chain, this worker re-anchors it at the frame GLOBAL \
-            committed above its head; report it with this line if it persists"),
+        "replay_mismatch" => ("this node", "the archive's certified shard frames do not apply to this worker's \
+            lineage (its pre-state, link, session or shard); once one frame's pre-state has mismatched 10 times over \
+            30 minutes, while the shard runs no consensus and its current session continues this shard's chain, this \
+            worker re-anchors it at the frame GLOBAL committed above its head; report it with this line if it \
+            persists"),
+        PROOF_VERIFICATION => ("this node's proof worker", "the replayed frame is authenticated and committed and \
+            waits for this node to verify its confidential proofs; it materializes once they verify, and recovery \
+            resumes without fetching it again — an expected wait; if it lasts hours, check this node's CPU and \
+            proofWorker settings"),
+        ENGINE_BUSY => ("this node", "this worker's shard engine did not answer the recovery in time, busy with \
+            other work (an inline proof verification, a long materialization); the next attempt asks again; if it \
+            persists, check this worker's 'verifying inline' and stall lines"),
         "archive_state" => ("archive", "no archive supplied the shard state this worker needs; \
             it retries; report it with this line if it persists"),
         _ => ("this node", "report it with this line if it persists"),
@@ -1749,11 +1832,110 @@ mod tests {
                 "archive_state",
             ),
             ("actor rejected checkpoint", "other"),
+            (
+                "execution unavailable: archive replay of frame 9 waits for this node's proof \
+                    verification (token proofs of this frame are verifying in the background)",
+                PROOF_VERIFICATION,
+            ),
+            (
+                "execution unavailable: archive replay of frame 9 waits for this node's proof \
+                    verification (token proof worker: Busy)",
+                PROOF_VERIFICATION,
+            ),
+            (
+                "execution unavailable: archive replay timed out",
+                ENGINE_BUSY,
+            ),
+            (
+                "execution unavailable: shard sync validation timed out",
+                ENGINE_BUSY,
+            ),
+            (
+                "execution unavailable: archive replay materialization did not commit",
+                "other",
+            ),
+            (
+                "invalid argument: archive replay frame 8: anchor does not link to predecessor \
+                    (it names parent 99999999, its own certificate none; local frame 7 digest \
+                    0a0b0c0d; session genesis it may name none)",
+                "replay_mismatch",
+            ),
+            (
+                "invalid argument: archive replay frame 8: frame 8 would open generation 2 at \
+                    frame 7, but the certified frame 9 authenticating it is of generation 3",
+                "replay_mismatch",
+            ),
+            (
+                "invalid argument: archive replay frame belongs to another shard",
+                "replay_mismatch",
+            ),
+            (
+                "invalid signature: archive replay frame 8: certificate rejected",
+                "other",
+            ),
         ] {
             assert_eq!(failure_class(error), class, "{error}");
         }
         assert_eq!(failure_guidance("no_archive_known").0, "this node");
         assert_eq!(failure_guidance("connect").0, "archive");
+        let (scope, action) = failure_guidance(PROOF_VERIFICATION);
+        assert_eq!(scope, "this node's proof worker");
+        assert!(action.contains("an expected wait"), "{action}");
+        assert!(!action.contains("re-anchor"), "{action}");
+        assert_eq!(failure_guidance(ENGINE_BUSY).0, "this node");
+        assert!(
+            failure_guidance("replay_mismatch")
+                .1
+                .contains("pre-state has mismatched"),
+            "only a pre-state mismatch counts toward a re-anchor"
+        );
+    }
+
+    /// A replay waiting for this node's proof verification, and a shard
+    /// engine that did not answer one, are no replay mismatch, whose
+    /// guidance tells operators the archive's frames do not replay onto
+    /// local state and promises a re-anchor: so read, a regular node's
+    /// replays waiting for their proofs, which every one of its 15 workers
+    /// met, reported streaks of up to 908 mismatches (2026-10-31). The texts
+    /// are those of the release base.
+    #[test]
+    fn a_replay_waiting_for_its_proofs_is_no_replay_mismatch() {
+        for error in [
+            "execution unavailable: archive replay materialization did not commit",
+            "execution unavailable: archive replay timed out",
+            "execution unavailable: token proofs of this frame are verifying in the background",
+            "execution unavailable: token proof worker: Busy",
+        ] {
+            let class = failure_class(error);
+            assert_ne!(
+                class,
+                "replay_mismatch",
+                "{error:?} is classed a replay mismatch, guided as: {}",
+                failure_guidance(class).1
+            );
+        }
+    }
+
+    /// An attempt whose replay waits for this node's proof verification is
+    /// recorded with its class, and counts toward no failure streak.
+    #[tokio::test]
+    async fn a_proof_verification_wait_counts_no_failure() {
+        let worker = SharedWorkerExecution::default();
+        for _ in 0..12 {
+            let _ = worker
+                .recovering(&[8; 32], async {
+                    Err(quil_types::error::QuilError::ExecutionUnavailable(
+                        "archive replay of frame 9 waits for this node's proof verification \
+                         (token proof worker: Busy)"
+                            .into(),
+                    ))
+                })
+                .await;
+        }
+        let r = worker.snapshot().recovery.unwrap();
+        assert_eq!(r.consecutive_failures, 0);
+        assert_eq!(failure_class(&r.last_error), PROOF_VERIFICATION);
+        assert_eq!(r.failures_by_class.get(PROOF_VERIFICATION), Some(&12));
     }
 
     /// This node's own GLOBAL state sync withholding committed GLOBAL state
