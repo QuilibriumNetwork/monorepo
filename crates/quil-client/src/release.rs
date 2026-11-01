@@ -18,29 +18,82 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use quil_config::{signatory_quorum, SIGNATORIES};
 
 use crate::system;
 
-/// Fetch a URL's body as bytes.
+/// Time limits of a release fetch.
+#[derive(Clone, Copy, Debug)]
+pub struct HttpTimeouts {
+    /// Connection setup, TLS included.
+    pub connect: Duration,
+    /// The longest wait for the next bytes of a response.
+    pub read: Duration,
+    /// The whole fetch, body included.
+    pub total: Duration,
+}
+
+/// The limits of every release fetch, so an unreachable or stalled server
+/// fails the fetch instead of holding the command, and the auto-update
+/// job, forever. The total admits a node binary (~270 MB) at ~150 kB/s.
+pub const HTTP_TIMEOUTS: HttpTimeouts = HttpTimeouts {
+    connect: Duration::from_secs(30),
+    read: Duration::from_secs(60),
+    total: Duration::from_secs(30 * 60),
+};
+
+/// An HTTP client enforcing `timeouts`.
+fn http_client(timeouts: HttpTimeouts) -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(timeouts.connect)
+        .read_timeout(timeouts.read)
+        .timeout(timeouts.total)
+        .build()
+        .map_err(|e| anyhow::anyhow!("build the HTTP client: {e}"))
+}
+
+/// Fetch a URL's body as bytes, within [`HTTP_TIMEOUTS`].
 pub async fn http_get_bytes(url: &str) -> anyhow::Result<Vec<u8>> {
-    let resp = reqwest::get(url)
+    http_get_bytes_with(HTTP_TIMEOUTS, url).await
+}
+
+/// [`http_get_bytes`] within `timeouts`.
+async fn http_get_bytes_with(timeouts: HttpTimeouts, url: &str) -> anyhow::Result<Vec<u8>> {
+    let failed = |what: &str, e: reqwest::Error| {
+        if e.is_timeout() {
+            anyhow::anyhow!(
+                "{what} {url}: timed out (limits: {}s to connect, {}s without data, {}s in \
+                 all)",
+                timeouts.connect.as_secs(),
+                timeouts.read.as_secs(),
+                timeouts.total.as_secs()
+            )
+        } else {
+            anyhow::anyhow!("{what} {url}: {e}")
+        }
+    };
+    let resp = http_client(timeouts)?
+        .get(url)
+        .send()
         .await
-        .map_err(|e| anyhow::anyhow!("GET {url}: {e}"))?;
+        .map_err(|e| failed("GET", e))?;
     if !resp.status().is_success() {
         anyhow::bail!("GET {url}: HTTP {}", resp.status());
     }
-    Ok(resp
-        .bytes()
-        .await
-        .map_err(|e| anyhow::anyhow!("read {url}: {e}"))?
-        .to_vec())
+    Ok(resp.bytes().await.map_err(|e| failed("read", e))?.to_vec())
 }
 
-/// Whether a remote file exists (HEAD-ish via GET status).
+/// Whether a remote file exists (HEAD-ish via GET status), within
+/// [`HTTP_TIMEOUTS`].
 pub async fn remote_exists(url: &str) -> bool {
-    reqwest::get(url)
+    let Ok(client) = http_client(HTTP_TIMEOUTS) else {
+        return false;
+    };
+    client
+        .get(url)
+        .send()
         .await
         .map(|r| r.status().is_success())
         .unwrap_or(false)
@@ -543,6 +596,28 @@ mod tests {
     #[test]
     fn quorum_threshold_is_seven() {
         assert_eq!(quil_config::signatory_quorum(), 7);
+    }
+
+    /// A server that takes the connection but never answers fails the
+    /// fetch within the limits, rather than holding it forever.
+    #[tokio::test]
+    async fn silent_release_server_times_out() {
+        // Never accepted: the kernel completes the handshake, nothing
+        // answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/release", listener.local_addr().unwrap());
+        let timeouts = HttpTimeouts {
+            connect: Duration::from_secs(1),
+            read: Duration::from_secs(1),
+            total: Duration::from_secs(3),
+        };
+        let fetch = http_get_bytes_with(timeouts, &url);
+        let Ok(result) = tokio::time::timeout(Duration::from_secs(20), fetch).await else {
+            panic!("GET {url} still waits on a silent server after 20 s");
+        };
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("timed out"), "{err}");
+        drop(listener);
     }
 
     #[test]
