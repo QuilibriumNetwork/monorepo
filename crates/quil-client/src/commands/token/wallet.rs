@@ -2285,20 +2285,28 @@ impl RecipientWallet {
         Ok(coins)
     }
 
+    /// This config's wallet: the `q-onion-key` of its keystore. A keystore
+    /// that predates wallet keys (a pre-2.1 node's) receives one first, as
+    /// the node creates it at startup, so the coins of an identity no 2.1
+    /// node runs can still be shielded into its own wallet.
     pub(super) fn load(
         tc: &TokenCtx,
         network: &[u8; 32],
         application: &[u8; 32],
     ) -> anyhow::Result<Self> {
+        ensure_wallet_key(tc)?;
+        let keystore = || crate::keys::describe_keystore(&tc.node_config, &tc.config_dir);
         let secret = Zeroizing::new(
             tc.key_manager
-                .get_secret_key_bytes_by_id("q-onion-key")
-                .map_err(|e| anyhow::anyhow!("q-onion-key secret: {e}"))?,
+                .get_secret_key_bytes_by_id(WALLET_KEY)
+                .map_err(|e| {
+                    anyhow::anyhow!("{WALLET_KEY} secret in keystore {}: {e}", keystore())
+                })?,
         );
         let public = tc
             .key_manager
-            .get_public_key_bytes_by_id("q-onion-key")
-            .map_err(|e| anyhow::anyhow!("q-onion-key public: {e}"))?;
+            .get_public_key_bytes_by_id(WALLET_KEY)
+            .map_err(|e| anyhow::anyhow!("{WALLET_KEY} public in keystore {}: {e}", keystore()))?;
         Self::from_keys(network, application, &public, secret)
     }
     fn from_keys(
@@ -2752,6 +2760,43 @@ fn parse_recipient(value: &str, context: &[u8; 32]) -> anyhow::Result<RecipientA
     .map_err(|e| anyhow::anyhow!("recipient address: {e:?}"))
 }
 
+/// The keystore entry holding a config's wallet key (sntrup761).
+const WALLET_KEY: &str = "q-onion-key";
+
+/// Create the wallet key in a keystore that has none. Only a keystore with
+/// a key that decrypts with the config's `encryptionKey` receives it: a
+/// missing or empty file most likely means a wrong `keyManagerFile.path`,
+/// and a key there would start a wallet nobody backs up. An existing key is
+/// never replaced, even one that does not decrypt.
+fn ensure_wallet_key(tc: &TokenCtx) -> anyhow::Result<()> {
+    if tc
+        .key_manager
+        .public_key_by_id(WALLET_KEY)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let keystore = crate::keys::describe_keystore(&tc.node_config, &tc.config_dir);
+    anyhow::ensure!(
+        crate::keys::keystore_access(&tc.key_manager) == crate::keys::KeystoreAccess::Readable,
+        "keystore {keystore} holds no {WALLET_KEY} wallet key, and no key that decrypts with \
+         key.keyManagerFile.encryptionKey of this config to show it is this config's \
+         keystore; qclient creates a wallet key only there: check key.keyManagerFile.path"
+    );
+    tc.key_manager
+        .create_agreement_key(WALLET_KEY, 9)
+        .map_err(|e| {
+            anyhow::anyhow!("create the {WALLET_KEY} wallet key in keystore {keystore}: {e}")
+        })?;
+    eprintln!(
+        "Created {WALLET_KEY}, the wallet key of this config, in keystore {keystore}, which \
+         predates wallet keys. Coins shielded or sent to this wallet can be spent only with this \
+         keys.yml and that config's encryptionKey: back up both."
+    );
+    Ok(())
+}
+
 /// The keystore Falcon key used as escrow and reward authority.
 fn falcon_signer(tc: &TokenCtx) -> anyhow::Result<std::sync::Arc<quil_crypto::FalconSigner>> {
     let secret = Zeroizing::new(tc.key_manager.get_secret_key_bytes_by_id("q-prover-key")?);
@@ -2889,9 +2934,9 @@ pub(super) async fn run_balance(
     }
     let network =
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
-    // An unreachable node or a keystore without wallet keys (a pre-2.1 node's)
-    // fails only the lines that need them; the unreachable node's own error,
-    // which names it and the fix, ends the output.
+    // An unreachable node or an unusable wallet key fails only the lines that
+    // need them; the unreachable node's own error, which names it and the
+    // fix, ends the output.
     let client = tc.connect().await;
     let unreachable = || anyhow::anyhow!("the node did not answer; see the error below");
     // Each phase's cost goes to stderr: a slow balance shows where it went.
