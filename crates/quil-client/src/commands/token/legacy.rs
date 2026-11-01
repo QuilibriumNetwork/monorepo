@@ -610,16 +610,18 @@ async fn list_owner(
 
 /// Every coin of `owners`. A long listing shows its progress on one line
 /// of a terminal's stderr, rewritten after each page and cleared once the
-/// listing ends; piped or redirected output gets none.
+/// listing ends; piped or redirected output gets none, nor does a `quiet`
+/// listing (the node manager, whose screen that line would overwrite).
 async fn list_owners(
     client: &Client,
     application: &[u8; 32],
     owners: &[(OwnerForm, [u8; 32])],
     label: &str,
     pages: &mut usize,
+    quiet: bool,
 ) -> anyhow::Result<Vec<Coin>> {
     use std::io::{IsTerminal, Write};
-    let terminal = std::io::stderr().is_terminal();
+    let terminal = !quiet && !super::output::captured() && std::io::stderr().is_terminal();
     let mut coins = Vec::new();
     for (form, owner) in owners {
         let mut shown = false;
@@ -665,6 +667,7 @@ pub(crate) async fn list(
         &key_owners(&public)?,
         "this identity",
         &mut 0,
+        false,
     )
     .await
 }
@@ -683,9 +686,167 @@ pub(crate) async fn unshielded(
         return Ok(None);
     };
     let owners = key_owners(&public)?;
-    let tally =
-        Tally::of(&list_owners(client, application, &owners, "this identity", pages).await?)?;
+    let tally = Tally::of(
+        &list_owners(client, application, &owners, "this identity", pages, false).await?,
+    )?;
     Ok(Some((tally.units, tally.unshielded, tally.shielded)))
+}
+
+/// `token shield-all`'s journal in the config directory: one
+/// `<unix seconds> <address hex>` line per coin of each submitted batch.
+pub(crate) const SHIELD_JOURNAL: &str = "legacy-shield-journal.txt";
+
+/// Legacy coins a batch shield from the config directory `dir` submitted
+/// within the last hour: shield-all leaves them for their batch to commit.
+pub(crate) fn recently_shielded(dir: &Path) -> BTreeSet<[u8; 32]> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    std::fs::read_to_string(dir.join(SHIELD_JOURNAL))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let (at, address) = line.split_once(' ')?;
+            let at: u64 = at.parse().ok()?;
+            let address: [u8; 32] = hex::decode(address).ok()?.try_into().ok()?;
+            (now.saturating_sub(at) < 3_600).then_some(address)
+        })
+        .collect()
+}
+
+/// One batch of a shield plan: its shard and its coins.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PlanBatch {
+    /// The shard's filter, as the shard list names it.
+    pub filter: Vec<u8>,
+    pub coins: usize,
+    pub units: u128,
+}
+
+/// One identity's legacy coins as the node manager shows them: the tally,
+/// how `token shield-all` would batch them, and when shields open. The
+/// listing is `token legacy`'s for one config identity, both owner forms,
+/// without its terminal progress line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Snapshot {
+    pub tally: Tally,
+    pub plan: Option<ShieldPlan>,
+    /// Coins per `token shield-all` batch; `None` without shield commands.
+    pub batch_max: Option<usize>,
+    pub head: Result<u64, String>,
+    pub rule: Option<ShieldRule>,
+    /// Listing pages read.
+    pub pages: usize,
+    /// `token shield-all`'s batches, in its order; empty without the shard
+    /// list or shield commands.
+    pub batches: Vec<PlanBatch>,
+    /// Unshielded coins submitted within the hour, left out of the plan.
+    pub pending: usize,
+    /// Every listed coin GLOBAL records as shielded, so a submitted batch
+    /// shows as included once its coins are.
+    pub shielded: BTreeSet<[u8; 32]>,
+}
+
+/// The [`Snapshot`] of the identity with Ed448 public key `public` on
+/// `network`, read from `client`; `config_dir` holds shield-all's journal.
+pub(crate) async fn snapshot(
+    client: &Client,
+    application: &[u8; 32],
+    public: &[u8; 57],
+    network: u8,
+    config_dir: Option<&Path>,
+) -> anyhow::Result<Snapshot> {
+    let mut pages = 0;
+    let listed = list_owners(
+        client,
+        application,
+        &key_owners(public)?,
+        "",
+        &mut pages,
+        true,
+    )
+    .await?;
+    let tally = Tally::of(&listed)?;
+    let recent = config_dir.map(recently_shielded).unwrap_or_default();
+    let shielded = listed
+        .iter()
+        .filter(|coin| coin.shielded)
+        .map(|coin| coin.address)
+        .collect();
+    let pending: BTreeSet<[u8; 32]> = listed
+        .iter()
+        .filter(|coin| !coin.shielded && recent.contains(&coin.address))
+        .map(|coin| coin.address)
+        .collect();
+    let coins: Vec<Coin> = listed
+        .into_iter()
+        .filter(|coin| !pending.contains(&coin.address))
+        .collect();
+    let shards = if tally.unshielded > pending.len() && BATCH_SHIELDS.is_some() {
+        live_shards(client, application).await.ok()
+    } else {
+        None
+    };
+    let paths: Option<Vec<Vec<bool>>> = shards
+        .as_ref()
+        .map(|shards| shards.iter().map(|(_, path)| path.clone()).collect());
+    let batches = match (&shards, BATCH_SHIELDS) {
+        (Some(shards), Some((max, _))) => plan_batches(&coins, shards, max),
+        _ => Vec::new(),
+    };
+    Ok(Snapshot {
+        tally,
+        plan: shield_plan(&coins, paths.as_deref()),
+        batch_max: BATCH_SHIELDS.map(|(max, _)| max),
+        head: global_head(client).await,
+        rule: shield_rule(network),
+        pages,
+        batches,
+        pending: pending.len(),
+        shielded,
+    })
+}
+
+/// `token shield-all`'s batches of the unshielded `coins`, as
+/// `wallet::shield_batches` cuts them: grouped by the deepest live shard,
+/// ascending by address, at most `max` per batch.
+pub(crate) fn plan_batches(
+    coins: &[Coin],
+    shards: &[(Vec<u8>, Vec<bool>)],
+    max: usize,
+) -> Vec<PlanBatch> {
+    let paths: Vec<Vec<bool>> = shards.iter().map(|(_, path)| path.clone()).collect();
+    let mut unshielded: Vec<([u8; 32], u128)> = coins
+        .iter()
+        .filter(|coin| !coin.shielded)
+        .map(|coin| (coin.address, coin.amount))
+        .collect();
+    unshielded.sort();
+    unshielded.dedup_by_key(|(address, _)| *address);
+    let mut groups: BTreeMap<&Vec<bool>, Vec<u128>> = BTreeMap::new();
+    for (address, amount) in &unshielded {
+        if let Some(path) = deepest_shard(&paths, address) {
+            groups.entry(path).or_default().push(*amount);
+        }
+    }
+    groups
+        .into_iter()
+        .flat_map(|(path, amounts)| {
+            let filter = shards
+                .iter()
+                .find(|(_, p)| p == path)
+                .map(|(filter, _)| filter.clone())
+                .unwrap_or_default();
+            amounts
+                .chunks(max.max(1))
+                .map(|chunk| PlanBatch {
+                    filter: filter.clone(),
+                    coins: chunk.len(),
+                    units: chunk.iter().sum(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// What to ask for an identity, given the owners listed for earlier ones.
@@ -849,11 +1010,12 @@ pub(crate) async fn ensure_shields_active(
     Ok(())
 }
 
-/// The bit paths of `application`'s live shards (any active prover).
-pub(crate) async fn live_shard_paths(
+/// The filters and bit paths of `application`'s live shards (any active
+/// prover).
+pub(crate) async fn live_shards(
     client: &Client,
     application: &[u8; 32],
-) -> anyhow::Result<Vec<Vec<bool>>> {
+) -> anyhow::Result<Vec<(Vec<u8>, Vec<bool>)>> {
     let shards = client
         .clone()
         .get_shard_info(quil_types::proto::node::GetShardInfoRequest { include_all: true })
@@ -862,11 +1024,25 @@ pub(crate) async fn live_shard_paths(
         .into_inner()
         .shards;
     Ok(shards
-        .iter()
+        .into_iter()
         .filter(|shard| shard.filter.starts_with(application) && shard.active_provers > 0)
         .filter_map(|shard| {
-            quil_forest::decode_shard_filter_or_root(&shard.filter, 32).map(|(_, bits)| bits)
+            let bits = quil_forest::decode_shard_filter_or_root(&shard.filter, 32)
+                .map(|(_, bits)| bits)?;
+            Some((shard.filter, bits))
         })
+        .collect())
+}
+
+/// The bit paths of `application`'s live shards (any active prover).
+pub(crate) async fn live_shard_paths(
+    client: &Client,
+    application: &[u8; 32],
+) -> anyhow::Result<Vec<Vec<bool>>> {
+    Ok(live_shards(client, application)
+        .await?
+        .into_iter()
+        .map(|(_, path)| path)
         .collect())
 }
 
@@ -1571,8 +1747,15 @@ pub(crate) async fn list_all(
                         if first.is_none() {
                             first = Some(client.clone());
                         }
-                        match list_owners(client, application, &owners, &identity.label, &mut 0)
-                            .await
+                        match list_owners(
+                            client,
+                            application,
+                            &owners,
+                            &identity.label,
+                            &mut 0,
+                            false,
+                        )
+                        .await
                         {
                             Ok(coins) => {
                                 dedup.record(&owners, &identity.label);

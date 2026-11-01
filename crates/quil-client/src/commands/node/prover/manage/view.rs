@@ -17,8 +17,12 @@ use ratatui::{
 
 #[cfg(test)]
 use super::super::format_quil_daily_round;
+use super::coins;
 use super::model::*;
 use super::util::{center_trunc, clamp_offset, filter_label, shared_filter_address};
+
+#[path = "coins_view.rs"]
+mod coins_view;
 
 // ── Colors: red is reserved for execution failures and errors ───────────────────────────────────
 
@@ -355,6 +359,10 @@ pub fn draw(f: &mut Frame, m: &mut Model) {
         render_help_screen(f, m, area);
         return;
     }
+    if m.tab == Tab::Coins {
+        coins_view::render(f, m, area);
+        return;
+    }
     render_main(f, m, area);
 }
 
@@ -442,14 +450,30 @@ fn sync_panel_heights(m: &mut Model, total: u16) -> [u16; 3] {
     heights
 }
 
+/// The single key row `?` leaves in place of the UI and Workers rows.
+fn collapsed_keys_line() -> Line<'static> {
+    let style = Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD);
+    Line::from(vec![
+        command_hint("?", "keys", style),
+        Span::raw(" "),
+        command_hint("h", "help", style),
+        Span::raw(" "),
+        command_hint("q", "quit", style),
+    ])
+}
+
 fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     let (actions, status) = footer_lines(m);
-    let mut actions = wrap_actions(actions, area.width);
-    if !m.filter_edit_active
+    let normal = !m.filter_edit_active
         && !m.is_filter_mode_active()
         && !m.sort_mode
-        && m.operation_confirmation.is_none()
-    {
+        && m.operation_confirmation.is_none();
+    let mut actions = if normal && !m.show_key_rows {
+        vec![collapsed_keys_line()]
+    } else {
+        wrap_actions(actions, area.width)
+    };
+    if normal && m.show_key_rows {
         actions.extend(wrap_actions(worker_commands_line(m), area.width));
     }
     let max_actions = usize::from(area.height.saturating_sub(15).max(1));
@@ -624,15 +648,25 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         m.horizontal_limits[1],
     );
 
-    render_notifications(f, m, status, chunks[3]);
+    let lines = message_lines(m, status, chunks[3].width.saturating_sub(2));
+    let focused = m.focus == PanelFocus::Notifications;
+    render_notifications(f, m, lines, focused, chunks[3]);
     f.render_widget(
         Paragraph::new(actions).style(Style::new().fg(HELP)),
         chunks[4],
     );
 }
 
-fn render_notifications(f: &mut Frame, m: &mut Model, primary: Line<'static>, area: Rect) {
-    let mut lines = message_lines(m, primary, area.width.saturating_sub(2));
+fn render_notifications(
+    f: &mut Frame,
+    m: &mut Model,
+    mut lines: Vec<Line<'static>>,
+    focused: bool,
+    area: Rect,
+) {
+    if lines.is_empty() {
+        lines.push(Line::default());
+    }
     if lines.len() == 1 && lines[0].width() == 0 {
         lines[0] = Line::from(Span::styled(
             match m.notice_minimum {
@@ -659,11 +693,7 @@ fn render_notifications(f: &mut Frame, m: &mut Model, primary: Line<'static>, ar
         .title(panel_title(title))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if m.focus == PanelFocus::Notifications {
-            PRIMARY
-        } else {
-            DIM
-        }));
+        .border_style(Style::new().fg(if focused { PRIMARY } else { DIM }));
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(
@@ -689,12 +719,97 @@ fn render_notifications(f: &mut Frame, m: &mut Model, primary: Line<'static>, ar
 
 // ── Header ───────────────────────────────────────────────────────────────
 
+fn severity_color(severity: NoticeSeverity) -> Color {
+    match severity {
+        NoticeSeverity::Info => PRIMARY,
+        NoticeSeverity::Warning => WARNING,
+        NoticeSeverity::Error => ERROR,
+    }
+}
+
+/// How many notices the Provers tab shows at the current level, and the
+/// highest severity among them; the transient status line is not counted.
+fn provers_notice_summary(m: &Model) -> Option<(usize, NoticeSeverity)> {
+    let mut found = Vec::new();
+    if global_alarm_active(m) {
+        found.push(NoticeSeverity::Error);
+    }
+    if m.notice_minimum <= NoticeSeverity::Warning {
+        if rpc_status_is_fresh(m)
+            && m.reported_app_stall_counts(std::time::Instant::now())
+                .is_some()
+        {
+            found.push(NoticeSeverity::Warning);
+        }
+        if m.app_stall_time.is_some() {
+            found.push(NoticeSeverity::Warning);
+        }
+    }
+    found.extend(
+        condition_notices(m)
+            .into_iter()
+            .map(|(_, severity, _)| severity)
+            .filter(|severity| *severity >= m.notice_minimum),
+    );
+    let shards = shard_severity(m);
+    if shards >= m.notice_minimum && shard_message(m).is_some() {
+        found.push(shards);
+    }
+    Some((found.len(), found.into_iter().max()?))
+}
+
+/// The same for the Coins tab; items waiting for an action count from the
+/// default level, as they show there.
+fn coins_notice_summary(m: &Model) -> Option<(usize, NoticeSeverity)> {
+    let shown = coins::shown_notices(m, fmt_claimable);
+    Some((
+        shown.len(),
+        shown.iter().map(|notice| notice.severity).max()?,
+    ))
+}
+
+/// `‹1› Provers  ‹2› Coins`, the current tab bold. The tab not on screen
+/// carries the count of its notices in the color of the highest, with a
+/// `!` for a warning or error when colors are off.
+fn tab_bar(m: &Model) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (tab, key, name) in [(Tab::Provers, "1", "Provers"), (Tab::Coins, "2", "Coins")] {
+        if !spans.is_empty() {
+            spans.push(Span::raw("  "));
+        }
+        let current = m.tab == tab;
+        spans.push(Span::styled(
+            format!("‹{key}› {name}"),
+            if current {
+                Style::new().fg(TEXT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(HELP)
+            },
+        ));
+        if current {
+            continue;
+        }
+        let summary = match tab {
+            Tab::Provers => provers_notice_summary(m),
+            Tab::Coins => coins_notice_summary(m),
+        };
+        if let Some((count, severity)) = summary {
+            let mark = !m.color_coding && severity >= NoticeSeverity::Warning;
+            spans.push(Span::styled(
+                format!(" {count}{}", if mark { "!" } else { "" }),
+                Style::new()
+                    .fg(severity_color(severity))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    Line::from(spans)
+}
+
 /// Pack complete KPI blocks, never splitting their internal pipe-separated fields.
 fn header_lines(m: &Model, width: u16) -> Vec<Line<'static>> {
-    let blocks = header_kpis(m);
-    if blocks.is_empty() {
-        return vec![];
-    }
+    let mut blocks = header_kpis(m);
+    blocks.insert(0, tab_bar(m));
     pack_kpis(blocks, width)
         .into_iter()
         .flat_map(|line| {
@@ -1751,6 +1866,31 @@ fn local_warning(m: &Model, a: &AllocationRow) -> bool {
     ) && a.execution.as_ref().and_then(|s| s.materialized_frame) == Some(0)
 }
 
+/// Frames a materializing worker normally trails the head peers report
+/// (the Available Shards footer says "1-2 frames").
+const RECOVERY_TRAIL_FRAMES: u64 = 2;
+
+/// The worker's own height is within the normal trail of the shard head peers
+/// report. Without both numbers nothing is known, so nothing counts as caught
+/// up.
+fn recovery_caught_up(a: &AllocationRow) -> bool {
+    a.latest_frame > 0
+        && a.execution
+            .as_ref()
+            .and_then(|e| e.materialized_frame)
+            .is_some_and(|h| h > 0 && h + RECOVERY_TRAIL_FRAMES >= a.latest_frame)
+}
+
+/// The latest recovery attempt failed and the worker is still behind; once
+/// it has caught up by another path the notice ends with the condition.
+fn recovery_failed(a: &AllocationRow) -> bool {
+    a.execution
+        .as_ref()
+        .and_then(|e| e.recovery.as_ref())
+        .is_some_and(|r| r.last_error_unix_ms > r.last_outcome_unix_ms)
+        && !recovery_caught_up(a)
+}
+
 fn local_color(m: &Model, a: &AllocationRow) -> Color {
     let state = m.execution_state(a.execution.as_ref());
     if matches!(state, "running" | "serving")
@@ -1882,7 +2022,9 @@ fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
         text += &format!(
             " | {}",
             if m.compact_actions {
-                recovery_summary(r)
+                recovery_summary(r, recovery_caught_up(a))
+            } else if r.last_error_unix_ms > r.last_outcome_unix_ms && recovery_caught_up(a) {
+                format!("{}; the worker has since caught up", recovery(r))
             } else {
                 recovery(r)
             }
@@ -3108,15 +3250,7 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
             )
         })
         .collect();
-    let recovery_failed = workers
-        .iter()
-        .filter(|a| {
-            a.execution
-                .as_ref()
-                .and_then(|e| e.recovery.as_ref())
-                .is_some_and(|r| r.last_error_unix_ms > r.last_outcome_unix_ms)
-        })
-        .count();
+    let recovery_failed = workers.iter().filter(|a| recovery_failed(a)).count();
     if recovery_failed > 0 {
         notices.push((
             "recovery-failed",
@@ -3141,10 +3275,12 @@ fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'sta
     } else {
         NoticeSeverity::Info
     };
-    // Filter-editor prompts are controls rather than notifications.
+    // Filter-editor prompts are controls rather than notifications; the
+    // reply to a key that does not apply shows from any level.
     let primary = if m.filter_edit_active
         || m.operation_confirmation.is_some()
         || primary_severity >= m.notice_minimum
+        || m.key_reply.as_deref() == Some(m.status_msg.as_str())
     {
         wrap_message(primary, width)
     } else {
@@ -3237,17 +3373,8 @@ fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'sta
 
 fn status_line(m: &Model) -> Line<'static> {
     if let Some((command, targets)) = &m.operation_confirmation {
-        let label = match command {
-            'l' => "Leave",
-            'r' => "Reject",
-            'p' => "Pause",
-            _ => "Change worker mode",
-        };
         return Line::from(Span::styled(
-            format!(
-                "{label} for {} allocation(s)? Enter confirms; Esc cancels.",
-                targets.len()
-            ),
+            super::update::confirmation_text(*command, targets),
             Style::new().fg(WARNING),
         ));
     }
@@ -3284,6 +3411,25 @@ fn command_hint(key: &str, description: &str, style: Style) -> Span<'static> {
     Span::styled(format!("‹{key}› {description}"), style)
 }
 
+/// A key row's hint: bright when the key acts on the current selection,
+/// dimmed when it does not. With colors off a dimmed key reads `(k)`
+/// instead of `‹k›`, as warnings carry `!`, and keeps the same width.
+fn key_hint(key: &str, description: &str, usable: bool, color: bool) -> Span<'static> {
+    if usable {
+        return command_hint(
+            key,
+            description,
+            Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD),
+        );
+    }
+    let text = if color {
+        format!("‹{key}› {description}")
+    } else {
+        format!("({key}) {description}")
+    };
+    Span::styled(text, Style::new().fg(DIM))
+}
+
 fn help_commands() -> Line<'static> {
     let mut spans = Vec::new();
     for (key, description) in [
@@ -3291,6 +3437,7 @@ fn help_commands() -> Line<'static> {
         ("↓/j", "down"),
         ("Pg↑/↓", "page"),
         ("Home/End", "first/last"),
+        ("d", "default view"),
         ("h/esc", "close"),
         ("q", "quit"),
     ] {
@@ -3309,9 +3456,21 @@ fn worker_commands_line(m: &Model) -> Line<'static> {
     legend_line(m, true)
 }
 
-/// Whether a normal-mode shortcut can act on the current panel/selection.
-fn ui_command_available(m: &Model, key: &str) -> bool {
+/// The focused Provers panel's name.
+fn panel_name(m: &Model) -> &'static str {
+    match m.focus {
+        PanelFocus::Allocations => "Allocations",
+        PanelFocus::Available => "Available Shards",
+        PanelFocus::Notifications => "Notifications",
+    }
+}
+
+/// Why a Provers UI key, as its hint names it, does nothing on the current
+/// panel and selection, as the one line pressing it shows; `None` when it
+/// acts. The UI row hides (compact) or dims (expanded) exactly these keys.
+pub(super) fn ui_key_refusal(m: &Model, key: &str) -> Option<String> {
     let table = m.focus != PanelFocus::Notifications;
+    let panel = panel_name(m);
     let (cursor, count) = if m.focus.is_alloc() {
         (m.alloc_cursor, m.sorted_allocations().len())
     } else if m.focus == PanelFocus::Available {
@@ -3322,39 +3481,47 @@ fn ui_command_available(m: &Model, key: &str) -> bool {
             m.notice_lines.saturating_sub(m.notice_visible) + 1,
         )
     };
+    let tables_only = || {
+        format!(
+            "{panel}: ‹{key}› applies to the Allocations and Available Shards tables; ‹tab› \
+             selects one."
+        )
+    };
+    let refused = |why: String| Some(why);
     match key {
-        "↑/k" => cursor > 0,
-        "↓/j" => cursor + 1 < count,
-        "←/→" => {
-            table
-                && (m.horizontal_limits[m.focus.index()] > 0
-                    || m.horizontal_offsets[m.focus.index()] > 0)
+        "↑/k" if cursor == 0 => refused(format!("{panel}: already at the first row.")),
+        "↓/j" if cursor + 1 >= count => refused(format!("{panel}: already at the last row.")),
+        "←/→" if !table => refused(tables_only()),
+        "←/→"
+            if m.horizontal_limits[m.focus.index()] == 0
+                && m.horizontal_offsets[m.focus.index()] == 0 =>
+        {
+            refused(format!("{panel}: every column fits; nothing to pan."))
         }
-        "b" | "s" | "f" => table,
-        "space" => table && count > 0,
-        "a" => {
-            table
-                && (count > 0
-                    || if m.focus.is_alloc() {
-                        !m.alloc_selected.is_empty()
-                    } else {
-                        !m.avail_selected.is_empty()
-                    })
+        "b" | "s" | "f" | "space" | "a" if !table => refused(tables_only()),
+        "space" if count == 0 => refused(format!("{panel}: no rows to select.")),
+        "a" if count == 0
+            && if m.focus.is_alloc() {
+                m.alloc_selected.is_empty()
+            } else {
+                m.avail_selected.is_empty()
+            } =>
+        {
+            refused(format!("{panel}: no rows to select."))
         }
         // Every panel has an adjustable shared edge. Limits constrain movement,
         // not availability; don't change the legend after its first layout.
-        "[/] {/}" => true,
-        _ => true,
+        _ => None,
     }
 }
 
-fn legend_line(m: &Model, workers: bool) -> Line<'static> {
-    let mut applicable: std::collections::HashSet<String> = std::collections::HashSet::new();
+/// The Workers (Ctrl+) actions that apply to the current panel and
+/// selection, by legend tag.
+pub(super) fn applicable_worker_actions(m: &Model) -> std::collections::HashSet<String> {
+    let mut applicable = std::collections::HashSet::new();
     if !m.action_in_flight {
         if m.focus.is_alloc() {
-            for a in m.applicable_alloc_actions() {
-                applicable.insert(a);
-            }
+            applicable.extend(m.applicable_alloc_actions());
             let sorted = m.sorted_allocations();
             if sorted.get(m.alloc_cursor).is_some_and(|r| r.worker_id >= 0) {
                 applicable.insert("ToggleManual".to_string());
@@ -3363,6 +3530,27 @@ fn legend_line(m: &Model, workers: bool) -> Line<'static> {
             applicable.insert("Join".to_string());
         }
     }
+    applicable
+}
+
+/// Add a key's hint to a key row: compact mode leaves out a key that does
+/// not apply to the selection, expanded mode dims it. Both legends use it.
+fn push_key_hint(
+    spans: &mut Vec<Span<'static>>,
+    m: &Model,
+    key: &str,
+    description: &str,
+    usable: bool,
+) {
+    if m.compact_actions && !usable {
+        return;
+    }
+    spans.push(Span::raw(" "));
+    spans.push(key_hint(key, description, usable, m.color_coding));
+}
+
+fn legend_line(m: &Model, workers: bool) -> Line<'static> {
+    let applicable = applicable_worker_actions(m);
     let filters_active = m.has_active_filters();
 
     let actions_label = if m.compact_actions {
@@ -3378,7 +3566,7 @@ fn legend_line(m: &Model, workers: bool) -> Line<'static> {
     };
     let units_label = format!("thresholds {}", m.threshold_unit.label());
     // (key, desc, action-tag)
-    let entries: [(&str, &str, &str); 24] = [
+    let entries: [(&str, &str, &str); 25] = [
         ("tab", "switch", ""),
         ("↑/k", "up", ""),
         ("↓/j", "down", ""),
@@ -3405,10 +3593,14 @@ fn legend_line(m: &Model, workers: bool) -> Line<'static> {
         ("v", "notice level", ""),
         ("t", refresh_label.as_str(), ""),
         ("[/] {/}", "upper/lower edge", ""),
+        ("?", "hide keys", ""),
         ("h", "help", ""),
         ("q", "quit", ""),
     ];
-    let mut spans = Vec::new();
+    let mut spans = vec![Span::styled(
+        if workers { "Workers (Ctrl+):" } else { "UI:" },
+        Style::new().fg(HELP).add_modifier(Modifier::BOLD),
+    )];
     for (key, desc, tag) in &entries {
         if key.starts_with("Ctrl+") != workers {
             continue;
@@ -3416,29 +3608,18 @@ fn legend_line(m: &Model, workers: bool) -> Line<'static> {
         let usable = if workers {
             applicable.contains(*tag)
         } else {
-            ui_command_available(m, key)
+            ui_key_refusal(m, key).is_none()
         };
-        if m.compact_actions && !usable {
-            continue;
-        }
-        if spans.is_empty() {
-            spans.push(Span::styled(
-                if workers { "Workers (Ctrl+):" } else { "UI:" },
-                Style::new().fg(HELP).add_modifier(Modifier::BOLD),
-            ));
-        }
-        spans.push(Span::raw(" "));
-        let style = Style::new().fg(if usable { PRIMARY } else { DIM });
-        let style = if usable {
-            style.add_modifier(Modifier::BOLD)
-        } else {
-            style
-        };
-        spans.push(command_hint(
+        push_key_hint(
+            &mut spans,
+            m,
             key.strip_prefix("Ctrl+").unwrap_or(key),
             desc,
-            style,
-        ));
+            usable,
+        );
+    }
+    if spans.len() == 1 {
+        spans.clear();
     }
     Line::from(spans)
 }
@@ -3520,7 +3701,7 @@ fn render_help_screen(f: &mut Frame, m: &mut Model, area: Rect) {
     let max_offset = body.len().saturating_sub(body_height);
     m.help_offset = m.help_offset.min(max_offset);
     let title = format!(
-        " Shard Manager — Help  ({}–{} of {})",
+        " Node Manager — Help  ({}–{} of {})",
         m.help_offset + 1,
         (m.help_offset + body_height).min(body.len()),
         body.len()
@@ -3934,6 +4115,9 @@ fn help_items() -> Vec<HelpItem> {
 
     vec![
         HelpItem::Blank,
+        sec("Tabs"),
+        kv("‹1› / ‹2›", "Show the Provers or the Coins tab; while a filter is edited, digits stay text. ‹tab› still moves between the panels of a tab"),
+        kv("Tab bar", "First block of the top header, `‹1› Provers  ‹2› Coins`, the current tab bold. The other tab shows how many notices it has at the current level, in the color of the highest (`!` marks a warning or error with colors off); items waiting for an action (`◆`) count from the default level"),
         sec("Top header KPIs"),
         kv("Peer ID", "This node's identity; compact `Peer: …` shows the last 8 characters, ‹n› expands it"),
         kv("Strategy", "Allocation scoring strategy the node reports; expanded mode spells out the priorities:"),
@@ -4060,7 +4244,7 @@ fn help_items() -> Vec<HelpItem> {
         item("`Allocations without a worker`: active, leaving, departing or `re-confirm!` allocations with Worker `-1`; they do no work and earn nothing until a worker is bound"),
         item("`Local execution blocked or stopped`: staffed earning allocations whose Execution is `blocked` or `stopped`, of those with fresh observations; the row footer names the blocker"),
         item("`Allocation epoch stale (re-confirm!)`: allocations whose epoch is older than the current one. The node reconfirms each allocation during every epoch, so its reconfirm has not been recorded; check the node's prover confirmation log lines"),
-        item("`Last recovery attempt failed`: workers whose latest archive recovery attempt failed, of workers with fresh observations; the Recovery footer gives the error and the failure streak"),
+        item("`Last recovery attempt failed`: workers whose latest archive recovery attempt failed and whose LocalMat is still below PeerHead, of workers with fresh observations (it ends once the worker catches up); the Recovery footer gives the error and the failure streak"),
         kv("Command legends", "Compact mode shows applicable UI/worker commands only; expanded mode also shows disabled commands. Usable commands share one highlight; labels show colors on/off and relative/absolute thresholds. `filter*` means a column filter is active"),
         kv("Scroll hints", "Bottom border counts hidden rows `↑`/`↓` and columns `←`/`→`"),
         kv("Colors", "What the main view's colors mean:"),
@@ -4076,12 +4260,16 @@ fn help_items() -> Vec<HelpItem> {
         sec("Display"),
         kv("‹n›", "Toggle compact / expanded display (n: names; default compact): identity, KPIs, action/reason names, threshold estimates, units and recovery/seal detail; default actions remain named"),
         kv("‹b›", "Visibility picker (b: blocks): ‹tab› moves focus between Columns, Top header and every panel header group; ‹↑/↓› selects, ‹space› toggles, ‹a› restores the focused group, ‹enter›/‹esc› closes. Interval, reward and Global field options nest beneath their KPI. Panel names and identity columns stay visible"),
-        kv("Columns group", "In the picker, visibility shared by both panels; ‹Shift+↑/↓› reorders focused table columns with their sub-items, ‹r› restores order, ‹c› hides Provers/Size/Shards and ‹a› restores all columns. Select/Filter stay pinned; settings last for the TUI session"),
+        kv("Columns group", "In the picker, visibility shared by both panels; ‹Shift+↑/↓› reorders focused table columns with their sub-items, ‹r› restores order, ‹c› hides Provers/Size/Shards and ‹a› restores all columns. Select/Filter stay pinned; the choice is kept between runs (see Saved view)"),
         kv("‹t›", "Cycle refresh (t: timer) 5/15/30/60s (default 15); startup and post-action fetches are immediate"),
         kv("‹c›", "Toggle color-coding of Ring, Mat/Lag/State, GlobalHead, ProverPhases, Worker, Status and Mode; values quoted in this help follow it"),
         kv("‹e›", "Show Next/Default Action thresholds relative to the received GLOBAL frame (`in Nf`, default) or as absolute frames (`@f…`)"),
+        kv("‹?›", "Hide or show the UI and Workers key rows; hidden, the one row `‹?› keys ‹h› help ‹q› quit` remains"),
+        kv("Dimmed keys", "A key acts only where it applies to the panel and selection. Compact (‹n›) leaves such a key out of the key rows; expanded shows it dimmed (with colors off it reads `(k)` instead of `‹k›`). Pressing it, shown or not, does nothing but say why"),
         kv("‹h›", "Open this help (‹↑/↓› or ‹Pg↑/↓› scroll; ‹h› or ‹esc› closes)"),
         kv("‹q› / ‹Ctrl+C›", "Quit"),
+        kv("Saved view", "Visible columns and their order, hidden KPIs and their fields, panel edges, sort, colors, thresholds mode, notice level, refresh interval and the key rows are kept between runs, per user, in `qclient-node-manage.yaml` beside the qclient config. Filters, scroll, selection and expanded rows are not. Entries a newer or older qclient does not know are skipped"),
+        kv("‹d› (in help)", "Restore the saved view's defaults; starting with `--reset-ui` does the same"),
         sec("Navigation"),
         kv("‹↑/k›", "Move cursor up; scrolls Notifications when it is focused"),
         kv("‹↓/j›", "Move cursor down; scrolls Notifications when it is focused"),
@@ -4096,7 +4284,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("‹Pg↑/↓›", "Page through Notifications; ‹Home/End› jump to its first/last line"),
         kv("‹[/]› / ‹{/}›", "Move the upper boundary up/down / the lower boundary up/down"),
         sec("Actions — Allocations panel"),
-        note("Operational commands require Ctrl. Leave/Reject/Pause/Mode ask ‹enter› or ‹esc›."),
+        note("Operational commands require Ctrl. Every one that signs or sends something (Leave, Confirm, Reject, Pause, Resume, Mode, and Join's worker choice) first names its allocations or shards and asks: ‹enter› sends, ‹esc› cancels."),
         note("‹Ctrl+C› quits; ‹Ctrl+J›/‹Ctrl+M› alias ‹enter›; ‹Ctrl+S›/‹Ctrl+Q› may be terminal flow control. Terminals also send ‹Ctrl+I› as ‹tab› and ‹Ctrl+H› as backspace, which is why some actions take a less obvious letter."),
         note("Pause/resume and mode changes are available in `AUTO`. Join/leave/confirm/reject require manual mode; Join also needs a free manual worker."),
         kv("‹Ctrl+L›", "Leave — request to leave an Active allocation (status 2)"),
@@ -4114,7 +4302,7 @@ fn help_items() -> Vec<HelpItem> {
         sec("Worker picker  (opens on ‹Ctrl+G›)"),
         kv("‹↑/k› / ‹↓/j›", "Move cursor between free workers"),
         kv("‹space›", "Toggle a worker into the manual-management set"),
-        kv("‹enter›", "Join the shard(s); selected workers are set to Manual"),
+        kv("‹enter›", "Ask to join the shard(s) with the selected workers, which are set to Manual; ‹enter› again joins, ‹esc› cancels"),
         kv("‹esc›", "Cancel the join"),
         HelpItem::Blank,
         sec("Sort mode  (press ‹s›)"),
@@ -4144,7 +4332,55 @@ fn help_items() -> Vec<HelpItem> {
         kv("‹enter›", "Apply the filter"),
         kv("‹esc›", "Cancel without changing the filter"),
         HelpItem::Blank,
+        sec(COINS_HELP_SECTION),
+        note("This node's claimable rewards and legacy coins, as `qclient token legacy` lists them, and the shield action; mint from the CLI for now. The middle panel follows the Balances row under the cursor: Claim status for `claimable`, Shield plan for `legacy`. ‹h› on this tab opens the help here."),
+        kv("Balances", "One row per kind; the cursor row's detail follows the table:"),
+        item("`claimable`: the reward balance the GLOBAL reward witness shows at the `As of` frame, read with each Provers refresh; `qclient token mint` authorizes a mint of it"),
+        item("`legacy`: Coins `U unshielded · S shielded` count the listed legacy coins of each kind, Amount is the unshielded total. Read in the background when the manager starts, every 10 min while the tab is open and on ‹r›; `As of` is the read's UTC time, a spinner beside it marks a read in progress. The detail gives the `qclient token shield-all` plan (batches of up to 96 coins from one shard each; coins on no live shard wait for a later run), when shields open, and the read's pages and duration"),
+        kv("State", "What the row needs:"),
+        item("`◆ claimable` / `◆ unshielded`: waiting for your action; `blue`, and the `◆` marker keeps the meaning with colors off"),
+        item("`unshielded` without `◆`: shields are not open yet, an expected wait; the notice gives the frame"),
+        item("`shielding i/N`: a shield run is proving or submitting batch i of N, whichever panel is on screen; its notices follow it in Notifications"),
+        item("`shielded`: every listed legacy coin is shielded; `none`: nothing to show"),
+        item("`loading`: the first read is in progress; `unavailable`: the read failed (`yellow`, or `!` with colors off); `no key`: the node config has no Ed448 key, so it owns no legacy coins"),
+        kv("Coins notices", "`Claimable: …` and `Legacy coins: U unshielded, S shielded; N batches` carry `◆` and show from the default level. `Shields open at f…` and `… on no live shard` are expected waits (info). A failing read is a warning that says since when it fails and how old the figures are; `Shield plan: shard list unavailable` means the batch count is a lower bound"),
+        kv("Claim status", "With the claimable row selected: the claimable reward to the base unit and the frame of its GLOBAL reward witness, and its authorization; `qclient token mint` authorizes a mint of it, as this manager does not yet"),
+        kv("Shield plan", "With the legacy row selected, or while a shield is prepared: one row per `qclient token shield-all` batch, in its order: Batch `i/N`, the Shard whose members verify it (its filter shortened from the middle), its Coins and Amount. The footer counts batches of up to 96 coins and coins on no live shard, which wait for a later run; coins submitted within the hour are hidden until their batch commits. `Shields open at f…` shows while shields are not yet admitted"),
+        kv("‹S›", "Shield, with the legacy row or the Shield plan selected: read the coins and quote each batch's fee, then confirm. The confirmation names the coins and batches, the amount, the recipient (this wallet, in full), the quoted fees and the `--max-fee` cap; ‹y› starts, any other key cancels. Batches are proved here one at a time and submitted to this node; one action runs at a time, and quitting during it asks first"),
+        kv("Node config", "Coin actions are signed with the node config the manager loaded (`--network <name>`: `~/.quilibrium/configs/<name>`; else the default config; else the node directory's `.config`), and a node accepts only submissions signed with its own peer key. An action signed with another config is refused before any read, naming the fix"),
+        kv("Shield notices", "`Shield batch i/N: proving … <60s` / `>60s` while a batch is proved; `submitted; inclusion not yet confirmed` until a legacy read shows its coins shielded (read every 2 min while waiting), then `included` (`green`). A failure (`red`) names the batch; batches before it stay submitted. `--render` reads and quotes for the confirmation but never runs it. `Action log: not written (…)` (`yellow`): the private action log refused the write, e.g. its file is open to other users; the shield runs on"),
+        kv("Logs", "A shield run logs one line at its start and one with its outcome (target `qclient::action`, at info; `RUST_LOG=qclient::action=info` shows them on stderr, so redirect it to a file): counts, frames, the duration and an error class, never amounts, the recipient, coin addresses or hashes, so they can be shared. The details (amounts, fees, recipient, coin addresses, the error) go only to the private action log `wallet/actions.jsonl` in the node config directory: one JSON line per step, owner-only (a wider mode refuses the write), never in the node's `.log/`, log exports or renders, kept a year within 4 MiB. `--no-action-log`, or `noActionLog: true` in the qclient config, turns it off; `qclient token shield-all` records there too"),
+        kv("--render", "A render may be shared, so it hides private wallet fields (a confirmation's amount, the recipient's address, shielded amounts) as `hidden in this render`; `--reveal` shows them. Amounts the network lists publicly under this node's key (legacy coins, the claimable reward) show either way"),
+        kv("‹r›", "Read legacy coins now, with the legacy row or the Shield plan selected; one read at a time"),
+        kv("‹[/]› / ‹{/}›", "Move the focused panel's upper edge up/down / its lower edge up/down; every panel keeps 3 rows. The Coins tab's edges are kept between runs apart from the Provers tab's"),
+        kv("‹tab›", "Move between Balances, the middle panel (Claim status or Shield plan) and Notifications"),
+        kv("‹↑/k› / ‹↓/j›", "Move the Balances or Shield plan cursor; scroll Notifications when it is focused"),
+        HelpItem::Blank,
     ]
+}
+
+/// The help section the Coins tab opens its help at.
+const COINS_HELP_SECTION: &str = "Coins tab";
+
+/// The first help line of `section` at `width`, so help can open there.
+pub(super) fn help_section_offset(width: u16, section: &str) -> usize {
+    let mut line = 0;
+    for (item, entry) in help_entries() {
+        if matches!(item, HelpItem::Section(name) if name == section) {
+            return line;
+        }
+        line += item.wrapped(usize::from(width), entry, false).len();
+    }
+    0
+}
+
+/// Open help at the current tab's section.
+pub(super) fn open_help(m: &mut Model) {
+    m.show_help = true;
+    m.help_offset = match m.tab {
+        Tab::Provers => 0,
+        Tab::Coins => help_section_offset(m.width.max(40), COINS_HELP_SECTION),
+    };
 }
 
 /// All settings groups stay on screen; Tab moves focus rather than replacing content.
@@ -4594,7 +4830,7 @@ mod tests {
             .to_string()
             .contains("Workers: running 15"));
         m.data_loaded = false;
-        assert_eq!(header_lines(&m, 40).len(), 1);
+        assert_eq!(header_lines(&m, 80).len(), 1);
     }
 
     #[test]
@@ -5422,6 +5658,77 @@ mod tests {
         assert!(condition_notices(&m).is_empty());
         update_message_lifetime(&mut m);
         assert!(m.notice_since.is_empty());
+    }
+
+    #[test]
+    fn recovery_failure_ends_when_the_worker_catches_up() {
+        use quil_types::proto::node::{ShardRecovery, WorkerExecution};
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let mut m = Model::new();
+        m.compact_actions = false;
+        m.last_fetch_success = Some(std::time::Instant::now());
+        m.worker_snapshot_received = Some((std::time::Instant::now(), now_ms));
+        let mut a = row("0c", 1, 1, 12, "", "");
+        a.status_name = "active".into();
+        a.latest_frame = 800;
+        a.execution = Some(WorkerExecution {
+            state: "syncing".into(),
+            observed_unix_ms: now_ms,
+            last_advance_unix_ms: now_ms,
+            materialized_frame: Some(700),
+            recovery: Some(ShardRecovery {
+                last_error_unix_ms: now_ms - 1000,
+                last_outcome_unix_ms: now_ms - 5000,
+                last_error: "did not commit".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        m.allocations = vec![a];
+        let failed = |m: &Model| {
+            condition_notices(m)
+                .iter()
+                .any(|(key, _, _)| *key == "recovery-failed")
+        };
+        assert!(failed(&m), "behind: the failed attempt is current");
+        m.allocations[0]
+            .execution
+            .as_mut()
+            .unwrap()
+            .materialized_frame = Some(800);
+        assert!(!failed(&m), "caught up by another path: the notice ends");
+        m.allocations[0]
+            .execution
+            .as_mut()
+            .unwrap()
+            .materialized_frame = Some(799);
+        assert!(!failed(&m), "one frame behind is the normal trail");
+        m.allocations[0]
+            .execution
+            .as_mut()
+            .unwrap()
+            .materialized_frame = Some(797);
+        assert!(failed(&m), "three frames behind is still behind");
+        m.allocations[0]
+            .execution
+            .as_mut()
+            .unwrap()
+            .materialized_frame = Some(800);
+        let footer = allocation_detail(&m, &m.allocations[0]).to_string();
+        assert!(footer.contains("did not commit"), "{footer}");
+        assert!(footer.contains("since caught up"), "{footer}");
+        m.compact_actions = true;
+        let footer = allocation_detail(&m, &m.allocations[0]).to_string();
+        assert!(!footer.contains("Last recovery attempt failed"), "{footer}");
+        m.allocations[0].latest_frame = 0;
+        let footer = allocation_detail(&m, &m.allocations[0]).to_string();
+        assert!(
+            footer.contains("Last recovery attempt failed"),
+            "unknown head: {footer}"
+        );
     }
 
     #[test]
@@ -7479,6 +7786,18 @@ mod tests {
             "Cursor",
             "Boundaries",
             "Typing",
+            "Tab bar",
+            "Saved view",
+            "Balances",
+            "State",
+            "Coins notices",
+            "Claim status",
+            "Shield plan",
+            "Shield notices",
+            "Logs",
+            "--render",
+            "Node config",
+            "Dimmed keys",
         ];
         for (section, key, _) in &sections {
             let named = key.starts_with('‹')
@@ -7842,8 +8161,8 @@ mod tests {
         let after = text(terminal.backend().buffer());
         assert!(m.help_offset > 0);
         assert_ne!(before, after);
-        assert!(before.starts_with(" Shard Manager — Help"));
-        assert!(after.starts_with(" Shard Manager — Help"));
+        assert!(before.starts_with(" Node Manager — Help"));
+        assert!(after.starts_with(" Node Manager — Help"));
         assert!(handle_key(&mut m, key(KeyCode::Esc)).is_empty());
         assert!(!m.show_help);
         assert_eq!(m.help_offset, 0);
@@ -7902,7 +8221,10 @@ mod compact_action_tests {
         for name in TOP_KPI_NAMES {
             m.hidden_header_kpis.insert((*name).into());
         }
-        assert!(header_lines(&m, 40).is_empty());
+        // The tab bar stays: it is how the other tab's notices show.
+        let lines = header_lines(&m, 40);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].to_string(), "‹1› Provers  ‹2› Coins");
     }
 
     #[test]

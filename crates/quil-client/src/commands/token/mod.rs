@@ -15,11 +15,15 @@ use crate::context::{Context, GlobalArgs};
 use crate::rpc::ConnectOpts;
 
 mod account;
+pub(crate) mod action_log;
 #[cfg(feature = "confidential-tokens")]
 pub(crate) mod balance;
-mod legacy;
+pub(crate) mod legacy;
+pub(crate) mod output;
 #[cfg(feature = "confidential-tokens")]
 mod wallet;
+#[cfg(feature = "native-proof")]
+pub(crate) use wallet::{execute_shield_all, plan_shield_all, shield_batch_fee, ShieldEvent};
 
 /// Flags shared by every `token` subcommand (Go `TokenCmd` persistent
 /// flags).
@@ -268,16 +272,22 @@ pub(crate) fn short_peer(peer: &str) -> String {
     format!("\u{2026}{}", tail.into_iter().rev().collect::<String>())
 }
 
+/// The fix `qclient token` offers for a submission signed by another config.
+pub(crate) const SUBMIT_CONFIG_REMEDY: &str =
+    "pass --submit-config <DIR> with the running node's config directory";
+
 /// Why the node at `node` would refuse submissions signed by the config in
 /// `signer_dir`: a node verifies a submission's authentication against its
 /// own peer key, so only its own config can sign one. `None` when the
 /// identities match, or when either side has none to compare (an older node
-/// reports no peer ID; then the node's own check is the only one).
+/// reports no peer ID; then the node's own check is the only one). `remedy`
+/// is the fix the caller's options offer.
 pub(crate) fn submit_identity_mismatch(
     node: &str,
     node_peer: &str,
     signer_dir: &std::path::Path,
     signer: &ConfigIdentity,
+    remedy: &str,
 ) -> Option<String> {
     let signer_peer = signer.shown()?;
     if node_peer.is_empty() || signer.holds(node_peer) {
@@ -285,8 +295,7 @@ pub(crate) fn submit_identity_mismatch(
     }
     Some(format!(
         "the node at {node} is peer {}, but submissions would be signed by {} (peer {}), \
-         and a node accepts only submissions signed with its own peer key; pass \
-         --submit-config <DIR> with the running node's config directory",
+         and a node accepts only submissions signed with its own peer key; {remedy}",
         short_peer(node_peer),
         signer_dir.display(),
         short_peer(signer_peer)
@@ -657,6 +666,13 @@ impl TokenCtx {
     /// nothing when the node cannot be asked or reports no peer ID; the
     /// submission then meets the node's own check as before.
     pub(crate) async fn check_submit_identity(&self) -> anyhow::Result<()> {
+        self.check_submit_identity_advising(SUBMIT_CONFIG_REMEDY)
+            .await
+    }
+
+    /// [`Self::check_submit_identity`], with `remedy` as the advice when it
+    /// refuses: a caller without `--submit-config` names its own fix.
+    pub(crate) async fn check_submit_identity_advising(&self, remedy: &str) -> anyhow::Result<()> {
         if self.submit_opts.is_light_node() {
             return Ok(());
         }
@@ -678,10 +694,28 @@ impl TokenCtx {
             &info.into_inner().peer_id,
             &self.submit_config_dir,
             &self.submit_identity,
+            remedy,
         ) {
             Some(mismatch) => Err(anyhow::anyhow!(mismatch)),
             None => Ok(()),
         }
+    }
+
+    /// The context `qclient token` builds for the default node config and
+    /// no read or public RPC: the node manager's coin actions use it, so
+    /// they read, quote and submit as the CLI does.
+    pub(crate) fn for_manager(global: GlobalArgs, max_fee: u128) -> anyhow::Result<Self> {
+        Self::load(
+            global,
+            &TokenCommonArgs {
+                public_rpc: false,
+                config: Vec::new(),
+                submit_config: None,
+                read_rpc: None,
+                insecure_read_rpc: false,
+                max_fee,
+            },
+        )
     }
 
     fn load(global: GlobalArgs, common: &TokenCommonArgs) -> anyhow::Result<Self> {
@@ -689,7 +723,7 @@ impl TokenCtx {
     }
 
     fn from_context(ctx: &Context, common: &TokenCommonArgs) -> anyhow::Result<Self> {
-        println!("Loading node config...");
+        output::line("Loading node config...".into());
         let config_arg = common.single_config()?;
         let (node_config, config_dir) = ctx.load_node_config(config_arg)?;
 
@@ -708,18 +742,15 @@ impl TokenCtx {
         // absent (a pre-migration keystore).
         let config_identity = ConfigIdentity::of(&node_config, &key_manager);
         match config_identity.shown() {
-            Some(peer) => println!("{peer}"),
-            None => println!("(no network identity configured)"),
+            Some(peer) => output::line(peer.to_string()),
+            None => output::line("(no network identity configured)".into()),
         }
         if config_arg.is_empty() || config_arg == "default" {
             let unused = std::env::current_dir()
                 .ok()
                 .and_then(|cwd| crate::nodeconfig::unused_local_config(&config_dir, &cwd));
             if unused.is_some() {
-                eprintln!(
-                    "{}",
-                    local_config_notice(&config_dir, config_identity.shown())
-                );
+                output::err_line(local_config_notice(&config_dir, config_identity.shown()));
             }
         }
         let (submit_opts, submit_key_manager, submit_config_dir, submit_identity) =
@@ -1572,6 +1603,7 @@ pub(crate) mod test_nodes {
                 public_rpc,
                 custom_rpc: String::new(),
                 node_symlink_name: String::new(),
+                no_action_log: false,
             },
         }
     }
@@ -1607,8 +1639,14 @@ mod submit_tests {
             ed448: Some("12D3KooWEd448CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCed4483".into()),
         };
         let dir = std::path::Path::new("prover").join(".config");
-        let error =
-            submit_identity_mismatch("/ip4/127.0.0.1/tcp/8337", node, &dir, &signer).unwrap();
+        let error = submit_identity_mismatch(
+            "/ip4/127.0.0.1/tcp/8337",
+            node,
+            &dir,
+            &signer,
+            SUBMIT_CONFIG_REMEDY,
+        )
+        .unwrap();
         assert_eq!(
             error,
             format!(
@@ -1624,14 +1662,26 @@ mod submit_tests {
         for own in [signer.falcon.clone(), signer.ed448.clone()] {
             let own = own.unwrap();
             assert_eq!(
-                submit_identity_mismatch("/ip4/127.0.0.1/tcp/8337", &own, &dir, &signer),
+                submit_identity_mismatch(
+                    "/ip4/127.0.0.1/tcp/8337",
+                    &own,
+                    &dir,
+                    &signer,
+                    SUBMIT_CONFIG_REMEDY
+                ),
                 None
             );
         }
         // Nothing to compare: an older node reports no peer ID, or the config
         // holds no identity.
         assert_eq!(
-            submit_identity_mismatch("/ip4/127.0.0.1/tcp/8337", "", &dir, &signer),
+            submit_identity_mismatch(
+                "/ip4/127.0.0.1/tcp/8337",
+                "",
+                &dir,
+                &signer,
+                SUBMIT_CONFIG_REMEDY
+            ),
             None
         );
         assert_eq!(
@@ -1639,7 +1689,8 @@ mod submit_tests {
                 "/ip4/127.0.0.1/tcp/8337",
                 node,
                 &dir,
-                &ConfigIdentity::default()
+                &ConfigIdentity::default(),
+                SUBMIT_CONFIG_REMEDY
             ),
             None
         );
