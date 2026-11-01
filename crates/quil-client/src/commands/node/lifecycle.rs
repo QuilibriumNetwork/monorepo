@@ -8,10 +8,45 @@ use std::path::Path;
 
 use crate::{release, system};
 
+/// The lock `node install` and `node update` hold while they change the
+/// node install, so auto-update runs (every 10 minutes) and manual runs
+/// never overlap.
+const UPDATE_LOCK: &str = "/var/quilibrium/.auto-update.lock";
+
+/// Take the exclusive lock at `path` (created 0600 if absent) until the
+/// returned file closes; fail at once if another run holds it.
+fn lock_node_updates(path: &Path) -> anyhow::Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| anyhow::anyhow!("create {}: {e} (root required)", dir.display()))?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("open {}: {e} (root required)", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "another qclient node install or update is running (it holds {}); nothing done",
+            path.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => {
+            anyhow::bail!("lock {}: {e}", path.display())
+        }
+    }
+}
+
 /// `node install [version]` — download+verify+install the node binary, then
 /// install the system service. An older version than the linked one needs
 /// `allow_downgrade`.
 pub async fn install(version: Option<&str>, allow_downgrade: bool) -> anyhow::Result<()> {
+    let _lock = lock_node_updates(Path::new(UPDATE_LOCK))?;
     let version = resolve_version(version).await?;
     println!("Installing Quilibrium node {version}...");
     let installed = release::download_and_install(
@@ -34,6 +69,7 @@ pub async fn update(
     restart: bool,
     allow_downgrade: bool,
 ) -> anyhow::Result<()> {
+    let _lock = lock_node_updates(Path::new(UPDATE_LOCK))?;
     let version = resolve_version(version).await?;
     println!("Updating Quilibrium node to {version}...");
     let installed = release::download_and_install(
@@ -327,5 +363,25 @@ mod tests {
         }
         std::fs::write(tmp.path().join("2.1.0.30"), b"not a directory").unwrap();
         assert_eq!(latest_version_in(tmp.path()).unwrap(), "2.1.0.25");
+    }
+
+    /// While one install or update holds the lock, another fails at once;
+    /// it runs once the first ends.
+    #[cfg(unix)]
+    #[test]
+    fn overlapping_node_updates_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("quilibrium").join(".auto-update.lock");
+        let held = lock_node_updates(&path).unwrap();
+        let err = lock_node_updates(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("another qclient node install or update is running"),
+            "{err}"
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        drop(held);
+        lock_node_updates(&path).unwrap();
     }
 }

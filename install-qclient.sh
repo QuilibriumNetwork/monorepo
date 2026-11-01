@@ -67,8 +67,12 @@ cleanup() {
     fi
 }
 
+# A download fails when the server does not connect within 30 s, sends
+# nothing for 60 s or takes over 30 min in all, so a stalled server never
+# holds the install.
 fetch() {
-    curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 "$@"
+    curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --connect-timeout 30 --speed-limit 1 --speed-time 60 --max-time 1800 "$@"
 }
 
 # Function to detect OS and architecture
