@@ -22,7 +22,7 @@
 //! atomic `Transaction` so they can never diverge.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use num_bigint::BigInt;
@@ -44,11 +44,14 @@ pub use crate::snapshot::{GenerationHandle, SnapshotManager};
 /// the store's keying and `quil_forest::PHASES` order.
 /// The CRDT's commit lock, counting releases: a view captured while holding
 /// it is current for as long as nobody has released it since, which lets new
-/// wallet scans share one snapshot until the next commit.
+/// wallet scans share one snapshot until the next commit. It also counts the
+/// threads waiting for it, so background work holding it can end its hold
+/// as soon as a commit or a reader asks.
 #[derive(Default)]
 pub(crate) struct CommitLock {
     inner: std::sync::Mutex<()>,
     releases: AtomicU64,
+    waiters: AtomicUsize,
 }
 
 thread_local! {
@@ -109,7 +112,9 @@ impl CommitLock {
             Err(std::sync::TryLockError::Poisoned(_)) => Err(()),
             Err(std::sync::TryLockError::WouldBlock) => {
                 let asked = std::time::Instant::now();
+                self.waiters.fetch_add(1, Ordering::SeqCst);
                 let guard = self.inner.lock().map_err(|_| ());
+                self.waiters.fetch_sub(1, Ordering::SeqCst);
                 let waited = asked.elapsed();
                 COMMIT_LOCK_WAIT.with(|total| total.set(total.get().saturating_add(waited)));
                 guard
@@ -120,6 +125,12 @@ impl CommitLock {
     /// Counted releases so far.
     fn releases(&self) -> u64 {
         self.releases.load(Ordering::SeqCst)
+    }
+
+    /// Threads waiting for the lock now. While one thread holds it, nobody
+    /// else stops waiting, so a holder that sees a waiter keeps seeing it.
+    fn waiters(&self) -> usize {
+        self.waiters.load(Ordering::SeqCst)
     }
 }
 
@@ -5248,8 +5259,12 @@ impl HypergraphCrdt {
     /// the commit lock, from the live index and heads
     /// ([`HypergraphStore::retention_replan`]) and the versions the store holds
     /// then, exactly as a pass holding the lock throughout would decide it at
-    /// that moment, in holds of about `pacing.hold`: a commit or a reader waits
-    /// for one hold, not for a scan. A version committed after the scan lies
+    /// that moment, in holds of at most about `pacing.hold`, each ended as soon
+    /// as another thread waits for the lock: every deletion step checks after
+    /// each record (a stale node record, a vertex's or a leaf key's versions),
+    /// so a commit or a reader waits for one record, not for a scan or a
+    /// chunk. A hold still deletes at least one record, so the pass advances
+    /// however busy the lock is. A version committed after the scan lies
     /// above every watermark it read, and a tree reset or rebuilt meanwhile
     /// loses its watermark in the live index, so neither is deleted.
     ///
@@ -5449,11 +5464,15 @@ impl HypergraphCrdt {
                     .then(|| self.resolve_phase_version_with(&forest, shard_id, phase_idx))
                     .flatten()
             };
+            // The hold ends once its budget is spent or anybody waits for
+            // the lock; a waiter cannot stop waiting while we hold it.
+            let stop = || self.commit_lock.waiters() > 0 || held.elapsed() >= hold_budget;
             let mut worked = false;
             while let Some(work) = queue.pop_front() {
-                // At least one chunk per hold, so a slow replan cannot stall
-                // the pass; after it, the hold ends at its budget.
-                if worked && held.elapsed() >= hold_budget {
+                // At least one record per hold, so a slow replan or a busy
+                // lock cannot stall the pass; after it, the hold ends at
+                // `stop`.
+                if worked && stop() {
                     queue.push_front(work);
                     break;
                 }
@@ -5519,17 +5538,16 @@ impl HypergraphCrdt {
                         let txn = self.store.new_transaction(false)?;
                         loop {
                             let end = (next + chunk).min(vertices.len());
-                            pass.blobs += self.store.retention_prune_vertices(
+                            let (deleted, judged) = self.store.retention_prune_vertices(
                                 txn.as_ref(),
                                 &keyspace,
                                 &vertices[next..end],
                                 &mut blob_budget,
+                                &stop,
                             )?;
-                            next = end;
-                            if next == vertices.len()
-                                || blob_budget == 0
-                                || held.elapsed() >= hold_budget
-                            {
+                            pass.blobs += deleted;
+                            next += judged.max(1).min(end - next);
+                            if next == vertices.len() || blob_budget == 0 || stop() {
                                 break;
                             }
                         }
@@ -5558,6 +5576,7 @@ impl HypergraphCrdt {
                                 min_ver,
                                 from.as_deref(),
                                 node_batch,
+                                &stop,
                             ) {
                                 Ok((reclaimed, None)) => {
                                     pass.nodes += reclaimed;
@@ -5567,7 +5586,7 @@ impl HypergraphCrdt {
                                 Ok((reclaimed, Some(next))) => {
                                     pass.nodes += reclaimed;
                                     from = Some(next);
-                                    if held.elapsed() >= hold_budget {
+                                    if stop() {
                                         break true;
                                     }
                                 }
@@ -5611,10 +5630,11 @@ impl HypergraphCrdt {
                                 min_ver,
                                 &key_hashes[next..end],
                                 &mut value_budget,
+                                &stop,
                             ) {
-                                Ok(deleted) => {
+                                Ok((deleted, judged)) => {
                                     pass.values += deleted;
-                                    next = end;
+                                    next += judged.max(1).min(end - next);
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -5626,10 +5646,7 @@ impl HypergraphCrdt {
                                     next = key_hashes.len();
                                 }
                             }
-                            if next == key_hashes.len()
-                                || value_budget == 0
-                                || held.elapsed() >= hold_budget
-                            {
+                            if next == key_hashes.len() || value_budget == 0 || stop() {
                                 break;
                             }
                         }
@@ -5644,6 +5661,9 @@ impl HypergraphCrdt {
                         }
                     }
                 }
+            }
+            if self.commit_lock.waiters() > 0 {
+                pass.yields += 1;
             }
             drop(forest);
             let hold = held.elapsed();

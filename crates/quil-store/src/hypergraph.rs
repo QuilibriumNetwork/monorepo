@@ -151,6 +151,21 @@ fn sweep_read_options() -> rocksdb::ReadOptions {
     options
 }
 
+/// The least key above every key starting with `prefix`, as an iterator's
+/// exclusive upper bound, or `None` when no key is (an empty or all-`0xff`
+/// prefix). A bounded iterator stops at the prefix's end instead of
+/// stepping on over whatever deleted keys follow it.
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    while let Some(last) = upper.pop() {
+        if last < 0xff {
+            upper.push(last + 1);
+            return Some(upper);
+        }
+    }
+    None
+}
+
 impl RocksHypergraphStore {
     fn backing_store_identity_backend(&self) -> quil_types::store::BackingStoreIdentity {
         self.db.backing_store_identity()
@@ -1529,6 +1544,10 @@ mod capture_tests;
 #[cfg(test)]
 #[path = "hypergraph_retention_tests.rs"]
 mod retention_tests;
+
+#[cfg(test)]
+#[path = "hypergraph_retention_record_tests.rs"]
+mod retention_record_tests;
 
 #[cfg(test)]
 #[path = "hypergraph_orphaned_head_tests.rs"]
