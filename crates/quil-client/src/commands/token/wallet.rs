@@ -23,6 +23,12 @@ mod native_tests;
 #[path = "wallet_submission_tests.rs"]
 mod submission_tests;
 
+#[cfg(feature = "native-proof")]
+#[path = "wallet_inclusion.rs"]
+pub(super) mod inclusion;
+#[cfg(feature = "native-proof")]
+use inclusion::{Follow, Submitted};
+
 // Shared by mint, shield and transfer preparation as well as native work. A permit
 // stays in the blocking worker when its async caller is cancelled.
 #[cfg(feature = "native-proof")]
@@ -359,7 +365,8 @@ impl RecipientWallet {
     }
 
     /// Submit one already-built operation using the node's authenticated Send
-    /// transport. Successful delivery does not establish transaction finality.
+    /// transport, returning the signed bundle's id ([`bundle_id`]). Successful
+    /// delivery does not establish transaction finality.
     pub(super) async fn submit(
         &self,
         client: &mut quil_types::proto::node::node_service_client::NodeServiceClient<
@@ -367,10 +374,15 @@ impl RecipientWallet {
         >,
         key_manager: &quil_keys::FileKeyManager,
         bytes: Vec<u8>,
-    ) -> anyhow::Result<()> {
-        let (domain, request) = self.prepare_submission(bytes.clone())?;
-        crate::send::send_message_request(client, key_manager, domain, request).await?;
-        Ok(())
+    ) -> anyhow::Result<[u8; 32]> {
+        let (domain, request) = self.prepare_submission(bytes)?;
+        let bundle = quil_types::proto::global::MessageBundle {
+            requests: vec![request],
+            timestamp: crate::send::now_millis(),
+        };
+        let id = bundle_id(&bundle)?;
+        crate::send::send_message_bundle(client, key_manager, domain, bundle).await?;
+        Ok(id)
     }
 
     /// Fetch one known escrow, requesting the complete typed record rather
@@ -3024,6 +3036,7 @@ pub(super) async fn run_transfer(
     requested_fee: Option<u128>,
     max_pages: usize,
     max_coins: usize,
+    wait: std::time::Duration,
 ) -> anyhow::Result<()> {
     let application = identifier(application)?;
     anyhow::ensure!(amount > 0, "transfer amount must be positive");
@@ -3073,9 +3086,9 @@ pub(super) async fn run_transfer(
             Err(error) => return Err(error),
         }
     };
-    submit_refreshed_operation(tc, &wallet, bytes).await?;
-    println!("Confidential transfer submitted. Finalized inclusion is not yet confirmed.");
-    Ok(())
+    let submitted = submit_refreshed_operation(tc, &wallet, bytes).await?;
+    let follow = Follow { wait, max_pages };
+    inclusion::follow(tc, &wallet, "transfer", submitted, follow).await
 }
 
 /// The fee a transfer pays: the caller's, or a quote for two coins and the
@@ -3630,6 +3643,16 @@ pub(super) async fn pay_for_bundle(
     Ok((claim, quote.global_execution))
 }
 
+/// SHA3-256 of a bundle's canonical bytes: what a shard routes it by, and what
+/// node logs name it by (`bundle=` and its first 4 bytes).
+fn bundle_id(bundle: &quil_types::proto::global::MessageBundle) -> anyhow::Result<[u8; 32]> {
+    use sha3::Digest;
+    let canonical =
+        quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(bundle)
+            .map_err(|e| anyhow::anyhow!("canonicalize bundle: {e}"))?;
+    Ok(sha3::Sha3_256::digest(canonical).into())
+}
+
 /// How long a custom-token operation waits for its QUIL settlement to be
 /// certified before giving up.
 #[cfg(feature = "native-proof")]
@@ -3637,6 +3660,8 @@ const SETTLEMENT_WAIT: std::time::Duration = std::time::Duration::from_secs(900)
 
 /// Submit a wallet operation. QUIL operations pay their own fee; every other
 /// application's operations carry a QUIL fee through a settlement claim.
+/// Returns what identifies the submission, for an operation the global commit
+/// decides.
 #[cfg(feature = "native-proof")]
 async fn submit_operation(
     tc: &TokenCtx,
@@ -3645,7 +3670,7 @@ async fn submit_operation(
         tonic::transport::Channel,
     >,
     bytes: Vec<u8>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<Submitted>> {
     if wallet.application == quil_execution::domains::QUIL_TOKEN {
         refresh_submission_fee(tc, client, &bytes).await?;
     }
@@ -3659,15 +3684,20 @@ async fn submit_refreshed_operation(
     tc: &TokenCtx,
     wallet: &RecipientWallet,
     bytes: Vec<u8>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<Submitted>> {
     if wallet.application == quil_execution::domains::QUIL_TOKEN {
-        return wallet
+        let mut submitted = Submitted::of(&wallet.network, wallet.application, &bytes);
+        let bundle = wallet
             .submit(
                 &mut tc.connect_submit().await?,
                 &tc.submit_key_manager,
                 bytes,
             )
-            .await;
+            .await?;
+        if let Some(submitted) = &mut submitted {
+            submitted.bundle = bundle;
+        }
+        return Ok(submitted);
     }
     submit_paid_operation(tc, wallet, bytes, None, SETTLEMENT_WAIT).await
 }
@@ -3682,8 +3712,9 @@ async fn submit_paid_operation(
     bytes: Vec<u8>,
     payment: Option<(RecipientAddress, u128)>,
     wait: std::time::Duration,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<Submitted>> {
     use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+    let mut submitted = Submitted::of(&wallet.network, wallet.application, &bytes);
     let (domain, request) = wallet.prepare_submission(bytes.clone())?;
     let timestamp = crate::send::now_millis();
     let rest = CanonicalMessageBundle {
@@ -3714,6 +3745,12 @@ async fn submit_paid_operation(
         ],
         timestamp,
     };
+    if let Some(submitted) = &mut submitted {
+        submitted.bundle = bundle_id(&bundle)?;
+        if global_execution {
+            submitted.route = inclusion::Route::Global;
+        }
+    }
     crate::send::send_to_venue(
         &mut tc.connect_submit().await?,
         &tc.submit_key_manager,
@@ -3723,7 +3760,7 @@ async fn submit_paid_operation(
     )
     .await?;
     println!("Submitted with its QUIL settlement claim.");
-    Ok(())
+    Ok(submitted)
 }
 
 /// Build a token's mint-entitlement tree from a file of
@@ -3883,6 +3920,7 @@ pub(super) async fn run_split(
     fee: u128,
     max_pages: usize,
     max_coins: usize,
+    wait: std::time::Duration,
 ) -> anyhow::Result<()> {
     let application = identifier(application)?;
     let coin_address = identifier(coin)?;
@@ -3919,9 +3957,9 @@ pub(super) async fn run_split(
             native_budget(),
         )
         .await?;
-    submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential split submitted. Finalized inclusion is not yet confirmed.");
-    Ok(())
+    let submitted = submit_operation(tc, &wallet, &mut client, bytes).await?;
+    let follow = Follow { wait, max_pages };
+    inclusion::follow(tc, &wallet, "split", submitted, follow).await
 }
 
 /// Merge the named coins (or the largest unspent coins) into one coin owned by
@@ -3934,6 +3972,7 @@ pub(super) async fn run_merge(
     fee: u128,
     max_pages: usize,
     max_coins: usize,
+    wait: std::time::Duration,
 ) -> anyhow::Result<()> {
     let application = identifier(application)?;
     anyhow::ensure!(
@@ -3973,9 +4012,9 @@ pub(super) async fn run_merge(
             native_budget(),
         )
         .await?;
-    submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential merge submitted. Finalized inclusion is not yet confirmed.");
-    Ok(())
+    let submitted = submit_operation(tc, &wallet, &mut client, bytes).await?;
+    let follow = Follow { wait, max_pages };
+    inclusion::follow(tc, &wallet, "merge", submitted, follow).await
 }
 
 /// Fund a escrow for a recipient's escrow address. This wallet's
@@ -3991,6 +4030,7 @@ pub(super) async fn run_pending_create(
     refund_after: Option<u64>,
     max_pages: usize,
     max_coins: usize,
+    wait: std::time::Duration,
 ) -> anyhow::Result<()> {
     use quil_lattice_ct::confidential::pending_claim::EscrowPolicy;
     use quil_types::crypto::Signer;
@@ -4055,9 +4095,10 @@ pub(super) async fn run_pending_create(
             native_budget(),
         )
         .await?;
-    submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential escrow funding submitted; refund authority becomes eligible at global frame {refund_after_global_frame}. Finalized inclusion is not yet confirmed.");
-    Ok(())
+    let submitted = submit_operation(tc, &wallet, &mut client, bytes).await?;
+    println!("Its refund authority becomes eligible at GLOBAL frame {refund_after_global_frame}.");
+    let follow = Follow { wait, max_pages };
+    inclusion::follow(tc, &wallet, "escrow funding", submitted, follow).await
 }
 
 /// The reward, fee and net amount of a reward mint, in QUIL: `verb` is
@@ -4082,6 +4123,7 @@ pub(super) async fn run_mint(
     recipient: Option<&str>,
     fee: u128,
     claim: Option<&std::path::Path>,
+    follow: Follow,
 ) -> anyhow::Result<()> {
     use quil_types::crypto::Signer;
     let application = quil_execution::domains::QUIL_TOKEN;
@@ -4089,12 +4131,25 @@ pub(super) async fn run_mint(
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &application)?);
     let mut client = tc.connect().await?;
+    let deadline = std::time::Instant::now() + follow.wait;
     if let Some(path) = claim {
         let mint_bytes = std::fs::read(path)?;
+        let mint = quil_lattice_ct::confidential::mint::Mint::decode(
+            &mint_bytes,
+            &wallet.network,
+            &wallet.application,
+        )
+        .map_err(|e| anyhow::anyhow!("invalid original mint: {e:?}"))?;
+        // Before the witness: a claim the node would not build says why, and
+        // what ends the wait, rather than only that it is not ready.
+        inclusion::await_claimable(tc, &mint.statement, path, deadline).await?;
         let bytes = wallet.create_mint_claim(&client, &mint_bytes).await?;
-        submit_operation(tc, &wallet, &mut client, bytes).await?;
-        println!("Confidential mint claim submitted. Finalized inclusion is not yet confirmed.");
-        return Ok(());
+        let submitted = submit_operation(tc, &wallet, &mut client, bytes).await?;
+        let follow = Follow {
+            wait: deadline.saturating_duration_since(std::time::Instant::now()),
+            ..follow
+        };
+        return inclusion::follow(tc, &wallet, "mint claim", submitted, follow).await;
     }
     let signer = falcon_signer(tc)?;
     let (cited_frame, reward_root, reward) = wallet.reward_claim(&client, signer.as_ref()).await?;
@@ -4125,8 +4180,32 @@ pub(super) async fn run_mint(
         .await?;
     let saved = tc.config_dir.join(format!("mint-{cited_frame}.bin"));
     std::fs::write(&saved, &bytes)?;
+    let statement = quil_lattice_ct::confidential::mint::Mint::decode(
+        &bytes,
+        &wallet.network,
+        &wallet.application,
+    )
+    .map_err(|e| anyhow::anyhow!("invalid mint: {e:?}"))?
+    .statement;
     submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential reward mint authorization submitted for global frame {cited_frame}. Once it is finalized, run `token mint --claim {}` to create the coins.", saved.display());
+    println!(
+        "Reward mint authorization submitted to GLOBAL and saved to {}. It cites the reward \
+         root of GLOBAL frame {cited_frame}, which is not its inclusion frame.",
+        saved.display()
+    );
+    let claim = format!("`token mint --claim {}`", saved.display());
+    if follow.wait.is_zero() {
+        println!(
+            "Once GLOBAL includes it, {claim} creates the coins; until then that command says \
+             what it waits for."
+        );
+        return Ok(());
+    }
+    if inclusion::await_claimable(tc, &statement, &saved, deadline).await? {
+        println!("Run {claim} to create the coins.");
+    } else {
+        println!("Once GLOBAL includes it, {claim} creates the coins.");
+    }
     Ok(())
 }
 
@@ -4139,6 +4218,7 @@ pub(super) async fn run_shield(
     source: &str,
     amount: u128,
     fee: u128,
+    follow: Follow,
 ) -> anyhow::Result<()> {
     let application = identifier(application)?;
     let source = identifier(source)?;
@@ -4168,9 +4248,17 @@ pub(super) async fn run_shield(
             native_budget(),
         )
         .await?;
-    submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential shield submitted. Finalized inclusion is not yet confirmed.");
-    Ok(())
+    // Which shard admits it: the one holding its source, as far as this
+    // node's shard list says.
+    let shard = super::legacy::live_shard_paths(&client, &application)
+        .await
+        .ok()
+        .and_then(|shards| super::legacy::deepest_shard(&shards, &source).cloned());
+    let mut submitted = submit_operation(tc, &wallet, &mut client, bytes).await?;
+    if let (Some(submitted), Some(shard)) = (&mut submitted, shard) {
+        submitted.route = inclusion::Route::Shard(shard);
+    }
+    inclusion::follow(tc, &wallet, "shield", submitted, follow).await
 }
 
 /// Groups of at most `max` legacy coins, each group inside one shard of
@@ -4257,6 +4345,7 @@ pub(super) async fn run_shield_all(
     tc: &TokenCtx,
     application: &str,
     max_per_batch: usize,
+    follow: Follow,
 ) -> anyhow::Result<()> {
     use quil_execution::token_intrinsic::cost::Shape;
     use quil_lattice_ct::confidential::shield::MAX_SHIELD_SOURCES;
@@ -4302,6 +4391,8 @@ pub(super) async fn run_shield_all(
         );
     }
     let count = batches.len();
+    let deadline = std::time::Instant::now() + follow.wait;
+    let mut submissions = Vec::new();
     for (index, sources) in batches.into_iter().enumerate() {
         let total = sources
             .iter()
@@ -4334,12 +4425,27 @@ pub(super) async fn run_shield_all(
                 native_budget(),
             )
             .await?;
-        submit_operation(tc, &wallet, &mut client, bytes).await?;
+        let shard = super::legacy::deepest_shard(&shards, &sources[0].address).cloned();
+        let submitted = submit_operation(tc, &wallet, &mut client, bytes).await?;
         record_shielded(tc, &sources)?;
-        println!("Batch {}/{count}: {} legacy coins, {} base units shielded (fee {fee}). Submitted; finalized inclusion is not yet confirmed.",
-            index + 1, sources.len(), total - fee);
+        println!(
+            "Batch {}/{count}: {} legacy coins, {} base units shielded (fee {fee}).",
+            index + 1,
+            sources.len(),
+            total - fee
+        );
+        if let Some(mut submitted) = submitted {
+            if let Some(shard) = shard {
+                submitted.route = inclusion::Route::Shard(shard);
+            }
+            inclusion::announce(tc, "batch shield", &submitted, !follow.wait.is_zero()).await;
+            submissions.push(submitted);
+        }
     }
-    Ok(())
+    if follow.wait.is_zero() || submissions.is_empty() {
+        return Ok(());
+    }
+    inclusion::settle(tc, &wallet, "batch shield", &submissions, follow, deadline).await
 }
 
 /// Explicit CLI submission; a successful RPC response is delivery, not finality.
@@ -4350,6 +4456,7 @@ pub(super) async fn run_claim(
     escrow: &str,
     fee: u128,
     refund: bool,
+    follow: Follow,
 ) -> anyhow::Result<()> {
     use quil_lattice_ct::confidential::{
         memo::{open_escrow_recovery, EscrowRecoveryMemo},
@@ -4420,9 +4527,8 @@ pub(super) async fn run_claim(
             },
         )
         .await?;
-    submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential escrow claim submitted. Finalized inclusion is not yet confirmed.");
-    Ok(())
+    let submitted = submit_operation(tc, &wallet, &mut client, bytes).await?;
+    inclusion::follow(tc, &wallet, "escrow claim", submitted, follow).await
 }
 
 /// Custom-token issuance. The keystore authority must be the token's configured
@@ -4438,6 +4544,7 @@ pub(super) async fn run_custom_mint(
     permissionless: bool,
     paid: Option<(&str, u128, std::time::Duration)>,
     entitlement: Vec<u8>,
+    follow: Follow,
 ) -> anyhow::Result<()> {
     use quil_lattice_ct::confidential::relation::backend::native::NativeBudget;
     let application = identifier(application)?;
@@ -4491,13 +4598,12 @@ pub(super) async fn run_custom_mint(
             &quil_context,
         )
         .map_err(|e| anyhow::anyhow!("payee address: {e:?}"))?;
-        submit_paid_operation(tc, &wallet, bytes, Some((payee, price)), wait).await?;
-        println!("Paid custom-token mint submitted with its claim. Finalized inclusion is not yet confirmed.");
-        return Ok(());
+        let submitted =
+            submit_paid_operation(tc, &wallet, bytes, Some((payee, price)), wait).await?;
+        return inclusion::follow(tc, &wallet, "paid custom-token mint", submitted, follow).await;
     }
-    submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential custom-token mint submitted. Finalized inclusion is not yet confirmed.");
-    Ok(())
+    let submitted = submit_operation(tc, &wallet, &mut client, bytes).await?;
+    inclusion::follow(tc, &wallet, "custom-token mint", submitted, follow).await
 }
 
 #[cfg(test)]

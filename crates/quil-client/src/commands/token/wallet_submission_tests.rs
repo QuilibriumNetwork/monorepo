@@ -136,6 +136,7 @@ async fn wallet_scans_owned_unspent_coins_over_rpc() {
         .encode()
         .unwrap()
         .to_vec();
+    let listed = coins.clone();
     let provider = Arc::new(Pages {
         network,
         application,
@@ -211,7 +212,140 @@ async fn wallet_scans_owned_unspent_coins_over_rpc() {
     provider
         .fail_continuation
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(wallet.scan_unspent(&client, 4, 2).await.unwrap().len(), 2);
+    assert_eq!(
+        wallet
+            .clone()
+            .scan_unspent(&client, 4, 2)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    // An operation's coins are found by content, whoever owns them; one the
+    // node does not list stays missing.
+    #[cfg(feature = "native-proof")]
+    {
+        let missing = create_output(&wallet.context, other.address(), 19)
+            .unwrap()
+            .output;
+        let wanted: Vec<Output> = listed
+            .iter()
+            .rev()
+            .map(|(_, output, _)| output.clone())
+            .chain([missing])
+            .collect();
+        let found = wallet
+            .find_coins(
+                &client,
+                &wanted,
+                4,
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            found,
+            listed
+                .iter()
+                .rev()
+                .map(|(address, _, _)| Some(*address))
+                .chain([None])
+                .collect::<Vec<_>>()
+        );
+        let owned: Vec<bool> = wanted.iter().map(|output| wallet.owns(output)).collect();
+        let expected: Vec<bool> = listed
+            .iter()
+            .rev()
+            .map(|(_, output, _)| other.owns(output))
+            .map(|theirs| !theirs)
+            .chain([false])
+            .collect();
+        assert_eq!(owned, expected);
+        assert_eq!(owned.iter().filter(|own| **own).count(), 3);
+    }
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// A submitted operation's decision is read from the node's GLOBAL state at
+/// the commit's record for it: committed or rejected with its frame, and
+/// absent while undecided.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn the_global_commit_decision_is_read_over_rpc() {
+    use quil_execution::token_intrinsic::global_commit::{
+        decision_address, encode_decision_record, Decision,
+    };
+    use quil_types::store::HypergraphStore;
+    let application = quil_execution::domains::QUIL_TOKEN;
+    let global = quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS;
+    let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+    let txn = store.new_transaction(false).unwrap();
+    let decided = [
+        ([1u8; 32], Decision::Committed { frame: 965_690 }),
+        (
+            [2u8; 32],
+            Decision::Rejected {
+                frame: 965_691,
+                reason: "already consumed".into(),
+            },
+        ),
+    ];
+    for (operation, decision) in &decided {
+        let record = decision_address(&application, operation).unwrap();
+        let mut vertex = global.to_vec();
+        vertex.extend_from_slice(&record);
+        let shard = quil_hypergraph::addressing::shard_key_for_location(
+            &quil_hypergraph::addressing::Location {
+                app_address: global,
+                data_address: record,
+            },
+        );
+        store
+            .save_vertex_underlying(
+                txn.as_ref(),
+                "vertex",
+                "adds",
+                &shard,
+                &vertex,
+                &encode_decision_record(decision).unwrap(),
+            )
+            .unwrap();
+    }
+    let server = quil_rpc::node_service::NodeRpcServer::new().with_hypergraph_store(store);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, serving) = serve_node(listener, server);
+    let client = quil_types::proto::node::node_service_client::NodeServiceClient::new(
+        tonic::transport::Endpoint::from_shared(endpoint)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap(),
+    );
+    for (operation, decision) in &decided {
+        assert_eq!(
+            inclusion::read_decision(&client, &application, operation)
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(decision)
+        );
+    }
+    assert_eq!(
+        inclusion::read_decision(&client, &application, &[3; 32])
+            .await
+            .unwrap(),
+        None,
+        "undecided"
+    );
+    assert_eq!(
+        inclusion::read_decision(&client, &[9; 32], &[1; 32])
+            .await
+            .unwrap(),
+        None,
+        "decisions are per application"
+    );
     stop.send(()).unwrap();
     serving.await.unwrap();
 }
@@ -714,6 +848,7 @@ async fn automatic_quil_fee_is_quoted_by_the_configured_node_and_bounded() {
         submit_identity: Default::default(),
         peer_id_bytes: Vec::new(),
         max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
+        read_flags: Vec::new(),
     };
     // 4096 bytes in a 1 TiB world cost one unit per byte, plus the headroom.
     assert_eq!(

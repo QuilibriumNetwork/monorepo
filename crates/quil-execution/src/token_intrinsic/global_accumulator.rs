@@ -164,23 +164,38 @@ pub(crate) fn read_record(
     let Some(blob) = state.get(&GLOBAL_INTRINSIC_ADDRESS, address, &disc)? else {
         return Ok(None);
     };
+    let Some(fields) = decode_record(&blob, expected_kind, keys)? else {
+        return Ok(None);
+    };
+    fields
+        .into_iter()
+        .map(|field| field.ok_or_else(|| invalid("record missing a field")))
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// The fields `keys` of a record's stored bytes, as a node's vertex read
+/// returns them, after checking its kind; each `None` when the record lacks
+/// it. `None` for an empty (cleared) blob.
+pub(crate) fn decode_record(
+    blob: &[u8],
+    expected_kind: &[u8; 32],
+    keys: &[&[u8]],
+) -> Result<Option<Vec<Option<Vec<u8>>>>> {
     if blob.is_empty() {
         return Ok(None);
     }
     let tree = quil_tries::VectorCommitmentTree {
-        root: quil_tries::deserialize_go_tree(&blob).map_err(|_| invalid("malformed record"))?,
+        root: quil_tries::deserialize_go_tree(blob).map_err(|_| invalid("malformed record"))?,
     };
     if tree.get(&[0xff; 32]) != Some(expected_kind.as_slice()) {
         return Err(invalid("record of another kind at an accumulator address"));
     }
-    keys.iter()
-        .map(|key| {
-            tree.get(key)
-                .map(<[u8]>::to_vec)
-                .ok_or_else(|| invalid("record missing a field"))
-        })
-        .collect::<Result<Vec<_>>>()
-        .map(Some)
+    Ok(Some(
+        keys.iter()
+            .map(|key| tree.get(key).map(<[u8]>::to_vec))
+            .collect(),
+    ))
 }
 
 struct Subtree {
