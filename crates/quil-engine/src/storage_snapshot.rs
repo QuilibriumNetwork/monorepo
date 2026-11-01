@@ -770,12 +770,28 @@ fn encode_member_until(
         if stop() {
             return Err(stopped());
         }
+        let size = captured.leaf_size(prefix)?;
+        // A leaf's data is at least its values (`Captured::leaf_size`), so a
+        // leaf with no labels kept at that many nodes or more is labelled now
+        // at no fewer. When even that many cannot be labelled by the
+        // renewal's grace frame, its seat is given up before the leaf asks
+        // for memory: waiting for it, the leaf would hold its place before
+        // other seats' leaves and make labelling ahead give its memory back,
+        // for nothing (2026-11-01: ten seats' large leaves waited for memory
+        // through the grace each epoch, and none was labelled ahead).
+        let least = data_node_count(u64::try_from(size).unwrap_or(u64::MAX));
+        let may_be_kept = store.is_some_and(|store| {
+            store
+                .find(captured.epoch, member, &leaf_id, |n| n >= least)
+                .is_some()
+        });
+        if !may_be_kept && gives_up_late_leaf(captured, member, &leaf_id, least, LeafCount::Least) {
+            return Err(stopped());
+        }
         // A leaf whose seat's renewal is past its grace leaves the queue for
         // memory, where it would hold its place before other seats' leaves.
         let memory = crate::storage_jobs::reserve_until(
-            encoding_bytes(data_node_count(estimated_leaf_bytes(
-                captured.leaf_size(prefix)?,
-            ))),
+            encoding_bytes(data_node_count(estimated_leaf_bytes(size))),
             stop,
         );
         let Some(mut memory) = memory.filter(|_| !stop()) else {
@@ -791,20 +807,9 @@ fn encode_member_until(
         memory.resize(encoding_bytes(ahead.as_ref().map_or(exact, |kept| kept.n)));
         // A leaf to label now that cannot end by the renewal's grace frame
         // would hold its memory for nothing: its seat renews without it.
-        let frame = global_frame().filter(|_| ahead.is_none());
-        let late = frame.and_then(|frame| misses_grace(captured.epoch, exact, frame));
-        if let (Some(frame), Some(frames_left)) = (frame, late) {
-            if give_up_snapshot(member, &captured.filter, captured.epoch) {
-                warn!(epoch = captured.epoch, filter = %hex::encode(&captured.filter),
-                    leaf = %hex::encode(&leaf_id), nodes = exact,
-                    estimated_minutes = label_estimate(exact).as_secs() / 60, frames_left,
-                    global_frame = frame, scope = "local",
-                    action = "check this node's CPU headroom and how many seats it labels at \
-                              once; the next epoch's snapshot starts again",
-                    "storage snapshot given up: this node would finish a seat's storage proof data \
-                     after the renewal's grace frame, so the seat renews without a storage \
-                     registration and earns no storage share on its shard this epoch");
-            }
+        if ahead.is_none()
+            && gives_up_late_leaf(captured, member, &leaf_id, exact, LeafCount::Exact)
+        {
             return Err(stopped());
         }
         let progress = leaf_started(
@@ -891,6 +896,51 @@ fn encode_member_until(
     replicas.put_snapshot_sources(captured.epoch, &captured.filter, &plan)?;
     replicas.put_leaf_nodes(captured.epoch, &captured.filter, &nodes)?;
     replicas.put_partition(captured.epoch, &captured.filter, &captured.prefixes)
+}
+
+/// How a leaf's nodes were counted for [`gives_up_late_leaf`].
+#[derive(Debug, Clone, Copy)]
+enum LeafCount {
+    /// From its values, before its data is read: the fewest it can take.
+    Least,
+    /// From its data.
+    Exact,
+}
+
+/// Give up `member`'s snapshot of `captured` when labelling its leaf
+/// `leaf_id` of `nodes` nodes now would end past the renewal's grace frame by
+/// its estimate ([`misses_grace`]): true when it is given up, warned once a
+/// seat ([`give_up_snapshot`]). False while this process has seen no GLOBAL
+/// frame.
+fn gives_up_late_leaf(
+    captured: &Captured,
+    member: &[u8],
+    leaf_id: &[u8],
+    nodes: u64,
+    counted: LeafCount,
+) -> bool {
+    let Some(frame) = global_frame() else {
+        return false;
+    };
+    let Some(frames_left) = misses_grace(captured.epoch, nodes, frame) else {
+        return false;
+    };
+    if give_up_snapshot(member, &captured.filter, captured.epoch) {
+        let counted = match counted {
+            LeafCount::Least => "at least, from its values before its data is read",
+            LeafCount::Exact => "from its data",
+        };
+        warn!(epoch = captured.epoch, filter = %hex::encode(&captured.filter),
+            leaf = %hex::encode(leaf_id), nodes, counted,
+            estimated_minutes = label_estimate(nodes).as_secs() / 60, frames_left,
+            global_frame = frame, scope = "local",
+            action = "check this node's CPU headroom and how many seats it labels at \
+                      once; the next epoch's snapshot starts again",
+            "storage snapshot given up: this node would finish a seat's storage proof data \
+             after the renewal's grace frame, so the seat renews without a storage \
+             registration and earns no storage share on its shard this epoch");
+    }
+    true
 }
 
 /// Snapshots this process's members encoded, kept for their seals' bindings
@@ -2959,6 +3009,80 @@ pub(crate) mod tests {
         )
         .expect("a seat whose snapshot was given up does not wait for it");
         assert!(roots[0].entries.is_empty());
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// A seat whose leaf cannot be labelled by the renewal's grace frame even
+    /// at the fewest nodes its values allow is given up before the leaf asks
+    /// for memory, so it neither waits for memory other work holds nor takes
+    /// a place before other seats' leaves; a seat whose leaf could still end
+    /// by then asks for its memory and waits as before (2026-11-01: ten seats'
+    /// large leaves waited for memory through the grace each epoch, and work
+    /// labelled ahead gave its memory back to them).
+    #[test]
+    fn a_seat_certain_to_miss_its_grace_is_given_up_before_it_asks_for_memory() {
+        use std::time::Duration;
+        let crdt = test_crdt();
+        let app = [0x85u8; 32];
+        for d in 0..12u8 {
+            crdt.add_vertex(
+                &Location {
+                    app_address: app,
+                    data_address: address(d.wrapping_mul(3), d),
+                },
+                &vec![d; 64 << 10],
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let epoch = 6;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let snapshot_frame = quil_types::consensus::storage_snapshot_frame(epoch);
+        let grace_frame = snapshot_frame + crate::app_shard_metadata::storage_snapshot_grace();
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let ask = |member: &[u8], lane: &[u8]| {
+            request_member(
+                crdt.clone(),
+                replicas.clone(),
+                member.to_vec(),
+                lane,
+                app.to_vec(),
+                epoch,
+                vec![current_source(&crdt, &app, epoch)],
+            )
+        };
+        // Other work holds all the memory: a leaf that asks for it waits.
+        let held = crate::storage_jobs::reserve(u64::MAX / 4);
+        let (early, late) = ([0x6Bu8; 32], [0x6Cu8; 32]);
+        let (early_lane, late_lane) = (
+            b"test lane: may end".to_vec(),
+            b"test lane: cannot".to_vec(),
+        );
+        // At the snapshot frame the leaf could end by the grace frame.
+        note_global_frame(snapshot_frame);
+        ask(&early, &early_lane);
+        assert!(
+            !crate::storage_jobs::wait_lane_idle(&early_lane, Duration::from_millis(500)),
+            "a leaf that could end by the grace frame asks for its memory and waits for it"
+        );
+        assert!(!snapshot_given_up(&early, &app, epoch));
+        // At the grace frame none can.
+        note_global_frame(grace_frame);
+        ask(&late, &late_lane);
+        assert!(
+            crate::storage_jobs::wait_lane_idle(&late_lane, Duration::from_secs(30)),
+            "a seat certain to miss its grace waited for memory"
+        );
+        assert!(snapshot_given_up(&late, &app, epoch));
+        // The seat asked earlier gets its memory once the other work ends,
+        // reads its leaf, and is given up then, as before.
+        drop(held);
+        assert!(crate::storage_jobs::wait_lane_idle(
+            &early_lane,
+            Duration::from_secs(60)
+        ));
+        assert!(snapshot_given_up(&early, &app, epoch));
+        assert_eq!(replicas.get_partition(epoch, &app).unwrap(), None);
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 
