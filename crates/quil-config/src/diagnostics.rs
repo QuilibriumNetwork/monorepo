@@ -1,6 +1,8 @@
 //! Opt-in diagnostics this node serves to peers its operator names. Every
 //! feature is off by default and serves, when on, only this node itself and
 //! the peers listed by ID; changes take effect on restart.
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Bounds of `diagnostics.healthReport.minIntervalSecs`.
@@ -63,6 +65,15 @@ pub struct HealthReportConfig {
     /// prints it) allowed to ask. This node itself is always allowed.
     #[serde(default, deserialize_with = "crate::deserialize_null_default")]
     pub allowed_peers: Vec<String>,
+    /// When the grant of a listed peer ends, in Unix seconds by peer ID, as
+    /// `qclient node diagnostics allow` writes it. A listed peer without an
+    /// entry has no end.
+    #[serde(
+        default,
+        deserialize_with = "crate::deserialize_null_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub allowed_until: BTreeMap<String, u64>,
     /// Seconds before the same peer is served again (10..=3600).
     #[serde(default = "default_min_interval_secs")]
     pub min_interval_secs: u64,
@@ -73,6 +84,7 @@ impl Default for HealthReportConfig {
         Self {
             enabled: false,
             allowed_peers: Vec::new(),
+            allowed_until: BTreeMap::new(),
             min_interval_secs: default_min_interval_secs(),
         }
     }
@@ -155,6 +167,32 @@ impl DiagnosticsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grant_ends_stay_out_of_a_config_without_any_and_are_known_keys() {
+        for yaml in [
+            "healthReport: {}\n",
+            "healthReport:\n  allowedUntil: null\n",
+        ] {
+            let parsed: DiagnosticsConfig = serde_yaml::from_str(yaml).unwrap();
+            assert!(parsed.health_report.allowed_until.is_empty());
+            let encoded = serde_yaml::to_string(&parsed).unwrap();
+            assert!(!encoded.contains("allowedUntil"), "{encoded}");
+        }
+        let yaml = "healthReport:\n  enabled: true\n  allowedPeers: [QmPeer]\n  allowedUntil:\n    QmPeer: 1800000000\n";
+        let parsed: DiagnosticsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(parsed.health_report.allowed_until["QmPeer"], 1_800_000_000);
+        assert_eq!(
+            serde_yaml::from_str::<DiagnosticsConfig>(&serde_yaml::to_string(&parsed).unwrap())
+                .unwrap(),
+            parsed
+        );
+        let keys = crate::unused_keys(&format!(
+            "diagnostics:\n  {}\n",
+            yaml.replace('\n', "\n  ").trim_end()
+        ));
+        assert!(keys.is_empty(), "{keys:?}");
+    }
 
     #[test]
     fn the_health_report_is_off_with_no_peers_unless_configured() {

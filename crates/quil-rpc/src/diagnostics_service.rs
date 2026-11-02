@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use prost::Message as _;
 use tonic::transport::{Channel, Endpoint};
@@ -471,10 +471,31 @@ pub struct Admission {
     enabled: bool,
     /// Empty while disabled, so every other caller takes the same lookup.
     allowed: HashSet<PeerId>,
+    /// When the grants of allowed peers end; a peer without an entry has no
+    /// end.
+    grant_ends: HashMap<PeerId, Instant>,
     own: PeerId,
     min_interval: Duration,
     served: Mutex<HashMap<PeerId, Instant>>,
     refusals: Mutex<RefusalSummary>,
+}
+
+/// When each grant of `allowed_until` (Unix seconds by peer ID) ends, on the
+/// clock of [`Admission::admit`]: an end already past is `now`. Keys that are
+/// not peer IDs name no allowed peer and are left out.
+fn grant_ends(
+    allowed_until: &BTreeMap<String, u64>,
+    now: Instant,
+    unix_now: u64,
+) -> HashMap<PeerId, Instant> {
+    allowed_until
+        .iter()
+        .filter_map(|(peer, until)| {
+            let peer = PeerId::from_str(peer.trim()).ok()?;
+            let left = Duration::from_secs(until.saturating_sub(unix_now));
+            Some((peer, now.checked_add(left)?))
+        })
+        .collect()
 }
 
 /// The peer IDs of `entries`, and the indices of the entries that are not
@@ -508,9 +529,15 @@ impl Admission {
             *quil_config::HEALTH_REPORT_INTERVAL_SECS.start(),
             *quil_config::HEALTH_REPORT_INTERVAL_SECS.end(),
         );
+        let unix_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let grant_ends = grant_ends(&config.allowed_until, Instant::now(), unix_now);
         if config.enabled {
             info!(
                 health_peers = allowed.len(),
+                peers_with_an_end = grant_ends.len(),
                 min_interval_secs,
                 serves = if allowed.is_empty() {
                     "this node only"
@@ -530,6 +557,7 @@ impl Admission {
             } else {
                 HashSet::new()
             },
+            grant_ends,
             own,
             min_interval: Duration::from_secs(min_interval_secs),
             served: Mutex::default(),
@@ -562,7 +590,8 @@ impl Admission {
         if *caller == self.own {
             return Ok(Requester::Own);
         }
-        if !self.allowed.contains(caller) {
+        let ended = self.grant_ends.get(caller).is_some_and(|end| now >= *end);
+        if ended || !self.allowed.contains(caller) {
             return Err(if self.enabled {
                 Refusal::NotAllowed
             } else {
@@ -726,6 +755,7 @@ mod tests {
             enabled,
             allowed_peers: allowed.iter().map(|peer| peer.to_base58()).collect(),
             min_interval_secs: 60,
+            ..Default::default()
         }
     }
 
@@ -766,6 +796,53 @@ mod tests {
 
     /// No identity, an unlisted peer and a node that has not enabled the
     /// report give the same answer; this node and listed peers are served.
+    #[test]
+    fn a_grant_admits_until_its_end_and_no_later() {
+        const HOUR: u64 = 3_600;
+        let (own, ending, lasting, lapsed) = (peer(), peer(), peer(), peer());
+        let mut granted = config(true, &[ending, lasting, lapsed]);
+        let unix_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        granted.allowed_until = BTreeMap::from([
+            (ending.to_base58(), unix_now + HOUR),
+            (lapsed.to_base58(), unix_now - 1),
+            ("not a peer ID".to_string(), unix_now + HOUR),
+        ]);
+        let admission = Admission::new(&granted, own);
+        let now = Instant::now();
+        let later = now + Duration::from_secs(HOUR + 1);
+        let denied = |caller: &PeerId, at: Instant| {
+            let status = admission.admit(Some(caller), at).unwrap_err();
+            (status.code(), status.message().to_string())
+        };
+        let refused = (tonic::Code::PermissionDenied, DENIED.to_string());
+        assert_eq!(
+            admission.admit(Some(&ending), now).unwrap(),
+            Requester::Peer(ending)
+        );
+        assert_eq!(denied(&ending, later), refused, "past its end");
+        assert_eq!(denied(&lapsed, now), refused, "ended before this start");
+        assert_eq!(
+            admission.admit(Some(&lasting), later).unwrap(),
+            Requester::Peer(lasting),
+            "a listed peer without an end stays served"
+        );
+        assert_eq!(admission.admit(Some(&own), later).unwrap(), Requester::Own);
+        // An end names no peer the list does not name.
+        let (mut unlisted, stranger) = (config(true, &[]), peer());
+        unlisted.allowed_until = BTreeMap::from([(stranger.to_base58(), unix_now + HOUR)]);
+        let admission = Admission::new(&unlisted, own);
+        assert_eq!(
+            admission
+                .admit(Some(&stranger), Instant::now())
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
     #[tokio::test]
     async fn only_this_node_and_listed_peers_are_served_and_refusals_are_alike() {
         let (own, listed, other) = (peer(), peer(), peer());
