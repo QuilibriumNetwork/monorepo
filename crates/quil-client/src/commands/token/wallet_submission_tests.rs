@@ -14,6 +14,11 @@ async fn wallet_scans_owned_unspent_coins_over_rpc() {
         root: Vec<u8>,
         coins: Vec<([u8; 32], Output, u64)>,
         fail_continuation: std::sync::atomic::AtomicBool,
+        /// Continuation reads that fail as a cut transfer does on a node.
+        cut_reads: std::sync::atomic::AtomicUsize,
+        /// A continuation read reports its snapshot expired.
+        expired: std::sync::atomic::AtomicBool,
+        continuations: std::sync::atomic::AtomicUsize,
     }
     impl CoinWitnessProvider for Pages {
         fn coin_page(
@@ -22,8 +27,28 @@ async fn wallet_scans_owned_unspent_coins_over_rpc() {
             snapshot: Option<&[u8; 32]>,
             after: Option<&[u8; 32]>,
         ) -> quil_types::error::Result<Option<CoinPageData>> {
+            use std::sync::atomic::Ordering::SeqCst;
             assert_eq!(domain, &self.application);
             assert!(snapshot.is_none() || snapshot == Some(&[33; 32]));
+            if after.is_some() {
+                self.continuations.fetch_add(1, SeqCst);
+                if self.expired.load(SeqCst) {
+                    return Err(quil_types::error::QuilError::NotFound(
+                        "coin scan snapshot unavailable or expired; restart scan".into(),
+                    ));
+                }
+                if self
+                    .cut_reads
+                    .fetch_update(SeqCst, SeqCst, |left| left.checked_sub(1))
+                    .is_ok()
+                {
+                    return Err(quil_types::error::QuilError::ExecutionUnavailable(
+                        "1 peer declined: 1x Unknown: h2 protocol error: error reading a body \
+                         from connection"
+                            .into(),
+                    ));
+                }
+            }
             if after.is_some()
                 && self
                     .fail_continuation
@@ -142,6 +167,9 @@ async fn wallet_scans_owned_unspent_coins_over_rpc() {
         root,
         coins,
         fail_continuation: std::sync::atomic::AtomicBool::new(false),
+        cut_reads: Default::default(),
+        expired: Default::default(),
+        continuations: Default::default(),
     });
     let store = Arc::new(quil_hypergraph::testing::MemStore::new());
     // A spend is spent once the global commit says so: its consumption record
@@ -211,6 +239,68 @@ async fn wallet_scans_owned_unspent_coins_over_rpc() {
     provider
         .fail_continuation
         .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        wallet
+            .clone()
+            .scan_unspent(&client, 4, 2)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    // neon, Nov 2: one cut page ended a scan minutes in and threw its pages
+    // away. The first cut read only ends the node's gathering of the first
+    // page; each one after fails an asking of page 2. Three askings again are
+    // allowed: the last recovers, with the scan where it was.
+    use std::sync::atomic::Ordering::SeqCst;
+    let allowed = 1 + SCAN_READ_RETRIES;
+    provider.cut_reads.store(allowed, SeqCst);
+    assert_eq!(
+        wallet
+            .clone()
+            .scan_unspent(&client, 4, 2)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "the scan went on from its cursor"
+    );
+    assert_eq!(provider.cut_reads.load(SeqCst), 0);
+    // One more cut and the scan ends, naming the page and how far it got.
+    provider.cut_reads.store(allowed + 1, SeqCst);
+    let stopped = wallet
+        .clone()
+        .scan_unspent(&client, 4, 2)
+        .await
+        .err()
+        .expect("past the bound the scan stops")
+        .to_string();
+    assert!(
+        stopped.starts_with("scan stopped at page 2 after 1 coins in 1 pages: "),
+        "{stopped}"
+    );
+    assert!(
+        stopped.contains("error reading a body from connection"),
+        "{stopped}"
+    );
+    assert_eq!(provider.cut_reads.load(SeqCst), 0);
+    // An expired snapshot takes a new scan: no asking again.
+    provider.expired.store(true, SeqCst);
+    provider.continuations.store(0, SeqCst);
+    let expired = wallet
+        .clone()
+        .scan_unspent(&client, 4, 2)
+        .await
+        .err()
+        .expect("the snapshot is gone")
+        .to_string();
+    assert!(expired.contains("restart scan"), "{expired}");
+    assert_eq!(
+        provider.continuations.load(SeqCst),
+        2,
+        "the node's gathering and one asking, not four"
+    );
+    provider.expired.store(false, SeqCst);
     assert_eq!(wallet.scan_unspent(&client, 4, 2).await.unwrap().len(), 2);
     stop.send(()).unwrap();
     serving.await.unwrap();
