@@ -59,7 +59,7 @@ sysinfo = "0.37.2"
 quil-store = { path = "../quil-store", features = ["test-utils"] }
 tokio = { version = "1", features = ["test-util"] }
 quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }
-quil-execution = { path = "../quil-execution", features = ["testing-stubs"] }
+quil-execution = { path = "../quil-execution", features = ["testing-stubs", "native-proof"] }
 quil-crypto = { path = "../quil-crypto", features = ["vdf-prover"] }
 bs58 = "0.5"
 parking_lot = "0.12"

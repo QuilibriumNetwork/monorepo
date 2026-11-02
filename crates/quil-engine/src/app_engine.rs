@@ -1860,7 +1860,13 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // The leader executes these after finalization like every member;
         // start verifying their proofs now.
         if let Some(exec) = self.execution_engine.as_ref() {
-            prewarm_proof_verdicts(exec, &self.app_address, &canonical_requests);
+            prewarm_proof_verdicts(
+                exec,
+                &self.app_address,
+                &canonical_requests,
+                &self.filter,
+                frame_number,
+            );
         }
         // Deliveries of globally committed outputs this shard owns, each its
         // own bundle, after the
@@ -3804,7 +3810,9 @@ impl AppConsensusEngine {
     /// The caller keeps the frame and retries (`PROOF_VERIFICATION_PENDING`).
     /// A leader carries such an operation only once it verified it, and
     /// members verify in arrival order, so a member waits here only when it
-    /// trails the leader; the queue then verifies what frames wait on first.
+    /// trails the leader; the queue then verifies what frames wait on first,
+    /// ahead of vote-time warm-ups and arrivals, and its background work
+    /// leaves the first node-wide worker slot to frames.
     /// The wait lasts until the verdicts are cached, warning every
     /// [`PROOF_DEFERRAL_OVERRUN`]. `None`: materialize now — every verdict is
     /// cached, the operations left are known to verify within the budget
@@ -3845,6 +3853,10 @@ impl AppConsensusEngine {
                     || proof_prewarm_running(&canon);
             queued_ahead = queued_ahead.max(queue.queued_ahead(&digest).unwrap_or(0));
         }
+        // This frame finalized and asked for its own submissions above
+        // (moving them to the frames' lane): warm-ups of the proposals that
+        // lost this frame or an earlier one are no longer needed.
+        queue.end_warmups(&self.filter, frame_number);
         if unverified.is_empty() && !proof_deferral_known(&self.filter, frame_number) {
             return None;
         }
@@ -12416,9 +12428,6 @@ pub(crate) fn build_requests_root_check(
                 Ok(_) => return Err(("requests root differs from the body", format!("frame {}", header.frame_number))),
                 Err(error) => return Err(("requests root not computable", format!("frame {}: {error}", header.frame_number))),
             }
-            // The body is bound to its root: its proofs are what this frame
-            // will execute if finalized.
-            prewarm_proof_verdicts(&exec, &app_addr, &canonical);
             // (b) Pre-state `state_roots` check. FAIL-CLOSED: a voter
             // must be EXACTLY at N-1 to
             // validate the declared pre-state via the deterministic
@@ -12559,6 +12568,16 @@ pub(crate) fn build_requests_root_check(
                     }
                 }
             }
+            // Every check passed: this member votes for the body, whose
+            // proofs are what this frame executes if finalized. Warm up only
+            // now; a proposal honest members refuse can never finalize.
+            prewarm_proof_verdicts(
+                &exec,
+                &app_addr,
+                &canonical,
+                &filter_for_verify,
+                header.frame_number,
+            );
             Ok(())
         },
     )
@@ -12612,13 +12631,18 @@ static PROOF_PREWARM_THREADS: std::sync::atomic::AtomicUsize =
 /// next frame that relays its spend. Verdicts are deterministic; this changes
 /// only when they are computed. Bounded: at most [`MAX_PROOF_PREWARMS`] threads,
 /// and a body already warming is not warmed again. A body with an operation
-/// not known to verify within the budget goes to the front of the admission
-/// queue ([`crate::admission_verify`]) instead, behind the submissions frames
-/// already wait on.
+/// not known to verify within the budget is queued as a warm-up of `frame`
+/// of `shard` in the admission queue ([`crate::admission_verify`]) instead:
+/// behind the submissions finalized frames wait on, bounded, and dropped
+/// once its time passed or `shard` materialized `frame`, since the proposal
+/// may never finalize (a leader could otherwise queue unbounded work ahead
+/// of every honest frame).
 pub(crate) fn prewarm_proof_verdicts(
     exec: &Arc<quil_execution::ExecutionEngineManager>,
     app_address: &[u8],
     canonical: &[Vec<u8>],
+    shard: &[u8],
+    frame: u64,
 ) {
     let addr = app_address[..app_address.len().min(32)].to_vec();
     let bundles: Vec<Vec<u8>> = canonical
@@ -12629,7 +12653,7 @@ pub(crate) fn prewarm_proof_verdicts(
         .cloned()
         .collect();
     // A bundle with an operation not known to verify within the budget (a
-    // batch shield) goes to the front of the node's one admission queue
+    // batch shield) goes to the node's one admission queue as a warm-up
     // instead: verified beside the queue's own verification, each ran at
     // half speed (devnet, 2026-10-29).
     let budget = exec.token_verification_budget();
@@ -12640,12 +12664,13 @@ pub(crate) fn prewarm_proof_verdicts(
         )
     });
     for bundle in &long {
-        crate::admission_verify::offer_submission(
+        crate::admission_verify::offer_warmup_submission(
             crate::admission_verify::global(),
             exec,
             &addr,
             bundle,
-            true,
+            shard,
+            frame,
         );
     }
     if bundles.is_empty() {
