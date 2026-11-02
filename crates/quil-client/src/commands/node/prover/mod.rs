@@ -53,7 +53,7 @@ pub enum ProverCommand {
     },
     /// Initiate a prover leave for the given shard filters.
     Leave {
-        /// Hex-encoded 32-byte shard filters (default: all-0xFF).
+        /// Hex-encoded 32-byte shard filters; at least one.
         filters: Vec<String>,
     },
     /// Confirm prover shard allocations for the given filters.

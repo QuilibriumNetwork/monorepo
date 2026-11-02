@@ -25,10 +25,16 @@ fn default_filter() -> Vec<u8> {
     vec![0xFFu8; 32]
 }
 
-/// Parse hex filter args, defaulting to a single all-0xFF filter.
-fn parse_filters(args: &[String]) -> anyhow::Result<Vec<Vec<u8>>> {
+/// Parse hex filter args. None is an error: the all-0xFF filter these ops once
+/// sent for an empty list names no seat and nothing expands it to every shard,
+/// so execution dropped the op while the command reported it sent.
+fn parse_filters(op: &str, args: &[String]) -> anyhow::Result<Vec<Vec<u8>>> {
     if args.is_empty() {
-        return Ok(vec![default_filter()]);
+        anyhow::bail!(
+            "prover {op} not sent: name the shard filters, as an empty list reaches no shard; \
+             `qclient node prover status` lists this node's, then run \
+             `qclient node prover {op} <filter>...`"
+        );
     }
     args.iter()
         .map(|a| hex::decode(a).map_err(|e| anyhow::anyhow!("invalid filter hex {a:?}: {e}")))
@@ -108,7 +114,7 @@ fn split_send_error(
 }
 
 pub async fn leave(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()> {
-    let filters = parse_filters(filter_args)?;
+    let filters = parse_filters("leave", filter_args)?;
     let mut client = pc.connect().await?;
     let frame = pc.last_global_head_frame(&mut client).await?;
     send_split(pc, &mut client, "leave", &filters, |chunk| {
@@ -123,7 +129,7 @@ pub async fn leave(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()>
 }
 
 pub async fn confirm(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()> {
-    let filters = parse_filters(filter_args)?;
+    let filters = parse_filters("confirm", filter_args)?;
     let mut client = pc.connect().await?;
     let frame = pc.last_global_head_frame(&mut client).await?;
     send_split(pc, &mut client, "confirm", &filters, |chunk| {
@@ -142,7 +148,7 @@ pub async fn confirm(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<(
 // until the field is retired from the proto.
 #[allow(deprecated)]
 pub async fn reject(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()> {
-    let filters = parse_filters(filter_args)?;
+    let filters = parse_filters("reject", filter_args)?;
     let mut client = pc.connect().await?;
     let frame = pc.last_global_head_frame(&mut client).await?;
     send_split(pc, &mut client, "reject", &filters, |chunk| {
@@ -300,6 +306,30 @@ fn wrap(request: Request) -> MessageRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty list is refused with the fix, for each op that took the dead
+    /// all-0xFF default; named filters parse, all-0xFF included if typed.
+    #[test]
+    fn an_empty_filter_list_is_refused_with_the_fix() {
+        for op in ["leave", "confirm", "reject"] {
+            let refusal = parse_filters(op, &[]).unwrap_err().to_string();
+            assert!(
+                refusal.starts_with(&format!("prover {op} not sent")),
+                "{refusal}"
+            );
+            assert!(refusal.contains("qclient node prover status"), "{refusal}");
+            assert!(
+                refusal.contains(&format!("qclient node prover {op} <filter>")),
+                "{refusal}"
+            );
+        }
+        let typed = ["aabb".to_string(), "ff".repeat(32)];
+        assert_eq!(
+            parse_filters("leave", &typed).unwrap(),
+            vec![vec![0xAA, 0xBB], vec![0xFF; 32]]
+        );
+        assert!(parse_filters("leave", &["zz".to_string()]).is_err());
+    }
 
     /// A partial send names the unsent filters as follow-up arguments, so a
     /// re-run does not resend the published messages; a first failure has
