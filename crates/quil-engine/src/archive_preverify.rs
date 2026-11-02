@@ -255,6 +255,7 @@ impl PrewarmShared {
                     parallelism: None,
                     done: None,
                     pause: Some(pause),
+                    background: false,
                 },
             );
             let mut state = self.lock();
@@ -519,6 +520,7 @@ pub fn preverify_through_within(
                     parallelism: None,
                     done: Some(&done),
                     pause: None,
+                    background: false,
                 },
             );
             if report.rounds == 1 {

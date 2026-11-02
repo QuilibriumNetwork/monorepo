@@ -106,6 +106,8 @@ pub struct WorkerVerifier {
     /// Argument placed before the worker arguments, for an executable that is
     /// the worker only in a mode (a node running itself as its worker).
     worker_mode_arg: Option<&'static str>,
+    /// A background verification (see [`Self::background`]).
+    background: bool,
 }
 
 /// Node-wide admission: one lock file per slot (`<path>` for slot 0, then
@@ -185,7 +187,20 @@ impl WorkerVerifier {
             admission_wait: Duration::ZERO,
             max_resident_bytes: None,
             worker_mode_arg: None,
+            background: false,
         })
+    }
+
+    /// A clone for background verifications (work no finalized frame waits
+    /// on yet). With more than one node-wide slot it never takes the first
+    /// one, which stays for frames and inline verifications in every node
+    /// process: `flock` has no fair queue, so without the reservation the
+    /// background work of other processes could hold every slot while a
+    /// frame waited. With a single slot nothing can be reserved.
+    pub fn background(&self) -> Self {
+        let mut clone = self.clone();
+        clone.background = true;
+        clone
     }
 
     /// Start the executable with `arg` first, selecting its worker mode.
@@ -375,7 +390,7 @@ impl WorkerVerifier {
         let _shared = self
             .shared_admission
             .as_deref()
-            .map(|shared| acquire_shared_until(shared, deadline))
+            .map(|shared| acquire_shared_until(shared, deadline, self.background))
             .transpose()?;
         let bytes = request.encode().map_err(ClientError::Request)?;
         run_worker_capped(
@@ -393,12 +408,14 @@ struct SharedPermit<'a>(&'a std::fs::File);
 
 /// Other node processes hold these locks too, and `flock` has no fair queue;
 /// poll until the caller's admission deadline rather than refusing at once.
+/// A `background` caller leaves the first slot free ([`WorkerVerifier::background`]).
 fn acquire_shared_until(
     shared: &SharedAdmission,
     deadline: Instant,
+    background: bool,
 ) -> Result<SharedPermit<'_>, ClientError> {
     loop {
-        match acquire_shared(shared) {
+        match acquire_shared_for(shared, background) {
             Err(ClientError::Busy) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(25));
             }
@@ -407,12 +424,23 @@ fn acquire_shared_until(
     }
 }
 
+#[cfg(test)]
 fn acquire_shared(shared: &SharedAdmission) -> Result<SharedPermit<'_>, ClientError> {
+    acquire_shared_for(shared, false)
+}
+
+/// Take a free node-wide slot; a `background` caller skips the first one
+/// when there are others.
+fn acquire_shared_for(
+    shared: &SharedAdmission,
+    background: bool,
+) -> Result<SharedPermit<'_>, ClientError> {
+    let reserved = usize::from(background && shared.files.len() > 1);
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
         // Nonblocking: busy is local unavailability, never proof rejection.
-        for file in &shared.files {
+        for file in shared.files.iter().skip(reserved) {
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                 return Ok(SharedPermit(file));
             }
@@ -425,7 +453,7 @@ fn acquire_shared(shared: &SharedAdmission) -> Result<SharedPermit<'_>, ClientEr
     }
     #[cfg(not(unix))]
     {
-        let _ = shared;
+        let _ = (shared, reserved);
         Err(ClientError::Configuration)
     }
 }
@@ -712,6 +740,70 @@ mod tests {
                     && v.as_deref() == Some(std::ffi::OsStr::new("2"))),
             "{envs:?}"
         );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Background verifications of every node process leave the first
+    /// node-wide slot to frames and inline verifications: holding the other
+    /// slots, they find the worker busy while a frame's verification is
+    /// admitted; a released slot admits background work again. With one
+    /// slot nothing is reserved.
+    #[cfg(unix)]
+    #[test]
+    fn background_verifications_leave_the_first_node_wide_slot_free() {
+        let directory =
+            std::env::temp_dir().join(format!("quil-admission-background-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let client = |slots: usize, name: &str| {
+            WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1))
+                .unwrap()
+                .with_concurrency(slots)
+                .unwrap()
+                .with_shared_admission(directory.join(name))
+                .unwrap()
+        };
+        // Three node processes' clients of one node-wide pair of slots.
+        let (one, two, frames) = (client(2, "slots"), client(2, "slots"), client(2, "slots"));
+        let (one, two) = (one.background(), two.background());
+        fn shared(verifier: &WorkerVerifier) -> Result<SharedPermit<'_>, ClientError> {
+            acquire_shared_for(
+                verifier.shared_admission.as_deref().unwrap(),
+                verifier.background,
+            )
+        }
+        let held = shared(&one).unwrap();
+        assert!(std::ptr::eq(
+            held.0,
+            &one.shared_admission.as_ref().unwrap().files[1]
+        ));
+        assert!(
+            matches!(shared(&two), Err(ClientError::Busy)),
+            "background work took the slot left for frames"
+        );
+        let request = WorkerRequest {
+            network: [1; 32],
+            application: [2; 32],
+            limits: CompileLimits {
+                max_inputs: 2,
+                max_outputs: 2,
+                max_depth: 32,
+            },
+            submission_bytes: 0,
+            transaction: &[],
+        };
+        assert!(matches!(two.verify(&request), Err(ClientError::Busy)));
+        // A frame's verification is admitted (and then fails to encode the
+        // empty transaction, after its admission).
+        assert!(matches!(
+            frames.verify(&request),
+            Err(ClientError::Request(_))
+        ));
+        drop(held);
+        assert!(matches!(two.verify(&request), Err(ClientError::Request(_))));
+        // One slot: background work takes it.
+        let single = client(1, "single").background();
+        assert!(shared(&single).is_ok());
+        drop((one, two, frames, single));
         std::fs::remove_dir_all(directory).unwrap();
     }
 

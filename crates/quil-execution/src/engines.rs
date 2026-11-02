@@ -715,6 +715,13 @@ impl TokenExecutionEngine {
         if operations.is_empty() {
             return counts;
         }
+        let background;
+        let worker = if pacing.background {
+            background = worker.background();
+            &background
+        } else {
+            worker
+        };
         let parallelism = pacing
             .parallelism
             .unwrap_or_else(|| worker.concurrency())

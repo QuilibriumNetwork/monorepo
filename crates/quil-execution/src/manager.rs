@@ -130,13 +130,15 @@ pub struct OperationEstimate {
 }
 
 /// How a pre-verification pass runs: at most `parallelism` operations at once
-/// (default: the worker's slots), each finished one counted into `done`, and
-/// none started while `pause` returns true.
+/// (default: the worker's slots), each finished one counted into `done`, none
+/// started while `pause` returns true, and as `background` work (no finalized
+/// frame waits on it) leaving the first node-wide worker slot free.
 #[derive(Default)]
 pub struct PreverifyPacing<'a> {
     pub parallelism: Option<usize>,
     pub done: Option<&'a std::sync::atomic::AtomicUsize>,
     pub pause: Option<&'a (dyn Fn() -> bool + Sync)>,
+    pub background: bool,
 }
 
 impl ExecutionEngineManager {
