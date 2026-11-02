@@ -1576,8 +1576,8 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             origins.retain(|_| *next.next().unwrap_or(&true));
         };
         // Every shard of the application collects every submission but a shield
-        // of another shard, and any one of them may execute it. Once the global commit has decided a
-        // bundle, whichever shard relayed it, it is done: drop it from the
+        // of another shard, and any one of them may execute it. Once the global
+        // commit has decided a bundle, whichever shard relayed it, it is done: drop it from the
         // mempool instead of verifying its proofs again.
         if let Some(manager) = self.execution_engine.as_ref() {
             let global = self
@@ -2833,6 +2833,8 @@ pub struct AppConsensusEngine {
     routing_seen: RoutingClock,
     /// Shields left to the shards holding their sources.
     shields_elsewhere: ShieldsElsewhere,
+    /// Submissions refused because no frame could execute them.
+    malformed_arrivals: MalformedArrivals,
     shard_frame_number: u64,
 
     // Message queues
@@ -3209,6 +3211,7 @@ impl AppConsensusEngine {
             current_rank: 0,
             routing_seen: Default::default(),
             shields_elsewhere: ShieldsElsewhere::default(),
+            malformed_arrivals: MalformedArrivals::default(),
             shard_frame_number: 0,
             _pending_messages: VecDeque::with_capacity(MAX_APP_MESSAGES_PER_RANK),
             proposal_cache: HashMap::new(),
@@ -7257,6 +7260,7 @@ impl AppConsensusEngine {
                     }
                     self.cleanup_frame_store();
                     self.note_gossip_refusals_quiet();
+                    self.report_arrivals_left();
                 }
 
                 // Passive-mode CW retry: keep trying to start simplex until the
@@ -11237,6 +11241,13 @@ impl AppConsensusEngine {
     // Message collection
     // ---------------------------------------------------------------
 
+    /// Log what the bounded arrival lines still hold, if a line is due: nothing
+    /// else would once arrivals stop.
+    fn report_arrivals_left(&mut self) {
+        self.shields_elsewhere.report(&self.filter);
+        self.malformed_arrivals.report(&self.filter);
+    }
+
     /// Add an application message to this shard's mempool for inclusion in
     /// a later frame. Nothing else holds it: a copy the mempool already
     /// holds adds nothing, and one its full rank buffer refuses is dropped,
@@ -11261,6 +11272,16 @@ impl AppConsensusEngine {
             quil_execution::ExecutionEngineManager::shield_source(&data),
         ) {
             self.shields_elsewhere.note(&self.filter, data.len());
+            return;
+        }
+        // Refused here it costs no room and no later proposal's time, on the
+        // shard that would have proposed it too. No frame could execute it.
+        if self
+            .execution_engine
+            .as_ref()
+            .is_some_and(|exec| exec.refused_before_native_work(&self.app_address, &data))
+        {
+            self.malformed_arrivals.note(&self.filter, data.len());
             return;
         }
         let now = std::time::Instant::now();
@@ -13603,6 +13624,50 @@ fn shield_proposed_elsewhere(filter: &[u8], operations: usize, source: Option<[u
         && source.is_some_and(|source| !shard_covers(filter, &source))
 }
 
+/// Submissions this shard refused on arrival since its last line.
+#[derive(Default)]
+struct MalformedArrivals {
+    submissions: u64,
+    bytes: u64,
+    logged: Option<std::time::Instant>,
+}
+
+impl MalformedArrivals {
+    /// Count one of `bytes`; one line when the first arrives and then at most
+    /// one per [`SHIELDS_ELSEWHERE_LOG_EVERY`] while they keep arriving.
+    fn note(&mut self, filter: &[u8], bytes: usize) {
+        self.submissions += 1;
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+        self.report(filter);
+    }
+
+    /// The line for what is counted, if one is due. The engine's cleanup timer
+    /// calls this too, so the last count is logged when arrivals stop.
+    fn report(&mut self, filter: &[u8]) {
+        if self.submissions == 0 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .logged
+            .is_some_and(|at| now.saturating_duration_since(at) < SHIELDS_ELSEWHERE_LOG_EVERY)
+        {
+            return;
+        }
+        self.logged = Some(now);
+        warn!(
+            filter = %hex::encode(filter),
+            submissions = self.submissions,
+            bytes = self.bytes,
+            scope = "a peer or wallet",
+            action = "none here: a wallet seeing this for its own submission has a version or encoding defect",
+            "submissions no frame could execute refused on arrival since the last line"
+        );
+        self.submissions = 0;
+        self.bytes = 0;
+    }
+}
+
 /// How often a worker reports the shields it left to their shards.
 const SHIELDS_ELSEWHERE_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
 
@@ -13620,6 +13685,15 @@ impl ShieldsElsewhere {
     fn note(&mut self, filter: &[u8], bytes: usize) {
         self.shields += 1;
         self.bytes = self.bytes.saturating_add(bytes as u64);
+        self.report(filter);
+    }
+
+    /// The line for what is counted, if one is due. The engine's cleanup timer
+    /// calls this too, so the last count is logged when arrivals stop.
+    fn report(&mut self, filter: &[u8]) {
+        if self.shields == 0 {
+            return;
+        }
         let now = std::time::Instant::now();
         if self
             .logged
@@ -26436,3 +26510,7 @@ mod arrival_tests;
 #[cfg(test)]
 #[path = "app_engine_relay_tests.rs"]
 mod relay_tests;
+
+#[cfg(test)]
+#[path = "app_engine_shield_hold_tests.rs"]
+mod shield_hold_tests;

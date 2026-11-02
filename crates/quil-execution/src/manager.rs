@@ -596,6 +596,59 @@ impl ExecutionEngineManager {
         1
     }
 
+    /// Whether a canonical bundle holds an operation dispatch refuses before
+    /// any native work ([`TokenPolicy::preflight`]: encoding, context,
+    /// dimensions): a pure check of its bytes and this network's limits, run
+    /// first when a frame executes it, so the bundle can never take effect
+    /// and waiting cannot change that. False without a token policy, and for
+    /// operations that do not commit through the global frame, which other
+    /// paths execute.
+    pub fn refused_before_native_work(&self, address: &[u8], bundle_bytes: &[u8]) -> bool {
+        #[cfg(feature = "native-proof")]
+        {
+            use crate::token_intrinsic::{dispatch::is_confidential_type, spend_entries};
+            let Some(Ok(application)) = address.get(..32).map(<[u8; 32]>::try_from) else {
+                return false;
+            };
+            if !self
+                .select_engine(&application)
+                .is_ok_and(|name| name == "token")
+            {
+                return false;
+            }
+            let Ok(bundle) =
+                crate::message_envelope::CanonicalMessageBundle::from_canonical_bytes(bundle_bytes)
+            else {
+                return false;
+            };
+            let policy = match self.engines.read() {
+                Ok(engines) => engines
+                    .get("token")
+                    .and_then(|e| e.as_any())
+                    .and_then(|e| e.downcast_ref::<TokenExecutionEngine>())
+                    .and_then(TokenExecutionEngine::token_verifier)
+                    .map(|(policy, _)| policy),
+                Err(_) => None,
+            };
+            let Some(policy) = policy else {
+                return false;
+            };
+            bundle.requests.iter().flatten().any(|request| {
+                let tp = request.inner_type_prefix;
+                is_confidential_type(tp)
+                    && spend_entries::commits_globally(&application, tp)
+                    && policy
+                        .preflight(&application, &request.inner_bytes, tp)
+                        .is_err()
+            })
+        }
+        #[cfg(not(feature = "native-proof"))]
+        {
+            let _ = (address, bundle_bytes);
+            false
+        }
+    }
+
     /// The legacy coin the first shield of a canonical bundle consumes. Only
     /// the shard holding that coin can verify the shield (its source check
     /// reads the shard's own store), so the bundle is routed there.
@@ -3318,6 +3371,170 @@ mod tests {
     }
 
     #[cfg(feature = "native-proof")]
+    /// What arrival refuses, a frame refuses the same way, for every type the
+    /// gate reads: dispatch's first step is the same pure check, which takes
+    /// no state, clock or frame.
+    #[test]
+    fn what_arrival_refuses_a_frame_refuses_the_same_way() {
+        use crate::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        use crate::token_engine::{
+            TYPE_LATTICE_MINT, TYPE_LATTICE_MINT_CLAIM, TYPE_LATTICE_PENDING,
+            TYPE_LATTICE_PENDING_CLAIM, TYPE_LATTICE_SETTLEMENT, TYPE_LATTICE_SHIELD,
+            TYPE_LATTICE_TRANSACTION,
+        };
+        use crate::token_intrinsic::{dispatch::TokenPolicy, spend_entries};
+        use quil_lattice_ct::confidential::{
+            relation::backend::worker_client::WorkerVerifier,
+            shield::{Shield, ShieldStatement},
+            transfer::{parameter_context, Output, MEMO_BYTES},
+            AmountOpening, CommitmentKey,
+        };
+        use quil_types::execution::{FrameExecutionContext, ShardPath, Venue};
+        let policy = TokenPolicy::for_network(0);
+        let directory = tempfile::tempdir().unwrap();
+        let worker = WorkerVerifier::new(
+            directory.path().join("absent-worker"),
+            1,
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        let manager = build_manager(false)
+            .with_token_worker(policy, worker)
+            .unwrap();
+        let bundle = |requests: &[&[u8]]| {
+            let requests = requests
+                .iter()
+                .map(|inner| {
+                    Some(CanonicalMessageRequest {
+                        inner_type_prefix: u32::from_be_bytes(inner[..4].try_into().unwrap()),
+                        inner_bytes: inner.to_vec(),
+                    })
+                })
+                .collect();
+            CanonicalMessageBundle {
+                requests,
+                timestamp: 1,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let state = crate::hypergraph_state::HypergraphState::new(manager.crdt());
+        let clock = crate::testing::NoopExecutionCrypto::new().clock_store;
+        let context = FrameExecutionContext {
+            frame_number: 7,
+            finalized_global_frame: Some(913),
+            shard: ShardPath::WHOLE,
+            venue: Some(Venue::Application),
+        };
+        // Refused by the check, by a frame's dispatch with the same error, and
+        // on the QUIL token by the whole execution path.
+        let refused = |application: &[u8; 32], operation: &[u8], tp: u32, name: &str| {
+            assert!(spend_entries::commits_globally(application, tp), "{name}");
+            let check = policy
+                .preflight(application, operation, tp)
+                .unwrap_err()
+                .to_string();
+            let frame = policy
+                .dispatch_for_commit(
+                    &state,
+                    context,
+                    clock.as_ref(),
+                    application,
+                    operation,
+                    tp,
+                    None,
+                    None,
+                )
+                .unwrap_err()
+                .to_string();
+            assert_eq!(frame, check, "{name}");
+            if application == &domains::QUIL_TOKEN {
+                let data = bundle(&[operation]);
+                assert!(
+                    manager.refused_before_native_work(application, &data),
+                    "{name}"
+                );
+                assert!(
+                    manager
+                        .process_message_with_context(context, &BigInt::from(0), application, &data)
+                        .is_err(),
+                    "{name}"
+                );
+            }
+        };
+        let quil = domains::QUIL_TOKEN;
+        let custom = [7; 32];
+        let types = [
+            ("transfer", quil, TYPE_LATTICE_TRANSACTION),
+            ("pending", quil, TYPE_LATTICE_PENDING),
+            ("pending claim", quil, TYPE_LATTICE_PENDING_CLAIM),
+            ("shield", quil, TYPE_LATTICE_SHIELD),
+            ("mint claim", quil, TYPE_LATTICE_MINT_CLAIM),
+            ("settlement", quil, TYPE_LATTICE_SETTLEMENT),
+            ("custom mint", custom, TYPE_LATTICE_MINT),
+        ];
+        for (name, application, tp) in types {
+            let mut junk = tp.to_be_bytes().to_vec();
+            refused(&application, &junk, tp, name);
+            junk.resize(4096, 0x44);
+            refused(&application, &junk, tp, name);
+        }
+        // The QUIL mint executes elsewhere, so the gate does not read it.
+        let mint = TYPE_LATTICE_MINT.to_be_bytes().to_vec();
+        assert!(!spend_entries::commits_globally(&quil, TYPE_LATTICE_MINT));
+        assert!(!manager.refused_before_native_work(&quil, &bundle(&[&mint])));
+        // Every way a shield can fail the check, and one that passes it.
+        let context_bytes = parameter_context(&policy.network, &quil);
+        let key = CommitmentKey::derive(&context_bytes);
+        let opening = AmountOpening::from_seed(&context_bytes, &[2; 32]);
+        let output = Output {
+            commitment: key.commit(10, &opening),
+            owner: [5; IDENTITY_BYTES],
+            memo: [6; MEMO_BYTES],
+        };
+        let mut proof = vec![0; 40];
+        proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
+        let formed = Shield {
+            statement: ShieldStatement {
+                network: policy.network,
+                application: quil,
+                transparent_address: [3; 32],
+                owner_public_key: [4; 57],
+                amount: 12,
+                fee: 2,
+                outputs: vec![output.clone()],
+            },
+            signature: [0; 114],
+            proof,
+        };
+        let good = formed.encode().unwrap();
+        policy.preflight(&quil, &good, TYPE_LATTICE_SHIELD).unwrap();
+        assert!(!manager.refused_before_native_work(&quil, &bundle(&[&good])));
+        let shield = TYPE_LATTICE_SHIELD;
+        refused(&quil, &good[..good.len() - 1], shield, "truncated shield");
+        let mut other = formed.clone();
+        other.statement.network = [9; 32];
+        refused(&quil, &other.encode().unwrap(), shield, "other network");
+        let mut version = good.clone();
+        version[11] ^= 0xff;
+        refused(&quil, &version, shield, "unknown version");
+        let mut wide = formed.clone();
+        wide.statement.outputs = vec![output; policy.limits.max_outputs + 1];
+        refused(&quil, &wide.encode().unwrap(), shield, "too many outputs");
+        // One operation that fails it sinks the bundle, in either place.
+        let junk = shield.to_be_bytes().to_vec();
+        let mixed = bundle(&[&junk, &good]);
+        assert!(manager.refused_before_native_work(&quil, &mixed));
+        assert!(manager.refused_before_native_work(&quil, &bundle(&[&good, &junk])));
+        let execute = |data: &[u8]| {
+            manager
+                .process_message_with_context(context, &BigInt::from(0), &quil, data)
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(execute(&mixed), execute(&bundle(&[&junk])));
+    }
+
     #[test]
     fn manager_token_worker_configures_both_venues_and_rejects_missing_engine() {
         use crate::token_intrinsic::{dispatch::TokenPolicy, state::SnapshotLimits};

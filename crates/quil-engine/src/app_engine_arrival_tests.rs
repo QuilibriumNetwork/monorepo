@@ -384,3 +384,66 @@ async fn a_shard_full_of_its_own_shields_collects_again_once_one_executes() {
         "a frame consumed one, and the shard still refuses its shields"
     );
 }
+
+/// The arrival lines are bounded, so what came after the last one must reach
+/// the log when arrivals stop, or a flood's end is lost.
+#[tokio::test]
+async fn the_last_count_of_shields_left_to_other_shards_is_logged_when_they_stop() {
+    let every = SHIELDS_ELSEWHERE_LOG_EVERY;
+    let elsewhere = source_under(&[true], 1);
+    let collector = Arc::new(MessageCollector::new());
+    let mut engine = engine_on(token_shard(&[false]), collector);
+    if !counts_confidential(&shield_bundle(elsewhere, 0, 1 << 10)) {
+        eprintln!("skipped: needs quil-execution's native prover (workspace build)");
+        return;
+    }
+    let logs = crate::outage::test_logs::CapturedLogs::default();
+    let _guard = logs.install();
+    let text = "shields for other shards left uncollected";
+    for n in 0..3 {
+        engine.add_app_message(&shield_bundle(elsewhere, n, 1 << 10));
+    }
+    assert_eq!(logs.lines_with(text).len(), 1, "the first one reports");
+    engine.report_arrivals_left();
+    assert_eq!(
+        logs.lines_with(text).len(),
+        1,
+        "bounded: none before it is due"
+    );
+    engine.shields_elsewhere.logged = std::time::Instant::now().checked_sub(every);
+    engine.report_arrivals_left();
+    let lines = logs.lines_with(text);
+    assert_eq!(lines.len(), 2, "the last count was lost: {lines:?}");
+    assert!(lines[1].contains("shields=2"), "{}", lines[1]);
+    engine.shields_elsewhere.logged = std::time::Instant::now().checked_sub(every);
+    engine.report_arrivals_left();
+    assert_eq!(logs.lines_with(text).len(), 2, "nothing left to report");
+}
+
+#[test]
+fn the_last_count_of_refused_arrivals_is_logged_when_they_stop() {
+    let every = SHIELDS_ELSEWHERE_LOG_EVERY;
+    let logs = crate::outage::test_logs::CapturedLogs::default();
+    let _guard = logs.install();
+    let text = "refused on arrival since the last line";
+    let mut refused = MalformedArrivals::default();
+    for _ in 0..3 {
+        refused.note(b"filter", 10);
+    }
+    assert_eq!(logs.lines_with(text).len(), 1, "the first one reports");
+    refused.report(b"filter");
+    assert_eq!(
+        logs.lines_with(text).len(),
+        1,
+        "bounded: none before it is due"
+    );
+    refused.logged = std::time::Instant::now().checked_sub(every);
+    refused.report(b"filter");
+    let lines = logs.lines_with(text);
+    assert_eq!(lines.len(), 2, "the last count was lost: {lines:?}");
+    assert!(lines[1].contains("submissions=2"), "{}", lines[1]);
+    assert!(lines[1].contains("bytes=20"), "{}", lines[1]);
+    refused.logged = std::time::Instant::now().checked_sub(every);
+    refused.report(b"filter");
+    assert_eq!(logs.lines_with(text).len(), 2, "nothing left to report");
+}
