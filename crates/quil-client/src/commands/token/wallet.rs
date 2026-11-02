@@ -638,7 +638,7 @@ impl RecipientWallet {
         bytes: Vec<u8>,
     ) -> anyhow::Result<()> {
         let (domain, request) = self.prepare_submission(bytes.clone())?;
-        crate::send::send_message_request(client, key_manager, domain, request).await?;
+        crate::send::send_message_request_retrying(client, key_manager, domain, request).await?;
         Ok(())
     }
 
@@ -3247,21 +3247,21 @@ pub(super) async fn quoted_quil_fee_for_cost(
     let policy = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(
         tc.node_config.p2p.network,
     );
-    let quote = tc
-        .connect_submit()
-        .await?
-        .get_token_fee_quote(quil_types::proto::node::GetTokenFeeQuoteRequest {
+    let quote = crate::retry::quote(
+        &tc.connect_submit().await?,
+        quil_types::proto::node::GetTokenFeeQuoteRequest {
             application: quil_execution::domains::QUIL_TOKEN.to_vec(),
             max_payload_bytes: cost,
             global_venue,
-        })
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "fee estimate unavailable from the configured node: {e}; provide an explicit --fee"
-            )
-        })?
-        .into_inner();
+        },
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "fee estimate unavailable from the configured node: {e}; provide an explicit --fee"
+        )
+    })?
+    .into_inner();
     anyhow::ensure!(
         !global_venue || quote.global_execution,
         "global venue fee quote was not priced for global execution"
@@ -3364,8 +3364,13 @@ fn checked_quil_fee_quote(
         .map_err(|_| anyhow::anyhow!("fee exceeds the token amount range"))
 }
 
-/// Refresh an available venue quote after proving. Unavailable venue quotes
-/// leave explicit-fee submission possible; they do not certify affordability.
+/// Refresh an available venue quote after proving. A finished proof is never
+/// thrown away for a quote the node cannot give now: busy (retried first),
+/// unavailable, unsupported, slow or interrupted leave submission possible
+/// with the supplied fee, which the node validates; they do not certify
+/// affordability. The node's refusals of the request (invalid, failed
+/// precondition, internal, unauthenticated) and a quote that shows the fee
+/// moved ([`FeeMoved`]) fail.
 #[cfg(feature = "native-proof")]
 async fn refresh_submission_fee(
     tc: &TokenCtx,
@@ -3383,33 +3388,83 @@ async fn refresh_submission_fee(
         return Ok(());
     }
     let cost = cost::state_growth(bytes)?;
-    let quote = match client
-        .get_token_fee_quote(quil_types::proto::node::GetTokenFeeQuoteRequest {
+    let policy = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(
+        tc.node_config.p2p.network,
+    );
+    refresh_fee_quote(
+        client,
+        &policy.network,
+        application,
+        cost,
+        // Reward mint authorizations execute in the global venue.
+        tp == quil_execution::token_intrinsic::constants::TYPE_LATTICE_MINT,
+        wire::fee(bytes)?,
+    )
+    .await
+}
+
+/// Quote `cost` bytes of growth for `application` and check that `paid`
+/// still covers it.
+#[cfg(feature = "native-proof")]
+async fn refresh_fee_quote(
+    client: &mut quil_types::proto::node::node_service_client::NodeServiceClient<
+        tonic::transport::Channel,
+    >,
+    network: &[u8; 32],
+    application: [u8; 32],
+    cost: u64,
+    global_venue: bool,
+    paid: u128,
+) -> anyhow::Result<()> {
+    let quote = match crate::retry::quote(
+        client,
+        quil_types::proto::node::GetTokenFeeQuoteRequest {
             application: application.to_vec(),
             max_payload_bytes: cost,
-            // Reward mint authorizations execute in the global venue.
-            global_venue: tp == quil_execution::token_intrinsic::constants::TYPE_LATTICE_MINT,
-        })
-        .await
+            global_venue,
+        },
+    )
+    .await
     {
         Ok(response) => response.into_inner(),
-        Err(error)
-            if matches!(
-                error.code(),
-                tonic::Code::Unavailable | tonic::Code::Unimplemented
-            ) =>
-        {
-            super::output::line(
-                "Fee refresh unavailable; submitting the supplied fee for node validation.".into(),
-            );
+        Err(error) if crate::retry::cannot_quote(error.code()) => {
+            super::output::line(format!(
+                "Fee refresh unavailable ({}); submitting the supplied fee for node validation.",
+                error.code()
+            ));
             return Ok(());
         }
         Err(error) => return Err(error.into()),
     };
-    let policy = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(
-        tc.node_config.p2p.network,
-    );
-    check_submission_fee_quote(&quote, &policy.network, cost, wire::fee(bytes)?)
+    check_submission_fee_quote(&quote, network, cost, paid)
+}
+
+/// The fee a finished proof carries no longer covers a fresh quote. Only this
+/// failure is answered by quoting again and proving again.
+#[cfg(feature = "native-proof")]
+#[derive(Debug)]
+struct FeeMoved(String);
+
+#[cfg(feature = "native-proof")]
+impl std::fmt::Display for FeeMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(feature = "native-proof")]
+impl std::error::Error for FeeMoved {}
+
+/// Rebuilds (and re-proofs) a command makes after the fee moved.
+#[cfg(feature = "native-proof")]
+const FEE_REBUILDS: usize = 3;
+
+/// Whether to prove again after `error` on the `attempt`th build: only when an
+/// automatic fee was quoted and a fresh quote shows it moved. A failed or
+/// refused quote never costs a second proof.
+#[cfg(feature = "native-proof")]
+fn fee_moved_rebuild(requested_fee: Option<u128>, attempt: usize, error: &anyhow::Error) -> bool {
+    requested_fee.is_none() && attempt < FEE_REBUILDS && error.is::<FeeMoved>()
 }
 
 #[cfg(feature = "native-proof")]
@@ -3420,8 +3475,11 @@ fn check_submission_fee_quote(
     paid: u128,
 ) -> anyhow::Result<()> {
     let required = checked_quil_fee_quote(quote, network, cost)?;
-    anyhow::ensure!(paid >= required,
-        "fee changed while preparing transaction: supplied {paid}, snapshot requires {required} for {cost} bytes of state growth; rebuild with an adequate --fee");
+    if paid < required {
+        return Err(anyhow::Error::new(FeeMoved(format!(
+            "fee changed while preparing transaction: supplied {paid}, snapshot requires {required} for {cost} bytes of state growth; rebuild with an adequate --fee"
+        ))));
+    }
     Ok(())
 }
 
@@ -3798,7 +3856,6 @@ pub(super) async fn run_transfer(
     let recipient = parse_recipient(recipient, &wallet.context)?;
     let limits = compile_limits();
     let mut client = tc.connect().await?;
-    const FEE_REBUILDS: usize = 3;
     let mut attempt = 0usize;
     let bytes = loop {
         attempt += 1;
@@ -3828,7 +3885,7 @@ pub(super) async fn run_transfer(
             .await?;
         match refresh_submission_fee(tc, &mut client, &bytes).await {
             Ok(()) => break bytes,
-            Err(error) if requested_fee.is_none() && attempt < FEE_REBUILDS => {
+            Err(error) if fee_moved_rebuild(requested_fee, attempt, &error) => {
                 println!("The fee moved while preparing the transfer ({error}); re-quoting and rebuilding.");
             }
             Err(error) => return Err(error),
@@ -3905,7 +3962,6 @@ pub(super) async fn run_pay(
     // larger one is answered with the price the refresh just reported, by
     // re-quoting and rebuilding rather than making the caller retry by hand.
     // An explicit fee is exact by contract and is never re-quoted.
-    const FEE_REBUILDS: usize = 3;
     let (bytes, fee) = {
         let mut attempt = 0usize;
         loop {
@@ -3956,7 +4012,7 @@ pub(super) async fn run_pay(
                 .await?;
             match refresh_submission_fee(tc, &mut client, &bytes).await {
                 Ok(()) => break (bytes, fee),
-                Err(error) if requested_fee.is_none() && attempt < FEE_REBUILDS => {
+                Err(error) if fee_moved_rebuild(requested_fee, attempt, &error) => {
                     println!("The fee moved while proving ({error}); re-quoting and rebuilding.");
                 }
                 Err(error) => return Err(error),
@@ -3970,7 +4026,7 @@ pub(super) async fn run_pay(
     )?;
     wallet
         .submit(
-            &mut tc.connect_submit().await?,
+            &mut crate::retry::connect(|| tc.connect_submit()).await?,
             &tc.submit_key_manager,
             bytes,
         )
@@ -4274,20 +4330,14 @@ pub(super) async fn pay_for_bundle(
     // An application no shard covers (and a deploy's base domain) executes in
     // the global venue; a node that does not quote that venue for the
     // application still quotes global pricing directly.
-    let quote = match tc
-        .connect()
-        .await?
-        .get_token_fee_quote(request(false))
-        .await
-    {
+    let quote = match crate::retry::quote(&tc.connect().await?, request(false)).await {
         Ok(quote) => quote.into_inner(),
-        Err(status) if status.code() == tonic::Code::Unavailable => tc
-            .connect()
-            .await?
-            .get_token_fee_quote(request(true))
-            .await
-            .map_err(|e| anyhow::anyhow!("destination fee quote unavailable: {e}"))?
-            .into_inner(),
+        Err(status) if status.code() == tonic::Code::Unavailable => {
+            crate::retry::quote(&tc.connect().await?, request(true))
+                .await
+                .map_err(|e| anyhow::anyhow!("destination fee quote unavailable: {e}"))?
+                .into_inner()
+        }
         Err(status) => anyhow::bail!("destination fee quote unavailable: {status}"),
     };
     anyhow::ensure!(
@@ -4424,7 +4474,7 @@ async fn submit_refreshed_operation(
     if wallet.application == quil_execution::domains::QUIL_TOKEN {
         return wallet
             .submit(
-                &mut tc.connect_submit().await?,
+                &mut crate::retry::connect(|| tc.connect_submit()).await?,
                 &tc.submit_key_manager,
                 bytes,
             )
@@ -4476,7 +4526,7 @@ async fn submit_paid_operation(
         timestamp,
     };
     crate::send::send_to_venue(
-        &mut tc.connect_submit().await?,
+        &mut crate::retry::connect(|| tc.connect_submit()).await?,
         &tc.submit_key_manager,
         domain,
         global_execution,
@@ -4563,15 +4613,20 @@ pub(super) async fn settlement_claim(
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let deadline = std::time::Instant::now() + wait;
     loop {
-        let response = tc
-            .connect()
-            .await?
-            .get_mint_authorization_witness(
-                quil_types::proto::node::GetMintAuthorizationWitnessRequest {
-                    receipt: receipt.to_vec(),
-                },
-            )
-            .await;
+        // The settlement is paid and the wait has its own deadline, so a
+        // failed connection is as transient here as an unavailable node.
+        let response = match tc.connect().await {
+            Ok(mut client) => {
+                client
+                    .get_mint_authorization_witness(
+                        quil_types::proto::node::GetMintAuthorizationWitnessRequest {
+                            receipt: receipt.to_vec(),
+                        },
+                    )
+                    .await
+            }
+            Err(error) => Err(tonic::Status::unavailable(format!("{error:#}"))),
+        };
         match response {
             Ok(witness) => {
                 let witness = witness.into_inner();
@@ -4622,7 +4677,7 @@ pub(super) async fn settlement_claim(
                     return Ok(claim.encode()?);
                 }
             }
-            Err(status) if matches!(status.code(), tonic::Code::Unavailable) => {}
+            Err(status) if crate::retry::transient(status.code()) => {}
             Err(status) => return Err(anyhow::anyhow!("settlement witness: {status}")),
         }
         anyhow::ensure!(
