@@ -530,7 +530,7 @@ async fn shield_preview(tc: &crate::commands::token::TokenCtx) -> anyhow::Result
     use crate::commands::token::{plan_shield_all, shield_batch_fee};
     // Before any listing or proof: a submission the node would refuse.
     check_identity(tc).await?;
-    let plan = plan_shield_all(tc, &quil_token(), shield::BATCH_COINS).await?;
+    let plan = plan_shield_all(tc, &quil_token(), shield::BATCH_COINS, None).await?;
     anyhow::ensure!(
         !plan.batches.is_empty(),
         "no unshielded legacy coins on a live shard to shield"
@@ -728,7 +728,7 @@ async fn confirmed_plan(
     preview: &shield::Preview,
 ) -> anyhow::Result<crate::commands::token::ShieldAllPlan> {
     use crate::commands::token::plan_shield_all;
-    let plan = plan_shield_all(tc, &quil_token(), shield::BATCH_COINS).await?;
+    let plan = plan_shield_all(tc, &quil_token(), shield::BATCH_COINS, None).await?;
     let (coins, units) = plan.totals()?;
     anyhow::ensure!(
         plan.batches.len() == preview.batches && coins == preview.coins && units == preview.units,
@@ -1425,6 +1425,41 @@ mod shield_action_tests {
         assert_eq!(last["phase"], "outcome");
         assert_eq!(last["outcome"], "failed");
         assert!(last["error"].as_str().unwrap().contains("the plan changed"));
+
+        // `--recipient`, as `token shield-all` passes it: the plan and the
+        // paced run's private log name that address, not this wallet's.
+        let address = tc.another_quil_address();
+        assert_ne!(address, preview.recipient);
+        let plan = crate::commands::token::plan_shield_all(
+            &tc,
+            &quil_token(),
+            shield::BATCH_COINS,
+            Some(&address),
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.recipient(), address);
+        let (notes, _lines) = tokio::sync::mpsc::unbounded_channel();
+        let submitted = crate::commands::token::output::capture(
+            notes,
+            crate::commands::token::execute_shield_all(
+                &tc,
+                plan,
+                PACING,
+                &mut recorder(),
+                None,
+                &mut |_| {},
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(submitted, 0);
+        let written = records();
+        let start = written
+            .iter()
+            .rfind(|r| r["phase"] == "start")
+            .expect("the run logged its start");
+        assert_eq!(start["recipient"], address.as_str());
 
         // Signed as another peer, the confirmation is refused before any
         // listing, as `token shield-all` refuses it.
