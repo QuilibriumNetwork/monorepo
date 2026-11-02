@@ -17,6 +17,12 @@
 //! leaves it installed, and the engine's own installation of a checkpoint
 //! runs after the turn is released. A recovery that handed its turn back
 //! takes at most every other turn while others wait ([`TurnQueue::next`]).
+//! While a replay, a re-anchor or a blocked successor's replay waits,
+//! checkpoint installs hold at most all but one turn: a node activating
+//! several seats at once otherwise fills every turn with installs of up to
+//! [`MAX_TURN_HOLD`] each, and its replays and successors wait for hours. An
+//! install it passes over takes the first turn it may, so installs still
+//! finish, one at a time.
 //! A claim withdrawn while it waits because its worker's engine stopped
 //! leaves its place to the same core's next claim of the same shard, which
 //! queues there rather than behind every claim that arrived meanwhile: an
@@ -165,6 +171,30 @@ struct Priority {
     replay: bool,
 }
 
+impl Priority {
+    /// Turn order past the longest waiter, lowest first: an owed re-anchor
+    /// or a blocked successor's or lagging voter's replay, a replay, a
+    /// blocked successor's or lagging voter's install, an install.
+    fn rank(&self) -> u8 {
+        if self.reanchor.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let first = self.blocked.load(Ordering::Relaxed) || self.lagging.load(Ordering::Relaxed);
+        match (self.replay, first) {
+            (true, true) => 0,
+            (true, false) => 1,
+            (false, true) => 2,
+            (false, false) => 3,
+        }
+    }
+
+    /// Its turn installs a checkpoint and may hold for [`MAX_TURN_HOLD`]: a
+    /// blocked successor's install counts, an owed re-anchor does not.
+    fn installs(&self) -> bool {
+        self.rank() >= 2
+    }
+}
+
 /// A queued worker.
 #[derive(Debug)]
 struct Waiter<T> {
@@ -181,21 +211,14 @@ struct Waiter<T> {
 }
 
 impl<T> Waiter<T> {
-    /// Turn order past the longest waiter, lowest first: an owed re-anchor
-    /// or a blocked successor's or lagging voter's replay, a replay, a
-    /// blocked successor's or lagging voter's install, an install.
+    /// Its [`Priority::rank`], read now.
     fn rank(&self) -> u8 {
-        if self.priority.reanchor.load(Ordering::Relaxed) {
-            return 0;
-        }
-        let first = self.priority.blocked.load(Ordering::Relaxed)
-            || self.priority.lagging.load(Ordering::Relaxed);
-        match (self.priority.replay, first) {
-            (true, true) => 0,
-            (true, false) => 1,
-            (false, true) => 2,
-            (false, false) => 3,
-        }
+        self.priority.rank()
+    }
+
+    /// Its turn would install a checkpoint ([`Priority::installs`]).
+    fn installs(&self) -> bool {
+        self.priority.installs()
     }
 
     /// Its seat departs and it needs more than a gap fill
@@ -209,7 +232,12 @@ impl<T> Waiter<T> {
 /// recovery queued again after handing its turn back keeps its first place.
 #[derive(Debug)]
 struct TurnQueue<T> {
+    /// Turns in all.
+    turns: usize,
     free: usize,
+    /// Turns held by checkpoint installs ([`Priority::installs`], as judged
+    /// when granted).
+    installs: usize,
     next_id: u64,
     next_ticket: u64,
     /// Turns granted in a row past the longest waiter.
@@ -222,7 +250,9 @@ struct TurnQueue<T> {
 impl<T> TurnQueue<T> {
     const fn new(turns: usize) -> Self {
         Self {
+            turns,
             free: turns,
+            installs: 0,
             next_id: 0,
             next_ticket: 0,
             bypassed: 0,
@@ -240,12 +270,21 @@ impl<T> TurnQueue<T> {
         now: Instant,
         grant: T,
     ) -> Result<(), u64> {
-        self.take_or_requeue(priority, core, None, now, grant).1
+        self.take_or_requeue(priority, core, None, now, grant)
+            .1
+            .map(|_install| ())
     }
 
-    /// Take a free turn when nobody waits; otherwise queue `grant`, at the
-    /// place of `ticket` when it has one, and return its id. Also returns
-    /// its ticket: `ticket`, or a new one after every other.
+    /// A turn that installs nothing ended: [`Self::next`]'s waiter.
+    #[cfg(test)]
+    fn pass(&mut self) -> Option<T> {
+        self.next(false).map(|(grant, _install)| grant)
+    }
+
+    /// Take a free turn when nobody waits, and return whether it installs;
+    /// otherwise queue `grant`, at the place of `ticket` when it has one, and
+    /// return its id. Also returns its ticket: `ticket`, or a new one after
+    /// every other.
     fn take_or_requeue(
         &mut self,
         priority: Priority,
@@ -253,7 +292,7 @@ impl<T> TurnQueue<T> {
         ticket: Option<u64>,
         now: Instant,
         grant: T,
-    ) -> (u64, Result<(), u64>) {
+    ) -> (u64, Result<bool, u64>) {
         let resumed = ticket.is_some();
         let ticket = ticket.unwrap_or_else(|| {
             self.next_ticket += 1;
@@ -261,7 +300,9 @@ impl<T> TurnQueue<T> {
         });
         if self.free > 0 && self.waiters.is_empty() {
             self.free -= 1;
-            return (ticket, Ok(()));
+            let install = priority.installs();
+            self.installs += usize::from(install);
+            return (ticket, Ok(install));
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -302,16 +343,36 @@ impl<T> TurnQueue<T> {
     /// it they take at most every other turn and the waiters behind them
     /// the rest. Requeued last instead, a 157,076-leaf install would wait
     /// behind every waiter for each of its about 77 turns.
-    fn next(&mut self) -> Option<T> {
+    ///
+    /// While any other waiter a turn may go to would not install, installs
+    /// hold at most all but one turn: of two turns filled with installs, the
+    /// first to hand back goes to a replay, and eight seats activating at
+    /// once left an operator's replays waiting 20 to 90 minutes with
+    /// installs on about 88% of the turn time. A longest waiter passed over
+    /// this way stays counted, so once no install holds the last turn it may
+    /// take it takes it at once. A queue of one turn reserves nothing: its
+    /// installs would never run.
+    ///
+    /// `ended_install`: the turn that ended was an install's. Returns the
+    /// waiter's grant and whether its turn installs.
+    fn next(&mut self, ended_install: bool) -> Option<(T, bool)> {
+        self.installs = self.installs.saturating_sub(usize::from(ended_install));
         if self.waiters.is_empty() {
             self.free += 1;
             return None;
         }
         let keeps = self.waiters.iter().any(|w| !w.departing());
         let candidate = |w: &Waiter<T>| !(keeps && w.departing());
-        let skip_resumed =
-            self.after_resumed && self.waiters.iter().any(|w| candidate(w) && !w.resumed);
-        let eligible = |w: &Waiter<T>| candidate(w) && !(skip_resumed && w.resumed);
+        let reserve = self.turns >= 2
+            && self.installs + 1 >= self.turns
+            && self.waiters.iter().any(|w| candidate(w) && !w.installs());
+        let open = |w: &Waiter<T>| candidate(w) && !(reserve && w.installs());
+        let skip_resumed = self.after_resumed && self.waiters.iter().any(|w| open(w) && !w.resumed);
+        let eligible = |w: &Waiter<T>| open(w) && !(skip_resumed && w.resumed);
+        let longest = self
+            .waiters
+            .iter()
+            .position(|w| candidate(w) && !(skip_resumed && w.resumed));
         let first = self.waiters.iter().position(eligible).unwrap_or(0);
         let pick = if self.bypassed < PRIORITY_RUN {
             self.waiters
@@ -323,10 +384,16 @@ impl<T> TurnQueue<T> {
         } else {
             first
         };
-        self.bypassed = if pick == first { 0 } else { self.bypassed + 1 };
+        self.bypassed = if Some(pick) == longest {
+            0
+        } else {
+            self.bypassed.saturating_add(1)
+        };
         let waiter = self.waiters.remove(pick)?;
         self.after_resumed = waiter.resumed;
-        Some(waiter.grant)
+        let install = waiter.installs();
+        self.installs += usize::from(install);
+        Some((waiter.grant, install))
     }
 
     /// Withdraw waiter `id`; false when it already got its turn.
@@ -339,7 +406,8 @@ impl<T> TurnQueue<T> {
     }
 
     /// Waiting workers, of them blocked successors, replays and departing
-    /// seats, the longest wait and whose it is.
+    /// seats, the longest wait and whose it is, the turns installs hold and
+    /// the longest wait of a waiter that would not install.
     fn load(&self, now: Instant) -> QueueLoad {
         QueueLoad {
             waiting: self.waiters.len(),
@@ -357,6 +425,14 @@ impl<T> TurnQueue<T> {
                 .max()
                 .unwrap_or_default(),
             front_core: self.waiters.front().map(|w| w.core),
+            install_turns: self.installs,
+            longest_replay_wait: self
+                .waiters
+                .iter()
+                .filter(|w| !w.installs())
+                .map(|w| now.saturating_duration_since(w.since))
+                .max()
+                .unwrap_or_default(),
         }
     }
 }
@@ -371,6 +447,10 @@ struct QueueLoad {
     longest_wait: Duration,
     /// The core of the longest waiter.
     front_core: Option<u32>,
+    /// Turns held by checkpoint installs.
+    install_turns: usize,
+    /// The longest wait of a waiter that would not install.
+    longest_replay_wait: Duration,
 }
 
 /// What a [`Saturation`] change logs.
@@ -517,7 +597,7 @@ struct KeptPlace {
 }
 
 struct State {
-    queue: TurnQueue<oneshot::Sender<()>>,
+    queue: TurnQueue<oneshot::Sender<bool>>,
     saturation: Saturation,
     holders: Vec<Holder>,
     next_holder: u64,
@@ -615,6 +695,8 @@ pub(crate) struct Turn<'a> {
     turns: &'a RecoveryTurns,
     id: u64,
     ticket: u64,
+    /// It counts as an install's turn ([`TurnQueue::installs`]).
+    install: bool,
 }
 
 impl Turn<'_> {
@@ -650,7 +732,7 @@ impl Drop for Turn<'_> {
                     "archive recovery turn held past its limit is released");
             }
         }
-        self.turns.release();
+        self.turns.release(self.install);
     }
 }
 
@@ -660,7 +742,8 @@ impl Drop for Turn<'_> {
 struct Queued<'a> {
     turns: &'a RecoveryTurns,
     id: u64,
-    granted: oneshot::Receiver<()>,
+    /// Answered with whether the granted turn installs.
+    granted: oneshot::Receiver<bool>,
     /// The turn was received and is now held by a [`Turn`].
     taken: bool,
     core: u32,
@@ -687,8 +770,10 @@ impl Drop for Queued<'_> {
             (withdrawn, state.observe(now))
         };
         self.turns.log(logged);
-        if !withdrawn && self.granted.try_recv().is_ok() {
-            self.turns.release();
+        if !withdrawn {
+            if let Ok(install) = self.granted.try_recv() {
+                self.turns.release(install);
+            }
         }
     }
 }
@@ -744,8 +829,8 @@ impl RecoveryTurns {
                 .queue
                 .take_or_requeue(priority, core, place, now, grant)
             {
-                (ticket, Ok(())) => {
-                    let turn = self.hold(&mut state, claim, ticket, now);
+                (ticket, Ok(install)) => {
+                    let turn = self.hold(&mut state, claim, ticket, install, now);
                     drop(state);
                     log_kept_place(core, &filter, kept);
                     return turn;
@@ -770,20 +855,29 @@ impl RecoveryTurns {
         log_kept_place(core, &filter, kept);
         self.log(logged);
         // The sender is dropped only after it granted the turn.
-        while tokio::time::timeout(SATURATION_TICK, &mut queued.granted)
-            .await
-            .is_err()
-        {
-            let logged = self.lock().observe(Instant::now());
-            self.log(logged);
-        }
+        let install = loop {
+            match tokio::time::timeout(SATURATION_TICK, &mut queued.granted).await {
+                Ok(granted) => break granted.unwrap_or_default(),
+                Err(_) => {
+                    let logged = self.lock().observe(Instant::now());
+                    self.log(logged);
+                }
+            }
+        };
         queued.taken = true;
         let mut state = self.lock();
-        self.hold(&mut state, claim, ticket, Instant::now())
+        self.hold(&mut state, claim, ticket, install, Instant::now())
     }
 
     /// Record `claim`'s worker as a holder from `now`.
-    fn hold(&self, state: &mut State, claim: Claim, ticket: u64, now: Instant) -> Turn<'_> {
+    fn hold(
+        &self,
+        state: &mut State,
+        claim: Claim,
+        ticket: u64,
+        install: bool,
+        now: Instant,
+    ) -> Turn<'_> {
         let Claim {
             core,
             filter,
@@ -806,6 +900,7 @@ impl RecoveryTurns {
             turns: self,
             id,
             ticket,
+            install,
         }
     }
 
@@ -817,13 +912,17 @@ impl RecoveryTurns {
         self.lock().keep_place(core, filter, ticket, now, now);
     }
 
-    fn release(&self) {
+    /// A turn ended; `install`: it was an install's. A grant whose waiter
+    /// has gone ends a turn of the class it was granted as.
+    fn release(&self, install: bool) {
         let logged = {
             let mut state = self.lock();
-            while let Some(grant) = state.queue.next() {
-                if grant.send(()).is_ok() {
+            let mut ended = install;
+            while let Some((grant, granted)) = state.queue.next(ended) {
+                if grant.send(granted).is_ok() {
                     break;
                 }
+                ended = granted;
             }
             state.observe(Instant::now())
         };
@@ -848,6 +947,8 @@ impl RecoveryTurns {
                 waiting_workers = load.waiting, blocked_successors_waiting = load.blocked_successors,
                 replays_waiting = load.replays, departing_waiting = load.departing,
                 longest_wait_secs = load.longest_wait.as_secs(),
+                install_turns = load.install_turns,
+                longest_replay_wait_secs = load.longest_replay_wait.as_secs(),
                 longest_waiting_core = %load.front_core.map_or_else(|| "none".to_string(), |core| core.to_string()),
                 permits = self.turns, saturated_secs = duration.as_secs(),
                 holders = %holders.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "),
@@ -856,7 +957,9 @@ impl RecoveryTurns {
                     workers wait their turn, frame replays before checkpoint installs and owed re-anchors, blocked \
                     successor sessions and voting members trailing their committee first, seats whose leave GLOBAL \
                     confirmed after every other unless they fill a gap of at most 32 frames, and no recovery holds a \
-                    turn much past 10 minutes; holders names what the turns do now; with 'archive recovery \
+                    turn much past 10 minutes; with replays waiting, installs hold at most permits-1 turns once one \
+                    hands back, so if install_turns equals permits and longest_replay_wait_secs is past 1200, installs \
+                    are crowding out replays: report it; holders names what the turns do now; with 'archive recovery \
                     failing' warnings check those first, otherwise it ends as the queue drains",
                 "archive recovery turns saturated"),
             Some((SaturationLog::Cleared { duration }, _, _)) => tracing::info!(
@@ -981,7 +1084,7 @@ mod tests {
         assert_eq!(queue.load(now).blocked_successors, 1);
         later.blocked.store(true, Ordering::Relaxed);
         assert_eq!(queue.load(now).blocked_successors, 2);
-        let order: Vec<_> = std::iter::from_fn(|| queue.next()).collect();
+        let order: Vec<_> = std::iter::from_fn(|| queue.pass()).collect();
         assert_eq!(order, ["blocked later", "blocked", "c"]);
         // Once nobody waits, a released turn is free again.
         assert_eq!(queue.free, 1);
@@ -1008,7 +1111,7 @@ mod tests {
                 .take_or_queue(waiter(true, false), 2, now, name)
                 .unwrap_err();
         }
-        let order: Vec<_> = std::iter::from_fn(|| queue.next()).collect();
+        let order: Vec<_> = std::iter::from_fn(|| queue.pass()).collect();
         assert_eq!(order, ["b1", "b2", "regular", "b3", "b4"]);
     }
 
@@ -1035,7 +1138,7 @@ mod tests {
             .take_or_queue(waiter(false, true), 5, now, "replay 2")
             .unwrap_err();
         assert_eq!(queue.load(now).replays, 3);
-        let order: Vec<_> = std::iter::from_fn(|| queue.next()).collect();
+        let order: Vec<_> = std::iter::from_fn(|| queue.pass()).collect();
         assert_eq!(
             order,
             [
@@ -1068,8 +1171,8 @@ mod tests {
         queue
             .take_or_queue(reanchor, 3, now, "re-anchor")
             .unwrap_err();
-        assert_eq!(queue.next(), Some("re-anchor"));
-        assert_eq!(queue.next(), Some("replay"));
+        assert_eq!(queue.pass(), Some("re-anchor"));
+        assert_eq!(queue.pass(), Some("replay"));
     }
 
     /// A recovery that handed its turn back keeps its place at the front,
@@ -1080,16 +1183,16 @@ mod tests {
         let now = Instant::now();
         let mut queue = TurnQueue::new(2);
         let (long1, taken) = queue.take_or_requeue(waiter(false, false), 1, None, now, "long 1");
-        assert_eq!(taken, Ok(()));
+        assert_eq!(taken, Ok(true));
         let (long2, taken) = queue.take_or_requeue(waiter(false, false), 2, None, now, "long 2");
-        assert_eq!(taken, Ok(()));
+        assert_eq!(taken, Ok(true));
         for (core, name) in [(3, "s1"), (4, "s2"), (5, "s3"), (6, "s4")] {
             queue
                 .take_or_queue(waiter(false, false), core, now, name)
                 .unwrap_err();
         }
         // Long 1 hands its turn back, then queues again in its first place.
-        assert_eq!(queue.next(), Some("s1"));
+        assert_eq!(queue.pass(), Some("s1"));
         let (ticket, _) =
             queue.take_or_requeue(waiter(false, false), 1, Some(long1), now, "long 1 again");
         assert_eq!(ticket, long1);
@@ -1098,25 +1201,224 @@ mod tests {
             Some(1),
             "it keeps its place"
         );
-        assert_eq!(queue.next(), Some("long 1 again"));
+        assert_eq!(queue.pass(), Some("long 1 again"));
         queue
             .take_or_requeue(waiter(false, false), 2, Some(long2), now, "long 2 again")
             .1
             .unwrap_err();
         assert_eq!(
-            queue.next(),
+            queue.pass(),
             Some("s2"),
             "after a resumed recovery's turn another waiter's"
         );
-        assert_eq!(queue.next(), Some("long 2 again"));
+        assert_eq!(queue.pass(), Some("long 2 again"));
         queue
             .take_or_requeue(waiter(false, false), 1, Some(long1), now, "long 1 third")
             .1
             .unwrap_err();
-        assert_eq!(queue.next(), Some("s3"));
-        assert_eq!(queue.next(), Some("long 1 third"));
-        assert_eq!(queue.next(), Some("s4"));
-        assert_eq!(queue.next(), None);
+        assert_eq!(queue.pass(), Some("s3"));
+        assert_eq!(queue.pass(), Some("long 1 third"));
+        assert_eq!(queue.pass(), Some("s4"));
+        assert_eq!(queue.pass(), None);
+    }
+
+    /// With a replay waiting, installs hold at most all but one turn once
+    /// one hands back; the longest waiter, an install passed over meanwhile,
+    /// takes the next install turn the moment one frees.
+    #[test]
+    fn installs_leave_a_turn_to_waiting_replays() {
+        let now = Instant::now();
+        let mut queue = TurnQueue::new(2);
+        for (core, name) in [(1, "i1"), (2, "i2")] {
+            assert_eq!(
+                queue
+                    .take_or_requeue(waiter(false, false), core, None, now, name)
+                    .1,
+                Ok(true)
+            );
+        }
+        queue
+            .take_or_queue(waiter(false, false), 3, now, "i3")
+            .unwrap_err();
+        for (core, name) in [(4, "r1"), (5, "r2"), (6, "r3")] {
+            queue
+                .take_or_queue(waiter(false, true), core, now, name)
+                .unwrap_err();
+        }
+        let load = queue.load(now + MINUTE);
+        assert_eq!(
+            (load.install_turns, load.longest_replay_wait),
+            (2, MINUTE),
+            "the warning names both"
+        );
+        assert_eq!(
+            queue.next(true),
+            Some(("r1", false)),
+            "install 1 handed back"
+        );
+        assert_eq!(queue.next(false), Some(("r2", false)));
+        assert_eq!(
+            queue.next(false),
+            Some(("r3", false)),
+            "the longest waiter's run is due, but install 2 holds the only turn installs may"
+        );
+        for (core, name) in [(7, "r4"), (8, "r5")] {
+            queue
+                .take_or_queue(waiter(false, true), core, now, name)
+                .unwrap_err();
+        }
+        assert_eq!(
+            queue.next(true),
+            Some(("i3", true)),
+            "install 2 handed back: the install passed over goes at once"
+        );
+        assert_eq!(queue.next(false), Some(("r4", false)));
+        assert_eq!(queue.next(false), Some(("r5", false)));
+        assert_eq!(queue.installs, 1);
+        assert_eq!(queue.next(true), None);
+        assert_eq!((queue.installs, queue.free), (0, 1));
+    }
+
+    /// Two installs of 4 turns each, with a replay arriving as every turn
+    /// ends: from the first hand-back on, installs never hold both turns
+    /// while a replay waits, and both still finish, one at a time.
+    #[test]
+    fn an_install_still_finishes_while_replays_keep_arriving() {
+        const INSTALL_TURN: Duration = Duration::from_secs(600);
+        const REPLAY_TURN: Duration = Duration::from_secs(40);
+        #[derive(Clone, Copy)]
+        enum Held {
+            /// Which of the two installs.
+            Install(usize),
+            Replay,
+        }
+        let start = Instant::now();
+        let mut queue = TurnQueue::new(2);
+        let mut left = [4u32, 4];
+        let mut tickets = [0u64; 2];
+        let mut ends: Vec<(Instant, Held)> = Vec::new();
+        for at in 0..2 {
+            let (ticket, taken) = queue.take_or_requeue(
+                waiter(false, false),
+                at as u32,
+                None,
+                start,
+                Held::Install(at),
+            );
+            assert_eq!(taken, Ok(true));
+            tickets[at] = ticket;
+            ends.push((start + INSTALL_TURN, Held::Install(at)));
+        }
+        let deadline = start + Duration::from_secs(8 * 700);
+        let mut core = 2;
+        while left != [0, 0] {
+            let soonest = (0..ends.len())
+                .min_by_key(|&at| ends[at].0)
+                .expect("a turn is always held");
+            let (now, ended) = ends.remove(soonest);
+            assert!(now <= deadline, "installs left past the deadline: {left:?}");
+            // A replay arrives, then the turn passes on, then an install
+            // that handed back queues again in its first place.
+            core += 1;
+            queue
+                .take_or_queue(waiter(false, true), core, now, Held::Replay)
+                .unwrap_err();
+            let ended_install = matches!(ended, Held::Install(_));
+            let (granted, _) = queue.next(ended_install).expect("a replay waits");
+            ends.push((
+                now + match granted {
+                    Held::Install(_) => INSTALL_TURN,
+                    Held::Replay => REPLAY_TURN,
+                },
+                granted,
+            ));
+            if let Held::Install(at) = ended {
+                left[at] -= 1;
+                if left[at] > 0 {
+                    queue
+                        .take_or_requeue(
+                            waiter(false, false),
+                            at as u32,
+                            Some(tickets[at]),
+                            now,
+                            Held::Install(at),
+                        )
+                        .1
+                        .unwrap_err();
+                }
+            }
+            assert!(
+                queue.installs < 2 || !queue.waiters.iter().any(|w| !w.installs()),
+                "installs hold both turns while a replay waits at {:?}",
+                now - start
+            );
+        }
+    }
+
+    /// Through the turns themselves: a dropped install's turn goes to a
+    /// replay while the other install holds a turn, and the install waiting
+    /// takes the next one as that install hands back.
+    #[tokio::test]
+    async fn installs_leave_a_turn_to_replays_until_one_hands_back() {
+        async fn next_grant(
+            grants: &mut tokio::sync::mpsc::UnboundedReceiver<&'static str>,
+        ) -> &'static str {
+            tokio::time::timeout(Duration::from_secs(60), grants.recv())
+                .await
+                .expect("a turn was granted")
+                .expect("a waiter is left")
+        }
+        let turns: &'static RecoveryTurns = Box::leak(Box::new(RecoveryTurns::new(2)));
+        let install_1 = turns.acquire(claim(1, false)).await;
+        let install_2 = turns.acquire(claim(2, false)).await;
+        let (granted, mut grants) = tokio::sync::mpsc::unbounded_channel();
+        let mut ends = std::collections::HashMap::new();
+        let mut tasks = Vec::new();
+        let waiters = [
+            ("install 3", claim(3, false)),
+            ("replay 4", replay_claim(4, false)),
+            ("replay 5", replay_claim(5, false)),
+            ("replay 6", replay_claim(6, false)),
+            ("replay 7", replay_claim(7, false)),
+        ];
+        for (name, seat) in waiters {
+            let (end, ended) = oneshot::channel::<()>();
+            ends.insert(name, end);
+            let granted = granted.clone();
+            tasks.push(tokio::spawn(async move {
+                let turn = turns.acquire(seat).await;
+                granted.send(name).unwrap();
+                let _ = ended.await;
+                drop(turn);
+            }));
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(turns.waiting(), 5);
+        drop(install_1);
+        assert_eq!(next_grant(&mut grants).await, "replay 4");
+        ends.remove("replay 4").unwrap().send(()).unwrap();
+        assert_eq!(next_grant(&mut grants).await, "replay 5");
+        ends.remove("replay 5").unwrap().send(()).unwrap();
+        assert_eq!(next_grant(&mut grants).await, "replay 6");
+        drop(install_2);
+        assert_eq!(next_grant(&mut grants).await, "install 3");
+        ends.remove("replay 6").unwrap().send(()).unwrap();
+        assert_eq!(next_grant(&mut grants).await, "replay 7");
+        ends.remove("replay 7").unwrap().send(()).unwrap();
+        ends.remove("install 3").unwrap().send(()).unwrap();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let state = turns.lock();
+        assert_eq!(
+            (
+                state.queue.free,
+                state.queue.installs,
+                state.queue.waiters.len(),
+                state.holders.len()
+            ),
+            (2, 0, 0, 0)
+        );
     }
 
     /// A blocked successor replays further batches in its turn until the
@@ -1155,7 +1457,7 @@ mod tests {
         queue
             .take_or_queue(lagging(), 4, now, "lagging voter")
             .unwrap_err();
-        let order: Vec<_> = std::iter::from_fn(|| queue.next()).collect();
+        let order: Vec<_> = std::iter::from_fn(|| queue.pass()).collect();
         assert_eq!(
             order,
             ["lagging voter", "replay", "install", "blocked install"]
@@ -1170,7 +1472,7 @@ mod tests {
         queue
             .take_or_queue(caught_up, 6, now, "caught up")
             .unwrap_err();
-        let order: Vec<_> = std::iter::from_fn(|| queue.next()).collect();
+        let order: Vec<_> = std::iter::from_fn(|| queue.pass()).collect();
         assert_eq!(order, ["replay 2", "caught up"]);
     }
 
@@ -1186,7 +1488,7 @@ mod tests {
         for (core, name) in [(2, "l1"), (3, "l2"), (4, "l3"), (5, "l4")] {
             queue.take_or_queue(lagging(), core, now, name).unwrap_err();
         }
-        let order: Vec<_> = std::iter::from_fn(|| queue.next()).collect();
+        let order: Vec<_> = std::iter::from_fn(|| queue.pass()).collect();
         assert_eq!(order, ["l1", "l2", "replay", "l3", "l4"]);
     }
 
@@ -1211,15 +1513,15 @@ mod tests {
             .take_or_requeue(lagging(), 2, Some(l2), now, "l2 again")
             .1
             .unwrap_err();
-        assert_eq!(queue.next(), Some("l1 again"));
+        assert_eq!(queue.pass(), Some("l1 again"));
         assert_eq!(
-            queue.next(),
+            queue.pass(),
             Some("s1"),
             "after a resumed recovery's turn another waiter's"
         );
-        assert_eq!(queue.next(), Some("l2 again"));
-        assert_eq!(queue.next(), Some("s2"));
-        assert_eq!(queue.next(), None);
+        assert_eq!(queue.pass(), Some("l2 again"));
+        assert_eq!(queue.pass(), Some("s2"));
+        assert_eq!(queue.pass(), None);
     }
 
     /// A worker whose seat departs waits while any seat the node keeps
@@ -1249,7 +1551,7 @@ mod tests {
             .take_or_queue(waiter(false, true), 6, now, "replay")
             .unwrap_err();
         assert_eq!(queue.load(now).departing, 2);
-        let order: Vec<_> = std::iter::from_fn(|| queue.next()).collect();
+        let order: Vec<_> = std::iter::from_fn(|| queue.pass()).collect();
         assert_eq!(
             order,
             [
@@ -1285,11 +1587,13 @@ mod tests {
                 departing: 0,
                 longest_wait: MINUTE * 2,
                 front_core: Some(2),
+                install_turns: 1,
+                longest_replay_wait: Duration::ZERO,
             }
         );
         assert!(queue.withdraw(id));
         assert!(!queue.withdraw(id));
-        assert_eq!(queue.next(), Some(3));
+        assert_eq!(queue.pass(), Some(3));
     }
 
     /// Saturation warns once a worker waited the threshold, then at most
@@ -1304,6 +1608,8 @@ mod tests {
             departing: 0,
             longest_wait,
             front_core: None,
+            install_turns: 0,
+            longest_replay_wait: Duration::ZERO,
         };
         let mut saturation = Saturation::new();
         assert_eq!(saturation.observe(start, load(1, Duration::ZERO)), None);
@@ -1421,6 +1727,10 @@ mod tests {
         assert_eq!(*ran.lock().unwrap(), ["second"]);
         let state = turns.lock();
         assert_eq!((state.queue.free, state.queue.waiters.len()), (1, 0));
+        assert_eq!(
+            state.queue.installs, 0,
+            "the dropped waiter's install turn ended with it"
+        );
     }
 
     /// A claim withdrawn as its worker's engine stopped leaves its place to
