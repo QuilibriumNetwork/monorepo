@@ -23,6 +23,12 @@ mod native_tests;
 #[path = "wallet_submission_tests.rs"]
 mod submission_tests;
 
+#[cfg(feature = "native-proof")]
+#[path = "wallet_mint_status.rs"]
+mod mint_status;
+#[cfg(feature = "native-proof")]
+pub(super) use mint_status::run_mint_status;
+
 // Shared by mint, shield and transfer preparation as well as native work. A permit
 // stays in the blocking worker when its async caller is cancelled.
 #[cfg(feature = "native-proof")]
@@ -1060,6 +1066,8 @@ impl RecipientWallet {
             super::output::line(mint_amounts_line("Claiming", reward, mint.statement.fee));
         }
         let receipt = receipt_address(&mint.statement)?;
+        #[cfg(feature = "native-proof")]
+        mint_status::note_consumed(client, &self.application, &receipt).await;
         let response = client
             .clone()
             .max_decoding_message_size(64 * 1024)

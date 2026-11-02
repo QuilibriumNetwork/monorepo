@@ -412,6 +412,37 @@ pub fn is_decided(
     .is_some())
 }
 
+/// A consumption record's fields: the operation that consumed its marker.
+fn consumed_fields(tx_id: &[u8; 32]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    Ok(vec![kind_field(KIND_CONSUMED)?, (vec![0], tx_id.to_vec())])
+}
+
+/// The blob of a consumption record, exactly as the commit stores it.
+pub fn encode_consumed_record(tx_id: &[u8; 32]) -> Result<Vec<u8>> {
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    for (key, value) in consumed_fields(tx_id)? {
+        tree.insert(&key, &value, &[], &num_bigint::BigInt::from(value.len()))?;
+    }
+    quil_tries::serialize_go_tree(tree.root.as_ref())
+        .map_err(|_| invalid("cannot encode consumption record"))
+}
+
+/// Parse a consumption record blob as a client reads it over RPC: the
+/// operation that consumed the marker.
+pub fn parse_consumed_record(blob: &[u8]) -> Result<[u8; 32]> {
+    let tree = quil_tries::VectorCommitmentTree {
+        root: quil_tries::deserialize_go_tree(blob)
+            .map_err(|_| invalid("malformed consumption record"))?,
+    };
+    if tree.get(&[0xff; 32]) != Some(records::kind(KIND_CONSUMED)?.as_slice()) {
+        return Err(invalid("not a consumption record"));
+    }
+    fixed(
+        tree.get(&[0])
+            .ok_or_else(|| invalid("consumption record names no operation"))?,
+    )
+}
+
 /// Whether `marker` is consumed in `application`.
 pub fn is_consumed(
     state: &HypergraphState,
@@ -1259,7 +1290,7 @@ pub fn commit_entry(
             state,
             frame,
             &consumed_address(application, marker)?,
-            &[kind_field(KIND_CONSUMED)?, (vec![0], entry.tx_id.to_vec())],
+            &consumed_fields(&entry.tx_id)?,
         )?;
     }
     if let Some(claim) = &entry.escrow_claim {
@@ -1403,6 +1434,9 @@ pub fn verify_relay(
         .collect()
 }
 
+/// Operations one `spends committed` line names; it counts the rest.
+const LISTED_COMMITS: usize = 16;
+
 /// Commit every entry a certified header relays, in relay order, returning
 /// the fees of the operations that committed (credited to the relaying
 /// shard's provers). Re-carried entries are already decided and add nothing.
@@ -1432,13 +1466,19 @@ pub fn materialize_relay(
     };
     let mint_fee_paid = frame >= settlement_record::committed_credit_frame();
     let mut fees = 0u128;
-    let (mut committed, mut rejected) = (0usize, 0usize);
+    let (mut committed, mut rejected, mut mint_claims) = (0usize, 0usize, 0usize);
+    let mut listed = Vec::new();
     for (_, entries) in verify_relay(frame, header_frame, relay)? {
         for entry in entries {
             match commit_entry(state, frame, &application, &entry, source_shard)? {
                 Outcome::Committed { fee, .. } => {
-                    if !(mint_fee_paid && entry.kind == TYPE_LATTICE_MINT_CLAIM) {
+                    let mint_claim = entry.kind == TYPE_LATTICE_MINT_CLAIM;
+                    if !(mint_fee_paid && mint_claim) {
                         fees = fees.saturating_add(fee);
+                    }
+                    mint_claims += usize::from(mint_claim);
+                    if listed.len() < LISTED_COMMITS {
+                        listed.push(hex::encode(&entry.tx_id[..8]));
                     }
                     committed += 1;
                 }
@@ -1458,7 +1498,20 @@ pub fn materialize_relay(
         }
     }
     if committed > 0 {
-        tracing::info!(frame, application = %hex::encode(&application[..8]), committed, rejected, fees, "spends committed");
+        // An operation's commit, findable by the first 8 bytes of its id.
+        tracing::info!(
+            frame,
+            application = %hex::encode(&application[..8]),
+            shard = %hex::encode(filter),
+            header_frame,
+            committed,
+            rejected,
+            mint_claims,
+            fees,
+            txs = %listed.join(","),
+            txs_unlisted = committed - listed.len(),
+            "spends committed"
+        );
     }
     Ok(fees)
 }
@@ -2078,6 +2131,105 @@ mod tests {
     /// A committed mint claim's fee was paid with its reward mint: from the
     /// committed-credit frame the relay credits it no second time, while the
     /// claim still commits.
+    #[test]
+    fn a_consumption_record_names_its_operation_from_its_stored_bytes() {
+        let state = mem_state();
+        commit_entry(&state, 100, &APP, &entry(1, &[20], &[]), SHARD).unwrap();
+        let stored = state
+            .get(
+                &crate::global_schema::GLOBAL_INTRINSIC_ADDRESS,
+                &consumed_address(&APP, &[20; 32]).unwrap(),
+                &crate::hypergraph_state::vertex_adds_discriminator().unwrap(),
+            )
+            .unwrap()
+            .expect("the commit wrote the record");
+        assert_eq!(parse_consumed_record(&stored).unwrap(), [1; 32]);
+        assert_eq!(encode_consumed_record(&[1; 32]).unwrap(), stored);
+        parse_consumed_record(&[]).unwrap_err();
+        // Another record is not read as a consumption.
+        let (binding, refund, consumed) = ([3; 32], 50, false);
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        for (key, value) in escrow_fields(&binding, refund, consumed).unwrap() {
+            tree.insert(&key, &value, &[], &num_bigint::BigInt::from(value.len()))
+                .unwrap();
+        }
+        let escrow = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+        parse_consumed_record(&escrow).unwrap_err();
+    }
+
+    /// One line per header with a commit: its shard and header frame, and the
+    /// operations it committed by the first 8 bytes of their ids, up to a bound.
+    #[test]
+    fn a_commit_line_names_the_header_and_its_operations() {
+        use std::sync::{Arc, Mutex};
+        struct Recorder(Arc<Mutex<Vec<String>>>);
+        impl tracing::Subscriber for Recorder {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Fields(String);
+                impl tracing::field::Visit for Fields {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!(" {}={:?}", field.name(), value));
+                    }
+                }
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let commit_line = |relayed: Vec<Vec<u8>>| {
+            let relay =
+                crate::token_intrinsic::spend_relay::encode_relay(&[(40, relayed)]).unwrap();
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            tracing::subscriber::with_default(Recorder(lines.clone()), || {
+                materialize_relay(&mem_state(), 100, &APP, 41, &relay).unwrap();
+            });
+            let lines = lines.lock().unwrap().clone();
+            lines
+                .into_iter()
+                .find(|line| line.contains("spends committed"))
+                .expect("a commit logs its line")
+        };
+        let mut claim = entry(2, &[30], &[]);
+        claim.kind = crate::token_engine::TYPE_LATTICE_MINT_CLAIM;
+        let line = commit_line(vec![
+            entry(1, &[20], &[]).encode().unwrap(),
+            claim.encode().unwrap(),
+        ]);
+        let has = |line: &str, field: &str| line.split(' ').any(|token| token == field);
+        assert!(has(&line, &format!("shard={}", hex::encode(APP))), "{line}");
+        assert!(has(&line, "header_frame=41"), "{line}");
+        assert!(has(&line, "committed=2"), "{line}");
+        assert!(has(&line, "mint_claims=1"), "{line}");
+        assert!(has(&line, "txs_unlisted=0"), "{line}");
+        assert!(
+            has(&line, "txs=0101010101010101,0202020202020202"),
+            "{line}"
+        );
+        // Past the bound the rest are counted, and the line stays one line.
+        let many = (0..LISTED_COMMITS as u8 + 3)
+            .map(|n| entry(100 + n, &[100 + n], &[]).encode().unwrap())
+            .collect();
+        let line = commit_line(many);
+        assert!(has(&line, "txs_unlisted=3"), "{line}");
+        let listed = line.split(" txs=").nth(1).unwrap();
+        let listed = listed.split(' ').next().unwrap();
+        assert_eq!(listed.split(',').count(), LISTED_COMMITS, "{line}");
+    }
+
     #[test]
     fn a_mint_claim_fee_is_credited_once_from_the_activation_frame() {
         use crate::token_intrinsic::settlement_record::set_committed_credit_frame_for_thread;

@@ -584,6 +584,10 @@ pub enum TokenCommand {
         /// Saved authorization bytes from the first stage; builds and submits the claim.
         #[arg(long)]
         claim: Option<PathBuf>,
+        /// Report a saved authorization and submit nothing: whether GLOBAL included
+        /// it, the frame a claim would cite, and whether its claim already committed.
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["recipient", "fee", "claim"])]
+        status: Option<PathBuf>,
     },
 }
 
@@ -608,8 +612,8 @@ impl TokenCommand {
             | TokenCommand::Split { .. }
             | TokenCommand::PendingTransfer { .. }
             | TokenCommand::Accept { .. }
-            | TokenCommand::Reject { .. }
-            | TokenCommand::Mint { .. } => true,
+            | TokenCommand::Reject { .. } => true,
+            TokenCommand::Mint { status, .. } => status.is_none(),
             #[cfg(feature = "native-proof")]
             TokenCommand::Shield { .. }
             | TokenCommand::ShieldAll { .. }
@@ -1103,11 +1107,15 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                 recipient,
                 fee,
                 claim,
+                status,
             } => {
                 anyhow::ensure!(
                     decoded == quil_execution::domains::QUIL_TOKEN,
                     "reward mint requires the QUIL application; use custom-mint for custom tokens"
                 );
+                if let Some(saved) = status {
+                    return wallet::run_mint_status(tc, saved).await;
+                }
                 // Recorded in the private action log, with the operator lines.
                 let mut action = action_log::CliAction::start(&tc.config_dir, &args.command);
                 let result = async {
