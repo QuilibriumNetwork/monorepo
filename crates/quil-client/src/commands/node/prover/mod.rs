@@ -44,9 +44,11 @@ pub enum ProverCommand {
     Shardinfo,
     /// Interactive prover shard management TUI.
     Manage(ManageArgs),
-    /// Joins the prover to the network for the given shard filters.
+    /// Joins the prover to the network for the given shard filters. Refused
+    /// unless a free manual worker waits for each: an auto worker's join is
+    /// decided by score. Switch workers to manual in `prover manage` first.
     Join {
-        /// Hex-encoded 32-byte shard filters (default: all-0xFF).
+        /// Hex-encoded 32-byte shard filters; at least one.
         filters: Vec<String>,
         /// Optional 32-byte hex reward delegate address.
         #[arg(long, default_value = "")]

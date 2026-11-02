@@ -680,6 +680,9 @@ pub struct ProverLifecycle {
     /// Seats the capacity shed spares while their storage renewal is under
     /// way, with the frame it first did (`report_storage_spared`).
     storage_shed_spared: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
+    /// Rejected operator joins already reported, by filter and join frame
+    /// (`report_rejected_joins`).
+    rejected_joins_reported: std::sync::Mutex<std::collections::HashSet<(Vec<u8>, u64)>>,
     /// Capacity leaves the halt-risk shield kept, with the epoch they were
     /// last reported in (`report_capacity_shield`).
     capacity_shield_reported: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
@@ -780,6 +783,7 @@ impl ProverLifecycle {
             storage_skips_warned: std::sync::Mutex::new(HashMap::new()),
             unlanded_leaves_reported: Default::default(),
             storage_shed_spared: std::sync::Mutex::new(HashMap::new()),
+            rejected_joins_reported: Default::default(),
             capacity_shield_reported: std::sync::Mutex::new(HashMap::new()),
             silence_shield_reported: std::sync::Mutex::new(HashMap::new()),
             last_join_attempt: RwLock::new(HashMap::new()),
@@ -1366,6 +1370,47 @@ impl ProverLifecycle {
             "seat renews although its worker has sent no vote for an epoch while the session's other \
              members voted: withholding it would cost the network more. Check this worker: restart it \
              if it stays silent (reported once per seat per epoch)");
+    }
+
+    /// One line per operator join the node rejects: the seat just goes, and
+    /// nothing else tells the operator, who was told it was sent. The planner's
+    /// own joins read their reason in the plan line, and carry a recorded reason
+    /// other than `M`.
+    fn report_rejected_joins(
+        &self,
+        actions: &[LifecycleAction],
+        joining: &[(Vec<u8>, u64)],
+        frame_number: u64,
+    ) {
+        let Ok(mut reported) = self.rejected_joins_reported.lock() else {
+            return;
+        };
+        let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        reported.retain(|(_, jf)| quil_types::consensus::epoch_for_frame(*jf) + 1 >= epoch);
+        for filter in actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::RejectJoins { filters, .. } => Some(filters),
+                _ => None,
+            })
+            .flatten()
+        {
+            let Some((_, join_frame)) = joining.iter().find(|(f, _)| f == filter) else {
+                continue;
+            };
+            let reason = self.allocation_reasons.reason(filter, true, *join_frame);
+            if !reason.as_deref().is_none_or(|r| r == "M")
+                || !reported.insert((filter.clone(), *join_frame))
+            {
+                continue;
+            }
+            info!(frame = frame_number, filter = %hex::encode(filter), join_frame = *join_frame,
+                scope = "local",
+                reason = "it scores well below the best shard, or the node has no worker for it",
+                action = "for a seat regardless of score, switch a free worker to manual \
+                          (qclient node prover manage, Ctrl+O) and send the join again",
+                "lifecycle: rejecting an operator's join; the seat goes");
+        }
     }
 
     /// Report the leaves rejected at `frame_number` because the halt-risk
@@ -4336,6 +4381,7 @@ impl ProverLifecycle {
                             .record(&[filter], joining, frame_number, reason)?;
                     }
                 }
+                self.report_rejected_joins(&actions, &joining_filters, frame_number);
                 self.commit_plan_attempts(&actions, frame_number, forced_rejection);
                 if !draining_cores.is_empty() {
                     self.note_drain_leaves(
@@ -7852,6 +7898,81 @@ mod proposal_loop_tests {
             "shard 0x01 must be joinable again after the reject backoff; proposed={:?}",
             p
         );
+    }
+
+    /// The planner's joins and an operator's, pending and past their window on
+    /// a node with no worker to give them: only the operator's says so, once per
+    /// join however often the plan repeats its rejection, and a later join of
+    /// the same shard speaks again.
+    #[test]
+    fn a_rejected_operator_join_logs_one_line_per_join() {
+        let address = vec![0xCDu8; 32];
+        let (operator, planner) = (filter_bytes(0xB2), filter_bytes(0xB3));
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(allocated_worker(1, filter_bytes(0xA1)));
+        let seats = |frame| {
+            vec![
+                alloc(filter_bytes(0xA1), ProverStatus::Active, 50),
+                alloc(operator.clone(), ProverStatus::Joining, frame),
+                alloc(planner.clone(), ProverStatus::Joining, frame),
+            ]
+        };
+        reg.set_prover(prover(address.clone(), seats(99)));
+        reg.set_summaries(vec![
+            shard_summary(filter_bytes(0xA1), 8),
+            shard_summary(operator.clone(), 8),
+            shard_summary(planner.clone(), 8),
+        ]);
+        let lifecycle = make_lifecycle(
+            address.clone(),
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle
+            .allocation_reasons
+            .record(std::slice::from_ref(&operator), true, 99, "M")
+            .unwrap();
+        lifecycle
+            .allocation_reasons
+            .record(std::slice::from_ref(&planner), true, 99, "$")
+            .unwrap();
+        let line = "lifecycle: rejecting an operator's join";
+        let window = quil_types::consensus::epoch_length_frames();
+        lifecycle.set_prover_root_verified_frame(window);
+        let (actions, logged) = evaluate_logged(&lifecycle, window, reg.as_ref(), wm.as_ref());
+        assert!(count_rejects(&actions) >= 2, "{actions:?}");
+        assert_eq!(logged.matches(line).count(), 1, "{logged}");
+        let at = logged.lines().find(|l| l.contains(line)).unwrap();
+        for text in [
+            " INFO ".to_string(),
+            format!("filter={}", hex::encode(&operator)),
+            "join_frame=99".to_string(),
+            "switch a free worker to manual".to_string(),
+        ] {
+            assert!(at.contains(&text), "{text} in {at}");
+        }
+        assert!(!at.contains(&hex::encode(&planner)), "{at}");
+
+        let next = window + JOIN_COOLDOWN_FRAMES;
+        lifecycle.set_prover_root_verified_frame(next);
+        let (_, logged) = evaluate_logged(&lifecycle, next, reg.as_ref(), wm.as_ref());
+        assert_eq!(logged.matches(line).count(), 0, "{logged}");
+
+        reg.set_prover(prover(address, seats(101)));
+        lifecycle
+            .allocation_reasons
+            .record(std::slice::from_ref(&operator), true, 101, "M")
+            .unwrap();
+        lifecycle
+            .allocation_reasons
+            .record(std::slice::from_ref(&planner), true, 101, "$")
+            .unwrap();
+        let later = next + JOIN_COOLDOWN_FRAMES;
+        lifecycle.set_prover_root_verified_frame(later);
+        let (_, logged) = evaluate_logged(&lifecycle, later, reg.as_ref(), wm.as_ref());
+        assert_eq!(logged.matches(line).count(), 1, "{logged}");
+        assert!(logged.contains("join_frame=101"), "{logged}");
     }
 
     /// The chain refuses a reject of a Joining allocation before the epoch
