@@ -20,6 +20,8 @@ pub(crate) mod action_log;
 pub(crate) mod balance;
 pub(crate) mod legacy;
 pub(crate) mod output;
+#[cfg(feature = "native-proof")]
+pub(crate) mod shield_pacing;
 #[cfg(feature = "confidential-tokens")]
 mod wallet;
 #[cfg(feature = "confidential-tokens")]
@@ -27,7 +29,8 @@ pub(crate) use wallet::saved_mints;
 #[cfg(feature = "native-proof")]
 pub(crate) use wallet::{
     execute_mint, execute_mint_claim, execute_shield_all, mint_claim_witness, plan_mint,
-    plan_shield_all, reward_mint_fee, shield_batch_fee, MintEvent, MintPlan, ShieldEvent,
+    plan_shield_all, reward_mint_fee, shield_batch_fee, MintEvent, MintPlan, ShieldAllPlan,
+    ShieldEvent, ShieldReport,
 };
 
 /// Flags shared by every `token` subcommand (Go `TokenCmd` persistent
@@ -396,11 +399,36 @@ pub enum TokenCommand {
     /// shields are refused ("source owner mismatch"), so this command refuses
     /// to start before the node's GLOBAL head reaches it. Batches themselves
     /// are admitted from frame 864,000. `token legacy` shows the plan.
+    ///
+    /// Batches are paced so a run cannot load GLOBAL faster than archives
+    /// verify the proofs (each batch costs an archive tens of seconds). One
+    /// batch at a time: after submitting, the run waits for the batch's
+    /// coins to stop reading unshielded before proving the next, and stops
+    /// naming the check if that takes longer than `--inclusion-timeout`
+    /// (time GLOBAL is paused does not count; the default, an hour, outlasts
+    /// the shard stalls of up to 30 minutes seen after frames carrying
+    /// batches: a batch commits with its shard's next frame). A submitted
+    /// batch's coins stay out of new runs for two hours. Submissions are at
+    /// least `--min-interval` seconds apart (default 300, at most 12 per
+    /// hour).
+    /// The run pauses while GLOBAL is degraded (head not advancing for 60 s,
+    /// or under 330 frames per hour as the head advanced across the sampled
+    /// window, judged once 10 minutes are sampled) and resumes after 10
+    /// minutes of healthy advance. Each pause, resume, submission and
+    /// inclusion is printed with the projected end.
     #[cfg(feature = "native-proof")]
     ShieldAll {
         /// Legacy coins per batch (1 to 96).
         #[arg(long, default_value_t = 96)]
         max_per_batch: usize,
+        /// Minimum seconds between two submissions. 0 disables the spacing
+        /// (devnets only; it can slow GLOBAL on mainnet).
+        #[arg(long, default_value_t = shield_pacing::DEFAULT_MIN_INTERVAL_SECS)]
+        min_interval: u64,
+        /// Seconds of healthy GLOBAL to wait for a submitted batch to be
+        /// included before stopping the run.
+        #[arg(long, default_value_t = shield_pacing::DEFAULT_INCLUSION_TIMEOUT_SECS)]
+        inclusion_timeout: u64,
     },
     /// Mint a custom token under its deployed policy.
     #[cfg(feature = "native-proof")]
@@ -1105,8 +1133,16 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                     None => result,
                 };
             }
-            TokenCommand::ShieldAll { max_per_batch } => {
-                return wallet::run_shield_all(&tc, &application, *max_per_batch).await
+            TokenCommand::ShieldAll {
+                max_per_batch,
+                min_interval,
+                inclusion_timeout,
+            } => {
+                let pacing = shield_pacing::Pacing {
+                    min_interval: *min_interval,
+                    inclusion_timeout: *inclusion_timeout,
+                };
+                return wallet::run_shield_all(&tc, &application, *max_per_batch, pacing).await;
             }
             TokenCommand::Shield {
                 source,

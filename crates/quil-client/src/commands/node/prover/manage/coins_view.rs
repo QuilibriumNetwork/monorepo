@@ -845,6 +845,12 @@ fn key_rows(m: &Model, width: u16) -> Vec<Line<'static>> {
             Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD),
         ))];
     }
+    if m.coins.shield.stop_pending {
+        return vec![Line::from(Span::styled(
+            "Stop shield: ‹y› stop before the next submission  any other key keeps it running",
+            Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD),
+        ))];
+    }
     if !m.show_key_rows {
         return vec![collapsed_keys_line()];
     }
@@ -867,6 +873,16 @@ fn key_rows(m: &Model, width: u16) -> Vec<Line<'static>> {
         ("S", "shield"),
         ("M", "mint"),
         ("C", "claim"),
+        (
+            "esc",
+            if m.coins.mint.dialog.is_some() {
+                "cancel mint"
+            } else if m.coins.shield.dialog.is_some() {
+                "cancel shield"
+            } else {
+                "stop shield"
+            },
+        ),
         ("n", compact),
         ("c", colors),
         ("v", "notice level"),
@@ -1103,6 +1119,79 @@ mod coins_render_tests {
                 "{width}\n{text}"
             );
         }
+    }
+
+    /// A paced run renders its waits as notices: a held batch while GLOBAL
+    /// is degraded (a warning), the included batches with the projected
+    /// end, and ‹esc›'s stop question as the key row; a render still hides
+    /// the shielded amount without --reveal.
+    #[test]
+    fn a_paced_run_renders_its_waits_and_its_stop_question() {
+        use super::super::super::shield::{self, Progress};
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut m = loaded();
+        m.color_coding = false;
+        m.mask_private = true;
+        m.coins.cursor = 1;
+        shield::request(&mut m);
+        shield::apply_preview(&mut m, Ok(shield::shield_tests::preview()));
+        super::super::super::update::handle_key(&mut m, KeyEvent::from(KeyCode::Char('y')));
+        let end = std::time::SystemTime::now() + Duration::from_secs(1_800);
+        let end = end.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        for progress in [
+            Progress::Proving {
+                index: 1,
+                count: 2,
+                coins: 96,
+            },
+            Progress::Proved { index: 1, count: 2 },
+            Progress::Submitted {
+                index: 1,
+                count: 2,
+                addresses: vec![[1; 32]; 96],
+                shielded: 7_000_000_000_000,
+            },
+            Progress::Included { index: 1, count: 2 },
+            Progress::Projected { end },
+            Progress::Proving {
+                index: 2,
+                count: 2,
+                coins: 4,
+            },
+            Progress::Proved { index: 2, count: 2 },
+            Progress::Paused {
+                reason: "GLOBAL head 2000 has not advanced for 75 s".into(),
+            },
+        ] {
+            shield::apply_progress(&mut m, progress);
+        }
+        for (width, height) in [(80, 40), (160, 40)] {
+            let text = render_text(&mut m, width, height);
+            println!("--- {width}x{height} ---\n{text}");
+            let flat = text
+                .lines()
+                .map(|line| line.trim_matches(|c| c == '│' || c == ' '))
+                .collect::<Vec<_>>()
+                .join(" ");
+            for part in [
+                "Shield batch 2/2: proved and held; paused since ",
+                "GLOBAL head 2000 has not advanced for 75 s; it submits after 10 min of healthy",
+                "Shield: 1 batch of 2 included: 96 coins shielded; projected end ~",
+            ] {
+                assert!(flat.contains(part), "{width}: {part}\n{text}");
+            }
+            assert!(text.contains("shielding 2/2"), "{width}\n{text}");
+            assert!(!text.contains("7000"), "{width}\n{text}");
+        }
+        super::super::super::update::handle_key(&mut m, KeyEvent::from(KeyCode::Esc));
+        let text = render_text(&mut m, 120, 30);
+        println!("--- 120x30 after esc ---\n{text}");
+        assert!(
+            text.contains(
+                "Stop shield: ‹y› stop before the next submission  any other key keeps it running"
+            ),
+            "{text}"
+        );
     }
 
     /// Without --reveal a render hides the confirmation's amount and the
@@ -1558,6 +1647,19 @@ mod coins_render_tests {
 
     /// The confirmation and a run's states as they draw; with
     /// `QCLIENT_RENDER_DIR` set, each frame is also written there.
+    /// While a mint or a shield is prepared, ‹esc› names what it cancels.
+    #[test]
+    fn esc_names_the_preparation_it_cancels() {
+        let mut m = loaded();
+        m.coins.mint.dialog = Some(MintDialog::Preparing(std::time::Instant::now(), false));
+        let text = render_text(&mut m, 200, 40);
+        assert!(text.contains("cancel mint"), "{text}");
+        m.coins.mint.dialog = None;
+        m.coins.shield.dialog = Some(Dialog::Preparing(std::time::Instant::now()));
+        let text = render_text(&mut m, 200, 40);
+        assert!(text.contains("cancel shield"), "{text}");
+    }
+
     #[test]
     fn shield_confirmation_and_progress_draw() {
         use super::super::super::shield::{self, Preview, Progress};
@@ -1686,10 +1788,12 @@ mod coins_render_tests {
             text.contains("Shield: 1 batch of 2 submitted (3 coins); inclusion not yet confirmed."),
             "{text}"
         );
+        // The run failed between batches: no batch was being proved or
+        // held, and one stays submitted.
         assert!(
-            text.contains("Shield batch 2/2 failed")
-                || text.contains("Shield: failed before any batch"),
+            text.contains("Shield: the run stopped after 1 batch of 2 submitted: fee changed"),
             "{text}"
         );
+        assert!(!text.contains("nothing was submitted"), "{text}");
     }
 }

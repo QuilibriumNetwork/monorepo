@@ -562,6 +562,11 @@ mod mint_tests {
         assert!(request_mint(&mut m).is_empty());
         assert!(super::super::shield::request(&mut m).is_empty());
         assert!(super::super::shield::quit_guard(&mut m, &key('q'), true).is_some());
+        assert!(
+            m.status_msg.starts_with("A submission is in progress"),
+            "{}",
+            m.status_msg
+        );
     }
 
     #[test]

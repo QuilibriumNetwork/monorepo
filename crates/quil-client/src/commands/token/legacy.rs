@@ -696,8 +696,15 @@ pub(crate) async fn unshielded(
 /// `<unix seconds> <address hex>` line per coin of each submitted batch.
 pub(crate) const SHIELD_JOURNAL: &str = "legacy-shield-journal.txt";
 
+/// A submitted batch's coins stay out of new runs this long after its
+/// submission (wall time), so a rerun after an inclusion timeout does not
+/// shield them twice: twice `shield_pacing::DEFAULT_INCLUSION_TIMEOUT_SECS`,
+/// which counts only healthy GLOBAL.
+pub(crate) const SUBMITTED_EXCLUSION_SECS: u64 = 7_200;
+
 /// Legacy coins a batch shield from the config directory `dir` submitted
-/// within the last hour: shield-all leaves them for their batch to commit.
+/// within the last two hours ([`SUBMITTED_EXCLUSION_SECS`]): shield-all
+/// leaves them for their batch to commit.
 pub(crate) fn recently_shielded(dir: &Path) -> BTreeSet<[u8; 32]> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -709,7 +716,7 @@ pub(crate) fn recently_shielded(dir: &Path) -> BTreeSet<[u8; 32]> {
             let (at, address) = line.split_once(' ')?;
             let at: u64 = at.parse().ok()?;
             let address: [u8; 32] = hex::decode(address).ok()?.try_into().ok()?;
-            (now.saturating_sub(at) < 3_600).then_some(address)
+            (now.saturating_sub(at) < SUBMITTED_EXCLUSION_SECS).then_some(address)
         })
         .collect()
 }
@@ -740,7 +747,8 @@ pub(crate) struct Snapshot {
     /// `token shield-all`'s batches, in its order; empty without the shard
     /// list or shield commands.
     pub batches: Vec<PlanBatch>,
-    /// Unshielded coins submitted within the hour, left out of the plan.
+    /// Unshielded coins submitted within the last two hours, left out of the
+    /// plan.
     pub pending: usize,
     /// Every listed coin GLOBAL records as shielded, so a submitted batch
     /// shows as included once its coins are.
@@ -980,7 +988,7 @@ async fn global_head(client: &Client) -> Result<u64, String> {
 
 /// Refuse to prove shields that admission would refuse at the node's GLOBAL
 /// head: the proving is wasted, and a refused batch also keeps its coins out
-/// of the next run for an hour. Without a known rule or head, go ahead.
+/// of the next run for two hours. Without a known rule or head, go ahead.
 #[cfg(feature = "native-proof")]
 pub(crate) async fn ensure_shields_active(
     client: &Client,
