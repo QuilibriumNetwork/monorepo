@@ -17,13 +17,13 @@ pub mod router;
 
 use std::sync::Arc;
 
-use pqcrypto_ntruprime::sntrup761;
-use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SecretKey as _, SharedSecret as _};
+use quil_sntrup761 as sntrup761;
+use zeroize::Zeroizing;
 
 /// sntrup761 onion key byte lengths.
-pub const ONION_PUBLIC_KEY_LEN: usize = sntrup761::public_key_bytes();
-pub const ONION_SECRET_KEY_LEN: usize = sntrup761::secret_key_bytes();
-pub const ONION_CIPHERTEXT_LEN: usize = sntrup761::ciphertext_bytes();
+pub const ONION_PUBLIC_KEY_LEN: usize = sntrup761::PUBLIC_KEY_LEN;
+pub const ONION_SECRET_KEY_LEN: usize = sntrup761::SECRET_KEY_LEN;
+pub const ONION_CIPHERTEXT_LEN: usize = sntrup761::CIPHERTEXT_LEN;
 
 /// KEM-encapsulate to a hop's onion public key (post-quantum, replaces X448
 /// ECDH). Returns `(shared_secret, ciphertext)`: the shared secret keys the
@@ -45,9 +45,12 @@ pub fn onion_kem_decapsulate(ciphertext: &[u8], onion_secret_key: &[u8]) -> Opti
 }
 
 /// Generate a fresh sntrup761 onion keypair `(public, secret)`.
-pub fn onion_keypair() -> (Vec<u8>, Vec<u8>) {
+pub fn onion_keypair() -> (Vec<u8>, Zeroizing<Vec<u8>>) {
     let (pk, sk) = sntrup761::keypair();
-    (pk.as_bytes().to_vec(), sk.as_bytes().to_vec())
+    (
+        pk.as_bytes().to_vec(),
+        Zeroizing::new(sk.as_bytes().to_vec()),
+    )
 }
 
 /// Callback invoked for every inbound link-level cell: `(src_peer_id, circ_id,
@@ -287,7 +290,7 @@ mod tests {
     struct FsInit {
         cell: Vec<u8>,
         ss_static: Vec<u8>,
-        eph_sec: Vec<u8>,
+        eph_sec: Zeroizing<Vec<u8>>,
         eph_pub: Vec<u8>,
         ct_static: Vec<u8>,
     }
@@ -332,7 +335,7 @@ mod tests {
     async fn drive_relay_create_handshake_replies_created() {
         let (onion_pk, onion_sk) = onion_keypair();
         let relay = Arc::new(OnionRelay::new());
-        relay.set_onion_secret_key(onion_sk);
+        relay.set_onion_secret_key(onion_sk.to_vec());
 
         let transport = Arc::new(MockTransport::default());
         drive_relay(relay.clone(), transport.clone(), None);
@@ -358,7 +361,7 @@ mod tests {
     async fn drive_relay_delivers_data_at_exit() {
         let (onion_pk, onion_sk) = onion_keypair();
         let relay = Arc::new(OnionRelay::new());
-        relay.set_onion_secret_key(onion_sk);
+        relay.set_onion_secret_key(onion_sk.to_vec());
 
         let delivered = Arc::new(std::sync::Mutex::new(None::<(u32, Vec<u8>)>));
         let d = delivered.clone();
@@ -445,5 +448,30 @@ mod tests {
             "no CREATED without an onion key"
         );
         assert_eq!(relay.active_relays().await, 0);
+    }
+
+    /// A value frozen from the pre-seam backend; see `quil-sntrup761/tests/kat.rs`.
+    fn frozen(name: &str) -> Vec<u8> {
+        const TABLE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../quil-sntrup761/tests/data/continuity.hex"
+        ));
+        let line = TABLE
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+            .unwrap();
+        (0..line.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&line[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// A CREATE cell from another build must reach the same hop secret.
+    #[test]
+    fn frozen_onion_ciphertext_decapsulates() {
+        assert_eq!(
+            onion_kem_decapsulate(&frozen("onion_ciphertext"), &frozen("key_secret")).unwrap(),
+            frozen("onion_shared_secret")
+        );
     }
 }

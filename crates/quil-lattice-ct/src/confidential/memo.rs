@@ -14,8 +14,7 @@ use aes_gcm::{
     aead::{AeadInPlace, KeyInit},
     Aes256Gcm, Nonce, Tag,
 };
-use pqcrypto_ntruprime::sntrup761;
-use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SecretKey as _, SharedSecret as _};
+use quil_sntrup761 as sntrup761;
 use rand::{rngs::OsRng, RngCore};
 use zeroize::Zeroizing;
 
@@ -576,5 +575,42 @@ mod tests {
             open_output(&context, secret.as_bytes(), &recipient, &output),
             Err(MemoError::InconsistentOutput)
         ));
+    }
+
+    /// A value frozen from the pre-seam backend; see `quil-sntrup761/tests/kat.rs`.
+    fn frozen(name: &str) -> Vec<u8> {
+        const TABLE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../quil-sntrup761/tests/data/continuity.hex"
+        ));
+        let line = TABLE
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+            .unwrap();
+        (0..line.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&line[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// A coin memo already on chain must stay readable, or its funds are lost.
+    #[test]
+    fn frozen_memo_opens() {
+        let context = [3; 32];
+        let recipient = RecipientSecret::from_seed(&context, &[9; 32]);
+        let output = Output {
+            commitment: AmountCommitment::from_bytes(&frozen("memo_commitment")).unwrap(),
+            owner: frozen("memo_owner").try_into().unwrap(),
+            memo: frozen("memo_memo").try_into().unwrap(),
+        };
+        let opened = open_output(&context, &frozen("key_secret"), &recipient, &output).unwrap();
+        assert_eq!(opened.amount, 987_654_321);
+        assert_eq!(
+            MembershipKey::derive(&context)
+                .owner_key(&opened.secrets.owner)
+                .identity_bytes()
+                .unwrap(),
+            output.owner
+        );
     }
 }

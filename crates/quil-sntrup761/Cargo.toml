@@ -1,0 +1,19 @@
+[package]
+name = "quil-sntrup761"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "The single seam between the workspace and its sntrup761 KEM backend"
+
+[dependencies]
+pqcrypto-ntruprime = "0.1"
+pqcrypto-traits = "0.3"
+zeroize = "1"
+
+[dev-dependencies]
+aes = "0.8"
+hex = "0.4"
+sha2 = "0.10"
+
+[lints]
+workspace = true

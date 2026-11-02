@@ -398,7 +398,7 @@ mod tests {
     fn spawn_relay(net: &Arc<MemNet>, peer: &[u8]) -> Vec<u8> {
         let (pk, sk) = onion_keypair();
         let relay = Arc::new(OnionRelay::new());
-        relay.set_onion_secret_key(sk);
+        relay.set_onion_secret_key(sk.to_vec());
         drive_relay(relay, net.transport(peer), None);
         pk
     }
@@ -418,7 +418,7 @@ mod tests {
         let (pk_c, sk_c) = onion_keypair();
         {
             let relay_c = Arc::new(OnionRelay::new());
-            relay_c.set_onion_secret_key(sk_c);
+            relay_c.set_onion_secret_key(sk_c.to_vec());
             let got = got.clone();
             let delivered = delivered.clone();
             let on_data: OnData = Arc::new(move |_peer: &[u8], circ, payload| {
@@ -478,7 +478,7 @@ mod tests {
         // relayB is the exit: on request, it sends a reply back up the circuit.
         let (pk_b, sk_b) = onion_keypair();
         let relay_b = Arc::new(OnionRelay::new());
-        relay_b.set_onion_secret_key(sk_b);
+        relay_b.set_onion_secret_key(sk_b.to_vec());
         let tb = net.transport(b"relayB");
         {
             let relay = relay_b.clone();
@@ -541,7 +541,7 @@ mod tests {
         let (pk, sk) = onion_keypair();
         {
             let relay = Arc::new(OnionRelay::new());
-            relay.set_onion_secret_key(sk);
+            relay.set_onion_secret_key(sk.to_vec());
             let got = got.clone();
             let on_data: OnData = Arc::new(move |_peer: &[u8], _circ, payload| {
                 *got.lock().unwrap() = Some(payload);

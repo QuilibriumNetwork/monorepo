@@ -171,8 +171,7 @@ mod tests {
             },
             transfer::{parameter_context, TARGET_TRANSACTION_BYTES},
         };
-        use pqcrypto_ntruprime::sntrup761;
-        use pqcrypto_traits::kem::{PublicKey as _, SecretKey as _};
+        use quil_sntrup761 as sntrup761;
 
         let started = std::time::Instant::now();
         let network = [121; 32];

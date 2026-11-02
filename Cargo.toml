@@ -35,6 +35,7 @@ members = [
     "crates/quil-config",
     "crates/quil-lifecycle",
     "crates/quil-crypto",
+    "crates/quil-sntrup761",
     "crates/quil-storage-stark",
     "crates/quil-tries",
     "crates/quil-tries-ffi",

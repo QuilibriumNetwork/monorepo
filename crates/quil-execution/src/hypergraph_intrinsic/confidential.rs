@@ -282,4 +282,30 @@ mod tests {
         assert!(verify_structural(&field));
         assert_eq!(open(&field, &kp.secret).unwrap(), Vec::<u8>::new());
     }
+
+    /// A value frozen from the pre-seam backend; see `quil-sntrup761/tests/kat.rs`.
+    fn frozen(name: &str) -> Vec<u8> {
+        const TABLE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../quil-sntrup761/tests/data/continuity.hex"
+        ));
+        let line = TABLE
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+            .unwrap();
+        (0..line.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&line[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// A field already on chain must stay readable.
+    #[test]
+    fn frozen_field_opens() {
+        let field = decode(&frozen("confidential_field")).unwrap();
+        assert_eq!(
+            open(&field, &frozen("key_secret")).unwrap(),
+            b"frozen confidential field"
+        );
+    }
 }

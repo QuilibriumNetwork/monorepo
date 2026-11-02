@@ -4556,8 +4556,7 @@ dependencies = [
  "libp2p-identity",
  "libp2p-swarm",
  "libp2p-yamux",
- "pqcrypto-ntruprime",
- "pqcrypto-traits",
+ "quil-sntrup761",
  "rcgen 0.13.2",
  "ring 0.17.14",
  "rustls",
@@ -6318,8 +6317,7 @@ dependencies = [
  "p3-koala-bear",
  "p3-symmetric",
  "poseidon-rs",
- "pqcrypto-ntruprime",
- "pqcrypto-traits",
+ "quil-sntrup761",
  "quil-types",
  "rand 0.8.5",
  "rayon",
@@ -6591,9 +6589,8 @@ dependencies = [
  "aes-gcm",
  "libc",
  "num-bigint 0.4.6",
- "pqcrypto-ntruprime",
- "pqcrypto-traits",
  "quil-lattice-proof-sys",
+ "quil-sntrup761",
  "rand 0.8.5",
  "sha2 0.10.9",
  "sha3 0.10.8",
@@ -6695,14 +6692,13 @@ dependencies = [
  "libp2p-gossipsub",
  "libp2p-identity",
  "lru",
- "pqcrypto-ntruprime",
- "pqcrypto-traits",
  "prometheus-client 0.23.1",
  "prost 0.13.5",
  "prost-build",
  "quil-config",
  "quil-crypto",
  "quil-lifecycle",
+ "quil-sntrup761",
  "quil-types",
  "rand 0.8.5",
  "sha2 0.10.9",
@@ -6770,6 +6766,18 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "x509-parser 0.16.0",
+]
+
+[[package]]
+name = "quil-sntrup761"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "hex 0.4.3",
+ "pqcrypto-ntruprime",
+ "pqcrypto-traits",
+ "sha2 0.10.9",
+ "zeroize",
 ]
 
 [[package]]
