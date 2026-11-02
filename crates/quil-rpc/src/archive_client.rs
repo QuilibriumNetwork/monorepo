@@ -395,7 +395,8 @@ impl ArchiveClient {
         // our own PQNoise connector (no rustls/TLS on :8340 anymore).
         let url = format!("http://{}", addr);
         let endpoint = Endpoint::from_shared(url)
-            .map_err(|e| ArchiveClientError::InvalidEndpoint(e.to_string()))?
+            .map_err(|e| ArchiveClientError::InvalidEndpoint(e.to_string()))?;
+        let endpoint = crate::pqnoise_channel::peer_endpoint(endpoint)
             // 10s connect (was 3s). Over WAN with 200-300ms RTT
             // the TLS handshake plus Ed448 cross-signature
             // verification can routinely take 1.5-2.5s; a 3s
@@ -2127,5 +2128,199 @@ mod off_thread_dial_tests {
                 count("failed")
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod flow_control_tests {
+    use super::*;
+    use crate::global_service::{FrameLookup, GlobalRpcServer};
+    use quil_types::proto::global::app_shard_service_server::AppShardServiceServer;
+    use quil_types::proto::global::global_service_server::GlobalServiceServer;
+    use quil_types::proto::global::{self, FrameHeader};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+    use tokio::net::TcpListener;
+    use tokio::time::Instant;
+
+    /// One-way latency of the test link; a round trip is twice this. A
+    /// request or response takes one round trip when its receiver grants it
+    /// whole, and one more per window it overflows: each test allows two.
+    const DELAY: Duration = Duration::from_millis(250);
+
+    struct NoFrames;
+    impl FrameLookup for NoFrames {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> {
+            Err("n/a".into())
+        }
+        fn get_frame(&self, _: u64) -> Result<global::GlobalFrame, String> {
+            Err("n/a".into())
+        }
+    }
+
+    /// Serves app frames whose header output has a fixed size.
+    struct Frames(usize);
+
+    #[tonic::async_trait]
+    impl crate::stub_services::AppShardFrameProvider for Frames {
+        async fn get_app_shard_frame(
+            &self,
+            _filter: Vec<u8>,
+            frame_number: u64,
+        ) -> Result<Option<AppShardFrame>, tonic::Status> {
+            Ok(Some(AppShardFrame {
+                header: Some(FrameHeader {
+                    frame_number,
+                    output: vec![0x5a; self.0],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+        }
+    }
+
+    /// Writes what `from` reads to `to`, each chunk [`DELAY`] after it was
+    /// read, and never holds the reader back: a link with that latency and
+    /// no bandwidth limit.
+    async fn delayed_copy(mut from: OwnedReadHalf, mut to: OwnedWriteHalf) {
+        let (chunks, mut queued) = tokio::sync::mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
+        tokio::spawn(async move {
+            while let Some((due, chunk)) = queued.recv().await {
+                tokio::time::sleep_until(due).await;
+                if to.write_all(&chunk).await.is_err() {
+                    return;
+                }
+            }
+            let _ = to.shutdown().await;
+        });
+        let mut buf = vec![0; 64 * 1024];
+        while let Ok(n @ 1..) = from.read(&mut buf).await {
+            if chunks
+                .send((Instant::now() + DELAY, buf[..n].to_vec()))
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    /// A `:8340` peer listener as the node builds it, reached over a link of
+    /// [`DELAY`] each way: the address to dial. It records the size of each
+    /// consensus message delivered to it in `delivered`, and serves app
+    /// frames with `frame_bytes` of output.
+    async fn far_peer(delivered: Arc<std::sync::Mutex<Vec<usize>>>, frame_bytes: usize) -> String {
+        let server_key = quil_p2p::generate_falcon_signing_key();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = listener.local_addr().unwrap();
+        let (streams_tx, streams) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let (key, streams_tx) = (server_key.clone(), streams_tx.clone());
+                tokio::spawn(async move {
+                    if let Ok(stream) = crate::pqnoise_channel::pq_server_handshake(tcp, &key).await
+                    {
+                        let _ = streams_tx.send(Ok::<_, std::io::Error>(stream));
+                    }
+                });
+            }
+        });
+        let global = GlobalRpcServer::new(Arc::new(NoFrames)).with_consensus_delivery(Arc::new(
+            move |request: tonic::Request<global::SubmitGlobalConsensusRequest>| {
+                delivered.lock().unwrap().push(request.get_ref().data.len());
+                Ok(())
+            },
+        ));
+        let frames =
+            crate::stub_services::AppShardRpcServer::with_provider(Arc::new(Frames(frame_bytes)));
+        tokio::spawn(
+            crate::pqnoise_channel::peer_server()
+                .add_service(
+                    GlobalServiceServer::new(global).max_decoding_message_size(64 * 1024 * 1024),
+                )
+                .add_service(
+                    AppShardServiceServer::new(frames).max_encoding_message_size(64 * 1024 * 1024),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::UnboundedReceiverStream::new(
+                    streams,
+                )),
+        );
+
+        let link = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = link.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((near, _)) = link.accept().await {
+                let Ok(far) = TcpStream::connect(peer).await else {
+                    continue;
+                };
+                let (near_read, near_write) = near.into_split();
+                let (far_read, far_write) = far.into_split();
+                tokio::spawn(delayed_copy(near_read, far_write));
+                tokio::spawn(delayed_copy(far_read, near_write));
+            }
+        });
+        address
+    }
+
+    /// A client on a cached connection to the far peer: the connection's
+    /// settings and windows are in place, as on the GLOBAL publisher's.
+    async fn connected(address: &str) -> ArchiveClient {
+        let client_key = quil_p2p::generate_falcon_signing_key();
+        let mut client = ArchiveClient::connect_mtls(address, &client_key)
+            .await
+            .expect("dials the far peer");
+        client
+            .submit_global_consensus(vec![3], vec![1; 1024])
+            .await
+            .expect("delivers a vote");
+        client
+    }
+
+    /// A multi-MB GLOBAL block reaches a far peer in one round trip, as a
+    /// vote does: the peer's listener grants the whole body at once. With
+    /// hyper's server default of 1 MiB it took at least three, and the
+    /// committee finalized from the votes before the block reached a far
+    /// archive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_multi_megabyte_block_reaches_a_far_peer_in_one_round_trip() {
+        let block = 3 << 20;
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut client = connected(&far_peer(delivered.clone(), 0).await).await;
+        let started = Instant::now();
+        client
+            .submit_global_consensus(vec![3], vec![2; block])
+            .await
+            .expect("delivers the block");
+        let took = started.elapsed();
+        assert_eq!(*delivered.lock().unwrap(), [1024, block]);
+        assert!(
+            took < DELAY * 4,
+            "a {block}-byte block took {took:?} at a {:?} round trip",
+            DELAY * 2
+        );
+    }
+
+    /// A multi-MB frame from a far peer arrives in one round trip: the
+    /// client grants the whole response at once. With hyper's client
+    /// default of 2 MiB per stream it took at least three.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_multi_megabyte_response_arrives_from_a_far_peer_in_one_round_trip() {
+        let output = 6 << 20;
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut client = connected(&far_peer(delivered, output).await).await;
+        let started = Instant::now();
+        let frame = client
+            .get_app_shard_frame(vec![0x21; 32], 1)
+            .await
+            .expect("answers the frame read");
+        let took = started.elapsed();
+        assert_eq!(
+            frame.and_then(|f| f.header).map(|h| h.output.len()),
+            Some(output)
+        );
+        assert!(
+            took < DELAY * 4,
+            "a {output}-byte response took {took:?} at a {:?} round trip",
+            DELAY * 2
+        );
     }
 }

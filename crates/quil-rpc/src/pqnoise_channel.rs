@@ -145,6 +145,39 @@ pub async fn pq_server_handshake(
     })
 }
 
+/// h2 stream flow-control window of the `:8340` transport, both ends.
+///
+/// The receiver of a body grants at most this much of it per round trip.
+/// hyper's defaults (1 MiB per connection and per stream on a server,
+/// 2 MiB per stream on a client) cut a multi-MB GLOBAL block into several
+/// round trips while its votes take one, so on a far link the committee
+/// finalized from the votes before the body arrived. 8 MiB carries a
+/// GLOBAL block or frame response in one flight.
+pub const PEER_STREAM_WINDOW: u32 = 8 << 20;
+
+/// h2 connection flow-control window of the `:8340` transport, both ends:
+/// two full stream windows, so a block does not wait behind a concurrent
+/// sync transfer on the same connection. It also bounds what one connection
+/// buffers that its handlers have not read; unary handlers read their
+/// requests as they arrive, up to the 64 MiB message limit they already
+/// allow.
+pub const PEER_CONNECTION_WINDOW: u32 = 16 << 20;
+
+/// The `:8340` server builder, with the transport's flow-control windows.
+pub fn peer_server() -> tonic::transport::Server {
+    tonic::transport::Server::builder()
+        .initial_stream_window_size(PEER_STREAM_WINDOW)
+        .initial_connection_window_size(PEER_CONNECTION_WINDOW)
+}
+
+/// `endpoint` with the `:8340` transport's flow-control windows, which bound
+/// how fast a response such as a GLOBAL frame arrives.
+pub fn peer_endpoint(endpoint: tonic::transport::Endpoint) -> tonic::transport::Endpoint {
+    endpoint
+        .initial_stream_window_size(PEER_STREAM_WINDOW)
+        .initial_connection_window_size(PEER_CONNECTION_WINDOW)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
