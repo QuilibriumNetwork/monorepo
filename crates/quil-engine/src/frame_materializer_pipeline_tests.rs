@@ -18,6 +18,15 @@ fn pipeline(
     prover: Vec<u8>,
     max_queued: usize,
 ) -> (GlobalFinalizationPipeline, Announcements) {
+    pipeline_with_busy_patience(rig, prover, max_queued, Duration::from_secs(60))
+}
+
+fn pipeline_with_busy_patience(
+    rig: &Rig,
+    prover: Vec<u8>,
+    max_queued: usize,
+    busy_patience: Duration,
+) -> (GlobalFinalizationPipeline, Announcements) {
     let heads = Arc::new(AtomicUsize::new(0));
     let gossip = Arc::new(AtomicUsize::new(0));
     let announcer = FinalizedFrameAnnouncer::new(
@@ -43,6 +52,7 @@ fn pipeline(
         GlobalFinalizationLimits {
             max_queued,
             max_attempts: 3,
+            busy_patience,
             retry: Duration::from_millis(1),
             max_ahead: 32,
         },
@@ -1477,6 +1487,145 @@ fn a_retry_episode_logs_its_first_failure_and_its_end() {
         ended[0]
     );
     assert!(logs.lines_with("legacy materializer").is_empty());
+}
+
+/// A gossip validation or RPC cost query holding the engines fails a capture
+/// at once, without executing. Retries within the patience are not counted:
+/// three of them spanned 300 ms and sent the frame to the legacy path.
+#[test]
+fn a_source_busy_for_a_moment_is_waited_out_without_the_legacy_path() {
+    let rig = Rig::new();
+    let input = certified_deploy(&rig);
+    let (pipeline, _) = pipeline(&rig, prover(&input), 8);
+    pipeline.offer(input.clone());
+    let reader = rig.source.execution_manager.hold_engines_for_test();
+    for _ in 0..10 {
+        assert!(matches!(pipeline.step(1), FinalizationStep::Retry(_)));
+    }
+    assert_eq!(rig.source.execution_counts().atomic_failed, 10);
+    assert!(rig.clock.get_global_clock_frame(1).is_err());
+    drop(reader);
+    let FinalizationStep::Published { frame, .. } = pipeline.step(1) else {
+        panic!("expected publication once the reader let go");
+    };
+    assert_eq!(frame, input);
+    assert!(!pipeline.attempted(1));
+}
+
+/// The bound: a source still busy past the patience counts again, the frame
+/// goes to the legacy path as before and the node goes on past it.
+#[test]
+fn a_source_busy_past_its_patience_goes_to_the_legacy_path_and_recovers() {
+    let rig = Rig::new();
+    let input = certified_deploy(&rig);
+    let patience = Duration::from_millis(50);
+    let (pipeline, _) = pipeline_with_busy_patience(&rig, prover(&input), 8, patience);
+    pipeline.offer(input.clone());
+    let reader = rig.source.execution_manager.hold_engines_for_test();
+    assert!(matches!(pipeline.step(1), FinalizationStep::Retry(_)));
+    std::thread::sleep(patience * 2);
+    for _ in 0..2 {
+        assert!(matches!(pipeline.step(1), FinalizationStep::Retry(_)));
+    }
+    assert!(matches!(pipeline.step(1), FinalizationStep::Legacy));
+    assert_eq!(rig.source.execution_counts().atomic_failed, 4);
+    drop(reader);
+    assert_eq!(rig.clock.get_global_clock_frame(1).unwrap(), input);
+    rig.source.materialize(&input).unwrap();
+    assert_eq!(rig.source.last_materialized_frame(), 1);
+    assert!(pipeline.finish_legacy(&input));
+}
+
+/// Holds a forest read on another thread, as a sync diff or split check does,
+/// until `until` returns.
+fn hold_forest(rig: &Rig, until: impl FnOnce() + Send + 'static) -> std::thread::JoinHandle<()> {
+    let crdt = rig.source.hypergraph.clone();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let _forest = crdt.hold_forest_for_test();
+        held_tx.send(()).unwrap();
+        until();
+    });
+    held_rx.recv().unwrap();
+    reader
+}
+
+/// A forest reader that outlasts the adoption locks' 500 ms patience used to
+/// discard the executed frame. It is waited out, and the wait keeps no lock
+/// that the registry's readers (leader selection, RPC) need.
+#[test]
+fn a_forest_reader_past_the_lock_patience_does_not_discard_the_executed_frame() {
+    let rig = Rig::new();
+    let input = certified_deploy(&rig);
+    let (pipeline, _) = pipeline(&rig, prover(&input), 8);
+    pipeline.offer(input);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let registry_reads = {
+        let (registry, stop) = (rig.source.prover_registry.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut longest = Duration::ZERO;
+            while !stop.load(Ordering::SeqCst) {
+                let started = std::time::Instant::now();
+                let _ = registry.get_provers(&[]);
+                longest = longest.max(started.elapsed());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            longest
+        })
+    };
+    let reader = hold_forest(&rig, || std::thread::sleep(Duration::from_millis(1900)));
+
+    let step = pipeline.step(1);
+
+    stop.store(true, Ordering::SeqCst);
+    let longest = registry_reads.join().unwrap();
+    reader.join().unwrap();
+    assert!(
+        matches!(step, FinalizationStep::Published { .. }),
+        "{step:?}"
+    );
+    assert_eq!(rig.source.execution_counts().atomic_failed, 0);
+    assert!(
+        longest < Duration::from_millis(1200),
+        "a registry read waited {longest:?}"
+    );
+}
+
+/// The bound: a reader held past the wait fails the attempt with the lock's
+/// name, the attempts run out, and the frame executes in place once it goes.
+#[test]
+fn a_forest_reader_past_the_wait_names_the_lock_and_the_frame_recovers_in_place() {
+    use crate::outage::test_logs::CapturedLogs;
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    let rig = Rig::new();
+    let input = certified_deploy(&rig);
+    let (pipeline, _) = pipeline(&rig, prover(&input), 8);
+    pipeline.offer(input.clone());
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let reader = hold_forest(&rig, move || {
+        let _ = released.recv();
+    });
+    let started = std::time::Instant::now();
+    for _ in 0..2 {
+        assert!(matches!(pipeline.step(1), FinalizationStep::Retry(_)));
+    }
+    assert!(matches!(pipeline.step(1), FinalizationStep::Legacy));
+    let waited = started.elapsed();
+    assert!(
+        waited >= quil_types::lock_patience::FOREST_READER_PATIENCE * 3,
+        "each attempt waits: {waited:?}"
+    );
+    assert_eq!(
+        logs.lines_with("is busy or poisoned: forest").len(),
+        2,
+        "the first failure's line and the legacy warning"
+    );
+    drop(release);
+    reader.join().unwrap();
+    rig.source.materialize(&input).unwrap();
+    assert_eq!(rig.source.last_materialized_frame(), 1);
+    assert!(pipeline.finish_legacy(&input));
 }
 
 /// Attempts that run out warn with their count and time, and the episode ends

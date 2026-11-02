@@ -90,6 +90,15 @@ pub struct GlobalFinalizationLimits {
     pub max_queued: usize,
     /// Consecutive failed attempts at one height before the legacy path.
     pub max_attempts: u32,
+    /// How long after a height's first failure a source another holder is
+    /// using ([`quil_execution::source_busy`]) is asked again every `retry`
+    /// without counting a failure. Such an attempt fails at capture, before
+    /// executing anything, and holds nothing between tries; the same source
+    /// makes a vote wait up to 20 s, while three counted tries span 300 ms.
+    /// With an execution of about 5 s, a frame that waits this long still
+    /// publishes within the 8 s a vote or proposal yields to its publication
+    /// and within the 10 s frame interval. Past it, failures count again.
+    pub busy_patience: Duration,
     /// First retry delay; it doubles with each counted failure.
     pub retry: Duration,
     /// Heights above the canonical head admitted as durable certified
@@ -106,6 +115,7 @@ impl Default for GlobalFinalizationLimits {
         Self {
             max_queued: 64,
             max_attempts: 3,
+            busy_patience: Duration::from_secs(3),
             retry: Duration::from_millis(100),
             max_ahead: 64,
         }
@@ -134,7 +144,9 @@ pub enum FinalizationStep {
 /// operator sees one line at its start and one at its end.
 struct Episode {
     frame: u64,
-    /// Counted failures.
+    /// Failures counted toward the legacy path.
+    counted: u32,
+    /// Every failure, including waits for a busy source.
     attempts: u32,
     started: Instant,
 }
@@ -143,6 +155,7 @@ impl Episode {
     fn begin(frame: u64) -> Self {
         Self {
             frame,
+            counted: 0,
             attempts: 0,
             started: Instant::now(),
         }
@@ -525,16 +538,21 @@ impl GlobalFinalizationPipeline {
                 error,
                 retryable: true,
             } => {
-                let attempts = {
+                let busy = quil_execution::source_busy(&error);
+                let (attempts, counted, waiting) = {
                     let mut state = self.lock();
                     if state.episode.as_ref().is_some_and(|e| e.frame != next) {
                         state.episode = None;
                     }
                     let episode = state.episode.get_or_insert_with(|| Episode::begin(next));
                     episode.attempts = episode.attempts.saturating_add(1);
-                    episode.attempts
+                    let waiting = busy && episode.started.elapsed() < self.limits.busy_patience;
+                    if !waiting {
+                        episode.counted = episode.counted.saturating_add(1);
+                    }
+                    (episode.attempts, episode.counted, waiting)
                 };
-                if attempts >= max_attempts {
+                if !waiting && counted >= max_attempts {
                     return self.legacy(next, &frame, &error.to_string());
                 }
                 if attempts == 1 {
@@ -554,8 +572,13 @@ impl GlobalFinalizationPipeline {
                         "atomic GLOBAL finalization unavailable; retrying"
                     );
                 }
+                if waiting {
+                    return FinalizationStep::Retry(self.limits.retry);
+                }
                 FinalizationStep::Retry(
-                    self.limits.retry.saturating_mul(1 << (attempts - 1).min(8)),
+                    self.limits
+                        .retry
+                        .saturating_mul(1 << counted.saturating_sub(1).min(8)),
                 )
             }
         }

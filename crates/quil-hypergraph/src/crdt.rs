@@ -959,6 +959,13 @@ impl HypergraphCrdt {
         self.forest.read().unwrap().db().is_some()
     }
 
+    /// Reads the forest until the returned guard drops, as a sync diff or a
+    /// split check does.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn hold_forest_for_test(&self) -> impl Sized + '_ {
+        self.forest.read().unwrap()
+    }
+
     /// Declare that `app` splits UNIFORMLY into `64^depth` sub-shards (QUIL =
     /// depth 1 ⇒ 64). Convenience over [`set_app_shard_prefixes`] for the uniform
     /// case; expands to the full prefix set `{[i]}` / `{[i,j]}` / … The set MUST

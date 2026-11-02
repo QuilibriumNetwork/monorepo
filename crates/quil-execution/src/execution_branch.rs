@@ -416,6 +416,10 @@ impl ExecutionPublicationGuard<'_> {
             .summary_rebuilds
             .into_inner()
             .map_err(|_| unavailable_engine("prepared summary"))?;
+        // Before the first lock below: registry readers (leader selection, RPC)
+        // would wait with it.
+        self.capture.await_forest_readers();
+        timing.mark("wait for forest readers");
         let mut registry = registry.prepare_adoption(&branch.registry, &self.overlay)?;
         let mut clock_cache = clock.prepare_execution_publication()?;
         let mut global_clock_cache = if Arc::ptr_eq(&clock, &global_clock) {
