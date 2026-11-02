@@ -3779,6 +3779,8 @@ impl ProverLifecycle {
             .filter(|(_, lf)| cur_epoch == quil_types::consensus::epoch_for_frame(*lf) + 1)
             .map(|(f, _)| f.clone())
             .collect();
+        // Leaves rejected for the seniority penalty, for their operator line.
+        let mut penalised_rejections: Vec<Vec<u8>> = Vec::new();
 
         if !ready_leave_filters.is_empty() {
             let manual_bound_filters = manually_managed_filters(&workers);
@@ -4100,6 +4102,7 @@ impl ProverLifecycle {
                 }
             }
             auto_reject.extend(penalty_withheld.iter().map(|(f, _)| f.clone()));
+            penalised_rejections.extend(penalty_withheld.iter().map(|(f, _)| f.clone()));
 
             auto_reject.extend(retained_rejections);
             let kept: Vec<&Vec<u8>> = capacity_shielded
@@ -4183,7 +4186,14 @@ impl ProverLifecycle {
                     .flatten()
                     .filter_map(|filter| leaving_filters.iter().find(|(f, _)| f == filter).cloned())
                     .collect();
-                self.leave_decisions.commit(&rejected, frame_number)?;
+                let new_rejections = self.leave_decisions.commit(&rejected, frame_number)?;
+                log_leave_rejections(
+                    frame_number,
+                    &new_rejections,
+                    &held_descriptors,
+                    self.strategy,
+                    &penalised_rejections,
+                );
                 for (filter, joining, reason) in proposal_reasons {
                     let accepted = actions.iter().any(|a| match a {
                         LifecycleAction::ProposeJoin { filters, .. } if joining => {
@@ -4245,6 +4255,55 @@ impl ProverLifecycle {
                 Err(error)
             }
         }
+    }
+}
+
+/// Why the node rejected a leave it decides itself: not a manual worker's.
+/// `held` is the seat's descriptor, absent while its current rank is unknown;
+/// `penalised` comes first, as it rejects the leave whatever else holds.
+fn leave_rejection_reason(
+    held: Option<&ShardDescriptor>,
+    strategy: Strategy,
+    penalised: bool,
+) -> &'static str {
+    if penalised {
+        return "seniority_penalty";
+    }
+    match held {
+        None => "unknown_rank",
+        Some(d) if strategy == Strategy::RewardGreedy && d.shards == 0 => "unknown_rank",
+        Some(d) if d.size > 0 && d.active_count <= proposer::HALT_RISK_PROVER_COUNT => "halt_risk",
+        Some(_) => "no_better_shard",
+    }
+}
+
+/// One line per leave the node has just rejected: nothing else tells the
+/// operator, whose seat only reads Active again. `new_rejections` holds each
+/// leave once (`LeaveDecisions::commit`), so a leave logs once however often
+/// the plan repeats its rejection, including across a restart.
+fn log_leave_rejections(
+    frame_number: u64,
+    new_rejections: &[(Vec<u8>, u64)],
+    held: &[ShardDescriptor],
+    strategy: Strategy,
+    penalised: &[Vec<u8>],
+) {
+    for (filter, leave_frame) in new_rejections {
+        let reason = leave_rejection_reason(
+            held.iter().find(|d| &d.filter == filter),
+            strategy,
+            penalised.contains(filter),
+        );
+        let action = if reason == "seniority_penalty" {
+            "none needed: the node keeps the seat until its shard keeps more than 3 provers after \
+             it leaves; a manual worker's leave goes ahead and costs the halt-risk leave penalty"
+        } else {
+            "to leave anyway, switch the worker to manual (qclient node prover manage, Ctrl+O) \
+             and send the leave again"
+        };
+        info!(frame = frame_number, filter = %hex::encode(filter), leave_frame, reason, action,
+            scope = "local",
+            "lifecycle: rejecting a leave, not a manual worker's; the seat returns to Active");
     }
 }
 
@@ -10490,6 +10549,158 @@ mod proposal_loop_tests {
         });
         let bytes = lines.0.lock().unwrap().clone();
         (actions, String::from_utf8(bytes).unwrap())
+    }
+
+    /// The operator lines one evaluation logged for rejected leaves.
+    fn leave_rejection_lines(logged: &str) -> Vec<&str> {
+        logged
+            .lines()
+            .filter(|line| line.contains("lifecycle: rejecting a leave"))
+            .collect()
+    }
+
+    /// A seat Leaving since `leave_frame` on a worker, in a shard of `active`
+    /// provers, with no free shard to go to, decided at frame 720.
+    fn pending_leave(
+        worker: WorkerInfo,
+        active: u32,
+        leave_frame: u64,
+        known_rank: bool,
+    ) -> (
+        Arc<ConfigurableWorkerManager>,
+        Arc<ConfigurableRegistry>,
+        Arc<ProverLifecycle>,
+    ) {
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(worker);
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut leaving = alloc(held.clone(), ProverStatus::Leaving, 10);
+        leaving.leave_frame_number = leave_frame;
+        reg.set_prover(prover(address.clone(), vec![leaving]));
+        reg.set_summaries(vec![shard_summary(held.clone(), active)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        // `make_lifecycle` seeds every summary's size with one shard, a known
+        // rank; none reads as the reward inputs not having arrived.
+        if !known_rank {
+            lc.set_local_shard_metrics(HashMap::from([(held, (1_000_000, 0))]));
+        }
+        lc.set_prover_root_verified_frame(720);
+        (wm, reg, lc)
+    }
+
+    /// A leave the score rule rejects says so once, at info, with its filter,
+    /// its frame, the reason and the way out; a repeat of the same rejection
+    /// says nothing and a later leave speaks again.
+    #[test]
+    fn a_rejected_leave_logs_one_line_per_leave() {
+        let held = filter_bytes(0xA1);
+        let (wm, reg, lc) = pending_leave(allocated_worker(1, held.clone()), 53, 10, true);
+
+        let (actions, logged) = evaluate_logged(&lc, 720, reg.as_ref(), wm.as_ref());
+        assert!(
+            actions.iter().any(|a| matches!(a, LifecycleAction::RejectLeaves { filters, .. } if filters.contains(&held))),
+            "{actions:?}"
+        );
+        let lines = leave_rejection_lines(&logged);
+        assert_eq!(lines.len(), 1, "{logged}");
+        for text in [
+            " INFO ",
+            &format!("filter={}", hex::encode(&held)),
+            "leave_frame=10",
+            "no_better_shard",
+            "switch the worker to manual",
+        ] {
+            assert!(lines[0].contains(text), "{text} in {}", lines[0]);
+        }
+
+        for frame in [721, 722] {
+            lc.set_prover_root_verified_frame(frame);
+            let (actions, logged) = evaluate_logged(&lc, frame, reg.as_ref(), wm.as_ref());
+            assert!(
+                actions.iter().any(|a| matches!(a, LifecycleAction::RejectLeaves { filters, .. } if filters.contains(&held))),
+                "the rejection repeats until it lands: {actions:?}"
+            );
+            assert!(leave_rejection_lines(&logged).is_empty(), "{logged}");
+        }
+
+        let mut again = alloc(held.clone(), ProverStatus::Leaving, 10);
+        again.leave_frame_number = 11;
+        reg.set_prover(prover(vec![0xCD; 32], vec![again]));
+        lc.set_prover_root_verified_frame(723);
+        let (_, logged) = evaluate_logged(&lc, 723, reg.as_ref(), wm.as_ref());
+        let lines = leave_rejection_lines(&logged);
+        assert_eq!(lines.len(), 1, "{logged}");
+        assert!(lines[0].contains("leave_frame=11"), "{}", lines[0]);
+    }
+
+    /// The other rejections name their own reason: an unknown rank, a shard
+    /// the departure would leave at halt risk, and an orphan's leave that would
+    /// cost the seniority penalty.
+    #[test]
+    fn a_rejected_leave_names_its_reason() {
+        let held = filter_bytes(0xA1);
+        quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(Some(2));
+        let (wm, reg, lc) = pending_leave(idle_worker(1), 1, 100, true);
+        let (_, logged) = evaluate_logged(&lc, 720, reg.as_ref(), wm.as_ref());
+        quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(None);
+        let lines = leave_rejection_lines(&logged);
+        assert_eq!(lines.len(), 1, "{logged}");
+        assert!(lines[0].contains("seniority_penalty"), "{}", lines[0]);
+        assert!(!lines[0].contains("switch the worker"), "{}", lines[0]);
+        for (active, known_rank, reason) in [(53, false, "unknown_rank"), (2, true, "halt_risk")] {
+            let (wm, reg, lc) =
+                pending_leave(allocated_worker(1, held.clone()), active, 10, known_rank);
+            let (_, logged) = evaluate_logged(&lc, 720, reg.as_ref(), wm.as_ref());
+            let lines = leave_rejection_lines(&logged);
+            assert_eq!(lines.len(), 1, "{reason}: {logged}");
+            assert!(lines[0].contains(reason), "{reason}: {}", lines[0]);
+        }
+    }
+
+    /// Each reason as the decision reaches it, the penalty first: it is what
+    /// rejected the leave whatever else holds.
+    #[test]
+    fn leave_rejection_reason_follows_the_decision() {
+        let descriptor = |size, shards, active_count| ShardDescriptor {
+            filter: filter_bytes(0xA1),
+            size,
+            ring: 0,
+            shards,
+            active_on_ring: 0,
+            total_active_joining: active_count,
+            active_count,
+            activating_count: 0,
+        };
+        let reason = leave_rejection_reason;
+        let healthy = descriptor(100, 1, 53);
+        let small = descriptor(100, 1, proposer::HALT_RISK_PROVER_COUNT);
+        let unpriced = descriptor(100, 0, 53);
+        let g = Strategy::RewardGreedy;
+        assert_eq!(reason(Some(&healthy), g, false), "no_better_shard");
+        assert_eq!(reason(None, g, false), "unknown_rank");
+        assert_eq!(reason(Some(&unpriced), g, false), "unknown_rank");
+        assert_eq!(reason(Some(&small), g, false), "halt_risk");
+        assert_eq!(reason(Some(&healthy), g, true), "seniority_penalty");
+        assert_eq!(
+            reason(Some(&unpriced), Strategy::DataGreedy, false),
+            "no_better_shard",
+            "only the reward strategy needs reward inputs"
+        );
+    }
+
+    /// A manual worker's leave is confirmed: no rejection, no line.
+    #[test]
+    fn a_manual_workers_leave_logs_no_rejection() {
+        let held = filter_bytes(0xA1);
+        let (wm, reg, lc) = pending_leave(manual_worker(1, held.clone()), 53, 10, true);
+        let (actions, logged) = evaluate_logged(&lc, 720, reg.as_ref(), wm.as_ref());
+        assert!(
+            actions.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters.contains(&held))),
+            "{actions:?}"
+        );
+        assert!(leave_rejection_lines(&logged).is_empty(), "{logged}");
     }
 
     /// One seated core, an idle manual core and an idle auto core, with one

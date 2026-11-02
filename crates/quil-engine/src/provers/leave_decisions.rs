@@ -81,7 +81,13 @@ impl LeaveDecisions {
 
     /// Persist accepted plan decisions before dispatch. A failed write or WAL
     /// sync returns an error without changing memory or allowing publication.
-    pub(crate) fn commit(&self, rejected: &[(Vec<u8>, u64)], frame: u64) -> Result<()> {
+    /// Returns the rejections not recorded before, each leave's once across
+    /// its decision epoch and a restart, for its operator line.
+    pub(crate) fn commit(
+        &self,
+        rejected: &[(Vec<u8>, u64)],
+        frame: u64,
+    ) -> Result<Vec<(Vec<u8>, u64)>> {
         let epoch = quil_types::consensus::epoch_for_frame(frame);
         let mut state = self
             .0
@@ -93,6 +99,7 @@ impl LeaveDecisions {
             .filter(|r| r.decision_epoch >= epoch)
             .cloned()
             .collect();
+        let mut new = Vec::new();
         for (filter, leave_frame) in rejected {
             let record = Rejection {
                 filter: filter.clone(),
@@ -101,10 +108,11 @@ impl LeaveDecisions {
             };
             if !next.contains(&record) {
                 next.push(record);
+                new.push((filter.clone(), *leave_frame));
             }
         }
         if next == state.rejections {
-            return Ok(());
+            return Ok(new);
         }
         if next.len() > 4096 {
             return Err(QuilError::Store("too many pending leave decisions".into()));
@@ -124,7 +132,7 @@ impl LeaveDecisions {
                 .map_err(|e| QuilError::Store(e.to_string()))?;
         }
         state.rejections = next;
-        Ok(())
+        Ok(new)
     }
 }
 
@@ -162,6 +170,35 @@ mod tests {
         drop(reopened);
         drop(other);
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    /// The rejection a leave's operator line hangs on is new once: not when
+    /// the plan repeats it, nor after a restart; a later leave is new again.
+    #[test]
+    fn commit_returns_a_leave_rejection_once() {
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let decisions = LeaveDecisions::default();
+        decisions.attach(db.clone(), &[7; 32]).unwrap();
+        let leave = (vec![1], 90);
+        assert_eq!(
+            decisions.commit(std::slice::from_ref(&leave), 800).unwrap(),
+            vec![leave.clone()]
+        );
+        assert!(decisions
+            .commit(std::slice::from_ref(&leave), 801)
+            .unwrap()
+            .is_empty());
+        let reopened = LeaveDecisions::default();
+        reopened.attach(db, &[7; 32]).unwrap();
+        assert!(reopened
+            .commit(std::slice::from_ref(&leave), 802)
+            .unwrap()
+            .is_empty());
+        let later = (vec![1], 91);
+        assert_eq!(
+            reopened.commit(&[leave, later.clone()], 803).unwrap(),
+            vec![later]
+        );
     }
 
     #[test]

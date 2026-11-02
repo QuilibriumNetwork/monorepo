@@ -51,7 +51,9 @@ pub enum ProverCommand {
         #[arg(long, default_value = "")]
         delegate: String,
     },
-    /// Initiate a prover leave for the given shard filters.
+    /// Initiate a prover leave for the given shard filters. Refused while a
+    /// filter is on an auto worker, whose leave the node would decide by score:
+    /// switch it to manual in `prover manage` first.
     Leave {
         /// Hex-encoded 32-byte shard filters (default: all-0xFF).
         filters: Vec<String>,
