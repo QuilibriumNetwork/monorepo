@@ -337,6 +337,14 @@ struct Args {
     #[arg(long)]
     generate_keys: bool,
 
+    /// With `--generate-keys`: create or replace the prover key and create
+    /// the peer key although the config directory or store shows this node
+    /// already had an identity. Its seats and seniority stay on the old one.
+    /// A one-time run, so that no setting hides the next accident; a replaced
+    /// key stays in the keystore as a `-legacy` entry.
+    #[arg(long, requires = "generate_keys")]
+    allow_new_identity: bool,
+
     /// Print peer info and exit
     #[arg(long)]
     peer_info: bool,
@@ -432,7 +440,9 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     initialize_tls_provider();
     let args = Args::parse();
 
-    // Load configuration first so logger paths / filters come from it.
+    // Load configuration first so logger paths / filters come from it. A
+    // missing config is generated, unless this directory shows a node ran here.
+    quil_keys::refuse_recreated_config(&args.config)?;
     let (config, config_notices) = quil_config::load_config_with_notices(&args.config)?;
     // Token proof worker settings fail fast, before any store opens.
     config
@@ -509,7 +519,9 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     if args.print_identity {
         // Ensure a stable Ed448 peer key (generate + persist if missing).
         let mut cfg = config.clone();
+        let store = quil_keys::StoreEvidence::unopened(std::path::Path::new(&cfg.db.path));
         if cfg.p2p.peer_priv_key.is_empty() {
+            quil_keys::refuse_new_peer_key(&args.config, store)?;
             cfg.p2p.peer_priv_key = quil_p2p::ed448_identity::Ed448Identity::generate()
                 .map_err(|e| anyhow::anyhow!("generate Ed448 peer key: {e}"))?
                 .to_config_hex();
@@ -535,6 +547,7 @@ async fn node_main() -> anyhow::Result<ExitCode> {
             Box::new(quil_crypto::FalconKeyConstructor),
         )?;
         fkm.set_peer_priv_key_hex(&cfg.p2p.peer_priv_key);
+        quil_keys::refuse_prover_key_change(&fkm, &args.config, store)?;
         fkm.ensure_standard_keys()?;
         use quil_keys::KeyManager as _;
         let bls_pubkey = fkm.get_public_key(quil_types::crypto::KeyType::Falcon512)?;
@@ -565,19 +578,36 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     // or starting the node. Used to bootstrap a node's consensus identity for a
     // committee list.
     if args.generate_keys {
-        let keys_path = quil_keys::resolve_keystore_path(&config.key.key_store_file, &args.config)?;
-        let proving_key_id = if config.engine.proving_key_id.is_empty() {
+        let mut cfg = config.clone();
+        // The explicit way past a refusal of the node's start: a peer key
+        // comes with it, as the next start would otherwise refuse to make one.
+        if args.allow_new_identity && cfg.p2p.peer_priv_key.is_empty() {
+            cfg.p2p.peer_priv_key = quil_p2p::ed448_identity::Ed448Identity::generate()
+                .map_err(|e| anyhow::anyhow!("generate Ed448 peer key: {e}"))?
+                .to_config_hex();
+            quil_config::save_config(&args.config, &cfg)?;
+        }
+        let keys_path = quil_keys::resolve_keystore_path(&cfg.key.key_store_file, &args.config)?;
+        let proving_key_id = if cfg.engine.proving_key_id.is_empty() {
             "default-proving-key".to_string()
         } else {
-            config.engine.proving_key_id.clone()
+            cfg.engine.proving_key_id.clone()
         };
         let fkm = quil_keys::FileKeyManager::new(
             keys_path,
-            &config.key.key_store_file.encryption_key,
+            &cfg.key.key_store_file.encryption_key,
             proving_key_id,
             Box::new(quil_crypto::FalconKeyConstructor),
         )?;
+        fkm.set_peer_priv_key_hex(&cfg.p2p.peer_priv_key);
+        if !args.allow_new_identity {
+            let store = quil_keys::StoreEvidence::unopened(std::path::Path::new(&cfg.db.path));
+            quil_keys::refuse_prover_key_change(&fkm, &args.config, store)?;
+        }
         fkm.ensure_standard_keys()?;
+        if args.allow_new_identity {
+            quil_keys::record_identity(&fkm, &args.config);
+        }
         use quil_keys::KeyManager as _;
         let consensus_pubkey = fkm.get_public_key(quil_types::crypto::KeyType::Falcon512)?;
         println!("CONSENSUS_PUBKEY={}", hex::encode(&consensus_pubkey));

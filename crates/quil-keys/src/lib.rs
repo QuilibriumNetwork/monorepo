@@ -1,7 +1,12 @@
 mod file_key_manager;
+mod identity_guard;
 mod keystore_path;
 
-pub use file_key_manager::{FileKeyManager, KeyEntry};
+pub use file_key_manager::{stored_prover_address, FileKeyManager, KeyEntry};
+pub use identity_guard::{
+    record_identity, refuse_new_peer_key, refuse_prover_key_change, refuse_recreated_config,
+    StoreEvidence,
+};
 pub use keystore_path::{resolve_existing_keystore_path, resolve_keystore_path};
 
 use quil_types::crypto::{KeyType, Signer};

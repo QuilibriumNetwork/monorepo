@@ -119,8 +119,10 @@ pub(crate) async fn start(
     // Shadow `config` with the filled-in version so the entire startup —
     // keys, networking, prover address, downstream peer-key reads — is
     // consistent on the very first run.
+    let store_evidence = keys::store_evidence(&hg_store, clock_store.as_ref());
     let owned_config;
     let config: &quil_config::Config = if config.p2p.peer_priv_key.is_empty() {
+        quil_keys::refuse_new_peer_key(config_dir, store_evidence)?;
         let key_hex = quil_p2p::ed448_identity::Ed448Identity::generate()
             .map_err(|e| anyhow::anyhow!("failed to generate Ed448 peer key: {}", e))?
             .to_config_hex();
@@ -138,7 +140,7 @@ pub(crate) async fn start(
         config
     };
 
-    let keys = keys::init(config, config_dir)?;
+    let keys = keys::init(config, config_dir, store_evidence)?;
     let file_key_manager = keys.file_key_manager.clone();
     let bls_pubkey = keys.bls_pubkey.clone();
     let prover_address = keys.prover_address;

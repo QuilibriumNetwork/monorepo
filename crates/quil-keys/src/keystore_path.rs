@@ -181,7 +181,7 @@ fn inspect(path: &Path) -> Result<Keystore> {
 
 /// Whether `path` names a keystore file that holds a prover key, following
 /// links; an unreadable path is an error rather than an absent keystore.
-fn holds_prover_key(path: &Path) -> Result<bool> {
+pub(crate) fn holds_prover_key(path: &Path) -> Result<bool> {
     match std::fs::metadata(path) {
         Ok(entry) if entry.is_file() => Ok(inspect(path)? == Keystore::WithProverKey),
         Ok(_) => Ok(false),
