@@ -350,6 +350,16 @@ impl Diagnosis {
 
 const TRANSPORTS: [Transport; 2] = [Transport::Tcp, Transport::Quic];
 
+/// Whether the doctor calls the node of `report` not reachable, for a notice
+/// elsewhere: the stream port it reads from the config changes no verdict.
+pub(crate) fn not_reachable(report: &NodeReachability) -> bool {
+    let observation = Observation {
+        report: report.clone(),
+        ..Default::default()
+    };
+    diagnose(&observation).verdict == Verdict::NotReachable
+}
+
 /// The verdicts and advice for `obs`.
 pub(crate) fn diagnose(obs: &Observation) -> Diagnosis {
     let report = &obs.report;
