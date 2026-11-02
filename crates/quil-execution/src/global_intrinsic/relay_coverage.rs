@@ -32,10 +32,12 @@ const LISTED_SHARDS: usize = 8;
 /// with nothing pending are forgotten first.
 const MAX_SHARDS: usize = 4096;
 
-/// The source frames neither header `frame` nor the shard's previously
-/// executed header `previous` relays; `None` when the windows leave no gap.
+/// The source frames no executed header relays between the shard's previously
+/// executed header `previous` and header `frame`: a header relays only the
+/// frames below it, so `previous` itself is left to later headers. `None`
+/// when the window leaves no gap; frame 0 is never relayed or reported.
 pub fn uncovered(previous: u64, frame: u64) -> Option<RangeInclusive<u64>> {
-    let first = previous.checked_add(1)?;
+    let first = previous.max(1);
     let window_start = *spend_relay::relay_window(frame).start();
     (window_start > first).then(|| first..=window_start - 1)
 }
@@ -294,34 +296,40 @@ fn log(frame: u64, report: Option<Report>) {
 mod tests {
     use super::*;
 
-    /// Header N relays N-8..=N-1: a successor up to 9 frames above the
-    /// previous header leaves nothing uncovered, one 10 frames above leaves
-    /// one frame, and a re-carried or lower header leaves none.
+    /// Header N relays N-8..=N-1, not N: a successor up to 8 frames above the
+    /// previous header leaves nothing uncovered, one 9 frames above leaves the
+    /// previous header's own frame, and a re-carried or lower header leaves
+    /// none.
     #[test]
     fn uncovered_frames_are_those_below_the_relay_window_after_the_previous_header() {
-        for next in 0..=19 {
+        for next in 0..=18 {
             assert_eq!(uncovered(10, next), None, "next {next}");
         }
-        assert_eq!(uncovered(10, 20), Some(11..=11));
-        assert_eq!(uncovered(10, 30), Some(11..=21));
-        assert_eq!(uncovered(0, 9), None);
+        assert_eq!(uncovered(10, 19), Some(10..=10));
+        assert_eq!(uncovered(10, 20), Some(10..=11));
+        assert_eq!(uncovered(10, 30), Some(10..=21));
+        assert_eq!(uncovered(0, 9), None, "frame 0 is never relayed");
         assert_eq!(uncovered(0, 10), Some(1..=1));
         assert_eq!(uncovered(u64::MAX, u64::MAX), None);
     }
 
     /// Every advance a contiguous carry makes, up to the window, logs
-    /// nothing.
+    /// nothing; the next advance leaves the previous header's frame.
     #[test]
     fn contiguous_carries_leave_no_gap() {
-        for previous in [0, 1, 7, 8, 978_129] {
-            for advance in 0..=RELAY_WINDOW_FRAMES + 1 {
+        for previous in [1, 7, 8, 978_129] {
+            for advance in 0..=RELAY_WINDOW_FRAMES {
                 assert_eq!(
                     uncovered(previous, previous + advance),
                     None,
                     "previous {previous}, advance {advance}"
                 );
             }
-            assert!(uncovered(previous, previous + RELAY_WINDOW_FRAMES + 2).is_some());
+            assert_eq!(
+                uncovered(previous, previous + RELAY_WINDOW_FRAMES + 1),
+                Some(previous..=previous),
+                "previous {previous}"
+            );
         }
     }
 
