@@ -95,6 +95,10 @@ pub(crate) struct MessageLoopArgs {
     /// is enabled; every inbound gossip message is recorded for the
     /// `GET /messages` endpoint. `None` (the default) means no overhead.
     pub recent_messages: Option<Arc<quil_explorer::RecentMessageRing>>,
+    /// The most-asked effective settings (`EffectiveConfig::status_brief`),
+    /// repeated in every `node status` line so a recent log window answers
+    /// them after the startup line rotated away.
+    pub config_brief: String,
 }
 
 /// The engines a message on `bitmask` reaches as a submission: every engine
@@ -210,6 +214,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         crdt: crdt_for_recv,
         genesis_seed: genesis_seed_for_recv,
         archive_mode: archive_mode_recv,
+        config_brief,
         prover_lifecycle: pl_for_recv,
         prover_registry: pr_for_recv,
         worker_manager: wm_for_recv,
@@ -687,6 +692,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 .collect::<Vec<_>>()
                                 .join(",")
                         },
+                        config = %config_brief,
                         "node status"
                     );
                     // Resolver traffic of the shards this process runs.
