@@ -41,35 +41,60 @@
 //! regular node, connected and subscribed to each shard's topic, while their
 //! seats renewed every epoch. A worker reports the votes its session host
 //! sent and received ([`crate::own_votes`]). A seat whose worker serves or
-//! closes the session that counts it, and has sent no vote since its host
-//! started while the other members' votes reach it, is silent. Its
-//! renewal is withheld as above once one host of the worker has been silent
-//! for an epoch: by the worker's own clock, which pauses while nobody's
-//! votes arrive, so a network outage lapses no one, and by observed GLOBAL
-//! frames, credited at most a settle period per observation, so a GLOBAL
-//! catch-up after a restart does not stand in for time. A new engine or host
-//! starts the run over and lifts a withheld renewal, so an operator who
-//! fixes and restarts the worker keeps the seat; so does a vote. An
-//! observation where the worker does not serve or the seat is outside its
-//! session neither adds to the run nor ends it. A present member sends a
-//! nullify vote whenever a view times out, so members of a stalled committee
-//! are not silent. A build that does not report its votes is never silent.
+//! closes the session that counts it, and hands the node no new vote while
+//! the other members' votes reach it, is silent. Its renewal is withheld as
+//! above once its worker has been silent for an epoch: by the worker's clock
+//! ([`SessionHosting::stopped_voting`] for a host that voted earlier), which
+//! pauses while nobody's votes arrive, so a network outage lapses no one, and
+//! by observed GLOBAL frames, credited at most a settle period per
+//! observation, so a GLOBAL catch-up after a restart does not stand in for
+//! time. A new engine starts the run over and lifts a withheld renewal, so an
+//! operator who fixes and restarts the worker keeps the seat; so does a vote.
+//! A new consensus host does neither (2026-11-02): each session starts a host,
+//! and a run a host ended made withholding a race. The seat was withheld only
+//! if one host outlived an epoch before its renewal landed, and 56% of 552
+//! mainnet sessions ended sooner; a host that had voted and stopped was never
+//! counted, and renewed (devnet, same day). An observation where the worker
+//! does not serve or the seat is outside its session neither adds to the run
+//! nor ends it. A present
+//! member sends a nullify vote whenever a view times out, so members of a
+//! stalled committee are not silent. A build that does not report its votes
+//! is never silent.
+//!
+//! This measures the worker, not its timing. How often a member's signature
+//! is in its committee's certificates mostly ranks latency: a certificate
+//! holds exactly a quorum, so a voter after the quorum never appears (measured
+//! 2026-11-02: seats named in 10-25% of certificates voted in a median 91% of
+//! the views one regular node saw). A late voter is not silent here. A seat
+//! that sent nothing is in no certificate either, and none of the seats that
+//! one node saw send nothing for an epoch (151 seat-epochs) was named in any.
+//!
+//! Silence withholds nothing where it would cost the network
+//! ([`SilenceShield`]): on a seat an operator pinned, during a coverage halt,
+//! where the shard's size is unknown or it would be left at the halt-risk
+//! prover count. A seat already withheld renews once one of these applies. No
+//! quorum check is needed: a seat that sends nothing is in no quorum, and
+//! leaving only lowers the quorum of the next session.
 //!
 //! A seat withheld for silence lapses, the allocator releases its worker and
 //! the orphan sweep leaves the seat. That worker is then held back from new
 //! seats: otherwise a broken engine would join, sit silent, lapse and leave
 //! again every few epochs, each time adding chain traffic and a pending join
 //! to every other prover's planning. It is released when it is seen voting,
-//! when its engine or host on the withheld seat restarts while still bound
-//! to it, after [`HELD_BACK_EPOCHS`] epochs, or when this node restarts. A
+//! when its engine on the withheld seat restarts while still bound to it,
+//! after [`HELD_BACK_EPOCHS`] epochs, which also ends the withholding of a
+//! seat it still holds, or when this node restarts. The node itself starts an
+//! engine on a seat being left, so a start while the seat is outside its
+//! session is no restart (2026-11-02, devnet: that start released the worker,
+//! the score rule rejected the leave of a seat whose worker could host, and
+//! the seat came back silent every four epochs). Until the hold ends the seat
+//! counts as unable to host for that leave, and its run outlasts an unbinding. A
 //! released worker that is still broken may join once more and must again
 //! be silent for an epoch, so it costs at most one leave in about five epochs. A
 //! worker released by the allocator reports nothing (an idle worker runs no
 //! engine), so restarting it shows only once the hold expires or it votes
 //! after binding to another seat; the allocator binds held-back workers last.
 //!
-//! Only silence from a host's start counts: a host that voted once and then
-//! wedged is not silent here.
 
 use std::collections::{HashMap, HashSet};
 
@@ -115,9 +140,10 @@ pub(crate) enum Hosting {
     Hosting,
     /// It hosts the session and has sent a vote since its host started.
     Voting,
-    /// It hosts the session and has sent no vote since its host started,
-    /// while the other members' votes reach it (`peer_votes` so far), for
-    /// `silent_ms` by its own clock.
+    /// It hosts the session and has sent no vote since its host started, or
+    /// none since an earlier vote ([`SessionHosting::stopped_voting`]), while
+    /// the other members' votes reach it (`peer_votes` so far), for
+    /// `silent_ms`.
     Silent { peer_votes: u64, silent_ms: u64 },
     /// It does not: startup refused or stopped, or the host is up but gated
     /// on unstaged data, so it neither proposes nor votes.
@@ -199,17 +225,11 @@ impl Instance {
         })
     }
 
-    /// How `self` differs from `before`, if it names another engine or
-    /// host: a restart.
-    fn restarted_since(&self, before: &Self) -> Option<&'static str> {
-        let differs = |now: u64, then: u64| now != 0 && then != 0 && now != then;
-        if differs(self.engine, before.engine) {
-            Some("its engine restarted")
-        } else if differs(self.host, before.host) {
-            Some("its consensus host restarted")
-        } else {
-            None
-        }
+    /// Whether `self` names another engine than `before`: a restart of the
+    /// worker. A new session starts a new host of the same engine.
+    fn engine_restarted_since(&self, before: &Self) -> Option<&'static str> {
+        (self.engine != 0 && before.engine != 0 && self.engine != before.engine)
+            .then_some("its engine restarted")
     }
 }
 
@@ -249,21 +269,23 @@ pub(crate) struct Unhosted {
     withheld: bool,
 }
 
-/// Since when one host of a seat's worker has hosted the session that
-/// counts it without sending a vote while the other members vote.
+/// Since when a seat's worker has hosted the session that counts it without
+/// sending a vote while the other members vote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Unvoted {
     pub core_id: u32,
-    /// The worker's engine and host this run observed.
+    /// The worker's engine this run observed, and its latest host.
     pub instance: Instance,
     /// The GLOBAL frame of the first silent observation in this run.
     pub since: u64,
     /// GLOBAL frames between consecutive silent observations, each step
     /// credited at most a settle period, summed.
     pub silent_frames: u64,
-    /// How long the host has been silent by the worker's clock, at the
+    /// How long its hosts have been silent by the worker's clock, at the
     /// latest silent observation.
     pub silent_ms: u64,
+    /// That silence up to the latest host's start.
+    earlier_hosts_ms: u64,
     /// Votes the worker had received from the other members at the latest
     /// silent observation.
     pub peer_votes: u64,
@@ -271,6 +293,41 @@ pub(crate) struct Unvoted {
     last: Option<u64>,
     /// Whether this run has withheld its seat's renewal.
     withheld: bool,
+}
+
+/// Why a silent seat's renewal is not withheld: see the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SilenceShield {
+    /// An operator pinned the seat's worker to it.
+    Pinned,
+    /// A shard's coverage is halted.
+    CoverageHalt,
+    /// The shard's size is unknown: no archive sizes yet, or it has no data.
+    ShardUnknown,
+    /// Once this seat left, its shard would hold no more active provers than
+    /// the halt-risk count (`active` includes this seat).
+    HaltRisk { active: u64 },
+}
+
+impl SilenceShield {
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::Pinned => "an operator pinned its worker to this seat",
+            Self::CoverageHalt => "a shard's coverage is halted",
+            Self::ShardUnknown => "its shard's size is not known",
+            Self::HaltRisk { .. } => "its shard would be left at the halt-risk prover count",
+        }
+    }
+}
+
+/// The latest report of a seat's host that had sent a vote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VotesSeen {
+    host: u64,
+    own: u64,
+    observed_ms: u64,
+    /// How long `own` has stood still while the other members voted.
+    stopped_ms: u64,
 }
 
 /// A worker whose seat was withheld for silence: it takes no new seats
@@ -305,6 +362,7 @@ pub(crate) enum VoteEvent {
 pub(crate) struct SessionHosting {
     unhosted: HashMap<Vec<u8>, Unhosted>,
     unvoted: HashMap<Vec<u8>, Unvoted>,
+    votes_seen: HashMap<Vec<u8>, VotesSeen>,
     held_back: HashMap<u32, HeldBack>,
     /// The GLOBAL frame of this process's first observation.
     started: Option<u64>,
@@ -375,16 +433,65 @@ impl SessionHosting {
         None
     }
 
+    /// What `observed`, classified from `report` at `now_ms`, means once the
+    /// seat's earlier reports are read with it: a host that voted and has
+    /// not voted since, while the other members' votes reach it, has stopped
+    /// voting and is silent for as long as that lasted; while none reach it,
+    /// that says nothing ([`Hosting::Hosting`]). A present member's count
+    /// keeps growing: each view that times out gets its nullify vote, again
+    /// every retry period.
+    pub fn stopped_voting(
+        &mut self,
+        filter: &[u8],
+        report: Option<&WorkerExecution>,
+        observed: Hosting,
+        now_ms: u64,
+    ) -> Hosting {
+        let (Hosting::Voting, Some(report)) = (&observed, report) else {
+            return observed;
+        };
+        let Some(own) = report.own_votes else {
+            return observed;
+        };
+        let host = report.host_started_unix_ms;
+        let fresh = VotesSeen {
+            host,
+            own,
+            observed_ms: now_ms,
+            stopped_ms: 0,
+        };
+        let seen = self.votes_seen.entry(filter.to_vec()).or_insert(fresh);
+        if seen.host != host || seen.own != own {
+            *seen = fresh;
+            return observed;
+        }
+        if seen.observed_ms == now_ms && seen.stopped_ms == 0 {
+            return observed;
+        }
+        let elapsed = now_ms.saturating_sub(seen.observed_ms);
+        seen.observed_ms = now_ms;
+        if report.last_peer_vote_unix_ms == 0
+            || now_ms.saturating_sub(report.last_peer_vote_unix_ms) > PEERS_VOTING_MS
+        {
+            return Hosting::Hosting;
+        }
+        seen.stopped_ms = seen.stopped_ms.saturating_add(elapsed.min(PEERS_VOTING_MS));
+        Hosting::Silent {
+            peer_votes: report.peer_votes,
+            silent_ms: seen.stopped_ms,
+        }
+    }
+
     /// Record whether the worker `core_id` bound to `filter`, whose seat
     /// stands at `seat`, votes in the session it hosts, as observed at GLOBAL
     /// `frame` from the report of its engine and host `instance`. A silent
     /// observation of a member seat adds the frames since the previous one,
-    /// if that was silent too, at most a settle period. A vote or a new
-    /// engine or host ends the run, and lifts a renewal it withheld; a vote
-    /// of a held-back worker anywhere, or its restart on the seat it was held
-    /// back for, releases it; a new engine on another seat (the allocator
-    /// bound it there) does not. Any other observation leaves the run as it
-    /// is.
+    /// if that was silent too, at most a settle period, whichever host it
+    /// comes from. A vote or a new engine ends the run, and lifts a renewal
+    /// it withheld; a vote of a held-back worker anywhere, or its restart on
+    /// the seat it was held back for, releases it; a new engine on another
+    /// seat (the allocator bound it there) does not. Any other observation
+    /// leaves the run as it is.
     pub fn observe_votes(
         &mut self,
         frame: u64,
@@ -396,17 +503,44 @@ impl SessionHosting {
         instance: Instance,
     ) -> Vec<VoteEvent> {
         let mut events = Vec::new();
+        // Outside its session the seat's engine is the node's own doing: a
+        // seat being left gets one started. Later reports compare with it.
+        if seat == Seat::Outside {
+            if let Some(held) = self
+                .held_back
+                .get_mut(&core_id)
+                .filter(|held| held.filter == filter)
+            {
+                held.instance.engine = instance.engine;
+            }
+            if let Some(run) = self
+                .unvoted
+                .get_mut(filter)
+                .filter(|run| run.core_id == core_id)
+            {
+                run.instance.engine = instance.engine;
+            }
+        }
         let release = self.held_back.get(&core_id).and_then(|held| {
             if *hosting == Hosting::Voting {
                 Some("it votes")
             } else if held.filter == filter {
-                instance.restarted_since(&held.instance)
+                instance.engine_restarted_since(&held.instance)
             } else {
                 None
             }
         });
         if let Some(how) = release {
             if let Some(held) = self.held_back.remove(&core_id) {
+                // It voted on another seat: the one it was held for is free.
+                if held.filter != filter
+                    && self
+                        .unvoted
+                        .get(&held.filter)
+                        .is_some_and(|run| run.withheld && run.core_id == core_id)
+                {
+                    self.unvoted.remove(&held.filter);
+                }
                 events.push(VoteEvent::Released { core_id, held, how });
             }
         }
@@ -423,7 +557,7 @@ impl SessionHosting {
             _ => self
                 .unvoted
                 .get(filter)
-                .and_then(|run| instance.restarted_since(&run.instance)),
+                .and_then(|run| instance.engine_restarted_since(&run.instance)),
         };
         if let Some(how) = ended {
             if let Some(run) = self.unvoted.remove(filter).filter(|run| run.withheld) {
@@ -444,16 +578,21 @@ impl SessionHosting {
                         since: frame,
                         silent_frames: 0,
                         silent_ms: 0,
+                        earlier_hosts_ms: 0,
                         peer_votes: 0,
                         last: None,
                         withheld: false,
                     });
+                if run.instance.host != instance.host {
+                    run.earlier_hosts_ms = run.silent_ms;
+                    run.instance = instance;
+                }
                 if let Some(last) = run.last {
                     let step = frame.saturating_sub(last).min(settle_frames(epoch_frames));
                     run.silent_frames = run.silent_frames.saturating_add(step);
                 }
                 run.last = Some(frame);
-                run.silent_ms = *silent_ms;
+                run.silent_ms = run.earlier_hosts_ms.saturating_add(*silent_ms);
                 run.peer_votes = *peer_votes;
             }
             _ => {
@@ -471,7 +610,9 @@ impl SessionHosting {
     }
 
     /// Release the workers held back for [`HELD_BACK_EPOCHS`] epochs by
-    /// GLOBAL `frame`.
+    /// GLOBAL `frame`, and end the withholding of the seats they were held
+    /// back for: no renewal is refused for ever, and a seat that renews and
+    /// stays silent is withheld again after an epoch.
     pub fn expire_held_back(&mut self, frame: u64, epoch_frames: u64) -> Vec<(u32, HeldBack)> {
         let span = epoch_frames.saturating_mul(HELD_BACK_EPOCHS);
         let expired: Vec<u32> = self
@@ -482,14 +623,39 @@ impl SessionHosting {
             .collect();
         expired
             .into_iter()
-            .filter_map(|core_id| self.held_back.remove(&core_id).map(|held| (core_id, held)))
+            .filter_map(|core_id| {
+                let held = self.held_back.remove(&core_id)?;
+                if self
+                    .unvoted
+                    .get(&held.filter)
+                    .is_some_and(|run| run.withheld && run.core_id == core_id)
+                {
+                    self.unvoted.remove(&held.filter);
+                }
+                Some((core_id, held))
+            })
             .collect()
     }
 
-    /// Forget seats no worker is bound to any more.
+    /// Whether `filter`'s renewal is withheld for silence, its hold running.
+    pub fn withheld_for_silence(&self, filter: &[u8]) -> bool {
+        self.unvoted.get(filter).is_some_and(|run| run.withheld)
+    }
+
+    /// Forget seats no worker is bound to any more, but for a run withheld for
+    /// silence while its worker's hold lasts: a worker released from the seat
+    /// may be bound to it again while it is being left.
     pub fn retain_bound(&mut self, bound: &HashSet<Vec<u8>>) {
         self.unhosted.retain(|filter, _| bound.contains(filter));
-        self.unvoted.retain(|filter, _| bound.contains(filter));
+        let held_back = &self.held_back;
+        self.unvoted.retain(|filter, run| {
+            bound.contains(filter)
+                || (run.withheld
+                    && held_back
+                        .get(&run.core_id)
+                        .is_some_and(|held| held.filter == *filter))
+        });
+        self.votes_seen.retain(|filter, _| bound.contains(filter));
     }
 
     /// Whether `filter`'s renewal is held back at GLOBAL `frame`: withheld
@@ -498,8 +664,16 @@ impl SessionHosting {
     /// waits out first; or once its worker's host was observed silent for
     /// `epoch_frames` and [`epoch_ms`]. A withheld run stays withheld until
     /// [`Self::observe`] or [`Self::observe_votes`] ends it; a run withheld
-    /// for silence holds its worker back from new seats.
-    pub fn withhold(&mut self, filter: &[u8], frame: u64, epoch_frames: u64) -> Option<Hold> {
+    /// for silence holds its worker back from new seats. Under `shield`, a
+    /// seat silent that long is not withheld, and one that was renews and
+    /// its worker is released.
+    pub fn withhold(
+        &mut self,
+        filter: &[u8],
+        frame: u64,
+        epoch_frames: u64,
+        shield: Option<SilenceShield>,
+    ) -> Option<Hold> {
         let settled = self
             .started
             .get_or_insert(frame)
@@ -526,6 +700,19 @@ impl SessionHosting {
         let due = run.silent_frames >= epoch_frames && run.silent_ms >= epoch_ms(epoch_frames);
         if !run.withheld && !due {
             return None;
+        }
+        if let Some(why) = shield {
+            run.withheld = false;
+            let core_id = run.core_id;
+            let run = run.clone();
+            if self
+                .held_back
+                .get(&core_id)
+                .is_some_and(|held| held.filter == filter)
+            {
+                self.held_back.remove(&core_id);
+            }
+            return Some(Hold::Shielded { run, why });
         }
         let first = !run.withheld;
         run.withheld = true;
@@ -563,6 +750,11 @@ pub(crate) enum Hold {
     /// Its worker hosts the session but has been silent for an epoch; the
     /// worker is held back from new seats.
     Unvoted(UnvotedHold),
+    /// Its worker has been silent for an epoch, and `why` keeps it renewing.
+    Shielded {
+        run: Unvoted,
+        why: SilenceShield,
+    },
 }
 
 /// A renewal withheld because its seat's worker cannot host.
@@ -599,7 +791,7 @@ impl RenewalWithheld {
         match hold {
             Hold::Withheld(_) => Some(Self::Unhosted),
             Hold::Unvoted(_) => Some(Self::Unvoted),
-            Hold::Settling { .. } => None,
+            Hold::Settling { .. } | Hold::Shielded { .. } => None,
         }
     }
 
@@ -623,10 +815,10 @@ impl RenewalWithheld {
             }
             Self::Unvoted => {
                 "no prover confirmation failed: this node withheld the seat's renewal on purpose ('seat \
-                renewal withheld' in the master log); it renews once this worker votes or its engine or \
-                host restarts on the seat, and the first GLOBAL session pass of the epoch after that \
-                seats it (the frame named above for a renewal this epoch); otherwise the seat stays \
-                lapsed and is left"
+                renewal withheld' in the master log); it renews once this worker votes or its engine \
+                restarts on the seat, and the first GLOBAL session pass of the epoch after that seats \
+                it (the frame named above for a renewal this epoch); otherwise the seat stays lapsed \
+                and is left"
             }
         }
     }
@@ -640,12 +832,16 @@ static WITHHELD_RENEWALS: std::sync::LazyLock<
     std::sync::Mutex<HashMap<Vec<u8>, (u64, RenewalWithheld)>>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// When the lifecycle last decided renewals.
+static RENEWALS_DECIDED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
 /// The lifecycle's renewal decision at GLOBAL `frame` withheld `withheld`,
 /// and no other seat's renewal.
 pub(crate) fn note_renewals_withheld(
     frame: u64,
     withheld: impl IntoIterator<Item = (Vec<u8>, RenewalWithheld)>,
 ) {
+    *RENEWALS_DECIDED.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
     let mut seats = WITHHELD_RENEWALS.lock().unwrap_or_else(|e| e.into_inner());
     seats.clear();
     seats.extend(
@@ -668,11 +864,359 @@ pub(crate) fn renewal_withheld(filter: &[u8], frame: u64) -> Option<RenewalWithh
         .map(|(_, why)| *why)
 }
 
+/// Whether this node's latest renewal decision, if made within an epoch's
+/// time, withheld the renewal of its seat on `filter` for silence: what the
+/// worker view shows the manager
+/// ([`crate::worker_execution::with_renewal_state`]).
+pub(crate) fn silent_renewal_withheld(filter: &[u8]) -> bool {
+    let epoch =
+        std::time::Duration::from_millis(epoch_ms(quil_types::consensus::epoch_length_frames()));
+    let fresh = RENEWALS_DECIDED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some_and(|decided| decided.elapsed() <= epoch);
+    fresh
+        && WITHHELD_RENEWALS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(filter)
+            .is_some_and(|(_, why)| *why == RenewalWithheld::Unvoted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const EPOCH: u64 = 720;
+
+    /// The worker view names only a silence decision, and only a seat of the
+    /// latest one.
+    #[test]
+    fn the_worker_view_reads_a_silence_decision() {
+        let (silent, unhosted) = (vec![0xe1; 32], vec![0xe2; 32]);
+        note_renewals_withheld(
+            1_000,
+            [
+                (silent.clone(), RenewalWithheld::Unvoted),
+                (unhosted.clone(), RenewalWithheld::Unhosted),
+            ],
+        );
+        assert!(silent_renewal_withheld(&silent));
+        assert!(!silent_renewal_withheld(&unhosted));
+        note_renewals_withheld(1_001, []);
+        assert!(!silent_renewal_withheld(&silent));
+    }
+
+    /// A report with `own` votes of host `host`, the others' last vote
+    /// `peer_age_ms` before `now_ms`.
+    fn counted(own: u64, host: u64, now_ms: u64, peer_age_ms: Option<u64>) -> WorkerExecution {
+        WorkerExecution {
+            state: "serving".into(),
+            observed_unix_ms: now_ms,
+            own_votes: Some(own),
+            peer_votes: 90,
+            last_peer_vote_unix_ms: peer_age_ms.map_or(0, |age| now_ms - age),
+            host_started_unix_ms: host,
+            engine_started_unix_ms: 1,
+            ..Default::default()
+        }
+    }
+
+    /// A host that voted and stopped is silent for as long as its count
+    /// stands still while the others vote: time while they do not is not
+    /// counted, a grown count or a new host starts over, and a build that
+    /// reports no count is never silent.
+    #[test]
+    fn a_host_that_stopped_voting_is_silent_while_the_others_vote() {
+        let filter = vec![1; 32];
+        let mut hosting = running();
+        let mut read = |report: &WorkerExecution, now_ms: u64| {
+            let observed = classify(Some(report), now_ms);
+            hosting.stopped_voting(&filter, Some(report), observed, now_ms)
+        };
+        let silent = |silent_ms: u64| Hosting::Silent {
+            peer_votes: 90,
+            silent_ms,
+        };
+        let minute = 60_000;
+        assert_eq!(
+            read(&counted(5, 7, minute, Some(1)), minute),
+            Hosting::Voting
+        );
+        assert_eq!(
+            read(&counted(5, 7, 2 * minute, Some(1)), 2 * minute),
+            silent(minute),
+            "the count stood still"
+        );
+        assert_eq!(
+            read(&counted(5, 7, 12 * minute, Some(1)), 12 * minute),
+            silent(3 * minute),
+            "a step counts at most the two minutes others' votes are fresh for"
+        );
+        assert_eq!(
+            read(&counted(5, 7, 13 * minute, None), 13 * minute),
+            Hosting::Hosting,
+            "nobody votes: says nothing"
+        );
+        assert_eq!(
+            read(&counted(5, 7, 14 * minute, Some(1)), 14 * minute),
+            silent(4 * minute),
+            "only the time while they vote counts"
+        );
+        assert_eq!(
+            read(&counted(6, 7, 15 * minute, Some(1)), 15 * minute),
+            Hosting::Voting,
+            "it voted"
+        );
+        assert_eq!(
+            read(&counted(6, 7, 16 * minute, Some(1)), 16 * minute),
+            silent(minute),
+            "a grown count starts the time over"
+        );
+        assert_eq!(
+            read(&counted(6, 8, 17 * minute, Some(1)), 17 * minute),
+            Hosting::Voting,
+            "another host's count is its own"
+        );
+        let older = WorkerExecution {
+            own_votes: None,
+            ..counted(6, 8, 18 * minute, Some(1))
+        };
+        assert_eq!(read(&older, 18 * minute), Hosting::Hosting);
+        assert_eq!(
+            hosting.stopped_voting(&filter, None, Hosting::Unknown, 18 * minute),
+            Hosting::Unknown
+        );
+    }
+
+    /// A seat silent across the hosts of its sessions is withheld once that
+    /// silence has lasted an epoch: a session rotating every epoch starts a
+    /// new host each time, and that says nothing about the worker. A vote of
+    /// the new host still ends the run.
+    #[test]
+    fn silence_across_session_hosts_withholds_after_an_epoch() {
+        let filter = vec![1; 32];
+        let mut hosting = running();
+        // A host's silence by its clock from its start, at 10 s a frame.
+        let host_silence = |started: u64| {
+            move |frame: u64| Hosting::Silent {
+                peer_votes: 90,
+                silent_ms: (frame - started) * epoch_ms(EPOCH) / EPOCH,
+            }
+        };
+        let instance = |host: u64| Instance { engine: 1, host };
+        // Sessions of 720 frames with a 15 frame handoff between their hosts.
+        observe_each(
+            &mut hosting,
+            &filter,
+            (15..720).step_by(10),
+            Seat::Member,
+            host_silence(15),
+            instance(1),
+        );
+        assert!(
+            hosting.withhold(&filter, 720, EPOCH, None).is_none(),
+            "not an epoch yet: this renewal goes out"
+        );
+        observe_each(
+            &mut hosting,
+            &filter,
+            (735..1_440).step_by(10),
+            Seat::Member,
+            host_silence(735),
+            instance(2),
+        );
+        let hold = unvoted(hosting.withhold(&filter, 1_440, EPOCH, None)).expect("two hosts");
+        assert_eq!(hold.run.since, 15);
+        assert!(hold.run.silent_ms >= epoch_ms(EPOCH), "{:?}", hold.run);
+        assert_eq!(hosting.held_back(), HashSet::from([1]));
+
+        // The worker's next host votes.
+        let events = observe_each(
+            &mut hosting,
+            &filter,
+            [1_450],
+            Seat::Member,
+            |_| Hosting::Voting,
+            instance(3),
+        );
+        assert!(
+            matches!(
+                &events[..],
+                [
+                    VoteEvent::Released { .. },
+                    VoteEvent::Lifted {
+                        how: "it votes",
+                        ..
+                    }
+                ]
+            ),
+            "{events:?}"
+        );
+        assert!(hosting.withhold(&filter, 1_450, EPOCH, None).is_none());
+    }
+
+    /// Under a shield a silent seat is not withheld, one already withheld
+    /// renews and its worker takes seats again, and without the shield the
+    /// seat is withheld again.
+    #[test]
+    fn a_shield_keeps_a_silent_seat_renewing() {
+        let filter = vec![1; 32];
+        let mut hosting = running();
+        observe_each(
+            &mut hosting,
+            &filter,
+            (0..=EPOCH).step_by(20),
+            Seat::Member,
+            |f| silent_since(0, f),
+            HOST,
+        );
+        let shield = Some(SilenceShield::HaltRisk { active: 4 });
+        let hold = hosting.withhold(&filter, EPOCH, EPOCH, shield);
+        assert!(
+            matches!(hold, Some(Hold::Shielded { why, .. }) if Some(why) == shield),
+            "{hold:?}"
+        );
+        assert!(hosting.held_back().is_empty(), "nothing withheld");
+        assert!(RenewalWithheld::of(&hold.unwrap()).is_none());
+
+        assert!(unvoted(hosting.withhold(&filter, EPOCH + 1, EPOCH, None)).is_some());
+        assert_eq!(hosting.held_back(), HashSet::from([1]));
+        assert!(matches!(
+            hosting.withhold(&filter, EPOCH + 2, EPOCH, shield),
+            Some(Hold::Shielded { .. })
+        ));
+        assert!(
+            hosting.held_back().is_empty(),
+            "the seat renews, its worker takes seats"
+        );
+    }
+
+    /// An engine the node starts on a seat being left is no restart of the
+    /// worker: it lifts nothing and releases no one, also when later reports
+    /// name it. A restart of the worker on the lapsed seat still does.
+    #[test]
+    fn an_engine_started_on_a_seat_being_left_is_no_restart() {
+        let filter = vec![1; 32];
+        let mut hosting = running();
+        held_back(&mut hosting, &filter);
+        let started = Instance {
+            engine: 4_000,
+            host: 0,
+        };
+        let events = observe_each(
+            &mut hosting,
+            &filter,
+            [EPOCH + 10],
+            Seat::Outside,
+            |_| Hosting::Hosting,
+            started,
+        );
+        assert!(events.is_empty(), "{events:?}");
+        assert!(hosting.withheld_for_silence(&filter));
+        assert_eq!(hosting.held_back(), HashSet::from([1]));
+        let events = observe_each(
+            &mut hosting,
+            &filter,
+            [EPOCH + 20],
+            Seat::Lapsed,
+            |_| absent(),
+            started,
+        );
+        assert!(events.is_empty(), "the same engine, seen again: {events:?}");
+        let events = observe_each(
+            &mut hosting,
+            &filter,
+            [EPOCH + 30],
+            Seat::Lapsed,
+            |_| absent(),
+            Instance {
+                engine: 5_000,
+                host: 0,
+            },
+        );
+        assert_eq!(events.len(), 2, "the worker restarted: {events:?}");
+        assert!(!hosting.withheld_for_silence(&filter));
+        assert!(hosting.held_back().is_empty());
+    }
+
+    /// A run withheld for silence outlasts its worker's unbinding while the
+    /// hold lasts, and no longer; any other run goes with the binding.
+    #[test]
+    fn a_withheld_run_outlasts_an_unbinding_for_its_hold() {
+        let (filter, other) = (vec![1; 32], vec![2; 32]);
+        let mut hosting = running();
+        held_back(&mut hosting, &filter);
+        hosting.retain_bound(&HashSet::new());
+        assert!(hosting.withheld_for_silence(&filter));
+        // It votes on another seat: the hold on this one ends.
+        let events = hosting.observe_votes(
+            EPOCH + 1,
+            EPOCH,
+            &other,
+            1,
+            Seat::Member,
+            &Hosting::Voting,
+            HOST,
+        );
+        assert!(
+            matches!(&events[..], [VoteEvent::Released { .. }]),
+            "{events:?}"
+        );
+        assert!(!hosting.withheld_for_silence(&filter));
+        assert!(hosting.withhold(&filter, EPOCH + 2, EPOCH, None).is_none());
+
+        let mut hosting = running();
+        observe_each(
+            &mut hosting,
+            &filter,
+            [10, 20],
+            Seat::Member,
+            |f| silent_since(0, f),
+            HOST,
+        );
+        hosting.retain_bound(&HashSet::new());
+        assert!(hosting.unvoted.is_empty(), "not withheld yet");
+    }
+
+    /// The hold's bound: after its epochs a worker takes new seats and the
+    /// seat renews, however silent, so no renewal is refused for ever; it
+    /// must then be silent for another epoch to be withheld again.
+    #[test]
+    fn a_withheld_seat_renews_when_its_hold_expires() {
+        let filter = vec![1; 32];
+        let mut hosting = running();
+        held_back(&mut hosting, &filter);
+        let end = EPOCH + HELD_BACK_EPOCHS * EPOCH;
+        assert!(hosting.expire_held_back(end - 1, EPOCH).is_empty());
+        assert!(unvoted(hosting.withhold(&filter, end - 1, EPOCH, None)).is_some());
+        assert_eq!(hosting.expire_held_back(end, EPOCH).len(), 1);
+        assert!(hosting.held_back().is_empty());
+        assert!(
+            hosting.withhold(&filter, end, EPOCH, None).is_none(),
+            "the seat renews"
+        );
+        observe_each(
+            &mut hosting,
+            &filter,
+            (end..end + EPOCH).step_by(20),
+            Seat::Member,
+            |f| silent_since(end, f),
+            HOST,
+        );
+        assert!(hosting
+            .withhold(&filter, end + EPOCH, EPOCH, None)
+            .is_none());
+        observe_each(
+            &mut hosting,
+            &filter,
+            [end + EPOCH],
+            Seat::Member,
+            |f| silent_since(end, f),
+            HOST,
+        );
+        assert!(unvoted(hosting.withhold(&filter, end + EPOCH, EPOCH, None)).is_some());
+    }
 
     /// The latest renewal decision's withheld seats are what a worker reads,
     /// for an epoch: a later decision replaces them, and one older than an
@@ -941,7 +1485,10 @@ mod tests {
                 HOST
             )
             .is_empty());
-            assert!(hosting.withhold(&filter, frame, EPOCH).is_none(), "{frame}");
+            assert!(
+                hosting.withhold(&filter, frame, EPOCH, None).is_none(),
+                "{frame}"
+            );
         }
         observe_each(
             &mut hosting,
@@ -952,11 +1499,12 @@ mod tests {
             HOST,
         );
         assert!(
-            hosting.withhold(&filter, 1_310, EPOCH).is_none(),
+            hosting.withhold(&filter, 1_310, EPOCH, None).is_none(),
             "710 silent frames"
         );
         observe_each(&mut hosting, &filter, [1_320], Seat::Member, silent, HOST);
-        let first = unvoted(hosting.withhold(&filter, 1_320, EPOCH)).expect("an epoch silent");
+        let first =
+            unvoted(hosting.withhold(&filter, 1_320, EPOCH, None)).expect("an epoch silent");
         assert!(
             first.first
                 && first.run.since == 100
@@ -964,7 +1512,7 @@ mod tests {
                 && first.run.peer_votes == 7
         );
         assert!(
-            !unvoted(hosting.withhold(&filter, 1_330, EPOCH))
+            !unvoted(hosting.withhold(&filter, 1_330, EPOCH, None))
                 .unwrap()
                 .first,
             "reported once per run"
@@ -987,7 +1535,7 @@ mod tests {
                 HOST,
             );
             assert!(
-                unvoted(hosting.withhold(&filter, frame, EPOCH)).is_some(),
+                unvoted(hosting.withhold(&filter, frame, EPOCH, None)).is_some(),
                 "lapsing lifts nothing"
             );
         }
@@ -1004,7 +1552,7 @@ mod tests {
             VoteEvent::Lifted { run, how: "it votes" }] if run.since == 100),
             "{events:?}"
         );
-        assert!(hosting.withhold(&filter, 1_460, EPOCH).is_none());
+        assert!(hosting.withhold(&filter, 1_460, EPOCH, None).is_none());
         assert!(hosting.held_back().is_empty());
 
         observe_each(
@@ -1015,11 +1563,11 @@ mod tests {
             |f| silent_since(2_000, f),
             HOST,
         );
-        assert!(unvoted(hosting.withhold(&filter, 2_720, EPOCH)).is_some());
+        assert!(unvoted(hosting.withhold(&filter, 2_720, EPOCH, None)).is_some());
         hosting.observe(2_730, EPOCH, &filter, 2, Seat::Member, silent(2_730));
         hosting.observe_votes(2_730, EPOCH, &filter, 2, Seat::Member, &silent(2_730), HOST);
         assert!(
-            hosting.withhold(&filter, 2_730, EPOCH).is_none(),
+            hosting.withhold(&filter, 2_730, EPOCH, None).is_none(),
             "a rebound seat starts over"
         );
         hosting.retain_bound(&HashSet::new());
@@ -1050,7 +1598,7 @@ mod tests {
             HOST,
         );
         assert!(
-            hosting.withhold(&filter, 725, EPOCH).is_none(),
+            hosting.withhold(&filter, 725, EPOCH, None).is_none(),
             "an epoch apart: one settle period credited"
         );
         observe_each(
@@ -1062,7 +1610,7 @@ mod tests {
             HOST,
         );
         assert!(
-            hosting.withhold(&filter, 1_500, EPOCH).is_none(),
+            hosting.withhold(&filter, 1_500, EPOCH, None).is_none(),
             "an epoch of frames in fifteen minutes"
         );
         observe_each(
@@ -1074,21 +1622,25 @@ mod tests {
             HOST,
         );
         assert!(
-            hosting.withhold(&filter, 1_510, EPOCH).is_some(),
+            hosting.withhold(&filter, 1_510, EPOCH, None).is_some(),
             "both an epoch of frames and of time"
         );
     }
 
-    /// A new engine or host starts the run over: silence spanning a restart
-    /// withholds nothing, and a restart lifts a withheld renewal and
-    /// releases the worker, also once the seat lapsed out of its session.
+    /// A new engine starts the run over: silence spanning a restart of the
+    /// worker withholds nothing, and such a restart lifts a withheld renewal
+    /// and releases the worker. A new host of the same engine does neither.
     #[test]
-    fn a_restart_starts_the_run_over_and_lifts_a_withheld_renewal() {
+    fn an_engine_restart_starts_the_run_over_and_lifts_a_withheld_renewal() {
         let filter = vec![1; 32];
         let mut hosting = running();
         let restarted_host = Instance {
             host: 3_000,
             ..HOST
+        };
+        let restarted_engine = Instance {
+            engine: 2_500,
+            ..restarted_host
         };
         observe_each(
             &mut hosting,
@@ -1104,11 +1656,11 @@ mod tests {
             (510..=900).step_by(10),
             Seat::Member,
             |f| silent_since(100, f),
-            restarted_host,
+            restarted_engine,
         );
         assert!(
-            hosting.withhold(&filter, 900, EPOCH).is_none(),
-            "the new host's run is 390 frames old"
+            hosting.withhold(&filter, 900, EPOCH, None).is_none(),
+            "the new engine's run is 390 frames old"
         );
         observe_each(
             &mut hosting,
@@ -1116,12 +1668,19 @@ mod tests {
             (910..=1_230).step_by(10),
             Seat::Member,
             |f| silent_since(100, f),
-            restarted_host,
+            Instance {
+                host: 3_500,
+                ..restarted_engine
+            },
         );
         assert!(
-            unvoted(hosting.withhold(&filter, 1_230, EPOCH)).is_some(),
-            "an epoch of the new host"
+            unvoted(hosting.withhold(&filter, 1_230, EPOCH, None)).is_some(),
+            "an epoch of that engine, across two of its hosts"
         );
+        let restarted_host = Instance {
+            host: 3_500,
+            ..restarted_engine
+        };
 
         // The seat lapsed out of its session: no host runs, the engine is
         // the same until the operator restarts the worker.
@@ -1138,7 +1697,7 @@ mod tests {
             no_host
         )
         .is_empty());
-        assert!(unvoted(hosting.withhold(&filter, 1_500, EPOCH)).is_some());
+        assert!(unvoted(hosting.withhold(&filter, 1_500, EPOCH, None)).is_some());
         let restarted = Instance {
             engine: 4_000,
             host: 0,
@@ -1168,7 +1727,8 @@ mod tests {
             "{events:?}"
         );
         assert!(
-            hosting.withhold(&filter, 1_510, EPOCH).is_none() && hosting.held_back().is_empty()
+            hosting.withhold(&filter, 1_510, EPOCH, None).is_none()
+                && hosting.held_back().is_empty()
         );
     }
 
@@ -1192,7 +1752,7 @@ mod tests {
             HOST,
         );
         assert!(
-            hosting.withhold(&filter, 725, EPOCH).is_none(),
+            hosting.withhold(&filter, 725, EPOCH, None).is_none(),
             "one settle period credited"
         );
         observe_each(
@@ -1204,7 +1764,7 @@ mod tests {
             HOST,
         );
         assert!(
-            hosting.withhold(&filter, 1_385, EPOCH).is_some(),
+            hosting.withhold(&filter, 1_385, EPOCH, None).is_some(),
             "an epoch credited in settle periods"
         );
     }
@@ -1220,7 +1780,9 @@ mod tests {
             |f| silent_since(0, f),
             HOST,
         );
-        assert!(unvoted(hosting.withhold(filter, EPOCH, EPOCH)).is_some_and(|hold| hold.first));
+        assert!(
+            unvoted(hosting.withhold(filter, EPOCH, EPOCH, None)).is_some_and(|hold| hold.first)
+        );
         assert_eq!(hosting.held_back(), HashSet::from([1]));
     }
 
@@ -1339,7 +1901,7 @@ mod tests {
                     Instance::of(Some(report)),
                 );
                 assert!(
-                    hosting.withhold(&filter, frame, EPOCH).is_none(),
+                    hosting.withhold(&filter, frame, EPOCH, None).is_none(),
                     "{case} at {frame}"
                 );
             }
@@ -1391,20 +1953,21 @@ mod tests {
         let mut hosting = running();
         hosting.observe(100, EPOCH, &filter, 1, Seat::Member, Hosting::Unknown);
         assert!(
-            hosting.withhold(&filter, 2_000, EPOCH).is_none(),
+            hosting.withhold(&filter, 2_000, EPOCH, None).is_none(),
             "unknown starts nothing"
         );
         hosting.observe(100, EPOCH, &filter, 1, Seat::Member, absent());
         hosting.observe(500, EPOCH, &filter, 1, Seat::Member, Hosting::Unknown);
-        assert!(hosting.withhold(&filter, 819, EPOCH).is_none());
-        let first = withheld(hosting.withhold(&filter, 820, EPOCH)).expect("an epoch unhosted");
+        assert!(hosting.withhold(&filter, 819, EPOCH, None).is_none());
+        let first =
+            withheld(hosting.withhold(&filter, 820, EPOCH, None)).expect("an epoch unhosted");
         assert_eq!(
             (first.run.core_id, first.run.since, first.run.state.as_str()),
             (1, 100, "blocked")
         );
         assert!(first.first && !first.run.from_start);
         assert!(
-            !withheld(hosting.withhold(&filter, 821, EPOCH))
+            !withheld(hosting.withhold(&filter, 821, EPOCH, None))
                 .unwrap()
                 .first,
             "reported once per run"
@@ -1417,30 +1980,30 @@ mod tests {
             "the withheld run is returned as it ends"
         );
         assert!(
-            hosting.withhold(&filter, 5_000, EPOCH).is_none(),
+            hosting.withhold(&filter, 5_000, EPOCH, None).is_none(),
             "hosting ends the run"
         );
 
         hosting.observe(900, EPOCH, &filter, 1, Seat::Member, absent());
         hosting.observe(1_000, EPOCH, &filter, 2, Seat::Member, absent());
         assert!(
-            hosting.withhold(&filter, 1_700, EPOCH).is_none(),
+            hosting.withhold(&filter, 1_700, EPOCH, None).is_none(),
             "a rebound seat starts over"
         );
-        assert!(hosting.withhold(&filter, 1_720, EPOCH).is_some());
+        assert!(hosting.withhold(&filter, 1_720, EPOCH, None).is_some());
 
         hosting.observe(1_800, EPOCH, &filter, 3, Seat::Member, absent());
         hosting.observe(1_900, EPOCH, &filter, 3, Seat::Outside, absent());
         hosting.observe(1_900, EPOCH, &filter, 3, Seat::Lapsed, absent());
         assert!(
-            hosting.withhold(&filter, 5_000, EPOCH).is_none(),
+            hosting.withhold(&filter, 5_000, EPOCH, None).is_none(),
             "a seat that leaves its session before its renewal is withheld owes no hosting"
         );
 
         hosting.observe(2_000, EPOCH, &filter, 3, Seat::Member, absent());
         hosting.retain_bound(&HashSet::new());
         assert!(
-            hosting.withhold(&filter, 5_000, EPOCH).is_none(),
+            hosting.withhold(&filter, 5_000, EPOCH, None).is_none(),
             "an unbound seat is forgotten"
         );
     }
@@ -1454,7 +2017,7 @@ mod tests {
         let mut hosting = running();
         hosting.observe(100, EPOCH, &filter, 1, Seat::Member, absent());
         assert!(
-            withheld(hosting.withhold(&filter, 820, EPOCH))
+            withheld(hosting.withhold(&filter, 820, EPOCH, None))
                 .unwrap()
                 .first
         );
@@ -1467,7 +2030,8 @@ mod tests {
             assert!(hosting
                 .observe(frame, EPOCH, &filter, 1, seat, observed)
                 .is_none());
-            let still = withheld(hosting.withhold(&filter, frame, EPOCH)).expect("still withheld");
+            let still =
+                withheld(hosting.withhold(&filter, frame, EPOCH, None)).expect("still withheld");
             assert!(!still.first && still.run.since == 100, "{frame}");
         }
         let ended = hosting.observe(
@@ -1483,14 +2047,14 @@ mod tests {
             Some(100),
             "refused only for its seat, it can host again"
         );
-        assert!(hosting.withhold(&filter, 1_480, EPOCH).is_none());
+        assert!(hosting.withhold(&filter, 1_480, EPOCH, None).is_none());
 
         hosting.observe(1_500, EPOCH, &filter, 1, Seat::Member, absent());
-        assert!(hosting.withhold(&filter, 2_220, EPOCH).is_some());
+        assert!(hosting.withhold(&filter, 2_220, EPOCH, None).is_some());
         hosting.observe(2_400, EPOCH, &filter, 1, Seat::Lapsed, absent());
         hosting.observe(2_410, EPOCH, &filter, 2, Seat::Lapsed, absent());
         assert!(
-            hosting.withhold(&filter, 2_410, EPOCH).is_none(),
+            hosting.withhold(&filter, 2_410, EPOCH, None).is_none(),
             "a newly bound worker starts over"
         );
     }
@@ -1511,7 +2075,7 @@ mod tests {
         let filter = vec![1; 32];
         let mut hosting = running();
         hosting.observe(100, EPOCH, &filter, 1, Seat::Member, absent());
-        assert!(withheld(hosting.withhold(&filter, 820, EPOCH)).is_some());
+        assert!(withheld(hosting.withhold(&filter, 820, EPOCH, None)).is_some());
         let ended = hosting.observe(
             1_440,
             EPOCH,
@@ -1541,12 +2105,12 @@ mod tests {
         for frame in [1_000, settled - 1] {
             for filter in [&member, &lapsed] {
                 assert_eq!(
-                    hosting.withhold(filter, frame, EPOCH),
+                    hosting.withhold(filter, frame, EPOCH, None),
                     Some(Hold::Settling { until: settled })
                 );
             }
             for filter in [&outside, &unknown, &hosts] {
-                assert!(hosting.withhold(filter, frame, EPOCH).is_none());
+                assert!(hosting.withhold(filter, frame, EPOCH, None).is_none());
             }
         }
         assert!(
@@ -1554,8 +2118,8 @@ mod tests {
             "reported once"
         );
         for filter in [&member, &lapsed] {
-            let first =
-                withheld(hosting.withhold(filter, settled, EPOCH)).expect("withheld once settled");
+            let first = withheld(hosting.withhold(filter, settled, EPOCH, None))
+                .expect("withheld once settled");
             assert!(first.first && first.run.from_start && first.run.since == 1_000);
         }
         assert!(hosting
@@ -1573,20 +2137,22 @@ mod tests {
             .is_some());
         for filter in [&member, &lapsed] {
             assert!(
-                hosting.withhold(filter, settled, EPOCH).is_none(),
+                hosting.withhold(filter, settled, EPOCH, None).is_none(),
                 "the worker's current state lifts it"
             );
         }
 
         hosting.observe(settled, EPOCH, &late, 6, Seat::Lapsed, absent());
         assert!(
-            hosting.withhold(&late, settled, EPOCH).is_none(),
+            hosting.withhold(&late, settled, EPOCH, None).is_none(),
             "first seen after the settle period"
         );
         hosting.observe(settled, EPOCH, &late, 6, Seat::Member, absent());
         assert!(hosting
-            .withhold(&late, settled + EPOCH - 1, EPOCH)
+            .withhold(&late, settled + EPOCH - 1, EPOCH, None)
             .is_none());
-        assert!(hosting.withhold(&late, settled + EPOCH, EPOCH).is_some());
+        assert!(hosting
+            .withhold(&late, settled + EPOCH, EPOCH, None)
+            .is_some());
     }
 }

@@ -90,6 +90,23 @@ pub fn with_store_state(
     Some(execution)
 }
 
+/// A worker's report as the worker view shows it, with this node's decision
+/// to withhold its seat's renewal for silence as its reason when it names
+/// none ([`quil_types::consensus::SILENT_RENEWAL_BLOCKER`]). The lifecycle's
+/// renewal reads the engine's own report.
+pub fn with_renewal_state(
+    filter: &[u8],
+    execution: Option<WorkerExecution>,
+) -> Option<WorkerExecution> {
+    let mut execution = execution?;
+    if execution.blocker.is_empty()
+        && crate::provers::session_hosting::silent_renewal_withheld(filter)
+    {
+        execution.blocker = quil_types::consensus::SILENT_RENEWAL_BLOCKER.into();
+    }
+    Some(execution)
+}
+
 /// Whether worker `core_id`'s own store has stopped writing: latched after
 /// a failed write or below the free-space floor, or held stopped while the
 /// node reopens it. Its shard cannot be prepared and it hosts no new seat.
@@ -1329,6 +1346,38 @@ pub fn recovery_leaves(tree_phase: u32, installed: u64, planned: u64) {
             r.leaves_observed_unix_ms = now;
         })
     });
+}
+
+#[cfg(test)]
+mod renewal_state_tests {
+    use super::*;
+    use crate::provers::session_hosting::{note_renewals_withheld, RenewalWithheld};
+
+    /// The worker view names a silence decision as the reason of a worker
+    /// reporting none, and leaves any other report alone.
+    #[test]
+    fn the_worker_view_names_a_silent_renewal_as_a_reason() {
+        let (held, other) = (vec![0xf1; 32], vec![0xf2; 32]);
+        note_renewals_withheld(1_000, [(held.clone(), RenewalWithheld::Unvoted)]);
+        let report = |blocker: &str| {
+            Some(WorkerExecution {
+                state: "serving".into(),
+                blocker: blocker.into(),
+                ..Default::default()
+            })
+        };
+        let view = with_renewal_state(&held, report("")).unwrap();
+        assert_eq!(view.blocker, quil_types::consensus::SILENT_RENEWAL_BLOCKER);
+        assert_eq!(view.state, "serving", "only the reason is added");
+        assert_eq!(with_renewal_state(&other, report("")).unwrap().blocker, "");
+        assert_eq!(
+            with_renewal_state(&held, report("state unavailable"))
+                .unwrap()
+                .blocker,
+            "state unavailable"
+        );
+        assert_eq!(with_renewal_state(&held, None), None);
+    }
 }
 
 #[cfg(test)]

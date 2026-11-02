@@ -162,7 +162,8 @@ pub fn phase_name(phase: Phase) -> &'static str {
 }
 
 pub fn blocker(text: &str) -> Blocker {
-    if text.is_empty() {
+    // The worker view's note of a renewal decision: nothing blocks the worker.
+    if text.is_empty() || text == quil_types::consensus::SILENT_RENEWAL_BLOCKER {
         return Blocker::None;
     }
     lookup(&BLOCKERS, text).unwrap_or(Blocker::Unrecognized)
@@ -703,6 +704,22 @@ pub async fn connect_peer(
         crate::QuilPqNoiseConnector::new(falcon_signing_key.to_vec()).with_expected_peer(expected);
     let channel = endpoint.connect_with_connector(connector).await?;
     Ok(DiagnosticsServiceClient::new(channel).max_decoding_message_size(2 * MAX_REPORT_BYTES))
+}
+
+#[cfg(test)]
+mod renewal_blocker_tests {
+    use super::*;
+
+    /// The worker view's note of a withheld renewal blocks nothing, and an
+    /// unknown text is still reported as unrecognized.
+    #[test]
+    fn a_withheld_renewal_note_is_no_blocker() {
+        assert_eq!(
+            blocker(quil_types::consensus::SILENT_RENEWAL_BLOCKER),
+            Blocker::None
+        );
+        assert_eq!(blocker("something else"), Blocker::Unrecognized);
+    }
 }
 
 #[cfg(test)]

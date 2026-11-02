@@ -3240,6 +3240,28 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
             ),
         ));
     }
+    let withheld = allocations
+        .iter()
+        .filter(|a| {
+            !matches!(
+                m.execution_state(a.execution.as_ref()),
+                "unknown" | "stale" | "cached"
+            ) && a
+                .execution
+                .as_ref()
+                .is_some_and(|e| e.blocker == quil_types::consensus::SILENT_RENEWAL_BLOCKER)
+        })
+        .count();
+    if withheld > 0 {
+        notices.push((
+            "renewal-withheld-no-vote",
+            NoticeSeverity::Warning,
+            format!(
+                "Renewal withheld, no vote sent: {withheld}/{} allocations.",
+                allocations.len()
+            ),
+        ));
+    }
     let workers: Vec<_> = m
         .allocations
         .iter()
@@ -4261,6 +4283,7 @@ fn help_items() -> Vec<HelpItem> {
         item("`Allocations without a worker`: active, leaving, departing or `re-confirm!` allocations with Worker `-1`; they do no work and earn nothing until a worker is bound"),
         item("`Local execution blocked or stopped`: staffed earning allocations whose Execution is `blocked` or `stopped`, of those with fresh observations; the row footer names the blocker"),
         item("`Allocation epoch stale (re-confirm!)`: allocations whose epoch is older than the current one. The node reconfirms each allocation during every epoch, so its reconfirm has not been recorded; check the node's prover confirmation log lines"),
+        item("`Renewal withheld, no vote sent`: local allocations whose worker hosts its committee session but has sent no vote for an epoch while the other members voted, of all allocations. The node leaves them to lapse: check the worker, and restart it if it stays silent. A seat renews once its worker votes or restarts, or at the latest four epochs on; the master log names each (`seat renewal withheld`)"),
         item("`Last recovery attempt failed`: workers whose latest archive recovery attempt failed and whose LocalMat is still below PeerHead, of workers with fresh observations (it ends once the worker catches up); the Recovery footer gives the error and the failure streak"),
         kv("Store notice", "`Store reads slow (this node's disk)`: the node reads one entry of its master store a second (the canary) and, on Linux, times its disk's reads and writes. Shown once a minute's canary p99 reaches 50ms, a read stays unfinished 1s, or the disk takes 20ms a read or 100ms a write (of 20+), two minutes in a row; it clears after three minutes under all of them. Work that reads the store falls behind and allocations may lapse. The cause is this node's disk: check that TRIM runs (fstrim.timer or the discard mount option), the disk's health (SMART) and other I/O load on it. `qclient node diagnostics health --self` and the node's `store i/o` log lines give the figures"),
         kv("Command legends", "Compact mode shows applicable UI/worker commands only; expanded mode also shows disabled commands. Usable commands share one highlight; labels show colors on/off and relative/absolute thresholds. `filter*` means a column filter is active"),
@@ -5671,6 +5694,8 @@ mod tests {
             consecutive_failures: 1,
             ..Default::default()
         });
+        m.allocations[2].execution.as_mut().unwrap().blocker =
+            quil_types::consensus::SILENT_RENEWAL_BLOCKER.into();
         // A bound worker's stopped engine is a lifecycle wait, not an allocation's failure.
         let mut bound = row("w9", 1, 1, 9, "", "");
         bound.status = 0;
@@ -5699,6 +5724,11 @@ mod tests {
             (
                 "allocation-epoch-stale",
                 "Allocation epoch stale (re-confirm!): 1/4 allocations.",
+                WARNING,
+            ),
+            (
+                "renewal-withheld-no-vote",
+                "Renewal withheld, no vote sent: 1/4 allocations.",
                 WARNING,
             ),
             (
@@ -5739,6 +5769,7 @@ mod tests {
         m.allocations[1].execution = execution("serving");
         m.allocations[2].epoch = 3;
         m.allocations[2].status_name = "active".into();
+        m.allocations[2].execution = execution("serving");
         m.allocations[3].execution = execution("serving");
         assert!(condition_notices(&m).is_empty());
         update_message_lifetime(&mut m);

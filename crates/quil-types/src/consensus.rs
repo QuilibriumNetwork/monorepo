@@ -191,6 +191,11 @@ pub struct ProverAllocationInfo {
     pub vertex_address: Vec<u8>,
 }
 
+/// What the worker view reports as a worker's reason when this node withholds
+/// its seat's renewal because the worker sent no vote for an epoch, for the
+/// manager's notice.
+pub const SILENT_RENEWAL_BLOCKER: &str = "renewal withheld: no vote sent";
+
 /// Number of frames an allocation has to be Confirmed or Rejected
 /// before the protocol implicitly treats it as expired. Joining
 /// allocations past `join_frame_number + GRACE` are effectively
