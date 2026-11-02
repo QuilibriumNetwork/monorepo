@@ -111,6 +111,7 @@ pub async fn leave(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()>
     let filters = parse_filters(filter_args)?;
     let mut client = pc.connect().await?;
     let frame = pc.last_global_head_frame(&mut client).await?;
+    super::leave_check::require_active(&mut client, &filters).await?;
     send_split(pc, &mut client, "leave", &filters, |chunk| {
         let sig = sign::leave_sig(&pc.key_manager, chunk, frame)?;
         Ok(Request::Leave(ProverLeave {
