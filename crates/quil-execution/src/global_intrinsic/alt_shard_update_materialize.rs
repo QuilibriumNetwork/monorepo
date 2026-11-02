@@ -70,6 +70,27 @@ pub fn alt_shard_update_shard_address(public_key: &[u8]) -> Result<[u8; 32]> {
     hash_bytes_to_32(public_key)
 }
 
+/// A root length an alt shard commit can hold: 64 (leaf or empty commitment) or
+/// 74 (elliptic curve point).
+pub fn is_storable_alt_shard_root(root: &[u8]) -> bool {
+    root.len() == 64 || root.len() == 74
+}
+
+/// Why no node should hold or propose this canonical `AltShardUpdate`, if so:
+/// everything [`validate_alt_shard_update`] checks but the frame window, which
+/// its submission cannot be judged by.
+pub fn alt_shard_update_refusal(inner: &[u8], key_manager: &dyn KeyManager) -> Option<String> {
+    let op = match AltShardUpdate::from_canonical_bytes(inner) {
+        Ok(op) => op,
+        Err(error) => return Some(error.to_string()),
+    };
+    match validate_alt_shard_update(&op, op.frame_number, key_manager) {
+        Ok(true) => None,
+        Ok(false) => Some("alt shard update: invalid signature".into()),
+        Err(error) => Some(error.to_string()),
+    }
+}
+
 /// Validate an `AltShardUpdate`. Checks structural invariants, frame-
 /// number window, and BLS48-581 G1 signature.
 ///
@@ -96,27 +117,25 @@ pub fn validate_alt_shard_update(
         )));
     }
 
-    // Root lengths: 64 (leaf/empty commitment) or 74 (elliptic curve point).
-    let is_valid_root_len = |n: usize| n == 64 || n == 74;
-    if !is_valid_root_len(op.vertex_adds_root.len()) {
+    if !is_storable_alt_shard_root(&op.vertex_adds_root) {
         return Err(QuilError::InvalidArgument(format!(
             "alt shard update: vertex adds root must be 64 or 74 bytes, got {}",
             op.vertex_adds_root.len()
         )));
     }
-    if !is_valid_root_len(op.vertex_removes_root.len()) {
+    if !is_storable_alt_shard_root(&op.vertex_removes_root) {
         return Err(QuilError::InvalidArgument(format!(
             "alt shard update: vertex removes root must be 64 or 74 bytes, got {}",
             op.vertex_removes_root.len()
         )));
     }
-    if !is_valid_root_len(op.hyperedge_adds_root.len()) {
+    if !is_storable_alt_shard_root(&op.hyperedge_adds_root) {
         return Err(QuilError::InvalidArgument(format!(
             "alt shard update: hyperedge adds root must be 64 or 74 bytes, got {}",
             op.hyperedge_adds_root.len()
         )));
     }
-    if !is_valid_root_len(op.hyperedge_removes_root.len()) {
+    if !is_storable_alt_shard_root(&op.hyperedge_removes_root) {
         return Err(QuilError::InvalidArgument(format!(
             "alt shard update: hyperedge removes root must be 64 or 74 bytes, got {}",
             op.hyperedge_removes_root.len()

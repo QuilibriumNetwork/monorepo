@@ -2128,26 +2128,52 @@ impl FrameMaterializer {
             return Ok(());
         }
 
-        let txn = self.hypergraph_store.new_transaction(false)?;
-
+        let mut commits = Vec::with_capacity(updates.len());
         for update in &updates {
             if update.public_key.is_empty() {
                 warn!("alt shard update with empty public key, skipping");
                 continue;
             }
 
-            let shard_address = match quil_crypto::poseidon::hash_bytes_to_32(&update.public_key) {
-                Ok(addr) => addr,
-                Err(e) => {
-                    warn!(error = %e, "failed to hash alt shard public key");
-                    continue;
-                }
-            };
+            match quil_crypto::poseidon::hash_bytes_to_32(&update.public_key) {
+                Ok(addr) => commits.push((addr, *update)),
+                Err(e) => warn!(error = %e, "failed to hash alt shard public key"),
+            }
+        }
 
+        // A frame's body is the leader's, and a certified one must execute:
+        // an error here refused the frame's atomic publication and every vote
+        // and proposal over it until it fell back to the in-place path, which
+        // logs the error, keeps the frame and writes none of its updates. Write
+        // none of them here too, so builds with and without this check hold the
+        // same alt shard records. No root covers them.
+        let unstorable = commits
+            .iter()
+            .filter(|(_, update)| !alt_shard_roots_storable(update))
+            .count();
+        if unstorable > 0 {
+            if UNSTORABLE_ALT_SHARD_FRAME.fetch_max(frame_number, Ordering::Relaxed) < frame_number
+            {
+                warn!(
+                    frame = frame_number,
+                    updates = commits.len(),
+                    unstorable,
+                    scope = "the frame's leader",
+                    action = "none on this node; report it if frames keep carrying them",
+                    "GLOBAL frame carries alt shard updates with roots no commit can hold; \
+                     writing none of its updates"
+                );
+            }
+            return Ok(());
+        }
+
+        let txn = self.hypergraph_store.new_transaction(false)?;
+
+        for (shard_address, update) in &commits {
             if let Err(e) = self.hypergraph_store.set_alt_shard_commit(
                 txn.as_ref(),
                 frame_number,
-                &shard_address,
+                shard_address,
                 &update.vertex_adds_root,
                 &update.vertex_removes_root,
                 &update.hyperedge_adds_root,
@@ -2736,9 +2762,49 @@ fn bundle_target_domain(bundle: &quil_types::proto::global::MessageBundle) -> Op
     None
 }
 
+/// The newest frame warned about for unstorable alt shard roots: a frame
+/// executes once per proposal, vote and publication, and warns once.
+static UNSTORABLE_ALT_SHARD_FRAME: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a commit can hold all four of the update's roots.
+fn alt_shard_roots_storable(update: &quil_types::proto::global::AltShardUpdate) -> bool {
+    use quil_execution::global_intrinsic::alt_shard_update_materialize::is_storable_alt_shard_root;
+    [
+        &update.vertex_adds_root,
+        &update.vertex_removes_root,
+        &update.hyperedge_adds_root,
+        &update.hyperedge_removes_root,
+    ]
+    .into_iter()
+    .all(|root| is_storable_alt_shard_root(root))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each root is checked, and each length a commit holds passes.
+    #[test]
+    fn an_alt_shard_update_is_storable_only_with_all_four_roots_storable() {
+        let good = quil_types::proto::global::AltShardUpdate {
+            vertex_adds_root: vec![1; 64],
+            vertex_removes_root: vec![2; 74],
+            hyperedge_adds_root: vec![3; 64],
+            hyperedge_removes_root: vec![4; 74],
+            ..Default::default()
+        };
+        assert!(alt_shard_roots_storable(&good));
+        for bad in 0..4 {
+            let mut update = good.clone();
+            *[
+                &mut update.vertex_adds_root,
+                &mut update.vertex_removes_root,
+                &mut update.hyperedge_adds_root,
+                &mut update.hyperedge_removes_root,
+            ][bad] = vec![0; 1];
+            assert!(!alt_shard_roots_storable(&update), "root {bad}");
+        }
+    }
 
     #[test]
     fn replacement_carrier_global_reward_route_is_independent_of_app_coverage() {
