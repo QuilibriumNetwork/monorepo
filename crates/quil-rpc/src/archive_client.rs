@@ -1280,6 +1280,13 @@ fn build_quil_client_config_uncached(
     Ok(Arc::new(config))
 }
 
+/// The host of `uri` as a dial target: `Uri` keeps an IPv6 literal in its
+/// brackets, which name no host to `TcpStream::connect`.
+fn dial_host(uri: &Uri) -> Option<&str> {
+    uri.host()
+        .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+}
+
 /// Tower service that, given a `Uri`, opens a TCP connection and wraps it
 /// in a rustls TLS session using the provided client config. Returns the
 /// resulting stream wrapped in `TokioIo` so it satisfies tonic 0.12's
@@ -1307,12 +1314,9 @@ impl Service<Uri> for QuilTlsConnector {
     fn call(&mut self, uri: Uri) -> Self::Future {
         let config = self.config.clone();
         Box::pin(async move {
-            let host = uri
-                .host()
-                .ok_or_else(|| "missing host in uri".to_string())?
-                .to_string();
+            let host = dial_host(&uri).ok_or_else(|| "missing host in uri".to_string())?;
             let port = uri.port_u16().unwrap_or(443);
-            let tcp = TcpStream::connect((host.as_str(), port)).await?;
+            let tcp = TcpStream::connect((host, port)).await?;
             let _ = tcp.set_nodelay(true);
             let connector = TlsConnector::from(config);
             // Quilibrium servers don't validate SNI; "localhost" matches what
@@ -1384,12 +1388,9 @@ impl Service<Uri> for QuilPqNoiseConnector {
         let expected_peer = self.expected_peer;
         let refused_peer = self.refused_peer;
         Box::pin(async move {
-            let host = uri
-                .host()
-                .ok_or_else(|| "missing host in uri".to_string())?
-                .to_string();
+            let host = dial_host(&uri).ok_or_else(|| "missing host in uri".to_string())?;
             let port = uri.port_u16().unwrap_or(443);
-            let tcp = TcpStream::connect((host.as_str(), port)).await?;
+            let tcp = TcpStream::connect((host, port)).await?;
             let (peer, stream) =
                 crate::pqnoise_channel::pq_client_handshake(tcp, falcon_signing_key.as_ref())
                     .await?;
@@ -1620,6 +1621,46 @@ mod tests {
 #[cfg(test)]
 mod pinned_archive_tests {
     use super::*;
+
+    #[test]
+    fn dial_host_strips_only_the_brackets_of_an_ipv6_literal() {
+        for (uri, host) in [
+            ("http://[::1]:8340", "::1"),
+            ("http://[2001:db8::7]:8340", "2001:db8::7"),
+            ("http://203.0.113.7:8340", "203.0.113.7"),
+            ("http://node.example.com:8340", "node.example.com"),
+        ] {
+            assert_eq!(dial_host(&uri.parse().unwrap()), Some(host), "{uri}");
+        }
+    }
+
+    /// Every stream dial (archives, peers, `qclient --addr [::1]:8340`) goes
+    /// through this connector with a bracketed literal.
+    #[tokio::test]
+    async fn pqnoise_connector_dials_an_ipv6_literal() {
+        let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
+            Ok(listener) => listener,
+            Err(e) => {
+                eprintln!("SKIP pqnoise_connector_dials_an_ipv6_literal: no IPv6 loopback: {e}");
+                return;
+            }
+        };
+        let address = listener.local_addr().unwrap();
+        let server_key = quil_p2p::generate_falcon_signing_key();
+        let handshake = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _ = crate::pqnoise_channel::pq_server_handshake(tcp, &server_key).await;
+        });
+        let mut connector = QuilPqNoiseConnector::new(quil_p2p::generate_falcon_signing_key());
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            connector.call(format!("http://{address}").parse().unwrap()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_ok(), "{:?}", result.err());
+        let _ = handshake.await;
+    }
 
     /// A dial to an endpoint pinned to an archive's identity reaches only
     /// that identity; an endpoint without a pin, and a connector that

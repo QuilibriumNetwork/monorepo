@@ -153,14 +153,16 @@ pub async fn connect_dispatch_mtls(
 }
 
 /// The node's stream endpoint (`:8340`) as a `host:port` to dial: its stream
-/// listen address, on localhost for a `0.0.0.0` listener.
+/// listen address, on localhost for a `0.0.0.0` or `::` listener.
 pub fn local_stream_addr(node_config: &quil_config::Config) -> anyhow::Result<String> {
     let stream = if node_config.p2p.stream_listen_multiaddr.is_empty() {
         "/ip4/0.0.0.0/tcp/8340"
     } else {
         node_config.p2p.stream_listen_multiaddr.as_str()
     };
-    Ok(grpc_multiaddr_to_host_port(stream)?.replace("0.0.0.0", "127.0.0.1"))
+    Ok(grpc_multiaddr_to_host_port(stream)?
+        .replace("0.0.0.0", "127.0.0.1")
+        .replace("[::]", "[::1]"))
 }
 
 /// Convert a gRPC listen multiaddr to a `host:port` string.
@@ -275,6 +277,20 @@ mod tests {
             grpc_multiaddr_to_host_port("/dns4/rpc.quilibrium.com/tcp/8337").unwrap(),
             "rpc.quilibrium.com:8337"
         );
+    }
+
+    #[test]
+    fn local_stream_addr_dials_a_wildcard_listener_on_loopback() {
+        for (listen, dial) in [
+            ("/ip4/0.0.0.0/tcp/8340", "127.0.0.1:8340"),
+            ("/ip4/192.0.2.5/tcp/8340", "192.0.2.5:8340"),
+            ("/ip6/::/tcp/8340", "[::1]:8340"),
+            ("/ip6/2001:db8::5/tcp/8340", "[2001:db8::5]:8340"),
+        ] {
+            let mut config = quil_config::Config::default();
+            config.p2p.stream_listen_multiaddr = listen.to_string();
+            assert_eq!(local_stream_addr(&config).unwrap(), dial, "{listen}");
+        }
     }
 
     #[test]

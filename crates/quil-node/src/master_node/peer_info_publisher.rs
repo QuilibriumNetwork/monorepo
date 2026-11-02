@@ -1031,8 +1031,14 @@ mod tests {
                 announce_stream: &none,
             };
             for listen in [LISTEN, "/ip4/0.0.0.0/udp/8336/quic-v1", "/ip6/::/tcp/8336"] {
-                for announce in ["", "/ip4/0.0.0.0/tcp/8336"] {
-                    for stream_listen in ["", "/ip4/0.0.0.0/tcp/8340", "/ip4/127.0.0.1/tcp/8340"] {
+                for announce in ["", "/ip4/0.0.0.0/tcp/8336", "/ip6/::/tcp/8336"] {
+                    for stream_listen in [
+                        "",
+                        "/ip4/0.0.0.0/tcp/8340",
+                        "/ip4/127.0.0.1/tcp/8340",
+                        "/ip6/::/tcp/8340",
+                        "/ip6/::1/tcp/8340",
+                    ] {
                         for worker_addrs in [&thread_mode, &process_mode] {
                             let (pubsub, _) = select_pubsub_addr(announce, &[], listen);
                             let stream = select_stream_addrs("", stream_listen, &pubsub);
@@ -1052,6 +1058,37 @@ mod tests {
                     }
                 }
             }
+        }
+
+        /// An IPv6 node without an override: its confirmed or specific
+        /// address, with the stream port on the same IP.
+        #[test]
+        fn peer_info_announces_an_ipv6_node() {
+            const QUIC6: &str = "/ip6/2001:db8::7/udp/8336/quic-v1";
+            let listen = "/ip6/::/udp/8336/quic-v1";
+            let (pubsub, source) = select_pubsub_addr("", &strings(&[QUIC6]), listen);
+            assert_eq!(
+                (pubsub.as_str(), source),
+                (QUIC6, AnnounceSource::Confirmed)
+            );
+            assert_eq!(
+                select_stream_addrs("", "/ip6/::/tcp/8340", &pubsub),
+                strings(&["/ip6/2001:db8::7/tcp/8340"])
+            );
+            // A specific listen address needs no AutoNAT server on IPv6.
+            let (pubsub, source) = select_pubsub_addr("", &[], QUIC6);
+            assert_eq!((pubsub.as_str(), source), (QUIC6, AnnounceSource::Fallback));
+            assert_eq!(
+                select_stream_addrs("", "/ip6/::/tcp/8340", &pubsub),
+                strings(&["/ip6/2001:db8::7/tcp/8340"])
+            );
+            // A wildcard without a confirmed address announces nothing.
+            let (pubsub, _) = select_pubsub_addr("", &[], listen);
+            assert_eq!(pubsub, "");
+            assert_eq!(
+                select_stream_addrs("", "/ip6/::/tcp/8340", &pubsub),
+                Vec::<String>::new()
+            );
         }
 
         /// A confirmed address and its stream port go into every record.

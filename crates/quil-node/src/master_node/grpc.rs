@@ -3384,19 +3384,34 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
     }
     let node_rpc = node_rpc_builder;
 
-    let stream_addr = {
-        let parts: Vec<&str> = config
-            .p2p
-            .stream_listen_multiaddr
-            .trim_start_matches('/')
-            .split('/')
-            .collect();
-        if parts.len() >= 4 && parts[0] == "ip4" && parts[2] == "tcp" {
-            format!("{}:{}", parts[1], parts[3])
-        } else {
+    let stream_addr = match crate::util::multiaddr::stream_listen_host_port(
+        &config.p2p.stream_listen_multiaddr,
+    ) {
+        Some(addr) => addr,
+        None => {
+            warn!(
+                configured = %config.p2p.stream_listen_multiaddr,
+                fallback = "0.0.0.0:8340",
+                "p2p.streamListenMultiaddr is not /ip4/HOST/tcp/PORT or /ip6/HOST/tcp/PORT, so \
+                 the peer gRPC listener takes the fallback address, on IPv4 only; fix the setting"
+            );
             "0.0.0.0:8340".to_string()
         }
     };
+    if crate::util::multiaddr::ipv6_p2p_without_stream(
+        &config.p2p.listen_multiaddr,
+        &config.p2p.stream_listen_multiaddr,
+        &config.p2p.announce_stream_listen_multiaddr,
+    ) {
+        warn!(
+            listen = %config.p2p.listen_multiaddr,
+            stream_listen = %config.p2p.stream_listen_multiaddr,
+            "the p2p listener takes IPv6 but the peer gRPC listener IPv4 only, so PeerInfo \
+             carries no stream address and peers cannot reach this node's stream port; set \
+             p2p.streamListenMultiaddr to /ip6/::/tcp/8340, or \
+             p2p.announceStreamListenMultiaddr"
+        );
+    }
 
     if let Ok(addr) = grpc_addr.parse::<std::net::SocketAddr>() {
         let node_rpc_service = tonic::service::interceptor::InterceptedService::new(
@@ -3946,9 +3961,15 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                     .map_err(anyhow::Error::from)?;
                 let res = rt.block_on(async move {
             info!(addr = %addr, "starting peer gRPC (mTLS) on dedicated runtime");
-            let listener = tokio::net::TcpListener::bind(addr)
-                .await
-                .map_err(anyhow::Error::from)?;
+            let listener = crate::util::stream_listener::bind(addr).await.map_err(|e| {
+                anyhow::anyhow!("binding the peer gRPC listener on {addr} failed: {e}")
+            })?;
+            let bound = listener.local_addr().map_err(anyhow::Error::from)?;
+            info!(
+                addr = %bound,
+                both_families = crate::util::stream_listener::takes_both_families(addr),
+                "peer gRPC listener bound"
+            );
             // Post-quantum :8340 transport: each connection runs a sntrup761
             // PQNoise handshake (replacing Ed448-mTLS) that authenticates the
             // peer's identity by its signature over the channel-binding hash.

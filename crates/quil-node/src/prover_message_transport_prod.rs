@@ -698,7 +698,7 @@ where
     for addr in archive_addrs {
         // Archive peer-info multiaddrs use the pubsub port (:8336);
         // the gRPC stream service listens on :8340.
-        let stream_addr = addr.replace(":8336", ":8340");
+        let stream_addr = crate::util::multiaddr::pubsub_to_stream_endpoint(&addr);
         let bytes = bundle_bytes.clone();
         let submit = submit.clone();
         // Parallel fan-out: each handle's result is awaited below, so
