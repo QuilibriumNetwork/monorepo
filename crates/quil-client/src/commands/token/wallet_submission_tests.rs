@@ -1831,6 +1831,46 @@ async fn spend_witnesses_rebuild_an_unreported_application_from_its_scan() {
     serving.await.unwrap();
 }
 
+/// A spend's witness notes reach the node manager's sink: it runs the same
+/// spends, and a print would overwrite its screen.
+#[tokio::test]
+async fn spend_witness_notes_reach_the_managers_sink() {
+    use crate::commands::token::output::capture;
+    let wallet = witness_wallet();
+    let (fixture, early, _) = ReportedCoins::with_other(&wallet, None, 2, &[], true);
+    let provider = Arc::new(RecordingCoins::new(&wallet, &fixture));
+    let (client, stop, serving) = witness_client(&fixture, provider).await;
+    let owned = wallet
+        .clone()
+        .scan_spendable(&client, 64, 16)
+        .await
+        .unwrap();
+    let coin = owned.iter().find(|coin| coin.address == early[0]).unwrap();
+    let selected = [(coin.address, &coin.output)];
+    let (notes, mut lines) = tokio::sync::mpsc::unbounded_channel();
+    capture(notes.clone(), wallet.witnesses(&client, &selected))
+        .await
+        .unwrap();
+    let line = lines.try_recv().unwrap();
+    assert!(
+        line.starts_with("Spend witnesses rebuilt from the selection scan"),
+        "{line}"
+    );
+    // The selection scan serves one spend; another rebuilds from its own.
+    capture(notes, wallet.witnesses(&client, &selected))
+        .await
+        .unwrap();
+    let line = lines.try_recv().unwrap();
+    assert!(
+        line.starts_with("Rebuilding spend witnesses from a full coin scan"),
+        "{line}"
+    );
+    let line = lines.try_recv().unwrap();
+    assert!(line.starts_with("spend witnesses: "), "{line}");
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
 /// A spend lists the coins once: the scan that selects its inputs keeps the
 /// coins under the subtrees holding the wallet's coins, another wallet's
 /// beside them included, and drops the rest, so the witnesses take no second

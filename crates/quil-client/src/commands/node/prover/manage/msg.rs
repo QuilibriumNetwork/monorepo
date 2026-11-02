@@ -21,6 +21,13 @@ pub enum Msg {
     MintPreview(Result<super::mint::Preview, String>),
     /// A running mint's or claim's report.
     Mint(super::mint::Progress),
+    /// The shielded coins and pending transfers read, or why the read
+    /// failed.
+    Shielded(Result<super::transfer::Read, String>),
+    /// A transfer action's confirmation, or why there is none.
+    TransferPreview(Result<super::transfer::Preview, String>),
+    /// A running transfer action's report.
+    Transfer(super::transfer::Progress),
     RewardRefresh(Result<Option<(u128, u64)>, String>),
     ShardLoading,
     ShardRefresh(Result<GetShardInfoResponse, String>),
