@@ -99,6 +99,17 @@ pub struct PreverifyCounts {
     pub unavailable: usize,
 }
 
+/// Why an arriving submission's confidential proofs are not verified on
+/// arrival ([`ExecutionEngineManager::arrival_operations`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArrivalRefusal {
+    /// The bundle or one of its confidential operations does not decode or
+    /// fails dispatch's checks before native work.
+    Malformed,
+    /// The global commit already decided one of its operations.
+    Decided,
+}
+
 impl PreverifyCounts {
     pub fn add(&mut self, other: PreverifyCounts) {
         self.operations += other.operations;
@@ -601,6 +612,89 @@ impl ExecutionEngineManager {
         {
             let _ = (global, address, bundle_bytes);
             false
+        }
+    }
+
+    /// Byte sizes of the confidential token operations of an arriving
+    /// canonical bundle that verifying it would send to the proof worker,
+    /// or why it needs no verification on arrival. Cheap: decoding and
+    /// record reads, no proof. Operations whose verdict is cached, or that
+    /// dispatch refuses before native work (encoding, context, dimensions,
+    /// fee: they fail execution without a proof), are left out. Refused
+    /// when the bundle does not decode, or when the global commit already
+    /// decided one of its operations (`global` holds GLOBAL state; a record
+    /// it cannot read counts as undecided): executing it again changes
+    /// nothing, and the collector keeps it from proposals once a finalized
+    /// frame carried it. `address` is the application, or a shard filter
+    /// under it. Empty without the native prover, and for bundles routed to
+    /// other engines.
+    pub fn arrival_operations(
+        &self,
+        global: &Arc<quil_hypergraph::HypergraphCrdt>,
+        address: &[u8],
+        bundle_bytes: &[u8],
+    ) -> std::result::Result<Vec<usize>, ArrivalRefusal> {
+        #[cfg(feature = "native-proof")]
+        {
+            use crate::token_intrinsic::{dispatch::is_confidential_type, global_commit};
+            let Some(Ok(application)) = address.get(..32).map(<[u8; 32]>::try_from) else {
+                return Ok(Vec::new());
+            };
+            if !self
+                .select_engine(&application)
+                .is_ok_and(|name| name == "token")
+            {
+                return Ok(Vec::new());
+            }
+            let bundle =
+                crate::message_envelope::CanonicalMessageBundle::from_canonical_bytes(bundle_bytes)
+                    .map_err(|_| ArrivalRefusal::Malformed)?;
+            let policy = match self.engines.read() {
+                Ok(engines) => engines
+                    .get("token")
+                    .and_then(|e| e.as_any())
+                    .and_then(|e| e.downcast_ref::<TokenExecutionEngine>())
+                    .and_then(TokenExecutionEngine::token_verifier)
+                    .map(|(policy, _)| policy),
+                Err(_) => None,
+            };
+            let state = crate::hypergraph_state::HypergraphState::new(global.clone());
+            let mut sizes = Vec::new();
+            for request in bundle.requests.iter().flatten() {
+                if !is_confidential_type(request.inner_type_prefix) {
+                    continue;
+                }
+                let tx_id = global_commit::tx_id(&request.inner_bytes);
+                if global_commit::is_decided(&state, &application, &tx_id).unwrap_or(false) {
+                    return Err(ArrivalRefusal::Decided);
+                }
+                if let Some(policy) = policy.as_ref() {
+                    if policy
+                        .preflight(
+                            &application,
+                            &request.inner_bytes,
+                            request.inner_type_prefix,
+                        )
+                        .is_err()
+                    {
+                        return Err(ArrivalRefusal::Malformed);
+                    }
+                    if policy.verdict_known(
+                        &application,
+                        &request.inner_bytes,
+                        request.inner_type_prefix,
+                    ) {
+                        continue;
+                    }
+                }
+                sizes.push(request.inner_bytes.len());
+            }
+            Ok(sizes)
+        }
+        #[cfg(not(feature = "native-proof"))]
+        {
+            let _ = (global, address, bundle_bytes);
+            Ok(Vec::new())
         }
     }
 
@@ -2069,6 +2163,161 @@ mod tests {
             .downcast_mut::<TokenExecutionEngine>()
             .unwrap();
         assert_eq!(token.mode(), crate::engines::ExecutionMode::Global);
+    }
+
+    /// An arriving bundle sends to the proof worker only its operations that
+    /// pass dispatch's checks before native work; one that does not decode,
+    /// holds an operation failing those checks, or holds an operation the
+    /// global commit decided sends none. Without a token policy every
+    /// confidential operation counts.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn arrival_operations_leave_out_decided_and_malformed_submissions() {
+        use crate::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        use crate::token_intrinsic::{dispatch::TokenPolicy, global_commit, state::SnapshotLimits};
+        use quil_lattice_ct::confidential::{
+            relation::backend::{native::NativeBudget, worker_client::WorkerVerifier},
+            shield::{Shield, ShieldStatement},
+            transfer::{parameter_context, CompileLimits, Output, MEMO_BYTES},
+            AmountOpening, CommitmentKey,
+        };
+        let network = [1; 32];
+        let application = domains::QUIL_TOKEN;
+        let context = parameter_context(&network, &application);
+        let key = CommitmentKey::derive(&context);
+        let opening = AmountOpening::from_seed(&context, &[2; 32]);
+        let mut proof = vec![0; 40];
+        proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
+        // Structurally valid only: no valid signature or native proof.
+        let tx = Shield {
+            statement: ShieldStatement {
+                network,
+                application,
+                transparent_address: [3; 32],
+                owner_public_key: [4; 57],
+                amount: 12,
+                fee: 2,
+                outputs: vec![Output {
+                    commitment: key.commit(10, &opening),
+                    owner: [5; IDENTITY_BYTES],
+                    memo: [6; MEMO_BYTES],
+                }],
+            },
+            signature: [0; 114],
+            proof,
+        };
+        let shield = CanonicalMessageRequest::wrap(tx.encode().unwrap()).unwrap();
+        let mut truncated = shield.inner_bytes.clone();
+        truncated.pop();
+        let malformed = CanonicalMessageRequest::wrap(truncated).unwrap();
+        let bundle = |requests: Vec<Option<CanonicalMessageRequest>>| {
+            CanonicalMessageBundle {
+                requests,
+                timestamp: 1,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let policy = TokenPolicy {
+            network,
+            limits: CompileLimits {
+                max_inputs: 2,
+                max_outputs: 2,
+                max_depth: 3,
+            },
+            snapshots: SnapshotLimits {
+                max_coins: 8,
+                max_depth: 3,
+                max_nodes: 24,
+            },
+            native_budget: NativeBudget {
+                max_native_bytes: 0,
+            },
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let worker = WorkerVerifier::new(
+            directory.path().join("absent-worker"),
+            1,
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(MemStore::new()),
+            Arc::new(NoopInclusionProver),
+        ));
+        let bare = build_manager(false);
+        let manager = build_manager(false)
+            .with_token_worker(policy, worker)
+            .unwrap();
+        let fresh = bundle(vec![Some(shield.clone())]);
+        assert_eq!(
+            manager.arrival_operations(&global, &application, &fresh),
+            Ok(vec![shield.inner_bytes.len()])
+        );
+        // A shard filter under the application reads the same.
+        let shard_filter = quil_forest::encode_shard_bit_path(&application, &[true, false]);
+        assert_eq!(
+            manager.arrival_operations(&global, &shard_filter, &fresh),
+            Ok(vec![shield.inner_bytes.len()])
+        );
+        assert_eq!(
+            manager.arrival_operations(
+                &global,
+                &application,
+                &bundle(vec![Some(shield.clone()), Some(malformed.clone())])
+            ),
+            Err(ArrivalRefusal::Malformed)
+        );
+        assert_eq!(
+            manager.arrival_operations(&global, &application, b"\x00\x00\x00\x01junk"),
+            Err(ArrivalRefusal::Malformed)
+        );
+        // Without a policy nothing is checked before the worker.
+        assert_eq!(
+            bare.arrival_operations(
+                &global,
+                &application,
+                &bundle(vec![Some(malformed.clone())])
+            ),
+            Ok(vec![malformed.inner_bytes.len()])
+        );
+        // Once the global commit decided it, executing it changes nothing.
+        let entry = global_commit::SpendEntry {
+            kind: 0x0512,
+            tx_id: global_commit::tx_id(&shield.inner_bytes),
+            source_frame: 40,
+            context: [8; 32],
+            root_digest: None,
+            consumptions: vec![[20; 32]],
+            outputs: vec![[20; 32]],
+            escrow_create: None,
+            escrow_claim: None,
+            fee: 5,
+            settlement: None,
+        };
+        let state = crate::hypergraph_state::HypergraphState::new(global.clone());
+        global_commit::commit_entry(
+            &state,
+            100,
+            &application,
+            &entry,
+            quil_types::execution::ShardPath::WHOLE,
+        )
+        .unwrap();
+        state.commit().unwrap();
+        assert_eq!(
+            manager.arrival_operations(&global, &application, &fresh),
+            Err(ArrivalRefusal::Decided)
+        );
+        assert_eq!(
+            bare.arrival_operations(&global, &application, &fresh),
+            Err(ArrivalRefusal::Decided)
+        );
+        // Other engines' bundles send nothing.
+        assert_eq!(
+            manager.arrival_operations(&global, &crate::domains::GLOBAL, &fresh),
+            Ok(Vec::new())
+        );
     }
 
     /// A bundle is done once the global commit has decided each of its
