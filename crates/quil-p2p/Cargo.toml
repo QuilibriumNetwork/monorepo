@@ -7,6 +7,10 @@ description = "P2P networking with BlossomSub pubsub for the Quilibrium node"
 
 [dev-dependencies]
 tokio-util = { version = "0.7", features = ["compat"] }
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread"] }
+libp2p-tls = "0.6"
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dependencies]
 quil-types = { path = "../quil-types" }
