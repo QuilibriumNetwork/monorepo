@@ -201,7 +201,8 @@ fn device_numbers_decode_like_glibc() {
             minor: 300
         }
     );
-    let big = ((4096u64 & !0xfff) << 32) | ((4096 & 0xfff) << 8) | 1;
+    let major = 4096u64;
+    let big = ((major & !0xfff) << 32) | ((major & 0xfff) << 8) | 1;
     assert_eq!(
         Device::from_dev(big),
         Device {
