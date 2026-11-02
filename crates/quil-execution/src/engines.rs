@@ -474,7 +474,14 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
             if let (Some(intrinsic), Some(state)) = (&self.intrinsic, &self.state) {
                 let step_checkpoint = state.changeset_len();
                 if let Err(error) = intrinsic.invoke_step(_frame_number, inner_bytes, state) {
-                    return finish_global_step(state, step_checkpoint, inner_tp, error);
+                    return finish_global_step(
+                        state,
+                        step_checkpoint,
+                        _frame_number,
+                        inner_bytes,
+                        inner_tp,
+                        error,
+                    );
                 }
             }
             Ok(())
@@ -1802,11 +1809,41 @@ fn finish_token_step(
     Ok(())
 }
 
+/// How often one prover's rejections of one operation kind get a line.
+const REJECTION_LINE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Provers and kinds tracked at once. Past it a newcomer waits for an entry to
+/// age out, so rejected operations cannot grow the map or the log without
+/// bound: at most this many lines per interval.
+const REJECTION_LINE_KEYS: usize = 64;
+
+/// Whether a rejection of `key` (operation type, prover) gets a line at `now`.
+fn rejection_line_due(
+    seen: &mut std::collections::HashMap<(u32, Vec<u8>), std::time::Instant>,
+    key: (u32, Vec<u8>),
+    now: std::time::Instant,
+) -> bool {
+    if seen.len() >= REJECTION_LINE_KEYS {
+        seen.retain(|_, at| now.duration_since(*at) < REJECTION_LINE_INTERVAL);
+    }
+    match seen.get(&key) {
+        Some(at) if now.duration_since(*at) < REJECTION_LINE_INTERVAL => false,
+        None if seen.len() >= REJECTION_LINE_KEYS => false,
+        _ => {
+            seen.insert(key, now);
+            true
+        }
+    }
+}
+
 /// Global lifecycle rejections remain per-operation skips. Infrastructure
 /// failures must reach the frame caller. Neither may retain partial step writes.
+/// A rejection also says so at info, bounded: the sender was told only that
+/// the message went out. Logging only; every node decides the same either way.
 fn finish_global_step(
     state: &crate::hypergraph_state::HypergraphState,
     checkpoint: usize,
+    frame_number: u64,
+    inner_bytes: &[u8],
     inner_type: u32,
     error: QuilError,
 ) -> Result<()> {
@@ -1815,6 +1852,30 @@ fn finish_global_step(
         return Err(error);
     }
     tracing::debug!(inner_type, %error, "global operation rejected");
+    static SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(u32, Vec<u8>), std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    let prover = extract_prover_address(inner_bytes, inner_type).unwrap_or_default();
+    let due = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .is_ok_and(|mut seen| {
+            rejection_line_due(
+                &mut seen,
+                (inner_type, prover.clone()),
+                std::time::Instant::now(),
+            )
+        });
+    if due {
+        let kind = crate::global_engine::peek_global_message_kind(inner_bytes)
+            .map_or_else(|_| "unknown".to_string(), |kind| format!("{kind:?}"));
+        tracing::info!(frame = frame_number, kind = %kind, prover = %hex::encode(&prover), %error,
+            scope = "the sending prover",
+            action = "the operation had no effect; if the prover is yours, check its allocations \
+                      with qclient node prover status and send it again",
+            "global operation rejected at execution and rolled back \
+             (at most one line per prover and kind per minute)");
+    }
     Ok(())
 }
 
@@ -3222,11 +3283,121 @@ mod tests {
             } else {
                 QuilError::InvalidArgument("rejected operation".into())
             };
-            let result = finish_global_step(&state, checkpoint, 0, error);
+            let result = finish_global_step(&state, checkpoint, 1, &[], 0, error);
             assert_eq!(result.is_err(), unavailable);
             assert_eq!(state.changeset_len(), checkpoint);
             assert_eq!(state.get(&[7; 32], &[9; 32], &va).unwrap(), None);
         }
+    }
+
+    /// Records the messages of the info events it sees.
+    #[derive(Clone, Default)]
+    struct InfoLines(Arc<std::sync::Mutex<Vec<String>>>);
+    struct Text<'a>(&'a mut String);
+    impl tracing::field::Visit for Text<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!("{}={value:?} ", field.name()));
+        }
+    }
+    impl tracing::Subscriber for InfoLines {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::INFO {
+                let mut line = String::new();
+                event.record(&mut Text(&mut line));
+                self.0.lock().unwrap().push(line);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A rejected operation says so at info with its frame, kind, prover and
+    /// reason, once per prover and kind per interval; a rejection for another
+    /// prover still speaks, and an infrastructure failure, which reaches the
+    /// frame caller, does not.
+    #[test]
+    fn a_rejected_operation_logs_a_bounded_line_with_its_reason() {
+        use crate::global_intrinsic::addressed_signature::AddressedSignature;
+        use crate::global_intrinsic::prover_filter_ops::{ProverLeave, TYPE_PROVER_LEAVE};
+        use crate::hypergraph_state::HypergraphState;
+        use quil_hypergraph::{testing::MemStore, HypergraphCrdt};
+        let state = HypergraphState::new(Arc::new(HypergraphCrdt::new(
+            Arc::new(MemStore::new()),
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+        )));
+        let leave = |address: u8| {
+            ProverLeave {
+                filters: vec![vec![0xAA; 32]],
+                frame_number: 5,
+                public_key_signature_bls48581: Some(AddressedSignature {
+                    address: vec![address; 32],
+                    signature: vec![1; AddressedSignature::SIG_LEN_SINGLE],
+                }),
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let lines = InfoLines::default();
+        let rejected = || QuilError::InvalidArgument("allocation status is 4".into());
+        tracing::subscriber::with_default(lines.clone(), || {
+            for bytes in [leave(0xD1), leave(0xD1), leave(0xD2)] {
+                finish_global_step(&state, 0, 7, &bytes, TYPE_PROVER_LEAVE, rejected()).unwrap();
+            }
+            assert!(finish_global_step(
+                &state,
+                0,
+                7,
+                &leave(0xD3),
+                TYPE_PROVER_LEAVE,
+                QuilError::Store("temporarily unavailable".into()),
+            )
+            .is_err());
+        });
+        let lines = lines.0.lock().unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for (line, prover) in lines.iter().zip(["d1", "d2"]) {
+            assert!(!line.contains("Some("), "{line}");
+            for text in [
+                "frame=7",
+                "kind=ProverLeave",
+                &format!("prover={}", prover.repeat(32)),
+                "allocation status is 4",
+                "rolled back",
+            ] {
+                assert!(line.contains(text), "{text} in {line}");
+            }
+        }
+    }
+
+    /// A prover's next line waits out the interval, and the map stays bounded
+    /// however many provers are rejected: past the cap a newcomer waits for an
+    /// entry to age out.
+    #[test]
+    fn rejection_lines_are_bounded_by_prover_kind_and_interval() {
+        let mut seen = std::collections::HashMap::new();
+        let start = std::time::Instant::now();
+        let later = start + REJECTION_LINE_INTERVAL;
+        let key = |n: usize| (1u32, n.to_be_bytes().to_vec());
+        assert!(rejection_line_due(&mut seen, key(0), start));
+        assert!(!rejection_line_due(&mut seen, key(0), start));
+        assert!(rejection_line_due(&mut seen, (2, key(0).1), start));
+        assert!(rejection_line_due(&mut seen, key(0), later));
+        for n in 1..REJECTION_LINE_KEYS * 2 {
+            let due = rejection_line_due(&mut seen, key(n), start);
+            assert_eq!(due, n + 2 <= REJECTION_LINE_KEYS, "newcomer {n}");
+        }
+        assert_eq!(seen.len(), REJECTION_LINE_KEYS);
+        let aged = later + REJECTION_LINE_INTERVAL;
+        assert!(rejection_line_due(&mut seen, key(1_000), aged));
+        assert_eq!(seen.len(), 1, "aged entries leave");
     }
 
     #[test]
