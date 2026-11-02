@@ -9,6 +9,17 @@ use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageR
 /// An application engine over an execution manager with no proof worker,
 /// and its collector.
 fn engine_with_execution() -> (AppConsensusEngine, Arc<MessageCollector>) {
+    let collector = Arc::new(MessageCollector::new());
+    let engine = engine_on(
+        quil_execution::domains::QUIL_TOKEN.to_vec(),
+        collector.clone(),
+    );
+    (engine, collector)
+}
+
+/// [`engine_with_execution`] for shard `filter` over `collector`, as a worker
+/// keeps its pool when it moves to another shard of the application.
+fn engine_on(filter: Vec<u8>, collector: Arc<MessageCollector>) -> AppConsensusEngine {
     let rocks = quil_store::RocksDb::open_in_memory().unwrap();
     let store = Arc::new(quil_store::RocksHypergraphStore::new(rocks.inner()));
     let prover = Arc::new(quil_types::crypto::NoopInclusionProver);
@@ -30,7 +41,6 @@ fn engine_with_execution() -> (AppConsensusEngine, Arc<MessageCollector>) {
     // Invalid argument"). Keep it for the process instead, as the node's
     // own exit does.
     std::mem::forget(manager.clone());
-    let collector = Arc::new(MessageCollector::new());
     let (events, _received) = mpsc::unbounded_channel();
     let private = [7; 57];
     let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
@@ -58,9 +68,8 @@ fn engine_with_execution() -> (AppConsensusEngine, Arc<MessageCollector>) {
         db_config: Default::default(),
         unified_cutover_hook: None,
     };
-    let app = quil_execution::domains::QUIL_TOKEN;
-    let (engine, _) = AppConsensusEngine::new(1, app.to_vec(), deps, events);
-    (engine, collector)
+    let (engine, _) = AppConsensusEngine::new(1, filter, deps, events);
+    engine
 }
 
 /// A canonical bundle of one confidential transfer of the QUIL token,
@@ -145,4 +154,233 @@ async fn arrivals_queue_at_most_their_budget_of_verification_time() {
          queued at about 8 s each against 600 worker-seconds"
     );
     assert!(queued >= 70, "the budget admits what fits: {queued} queued");
+}
+
+/// The longest shield this test sends: a carrier of 1 MiB does not pass the
+/// wire conversion an arrival goes through.
+const LONG_SHIELD: usize = (1 << 20) - (1 << 10);
+/// Long shields that overflow the 64 MiB rank buffer.
+const OVERFLOW: u32 = 66;
+
+/// A canonical bundle of one batch shield of the QUIL token consuming
+/// `source` first, distinct per `n`, about `bytes` long: its carrier header,
+/// type and version tags and its source are what routing reads, and the rest
+/// is arbitrary.
+fn shield_bundle(source: [u8; 32], n: u32, bytes: usize) -> Vec<u8> {
+    let mut inner = shield_inner(source, n);
+    inner.resize(bytes.max(inner.len()), 0x44);
+    token_bundle(inner)
+}
+
+fn shield_inner(source: [u8; 32], n: u32) -> Vec<u8> {
+    let tp = quil_execution::token_engine::TYPE_LATTICE_SHIELD;
+    let mut inner = tp.to_be_bytes().to_vec();
+    inner.extend_from_slice(b"QCT3SH\0\x03");
+    inner.extend_from_slice(&[1; 32]);
+    inner.extend_from_slice(&quil_execution::domains::QUIL_TOKEN);
+    inner.extend_from_slice(&[0x22; 57]);
+    inner.extend_from_slice(&96u16.to_be_bytes());
+    inner.extend_from_slice(&source);
+    inner.extend_from_slice(&n.to_le_bytes());
+    inner
+}
+
+fn token_bundle(inner: Vec<u8>) -> Vec<u8> {
+    CanonicalMessageBundle {
+        requests: vec![Some(CanonicalMessageRequest {
+            inner_type_prefix: quil_execution::token_engine::TYPE_LATTICE_SHIELD,
+            inner_bytes: inner,
+        })],
+        timestamp: 1,
+    }
+    .to_canonical_bytes()
+    .unwrap()
+}
+
+/// Shard filter of the QUIL token at `bits`.
+fn token_shard(bits: &[bool]) -> Vec<u8> {
+    quil_forest::encode_shard_bit_path(&quil_execution::domains::QUIL_TOKEN, bits)
+}
+
+/// A coin address whose first bits are `bits`.
+fn source_under(bits: &[bool], n: u8) -> [u8; 32] {
+    let mut source = [n; 32];
+    for (index, bit) in bits.iter().enumerate() {
+        if *bit {
+            source[index / 8] |= 0x80 >> (index % 8);
+        } else {
+            source[index / 8] &= !(0x80 >> (index % 8));
+        }
+    }
+    source
+}
+
+/// 2026-11-02: every worker held bundles only another shard can propose until
+/// its 64 MiB rank buffer refused the ones its own shard had to propose,
+/// which were lost on that worker and skipped their arrival verification.
+#[tokio::test]
+async fn shields_only_another_shard_proposes_do_not_refuse_this_shards_own() {
+    let shard = token_shard(&[false]);
+    let (elsewhere, own) = (source_under(&[true], 1), source_under(&[false], 2));
+    let collector = Arc::new(MessageCollector::new());
+    let mut engine = engine_on(shard, collector.clone());
+    if !counts_confidential(&shield_bundle(own, 0, 1 << 10)) {
+        eprintln!("skipped: needs quil-execution's native prover (workspace build)");
+        return;
+    }
+    for n in 0..OVERFLOW {
+        engine.add_app_message(&shield_bundle(elsewhere, n, LONG_SHIELD));
+    }
+    let held = collector.total_pending();
+    engine.add_app_message(&shield_bundle(own, 1000, LONG_SHIELD));
+    assert_eq!(
+        collector.total_pending(),
+        held + 1,
+        "this shard's own shield was refused: {held} bundles only another shard can propose \
+         filled its rank buffer"
+    );
+}
+
+/// A shield is held only where it can be proposed; a submission that any
+/// shard may carry past the routing fallback, and a shield whose source this
+/// node cannot read, are held on every shard as before.
+#[tokio::test]
+async fn a_shield_is_collected_only_on_the_shard_holding_its_source() {
+    let holding = [false, true];
+    let source = source_under(&holding, 3);
+    let shards: Vec<Vec<bool>> = vec![
+        vec![false, false],
+        vec![false, true],
+        vec![true, false],
+        vec![true, true],
+    ];
+    if !counts_confidential(&shield_bundle(source, 0, 1 << 10)) {
+        eprintln!("skipped: needs quil-execution's native prover (workspace build)");
+        return;
+    }
+    for bits in &shards {
+        let collector = Arc::new(MessageCollector::new());
+        let mut engine = engine_on(token_shard(bits), collector.clone());
+        engine.add_app_message(&shield_bundle(source, 1, 1 << 10));
+        assert_eq!(
+            collector.total_pending(),
+            usize::from(bits.as_slice() == holding),
+            "shard {bits:?} of a shield whose source is under {holding:?}"
+        );
+        engine.add_app_message(&transfer_bundle(1));
+        // Cut before its source: the carrier passes, the source cannot be read.
+        let mut unreadable = shield_inner(source, 2);
+        unreadable.truncate(100);
+        engine.add_app_message(&token_bundle(unreadable));
+        assert_eq!(
+            collector.total_pending(),
+            usize::from(bits.as_slice() == holding) + 2,
+            "shard {bits:?} dropped a transfer or a shield with no readable source"
+        );
+    }
+    // The application's one shard holds every source.
+    let collector = Arc::new(MessageCollector::new());
+    let mut engine = engine_on(
+        quil_execution::domains::QUIL_TOKEN.to_vec(),
+        collector.clone(),
+    );
+    engine.add_app_message(&shield_bundle(source, 1, 1 << 10));
+    assert_eq!(collector.total_pending(), 1, "an unsplit application");
+}
+
+/// A split while a shield is held: the members' pools go with them, so the
+/// child holding the source proposes it, and it never leaves a sibling's pool
+/// for this; a merge brings it back within the merged shard's range. New
+/// arrivals on a child follow the child's range.
+#[tokio::test]
+async fn a_held_shield_follows_splits_and_merges_to_its_proposer() {
+    let (parent, left, right) = (
+        token_shard(&[false]),
+        token_shard(&[false, false]),
+        token_shard(&[false, true]),
+    );
+    let (under_left, under_right) = (
+        source_under(&[false, false], 4),
+        source_under(&[false, true], 5),
+    );
+    let collector = Arc::new(MessageCollector::new());
+    if !counts_confidential(&shield_bundle(under_left, 0, 1 << 10)) {
+        eprintln!("skipped: needs quil-execution's native prover (workspace build)");
+        return;
+    }
+    let mut engine = engine_on(parent.clone(), collector.clone());
+    engine.add_app_message(&shield_bundle(under_left, 1, 1 << 10));
+    engine.add_app_message(&shield_bundle(under_right, 2, 1 << 10));
+    assert_eq!(collector.total_pending(), 2, "the parent holds both");
+    // The worker moves to the left child with its pool (`thread_worker`).
+    collector.rebase_ranks();
+    let mut child = engine_on(left.clone(), collector.clone());
+    assert_eq!(collector.total_pending(), 2, "a split drops nothing");
+    let proposes = |shard: &[u8], source: [u8; 32]| {
+        routed_selection(
+            shard,
+            &[left.clone(), right.clone()],
+            &[[9; 32]],
+            &[1],
+            &[Some(source)],
+            &[std::time::Duration::ZERO],
+            ROUTED_FALLBACK,
+        )[0]
+    };
+    assert!(proposes(&left, under_left));
+    assert!(!proposes(&left, under_right));
+    assert!(proposes(&right, under_right));
+    child.add_app_message(&shield_bundle(under_right, 3, 1 << 10));
+    assert_eq!(collector.total_pending(), 2, "the sibling's new arrival");
+    child.add_app_message(&shield_bundle(under_left, 4, 1 << 10));
+    assert_eq!(collector.total_pending(), 3, "its own new arrival");
+    // The children merge: the merged shard proposes what either held.
+    collector.rebase_ranks();
+    let _merged = engine_on(parent.clone(), collector.clone());
+    assert_eq!(collector.total_pending(), 3, "a merge drops nothing");
+    assert!(routed_selection(
+        &parent,
+        std::slice::from_ref(&parent),
+        &[[9; 32], [8; 32]],
+        &[1, 1],
+        &[Some(under_left), Some(under_right)],
+        &[std::time::Duration::ZERO; 2],
+        ROUTED_FALLBACK,
+    )
+    .iter()
+    .all(|keep| *keep));
+}
+
+/// The rank buffer still bounds a shard's own shields, and it recovers: past
+/// the cap they are refused, and once a frame consumed some, arrivals are
+/// collected again.
+#[tokio::test]
+async fn a_shard_full_of_its_own_shields_collects_again_once_one_executes() {
+    let own = source_under(&[false], 6);
+    let collector = Arc::new(MessageCollector::new());
+    let mut engine = engine_on(token_shard(&[false]), collector.clone());
+    if !counts_confidential(&shield_bundle(own, 0, 1 << 10)) {
+        eprintln!("skipped: needs quil-execution's native prover (workspace build)");
+        return;
+    }
+    let first = shield_bundle(own, 0, LONG_SHIELD);
+    engine.add_app_message(&first);
+    for n in 1..OVERFLOW {
+        engine.add_app_message(&shield_bundle(own, n, LONG_SHIELD));
+    }
+    let held = collector.total_pending();
+    assert!(
+        held > 1 && held < OVERFLOW as usize,
+        "the cap held {held} of {OVERFLOW} long shields"
+    );
+    engine.add_app_message(&shield_bundle(own, 1000, LONG_SHIELD));
+    assert_eq!(collector.total_pending(), held, "full: refused");
+    collector.mark_finalized(&[canonical_app_message(&first)]);
+    assert_eq!(collector.total_pending(), held - 1);
+    engine.add_app_message(&shield_bundle(own, 1000, LONG_SHIELD));
+    assert_eq!(
+        collector.total_pending(),
+        held,
+        "a frame consumed one, and the shard still refuses its shields"
+    );
 }
