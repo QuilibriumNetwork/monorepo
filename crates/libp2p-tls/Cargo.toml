@@ -65,12 +65,9 @@ features = [
 default-features = false
 
 # Quilibrium: sntrup761 (Streamlined NTRU Prime) KEM for the post-quantum QUIC
-# key-exchange group. PQClean via pqcrypto-ntruprime.
-[dependencies.pqcrypto-ntruprime]
-version = "0.1"
-
-[dependencies.pqcrypto-traits]
-version = "0.3"
+# key-exchange group.
+[dependencies.quil-sntrup761]
+path = "../quil-sntrup761"
 
 [dependencies.thiserror]
 version = "2"

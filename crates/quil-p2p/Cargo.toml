@@ -60,10 +60,10 @@ libp2p-identity = { version = "0.2", features = ["ed448", "falcon"] }
 void = "1"
 snow = "0.9"
 bs58 = "0.5"
-# Post-quantum forward-secret Noise (PQNoise framework) + audited NTRU KEM.
+# Post-quantum forward-secret Noise (PQNoise framework) + an NTRU KEM.
 # `clatter` implements the vetted KEM-based Noise handshake (Angel/Dowling/
-# Hülsing/Schwabe); we supply Streamlined NTRU Prime (sntrup761, PQClean via
-# pqcrypto-ntruprime — the OpenSSH-deployed NTRU-family KEM) through clatter's
+# Hülsing/Schwabe); we supply Streamlined NTRU Prime (sntrup761, via
+# quil-sntrup761 — the OpenSSH-deployed NTRU-family KEM) through clatter's
 # `Kem` trait. Non-hybrid, pure-NTRU. Kyber/ML-KEM features intentionally OFF.
 clatter = { version = "2.2", default-features = false, features = [
     "alloc",
@@ -71,8 +71,7 @@ clatter = { version = "2.2", default-features = false, features = [
     "use-chacha20poly1305",
     "use-sha",
 ] }
-pqcrypto-ntruprime = "0.1"
-pqcrypto-traits = "0.3"
+quil-sntrup761 = { path = "../quil-sntrup761" }
 # Length-delimited AEAD framing for the PQNoise libp2p security transport
 # (mirrors libp2p-noise's io layer).
 bytes = "1"

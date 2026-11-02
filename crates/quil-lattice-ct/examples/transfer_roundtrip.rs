@@ -1,7 +1,5 @@
 //! Complete transfer fixture with real recipient memos. Fixed input
 //! seeds are public benchmark data. This does not exercise node admission.
-use pqcrypto_ntruprime::sntrup761;
-use pqcrypto_traits::kem::{PublicKey as _, SecretKey as _};
 use quil_lattice_ct::confidential::{
     address::RecipientAddress,
     coin_tree::{CoinRecord, CoinTree, RootRecord, ROOT_RECORD_BYTES},
@@ -15,6 +13,7 @@ use quil_lattice_ct::confidential::{
     },
     CommitmentKey,
 };
+use quil_sntrup761 as sntrup761;
 use std::{io::Read, time::Instant};
 
 fn main() {

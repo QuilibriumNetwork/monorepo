@@ -344,7 +344,7 @@ mod tests {
         let _b = OnionNode::new(
             net.transport(b"B"),
             b"B".to_vec(),
-            Some(sk_b),
+            Some(sk_b.to_vec()),
             None,
             None,
             None,
@@ -352,7 +352,7 @@ mod tests {
         let _c = OnionNode::new(
             net.transport(b"C"),
             b"C".to_vec(),
-            Some(sk_c),
+            Some(sk_c.to_vec()),
             None,
             Some(exit_c),
             None,
@@ -408,7 +408,7 @@ mod tests {
         let b = OnionNode::new(
             net.transport(b"B"),
             b"B".to_vec(),
-            Some(sk_b),
+            Some(sk_b.to_vec()),
             None,
             Some(exit_b),
             None,
@@ -416,7 +416,7 @@ mod tests {
         let _c = OnionNode::new(
             net.transport(b"C"),
             b"C".to_vec(),
-            Some(sk_c),
+            Some(sk_c.to_vec()),
             None,
             Some(exit_c),
             None,
@@ -458,7 +458,7 @@ mod tests {
         let _b = OnionNode::new(
             net.transport(b"B"),
             b"B".to_vec(),
-            Some(sk_b),
+            Some(sk_b.to_vec()),
             None,
             None,
             None,
@@ -501,7 +501,7 @@ mod tests {
         let _b = OnionNode::new(
             net.transport(b"B"),
             b"B".to_vec(),
-            Some(sk_b),
+            Some(sk_b.to_vec()),
             None,
             None,
             None,
@@ -528,7 +528,7 @@ mod tests {
         let c = OnionNode::new(
             net.transport(b"C"),
             b"C".to_vec(),
-            Some(sk_c),
+            Some(sk_c.to_vec()),
             None,
             Some(exit_c),
             None,

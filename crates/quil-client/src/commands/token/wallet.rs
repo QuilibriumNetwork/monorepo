@@ -5951,6 +5951,49 @@ pub(super) async fn run_custom_mint(
 
 #[cfg(test)]
 mod tests {
+    /// A value frozen from the pre-seam backend; see `quil-sntrup761/tests/kat.rs`.
+    fn frozen(name: &str) -> Vec<u8> {
+        const TABLE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../quil-sntrup761/tests/data/continuity.hex"
+        ));
+        let line = TABLE
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+            .unwrap();
+        (0..line.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&line[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The recipient seed hashes the raw secret key: a stored wallet key must
+    /// keep its address and open its coins, or the funds are unreachable.
+    #[test]
+    fn frozen_wallet_key_keeps_its_address_and_opens_its_coin() {
+        let wallet = super::RecipientWallet::from_keys(
+            &[63; 32],
+            &[64; 32],
+            &frozen("key_public"),
+            super::Zeroizing::new(frozen("key_secret")),
+        )
+        .unwrap();
+        assert_eq!(
+            wallet.address().encode()[..],
+            frozen("wallet_address")[..],
+            "wallet address changed"
+        );
+        let coin = super::Output {
+            commitment: quil_lattice_ct::confidential::AmountCommitment::from_bytes(&frozen(
+                "wallet_coin_commitment",
+            ))
+            .unwrap(),
+            owner: frozen("wallet_coin_owner").try_into().unwrap(),
+            memo: frozen("wallet_coin_memo").try_into().unwrap(),
+        };
+        assert_eq!(wallet.open(&coin).unwrap().amount, 1_234_567_890);
+    }
+
     #[cfg(feature = "native-proof")]
     #[test]
     fn automatic_fee_headroom_rounds_up_and_checks_range() {

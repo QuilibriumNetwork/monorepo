@@ -26,10 +26,8 @@ rayon = "1"
 # Falcon / FN-DSA-512 post-quantum consensus signatures (pure Rust, Pornin).
 fn-dsa = "0.3"
 # sntrup761 (Streamlined NTRU Prime) KEM — post-quantum config read/encryption
-# keys, replacing X448. PQClean via pqcrypto-ntruprime (same crate the QUIC
-# transport key-exchange uses).
-pqcrypto-ntruprime = "0.1"
-pqcrypto-traits = "0.3"
+# keys, replacing X448. The same seam the QUIC transport key-exchange uses.
+quil-sntrup761 = { path = "../quil-sntrup761" }
 # AES-256-GCM for payloads sealed to an sntrup761 key (`seal`).
 aes-gcm = "0.10"
 poseidon-rs = "0.0.10"

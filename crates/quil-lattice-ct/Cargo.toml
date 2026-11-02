@@ -13,14 +13,13 @@ zeroize = { version = "1.8", optional = true }
 aes = { version = "0.8.4", features = ["zeroize"], optional = true }
 num-bigint = { version = "0.4.6", optional = true }
 aes-gcm = { version = "0.10.3", features = ["zeroize"], optional = true }
-pqcrypto-ntruprime = { version = "0.1", optional = true }
-pqcrypto-traits = { version = "0.3", optional = true }
+quil-sntrup761 = { path = "../quil-sntrup761", optional = true }
 rand = { version = "0.8", optional = true }
 quil-lattice-proof-sys = { path = "../quil-lattice-proof-sys", features = ["native-backend"], optional = true }
 
 [features]
 # Token codecs and relations; the native proof backend is separately selectable.
-confidential-tokens = ["dep:sha3", "dep:zeroize", "dep:aes", "dep:num-bigint", "dep:aes-gcm", "dep:pqcrypto-ntruprime", "dep:pqcrypto-traits", "dep:rand", "dep:libc"]
+confidential-tokens = ["dep:sha3", "dep:zeroize", "dep:aes", "dep:num-bigint", "dep:aes-gcm", "dep:quil-sntrup761", "dep:rand", "dep:libc"]
 native-proof = ["confidential-tokens", "dep:quil-lattice-proof-sys"]
 # Benchmark-only relation ablation (QUIL_ABLATION=no_ownership|no_membership). Never enable in node or wallet builds.
 ablation-bench = ["quil-lattice-proof-sys?/bench-knobs"]

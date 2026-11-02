@@ -12,7 +12,7 @@
 //! (Angel/Dowling/Hülsing/Schwabe, CCS'22). It owns the handshake state
 //! machine, transcript hashing, and the `pqxx` pattern (mutual auth via
 //! static KEM keys + forward secrecy via ephemeral KEM).
-//! * **Streamlined NTRU Prime (sntrup761)** via PQClean (`pqcrypto-ntruprime`)
+//! * **Streamlined NTRU Prime (sntrup761)** via `quil-sntrup761`
 //! — the NTRU-family KEM deployed in OpenSSH (`sntrup761x25519`) at internet
 //! scale. Pure NTRU, **non-hybrid**, non-NIST-standardized. Supplied to
 //! clatter through its `Kem` trait ([`Sntrup761`]).
@@ -39,8 +39,7 @@ use clatter::traits::{CryptoComponent, Kem, Rng};
 use clatter::transportstate::TransportState;
 use clatter::{Handshaker, KeyPair, PqHandshake};
 
-use pqcrypto_ntruprime::sntrup761;
-use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SecretKey as _, SharedSecret as _};
+use quil_sntrup761 as sntrup761;
 
 use quil_types::error::{QuilError, Result};
 
@@ -53,8 +52,8 @@ const MAX_FRAME: usize = MAX_MESSAGE_LEN;
 // Streamlined NTRU Prime (sntrup761) as a clatter KEM.
 //
 // Mirrors clatter's own `crypto_impl/pqclean_ml_kem.rs` wrapper exactly, but
-// over PQClean's sntrup761 instead of ML-KEM. PQClean drives its own internal
-// CSPRNG, so the `Rng` argument is unused (same as the ML-KEM wrapper).
+// over sntrup761 instead of ML-KEM. The KEM draws its own system randomness,
+// so the `Rng` argument is unused (same as the ML-KEM wrapper).
 // ---------------------------------------------------------------------------
 
 /// Streamlined NTRU Prime (sntrup761) KEM: pk 1158 B / sk 1763 B / ct 1039 B /
@@ -69,13 +68,13 @@ impl CryptoComponent for Sntrup761 {
 }
 
 impl Kem for Sntrup761 {
-    type SecretKey = SensitiveByteArray<HeapArray<{ sntrup761::secret_key_bytes() }>>;
-    type PubKey = HeapArray<{ sntrup761::public_key_bytes() }>;
-    type Ct = HeapArray<{ sntrup761::ciphertext_bytes() }>;
-    type Ss = SensitiveByteArray<[u8; sntrup761::shared_secret_bytes()]>;
+    type SecretKey = SensitiveByteArray<HeapArray<{ sntrup761::SECRET_KEY_LEN }>>;
+    type PubKey = HeapArray<{ sntrup761::PUBLIC_KEY_LEN }>;
+    type Ct = HeapArray<{ sntrup761::CIPHERTEXT_LEN }>;
+    type Ss = SensitiveByteArray<[u8; sntrup761::SHARED_SECRET_LEN]>;
 
     fn genkey_rng<R: Rng>(_rng: &mut R) -> KemResult<KeyPair<Self::PubKey, Self::SecretKey>> {
-        // PQClean uses its own RNG.
+        // The KEM draws its own randomness.
         let (pk, sk) = sntrup761::keypair();
         Ok(KeyPair {
             public: ByteArray::from_slice(pk.as_bytes()),
@@ -85,7 +84,7 @@ impl Kem for Sntrup761 {
 
     fn encapsulate<R: Rng>(pk: &[u8], _rng: &mut R) -> KemResult<(Self::Ct, Self::Ss)> {
         let pk = sntrup761::PublicKey::from_bytes(pk).map_err(|_| KemError::Input)?;
-        // PQClean uses its own RNG.
+        // The KEM draws its own randomness.
         let (ss, ct) = sntrup761::encapsulate(&pk);
         Ok((
             Self::Ct::from_slice(ct.as_bytes()),

@@ -20,11 +20,10 @@
 //! * client: [`ActiveKeyExchange::complete`] receives the server's ciphertext
 //!   and **decapsulates** to the same shared secret.
 //!
-//! sntrup761 is the OpenSSH-deployed, PQClean-audited NTRU-family KEM
-//! (pk 1158 B / ct 1039 B / shared secret 32 B), via `pqcrypto-ntruprime`.
+//! sntrup761 is the OpenSSH-deployed NTRU-family KEM
+//! (pk 1158 B / ct 1039 B / shared secret 32 B), via `quil-sntrup761`.
 
-use pqcrypto_ntruprime::sntrup761;
-use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SecretKey as _, SharedSecret as _};
+use quil_sntrup761 as sntrup761;
 use rustls::crypto::{ActiveKeyExchange, CompletedKeyExchange, SharedSecret, SupportedKxGroup};
 use rustls::{Error, NamedGroup, PeerMisbehaved};
 
@@ -45,11 +44,8 @@ impl SupportedKxGroup for Sntrup761KxGroup {
 
     /// Client side: generate an sntrup761 keypair.
     fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, Error> {
-        let (pk, sk) = sntrup761::keypair();
-        Ok(Box::new(Sntrup761KeyExchange {
-            public: pk.as_bytes().to_vec(),
-            secret: sk.as_bytes().to_vec(),
-        }))
+        let (public, secret) = sntrup761::keypair();
+        Ok(Box::new(Sntrup761KeyExchange { public, secret }))
     }
 
     /// Server side: encapsulate to the client's public key (KEM data
@@ -68,23 +64,21 @@ impl SupportedKxGroup for Sntrup761KxGroup {
 
 /// A client-side in-progress sntrup761 exchange (holds the ephemeral keypair).
 struct Sntrup761KeyExchange {
-    public: Vec<u8>,
-    secret: Vec<u8>,
+    public: sntrup761::PublicKey,
+    secret: sntrup761::SecretKey,
 }
 
 impl ActiveKeyExchange for Sntrup761KeyExchange {
     /// Client side: decapsulate the server's ciphertext to the shared secret.
     fn complete(self: Box<Self>, peer_pub_key: &[u8]) -> Result<SharedSecret, Error> {
-        let sk = sntrup761::SecretKey::from_bytes(&self.secret)
-            .map_err(|_| Error::PeerMisbehaved(PeerMisbehaved::InvalidKeyShare))?;
         let ct = sntrup761::Ciphertext::from_bytes(peer_pub_key)
             .map_err(|_| Error::PeerMisbehaved(PeerMisbehaved::InvalidKeyShare))?;
-        let ss = sntrup761::decapsulate(&ct, &sk);
+        let ss = sntrup761::decapsulate(&ct, &self.secret);
         Ok(SharedSecret::from(ss.as_bytes()))
     }
 
     fn pub_key(&self) -> &[u8] {
-        &self.public
+        self.public.as_bytes()
     }
 
     fn group(&self) -> NamedGroup {
@@ -106,18 +100,18 @@ mod tests {
         // Client starts.
         let client = group.start().unwrap();
         let client_pk = client.pub_key().to_vec();
-        assert_eq!(client_pk.len(), sntrup761::public_key_bytes());
+        assert_eq!(client_pk.len(), sntrup761::PUBLIC_KEY_LEN);
 
         // Server encapsulates to the client's public key.
         let completed = group.start_and_complete(&client_pk).unwrap();
         assert_eq!(completed.group, SNTRUP761_GROUP);
-        assert_eq!(completed.pub_key.len(), sntrup761::ciphertext_bytes());
+        assert_eq!(completed.pub_key.len(), sntrup761::CIPHERTEXT_LEN);
         let server_secret = completed.secret.secret_bytes().to_vec();
 
         // Client decapsulates the server's ciphertext.
         let client_secret = client.complete(&completed.pub_key).unwrap();
         assert_eq!(client_secret.secret_bytes(), &server_secret[..]);
-        assert_eq!(server_secret.len(), sntrup761::shared_secret_bytes());
+        assert_eq!(server_secret.len(), sntrup761::SHARED_SECRET_LEN);
     }
 
     #[test]
