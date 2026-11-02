@@ -160,6 +160,56 @@ fn select_coins(
 /// `max_coins` answers pages of eight, which the page checks accept too.
 const SCAN_PAGE_ENTRIES: usize = quil_types::store::MAX_SCAN_PAGE_ENTRIES;
 
+/// Times a scan's read is asked again after the node could not deliver it,
+/// and the wait before each. A failed page leaves the scan where it was, so
+/// asking again costs one page, where failing costs the whole scan. A call
+/// ends at the channel's deadline (120 s), which bounds the page at 8.5 min.
+const SCAN_READ_RETRIES: usize = 3;
+#[cfg(not(test))]
+const SCAN_READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(test)]
+const SCAN_READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Whether a scan's read can succeed if asked again. A snapshot that expired
+/// or a pin that is gone says "restart": only a new scan can read it.
+fn scan_read_is_transient(status: &tonic::Status) -> bool {
+    use tonic::Code;
+    matches!(
+        status.code(),
+        Code::Unavailable
+            | Code::Unknown
+            | Code::Cancelled
+            | Code::DeadlineExceeded
+            | Code::ResourceExhausted
+            | Code::Aborted
+    ) && !status.message().contains("restart")
+}
+
+/// `read`, asked again while it fails in a way that can pass.
+async fn retry_scan_read<T, F, Fut>(what: &str, mut read: F) -> Result<T, tonic::Status>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, tonic::Status>>,
+{
+    let mut retries = 0;
+    loop {
+        let status = match read().await {
+            Ok(value) => return Ok(value),
+            Err(status) => status,
+        };
+        if retries >= SCAN_READ_RETRIES || !scan_read_is_transient(&status) {
+            return Err(status);
+        }
+        retries += 1;
+        eprintln!(
+            "confidential scan: {what} failed ({}); asking again in {} s ({retries}/{SCAN_READ_RETRIES})",
+            status.message(),
+            SCAN_READ_RETRY_DELAY.as_secs()
+        );
+        tokio::time::sleep(SCAN_READ_RETRY_DELAY).await;
+    }
+}
+
 /// Page budget of a witness rebuild's scan until a balance scan sets one: the
 /// `--max-pages` default.
 const DEFAULT_SCAN_PAGES: usize = 2048;
@@ -506,6 +556,22 @@ impl ScanReport {
             self.spent_checks
         )
     }
+
+    /// The error ending a scan: which page it could not read and how far it
+    /// got, with the node's own reason. A wallet scan only reads, so nothing
+    /// was lost; the next scan starts over because it needs a fresh snapshot.
+    fn stopped(&self, error: anyhow::Error) -> anyhow::Error {
+        let reason = match error.downcast_ref::<tonic::Status>() {
+            Some(status) => status.message().to_string(),
+            None => format!("{error:#}"),
+        };
+        anyhow::anyhow!(
+            "scan stopped at page {} after {} coins in {} pages: {reason}; a scan only reads, so nothing is lost: run it again",
+            self.pages + 1,
+            self.coins,
+            self.pages
+        )
+    }
 }
 
 impl CoinScan {
@@ -733,15 +799,20 @@ impl RecipientWallet {
     ) -> anyhow::Result<(bool, Vec<u8>)> {
         let mut address = quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS.to_vec();
         address.extend_from_slice(record);
-        let response = client
-            .clone()
-            .max_decoding_message_size(66_560)
-            .get_vertex_data(quil_types::proto::node::GetVertexDataRequest {
-                address,
-                full_data: true,
-            })
-            .await?
-            .into_inner();
+        let response = retry_scan_read("a record read", || {
+            let mut client = client.clone().max_decoding_message_size(66_560);
+            let address = address.clone();
+            async move {
+                client
+                    .get_vertex_data(quil_types::proto::node::GetVertexDataRequest {
+                        address,
+                        full_data: true,
+                    })
+                    .await
+            }
+        })
+        .await?
+        .into_inner();
         Self::decode_global_record(response)
     }
 
@@ -2180,17 +2251,20 @@ impl RecipientWallet {
             !scan.finished && scan.remaining_pages > 0,
             "scan ended or page budget exhausted"
         );
-        Ok(client
-            .clone()
-            .max_decoding_message_size(quil_types::store::scan_page_bytes(SCAN_PAGE_ENTRIES))
-            .list_coins(quil_types::proto::node::ListCoinsRequest {
+        let response = retry_scan_read("a page", || {
+            let mut client = client
+                .clone()
+                .max_decoding_message_size(quil_types::store::scan_page_bytes(SCAN_PAGE_ENTRIES));
+            let request = quil_types::proto::node::ListCoinsRequest {
                 domain: self.application.to_vec(),
                 snapshot_id: scan.snapshot_id.map(|id| id.to_vec()).unwrap_or_default(),
                 after: scan.after.map(|id| id.to_vec()).unwrap_or_default(),
                 max_coins: SCAN_PAGE_ENTRIES as u32,
-            })
-            .await?
-            .into_inner())
+            };
+            async move { client.list_coins(request).await }
+        })
+        .await?;
+        Ok(response.into_inner())
     }
 
     fn recover_page(&self, page: Vec<([u8; 32], Output)>) -> anyhow::Result<Vec<OwnedCoin>> {
@@ -2299,7 +2373,10 @@ impl RecipientWallet {
             .store(max_pages, std::sync::atomic::Ordering::Relaxed);
         let mut unspent = Vec::new();
         while !scan.finished() {
-            let records = self.scan_next_records(client, &mut scan).await?;
+            let records = self
+                .scan_next_records(client, &mut scan)
+                .await
+                .map_err(|error| report.stopped(error))?;
             report.pages += 1;
             report.coins += records.len();
             report.opened += records.len();
@@ -2321,7 +2398,11 @@ impl RecipientWallet {
             let mut ours = std::collections::HashSet::new();
             for coin in owned {
                 report.spent_checks += 1;
-                if self.is_unspent_hint(client, &coin.image).await? {
+                let unspent_hint = self
+                    .is_unspent_hint(client, &coin.image)
+                    .await
+                    .map_err(|error| report.stopped(error))?;
+                if unspent_hint {
                     anyhow::ensure!(
                         unspent.len() < max_owned,
                         "owned coin limit exceeded; scan incomplete"
@@ -7212,6 +7293,74 @@ mod tests {
     /// confidential coin) answers a fresh scan with one empty, final page
     /// that has no root. The wallet takes it as a complete scan holding no
     /// coin, and refuses a rootless page that claims more.
+    /// The transient class is what a node answers when a page did not reach
+    /// it; an expired snapshot or a lost pin needs a new scan, and a refusal
+    /// of the request will not change.
+    #[test]
+    fn a_scan_read_asks_again_only_when_that_can_help() {
+        use tonic::Status;
+        for transient in [
+            Status::unavailable("no node serving application 01 answered this node: 1 peer declined: 1x Unknown: h2 protocol error: error reading a body from connection"),
+            Status::unknown("h2 protocol error: error reading a body from connection"),
+            Status::cancelled("Timeout expired"),
+            Status::resource_exhausted("coin scan workers busy; retry later"),
+        ] {
+            assert!(scan_read_is_transient(&transient), "{transient}");
+        }
+        for final_answer in [
+            Status::unavailable("coin scan snapshot unavailable or expired; restart scan"),
+            Status::unavailable("the peer serving this scan is no longer pinned; restart the scan"),
+            Status::invalid_argument("domain must be 32 bytes"),
+            Status::internal("invalid coin scan page"),
+            Status::unimplemented("coin scan is not enabled"),
+        ] {
+            assert!(!scan_read_is_transient(&final_answer), "{final_answer}");
+        }
+    }
+
+    /// The bound: three more askings of a read, then the last failure.
+    #[tokio::test]
+    async fn a_scan_read_asks_again_within_its_bound() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tonic::Status;
+        let read_failing = |failures: usize| {
+            let calls = std::sync::Arc::new(AtomicUsize::new(0));
+            let read = {
+                let calls = calls.clone();
+                move || {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if n < failures {
+                            Err(Status::unavailable(format!("attempt {n}")))
+                        } else {
+                            Ok(n)
+                        }
+                    }
+                }
+            };
+            (calls, read)
+        };
+        let (calls, read) = read_failing(SCAN_READ_RETRIES);
+        assert_eq!(
+            retry_scan_read("a page", read).await.unwrap(),
+            SCAN_READ_RETRIES,
+            "the last allowed asking recovers"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), SCAN_READ_RETRIES + 1);
+        let (calls, read) = read_failing(usize::MAX);
+        let status = retry_scan_read("a page", read).await.unwrap_err();
+        assert_eq!(status.message(), format!("attempt {SCAN_READ_RETRIES}"));
+        assert_eq!(calls.load(Ordering::SeqCst), SCAN_READ_RETRIES + 1);
+        let calls = AtomicUsize::new(0);
+        let refused: Result<(), _> = retry_scan_read("a page", || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(Status::invalid_argument("no")) }
+        })
+        .await;
+        assert!(refused.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn a_rootless_first_page_completes_the_scan_without_coins() {
         use quil_types::proto::node::ListCoinsResponse;
