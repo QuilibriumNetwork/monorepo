@@ -1741,7 +1741,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                                 match evaluated {
                                                                     Ok(actions) => {
                                                                         for action in actions {
-                                                                            info!(frame = exec_num, ?action, "prover lifecycle action");
+                                                                            if pl_for_recv.action_is_new(&action) { info!(frame = exec_num, ?action, "prover lifecycle action"); }
                                                                             pp_for_recv.dispatch(action);
                                                                         }
                                                                     }

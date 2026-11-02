@@ -2519,11 +2519,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         match evaluated {
                             Ok(actions) => {
                                 for action in actions {
-                                    tracing::info!(
-                                        frame = frame_num,
-                                        ?action,
-                                        "prover lifecycle action"
-                                    );
+                                    if pl_for_poller.action_is_new(&action) {
+                                        tracing::info!(
+                                            frame = frame_num,
+                                            ?action,
+                                            "prover lifecycle action"
+                                        );
+                                    }
                                     pp_for_poller.dispatch(action);
                                 }
                             }
