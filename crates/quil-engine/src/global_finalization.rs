@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use quil_types::error::Result;
 use quil_types::proto::global::GlobalFrame;
@@ -129,11 +129,45 @@ pub enum FinalizationStep {
     Retry(Duration),
 }
 
+/// Failed atomic attempts at one height, from the first failure until the
+/// frame is published, executed through its canonical record or passed. An
+/// operator sees one line at its start and one at its end.
+struct Episode {
+    frame: u64,
+    /// Counted failures.
+    attempts: u32,
+    started: Instant,
+}
+
+impl Episode {
+    fn begin(frame: u64) -> Self {
+        Self {
+            frame,
+            attempts: 0,
+            started: Instant::now(),
+        }
+    }
+
+    fn waited_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    fn end(self, outcome: &'static str) {
+        tracing::info!(
+            frame = self.frame,
+            attempts = self.attempts,
+            duration_ms = self.waited_ms(),
+            outcome,
+            "atomic GLOBAL finalization retry episode ended"
+        );
+    }
+}
+
 #[derive(Default)]
 struct State {
     queued: BTreeMap<u64, GlobalFrame>,
-    /// Counted failures at one height.
-    attempts: Option<(u64, u32)>,
+    /// The failed atomic attempts at the height being published.
+    episode: Option<Episode>,
     /// Inputs that failed authentication, by height and VDF output.
     rejected: BTreeSet<(u64, Vec<u8>)>,
 }
@@ -361,8 +395,10 @@ impl GlobalFinalizationPipeline {
         let mut state = self.lock();
         state.queued.retain(|number, _| *number > cursor);
         state.rejected.retain(|(number, _)| *number > cursor);
-        if matches!(state.attempts, Some((number, _)) if number <= cursor) {
-            state.attempts = None;
+        let passed = state.episode.take_if(|episode| episode.frame <= cursor);
+        drop(state);
+        if let Some(episode) = passed {
+            episode.end("passed");
         }
     }
 
@@ -378,7 +414,7 @@ impl GlobalFinalizationPipeline {
     /// legacy hand-over has not yet completed: the worker then executes the
     /// canonical record in place rather than attempt it again.
     pub fn attempted(&self, number: u64) -> bool {
-        matches!(self.lock().attempts, Some((height, _)) if height == number)
+        matches!(&self.lock().episode, Some(episode) if episode.frame == number)
     }
 
     /// The legacy materializer completed `frame`. True when it is the queued
@@ -388,8 +424,11 @@ impl GlobalFinalizationPipeline {
             return false;
         };
         let mut state = self.lock();
-        if matches!(state.attempts, Some((number, _)) if number == header.frame_number) {
-            state.attempts = None;
+        if let Some(episode) = state
+            .episode
+            .take_if(|episode| episode.frame == header.frame_number)
+        {
+            episode.end("canonical record");
         }
         match state.queued.remove(&header.frame_number) {
             Some(queued) => {
@@ -463,10 +502,7 @@ impl GlobalFinalizationPipeline {
         }
         match attempt {
             GlobalFinalizationAttempt::Published(result) => {
-                let mut state = self.lock();
-                state.queued.remove(&next);
-                state.attempts = None;
-                drop(state);
+                self.finish(next, "published");
                 tracing::info!(
                     frame = next,
                     processed = result.processed,
@@ -476,9 +512,7 @@ impl GlobalFinalizationPipeline {
                 FinalizationStep::Published { frame, result }
             }
             GlobalFinalizationAttempt::Replayed => {
-                let mut state = self.lock();
-                state.queued.remove(&next);
-                state.attempts = None;
+                self.finish(next, "replayed");
                 FinalizationStep::Idle
             }
             GlobalFinalizationAttempt::Busy => FinalizationStep::Retry(self.limits.retry / 2),
@@ -493,22 +527,33 @@ impl GlobalFinalizationPipeline {
             } => {
                 let attempts = {
                     let mut state = self.lock();
-                    let attempts = match state.attempts {
-                        Some((number, n)) if number == next => n.saturating_add(1),
-                        _ => 1,
-                    };
-                    state.attempts = Some((next, attempts));
-                    attempts
+                    if state.episode.as_ref().is_some_and(|e| e.frame != next) {
+                        state.episode = None;
+                    }
+                    let episode = state.episode.get_or_insert_with(|| Episode::begin(next));
+                    episode.attempts = episode.attempts.saturating_add(1);
+                    episode.attempts
                 };
                 if attempts >= max_attempts {
                     return self.legacy(next, &frame, &error.to_string());
                 }
-                tracing::debug!(
-                    frame = next,
-                    attempts,
-                    %error,
-                    "atomic GLOBAL finalization unavailable; retrying"
-                );
+                if attempts == 1 {
+                    tracing::info!(
+                        frame = next,
+                        attempt = attempts,
+                        reason = %error,
+                        scope = "this node",
+                        until = "it publishes, else it executes in place",
+                        "atomic GLOBAL finalization unavailable; retrying"
+                    );
+                } else {
+                    tracing::debug!(
+                        frame = next,
+                        attempt = attempts,
+                        reason = %error,
+                        "atomic GLOBAL finalization unavailable; retrying"
+                    );
+                }
                 FinalizationStep::Retry(
                     self.limits.retry.saturating_mul(1 << (attempts - 1).min(8)),
                 )
@@ -528,17 +573,34 @@ impl GlobalFinalizationPipeline {
             "finalized GLOBAL frame failed authentication; not publishing it"
         );
         let output = frame.header.map(|h| h.output).unwrap_or_default();
+        self.lock().rejected.insert((next, output));
+        self.finish(next, "rejected");
+        FinalizationStep::Idle
+    }
+
+    /// `next` needs nothing more from the worker: forget it and end its
+    /// episode, if it had one.
+    fn finish(&self, next: u64, outcome: &'static str) {
         let mut state = self.lock();
         state.queued.remove(&next);
-        state.rejected.insert((next, output));
-        FinalizationStep::Idle
+        let episode = state.episode.take();
+        drop(state);
+        if let Some(episode) = episode {
+            episode.end(outcome);
+        }
     }
 
     fn legacy(&self, next: u64, frame: &GlobalFrame, reason: &str) -> FinalizationStep {
         let step = self.write_canonical(next, frame);
         if matches!(step, FinalizationStep::Legacy) {
+            let (attempts, waited_ms) = match &self.lock().episode {
+                Some(episode) if episode.frame == next => (episode.attempts, episode.waited_ms()),
+                _ => (0, 0),
+            };
             tracing::warn!(
                 frame = next,
+                attempts,
+                waited_ms,
                 reason,
                 "publishing finalized GLOBAL frame through the legacy materializer"
             );

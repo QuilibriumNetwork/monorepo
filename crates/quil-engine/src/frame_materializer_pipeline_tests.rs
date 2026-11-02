@@ -1430,3 +1430,131 @@ fn publication_ends_the_wait_for_a_finalized_body_and_only_ingesting_archives_wa
         "without sequenced ingest the parent is executed at once"
     );
 }
+
+/// A finalization whose atomic attempts fail and then recover: an operator
+/// sees the first failure, with its reason, and the end with its duration,
+/// and nothing for the failures between.
+#[test]
+fn a_retry_episode_logs_its_first_failure_and_its_end() {
+    use crate::outage::test_logs::CapturedLogs;
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    let rig = Rig::new();
+    let input = certified_deploy(&rig);
+    let (pipeline, _) = pipeline(&rig, prover(&input), 8);
+    pipeline.offer(input);
+
+    let reader = rig.source.execution_manager.hold_engines_for_test();
+    for _ in 0..2 {
+        assert!(matches!(pipeline.step(1), FinalizationStep::Retry(_)));
+    }
+    drop(reader);
+    assert!(logs.lines_with("retry episode ended").is_empty());
+    assert!(matches!(
+        pipeline.step(1),
+        FinalizationStep::Published { .. }
+    ));
+
+    let first = logs.lines_with("atomic GLOBAL finalization unavailable; retrying");
+    assert_eq!(first.len(), 1, "one line per episode: {first:?}");
+    assert!(
+        first[0].contains(" INFO ")
+            && first[0].contains("frame=1")
+            && first[0].contains("attempt=1")
+            && first[0].contains("execution branch engines: busy elsewhere"),
+        "{}",
+        first[0]
+    );
+    let ended = logs.lines_with("retry episode ended");
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert!(
+        ended[0].contains(" INFO ")
+            && ended[0].contains("frame=1")
+            && ended[0].contains("attempts=2")
+            && ended[0].contains("duration_ms=")
+            && ended[0].contains("outcome=\"published\""),
+        "{}",
+        ended[0]
+    );
+    assert!(logs.lines_with("legacy materializer").is_empty());
+}
+
+/// Attempts that run out warn with their count and time, and the episode ends
+/// once the frame has executed in place.
+#[test]
+fn an_exhausted_retry_episode_warns_and_ends_when_the_frame_executes_in_place() {
+    use crate::outage::test_logs::CapturedLogs;
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    let rig = Rig::new();
+    let old = certified_deploy(&rig);
+    rig.source.materialize(&old).unwrap();
+    let mut stored = old.clone();
+    stored
+        .header
+        .as_mut()
+        .unwrap()
+        .public_key_signature_bls48581 = None;
+    save(rig.clock.as_ref(), &stored);
+    let mut next = state_frame(&rig.source, 2, 73, id(&old));
+    certify_parent(&mut next, &rig.signer, 0, old.header.as_ref().unwrap().rank);
+    let (pipeline, _) = pipeline(&rig, prover(&next), 8);
+    pipeline.offer(next.clone());
+    for _ in 0..2 {
+        assert!(matches!(pipeline.step(2), FinalizationStep::Retry(_)));
+    }
+    assert!(matches!(pipeline.step(2), FinalizationStep::Legacy));
+
+    assert_eq!(
+        logs.lines_with("atomic GLOBAL finalization unavailable; retrying")
+            .len(),
+        1
+    );
+    let warned = logs.lines_with("through the legacy materializer");
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert!(
+        warned[0].contains(" WARN ")
+            && warned[0].contains("frame=2")
+            && warned[0].contains("attempts=3")
+            && warned[0].contains("waited_ms="),
+        "{}",
+        warned[0]
+    );
+    assert!(logs.lines_with("retry episode ended").is_empty());
+
+    rig.source.materialize(&next).unwrap();
+    assert!(pipeline.finish_legacy(&next));
+    let ended = logs.lines_with("retry episode ended");
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert!(
+        ended[0].contains("frame=2")
+            && ended[0].contains("attempts=3")
+            && ended[0].contains("outcome=\"canonical record\""),
+        "{}",
+        ended[0]
+    );
+}
+
+/// A frame another path executed ends its episode when the worker moves on.
+#[test]
+fn a_retry_episode_ends_when_its_frame_is_passed() {
+    use crate::outage::test_logs::CapturedLogs;
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    let rig = Rig::new();
+    let input = certified_deploy(&rig);
+    let (pipeline, _) = pipeline(&rig, prover(&input), 8);
+    pipeline.offer(input);
+    let reader = rig.source.execution_manager.hold_engines_for_test();
+    assert!(matches!(pipeline.step(1), FinalizationStep::Retry(_)));
+    drop(reader);
+    assert!(pipeline.attempted(1));
+
+    pipeline.prune_through(0);
+    assert!(pipeline.attempted(1), "not passed yet");
+    pipeline.prune_through(1);
+    assert!(!pipeline.attempted(1));
+    let ended = logs.lines_with("retry episode ended");
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert!(ended[0].contains("outcome=\"passed\""), "{}", ended[0]);
+}
