@@ -87,8 +87,7 @@ pub(crate) fn configured_log_dir(global: &GlobalArgs) -> anyhow::Result<Option<P
             Some(service) => (service.config_dir(), Some(service.working_dir)),
             None => (nodeconfig::default_node_config_dir(network)?, None),
         };
-    let config =
-        quil_config::load_config(&config_dir).map_err(|e| anyhow::anyhow!("load config: {e}"))?;
+    let config = nodeconfig::load_existing_node_config(&config_dir, false)?;
     Ok(config
         .logger
         .log_dir(&config_dir)

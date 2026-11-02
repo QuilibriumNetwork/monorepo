@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use clap::Subcommand;
 
+use quil_p2p::ed448_identity::Ed448Identity;
+
 use crate::context::GlobalArgs;
-use crate::{nodeconfig, system};
+use crate::{keys, nodeconfig, system};
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
@@ -17,7 +19,9 @@ pub enum ConfigCommand {
     Create {
         /// Name for the configuration (defaults to `default-config`; cannot be `default`).
         name: Option<String>,
-        /// Symlink this config as the `default` (always set on create, like Go).
+        /// Make this config the `default` even though `default` holds keys,
+        /// which changes the identity of a node started from `default`. A
+        /// `default` without keys always moves to the new config.
         #[arg(short = 'd', long)]
         default: bool,
     },
@@ -39,7 +43,8 @@ pub enum ConfigCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Set the `default` config symlink to a named config.
+    /// Set the `default` config symlink to a named config, and with it the
+    /// identity of a node started from `default`.
     Switch {
         /// The config to make default (lists available configs if omitted).
         name: Option<String>,
@@ -50,7 +55,8 @@ pub enum ConfigCommand {
         name: String,
         /// Source directory (must contain config.yml + keys.yml).
         source_dir: String,
-        /// Also set it as the default config.
+        /// Also set it as the default config, and with it the identity of a
+        /// node started from `default`.
         #[arg(short = 'd', long)]
         default: bool,
     },
@@ -75,8 +81,15 @@ pub fn run(global: GlobalArgs, cmd: &ConfigCommand) -> anyhow::Result<()> {
 /// `quil_config::load_config`, which generates defaults + a random keystore
 /// encryption key on first run) plus a `keys.yml` placeholder — the real keys
 /// are generated when the node first starts. Like Go, the new config is
-/// symlinked as `default` so it is immediately usable.
-fn create(name: Option<&str>, _set_default: bool) -> anyhow::Result<()> {
+/// symlinked as `default` so it is immediately usable, unless `default` holds
+/// keys: moving it would change a node's identity, which needs `set_default`.
+fn create(name: Option<&str>, set_default: bool) -> anyhow::Result<()> {
+    let notice = create_in(&system::node_config_home_dir()?, name, set_default)?;
+    println!("{notice}");
+    Ok(())
+}
+
+fn create_in(configs_dir: &Path, name: Option<&str>, set_default: bool) -> anyhow::Result<String> {
     let config_name = match name {
         Some(n) if !n.is_empty() => n.to_string(),
         _ => "default-config".to_string(),
@@ -85,8 +98,9 @@ fn create(name: Option<&str>, _set_default: bool) -> anyhow::Result<()> {
         anyhow::bail!("'default' is reserved for the symlink. Please use a different name.");
     }
 
-    let configs_dir = system::node_config_home_dir()?;
     let config_dir = configs_dir.join(&config_name);
+    quil_keys::refuse_recreated_config(&config_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let existed = config_dir.join("config.yml").is_file();
 
     // Generates config.yml with defaults (and the keystore encryption key).
     quil_config::load_config(&config_dir)
@@ -107,22 +121,139 @@ fn create(name: Option<&str>, _set_default: bool) -> anyhow::Result<()> {
         );
     }
 
-    // Match Go's `CreateDefaultNodeConfig`, which always symlinks the new
-    // config as `default` so the node uses it immediately.
+    let done = if existed {
+        format!("The {config_name} configuration already exists and is unchanged")
+    } else {
+        format!("Successfully created {config_name} configuration")
+    };
+    let mut lines = match current_default(configs_dir) {
+        Some((dir, identity))
+            if identity.has_keys()
+                && !set_default
+                && std::fs::canonicalize(&config_dir).ok().as_ref() != Some(&dir) =>
+        {
+            vec![format!(
+                "{done}; default stays on {} ({}). To run this config, which changes the node's \
+                 identity: qclient node config switch {config_name}",
+                dir.display(),
+                identity.describe()
+            )]
+        }
+        // Go's `CreateDefaultNodeConfig` symlinks the new config as `default`
+        // so the node uses it immediately.
+        _ => {
+            let change = repoint_default(configs_dir, &config_dir)?;
+            let mut lines = vec![format!("{done}; symlinked to default")];
+            lines.extend(change);
+            lines
+        }
+    };
+    if !existed {
+        lines.push("The keys.yml file will only contain 'null:' until the node is started.".into());
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Who a node started from a config directory is, for messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigIdentity {
+    prover: Option<String>,
+    peer: Option<String>,
+}
+
+impl ConfigIdentity {
+    /// Read from `dir` without creating anything in it. The keys of a config
+    /// that cannot be read stay unknown; a keystore that cannot be read still
+    /// counts as holding a key.
+    fn of(dir: &Path) -> Self {
+        let config = nodeconfig::load_existing_node_config(dir, true).ok();
+        let keystore = config
+            .as_ref()
+            .map_or_else(|| dir.join("keys.yml"), |c| keys::keystore_path(c, dir));
+        let prover = match quil_keys::stored_prover_address(&keystore) {
+            Ok(address) => address.map(|a| tail(&hex::encode(a))),
+            Err(_) => Some("unreadable".to_string()),
+        };
+        let peer = config
+            .and_then(|c| Ed448Identity::from_config_hex(&c.p2p.peer_priv_key).ok())
+            .map(|id| tail(&id.peer_id_base58()));
+        Self { prover, peer }
+    }
+
+    fn has_keys(&self) -> bool {
+        self.prover.is_some() || self.peer.is_some()
+    }
+
+    fn describe(&self) -> String {
+        let prover = self
+            .prover
+            .as_ref()
+            .map_or("no prover key yet".to_string(), |p| format!("prover {p}"));
+        match &self.peer {
+            Some(peer) => format!("{prover}, peer {peer}"),
+            None => prover,
+        }
+    }
+}
+
+/// `…` and the last six characters of `id`, as logs name peers and provers.
+fn tail(id: &str) -> String {
+    format!("…{}", &id[id.len().saturating_sub(6)..])
+}
+
+/// The directory `default` points at, and who it is.
+fn current_default(configs_dir: &Path) -> Option<(PathBuf, ConfigIdentity)> {
+    let dir = std::fs::canonicalize(configs_dir.join("default")).ok()?;
+    let identity = ConfigIdentity::of(&dir);
+    Some((dir, identity))
+}
+
+/// Point `default` at `target`. Returns what that changes for a node started
+/// from `default`, if it changes who that node is.
+fn repoint_default(configs_dir: &Path, target: &Path) -> anyhow::Result<Option<String>> {
+    let previous = current_default(configs_dir);
     let default_link = configs_dir.join("default");
-    if default_link.exists() || std::fs::symlink_metadata(&default_link).is_ok() {
+    if std::fs::symlink_metadata(&default_link).is_ok() {
         let _ = std::fs::remove_file(&default_link);
     }
     #[cfg(unix)]
-    std::os::unix::fs::symlink(&config_dir, &default_link)
+    std::os::unix::fs::symlink(target, &default_link)
         .map_err(|e| anyhow::anyhow!("create default symlink: {e}"))?;
-
-    println!("Successfully created {config_name} configuration and symlinked to default");
-    println!("The keys.yml file will only contain 'null:' until the node is started.");
-    Ok(())
+    let new = ConfigIdentity::of(target);
+    Ok(previous.and_then(|(dir, old)| {
+        (old.has_keys() && old != new).then(|| {
+            let to = if new.prover.is_some() {
+                new.describe()
+            } else {
+                "a new prover made at its first start".to_string()
+            };
+            format!(
+                "A node started from default changes identity: {} (in {}) to {to}. The old \
+                 identity keeps its seats and seniority; restart the node to apply.",
+                old.describe(),
+                dir.display()
+            )
+        })
+    }))
 }
 
 fn import(name: &str, source_dir: &str, set_default: bool) -> anyhow::Result<()> {
+    let notice = import_in(
+        &system::node_config_home_dir()?,
+        name,
+        source_dir,
+        set_default,
+    )?;
+    println!("{notice}");
+    Ok(())
+}
+
+fn import_in(
+    configs_dir: &Path,
+    name: &str,
+    source_dir: &str,
+    set_default: bool,
+) -> anyhow::Result<String> {
     let source = std::path::Path::new(source_dir);
     if !source.exists() {
         anyhow::bail!("Source directory does not exist: {source_dir}");
@@ -130,24 +261,30 @@ fn import(name: &str, source_dir: &str, set_default: bool) -> anyhow::Result<()>
     if !nodeconfig::has_node_config_files(source) {
         anyhow::bail!("{source_dir} is not a valid config directory (needs config.yml + keys.yml)");
     }
-    let configs_dir = system::node_config_home_dir()?;
     let target = configs_dir.join(name);
+    if target.join("config.yml").exists() || target.join("keys.yml").exists() {
+        anyhow::bail!(
+            "{} already holds a config: importing would overwrite its keys. Choose another name, \
+             or move it away first",
+            target.display()
+        );
+    }
     quil_config::create_private_dir_all(&target)?;
     copy_dir(source, &target)?;
 
     if set_default {
-        let default_link = configs_dir.join("default");
-        if std::fs::symlink_metadata(&default_link).is_ok() {
-            let _ = std::fs::remove_file(&default_link);
-        }
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&target, &default_link)
-            .map_err(|e| anyhow::anyhow!("create default symlink: {e}"))?;
-        println!("Successfully imported config files to {name} and symlinked to default");
+        let change = repoint_default(configs_dir, &target)?;
+        let mut lines = vec![format!(
+            "Successfully imported config files to {name} and symlinked to default"
+        )];
+        lines.extend(change);
+        Ok(lines.join("\n"))
     } else {
-        println!("Successfully imported config files to {}", target.display());
+        Ok(format!(
+            "Successfully imported config files to {}",
+            target.display()
+        ))
     }
-    Ok(())
 }
 
 /// Recursively copy a directory tree. It holds private keys: directories
@@ -208,31 +345,33 @@ fn switch(name: Option<&str>) -> anyhow::Result<()> {
         anyhow::bail!("Invalid configuration name. 'default' is reserved.");
     }
 
-    let configs_dir = system::node_config_home_dir()?;
-    let source = configs_dir.join(&name);
+    let notice = switch_in(&system::node_config_home_dir()?, &name)?;
+    println!("{notice}");
+    Ok(())
+}
+
+fn switch_in(configs_dir: &Path, name: &str) -> anyhow::Result<String> {
+    let source = configs_dir.join(name);
     if !nodeconfig::has_node_config_files(&source) {
         anyhow::bail!(
             "{} is not a valid config directory (needs config.yml + keys.yml)",
             source.display()
         );
     }
-    let default_link = configs_dir.join("default");
-    // Replace any existing `default` symlink/dir entry.
-    if default_link.exists() || std::fs::symlink_metadata(&default_link).is_ok() {
-        let _ = std::fs::remove_file(&default_link);
-    }
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&source, &default_link)
-        .map_err(|e| anyhow::anyhow!("create default symlink: {e}"))?;
-    println!("Default config set to {name}");
-    Ok(())
+    let change = repoint_default(configs_dir, &source)?;
+    let mut lines = vec![format!("Default config set to {name}")];
+    lines.extend(change);
+    Ok(lines.join("\n"))
 }
 
 fn set(global: GlobalArgs, key: &str, value: &str) -> anyhow::Result<()> {
     let network = global.network.as_deref().filter(|s| !s.is_empty());
     let dir = nodeconfig::default_node_config_dir(network)?;
-    let mut cfg =
-        quil_config::load_config(&dir).map_err(|e| anyhow::anyhow!("load config: {e}"))?;
+    set_at(&dir, key, value)
+}
+
+fn set_at(dir: &Path, key: &str, value: &str) -> anyhow::Result<()> {
+    let mut cfg = nodeconfig::load_existing_node_config(dir, false)?;
 
     match key {
         "p2p.listenMultiaddr" => cfg.p2p.listen_multiaddr = value.to_string(),
@@ -244,7 +383,7 @@ fn set(global: GlobalArgs, key: &str, value: &str) -> anyhow::Result<()> {
         }
     }
 
-    quil_config::save_config(&dir, &cfg).map_err(|e| anyhow::anyhow!("save config: {e}"))?;
+    quil_config::save_config(dir, &cfg).map_err(|e| anyhow::anyhow!("save config: {e}"))?;
     println!("Successfully updated {key} to {value} in {}", dir.display());
     Ok(())
 }
@@ -425,6 +564,217 @@ fn new_private_file(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    mod identity {
+        use super::*;
+
+        /// The config home under `home`, as qclient lays it out.
+        fn configs(home: &Path) -> PathBuf {
+            home.join(".quilibrium").join("configs")
+        }
+
+        fn create_under(
+            home: &Path,
+            name: Option<&str>,
+            set_default: bool,
+        ) -> anyhow::Result<String> {
+            create_in(&configs(home), name, set_default)
+        }
+
+        fn import_under(home: &Path, name: &str, source: &Path) -> anyhow::Result<String> {
+            import_in(&configs(home), name, source.to_str().unwrap(), false)
+        }
+
+        fn set_under(dir: &Path, key: &str, value: &str) -> anyhow::Result<()> {
+            set_at(dir, key, value)
+        }
+
+        /// `dir` as a node leaves it: a config with a peer key and a keystore
+        /// with a prover key. Returns the prover's address in hex.
+        fn node_config(dir: &Path) -> String {
+            let mut config = quil_config::load_config(dir).unwrap();
+            config.p2p.peer_priv_key = Ed448Identity::generate().unwrap().to_config_hex();
+            quil_config::save_config(dir, &config).unwrap();
+            let km = quil_keys::FileKeyManager::new(
+                dir.join("keys.yml"),
+                &config.key.key_store_file.encryption_key,
+                "default-proving-key".into(),
+                Box::new(quil_crypto::FalconKeyConstructor),
+            )
+            .unwrap();
+            let public_key = km.create_falcon_key("q-prover-key").unwrap();
+            hex::encode(quil_crypto::poseidon::hash_bytes_to_32(&public_key).unwrap())
+        }
+
+        /// A home whose `default` points at the config `old`, which holds keys.
+        fn home_with_default_identity() -> (tempfile::TempDir, PathBuf, String) {
+            let home = tempfile::tempdir().unwrap();
+            let old = configs(home.path()).join("old");
+            let address = node_config(&old);
+            std::os::unix::fs::symlink(&old, configs(home.path()).join("default")).unwrap();
+            (home, old, address)
+        }
+
+        fn default_target(home: &Path) -> PathBuf {
+            std::fs::read_link(configs(home).join("default")).unwrap()
+        }
+
+        #[test]
+        fn create_keeps_a_default_that_holds_an_identity() {
+            let (home, old, _) = home_with_default_identity();
+
+            create_under(home.path(), Some("other"), false).unwrap();
+
+            let now = default_target(home.path());
+            assert_eq!(
+                now,
+                old,
+                "node config create moved default from a config holding keys to {}: a node \
+                 started from it gets a new identity",
+                now.display()
+            );
+            assert!(configs(home.path()).join("other/config.yml").is_file());
+        }
+
+        #[test]
+        fn create_says_default_stays_and_how_to_switch() {
+            let (home, old, address) = home_with_default_identity();
+
+            let notice = create_under(home.path(), Some("other"), false).unwrap();
+
+            assert!(notice.contains("default stays on"), "{notice}");
+            let old = std::fs::canonicalize(old).unwrap();
+            assert!(notice.contains(&old.display().to_string()), "{notice}");
+            assert!(notice.contains(&tail(&address)), "{notice}");
+            assert!(
+                notice.contains("qclient node config switch other"),
+                "{notice}"
+            );
+        }
+
+        #[test]
+        fn create_with_the_default_flag_moves_it_and_names_the_identity_change() {
+            let (home, old, address) = home_with_default_identity();
+
+            let notice = create_under(home.path(), Some("other"), true).unwrap();
+
+            assert_eq!(
+                default_target(home.path()),
+                configs(home.path()).join("other")
+            );
+            assert!(notice.contains("changes identity"), "{notice}");
+            assert!(notice.contains(&tail(&address)), "{notice}");
+            let old = std::fs::canonicalize(old).unwrap();
+            assert!(notice.contains(&old.display().to_string()), "{notice}");
+            assert!(
+                notice.contains("a new prover made at its first start"),
+                "{notice}"
+            );
+        }
+
+        #[test]
+        fn create_points_default_at_the_new_config_when_it_holds_no_keys() {
+            let home = tempfile::tempdir().unwrap();
+
+            let first = create_under(home.path(), Some("first"), false).unwrap();
+            assert_eq!(
+                default_target(home.path()),
+                configs(home.path()).join("first")
+            );
+            assert!(!first.contains("changes identity"), "{first}");
+
+            let second = create_under(home.path(), Some("second"), false).unwrap();
+            assert_eq!(
+                default_target(home.path()),
+                configs(home.path()).join("second")
+            );
+            assert!(!second.contains("changes identity"), "{second}");
+        }
+
+        #[test]
+        fn create_refuses_a_directory_a_node_left_without_config() {
+            let home = tempfile::tempdir().unwrap();
+            let dir = configs(home.path()).join("lost");
+            node_config(&dir);
+            std::fs::remove_file(dir.join("config.yml")).unwrap();
+
+            let err = create_under(home.path(), Some("lost"), false)
+                .expect_err("a new config could not decrypt the keystore there")
+                .to_string();
+
+            assert!(err.contains("refusing to create a new config.yml"), "{err}");
+            assert!(!dir.join("config.yml").exists());
+        }
+
+        #[test]
+        fn create_on_an_existing_config_says_so_and_changes_nothing() {
+            let (home, old, _) = home_with_default_identity();
+            let config_before = std::fs::read(old.join("config.yml")).unwrap();
+
+            let notice = create_under(home.path(), Some("old"), false).unwrap();
+
+            assert!(notice.contains("already exists"), "{notice}");
+            assert!(!notice.contains("changes identity"), "{notice}");
+            assert_eq!(
+                std::fs::read(old.join("config.yml")).unwrap(),
+                config_before
+            );
+        }
+
+        #[test]
+        fn switch_names_the_identity_it_changes() {
+            let (home, _, old_address) = home_with_default_identity();
+            let new_address = node_config(&configs(home.path()).join("new"));
+
+            let notice = switch_in(&configs(home.path()), "new").unwrap();
+
+            assert_eq!(
+                default_target(home.path()),
+                configs(home.path()).join("new")
+            );
+            assert!(notice.contains("changes identity"), "{notice}");
+            assert!(notice.contains(&tail(&old_address)), "{notice}");
+            assert!(notice.contains(&tail(&new_address)), "{notice}");
+        }
+
+        #[test]
+        fn switch_back_to_the_current_default_changes_no_identity() {
+            let (home, _, _) = home_with_default_identity();
+            let notice = switch_in(&configs(home.path()), "old").unwrap();
+            assert_eq!(notice, "Default config set to old");
+        }
+
+        #[test]
+        fn import_does_not_overwrite_a_config_that_holds_keys() {
+            let (home, old, _) = home_with_default_identity();
+            let keystore = std::fs::read(old.join("keys.yml")).unwrap();
+            let source = tempfile::tempdir().unwrap();
+            node_config(source.path());
+
+            let outcome = import_under(home.path(), "old", source.path());
+
+            assert!(
+                std::fs::read(old.join("keys.yml")).unwrap() == keystore,
+                "node config import overwrote the keystore of an existing config"
+            );
+            assert!(outcome.is_err());
+        }
+
+        #[test]
+        fn set_writes_no_config_into_a_directory_without_one() {
+            let dir = tempfile::tempdir().unwrap();
+
+            let outcome = set_under(dir.path(), "p2p.listenMultiaddr", "/ip4/0.0.0.0/udp/8336");
+
+            assert!(
+                !dir.path().join("config.yml").exists(),
+                "node config set wrote a new config, with a new identity, into a directory \
+                 without one"
+            );
+            assert!(outcome.is_err());
+        }
+    }
 
     const RETIRED: &str = "p2p:\n  network: 1\n  d: 8\n  bootstrapPeer: x\nengine:\n  framePublish:\n    mode: full\n  archiveMode: true\n";
 
