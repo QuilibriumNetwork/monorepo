@@ -11,6 +11,7 @@ pub mod context;
 pub mod keys;
 pub mod nodeconfig;
 pub mod release;
+pub mod retry;
 pub mod rpc;
 pub mod send;
 pub mod system;

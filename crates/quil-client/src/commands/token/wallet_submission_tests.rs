@@ -1902,3 +1902,356 @@ async fn spend_witnesses_come_from_the_selection_scan() {
     stop.send(()).unwrap();
     serving.await.unwrap();
 }
+
+// ---- Retries after proving: the call sites, against a node that fails ----
+
+/// A loopback node that refuses its first `failures` calls of any kind with
+/// `status` before they reach the service. Returns its gRPC multiaddr, the
+/// number of calls it received, and its shutdown.
+#[cfg(feature = "native-proof")]
+async fn flaky_node(
+    server: quil_rpc::node_service::NodeRpcServer,
+    status: tonic::Status,
+    failures: usize,
+) -> (
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let service = quil_types::proto::node::node_service_server::NodeServiceServer::with_interceptor(
+        server,
+        move |request: tonic::Request<()>| {
+            if seen.fetch_add(1, Ordering::SeqCst) < failures {
+                Err(status.clone())
+            } else {
+                Ok(request)
+            }
+        },
+    );
+    let (listener, multiaddr) = bind_loopback().await;
+    let incoming = futures::stream::unfold(listener, |listener| async {
+        let result = listener.accept().await.map(|(socket, _)| socket);
+        Some((result, listener))
+    });
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(async {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    (multiaddr, calls, stop, serving)
+}
+
+#[cfg(feature = "native-proof")]
+async fn client_at(
+    multiaddr: &str,
+) -> quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel> {
+    let address = crate::rpc::grpc_multiaddr_to_host_port(multiaddr).unwrap();
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    quil_types::proto::node::node_service_client::NodeServiceClient::new(channel)
+}
+
+#[cfg(feature = "native-proof")]
+fn quote_network() -> [u8; 32] {
+    quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(
+        quil_config::Config::default().p2p.network,
+    )
+    .network
+}
+
+/// A node quoting one unit per byte of state growth at 4,096 bytes.
+#[cfg(feature = "native-proof")]
+fn quoting_node() -> quil_rpc::node_service::NodeRpcServer {
+    let network = quote_network();
+    quil_rpc::node_service::NodeRpcServer::new().with_token_fee_provider(Arc::new(
+        move |_application, _global_venue| {
+            Ok(quil_rpc::node_service::TokenFeeSnapshot {
+                network,
+                observed_frame: 42,
+                global_execution: true,
+                difficulty: 50_000,
+                world_state_bytes: 1 << 40,
+                fee_multiplier_vote: 1,
+            })
+        },
+    ))
+}
+
+/// The post-proving refresh of a 4,096-byte operation paying `paid`, against
+/// a quoting node that refuses its first `failures` calls with `status`.
+/// Returns the outcome and the number of calls the node received.
+#[cfg(feature = "native-proof")]
+async fn refresh_case(
+    status: tonic::Status,
+    failures: usize,
+    paid: u128,
+) -> (anyhow::Result<()>, usize) {
+    crate::retry::NO_WAIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (multiaddr, calls, stop, serving) = flaky_node(quoting_node(), status, failures).await;
+    let mut client = client_at(&multiaddr).await;
+    let result = refresh_fee_quote(
+        &mut client,
+        &quote_network(),
+        quil_execution::domains::QUIL_TOKEN,
+        4096,
+        false,
+        paid,
+    )
+    .await;
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+    (result, calls.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_busy_quote_is_retried_by_the_post_proving_refresh() {
+    let busy = tonic::Status::resource_exhausted("fee quote workers busy");
+    let (result, calls) = refresh_case(busy, 2, 5000).await;
+    result.expect("the refresh must pass once a quote worker is free");
+    assert_eq!(calls, 3, "two refusals, then the quote");
+}
+
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_post_proving_refresh_keeps_the_proof_on_a_transient_quote_failure() {
+    use tonic::{Code, Status};
+    // A node still busy after the whole retry budget, and every other
+    // transient or unsupported answer: the finished proof is submitted with
+    // its supplied fee for the node to validate.
+    let (result, calls) = refresh_case(Status::resource_exhausted("busy"), usize::MAX, 5000).await;
+    result.expect("a node busy past the budget must not lose the proof");
+    assert!((3..30).contains(&calls), "bounded retries, got {calls}");
+    for code in [
+        Code::Unavailable,
+        Code::Unimplemented,
+        Code::DeadlineExceeded,
+        Code::Aborted,
+        Code::Cancelled,
+        Code::Unknown,
+    ] {
+        let (result, calls) = refresh_case(Status::new(code, "injected"), usize::MAX, 5000).await;
+        result.unwrap_or_else(|e| panic!("{code:?} lost the proof: {e}"));
+        assert_eq!(calls, 1, "{code:?} is kept without retrying");
+    }
+    // The node's real refusals still fail, once.
+    for code in [
+        Code::InvalidArgument,
+        Code::FailedPrecondition,
+        Code::Internal,
+        Code::PermissionDenied,
+        Code::Unauthenticated,
+    ] {
+        let (result, calls) = refresh_case(Status::new(code, "injected"), usize::MAX, 5000).await;
+        let error = result.expect_err("a refusal must fail the refresh");
+        assert!(!error.is::<FeeMoved>(), "{code:?} is not a fee move");
+        assert_eq!(calls, 1, "{code:?} is not retried");
+    }
+    // A quote that shows the fee moved is the one failure a rebuild answers.
+    let (result, calls) = refresh_case(Status::ok(""), 0, 1).await;
+    let error = result.expect_err("an underpaying fee must fail the refresh");
+    assert!(error.is::<FeeMoved>(), "{error}");
+    assert_eq!(calls, 1);
+}
+
+#[cfg(feature = "native-proof")]
+#[test]
+fn only_a_moved_fee_rebuilds_the_proof() {
+    let moved = anyhow::Error::new(FeeMoved("supplied 1, snapshot requires 2".into()));
+    assert!(fee_moved_rebuild(None, 1, &moved));
+    assert!(fee_moved_rebuild(None, FEE_REBUILDS - 1, &moved));
+    assert!(
+        !fee_moved_rebuild(None, FEE_REBUILDS, &moved),
+        "the rebuilds are bounded"
+    );
+    assert!(
+        !fee_moved_rebuild(Some(5), 1, &moved),
+        "an explicit fee is exact and never re-quoted"
+    );
+    // No refresh failure other than a moved fee re-proves.
+    let rpc: anyhow::Error = tonic::Status::deadline_exceeded("slow").into();
+    let mismatch = anyhow::anyhow!("fee quote context does not match request");
+    assert!(!fee_moved_rebuild(None, 1, &rpc));
+    assert!(!fee_moved_rebuild(None, 1, &mismatch));
+}
+
+/// A key manager holding the peer key a send is signed with.
+#[cfg(feature = "native-proof")]
+fn peer_key_manager(directory: &std::path::Path) -> (quil_keys::FileKeyManager, Vec<u8>) {
+    let km = quil_keys::FileKeyManager::new(
+        directory.join("keys.yml"),
+        &hex::encode([7; 32]),
+        "q-prover-key".into(),
+        Box::new(quil_crypto::FalconKeyConstructor),
+    )
+    .unwrap();
+    let seed = [8; 57];
+    let public = quil_crypto::Ed448Signer::derive_public(&seed).unwrap();
+    let mut peer = seed.to_vec();
+    peer.extend_from_slice(&public);
+    km.set_peer_priv_key_hex(&hex::encode(peer));
+    (km, public)
+}
+
+/// A structurally valid token operation request (not a proof): the node's
+/// canonicalization needs only its carrier header.
+#[cfg(feature = "native-proof")]
+fn token_operation_request() -> quil_types::proto::global::MessageRequest {
+    let mut bytes = vec![0, 0, 5, 0x12];
+    bytes.extend_from_slice(b"QCT3TX\x00\x02");
+    bytes.extend_from_slice(&[1; 32]);
+    bytes.extend_from_slice(&[2; 32]);
+    quil_types::proto::global::MessageRequest {
+        request: Some(
+            quil_types::proto::global::message_request::Request::TokenOperation(
+                quil_types::proto::token::TokenOperation {
+                    canonical_bytes: bytes,
+                },
+            ),
+        ),
+        ..Default::default()
+    }
+}
+
+/// A node whose send handler records each payload and answers `outcome`.
+#[cfg(feature = "native-proof")]
+fn recording_node(
+    outcome: Result<(), String>,
+) -> (
+    quil_rpc::node_service::NodeRpcServer,
+    Arc<Mutex<Vec<Vec<u8>>>>,
+) {
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let captured = received.clone();
+    let server = quil_rpc::node_service::NodeRpcServer::new().with_send_handler_fn(Arc::new(
+        move |_domain, payload, _authentication| {
+            captured.lock().unwrap().push(payload);
+            let outcome = outcome.clone();
+            Box::pin(async move { outcome })
+        },
+    ));
+    (server, received)
+}
+
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_delivery_that_fails_transiently_is_resent() {
+    crate::retry::NO_WAIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let (km, _) = peer_key_manager(directory.path());
+    let (server, received) = recording_node(Ok(()));
+    let (multiaddr, calls, stop, serving) =
+        flaky_node(server, tonic::Status::unavailable("node restarting"), 2).await;
+    let mut client = client_at(&multiaddr).await;
+    crate::send::send_message_request_retrying(
+        &mut client,
+        &km,
+        vec![2; 32],
+        token_operation_request(),
+    )
+    .await
+    .expect("a node that comes back within the budget must take the submission");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(
+        received.lock().unwrap().len(),
+        1,
+        "the node was reached once, after two refusals"
+    );
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_rejected_delivery_is_not_resent() {
+    crate::retry::NO_WAIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let (km, _) = peer_key_manager(directory.path());
+    let (server, received) = recording_node(Err("test rejection".into()));
+    let (multiaddr, calls, stop, serving) =
+        flaky_node(server, tonic::Status::unavailable("unused"), 0).await;
+    let mut client = client_at(&multiaddr).await;
+    let error = crate::send::send_message_request_retrying(
+        &mut client,
+        &km,
+        vec![2; 32],
+        token_operation_request(),
+    )
+    .await
+    .expect_err("a rejected submission must fail");
+    assert!(error.to_string().contains("send rpc"), "{error}");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        received.lock().unwrap().len(),
+        1,
+        "delivered once, not resent"
+    );
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_transient_witness_failure_keeps_waiting_for_the_settlement() {
+    let directory = tempfile::tempdir().unwrap();
+    let key_manager = Arc::new(
+        quil_keys::FileKeyManager::new(
+            directory.path().join("keys.yml"),
+            &hex::encode([9; 32]),
+            "q-prover-key".into(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )
+        .unwrap(),
+    );
+    let (multiaddr, calls, stop, serving) = flaky_node(
+        quil_rpc::node_service::NodeRpcServer::new(),
+        tonic::Status::deadline_exceeded("slow"),
+        usize::MAX,
+    )
+    .await;
+    let opts = crate::rpc::ConnectOpts {
+        listen_grpc_multiaddr: multiaddr,
+        ..Default::default()
+    };
+    let tc = TokenCtx {
+        node_config: quil_config::Config::default(),
+        config_dir: directory.path().to_path_buf(),
+        key_manager: key_manager.clone(),
+        connect_opts: opts.clone(),
+        submit_opts: opts,
+        submit_key_manager: key_manager,
+        submit_config_dir: directory.path().to_path_buf(),
+        submit_identity: Default::default(),
+        peer_id_bytes: Vec::new(),
+        max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
+    };
+    // A zero wait ends the loop after the first answer: a slow witness read
+    // is a wait for the settlement, not a failure of the operation.
+    let error = settlement_claim(
+        &tc,
+        [3; 32],
+        [4; 32],
+        1,
+        &ClaimBinding::Bundle([0; 32]),
+        None,
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect_err("nothing certified the settlement");
+    assert!(error.to_string().contains("not yet certified"), "{error}");
+    assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}

@@ -90,16 +90,53 @@ pub async fn send_message_bundle(
     bundle: MessageBundle,
 ) -> anyhow::Result<()> {
     let sig = sign_bundle(key_manager, &domain, &bundle)?;
-    client
-        .send(tonic::Request::new(SendRequest {
+    deliver(
+        client,
+        SendRequest {
             domain,
             request: Some(bundle),
             authentication: sig,
             delivery_data: Vec::new(),
-        }))
+        },
+    )
+    .await
+}
+
+/// [`send_message_request`] for a submission that follows a finished proof: the
+/// bundle is built and signed once, and the identical request is resent when
+/// the node could not be reached or did not answer in time (see
+/// [`crate::retry`]). A node's refusal fails at once.
+pub async fn send_message_request_retrying(
+    client: &mut NodeServiceClient<Channel>,
+    key_manager: &FileKeyManager,
+    domain: Vec<u8>,
+    request: MessageRequest,
+) -> anyhow::Result<()> {
+    let bundle = MessageBundle {
+        requests: vec![request],
+        timestamp: now_millis(),
+    };
+    let authentication = sign_bundle(key_manager, &domain, &bundle)?;
+    deliver(
+        client,
+        SendRequest {
+            domain,
+            request: Some(bundle),
+            authentication,
+            delivery_data: Vec::new(),
+        },
+    )
+    .await
+}
+
+/// Send `request`, resending it unchanged on a transient failure.
+async fn deliver(
+    client: &mut NodeServiceClient<Channel>,
+    request: SendRequest,
+) -> anyhow::Result<()> {
+    crate::retry::deliver(client, request)
         .await
-        .map_err(|e| anyhow::anyhow!("send rpc: {e}"))?;
-    Ok(())
+        .map_err(|e| anyhow::anyhow!("send rpc: {e}"))
 }
 
 /// Seconds a paid submission waits for its QUIL settlement to be certified.
