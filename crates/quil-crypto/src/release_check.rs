@@ -1,7 +1,8 @@
 //! Verify the running binary against the published release digest and
-//! signatures. Mirrors the Go path at `node/main.go:309-378`.
+//! signatures: the startup self-check of the node and of qclient. Mirrors the
+//! Go path at `node/main.go:309-378`.
 //!
-//! On startup the node:
+//! On startup the binary:
 //! 1. Computes SHA3-256 of its own executable.
 //! 2. Reads `<exe>.dgst` (an `sha3sum`-style line of the form
 //! `SHA3-256(<filename>)= <hex>`) and checks that the parsed
@@ -20,31 +21,38 @@
 //! N=17, that's `(13/2)+(13%2) = 6 + 1 = 7`.
 
 use ed448_rust::PublicKey;
+use quil_config::SIGNATORIES;
 use sha3::{Digest, Sha3_256};
 use std::path::{Path, PathBuf};
 
-/// Ed448 public keys of the release signatories, hex-encoded.
-/// Mirrors `config.Signatories` in `/config/config.go:151-169`.
-/// **Order matters**: `.dgst.sig.N` is signed by `SIGNATORIES[N-1]`.
-pub const SIGNATORIES: &[&str] = &[
-    "b1214da7f355f5a9edb7bcc23d403bdf789f070cca10db2b4cadc22f2d837afb650944853e35d5f42ef3c4105b802b144b4077d5d3253e4100",
-    "de4cfe7083104bfe32f0d4082fa0200464d8b10804a811653eedda376efcad64dd222f0f0ceb0b8ae58abe830d7a7e3f3b2d79d691318daa00",
-    "540237a35e124882d6b64e7bb5718273fa338e553f772b77fe90570e45303762b34131bdcb6c0b9f2cf9e393d9c7e0f546eeab0bcbbd881680",
-    "fbe4166e37f93f90d2ebf06305315ae11b37e501d09596f8bde11ba9d343034fbca80f252205aa2f582a512a72ad293df371baa582da072900",
-    "4160572e493e1bf15c44e055b11bf75230c76c7d2c67b48066770ab03dfd5ed34c97b9a431ec18578c83a0df9250b8362c38068650e8b01400",
-    "45170b626884b85d61ae109f2aa9b0e1ecc18b181508431ea6308f3869f2adae49da9799a0a594eaa4ef3ad492518fb1729decd44169d40d00",
-    "92cd8ee5362f3ae274a75ab9471024dbc144bff441ed8af7d19750ac512ff51e40e7f7b01e4f96b6345dd58878565948c3eb52c53f250b5080",
-    "001a4cbfce5d9aeb7e20665b0d236721b228a32f0baee62ffa77f45b82ecaf577e8a38b7ef91fcf7d2d2d2b504f085461398d30b24abb1d700",
-    "65b835071731c6e785bb2d107c7d85d8a537d79c435c3f42bb2f87027f93f858d7b37c598cef267a5db46e345f7a6f81969b465686657d1e00",
-    "b6df0ebab6ea20cc2eb718db5873c07bb50cf239a16bb6306bbe0f24280664f99f732c4049b8eda1226067e70ffb81958834d486942a122100",
-    "3e087771c36098cb2d371711fd882d309b4caebbd06ded3077a975231344f027ad31c7069e76ba5070451d8eb5abf29bfeb34fcdf9ba906480",
-    "57be2861faf0fffcbfd122c85c77010dce8f213030905781b85b6f345d912c7b5ace17797d9810899dfb8d13e7c8369595740725ab3dd5bd00",
-    "61628beef8f6964466fd078d6a2b90a397ab0777a14b9728227fd19f36752f9451b1a8d780740a0b9a8ce3df5f89ca7b9ff17de9274a270980",
-    "9ab76d775487c85c8e5aa0c5b3f961772967899a14644651031ae5f98ac197bee3f8880492c4fdba268716fc4b7c38ffcac370b663ac10b600",
-    "c0d2d47d6309572a055abf593de26a8c980be04df9672ed40939f93b51806be53f6e58f330ff348592350783d24109fa7db8bf7e61c9a8b780",
-    "6e2872f73c4868c4286bef7bfe2f5479a41c42f4e07505efa4883c7950c740252e0eea78eef10c584b19b1dcda01f7767d3135d07c33244100",
-    "0ca6f5a9d7f86c1111be5edf31e26979918aa4fa3daae6de1120e05c2a09bdb8d2feeb084286a3347e06ced25530358cbc74c204d2a1753a00",
-];
+/// What to do about a failed [`self_check`], for its error message.
+pub const SELF_CHECK_HINT: &str = "are you running this from source? (use \
+     --signature-check=false or QUILIBRIUM_SIGNATURE_CHECK=false)";
+
+/// What [`self_check`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SelfCheck {
+    /// The binary verified, with this many valid signatures.
+    Verified(usize),
+    /// `--signature-check=false` or `QUILIBRIUM_SIGNATURE_CHECK=false`.
+    Disabled,
+    /// No signature check on this platform (Windows).
+    Unavailable,
+}
+
+/// The release self-check of a starting binary: verify the running executable
+/// unless `enabled` is false or the platform has no check. An error means the
+/// binary must not run.
+pub fn self_check(enabled: bool) -> Result<SelfCheck, ReleaseCheckError> {
+    if !enabled {
+        return Ok(SelfCheck::Disabled);
+    }
+    if cfg!(target_os = "windows") {
+        return Ok(SelfCheck::Unavailable);
+    }
+    let exe = std::env::current_exe().map_err(|source| ReleaseCheckError::ExePath { source })?;
+    verify_release_signatures(&exe).map(SelfCheck::Verified)
+}
 
 /// Minimum number of valid signatures required to accept the release.
 /// Matches Go's `((N-4)/2) + ((N-4) % 2)` formula.
@@ -55,6 +63,11 @@ pub fn quorum_required(total_signatories: usize) -> usize {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReleaseCheckError {
+    #[error("could not determine the executable path: {source}")]
+    ExePath {
+        #[source]
+        source: std::io::Error,
+    },
     #[error("io reading {path}: {source}")]
     Io {
         path: PathBuf,
@@ -97,7 +110,7 @@ pub enum ReleaseCheckError {
 /// Verify `<exe_path>`, `<exe_path>.dgst`, and `<exe_path>.dgst.sig.*`.
 /// Returns the number of valid signatures observed on success.
 pub fn verify_release_signatures(exe_path: &Path) -> Result<usize, ReleaseCheckError> {
-    verify_release_signatures_with(exe_path, SIGNATORIES)
+    verify_release_signatures_with(exe_path, &SIGNATORIES)
 }
 
 /// Same as [`verify_release_signatures`] but with a caller-supplied
@@ -106,11 +119,13 @@ pub fn verify_release_signatures_with(
     exe_path: &Path,
     signatories_hex: &[&str],
 ) -> Result<usize, ReleaseCheckError> {
-    let exe_bytes = std::fs::read(exe_path).map_err(|e| ReleaseCheckError::Io {
+    // A release runs through its symlink (/usr/local/bin/qclient); on macOS
+    // `current_exe` returns the link. The release files sit beside, and the
+    // signed label names, the file it links.
+    let exe_path = &std::fs::canonicalize(exe_path).map_err(|e| ReleaseCheckError::Io {
         path: exe_path.to_path_buf(),
         source: e,
     })?;
-    let computed: [u8; 32] = Sha3_256::digest(&exe_bytes).into();
 
     let dgst_path = append_suffix(exe_path, ".dgst");
     let dgst_contents = std::fs::read(&dgst_path).map_err(|e| ReleaseCheckError::Io {
@@ -142,6 +157,9 @@ pub fn verify_release_signatures_with(
         path: dgst_path.clone(),
         detail: format!("invalid hex: {}", e),
     })?;
+    // Hashed last and in pieces: a build without a digest file fails at once,
+    // and a check does not hold the whole binary in memory.
+    let computed = file_sha3(exe_path)?;
     if claimed != computed {
         return Err(ReleaseCheckError::DigestMismatch {
             claimed: hex::encode(claimed),
@@ -204,6 +222,18 @@ pub fn verify_release_signatures_with(
 /// writes it, names `file`.
 fn label_names(label: &str, file: &str) -> bool {
     label == format!("SHA3-256({file})=")
+}
+
+/// The SHA3-256 of a file.
+fn file_sha3(path: &Path) -> Result<[u8; 32], ReleaseCheckError> {
+    let io = |source| ReleaseCheckError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let mut file = std::fs::File::open(path).map_err(io)?;
+    let mut hasher = Sha3_256::new();
+    std::io::copy(&mut file, &mut hasher).map_err(io)?;
+    Ok(hasher.finalize().into())
 }
 
 fn append_suffix(p: &Path, suffix: &str) -> PathBuf {
@@ -303,6 +333,55 @@ mod tests {
         }
     }
 
+    /// A release run through a symlink verifies as the file it links, and
+    /// that name is the one the label must carry: a copy under another name
+    /// beside the same release files stays refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_release_verifies_under_the_release_name() {
+        use ed448_rust::{PrivateKey, KEY_LENGTH};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let name = "qclient-2.1.0.25-linux-amd64";
+        let exe = tmp.path().join(name);
+        std::fs::write(&exe, b"release").unwrap();
+        let digest: [u8; 32] = Sha3_256::digest(b"release").into();
+        let dgst = format!("SHA3-256({name})= {}\n", hex::encode(digest));
+        std::fs::write(append_suffix(&exe, ".dgst"), &dgst).unwrap();
+        let sk = PrivateKey::from([0xC3u8; KEY_LENGTH]);
+        let sig = sk.sign(dgst.as_bytes(), None).unwrap();
+        std::fs::write(append_suffix(&exe, ".dgst.sig.1"), &sig).unwrap();
+        let pk_hex = hex::encode(PublicKey::from(&sk).as_byte());
+
+        let link = tmp.path().join("qclient");
+        std::os::unix::fs::symlink(&exe, &link).unwrap();
+        let count = verify_release_signatures_with(&link, &[pk_hex.as_str()]).unwrap();
+        assert_eq!(count, 1);
+
+        let copy = tmp.path().join("renamed");
+        std::fs::copy(&exe, &copy).unwrap();
+        std::fs::write(append_suffix(&copy, ".dgst"), &dgst).unwrap();
+        std::fs::write(append_suffix(&copy, ".dgst.sig.1"), &sig).unwrap();
+        let err = verify_release_signatures_with(&copy, &[pk_hex.as_str()]).unwrap_err();
+        assert!(
+            matches!(err, ReleaseCheckError::NameMismatch { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// Enabled, the check fails closed on a binary without release files (a
+    /// test binary is one); disabled, it reads nothing.
+    #[cfg(unix)]
+    #[test]
+    fn self_check_fails_closed_without_release_files_unless_disabled() {
+        assert_eq!(self_check(false).unwrap(), SelfCheck::Disabled);
+        match self_check(true).unwrap_err() {
+            ReleaseCheckError::Io { path, .. } => {
+                assert!(path.to_string_lossy().ends_with(".dgst"), "{path:?}")
+            }
+            other => panic!("expected the missing digest file, got {other:?}"),
+        }
+    }
+
     /// Tampered binary — digest in .dgst no longer matches.
     #[test]
     fn tampered_binary_rejected() {
@@ -358,7 +437,7 @@ mod tests {
     #[test]
     fn published_label_names_its_file() {
         const DGST: &[u8] =
-            include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst");
+            include_bytes!("../../quil-node/tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst");
         let label = std::str::from_utf8(DGST)
             .unwrap()
             .split(' ')
@@ -384,11 +463,15 @@ mod tests {
         assert_eq!(quorum_required(4), 0);
         // N=0: 0 (saturating)
         assert_eq!(quorum_required(0), 0);
+        assert_eq!(
+            quorum_required(SIGNATORIES.len()),
+            quil_config::signatory_quorum()
+        );
     }
 
     /// Offline check against fixtures pulled from
     /// `https://releases.quilibrium.com/` and committed under
-    /// `tests/fixtures/release/`. Asserts every published signature
+    /// `quil-node/tests/fixtures/release/`. Asserts every published signature
     /// for `node-2.1.0.22-linux-amd64` validates against the
     /// production [`SIGNATORIES`] using the same Ed448 verify call
     /// the live path uses, and that quorum is met.
@@ -399,38 +482,52 @@ mod tests {
     #[test]
     fn production_signatories_offline() {
         const DGST: &[u8] =
-            include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst");
+            include_bytes!("../../quil-node/tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst");
         // (one-based signatory index, signature bytes) pairs for
         // every `.dgst.sig.N` present in the release. Quorum on N=17
         // is 7; the published set has exactly 7 here.
         let sigs: &[(usize, &[u8])] = &[
             (
                 1,
-                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.1"),
+                include_bytes!(
+                    "../../quil-node/tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.1"
+                ),
             ),
             (
                 2,
-                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.2"),
+                include_bytes!(
+                    "../../quil-node/tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.2"
+                ),
             ),
             (
                 10,
-                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.10"),
+                include_bytes!(
+                    "../../quil-node/tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.10"
+                ),
             ),
             (
                 13,
-                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.13"),
+                include_bytes!(
+                    "../../quil-node/tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.13"
+                ),
             ),
             (
                 14,
-                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.14"),
+                include_bytes!(
+                    "../../quil-node/tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.14"
+                ),
             ),
             (
                 16,
-                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.16"),
+                include_bytes!(
+                    "../../quil-node/tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.16"
+                ),
             ),
             (
                 17,
-                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.17"),
+                include_bytes!(
+                    "../../quil-node/tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.17"
+                ),
             ),
         ];
 
@@ -469,7 +566,7 @@ mod tests {
     /// path. This test specifically guards the signatory list and
     /// Ed448 verify implementation against published wire data.
     ///
-    /// **Run manually**: `cargo test -p quil-node \
+    /// **Run manually**: `cargo test -p quil-crypto \
     /// release_check::tests::production_release_signatures \
     /// -- --ignored --nocapture`
     #[test]

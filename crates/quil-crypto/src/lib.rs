@@ -8,6 +8,7 @@ mod inclusion;
 mod key_manager;
 pub mod porep;
 pub mod poseidon;
+pub mod release_check;
 pub mod sdr;
 pub mod seal;
 mod secp256k1;
