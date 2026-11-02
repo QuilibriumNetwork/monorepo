@@ -991,7 +991,15 @@ async fn transfer_action(
 ) -> anyhow::Result<()> {
     use super::transfer::Kind;
     use crate::commands::token::{
-        run_claim, run_merge, run_pending_create, run_transfer, SCAN_MAX_COINS, SCAN_MAX_PAGES,
+        run_claim, run_merge, run_pending_create, run_transfer, Follow, SCAN_MAX_COINS,
+        SCAN_MAX_PAGES,
+    };
+    // The manager prints each submission's identifiers into its notice and
+    // leaves the wait to the operator (`token inclusion`, named in the notice).
+    const NO_WAIT: std::time::Duration = std::time::Duration::ZERO;
+    let no_follow = || Follow {
+        wait: NO_WAIT,
+        max_pages: SCAN_MAX_PAGES,
     };
     own_node_only(tc)?;
     let app = quil_token();
@@ -1007,6 +1015,7 @@ async fn transfer_action(
                 None,
                 SCAN_MAX_PAGES,
                 SCAN_MAX_COINS,
+                NO_WAIT,
             )
             .await
         }
@@ -1024,14 +1033,31 @@ async fn transfer_action(
                 *refund_after,
                 SCAN_MAX_PAGES,
                 SCAN_MAX_COINS,
+                NO_WAIT,
             )
             .await
         }
         Kind::Accept { escrow, .. } => {
-            run_claim(tc, &app, &hex::encode(escrow), preview.fee, false).await
+            run_claim(
+                tc,
+                &app,
+                &hex::encode(escrow),
+                preview.fee,
+                false,
+                no_follow(),
+            )
+            .await
         }
         Kind::Refund { escrow, .. } => {
-            run_claim(tc, &app, &hex::encode(escrow), preview.fee, true).await
+            run_claim(
+                tc,
+                &app,
+                &hex::encode(escrow),
+                preview.fee,
+                true,
+                no_follow(),
+            )
+            .await
         }
         Kind::Merge => {
             run_merge(
@@ -1041,6 +1067,7 @@ async fn transfer_action(
                 preview.fee,
                 SCAN_MAX_PAGES,
                 SCAN_MAX_COINS,
+                NO_WAIT,
             )
             .await
         }
@@ -1682,6 +1709,7 @@ mod shield_action_tests {
             submit_identity: Default::default(),
             peer_id_bytes: Vec::new(),
             max_fee: u128::MAX,
+            read_flags: Vec::new(),
         };
         let (notes, mut lines) = tokio::sync::mpsc::unbounded_channel();
         let preview = crate::commands::token::output::capture(notes, shield_preview(&tc))
@@ -1959,6 +1987,7 @@ mod mint_action_tests {
             submit_identity: Default::default(),
             peer_id_bytes: Vec::new(),
             max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
+            read_flags: Vec::new(),
         };
         let (notes, mut lines) = tokio::sync::mpsc::unbounded_channel();
         let preview = crate::commands::token::output::capture(notes, mint_preview(&tc))
@@ -2825,6 +2854,7 @@ mod transfer_action_tests {
             submit_config_dir: directory.path().to_path_buf(),
             submit_identity: Default::default(),
             peer_id_bytes: Vec::new(),
+            read_flags: Vec::new(),
             max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
         };
         let capture = |kind| {
@@ -2927,6 +2957,7 @@ mod transfer_action_tests {
                 submit_config_dir: directory.path().to_path_buf(),
                 submit_identity: Default::default(),
                 peer_id_bytes: Vec::new(),
+                read_flags: Vec::new(),
                 max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
             };
             let refused = |error: String| {
