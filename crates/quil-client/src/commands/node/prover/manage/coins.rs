@@ -249,6 +249,20 @@ pub fn key_refusal(m: &Model, key: &str) -> Option<String> {
             Some("Mint: ‹C› claims a saved authorization; select it in the Claim status.".into())
         }
         "C" => super::mint::claim_refusal(m),
+        "esc" if m.coins.shield.dialog.is_some() || m.coins.mint.dialog.is_some() => None,
+        "esc" => match m
+            .coins
+            .shield
+            .run
+            .as_ref()
+            .filter(|_| super::shield::running(m))
+        {
+            None => Some("Shield: ‹esc› stops a running shield; none is running.".into()),
+            Some(run) if run.stopping => {
+                Some("Shield: already stopping; nothing more is submitted.".into())
+            }
+            Some(_) => None,
+        },
         "[/] {/}" => ['[', ']', '{', '}']
             .iter()
             .all(|&key| edge_move(m, key).is_err())
@@ -370,6 +384,7 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         KeyCode::Char('S') => Some("S"),
         KeyCode::Char('M') => Some("M"),
         KeyCode::Char('C') => Some("C"),
+        KeyCode::Esc => Some("esc"),
         _ => None,
     };
     if let Some(why) = hint.and_then(|key| key_refusal(m, key)) {
@@ -398,6 +413,7 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             m.status_msg = "Shield: cancelled; nothing was submitted.".into();
             m.status_is_error = false;
         }
+        KeyCode::Esc => return super::shield::stop_request(m),
         KeyCode::Char('r') => return start_legacy(m, Instant::now()),
         KeyCode::Tab => {
             m.coins.focus = match m.coins.focus {

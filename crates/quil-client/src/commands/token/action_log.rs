@@ -523,7 +523,8 @@ impl ShieldRecorder {
             ),
             ShieldEvent::Nothing { .. }
             | ShieldEvent::Uncovered(_)
-            | ShieldEvent::Proving { .. } => None,
+            | ShieldEvent::Proving { .. }
+            | ShieldEvent::Proved { .. } => None,
         }
     }
 

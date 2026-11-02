@@ -458,6 +458,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::MintPrepare => "mint reads and quote",
         Cmd::ClaimPrepare(..) => "mint claim reads",
         Cmd::MintRun(_) => "mint",
+        Cmd::ShieldStop => "shield stop",
         Cmd::Join(_) => "join",
         Cmd::Lifecycle { .. } => "lifecycle operation",
         Cmd::ToggleManual { .. } | Cmd::MarkManual(_) => "worker mode change",
@@ -481,6 +482,9 @@ struct RefreshState {
     /// The private action log a shield or a mint records itself in,
     /// unless off.
     action_log: Option<crate::commands::token::action_log::ActionLog>,
+    /// Set to stop the running shield before its next submission; one
+    /// runs at a time, and each run starts with it cleared.
+    shield_stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for RefreshState {
@@ -494,6 +498,7 @@ impl Default for RefreshState {
             config_dir: None,
             token: None,
             action_log: None,
+            shield_stop: Arc::default(),
         }
     }
 }
@@ -610,11 +615,16 @@ fn spawn_action(
         Cmd::ShieldRun(preview) => {
             let token = refresh.token.clone();
             let log = refresh.action_log.clone();
+            let stop = refresh.shield_stop.clone();
+            stop.store(false, std::sync::atomic::Ordering::Relaxed);
             tokio::spawn(async move {
                 let progress = tx.clone();
-                let _ = tx.send(actions::shield_run(token, preview, progress, log).await);
+                let _ = tx.send(actions::shield_run(token, preview, progress, log, stop).await);
             });
         }
+        Cmd::ShieldStop => refresh
+            .shield_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed),
         Cmd::Join(filters) => {
             tokio::spawn(async move {
                 let _ = tx.send(actions::do_join(client, filters).await);

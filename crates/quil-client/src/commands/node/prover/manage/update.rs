@@ -26,7 +26,7 @@ pub enum Cmd {
     FetchLegacy,
     /// Read and quote `token shield-all`'s batches for its confirmation.
     ShieldPrepare,
-    /// Prove and submit the confirmed batches.
+    /// Prove and submit the confirmed batches, paced.
     ShieldRun(super::shield::Preview),
     /// Read the reward and quote the fee for a mint confirmation.
     MintPrepare,
@@ -34,6 +34,8 @@ pub enum Cmd {
     ClaimPrepare(std::path::PathBuf, u64),
     /// Prove and submit the confirmed mint, or submit the claim.
     MintRun(super::mint::Preview),
+    /// End the running shield before its next submission.
+    ShieldStop,
     Join(Vec<Vec<u8>>),
     Lifecycle {
         action: String,
