@@ -119,6 +119,47 @@ jobs:
         run: cargo check --workspace --locked --all-targets
 
   # -----------------------------------------------------------------
+  # clippy — lint the workspace. [workspace.lints.clippy] in Cargo.toml
+  # denies every default lint except the ones it lists as warnings, so
+  # the job fails on anything new while those warnings are fixed and
+  # the list shrinks. Not a required check.
+  # -----------------------------------------------------------------
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    needs: scope
+    if: needs.scope.outputs.run == 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Pull LFS files
+        run: git lfs pull
+
+      - id: native-deps
+        uses: ./.github/actions/setup-native-deps
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # Don't let the action set RUSTFLAGS
+          rustflags: ""
+          # The explicit cache below owns restore/save for this job.
+          cache: false
+          components: clippy
+
+      # Its own cache: the check job's RUSTFLAGS change every unit hash.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
+          shared-key: rust-clippy
+          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' }}
+
+      - name: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --locked --all-targets
+
+  # -----------------------------------------------------------------
   # test — `cargo nextest run` against the whole workspace, split
   # across three runners: the run is CPU-bound (about 2,500
   # test-seconds on a 4-vCPU runner), so each partition's share of the
