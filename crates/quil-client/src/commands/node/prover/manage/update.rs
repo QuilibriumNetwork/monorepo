@@ -8,6 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use super::super::epoch::{epoch_len, ConfirmWindow, WindowState};
 use super::super::sign;
 use super::coins;
+use super::mint;
 use super::model::{
     AwaitFilterEntry, ColumnFilter, FilterColKind, Model, PanelFocus, PendingAction, Tab,
 };
@@ -27,6 +28,12 @@ pub enum Cmd {
     ShieldPrepare,
     /// Prove and submit the confirmed batches.
     ShieldRun(super::shield::Preview),
+    /// Read the reward and quote the fee for a mint confirmation.
+    MintPrepare,
+    /// Read the saved authorization's GLOBAL witness for a claim.
+    ClaimPrepare(std::path::PathBuf, u64),
+    /// Prove and submit the confirmed mint, or submit the claim.
+    MintRun(super::mint::Preview),
     Join(Vec<Vec<u8>>),
     Lifecycle {
         action: String,
@@ -50,8 +57,26 @@ pub enum Cmd {
 
 pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
     match msg {
-        Msg::LegacyRefresh { answer, took } => {
+        Msg::LegacyRefresh {
+            answer,
+            took,
+            mints,
+        } => {
+            m.coins.mint.saved = mints;
+            m.coins.mint.cursor = m
+                .coins
+                .mint
+                .cursor
+                .min(m.coins.mint.saved.len().saturating_sub(1));
             coins::apply_legacy(m, answer, took);
+            vec![]
+        }
+        Msg::MintPreview(preview) => {
+            mint::apply_preview(m, preview);
+            vec![]
+        }
+        Msg::Mint(progress) => {
+            mint::apply_progress(m, progress);
             vec![]
         }
         Msg::ShieldPreview(preview) => {
@@ -549,6 +574,9 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     if m.tab == Tab::Coins {
         if matches!(m.coins.shield.dialog, Some(shield::Dialog::Confirm(_))) {
             return shield::dialog_key(m, ev);
+        }
+        if matches!(m.coins.mint.dialog, Some(mint::Dialog::Confirm(_))) {
+            return mint::dialog_key(m, ev);
         }
         if m.show_help {
             return handle_help_key(m, ev);

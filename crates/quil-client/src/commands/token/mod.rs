@@ -22,8 +22,13 @@ pub(crate) mod legacy;
 pub(crate) mod output;
 #[cfg(feature = "confidential-tokens")]
 mod wallet;
+#[cfg(feature = "confidential-tokens")]
+pub(crate) use wallet::saved_mints;
 #[cfg(feature = "native-proof")]
-pub(crate) use wallet::{execute_shield_all, plan_shield_all, shield_batch_fee, ShieldEvent};
+pub(crate) use wallet::{
+    execute_mint, execute_mint_claim, execute_shield_all, mint_claim_witness, plan_mint,
+    plan_shield_all, reward_mint_fee, shield_batch_fee, MintEvent, MintPlan, ShieldEvent,
+};
 
 /// Flags shared by every `token` subcommand (Go `TokenCmd` persistent
 /// flags).
@@ -1075,26 +1080,30 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                     decoded == quil_execution::domains::QUIL_TOKEN,
                     "reward mint requires the QUIL application; use custom-mint for custom tokens"
                 );
-                // The mint pays its own state-growth charge (one coin and the
-                // receipt marker) out of the minted amount.
-                let mint_fee = if claim.is_some() {
-                    0
-                } else {
-                    // Reward mints execute in the global venue: quote its pricing.
-                    wallet::quoted_quil_fee(
+                // Recorded in the private action log, with the operator lines.
+                let mut action = action_log::CliAction::start(&tc.config_dir, &args.command);
+                let result = async {
+                    // The mint pays its own state-growth charge (one coin and
+                    // the receipt marker) out of the minted amount.
+                    let mint_fee = if claim.is_some() {
+                        0
+                    } else {
+                        wallet::reward_mint_fee(&tc, *fee).await?
+                    };
+                    wallet::run_mint(
                         &tc,
-                        *fee,
-                        Shape {
-                            coins: 1,
-                            markers: 1,
-                            escrow: false,
-                        },
-                        true,
+                        recipient.as_deref(),
+                        mint_fee,
+                        claim.as_deref(),
+                        action.as_mut(),
                     )
-                    .await?
+                    .await
+                }
+                .await;
+                return match action {
+                    Some(action) => action.finish(result),
+                    None => result,
                 };
-                return wallet::run_mint(&tc, recipient.as_deref(), mint_fee, claim.as_deref())
-                    .await;
             }
             TokenCommand::ShieldAll { max_per_batch } => {
                 return wallet::run_shield_all(&tc, &application, *max_per_batch).await

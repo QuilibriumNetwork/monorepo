@@ -20,7 +20,7 @@ impl CoinWitnessProvider for Rewards {
 
 // Build a real GLOBAL membership proof, including a genuine zero-valued
 // record. No signing, native proving or token submission is involved.
-fn reward_witness(owner: [u8; 32], amount: u128) -> RewardWitnessData {
+pub(crate) fn reward_witness(owner: [u8; 32], amount: u128) -> RewardWitnessData {
     use quil_execution::{
         global_schema,
         hypergraph_state::{vertex_adds_discriminator, HypergraphState},

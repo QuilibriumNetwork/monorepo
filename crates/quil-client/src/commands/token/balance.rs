@@ -117,4 +117,4 @@ fn reason(error: &anyhow::Error) -> String {
 
 #[cfg(test)]
 #[path = "balance_tests.rs"]
-mod tests;
+pub(crate) mod tests;

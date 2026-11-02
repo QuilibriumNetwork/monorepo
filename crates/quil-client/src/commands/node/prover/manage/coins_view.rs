@@ -4,6 +4,9 @@
 
 use std::time::{Instant, SystemTime};
 
+use super::super::mint::{
+    Dialog as MintDialog, Preview as MintPreview, Stage as MintStage, Status as MintStatus,
+};
 use super::super::shield::{Dialog, Preview};
 use super::coins::{self, CoinsFocus, Middle, ATTENTION};
 use super::*;
@@ -425,9 +428,9 @@ fn confirm_lines(preview: &Preview, width: u16, mask: bool) -> Vec<Line<'static>
 /// Rows the panel scrolls: first shown, total and shown.
 type Scroll = Option<(usize, usize, usize)>;
 
-/// The Claim status panel: the claimable reward at its frame and how a
-/// mint of it is authorized.
-fn claim_lines(m: &Model, width: u16) -> Vec<Line<'static>> {
+/// The Claim status panel in `height` rows: the claimable reward at its
+/// frame, its mint, and the authorizations saved for a claim.
+fn claim_lines(m: &Model, width: u16, height: u16) -> Vec<Line<'static>> {
     let row = |label: &str, text: String| {
         Line::from(vec![
             Span::styled(
@@ -447,26 +450,144 @@ fn claim_lines(m: &Model, width: u16) -> Vec<Line<'static>> {
         (None, Some(error)) => format!("read failed ({error})"),
         (None, None) => "none".into(),
     };
-    let authorization = match m.claimable_reward {
-        Some((units, _)) if units > 0 => {
-            "none from this manager; `qclient token mint` authorizes a mint of it"
+    let authorization = if super::super::mint::running(m) {
+        "a mint or claim is under way; Notifications follow it"
+    } else {
+        match m.claimable_reward {
+            Some((units, _)) if units > 0 => {
+                "‹M› authorizes a mint of it, as `qclient token mint` does"
+            }
+            _ => "nothing to authorize",
         }
-        _ => "nothing to authorize",
     };
-    [
+    let mut lines: Vec<Line<'static>> = [
         row("Claimable", claimable),
         row("Authorization", authorization.into()),
     ]
     .into_iter()
     .flat_map(|line| wrap_message(line, width))
-    .collect()
+    .collect();
+    let rest = usize::from(height).saturating_sub(lines.len());
+    lines.extend(saved_lines(m, width, rest));
+    lines
 }
 
-/// The middle panel's title and lines: the confirmation while it is open;
+/// The authorizations `token mint` saved, newest first, one row each with
+/// the Claim status cursor, in `rows` lines.
+fn saved_lines(m: &Model, width: u16, rows: usize) -> Vec<Line<'static>> {
+    let help = Style::new().fg(HELP);
+    let saved = &m.coins.mint.saved;
+    if saved.is_empty() {
+        return wrap_message(
+            Line::from(Span::styled(
+                "Saved authorizations: none; a mint saves one as mint-<frame>.bin for its claim.",
+                help,
+            )),
+            width,
+        );
+    }
+    let cell = |amount: Option<u128>| amount.map_or("-".to_string(), fixed_amount);
+    let cells: Vec<[String; 4]> = saved
+        .iter()
+        .map(|saved| {
+            [
+                format!("f{}", saved.cited_frame),
+                cell(
+                    saved
+                        .amounts
+                        .map(|(reward, fee)| reward.saturating_sub(fee)),
+                ),
+                cell(saved.amounts.map(|(_, fee)| fee)),
+                match super::super::mint::status(saved) {
+                    MintStatus::Unavailable => "unavailable".to_string(),
+                },
+            ]
+        })
+        .collect();
+    let headers = ["Cited", "Amount [Q]", "Fee [Q]", "State"];
+    let mut widths = headers.map(str::len);
+    for row in &cells {
+        for (width, text) in widths.iter_mut().zip(row) {
+            *width = (*width).max(text.chars().count());
+        }
+    }
+    let line = |cells: [&str; 4]| {
+        format!(
+            "{:<w0$}  {:>w1$}  {:>w2$}  {:<w3$}",
+            cells[0],
+            cells[1],
+            cells[2],
+            cells[3],
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+            w3 = widths[3]
+        )
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        line(headers),
+        Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+    ))];
+    let visible = rows.saturating_sub(2).max(1);
+    let focused = m.coins.focus == CoinsFocus::Middle;
+    let first = m.coins.mint.cursor.saturating_sub(visible - 1);
+    for (i, row) in cells.iter().enumerate().skip(first).take(visible) {
+        let mut style = Style::new().fg(TEXT);
+        if i == m.coins.mint.cursor {
+            style = style.bg(if focused {
+                CURSOR_BG
+            } else {
+                INACTIVE_CURSOR_BG
+            });
+        }
+        lines.push(Line::from(Span::styled(
+            line([&row[0], &row[1], &row[2], &row[3]]),
+            style,
+        )));
+    }
+    lines.extend(wrap_message(
+        Line::from(Span::styled(
+            "State: this node reports no authorization status; ‹C› checks for the finalized \
+             witness before it claims.",
+            help,
+        )),
+        width,
+    ));
+    lines
+}
+
+/// The middle panel's title and lines: a confirmation while one is open;
 /// else the selected Balances row's panel ([`Middle`]).
 fn middle_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'static>>, Scroll) {
+    match &m.coins.mint.dialog {
+        Some(MintDialog::Confirm(preview)) => {
+            let title = match preview.stage {
+                MintStage::Authorize => "Confirm mint",
+                MintStage::Claim { .. } => "Confirm claim",
+            };
+            let lines = mint_confirm_lines(preview, width, m.mask_private);
+            return (title.into(), lines, None);
+        }
+        Some(MintDialog::Preparing(_, claim)) => {
+            let text = if *claim {
+                "Reading the authorization's GLOBAL witness…"
+            } else {
+                "Reading the reward and quoting the fee…"
+            };
+            return (
+                Middle::Claim.title().into(),
+                vec![Line::from(Span::styled(
+                    format!("{} {text}", spinner(m)),
+                    Style::new().fg(PRIMARY),
+                ))],
+                None,
+            );
+        }
+        None => {}
+    }
     if coins::middle(m) == Middle::Claim {
-        return (Middle::Claim.title().into(), claim_lines(m, width), None);
+        let lines = claim_lines(m, width, height);
+        return (Middle::Claim.title().into(), lines, None);
     }
     plan_lines(m, width, height)
 }
@@ -586,8 +707,138 @@ fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'stat
     ("Shield plan".into(), lines, scroll)
 }
 
+/// The mint confirmation: the stage and its exact inputs; `mask` hides the
+/// amounts and the recipient's address.
+fn mint_confirm_lines(preview: &MintPreview, width: u16, mask: bool) -> Vec<Line<'static>> {
+    let row = |label: &str, text: String| {
+        Line::from(vec![
+            Span::styled(
+                format!("{label}: "),
+                Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(text, Style::new().fg(TEXT)),
+        ])
+    };
+    let title = |text: &str| {
+        Line::from(Span::styled(
+            text.to_string(),
+            Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD),
+        ))
+    };
+    // To the base unit, as `token mint` prints it: a fee far below
+    // 0.00001 Q must not round the minted amount up to the reward.
+    let amount = row(
+        "Amount",
+        if mask {
+            MASKED.to_string()
+        } else {
+            format!(
+                "{} Q (reward {} Q less fee {} Q)",
+                exact_amount(preview.minted()),
+                exact_amount(preview.reward),
+                exact_amount(preview.fee)
+            )
+        },
+    );
+    let lines = match &preview.stage {
+        MintStage::Authorize => vec![
+            title("Authorize a reward mint, as `qclient token mint` does:"),
+            row(
+                "Reward",
+                if mask {
+                    format!(
+                        "{MASKED}; claimable at f{}, from the GLOBAL reward witness",
+                        preview.cited_frame
+                    )
+                } else {
+                    format!(
+                        "{} Q claimable at f{}, from the GLOBAL reward witness",
+                        exact_amount(preview.reward),
+                        preview.cited_frame
+                    )
+                },
+            ),
+            amount,
+            row(
+                "Fee",
+                format!(
+                    "{} base units ({} Q) as quoted now, paid from the reward",
+                    preview.fee,
+                    exact_amount(preview.fee)
+                ),
+            ),
+            row(
+                "Cap",
+                format!(
+                    "{} Q (--max-fee); a higher quote is refused",
+                    fmt_claimable(preview.max_fee)
+                ),
+            ),
+            row(
+                "Recipient",
+                if mask {
+                    format!("this node's wallet, its address {MASKED}")
+                } else {
+                    recipient_text(&preview.recipient)
+                },
+            ),
+            row(
+                "Saved as",
+                "mint-<frame>.bin in the node config directory, for the claim; <frame> is the \
+                 GLOBAL frame the proof cites"
+                    .into(),
+            ),
+            Line::from(Span::styled(
+                "The authorization is proved here and submitted to this node. The run reads the \
+                 reward and quotes the fee again at the frame then current: a reward that grew \
+                 is minted in full to this wallet, and the outcome names both amounts; a changed \
+                 fee reopens this confirmation with it; a reward that fell stops the run. ‹C› \
+                 claims it once GLOBAL finalizes it.",
+                Style::new().fg(HELP),
+            )),
+        ],
+        MintStage::Claim { path, witness } => vec![
+            title("Claim a reward mint, as `qclient token mint --claim` does:"),
+            row(
+                "Authorization",
+                format!(
+                    "{}, citing f{}; finalized, its GLOBAL witness cites f{witness}",
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    preview.cited_frame
+                ),
+            ),
+            amount,
+            row(
+                "Recipient",
+                "as the authorization names it (this node's wallet unless `token mint` was \
+                 given another)"
+                    .into(),
+            ),
+            Line::from(Span::styled(
+                "The claim is built here and submitted to this node; it creates the coins.",
+                Style::new().fg(HELP),
+            )),
+        ],
+    };
+    lines
+        .into_iter()
+        .flat_map(|line| wrap_message(line, width))
+        .collect()
+}
+
 /// The UI key row of the Coins tab, or the collapsed row.
 fn key_rows(m: &Model, width: u16) -> Vec<Line<'static>> {
+    if let Some(MintDialog::Confirm(preview)) = &m.coins.mint.dialog {
+        return vec![Line::from(Span::styled(
+            match preview.stage {
+                MintStage::Authorize => "Confirm: ‹y› authorize the mint  any other key cancels",
+                MintStage::Claim { .. } => "Confirm: ‹y› claim  any other key cancels",
+            },
+            Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD),
+        ))];
+    }
     if matches!(m.coins.shield.dialog, Some(Dialog::Confirm(_))) {
         return vec![Line::from(Span::styled(
             "Confirm: ‹y› shield  any other key cancels",
@@ -614,6 +865,8 @@ fn key_rows(m: &Model, width: u16) -> Vec<Line<'static>> {
         ("↓/j", "down"),
         ("r", "read legacy"),
         ("S", "shield"),
+        ("M", "mint"),
+        ("C", "claim"),
         ("n", compact),
         ("c", colors),
         ("v", "notice level"),
@@ -684,7 +937,8 @@ pub(super) fn render(f: &mut Frame, m: &mut Model, area: Rect) {
         plan_area.width.saturating_sub(2),
         plan_area.height.saturating_sub(2),
     );
-    let dialog = matches!(m.coins.shield.dialog, Some(Dialog::Confirm(_)));
+    let dialog = matches!(m.coins.shield.dialog, Some(Dialog::Confirm(_)))
+        || matches!(m.coins.mint.dialog, Some(MintDialog::Confirm(_)));
     let block = bordered(title, dialog || m.coins.focus == CoinsFocus::Middle);
     let inner = block.inner(plan_area);
     f.render_widget(block, plan_area);
@@ -807,7 +1061,9 @@ mod coins_render_tests {
                 "{text}"
             );
             assert!(
-                text.contains("Authorization: none from this manager; `qclient token mint`"),
+                text.contains(
+                    "Authorization: ‹M› authorizes a mint of it, as `qclient token mint`"
+                ),
                 "{text}"
             );
             m.coins.cursor = 1;
@@ -985,6 +1241,43 @@ mod coins_render_tests {
                 }
             }
         }
+        // `M` on the claimable row and in its Claim status; `C` in the Claim
+        // status only, with a saved authorization under its cursor.
+        m.coins.cursor = 0;
+        m.compact_actions = true;
+        let text = keys(&mut m, 120);
+        assert!(
+            text.contains("‹M› mint") && !text.contains("claim"),
+            "{text}"
+        );
+        m.compact_actions = false;
+        let text = keys(&mut m, 120);
+        assert!(
+            text.contains("‹M› mint") && text.contains("(C) claim"),
+            "{text}"
+        );
+        m.coins.cursor = 1;
+        let text = keys(&mut m, 120);
+        assert!(text.contains("(M) mint"), "{text}");
+        m.coins.cursor = 0;
+        m.coins.focus = CoinsFocus::Middle;
+        let text = keys(&mut m, 120);
+        assert!(
+            text.contains("‹M› mint") && text.contains("(C) claim"),
+            "no saved authorization to claim\n{text}"
+        );
+        m.coins.mint.saved = vec![super::super::super::mint::Saved {
+            path: "/x/mint-1200.bin".into(),
+            cited_frame: 1200,
+            amounts: Some((900, 9)),
+        }];
+        let text = keys(&mut m, 120);
+        assert!(
+            text.contains("‹M› mint") && text.contains("‹C› claim"),
+            "{text}"
+        );
+        m.coins.focus = CoinsFocus::Balances;
+        m.coins.mint.saved.clear();
         m.coins.cursor = 0;
         m.color_coding = true;
         let text = keys(&mut m, 120);
@@ -1024,6 +1317,167 @@ mod coins_render_tests {
                 assert!(text.contains("‹[/] {/}› upper/lower edge"), "{text}");
             }
         }
+    }
+
+    /// The Claim status lists the saved authorizations, and both mint
+    /// confirmations draw there, masked unless revealed; with
+    /// `QCLIENT_RENDER_DIR` set, each frame is also written there.
+    #[test]
+    fn claim_status_lists_authorizations_and_mint_confirmations_draw() {
+        use super::super::super::mint::{self, Saved, Stage};
+        let dump = |name: &str, text: &str| {
+            if let Ok(dir) = std::env::var("QCLIENT_RENDER_DIR") {
+                std::fs::write(format!("{dir}/{name}.txt"), text).unwrap();
+            }
+        };
+        let mut m = loaded();
+        m.color_coding = false;
+        m.coins.mint.saved = vec![Saved {
+            path: "/cfg/mint-1200.bin".into(),
+            cited_frame: 1200,
+            amounts: Some((80_000_000_000, 8_000_000)),
+        }];
+        for width in [80, 120] {
+            let text = render_text(&mut m, width, 40);
+            dump(&format!("offline-claim-status-{width}x40"), &text);
+            assert!(text.contains("╭ Claim status"), "{text}");
+            assert!(text.contains("Cited  Amount [Q]  Fee [Q]  State"), "{text}");
+            assert!(
+                text.contains("f1200     9.99900  0.00100  unavailable"),
+                "{text}"
+            );
+            // The claimable row is selected: `M` acts, `C` waits for the
+            // Claim status.
+            assert!(
+                text.contains("‹M› mint") && !text.contains("‹C› claim"),
+                "{text}"
+            );
+        }
+        let preview = |stage| mint::Preview {
+            stage,
+            cited_frame: 1200,
+            reward: 80_000_000_000,
+            fee: 8_000_000,
+            max_fee: 800_000_000,
+            recipient: format!("0x{}", "cd".repeat(40)),
+        };
+        // A confirmation shows in the Claim status whichever row is
+        // selected.
+        m.coins.cursor = 1;
+        m.coins.mint.dialog = Some(mint::Dialog::Confirm(preview(Stage::Authorize)));
+        let text = render_text(&mut m, 120, 40);
+        dump("offline-mint-confirm-120x40", &text);
+        for line in [
+            "Confirm mint",
+            "Reward: 10.000000000000 Q claimable at f1200, from the GLOBAL reward witness",
+            "Amount: 9.999000000000 Q (reward 10.000000000000 Q less fee 0.001000000000 Q)",
+            "Fee: 8000000 base units (0.001000000000 Q) as quoted now, paid from the reward",
+            "Cap: 0.1 Q (--max-fee); a higher quote is refused",
+            "Recipient: this node's wallet, 0xcdcdcdcdcdcd",
+            "Saved as: mint-<frame>.bin in the node config directory, for the claim",
+            "Confirm: ‹y› authorize the mint  any other key cancels",
+        ] {
+            assert!(text.contains(line), "{line}\n{text}");
+        }
+        // The run's re-read, unwrapped: a grown reward is minted, a
+        // changed fee reopens it.
+        let help: String = mint_confirm_lines(&preview(Stage::Authorize), 400, false)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        assert!(
+            help.contains(
+                "The run reads the reward and quotes the fee again at the frame then current: a \
+                 reward that grew is minted in full to this wallet, and the outcome names both \
+                 amounts; a changed fee reopens this confirmation with it; a reward that fell \
+                 stops the run."
+            ),
+            "{help}"
+        );
+        m.mask_private = true;
+        let text = render_text(&mut m, 120, 40);
+        dump("offline-mint-confirm-masked-120x40", &text);
+        for line in [
+            "Reward: hidden in this render (--reveal shows it); claimable at f1200",
+            "Amount: hidden in this render (--reveal shows it)",
+            "Recipient: this node's wallet, its address hidden in this render",
+        ] {
+            assert!(text.contains(line), "{line}\n{text}");
+        }
+        for private in ["10.000000000000", "9.999000000000", "cdcdcd"] {
+            assert!(!text.contains(private), "{private}\n{text}");
+        }
+        m.mask_private = false;
+        // A run that found the reward grown at the confirmed fee mints it
+        // and names both amounts and the frame its authorization cites.
+        mint::dialog_key(
+            &mut m,
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('y')),
+        );
+        mint::apply_progress(
+            &mut m,
+            mint::Progress::Submitted {
+                cited_frame: 1204,
+                reward: 84_000_000_000,
+                saved: "/cfg/mint-1204.bin".into(),
+            },
+        );
+        mint::apply_progress(&mut m, mint::Progress::Done(Ok(())));
+        for width in [80, 200] {
+            let text = render_text(&mut m, width, 40);
+            dump(&format!("offline-mint-grown-{width}x40"), &text);
+            if width == 200 {
+                assert!(
+                    text.contains(
+                        "Mint f1204: authorization of 10.499 Q submitted (confirmed 9.999 Q; \
+                         the reward grew); inclusion not yet confirmed; ‹C› claims it once \
+                         GLOBAL finalizes it."
+                    ),
+                    "{text}"
+                );
+            }
+            assert!(!text.contains("Confirm mint"), "{text}");
+        }
+        // One that found the fee quoted otherwise opens the confirmation
+        // again with it.
+        m.coins.mint.run = None;
+        m.coins.mint.dialog = Some(mint::Dialog::Confirm(preview(Stage::Authorize)));
+        mint::dialog_key(
+            &mut m,
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('y')),
+        );
+        mint::apply_progress(
+            &mut m,
+            mint::Progress::Requoted(mint::Preview {
+                cited_frame: 1205,
+                fee: 8_800_000,
+                ..preview(Stage::Authorize)
+            }),
+        );
+        let text = render_text(&mut m, 120, 40);
+        dump("offline-mint-fee-requoted-120x40", &text);
+        for line in [
+            "Mint: the fee quote changed from 8000000 to 8800000 base units; confirm again.",
+            "Fee: 8800000 base units (0.001100000000 Q) as quoted now, paid from the reward",
+        ] {
+            assert!(text.contains(line), "{line}\n{text}");
+        }
+        m.coins.mint.requoted = None;
+        m.coins.mint.dialog = Some(mint::Dialog::Confirm(preview(Stage::Claim {
+            path: "/cfg/mint-1200.bin".into(),
+            witness: 1250,
+        })));
+        let text = render_text(&mut m, 120, 40);
+        dump("offline-mint-claim-confirm-120x40", &text);
+        assert!(
+            text.contains("Authorization: mint-1200.bin, citing f1200; finalized, its GLOBAL witness cites f1250"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Confirm: ‹y› claim  any other key cancels"),
+            "{text}"
+        );
+        assert!(!text.contains("/cfg/"), "{text}");
     }
 
     /// The Provers rows follow the same rule, and pressing a key that does

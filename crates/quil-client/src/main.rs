@@ -134,13 +134,7 @@ fn real_main() -> anyhow::Result<()> {
     if let Some(message) = quil_lattice_ct::native_cpu::unsupported_cpu_message("qclient") {
         anyhow::bail!(message);
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    quil_client::init_logging();
 
     let cli = Cli::parse();
     let global = GlobalArgs::from(&cli.global);
