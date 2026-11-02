@@ -3778,7 +3778,7 @@ impl AppConsensusEngine {
         let budget_secs = exec.token_verification_budget();
         // Operations not known to verify within the budget; the others verify
         // when the frame executes, as before.
-        let mut unverified: Vec<usize> = Vec::new();
+        let mut unverified: Vec<quil_execution::manager::OperationEstimate> = Vec::new();
         let mut verifying = true;
         let mut restarted = false;
         // Submissions queued ahead of this frame's last one.
@@ -3805,7 +3805,7 @@ impl AppConsensusEngine {
         }
         let estimate_secs: f64 = unverified
             .iter()
-            .map(|bytes| quil_execution::ExecutionEngineManager::estimated_verify_secs(*bytes))
+            .map(quil_execution::ExecutionEngineManager::estimated_operation_secs)
             .sum();
         let decision = PROOF_DEFERRALS
             .lock()
@@ -13237,15 +13237,19 @@ struct BundleProofs {
     released: bool,
 }
 
-/// Whether a bundle whose unverified confidential operations are `sizes`
-/// bytes each is verified in the background before a frame carries it: one
-/// of them is not known to verify within `budget_secs` (a batch shield, or a
-/// size class this node has not measured). Never without a proof worker
-/// (`None`), whose verifications are not budgeted.
-fn verifies_in_background(sizes: &[usize], budget_secs: Option<f64>) -> bool {
+/// Whether a bundle whose unverified confidential operations are
+/// `operations` is verified in the background before a frame carries it:
+/// one of them is not known to verify within `budget_secs` (a batch shield
+/// by its size or sources, or a size class this node has not measured from
+/// accepted verdicts). Never without a proof worker (`None`), whose
+/// verifications are not budgeted.
+fn verifies_in_background(
+    operations: &[quil_execution::manager::OperationEstimate],
+    budget_secs: Option<f64>,
+) -> bool {
     budget_secs.is_some_and(|budget| {
-        sizes.iter().any(|bytes| {
-            !quil_execution::ExecutionEngineManager::verification_known_to_fit(*bytes, budget)
+        operations.iter().any(|operation| {
+            !quil_execution::ExecutionEngineManager::operation_known_to_fit(operation, budget)
         })
     })
 }
@@ -13291,7 +13295,7 @@ fn bundle_proofs(
         unverified: unverified.len(),
         unverified_secs: unverified
             .iter()
-            .map(|bytes| quil_execution::ExecutionEngineManager::estimated_verify_secs(*bytes))
+            .map(quil_execution::ExecutionEngineManager::estimated_operation_secs)
             .sum(),
         long,
         verifying,
@@ -20931,10 +20935,14 @@ mod tests {
     /// operations or without a proof worker's budget.
     #[test]
     fn unmeasured_operations_verify_in_the_background() {
-        assert!(verifies_in_background(&[177_490], Some(12.0)));
-        assert!(verifies_in_background(&[2048, 177_490], Some(12.0)));
+        let op = |bytes| quil_execution::manager::OperationEstimate {
+            bytes,
+            floor_secs: 0.0,
+        };
+        assert!(verifies_in_background(&[op(177_490)], Some(12.0)));
+        assert!(verifies_in_background(&[op(2048), op(177_490)], Some(12.0)));
         assert!(!verifies_in_background(&[], Some(12.0)));
-        assert!(!verifies_in_background(&[177_490], None));
+        assert!(!verifies_in_background(&[op(177_490)], None));
     }
 
     /// An arriving confidential bundle is verified on the shard that
