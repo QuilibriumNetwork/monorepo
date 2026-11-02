@@ -380,7 +380,7 @@ fn reproduces_repeated_header_credit() {
 }
 
 /// Header 15 after header 1 relays source frames 7..=14 only: GLOBAL warns
-/// that frames 2..=6 are relayed by no executed header, naming the shard,
+/// that frames 1..=6 are relayed by no executed header, naming the shard,
 /// both headers and the GLOBAL frame.
 #[test]
 fn a_header_past_the_relay_window_warns_of_the_uncovered_frames() {
@@ -395,19 +395,19 @@ fn a_header_past_the_relay_window_warns_of_the_uncovered_frames() {
         &format!("shard={}", hex::encode([0x68; 32])),
         "shard_frame=15",
         "previous_shard_frame=1",
-        "uncovered_first=2",
+        "uncovered_first=1",
         "uncovered_last=6",
-        "uncovered_frames=5",
+        "uncovered_frames=6",
     ] {
         assert!(line.contains(field), "{field} missing from: {line}");
     }
 }
 
-/// Header 10 after header 1 relays source frames 2..=9: every frame is
+/// Header 9 after header 1 relays source frames 1..=8: every frame is
 /// covered, and nothing is logged about relay coverage.
 #[test]
 fn a_header_within_the_relay_window_does_not_warn() {
-    let (credited, log) = execute_headers(&[(3, 1), (4, 10)]);
+    let (credited, log) = execute_headers(&[(3, 1), (4, 9)]);
     assert_eq!(credited.len(), 2, "both headers executed: {log}");
     assert!(!log.contains("spend relay coverage"), "{log}");
 }
