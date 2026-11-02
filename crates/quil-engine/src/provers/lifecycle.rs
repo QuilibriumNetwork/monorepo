@@ -100,6 +100,12 @@ pub const JOIN_FILTER_COOLDOWN_FRAMES: u64 = 30;
 /// window. Tunable.
 pub const JOIN_REJECT_BACKOFF_FRAMES: u64 = DEFAULT_CONFIRM_WINDOW_FRAMES;
 
+/// Epochs after a departure that this node's planner stays off a shard its
+/// operator left (`operator_left_holds`), so a free auto worker does not undo
+/// the leave at the next cycle. Bounded, and a shard at halt risk is joined
+/// anyway: the hold never decides a shard's coverage.
+pub const OPERATOR_LEAVE_HOLD_EPOCHS: u64 = 1;
+
 /// Why a proposed join stopped keeping its filter from new joins
 /// (`ProverLifecycle::join_hold_ended`).
 enum JoinHoldEnd {
@@ -686,6 +692,9 @@ pub struct ProverLifecycle {
     /// Silent seats a shield keeps renewing, with the epoch they were last
     /// reported in (`report_silence_shield`).
     silence_shield_reported: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
+    /// Holds on shards the operator left already reported, by filter and leave
+    /// frame (`report_operator_left_holds`).
+    operator_left_reported: std::sync::Mutex<std::collections::HashSet<(Vec<u8>, u64)>>,
     /// Per-filter "last frame we proposed Join on this filter."
     /// Worker-level `pending_filter_frame` already prevents re-using
     /// the same worker slot mid-flight, but it times out after 10
@@ -782,6 +791,7 @@ impl ProverLifecycle {
             storage_shed_spared: std::sync::Mutex::new(HashMap::new()),
             capacity_shield_reported: std::sync::Mutex::new(HashMap::new()),
             silence_shield_reported: std::sync::Mutex::new(HashMap::new()),
+            operator_left_reported: Default::default(),
             last_join_attempt: RwLock::new(HashMap::new()),
             shard_info_loaded: AtomicBool::new(false),
             submission_attempts,
@@ -1404,6 +1414,25 @@ impl ProverLifecycle {
                  active provers than the halt-risk count, so the seat stays and renews for the \
                  next epoch, and the surplus leave does not propose it again while the shard is \
                  that small (reported once per seat per epoch)");
+        }
+    }
+
+    /// One line per hold, when it starts: the planner's silence on a shard is
+    /// otherwise indistinguishable from the shard scoring low.
+    fn report_operator_left_holds(&self, frame_number: u64, holds: &[OperatorLeftHold]) {
+        let Ok(mut reported) = self.operator_left_reported.lock() else {
+            return;
+        };
+        reported.retain(|(f, lf)| holds.iter().any(|h| &h.filter == f && h.leave_frame == *lf));
+        for hold in holds {
+            if reported.insert((hold.filter.clone(), hold.leave_frame)) {
+                info!(frame = frame_number, filter = %hex::encode(&hold.filter),
+                    leave_frame = hold.leave_frame, until_epoch = hold.until_epoch, scope = "local",
+                    action = "none needed; to keep free workers off the shard for longer, switch \
+                              them to manual; a join you send yourself goes ahead",
+                    "lifecycle: the planner stays off a shard the operator left, unless it falls \
+                     to halt risk");
+            }
         }
     }
 
@@ -2355,6 +2384,21 @@ impl ProverLifecycle {
         if !reject_backoff.is_empty() {
             proposal_descriptors.retain(|d| !reject_backoff.contains(&d.filter));
         }
+        // A shard the operator left: a free auto worker would otherwise rejoin
+        // it at the next cycle. Local to this node's own proposals: no other
+        // planner's view changes, and a shard short of provers is joined anyway.
+        let operator_left = operator_left_holds(
+            prover_info.as_ref().map_or(&[][..], |p| &p.allocations),
+            frame_number,
+            &self.allocation_reasons,
+        );
+        if !operator_left.is_empty() {
+            proposal_descriptors.retain(|d| {
+                !operator_left.iter().any(|h| h.filter == d.filter)
+                    || proposer::halt_risk_unstaffed(d)
+            });
+        }
+        self.report_operator_left_holds(frame_number, &operator_left);
         // A shard a pending split or merge has frozen: the chain refuses the
         // whole join if it names one, taking the other shards with it.
         if let Ok(frozen) = self.frozen_shards.read() {
@@ -4681,6 +4725,51 @@ pub(crate) fn is_settled_split_parent(
         && !remote_shards.contains(filter)
         && !arriving_shards.contains(filter)
         && is_split_parent(filter, known)
+}
+
+/// A departed seat this node's planner stays off for now.
+#[derive(Debug, PartialEq, Eq)]
+struct OperatorLeftHold {
+    filter: Vec<u8>,
+    leave_frame: u64,
+    /// The first epoch the planner may rejoin.
+    until_epoch: u64,
+}
+
+/// Seats that departed on a leave the planner did not propose: the planner
+/// records its own reason for each leave it proposes, and an operator's reads
+/// `M` (sent through this node) or has no record. A leave whose record is
+/// missing (a store reset, a proposal that landed an epoch later, a leave sent
+/// through another node) reads as an operator's; it costs only this bounded
+/// hold. Read from committed state, so it survives a restart.
+fn operator_left_holds(
+    allocations: &[quil_types::consensus::ProverAllocationInfo],
+    frame_number: u64,
+    reasons: &super::allocation_reasons::AllocationReasons,
+) -> Vec<OperatorLeftHold> {
+    use quil_types::consensus::{epoch_for_frame, EffectiveStatus};
+    let epoch = epoch_for_frame(frame_number);
+    allocations
+        .iter()
+        .filter(|a| {
+            a.status == ProverStatus::Leaving
+                && a.leave_frame_number > 0
+                && a.effective_status(frame_number) == EffectiveStatus::ExpiredLeaving
+        })
+        .filter_map(|a| {
+            // A leave proposed in epoch E departs at the E+2 boundary.
+            let until_epoch =
+                epoch_for_frame(a.leave_frame_number) + 2 + OPERATOR_LEAVE_HOLD_EPOCHS;
+            let reason = reasons.reason(&a.confirmation_filter, false, a.leave_frame_number);
+            (epoch < until_epoch && reason.as_deref().is_none_or(|r| r == "M")).then(|| {
+                OperatorLeftHold {
+                    filter: a.confirmation_filter.clone(),
+                    leave_frame: a.leave_frame_number,
+                    until_epoch,
+                }
+            })
+        })
+        .collect()
 }
 
 fn build_proposal_descriptors(
@@ -7786,6 +7875,176 @@ mod proposal_loop_tests {
             count_proposed_joins(&actions) > 0,
             "expected joins to resume past cooldown"
         );
+    }
+
+    /// A departed seat, left at `leave_frame` of epoch 0, with free workers and
+    /// `active` provers on its shard.
+    fn operator_left(
+        active: u32,
+    ) -> (
+        Arc<ConfigurableWorkerManager>,
+        Arc<ConfigurableRegistry>,
+        Arc<ProverLifecycle>,
+    ) {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(idle_worker(1));
+        wm.add(idle_worker(2));
+        wm.add(idle_worker(3));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_summaries(vec![
+            shard_summary(filter_bytes(0x01), active),
+            shard_summary(filter_bytes(0x02), 8),
+        ]);
+        let mut left = alloc(filter_bytes(0x01), ProverStatus::Leaving, 50);
+        left.leave_frame_number = 100;
+        reg.set_prover(prover(address.clone(), vec![left]));
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        (wm, reg, lifecycle)
+    }
+
+    fn proposed_joins(actions: &[LifecycleAction]) -> Vec<Vec<u8>> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeJoin { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    fn evaluate_at(
+        lifecycle: &ProverLifecycle,
+        frame: u64,
+        reg: &dyn ProverRegistry,
+        wm: &dyn WorkerManager,
+    ) -> Vec<LifecycleAction> {
+        lifecycle.set_prover_root_verified_frame(frame);
+        lifecycle.evaluate(frame, 1, reg, wm).unwrap()
+    }
+
+    /// The bound and its recovery: after the operator's leave departs, free
+    /// auto workers stay off the shard through the hold and take it again at
+    /// its end, while the planner goes on joining other shards.
+    #[test]
+    fn a_shard_the_operator_left_is_held_off_then_joinable() {
+        let epoch = quil_types::consensus::epoch_length_frames();
+        let (wm, reg, lifecycle) = operator_left(8);
+        let during = epoch_end_of_hold(epoch) - 1;
+        let p = proposed_joins(&evaluate_at(&lifecycle, during, reg.as_ref(), wm.as_ref()));
+        assert!(!p.contains(&filter_bytes(0x01)), "held off: {p:?}");
+        assert!(p.contains(&filter_bytes(0x02)), "others still join: {p:?}");
+
+        let after = epoch_end_of_hold(epoch);
+        let p = proposed_joins(&evaluate_at(&lifecycle, after, reg.as_ref(), wm.as_ref()));
+        assert!(p.contains(&filter_bytes(0x01)), "joinable again: {p:?}");
+    }
+
+    /// The first frame the planner may rejoin the shard `operator_left` leaves
+    /// in epoch 0.
+    fn epoch_end_of_hold(epoch: u64) -> u64 {
+        (2 + OPERATOR_LEAVE_HOLD_EPOCHS) * epoch
+    }
+
+    /// The network effect: the hold never costs a shard coverage. One at halt
+    /// risk with nobody on the way is joined during the hold.
+    #[test]
+    fn a_held_shard_at_halt_risk_is_joined_anyway() {
+        let epoch = quil_types::consensus::epoch_length_frames();
+        let (wm, reg, lifecycle) = operator_left(1);
+        let during = epoch_end_of_hold(epoch) - 1;
+        let p = proposed_joins(&evaluate_at(&lifecycle, during, reg.as_ref(), wm.as_ref()));
+        assert!(p.contains(&filter_bytes(0x01)), "at halt risk: {p:?}");
+    }
+
+    /// The record an operator's leave leaves when sent through this node (the
+    /// send handler writes `M`) holds the shard as no record does.
+    #[test]
+    fn a_leave_recorded_as_manual_holds_the_shard() {
+        let epoch = quil_types::consensus::epoch_length_frames();
+        let (wm, reg, lifecycle) = operator_left(8);
+        lifecycle
+            .allocation_reasons
+            .record(&[filter_bytes(0x01)], false, 90, "M")
+            .unwrap();
+        let during = epoch_end_of_hold(epoch) - 1;
+        let p = proposed_joins(&evaluate_at(&lifecycle, during, reg.as_ref(), wm.as_ref()));
+        assert!(!p.contains(&filter_bytes(0x01)), "held off: {p:?}");
+    }
+
+    /// A leave the planner proposed itself holds nothing: it records why, and
+    /// it may want the shard back.
+    #[test]
+    fn a_shard_the_planner_left_is_not_held_off() {
+        let epoch = quil_types::consensus::epoch_length_frames();
+        let (wm, reg, lifecycle) = operator_left(8);
+        lifecycle
+            .allocation_reasons
+            .record(&[filter_bytes(0x01)], false, 90, "$")
+            .unwrap();
+        let during = epoch_end_of_hold(epoch) - 1;
+        let p = proposed_joins(&evaluate_at(&lifecycle, during, reg.as_ref(), wm.as_ref()));
+        assert!(p.contains(&filter_bytes(0x01)), "not held: {p:?}");
+    }
+
+    /// A hold says so once, with the shard, the leave and its end.
+    #[test]
+    fn a_hold_logs_one_line_when_it_starts() {
+        let epoch = quil_types::consensus::epoch_length_frames();
+        let (wm, reg, lifecycle) = operator_left(8);
+        let count = |logged: &str| {
+            logged
+                .matches("stays off a shard the operator left")
+                .count()
+        };
+        let during = 2 * epoch + 1;
+        lifecycle.set_prover_root_verified_frame(during);
+        let (_, logged) = evaluate_logged(&lifecycle, during, reg.as_ref(), wm.as_ref());
+        assert_eq!(count(&logged), 1, "{logged}");
+        for text in [
+            format!("filter={}", hex::encode(filter_bytes(0x01))),
+            "leave_frame=100".to_string(),
+            format!("until_epoch={}", 2 + OPERATOR_LEAVE_HOLD_EPOCHS),
+        ] {
+            assert!(logged.contains(&text), "{text} in {logged}");
+        }
+        lifecycle.set_prover_root_verified_frame(during + 1);
+        let (_, logged) = evaluate_logged(&lifecycle, during + 1, reg.as_ref(), wm.as_ref());
+        assert_eq!(count(&logged), 0, "{logged}");
+    }
+
+    /// Only a departed seat is held, and only until its bound; a seat still
+    /// serving its notice is ours and no candidate anyway, and any other
+    /// status is none of this.
+    #[test]
+    fn holds_cover_departed_operator_leaves_within_the_bound() {
+        let epoch = quil_types::consensus::epoch_length_frames();
+        let reasons = crate::provers::allocation_reasons::AllocationReasons::default();
+        let mut left = alloc(filter_bytes(0x01), ProverStatus::Leaving, 50);
+        left.leave_frame_number = 100;
+        let holds = |a: &ProverAllocationInfo, frame| {
+            operator_left_holds(std::slice::from_ref(a), frame, &reasons)
+        };
+        assert!(holds(&left, 2 * epoch - 1).is_empty(), "serving its notice");
+        let until_epoch = 2 + OPERATOR_LEAVE_HOLD_EPOCHS;
+        assert_eq!(
+            holds(&left, 2 * epoch),
+            vec![OperatorLeftHold {
+                filter: filter_bytes(0x01),
+                leave_frame: 100,
+                until_epoch,
+            }],
+            "departed"
+        );
+        assert_eq!(holds(&left, until_epoch * epoch - 1).len(), 1, "last frame");
+        assert!(holds(&left, until_epoch * epoch).is_empty(), "the bound");
+        let rejected = alloc(filter_bytes(0x01), ProverStatus::Rejected, 50);
+        assert!(holds(&rejected, 2 * epoch).is_empty());
     }
 
     #[test]
