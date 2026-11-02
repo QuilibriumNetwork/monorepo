@@ -734,6 +734,185 @@ fn a_seal_from_kept_labels_is_the_relabelled_seal() {
     );
 }
 
+/// [`statement`] for `epoch`.
+fn statement_at<'a>(
+    member: &'a [u8],
+    encoded: &EncodedLeaf,
+    epoch: u64,
+    beacon: &'a [u8],
+) -> SealStatement<'a> {
+    SealStatement {
+        epoch,
+        ..statement(member, encoded, beacon)
+    }
+}
+
+/// From the stable replica key epoch an unchanged leaf registers the same
+/// replica and commitments every epoch, and each epoch's seal still answers
+/// that epoch alone: a proof of epoch E is refused for E+1 at a later beacon
+/// and even at E's own, and so is an opening of E replayed as E+1's.
+#[test]
+fn a_stable_key_keeps_an_unchanged_leaf_and_each_proof_to_its_epoch() {
+    quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(EPOCH));
+    let m = member(1);
+    let raw = data(200 * NODE_BYTES, 2);
+    let at = |epoch| encode_leaf(&raw, &sdr::replica_key(&m, LEAF, epoch), &params());
+    let (this, next) = (at(EPOCH), at(EPOCH + 1));
+    assert_eq!(
+        this.replica, next.replica,
+        "an unchanged leaf keeps its replica"
+    );
+    assert_eq!(this.registration_root(), next.registration_root());
+    let proof = prove_seal(
+        &this.replica,
+        &statement_at(&m, &this, EPOCH, b"beacon-1"),
+        &params(),
+        16,
+    )
+    .unwrap();
+    let verify = |epoch, beacon: &[u8], proof: &SealProof| {
+        verify_seal(
+            &statement_at(&m, &this, epoch, beacon),
+            proof,
+            &params(),
+            16,
+        )
+    };
+    assert_eq!(verify(EPOCH, b"beacon-1", &proof), Ok(()));
+    assert!(
+        verify(EPOCH + 1, b"beacon-2", &proof).is_err(),
+        "an epoch's seal replayed for the next at its beacon"
+    );
+    assert!(
+        verify(EPOCH + 1, b"beacon-1", &proof).is_err(),
+        "an epoch's seal replayed for the next at the same beacon"
+    );
+    let again = prove_seal(
+        &next.replica,
+        &statement_at(&m, &next, EPOCH + 1, b"beacon-2"),
+        &params(),
+        16,
+    )
+    .unwrap();
+    assert_eq!(
+        verify(EPOCH + 1, b"beacon-2", &again),
+        Ok(()),
+        "the next epoch seals the same replica afresh"
+    );
+
+    let root = this.registration_root();
+    let rho = (0u8..=255)
+        .map(|i| [i; 32])
+        .find(|rho| {
+            opening_index(rho, LEAF, EPOCH, &m, 0, this.n)
+                != opening_index(rho, LEAF, EPOCH + 1, &m, 0, this.n)
+        })
+        .expect("a beacon whose epochs open different nodes");
+    let open = |epoch| {
+        build_opening(
+            &this.replica,
+            &this.replica_cap,
+            &root,
+            LEAF,
+            epoch,
+            &m,
+            0,
+            &rho,
+        )
+        .unwrap()
+    };
+    assert!(verify_opening(&open(EPOCH), &rho));
+    assert!(verify_opening(&open(EPOCH + 1), &rho));
+    let replayed = crate::porep::StorageOpening {
+        epoch: EPOCH + 1,
+        ..open(EPOCH)
+    };
+    assert!(
+        !verify_opening(&replayed, &rho),
+        "an epoch's opening replayed for the next at the same beacon"
+    );
+    quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
+}
+
+/// With a stable key a member can label a leaf long before it registers it,
+/// but not prove its seal: a proof made before the beacon, at a guess of it,
+/// is refused at the beacon GLOBAL fixes after the registration.
+#[test]
+fn a_seal_proved_before_its_beacon_is_refused() {
+    quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(EPOCH));
+    let m = member(1);
+    let encoded = encode(&m, &data(200 * NODE_BYTES, 3));
+    let guessed = prove_seal(
+        &encoded.replica,
+        &statement(&m, &encoded, b"guessed"),
+        &params(),
+        16,
+    )
+    .unwrap();
+    assert_eq!(
+        verify_seal(
+            &statement(&m, &encoded, b"guessed"),
+            &guessed,
+            &params(),
+            16
+        ),
+        Ok(())
+    );
+    assert!(
+        verify_seal(&statement(&m, &encoded, b"fixed"), &guessed, &params(), 16).is_err(),
+        "a precomputed seal"
+    );
+    quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
+}
+
+/// A leaf whose data changes at the same node count keeps its labels under a
+/// stable key, so only the data's part is encoded again, and the new replica
+/// seals. A seal an older build proves with the epoch-bound key for the same
+/// epoch is refused.
+#[test]
+fn a_changed_leaf_reuses_its_labels_and_an_epoch_keyed_seal_fails() {
+    use quil_types::consensus::set_stable_replica_key_epoch_for_thread;
+    set_stable_replica_key_epoch_for_thread(Some(EPOCH));
+    let m = member(2);
+    let before = data(200 * NODE_BYTES, 4);
+    let after = data(200 * NODE_BYTES, 5);
+    let n = data_node_count(before.len() as u64);
+    let key = sdr::replica_key(&m, LEAF, EPOCH);
+    assert_eq!(key, sdr::replica_key(&m, LEAF, EPOCH + 1));
+    let (kept, comm_c) = Kept::label(n, &key);
+    let old = encode_with_labels(&before, n, kept.layers.last().unwrap(), comm_c).unwrap();
+    let new = encode_with_labels(&after, n, kept.layers.last().unwrap(), comm_c).unwrap();
+    assert_eq!(new.comm_c, old.comm_c, "the same labels");
+    assert_ne!(new.replica, old.replica);
+    let whole = encode_leaf_at(&after, &key, &params(), n, &mut |_, _| {});
+    assert_eq!(new.registration_root(), whole.registration_root());
+    let next = |encoded| statement_at(&m, encoded, EPOCH + 1, b"beacon");
+    let proof = prove_seal(&new.replica, &next(&new), &params(), 16).unwrap();
+    assert_eq!(verify_seal(&next(&new), &proof, &params(), 16), Ok(()));
+
+    // An older build: the epoch-bound key, a self-consistent registration
+    // and seal under it.
+    set_stable_replica_key_epoch_for_thread(Some(u64::MAX));
+    let old_key = sdr::replica_key(&m, LEAF, EPOCH + 1);
+    assert_ne!(old_key, key);
+    let stale = encode_leaf_at(&after, &old_key, &params(), n, &mut |_, _| {});
+    let stale_proof = prove_seal(&stale.replica, &next(&stale), &params(), 16).unwrap();
+    assert_eq!(
+        verify_seal(&next(&stale), &stale_proof, &params(), 16),
+        Ok(())
+    );
+    set_stable_replica_key_epoch_for_thread(Some(EPOCH));
+    assert!(
+        verify_seal(&next(&stale), &stale_proof, &params(), 16).is_err(),
+        "a seal under the epoch-bound key past the stable key epoch"
+    );
+    assert!(
+        prove_seal(&stale.replica, &next(&stale), &params(), 16).is_err(),
+        "its labels are not the stable key's"
+    );
+    set_stable_replica_key_epoch_for_thread(None);
+}
+
 /// A count labelled ahead stays registrable while the data changes by a few
 /// percent, and a registration never pads past an eighth and the floor.
 #[test]

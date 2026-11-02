@@ -204,6 +204,15 @@ pub(crate) fn initialize(network: u8) {
             "QUIL_STORAGE_KICK_SUSPENSION_EPOCH override active (localnet only)"
         );
     }
+    let stable_key_epoch = quil_types::consensus::init_stable_replica_key_epoch(network);
+    if network != 0 && stable_key_epoch != u64::MAX {
+        tracing::warn!(
+            epoch = stable_key_epoch,
+            hash_storage_proof_epoch = hash_epoch,
+            "QUIL_STABLE_REPLICA_KEY_EPOCH override active (localnet only; never before the hash \
+             storage proof epoch)"
+        );
+    }
     let (restoration_frame, restored_provers) =
         quil_types::consensus::init_kicked_seniority_restoration(network);
     if network != 0 && restoration_frame != u64::MAX {
