@@ -48,7 +48,9 @@ pub struct ProofWorkerConfig {
     /// CPU-time limit applied inside the verifier child (seconds, 1..=3600).
     #[serde(default = "default_cpu_seconds")]
     pub cpu_seconds: u64,
-    /// Wall-clock deadline for one verification (seconds, 1..=3600).
+    /// Wall-clock deadline for one verification (seconds, 1..=3600). The node
+    /// stops a verification of a size class it has measured sooner, at six
+    /// times the class's mean and at least 900 s, and gives its retry this much.
     #[serde(default = "default_wall_timeout_secs")]
     pub wall_timeout_secs: u64,
     /// Linux-only `RLIMIT_AS` for the child in bytes; 0 leaves it unset.
@@ -58,12 +60,13 @@ pub struct ProofWorkerConfig {
     /// Verifications admitted concurrently per node (1..=64), shared by every
     /// execution manager and node process through the admission file. Each
     /// child needs about 1 GB at depth 32; keep `maxConcurrent × nativeThreads`
-    /// at or below the machine's cores. Unset: 2, except on an archive, which
-    /// takes its CPUs divided by `nativeThreads`, at most one per 3 GiB of
-    /// available memory, within 2..=8: an archive verifies the confidential
-    /// operations a GLOBAL frame carries before it publishes that frame, and
-    /// two slots fall behind their arrival. Unset stays unset when the node
-    /// saves its config.
+    /// at or below the machine's cores. Unset: the node's CPUs divided by
+    /// `nativeThreads`, at most one per 6 GiB of available memory (an archive:
+    /// 3 GiB), within 2..=16 (an archive: 2..=8): a member cannot apply a frame
+    /// carrying a batch shield until its own verdict arrives, and an archive
+    /// verifies what a GLOBAL frame carries before it publishes that frame, so
+    /// too few slots stall them behind arrivals. Unset stays unset when the
+    /// node saves its config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<usize>,
     /// Native aggregation threads per verifier child (1..=8). Aggregation

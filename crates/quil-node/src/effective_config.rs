@@ -96,7 +96,7 @@ pub(crate) struct EffectiveConfig {
     pub proof_disabled: bool,
     /// Verifications admitted at once, shared by every worker of the node.
     /// `proofWorker.maxConcurrent` as written: the number, or `unset` when the
-    /// node chooses it (releases that size an archive's slots from its machine).
+    /// node chooses it (releases that size the slots from the machine).
     /// The slots in use are in the `token proof worker configured` line and,
     /// for the master, in `node status` (`proof_slots`).
     pub proof_slots_configured: String,

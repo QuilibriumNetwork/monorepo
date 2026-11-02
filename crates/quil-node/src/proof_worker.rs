@@ -20,26 +20,35 @@ pub(crate) const WORKER_FILE_NAME: &str = "quil-amount-proof-worker";
 pub(crate) const WORKER_MODE_ARG: &str = "--amount-proof-worker";
 pub(crate) const WORKER_PATH_ENV: &str = "QUIL_AMOUNT_WORKER_PATH";
 
-/// Verifier slots of a node that leaves `proofWorker.maxConcurrent` unset,
-/// and the fewest an archive sizes itself to.
+/// Verifier slots of a node that leaves `proofWorker.maxConcurrent` unset and
+/// cannot count its CPUs, the fewest a node sizes itself to, and the slots a
+/// regular node budgets a frame's verification by.
 const DEFAULT_MAX_CONCURRENT: usize = 2;
 /// Most verifier slots an archive sizes itself to.
 const ARCHIVE_MAX_CONCURRENT_CAP: usize = 8;
+/// Most verifier slots a regular node sizes itself to, 15 verifying at once
+/// beside the slot left for frames: 510 batch shields of about 100 s each in
+/// 50 min need 17 on a node serving every shard (2026-11-02).
+const REGULAR_MAX_CONCURRENT_CAP: usize = 16;
 /// Available memory an archive sets aside per verifier child when it sizes
 /// its slots: the largest resident size recorded for one depth-32 child
 /// (2.73 GB, see `proofWorker.maxResidentBytes`) plus margin, so busy slots
 /// fit the memory they were sized to.
 const ARCHIVE_CHILD_MEMORY_BYTES: u64 = 3 << 30;
+/// Available memory a regular node sets aside per verifier child when it
+/// sizes its slots: as much as an archive, and that much again for its own
+/// growth, since it reads this at startup, before its stores load (one node's
+/// process grew to 16.5 GB resident of 31 GB, 2026-11-02).
+const REGULAR_CHILD_MEMORY_BYTES: u64 = 6 << 30;
 
 /// Where a node's verifier slot count came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SlotSource {
     /// `proofWorker.maxConcurrent`.
     Configured,
-    /// [`DEFAULT_MAX_CONCURRENT`]: not an archive, or an archive whose CPU
-    /// count is unknown.
+    /// [`DEFAULT_MAX_CONCURRENT`]: the CPU count is unknown.
     Default,
-    /// An archive's CPUs and available memory.
+    /// The node's CPUs and available memory.
     Machine,
 }
 
@@ -49,7 +58,7 @@ impl SlotSource {
             SlotSource::Configured => "proofWorker.maxConcurrent",
             SlotSource::Default => "default",
             SlotSource::Machine => {
-                "archive: CPUs / nativeThreads, bounded by memory; proofWorker.maxConcurrent overrides"
+                "CPUs / nativeThreads, bounded by memory; proofWorker.maxConcurrent overrides"
             }
         }
     }
@@ -60,23 +69,31 @@ impl SlotSource {
 struct VerifierSlots {
     slots: usize,
     source: SlotSource,
+    /// Slots a frame's verification budget counts
+    /// ([`WorkerVerifier::with_budget_slots`]).
+    frame_budget_slots: usize,
     /// CPUs the node may use, when the machine was asked.
     cpus: Option<usize>,
     /// Available memory in bytes, when the machine was asked.
     available_memory: Option<u64>,
     /// `cpus / nativeThreads`.
     cpu_slots: Option<usize>,
-    /// `available_memory / ARCHIVE_CHILD_MEMORY_BYTES`.
+    /// Available memory over what one child is set aside.
     memory_slots: Option<usize>,
 }
 
 /// Verifier slots for a node. An explicit `maxConcurrent` always wins. Unset,
-/// a regular node takes [`DEFAULT_MAX_CONCURRENT`]; an archive takes `cpus /
-/// nativeThreads`, at most `available_memory / ARCHIVE_CHILD_MEMORY_BYTES`,
-/// within `DEFAULT_MAX_CONCURRENT..=ARCHIVE_MAX_CONCURRENT_CAP`: it verifies
-/// the confidential operations of each GLOBAL frame before publishing it, and
-/// two slots fell behind their arrival (2026-10-30). Unknown CPUs leave the
-/// default; unknown memory leaves the CPU bound.
+/// a node takes `cpus / nativeThreads`, at most its available memory over what
+/// it sets aside per child, from [`DEFAULT_MAX_CONCURRENT`] up to its cap. An
+/// archive verifies the confidential operations of each GLOBAL frame before
+/// publishing it, and two slots fell behind their arrival (2026-10-30). A
+/// regular node cannot apply a frame carrying a batch shield until its own
+/// verdict arrives: with two slots it verified one at a time, about 6 of 100 s
+/// per 600 s across all its shards, and shards missed quorum for over an hour
+/// (2026-11-02). Each child averages 2.7 CPUs at the default four threads
+/// (173 CPU-s in 65 s), so the queue's `slots - 1` take at most 2/3 of the CPUs
+/// and the workers keep the rest. Unknown CPUs leave the default; unknown
+/// memory leaves the CPU bound.
 fn verifier_slots(
     config: &ProofWorkerConfig,
     archive: bool,
@@ -86,6 +103,7 @@ fn verifier_slots(
     let fixed = |slots, source| VerifierSlots {
         slots,
         source,
+        frame_budget_slots: slots,
         cpus,
         available_memory,
         cpu_slots: None,
@@ -94,12 +112,14 @@ fn verifier_slots(
     if let Some(slots) = config.max_concurrent {
         return fixed(slots, SlotSource::Configured);
     }
-    if !archive {
-        return fixed(DEFAULT_MAX_CONCURRENT, SlotSource::Default);
-    }
+    let (child_memory, cap) = if archive {
+        (ARCHIVE_CHILD_MEMORY_BYTES, ARCHIVE_MAX_CONCURRENT_CAP)
+    } else {
+        (REGULAR_CHILD_MEMORY_BYTES, REGULAR_MAX_CONCURRENT_CAP)
+    };
     let cpu_slots = cpus.map(|cpus| cpus / usize::from(config.native_threads.max(1)));
-    let memory_slots = available_memory
-        .map(|bytes| usize::try_from(bytes / ARCHIVE_CHILD_MEMORY_BYTES).unwrap_or(usize::MAX));
+    let memory_slots =
+        available_memory.map(|bytes| usize::try_from(bytes / child_memory).unwrap_or(usize::MAX));
     let Some(by_cpu) = cpu_slots else {
         return VerifierSlots {
             memory_slots,
@@ -108,10 +128,17 @@ fn verifier_slots(
     };
     let slots = by_cpu
         .min(memory_slots.unwrap_or(usize::MAX))
-        .clamp(DEFAULT_MAX_CONCURRENT, ARCHIVE_MAX_CONCURRENT_CAP);
+        .clamp(DEFAULT_MAX_CONCURRENT, cap);
     VerifierSlots {
         slots,
         source: SlotSource::Machine,
+        // A proposal's budget is what its members verify inline: a leader's
+        // CPUs must not raise it for members with fewer.
+        frame_budget_slots: if archive {
+            slots
+        } else {
+            DEFAULT_MAX_CONCURRENT
+        },
         cpus,
         available_memory,
         cpu_slots,
@@ -134,6 +161,26 @@ fn process_cpus() -> Option<usize> {
             .flatten()
             .map(|cpus| cpus.get())
     })
+}
+
+/// Memory verifier children may take: what the host has available, at most
+/// this process's cgroup limit, read like the store's memory budget. Cgroup
+/// v2, then v1; "max" (no limit) does not parse.
+fn available_for_verifiers() -> Option<u64> {
+    let limit = [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ]
+    .iter()
+    .find_map(|path| {
+        std::fs::read_to_string(path)
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    });
+    crate::mem_stats::host_memory()
+        .map(|memory| limit.map_or(memory.available_bytes, |l| l.min(memory.available_bytes)))
 }
 
 /// Resolution order: `proofWorker.path`, then `QUIL_AMOUNT_WORKER_PATH`, then
@@ -199,6 +246,7 @@ fn build_worker(
     }
     worker = worker
         .with_concurrency(slots.slots)
+        .and_then(|w| w.with_budget_slots(slots.frame_budget_slots))
         .and_then(|w| w.with_native_threads(config.native_threads))
         .and_then(|w| w.with_admission_wait(Duration::from_millis(config.admission_wait_ms)))
         .map_err(|e| anyhow::anyhow!("proofWorker concurrency settings rejected: {e:?}"))?;
@@ -227,6 +275,7 @@ fn build_worker(
         wall_timeout_secs = config.wall_timeout_secs,
         max_concurrent = slots.slots,
         max_concurrent_from = slots.source.as_str(),
+        frame_budget_slots = slots.frame_budget_slots,
         cpus = slots.cpus,
         cpu_slots = slots.cpu_slots,
         available_memory_bytes = slots.available_memory,
@@ -268,7 +317,7 @@ pub(crate) fn build_node_worker(
 /// All processes of one node use its base DB directory for verifier admission,
 /// even when remote workers store their shard data in separate directories.
 /// Readiness is checked first, before creating the directory or lock file.
-/// An archive without `maxConcurrent` sizes its slots to this machine
+/// A node without `maxConcurrent` sizes its slots to this machine
 /// ([`verifier_slots`]). A process takes at most its own count of the shared
 /// slot files, so processes that chose different counts together run at most
 /// the largest.
@@ -277,13 +326,8 @@ pub(crate) fn build_node_worker_as(
     archive: bool,
 ) -> anyhow::Result<Option<WorkerVerifier>> {
     let proof = &config.proof_worker;
-    let slots = if archive && proof.max_concurrent.is_none() && !proof.disabled {
-        verifier_slots(
-            proof,
-            true,
-            process_cpus(),
-            crate::mem_stats::host_memory().map(|memory| memory.available_bytes),
-        )
+    let slots = if proof.max_concurrent.is_none() && !proof.disabled {
+        verifier_slots(proof, archive, process_cpus(), available_for_verifiers())
     } else {
         verifier_slots(proof, archive, None, None)
     };
@@ -326,6 +370,10 @@ pub(crate) fn install_token_worker(
 }
 
 #[cfg(test)]
+#[path = "proof_worker_capacity_tests.rs"]
+mod capacity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -335,18 +383,12 @@ mod tests {
     }
 
     #[test]
-    fn an_unset_max_concurrent_follows_an_archives_machine_only() {
+    fn an_unset_max_concurrent_follows_an_archives_machine() {
         const GIB: u64 = 1 << 30;
         let unset = ProofWorkerConfig::default();
         let slots = |config: &ProofWorkerConfig, archive, cpus, memory| {
             verifier_slots(config, archive, cpus, memory).slots
         };
-        // A regular node keeps two slots whatever the machine.
-        let regular = verifier_slots(&unset, false, Some(32), Some(64 * GIB));
-        assert_eq!(
-            (regular.slots, regular.source),
-            (DEFAULT_MAX_CONCURRENT, SlotSource::Default)
-        );
         // An archive takes CPUs / nativeThreads (4 by default).
         let archive = verifier_slots(&unset, true, Some(16), Some(64 * GIB));
         assert_eq!(
@@ -511,8 +553,17 @@ mod tests {
              at once; two let GLOBAL frames wait on a proof backlog"
         );
         config.engine.archive_mode = false;
-        let regular = build_node_worker(&config).unwrap().unwrap().concurrency();
-        assert_eq!(regular, 2, "a regular node keeps two verifier slots");
+        let regular = build_node_worker(&config).unwrap().unwrap();
+        assert!(
+            regular.concurrency() >= 2 && regular.concurrency() <= cpus.max(2),
+            "a regular node on {cpus} CPUs admitted {} verifications at once",
+            regular.concurrency()
+        );
+        assert_eq!(
+            regular.budget_concurrency(),
+            2,
+            "a regular node's CPUs raised what its proposals make members verify inline"
+        );
         config.engine.archive_mode = true;
         // `into` builds both where the field is optional and where it is a
         // plain count (the release base).
