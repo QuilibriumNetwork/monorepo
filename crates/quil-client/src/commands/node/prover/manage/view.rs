@@ -115,10 +115,22 @@ fn fmt_forecast(value: &BigInt) -> String {
         .trim_start_matches('~')
         .to_string()
 }
+/// A held cadence past its budget; missing data stays `-`. Plain text keeps the
+/// marker colors would give.
+fn stale_cell(m: &Model) -> &'static str {
+    if m.color_coding {
+        "stale"
+    } else {
+        "stale!"
+    }
+}
 fn reward_cell(m: &Model, v: &BigInt, filter: &[u8]) -> String {
     (0..3)
         .filter(|i| m.reward_mask() & (1 << i) != 0)
         .map(|i| {
+            if i != 2 && m.app_cadence_stale() && m.node_app_cadence.contains_key(filter) {
+                return stale_cell(m).to_string();
+            }
             m.daily_reward(v, filter, i)
                 .map_or_else(|| "-".into(), |v| fmt_forecast(&v))
         })
@@ -129,6 +141,14 @@ fn reward_total(m: &Model, rows: &[AllocationRow], kind: usize) -> String {
     (0..3)
         .filter(|i| m.reward_mask() & (1 << i) != 0)
         .map(|i| {
+            if i != 2
+                && m.app_cadence_stale()
+                && rows
+                    .iter()
+                    .any(|row| m.node_app_cadence.contains_key(&row.filter))
+            {
+                return stale_cell(m).to_string();
+            }
             let mut total = BigInt::from(0);
             let mut unknown = false;
             let mut known = false;
@@ -171,10 +191,14 @@ fn reward_total(m: &Model, rows: &[AllocationRow], kind: usize) -> String {
 }
 fn cadence_coverage(m: &Model, filter: &[u8]) -> Option<String> {
     let c = m.node_app_cadence.get(filter)?;
+    // A stale row's cells already read `stale`; the detail repeats no value.
+    if m.app_cadence_stale() {
+        return None;
+    }
     let values = [false, true]
         .iter()
         .map(|day| {
-            m.cadence_window(c, *day)
+            super::super::observed_window(c, *day)
                 .map_or_else(|| "-".into(), |w| format!("{}m", w.observed_seconds / 60))
         })
         .collect::<Vec<_>>();
@@ -184,7 +208,11 @@ fn interval_values(
     m: &Model,
     cadence: Option<&quil_types::proto::node::FrameCadence>,
     mask: u8,
+    stale: bool,
 ) -> String {
+    if stale && cadence.is_some() {
+        return stale_cell(m).into();
+    }
     [false, true]
         .iter()
         .enumerate()
@@ -192,7 +220,7 @@ fn interval_values(
         .map(|(_, day)| {
             fmt_interval(
                 cadence
-                    .and_then(|c| m.cadence_window(c, *day))
+                    .and_then(|c| super::super::observed_window(c, *day))
                     .and_then(|w| {
                         (w.advanced_frames > 0)
                             .then(|| w.observed_seconds as f64 / w.advanced_frames as f64)
@@ -975,7 +1003,12 @@ fn header_kpis(m: &Model) -> Vec<Line<'static>> {
                 "{} [s {}]: {}",
                 if compact { "Global" } else { "Global interval" },
                 m.global_interval_labels(),
-                interval_values(m, m.node_global_cadence.as_ref(), m.global_interval_mask())
+                interval_values(
+                    m,
+                    m.node_global_cadence.as_ref(),
+                    m.global_interval_mask(),
+                    m.global_cadence_stale(),
+                )
             ),
         ),
         (
@@ -1551,7 +1584,12 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
         12 => allocation_status_text(m, a),
         13 => a.mode().to_string(),
         14 => next_action_text(m, &a.next_action),
-        16 => interval_values(m, m.node_app_cadence.get(&a.filter), m.interval_mask()),
+        16 => interval_values(
+            m,
+            m.node_app_cadence.get(&a.filter),
+            m.interval_mask(),
+            m.app_cadence_stale(),
+        ),
         ALLOC_PROVER_PHASES_COL => prover_phases_cell(m, a.prover_counts.as_ref(), &a.shard_size),
         _ => a
             .default_action
@@ -2386,6 +2424,8 @@ fn render_alloc_panel(
                     WARNING
                 } else if ci == 10 && m.color_coding && a.worker_id < 0 {
                     ERROR
+                } else if matches!(ci, 10 | 16) && m.color_coding && m.app_cadence_stale() {
+                    WARNING
                 } else if ci == 12 && m.color_coding {
                     status_color(&a.status_name)
                 } else {
@@ -2445,6 +2485,9 @@ fn render_alloc_panel(
                     },
                     10 if m.color_coding && a.worker_id < 0 => {
                         Span::styled(cell.clone(), Style::new().fg(ERROR))
+                    }
+                    10 | 16 if m.color_coding && m.app_cadence_stale() => {
+                        Span::styled(cell.clone(), Style::new().fg(WARNING))
                     }
                     12 if m.color_coding => {
                         Span::styled(cell.clone(), Style::new().fg(status_color(&a.status_name)))
@@ -2507,7 +2550,12 @@ fn avail_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
                 state.to_string()
             }
         }
-        11 => interval_values(m, m.node_app_cadence.get(&s.filter), m.interval_mask()),
+        11 => interval_values(
+            m,
+            m.node_app_cadence.get(&s.filter),
+            m.interval_mask(),
+            m.app_cadence_stale(),
+        ),
         AVAIL_PROVER_PHASES_COL => prover_phases_cell(m, s.prover_counts.as_ref(), &s.shard_size),
         _ => {
             if s.ring == UNKNOWN_REWARD_RING {
@@ -2895,6 +2943,8 @@ fn render_avail_panel(
                         WARNING
                     } else if m.color_coding && c == 8 && m.committed_app_flagged(&s.filter) {
                         WARNING
+                    } else if m.color_coding && matches!(c, 10 | 11) && m.app_cadence_stale() {
+                        WARNING
                     } else if m.color_coding && matches!(c, 6 | 9) {
                         materialization_state_color(materialization_state(
                             s.materialized_frame,
@@ -2953,6 +3003,9 @@ fn render_avail_panel(
                         Span::styled(cell, Style::new().fg(WARNING))
                     }
                     7 | 8 if m.color_coding => Span::styled(cell, Style::new().fg(HELP)),
+                    10 | 11 if m.color_coding && m.app_cadence_stale() => {
+                        Span::styled(cell, Style::new().fg(WARNING))
+                    }
                     AVAIL_PROVER_PHASES_COL
                         if m.color_coding
                             && prover_halt_risk(s.prover_counts.as_ref(), &s.shard_size) =>
@@ -3394,6 +3447,16 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
                 "Reward now 60m {} vs 24h {} Q/d.",
                 super::super::format_quil_daily_units(&hour),
                 super::super::format_quil_daily_units(&day)
+            ),
+        ));
+    }
+    if m.app_cadence_stale() && !m.node_app_cadence.is_empty() {
+        notices.push((
+            "shard-intervals-stale",
+            NoticeSeverity::Warning,
+            format!(
+                "Shard intervals and forecasts stale >{}s: no shard answer.",
+                m.app_cadence_budget_seconds()
             ),
         ));
     }
@@ -4569,7 +4632,7 @@ fn help_items() -> Vec<HelpItem> {
         item("`red`: blocked/error"),
         sec("Measurements and forecasts"),
         kv("Frame windows", "Node samples once/minute; `60m`/`24h` windows survive updates. Downtime/missing reads excluded; selected row shows coverage. Generation changes cannot count inherited heights as produced frames"),
-        kv("Frame intervals", "GLOBAL measures received head; app measures committed GlobalHead. Node history survives updates, retains at most 24h, samples once/minute. Freshness 90s; coverage in RPC. Forecasts use current per-frame reward and observed frame rate; 10s is theoretical, none proves earned credits"),
+        kv("Frame intervals", "GLOBAL measures received head; app measures committed GlobalHead. Node history survives updates, retains at most 24h, samples once/minute and withholds a sample over 90s old; coverage in RPC. A value stays through a late or failed refresh; once no answer has come for one refresh plus its RPC timeout, cells read `stale` (color, or `stale!`) and the `Shard intervals and forecasts stale` notice names the wait: it says the node's RPC is not answering, not that frames stopped. `-` means the node holds no sample. Forecasts use current per-frame reward and observed frame rate; 10s is theoretical, none proves earned credits"),
         kv("Reward estimates", "`60m`/`24h` are observation windows, scaled by the quorum share: a frame pays only its certificate's signers, n−⌊(n−1)/3⌋ of the n active and leaving provers; `T` (`theory` in expanded mode) assumes 10s/frame, every frame paid. Forecasts in heading order; ‹b› exposes shared `60m`/`24h`/`T` sub-items under the Reward column and Allocations header Reward KPI. `~` before `Q/d` marks estimates. Observed zero progress estimates zero; actual credits separate; reward sort/filter uses the first visible window"),
         kv("Global citation", "Compact Global heading / expanded Snapshot cite the GLOBAL frame behind GlobalHead cells. Compact `@-Nf` / `@+Nf` offsets refer to the top Global head; equal-frame citations are omitted. Claimable uses its authenticated balance frame. Expanded shows absolute frames"),
         sec("Display"),
@@ -7233,6 +7296,139 @@ mod tests {
     }
 
     #[test]
+    fn overdue_cadence_reads_stale_while_missing_stays_a_dash() {
+        use quil_types::proto::node::{FrameCadence, FrameWindow};
+        use std::time::{Duration, Instant};
+        let mut m = Model::new();
+        m.data_loaded = true;
+        m.refresh_seconds = 60;
+        m.reward_windows = 5; // 60m/T
+        m.interval_windows = 1; // 60m
+        m.color_coding = true;
+        m.last_fetch_success = Some(Instant::now());
+        let mut a = row("aa", 3, 1, 1, "", "");
+        a.status = 2;
+        a.epoch = m.current_epoch;
+        a.filter = vec![0xaa];
+        a.estimated_reward = BigInt::from(1_000_000);
+        let mut idle = row("bb", 3, 1, 2, "", "");
+        idle.status = 2;
+        idle.epoch = m.current_epoch;
+        idle.filter = vec![0xbb];
+        idle.estimated_reward = BigInt::from(1_000_000);
+        let mut peer = shard("aa", 1, 1);
+        peer.filter = vec![0xaa];
+        let c = FrameCadence {
+            last_observed_unix_seconds: 1,
+            hour: Some(FrameWindow {
+                window_seconds: 3600,
+                observed_seconds: 600,
+                advanced_frames: 30,
+            }),
+            day: None,
+        };
+        m.node_global_cadence = Some(c);
+        m.node_app_cadence.insert(a.filter.clone(), c);
+        m.node_global_cadence_received = Some(Instant::now());
+        m.node_app_cadence_received = Some(Instant::now());
+        let theory = fmt_forecast(&(&a.estimated_reward * BigInt::from(8640)));
+        let notices = |m: &Model| {
+            message_lines(m, Line::default(), 300)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let global = |m: &Model| {
+            header_kpis(m)
+                .iter()
+                .map(ToString::to_string)
+                .find(|line| line.contains("Global [s"))
+                .unwrap()
+        };
+
+        // Within the budget nothing is stale, however old the sample's clock.
+        assert_eq!(alloc_cell(&m, &a, 16, 0), "20.0");
+        assert!(alloc_cell(&m, &a, 10, 0).ends_with(&format!("/{theory}")));
+        assert!(!alloc_cell(&m, &a, 10, 0).starts_with('-'));
+        assert!(global(&m).contains("Global [s 60m/24h]: 20.0/-"));
+        update_message_lifetime(&mut m);
+        assert!(!notices(&m).contains("stale"));
+
+        // Past it: named cells, one notice with the affected signal and wait.
+        let overdue = Instant::now() - Duration::from_secs(121);
+        m.node_app_cadence_received = Some(overdue);
+        assert_eq!(alloc_cell(&m, &a, 16, 0), "stale");
+        assert_eq!(avail_cell(&m, &peer, 11, 0), "stale");
+        assert_eq!(alloc_cell(&m, &a, 10, 0), format!("stale/{theory}"));
+        assert_eq!(reward_total(&m, &[a.clone()], 0), format!("stale/{theory}"));
+        assert_eq!(cadence_coverage(&m, &a.filter), None);
+        update_message_lifetime(&mut m);
+        assert!(notices(&m).contains("Shard intervals and forecasts stale >120s: no shard answer."));
+        m.notice_minimum = NoticeSeverity::Error;
+        assert!(!notices(&m).contains("Shard intervals"));
+        m.notice_minimum = NoticeSeverity::Warning;
+
+        // A row the node held no sample for has nothing to be stale.
+        assert_eq!(alloc_cell(&m, &idle, 16, 0), "-");
+        assert_eq!(alloc_cell(&m, &idle, 10, 0), format!("-/{theory}"));
+
+        // Global keeps its own clock.
+        assert!(global(&m).contains("Global [s 60m/24h]: 20.0/-"));
+        m.node_global_cadence_received = Some(Instant::now() - Duration::from_secs(76));
+        assert!(global(&m).contains("Global [s 60m/24h]: stale"));
+
+        // Color marks both row renderings; plain text carries the marker.
+        for allocations in [[a.clone(), idle.clone()], [idle.clone(), a.clone()]] {
+            let lines = render_alloc_panel(&mut m, &allocations, Rect::new(0, 0, 300, 6), None);
+            let span = lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.trim() == "stale")
+                .expect("an interval cell reads stale");
+            assert_eq!(span.style.fg, Some(WARNING));
+        }
+        let mut other = shard("cc", 1, 1);
+        other.filter = vec![0xcc];
+        for available in [[peer.clone(), other.clone()], [other, peer.clone()]] {
+            let lines = render_avail_panel(&mut m, &available, Rect::new(0, 0, 300, 5), None);
+            let span = lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.trim() == "stale")
+                .expect("an interval cell reads stale");
+            assert_eq!(span.style.fg, Some(WARNING));
+        }
+        m.color_coding = false;
+        assert_eq!(alloc_cell(&m, &a, 16, 0), "stale!");
+        assert_eq!(alloc_cell(&m, &a, 10, 0), format!("stale!/{theory}"));
+
+        // Sizing goes through the same text in both modes: nothing is cut.
+        for mode in [ColumnSizing::Fixed, ColumnSizing::Dynamic] {
+            m.column_sizing = mode;
+            let text = render_alloc_panel(
+                &mut m,
+                &[a.clone(), idle.clone()],
+                Rect::new(0, 0, 260, 6),
+                None,
+            )
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+            assert!(text.contains(&format!("stale!/{theory}")), "{text}");
+        }
+
+        // A fresh answer ends all of it.
+        m.node_app_cadence_received = Some(Instant::now());
+        m.node_global_cadence_received = Some(Instant::now());
+        m.color_coding = true;
+        update_message_lifetime(&mut m);
+        assert_eq!(alloc_cell(&m, &a, 16, 0), "20.0");
+        assert!(!notices(&m).contains("stale"));
+    }
+
+    #[test]
     fn frame_interval_cells_and_header_share_the_window_in_both_layouts() {
         use quil_types::proto::node::{FrameCadence, FrameWindow};
         let now = std::time::SystemTime::now()
@@ -9022,20 +9218,15 @@ mod compact_action_tests {
     fn global_cadence(
         hour: Option<(u64, u64)>,
         day: Option<(u64, u64)>,
-        age: u64,
     ) -> quil_types::proto::node::FrameCadence {
         use quil_types::proto::node::{FrameCadence, FrameWindow};
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
         let window = |seconds, (observed_seconds, advanced_frames)| FrameWindow {
             window_seconds: seconds,
             observed_seconds,
             advanced_frames,
         };
         FrameCadence {
-            last_observed_unix_seconds: now - age,
+            last_observed_unix_seconds: 1,
             hour: hour.map(|w| window(3600, w)),
             day: day.map(|w| window(86400, w)),
         }
@@ -9060,7 +9251,7 @@ mod compact_action_tests {
             global_kpi_at(&m, CLOCK),
             "Global: frame 896608 | epoch 1245 | next boundary in 512 frames"
         );
-        m.node_global_cadence = Some(global_cadence(Some((3600, 191)), Some((86_400, 8_640)), 0));
+        m.node_global_cadence = Some(global_cadence(Some((3600, 191)), Some((86_400, 8_640))));
         assert_eq!(
             global_kpi_at(&m, CLOCK),
             "Global: frame 896608 | epoch 1245 | next boundary in 512 frames, ~2h41m (~23:52 UTC)"
@@ -9074,17 +9265,15 @@ mod compact_action_tests {
             .to_string()
             .contains("Global: f896608 | e1245 | next 512f ~2h41m ·"));
         // Without 60m advances the 24h window (10s/frame) estimates instead.
-        m.node_global_cadence = Some(global_cadence(Some((3600, 0)), Some((7_200, 720)), 0));
+        m.node_global_cadence = Some(global_cadence(Some((3600, 0)), Some((7_200, 720))));
         assert_eq!(
             global_kpi_at(&m, CLOCK),
             "Global: f896608 | e1245 | next 512f ~1h25m"
         );
         // A stale or missing measurement shows frames only, never a guessed time.
-        m.node_global_cadence = Some(global_cadence(
-            Some((3600, 191)),
-            Some((86_400, 8_640)),
-            600,
-        ));
+        m.node_global_cadence = Some(global_cadence(Some((3600, 191)), Some((86_400, 8_640))));
+        m.node_global_cadence_received =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(600));
         assert_eq!(
             global_kpi_at(&m, CLOCK),
             "Global: f896608 | e1245 | next 512f"
@@ -9104,7 +9293,7 @@ mod compact_action_tests {
         let mut m = Model::new();
         m.data_loaded = true;
         m.epoch_length = 720;
-        m.node_global_cadence = Some(global_cadence(Some((3600, 360)), None, 0)); // 10s/frame
+        m.node_global_cadence = Some(global_cadence(Some((3600, 360)), None)); // 10s/frame
         m.last_received_frame = 896_400;
         assert_eq!(
             global_kpi_at(&m, CLOCK),
@@ -9133,7 +9322,7 @@ mod compact_action_tests {
         m.data_loaded = true;
         m.epoch_length = 720;
         m.last_received_frame = 896_608;
-        m.node_global_cadence = Some(global_cadence(Some((3600, 191)), None, 0));
+        m.node_global_cadence = Some(global_cadence(Some((3600, 191)), None));
         handle_key(&mut m, key(KeyCode::Char('b')));
         assert!(m.column_picker_active);
         handle_key(&mut m, key(KeyCode::Tab));
@@ -9186,7 +9375,7 @@ mod compact_action_tests {
         a.default_action = ActionHint::at("expire", 897_840);
         assert_eq!(alloc_cell(&m, &a, 14, 0), "(R|Y) in 512f");
         assert_eq!(alloc_cell(&m, &a, 15, 0), "expire in 1232f");
-        m.node_global_cadence = Some(global_cadence(Some((3600, 191)), None, 0));
+        m.node_global_cadence = Some(global_cadence(Some((3600, 191)), None));
         assert_eq!(
             alloc_cell(&m, &a, 14, 0),
             "(R|Y) in 512f",
@@ -9209,7 +9398,7 @@ mod compact_action_tests {
         // The fixed layout grows the action columns to the estimate.
         m.last_received_frame = 896_608;
         m.column_sizing = ColumnSizing::Fixed;
-        m.node_global_cadence = Some(global_cadence(Some((3600, 191)), None, 0));
+        m.node_global_cadence = Some(global_cadence(Some((3600, 191)), None));
         let (w, _) = alloc_col_widths(&m, 260, &[a.clone()]);
         assert!(
             w[14] >= printed_width(&alloc_cell(&m, &a, 14, 0))
