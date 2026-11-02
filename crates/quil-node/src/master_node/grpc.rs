@@ -137,6 +137,8 @@ pub(crate) struct GrpcArgs {
     pub inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver>,
     pub peer_id: quil_p2p::PeerId,
     pub p2p_handle: quil_p2p::node::P2PHandle,
+    /// The master's addresses of the last published PeerInfo.
+    pub announced_addrs: tokio::sync::watch::Receiver<super::peer_info_publisher::AnnouncedAddrs>,
     pub file_key_manager: Arc<quil_keys::FileKeyManager>,
     pub mtls_seed: Option<[u8; 57]>,
     pub crdt: Arc<quil_hypergraph::HypergraphCrdt>,
@@ -1579,6 +1581,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         inclusion_prover,
         peer_id,
         p2p_handle,
+        announced_addrs,
         file_key_manager,
         mtls_seed,
         crdt,
@@ -2429,6 +2432,18 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         let pic = peer_info_cache.clone();
         node_rpc_builder = node_rpc_builder
             .with_peer_info_snapshot(Arc::new(move || pic.read().values().cloned().collect()));
+    }
+    {
+        let p2p = p2p_handle.clone();
+        let external = p2p_handle.watch_external_addresses();
+        node_rpc_builder = node_rpc_builder.with_node_reachability(Arc::new(move || {
+            super::peer_info_publisher::node_reachability(
+                p2p.listen_addresses(),
+                &external.borrow(),
+                &announced_addrs.borrow(),
+                std::time::Instant::now(),
+            )
+        }));
     }
     {
         let p2p_handle_for_score = p2p_handle.clone();

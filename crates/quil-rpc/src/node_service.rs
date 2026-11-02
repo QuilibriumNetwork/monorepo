@@ -408,6 +408,9 @@ pub struct NodeRpcServer {
     /// `get_peer_info`. Each entry is a raw `CanonicalPeerInfo`
     /// decoded from GLOBAL_PEER_INFO bitmask.
     pub peer_info_snapshot: Option<Arc<dyn Fn() -> Vec<quil_p2p::CanonicalPeerInfo> + Send + Sync>>,
+    /// This node's own reachability for `get_node_info`: its p2p listeners,
+    /// AutoNAT's view and the addresses its PeerInfo announces.
+    pub node_reachability: Option<Arc<dyn Fn() -> node::NodeReachability + Send + Sync>>,
     /// Optional traversal-proof generator. Given
     /// `(domain, atom_type, phase_type, keys)`, returns the serialized
     /// `MultiKeyTraversalProof` bytes. Implemented by the caller so
@@ -510,6 +513,7 @@ impl NodeRpcServer {
             metrics_renderer: None,
             worker_control: None,
             peer_info_snapshot: None,
+            node_reachability: None,
             traversal_proof_generator: None,
             send_handler_fn: None,
             peer_score_provider: None,
@@ -714,6 +718,13 @@ impl NodeRpcServer {
         self.peer_info_snapshot = Some(snapshot);
         self
     }
+    pub fn with_node_reachability(
+        mut self,
+        reachability: Arc<dyn Fn() -> node::NodeReachability + Send + Sync>,
+    ) -> Self {
+        self.node_reachability = Some(reachability);
+        self
+    }
     pub fn with_traversal_proof_generator(mut self, generator: TraversalProofGenerator) -> Self {
         self.traversal_proof_generator = Some(generator);
         self
@@ -862,6 +873,7 @@ impl NodeService for NodeRpcServer {
             last_received_frame: self.current_frame.effective(),
             last_global_head_frame: self.last_global_head_frame.load(Ordering::Relaxed),
             reachable: self.reachable,
+            node_reachability: self.node_reachability.as_ref().map(|f| f()),
             shard_allocations,
             // Epoch is derived from the same frame the effective-status grace
             // checks above used (`current_frame.effective()`), so the client's

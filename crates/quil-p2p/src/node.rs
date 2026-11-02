@@ -570,6 +570,8 @@ impl P2PNode {
             crate::external_addr::ExternalAddrTracker::new(want_tcp, want_quic, is_routable);
         let (external_tx, external_addrs) =
             tokio::sync::watch::channel(crate::external_addr::ConfirmedExternalAddrs::default());
+        // The listeners' current addresses, one per bound interface address.
+        let (listen_tx, listen_addrs) = tokio::sync::watch::channel(Vec::<String>::new());
         // AutoNAT's servers: peers that serve it, one per remote IP, and the
         // configured bootstrap and direct peers.
         // The listeners bind IPv4 only (see above).
@@ -752,6 +754,7 @@ impl P2PNode {
                         match event {
                             libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
                                 debug!(%address, "listening");
+                                listen_tx.send_if_modified(|addrs| add_listen_addr(addrs, &address));
                                 // Dial bootstrap peers and start DHT bootstrap
                                 if !bootstrapped {
                                     bootstrapped = true;
@@ -813,6 +816,14 @@ impl P2PNode {
                                         debug!("Kademlia: advertising as Quilibrium peer");
                                     }
                                 }
+                            }
+                            libp2p::swarm::SwarmEvent::ExpiredListenAddr { address, .. } => {
+                                debug!(%address, "no longer listening");
+                                listen_tx.send_if_modified(|addrs| remove_listen_addrs(addrs, std::slice::from_ref(&address)));
+                            }
+                            libp2p::swarm::SwarmEvent::ListenerClosed { addresses, .. } => {
+                                debug!(?addresses, "listener closed");
+                                listen_tx.send_if_modified(|addrs| remove_listen_addrs(addrs, &addresses));
                             }
                             libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
                                 crate::autonat_servers::apply(
@@ -1320,6 +1331,7 @@ impl P2PNode {
                 peer_id,
                 cmd_tx,
                 external_addrs,
+                listen_addrs,
                 peer_count,
                 metrics_registry,
                 direct_stats,
@@ -1338,6 +1350,8 @@ pub struct P2PHandle {
     /// The current AutoNAT-confirmed external addresses, kept by the swarm
     /// event loop.
     external_addrs: tokio::sync::watch::Receiver<crate::external_addr::ConfirmedExternalAddrs>,
+    /// The listeners' current addresses, kept by the swarm event loop.
+    listen_addrs: tokio::sync::watch::Receiver<Vec<String>>,
     /// Connected peer count, updated by the swarm event loop.
     peer_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// P2P prometheus registry (`blossomsub_*` + `libp2p_*` families),
@@ -1728,6 +1742,13 @@ impl P2PHandle {
         self.external_addrs.borrow().addrs.clone()
     }
 
+    /// The p2p listeners' current addresses: one per bound interface
+    /// address, as the swarm reports them (a wildcard listener reports each
+    /// interface's address).
+    pub fn listen_addresses(&self) -> Vec<String> {
+        self.listen_addrs.borrow().clone()
+    }
+
     /// Follow changes to [`observed_addresses`](Self::observed_addresses).
     pub fn watch_external_addresses(
         &self,
@@ -1763,6 +1784,7 @@ impl P2PHandle {
             peer_id,
             cmd_tx,
             external_addrs: tokio::sync::watch::channel(Default::default()).1,
+            listen_addrs: tokio::sync::watch::channel(Vec::new()).1,
             peer_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics_registry: std::sync::Arc::new(std::sync::Mutex::new(
                 prometheus_client::registry::Registry::default(),
@@ -1890,6 +1912,23 @@ pub fn message_id(data: &[u8]) -> Vec<u8> {
     id
 }
 
+/// Add a listener's new address; whether the list changed.
+fn add_listen_addr(addrs: &mut Vec<String>, address: &Multiaddr) -> bool {
+    let address = address.to_string();
+    if addrs.contains(&address) {
+        return false;
+    }
+    addrs.push(address);
+    true
+}
+
+/// Remove addresses a listener no longer has; whether the list changed.
+fn remove_listen_addrs(addrs: &mut Vec<String>, gone: &[Multiaddr]) -> bool {
+    let before = addrs.len();
+    addrs.retain(|addr| !gone.iter().any(|g| g.to_string() == *addr));
+    addrs.len() != before
+}
+
 /// Drop the addresses no dial-back confirmed for too long, publish the
 /// confirmed addresses with AutoNAT's current view when either changed, and
 /// log the tracker's pending-move and hold lines. Runs after every AutoNAT
@@ -1979,4 +2018,54 @@ pub(crate) fn is_routable(addr: &Multiaddr) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod listen_addr_tests {
+    use super::{add_listen_addr, remove_listen_addrs};
+    use libp2p::Multiaddr;
+
+    fn ma(s: &str) -> Multiaddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn listen_addresses_follow_new_expired_and_closed_listeners() {
+        let mut addrs = Vec::new();
+        assert!(add_listen_addr(&mut addrs, &ma("/ip4/192.0.2.10/tcp/8336")));
+        assert!(add_listen_addr(&mut addrs, &ma("/ip4/127.0.0.1/tcp/8336")));
+        // A repeated report changes nothing.
+        assert!(!add_listen_addr(
+            &mut addrs,
+            &ma("/ip4/192.0.2.10/tcp/8336")
+        ));
+        assert!(add_listen_addr(
+            &mut addrs,
+            &ma("/ip4/192.0.2.10/udp/8336/quic-v1")
+        ));
+        assert_eq!(
+            addrs,
+            [
+                "/ip4/192.0.2.10/tcp/8336",
+                "/ip4/127.0.0.1/tcp/8336",
+                "/ip4/192.0.2.10/udp/8336/quic-v1"
+            ]
+        );
+        assert!(remove_listen_addrs(
+            &mut addrs,
+            &[ma("/ip4/127.0.0.1/tcp/8336")]
+        ));
+        assert!(!remove_listen_addrs(
+            &mut addrs,
+            &[ma("/ip4/198.51.100.1/tcp/8336")]
+        ));
+        assert!(remove_listen_addrs(
+            &mut addrs,
+            &[
+                ma("/ip4/192.0.2.10/tcp/8336"),
+                ma("/ip4/192.0.2.10/udp/8336/quic-v1")
+            ]
+        ));
+        assert!(addrs.is_empty());
+    }
 }

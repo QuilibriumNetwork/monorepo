@@ -436,6 +436,10 @@ pub(crate) async fn start(
     // include them.
     let pi_worker_manager: Arc<std::sync::OnceLock<Arc<dyn quil_engine::worker::WorkerManager>>> =
         Arc::new(std::sync::OnceLock::new());
+    // The master's addresses of the last published PeerInfo, for the node
+    // info RPC.
+    let (announced_tx, announced_rx) =
+        tokio::sync::watch::channel(peer_info_publisher::AnnouncedAddrs::default());
     peer_info_publisher::spawn(
         &mut sup,
         peer_info_publisher::PeerInfoPublisherArgs {
@@ -459,6 +463,7 @@ pub(crate) async fn start(
             archive_mode,
             network,
             onion_routing_enabled: !config.p2p.disable_onion_routing,
+            announced: announced_tx,
         },
     );
 
@@ -1803,6 +1808,7 @@ pub(crate) async fn start(
     grpc::spawn_all(
         &mut sup,
         grpc::GrpcArgs {
+            announced_addrs: announced_rx,
             frame_observations_path: std::path::Path::new(config_dir)
                 .join("frame-observations.bin"),
             diagnostics_spool: std::path::Path::new(config_dir)
