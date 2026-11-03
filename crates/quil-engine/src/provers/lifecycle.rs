@@ -563,6 +563,8 @@ pub struct ProverLifecycle {
     /// session that counts it; a seat an epoch unhosted is not renewed.
     session_hosting: std::sync::Mutex<super::session_hosting::SessionHosting>,
     leave_decisions: super::leave_decisions::LeaveDecisions,
+    /// What the latest plan repeats, for its bounded log lines.
+    plan_repeats: std::sync::Mutex<super::plan_repeats::PlanRepeats>,
     pub allocation_reasons: super::allocation_reasons::AllocationReasons,
     /// This node's prover address (32 bytes, Poseidon hash of BLS pubkey).
     pub prover_address: Vec<u8>,
@@ -751,6 +753,7 @@ impl ProverLifecycle {
         Self {
             evaluation_lock: std::sync::Mutex::new(()),
             leave_decisions: super::leave_decisions::LeaveDecisions::default(),
+            plan_repeats: Default::default(),
             allocation_reasons: super::allocation_reasons::AllocationReasons::default(),
             prover_address,
             proof_in_progress: AtomicBool::new(false),
@@ -1643,6 +1646,102 @@ impl ProverLifecycle {
                 _ => {}
             }
         }
+    }
+
+    /// Whether `action`, of the latest plan, was not in the one before it: a
+    /// repeat is covered by the plan's repeat lines.
+    pub fn action_is_new(&self, action: &LifecycleAction) -> bool {
+        self.plan_repeats
+            .lock()
+            .map_or(true, |repeats| repeats.is_new(action))
+    }
+
+    /// Whether the latest plan repeats work on any of `filters`.
+    pub(crate) fn plan_repeats_filters(&self, filters: &[Vec<u8>]) -> bool {
+        self.plan_repeats
+            .lock()
+            .is_ok_and(|repeats| repeats.repeats_filters(filters))
+    }
+
+    /// Log the transitions of a plan that repeats, with why it does, and say
+    /// whether the plan holds new work, so its own line is logged only then.
+    fn report_plan_repeats(
+        &self,
+        actions: &[LifecycleAction],
+        held: &[ShardDescriptor],
+        frame_number: u64,
+    ) -> bool {
+        use crate::outage::OutageEvent;
+        let Ok(mut repeats) = self.plan_repeats.lock() else {
+            return !actions.is_empty();
+        };
+        let seen = repeats.observe(actions, frame_number, std::time::Instant::now());
+        if seen.event.is_none() {
+            return seen.new_work;
+        }
+        // Every node refuses a leave confirm at this floor
+        // (`check_leave_confirm_halt_risk`).
+        let floor =
+            quil_execution::global_intrinsic::materialize::HALT_RISK_PROVER_COUNT as u64 + 1;
+        let at_floor: Vec<String> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ConfirmLeaves { filters, .. } => Some(filters),
+                _ => None,
+            })
+            .flatten()
+            .filter(|f| {
+                held.iter()
+                    .any(|d| &d.filter == *f && d.active_count <= floor)
+            })
+            .map(hex::encode)
+            .collect();
+        let reason = if at_floor.is_empty() {
+            "the registry does not show its outcome yet; a send is retried at most every 30 frames"
+        } else {
+            "every node refuses a leave confirm while its shard keeps at most 4 active provers; \
+             the seat lapses at the epoch boundary and departs all the same"
+        };
+        let repeated = repeats.repeated();
+        match seen.event {
+            Some(OutageEvent::Began) => {
+                info!(
+                    frame = frame_number,
+                    ?repeated,
+                    ?at_floor,
+                    reason,
+                    scope = "local",
+                    action = "none needed unless it outlasts the epoch",
+                    "lifecycle: the plan repeats until the registry shows its outcome"
+                );
+            }
+            Some(OutageEvent::Continues { secs, failures }) => {
+                info!(
+                    frame = frame_number,
+                    since_frame = seen.since_frame,
+                    secs,
+                    plans = failures,
+                    ?repeated,
+                    ?at_floor,
+                    reason,
+                    scope = "local",
+                    action = "none needed unless it outlasts the epoch",
+                    "lifecycle: the plan still repeats"
+                );
+            }
+            Some(OutageEvent::Ended { secs, failures }) => {
+                info!(
+                    frame = frame_number,
+                    since_frame = seen.since_frame,
+                    secs,
+                    plans = failures,
+                    scope = "local",
+                    "lifecycle: the plan no longer repeats"
+                );
+            }
+            None => {}
+        }
+        seen.new_work
     }
 
     /// Go's `selectExcessPendingFilters` (`worker_allocator.go:1319-1385`)
@@ -4243,19 +4342,36 @@ impl ProverLifecycle {
                 serving,
                 worker_capacity,
             );
-            info!(
-                frame = frame_number,
-                score = auto_confirm.len(),
-                capacity = capacity_ready.len(),
-                halt_risk_swap = swap_confirm.len(),
-                orphan = orphan_ready.len(),
-                lapsed = lapsed_ready.len(),
-                manual = manual_ready.len(),
-                reject = auto_reject.len(),
-                penalty_withheld = penalty_withheld.len(),
-                confirmed_departure_workers = confirmed_departure_workers.len(),
-                "lifecycle leave decision causes"
-            );
+            let causes = [
+                auto_confirm.len(),
+                capacity_ready.len(),
+                swap_confirm.len(),
+                orphan_ready.len(),
+                lapsed_ready.len(),
+                manual_ready.len(),
+                auto_reject.len(),
+                penalty_withheld.len(),
+                confirmed_departure_workers.len(),
+            ];
+            if self
+                .plan_repeats
+                .lock()
+                .is_ok_and(|mut repeats| repeats.causes_changed(causes))
+            {
+                info!(
+                    frame = frame_number,
+                    score = auto_confirm.len(),
+                    capacity = capacity_ready.len(),
+                    halt_risk_swap = swap_confirm.len(),
+                    orphan = orphan_ready.len(),
+                    lapsed = lapsed_ready.len(),
+                    manual = manual_ready.len(),
+                    reject = auto_reject.len(),
+                    penalty_withheld = penalty_withheld.len(),
+                    confirmed_departure_workers = confirmed_departure_workers.len(),
+                    "lifecycle leave decision causes"
+                );
+            }
             if !lapsed_ready.is_empty() {
                 info!(frame = frame_number, lapsed = lapsed_ready.len(), scope = "local",
                     reason = "seat had missed its epoch renewal when its leave was proposed, and its rebound worker is seen unable to host its session",
@@ -4354,7 +4470,8 @@ impl ProverLifecycle {
                         &held_descriptors,
                     );
                 }
-                if !actions.is_empty() && tracing::enabled!(tracing::Level::INFO) {
+                let new_work = self.report_plan_repeats(&actions, &held_descriptors, frame_number);
+                if new_work && tracing::enabled!(tracing::Level::INFO) {
                     let inputs: Vec<_> = held_descriptors.iter().map(|d| {
                         let summary = summaries.iter().find(|s| s.filter == d.filter);
                         let allocation = prover_info.as_ref().and_then(|p| p.allocations.iter()
@@ -5884,6 +6001,73 @@ mod proposal_loop_tests {
         assert!(missing.stored_ring.is_none());
         assert!(missing.allocation_epoch.is_none());
         assert_eq!(missing.ring_source, "summary_tail");
+    }
+
+    /// A leave confirm planned frame after frame logs its plan, action
+    /// decision and repeat once, with the reason, and its end, not per frame.
+    #[test]
+    fn a_repeated_leave_confirm_logs_once_with_its_reason() {
+        let held = filter_bytes(0xA1);
+        let address = vec![0xCD; 32];
+        for (active, reason) in [
+            (2, "keeps at most 4 active provers"),
+            (53, "does not show its outcome yet"),
+        ] {
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            wm.add(manual_worker(1, held.clone()));
+            let reg = Arc::new(ConfigurableRegistry::new());
+            let mut leaving = alloc(held.clone(), ProverStatus::Leaving, 10);
+            leaving.leave_frame_number = 10;
+            reg.set_prover(prover(address.clone(), vec![leaving]));
+            reg.set_summaries(vec![shard_summary(held.clone(), active)]);
+            let lc = make_lifecycle(
+                address.clone(),
+                wm.clone() as Arc<dyn WorkerManager>,
+                reg.clone() as Arc<dyn ProverRegistry>,
+            );
+            let mut logged = String::new();
+            for frame in 720..730 {
+                lc.set_prover_root_verified_frame(frame);
+                let (actions, lines) = evaluate_logged(&lc, frame, reg.as_ref(), wm.as_ref());
+                assert!(
+                    actions.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters.contains(&held))),
+                    "{actions:?}"
+                );
+                let planned = actions
+                    .iter()
+                    .find(|a| matches!(a, LifecycleAction::ConfirmLeaves { .. }))
+                    .unwrap();
+                assert_eq!(lc.action_is_new(planned), frame == 720, "{frame}");
+                assert_eq!(
+                    lc.plan_repeats_filters(std::slice::from_ref(&held)),
+                    frame > 720
+                );
+                logged.push_str(&lines);
+            }
+            let count = |text: &str| logged.matches(text).count();
+            assert_eq!(count("lifecycle plan prepared"), 1, "{logged}");
+            assert_eq!(count("lifecycle leave decision causes"), 1, "{logged}");
+            assert_eq!(count("the plan repeats until"), 1, "{logged}");
+            let began = logged
+                .lines()
+                .find(|l| l.contains("the plan repeats until"))
+                .unwrap();
+            assert!(began.contains(" INFO "), "{began}");
+            assert!(began.contains(reason), "{reason} in {began}");
+            assert!(began.contains(&hex::encode(&held)), "{began}");
+
+            reg.set_prover(prover(
+                address.clone(),
+                vec![alloc(held.clone(), ProverStatus::Active, 10)],
+            ));
+            lc.set_prover_root_verified_frame(730);
+            let (_, lines) = evaluate_logged(&lc, 730, reg.as_ref(), wm.as_ref());
+            assert_eq!(
+                lines.matches("the plan no longer repeats").count(),
+                1,
+                "{lines}"
+            );
+        }
     }
 
     /// A worker manager whose workers cannot be listed, so every evaluation

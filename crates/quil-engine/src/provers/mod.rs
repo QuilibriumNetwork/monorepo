@@ -4,6 +4,7 @@ pub mod draining;
 pub(crate) mod leave_decisions;
 pub mod lifecycle;
 pub(crate) mod plan;
+pub(crate) mod plan_repeats;
 pub mod proposer;
 pub(crate) mod renewal_storage;
 pub(crate) mod seniority_guard;

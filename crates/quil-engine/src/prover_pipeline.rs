@@ -1840,17 +1840,29 @@ impl ProverPipeline {
         frame_number: u64,
     ) -> Option<crate::submission_attempts::SubmissionAttempt> {
         let requested = filters.len();
+        let repeats = self.lifecycle.plan_repeats_filters(filters);
         let attempts = &self.lifecycle.submission_attempts;
         retain_paired(filters, worker_ids.as_deref_mut(), |filter| {
             !attempts.owned(filter, frame_number, kind)
         });
         let Some(mut attempt) = attempts.begin(filters, frame_number, kind) else {
-            info!(
-                op,
-                frame = frame_number,
-                filters = requested,
-                "shard submission deferred: another operation owns its filters"
-            );
+            // A repeated plan's retry fence defers it nearly every frame; the
+            // plan's repeat lines cover that.
+            if repeats {
+                debug!(
+                    op,
+                    frame = frame_number,
+                    filters = requested,
+                    "shard submission deferred: another operation owns its filters"
+                );
+            } else {
+                info!(
+                    op,
+                    frame = frame_number,
+                    filters = requested,
+                    "shard submission deferred: another operation owns its filters"
+                );
+            }
             return None;
         };
         let over_long: Vec<Vec<u8>> = filters
