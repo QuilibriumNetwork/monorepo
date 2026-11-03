@@ -1,0 +1,69 @@
+name: Free runner disk
+description: |
+  Prints the runner's identity and capacity, removes preinstalled software
+  the test jobs do not use, and, when the system disk is still too small
+  for the workspace build, puts target/ on the separate /mnt disk. Run it
+  after checkout and before the cache restore: a bind mount leaves the
+  cache key and the restored path unchanged, where CARGO_TARGET_DIR would
+  change both. Not part of the native-deps action, whose hash keys caches.
+
+inputs:
+  min-free-gib:
+    description: Free GiB on the build disk below which target/ moves to /mnt
+    # The test build's target/ grew by 51 GB on run 41587502230; the rest
+    # is margin for the cache restore and the runner's own growth.
+    default: "70"
+
+runs:
+  using: composite
+  steps:
+    # Printed before anything is removed or built, so a runner that dies
+    # later has still logged which machine type it was.
+    - name: runner identity and capacity
+      shell: bash
+      run: |
+        echo "vendor: $(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || echo unknown)"
+        echo "product: $(cat /sys/class/dmi/id/product_name 2>/dev/null || echo unknown)"
+        echo "image: ${ImageOS:-unknown} ${ImageVersion:-unknown}, runner: ${RUNNER_NAME:-unknown}"
+        echo "cpus: $(nproc)"
+        free -g
+        df -h / /mnt || true
+        lsblk || true
+
+    - name: free disk space
+      shell: bash
+      run: |
+        # Nothing here runs Docker, Python, Node or Go from the runner
+        # image: toolchains come from rustup, tools from install-action.
+        sudo du -sh /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache 2>/dev/null || true
+        if command -v docker >/dev/null; then sudo docker system df || true; fi
+        sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/*
+        if command -v docker >/dev/null; then sudo docker image prune -af || true; fi
+        df -h /
+
+    - name: place target/ on the larger disk
+      shell: bash
+      env:
+        MIN_FREE_GIB: ${{ inputs.min-free-gib }}
+      run: |
+        need=$((MIN_FREE_GIB << 30))
+        avail=$(df -B1 --output=avail "$GITHUB_WORKSPACE" | tail -1)
+        if [ "$avail" -ge "$need" ]; then
+          echo "$((avail >> 30)) GiB free; target/ stays here"
+          exit 0
+        fi
+        mnt=0
+        if mountpoint -q /mnt; then
+          mnt=$(df -B1 --output=avail /mnt | tail -1)
+        fi
+        if [ "$mnt" -gt "$avail" ]; then
+          sudo mkdir -p /mnt/target "$GITHUB_WORKSPACE/target"
+          sudo chown "$(id -u):$(id -g)" /mnt/target "$GITHUB_WORKSPACE/target"
+          sudo mount --bind /mnt/target "$GITHUB_WORKSPACE/target"
+          avail=$mnt
+          echo "target/ is on /mnt"
+        fi
+        df -h "$GITHUB_WORKSPACE/target" "$GITHUB_WORKSPACE" || true
+        if [ "$avail" -lt "$need" ]; then
+          echo "::warning::$((avail >> 30)) GiB free for target/; the test build needs about 51 GiB and the job asks for $MIN_FREE_GIB"
+        fi

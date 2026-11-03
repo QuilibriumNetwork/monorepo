@@ -186,6 +186,10 @@ jobs:
       - name: Pull LFS files
         run: git lfs pull
 
+      # The test binaries fill most of a runner's disk and some runners
+      # have less; the action prints which, frees space and moves target/.
+      - uses: ./.github/actions/free-runner-disk
+
       - id: native-deps
         uses: ./.github/actions/setup-native-deps
 
@@ -238,6 +242,13 @@ jobs:
               --partition "count:$PARTITION/3"
           fi
 
+      # The space the build left, for sizing the step that frees it.
+      - name: disk usage
+        if: always()
+        run: |
+          df -h /
+          du -sh target || true
+
   # test-result — the required check `test (cargo nextest)`: passes only
   # when every partition passed. It runs unless the run was cancelled or
   # scope skipped the tests, so a failed or skipped partition, or a
@@ -275,6 +286,10 @@ jobs:
 
       - name: Pull LFS files
         run: git lfs pull
+
+      # The test binaries fill most of a runner's disk and some runners
+      # have less; the action prints which, frees space and moves target/.
+      - uses: ./.github/actions/free-runner-disk
 
       - id: native-deps
         uses: ./.github/actions/setup-native-deps
@@ -330,6 +345,12 @@ jobs:
             exit 0
           fi
           cargo nextest run "${args[@]}" --no-fail-fast
+
+      - name: disk usage
+        if: always()
+        run: |
+          df -h /
+          du -sh target || true
 
   # ------------------------------------------------------------------
   # release-build — verify `node/build.sh` succeeds on every supported
