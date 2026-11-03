@@ -118,7 +118,7 @@ mod types;
 pub use metrics::Config as MetricsConfig;
 
 pub use self::{
-    behaviour::{Behaviour, Event, MessageAuthenticity},
+    behaviour::{Behaviour, Event, MessageAuthenticity, UnsentRpcStats},
     config::{Config, ConfigBuilder, ValidationMode, Version},
     error::{ConfigBuilderError, PublishError, SubscriptionError, ValidationError},
     mcache::MessageCacheStats,

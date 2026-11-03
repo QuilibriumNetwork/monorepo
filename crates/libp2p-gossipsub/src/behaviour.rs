@@ -354,6 +354,20 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
 
     /// QUILIBRIUM: inbound RPCs dropped before decoding.
     rejected_rpcs: RejectedRpcStats,
+
+    /// QUILIBRIUM: RPCs not queued because the peer was no longer connected.
+    unsent_rpcs: UnsentRpcStats,
+}
+
+/// QUILIBRIUM: RPCs the behaviour did not queue because their peer was not in its connected
+/// peer list (a peer that disconnected after the RPC was addressed to it), counted since the
+/// behaviour was built.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UnsentRpcStats {
+    /// RPCs dropped.
+    pub unsent: u64,
+    /// The peer of the latest.
+    pub last: Option<PeerId>,
 }
 
 /// QUILIBRIUM: the behaviour penalty (P7) of a peer per RPC dropped before decoding. P7 is
@@ -478,6 +492,7 @@ where
             failed_messages: Default::default(),
             gossip_promises: Default::default(),
             rejected_rpcs: RejectedRpcStats::default(),
+            unsent_rpcs: UnsentRpcStats::default(),
         })
     }
 
@@ -545,6 +560,12 @@ where
     /// than an RPC may or were malformed (see [`RejectedRpcStats`]).
     pub fn rejected_rpc_stats(&self) -> RejectedRpcStats {
         self.rejected_rpcs
+    }
+
+    /// QUILIBRIUM: RPCs dropped because their peer had left the connected peer list (see
+    /// [`UnsentRpcStats`]).
+    pub fn unsent_rpc_stats(&self) -> UnsentRpcStats {
+        self.unsent_rpcs
     }
 
     /// Returns the gossipsub score for a given peer, if one exists.
@@ -3038,7 +3059,12 @@ where
         }
 
         let Some(peer) = &mut self.connected_peers.get_mut(&peer_id) else {
-            tracing::error!(peer = %peer_id,
+            // QUILIBRIUM: a peer that disconnected while a message was addressed to it; the
+            // message is dropped for it alone. Counted (`unsent_rpc_stats`) and summarized by
+            // the node, not logged per message.
+            self.unsent_rpcs.unsent += 1;
+            self.unsent_rpcs.last = Some(peer_id);
+            tracing::debug!(peer = %peer_id,
                     "Could not send rpc to connection handler, peer doesn't exist in connected peer list");
             return false;
         };
