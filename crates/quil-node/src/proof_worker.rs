@@ -113,9 +113,9 @@ fn verifier_slots(
         return fixed(slots, SlotSource::Configured);
     }
     let (child_memory, cap) = if archive {
-        (ARCHIVE_CHILD_MEMORY_BYTES, ARCHIVE_MAX_CONCURRENT_CAP)
+        (child_memory_bytes(true), ARCHIVE_MAX_CONCURRENT_CAP)
     } else {
-        (REGULAR_CHILD_MEMORY_BYTES, REGULAR_MAX_CONCURRENT_CAP)
+        (child_memory_bytes(false), REGULAR_MAX_CONCURRENT_CAP)
     };
     let cpu_slots = cpus.map(|cpus| cpus / usize::from(config.native_threads.max(1)));
     let memory_slots =
@@ -144,6 +144,33 @@ fn verifier_slots(
         cpu_slots,
         memory_slots,
     }
+}
+
+/// Available memory set aside per verifier child when a node sizes its slots.
+fn child_memory_bytes(archive: bool) -> u64 {
+    if archive {
+        ARCHIVE_CHILD_MEMORY_BYTES
+    } else {
+        REGULAR_CHILD_MEMORY_BYTES
+    }
+}
+
+/// The verifier slots `available_memory` admits under the rule an unset
+/// `maxConcurrent` follows ([`verifier_slots`]: one per child's memory, never
+/// under [`DEFAULT_MAX_CONCURRENT`]), when an explicit `configured` count
+/// exceeds them; `None` when it fits or memory is unknown. A node keeps the
+/// configured count: this only names the risk (2026-11-03: regular nodes
+/// configured with 16, 12 and 6 slots and about 40 GB free, at about 3 GB a
+/// busy child).
+fn configured_over_memory(
+    configured: usize,
+    archive: bool,
+    available_memory: Option<u64>,
+) -> Option<usize> {
+    let admitted = usize::try_from(available_memory? / child_memory_bytes(archive))
+        .unwrap_or(usize::MAX)
+        .max(DEFAULT_MAX_CONCURRENT);
+    (configured > admitted).then_some(admitted)
 }
 
 /// CPUs this process may use, counted on a thread moved onto the process's
@@ -326,6 +353,22 @@ pub(crate) fn build_node_worker_as(
     archive: bool,
 ) -> anyhow::Result<Option<WorkerVerifier>> {
     let proof = &config.proof_worker;
+    if let (Some(configured), false) = (proof.max_concurrent, proof.disabled) {
+        let available = available_for_verifiers();
+        if let Some(admitted) = configured_over_memory(configured, archive, available) {
+            tracing::warn!(
+                configured,
+                memory_admits = admitted,
+                available_memory_bytes = available,
+                child_memory_bytes = child_memory_bytes(archive),
+                scope = "this node",
+                action = "lower proofWorker.maxConcurrent to at most memory_admits, or unset it so the \
+                          node sizes its slots from its CPUs and memory; the configured value is kept",
+                "proofWorker.maxConcurrent exceeds what available memory admits: verifier children \
+                 busy at once may exhaust this node's memory"
+            );
+        }
+    }
     let slots = if proof.max_concurrent.is_none() && !proof.disabled {
         verifier_slots(proof, archive, process_cpus(), available_for_verifiers())
     } else {
@@ -431,6 +474,153 @@ mod tests {
                 (configured, SlotSource::Configured)
             );
         }
+    }
+
+    /// An explicit `maxConcurrent` above what available memory admits under
+    /// the auto-size rule is named, never changed: a regular node admits one
+    /// slot per 6 GiB, an archive one per 3 GiB, never under two; unknown
+    /// memory says nothing.
+    #[test]
+    fn a_configured_count_over_available_memory_is_named() {
+        const GIB: u64 = 1 << 30;
+        // The operator report: 16, 12 and 6 slots with about 40 GB available.
+        let forty = Some(40 * GIB);
+        assert_eq!(configured_over_memory(16, false, forty), Some(6));
+        assert_eq!(configured_over_memory(12, false, forty), Some(6));
+        assert_eq!(configured_over_memory(7, false, forty), Some(6));
+        assert_eq!(
+            configured_over_memory(6, false, forty),
+            None,
+            "at the bound"
+        );
+        assert_eq!(configured_over_memory(1, false, forty), None);
+        // An archive sets aside half as much per child.
+        assert_eq!(configured_over_memory(16, true, forty), Some(13));
+        assert_eq!(configured_over_memory(13, true, forty), None);
+        // Never under the default, as the auto size.
+        assert_eq!(configured_over_memory(2, false, Some(GIB)), None);
+        assert_eq!(configured_over_memory(3, false, Some(GIB)), Some(2));
+        // Unknown memory says nothing.
+        assert_eq!(configured_over_memory(64, false, None), None);
+        // Agrees with the auto size wherever memory is its bound.
+        let unset = ProofWorkerConfig::default();
+        for gib in [1u64, 12, 18, 40, 95] {
+            for archive in [false, true] {
+                let auto = verifier_slots(&unset, archive, Some(1024), Some(gib * GIB)).slots;
+                assert_eq!(
+                    configured_over_memory(auto, archive, Some(gib * GIB)),
+                    None,
+                    "{gib} GiB"
+                );
+                if auto < ARCHIVE_MAX_CONCURRENT_CAP.min(REGULAR_MAX_CONCURRENT_CAP) {
+                    assert_eq!(
+                        configured_over_memory(auto + 1, archive, Some(gib * GIB)),
+                        Some(auto),
+                        "{gib} GiB, archive {archive}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every event's level and fields, from the thread that installed it.
+    #[derive(Clone, Default)]
+    struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for Recorder {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!(" {}={:?}", field.name(), value));
+                }
+            }
+            let mut fields = Fields(event.metadata().level().to_string());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A node started with more verifier slots than its memory admits warns
+    /// once and keeps them; one within its memory does not warn.
+    #[test]
+    fn a_node_configured_over_its_memory_warns_and_keeps_its_slots() {
+        const GIB: u64 = 1 << 30;
+        let Some(available) = available_for_verifiers() else {
+            eprintln!("skipped: available memory unknown");
+            return;
+        };
+        if !(2 * REGULAR_CHILD_MEMORY_BYTES..64 * REGULAR_CHILD_MEMORY_BYTES).contains(&available) {
+            eprintln!("skipped: {} GiB available", available / GIB);
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let worker = directory.path().join(WORKER_FILE_NAME);
+        std::fs::write(&worker, b"#!/bin/sh\ncat >/dev/null\nexit 80\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut config = quil_config::Config::default();
+        config.db.path = directory
+            .path()
+            .join("base-store")
+            .to_string_lossy()
+            .into_owned();
+        let mut warned = |configured: usize| {
+            config.proof_worker = ProofWorkerConfig {
+                path: worker.to_string_lossy().into_owned(),
+                max_concurrent: Some(configured),
+                ..Default::default()
+            };
+            let logs = Recorder::default();
+            let slots = {
+                let _logging = tracing::subscriber::set_default(logs.clone());
+                build_node_worker_as(&config, false)
+                    .unwrap()
+                    .unwrap()
+                    .concurrency()
+            };
+            let lines: Vec<String> = logs
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| line.contains("exceeds what available memory admits"))
+                .cloned()
+                .collect();
+            (slots, lines)
+        };
+        let (slots, lines) = warned(64);
+        assert_eq!(slots, 64, "the configured count was not kept");
+        assert_eq!(
+            lines.len(),
+            1,
+            "64 slots on {} GiB: {lines:?}",
+            available / GIB
+        );
+        assert!(
+            lines[0].starts_with("WARN") && lines[0].contains("configured=64"),
+            "{}",
+            lines[0]
+        );
+        let (slots, lines) = warned(2);
+        assert_eq!((slots, lines.len()), (2, 0), "two slots warned: {lines:?}");
     }
 
     /// An archive budgets 3 GiB of available memory per verifier slot, above
