@@ -2559,6 +2559,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         let send_transport = prover_pipeline.transport.clone();
         let send_lifecycle = prover_pipeline.lifecycle.clone();
         let send_owner = prover_address.to_vec();
+        let send_frame = current_frame.clone();
         let send_handler: quil_rpc::SendHandler = Arc::new(
             move |domain: Vec<u8>,
                   payload: Vec<u8>,
@@ -2571,6 +2572,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                 let transport = send_transport.clone();
                 let lifecycle = send_lifecycle.clone();
                 let owner = send_owner.clone();
+                let frame = send_frame.clone();
                 let ed448_pub = peer_ed448_pub.clone();
                 Box::pin(async move {
                     if domain.len() != 32 {
@@ -2604,6 +2606,16 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                     if domain.iter().all(|&b| b == 0xff) {
                         if let Ok(bundle) = quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(&payload) {
                             for request in bundle.requests.into_iter().flatten() {
+                                // Its outcome is read from this node's view: bring
+                                // the view past the op instead of waiting for the
+                                // periodic pull.
+                                if let Some(through) = quil_engine::global_view_refresh::operator_op_view_frame(request.inner_type_prefix, frame.effective()) {
+                                    quil_engine::global_view_refresh::shared().request(
+                                        quil_engine::global_view_refresh::Reason::OperatorOpSent,
+                                        through,
+                                        std::time::Instant::now(),
+                                    );
+                                }
                                 if request.inner_type_prefix == quil_execution::global_intrinsic::prover_filter_ops::TYPE_PROVER_LEAVE {
                                     if let Ok(leave) = quil_execution::global_intrinsic::prover_filter_ops::ProverLeave::from_canonical_bytes(&request.inner_bytes) {
                                         if leave.public_key_signature_bls48581.as_ref().is_some_and(|sig| sig.address == owner) {
