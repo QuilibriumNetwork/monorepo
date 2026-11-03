@@ -2679,20 +2679,67 @@ mod tests {
         assert_eq!(reads.done.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
+    /// What the self-test's time budget protects: it runs once on each worker
+    /// thread before the worker serves, so a signer that takes seconds (a key
+    /// generated per message, a hang) delays every worker's startup. A good
+    /// signer needs about 25 ms; the bound is 40 times that, because a bound
+    /// near the cost fails under a loaded CI host.
+    const SELF_TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// The fastest of up to `attempts` self-test runs whose signer waits
+    /// `sign_delay` per message, stopping at the first within the budget. A
+    /// slow signer is slow in every attempt; descheduling by parallel load
+    /// hits one attempt at a time.
+    fn fastest_self_test(
+        key: &quil_crypto::FalconSigner,
+        attempts: u32,
+        sign_delay: std::time::Duration,
+    ) -> std::time::Duration {
+        use quil_types::crypto::Signer as _;
+        let mut fastest = std::time::Duration::MAX;
+        for _ in 0..attempts {
+            let started = std::time::Instant::now();
+            let failures = falcon_self_test_failures(
+                |m| {
+                    std::thread::sleep(sign_delay);
+                    key.sign_with_domain(m, FALCON_SELF_TEST_DOMAIN).ok()
+                },
+                |m, sig| {
+                    quil_crypto::falcon_verify(key.public_key(), sig, m, FALCON_SELF_TEST_DOMAIN)
+                },
+            );
+            assert_eq!(failures, 0);
+            fastest = fastest.min(started.elapsed());
+            if fastest < SELF_TEST_BUDGET {
+                break;
+            }
+        }
+        fastest
+    }
+
     #[test]
     fn falcon_self_test_passes_a_good_signer_quickly() {
         let started = std::time::Instant::now();
         let key = self_test_key();
         let keygen = started.elapsed();
-        let started = std::time::Instant::now();
-        assert_eq!(self_test_with(&key, |_| false), 0);
-        let test = started.elapsed();
+        let test = fastest_self_test(&key, 5, std::time::Duration::ZERO);
         eprintln!(
             "falcon self-test: keygen {keygen:?}, {FALCON_SELF_TEST_MESSAGES} sign+verify {test:?}"
         );
         assert!(
-            test < std::time::Duration::from_millis(100),
-            "self-test took {test:?}"
+            test < SELF_TEST_BUDGET,
+            "the fastest of 5 self-test runs took {test:?}, budget {SELF_TEST_BUDGET:?}"
+        );
+    }
+
+    #[test]
+    fn falcon_self_test_budget_fails_a_slow_signer() {
+        let key = self_test_key();
+        let slow = std::time::Duration::from_millis(150);
+        let test = fastest_self_test(&key, 1, slow);
+        assert!(
+            test >= SELF_TEST_BUDGET,
+            "a signer taking {slow:?} per message fit the budget: {test:?}"
         );
     }
 
