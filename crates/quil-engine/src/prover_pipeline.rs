@@ -385,6 +385,26 @@ fn stopped_mid_encode(
     }
 }
 
+/// Ask for an early registry pull that can show a shard snapshot `epoch`'s
+/// renewal at `frame_number` waits for. GLOBAL writes the record in the first
+/// frame at or after the snapshot frame, so a view below that frame cannot
+/// hold it; and a pull reaches the state before the head, so the frame before
+/// this one is the latest one asked for.
+fn ask_for_snapshot_record(
+    view: &crate::global_view_refresh::ViewRefresh,
+    frame_number: u64,
+    epoch: u64,
+    now: std::time::Instant,
+) -> bool {
+    view.request(
+        crate::global_view_refresh::Reason::StorageRecordAwaited,
+        frame_number
+            .saturating_sub(1)
+            .max(quil_types::consensus::storage_snapshot_frame(epoch)),
+        now,
+    )
+}
+
 /// How often the seats a confirm leaves out pending their storage snapshot
 /// are reported while the same ones stay pending.
 const PENDING_SNAPSHOT_REPORT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -2208,9 +2228,10 @@ impl ProverPipeline {
                     .iter()
                     .any(|(shard, _)| shard.as_slice() == filter)
             {
-                crate::global_view_refresh::shared().request(
-                    crate::global_view_refresh::Reason::StorageRecordAwaited,
-                    frame_number.saturating_sub(1),
+                ask_for_snapshot_record(
+                    &crate::global_view_refresh::shared(),
+                    frame_number,
+                    epoch,
                     std::time::Instant::now(),
                 );
             }
@@ -4237,6 +4258,32 @@ mod tests {
             succession.public_key_signature_bls48581, merge.public_key_signature_bls48581,
             "the prover signs the targets as for a merge"
         );
+    }
+
+    /// A renewal waiting for its shard's snapshot record asks for a pull that
+    /// reaches the snapshot frame, the earliest frame GLOBAL records it in:
+    /// a pull through the frame before it cannot hold the record, yet it
+    /// spends the early-pull gap. Later frames ask for the frame before.
+    #[test]
+    fn a_renewal_awaiting_a_snapshot_record_asks_for_a_pull_reaching_its_frame() {
+        use crate::global_view_refresh::{Reason, ViewRefresh};
+        let epoch = 7u64;
+        let at = quil_types::consensus::storage_snapshot_frame(epoch);
+        let asked = |frame: u64| {
+            let view = ViewRefresh::default();
+            view.enable(quil_types::consensus::epoch_length_frames());
+            super::ask_for_snapshot_record(&view, frame, epoch, std::time::Instant::now());
+            view.requested(Reason::StorageRecordAwaited)
+                .expect("the renewal asked")
+        };
+        for frame in [at, at + 1] {
+            assert!(
+                asked(frame) >= at,
+                "at frame {frame} the pull must reach the snapshot frame {at}, asked for {}",
+                asked(frame)
+            );
+        }
+        assert_eq!(asked(at + 9), at + 8, "later, the frame before this one");
     }
 
     #[test]
