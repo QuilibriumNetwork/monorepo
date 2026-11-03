@@ -774,7 +774,7 @@ fn worker_action_refusal(m: &Model, command: char) -> Option<String> {
     } else if m.selected_alloc_rows().is_empty() {
         "no allocation selected.".to_string()
     } else if matches!(command, 'l' | 'y' | 'r')
-        && m.selected_alloc_rows().iter().any(|r| !r.manually_managed)
+        && m.selected_alloc_rows().iter().any(|r| r.auto_worker())
     {
         "join/leave/confirm/reject require manual mode; AUTO allows pause/resume and mode \
          changes."
@@ -1148,7 +1148,7 @@ fn operation_targets(m: &Model, command: char) -> Vec<(String, u32, i64, bool)> 
 }
 
 fn manual_actions_allowed(m: &mut Model) -> bool {
-    if m.focus.is_alloc() && m.selected_alloc_rows().iter().any(|r| !r.manually_managed) {
+    if m.focus.is_alloc() && m.selected_alloc_rows().iter().any(|r| r.auto_worker()) {
         m.status_msg = "Join/leave/confirm/reject require manual mode; AUTO allows pause/resume and mode changes.".into();
         m.status_is_error = true;
         m.status_sticky = true;
@@ -1950,6 +1950,26 @@ mod tests {
         assert!(m.status_msg.starts_with("Leave waits"), "{}", m.status_msg);
     }
 
+    /// A seat with no worker has no mode, so the operator's actions reach it;
+    /// a seat on an auto worker stays refused.
+    #[test]
+    fn actions_on_a_seat_with_no_worker_are_not_refused_as_auto() {
+        for (status, command, action) in [(2, 'l', "Leave"), (4, 'r', "Reject")] {
+            let mut m = operational_model(status);
+            m.allocations[0].manually_managed = false;
+            assert_eq!(m.allocations[0].worker_id, -1);
+            assert!(!m.allocations[0].auto_worker());
+            assert!(manual_actions_allowed(&mut m), "{action}");
+            assert!(!m.status_msg.contains("manual mode"), "{}", m.status_msg);
+
+            m.allocations[0].worker_id = 1;
+            assert!(m.allocations[0].auto_worker());
+            assert!(!manual_actions_allowed(&mut m), "{action}");
+            assert!(m.status_msg.contains("manual mode"), "{}", m.status_msg);
+            assert!(dispatch_operation(&mut m, command).is_empty(), "{action}");
+        }
+    }
+
     fn operational_model(status: u32) -> Model {
         let mut m = Model::new();
         m.process_refresh_data(
@@ -2298,6 +2318,7 @@ mod tests {
         let mut auto = m.allocations[0].clone();
         auto.filter_key = "auto".into();
         auto.manually_managed = false;
+        auto.worker_id = 1;
         m.allocations.push(auto);
         m.alloc_selected
             .extend([m.allocations[0].filter_key.clone(), "auto".into()]);
@@ -2310,6 +2331,7 @@ mod tests {
         let key = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
         let mut m = operational_model(2);
         m.allocations[0].manually_managed = false;
+        m.allocations[0].worker_id = 1;
         assert_eq!(
             m.applicable_alloc_actions(),
             ["Pause".to_string()].into_iter().collect()
@@ -2323,6 +2345,7 @@ mod tests {
         assert!(!m.allocations[0].manually_managed);
         let mut m = operational_model(3);
         m.allocations[0].manually_managed = false;
+        m.allocations[0].worker_id = 1;
         assert_eq!(
             m.applicable_alloc_actions(),
             ["Resume".to_string()].into_iter().collect()
@@ -2342,6 +2365,7 @@ mod tests {
         auto.filter_key = "auto".into();
         auto.filter = vec![2];
         auto.manually_managed = false;
+        auto.worker_id = 1;
         m.allocations.push(auto);
         m.alloc_selected
             .extend([m.allocations[0].filter_key.clone(), "auto".into()]);
@@ -2385,6 +2409,7 @@ mod tests {
         m.join_picker_active = true;
         m.join_picker_selected.insert(2);
         m.allocations[0].manually_managed = false;
+        m.allocations[0].worker_id = 1;
         assert!(
             handle_join_picker_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 .is_empty()
