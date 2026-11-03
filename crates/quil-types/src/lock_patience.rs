@@ -11,6 +11,11 @@ use std::time::{Duration, Instant};
 /// How long one publication step keeps trying the locks it needs.
 pub const LOCK_PATIENCE: Duration = Duration::from_millis(500);
 
+/// How long a publication waits for a moment without forest readers before it
+/// takes the locks its adoption needs. The alternative is executing the frame
+/// again, about 3.4 s or more on mainnet.
+pub const FOREST_READER_PATIENCE: Duration = Duration::from_secs(2);
+
 /// One deadline shared by every lock a step takes, so waits cannot add up.
 pub struct Patience {
     deadline: Instant,

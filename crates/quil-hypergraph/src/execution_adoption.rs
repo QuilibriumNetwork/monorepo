@@ -43,10 +43,13 @@ fn unavailable(message: &str) -> QuilError {
 fn write<'a, T>(
     patience: &quil_types::lock_patience::Patience,
     lock: &'a RwLock<T>,
+    name: &str,
 ) -> Result<RwLockWriteGuard<'a, T>> {
-    patience
-        .write(lock)
-        .ok_or_else(|| unavailable("execution adoption metadata is busy or poisoned"))
+    patience.write(lock).ok_or_else(|| {
+        QuilError::ExecutionUnavailable(format!(
+            "execution adoption metadata is busy or poisoned: {name}"
+        ))
+    })
 }
 
 fn take<T>(lock: RwLock<T>) -> Result<T> {
@@ -60,6 +63,19 @@ impl ExecutionCapture<'_> {
             .db()
             .cloned()
             .ok_or_else(|| unavailable("canonical publication requires a durable forest"))
+    }
+
+    /// Wait, for at most `FOREST_READER_PATIENCE`, for a moment without
+    /// forest readers. Some read a whole tree under the lock (a sync diff, a
+    /// split check, a size count), far past the patience of the adoption's
+    /// own locks. This keeps no lock, so nothing but what the capture already
+    /// excludes waits with it, and readers keep running. A later reader, or
+    /// false, leaves the adoption's own bounded wait to decide.
+    pub fn await_forest_readers(&self) -> bool {
+        use quil_types::lock_patience::{Patience, FOREST_READER_PATIENCE};
+        Patience::for_duration(FOREST_READER_PATIENCE)
+            .write(&self.source.forest)
+            .is_some()
     }
 
     /// Snapshot the completed private CRDT with the same bounds/coherence checks
@@ -108,7 +124,7 @@ impl ExecutionCapture<'_> {
         // Acquire this first and use bounded try-locks throughout to avoid
         // inversion: no wait outlasts the deadline.
         let patience = quil_types::lock_patience::Patience::new();
-        let forest = write(&patience, &source.forest)?;
+        let forest = write(&patience, &source.forest, "forest")?;
         if !read(&source.pending)?.is_empty()
             || !read(&source.pending_blobs)?.is_empty()
             || !read(&source.pending_records)?.is_empty()
@@ -118,15 +134,15 @@ impl ExecutionCapture<'_> {
                 "canonical source has unfinished CRDT mutations",
             ));
         }
-        let roots = write(&patience, &source.prover_root_by_frame)?;
-        let world_sizes = write(&patience, &source.world_size_by_frame)?;
-        let phase_versions = write(&patience, &source.phase_versions)?;
-        let global_versions = write(&patience, &source.global_versions)?;
-        let prefixes = write(&patience, &source.app_shard_prefixes)?;
-        let bit_paths = write(&patience, &source.app_shard_bit_paths)?;
-        let shard_metadata = write(&patience, &source.shard_metadata)?;
-        let sizes = write(&patience, &source.sub_meta)?;
-        let covered = write(&patience, &source.covered_prefix)?;
+        let roots = write(&patience, &source.prover_root_by_frame, "prover roots")?;
+        let world_sizes = write(&patience, &source.world_size_by_frame, "world sizes")?;
+        let phase_versions = write(&patience, &source.phase_versions, "phase versions")?;
+        let global_versions = write(&patience, &source.global_versions, "global versions")?;
+        let prefixes = write(&patience, &source.app_shard_prefixes, "shard prefixes")?;
+        let bit_paths = write(&patience, &source.app_shard_bit_paths, "shard bit paths")?;
+        let shard_metadata = write(&patience, &source.shard_metadata, "shard metadata")?;
+        let sizes = write(&patience, &source.sub_meta, "shard sizes")?;
+        let covered = write(&patience, &source.covered_prefix, "covered prefix")?;
         if *covered != state.covered {
             return Err(unavailable(
                 "private execution changed node coverage policy",
