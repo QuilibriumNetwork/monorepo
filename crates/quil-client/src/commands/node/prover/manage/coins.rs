@@ -158,6 +158,40 @@ fn move_edge(m: &mut Model, key: char) {
     }
 }
 
+/// Place the panels in `rest` lines: Balances' default `balances` lines
+/// moved by its edge first, then `split` gives Notifications' default
+/// height from the lines Balances leaves, the middle panel the rest, and
+/// their edge moves. The split so follows the height Balances is drawn
+/// with. Kept and stored as [`place_edges`] keeps and stores them.
+pub fn place_panels(
+    m: &mut Model,
+    rest: u16,
+    balances: u16,
+    split: impl Fn(u16) -> u16,
+) -> [u16; PANELS] {
+    let min = PANEL_MIN;
+    let upper = if balances >= min && rest >= balances + 2 * min {
+        i32::from(m.coins.edges[0]).clamp(
+            i32::from(min) - i32::from(balances),
+            i32::from(rest - balances - 2 * min),
+        )
+    } else {
+        0
+    };
+    let drawn = (i32::from(balances) + upper) as u16;
+    let left = rest.saturating_sub(drawn);
+    let notices = split(left);
+    let heights = [drawn, left.saturating_sub(notices), notices];
+    // Balances' edge is in `drawn`: place_edges moves only the lower one,
+    // and a terminal too small for it keeps the edge for a larger one.
+    let moved = m.coins.edges[0];
+    let placed = heights.iter().all(|&h| h >= min);
+    m.coins.edges[0] = 0;
+    let heights = place_edges(m, heights);
+    m.coins.edges[0] = if placed { upper as i16 } else { moved };
+    heights
+}
+
 /// Apply the moved edges to the panels' default `heights`, each kept to
 /// [`PANEL_MIN`], and store the result and the edges as drawn, so the next
 /// key moves the visible edge.

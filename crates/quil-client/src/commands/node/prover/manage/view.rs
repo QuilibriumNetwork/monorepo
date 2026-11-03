@@ -450,6 +450,28 @@ fn sync_panel_heights(m: &mut Model, total: u16) -> [u16; 3] {
     heights
 }
 
+/// The key rows' height, whatever the selection, focus or mode: compact
+/// mode leaves out keys that do not apply and a mode swaps in its prompt,
+/// so the rows take the height `rows` gives with every key shown, as
+/// expanded mode draws them, or the one row `?` leaves. Panel borders then
+/// move only with the terminal and the edge keys.
+fn key_rows_height(m: &mut Model, rows: impl Fn(&Model) -> usize) -> usize {
+    if !m.show_key_rows {
+        return 1;
+    }
+    let compact = std::mem::replace(&mut m.compact_actions, false);
+    let height = rows(m);
+    m.compact_actions = compact;
+    height
+}
+
+/// Key `rows` on the last of `height` lines, blank lines above them.
+fn pad_key_rows(rows: Vec<Line<'static>>, height: usize) -> Vec<Line<'static>> {
+    let mut padded = vec![Line::default(); height.saturating_sub(rows.len())];
+    padded.extend(rows);
+    padded
+}
+
 /// The single key row `?` leaves in place of the UI and Workers rows.
 fn collapsed_keys_line() -> Line<'static> {
     let style = Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD);
@@ -461,6 +483,11 @@ fn collapsed_keys_line() -> Line<'static> {
         command_hint("q", "quit", style),
     ])
 }
+
+/// Panel content lines that leave the Notifications panel its full three
+/// lines (`base_panel_heights`): the key rows reserved beyond the keys
+/// shown never take them.
+const MIN_PANELS_FOR_NOTICES: u16 = 8;
 
 fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     let (actions, status) = footer_lines(m);
@@ -481,9 +508,22 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         actions.truncate(max_actions);
         actions[max_actions - 1] = Line::from("‹h› all keys  ‹q› quit");
     }
-    let actions_h = actions.len() as u16;
+    let reserved = key_rows_height(m, |m| {
+        wrap_actions(help_line(m), area.width).len()
+            + wrap_actions(worker_commands_line(m), area.width).len()
+    });
     let header = header_lines(m, area.width);
     let header_height = header.len() as u16;
+    // On a terminal too short to give the panels `MIN_PANELS_FOR_NOTICES`
+    // lines beside the reserved key rows, the rows shown are all the keys
+    // take, so a wrapped notice keeps the lines it needs.
+    let room = usize::from(
+        area.height
+            .saturating_sub(6 + header_height + MIN_PANELS_FOR_NOTICES),
+    );
+    let reserved = reserved.min(max_actions).min(room.max(actions.len()));
+    let actions = pad_key_rows(actions, reserved);
+    let actions_h = actions.len() as u16;
     // Content height depends only on terminal geometry and explicit resize keys.
     let [alloc_h, avail_h, notice_h] =
         sync_panel_heights(m, area.height.saturating_sub(6 + header_height + actions_h));
@@ -2062,22 +2102,77 @@ fn allocation_detail_lines(m: &Model, sorted: &[AllocationRow], area: Rect) -> V
     let Some(row) = sorted.get(m.alloc_cursor) else {
         return vec![];
     };
-    let mut lines = wrap_message(allocation_detail(m, row), area.width);
-    let limit = usize::from(area.height.saturating_sub(2))
-        .min(usize::from(area.height / 2))
+    fit_detail(
+        wrap_message(allocation_detail(m, row), area.width),
+        area.width,
+        area.height,
+        2,
+    )
+}
+
+/// The detail lines a panel `width` by `height` inside its borders pins
+/// to its bottom, under content whose first `keep` lines (a table's
+/// header and the rows it must show) the detail never displaces: none in
+/// a panel of `keep` lines or fewer, else at most half the panel, a
+/// longer detail ending in a marker. Every panel follows the Allocations
+/// panel's rule, `keep` 2 for a table that scrolls.
+fn fit_detail(
+    mut lines: Vec<Line<'static>>,
+    width: u16,
+    height: u16,
+    keep: u16,
+) -> Vec<Line<'static>> {
+    if height <= keep || width == 0 {
+        return vec![];
+    }
+    let limit = usize::from(height - keep)
+        .min(usize::from(height / 2))
         .max(1);
     if lines.len() > limit {
         lines.truncate(limit);
-        lines[limit - 1] = Line::from(Span::styled(
-            "… enlarge panel for details",
-            Style::new().fg(HELP),
-        ));
-        lines[limit - 1] = wrap_message(lines[limit - 1].clone(), area.width)
-            .into_iter()
-            .next()
-            .unwrap_or_default();
+        lines[limit - 1] = enlarge_marker(width);
     }
     lines
+}
+
+/// A panel's `lines` in `height` lines `width` wide inside its borders:
+/// all of them when they fit, else the first lines and the enlarge
+/// marker last, so a panel never drops lines unmarked.
+fn fit_lines(mut lines: Vec<Line<'static>>, width: u16, height: u16) -> Vec<Line<'static>> {
+    let height = usize::from(height);
+    if height > 0 && lines.len() > height {
+        lines.truncate(height);
+        lines[height - 1] = enlarge_marker(width);
+    }
+    lines
+}
+
+/// The line that ends a panel too short for its lines.
+fn enlarge_marker(width: u16) -> Line<'static> {
+    wrap_message(
+        Line::from(Span::styled(
+            "… enlarge panel for details",
+            Style::new().fg(HELP),
+        )),
+        width,
+    )
+    .into_iter()
+    .next()
+    .unwrap_or_default()
+}
+
+/// A panel's `height` lines: `content` from the top and `detail` (from
+/// [`fit_detail`]) on the last lines, blank lines between; content past
+/// the room the detail leaves is cut.
+fn pin_detail(
+    mut content: Vec<Line<'static>>,
+    detail: Vec<Line<'static>>,
+    height: u16,
+) -> Vec<Line<'static>> {
+    let room = usize::from(height).saturating_sub(detail.len());
+    content.resize(room, Line::default());
+    content.extend(detail);
+    content
 }
 
 fn render_alloc_panel(
@@ -4614,12 +4709,15 @@ fn render_join_picker(f: &mut Frame, m: &mut Model, area: Rect) {
             lines.push(Line::from(text));
         }
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  space: toggle  enter: confirm join  esc: cancel",
-        Style::new().fg(HELP),
-    )));
-    f.render_widget(Paragraph::new(lines), area);
+    // The keys keep to the screen's bottom, as on every other screen.
+    let keys = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  space: toggle  enter: confirm join  esc: cancel",
+            Style::new().fg(HELP),
+        )),
+    ];
+    f.render_widget(Paragraph::new(pin_detail(lines, keys, area.height)), area);
 }
 
 #[cfg(test)]
@@ -8253,6 +8351,112 @@ mod tests {
         assert!(handle_key(&mut m, key(KeyCode::Esc)).is_empty());
         assert!(!m.show_help);
         assert_eq!(m.help_offset, 0);
+    }
+
+    /// Every panel's detail follows the Allocations rule: none in a
+    /// panel of `keep` lines or fewer, else at most half the panel and
+    /// never the kept lines, a longer detail ending in the marker; the
+    /// detail lands on the panel's last lines under its content.
+    #[test]
+    fn panel_detail_fits_by_the_allocations_rule_and_keeps_to_the_bottom() {
+        let detail = || {
+            (0..6)
+                .map(|i| Line::from(format!("d{i}")))
+                .collect::<Vec<_>>()
+        };
+        let text = |lines: &[Line<'static>]| lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        assert!(fit_detail(detail(), 40, 2, 2).is_empty());
+        assert!(fit_detail(detail(), 40, 3, 3).is_empty());
+        assert!(fit_detail(detail(), 0, 20, 2).is_empty());
+        assert_eq!(
+            text(&fit_detail(detail(), 40, 3, 2)),
+            ["… enlarge panel for details"]
+        );
+        assert_eq!(
+            text(&fit_detail(detail(), 40, 4, 3)),
+            ["… enlarge panel for details"]
+        );
+        assert_eq!(
+            text(&fit_detail(detail(), 40, 8, 2)),
+            ["d0", "d1", "d2", "… enlarge panel for details"]
+        );
+        assert_eq!(text(&fit_detail(detail(), 40, 20, 2)).len(), 6);
+        let content = vec![Line::from("h"), Line::from("r")];
+        assert_eq!(
+            text(&pin_detail(content.clone(), vec![Line::from("d")], 5)),
+            ["h", "r", "", "", "d"]
+        );
+        assert_eq!(
+            text(&pin_detail(content, vec![Line::from("d")], 2)),
+            ["h", "d"]
+        );
+    }
+
+    /// The Provers panels keep their borders while the cursor walks the
+    /// Allocations rows and the focus moves: compact mode leaves out the
+    /// keys that do not apply there, and the key rows keep their height.
+    #[test]
+    fn provers_panel_borders_stay_put_across_cursor_and_focus_moves() {
+        let mut m = Model::new();
+        m.data_loaded = true;
+        m.color_coding = false;
+        m.allocations = joining_table();
+        m.cached_shard_info = Some(Default::default());
+        let borders = |text: &str| {
+            text.lines()
+                .enumerate()
+                .filter(|(_, line)| line.starts_with('╭') || line.starts_with('╰'))
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>()
+        };
+        let last = m.allocations.len() - 1;
+        for compact in [true, false] {
+            m.compact_actions = compact;
+            for (width, height) in [(80, 24), (120, 40), (200, 60)] {
+                m.focus = PanelFocus::Allocations;
+                m.alloc_cursor = 0;
+                let text = render_text(&mut m, width, height);
+                let base = borders(&text);
+                assert_eq!(base.len(), 6, "{text}");
+                for (focus, cursor) in [
+                    (PanelFocus::Allocations, 1),
+                    (PanelFocus::Allocations, last),
+                    (PanelFocus::Available, 0),
+                    (PanelFocus::Notifications, 0),
+                ] {
+                    m.focus = focus;
+                    m.alloc_cursor = cursor;
+                    let moved = render_text(&mut m, width, height);
+                    assert_eq!(
+                        borders(&moved),
+                        base,
+                        "{width}x{height} {focus:?} row {cursor}\n{text}\n{moved}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The worker picker keeps its keys on the screen's last line, as
+    /// every other screen does, however few workers it lists.
+    #[test]
+    fn the_join_picker_keeps_its_keys_on_the_last_line() {
+        let mut m = Model::new();
+        m.join_picker_active = true;
+        m.join_picker_filters = vec![vec![0xab; 3]];
+        m.join_picker_workers = vec![2, 3];
+        for (width, height) in [(80, 24), (100, 70)] {
+            let text = render_text(&mut m, width, height);
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(lines.len(), usize::from(height), "{text}");
+            assert_eq!(
+                lines.last().unwrap().trim(),
+                "space: toggle  enter: confirm join  esc: cancel",
+                "{text}"
+            );
+            assert!(lines[5].contains("Worker 3"), "{text}");
+            assert!(lines[6].is_empty(), "{text}");
+        }
     }
 }
 
