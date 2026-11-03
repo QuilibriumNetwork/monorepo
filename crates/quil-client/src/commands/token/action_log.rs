@@ -433,6 +433,7 @@ fn cli_action(command: &super::TokenCommand) -> Option<(&'static str, serde_json
             recipient,
             fee: given,
             claim: None,
+            status: None,
         } => (
             "mint",
             serde_json::json!({ "recipient": recipient, "fee": fee(given) }),
