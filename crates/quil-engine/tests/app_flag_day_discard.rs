@@ -257,6 +257,19 @@ async fn legacy_history_is_discarded_and_the_first_session_certifies_from_frame_
     }
     assert!(legacy_head >= 3);
 
+    // The wait above counts frames across all members; a lagging member may
+    // not have stored one yet, so wait for each member's own head.
+    for (index, worker) in harness.workers.iter().enumerate() {
+        let clock = worker.clock.as_ref().unwrap();
+        until(Duration::from_secs(60), || {
+            let head = clock.get_latest_shard_clock_frame(&filter).ok()?;
+            let view = CommittedView::capture(&global).unwrap();
+            (session_of(&view, &head).as_ref() == Some(&first)).then_some(())
+        })
+        .await
+        .unwrap_or_else(|| panic!("worker {index} stores a frame of the first session"));
+    }
+
     // The application state crossed the flag day unchanged.
     for worker in &harness.workers {
         let shard = worker.shard.as_ref().unwrap();
