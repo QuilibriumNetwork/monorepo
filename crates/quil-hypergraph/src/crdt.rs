@@ -50,6 +50,9 @@ pub use crate::snapshot::{GenerationHandle, SnapshotManager};
 #[derive(Default)]
 pub(crate) struct CommitLock {
     inner: std::sync::Mutex<()>,
+    /// The node's GLOBAL CRDT's, which every worker reads: its waits are
+    /// marked apart from those for a worker's own store's lock.
+    global: AtomicBool,
     releases: AtomicU64,
     waiters: AtomicUsize,
 }
@@ -105,8 +108,12 @@ impl CommitLock {
     /// for a held lock is added to this thread's
     /// [`commit_lock_wait_on_this_thread`].
     fn wait(&self) -> std::result::Result<std::sync::MutexGuard<'_, ()>, ()> {
-        let _probe =
-            quil_types::thread_probe::section(quil_types::thread_probe::Section::CommitLockWait);
+        use quil_types::thread_probe::{section, Section};
+        let _probe = section(if self.global.load(Ordering::Relaxed) {
+            Section::GlobalCommitLockWait
+        } else {
+            Section::CommitLockWait
+        });
         match self.inner.try_lock() {
             Ok(guard) => Ok(guard),
             Err(std::sync::TryLockError::Poisoned(_)) => Err(()),
@@ -868,6 +875,8 @@ impl HypergraphCrdt {
     /// forest concurrently. Poisoning is recovered (a panic mid-write is already
     /// a stop-the-materializer condition upstream). See `forest_write_lock`.
     pub fn lock_forest_writes(&self) -> ForestWriteGuard<'_> {
+        let _probe =
+            quil_types::thread_probe::section(quil_types::thread_probe::Section::ForestBarrierWait);
         ForestWriteGuard {
             source: self,
             _guard: self
@@ -875,6 +884,12 @@ impl HypergraphCrdt {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()),
         }
+    }
+
+    /// This is the node's GLOBAL CRDT: name waits for its commit lock so, in
+    /// what a blocked thread reports, apart from a worker's own store's.
+    pub fn name_commit_lock_global(&self) {
+        self.commit_lock.global.store(true, Ordering::Relaxed);
     }
 
     /// Refuse a maintenance token belonging to another CRDT before any reads
@@ -7130,5 +7145,50 @@ mod commit_lock_wait_tests {
             waited >= Duration::from_millis(200),
             "the wait is counted: {waited:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod commit_lock_label_tests {
+    use super::*;
+    use crate::testing::{MemStore, StubProver};
+    use quil_types::thread_probe::{install, Section, ThreadProbe};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// What a thread waiting for `hg`'s commit lock is marked as waiting in.
+    fn marked_wait(hg: &HypergraphCrdt) -> Section {
+        let probe = ThreadProbe::new();
+        let held = hg.commit_lock.lock().unwrap();
+        std::thread::scope(|scope| {
+            let waiter_probe = probe.clone();
+            scope.spawn(move || {
+                let _installed = install(waiter_probe);
+                hg.read_execution_record(b"key").unwrap();
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let section = loop {
+                if let Some(mark) = probe.snapshot().section {
+                    break mark.section;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the waiter never marked"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            drop(held);
+            section
+        })
+    }
+
+    /// A blocked thread's report tells the GLOBAL CRDT's lock from a worker
+    /// store's: which of them a fence rewind waits for was unknowable.
+    #[test]
+    fn a_wait_names_whose_commit_lock_it_is() {
+        let hg = HypergraphCrdt::new(Arc::new(MemStore::new()), Arc::new(StubProver));
+        assert_eq!(marked_wait(&hg), Section::CommitLockWait);
+        hg.name_commit_lock_global();
+        assert_eq!(marked_wait(&hg), Section::GlobalCommitLockWait);
     }
 }

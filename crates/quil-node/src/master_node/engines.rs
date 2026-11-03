@@ -33,6 +33,7 @@ pub(crate) fn init_engines(
         storage.hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
         inclusion_prover.clone(),
     ));
+    crdt.name_commit_lock_global();
     // Commit global-consensus state into the JMT forest. Install the
     // persistent forest when the DB is migrated OR brand-new/fresh (a new
     // forest-native node builds on the persistent forest from genesis instead of
