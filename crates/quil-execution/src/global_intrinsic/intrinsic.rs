@@ -100,6 +100,63 @@ struct SessionPassTiming {
     steps: Vec<(&'static str, u64)>,
     filters: usize,
     allocations: Option<usize>,
+    /// Time spent in `CommittedProverScan::try_scan`, shared with the
+    /// eligibility closure that may scan lazily.
+    scan_ms: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+/// How a committee session pass is logged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionPassLevel {
+    Quiet,
+    Info,
+    Warn,
+}
+
+/// Fixed part of the scan budget (ms) and its per-1,000-allocations part.
+/// Measured on archives: the epoch-boundary scan of the committed GLOBAL
+/// prover shard takes 1.5-3.7 s for ~25,600 allocations (156 filters), flat
+/// over 12 h, so it is expected every epoch. The budget is 250 ms per 1,000
+/// allocations (6.4 s at that size, about 1.7x the worst sample), never under
+/// 5 s; past it the scan is slower than a regular shard needs.
+const SESSION_SCAN_BASE_BUDGET_MS: u64 = 5_000;
+const SESSION_SCAN_BUDGET_MS_PER_1000: u64 = 250;
+/// Any pass whose work apart from the scan takes this long warns.
+const SESSION_PASS_SLOW_MS: u64 = 500;
+
+/// Classifies a pass: the prover scan is judged against its size-derived
+/// budget, everything else against [`SESSION_PASS_SLOW_MS`].
+fn classify_session_pass(
+    total_ms: u64,
+    scan_ms: u64,
+    allocations: Option<usize>,
+) -> SessionPassLevel {
+    if scan_ms == 0 {
+        return if total_ms >= SESSION_PASS_SLOW_MS {
+            SessionPassLevel::Warn
+        } else {
+            SessionPassLevel::Quiet
+        };
+    }
+    let budget = SESSION_SCAN_BASE_BUDGET_MS.max(
+        (allocations.unwrap_or(0) as u64).saturating_mul(SESSION_SCAN_BUDGET_MS_PER_1000) / 1000,
+    );
+    if total_ms.saturating_sub(scan_ms) >= SESSION_PASS_SLOW_MS || scan_ms > budget {
+        SessionPassLevel::Warn
+    } else {
+        SessionPassLevel::Info
+    }
+}
+
+/// The prover scan, timed into `scan_ms`.
+fn timed_prover_scan(
+    hg: &Arc<quil_hypergraph::HypergraphCrdt>,
+    scan_ms: &std::cell::Cell<u64>,
+) -> Result<crate::prover_registry::CommittedProverScan> {
+    let started = std::time::Instant::now();
+    let scan = crate::prover_registry::CommittedProverScan::try_scan(hg);
+    scan_ms.set(scan_ms.get() + started.elapsed().as_millis() as u64);
+    scan
 }
 
 impl SessionPassTiming {
@@ -112,6 +169,7 @@ impl SessionPassTiming {
             steps: Vec::new(),
             filters: 0,
             allocations: None,
+            scan_ms: Default::default(),
         }
     }
 
@@ -126,9 +184,20 @@ impl SessionPassTiming {
 impl Drop for SessionPassTiming {
     fn drop(&mut self) {
         let total = self.started.elapsed().as_millis() as u64;
-        if total >= 500 {
-            tracing::warn!(frame = self.frame, total_ms = total, filters = self.filters,
-                allocations = ?self.allocations, steps = ?self.steps, "committee session pass is slow");
+        let scan_ms = self.scan_ms.get();
+        let reconcile_ms = self
+            .steps
+            .iter()
+            .find(|(step, _)| *step == "membership reconciliation")
+            .map_or(0, |(_, ms)| *ms);
+        match classify_session_pass(total, scan_ms, self.allocations) {
+            SessionPassLevel::Quiet => {}
+            SessionPassLevel::Info => tracing::info!(frame = self.frame, total_ms = total,
+                scan_ms, reconcile_ms, filters = self.filters, allocations = ?self.allocations,
+                "committee session pass scanned the prover shard"),
+            SessionPassLevel::Warn => tracing::warn!(frame = self.frame, total_ms = total,
+                scan_ms, reconcile_ms, filters = self.filters, allocations = ?self.allocations,
+                steps = ?self.steps, "committee session pass is slow"),
         }
     }
 }
@@ -4988,7 +5057,7 @@ impl GlobalIntrinsic {
         let mut absent: Vec<super::handoff::exclusion::Decision> = Vec::new();
         if super::handoff::exclusion::evaluates(frame_number) {
             let scan: &crate::prover_registry::CommittedProverScan =
-                scanned.insert(crate::prover_registry::CommittedProverScan::try_scan(hg)?);
+                scanned.insert(timed_prover_scan(hg, &timing.scan_ms)?);
             let mut desired = |filter: &[u8]| -> Result<Vec<Vec<u8>>> {
                 Ok(super::handoff::schedule::desired_members(
                     scan,
@@ -5017,9 +5086,10 @@ impl GlobalIntrinsic {
         // they authorize is visible to the reconciliation below. A fenced
         // membership successor takes the eligibility that reconciliation
         // compares against: the same scan, read only once a fence needs it.
+        let eligible_scan_ms = timing.scan_ms.clone();
         let mut eligible = |filter: &[u8]| -> Result<Vec<Vec<u8>>> {
             if scanned.is_none() {
-                scanned = Some(crate::prover_registry::CommittedProverScan::try_scan(hg)?);
+                scanned = Some(timed_prover_scan(hg, &eligible_scan_ms)?);
             }
             let desired = scanned.as_ref().map_or_else(Vec::new, |scan| {
                 super::handoff::schedule::desired_members(scan, filter, frame_number)
@@ -5084,7 +5154,7 @@ impl GlobalIntrinsic {
         }
         let mut scan = match scanned {
             Some(scan) => scan,
-            None => crate::prover_registry::CommittedProverScan::try_scan(hg)?,
+            None => timed_prover_scan(hg, &timing.scan_ms)?,
         };
         timing.allocations = Some(scan.allocations.len());
         timing.lap("prover scan");
@@ -6507,6 +6577,27 @@ mod tests {
     use crate::global_intrinsic::addressed_signature::AddressedSignature;
     use crate::global_schema::{write_field, write_type};
     use quil_types::crypto::KeyType;
+
+    /// The expected epoch-boundary scan (3.7 s for 25,600 allocations) logs
+    /// at info; a slow remainder, a slow scan-free pass or a scan past its
+    /// size-derived budget warns.
+    #[test]
+    fn session_pass_classification() {
+        use SessionPassLevel::*;
+        assert_eq!(classify_session_pass(3_800, 3_700, Some(25_600)), Info);
+        assert_eq!(classify_session_pass(1_600, 1_500, Some(25_600)), Info);
+        assert_eq!(classify_session_pass(200, 0, None), Quiet);
+        assert_eq!(classify_session_pass(499, 0, None), Quiet);
+        assert_eq!(classify_session_pass(500, 0, None), Warn);
+        // Scan fine, the rest slow.
+        assert_eq!(classify_session_pass(4_300, 3_700, Some(25_600)), Warn);
+        // Scan past 250 ms per 1,000 allocations (6.4 s here) and past 5 s.
+        assert_eq!(classify_session_pass(6_500, 6_450, Some(25_600)), Warn);
+        assert_eq!(classify_session_pass(6_300, 6_250, Some(25_600)), Info);
+        // The floor holds for a small shard.
+        assert_eq!(classify_session_pass(4_900, 4_850, Some(100)), Info);
+        assert_eq!(classify_session_pass(5_100, 5_050, Some(100)), Warn);
+    }
 
     /// From the required-anchor epoch GLOBAL refuses a shard frame header
     /// without a GLOBAL anchor, before any verification; an anchored header
