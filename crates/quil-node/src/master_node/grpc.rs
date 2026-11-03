@@ -2106,9 +2106,17 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                 let copy = request.clone();
                 let bundle = prover_bundle(request)?;
                 let tracked = track_worker_request(&copy, Some(frames.effective()));
+                let is_reward_proof = kind == WorkerSubmission::FrameHeader;
                 let failed = move |error: &dyn std::fmt::Display| {
                     unpublished(&copy, tracked);
                     let (kind, filter) = describe_request(&copy);
+                    if is_reward_proof {
+                        // Counted in the interval's summary, a warn.
+                        super::reward_proofs::reward_proof_failed();
+                        tracing::debug!(core_id, kind, filter = %filter, error = %error,
+                            "standalone worker submission: transport submission failed");
+                        return;
+                    }
                     tracing::warn!(core_id, kind, filter = %filter, error = %error,
                         "standalone worker submission: transport submission failed");
                 };

@@ -723,6 +723,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     );
                     let proc_mem = crate::mem_stats::process_memory();
                     let host_mem = crate::mem_stats::host_memory();
+                    let (rocksdb_stores, rocksdb_memtables, rocksdb_table_readers) =
+                        quil_store::open_stores_memory();
                     let global_frames = clock_store_recv.global_frame_cache_stats();
                     let global_mempool = mc_for_recv.pending_totals();
                     info!(
@@ -786,6 +788,18 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                             .map(|(used, _)| crate::mem_stats::fmt_mb(used)),
                         rocksdb_shared_cache_capacity_mb = quil_store::shared_block_cache_memory()
                             .map(|(_, capacity)| crate::mem_stats::fmt_mb(capacity)),
+                        // Every RocksDB store open in this process (the
+                        // master's and each thread worker's): memtables and
+                        // table readers, beside jemalloc's `allocated_mb`.
+                        rocksdb_open_stores = rocksdb_stores,
+                        rocksdb_memtables_mb = %crate::mem_stats::fmt_mb(rocksdb_memtables),
+                        rocksdb_table_readers_mb = %crate::mem_stats::fmt_mb(rocksdb_table_readers),
+                        // What storage jobs hold through their admission
+                        // reservations (mostly labelling buffers), which a
+                        // memory watch subtracts from `allocated_mb`.
+                        labelling_buffers_mb = %crate::mem_stats::fmt_mb(
+                            quil_engine::storage_jobs::held_bytes()
+                        ),
                         "memory snapshot"
                     );
                     if let Some(h) = host_mem {

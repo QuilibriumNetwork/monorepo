@@ -132,10 +132,115 @@ pub(crate) fn worker_submission(request: &[u8]) -> Option<WorkerSubmission> {
     }
 }
 
-/// Log a certified shard frame header going out as a reward proof.
+/// How often the reward proofs submitted are summarised.
+const REWARD_PROOF_SUMMARY_SECS: u64 = 600;
+
+/// The reward proofs submitted since the last summary.
+#[derive(Default)]
+struct RewardProofTally {
+    since: Option<std::time::Instant>,
+    thread: u64,
+    standalone: u64,
+    failed: u64,
+    shards: std::collections::HashSet<Vec<u8>>,
+}
+
+/// One interval's reward proofs, by outcome.
+#[derive(Debug, PartialEq, Eq)]
+struct RewardProofSummary {
+    secs: u64,
+    thread: u64,
+    standalone: u64,
+    failed: u64,
+    shards: usize,
+}
+
+impl RewardProofTally {
+    /// Count a proof submitted for `filter` by a `thread` or `standalone`
+    /// worker at `now`, or (`filter` None) one whose transport submission
+    /// failed; the interval's summary once it has passed.
+    fn note(
+        &mut self,
+        now: std::time::Instant,
+        worker: &str,
+        filter: Option<Vec<u8>>,
+    ) -> Option<RewardProofSummary> {
+        let since = *self.since.get_or_insert(now);
+        match (worker, filter) {
+            (_, None) => self.failed += 1,
+            ("thread", Some(filter)) => {
+                self.thread += 1;
+                self.shards.insert(filter);
+            }
+            (_, Some(filter)) => {
+                self.standalone += 1;
+                self.shards.insert(filter);
+            }
+        }
+        let secs = now.saturating_duration_since(since).as_secs();
+        if secs < REWARD_PROOF_SUMMARY_SECS {
+            return None;
+        }
+        self.since = Some(now);
+        let summary = RewardProofSummary {
+            secs,
+            thread: self.thread,
+            standalone: self.standalone,
+            failed: self.failed,
+            shards: self.shards.len(),
+        };
+        self.thread = 0;
+        self.standalone = 0;
+        self.failed = 0;
+        self.shards.clear();
+        Some(summary)
+    }
+}
+
+static REWARD_PROOFS: std::sync::Mutex<Option<RewardProofTally>> = std::sync::Mutex::new(None);
+
+fn note_reward_proof(worker: &str, filter: Option<Vec<u8>>) {
+    let summary = REWARD_PROOFS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(Default::default)
+        .note(std::time::Instant::now(), worker, filter);
+    let Some(s) = summary else { return };
+    if s.failed > 0 {
+        tracing::warn!(
+            secs = s.secs,
+            thread = s.thread,
+            standalone = s.standalone,
+            failed = s.failed,
+            shards = s.shards,
+            scope = "archive transport",
+            action = "check",
+            "reward proofs submitted to GLOBAL_PROVER: some failed to send; check this node's \
+             connection to the archives (one summary per interval; each proof is logged at debug)"
+        );
+    } else {
+        tracing::info!(
+            secs = s.secs,
+            thread = s.thread,
+            standalone = s.standalone,
+            failed = s.failed,
+            shards = s.shards,
+            "reward proofs submitted to GLOBAL_PROVER (one summary per interval; each proof is \
+             logged at debug)"
+        );
+    }
+}
+
+/// A reward proof's transport submission failed.
+pub(crate) fn reward_proof_failed() {
+    note_reward_proof("standalone", None);
+}
+
+/// Log a certified shard frame header going out as a reward proof: one debug
+/// line, and the interval's summary.
 pub(crate) fn log_reward_proof(core_id: u32, worker: &'static str, header: &[u8]) {
     if let Ok(h) = FrameHeader::from_canonical_bytes(header) {
-        tracing::info!(
+        tracing::debug!(
             core_id,
             worker,
             filter = %hex::encode(&h.address),
@@ -144,6 +249,7 @@ pub(crate) fn log_reward_proof(core_id: u32, worker: &'static str, header: &[u8]
             prover = %hex::encode(&h.prover),
             "submitting reward proof to GLOBAL_PROVER"
         );
+        note_reward_proof(worker, Some(h.address));
     }
 }
 
@@ -165,6 +271,46 @@ pub(crate) fn prover_bundle(request: Vec<u8>) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reward_proofs_are_summarised_once_per_interval_by_outcome() {
+        let start = std::time::Instant::now();
+        let at = |secs: u64| start + std::time::Duration::from_secs(secs);
+        let mut tally = RewardProofTally::default();
+        assert_eq!(tally.note(at(0), "thread", Some(vec![1])), None);
+        assert_eq!(tally.note(at(1), "thread", Some(vec![1])), None);
+        assert_eq!(tally.note(at(2), "standalone", Some(vec![2])), None);
+        assert_eq!(tally.note(at(3), "standalone", None), None);
+        assert_eq!(
+            tally.note(at(REWARD_PROOF_SUMMARY_SECS), "thread", Some(vec![3])),
+            Some(RewardProofSummary {
+                secs: REWARD_PROOF_SUMMARY_SECS,
+                thread: 3,
+                standalone: 1,
+                failed: 1,
+                shards: 3,
+            })
+        );
+        // The next interval starts from zero.
+        assert_eq!(
+            tally.note(at(REWARD_PROOF_SUMMARY_SECS + 1), "thread", Some(vec![1])),
+            None
+        );
+        assert_eq!(
+            tally.note(
+                at(2 * REWARD_PROOF_SUMMARY_SECS),
+                "standalone",
+                Some(vec![1])
+            ),
+            Some(RewardProofSummary {
+                secs: REWARD_PROOF_SUMMARY_SECS,
+                thread: 1,
+                standalone: 1,
+                failed: 0,
+                shards: 1,
+            })
+        );
+    }
 
     #[test]
     fn only_frame_headers_handoff_submissions_and_presence_reports_are_worker_submissions() {
