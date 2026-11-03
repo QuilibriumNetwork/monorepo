@@ -1881,12 +1881,23 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
     {
         let db = db_arc.clone();
         sup.spawn("rocksdb-health", move |token| async move {
+            let mut latency = super::store_latency::StoreLatency::default();
+            let probe = super::store_latency::FsyncProbe::new(db.inner().path());
             loop {
                 tokio::select! {
                     _ = token.cancelled() => return Ok(()),
                     _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
                 }
                 let health = db.health();
+                latency.observe(super::store_latency::Sample {
+                    fsync_ms: probe.measure().await,
+                    pressure: super::store_latency::Pressure::read(),
+                    master: db.inner().take_write_times(),
+                    all_stores: quil_forest::take_all_stores_write_times(),
+                    pending_compaction_mb: health.pending_compaction_bytes >> 20,
+                    level0_files: health.level0_files,
+                    write_stopped: health.write_stopped,
+                });
                 info!(
                     level0_files = health.level0_files,
                     pending_compaction_mb = health.pending_compaction_bytes >> 20,

@@ -32,6 +32,7 @@ pub(crate) mod runtime_state;
 mod shard_sender;
 pub(crate) mod stall_watch;
 pub(crate) mod storage;
+mod store_latency;
 pub(crate) mod worker_manager;
 
 /// How long shutdown waits for the worker threads to stop before the

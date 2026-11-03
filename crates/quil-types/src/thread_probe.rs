@@ -68,6 +68,8 @@ sections! {
     EngineUpkeep => "loop upkeep",
     // Synchronous sections.
     CommitLockWait => "CRDT commit lock wait",
+    GlobalCommitLockWait => "GLOBAL CRDT commit lock wait",
+    ForestBarrierWait => "shard forest write barrier wait",
     GlobalViewCapture => "GLOBAL committed view capture",
     FinalizedRecordsScan => "finalized records scan",
     FenceRewind => "fence rewind check",
