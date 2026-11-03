@@ -5356,6 +5356,53 @@ pub(super) fn shield_batches(
     (batches, uncovered)
 }
 
+/// Shards [`uncovered_by_shard`] names, the most coins first.
+const UNCOVERED_LISTED_SHARDS: usize = 8;
+
+/// `<filter> <n> coins, <k> active provers` for the shards of `shards`
+/// (filter, bit path, active provers) holding the most `uncovered` coins,
+/// each coin counted under the deepest listed shard covering it, or under
+/// `no listed shard`; and how many shards are past the listed few.
+pub(super) fn uncovered_by_shard(
+    uncovered: &[[u8; 32]],
+    shards: &[(Vec<u8>, Vec<bool>, u32)],
+) -> (String, usize) {
+    let paths: Vec<Vec<bool>> = shards.iter().map(|(_, path, _)| path.clone()).collect();
+    let mut counts: std::collections::BTreeMap<Option<(Vec<u8>, u32)>, usize> =
+        std::collections::BTreeMap::new();
+    for address in uncovered {
+        let shard = super::legacy::deepest_shard(&paths, address).and_then(|path| {
+            shards
+                .iter()
+                .find(|(_, listed, _)| listed == path)
+                .map(|(filter, _, active)| (filter.clone(), *active))
+        });
+        *counts.entry(shard).or_default() += 1;
+    }
+    let mut ranked: Vec<_> = counts.into_iter().collect();
+    ranked.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.is_none().cmp(&b.0.is_none()))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let unlisted = ranked.len().saturating_sub(UNCOVERED_LISTED_SHARDS);
+    let line = ranked
+        .into_iter()
+        .take(UNCOVERED_LISTED_SHARDS)
+        .map(|(shard, coins)| match shard {
+            Some((filter, active)) => {
+                format!(
+                    "{} {coins} coins, {active} active provers",
+                    hex::encode(filter)
+                )
+            }
+            None => format!("no listed shard {coins} coins"),
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    (line, unlisted)
+}
+
 /// Legacy coins this wallet submitted in a batch shield within the last two
 /// hours (`shield_pacing::SUBMITTED_EXCLUSION_SECS`): a resumed run leaves
 /// them for their batch to commit.
@@ -5563,10 +5610,23 @@ pub(crate) async fn plan_shield_all(
         return Ok(plan);
     }
     super::legacy::ensure_shields_active(&plan.client, tc.node_config.p2p.network, true).await?;
-    let live = super::legacy::live_shards(&plan.client, &application).await?;
+    let listed_shards = super::legacy::app_shards(&plan.client, &application).await?;
+    let live = super::legacy::live_of(&listed_shards);
     let paths: Vec<Vec<bool>> = live.iter().map(|(_, path)| path.clone()).collect();
     let candidates = coins.len();
     let (batches, uncovered) = shield_batches(coins, &paths, max_per_batch);
+    if !uncovered.is_empty() {
+        let (shards, unlisted_shards) = uncovered_by_shard(&uncovered, &listed_shards);
+        tracing::info!(
+            uncovered = uncovered.len(),
+            shards = %shards,
+            unlisted_shards,
+            scope = "network: no active prover verifies a shield in these shards; not this wallet",
+            action = "the coins stay unshielded; run shield-all again once their shard has \
+                active provers (the node's shard list shows the count)",
+            "shield-all left legacy coins in no live shard: their shards and active provers",
+        );
+    }
     plan.duplicates = candidates - batches.iter().map(Vec::len).sum::<usize>() - uncovered.len();
     plan.shards = batches
         .iter()
@@ -7631,6 +7691,51 @@ mod tests {
         assert!(wallet
             .verify_paths(&[(address, &other)], &root, &[path()])
             .is_err());
+    }
+
+    /// Coins no live shard covers are counted under the deepest listed shard
+    /// covering them, with its active provers, the most coins first; those
+    /// no listed shard covers apart; the list is bounded.
+    #[test]
+    fn uncovered_by_shard_names_each_coins_shard_and_its_provers() {
+        let coin = |top: u8, n: u8| {
+            let mut a = [n; 32];
+            a[0] = top;
+            a
+        };
+        fn filter(path: &[bool]) -> Vec<u8> {
+            quil_forest::encode_shard_bit_path(&[7; 32], path)
+        }
+        let shards = vec![
+            (filter(&[true]), vec![true], 0),
+            (filter(&[false, true]), vec![false, true], 0),
+            (filter(&[false, false, false]), vec![false, false, false], 4),
+        ];
+        let uncovered = [coin(0x80, 1), coin(0xc0, 2), coin(0x40, 3), coin(0x20, 4)];
+        let (line, unlisted) = uncovered_by_shard(&uncovered, &shards);
+        assert_eq!(
+            line,
+            format!(
+                "{} 2 coins, 0 active provers; {} 1 coins, 0 active provers; \
+                 no listed shard 1 coins",
+                hex::encode(&shards[0].0),
+                hex::encode(&shards[1].0)
+            )
+        );
+        assert_eq!(unlisted, 0);
+
+        let many: Vec<(Vec<u8>, Vec<bool>, u32)> = (0..UNCOVERED_LISTED_SHARDS as u8 + 2)
+            .map(|n| {
+                let path: Vec<bool> = (0..8).map(|bit| n & (0x80 >> bit) != 0).collect();
+                (filter(&path), path, 0)
+            })
+            .collect();
+        let coins: Vec<[u8; 32]> = (0..UNCOVERED_LISTED_SHARDS as u8 + 2)
+            .map(|n| coin(n, n))
+            .collect();
+        let (line, unlisted) = uncovered_by_shard(&coins, &many);
+        assert_eq!(unlisted, 2);
+        assert_eq!(line.matches("; ").count(), UNCOVERED_LISTED_SHARDS - 1);
     }
 
     /// Batches never span shards: each coin goes to the deepest live shard

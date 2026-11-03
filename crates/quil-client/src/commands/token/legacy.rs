@@ -1018,12 +1018,12 @@ pub(crate) async fn ensure_shields_active(
     Ok(())
 }
 
-/// The filters and bit paths of `application`'s live shards (any active
-/// prover).
-pub(crate) async fn live_shards(
+/// The filters, bit paths and active prover counts of `application`'s
+/// shards in the node's shard list.
+pub(crate) async fn app_shards(
     client: &Client,
     application: &[u8; 32],
-) -> anyhow::Result<Vec<(Vec<u8>, Vec<bool>)>> {
+) -> anyhow::Result<Vec<(Vec<u8>, Vec<bool>, u32)>> {
     let shards = client
         .clone()
         .get_shard_info(quil_types::proto::node::GetShardInfoRequest { include_all: true })
@@ -1033,13 +1033,31 @@ pub(crate) async fn live_shards(
         .shards;
     Ok(shards
         .into_iter()
-        .filter(|shard| shard.filter.starts_with(application) && shard.active_provers > 0)
+        .filter(|shard| shard.filter.starts_with(application))
         .filter_map(|shard| {
             let bits = quil_forest::decode_shard_filter_or_root(&shard.filter, 32)
                 .map(|(_, bits)| bits)?;
-            Some((shard.filter, bits))
+            Some((shard.filter, bits, shard.active_provers))
         })
         .collect())
+}
+
+/// The live ones of `shards` (any active prover), as filters and bit paths.
+pub(crate) fn live_of(shards: &[(Vec<u8>, Vec<bool>, u32)]) -> Vec<(Vec<u8>, Vec<bool>)> {
+    shards
+        .iter()
+        .filter(|(_, _, active)| *active > 0)
+        .map(|(filter, path, _)| (filter.clone(), path.clone()))
+        .collect()
+}
+
+/// The filters and bit paths of `application`'s live shards (any active
+/// prover).
+pub(crate) async fn live_shards(
+    client: &Client,
+    application: &[u8; 32],
+) -> anyhow::Result<Vec<(Vec<u8>, Vec<bool>)>> {
+    Ok(live_of(&app_shards(client, application).await?))
 }
 
 /// The bit paths of `application`'s live shards (any active prover).

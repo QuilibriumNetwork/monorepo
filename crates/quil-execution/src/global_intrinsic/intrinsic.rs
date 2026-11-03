@@ -3167,13 +3167,18 @@ impl GlobalIntrinsic {
                         &op.accumulator,
                     )?;
                     #[cfg(feature = "confidential-tokens")]
-                    crate::token_intrinsic::global_commit::materialize_relay(
-                        state,
-                        frame_number,
-                        &op.address,
-                        op.frame_number,
-                        &op.spends,
-                    )?;
+                    {
+                        super::commit_destinations::header_executed(frame_number, &op.address);
+                        let commit =
+                            crate::token_intrinsic::global_commit::materialize_relay_placed(
+                                state,
+                                frame_number,
+                                &op.address,
+                                op.frame_number,
+                                &op.spends,
+                            )?;
+                        self.log_commit_destinations(frame_number, &op.address, &commit, state);
+                    }
                 }
             }
             executed = Some(tip);
@@ -3589,13 +3594,18 @@ impl GlobalIntrinsic {
         // this frame's order. The report is processed first so a spend can
         // cite the root it carries.
         #[cfg(feature = "confidential-tokens")]
-        let committed_fees = crate::token_intrinsic::global_commit::materialize_relay(
-            state,
-            frame_number,
-            &op.address,
-            op.frame_number,
-            &op.spends,
-        )?;
+        let committed_fees = {
+            super::commit_destinations::header_executed(frame_number, &op.address);
+            let commit = crate::token_intrinsic::global_commit::materialize_relay_placed(
+                state,
+                frame_number,
+                &op.address,
+                op.frame_number,
+                &op.spends,
+            )?;
+            self.log_commit_destinations(frame_number, &op.address, &commit, state);
+            commit.fees
+        };
         timing.mark("relay");
         #[cfg(not(feature = "confidential-tokens"))]
         let committed_fees = 0u128;
@@ -4157,6 +4167,8 @@ impl GlobalIntrinsic {
         super::handoff::superseded::flush_due(frame_number);
         #[cfg(feature = "confidential-tokens")]
         super::relay_coverage::flush_due(frame_number);
+        #[cfg(feature = "confidential-tokens")]
+        self.check_unstaffed_destinations(frame_number, state);
         state.stage_records([quil_types::store::RecordMutation {
             key: DUE_FRAME_KEY.to_vec(),
             value: Some(frame_number.to_be_bytes().to_vec()),
@@ -4448,6 +4460,122 @@ impl GlobalIntrinsic {
             None => Err(ABSENT),
             Some(((_, first), rest)) if rest.iter().all(|(_, order)| order == first) => Ok(first.clone()),
             Some(_) => Err("the frame record holds the merge in more than one order, and which applied is unknown"),
+        }
+    }
+
+    /// Every registered shard of this frame's grid as `(application,
+    /// shard)`; `None` when this node keeps no grid or it cannot be read.
+    /// One scan of the local shard rows plus this frame's staged records,
+    /// as [`Self::reconcile_orphaned_blocks`] reads them. Logging only.
+    #[cfg(feature = "confidential-tokens")]
+    fn registered_shards(
+        &self,
+        state: &HypergraphState,
+    ) -> Option<Vec<([u8; 32], super::commit_destinations::GridShard)>> {
+        let (Some(store), true) = (
+            self.shards_store.as_ref(),
+            self.shard_metadata_writes_enabled,
+        ) else {
+            return None;
+        };
+        let rows = quil_store::ShardMetadataBatch::new(store.clone(), state.pending_records())
+            .range_app_shards()
+            .ok()?;
+        Some(
+            rows.into_iter()
+                .filter_map(|row| {
+                    let application = <[u8; 32]>::try_from(row.shard_key.get(3..35)?).ok()?;
+                    let path = quil_forest::shard_bit_path_from_prefix(&row.prefix)
+                        .unwrap_or_else(|| quil_forest::prefix_to_bits(&row.prefix, 6));
+                    let filter = quil_forest::shard_prefix_to_filter(&application, &row.prefix);
+                    Some((
+                        application,
+                        super::commit_destinations::GridShard { path, filter },
+                    ))
+                })
+                .collect(),
+        )
+    }
+
+    /// `filter`'s active provers at GLOBAL frame `frame_number` from the
+    /// in-memory registry (one read lock, as the header's own committee
+    /// check takes); `None` without a registry or on a read error.
+    #[cfg(feature = "confidential-tokens")]
+    fn active_prover_count(&self, filter: &[u8], frame_number: u64) -> Option<usize> {
+        self.prover_registry
+            .as_deref()?
+            .get_active_provers(filter, frame_number)
+            .ok()
+            .map(|provers| provers.len())
+    }
+
+    /// The line naming the shards a header's committed outputs were routed
+    /// to, and the unstaffed-owner warnings
+    /// ([`super::commit_destinations`]). Reads nothing when it committed no
+    /// output or escrow. Logging only.
+    #[cfg(feature = "confidential-tokens")]
+    fn log_commit_destinations(
+        &self,
+        frame_number: u64,
+        source: &[u8],
+        commit: &crate::token_intrinsic::global_commit::RelayCommit,
+        state: &HypergraphState,
+    ) {
+        if commit.placed.is_empty() {
+            return;
+        }
+        let Some(application) = source.get(..32).and_then(|a| <[u8; 32]>::try_from(a).ok()) else {
+            return;
+        };
+        let grid: Option<Vec<super::commit_destinations::GridShard>> =
+            self.registered_shards(state).map(|rows| {
+                rows.into_iter()
+                    .filter(|(row_application, _)| *row_application == application)
+                    .map(|(_, shard)| shard)
+                    .collect()
+            });
+        super::commit_destinations::log_commit(
+            frame_number,
+            source,
+            &application,
+            grid.as_deref(),
+            commit,
+            |filter| self.active_prover_count(filter, frame_number),
+        );
+    }
+
+    /// Warn about the staffed shards holding committed outputs that execute
+    /// no header ([`super::commit_destinations::SILENT_FRAMES`]), and re-read
+    /// the staffing of those without active provers or warned silent, at most
+    /// once per [`super::commit_destinations::CHECK_INTERVAL`]; nothing while
+    /// none waits. Logging only.
+    #[cfg(feature = "confidential-tokens")]
+    fn check_unstaffed_destinations(&self, frame_number: u64, state: &HypergraphState) {
+        use super::commit_destinations::Staffing;
+        super::commit_destinations::check_silent(frame_number, |filter| {
+            self.active_prover_count(filter, frame_number)
+        });
+        let due = super::commit_destinations::due_checks();
+        if due.is_empty() {
+            return;
+        }
+        let registered: Option<std::collections::HashSet<Vec<u8>>> = self
+            .registered_shards(state)
+            .map(|rows| rows.into_iter().map(|(_, shard)| shard.filter).collect());
+        for filter in due {
+            let staffing = if registered
+                .as_ref()
+                .is_some_and(|registered| !registered.contains(&filter))
+            {
+                Staffing::LeftGrid
+            } else {
+                match self.active_prover_count(&filter, frame_number) {
+                    Some(0) => Staffing::Unstaffed,
+                    Some(count) => Staffing::Staffed(count),
+                    None => continue,
+                }
+            };
+            super::commit_destinations::resolve(frame_number, &filter, staffing);
         }
     }
 
