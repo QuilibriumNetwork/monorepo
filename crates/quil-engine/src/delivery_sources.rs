@@ -46,6 +46,9 @@ const REPORT_AFTER_SWEEPS: u64 = 6;
 /// A read of the pending deliveries that takes this long or longer is slow:
 /// it outlasts the engine tick that starts the sweeps.
 const SLOW_READ: Duration = Duration::from_secs(10);
+/// A slow-read outage ends only when a read takes less than this: reads
+/// hovering at [`SLOW_READ`] would otherwise end and restart it each time.
+const FAST_AGAIN: Duration = Duration::from_secs(5);
 
 /// A source frame: the executing shard's filter and its frame number.
 type Source = (Vec<u8>, u64);
@@ -257,10 +260,15 @@ fn observe_read(slow_reads: &mut Outage, filter: &[u8], read: &Read, now: Instan
     } else {
         ("store", "report")
     };
-    match (
-        slow_reads.observe(now.into_std(), read.total < SLOW_READ),
-        read.lock_bound(),
-    ) {
+    // Hysteresis: a read under SLOW_READ is fast again only once the outage
+    // has ended below FAST_AGAIN; between the two it stays slow.
+    let fast = read.total
+        < if slow_reads.is_active() {
+            FAST_AGAIN
+        } else {
+            SLOW_READ
+        };
+    match (slow_reads.observe(now.into_std(), fast), read.lock_bound()) {
         (Some(OutageEvent::Began), true) => warn!(
             filter = %hex::encode(filter), read_secs, lock_wait_ms, queued_ms, pending, blocks_scanned,
             waited_on, scope = "local", action,
@@ -753,6 +761,42 @@ mod tests {
             start + 3 * TICK,
         );
         assert_eq!(logs.lines_with("fast again").len(), 1);
+    }
+
+    /// Reads hovering at the threshold (9.6 s and 10.4 s alternately) are one
+    /// outage: it starts once, and ends only on a read under half the
+    /// threshold.
+    #[test]
+    fn reads_hovering_at_the_threshold_log_one_start() {
+        let logs = CapturedLogs::default();
+        let _logging = logs.install();
+        let mut slow_reads = Outage::default();
+        let start = Instant::now();
+        for i in 0..10u32 {
+            let ms = if i % 2 == 0 { 10_400 } else { 9_600 };
+            observe_read(
+                &mut slow_reads,
+                &FILTER,
+                &took(Duration::from_millis(ms)),
+                start + i * TICK,
+            );
+        }
+        assert_eq!(logs.lines_with("is slow").len(), 1);
+        assert!(logs.lines_with("fast again").is_empty());
+        observe_read(
+            &mut slow_reads,
+            &FILTER,
+            &took(Duration::from_millis(4_900)),
+            start + 10 * TICK,
+        );
+        assert_eq!(logs.lines_with("fast again").len(), 1);
+        observe_read(
+            &mut slow_reads,
+            &FILTER,
+            &took(Duration::from_millis(10_400)),
+            start + 11 * TICK,
+        );
+        assert_eq!(logs.lines_with("is slow").len(), 2);
     }
 
     /// A slow read that mostly waited for the store's commit lock says so,
