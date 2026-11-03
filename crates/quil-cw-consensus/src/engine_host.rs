@@ -448,7 +448,10 @@ where
 
     let shutdown = shutdown.unwrap_or_default();
     let registration = hosts.register(&shutdown);
-    let thread = std::thread::spawn(move || {
+    // Named for its journal partition (`global`, `app-<filter>`), so a crash
+    // on it, a stack overflow say, names the shard whose engine it ran.
+    let host = std::thread::Builder::new().name(format!("cw-{}", params.partition));
+    let spawned = host.spawn(move || {
         // Released last, once the runtime and the engine's actors are gone.
         let Some(_registration) = registration else {
             return;
@@ -524,6 +527,7 @@ where
             context.wait_idle().await;
         });
     });
+    let thread = spawned.expect("spawn a consensus host thread");
 
     GlobalHostHandle {
         inbound,

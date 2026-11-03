@@ -857,20 +857,23 @@ impl FrameMaterializer {
                     fh_bytes.len(),
                 ));
                 std::thread::scope(|s| {
-                    for c in fh_bytes.chunks(chunk) {
+                    for (part, c) in fh_bytes.chunks(chunk).enumerate() {
                         let out = &out;
                         let em = &self.execution_manager;
                         // FrameHeaders route to the global engine (0xff).
                         let addr = global_addr.clone();
-                        s.spawn(move || {
-                            let mut local = Vec::with_capacity(c.len());
-                            for bytes in c {
-                                let result = em.validate_message(frame_number, &addr, bytes);
-                                local.push((bytes.clone(), result));
-                            }
-                            let mut g = out.lock().unwrap();
-                            g.extend(local);
-                        });
+                        std::thread::Builder::new()
+                            .name(format!("frame-hdr-{part}"))
+                            .spawn_scoped(s, move || {
+                                let mut local = Vec::with_capacity(c.len());
+                                for bytes in c {
+                                    let result = em.validate_message(frame_number, &addr, bytes);
+                                    local.push((bytes.clone(), result));
+                                }
+                                let mut g = out.lock().unwrap();
+                                g.extend(local);
+                            })
+                            .expect("spawn a frame header validation thread");
                     }
                 });
                 finish_frame_header_validation(out.into_inner().unwrap())?

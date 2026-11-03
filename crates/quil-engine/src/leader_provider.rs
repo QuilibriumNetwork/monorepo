@@ -964,16 +964,19 @@ pub(crate) fn select_shard_tips(
     let mut shards = shards.into_iter();
     let parts: Vec<ShardTips> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|_| {
+            .map(|lane| {
                 let part: Vec<_> = shards.by_ref().take(chunk).collect();
                 let select = &select;
-                scope.spawn(move || {
-                    let mut out = ShardTips::default();
-                    for candidates in part {
-                        select(candidates, &mut out);
-                    }
-                    out
-                })
+                std::thread::Builder::new()
+                    .name(format!("shard-tips-{lane}"))
+                    .spawn_scoped(scope, move || {
+                        let mut out = ShardTips::default();
+                        for candidates in part {
+                            select(candidates, &mut out);
+                        }
+                        out
+                    })
+                    .expect("spawn a shard tip selection thread")
             })
             .collect();
         handles

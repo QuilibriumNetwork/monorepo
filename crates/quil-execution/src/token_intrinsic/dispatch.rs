@@ -1218,9 +1218,12 @@ fn watched_verification_every<T: Send>(
     let estimate = estimated_verify_secs(operation_bytes);
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let result = std::thread::scope(|scope| {
-        scope.spawn(move || {
-            let _ = sender.send(verify());
-        });
+        std::thread::Builder::new()
+            .name("proof-verify".into())
+            .spawn_scoped(scope, move || {
+                let _ = sender.send(verify());
+            })
+            .expect("spawn a proof verification thread");
         let (mut reported_long, mut warned) = (false, false);
         loop {
             let next_report = match (reported_long, warned) {

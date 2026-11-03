@@ -948,7 +948,10 @@ pub fn deliver(message: SeatMessage, publish: Publish) {
         }
     };
     if start {
-        std::thread::spawn(move || watch(member));
+        std::thread::Builder::new()
+            .name("epoch-batch".into())
+            .spawn(move || watch(member))
+            .expect("spawn a storage epoch batch thread");
     }
 }
 
