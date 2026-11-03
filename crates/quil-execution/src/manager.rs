@@ -1319,6 +1319,7 @@ impl ExecutionEngineManager {
         let label = crate::metrics::engine_label(&engine_name);
         crate::metrics::inc_execution_requests(label, "validate");
         let start = std::time::Instant::now();
+        let _held = quil_types::lock_holders::hold(quil_types::lock_holders::Holder::Validation);
         let engines = self.engines.read().unwrap();
         let res = if let Some(engine) = engines.get(&engine_name) {
             engine.validate_message(frame_number, address, message)
@@ -1371,6 +1372,7 @@ impl ExecutionEngineManager {
         let label = crate::metrics::engine_label(&engine_name);
         crate::metrics::inc_execution_requests(label, "process");
         let start = std::time::Instant::now();
+        let _held = quil_types::lock_holders::hold(quil_types::lock_holders::Holder::Processing);
         let engines = self.engines.read().unwrap();
         let res = if let Some(engine) = engines.get(&engine_name) {
             engine.process_message_with_context(context, fee_multiplier, address, message)
@@ -1392,6 +1394,7 @@ impl ExecutionEngineManager {
     /// the per-message `tx_map` that feeds `requests_root`.
     pub fn lock(&self, frame_number: u64, address: &[u8], message: &[u8]) -> Result<Vec<Vec<u8>>> {
         let engine_name = self.select_engine(address)?;
+        let _held = quil_types::lock_holders::hold(quil_types::lock_holders::Holder::Processing);
         let engines = self.engines.read().unwrap();
         if let Some(engine) = engines.get(&engine_name) {
             engine.lock(frame_number, address, message)
@@ -1422,6 +1425,7 @@ impl ExecutionEngineManager {
     /// Other operation types retain their current pricing policy; their presence
     /// cannot erase a token operation's cost contribution.
     pub fn get_cost(&self, message: &[u8]) -> Result<BigInt> {
+        let _held = quil_types::lock_holders::hold(quil_types::lock_holders::Holder::CostQuery);
         let engines = self.engines.read().unwrap();
         // World-state growth of hypergraph and compute writes (and of a
         // settlement claim's consumption marker), paid by the settlement the
