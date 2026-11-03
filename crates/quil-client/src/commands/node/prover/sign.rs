@@ -7,9 +7,8 @@
 //!
 //! The exact messages and domains are taken from the node's verify path
 //! (`quil_execution::global_intrinsic::verify`), so a signature produced
-//! here is accepted by the running node. See the round-trip test below,
-//! which checks the produced signature against the same
-//! `KeyManager::validate_signature` the node uses.
+//! here is accepted by the running node. The tests below send each op through
+//! its encoding and the verifier every node runs.
 
 use quil_keys::FileKeyManager;
 use quil_types::crypto::Signer;
@@ -18,9 +17,9 @@ use quil_types::proto::keys::Bls48581AddressedSignature;
 
 use quil_execution::global_intrinsic::prover_update_materialize::prover_update_domain;
 use quil_execution::global_intrinsic::prover_verify::{
-    multi_filter_signing_message, prover_confirm_domain, prover_leave_domain, prover_pause_domain,
-    prover_reject_domain, prover_resume_domain, prover_update_signing_message,
-    single_filter_signing_message,
+    multi_filter_signing_message, prover_confirm_domain, prover_leave_domain,
+    prover_leave_signing_message, prover_pause_domain, prover_reject_domain, prover_resume_domain,
+    prover_update_signing_message, single_filter_signing_message,
 };
 
 /// Build the `Bls48581AddressedSignature` for a prover op: sign `message`
@@ -96,7 +95,7 @@ pub fn leave_sig(
     frame: u64,
 ) -> anyhow::Result<Bls48581AddressedSignature> {
     check_filters("leave", filters)?;
-    let msg = multi_filter_signing_message(filters, frame);
+    let msg = prover_leave_signing_message(filters, frame);
     let domain = prover_leave_domain().map_err(|e| anyhow::anyhow!("leave domain: {e}"))?;
     addressed_sig(km, &msg, &domain)
 }
@@ -182,6 +181,209 @@ mod tests {
         (km, dir)
     }
 
+    /// A prover vertex as every node reads it: this key's.
+    fn prover_tree(km: &FileKeyManager) -> quil_tries::VectorCommitmentTree {
+        let pubkey = km
+            .get_signer_by_id("q-prover-key")
+            .unwrap()
+            .public_key()
+            .to_vec();
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        quil_execution::global_schema::write_type(&mut tree, "prover:Prover").unwrap();
+        quil_execution::global_schema::write_field(
+            &mut tree,
+            "prover:Prover",
+            "PublicKey",
+            &pubkey,
+        )
+        .unwrap();
+        tree
+    }
+
+    /// An allocation vertex in raw execution status `status`.
+    fn allocation_tree(status: u8) -> quil_tries::VectorCommitmentTree {
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        let class = "allocation:ProverAllocation";
+        quil_execution::global_schema::write_type(&mut tree, class).unwrap();
+        quil_execution::global_schema::write_field(&mut tree, class, "Status", &[status]).unwrap();
+        tree
+    }
+
+    /// Filter lists a message framing could treat alike: several of differing
+    /// lengths, whose concatenation does not show where each ends, and one.
+    fn filter_lists() -> [Vec<Vec<u8>>; 2] {
+        [
+            vec![vec![0x08; 32], vec![0x09; 40], vec![0x0A; 35]],
+            vec![vec![0x08; 32]],
+        ]
+    }
+
+    /// The network's verdict on a leave `qclient` signs, after its wire
+    /// encoding. The manager builds its leave through the same `leave_sig`
+    /// (`manage::actions::build_request`), whose test sends it here too.
+    #[test]
+    fn a_leave_passes_the_network_verifier() {
+        use quil_execution::global_intrinsic::{
+            conversions, prover_filter_ops::ProverLeave, verify,
+        };
+        let (km, _d) = km_with_prover_key();
+        let tree = prover_tree(&km);
+        for filters in filter_lists() {
+            let pb = quil_types::proto::global::ProverLeave {
+                filters: filters.clone(),
+                frame_number: 777,
+                public_key_signature_bls48581: Some(leave_sig(&km, &filters, 777).unwrap()),
+            };
+            let wire = conversions::prover_leave_from_proto(&pb)
+                .to_canonical_bytes()
+                .unwrap();
+            let op = ProverLeave::from_canonical_bytes(&wire).unwrap();
+            assert_eq!(op.filters, filters);
+            assert!(
+                verify::verify_prover_leave(&op, &tree, &quil_crypto::DefaultKeyManager::new())
+                    .unwrap(),
+                "the network refuses a leave signed by qclient: verify_prover_leave returned \
+                 false for {} filter(s), so every node drops it while the command reports it sent",
+                filters.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_pause_passes_the_network_verifier() {
+        use quil_execution::global_intrinsic::{
+            conversions, prover_filter_ops::ProverPause, verify,
+        };
+        let (km, _d) = km_with_prover_key();
+        let filter = vec![0x08; 35];
+        let pb = quil_types::proto::global::ProverPause {
+            filter: filter.clone(),
+            frame_number: 777,
+            public_key_signature_bls48581: Some(pause_sig(&km, &filter, 777).unwrap()),
+        };
+        let wire = conversions::prover_pause_from_proto(&pb)
+            .to_canonical_bytes()
+            .unwrap();
+        let op = ProverPause::from_canonical_bytes(&wire).unwrap();
+        assert_eq!(op.filter, filter);
+        let active = allocation_tree(1);
+        assert!(verify::verify_prover_pause(
+            &op,
+            &prover_tree(&km),
+            Some(&active),
+            &quil_crypto::DefaultKeyManager::new()
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn a_resume_passes_the_network_verifier() {
+        use quil_execution::global_intrinsic::{
+            conversions, prover_filter_ops::ProverResume, verify,
+        };
+        let (km, _d) = km_with_prover_key();
+        let filter = vec![0x08; 35];
+        let pb = quil_types::proto::global::ProverResume {
+            filter: filter.clone(),
+            frame_number: 777,
+            public_key_signature_bls48581: Some(resume_sig(&km, &filter, 777).unwrap()),
+        };
+        let wire = conversions::prover_resume_from_proto(&pb)
+            .to_canonical_bytes()
+            .unwrap();
+        let op = ProverResume::from_canonical_bytes(&wire).unwrap();
+        assert_eq!(op.filter, filter);
+        let paused = allocation_tree(2);
+        assert!(verify::verify_prover_resume(
+            &op,
+            &prover_tree(&km),
+            Some(&paused),
+            &quil_crypto::DefaultKeyManager::new()
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn a_confirm_passes_the_network_verifier() {
+        use quil_execution::global_intrinsic::{conversions, prover_ops::ProverConfirm, verify};
+        let (km, _d) = km_with_prover_key();
+        let tree = prover_tree(&km);
+        for filters in filter_lists() {
+            let pb = confirm_op(&km, &filters, 777).unwrap();
+            let wire = conversions::prover_confirm_from_proto(&pb)
+                .to_canonical_bytes()
+                .unwrap();
+            let op = ProverConfirm::from_canonical_bytes(&wire).unwrap();
+            assert_eq!(op.filters, filters);
+            assert!(verify::verify_prover_confirm(
+                &op,
+                &tree,
+                &quil_crypto::DefaultKeyManager::new()
+            )
+            .unwrap());
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)] // ProverReject.filter is a deprecated wire field.
+    fn a_reject_passes_the_network_verifier() {
+        use quil_execution::global_intrinsic::{conversions, prover_ops::ProverReject, verify};
+        let (km, _d) = km_with_prover_key();
+        let tree = prover_tree(&km);
+        for filters in filter_lists() {
+            let pb = quil_types::proto::global::ProverReject {
+                filter: Vec::new(),
+                frame_number: 777,
+                public_key_signature_bls48581: Some(reject_sig(&km, &filters, 777).unwrap()),
+                filters: filters.clone(),
+            };
+            let wire = conversions::prover_reject_from_proto(&pb)
+                .to_canonical_bytes()
+                .unwrap();
+            let op = ProverReject::from_canonical_bytes(&wire).unwrap();
+            assert_eq!(op.filters, filters);
+            assert!(verify::verify_prover_reject(
+                &op,
+                &tree,
+                &quil_crypto::DefaultKeyManager::new()
+            )
+            .unwrap());
+        }
+    }
+
+    /// Both forms `delegate` sends: the frame it signs from the replay guard
+    /// epoch, and none before it.
+    #[test]
+    fn an_update_passes_the_network_verifier() {
+        use quil_execution::global_intrinsic::{conversions, prover_ops::ProverUpdate, verify};
+        let (km, _d) = km_with_prover_key();
+        let tree = prover_tree(&km);
+        let delegate = vec![0x11; 32];
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(1));
+        let epoch = quil_types::consensus::epoch_length_frames();
+        for head in [epoch - 1, epoch + 7] {
+            let frame = ProverUpdate::signed_frame(head);
+            assert_eq!(frame == 0, head < epoch);
+            let pb = quil_types::proto::global::ProverUpdate {
+                delegate_address: delegate.clone(),
+                public_key_signature_bls48581: Some(update_sig(&km, &delegate, frame).unwrap()),
+                frame_number: frame,
+            };
+            let wire = conversions::prover_update_from_proto(&pb)
+                .to_canonical_bytes()
+                .unwrap();
+            let op = ProverUpdate::from_canonical_bytes(&wire).unwrap();
+            assert!(verify::verify_prover_update(
+                &op,
+                &tree,
+                head,
+                &quil_crypto::DefaultKeyManager::new()
+            )
+            .unwrap());
+        }
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(None);
+    }
+
     /// The signature this module produces must be accepted by the exact
     /// `validate_signature` the node's verify path calls.
     #[test]
@@ -197,7 +399,7 @@ mod tests {
             .unwrap()
             .public_key()
             .to_vec();
-        let message = multi_filter_signing_message(&filters, frame);
+        let message = prover_leave_signing_message(&filters, frame);
         let domain = prover_leave_domain().unwrap();
 
         let ok = km

@@ -68,15 +68,23 @@ async fn send_split(
             .map_err(|e| split_send_error(op, index, count, filters, sent, e))?;
         sent += chunk.len();
     }
-    if count > 1 {
-        println!(
-            "Prover {op} sent successfully as {count} messages for {} filters",
-            filters.len()
-        );
-    } else {
-        println!("Prover {op} sent successfully");
-    }
+    println!("{}", sent_text(op, count, filters.len()));
     Ok(())
+}
+
+/// What a sent op is known to have done: nothing yet. The node takes the
+/// message and every node then judges it, with no answer back here.
+fn sent_text(op: &str, messages: usize, filters: usize) -> String {
+    let sent = if messages > 1 {
+        format!("Prover {op} sent as {messages} messages for {filters} filters")
+    } else {
+        format!("Prover {op} sent")
+    };
+    format!(
+        "{sent}; not yet included. `qclient node prover status` shows the change after this \
+         node's next registry refresh, by the next epoch boundary; no change after that means \
+         the network dropped it."
+    )
 }
 
 /// The error of a split op whose message `index` (from 0) of `count` was not
@@ -169,7 +177,7 @@ pub async fn pause(pc: &ProverCtx, filter_arg: Option<&str>) -> anyhow::Result<(
     };
     pc.send_global(&mut client, wrap(Request::Pause(op)))
         .await?;
-    println!("Prover pause sent successfully");
+    println!("{}", sent_text("pause", 1, 1));
     Ok(())
 }
 
@@ -185,7 +193,7 @@ pub async fn resume(pc: &ProverCtx, filter_arg: Option<&str>) -> anyhow::Result<
     };
     pc.send_global(&mut client, wrap(Request::Resume(op)))
         .await?;
-    println!("Prover resume sent successfully");
+    println!("{}", sent_text("resume", 1, 1));
     Ok(())
 }
 
@@ -300,6 +308,18 @@ fn wrap(request: Request) -> MessageRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A send says what is known: sent, not included, and how to check.
+    #[test]
+    fn a_sent_op_does_not_claim_success() {
+        for text in [sent_text("leave", 1, 1), sent_text("leave", 3, 250)] {
+            assert!(!text.contains("successfully"), "{text}");
+            assert!(text.contains("not yet included"), "{text}");
+            assert!(text.contains("qclient node prover status"), "{text}");
+            assert!(text.contains("by the next epoch boundary"), "{text}");
+        }
+        assert!(sent_text("leave", 3, 250).starts_with("Prover leave sent as 3 messages for 250"));
+    }
 
     /// A partial send names the unsent filters as follow-up arguments, so a
     /// re-run does not resend the published messages; a first failure has

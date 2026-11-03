@@ -96,8 +96,9 @@ pub fn single_filter_signing_message(filter: &[u8], frame_number: u64) -> Vec<u8
     msg
 }
 
-/// Build the signing message for a multi-filter op (Leave, Confirm, Reject).
-/// For Leave: `message = concat(filters) || frame_number_be_u64`
+/// Build the signing message for a multi-filter op (Confirm, Reject, Join):
+/// `message = concat(filters) || frame_number_be_u64`. A leave signs
+/// [`prover_leave_signing_message`] instead.
 /// For Confirm/Reject: the Go code uses a similar construction but the
 /// older `filter` field is deprecated and `filters` is the canonical list.
 pub fn multi_filter_signing_message(filters: &[Vec<u8>], frame_number: u64) -> Vec<u8> {
