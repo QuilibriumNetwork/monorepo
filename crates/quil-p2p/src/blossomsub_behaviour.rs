@@ -137,6 +137,7 @@ pub struct BlossomSubBehaviour {
     cache_pressure: CachePressure,
     /// Operator log state for gossip RPCs dropped before decoding.
     rejected_rpcs: RejectedRpcLog,
+    unsent_rpcs: UnsentRpcLog,
     /// Whether gossipsub metric families have been registered (guards against
     /// double-registration on a repeated `set_signing_identity`).
     metrics_registered: bool,
@@ -186,6 +187,7 @@ impl BlossomSubBehaviour {
             last_need_peers_check: std::time::Instant::now(),
             cache_pressure: CachePressure::default(),
             rejected_rpcs: RejectedRpcLog::default(),
+            unsent_rpcs: UnsentRpcLog::default(),
             metrics_registered: false,
             warned_forward_filter: false,
             metrics_registry: Arc::new(std::sync::Mutex::new(
@@ -236,6 +238,7 @@ impl BlossomSubBehaviour {
         // The new inner behaviour's cache and rejection counters start from zero.
         self.cache_pressure = CachePressure::default();
         self.rejected_rpcs = RejectedRpcLog::default();
+        self.unsent_rpcs = UnsentRpcLog::default();
         // Enable peer scoring. Two channels are active:
         //  (1) application score (`set_application_score`) — driven by the node
         //      (peer_authenticator / per-source drop-rate penalties);
@@ -475,6 +478,7 @@ impl BlossomSubBehaviour {
             .observe(self.inner.message_cache_stats(), now);
         self.rejected_rpcs
             .observe(self.inner.rejected_rpc_stats(), now);
+        self.unsent_rpcs.observe(self.inner.unsent_rpc_stats(), now);
         if self.subscriptions.is_empty() {
             return;
         }
@@ -727,6 +731,50 @@ impl RejectedRpcLog {
             }
         }
         Some(line)
+    }
+}
+
+/// Gossip RPCs for peers that disconnected are summarized at most this often.
+const UNSENT_RPC_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Operator log of the gossip RPCs dropped because their peer had left the connected peer
+/// list: one info line per [`UNSENT_RPC_LOG_INTERVAL`] while they continue, with the count
+/// since the previous line. Each is the loss of one message for one peer that disconnected.
+#[derive(Debug, Default)]
+struct UnsentRpcLog {
+    /// Counters at the previous line.
+    logged: gossipsub::UnsentRpcStats,
+    last_log: Option<std::time::Instant>,
+}
+
+impl UnsentRpcLog {
+    /// Returns the RPCs dropped since the previous line when one is due.
+    fn observe(
+        &mut self,
+        stats: gossipsub::UnsentRpcStats,
+        now: std::time::Instant,
+    ) -> Option<u64> {
+        let unsent = stats.unsent.saturating_sub(self.logged.unsent);
+        if unsent == 0 {
+            return None;
+        }
+        let since = self.last_log.map(|at| now.duration_since(at));
+        if since.is_some_and(|since| since < UNSENT_RPC_LOG_INTERVAL) {
+            return None;
+        }
+        self.logged = stats;
+        self.last_log = Some(now);
+        let latest_peer = stats.last.map(|peer| peer.to_string()).unwrap_or_default();
+        tracing::info!(
+            unsent,
+            total = stats.unsent,
+            %latest_peer,
+            since_secs = since.map_or(0, |since| since.as_secs()),
+            "gossip RPCs dropped for peers that had disconnected; the counts are since the \
+             previous line. Each is one message not sent to one departed peer; nothing to do \
+             unless the count stays high for hours"
+        );
+        Some(unsent)
     }
 }
 
@@ -1071,6 +1119,21 @@ mod propagation_tests {
             pressure.observe(stats(13), at(201)),
             Some(CachePressureLog::Started)
         );
+    }
+
+    #[test]
+    fn unsent_rpcs_log_one_bounded_summary_per_interval() {
+        let stats = |unsent| gossipsub::UnsentRpcStats { unsent, last: None };
+        let t0 = std::time::Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let mut log = UnsentRpcLog::default();
+        assert_eq!(log.observe(stats(0), at(0)), None);
+        assert_eq!(log.observe(stats(3), at(1)), Some(3));
+        assert_eq!(log.observe(stats(50), at(2)), None);
+        assert_eq!(log.observe(stats(60), at(40)), None);
+        assert_eq!(log.observe(stats(60), at(70)), Some(57));
+        assert_eq!(log.observe(stats(60), at(200)), None);
+        assert_eq!(log.observe(stats(61), at(201)), Some(1));
     }
 
     #[test]

@@ -7005,3 +7005,60 @@ fn rejected_rpc_penalises_its_sender() {
         }
     );
 }
+
+/// QUILIBRIUM: an RPC addressed to a peer that has disconnected is dropped for that peer alone,
+/// counted for the node's log and not queued for anyone else.
+#[test]
+fn rpc_for_a_disconnected_peer_is_counted_not_queued() {
+    let (mut gs, peers, mut receivers, topics) = inject_nodes1()
+        .peer_no(2)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .create_network();
+    assert_eq!(gs.unsent_rpc_stats(), UnsentRpcStats::default());
+
+    // Nothing reaches the log at error level, where the node's log is read.
+    #[derive(Clone, Default)]
+    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let sink = Sink::default();
+    let writer = sink.clone();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+
+    disconnect_peer(&mut gs, &peers[0]);
+    assert!(!gs.send_message(peers[0], RpcOut::Subscribe(topics[0].clone())));
+    assert!(!gs.send_message(peers[0], RpcOut::Subscribe(topics[0].clone())));
+    assert!(
+        sink.0.lock().unwrap().is_empty(),
+        "an RPC for a departed peer was logged at error: {}",
+        String::from_utf8_lossy(&sink.0.lock().unwrap())
+    );
+    assert_eq!(
+        gs.unsent_rpc_stats(),
+        UnsentRpcStats {
+            unsent: 2,
+            last: Some(peers[0]),
+        }
+    );
+
+    // A connected peer still gets its RPC and is not counted.
+    assert!(gs.send_message(peers[1], RpcOut::Subscribe(topics[0].clone())));
+    assert_eq!(gs.unsent_rpc_stats().unsent, 2);
+    let receiver = receivers.remove(&peers[1]).unwrap();
+    let queued = receiver.priority.get_ref().len() + receiver.non_priority.get_ref().len();
+    assert!(queued > 0, "the connected peer's RPC was not queued");
+}
