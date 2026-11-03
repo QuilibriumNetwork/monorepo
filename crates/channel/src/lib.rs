@@ -2,7 +2,6 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::prelude::*;
 use ed448_rust::Ed448Error;
-use hex;
 use hkdf::Hkdf;
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};

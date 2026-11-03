@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use subtle::ConstantTimeEq;
 
 const DOUBLE_RATCHET_PROTOCOL_VERSION: u16 = 1;
-const DOUBLE_RATCHET_PROTOCOL: u16 = 1 << 8 + DOUBLE_RATCHET_PROTOCOL_VERSION;
+const DOUBLE_RATCHET_PROTOCOL: u16 = 1 << (8 + DOUBLE_RATCHET_PROTOCOL_VERSION);
 
 const CHAIN_KEY: u8 = 0x01;
 const MESSAGE_KEY: u8 = 0x02;
@@ -155,9 +155,9 @@ impl P2PChannelEnvelope {
                 associated_data: header_associated_data,
             },
             message_body: MessageCiphertext {
-                ciphertext: ciphertext,
-                initialization_vector: initialization_vector,
-                associated_data: associated_data,
+                ciphertext,
+                initialization_vector,
+                associated_data,
             },
         })
     }
@@ -239,7 +239,7 @@ impl DoubleRatchetParticipant {
             previous_sending_chain_length: self.previous_sending_chain_length,
             current_receiving_chain_length: self.current_receiving_chain_length,
             previous_receiving_chain_length: self.previous_receiving_chain_length,
-            skipped_keys_map: skipped_keys_map,
+            skipped_keys_map,
         };
 
         serde_json::to_string(&participant)
@@ -305,9 +305,9 @@ impl DoubleRatchetParticipant {
                                 &sending_ephemeral_private_key,
                             ),
                             receiving_ephemeral_key: receiving_ephemeral_ct.unwrap(),
-                            root_key: root_key,
-                            sending_chain_key: sending_chain_key,
-                            current_sending_header_key: current_sending_header_key,
+                            root_key,
+                            sending_chain_key,
+                            current_sending_header_key,
                             current_receiving_header_key: current_receiving_header_key,
                             next_sending_header_key: next_sending_header_key,
                             next_receiving_header_key: next_receiving_header_key,
