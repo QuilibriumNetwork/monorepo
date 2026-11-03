@@ -415,6 +415,13 @@ fn report_pending_snapshots(frame_number: u64, prepared: &PreparedConfirm) {
     if pending.is_empty() {
         return;
     }
+    crate::storage_registration_landed::note_waiting(
+        &pending
+            .iter()
+            .map(|seat| seat.filter.clone())
+            .collect::<Vec<_>>(),
+        frame_number,
+    );
     // A confirm in epoch E registers the snapshot for E + 1.
     let epoch = quil_types::consensus::epoch_for_frame(frame_number) + 1;
     let grace_frame = quil_types::consensus::storage_snapshot_frame(epoch)
