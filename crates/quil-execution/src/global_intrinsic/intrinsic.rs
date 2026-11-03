@@ -9036,10 +9036,16 @@ mod tests {
                 gi.invoke_step(confirm_frame + 1, &bytes, &state).is_err(),
                 "before its beacon frame is past"
             );
+            let refused = |frame: u64, bytes: &[u8]| {
+                gi.invoke_step(frame, bytes, &state)
+                    .expect_err("refused")
+                    .to_string()
+            };
+            let late = refused(epoch * epoch_frames, &bytes);
             assert!(
-                gi.invoke_step(epoch * epoch_frames, &bytes, &state)
-                    .is_err(),
-                "once its epoch has begun"
+                late.contains(epoch_proof::REFUSED_LATE)
+                    && late.contains("frames past the deadline: 1"),
+                "once its epoch has begun: {late}"
             );
             let other = StorageEpochProof {
                 member: [0x77; 32],
@@ -9066,9 +9072,18 @@ mod tests {
             assert!(seat().sealed_for(epoch));
             gi.invoke_step(confirm_frame + 2, &bytes, &state)
                 .expect("the same frame applied again");
+            let again = refused(confirm_frame + 3, &bytes);
             assert!(
-                gi.invoke_step(confirm_frame + 3, &bytes, &state).is_err(),
-                "sealed once"
+                again.contains(epoch_proof::REFUSED_DUPLICATE),
+                "sealed once: {again}"
+            );
+            // GLOBAL checks the deadline first: a late copy reads as both.
+            let late_copy = refused(epoch * epoch_frames + 4, &bytes);
+            assert!(
+                late_copy.contains(epoch_proof::REFUSED_DUPLICATE)
+                    && late_copy.contains(&format!("sealed at frame {}", confirm_frame + 2))
+                    && late_copy.contains("frames past the deadline: 5"),
+                "a late copy of an applied seal: {late_copy}"
             );
 
             // In the epoch: two committed frames, eight held rewards of a
@@ -9157,9 +9172,10 @@ mod tests {
                 gi.invoke_step(from - 1, &bytes, &state).is_err(),
                 "frames anchored in the epoch may still arrive"
             );
+            let late = refused(until, &bytes);
             assert!(
-                gi.invoke_step(until, &bytes, &state).is_err(),
-                "past its window"
+                late.contains(epoch_proof::REFUSED_LATE),
+                "past its window: {late}"
             );
             let mut missing = settling.clone();
             missing.seats[0].frames.truncate(1);
@@ -9196,9 +9212,16 @@ mod tests {
                 seat().slot(epoch).unwrap().outcome,
                 storage_seat::Outcome::Settled(from)
             );
+            let again = refused(from + 1, &bytes);
             assert!(
-                gi.invoke_step(from + 1, &bytes, &state).is_err(),
-                "settled once"
+                again.contains(epoch_proof::REFUSED_DUPLICATE),
+                "settled once: {again}"
+            );
+            let late_copy = refused(until + 2, &bytes);
+            assert!(
+                late_copy.contains(epoch_proof::REFUSED_DUPLICATE)
+                    && late_copy.contains(&format!("settled at frame {from}")),
+                "a late copy of an applied settlement: {late_copy}"
             );
             quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
         }
