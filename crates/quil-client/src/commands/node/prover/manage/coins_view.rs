@@ -108,11 +108,9 @@ fn legacy_row(m: &Model) -> [Cell; 5] {
     };
     [
         plain("legacy"),
-        plain(if total > 0 {
-            format!(
-                "{} unshielded · {} shielded",
-                tally.unshielded, tally.shielded
-            )
+        // Unshielded of all listed; the detail splits them by kind.
+        plain(if tally.unshielded > 0 {
+            format!("{}/{total}", tally.unshielded)
         } else {
             "0".into()
         }),
@@ -140,25 +138,10 @@ fn detail(m: &Model) -> String {
     let legacy = &m.coins.legacy;
     let mut parts = Vec::new();
     if let Some((Some(snapshot), _, took)) = &legacy.answer {
-        if let Some(plan) = snapshot.plan {
-            let mut text = format!(
-                "plan {}{} {} of ≤{} coins",
-                if plan.exact { "" } else { "≥" },
-                plan.batches,
-                if plan.batches == 1 {
-                    "batch"
-                } else {
-                    "batches"
-                },
-                snapshot.batch_max.unwrap_or(0)
-            );
-            if plan.outside > 0 {
-                text.push_str(&format!(", {} on no live shard", plan.outside));
-            }
-            parts.push(text);
-        }
-        if let Some((frame, left)) = coins::shields_open_at(snapshot) {
-            parts.push(format!("shields open at f{frame} (in {left} frames)"));
+        // The row's U/T leaves out the shielded count; the plan and when
+        // shields open are the Shield plan's, on screen with this row.
+        if snapshot.tally.shielded > 0 {
+            parts.push(format!("{} shielded", snapshot.tally.shielded));
         }
         parts.push(format!(
             "read {} pages in {:.1}s",
@@ -1029,7 +1012,8 @@ mod coins_render_tests {
         assert!(text.contains("Balances"));
         assert!(row("claimable").contains("◆ claimable"), "{text}");
         let legacy = row("legacy");
-        assert!(legacy.contains("4 unshielded · 6 shielded"), "{legacy}");
+        assert!(legacy.contains("4/10"), "{legacy}");
+        assert!(!legacy.contains("shielded ·"), "{legacy}");
         assert!(legacy.contains("◆ unshielded"), "{legacy}");
         assert!(
             text.contains("◆ Legacy coins: 4 unshielded, 6 shielded; 2 batches; ‹S› shields the"),
@@ -1050,7 +1034,7 @@ mod coins_render_tests {
         );
         let text = render_text(&mut m, 200, 24);
         assert!(
-            text.contains("Legacy coins: plan 2 batches of ≤96 coins, 1 on no live shard; read 8 pages in 6.2s"),
+            text.contains("Legacy coins: 6 shielded; read 8 pages in 6.2s"),
             "{text}"
         );
         assert!(
@@ -1062,6 +1046,70 @@ mod coins_render_tests {
     /// The middle panel follows the Balances selection and its title names
     /// it; a running shield stays on the legacy row and in Notifications
     /// with the claimable reward selected.
+    /// The legacy row counts the unshielded of all listed coins, `0`
+    /// once none is (its state says which), at every width.
+    #[test]
+    fn the_legacy_row_counts_unshielded_of_all_listed_coins() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.coins.cursor = 1;
+        for (unshielded, shielded, coins, state) in [
+            (4, 6, "4/10", "◆ unshielded"),
+            (0, 6, "0", "shielded"),
+            (0, 0, "0", "none"),
+        ] {
+            if let Some((Some(snapshot), _, _)) = m.coins.legacy.answer.as_mut() {
+                snapshot.tally.unshielded = unshielded;
+                snapshot.tally.shielded = shielded;
+            }
+            for width in [80, 120, 200] {
+                let text = render_text(&mut m, width, 40);
+                let row = text
+                    .lines()
+                    .find(|line| {
+                        line.trim_start_matches('│')
+                            .trim_start()
+                            .starts_with("legacy")
+                    })
+                    .unwrap_or_else(|| panic!("no legacy row in\n{text}"));
+                let cells: Vec<&str> = row
+                    .trim_matches('│')
+                    .split("  ")
+                    .map(str::trim)
+                    .filter(|cell| !cell.is_empty())
+                    .collect();
+                assert_eq!(cells[1], coins, "{width}\n{text}");
+                assert!(cells.contains(&state), "{width}\n{text}");
+            }
+        }
+    }
+
+    /// The legacy row's detail adds the shielded count the row's U/T
+    /// leaves out, and repeats neither the unshielded count nor the
+    /// Shield plan's figures.
+    #[test]
+    fn the_legacy_detail_adds_the_shielded_count() {
+        let mut m = loaded();
+        m.coins.cursor = 1;
+        for (unshielded, shielded) in [(4, 6), (0, 6), (0, 0)] {
+            if let Some((Some(snapshot), _, _)) = m.coins.legacy.answer.as_mut() {
+                snapshot.tally.unshielded = unshielded;
+                snapshot.tally.shielded = shielded;
+            }
+            let text = detail(&m);
+            assert!(
+                !text.contains("unshielded") && !text.contains("batch"),
+                "{text}"
+            );
+            if shielded > 0 {
+                let split = format!("Legacy coins: {shielded} shielded; read 8 pages");
+                assert!(text.starts_with(&split), "{text}");
+            } else {
+                assert!(text.starts_with("Legacy coins: read 8 pages"), "{text}");
+            }
+        }
+    }
+
     #[test]
     fn the_middle_panel_follows_the_selection_and_a_run_stays_visible() {
         use super::super::super::shield::{self, Progress};
