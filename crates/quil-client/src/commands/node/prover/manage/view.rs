@@ -4965,6 +4965,7 @@ mod tests {
         let mut a = row("01", 1, 1, 1, "", "");
         a.status = 2;
         a.manually_managed = false;
+        a.worker_id = 1;
         m.allocations = vec![a];
         for (status, enabled, disabled) in [
             (2, "‹P› pause", "‹U› resume"),
@@ -4993,6 +4994,7 @@ mod tests {
         let mut a = row("01", 1, 1, 1, "", "");
         a.status = 2;
         a.manually_managed = false;
+        a.worker_id = 1;
         m.allocations = vec![a];
         assert_eq!(
             worker_commands_line(&m).to_string(),

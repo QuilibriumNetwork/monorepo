@@ -1857,6 +1857,98 @@ mod epoch_end_tests {
     }
 }
 
+#[cfg(test)]
+mod lifecycle_request_tests {
+    use super::*;
+    use quil_execution::global_intrinsic::{conversions, prover_filter_ops, prover_ops, verify};
+
+    fn prover_tree(pubkey: &[u8]) -> quil_tries::VectorCommitmentTree {
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        quil_execution::global_schema::write_type(&mut tree, "prover:Prover").unwrap();
+        quil_execution::global_schema::write_field(&mut tree, "prover:Prover", "PublicKey", pubkey)
+            .unwrap();
+        tree
+    }
+
+    fn allocation_tree(status: u8) -> quil_tries::VectorCommitmentTree {
+        let class = "allocation:ProverAllocation";
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        quil_execution::global_schema::write_type(&mut tree, class).unwrap();
+        quil_execution::global_schema::write_field(&mut tree, class, "Status", &[status]).unwrap();
+        tree
+    }
+
+    /// Confirm, reject, pause and resume as the manager builds them, through
+    /// their wire encoding and the verifier every node runs.
+    #[test]
+    fn the_managers_requests_pass_the_network_verifier() {
+        let directory = tempfile::tempdir().unwrap();
+        let km = FileKeyManager::new(
+            directory.path().join("keys.yml"),
+            "",
+            "q-prover-key".into(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )
+        .unwrap();
+        km.create_falcon_key("q-prover-key").unwrap();
+        let pubkey = km
+            .get_signer_by_id("q-prover-key")
+            .unwrap()
+            .public_key()
+            .to_vec();
+        let tree = prover_tree(&pubkey);
+        let verifier = quil_crypto::DefaultKeyManager::new();
+        let filters = vec![vec![0x08; 32], vec![0x09; 35]];
+        let build = |action, filters: &[Vec<u8>]| {
+            build_request(&km, action, filters, 777)
+                .unwrap()
+                .request
+                .unwrap()
+        };
+
+        let Request::Confirm(pb) = build("Confirm", &filters) else {
+            panic!("a confirm");
+        };
+        let wire = conversions::prover_confirm_from_proto(&pb)
+            .to_canonical_bytes()
+            .unwrap();
+        let op = prover_ops::ProverConfirm::from_canonical_bytes(&wire).unwrap();
+        assert_eq!(op.filters, filters);
+        assert!(verify::verify_prover_confirm(&op, &tree, &verifier).unwrap());
+
+        let Request::Reject(pb) = build("Reject", &filters) else {
+            panic!("a reject");
+        };
+        let wire = conversions::prover_reject_from_proto(&pb)
+            .to_canonical_bytes()
+            .unwrap();
+        let op = prover_ops::ProverReject::from_canonical_bytes(&wire).unwrap();
+        assert_eq!(op.filters, filters);
+        assert!(verify::verify_prover_reject(&op, &tree, &verifier).unwrap());
+
+        let single = &filters[1..];
+        let Request::Pause(pb) = build("Pause", single) else {
+            panic!("a pause");
+        };
+        let wire = conversions::prover_pause_from_proto(&pb)
+            .to_canonical_bytes()
+            .unwrap();
+        let op = prover_filter_ops::ProverPause::from_canonical_bytes(&wire).unwrap();
+        let active = allocation_tree(1);
+        assert!(verify::verify_prover_pause(&op, &tree, Some(&active), &verifier).unwrap());
+
+        let Request::Resume(pb) = build("Resume", single) else {
+            panic!("a resume");
+        };
+        let wire = conversions::prover_resume_from_proto(&pb)
+            .to_canonical_bytes()
+            .unwrap();
+        let op = prover_filter_ops::ProverResume::from_canonical_bytes(&wire).unwrap();
+        let paused = allocation_tree(2);
+        assert!(verify::verify_prover_resume(&op, &tree, Some(&paused), &verifier).unwrap());
+    }
+}
+
 #[cfg(all(test, feature = "native-proof"))]
 mod recheck_tests {
     use super::*;

@@ -284,6 +284,12 @@ impl AllocationRow {
         .then_some(status)
     }
 
+    /// Whether the node decides this seat for an auto worker. A seat no worker
+    /// serves has no mode: the node confirms its leave as an orphan's.
+    pub fn auto_worker(&self) -> bool {
+        self.worker_id >= 0 && !self.manually_managed
+    }
+
     /// The Mode cell — `m` when the row's worker is managed by hand, `a` when
     /// the node assigns it. Cell values are lower-case; headers carry the
     /// capital.
@@ -1608,7 +1614,7 @@ impl Model {
                 }
                 a
             };
-            if !row.manually_managed {
+            if row.auto_worker() {
                 return match row.status {
                     2 => ["Pause".to_string()].into_iter().collect(),
                     3 => ["Resume".to_string()].into_iter().collect(),
