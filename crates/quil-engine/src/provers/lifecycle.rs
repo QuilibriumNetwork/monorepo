@@ -1886,9 +1886,16 @@ impl ProverLifecycle {
             return Ok(Vec::new());
         }
 
-        let _evaluation = self.evaluation_lock.lock().map_err(|_| {
-            quil_types::error::QuilError::Internal("lifecycle evaluation lock poisoned".into())
-        })?;
+        // The message loop's GLOBAL frame path also evaluates, so this wait
+        // can hold that task.
+        let _evaluation = {
+            let _wait = quil_types::thread_probe::section(
+                quil_types::thread_probe::Section::LifecycleEvaluationLockWait,
+            );
+            self.evaluation_lock.lock().map_err(|_| {
+                quil_types::error::QuilError::Internal("lifecycle evaluation lock poisoned".into())
+            })?
+        };
 
         // Between frames, before any gate: a draining worker that holds no
         // seat and no join stops.
@@ -1915,19 +1922,24 @@ impl ProverLifecycle {
         }
 
         // Gather inputs
-        let registry_view = registry.get_lifecycle_view(&self.prover_address, frame_number)?;
+        let registry_view = {
+            let _read = quil_types::thread_probe::section(
+                quil_types::thread_probe::Section::LifecycleRegistryView,
+            );
+            registry.get_lifecycle_view(&self.prover_address, frame_number)?
+        };
         let summaries = registry_view.summaries;
         let prover_info = registry_view.prover;
         let membership = registry_view.members;
         let reward_rings = registry_view.reward_rings;
-        let workers = worker_manager.range_workers()?;
+        let workers = worker_read(|| worker_manager.range_workers())?;
         let worker_view = WorkerView::from_workers(workers.clone());
         // Allocations the node may hold. Not `workers.len()`: records left
         // from a larger configuration still finish their obligations but add
         // no capacity.
-        let worker_capacity = worker_manager.allocation_capacity()?;
+        let worker_capacity = worker_read(|| worker_manager.allocation_capacity())?;
         // Workers above the configured count, and the seats they hold.
-        let draining_cores = worker_manager.draining_workers();
+        let draining_cores = worker_read(|| worker_manager.draining_workers());
         let draining_filters: std::collections::HashSet<Vec<u8>> = workers
             .iter()
             .filter(|w| draining_cores.contains(&w.core_id) && !w.filter.is_empty())
@@ -2378,10 +2390,10 @@ impl ProverLifecycle {
                 .collect();
             // A worker stopped to reopen its store cannot host its seat.
             let executions = crate::worker_execution::with_held_stores(
-                worker_manager.worker_execution(),
+                worker_read(|| worker_manager.worker_execution()),
                 &bound,
             );
-            let unanswered = worker_manager.unanswered_workers();
+            let unanswered = worker_read(|| worker_manager.unanswered_workers());
             let now = crate::worker_execution::now_ms();
             let mut hosting = self
                 .session_hosting
@@ -4251,11 +4263,11 @@ impl ProverLifecycle {
 /// Retire each draining worker that holds no seat and no pending join
 /// (`WorkerManager::retire_worker`); its store stays on disk.
 fn retire_drained_workers(worker_manager: &dyn WorkerManager) {
-    let draining = worker_manager.draining_workers();
+    let draining = worker_read(|| worker_manager.draining_workers());
     if draining.is_empty() {
         return;
     }
-    let Ok(workers) = worker_manager.range_workers() else {
+    let Ok(workers) = worker_read(|| worker_manager.range_workers()) else {
         return;
     };
     for worker in workers.iter().filter(|w| draining.contains(&w.core_id)) {
@@ -4268,6 +4280,16 @@ fn retire_drained_workers(worker_manager: &dyn WorkerManager) {
                 "draining worker could not be retired");
         }
     }
+}
+
+/// Run one worker manager read as a marked section: the node's managers
+/// answer each from their worker table's lock, so an evaluation can wait
+/// there (`draining_workers` and `allocation_capacity` default to a range
+/// read).
+fn worker_read<T>(read: impl FnOnce() -> T) -> T {
+    let _read =
+        quil_types::thread_probe::section(quil_types::thread_probe::Section::LifecycleWorkerRead);
+    read()
 }
 
 /// Preserve the exact scoring inputs, without treating a decoded ring zero
@@ -5722,6 +5744,128 @@ mod proposal_loop_tests {
         fn respawn_worker(&self, _: u32, _: &[u8]) -> Result<()> {
             Ok(())
         }
+    }
+
+    /// A worker manager whose workers cannot be listed until `gate` is free.
+    /// It keeps the default `draining_workers`, which lists the workers, as
+    /// the node's managers do.
+    struct GatedWorkers {
+        gate: std::sync::Mutex<()>,
+    }
+
+    impl WorkerManager for GatedWorkers {
+        fn set_worker_filter(&self, _: u32, _: &[u8], _: bool) -> Result<()> {
+            Ok(())
+        }
+        fn deallocate_worker(&self, _: u32) -> Result<()> {
+            Ok(())
+        }
+        fn check_workers_connected(&self) -> Result<Vec<u32>> {
+            Ok(Vec::new())
+        }
+        fn range_workers(&self) -> Result<Vec<WorkerInfo>> {
+            let _wait = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+            Err(quil_types::error::QuilError::Store("unreadable".into()))
+        }
+        fn respawn_worker(&self, _: u32, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run one evaluation on a thread carrying a master-task probe while the
+    /// caller holds what it waits on. Returns the section the watchdog would
+    /// name once it shows `expected` (else the last seen, after 10 s) and the
+    /// evaluation's thread; the caller releases the wait, joins, then
+    /// asserts, so a failed assertion poisons nothing the thread waits on.
+    fn section_named_while_blocked(
+        lc: Arc<ProverLifecycle>,
+        wm: Arc<dyn WorkerManager>,
+        reg: Arc<TestProverRegistry>,
+        expected: &str,
+    ) -> (Option<&'static str>, std::thread::JoinHandle<()>) {
+        use quil_types::thread_probe::{install, ThreadProbe};
+        lc.set_prover_root_verified_frame(100);
+        let probe = ThreadProbe::new();
+        let on_thread = probe.clone();
+        let worker = std::thread::spawn(move || {
+            let _installed = install(on_thread);
+            let _ = lc.evaluate(100, 50_000, reg.as_ref(), wm.as_ref());
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut seen = None;
+        while std::time::Instant::now() < deadline {
+            seen = probe.snapshot().section.map(|m| m.section.label());
+            if seen == Some(expected) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        (seen, worker)
+    }
+
+    /// An evaluation waiting for the evaluation lock another thread holds is
+    /// marked as that wait, not as the unmarked evaluation around it.
+    #[test]
+    fn an_evaluation_waiting_for_its_lock_is_marked() {
+        let address = vec![0xCD; 32];
+        let wm: Arc<dyn WorkerManager> = Arc::new(UnlistableWorkers);
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), Vec::new()));
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        let expected = "prover lifecycle evaluation lock wait";
+        let held = lc.evaluation_lock.lock().unwrap();
+        let (seen, worker) = section_named_while_blocked(lc.clone(), wm, reg, expected);
+        drop(held);
+        worker.join().unwrap();
+        assert_eq!(
+            seen,
+            Some(expected),
+            "the blocked evaluation names its wait"
+        );
+    }
+
+    /// An evaluation waiting for the registry's lifecycle view is marked.
+    #[test]
+    fn an_evaluation_waiting_for_the_registry_view_is_marked() {
+        let address = vec![0xCD; 32];
+        let wm: Arc<dyn WorkerManager> = Arc::new(UnlistableWorkers);
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), Vec::new()));
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        let expected = "prover registry lifecycle view";
+        let held = reg.hold_provers();
+        let (seen, worker) = section_named_while_blocked(lc, wm, reg.clone(), expected);
+        drop(held);
+        worker.join().unwrap();
+        assert_eq!(
+            seen,
+            Some(expected),
+            "the blocked evaluation names its wait"
+        );
+    }
+
+    /// An evaluation waiting for the worker manager is marked. Its first
+    /// read is the drained-worker retirement's, before any gate.
+    #[test]
+    fn an_evaluation_waiting_for_the_worker_read_is_marked() {
+        let address = vec![0xCD; 32];
+        let gated = Arc::new(GatedWorkers {
+            gate: std::sync::Mutex::new(()),
+        });
+        let wm: Arc<dyn WorkerManager> = gated.clone();
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), Vec::new()));
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        let expected = "worker manager read";
+        let held = gated.gate.lock().unwrap();
+        let (seen, worker) = section_named_while_blocked(lc, wm, reg, expected);
+        drop(held);
+        worker.join().unwrap();
+        assert_eq!(
+            seen,
+            Some(expected),
+            "the blocked evaluation names its wait"
+        );
     }
 
     /// Evaluations that keep failing decide no joins, confirms or leaves; the
