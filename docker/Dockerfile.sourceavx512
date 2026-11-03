@@ -206,6 +206,9 @@ RUN apt-get update && apt-get install -y \
     libmpfr6 \
     && rm -rf /var/lib/apt/lists/*
 
+# Source builds aren't signed, so signature check is off for node and qclient.
+ENV QUILIBRIUM_SIGNATURE_CHECK=false
+
 ARG NODE_VERSION
 ARG GIT_REPO
 ARG GIT_BRANCH
