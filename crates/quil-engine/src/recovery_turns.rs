@@ -796,6 +796,11 @@ impl RecoveryTurns {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// How long the longest waiter has waited for a turn.
+    pub(crate) fn longest_wait(&self) -> Duration {
+        self.lock().queue.load(Instant::now()).longest_wait
+    }
+
     /// Workers waiting for a turn.
     #[cfg(test)]
     pub(crate) fn waiting(&self) -> usize {
