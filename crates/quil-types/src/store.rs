@@ -68,6 +68,14 @@ pub trait KvDb: Send + Sync {
         let _ = (start, end, min_file_bytes);
         Ok(true)
     }
+    /// Bytes of the store's live table files: all of them, or with `range`
+    /// `[start, end)` those whose keys overlap it (an upper bound on what the
+    /// range takes: a file there may also hold keys beside it). `0` where
+    /// the store keeps no table files.
+    fn live_file_bytes(&self, range: Option<(&[u8], &[u8])>) -> Result<u64> {
+        let _ = range;
+        Ok(0)
+    }
     fn compact_all(&self) -> Result<()>;
     fn close(&self) -> Result<()>;
     fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()>;

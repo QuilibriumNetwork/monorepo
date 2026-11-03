@@ -713,6 +713,15 @@ mod read_only_tests {
     }
 }
 
+/// Whether `file`'s keys span into `[start, end)`: its first key is below
+/// `end` and its last at or past `start`.
+fn file_overlaps(file: &rocksdb::LiveFile, start: &[u8], end: &[u8]) -> bool {
+    match (file.start_key.as_deref(), file.end_key.as_deref()) {
+        (Some(first), Some(last)) => first < end && last >= start,
+        _ => false,
+    }
+}
+
 impl store::KvDb for RocksDb {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.db
@@ -761,13 +770,21 @@ impl store::KvDb for RocksDb {
             .db
             .live_files()
             .map_err(|e| QuilError::Store(e.to_string()))?;
-        Ok(files.iter().any(|file| {
-            file.size as u64 >= min_file_bytes
-                && match (file.start_key.as_deref(), file.end_key.as_deref()) {
-                    (Some(first), Some(last)) => first < end && last >= start,
-                    _ => false,
-                }
-        }))
+        Ok(files
+            .iter()
+            .any(|file| file.size as u64 >= min_file_bytes && file_overlaps(file, start, end)))
+    }
+
+    fn live_file_bytes(&self, range: Option<(&[u8], &[u8])>) -> Result<u64> {
+        let files = self
+            .db
+            .live_files()
+            .map_err(|e| QuilError::Store(e.to_string()))?;
+        Ok(files
+            .iter()
+            .filter(|file| range.is_none_or(|(start, end)| file_overlaps(file, start, end)))
+            .map(|file| file.size as u64)
+            .sum())
     }
 
     fn compact_reclaiming(&self, start: &[u8], end: &[u8], min_file_bytes: u64) -> Result<bool> {

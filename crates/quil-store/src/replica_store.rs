@@ -71,6 +71,10 @@ const CHUNKS_PER_SCAN: u64 = 256;
 /// replica as one data block ([`reclaim`]): table
 /// files are cut at 64 MB, but no value is split across blocks or files.
 const WHOLE_REPLICA_FILE_BYTES: u64 = 128 << 20;
+/// Longest a compaction of evicted replicas runs before it warns
+/// ([`compact_evicted`]): an epoch evicts once per store, and its compaction
+/// reads about one epoch of a store's replicas.
+const EVICTED_COMPACTION_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
 /// What the cached leaf records ([`ReplicaStore::get_hash_leaf`]) may hold:
 /// a 1 GiB replica's cap is about 2 MiB.
 const LEAF_CACHE_BYTES: usize = 128 << 20;
@@ -220,7 +224,6 @@ impl HashLeaf {
 /// compaction may leave a bottommost file holding one for days. A compaction
 /// reads the block once: about a replica in memory, for seconds.
 fn reclaim(db: &Arc<dyn KvDb>, lo: &[u8], hi: &[u8], what: &'static str) {
-    static RECLAIMING: Mutex<()> = Mutex::new(());
     let _one = RECLAIMING.lock().unwrap_or_else(PoisonError::into_inner);
     let started = std::time::Instant::now();
     match db.compact_reclaiming(&lo, &hi, WHOLE_REPLICA_FILE_BYTES) {
@@ -237,6 +240,89 @@ fn reclaim(db: &Arc<dyn KvDb>, lo: &[u8], hi: &[u8], what: &'static str) {
             "compacting storage replicas stored whole failed: lookups beside them keep reading \
              them"),
     }
+}
+
+/// One compaction of replica keys at a time in this process ([`reclaim`],
+/// [`compact_evicted`]): each reads all it covers, up to an epoch of a
+/// store's replicas.
+static RECLAIMING: Mutex<()> = Mutex::new(());
+
+/// Compact the evicted chunks `[lo, hi)` of the replicas below `keep_from`
+/// in `store`, logging its start and end, and a warning once it runs past
+/// [`EVICTED_COMPACTION_BUDGET`]. The lines give the bytes of the table
+/// files overlapping the range (`range_mb`: files bordering it count whole)
+/// and of the whole store (which the next epoch's encoding may be filling
+/// meanwhile): a range still as large after its compaction is held by a
+/// snapshot or iterator older than the eviction.
+fn compact_evicted(db: &Arc<dyn KvDb>, lo: &[u8], hi: &[u8], keep_from: u64, store: &str) {
+    let _one = RECLAIMING.lock().unwrap_or_else(PoisonError::into_inner);
+    let failed = |error: &QuilError, ms: u64| {
+        tracing::warn!(store, below_epoch = keep_from, ms, %error, scope = "this node",
+            action = "check this node's disk and store health; the next epoch's eviction \
+                      compacts again",
+            "compacting evicted storage replicas failed: their disk space stays taken until \
+             RocksDB compacts there")
+    };
+    let measure = || -> Result<(u64, u64)> {
+        Ok((
+            db.live_file_bytes(Some((lo, hi)))?,
+            db.live_file_bytes(None)?,
+        ))
+    };
+    let (in_range, before) = match measure() {
+        Ok((0, _)) => return,
+        Ok(bytes) => bytes,
+        Err(error) => return failed(&error, 0),
+    };
+    tracing::info!(
+        store,
+        below_epoch = keep_from,
+        range_mb = in_range >> 20,
+        store_mb = before >> 20,
+        budget_s = EVICTED_COMPACTION_BUDGET.as_secs(),
+        "compacting evicted storage replicas: their disk space returns when it ends"
+    );
+    let started = std::time::Instant::now();
+    let (finished, finishing) = std::sync::mpsc::channel::<()>();
+    let compacted = std::thread::scope(|scope| {
+        // Only a warning: a compaction cannot be cut short.
+        let _ = std::thread::Builder::new()
+            .name("replica-reclaim-watch".into())
+            .spawn_scoped(scope, move || {
+                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                    finishing.recv_timeout(EVICTED_COMPACTION_BUDGET)
+                {
+                    tracing::warn!(
+                        store,
+                        below_epoch = keep_from,
+                        budget_s = EVICTED_COMPACTION_BUDGET.as_secs(),
+                        scope = "this node",
+                        action = "check this node's disk load; it keeps running and logs its \
+                                  end",
+                        "compacting evicted storage replicas is running past its budget: \
+                         their disk space returns when it ends"
+                    );
+                }
+            });
+        let compacted = db.compact_reclaiming(lo, hi, 0);
+        drop(finished);
+        compacted
+    });
+    let ms = started.elapsed().as_millis() as u64;
+    let (in_range_after, after) = match compacted.and_then(|_| measure()) {
+        Ok(bytes) => bytes,
+        Err(error) => return failed(&error, ms),
+    };
+    tracing::info!(
+        store,
+        below_epoch = keep_from,
+        range_mb_before = in_range >> 20,
+        range_mb_after = in_range_after >> 20,
+        store_mb_before = before >> 20,
+        store_mb_after = after >> 20,
+        ms,
+        "compacted evicted storage replicas"
+    );
 }
 
 /// Threads of this module's still running ([`wait_for_background_work`]).
@@ -447,6 +533,19 @@ type LegacyLookups = HashMap<LeafCacheKey, (std::sync::Weak<dyn KvDb>, LegacyLoo
 fn legacy_lookups() -> std::sync::MutexGuard<'static, LegacyLookups> {
     static LOOKUPS: OnceLock<Mutex<LegacyLookups>> = OnceLock::new();
     LOOKUPS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+type EvictedBelow = HashMap<usize, (std::sync::Weak<dyn KvDb>, u64)>;
+
+/// The epoch each open store was last evicted below in this process
+/// ([`ReplicaStore::evict_below_epoch_once`]), by store. Each holds its
+/// store weakly, as [`LeafCache`] does.
+fn evicted_below() -> std::sync::MutexGuard<'static, EvictedBelow> {
+    static EVICTED: OnceLock<Mutex<EvictedBelow>> = OnceLock::new();
+    EVICTED
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -895,6 +994,34 @@ impl ReplicaStore {
     /// Drop every replica for an epoch strictly below `keep_from` — called
     /// after re-encoding for a new epoch so stale replicas don't accumulate.
     pub fn evict_below_epoch(&self, keep_from: u64) -> Result<()> {
+        self.evict(keep_from, "unnamed")
+    }
+
+    /// [`Self::evict_below_epoch`], unless this store was already evicted
+    /// below `keep_from` or a later epoch in this process; whether it
+    /// evicted. A boundary then writes its range deletions, and compacts
+    /// them, once per store, however often confirmations ask (a
+    /// reconfirmation asks every few frames until it publishes). `store`
+    /// names it in the compaction's lines. A failed eviction is not
+    /// recorded: the next call tries again.
+    pub fn evict_below_epoch_once(&self, keep_from: u64, store: &str) -> Result<bool> {
+        if keep_from == 0 {
+            return Ok(false);
+        }
+        let mut evicted = evicted_below();
+        let id = self.identity();
+        if let Some((open, below)) = evicted.get(&id) {
+            if open.strong_count() > 0 && *below >= keep_from {
+                return Ok(false);
+            }
+        }
+        self.evict(keep_from, store)?;
+        evicted.retain(|_, (open, _)| open.strong_count() > 0);
+        evicted.insert(id, (Arc::downgrade(&self.db), keep_from));
+        Ok(true)
+    }
+
+    fn evict(&self, keep_from: u64, store: &str) -> Result<()> {
         let mut lo = Vec::with_capacity(9);
         lo.push(STORAGE_REPLICA);
         lo.extend_from_slice(&0u64.to_be_bytes());
@@ -915,7 +1042,46 @@ impl ReplicaStore {
             self.db
                 .delete_range(&meta_key(kind, 0, &[]), &meta_key(kind, keep_from, &[]))?;
         }
+        self.compact_evicted_in_background(keep_from, store);
         Ok(())
+    }
+
+    /// Compact the evicted epochs' chunks ([`HASH_NODES`] keys below
+    /// `keep_from`, nearly all a replica takes) off the calling thread. A
+    /// range deletion only hides them: until a compaction through the
+    /// bottommost level reaches them they keep their space, an epoch of a
+    /// store's replicas, for as long as automatic compaction leaves those
+    /// files alone (days on a regular node).
+    fn compact_evicted_in_background(&self, keep_from: u64, store: &str) {
+        let lo = meta_key(HASH_NODES, 0, &[]);
+        let hi = meta_key(HASH_NODES, keep_from, &[]);
+        match self
+            .db
+            .live_file_bytes(Some((lo.as_slice(), hi.as_slice())))
+        {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(store, below_epoch = keep_from, %error,
+                    "compaction of evicted storage replicas not started");
+                return;
+            }
+        }
+        let db = self.db.clone();
+        let name = store.to_owned();
+        let running = Background::start();
+        let spawned = std::thread::Builder::new()
+            .name("replica-reclaim".into())
+            .spawn(move || {
+                let _running = running;
+                compact_evicted(&db, &lo, &hi, keep_from, &name);
+                // The store may close here: before the thread is counted out.
+                drop(db);
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(store, below_epoch = keep_from, %error,
+                "compaction of evicted storage replicas not started");
+        }
     }
 
     /// Iterate `(leaf_id, replica)` for every leaf stored under `epoch`. Used by
@@ -1180,6 +1346,62 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
         assert_eq!(s.get(9, b"old").unwrap(), None);
+    }
+
+    /// Bytes of `db`'s live table files.
+    fn table_bytes(db: &crate::RocksDb) -> u64 {
+        let files = db.inner().live_files().unwrap();
+        files.iter().map(|file| file.size as u64).sum()
+    }
+
+    /// Evicted epochs' chunks leave the table files: a range deletion only
+    /// hid them, and nothing compacted the chunk range, so on a regular
+    /// node they kept their space for days (about 10 GiB on one).
+    #[test]
+    fn eviction_compacts_the_evicted_chunks_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::RocksDb::open(dir.path()).unwrap());
+        let s = ReplicaStore::new(db.clone());
+        // Random, as a replica is: stored uncompressed.
+        let mut x = 0x2545_F491u32;
+        let mut replica = |nodes: usize| -> Vec<u8> {
+            (0..nodes * NODE_BYTES / 4)
+                .flat_map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    x.to_le_bytes()
+                })
+                .collect()
+        };
+        let nodes = 128 * CHUNK_NODES as usize;
+        let replica_bytes = (nodes * NODE_BYTES) as u64;
+        for epoch in [3, 4, 6] {
+            let value = replica(nodes);
+            s.put_hash(epoch, b"leaf", &value, &[1u8; 64], &[2u8; 96])
+                .unwrap();
+        }
+        db.inner().flush().unwrap();
+        let before = table_bytes(&db);
+        assert!(
+            before >= 3 * replica_bytes,
+            "the control: three replicas take {before} bytes"
+        );
+        s.evict_below_epoch(5).unwrap();
+        assert_eq!(
+            wait_for_background_work(std::time::Duration::from_secs(120)),
+            0
+        );
+        let after = table_bytes(&db);
+        assert!(
+            after < before - 2 * replica_bytes + replica_bytes / 8,
+            "the two evicted replicas still take space: {before} bytes before, {after} after"
+        );
+        assert!(
+            s.db.get(&chunk_key(6, b"leaf", 0)).unwrap().is_some(),
+            "the kept epoch's chunks stay"
+        );
+        assert!(s.db.get(&chunk_key(4, b"leaf", 0)).unwrap().is_none());
     }
 
     #[test]
