@@ -73,7 +73,7 @@ jobs:
     needs: scope
     if: needs.scope.outputs.run == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           lfs: true
 
@@ -130,7 +130,7 @@ jobs:
     needs: scope
     if: needs.scope.outputs.run == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           lfs: true
 
@@ -179,7 +179,7 @@ jobs:
       matrix:
         partition: [1, 2, 3]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           lfs: true
 
@@ -269,7 +269,7 @@ jobs:
     needs: scope
     if: needs.scope.outputs.run == 'true' && github.event_name != 'merge_group'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           lfs: true
 
@@ -359,7 +359,7 @@ jobs:
             quil_platform: arm64_macos
     runs-on: ${{ matrix.runs-on }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           lfs: true
 

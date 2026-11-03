@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_transport(false)
         .emit_rerun_if_changed(true)
         .file_descriptor_set_path(&descriptor_path)
-        .compile_protos(protos, &[proto_dir.clone()])?;
+        .compile_protos(protos, std::slice::from_ref(&proto_dir))?;
 
     Ok(())
 }
