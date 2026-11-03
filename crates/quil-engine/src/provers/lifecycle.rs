@@ -299,16 +299,31 @@ pub struct AllocationBuckets {
     /// (`EffectiveStatus::ExpiredEpoch`) — must re-confirm fresh leaf roots
     /// for the current epoch to keep counting + avoid the storage audit.
     pub expired_epoch: Vec<Vec<u8>>,
+    /// Expired joins and leaves the network still refuses to re-join (until
+    /// `REJOIN_WINDOW_FRAMES` after their join frame). No worker serves them,
+    /// so they stay out of `all_ours` and hold no worker slot; they only leave
+    /// the join candidates ([`Self::join_excluded`]).
+    pub rejoin_blocked: Vec<Vec<u8>>,
 }
 
 impl AllocationBuckets {
+    /// The filters no join may name: those we hold, and those still inside
+    /// their rejoin window.
+    pub fn join_excluded(&self) -> Vec<Vec<u8>> {
+        self.all_ours
+            .iter()
+            .chain(&self.rejoin_blocked)
+            .cloned()
+            .collect()
+    }
+
     /// Partition a prover's allocation list by effective status at
     /// `frame_number`. Terminal and expired statuses (Rejected,
     /// Kicked, ExpiredJoining, ExpiredLeaving, Unknown) are
-    /// excluded from every bucket — the lifecycle treats them as
-    /// "doesn't exist," which prevents `plan_leaves` from
-    /// proposing a Leave for an allocation the network already
-    /// considers terminal.
+    /// excluded from every bucket but `rejoin_blocked` — the
+    /// lifecycle treats them as "doesn't exist," which prevents
+    /// `plan_leaves` from proposing a Leave for an allocation the
+    /// network already considers terminal.
     pub fn from_allocations(
         allocations: &[quil_types::consensus::ProverAllocationInfo],
         frame_number: u64,
@@ -396,15 +411,20 @@ impl AllocationBuckets {
                 // the one filter it cannot take, which after split/merge churn
                 // left whole nodes carrying no shard at all. So keep it out of
                 // every ACTION bucket exactly as before (no Leave for something
-                // already terminal on chain) but keep it in `all_ours` until the
-                // window passes, so those workers go to a shard it CAN join.
+                // already terminal on chain) but keep it out of the join
+                // candidates until the window passes, so those workers go to a
+                // shard it CAN join. Not in `all_ours`: no worker serves it, and
+                // counting it against capacity held the very worker it should
+                // redirect, so the node proposed no join anywhere.
                 EffectiveStatus::ExpiredJoining | EffectiveStatus::ExpiredLeaving => {
                     if frame_number
                         < alloc.join_frame_number.saturating_add(
                             quil_execution::global_intrinsic::verify::REJOIN_WINDOW_FRAMES,
                         )
                     {
-                        buckets.all_ours.push(alloc.confirmation_filter.clone());
+                        buckets
+                            .rejoin_blocked
+                            .push(alloc.confirmation_filter.clone());
                     }
                 }
                 // Terminal / past-grace. Treat as "doesn't exist":
@@ -557,6 +577,8 @@ pub struct ProverLifecycle {
     evaluation_outage: std::sync::Mutex<crate::outage::Outage>,
     /// The contents and time of the last `lifecycle allocation buckets` line.
     buckets_logged: std::sync::Mutex<Option<(String, std::time::Instant)>>,
+    /// Whether free workers are waiting on capacity; see [`capacity_wait_note`].
+    capacity_wait: std::sync::Mutex<Option<CapacityWait>>,
     /// Halt-risk leave penalty notices already logged (#976).
     seniority_guard: std::sync::Mutex<SeniorityGuard>,
     /// How long each bound seat's worker has not hosted the committee
@@ -760,6 +782,7 @@ impl ProverLifecycle {
             // Evaluated once per GLOBAL frame: three failed frames in a row.
             evaluation_outage: std::sync::Mutex::new(crate::outage::Outage::begin_after(3)),
             buckets_logged: std::sync::Mutex::new(None),
+            capacity_wait: std::sync::Mutex::new(None),
             seniority_guard: Default::default(),
             session_hosting: Default::default(),
             initial_sync_complete: AtomicBool::new(false),
@@ -2215,6 +2238,9 @@ impl ProverLifecycle {
             .as_ref()
             .map(|p| AllocationBuckets::from_allocations(&p.allocations, frame_number))
             .unwrap_or_default();
+        // Join candidates skip the seats still inside their rejoin window as
+        // well as those we hold; only the held ones count against capacity.
+        let join_excluded_filters = buckets.join_excluded();
         let joining_filters = buckets.joining;
         let active_filters = buckets.active;
         let leaving_filters = buckets.leaving;
@@ -2434,13 +2460,13 @@ impl ProverLifecycle {
             proposal_grid_filters(&shards_store_filters, &current_summaries, &remote_shards);
         let mut proposal_descriptors = build_proposal_descriptors(
             &current_summaries,
-            &all_our_filters,
+            &join_excluded_filters,
             &shard_sizes_snapshot,
             &proposal_grid,
         );
         // Recently-rejected join backoff: drop any shard that rejected our
         // join within the last `JOIN_REJECT_BACKOFF_FRAMES`. A Rejected
-        // allocation is terminal so it's excluded from `all_our_filters`
+        // allocation is terminal so it's excluded from `join_excluded_filters`
         // and would otherwise reappear as a join candidate immediately —
         // producing the Joining↔Rejected oscillation that saturates
         // workers with never-confirming pending joins. Backing it off
@@ -2754,6 +2780,27 @@ impl ProverLifecycle {
             )
             .collect();
         let allow_proposals = !assignable_worker_ids.is_empty();
+        let note = self
+            .capacity_wait
+            .lock()
+            .map(|mut state| {
+                capacity_wait_note(
+                    &mut state,
+                    &CapacityCounts {
+                        frame: frame_number,
+                        free_workers: free_worker_ids.len(),
+                        assignable_workers: assignable_worker_ids.len(),
+                        occupied,
+                        unbound_held: unbound_held_count,
+                        worker_capacity,
+                    },
+                    std::time::Instant::now(),
+                )
+            })
+            .unwrap_or(None);
+        if let Some(note) = note {
+            log_capacity_wait(&note);
+        }
 
         // Go's canPropose (cooldown + readiness + halt). The
         // readiness snapshot was captured at the top of evaluate;
@@ -3184,7 +3231,7 @@ impl ProverLifecycle {
                 .iter()
                 .filter(|s| {
                     !s.filter.is_empty()
-                        && !all_our_filters.contains(&s.filter)
+                        && !join_excluded_filters.contains(&s.filter)
                         && shard_sizes_snapshot.get(&s.filter).copied().unwrap_or(0) == 0
                 })
                 .count();
@@ -4980,6 +5027,138 @@ fn build_decide_descriptors(
         .collect()
 }
 
+/// How often a continuing capacity wait is logged again.
+const CAPACITY_WAIT_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A capacity wait in progress: free workers, but no join may be proposed.
+#[derive(Debug)]
+struct CapacityWait {
+    since_frame: u64,
+    since: std::time::Instant,
+    logged: std::time::Instant,
+}
+
+/// The counts one evaluation saw when deciding whether joins may be proposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CapacityCounts {
+    frame: u64,
+    free_workers: usize,
+    assignable_workers: usize,
+    occupied: usize,
+    unbound_held: usize,
+    worker_capacity: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CapacityWaitNote {
+    Began(CapacityWaitDetail),
+    Continues(CapacityWaitDetail, u64),
+    Ended {
+        secs: u64,
+        frames: u64,
+        outcome: &'static str,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CapacityWaitDetail {
+    counts: CapacityCounts,
+    reason: &'static str,
+    expected: &'static str,
+}
+
+/// Whether the planner has free workers yet may propose no join, and the line
+/// to log: one on entering the wait, a repeat every [`CAPACITY_WAIT_LOG_EVERY`]
+/// while it lasts, one when it ends.
+fn capacity_wait_note(
+    state: &mut Option<CapacityWait>,
+    c: &CapacityCounts,
+    now: std::time::Instant,
+) -> Option<CapacityWaitNote> {
+    let waiting = c.free_workers > 0 && c.assignable_workers == 0;
+    if !waiting {
+        return state.take().map(|w| CapacityWaitNote::Ended {
+            secs: now.duration_since(w.since).as_secs(),
+            frames: c.frame.saturating_sub(w.since_frame),
+            outcome: if c.free_workers == 0 {
+                "no worker is free any more"
+            } else {
+                "free workers may take joins again"
+            },
+        });
+    }
+    let (reason, expected) = if c.unbound_held >= c.free_workers {
+        (
+            "seats we hold with no worker bound to them take every free worker",
+            "the free workers are bound to those seats; joins resume once a held seat ends \
+             or the worker count rises",
+        )
+    } else {
+        (
+            "every worker slot is occupied by a seat we hold or a worker's bound shard",
+            "joins resume once a held seat ends or the worker count rises",
+        )
+    };
+    let detail = CapacityWaitDetail {
+        counts: *c,
+        reason,
+        expected,
+    };
+    match state {
+        None => {
+            *state = Some(CapacityWait {
+                since_frame: c.frame,
+                since: now,
+                logged: now,
+            });
+            Some(CapacityWaitNote::Began(detail))
+        }
+        Some(w) if now.duration_since(w.logged) >= CAPACITY_WAIT_LOG_EVERY => {
+            w.logged = now;
+            Some(CapacityWaitNote::Continues(
+                detail,
+                now.duration_since(w.since).as_secs(),
+            ))
+        }
+        Some(_) => None,
+    }
+}
+
+fn log_capacity_wait(note: &CapacityWaitNote) {
+    let (d, waited) = match note {
+        CapacityWaitNote::Began(d) => (d, 0),
+        CapacityWaitNote::Continues(d, secs) => (d, *secs),
+        CapacityWaitNote::Ended {
+            secs,
+            frames,
+            outcome,
+        } => {
+            info!(
+                secs,
+                frames,
+                outcome,
+                scope = "local",
+                "free workers no longer wait for capacity"
+            );
+            return;
+        }
+    };
+    let c = &d.counts;
+    info!(
+        frame = c.frame,
+        free_workers = c.free_workers,
+        occupied = c.occupied,
+        unbound_held = c.unbound_held,
+        worker_capacity = c.worker_capacity,
+        waited_secs = waited,
+        scope = "local",
+        action = "wait",
+        reason = d.reason,
+        expected = d.expected,
+        "no join is proposed: free workers wait for capacity"
+    );
+}
+
 /// How often an unchanged `lifecycle allocation buckets` line repeats.
 const BUCKETS_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
 
@@ -5133,17 +5312,21 @@ mod buckets_tests {
             quil_types::consensus::EffectiveStatus::ExpiredJoining
         );
 
-        // Inside the chain's window: owned, so the proposer leaves it alone.
+        // Inside the chain's window: no join candidate, so the proposer
+        // leaves it alone.
         assert!(
             expired_at < join_frame + window,
             "fixture must sit inside the window"
         );
         let blocked = AllocationBuckets::from_allocations(&[allocation.clone()], expired_at);
         assert_eq!(
-            blocked.all_ours.len(),
-            1,
-            "an expired join the chain still blocks stays owned"
+            blocked.join_excluded(),
+            vec![vec![0x09]],
+            "an expired join the chain still blocks is no join candidate"
         );
+        assert_eq!(blocked.rejoin_blocked, vec![vec![0x09]]);
+        // ...nor a seat we hold: no worker serves it, so it takes no slot.
+        assert!(blocked.all_ours.is_empty());
         // ...but it is not an ACTION: no re-confirm, no Leave for something the
         // chain already treats as gone.
         assert!(blocked.joining.is_empty());
@@ -5154,7 +5337,7 @@ mod buckets_tests {
         // candidate again.
         let free = AllocationBuckets::from_allocations(&[allocation], join_frame + window);
         assert!(
-            free.all_ours.is_empty(),
+            free.join_excluded().is_empty(),
             "past the window the shard is re-joinable"
         );
 
@@ -5205,7 +5388,7 @@ mod buckets_tests {
         .into_iter()
         .collect();
 
-        let ours = AllocationBuckets::from_allocations(&[blocked.clone()], at).all_ours;
+        let ours = AllocationBuckets::from_allocations(&[blocked.clone()], at).join_excluded();
         let descriptors = super::build_proposal_descriptors(&summaries, &ours, &shard_sizes, &[]);
         assert!(
             descriptors.iter().all(|d| d.filter != blocked_filter),
@@ -5231,7 +5414,7 @@ mod buckets_tests {
         // Past the window the network accepts a re-join, so it is a candidate
         // again and nothing is permanently forfeited.
         let later = join_frame + window;
-        let ours_later = AllocationBuckets::from_allocations(&[blocked], later).all_ours;
+        let ours_later = AllocationBuckets::from_allocations(&[blocked], later).join_excluded();
         assert!(ours_later.is_empty());
         let reopened =
             super::build_proposal_descriptors(&summaries, &ours_later, &shard_sizes, &[]);
@@ -5611,6 +5794,99 @@ mod buckets_tests {
         assert!(
             b.expired_epoch.is_empty(),
             "global empty-filter alloc must never re-confirm",
+        );
+    }
+
+    fn capacity_counts(
+        frame: u64,
+        free_workers: usize,
+        assignable_workers: usize,
+        unbound_held: usize,
+    ) -> CapacityCounts {
+        CapacityCounts {
+            frame,
+            free_workers,
+            assignable_workers,
+            occupied: 2,
+            unbound_held,
+            worker_capacity: 2,
+        }
+    }
+
+    /// Seats we hold that no worker serves yet take every free worker, so no
+    /// join may be proposed. The planner says so once with the counts, repeats
+    /// on a bound, and logs the end when the workers are bound to the seats.
+    #[test]
+    fn a_free_worker_owed_to_a_held_seat_is_logged_as_a_capacity_wait() {
+        let start = std::time::Instant::now();
+        let later = |s| start + std::time::Duration::from_secs(s);
+        let mut state = None;
+        let Some(CapacityWaitNote::Began(d)) =
+            capacity_wait_note(&mut state, &capacity_counts(100, 1, 0, 1), start)
+        else {
+            panic!("entering the wait logs");
+        };
+        assert_eq!(d.counts, capacity_counts(100, 1, 0, 1));
+        assert!(d.reason.contains("no worker bound"), "{}", d.reason);
+        assert!(d.expected.contains("joins resume"), "{}", d.expected);
+        assert_eq!(
+            capacity_wait_note(&mut state, &capacity_counts(105, 1, 0, 1), later(599)),
+            None,
+            "quiet inside the interval"
+        );
+        assert!(matches!(
+            capacity_wait_note(&mut state, &capacity_counts(160, 1, 0, 1), later(600)),
+            Some(CapacityWaitNote::Continues(_, 600))
+        ));
+        assert_eq!(
+            capacity_wait_note(&mut state, &capacity_counts(170, 0, 0, 0), later(660)),
+            Some(CapacityWaitNote::Ended {
+                secs: 660,
+                frames: 70,
+                outcome: "no worker is free any more",
+            })
+        );
+        assert!(state.is_none());
+        assert_eq!(
+            capacity_wait_note(&mut state, &capacity_counts(180, 0, 0, 0), later(670)),
+            None,
+            "nothing more once the wait is over"
+        );
+    }
+
+    /// At the worker count with every seat served, a free worker (one above
+    /// the count) gets no join: the slots are full. The line names that, and
+    /// its end says joins may be proposed again.
+    #[test]
+    fn a_free_worker_at_a_full_worker_count_is_logged_until_a_slot_opens() {
+        let start = std::time::Instant::now();
+        let mut state = None;
+        let Some(CapacityWaitNote::Began(d)) =
+            capacity_wait_note(&mut state, &capacity_counts(100, 1, 0, 0), start)
+        else {
+            panic!("entering the wait logs");
+        };
+        assert!(d.reason.contains("every worker slot"), "{}", d.reason);
+        assert_eq!(
+            capacity_wait_note(
+                &mut state,
+                &capacity_counts(130, 1, 1, 0),
+                start + std::time::Duration::from_secs(300)
+            ),
+            Some(CapacityWaitNote::Ended {
+                secs: 300,
+                frames: 30,
+                outcome: "free workers may take joins again",
+            })
+        );
+        assert_eq!(
+            capacity_wait_note(
+                &mut state,
+                &capacity_counts(0, 0, 0, 0),
+                start + std::time::Duration::from_secs(310)
+            ),
+            None,
+            "a node with nothing free logs nothing"
         );
     }
 
@@ -10652,6 +10928,65 @@ mod proposal_loop_tests {
             "5 idle workers less 3 allocations already owed a slot = 2; got \
              {} in {:?}",
             proposed, actions
+        );
+    }
+
+    /// A seat inside its rejoin window blocks a join of its own shard and
+    /// nothing else. With short epochs it reads expired while the chain still
+    /// refuses a re-join; no worker serves it, so a node at its worker count
+    /// with only that seat still has a free worker and must spend it on
+    /// another shard. Counting the seat against capacity left the worker idle
+    /// until the window passed. The blocked shard is at halt risk, so it would
+    /// be picked first were it a candidate.
+    #[test]
+    fn a_rejoin_window_seat_blocks_only_its_own_shard() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        struct RestoreEpoch(u64);
+        impl Drop for RestoreEpoch {
+            fn drop(&mut self) {
+                quil_types::consensus::set_epoch_length_frames(self.0);
+            }
+        }
+        let _restore = RestoreEpoch(quil_types::consensus::epoch_length_frames());
+        quil_types::consensus::set_epoch_length_frames(60);
+        let window = quil_execution::global_intrinsic::verify::REJOIN_WINDOW_FRAMES;
+
+        let address = vec![0xCDu8; 32];
+        let blocked = filter_bytes(0xB1);
+        let open = filter_bytes(0xB2);
+        let joined = 100u64;
+        // Two epochs on: expired by this node's reckoning, still inside the
+        // chain's window.
+        let at = 60 * (quil_types::consensus::epoch_for_frame(joined) + 2);
+        assert!(at < joined + window, "fixture must sit inside the window");
+        let seat = alloc(blocked.clone(), ProverStatus::Joining, joined);
+        assert_eq!(
+            seat.effective_status(at),
+            quil_types::consensus::EffectiveStatus::ExpiredJoining
+        );
+
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(idle_worker(1));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), vec![seat]));
+        reg.set_summaries(vec![
+            shard_summary(blocked.clone(), 1),
+            shard_summary(open.clone(), 10),
+        ]);
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        assert_eq!(wm.allocation_capacity().unwrap(), 1, "at its worker count");
+        lifecycle.set_prover_root_verified_frame(at);
+        let actions = lifecycle
+            .evaluate(at, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        assert_eq!(
+            proposed_join_filters(&actions),
+            vec![open],
+            "the free worker joins the other shard, never the blocked one: {actions:?}"
         );
     }
 
