@@ -3300,6 +3300,17 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
             },
         ));
     }
+    if m.cached_node_info
+        .as_ref()
+        .and_then(|info| info.node_reachability.as_ref())
+        .is_some_and(crate::commands::node::doctor::not_reachable)
+    {
+        notices.push((
+            "peers-cannot-dial",
+            NoticeSeverity::Warning,
+            "Reachability: peers cannot dial this node; run qclient node doctor.".to_string(),
+        ));
+    }
     notices
 }
 
@@ -4285,6 +4296,7 @@ fn help_items() -> Vec<HelpItem> {
         item("`Allocation epoch stale (re-confirm!)`: allocations whose epoch is older than the current one. The node reconfirms each allocation during every epoch, so its reconfirm has not been recorded; check the node's prover confirmation log lines"),
         item("`Renewal withheld, no vote sent`: local allocations whose worker hosts its committee session but has sent no vote for an epoch while the other members voted, of all allocations. The node leaves them to lapse: check the worker, and restart it if it stays silent. A seat renews once its worker votes or restarts, or at the latest four epochs on; the master log names each (`seat renewal withheld`)"),
         item("`Last recovery attempt failed`: workers whose latest archive recovery attempt failed and whose LocalMat is still below PeerHead, of workers with fresh observations (it ends once the worker catches up); the Recovery footer gives the error and the failure streak"),
+        kv("Reachability notice", "`Reachability: peers cannot dial this node`: the verdict of `qclient node doctor`, from the node's own view: AutoNAT servers on 2 or more IPs could not dial it back, AutoNAT holds it private with no confirmed address, or its address is behind carrier-grade NAT. It ends once AutoNAT confirms an address. Missing or unsettled AutoNAT results show nothing. The doctor gives a verdict per address family and what to change; it changes nothing itself."),
         kv("Store notice", "`Store reads slow (this node's disk)`: the node reads one entry of its master store a second (the canary) and, on Linux, times its disk's reads and writes. Shown once a minute's canary p99 reaches 50ms, a read stays unfinished 1s, or the disk takes 20ms a read or 100ms a write (of 20+), two minutes in a row; it clears after three minutes under all of them. Work that reads the store falls behind and allocations may lapse. The cause is this node's disk: check that TRIM runs (fstrim.timer or the discard mount option), the disk's health (SMART) and other I/O load on it. `qclient node diagnostics health --self` and the node's `store i/o` log lines give the figures"),
         kv("Command legends", "Compact mode shows applicable UI/worker commands only; expanded mode also shows disabled commands. Usable commands share one highlight; labels show colors on/off and relative/absolute thresholds. `filter*` means a column filter is active"),
         kv("Scroll hints", "Bottom border counts hidden rows `↑`/`↓` and columns `←`/`→`"),
@@ -4807,6 +4819,61 @@ mod tests {
         assert!(store(&m).is_empty());
         m.cached_node_info = Some(NodeInfoResponse::default());
         assert!(store(&m).is_empty());
+    }
+
+    #[test]
+    fn a_node_peers_cannot_dial_shows_one_notice_pointing_to_the_doctor() {
+        use quil_types::proto::node::{AutonatProbeFailure, NodeInfoResponse, NodeReachability};
+        use std::time::{Duration, Instant};
+        let report = |unreachable: bool, confirmed: &[&str]| NodeInfoResponse {
+            node_reachability: Some(NodeReachability {
+                listen_multiaddrs: vec!["/ip4/192.168.1.20/tcp/8336".to_string()],
+                nat_status: "unknown".to_string(),
+                confirmed_multiaddrs: confirmed.iter().map(|a| a.to_string()).collect(),
+                probe_failure: Some(AutonatProbeFailure {
+                    class: "dial_error".to_string(),
+                    probes: 14,
+                    failing_secs: 1_920,
+                    unreachable,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut m = Model::new();
+        m.compact_actions = false;
+        m.data_loaded = true;
+        m.allocations = joining_table();
+        m.last_fetch_success = Some(Instant::now());
+        m.cached_node_info = Some(report(true, &[]));
+        let shown = |m: &Model| {
+            condition_notices(m)
+                .into_iter()
+                .filter(|(key, ..)| *key == "peers-cannot-dial")
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            shown(&m),
+            vec![(
+                "peers-cannot-dial",
+                NoticeSeverity::Warning,
+                "Reachability: peers cannot dial this node; run qclient node doctor.".to_string()
+            )]
+        );
+        update_message_lifetime(&mut m);
+        let text = render_text(&mut m, 160, 30);
+        assert!(text.contains("peers cannot dial this node"), "{text}");
+        m.last_fetch_success = Some(Instant::now() - Duration::from_secs(3600));
+        assert!(shown(&m).is_empty(), "stale status establishes nothing");
+        m.last_fetch_success = Some(Instant::now());
+        // Failing probes that do not settle it yet, a confirmed address, and
+        // a node that predates the report are no claim.
+        m.cached_node_info = Some(report(false, &[]));
+        assert!(shown(&m).is_empty(), "unsettled probes");
+        m.cached_node_info = Some(report(true, &["/ip4/203.0.113.7/tcp/8336"]));
+        assert!(shown(&m).is_empty(), "confirmed by AutoNAT");
+        m.cached_node_info = Some(NodeInfoResponse::default());
+        assert!(shown(&m).is_empty(), "no report");
     }
 
     /// The help as text keeps every section heading and has no styling.
@@ -7894,6 +7961,7 @@ mod tests {
             "Global app notice",
             "Reward notice",
             "Allocation notices",
+            "Reachability notice",
             "Store notice",
             "Command legends",
             "Scroll hints",
