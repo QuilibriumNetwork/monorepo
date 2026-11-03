@@ -7670,7 +7670,8 @@ impl AppConsensusEngine {
             .unwrap_or_default();
         let (state, began) = match stall {
             RecordStall::Ended { state, outcome } => {
-                info!(core_id = self.core_id, filter = %filter, session = %session,
+                info!(core_id = self.core_id, filter = %filter, session = %session, committed_frame,
+                    latest_global_frame = self.latest_global_header_frame(),
                     global_executed = state.executed, checkpoint = state.checkpoint,
                     copies = state.copies, waited_secs = state.waited_secs, outcome,
                     "closing session's seal record stall ended");
@@ -8559,6 +8560,7 @@ impl AppConsensusEngine {
         } else if !timer_due(&self.seal_follow, self.seal_published_at) {
             return;
         }
+        let view_frame = view.as_ref().ok().map(handoff::CommittedView::frame);
         match view.and_then(|view| handoff::schedule::seal_submitted(&view, session)) {
             Ok(false) => {
                 self.publish_seal(&submission, trigger);
@@ -8569,7 +8571,7 @@ impl AppConsensusEngine {
                 let stall = self.seal_drain_progress.clear(now);
                 self.log_seal_drain_stall(stall, None);
                 let record = self.seal_record.clear("recorded", now);
-                self.log_seal_record_stall(record, None);
+                self.log_seal_record_stall(record, view_frame);
             }
             Err(_) => {}
         }
@@ -8602,7 +8604,12 @@ impl AppConsensusEngine {
             let stall = self.seal_drain_progress.clear(now);
             self.log_seal_drain_stall(stall, None);
             let record = self.seal_record.clear("cleared", now);
-            self.log_seal_record_stall(record, None);
+            let view_frame = if record.is_some() {
+                handoff_view_frame(&global)
+            } else {
+                None
+            };
+            self.log_seal_record_stall(record, view_frame);
             self.sealed_session = None;
             self.seal_published_at = None;
             self.seal_published_head = None;
@@ -16302,6 +16309,13 @@ pub(crate) fn validate_app_frame_panic_safe(
             "app-shard frame validation panicked (malformed input)".into(),
         )),
     }
+}
+
+/// The frame of this worker's committed GLOBAL view, `None` when unreadable.
+fn handoff_view_frame(global: &Arc<quil_hypergraph::HypergraphCrdt>) -> Option<u64> {
+    quil_execution::global_intrinsic::handoff::CommittedView::capture(global)
+        .ok()
+        .map(|view| view.frame())
 }
 
 /// Whether a session's committed GLOBAL view, at `committed_frame`, trails
@@ -25571,7 +25585,13 @@ mod tests {
         engine.maintain_committee_session().await;
         let ended = logs.lines_with("seal record stall ended");
         assert_eq!(ended.len(), 1, "{ended:?}");
-        for field in ["INFO", "cleared", "copies=1", session.as_str()] {
+        for field in [
+            "INFO",
+            "cleared",
+            "copies=1",
+            "committed_frame=2",
+            session.as_str(),
+        ] {
             assert!(ended[0].contains(field), "{field}: {}", ended[0]);
         }
         assert!(!engine.seal_record.waiting());

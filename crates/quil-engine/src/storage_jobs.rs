@@ -836,6 +836,27 @@ struct Look {
     share: u64,
 }
 
+/// What keeps a waiting job from starting: every slot held (`job_slots`),
+/// the reservations held plus its own over the jobs' share or the share
+/// unreadable (`memory`), else it would fit and a job ahead of it in order
+/// holds its place (`queue_order`).
+fn binding_limit(
+    holders: usize,
+    slots: usize,
+    reserved: u64,
+    bytes: u64,
+    share: Option<u64>,
+) -> &'static str {
+    if holders >= slots {
+        "job_slots"
+    } else if share.is_none_or(|share| u128::from(reserved) + u128::from(bytes) > u128::from(share))
+    {
+        "memory"
+    } else {
+        "queue_order"
+    }
+}
+
 impl Admission {
     /// At most `slots` reservations held at once, sharing the memory
     /// `available` reports (`None` when it cannot tell: one at a time).
@@ -959,10 +980,19 @@ impl Admission {
                          one of them ends: an expected wait"
                     );
                 } else {
+                    let limit = binding_limit(
+                        state.holders,
+                        self.slots,
+                        state.reserved,
+                        bytes,
+                        look.map(|look| look.share),
+                    );
                     info!(
                         bytes,
+                        limit,
                         reserved = state.reserved,
                         jobs = state.holders,
+                        slots = self.slots,
                         available = look.map(|look| look.available),
                         idle_available = look.map(|look| look.idle_available),
                         window_low = look.map(|look| look.window_low),
@@ -973,7 +1003,11 @@ impl Admission {
                             .position(|waiting| waiting.ticket == ticket)
                             .unwrap_or(0),
                         due = urgency == Urgency::Due,
-                        "storage job waits for memory"
+                        "storage job waits to start: `limit` is what binds: memory (the \
+                         reservations held plus this job exceed the share), job_slots (every \
+                         slot is held) or queue_order (it would fit, but a job ahead of it in \
+                         order waits for memory and holds its place); an expected wait that \
+                         ends when a job ends"
                     );
                 }
             }
@@ -2015,6 +2049,58 @@ mod tests {
             let _ = released.recv();
         });
         Held { granted, release }
+    }
+
+    /// The wait line names what binds: the slots, the memory, or the order.
+    #[test]
+    fn the_binding_limit_is_named() {
+        assert_eq!(binding_limit(4, 4, 10, 1, Some(100)), "job_slots");
+        assert_eq!(binding_limit(4, 4, 10, 1, None), "job_slots");
+        assert_eq!(binding_limit(2, 4, 90, 11, Some(100)), "memory");
+        assert_eq!(binding_limit(2, 4, 10, 1, None), "memory");
+        assert_eq!(binding_limit(2, 4, 90, 10, Some(100)), "queue_order");
+    }
+
+    /// A job waiting because every slot is held, or because the memory is,
+    /// logs which, with the slots and holders.
+    #[test]
+    fn a_waiting_job_logs_its_binding_limit() {
+        let logs = crate::outage::test_logs::CapturedLogs::default();
+        // Releases `held` once the reserving thread has logged its wait.
+        let waits = |admission: &'static Admission, bytes: u64, held: Held| {
+            let logs = logs.clone();
+            let (started_tx, started) = mpsc::channel();
+            let waiting = std::thread::spawn(move || {
+                let _logging = logs.install();
+                let reservation = admission.reserve(bytes);
+                started_tx.send(()).unwrap();
+                drop(reservation);
+            });
+            assert!(started.recv_timeout(NOT_YET).is_err(), "it waits");
+            drop(held.release);
+            started.recv_timeout(SOON).unwrap();
+            waiting.join().unwrap();
+        };
+        // One slot, held.
+        let admission = admission_capped(1, 1 << 50);
+        let held = hold(admission, GIB);
+        assert!(granted(&held));
+        waits(admission, GIB, held);
+        let lines = logs.lines_with("storage job waits to start");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        for field in ["limit=\"job_slots\"", "slots=1", "jobs=1"] {
+            assert!(lines[0].contains(field), "{field}: {}", lines[0]);
+        }
+        // Slots to spare, memory not: a request over the share waits.
+        let admission = admission_capped(8, 2 * GIB);
+        let held = hold(admission, GIB);
+        assert!(granted(&held));
+        waits(admission, 4 * GIB, held);
+        let lines = logs.lines_with("storage job waits to start");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for field in ["limit=\"memory\"", "slots=8", "jobs=1"] {
+            assert!(lines[1].contains(field), "{field}: {}", lines[1]);
+        }
     }
 
     /// At most [`AHEAD_JOBS`] leaves are labelled ahead at once whatever the
