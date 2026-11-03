@@ -182,6 +182,26 @@ enum RespawnOutcome {
 }
 
 /// gRPC endpoint for a remote worker.
+/// Store key of the manual workers' record ([`SavedManualWorkers`]).
+const MANUAL_WORKERS_KEY: &[u8] = b"local:remote-workers:manual:v1";
+
+/// A remote worker the operator manages by hand, with the seat it serves.
+/// Named by its endpoint: a core id is only its place in
+/// `data_worker_stream_multiaddrs`, so a reordered list must not hand the mode
+/// to another machine.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ManualWorker {
+    endpoint: String,
+    filter: Vec<u8>,
+}
+
+/// The manual workers last written, and where.
+#[derive(Default)]
+struct SavedManualWorkers {
+    store: Option<std::sync::Arc<quil_store::RocksDb>>,
+    written: Vec<ManualWorker>,
+}
+
 #[derive(Debug)]
 struct RemoteWorkerState {
     core_id: u32,
@@ -236,6 +256,9 @@ struct RemoteWorkerState {
 const WORKER_CHANNEL_SAN: &str = "quil-worker";
 
 pub struct RemoteWorkerManager {
+    /// Where the manual workers are saved across restarts
+    /// (`restore_manual_workers`).
+    manual_saved: Mutex<SavedManualWorkers>,
     /// Shared so background tasks spawned from `set_worker_filter`
     /// (which only has `&self`) can re-acquire the channel to issue
     /// the Respawn RPC after this method returns.
@@ -378,6 +401,7 @@ impl RemoteWorkerManager {
             executions: Mutex::new(HashMap::new()),
             unanswered: Mutex::new(HashMap::new()),
             evict_unsupported: Default::default(),
+            manual_saved: Default::default(),
         }
     }
 
@@ -400,6 +424,98 @@ impl RemoteWorkerManager {
             })
             .collect();
         Self::new(endpoints, master_endpoint, channel_tls_pem)
+    }
+
+    /// Give the manual workers back their mode and seat from `db`, and keep
+    /// them saved there from now on: a restart must not hand a manual worker's
+    /// seat to the score rule, nor its leave. The seat comes back with it
+    /// because the allocator otherwise rebinds in its own order, which can put
+    /// an auto worker on that seat and the manual worker on another. Returns
+    /// how many workers came back. A saved endpoint no longer configured is
+    /// dropped, its worker gone. On an unreadable record every worker stays
+    /// auto and the next mode change overwrites it.
+    pub fn restore_manual_workers(&self, db: std::sync::Arc<quil_store::RocksDb>) -> Result<usize> {
+        use quil_types::store::KvDb;
+        let saved: Result<Vec<ManualWorker>> = db.get(MANUAL_WORKERS_KEY).and_then(|bytes| {
+            bytes.map_or(Ok(Vec::new()), |bytes| {
+                serde_json::from_slice(&bytes)
+                    .map_err(|e| QuilError::Store(format!("invalid manual worker record: {e}")))
+            })
+        });
+        let (saved, unreadable) = match saved {
+            Ok(saved) => (saved, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        let mut restored = 0;
+        for manual in &saved {
+            let core_id = self
+                .workers
+                .lock()
+                .unwrap()
+                .values()
+                .find(|w| w.endpoint == manual.endpoint)
+                .map(|w| w.core_id);
+            let Some(core_id) = core_id else {
+                info!(endpoint = %manual.endpoint, scope = "local",
+                    "a saved manual remote worker is no longer configured; dropping its record");
+                continue;
+            };
+            // As the local restore: the allocator starts consensus when it
+            // sees the allocation.
+            self.set_worker_filter(core_id, &manual.filter, false)?;
+            if let Some(worker) = self.workers.lock().unwrap().get_mut(&core_id) {
+                worker.manually_managed = true;
+            }
+            restored += 1;
+        }
+        {
+            let mut state = self.manual_saved.lock().unwrap();
+            state.store = Some(db);
+            state.written = saved;
+        }
+        // Drops the record of a machine no longer configured.
+        self.write_manual_workers();
+        unreadable.map_or(Ok(restored), Err)
+    }
+
+    /// Save the manual workers if they changed. A failed write leaves the mode
+    /// in memory until the next restart, and says so.
+    fn write_manual_workers(&self) {
+        let mut current: Vec<ManualWorker> = self
+            .workers
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|w| w.manually_managed)
+            .map(|w| ManualWorker {
+                endpoint: w.endpoint.clone(),
+                filter: w.filter.clone(),
+            })
+            .collect();
+        current.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
+        let mut saved = self.manual_saved.lock().unwrap();
+        let Some(store) = saved.store.clone() else {
+            return;
+        };
+        if saved.written == current {
+            return;
+        }
+        let written = serde_json::to_vec(&current)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| {
+                let inner = store.inner();
+                inner
+                    .put(MANUAL_WORKERS_KEY, bytes)
+                    .map_err(|e| e.to_string())?;
+                inner.flush_wal(true).map_err(|e| e.to_string())?;
+                Ok(())
+            });
+        match written {
+            Ok(()) => saved.written = current,
+            Err(error) => warn!(%error, scope = "this node",
+                action = "the workers' modes hold until the node restarts; check the node's store",
+                "could not save the manual remote workers"),
+        }
     }
 
     /// Take the event receiver (call once at startup).
@@ -1390,6 +1506,8 @@ impl WorkerManager for RemoteWorkerManager {
             }
         };
 
+        self.write_manual_workers();
+
         // Empty filter = idle slot reservation (e.g. startup
         // pre-allocation at main.rs that creates `cores - 1` empty
         // slots before any shard work is assigned). There is no
@@ -1454,6 +1572,8 @@ impl WorkerManager for RemoteWorkerManager {
             w.lost = None;
             info!(core_id, "remote worker deallocated");
         }
+        drop(workers);
+        self.write_manual_workers();
         Ok(())
     }
 
@@ -1533,14 +1653,13 @@ impl WorkerManager for RemoteWorkerManager {
                 changed
             })
         };
-        // As the local manager logs it. This manager keeps no worker store,
-        // so the mode lasts until the node restarts; `data_worker_filters`
-        // is what pins a remote worker across restarts.
+        self.write_manual_workers();
+        // As the local manager logs it.
         if changed {
             info!(
                 core_id,
                 mode = if manually_managed { "manual" } else { "auto" },
-                persisted = false,
+                persisted = self.manual_saved.lock().unwrap().store.is_some(),
                 "worker management mode changed"
             );
         }
@@ -1861,6 +1980,143 @@ mod tests {
         );
         assert!(logged.contains("persisted=false"), "{logged}");
         assert!(!mgr.range_workers().unwrap()[0].manually_managed);
+    }
+}
+
+#[cfg(test)]
+mod manual_worker_tests {
+    use super::*;
+    use crate::worker::manually_managed_filters;
+    use std::sync::Arc;
+
+    const ONE: &str = "http://10.0.0.1:32501";
+    const TWO: &str = "http://10.0.0.2:32501";
+
+    fn manager(endpoints: &[&str]) -> RemoteWorkerManager {
+        RemoteWorkerManager::new(
+            endpoints
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (i as u32 + 1, e.to_string()))
+                .collect(),
+            String::new(),
+            None,
+        )
+    }
+
+    fn database() -> Arc<quil_store::RocksDb> {
+        Arc::new(quil_store::RocksDb::open_in_memory().unwrap())
+    }
+
+    fn worker(mgr: &RemoteWorkerManager, core_id: u32) -> WorkerInfo {
+        mgr.range_workers()
+            .unwrap()
+            .into_iter()
+            .find(|w| w.core_id == core_id)
+            .unwrap()
+    }
+
+    /// A restart keeps a manual worker's mode and seat, so its seat still
+    /// reads manual to the leave decision; an auto worker stays auto, with no
+    /// seat until the allocator gives it one.
+    #[test]
+    fn a_restart_keeps_a_manual_worker_and_its_seat() {
+        let db = database();
+        let seat = vec![0xAA; 32];
+        let before = manager(&[ONE, TWO]);
+        assert_eq!(before.restore_manual_workers(db.clone()).unwrap(), 0);
+        before.set_worker_filter(1, &seat, false).unwrap();
+        before.set_manually_managed(1, true).unwrap();
+        before.set_worker_filter(2, &[0xBB; 32], false).unwrap();
+
+        let after = manager(&[ONE, TWO]);
+        assert_eq!(after.restore_manual_workers(db).unwrap(), 1);
+        let (manual, auto) = (worker(&after, 1), worker(&after, 2));
+        assert!(manual.manually_managed);
+        assert_eq!(manual.filter, seat);
+        assert!(!auto.manually_managed);
+        assert!(auto.filter.is_empty());
+        assert_eq!(
+            manually_managed_filters(&after.range_workers().unwrap()),
+            std::collections::HashSet::from([seat])
+        );
+    }
+
+    /// The record follows the operator: a seat change, a release and a switch
+    /// back to auto all land, each as the last state before the restart.
+    #[test]
+    fn the_record_follows_the_workers_changes() {
+        let db = database();
+        let first = manager(&[ONE]);
+        first.restore_manual_workers(db.clone()).unwrap();
+        first.set_manually_managed(1, true).unwrap();
+        first.set_worker_filter(1, &[0xAA; 32], false).unwrap();
+        first.set_worker_filter(1, &[0xCC; 32], false).unwrap();
+
+        let second = manager(&[ONE]);
+        assert_eq!(second.restore_manual_workers(db.clone()).unwrap(), 1);
+        assert_eq!(worker(&second, 1).filter, vec![0xCC; 32]);
+        second.deallocate_worker(1).unwrap();
+
+        let third = manager(&[ONE]);
+        assert_eq!(third.restore_manual_workers(db.clone()).unwrap(), 1);
+        let idle = worker(&third, 1);
+        assert!(idle.manually_managed, "an idle manual worker stays manual");
+        assert!(idle.filter.is_empty());
+        third.set_manually_managed(1, false).unwrap();
+
+        let fourth = manager(&[ONE]);
+        assert_eq!(fourth.restore_manual_workers(db).unwrap(), 0);
+        assert!(!worker(&fourth, 1).manually_managed);
+    }
+
+    /// The mode belongs to the machine, not to its place in the list: a
+    /// reordered list keeps it on the machine, and a removed one drops it.
+    #[test]
+    fn the_mode_stays_with_the_endpoint() {
+        let db = database();
+        let before = manager(&[ONE, TWO]);
+        before.restore_manual_workers(db.clone()).unwrap();
+        before.set_manually_managed(1, true).unwrap();
+
+        let reordered = manager(&[TWO, ONE]);
+        assert_eq!(reordered.restore_manual_workers(db.clone()).unwrap(), 1);
+        assert!(!worker(&reordered, 1).manually_managed);
+        assert!(worker(&reordered, 2).manually_managed);
+
+        let removed = manager(&[TWO]);
+        assert_eq!(removed.restore_manual_workers(db.clone()).unwrap(), 0);
+        assert!(!worker(&removed, 1).manually_managed);
+        let later = manager(&[ONE, TWO]);
+        assert_eq!(
+            later.restore_manual_workers(db).unwrap(),
+            0,
+            "a removed machine's record is dropped"
+        );
+    }
+
+    /// An unreadable record is an error, every worker stays auto, and the next
+    /// mode change replaces it.
+    #[test]
+    fn an_unreadable_record_fails_loudly_and_recovers() {
+        use quil_types::store::KvDb;
+        let db = database();
+        db.set(MANUAL_WORKERS_KEY, b"invalid").unwrap();
+        let mgr = manager(&[ONE]);
+        assert!(mgr.restore_manual_workers(db.clone()).is_err());
+        assert!(!worker(&mgr, 1).manually_managed);
+        mgr.set_manually_managed(1, true).unwrap();
+        let after = manager(&[ONE]);
+        assert_eq!(after.restore_manual_workers(db).unwrap(), 1);
+    }
+
+    /// Without a store the mode stays in memory, as before.
+    #[test]
+    fn without_a_store_nothing_is_saved() {
+        let mgr = manager(&[ONE]);
+        mgr.set_manually_managed(1, true).unwrap();
+        assert!(worker(&mgr, 1).manually_managed);
+        assert!(mgr.manual_saved.lock().unwrap().written.is_empty());
     }
 }
 
