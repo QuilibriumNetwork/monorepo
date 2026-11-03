@@ -341,6 +341,9 @@ pub enum Refusal {
     /// node holds no more of it: its shard's waiting frames are at their cap,
     /// or it came from neither this node nor a known active prover.
     AwaitingExecution,
+    /// Nothing on this node takes messages from its collector: it proposes no
+    /// GLOBAL frames ([`MessageCollector::set_no_proposer`]).
+    NoProposer,
 }
 
 impl Refusal {
@@ -351,6 +354,7 @@ impl Refusal {
             Self::RankFull => "rank buffer full",
             Self::InvalidShardFrame => "shard frame failed verification",
             Self::AwaitingExecution => "shard frame waits for this node's GLOBAL execution, which holds such frames only from active provers and up to a cap per shard",
+            Self::NoProposer => "this node is not an archive: it proposes no GLOBAL frames, so a message submitted to it would never be included",
         }
     }
 
@@ -458,6 +462,8 @@ pub struct MessageCollector {
     buffers: RwLock<HashMap<u64, RankBuffer>>,
     /// When true, only prover-protocol messages are accepted.
     prover_only_mode: std::sync::atomic::AtomicBool,
+    /// Nothing takes messages from this collector.
+    no_proposer: std::sync::atomic::AtomicBool,
     /// Per-shard last-seen-frame deduplication. Mirrors Go's
     /// `shardFrameDedup` at `message_collector.go:255-269`. Different
     /// delivery paths (pubsub vs gRPC) can produce different
@@ -755,6 +761,7 @@ impl MessageCollector {
         Self {
             buffers: RwLock::new(HashMap::new()),
             prover_only_mode: std::sync::atomic::AtomicBool::new(false),
+            no_proposer: std::sync::atomic::AtomicBool::new(false),
             shard_frame_dedup: RwLock::new(HashMap::new()),
             finalized: RwLock::new(FinalizedSet::new()),
             valid_shard_addresses: RwLock::new(HashSet::new()),
@@ -1036,6 +1043,9 @@ impl MessageCollector {
         verified: bool,
         provenance: Provenance,
     ) -> SubmitOutcome {
+        if self.no_proposer.load(std::sync::atomic::Ordering::Acquire) {
+            return SubmitOutcome::Filtered(Refusal::NoProposer);
+        }
         // Prover-only mode filtering: check if the message is a
         // prover-protocol op (type prefix 0x0301-0x031A). If not,
         // reject it during degraded coverage.
@@ -1773,6 +1783,18 @@ impl MessageCollector {
             .fold((0, 0), |(messages, bytes), b| {
                 (messages + b.len(), bytes + b.bytes)
             })
+    }
+
+    /// Refuse every message from now on: this node proposes no GLOBAL frames,
+    /// so nothing would ever collect, finalize or prune what it held. Held
+    /// instead, a regular node's collector told each submitter "accepted" for
+    /// a message no frame would carry, stayed on the one rank its process
+    /// started at, and at its cap refused everything until a restart
+    /// (2026-11-02: 64 MiB on two regular nodes, one of them 22 h in that
+    /// state).
+    pub fn set_no_proposer(&self) {
+        self.no_proposer
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Set prover-only mode. When enabled, non-prover messages are
@@ -2694,6 +2716,42 @@ mod tests {
         b2.extend_from_slice(b"another");
         assert!(mc.add_message(3, b2.clone()));
         assert!(!mc.add_message(3, b2));
+    }
+
+    /// A collector nothing consumes holds nothing, whatever arrives: a submit
+    /// is refused for good (no retry), names why, and neither fills the rank
+    /// nor counts as delivered.
+    #[test]
+    fn a_collector_with_no_proposer_refuses_everything_and_holds_nothing() {
+        let mc = MessageCollector::new();
+        mc.set_no_proposer();
+        let refused = SubmitOutcome::Filtered(Refusal::NoProposer);
+        let chunk = vec![0x03; 1 << 20];
+        for n in 0..(MAX_BYTES_PER_RANK >> 20) + 2 {
+            let mut data = 0x0301u32.to_be_bytes().to_vec();
+            data.extend_from_slice(&(n as u64).to_be_bytes());
+            data.extend_from_slice(&chunk);
+            assert_eq!(mc.add_message_outcome(7, data), refused);
+        }
+        assert_eq!(
+            mc.add_message_outcome_from(7, shard_bundle(1, 1, 0, 1), Provenance::Other),
+            refused
+        );
+        assert!(!mc.add_message(7, b"prover-op".to_vec()));
+        assert_eq!(mc.pending_totals(), (0, 0), "nothing is held");
+        assert!(!Refusal::NoProposer.retryable());
+        assert!(Refusal::NoProposer.reason().contains("not an archive"));
+    }
+
+    /// The default collector, an archive's, still holds what it is sent.
+    #[test]
+    fn a_collector_with_a_proposer_holds_what_it_accepts() {
+        let mc = MessageCollector::new();
+        assert_eq!(
+            mc.add_message_outcome(7, b"prover-op".to_vec()),
+            SubmitOutcome::Accepted
+        );
+        assert_eq!(mc.pending_count(7), 1);
     }
 
     #[test]

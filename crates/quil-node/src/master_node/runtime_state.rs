@@ -15,8 +15,21 @@ pub(crate) struct RuntimeState {
         Arc<std::sync::OnceLock<Arc<quil_engine::remote_worker::RemoteWorkerManager>>>,
 }
 
+/// The node's GLOBAL message collector. Only a node taking part in GLOBAL
+/// consensus collects from it: elsewhere it refuses every message.
+fn global_message_collector(
+    consensus_participant: bool,
+) -> Arc<quil_engine::message_collector::MessageCollector> {
+    let collector = Arc::new(quil_engine::message_collector::MessageCollector::new());
+    if !consensus_participant {
+        collector.set_no_proposer();
+    }
+    collector
+}
+
 pub(crate) fn init(
     sup: &mut Supervisor<anyhow::Error>,
+    consensus_participant: bool,
     hg_store: Arc<quil_store::RocksHypergraphStore>,
     shard_engines: Arc<
         parking_lot::RwLock<
@@ -27,7 +40,7 @@ pub(crate) fn init(
     // ---------------------------------------------------------------
     // 5c. Message collector + consensus event loop
     // ---------------------------------------------------------------
-    let message_collector = Arc::new(quil_engine::message_collector::MessageCollector::new());
+    let message_collector = global_message_collector(consensus_participant);
 
     // The consensus event loop is optional — it runs only when this node
     // has a BLS proving key and is an active prover. For now we create
@@ -293,5 +306,39 @@ pub(crate) fn init(
         coverage_monitor,
         halt_state,
         remote_worker_manager_for_halt,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quil_engine::message_collector::{Refusal, SubmitOutcome};
+
+    /// A regular node's collector told submitters "accepted", held what they
+    /// sent for good, and at its cap stayed full until a restart.
+    #[test]
+    fn only_a_consensus_participants_collector_holds_messages() {
+        let regular = global_message_collector(false);
+        assert_eq!(
+            regular.add_message_outcome(1, b"prover-op".to_vec()),
+            SubmitOutcome::Filtered(Refusal::NoProposer),
+            "a regular node accepted a message no frame of its would carry"
+        );
+        assert_eq!(regular.pending_totals(), (0, 0));
+
+        let participant = global_message_collector(true);
+        assert_eq!(
+            participant.add_message_outcome(1, b"prover-op".to_vec()),
+            SubmitOutcome::Accepted
+        );
+        assert_eq!(participant.pending_count(1), 1);
+    }
+
+    #[test]
+    fn archives_and_localnet_regulars_take_part_in_global_consensus() {
+        assert!(super::super::global_consensus_participant(true, 0));
+        assert!(super::super::global_consensus_participant(false, 99));
+        assert!(!super::super::global_consensus_participant(false, 0));
+        assert!(!super::super::global_consensus_participant(false, 1));
     }
 }

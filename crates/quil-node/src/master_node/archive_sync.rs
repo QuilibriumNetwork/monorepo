@@ -3864,7 +3864,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     // dispatch and forwarded to workers, (c) cause QC
                     // verification failures with genesis-shaped all-zero
                     // signatures.
-                    let is_consensus_participant = sync_archive_mode || network == 99;
+                    let is_consensus_participant = super::global_consensus_participant(sync_archive_mode, network);
                     let is_global_prover = if is_consensus_participant {
                         match global_prover_once_loaded(&sync_pr, &sync_pa, &sync_token).await {
                             Some(global) => global,
