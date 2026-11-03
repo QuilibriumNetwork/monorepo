@@ -190,6 +190,13 @@ pub(crate) fn initialize(network: u8) {
             "QUIL_PROVER_OP_REPLAY_GUARD_EPOCH override active (localnet only)"
         );
     }
+    let sealed_epoch = quil_types::consensus::init_sealed_storage_epoch(network);
+    if network != 0 && sealed_epoch != u64::MAX {
+        tracing::warn!(
+            epoch = sealed_epoch,
+            "QUIL_SEALED_STORAGE_EPOCH override active (localnet only)"
+        );
+    }
     let unsealed_epoch = quil_types::consensus::init_unsealed_issuance_epoch(network);
     if network != 0 && unsealed_epoch != u64::MAX {
         tracing::warn!(

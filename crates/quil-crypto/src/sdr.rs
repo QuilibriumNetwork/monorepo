@@ -471,15 +471,24 @@ pub fn build_leaf_replica(
     (replica, leaf)
 }
 
-/// Derive a member's replica key from its identity, shard, and epoch.
+/// Derive the replica key. Before mandatory sealing it binds the epoch;
+/// from that epoch a distinct domain binds the member and leaf only. Proof
+/// challenges and transcripts continue to bind each epoch and fresh beacon.
 pub fn replica_key(member_id: &[u8], shard_id: &[u8], epoch: u64) -> [u8; 32] {
     let mut h = Sha3_256::new();
-    h.update(b"quil/porep/replica-key/v1");
+    let stable = quil_types::consensus::sealed_storage_required(epoch);
+    h.update(if stable {
+        &b"quil/porep/replica-key/stable/v1"[..]
+    } else {
+        &b"quil/porep/replica-key/v1"[..]
+    });
     h.update((member_id.len() as u32).to_be_bytes());
     h.update(member_id);
     h.update((shard_id.len() as u32).to_be_bytes());
     h.update(shard_id);
-    h.update(epoch.to_be_bytes());
+    if !stable {
+        h.update(epoch.to_be_bytes());
+    }
     h.finalize().into()
 }
 

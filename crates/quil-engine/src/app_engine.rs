@@ -1353,6 +1353,22 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // Committee epoch is GLOBAL-frame-defined; read it at the anchor, NOT the
         // app-shard-local clock tip (unrelated to global). See `committee_anchor_gfn`.
         let committee_frame = anchor_gfn;
+        if quil_types::consensus::sealed_storage_required_at(anchor_gfn) {
+            let slot = self.prover_registry.get_storage_seat_slot(
+                &self.local_prover_address,
+                &self.filter,
+                quil_types::consensus::epoch_for_frame(anchor_gfn),
+            )?;
+            if !quil_types::consensus::storage_seat_eligible(
+                &self.filter,
+                anchor_gfn,
+                slot.as_ref(),
+            ) {
+                return Err(QuilError::NoVote(
+                    "local storage is not sealed for this epoch".into(),
+                ));
+            }
+        }
         let active = self
             .prover_registry
             .get_active_provers(&self.filter, committee_frame)
@@ -9342,6 +9358,38 @@ impl AppConsensusEngine {
             )),
             _ => None,
         };
+        let requests_root_check = requests_root_check.map(|check| {
+            let registry = self.prover_registry.clone();
+            let member = self.local_prover_address.clone();
+            let filter = self.filter.clone();
+            Arc::new(move |frame: &quil_types::proto::global::AppShardFrame| {
+                if let Some(header) = frame.header.as_ref() {
+                    let anchor = header.global_frame_number;
+                    if quil_types::consensus::sealed_storage_required_at(anchor) {
+                        for address in [&member[..], &header.prover[..]] {
+                            let slot = registry
+                                .get_storage_seat_slot(
+                                    address,
+                                    &filter,
+                                    quil_types::consensus::epoch_for_frame(anchor),
+                                )
+                                .map_err(|error| ("storage seal unavailable", error.to_string()))?;
+                            if !quil_types::consensus::storage_seat_eligible(
+                                &filter,
+                                anchor,
+                                slot.as_ref(),
+                            ) {
+                                return Err((
+                                    "unsealed storage participant",
+                                    format!("anchor {anchor}"),
+                                ));
+                            }
+                        }
+                    }
+                }
+                check(frame)
+            }) as crate::cw_app_seams::AppRequestsRootCheck
+        });
         // Stage-gate: the CW proposer/verifier are gated on `data_ready` until this
         // member holds the covered sub-shard's committed DATA in its own CRDT.
         // Without it, `build_vote_openings` yields no storage openings → the frame

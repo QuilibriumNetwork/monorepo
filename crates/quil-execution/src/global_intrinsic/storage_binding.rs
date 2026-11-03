@@ -455,6 +455,17 @@ pub fn prove(
     entries: &[Entry],
     proof_of: &dyn Fn(u8, &[u8; 32]) -> Result<CompactProof, String>,
 ) -> Result<LeafBinding, String> {
+    prove_with_cap(claim, entries, proof_of, None)
+}
+
+/// Reuse the snapshot's data-tree cap when preparing its binding. Every
+/// opened subtree must still match the cap and the registered commitment.
+pub fn prove_with_cap(
+    claim: &LeafClaim,
+    entries: &[Entry],
+    proof_of: &dyn Fn(u8, &[u8; 32]) -> Result<CompactProof, String>,
+    cap: Option<&quil_crypto::storage_proof::MerkleCap>,
+) -> Result<LeafBinding, String> {
     use quil_crypto::storage_proof::{data_nodes, MerkleTree, NODE_BYTES};
     let data = leaf_data(claim.filter, claim.prefix, entries);
     let mut nodes = data_nodes(&data);
@@ -464,15 +475,32 @@ pub fn prove(
         return fail("the registration is not this snapshot's data");
     }
     nodes.resize(claim.n as usize * NODE_BYTES, 0);
-    let tree = MerkleTree::from_nodes(&nodes).ok_or("storage binding: no data tree")?;
-    if tree.commitment(Tree::Data) != claim.comm_d || tree.n() != claim.n {
+    let tree = if cap.is_none() {
+        Some(MerkleTree::from_nodes(&nodes).ok_or("storage binding: no data tree")?)
+    } else {
+        None
+    };
+    let (commitment, n) = match (cap, tree.as_ref()) {
+        (Some(cap), _) => (cap.commitment(Tree::Data), cap.n),
+        (_, Some(tree)) => (tree.commitment(Tree::Data), tree.n()),
+        _ => return fail("no data commitment"),
+    };
+    if commitment != claim.comm_d || n != claim.n {
         return fail("the registration is not this snapshot's data");
     }
+    let invalid = std::cell::Cell::new(false);
     let open = |index: u64| Opening {
         node: nodes[index as usize * NODE_BYTES..][..NODE_BYTES]
             .try_into()
             .expect("a node"),
-        path: tree.path(index),
+        path: if let Some(cap) = cap {
+            cap.path(&nodes, index).unwrap_or_else(|| {
+                invalid.set(true);
+                Vec::new()
+            })
+        } else {
+            tree.as_ref().unwrap().path(index)
+        },
     };
     let header = header_nodes(claim.filter, claim.prefix);
     let count = entries.len() as u64;
@@ -537,6 +565,9 @@ pub fn prove(
             None => None,
         };
         proved.coverage.push(CoverageCheck { proof, record });
+    }
+    if invalid.get() {
+        return fail("a binding subtree differs from the cached data cap");
     }
     Ok(proved)
 }

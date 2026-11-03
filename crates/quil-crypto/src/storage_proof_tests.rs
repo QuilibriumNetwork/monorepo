@@ -786,3 +786,170 @@ fn labelling_stops_when_told_and_is_unchanged_otherwise() {
         "it stops at the first look that says so"
     );
 }
+
+#[test]
+fn streaming_caps_match_full_trees_including_partial_subtrees() {
+    for n in [1, 2, 3, 7, 1024, 1025, 3000] {
+        let bytes = nodes(n, 3);
+        let digests = hash::digests_from_bytes(&bytes).unwrap();
+        let full = MerkleTree::from_digests(digests.clone());
+        for height in [0, 3, CAP_HEIGHT, 20] {
+            let cap = MerkleCap::from_digests(&digests, height);
+            assert_eq!(cap, full.cap(height), "n={n} height={height}");
+            for i in [0, n / 2, n - 1] {
+                assert_eq!(cap.path(&bytes, i as u64), Some(full.path(i as u64)));
+            }
+        }
+    }
+}
+
+#[test]
+fn concurrent_labels_match_the_scalar_reference_on_every_layer() {
+    let barrier = std::sync::Barrier::new(4);
+    std::thread::scope(|scope| {
+        for (id, n) in [17usize, 18, 19, 17].into_iter().enumerate() {
+            let barrier = &barrier;
+            scope.spawn(move || {
+                let key = [id as u8 + 1; 32];
+                let expected = all_layers(n, &key);
+                let thread = std::thread::current().id();
+                let mut layers = Vec::new();
+                barrier.wait();
+                let (last, columns) = label_leaf(n as u64, &key, &params(), &mut |_, layer| {
+                    assert_eq!(thread, std::thread::current().id());
+                    layers.push(layer.to_vec());
+                });
+                assert_eq!(layers, expected);
+                assert_eq!(last, *expected.last().unwrap());
+                for v in 0..n {
+                    let column: Vec<Node> =
+                        expected.iter().map(|l| hash::to_bytes(&l[v])).collect();
+                    assert_eq!(hash::to_bytes(&columns[v]), column_digest(&column).unwrap());
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn cancelling_one_batched_leaf_does_not_cancel_its_peers() {
+    let barrier = std::sync::Barrier::new(4);
+    std::thread::scope(|scope| {
+        for id in 0..4 {
+            let barrier = &barrier;
+            scope.spawn(move || {
+                let stopped = std::cell::Cell::new(false);
+                barrier.wait();
+                let result = label_leaf_until(
+                    73,
+                    &[id; 32],
+                    &params(),
+                    &mut |_, _| {
+                        if id == 0 {
+                            stopped.set(true);
+                        }
+                    },
+                    &|| stopped.get(),
+                );
+                assert_eq!(result.is_none(), id == 0);
+                if let Some((last, _)) = result {
+                    assert_eq!(last, *all_layers(73, &[id; 32]).last().unwrap());
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn sparse_seals_equal_dense_seals_and_reject_stale_cache_roots() {
+    struct Sparse {
+        kept: Kept,
+        encoded: EncodedLeaf,
+        data: Vec<u8>,
+        column: Vec<u8>,
+        cap: MerkleCap,
+    }
+    impl LabelSource for Sparse {
+        fn label(&self, layer: usize, v: u64) -> Option<Node> {
+            self.kept.label(layer, v)
+        }
+        fn columns(&self) -> Option<Vec<Digest>> {
+            panic!("sparse seals must not load full columns")
+        }
+        fn last_layer(&self) -> Option<Vec<Digest>> {
+            panic!("sparse seals must not load a full label layer")
+        }
+        fn cap(&self, tree: Tree) -> Option<MerkleCap> {
+            Some(match tree {
+                Tree::Data => self.encoded.data_cap.clone(),
+                Tree::Column => self.cap.clone(),
+                Tree::Replica => self.encoded.replica_cap.clone(),
+            })
+        }
+        fn nodes(&self, tree: Tree, range: std::ops::Range<u64>) -> Option<Vec<u8>> {
+            assert!(range.end - range.start <= 1 << CAP_HEIGHT);
+            let bytes = match tree {
+                Tree::Data => &self.data,
+                Tree::Column => &self.column,
+                Tree::Replica => &self.encoded.replica,
+            };
+            Some(bytes[range.start as usize * NODE_BYTES..range.end as usize * NODE_BYTES].to_vec())
+        }
+    }
+    let m = member(3);
+    let raw = data(1025 * 30, 9);
+    let key = sdr::replica_key(&m, LEAF, EPOCH);
+    let (kept, comm_c) = Kept::label(1025, &key);
+    let encoded = encode_with_labels(&raw, 1025, kept.layers.last().unwrap(), comm_c).unwrap();
+    let stmt = statement(&m, &encoded, b"beacon");
+    let dense = prove_seal_with_labels(&encoded.replica, &stmt, &params(), 8, &kept).unwrap();
+    let source = Sparse {
+        cap: MerkleCap::from_digests(&kept.columns, CAP_HEIGHT),
+        column: hash::digests_to_bytes(&kept.columns),
+        data: data_nodes(&raw),
+        kept,
+        encoded,
+    };
+    let sparse = prove_seal_with_labels(&[], &stmt, &params(), 8, &source).unwrap();
+    assert_eq!(sparse, dense);
+    verify_seal(&stmt, &sparse, &params(), 8).unwrap();
+    let wrong = SealStatement {
+        epoch: EPOCH + 1,
+        ..stmt
+    };
+    assert!(prove_seal_with_labels(&[], &wrong, &params(), 8, &source).is_err());
+    let wrong = SealStatement {
+        registered: Registered {
+            comm_d: [0; NODE_BYTES],
+            ..stmt.registered
+        },
+        ..stmt
+    };
+    assert!(prove_seal_with_labels(&[], &wrong, &params(), 8, &source).is_err());
+}
+
+#[test]
+fn stable_keys_start_at_1393_and_still_bind_the_identity_and_leaf() {
+    quil_types::consensus::set_sealed_storage_epoch_for_thread(Some(1393));
+    assert_ne!(
+        sdr::replica_key(b"a", b"leaf", 1391),
+        sdr::replica_key(b"a", b"leaf", 1392)
+    );
+    assert_ne!(
+        sdr::replica_key(b"a", b"leaf", 1392),
+        sdr::replica_key(b"a", b"leaf", 1393)
+    );
+    assert_eq!(
+        sdr::replica_key(b"a", b"leaf", 1393),
+        sdr::replica_key(b"a", b"leaf", 1394)
+    );
+    assert_ne!(
+        sdr::replica_key(b"a", b"leaf", 1393),
+        sdr::replica_key(b"b", b"leaf", 1393)
+    );
+    assert_ne!(
+        sdr::replica_key(b"a", b"leaf", 1393),
+        sdr::replica_key(b"a", b"other", 1393)
+    );
+    quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
+}

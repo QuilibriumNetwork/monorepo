@@ -59,6 +59,8 @@ const HASH_LEAF: u8 = 0x05;
 /// length-prefixed leaf id and chunk index, so opening a node reads one chunk
 /// instead of the whole replica.
 const HASH_NODES: u8 = 0x06;
+/// Optional snapshot-data cap for sparse seal preparation.
+const DATA_CAP: u8 = 0x07;
 
 /// Nodes per stored chunk: one subtree below the cap, all a member reads of a
 /// replica to open one node of it (`MerkleCap::subtree`).
@@ -510,6 +512,7 @@ impl ReplicaStore {
             ));
         }
         forget_leaves(|e, id| e == epoch && id == leaf_id);
+        self.db.delete(&meta_key(DATA_CAP, epoch, leaf_id))?;
         self.db.delete(&leaf_key(epoch, leaf_id))?;
         self.db.delete_range(
             &chunk_key(epoch, leaf_id, 0),
@@ -529,6 +532,34 @@ impl ReplicaStore {
             &leaf_key(epoch, leaf_id),
             &HashLeaf::encode(n, cap, registration_root),
         )
+    }
+
+    /// Cache metadata only after the replica was committed; always bind it
+    /// back to that registration when reading it.
+    pub fn put_data_cap(&self, epoch: u64, leaf_id: &[u8], cap: &MerkleCap) -> Result<()> {
+        use quil_crypto::storage_proof::{parse_registration_root, Tree};
+        let _writing = hash_writes().lock().unwrap_or_else(PoisonError::into_inner);
+        let leaf = self
+            .db
+            .get(&leaf_key(epoch, leaf_id))?
+            .and_then(|bytes| HashLeaf::decode(&bytes).ok())
+            .ok_or_else(|| QuilError::Store("no chunked replica for data cap".into()))?;
+        let registered = parse_registration_root(&leaf.registration_root)
+            .ok_or_else(|| QuilError::Store("invalid replica registration".into()))?;
+        if cap.n != leaf.n || cap.commitment(Tree::Data) != registered.comm_d {
+            return Err(QuilError::Store(
+                "data cap differs from replica registration".into(),
+            ));
+        }
+        self.db
+            .set(&meta_key(DATA_CAP, epoch, leaf_id), &cap.to_bytes())
+    }
+
+    pub fn get_data_cap(&self, epoch: u64, leaf_id: &[u8]) -> Result<Option<MerkleCap>> {
+        let Some(bytes) = self.db.get(&meta_key(DATA_CAP, epoch, leaf_id))? else {
+            return Ok(None);
+        };
+        Ok(MerkleCap::from_bytes(&bytes))
     }
 
     /// A hash-proof epoch's leaf as [`Self::put_hash`] stored it, nodes and
@@ -884,6 +915,7 @@ impl ReplicaStore {
     pub fn delete(&self, epoch: u64, leaf_id: &[u8]) -> Result<()> {
         let _writing = hash_writes().lock().unwrap_or_else(PoisonError::into_inner);
         forget_leaves(|e, id| e == epoch && id == leaf_id);
+        self.db.delete(&meta_key(DATA_CAP, epoch, leaf_id))?;
         self.db.delete(&leaf_key(epoch, leaf_id))?;
         self.db.delete_range(
             &chunk_key(epoch, leaf_id, 0),
@@ -911,6 +943,7 @@ impl ReplicaStore {
             LEAF_NODES,
             HASH_LEAF,
             HASH_NODES,
+            DATA_CAP,
         ] {
             self.db
                 .delete_range(&meta_key(kind, 0, &[]), &meta_key(kind, keep_from, &[]))?;

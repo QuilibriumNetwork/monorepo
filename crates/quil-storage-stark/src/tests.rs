@@ -571,3 +571,24 @@ fn opening_costs() {
         proof.len() / 1024
     );
 }
+
+#[test]
+fn stable_replica_keys_do_not_allow_epoch_stark_replay_after_1393() {
+    let legacy = Fixture::at(b"stable-key-leaf", 1392, 4096, 3);
+    let first = Fixture::at(b"stable-key-leaf", 1393, 4096, 3);
+    let next = Fixture::at(b"stable-key-leaf", 1394, 4096, 3);
+    assert_ne!(legacy.encoded.replica, first.encoded.replica);
+    assert_eq!(first.encoded.replica, next.encoded.replica);
+    let params = SdrParams::default();
+    let count = 8;
+    let statement = first.statement(b"beacon");
+    let plain = first.seal(&statement, count);
+    let proof = seal::prove(&statement, &params, count, &plain).unwrap();
+    seal::verify(&statement, &params, count, &proof).unwrap();
+    let later = next.statement(b"beacon");
+    assert!(seal::verify(&later, &params, count, &proof).is_err());
+    let plain = next.seal(&later, count);
+    let proof = seal::prove(&later, &params, count, &plain).unwrap();
+    seal::verify(&later, &params, count, &proof).unwrap();
+    assert!(seal::verify(&statement, &params, count, &proof).is_err());
+}

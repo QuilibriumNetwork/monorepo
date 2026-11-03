@@ -633,6 +633,18 @@ impl InMemoryProverRegistry {
         out
     }
 
+    fn storage_eligible(&self, member: &[u8], filter: &[u8], frame: u64) -> bool {
+        if filter.is_empty() || !quil_types::consensus::sealed_storage_required_at(frame) {
+            return true;
+        }
+        let slot = self.get_storage_seat_slot(
+            member,
+            filter,
+            quil_types::consensus::epoch_for_frame(frame),
+        );
+        quil_types::consensus::storage_seat_eligible(filter, frame, slot)
+    }
+
     pub fn get_active_provers(&self, filter: &[u8], frame_number: u64) -> Vec<&ProverInfo> {
         let Some(addrs) = self.filter_cache.get(filter) else {
             return Vec::new();
@@ -641,6 +653,7 @@ impl InMemoryProverRegistry {
             addrs
                 .iter()
                 .filter_map(|a| self.prover_cache.get(a))
+                .filter(|p| self.storage_eligible(&p.address, filter, frame_number))
                 .filter(|p| {
                     p.allocations.iter().any(|alloc| {
                         alloc.confirmation_filter == filter
@@ -728,6 +741,7 @@ impl InMemoryProverRegistry {
             let pick = |lenient: bool| -> Vec<Vec<u8>> {
                 addrs
                     .iter()
+                    .filter(|a| self.storage_eligible(a, filter, frame_number))
                     .filter(|a| {
                         self.prover_cache
                             .get(*a)
@@ -3033,6 +3047,8 @@ pub struct CommittedProverScan {
     releases: Vec<Option<crate::global_intrinsic::prover_release::Release>>,
     /// Each prover's committed seniority, by address.
     seniority: HashMap<Vec<u8>, u64>,
+    /// Sealed epochs only; scheduling never retains the full opening chains.
+    seats: HashMap<(Vec<u8>, Vec<u8>), Vec<u64>>,
 }
 
 impl CommittedProverScan {
@@ -3057,6 +3073,7 @@ impl CommittedProverScan {
             ring_keys,
             releases,
             seniority: HashMap::new(),
+            seats: HashMap::new(),
         }
     }
 
@@ -3083,6 +3100,7 @@ impl CommittedProverScan {
             ring_keys,
             releases,
             seniority,
+            seats: HashMap::new(),
         }
     }
 
@@ -3123,6 +3141,7 @@ impl CommittedProverScan {
         let mut ring_keys = Vec::new();
         let mut releases = Vec::new();
         let mut seniority: HashMap<Vec<u8>, u64> = HashMap::new();
+        let mut seats = HashMap::new();
 
         // Tombstones first: `remove_vertex` leaves the "adds" blob in place, so
         // an adds-only walk resurrects deleted records (the provers the split
@@ -3148,7 +3167,10 @@ impl CommittedProverScan {
                 // leaf-root registrations, rewards, authorization records). A type
                 // hash is stored as a raw leaf value, so a vertex whose bytes hold
                 // neither hash cannot be one: skip it without parsing its tree.
-                if !holds_scanned_type(&data) {
+                if !holds_scanned_type(&data)
+                    && memchr::memmem::find(&data, &crate::global_schema::type_hash_storage_seat())
+                        .is_none()
+                {
                     return;
                 }
                 let root = match deserialize_go_tree(&data) {
@@ -3158,6 +3180,21 @@ impl CommittedProverScan {
                 let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
                     return;
                 };
+                if type_hash == crate::global_schema::type_hash_storage_seat() {
+                    use crate::global_intrinsic::storage_seat;
+                    let member = read_bytes(&root, storage_seat::CLASS, "Member");
+                    let filter = read_bytes(&root, storage_seat::CLASS, "ShardFilter");
+                    if member.len() == 32 {
+                        if let Ok(epochs) = storage_seat::decode_sealed_epochs(&read_bytes(
+                            &root,
+                            storage_seat::CLASS,
+                            "Slots",
+                        )) {
+                            seats.insert((member, filter), epochs);
+                        }
+                    }
+                    return;
+                }
                 if type_hash == TYPE_HASH_ALLOCATION {
                     if let Some((prover_ref, alloc)) = decode_allocation(&vk, &root) {
                         allocations.push((prover_ref, alloc));
@@ -3185,6 +3222,7 @@ impl CommittedProverScan {
                 ring_keys,
                 releases,
                 seniority,
+                seats,
             },
             removes.and(adds),
         )
@@ -3346,6 +3384,15 @@ impl CommittedProverScan {
             for (prover_ref, alloc) in &self.allocations {
                 if alloc.confirmation_filter != filter
                     || !committee_eligible(alloc, frame_number, lenient)
+                    || (!filter.is_empty()
+                        && quil_types::consensus::sealed_storage_required_at(frame_number)
+                        && !self
+                            .seats
+                            .get(&(prover_ref.clone(), filter.to_vec()))
+                            .is_some_and(|epochs| {
+                                epochs
+                                    .contains(&quil_types::consensus::epoch_for_frame(frame_number))
+                            }))
                 {
                     continue;
                 }
@@ -8243,4 +8290,109 @@ mod tests {
     include!("prover_registry_storage_tests.rs");
     include!("prover_registry_penalties_tests.rs");
     include!("registry_rows_tests.rs");
+    #[test]
+    fn sealed_storage_membership_has_no_empty_committee_bypass() {
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(Some(1393));
+        let boundary = quil_types::consensus::epoch_start_frame(1393);
+        let filter = vec![0x71; 32];
+        let mut registry = InMemoryProverRegistry::new();
+        for id in 1..=3 {
+            let address = vec![id; 32];
+            let mut alloc = leaving_alloc(filter.clone(), 1393, 0, 0);
+            alloc.status = ProverStatus::Active;
+            registry.prover_cache.insert(
+                address.clone(),
+                ProverInfo {
+                    public_key: vec![id; 897],
+                    address: address.clone(),
+                    status: ProverStatus::Active,
+                    kick_frame_number: 0,
+                    allocations: vec![alloc],
+                    available_storage: 0,
+                    seniority: 0,
+                    delegate_address: vec![],
+                },
+            );
+            registry
+                .filter_cache
+                .entry(filter.clone())
+                .or_default()
+                .push(address.clone());
+            if id > 1 {
+                registry.seat_cache.insert(
+                    (address, filter.clone()),
+                    vec![quil_types::consensus::StorageSeatSlot {
+                        epoch: 1393,
+                        leaves: vec![vec![]],
+                        registered_at: boundary - 10,
+                        sealed_at: (id == 3).then_some(boundary - 1),
+                        frames: 0,
+                        accumulator: [0; 32],
+                        chained: vec![],
+                        open: true,
+                    }],
+                );
+            }
+        }
+        let mut scan = CommittedProverScan::from_parts(
+            registry
+                .prover_cache
+                .iter()
+                .map(|(a, p)| (a.clone(), p.public_key.clone()))
+                .collect(),
+            registry
+                .prover_cache
+                .iter()
+                .map(|(a, p)| (a.clone(), p.allocations[0].clone()))
+                .collect(),
+        );
+        scan.seats = registry
+            .seat_cache
+            .iter()
+            .map(|(key, slots)| {
+                (
+                    key.clone(),
+                    slots
+                        .iter()
+                        .filter(|slot| {
+                            !slot.leaves.is_empty()
+                                && slot.sealed_at.is_some_and(|at| {
+                                    at < quil_types::consensus::epoch_start_frame(slot.epoch)
+                                })
+                        })
+                        .map(|slot| slot.epoch)
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(registry.get_active_provers(&filter, boundary - 1).len(), 3);
+        assert_eq!(scan.active_on_filter(&filter, boundary - 1).len(), 3);
+        assert_eq!(
+            registry
+                .get_active_provers(&filter, boundary)
+                .iter()
+                .map(|p| p.address.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![3; 32]]
+        );
+        assert_eq!(
+            registry.get_ordered_provers(&[0; 32], &filter, boundary),
+            vec![vec![3; 32]]
+        );
+        assert_eq!(
+            scan.active_on_filter(&filter, boundary)
+                .iter()
+                .map(|(_, a)| a.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![3; 32]]
+        );
+        registry.seat_cache.clear();
+        scan.seats.clear();
+        assert!(registry.get_active_provers(&filter, boundary).is_empty());
+        assert!(registry
+            .get_ordered_provers(&[0; 32], &filter, boundary)
+            .is_empty());
+        assert!(scan.active_on_filter(&filter, boundary).is_empty());
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
+    }
 }

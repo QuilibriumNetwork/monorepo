@@ -13,6 +13,7 @@ pub mod seal;
 mod secp256k1;
 pub mod sntrup761;
 pub mod storage_hash;
+mod storage_labels_compute;
 pub mod storage_proof;
 
 pub use bulletproof_adapter::Decaf448BulletproofProver;

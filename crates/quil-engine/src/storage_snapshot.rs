@@ -233,7 +233,15 @@ impl Captured {
     /// tile the shard; an empty shard has none.
     fn partition(&self, max: u128) -> Result<Vec<Vec<bool>>> {
         if self.size(&self.bits)? == 0 {
-            return Ok(Vec::new());
+            // Empty ranges still need an identity-bound, verifiable seal once
+            // storage is mandatory. Bind their canonical empty snapshot too.
+            return Ok(
+                if quil_types::consensus::sealed_storage_required(self.epoch) {
+                    vec![vec![]]
+                } else {
+                    Vec::new()
+                },
+            );
         }
         let mut leaves = Vec::new();
         let mut pending = vec![Vec::new()];
@@ -356,14 +364,21 @@ impl Captured {
     /// Prove the binding of the leaf `claim` describes (its prefix one of
     /// [`Self::prefixes`]): the data registered is this snapshot's.
     pub fn prove_binding(&self, claim: &LeafClaim) -> Result<LeafBinding> {
+        self.prove_binding_with_cap(claim, None)
+    }
+
+    fn prove_binding_with_cap(
+        &self,
+        claim: &LeafClaim,
+        cap: Option<&quil_crypto::storage_proof::MerkleCap>,
+    ) -> Result<LeafBinding> {
         let entries = self.entries(claim.prefix)?;
         let proof_of =
             |phase: u8, address: &[u8; 32]| self.proof(phase, address).map_err(|e| e.to_string());
-        binding::prove(claim, &entries, &proof_of).map_err(QuilError::InvalidArgument)
+        binding::prove_with_cap(claim, &entries, &proof_of, cap).map_err(QuilError::InvalidArgument)
     }
 
-    /// The summed size of the vertices and hyperedges added under a leaf:
-    /// its data less the index ([`Self::leaf_data`]).
+    /// Values' bytes under one leaf, before its canonical index is added.
     pub fn leaf_size(&self, prefix: &[u32]) -> Result<u128> {
         self.size(&self.leaf_bits(prefix)?)
     }
@@ -788,7 +803,10 @@ fn encode_member_until(
                 padded_nodes_allowed(exact, n)
             })
         });
-        memory.resize(encoding_bytes(ahead.as_ref().map_or(exact, |kept| kept.n)));
+        memory.resize(ahead.as_ref().map_or_else(
+            || encoding_bytes(exact),
+            |kept| quil_crypto::storage_proof::encoding_with_labels_bytes(kept.n),
+        ));
         // A leaf to label now that cannot end by the renewal's grace frame
         // would hold its memory for nothing: its seat renews without it.
         let frame = global_frame().filter(|_| ahead.is_none());
@@ -826,6 +844,10 @@ fn encode_member_until(
         let ahead = from_kept.is_some();
         // Labelled now and kept when there is room; otherwise encoded as by a
         // process that keeps no labels, and its seal labels it again.
+        let mut data = Some(data);
+        if from_kept.is_none() {
+            data.take();
+        }
         let labelled = match (&from_kept, store) {
             (None, Some(store)) => {
                 match store.admit(captured.epoch, member, &leaf_id, exact, Stage::Snapshot) {
@@ -864,7 +886,8 @@ fn encode_member_until(
                         (last, comm_c)
                     }
                 };
-                quil_crypto::storage_proof::encode_with_labels(&data, exact, &last, comm_c)
+                let fresh = captured.leaf_data(prefix)?;
+                quil_crypto::storage_proof::encode_with_labels(&fresh, exact, &last, comm_c)
                     .map_err(QuilError::Internal)?
             }
         };
@@ -876,6 +899,7 @@ fn encode_member_until(
             &encoded.replica_cap.to_bytes(),
             &encoded.registration_root(),
         )?;
+        replicas.put_data_cap(captured.epoch, &leaf_id, &encoded.data_cap)?;
         progress.end(LeafOutcome::Completed);
         Ok((encoded.n, ahead))
     })?;
@@ -1337,6 +1361,7 @@ pub fn chained_beacons(
 /// count was not recorded counts as a full one.
 fn seat_part_bytes(
     replicas: &ReplicaStore,
+    member: &[u8],
     filter: &[u8],
     sealed: Option<(u64, &[Vec<u32>])>,
     settled: Option<(u64, &[Vec<u32>])>,
@@ -1361,9 +1386,21 @@ fn seat_part_bytes(
     let node_bytes = quil_crypto::storage_proof::NODE_BYTES as u64;
     let (mut loaded, mut relabel) = (0u64, 0u64);
     if let Some((epoch, leaves)) = sealed {
-        for n in nodes(epoch, leaves)? {
-            loaded = loaded.saturating_add(n.saturating_mul(node_bytes));
-            relabel = relabel.max(encoding_bytes(n));
+        for (prefix, n) in leaves.iter().zip(nodes(epoch, leaves)?) {
+            let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(filter, prefix);
+            let sparse = crate::storage_labels::installed()
+                .and_then(|store| store.find(epoch, member, &leaf_id, |count| count == n))
+                .and_then(|kept| kept.with_replica(replicas, epoch, &leaf_id))
+                .is_some();
+            if sparse {
+                loaded = loaded.saturating_add(40 << 20);
+                // Binding a snapshot still reads that leaf's data. It does not
+                // keep all replicas or full trees while opening sparse paths.
+                relabel = relabel.max(n.saturating_mul(4 * node_bytes));
+            } else {
+                loaded = loaded.saturating_add(n.saturating_mul(node_bytes));
+                relabel = relabel.max(encoding_bytes(n));
+            }
         }
     }
     if let Some((epoch, leaves)) = settled {
@@ -1397,6 +1434,7 @@ pub fn prepare_member_seat(
     use quil_types::error::QuilError;
     let bytes = seat_part_bytes(
         replicas,
+        member,
         filter,
         seal.map(|(slot, _, _)| (epoch + 2, slot.leaves.as_slice())),
         settle.map(|(slot, _)| (epoch, slot.leaves.as_slice())),
@@ -1416,6 +1454,7 @@ pub fn prepare_member_seat(
         ..Default::default()
     };
     let mut sealed = Vec::new();
+    let mut kept = Vec::new();
     let mut bindings = Vec::new();
     if let Some((slot, beacon_output, captured)) = seal {
         let beacon =
@@ -1427,13 +1466,22 @@ pub fn prepare_member_seat(
         }
         for prefix in &slot.leaves {
             let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(filter, prefix);
-            let stored = replicas.get_hash(epoch + 2, &leaf_id)?.ok_or_else(|| {
-                QuilError::ExecutionUnavailable(format!(
-                    "no stored replica of leaf {} for epoch {}",
-                    hex::encode(&leaf_id),
-                    epoch + 2
-                ))
-            })?;
+            let stored = replicas
+                .get_hash_leaf(epoch + 2, &leaf_id)?
+                .ok_or_else(|| {
+                    QuilError::ExecutionUnavailable(format!(
+                        "no stored replica of leaf {} for epoch {}",
+                        hex::encode(&leaf_id),
+                        epoch + 2
+                    ))
+                })?;
+            let find = || {
+                crate::storage_labels::installed()?
+                    .find(epoch + 2, member, &leaf_id, |n| n == stored.n)
+            };
+            let sparse = find().and_then(|kept| kept.with_replica(replicas, epoch + 2, &leaf_id));
+            let source = sparse.is_some();
+            kept.push(sparse.or_else(find));
             let registered =
                 quil_crypto::storage_proof::parse_registration_root(&stored.registration_root)
                     .ok_or_else(|| {
@@ -1441,17 +1489,29 @@ pub fn prepare_member_seat(
                             "a stored replica without a hash registration".into(),
                         )
                     })?;
-            let n = (stored.replica.len() / quil_crypto::storage_proof::NODE_BYTES) as u64;
+            let n = stored.n;
             let leaf_claim =
                 captured.claim(prefix, &leaf_id, member, &beacon, registered.comm_d, n)?;
-            bindings.push(captured.prove_binding(&leaf_claim)?);
+            let data_cap = replicas.get_data_cap(epoch + 2, &leaf_claim.leaf_id)?;
+            bindings.push(captured.prove_binding_with_cap(&leaf_claim, data_cap.as_ref())?);
             claim.seals.push(epoch_proof::SealedLeaf {
                 n,
                 registered,
                 beacon: beacon.clone(),
                 leaf_id,
             });
-            sealed.push(stored.replica);
+            sealed.push(if source {
+                quil_store::replica_store::LoadedReplica::new(Vec::new())
+            } else {
+                replicas
+                    .get_hash(epoch + 2, &claim.seals.last().unwrap().leaf_id)?
+                    .ok_or_else(|| {
+                        QuilError::ExecutionUnavailable(
+                            "replica disappeared during seal preparation".into(),
+                        )
+                    })?
+                    .replica
+            });
         }
     }
     let held = match settle {
@@ -1506,14 +1566,6 @@ pub fn prepare_member_seat(
         .unwrap_or_default();
     // The labels kept when each sealed leaf was labelled, opened instead of
     // labelling it again.
-    let kept: Vec<Option<crate::storage_labels::Kept>> = claim
-        .seals
-        .iter()
-        .map(|leaf| {
-            crate::storage_labels::installed()?
-                .find(claim.seal_epoch, member, &leaf.leaf_id, |n| n == leaf.n)
-        })
-        .collect();
     if !kept.is_empty() {
         info!(epoch = claim.seal_epoch, filter = %hex::encode(filter), sealed = kept.len(),
             from_kept_labels = kept.iter().filter(|kept| kept.is_some()).count(),
@@ -2999,5 +3051,34 @@ pub(crate) mod tests {
         assert_eq!(files_under(&dir), Vec::<std::path::PathBuf>::new());
         let _ = std::fs::remove_dir_all(&dir);
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+    #[test]
+    fn an_empty_shard_can_seal_its_canonical_snapshot_after_1393() {
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(Some(1393));
+        let crdt = test_crdt();
+        let app = [0x97; 32];
+        let member = [0x74; 32];
+        let epoch = 1393;
+        let captured =
+            capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
+        assert_eq!(captured.prefixes.len(), 1);
+        let prefix = &captured.prefixes[0];
+        let leaf = quil_execution::global_intrinsic::leaf_id_bytes(&app, prefix);
+        let data = captured.leaf_data(prefix).unwrap();
+        let encoded = quil_crypto::storage_proof::encode_leaf(
+            &data,
+            &quil_crypto::sdr::replica_key(&member, &leaf, epoch),
+            &quil_crypto::sdr::SdrParams::default(),
+        );
+        let claim = captured
+            .claim(prefix, &leaf, &member, b"beacon", encoded.comm_d, encoded.n)
+            .unwrap();
+        let binding = captured
+            .prove_binding_with_cap(&claim, Some(&encoded.data_cap))
+            .unwrap();
+        binding::verify(&claim, &binding).unwrap();
+        let dense = captured.prove_binding(&claim).unwrap();
+        assert_eq!(binding.to_bytes(), dense.to_bytes());
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
     }
 }

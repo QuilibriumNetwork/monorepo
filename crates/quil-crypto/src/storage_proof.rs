@@ -7,12 +7,13 @@
 //! pairing or a trusted setup. Every hash is [`crate::storage_hash`]'s
 //! Poseidon2, so a STARK can recompute it.
 //!
-//! Per member, leaf and epoch:
+//! Per member and leaf (with an epoch-specific key before mandatory sealing):
 //! - `D`: the leaf's canonical data, 30 bytes per node packed into 8 field
 //!   elements ([`data_nodes`]);
 //! - labels: the stacked depth-robust labelling over [`crate::sdr`]'s graph,
 //!   keyed by [`sdr::replica_key`]`(member, leaf_id, epoch)`;
-//! - `R = D + labels[L-1]` element-wise, unique to the member, leaf and epoch;
+//! - `R = D + labels[L-1]` element-wise, unique to the member and leaf;
+//!   unchanged data can reuse its replica after the stable-key cutover;
 //! - `comm_D`, `comm_C`, `comm_R`: Merkle commitments over `D`, over the column
 //!   digests (each node's labels on every layer, chained) and over `R`. The
 //!   member registers all three.
@@ -37,9 +38,23 @@ use crate::storage_hash::{self as hash, Digest, Domain};
 pub const NODE_BYTES: usize = hash::DIGEST_BYTES;
 pub type Node = [u8; NODE_BYTES];
 
+/// Keep anonymous labelling scratch files on the labels' filesystem, where
+/// the engine's disk admission margin accounts for concurrent storage work.
+pub fn set_label_scratch_directory(path: std::path::PathBuf) {
+    crate::storage_labels_compute::set_scratch_directory(path);
+}
+
 /// Height of the subtrees a member recomputes from its replica to open a node.
 /// It keeps only the levels above ([`MerkleCap`], ~2 MiB for a 1 GiB replica).
 pub const CAP_HEIGHT: usize = 10;
+
+/// Dense opening sets need a shallower cap on small leaves. Keep about
+/// 1024 subtrees there; large leaves retain the normal 1024-node subtrees.
+/// This is local cache layout only and never changes a Merkle commitment.
+pub fn seal_cap_height(n: u64) -> usize {
+    let groups = (n / 1024).max(1);
+    ((63 - groups.leading_zeros()) as usize).min(CAP_HEIGHT)
+}
 
 /// A registration's leaf root: `comm_D ‖ comm_C ‖ comm_R`.
 pub const REGISTRATION_ROOT_BYTES: usize = 3 * NODE_BYTES;
@@ -109,16 +124,46 @@ fn bind(tree: Tree, n: u64, root: &Digest) -> Digest {
 
 /// The level above `level`, which sits at `height`.
 fn parent_level(level: &[Digest], height: usize) -> Vec<Digest> {
-    level
-        .par_chunks(2)
-        .map(|pair| {
-            let right = pair
-                .get(1)
-                .copied()
-                .unwrap_or_else(|| empty_subtree(height));
-            hash::compress(&pair[0], &right, Domain::Node)
-        })
-        .collect()
+    use p3_field::PackedValue;
+    let mut out = vec![hash::ZERO; level.len().div_ceil(2)];
+    let width = hash::packing_width();
+    out.par_chunks_mut(256 * width)
+        .enumerate()
+        .for_each(|(block, output)| {
+            let start = block * 256 * width;
+            for (group, chunk) in output.chunks_mut(width).enumerate() {
+                let at = start + group * width;
+                if chunk.len() == width {
+                    let left = std::array::from_fn(|j| {
+                        hash::Packed::from_fn(|lane| level[2 * (at + lane)][j])
+                    });
+                    let right = std::array::from_fn(|j| {
+                        hash::Packed::from_fn(|lane| {
+                            level
+                                .get(2 * (at + lane) + 1)
+                                .copied()
+                                .unwrap_or_else(|| empty_subtree(height))[j]
+                        })
+                    });
+                    let result = hash::compress_packed(&left, &right, Domain::Node);
+                    for (lane, node) in chunk.iter_mut().enumerate() {
+                        *node = std::array::from_fn(|j| result[j].as_slice()[lane]);
+                    }
+                } else {
+                    for (lane, node) in chunk.iter_mut().enumerate() {
+                        *node = hash::compress(
+                            &level[2 * (at + lane)],
+                            &level
+                                .get(2 * (at + lane) + 1)
+                                .copied()
+                                .unwrap_or_else(|| empty_subtree(height)),
+                            Domain::Node,
+                        );
+                    }
+                }
+            }
+        });
+    out
 }
 
 /// A whole tree, every level held.
@@ -230,6 +275,44 @@ pub struct MerkleCap {
 }
 
 impl MerkleCap {
+    /// Build only the upper levels, retaining at most one subtree below
+    /// the cap at a time. The reader supplies canonical digests in order.
+    pub fn from_reader(
+        n: u64,
+        height: usize,
+        mut read: impl FnMut(std::ops::Range<u64>) -> Option<Vec<Digest>>,
+    ) -> Option<Self> {
+        if n == 0 || n >= MAX_NODES {
+            return None;
+        }
+        let height = height.min(tree_depth(n));
+        let step = 1u64.checked_shl(height as u32)?;
+        let mut bottom = Vec::with_capacity(n.div_ceil(step) as usize);
+        for start in (0..n).step_by(step as usize) {
+            let end = (start + step).min(n);
+            let mut level = read(start..end)?;
+            if level.len() as u64 != end - start {
+                return None;
+            }
+            for h in 0..height {
+                level = parent_level(&level, h);
+            }
+            bottom.push(level[0]);
+        }
+        let mut levels = vec![bottom];
+        for h in height..tree_depth(n) {
+            levels.push(parent_level(levels.last()?, h));
+        }
+        Some(Self { n, height, levels })
+    }
+
+    pub fn from_digests(nodes: &[Digest], height: usize) -> Self {
+        Self::from_reader(nodes.len() as u64, height, |range| {
+            Some(nodes[range.start as usize..range.end as usize].to_vec())
+        })
+        .expect("nonempty bounded leaf")
+    }
+
     pub fn commitment(&self, tree: Tree) -> Node {
         hash::to_bytes(&bind(tree, self.n, &self.levels.last().expect("a root")[0]))
     }
@@ -342,7 +425,7 @@ impl MerkleCap {
 /// 16 absorbs two whole digests. The input has a fixed shape: absent parents
 /// (node 0 has no DRG parents, layer 0 reads no layer below) are zero
 /// digests.
-fn label(
+pub(crate) fn label(
     key: &Digest,
     layer: usize,
     v: u64,
@@ -384,6 +467,7 @@ pub const STOP_CHECK_NODES: usize = 1024;
 /// `on_layer`; returns the last. Two layers resident at a time, plus the
 /// parent table of [`sdr::graph_parents`]. Labelling is sequential within a
 /// layer: every label depends on its predecessor.
+#[cfg(test)]
 fn label_layers(
     n: usize,
     key: &Digest,
@@ -444,10 +528,16 @@ pub fn column_digest(labels: &[Node]) -> Option<Node> {
 }
 
 fn fold_layer(columns: &mut [Digest], layer: &[Digest]) {
+    let width = hash::packing_width() * 256;
     columns
-        .par_iter_mut()
-        .zip(layer.par_iter())
-        .for_each(|(column, label)| *column = column_step(column, label));
+        .par_chunks_mut(width)
+        .zip(layer.par_chunks(width))
+        .for_each(|(columns, layer)| {
+            // A small bounded buffer also avoids aliasing the input/output slices.
+            let mut output = vec![hash::ZERO; columns.len()];
+            hash::compress_many(columns, layer, &mut output, Domain::Column);
+            columns.copy_from_slice(&output);
+        });
 }
 
 /// The leaf's data as serialized nodes: 30 bytes per node, zero-padded to at
@@ -475,6 +565,8 @@ pub struct EncodedLeaf {
     pub comm_r: Node,
     /// What, with the replica, opens any node of it.
     pub replica_cap: MerkleCap,
+    /// Snapshot data tree, reused when the seal challenges arrive.
+    pub data_cap: MerkleCap,
 }
 
 impl EncodedLeaf {
@@ -497,13 +589,39 @@ pub fn data_node_count(bytes: u64) -> u64 {
         .max(MIN_NODES as u64)
 }
 
-/// Bytes [`encode_leaf`] or [`prove_seal`] holds at its peak for a leaf of
-/// `n` nodes: the leaf's nodes six times over (its data or replica as given
-/// and as digests, the column digests, two label layers, and the trees built
-/// after) and the parent table.
+/// Peak for labelling alone: two label layers and at most one in-memory
+/// column accumulator. Graph tables are shared or disk-backed; callbacks
+/// borrow immutable layers without retaining an extra complete copy.
+pub fn label_working_bytes(n: u64, params: &SdrParams) -> u64 {
+    if params.drg_degree == 6 && params.expander_degree == 8 && params.layers == 11 {
+        n.saturating_mul((3 * NODE_BYTES) as u64)
+            .saturating_add(n.saturating_mul(56).min(8 << 20))
+            .saturating_add(4 << 20)
+    } else {
+        labelling_peak_bytes(n, params)
+    }
+}
+
+/// Encoding from labels already computed holds the raw payload, last layer,
+/// packed replica and serialized output; tree construction holds one subtree.
+pub fn encoding_with_labels_bytes(n: u64) -> u64 {
+    n.saturating_mul((5 * NODE_BYTES) as u64)
+        .saturating_add(4 << 20)
+}
+
+/// Conservative encoding / dense-seal peak for a leaf of `n` nodes. The
+/// standard labeller bounds graph memory; custom parameters retain the
+/// original in-memory graph implementation.
 pub fn labelling_peak_bytes(n: u64, params: &SdrParams) -> u64 {
     let parents = 4 * (params.drg_degree.max(1) + params.expander_degree);
-    n.saturating_mul((6 * NODE_BYTES + parents) as u64)
+    if params.drg_degree == 6 && params.expander_degree == 8 && params.layers == 11 {
+        // Includes encoding buffers and the compatible dense proof fallback.
+        // Large graph tables and column accumulators use scratch storage.
+        n.saturating_mul((6 * NODE_BYTES) as u64)
+            .saturating_add(n.saturating_mul(parents as u64).min(8 << 20))
+    } else {
+        n.saturating_mul((6 * NODE_BYTES + parents) as u64)
+    }
 }
 
 /// Nodes a registration may pad a leaf's data with, with zeros, beyond its
@@ -543,23 +661,20 @@ pub fn encode_leaf(data: &[u8], key: &[u8], params: &SdrParams) -> EncodedLeaf {
 /// finished layer to `on_layer` (to keep for the seal,
 /// [`prove_seal_with_labels`]).
 pub fn encode_leaf_at(
-    data: &[u8],
+    data_bytes: &[u8],
     key: &[u8],
     params: &SdrParams,
     n: u64,
     on_layer: &mut dyn FnMut(usize, &[Digest]),
 ) -> EncodedLeaf {
-    let mut data = packed_data(data);
     assert!(
-        n as usize >= data.len(),
-        "a leaf of {} nodes encoded at {n}",
-        data.len()
+        n >= data_node_count(data_bytes.len() as u64),
+        "encoded leaf count smaller than data"
     );
-    data.resize(n as usize, hash::ZERO);
-    let comm_d = MerkleTree::from_digests(data.clone()).commitment(Tree::Data);
     let (last, columns) = label_leaf(n, key, params, on_layer);
-    let comm_c = MerkleTree::from_digests(columns).commitment(Tree::Column);
-    assemble(data, &last, comm_d, comm_c)
+    let comm_c = MerkleCap::from_digests(&columns, seal_cap_height(n)).commitment(Tree::Column);
+    drop(columns);
+    encode_with_labels(data_bytes, n, &last, comm_c).expect("valid padded labels")
 }
 
 /// A leaf's labels, which depend on its key and node count alone, never on
@@ -590,6 +705,9 @@ pub fn label_leaf_until(
         "a leaf of {n} nodes"
     );
     let n = n as usize;
+    if params.drg_degree == 6 && params.expander_degree == 8 && params.layers == 11 {
+        return crate::storage_labels_compute::label(n, hash::key_digest(key), on_layer, stop);
+    }
     let mut columns = vec![hash::ZERO; n];
     let last = label_layers_until(
         n,
@@ -622,28 +740,31 @@ pub fn encode_with_labels(
         ));
     }
     data.resize(n as usize, hash::ZERO);
-    let comm_d = MerkleTree::from_digests(data.clone()).commitment(Tree::Data);
-    Ok(assemble(data, last, comm_d, comm_c))
+    let data_cap = MerkleCap::from_digests(&data, seal_cap_height(n));
+    Ok(assemble(data, last, data_cap, comm_c))
 }
 
 /// The replica, `data + last`, with its tree.
-fn assemble(data: Vec<Digest>, last: &[Digest], comm_d: Node, comm_c: Node) -> EncodedLeaf {
+fn assemble(
+    mut data: Vec<Digest>,
+    last: &[Digest],
+    data_cap: MerkleCap,
+    comm_c: Node,
+) -> EncodedLeaf {
     let n = data.len() as u64;
-    let replica: Vec<Digest> = data
-        .par_iter()
+    data.par_iter_mut()
         .zip(last.par_iter())
-        .map(|(d, l)| hash::add(d, l))
-        .collect();
-    drop(data);
-    let replica_bytes = hash::digests_to_bytes(&replica);
-    let replica_tree = MerkleTree::from_digests(replica);
+        .for_each(|(d, l)| *d = hash::add(d, l));
+    let replica_cap = MerkleCap::from_digests(&data, CAP_HEIGHT);
+    let replica = hash::digests_to_bytes(&data);
     EncodedLeaf {
         n,
-        comm_d,
+        comm_d: data_cap.commitment(Tree::Data),
         comm_c,
-        comm_r: replica_tree.commitment(Tree::Replica),
-        replica_cap: replica_tree.cap(CAP_HEIGHT),
-        replica: replica_bytes,
+        comm_r: replica_cap.commitment(Tree::Replica),
+        data_cap,
+        replica_cap,
+        replica,
     }
 }
 
@@ -764,18 +885,19 @@ pub fn prove_seal(
     count: usize,
 ) -> Result<SealProof, String> {
     let mut seal = Seal::new(replica, statement, params, count)?;
-    let key = hash::key_digest(&sdr::replica_key(
-        statement.member,
-        statement.leaf_id,
-        statement.epoch,
-    ));
-    let mut columns = vec![hash::ZERO; seal.replica.len()];
-    let last = label_layers(seal.replica.len(), &key, params, &mut |_, layer| {
-        fold_layer(&mut columns, layer);
-        for (v, labels) in seal.kept.iter_mut() {
-            labels.push(hash::to_bytes(&layer[*v as usize]));
-        }
-    });
+    let key = sdr::replica_key(statement.member, statement.leaf_id, statement.epoch);
+    let (last, columns) = label_leaf_until(
+        statement.n,
+        &key,
+        params,
+        &mut |_, layer| {
+            for (v, labels) in seal.kept.iter_mut() {
+                labels.push(hash::to_bytes(&layer[*v as usize]));
+            }
+        },
+        &|| false,
+    )
+    .ok_or("seal labelling unavailable")?;
     seal.finish(statement, columns, last)
 }
 
@@ -788,6 +910,13 @@ pub trait LabelSource {
     fn columns(&self) -> Option<Vec<Digest>>;
     /// The last layer.
     fn last_layer(&self) -> Option<Vec<Digest>>;
+    /// Optional sparse seal support. Older stores continue to use the dense path.
+    fn cap(&self, _tree: Tree) -> Option<MerkleCap> {
+        None
+    }
+    fn nodes(&self, _tree: Tree, _range: std::ops::Range<u64>) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// [`prove_seal`] from the labels kept when the leaf was labelled, with no
@@ -799,6 +928,19 @@ pub fn prove_seal_with_labels(
     count: usize,
     labels: &dyn LabelSource,
 ) -> Result<SealProof, String> {
+    if let (Some(data), Some(column), Some(replica_cap)) = (
+        labels.cap(Tree::Data),
+        labels.cap(Tree::Column),
+        labels.cap(Tree::Replica),
+    ) {
+        return prove_seal_from_caps(
+            statement,
+            params,
+            count,
+            labels,
+            &[data, column, replica_cap],
+        );
+    }
     let mut seal = Seal::new(replica, statement, params, count)?;
     let n = seal.replica.len();
     let columns = labels
@@ -822,6 +964,75 @@ pub fn prove_seal_with_labels(
         .filter(|last| last.len() == n)
         .ok_or("no kept last layer for the leaf")?;
     seal.finish(statement, columns, last)
+}
+
+/// Open only challenged subtrees; every cached cap and opening is checked
+/// against the registration, then the ordinary seal verifier checks the result.
+fn prove_seal_from_caps(
+    statement: &SealStatement,
+    params: &SdrParams,
+    count: usize,
+    labels: &dyn LabelSource,
+    caps: &[MerkleCap; 3],
+) -> Result<SealProof, String> {
+    let trees = [Tree::Data, Tree::Column, Tree::Replica];
+    let roots = [
+        statement.registered.comm_d,
+        statement.registered.comm_c,
+        statement.registered.comm_r,
+    ];
+    for ((cap, tree), root) in caps.iter().zip(trees).zip(roots) {
+        if cap.n != statement.n || cap.commitment(tree) != root {
+            return Err("cached seal cap differs from registration".into());
+        }
+    }
+    let open = |tree: Tree, index: u64| -> Result<(Node, Vec<Node>), String> {
+        let cap = &caps[tree as usize];
+        let below = cap.subtree(index).ok_or("seal index outside cap")?;
+        let bytes = labels
+            .nodes(tree, below.clone())
+            .ok_or("cached seal subtree missing")?;
+        let path = cap
+            .subtree_path(&bytes, index)
+            .ok_or("cached seal subtree differs from cap")?;
+        let at = (index - below.start) as usize * NODE_BYTES;
+        Ok((bytes[at..at + NODE_BYTES].try_into().unwrap(), path))
+    };
+    let column = |index| -> Result<ColumnOpening, String> {
+        let labels = (0..params.layers)
+            .map(|layer| {
+                labels
+                    .label(layer, index)
+                    .ok_or("cached seal label missing".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (digest, path) = open(Tree::Column, index)?;
+        if column_digest(&labels) != Some(digest) {
+            return Err("cached seal labels differ from column".into());
+        }
+        Ok(ColumnOpening { labels, path })
+    };
+    let mut openings = Vec::with_capacity(count);
+    for index in seal_challenges(statement, count) {
+        let (same, below) = parents_of(index, statement.n, params);
+        let (data, data_path) = open(Tree::Data, index)?;
+        let (replica, replica_path) = open(Tree::Replica, index)?;
+        openings.push(SealOpening {
+            data,
+            data_path,
+            replica,
+            replica_path,
+            column: column(index)?,
+            parents: same
+                .into_iter()
+                .chain(below)
+                .map(column)
+                .collect::<Result<_, _>>()?,
+        });
+    }
+    let proof = SealProof { openings };
+    verify_seal(statement, &proof, params, count)?;
+    Ok(proof)
 }
 
 /// A seal proof being made: the replica, the challenges and their parents,
