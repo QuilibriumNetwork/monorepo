@@ -747,6 +747,8 @@ pub(crate) struct ReplayTurn {
     pub batches: u32,
     pub fetch_ms: u64,
     pub replay_ms: u64,
+    /// Waiting to take back the turn lent during its replays.
+    pub turn_back_ms: u64,
     /// The turn ended below its replay target.
     pub behind: bool,
 }
@@ -961,6 +963,8 @@ pub(crate) async fn recover_shard_from_latest(
         let committed_tip = target.committed_tip().await;
         let (started, from, replay_us) =
             (Instant::now(), target.materialized(), &AtomicU64::new(0));
+        // Replaying reads no archive: the turn serves the queue meanwhile.
+        let (lending, took_back_us) = (turn.as_ref(), &AtomicU64::new(0));
         let (mut materialized, mut batches) = (from, 0);
         // A batch short of its target replayed all its frames: each frame
         // advances the replay or fails it.
@@ -992,16 +996,22 @@ pub(crate) async fn recover_shard_from_latest(
                         .header
                         .as_ref()
                         .map_or(0, |header| header.frame_number);
-                    let advanced = waiting_out_global_sync(
-                        sync_wait,
-                        target,
-                        filter,
-                        number,
-                        "archive replay",
-                        move || target.replay(frame.clone(), child.clone()),
-                    )
-                    .await;
-                    replay_us.fetch_add(at.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    let (advanced, took_back) =
+                        crate::recovery_turns::lent_during(lending, async {
+                            let advanced = waiting_out_global_sync(
+                                sync_wait,
+                                target,
+                                filter,
+                                number,
+                                "archive replay",
+                                move || target.replay(frame.clone(), child.clone()),
+                            )
+                            .await;
+                            replay_us.fetch_add(at.elapsed().as_micros() as u64, Ordering::Relaxed);
+                            advanced
+                        })
+                        .await;
+                    took_back_us.fetch_add(took_back.as_micros() as u64, Ordering::Relaxed);
                     advanced
                 },
             )
@@ -1028,11 +1038,15 @@ pub(crate) async fn recover_shard_from_latest(
             materialized = replay.materialized;
         };
         let replay_ms = replay_us.load(Ordering::Relaxed) / 1000;
+        let turn_back_ms = took_back_us.load(Ordering::Relaxed) / 1000;
         let turn = ReplayTurn {
             frames: replay.materialized.saturating_sub(from),
             batches,
-            fetch_ms: (started.elapsed().as_millis() as u64).saturating_sub(replay_ms),
+            fetch_ms: (started.elapsed().as_millis() as u64)
+                .saturating_sub(replay_ms)
+                .saturating_sub(turn_back_ms),
             replay_ms,
+            turn_back_ms,
             behind: replay.materialized < replay.target,
         };
         return Ok(ShardRecoveryProgress::Replayed {
@@ -2460,6 +2474,64 @@ mod tests {
         }
     }
 
+    /// A replay blocked in its engine leaves its turn to the worker behind
+    /// it, and goes on once that worker's turn ends.
+    #[tokio::test]
+    async fn a_replay_in_its_engine_lends_its_turn_to_the_next_worker() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive {
+            latest: Some(frame(131)),
+            calls: calls.clone(),
+        };
+        let turns: &'static crate::recovery_turns::RecoveryTurns =
+            Box::leak(Box::new(crate::recovery_turns::RecoveryTurns::new(1)));
+        let claim = |core: u32| crate::recovery_turns::Claim {
+            core,
+            filter: vec![5; 32],
+            kind: crate::recovery_turns::RecoveryKind::Replay,
+            execution: Default::default(),
+            ticket: None,
+        };
+        let held = turns.acquire(claim(1)).await;
+        let (got_tx, got) = tokio::sync::oneshot::channel();
+        let (end_tx, end) = tokio::sync::oneshot::channel::<()>();
+        let behind = tokio::spawn(async move {
+            let _turn = turns.acquire(claim(2)).await;
+            got_tx.send(()).unwrap();
+            let _ = end.await;
+        });
+        tokio::task::yield_now().await;
+        let target = Target {
+            calls: calls.clone(),
+            cursor: 129.into(),
+            valid: false,
+            install_ok: false,
+            blocked: false.into(),
+            unblock_at: 0,
+        };
+        let recovery = recover_shard_from_latest(
+            &archive,
+            &[5; 32],
+            Some(frame(130)),
+            &target,
+            &[],
+            Some(held),
+        );
+        let mut recovery = Box::pin(recovery);
+        // The first replayed frame lends the turn on, so the worker behind
+        // has it while the recovery asks for it back.
+        tokio::select! {
+            _ = &mut recovery => panic!("it needs the turn back to go on"),
+            got = got => got.unwrap(),
+        }
+        end_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), recovery)
+            .await
+            .expect("the turn comes back")
+            .unwrap();
+        behind.await.unwrap();
+    }
+
     #[tokio::test]
     async fn existing_worker_lineage_replays_instead_of_replacing_its_tree() {
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -2826,14 +2898,17 @@ mod tests {
             }
         ));
         let calls = calls.lock().unwrap().clone();
+        // Its place: its first archive read comes before the other worker
+        // is granted a turn. The other is granted only once the first lends
+        // the turn, during its first frame's replay (recovery_turns::lent_during).
         assert_eq!(
             calls.first().map(String::as_str),
             Some("fetch 0"),
             "{calls:?}"
         );
         assert_eq!(
-            calls.last().map(String::as_str),
-            Some("other granted"),
+            calls.iter().filter(|call| *call == "other granted").count(),
+            1,
             "{calls:?}"
         );
         assert!(
@@ -3128,14 +3203,17 @@ mod tests {
             "{again:?}"
         );
         let calls = calls.lock().unwrap().clone();
+        // Its place: its first archive read comes before the other worker
+        // is granted a turn, which it gets only once the restarted recovery
+        // lends it (recovery_turns::lent_during).
         assert_eq!(
             calls.first().map(String::as_str),
             Some("fetch 0"),
             "the restarted engine's recovery takes the next turn: {calls:?}"
         );
         assert_eq!(
-            calls.last().map(String::as_str),
-            Some("other granted"),
+            calls.iter().filter(|call| *call == "other granted").count(),
+            1,
             "{calls:?}"
         );
     }

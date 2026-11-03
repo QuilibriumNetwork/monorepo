@@ -29,9 +29,18 @@
 //! engine restarts on its seat at its activation, around a GLOBAL sync or
 //! at an operator's action. The place serves one claim, and lapses
 //! [`place_kept_for`] after its first withdrawal since its last turn.
+//!
+//! A turn bounds archive reads; a replay spends much of its turn on none, in
+//! its own engine or waiting out this node's GLOBAL state sync. While it does
+//! it lends the turn to the queue ([`lent_during`]) and takes the next one
+//! that ends to fetch its next frame: archive reads stay at [`RECOVERY_TURNS`]
+//! at once and at most [`MAX_LENT_TURNS`] more workers replay beside them. With
+//! both turns kept through local work, 47 to 52 waiters on a node waited 10
+//! to 80 minutes for batches taking 25 to 58 s (2026-11-03), 61 to 85% of it
+//! local.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -42,6 +51,12 @@ use crate::worker_execution::SharedWorkerExecution;
 
 /// Archive shard recoveries this process runs at once.
 pub(crate) const RECOVERY_TURNS: usize = 2;
+
+/// Turns lent out at once ([`lent_during`]): how many more workers than
+/// [`RECOVERY_TURNS`] may be in a replay. Each replays on its own worker
+/// thread and store, on the node's disk. Past this a replay keeps its turn
+/// through its local work, as before lending existed.
+pub(crate) const MAX_LENT_TURNS: usize = 6;
 
 /// Turns in a row that may go past the longest waiter to replays and
 /// blocked successors, so other recoveries still progress meanwhile.
@@ -245,6 +260,12 @@ struct TurnQueue<T> {
     /// The last turn went to a resumed waiter.
     after_resumed: bool,
     waiters: VecDeque<Waiter<T>>,
+    /// Holders whose turn is lent out ([`lent_during`]), in local work.
+    lent: usize,
+    /// Holders back from local work waiting for a turn, by id: each goes
+    /// before every waiter, or the workers lent to would keep their fetches
+    /// from those already part way through a batch.
+    returning: VecDeque<(u64, T)>,
 }
 
 impl<T> TurnQueue<T> {
@@ -258,7 +279,38 @@ impl<T> TurnQueue<T> {
             bypassed: 0,
             after_resumed: false,
             waiters: VecDeque::new(),
+            lent: 0,
+            returning: VecDeque::new(),
         }
+    }
+
+    /// Whether a holder may lend its turn now: someone could use it, and
+    /// fewer than [`MAX_LENT_TURNS`] are out.
+    fn may_lend(&self) -> bool {
+        self.lent < MAX_LENT_TURNS && !(self.waiters.is_empty() && self.returning.is_empty())
+    }
+
+    /// A holder back from local work asks for a turn: taken if one is free,
+    /// else queued as `grant` under the returned id.
+    fn take_back(&mut self, grant: T) -> Option<u64> {
+        self.lent = self.lent.saturating_sub(1);
+        if self.free > 0 {
+            self.free -= 1;
+            return None;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.returning.push_back((id, grant));
+        Some(id)
+    }
+
+    /// Withdraw a returning holder; false when it already got its turn.
+    fn withdraw_returning(&mut self, id: u64) -> bool {
+        let Some(at) = self.returning.iter().position(|(held, _)| *held == id) else {
+            return false;
+        };
+        self.returning.remove(at);
+        true
     }
 
     /// A new arrival: [`Self::take_or_requeue`] without a ticket.
@@ -357,6 +409,9 @@ impl<T> TurnQueue<T> {
     /// waiter's grant and whether its turn installs.
     fn next(&mut self, ended_install: bool) -> Option<(T, bool)> {
         self.installs = self.installs.saturating_sub(usize::from(ended_install));
+        if let Some((_, grant)) = self.returning.pop_front() {
+            return Some((grant, false));
+        }
         if self.waiters.is_empty() {
             self.free += 1;
             return None;
@@ -426,6 +481,7 @@ impl<T> TurnQueue<T> {
                 .unwrap_or_default(),
             front_core: self.waiters.front().map(|w| w.core),
             install_turns: self.installs,
+            lent_turns: self.lent,
             longest_replay_wait: self
                 .waiters
                 .iter()
@@ -449,6 +505,8 @@ struct QueueLoad {
     front_core: Option<u32>,
     /// Turns held by checkpoint installs.
     install_turns: usize,
+    /// Holders in local work, their turns lent out.
+    lent_turns: usize,
     /// The longest wait of a waiter that would not install.
     longest_replay_wait: Duration,
 }
@@ -697,9 +755,78 @@ pub(crate) struct Turn<'a> {
     ticket: u64,
     /// It counts as an install's turn ([`TurnQueue::installs`]).
     install: bool,
+    /// Where its turn is: held, lent out, or being taken back.
+    lending: AtomicU8,
+}
+
+/// [`Turn::lending`]: the holder has its turn.
+const TURN_HELD: u8 = 0;
+/// Lent out; counted in [`TurnQueue::lent`].
+const TURN_LENT: u8 = 1;
+/// Asked for back; no longer counted lent, and not yet held.
+const TURN_RETURNING: u8 = 2;
+
+/// Run `work`, which reads no archive, with `turn` lent to the queue, and
+/// take a turn back after it, before the holder's next archive read. Without
+/// a turn, with nobody waiting, or with [`MAX_LENT_TURNS`] out, the holder
+/// just does the work holding it. Also returns how long taking it back took.
+///
+/// A lent turn cannot strand its queue: it goes on at once, and a holder back
+/// from local work waits only for the next turn to end, before any waiter. A
+/// turn ends within a replay's archive read, or at an install's hold limit.
+/// Holders only leave while returning holders take every ended turn, so the
+/// waiters are served again once those are through.
+pub(crate) async fn lent_during<R>(
+    turn: Option<&Turn<'_>>,
+    work: impl std::future::Future<Output = R>,
+) -> (R, Duration) {
+    let Some(turn) = turn.filter(|turn| turn.lend()) else {
+        return (work.await, Duration::ZERO);
+    };
+    let done = work.await;
+    let asked = Instant::now();
+    turn.take_back().await;
+    (done, asked.elapsed())
 }
 
 impl Turn<'_> {
+    /// Lend this turn out, if it may be: an install's never is, since it
+    /// holds its archive reads across its local work.
+    fn lend(&self) -> bool {
+        if self.install || self.lending.load(Ordering::Relaxed) != TURN_HELD {
+            return false;
+        }
+        {
+            let mut state = self.turns.lock();
+            if !state.queue.may_lend() {
+                return false;
+            }
+            state.queue.lent += 1;
+        }
+        self.lending.store(TURN_LENT, Ordering::Relaxed);
+        self.turns.release(false);
+        true
+    }
+
+    /// Hold a turn again. Dropped while it waits, the request leaves the
+    /// queue, and a turn granted meanwhile passes on.
+    async fn take_back(&self) {
+        let (grant, granted) = oneshot::channel();
+        self.lending.store(TURN_RETURNING, Ordering::Relaxed);
+        let id = self.turns.lock().queue.take_back(grant);
+        if let Some(id) = id {
+            let mut returning = Returning {
+                turns: self.turns,
+                id,
+                granted,
+                taken: false,
+            };
+            // The sender is dropped only after it granted the turn.
+            let _ = (&mut returning.granted).await;
+            returning.taken = true;
+        }
+        self.lending.store(TURN_HELD, Ordering::Relaxed);
+    }
     /// Its holder's place in the queue, kept if it queues again after
     /// handing the turn back ([`Claim::ticket`]).
     pub(crate) fn ticket(&self) -> u64 {
@@ -732,7 +859,37 @@ impl Drop for Turn<'_> {
                     "archive recovery turn held past its limit is released");
             }
         }
-        self.turns.release(self.install);
+        match self.lending.load(Ordering::Relaxed) {
+            TURN_HELD => self.turns.release(self.install),
+            TURN_LENT => {
+                let mut state = self.turns.lock();
+                state.queue.lent = state.queue.lent.saturating_sub(1);
+            }
+            // [`Returning`] settled it as it dropped, before this.
+            _ => {}
+        }
+    }
+}
+
+/// A lent turn's holder asking for one back. Dropped unanswered, it leaves
+/// the queue; dropped answered, it passes the turn on.
+struct Returning<'a> {
+    turns: &'a RecoveryTurns,
+    id: u64,
+    granted: oneshot::Receiver<bool>,
+    /// The turn was received.
+    taken: bool,
+}
+
+impl Drop for Returning<'_> {
+    fn drop(&mut self) {
+        if self.taken {
+            return;
+        }
+        let withdrawn = self.turns.lock().queue.withdraw_returning(self.id);
+        if !withdrawn && self.granted.try_recv().is_ok() {
+            self.turns.release(false);
+        }
     }
 }
 
@@ -901,6 +1058,7 @@ impl RecoveryTurns {
             id,
             ticket,
             install,
+            lending: AtomicU8::new(TURN_HELD),
         }
     }
 
@@ -947,13 +1105,14 @@ impl RecoveryTurns {
                 waiting_workers = load.waiting, blocked_successors_waiting = load.blocked_successors,
                 replays_waiting = load.replays, departing_waiting = load.departing,
                 longest_wait_secs = load.longest_wait.as_secs(),
-                install_turns = load.install_turns,
+                install_turns = load.install_turns, lent_turns = load.lent_turns,
                 longest_replay_wait_secs = load.longest_replay_wait.as_secs(),
                 longest_waiting_core = %load.front_core.map_or_else(|| "none".to_string(), |core| core.to_string()),
                 permits = self.turns, saturated_secs = duration.as_secs(),
                 holders = %holders.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "),
                 scope = "this node",
-                action = "this node recovers at most this many shards from archives at once to bound their load; \
+                action = "this node reads for at most this many shard recoveries from archives at once to bound their load, \
+                    and lent_turns more replay meanwhile on this node's own engines; \
                     workers wait their turn, frame replays before checkpoint installs and owed re-anchors, blocked \
                     successor sessions and voting members trailing their committee first, seats whose leave GLOBAL \
                     confirmed after every other unless they fill a gap of at most 32 frames, and no recovery holds a \
@@ -980,6 +1139,222 @@ fn log_kept_place(core: u32, filter: &[u8], kept: Option<(u64, Instant)>) {
             withdrawn_secs = since.elapsed().as_secs(), scope = "this node's worker",
             "archive recovery queues again in the place its stopped engine's request held: \
             the shard engine restarted on this core");
+    }
+}
+
+#[cfg(test)]
+mod lending_tests {
+    use super::*;
+
+    fn replay(core: u32) -> Claim {
+        Claim {
+            core,
+            filter: vec![core as u8; 32],
+            kind: RecoveryKind::Replay,
+            execution: SharedWorkerExecution::default(),
+            ticket: None,
+        }
+    }
+
+    fn install(core: u32) -> Claim {
+        Claim {
+            kind: RecoveryKind::Install,
+            ..replay(core)
+        }
+    }
+
+    fn leaked(turns: usize) -> &'static RecoveryTurns {
+        Box::leak(Box::new(RecoveryTurns::new(turns)))
+    }
+
+    /// A worker that takes a turn, tells `got`, and holds it until `end`.
+    fn taking(
+        turns: &'static RecoveryTurns,
+        core: u32,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        oneshot::Receiver<()>,
+        oneshot::Sender<()>,
+    ) {
+        let (got_tx, got) = oneshot::channel();
+        let (end, end_rx) = oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _turn = turns.acquire(replay(core)).await;
+            got_tx.send(()).unwrap();
+            let _ = end_rx.await;
+        });
+        (task, got, end)
+    }
+
+    async fn settles<T>(wait: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("it never came")
+    }
+
+    /// The lent turn reaches a waiter while its holder works; back from the
+    /// work the holder waits for it, then goes before every other waiter.
+    #[tokio::test]
+    async fn a_lent_turn_serves_a_waiter_and_its_holder_goes_first_after() {
+        let turns = leaked(1);
+        let held = turns.acquire(replay(1)).await;
+        let (second, got_second, end_second) = taking(turns, 2);
+        tokio::task::yield_now().await;
+        let (third, mut got_third, end_third) = taking(turns, 3);
+        tokio::task::yield_now().await;
+        let (worked, work) = oneshot::channel::<()>();
+        let lending = lent_during(Some(&held), async {
+            settles(got_second).await.unwrap();
+            let _ = worked.send(());
+        });
+        let mut lending = Box::pin(lending);
+        // The work ended; the holder cannot read yet: the second has the turn.
+        let waiting = tokio::time::timeout(Duration::from_millis(200), &mut lending).await;
+        assert!(waiting.is_err(), "the holder waits for a turn to end");
+        settles(work).await.unwrap();
+        end_second.send(()).unwrap();
+        settles(&mut lending).await;
+        assert!(
+            got_third.try_recv().is_err(),
+            "the holder went before the third"
+        );
+        assert_eq!(turns.lock().queue.lent, 0);
+        drop(lending);
+        drop(held);
+        settles(got_third).await.unwrap();
+        end_third.send(()).unwrap();
+        settles(second).await.unwrap();
+        settles(third).await.unwrap();
+        settles(turns.acquire(replay(9))).await;
+    }
+
+    /// With nobody waiting there is nothing to lend for.
+    #[tokio::test]
+    async fn a_turn_nobody_waits_for_is_not_lent() {
+        let turns = leaked(1);
+        let held = turns.acquire(replay(1)).await;
+        let (_, took) = lent_during(Some(&held), async {
+            assert_eq!(turns.lock().queue.lent, 0);
+        })
+        .await;
+        assert_eq!(took, Duration::ZERO);
+        assert_eq!(held.lending.load(Ordering::Relaxed), TURN_HELD);
+    }
+
+    /// An install reads the archive across its work: its turn stays.
+    #[tokio::test]
+    async fn an_install_keeps_its_turn() {
+        let turns = leaked(1);
+        let held = turns.acquire(install(1)).await;
+        assert!(held.install);
+        let (_second, _got, _end) = taking(turns, 2);
+        tokio::task::yield_now().await;
+        lent_during(Some(&held), async {
+            assert_eq!(turns.lock().queue.lent, 0, "not lent");
+        })
+        .await;
+    }
+
+    /// At most [`MAX_LENT_TURNS`] are out: the next holder keeps its turn
+    /// through its work, so the waiters behind it wait.
+    #[tokio::test]
+    async fn no_more_than_the_limit_are_lent() {
+        let turns = leaked(1);
+        let gate = turns.acquire(replay(1000)).await;
+        let (hold, mut in_work) = (Arc::new(tokio::sync::Notify::new()), Vec::new());
+        // Queued behind the gate: each takes its turn in order and lends it,
+        // staying in its work.
+        for core in 0..=MAX_LENT_TURNS as u32 + 1 {
+            let (hold, (tx, rx)) = (hold.clone(), oneshot::channel());
+            tokio::spawn(async move {
+                let turn = turns.acquire(replay(core)).await;
+                lent_during(Some(&turn), async {
+                    tx.send(()).unwrap();
+                    hold.notified().await;
+                })
+                .await;
+            });
+            tokio::task::yield_now().await;
+            in_work.push(rx);
+        }
+        let (_last, mut got_last, _end) = taking(turns, 99);
+        tokio::task::yield_now().await;
+        drop(gate);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        let working = in_work
+            .iter_mut()
+            .filter_map(|rx| rx.try_recv().ok())
+            .count();
+        assert_eq!(turns.lock().queue.lent, MAX_LENT_TURNS);
+        assert_eq!(
+            working,
+            MAX_LENT_TURNS + 1,
+            "the limit's holders and the one keeping its turn"
+        );
+        assert!(
+            got_last.try_recv().is_err(),
+            "the turn was not lent past the limit"
+        );
+    }
+
+    /// A holder stopped in its local work owns no turn: none is released
+    /// twice, and the count of lent turns comes back.
+    #[tokio::test]
+    async fn a_holder_stopped_while_its_turn_is_lent_releases_nothing() {
+        let turns = leaked(1);
+        let held = turns.acquire(replay(1)).await;
+        let (second, got, end) = taking(turns, 2);
+        tokio::task::yield_now().await;
+        {
+            let lending = lent_during(Some(&held), std::future::pending::<()>());
+            let mut lending = Box::pin(lending);
+            assert!(futures_poll_once(&mut lending).await.is_none());
+        }
+        drop(held);
+        settles(got).await.unwrap();
+        assert_eq!(turns.lock().queue.lent, 0);
+        // The second holds the only turn: a third must wait for it.
+        let (third, mut got_third, end_third) = taking(turns, 3);
+        tokio::task::yield_now().await;
+        assert!(got_third.try_recv().is_err(), "one turn, not two");
+        end.send(()).unwrap();
+        settles(second).await.unwrap();
+        settles(got_third).await.unwrap();
+        end_third.send(()).unwrap();
+        settles(third).await.unwrap();
+    }
+
+    /// A holder stopped while it waits to take a turn back leaves that wait:
+    /// the turn goes on to the next waiter.
+    #[tokio::test]
+    async fn a_holder_stopped_taking_its_turn_back_leaves_the_queue() {
+        let turns = leaked(1);
+        let held = turns.acquire(replay(1)).await;
+        let (second, got, end) = taking(turns, 2);
+        tokio::task::yield_now().await;
+        {
+            let lending = lent_during(Some(&held), std::future::ready(()));
+            let mut lending = Box::pin(lending);
+            assert!(futures_poll_once(&mut lending).await.is_none());
+            settles(got).await.unwrap();
+            assert_eq!(turns.lock().queue.returning.len(), 1);
+        }
+        assert_eq!(turns.lock().queue.returning.len(), 0);
+        drop(held);
+        end.send(()).unwrap();
+        settles(second).await.unwrap();
+        settles(turns.acquire(replay(9))).await;
+    }
+
+    /// One poll of `future`.
+    async fn futures_poll_once<F: std::future::Future + Unpin>(
+        future: &mut F,
+    ) -> Option<F::Output> {
+        tokio::time::timeout(Duration::from_millis(50), future)
+            .await
+            .ok()
     }
 }
 
@@ -1589,6 +1964,7 @@ mod tests {
                 front_core: Some(2),
                 install_turns: 1,
                 longest_replay_wait: Duration::ZERO,
+                lent_turns: 0,
             }
         );
         assert!(queue.withdraw(id));
@@ -1610,6 +1986,7 @@ mod tests {
             front_core: None,
             install_turns: 0,
             longest_replay_wait: Duration::ZERO,
+            lent_turns: 0,
         };
         let mut saturation = Saturation::new();
         assert_eq!(saturation.observe(start, load(1, Duration::ZERO)), None);
