@@ -913,6 +913,10 @@ pub struct WorkerAllocator {
     registry_syncs_running: std::sync::Mutex<HashMap<u64, u64>>,
     /// Latest begin frame of a sync that has refreshed the registry.
     registry_synced_from_frame: std::sync::atomic::AtomicU64,
+    /// The seats [`WorkerAllocator::renewal_awaits_registry_sync`] holds, with
+    /// their confirm's publication frame and the last frame that can include
+    /// it, for the lines that report a hold's start and end.
+    renewal_sync_holds: std::sync::Mutex<HashMap<Vec<u8>, (u64, u64)>>,
     /// Once-guard for the prover-reset-v3 worker-filter reset (mainnet frame
     /// 747_000). Fires exactly at that frame in `on_new_frame`, clearing every
     /// AUTO-managed worker's persisted deep filter so re-join lands on the clean
@@ -943,6 +947,8 @@ impl WorkerAllocator {
     /// then proposes leaving a registration the protocol still accepts.
     /// Only a confirm counts: a seat whose leave is in flight is not being
     /// renewed, and a confirm naming it once it is Leaving is refused.
+    /// Nor does a published renewal lose it while this node's registry may
+    /// not show it yet ([`Self::renewal_awaits_registry_sync`]).
     pub(crate) fn renewal_recovering(
         &self,
         allocation: &quil_types::consensus::ProverAllocationInfo,
@@ -954,6 +960,107 @@ impl WorkerAllocator {
                 && self
                     .submission_attempts
                     .confirming(&allocation.confirmation_filter, frame))
+            || self
+                .renewal_awaits_registry_sync(allocation, frame)
+                .is_some()
+    }
+
+    /// Whether the registry may still lack a renewal whose last possible
+    /// inclusion frame is `included_frame`: on a node whose registry follows
+    /// prover-tree syncs, none begun after that frame has refreshed it yet.
+    /// A sync anchors at the frame before its begin frame.
+    pub(crate) fn registry_may_lack_renewal(&self, included_frame: u64) -> bool {
+        self.pending_joins_await_sync
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && self
+                .registry_synced_from_frame
+                .load(std::sync::atomic::Ordering::SeqCst)
+                <= included_frame
+    }
+
+    /// The frame this node published a renewal of `allocation` at in its
+    /// recovery epoch, and the last frame that can include it, while past
+    /// that epoch the registry still shows the seat lapsed and may lack the
+    /// renewal: no prover-tree sync begun after that frame has refreshed it
+    /// ([`Self::registry_may_lack_renewal`]), for at most
+    /// `PROPOSAL_SYNC_CEILING_FRAMES` after publication, so failing syncs
+    /// cannot pin the worker. A renewal included late in the recovery epoch
+    /// reaches such a registry after the boundary; meanwhile its worker was
+    /// released and the orphan sweep left the seat it renewed (2026-11-03, a
+    /// devnet). GLOBAL includes a confirm at any frame of the epoch it is
+    /// signed in (`validate_confirm_epoch`), not only the next one, so a
+    /// sync begun between publication and inclusion does not end the hold.
+    fn renewal_awaits_registry_sync(
+        &self,
+        allocation: &quil_types::consensus::ProverAllocationInfo,
+        frame: u64,
+    ) -> Option<(u64, u64)> {
+        use quil_types::consensus::{epoch_for_frame, epoch_start_frame, EffectiveStatus};
+        let recovery_epoch = allocation.epoch.checked_add(1)?;
+        let next_epoch = recovery_epoch.checked_add(1)?;
+        if allocation.effective_status(frame) != EffectiveStatus::ExpiredEpoch
+            || epoch_for_frame(frame) != next_epoch
+        {
+            return None;
+        }
+        let published = self
+            .submission_attempts
+            .confirm_published_in(&allocation.confirmation_filter, recovery_epoch)?;
+        let last_inclusion = epoch_start_frame(next_epoch).saturating_sub(1);
+        (frame <= published.saturating_add(PROPOSAL_SYNC_CEILING_FRAMES)
+            && self.registry_may_lack_renewal(last_inclusion))
+        .then_some((published, last_inclusion))
+    }
+
+    /// Report where [`Self::renewal_awaits_registry_sync`] starts and stops
+    /// holding a seat among `allocations` at `frame`.
+    fn log_renewal_sync_holds(
+        &self,
+        allocations: &[quil_types::consensus::ProverAllocationInfo],
+        frame: u64,
+    ) {
+        let held: HashMap<Vec<u8>, (u64, u64)> = allocations
+            .iter()
+            .filter_map(|a| {
+                self.renewal_awaits_registry_sync(a, frame)
+                    .map(|hold| (a.confirmation_filter.clone(), hold))
+            })
+            .collect();
+        let mut logged = self
+            .renewal_sync_holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (filter, (published, last_inclusion)) in
+            held.iter().filter(|(f, _)| !logged.contains_key(*f))
+        {
+            info!(frame, filter = hex::encode(filter), confirm_frame = published,
+                last_inclusion_frame = last_inclusion,
+                ceiling_frame = published + PROPOSAL_SYNC_CEILING_FRAMES, scope = "local",
+                "lapsed seat keeps its worker: this node published its renewal in the recovery epoch, and the \
+                 registry shows it only after a prover-tree sync begun after the last frame that can include it; \
+                 held until such a sync completes or the ceiling frame");
+        }
+        for (filter, (published, last_inclusion)) in
+            logged.iter().filter(|(f, _)| !held.contains_key(*f))
+        {
+            let renewed = allocations.iter().any(|a| {
+                &a.confirmation_filter == filter
+                    && a.effective_status(frame)
+                        != quil_types::consensus::EffectiveStatus::ExpiredEpoch
+            });
+            let ended = if renewed || !self.registry_may_lack_renewal(*last_inclusion) {
+                "synced"
+            } else if frame > published + PROPOSAL_SYNC_CEILING_FRAMES {
+                "ceiling"
+            } else {
+                "epoch_passed"
+            };
+            info!(frame, filter = hex::encode(filter), confirm_frame = published, ended, renewed,
+                scope = "local",
+                "lapsed seat's registry-sync hold ended: renewed keeps the worker; otherwise the allocator \
+                 releases it unless a renewal of the seat runs");
+        }
+        *logged = held;
     }
 
     /// Whether a lapsed seat keeps its worker until the lifecycle first
@@ -1406,6 +1513,7 @@ impl WorkerAllocator {
             pending_joins_await_sync: std::sync::atomic::AtomicBool::new(false),
             registry_syncs_running: std::sync::Mutex::new(HashMap::new()),
             registry_synced_from_frame: std::sync::atomic::AtomicU64::new(0),
+            renewal_sync_holds: std::sync::Mutex::new(HashMap::new()),
             worker_reset_v3_done: std::sync::atomic::AtomicBool::new(false),
             pending_shard_changes: RwLock::new(None),
             payload_eviction: std::sync::Mutex::new(HashMap::new()),
@@ -2045,6 +2153,10 @@ impl WorkerAllocator {
 
         // Get current worker assignments
         let workers = self.worker_manager.range_workers()?;
+
+        if let Some(prover) = prover_info.as_ref() {
+            self.log_renewal_sync_holds(&prover.allocations, frame_number);
+        }
 
         // The seats the first reconcile finds bound although lapsed past
         // recovery; see `awaits_renewal_offer`.
@@ -4973,6 +5085,228 @@ mod tests {
                 "a failed renewal no longer reserves the worker"
             );
         }
+    }
+
+    /// A renewal published late in the recovery epoch reaches a registry that
+    /// follows prover-tree syncs only after the boundary. Until a sync begun
+    /// after its inclusion completes, the seat keeps its worker and is not
+    /// given up, so the orphan sweep does not leave it; a failing sync holds
+    /// it for at most `PROPOSAL_SYNC_CEILING_FRAMES` (2026-11-03, a devnet:
+    /// the worker was released at the boundary and the seat left).
+    #[test]
+    fn a_renewal_published_in_the_recovery_epoch_keeps_its_worker_until_a_registry_sync_shows_it() {
+        use quil_types::consensus::EffectiveStatus;
+        let filter = vec![0x01; 32];
+        let published = 1430;
+        for synced in [true, false] {
+            let wm = Arc::new(MockWorkerManager::new());
+            wm.allocate_worker(1, &filter).unwrap();
+            let mut renewing = make_alloc(filter.clone());
+            renewing.epoch = 0;
+            let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+                renewing.clone()
+            ])));
+            let allocator = WorkerAllocator::new(wm.clone(), reg.clone(), vec![0xAA; 32]);
+            allocator.hold_pending_joins_for_registry_sync();
+            allocator.note_renewals_offered();
+            allocator.note_registry_sync_begun(1, 1420);
+            allocator.note_registry_synced(1);
+            allocator
+                .submission_attempts
+                .begin(
+                    std::slice::from_ref(&filter),
+                    published,
+                    crate::submission_attempts::OpKind::Confirm,
+                )
+                .unwrap()
+                .published(published);
+            let bound = || wm.range_workers().unwrap()[0].filter == filter;
+            let logged = reconcile_logged(&allocator, 1440);
+            assert!(
+                bound(),
+                "worker core 1 released from seat {} at frame 1440: its renewal was published at frame \
+                 {published} in the recovery epoch and no registry sync begun since has completed",
+                hex::encode(&filter)
+            );
+            assert_eq!(
+                allocator.given_up_among(std::slice::from_ref(&renewing), &filter, 1440),
+                None,
+                "the orphan sweep must not leave a seat whose renewal the registry may lack"
+            );
+            let start = "lapsed seat keeps its worker";
+            assert_eq!(logged.matches(start).count(), 1, "{logged}");
+            assert!(logged.contains("ceiling_frame=1490"), "{logged}");
+            assert!(
+                !reconcile_logged(&allocator, 1441).contains(start),
+                "reported once"
+            );
+            let end = "registry-sync hold ended";
+            if synced {
+                // A sync begun after the inclusion shows the renewal.
+                allocator.note_registry_sync_begun(2, 1441);
+                renewing.epoch = 2;
+                reg.set_prover(prover_with(vec![renewing.clone()]));
+                allocator.note_registry_synced(2);
+                let logged = reconcile_logged(&allocator, 1442);
+                assert!(bound(), "the renewed seat keeps its worker");
+                assert_eq!(renewing.effective_status(1442), EffectiveStatus::Active);
+                assert!(
+                    logged.contains(end)
+                        && logged.contains("ended=\"synced\"")
+                        && logged.contains("renewed=true"),
+                    "{logged}"
+                );
+            } else {
+                let ceiling = published + PROPOSAL_SYNC_CEILING_FRAMES;
+                allocator.on_new_frame(ceiling).unwrap();
+                assert!(bound(), "held through the ceiling frame");
+                let logged = reconcile_logged(&allocator, ceiling + 1);
+                assert!(
+                    !bound(),
+                    "failing syncs cannot pin the worker past the ceiling"
+                );
+                assert!(
+                    allocator
+                        .given_up_among(std::slice::from_ref(&renewing), &filter, ceiling + 1)
+                        .is_some(),
+                    "past the ceiling the seat is given up again"
+                );
+                assert!(
+                    logged.contains(end)
+                        && logged.contains("ended=\"ceiling\"")
+                        && logged.contains("renewed=false"),
+                    "{logged}"
+                );
+            }
+        }
+    }
+
+    /// The hold covers only a renewal published in the recovery epoch, on a
+    /// node whose registry follows prover-tree syncs, and ends once a sync
+    /// begun after the last frame that can include it has refreshed the
+    /// registry without it.
+    #[test]
+    fn the_renewal_registry_hold_needs_a_recovery_epoch_publication_and_an_unsynced_registry() {
+        let filter = vec![0x01; 32];
+        // (publication frame, registry follows syncs, sync begun past the
+        // recovery epoch).
+        // 1440 opens the epoch after the recovery epoch: a publication there
+        // is no recovery-epoch renewal. Checked at 1470, inside every case's
+        // sync ceiling and past that confirm's 30-frame retry fence, which
+        // on its own keeps a lapsed seat's worker. (A publication in the
+        // seat's own epoch lies past the ceiling by then: it proves nothing.)
+        let checked = 1470;
+        for (published, awaits_sync, later_sync) in [
+            (1440, true, false),
+            (1430, false, false),
+            (1430, true, true),
+        ] {
+            let wm = Arc::new(MockWorkerManager::new());
+            wm.allocate_worker(1, &filter).unwrap();
+            let mut lapsed = make_alloc(filter.clone());
+            lapsed.epoch = 0;
+            let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![lapsed])));
+            let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+            if awaits_sync {
+                allocator.hold_pending_joins_for_registry_sync();
+            }
+            allocator.note_renewals_offered();
+            allocator
+                .submission_attempts
+                .begin(
+                    std::slice::from_ref(&filter),
+                    published,
+                    crate::submission_attempts::OpKind::Confirm,
+                )
+                .unwrap()
+                .published(published);
+            if later_sync {
+                allocator.note_registry_sync_begun(1, 1440);
+                allocator.note_registry_synced(1);
+            }
+            if published == 1440 {
+                allocator.on_new_frame(1440).unwrap();
+                assert!(
+                    !wm.range_workers().unwrap()[0].filter.is_empty(),
+                    "a confirm inside its retry fence keeps the worker"
+                );
+            }
+            allocator.on_new_frame(checked).unwrap();
+            assert!(
+                wm.range_workers().unwrap()[0].filter.is_empty(),
+                "published={published} awaits_sync={awaits_sync} later_sync={later_sync}"
+            );
+        }
+    }
+
+    /// GLOBAL includes a renewal at any frame of the epoch it is signed in,
+    /// so a prover-tree sync begun after its publication but before a late
+    /// inclusion completes without it. The hold lasts until a sync begun
+    /// past the recovery epoch's last frame completes, then the seat lapses
+    /// as before (2026-11-03).
+    #[test]
+    fn the_renewal_registry_hold_outlasts_a_sync_begun_before_a_late_inclusion() {
+        let filter = vec![0x01; 32];
+        let published = 1430;
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.allocate_worker(1, &filter).unwrap();
+        let mut lapsed = make_alloc(filter.clone());
+        lapsed.epoch = 0;
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            lapsed.clone()
+        ])));
+        let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+        allocator.hold_pending_joins_for_registry_sync();
+        allocator.note_renewals_offered();
+        allocator.note_registry_sync_begun(1, 1420);
+        allocator.note_registry_synced(1);
+        allocator
+            .submission_attempts
+            .begin(
+                std::slice::from_ref(&filter),
+                published,
+                crate::submission_attempts::OpKind::Confirm,
+            )
+            .unwrap()
+            .published(published);
+        // Begun after the publication, before an inclusion at 1436.
+        let early_sync = published + 3;
+        allocator.note_registry_sync_begun(2, early_sync);
+        allocator.note_registry_synced(2);
+        let bound = || wm.range_workers().unwrap()[0].filter == filter;
+        allocator.on_new_frame(1440).unwrap();
+        assert!(
+            bound(),
+            "worker core 1 released from seat {} at frame 1440: its renewal, published at frame \
+             {published}, may be included up to frame 1439, so a registry sync begun at frame \
+             {early_sync} cannot show it",
+            hex::encode(&filter)
+        );
+        assert_eq!(
+            allocator.given_up_among(std::slice::from_ref(&lapsed), &filter, 1440),
+            None,
+            "the orphan sweep must not leave a seat whose renewal a later frame may include"
+        );
+        // Begun once no frame can include the renewal: the seat lapsed.
+        allocator.note_registry_sync_begun(3, 1440);
+        allocator.note_registry_synced(3);
+        let logged = reconcile_logged(&allocator, 1441);
+        assert!(
+            !bound(),
+            "a registry synced past the recovery epoch releases the worker"
+        );
+        assert!(
+            allocator
+                .given_up_among(std::slice::from_ref(&lapsed), &filter, 1441)
+                .is_some(),
+            "and the seat is given up"
+        );
+        assert!(
+            logged.contains("registry-sync hold ended")
+                && logged.contains("ended=\"synced\"")
+                && logged.contains("renewed=false"),
+            "{logged}"
+        );
     }
 
     /// A seat lapsed past its recovery epoch whose leave is in flight is not

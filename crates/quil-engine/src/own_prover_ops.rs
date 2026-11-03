@@ -43,8 +43,13 @@ struct Submitted {
     observed: u64,
 }
 
+/// The tracked operations, and the frame that included this node's latest
+/// leave of each filter ([`OwnProverOps::leave_included`]).
 #[derive(Default)]
-pub struct OwnProverOps(Mutex<HashMap<Vec<u8>, Submitted>>);
+pub struct OwnProverOps(
+    Mutex<HashMap<Vec<u8>, Submitted>>,
+    Mutex<HashMap<Vec<u8>, u64>>,
+);
 
 /// The process-wide tracker the prover pipeline and the GLOBAL frame
 /// receiver share.
@@ -209,10 +214,42 @@ impl OwnProverOps {
         self.observe_requests(frame_number, &requests);
     }
 
+    /// The frame that included this node's latest leave of `filter`, kept
+    /// for `PROPOSAL_SYNC_CEILING_FRAMES`: a registry that follows the chain
+    /// through prover-tree syncs shows the seat Leaving only after the next
+    /// one, and until then it still reads the seat as renewable.
+    pub fn leave_included(&self, filter: &[u8]) -> Option<u64> {
+        self.1.lock().ok()?.get(filter).copied()
+    }
+
+    /// Record `filters`' leave as included at `frame`, as
+    /// [`Self::observe_frame`] does.
+    #[cfg(test)]
+    pub(crate) fn note_leave_included(&self, filters: &[Vec<u8>], frame: u64) {
+        let mut leaves = self.1.lock().unwrap();
+        for filter in filters {
+            leaves.insert(filter.clone(), frame);
+        }
+    }
+
     fn observe_requests(&self, frame_number: u64, requests: &[Vec<u8>]) {
         let Ok(mut ops) = self.0.lock() else { return };
+        if let Ok(mut leaves) = self.1.lock() {
+            leaves.retain(|_, included| {
+                frame_number
+                    <= included
+                        .saturating_add(crate::worker_allocator::PROPOSAL_SYNC_CEILING_FRAMES)
+            });
+        }
         for request in requests {
             if let Some(op) = ops.remove(request) {
+                if op.kind == "leave" {
+                    if let Ok(mut leaves) = self.1.lock() {
+                        for filter in &op.filters {
+                            leaves.insert(filter.clone(), frame_number);
+                        }
+                    }
+                }
                 info!(
                     kind = op.kind,
                     filter_count = op.filters.len(),
@@ -361,6 +398,46 @@ mod tests {
         assert!(
             ops.0.lock().unwrap().contains_key(&join),
             "the join is still tracked"
+        );
+    }
+
+    /// The frame that included a leave is kept per filter for the registry
+    /// sync ceiling; a confirm's inclusion is not a leave's.
+    #[test]
+    fn an_included_leave_is_remembered_until_the_sync_ceiling() {
+        use crate::worker_allocator::PROPOSAL_SYNC_CEILING_FRAMES;
+        let ops = OwnProverOps::default();
+        let (left, renewed) = (vec![7u8; 32], vec![8u8; 32]);
+        let leave = ProverLeave {
+            filters: vec![left.clone()],
+            frame_number: 100,
+            ..Default::default()
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        let confirm = ProverConfirm {
+            filters: vec![renewed.clone()],
+            frame_number: 100,
+            ..Default::default()
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        ops.submitted(&leave, 100);
+        ops.submitted(&confirm, 100);
+        ops.observe_requests(101, &[leave, confirm]);
+        assert_eq!(
+            ops.leave_included(&left),
+            Some(101),
+            "an included leave is recorded"
+        );
+        assert_eq!(ops.leave_included(&renewed), None);
+        ops.observe_requests(101 + PROPOSAL_SYNC_CEILING_FRAMES, &[]);
+        assert_eq!(ops.leave_included(&left), Some(101));
+        ops.observe_requests(102 + PROPOSAL_SYNC_CEILING_FRAMES, &[]);
+        assert_eq!(
+            ops.leave_included(&left),
+            None,
+            "forgotten past the ceiling"
         );
     }
 

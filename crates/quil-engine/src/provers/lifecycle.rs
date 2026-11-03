@@ -665,6 +665,10 @@ pub struct ProverLifecycle {
     /// Seats whose renewal was skipped for a pending leave, with the epoch
     /// it was last reported in (`renewal_awaits_leave`).
     renewal_skips_reported: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
+    /// Seats whose renewal waits past the leave cooldown for the registry to
+    /// show their included leave, with that inclusion frame, once reported
+    /// (`leave_awaits_registry`).
+    leave_landing_reported: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
     /// Seats whose storage for the epoch their renewal registers was encoding
     /// or encoded when the confirm pipeline last prepared them, with that
     /// epoch (`note_renewal_storage`); kept in the node's store from
@@ -776,6 +780,7 @@ impl ProverLifecycle {
             shards_store: RwLock::new(None),
             last_leave_attempt: RwLock::new(HashMap::new()),
             renewal_skips_reported: std::sync::Mutex::new(HashMap::new()),
+            leave_landing_reported: std::sync::Mutex::new(HashMap::new()),
             renewal_storage: super::renewal_storage::RenewalStorageNotes::default(),
             storage_skips_warned: std::sync::Mutex::new(HashMap::new()),
             unlanded_leaves_reported: Default::default(),
@@ -1087,16 +1092,21 @@ impl ProverLifecycle {
             return true;
         }
         // Before publication, the registry still calls the source Active.
-        // Keep the existing bounded retry window for a failed submission.
-        self.last_leave_attempt
-            .read()
-            .map(|attempts| {
-                attempts.iter().any(|(filter, last)| {
-                    auto_bound.contains(filter)
-                        && frame_number.saturating_sub(*last) < LEAVE_COOLDOWN_FRAMES
+        // Keep the existing bounded retry window for a failed submission,
+        // and past it wait for the registry to show an included leave.
+        auto_bound
+            .iter()
+            .any(|filter| self.leave_unseen(filter, frame_number).is_some())
+            || self
+                .last_leave_attempt
+                .read()
+                .map(|attempts| {
+                    attempts.iter().any(|(filter, last)| {
+                        auto_bound.contains(filter)
+                            && frame_number.saturating_sub(*last) < LEAVE_COOLDOWN_FRAMES
+                    })
                 })
-            })
-            .unwrap_or(true)
+                .unwrap_or(true)
     }
 
     /// Whether this node proposed leaving `filter` within
@@ -1107,6 +1117,9 @@ impl ProverLifecycle {
     /// per seat per epoch while the seat's storage for the next epoch is
     /// being encoded or is encoded and the renewal's grace frame is ahead:
     /// that work is then lost.
+    /// Past the cooldown, it still waits while this node's leave of it was
+    /// included and the registry may not show it yet
+    /// ([`Self::leave_awaits_registry`]).
     fn renewal_awaits_leave(&self, filter: &[u8], frame_number: u64) -> bool {
         let Some(proposed) = self
             .last_leave_attempt
@@ -1115,7 +1128,7 @@ impl ProverLifecycle {
             .and_then(|attempts| attempts.get(filter).copied())
             .filter(|last| frame_number.saturating_sub(*last) < LEAVE_COOLDOWN_FRAMES)
         else {
-            return false;
+            return self.leave_awaits_registry(filter, frame_number);
         };
         let epoch = quil_types::consensus::epoch_for_frame(frame_number);
         if let Some((storage, registers, grace_frame)) =
@@ -1163,6 +1176,52 @@ impl ProverLifecycle {
                  has not landed by the resume frame (reported once per seat per epoch)");
         }
         true
+    }
+
+    /// Whether this node's leave of `filter` reached a GLOBAL frame
+    /// (`own_prover_ops`) that the registry may not show yet: no prover-tree
+    /// sync begun after the inclusion has refreshed it
+    /// (`WorkerAllocator::registry_may_lack_renewal`), for at most
+    /// `PROPOSAL_SYNC_CEILING_FRAMES` after it. Such a registry still reads
+    /// the seat as renewable, and a confirm naming it is refused once it is
+    /// Leaving (2026-11-03, a devnet: renewal resumed at the cooldown's end
+    /// for a seat whose leave was included 19 frames before). Reported once
+    /// per seat and inclusion.
+    fn leave_awaits_registry(&self, filter: &[u8], frame_number: u64) -> bool {
+        let ceiling = crate::worker_allocator::PROPOSAL_SYNC_CEILING_FRAMES;
+        let Some(included) = self.leave_unseen(filter, frame_number) else {
+            return false;
+        };
+        let due = self
+            .leave_landing_reported
+            .lock()
+            .is_ok_and(|mut reported| {
+                reported.retain(|_, at| frame_number <= at.saturating_add(ceiling));
+                reported.insert(filter.to_vec(), included) != Some(included)
+            });
+        if due {
+            tracing::info!(frame = frame_number, filter = hex::encode(filter), leave_included_frame = included,
+                ceiling_frame = included + ceiling, scope = "local",
+                "seat renewal stays skipped past the leave cooldown: this node's leave of the seat was included, \
+                 and the registry shows it Leaving only after a prover-tree sync begun after the inclusion; \
+                 renewal resumes if that sync still shows the seat renewable, or at the ceiling frame");
+        }
+        true
+    }
+
+    /// The frame that included this node's leave of `filter`, while the
+    /// registry may not show it yet ([`Self::leave_awaits_registry`]).
+    /// Until then the leave cooldown's end neither renews the seat nor
+    /// proposes leaving it again, nor starts another replacement wave.
+    fn leave_unseen(&self, filter: &[u8], frame_number: u64) -> Option<u64> {
+        crate::own_prover_ops::tracker()
+            .leave_included(filter)
+            .filter(|included| {
+                frame_number
+                    <= included
+                        .saturating_add(crate::worker_allocator::PROPOSAL_SYNC_CEILING_FRAMES)
+                    && self.allocator.registry_may_lack_renewal(*included)
+            })
     }
 
     /// Record how the confirm pipeline prepared seats' storage at
@@ -1428,6 +1487,7 @@ impl ProverLifecycle {
                     .get(f)
                     .map(|&last| frame_number.saturating_sub(last) >= LEAVE_COOLDOWN_FRAMES)
                     .unwrap_or(true)
+                    && self.leave_unseen(f, frame_number).is_none()
             })
             .collect()
     }
@@ -7283,6 +7343,208 @@ mod proposal_loop_tests {
         let mut both = renewals(721 + LEAVE_COOLDOWN_FRAMES);
         both.sort();
         assert_eq!(both, vec![held, other], "renewed once the cooldown ends");
+    }
+
+    /// A lapsed seat whose renewal this node published in the recovery epoch
+    /// is not left as an unrecoverable orphan while a registry that follows
+    /// prover-tree syncs may lack the renewal, and is once the ceiling passes
+    /// without a sync (2026-11-03, a devnet: the sweep left the seat in the
+    /// pass that released its worker, before the sync showed the renewal).
+    #[test]
+    fn the_orphan_sweep_spares_a_renewal_the_registry_may_lack_until_the_ceiling() {
+        use crate::submission_attempts::OpKind;
+        use crate::worker_allocator::PROPOSAL_SYNC_CEILING_FRAMES;
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, held.clone()));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(
+            address.clone(),
+            vec![ProverAllocationInfo {
+                epoch: 0,
+                ..alloc(held.clone(), ProverStatus::Active, 10)
+            }],
+        ));
+        reg.set_summaries(vec![shard_summary(held.clone(), 50)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        lc.allocator.hold_pending_joins_for_registry_sync();
+        lc.allocator.note_renewals_offered();
+        lc.allocator.note_registry_sync_begun(1, 1420);
+        lc.allocator.note_registry_synced(1);
+        let published = 1430;
+        lc.submission_attempts
+            .begin(std::slice::from_ref(&held), published, OpKind::Confirm)
+            .unwrap()
+            .published(published);
+        let evaluate = |frame: u64| {
+            lc.allocator.on_new_frame(frame).unwrap();
+            lc.set_prover_root_verified_frame(frame);
+            lc.evaluate(frame, 50_000, reg.as_ref(), wm.as_ref())
+                .unwrap()
+        };
+        let ceiling = published + PROPOSAL_SYNC_CEILING_FRAMES;
+        for frame in [1440, ceiling] {
+            let actions = evaluate(frame);
+            assert!(
+                !proposed_leaves(&actions).contains(&held),
+                "frame {frame}: the seat renewed at {published} is left as an orphan before the \
+                 registry can show the renewal: {actions:?}"
+            );
+            assert_eq!(wm.range_workers().unwrap()[0].filter, held);
+        }
+        let actions = evaluate(ceiling + 1);
+        assert!(
+            proposed_leaves(&actions).contains(&held),
+            "past the ceiling the lapsed seat is left: {actions:?}"
+        );
+    }
+
+    /// A seat no worker serves yet, renewed 9 frames before the boundary (a
+    /// split's held-over seat renewed late in its recovery epoch), is not
+    /// given up or left after it while the registry may lack the renewal,
+    /// past the confirm's retry fence too: judged on a view synced before the
+    /// renewal landed, it was left although GLOBAL had renewed it (2026-11-03,
+    /// a devnet). A sync begun past the recovery epoch that still shows it
+    /// lapsed gives it up.
+    #[test]
+    fn an_unbound_seat_renewed_before_the_boundary_is_kept_until_a_registry_sync_shows_it() {
+        use crate::submission_attempts::OpKind;
+        use crate::worker_allocator::GivenUp;
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA3);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(idle_worker(1));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let seat = ProverAllocationInfo {
+            epoch: 0,
+            ..alloc(held.clone(), ProverStatus::Active, 10)
+        };
+        reg.set_prover(prover(address.clone(), vec![seat.clone()]));
+        reg.set_summaries(vec![shard_summary(held.clone(), 50)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        lc.hold_gone_shard_leaves_for_sync();
+        lc.allocator.note_renewals_offered();
+        lc.allocator.note_registry_sync_begun(1, 1420);
+        lc.allocator.note_registry_synced(1);
+        lc.submission_attempts
+            .begin(std::slice::from_ref(&held), 1431, OpKind::Confirm)
+            .unwrap()
+            .published(1431);
+        for frame in [1440, 1461] {
+            assert_eq!(
+                lc.allocator.gives_up(&seat, frame),
+                None,
+                "frame {frame}: the seat whose renewal was published at frame 1431, before the boundary, \
+                 was given up on a registry that cannot show the renewal yet: it is left although GLOBAL \
+                 renewed it"
+            );
+            lc.set_prover_root_verified_frame(frame);
+            let actions = lc
+                .evaluate(frame, 50_000, reg.as_ref(), wm.as_ref())
+                .unwrap();
+            assert_eq!(
+                count_proposed_leaves(&actions),
+                0,
+                "frame {frame}: {actions:?}"
+            );
+        }
+        lc.allocator.note_registry_sync_begun(2, 1462);
+        lc.allocator.note_registry_synced(2);
+        assert_eq!(
+            lc.allocator.gives_up(&seat, 1463),
+            Some(GivenUp::Lapsed),
+            "a registry synced past the recovery epoch without the renewal gives the seat up"
+        );
+    }
+
+    /// Past the leave cooldown, a seat whose leave this node saw included is
+    /// neither renewed, nor proposed for leave again, nor counted out of the
+    /// replacement wave, while a registry that follows prover-tree syncs may
+    /// not show the leave yet (2026-11-03, a devnet: renewal resumed at the
+    /// cooldown's end and a confirm went out for the seat being left). A
+    /// sync begun after the inclusion that still shows the seat renewable
+    /// resumes all three, as does the ceiling.
+    #[test]
+    fn renewal_waits_for_the_registry_to_show_an_included_leave() {
+        use crate::worker_allocator::PROPOSAL_SYNC_CEILING_FRAMES;
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let skipped = "seat renewal stays skipped past the leave cooldown";
+        for synced in [true, false] {
+            // Filters no other test records an included leave for.
+            let held = filter_bytes(if synced { 0xB1 } else { 0xB2 });
+            let other = filter_bytes(0xA2);
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            wm.add(allocated_worker(1, held.clone()));
+            wm.add(allocated_worker(2, other.clone()));
+            let reg = Arc::new(ConfigurableRegistry::new());
+            let lapsed = |filter: &Vec<u8>| ProverAllocationInfo {
+                epoch: 0,
+                ..alloc(filter.clone(), ProverStatus::Active, 10)
+            };
+            let info = prover(address.clone(), vec![lapsed(&held), lapsed(&other)]);
+            reg.set_prover(info.clone());
+            reg.set_summaries(vec![
+                shard_summary(held.clone(), 50),
+                shard_summary(other.clone(), 50),
+            ]);
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            lc.allocator.hold_pending_joins_for_registry_sync();
+            let renewals = |frame: u64| {
+                lc.set_prover_root_verified_frame(frame);
+                let (actions, logged) = evaluate_logged(&lc, frame, reg.as_ref(), wm.as_ref());
+                (renewed(&actions), logged)
+            };
+            let workers = wm.range_workers().unwrap();
+            let included = 722;
+            lc.record_leave_attempts(std::slice::from_ref(&held), included - 1);
+            crate::own_prover_ops::tracker()
+                .note_leave_included(std::slice::from_ref(&held), included);
+            let resume = included - 1 + LEAVE_COOLDOWN_FRAMES;
+            let (renewing, logged) = renewals(resume);
+            assert_eq!(
+                renewing,
+                vec![other.clone()],
+                "synced={synced}: renewal of {} resumed at the cooldown's end although its leave was \
+                 included at {included} and the registry may not show it",
+                hex::encode(&held)
+            );
+            assert_eq!(logged.matches(skipped).count(), 1, "{logged}");
+            assert!(
+                lc.filter_recent_leave_attempts(vec![held.clone()], resume)
+                    .is_empty(),
+                "the included leave is not proposed again"
+            );
+            assert!(
+                lc.replacement_leave_pending(Some(&info), &workers, resume),
+                "the included leave still counts as pending"
+            );
+            let back = if synced {
+                // A sync begun after the inclusion still shows the seat
+                // renewable: the leave did not take.
+                lc.allocator.note_registry_sync_begun(1, included + 1);
+                lc.allocator.note_registry_synced(1);
+                resume + 1
+            } else {
+                let ceiling = included + PROPOSAL_SYNC_CEILING_FRAMES;
+                let (renewing, logged) = renewals(ceiling);
+                assert_eq!(renewing, vec![other.clone()], "held through the ceiling");
+                assert!(!logged.contains(skipped), "reported once: {logged}");
+                ceiling + 1
+            };
+            let mut both = vec![held.clone(), other.clone()];
+            both.sort();
+            let (renewing, _) = renewals(back);
+            assert_eq!(renewing, both, "synced={synced}: renewal resumes");
+            assert_eq!(
+                lc.filter_recent_leave_attempts(vec![held.clone()], back),
+                vec![held.clone()]
+            );
+            assert!(!lc.replacement_leave_pending(Some(&info), &workers, back));
+        }
     }
 
     #[test]
