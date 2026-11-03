@@ -113,6 +113,11 @@ impl TestProverRegistry {
         }
     }
 
+    /// Block every prover read until the guard drops.
+    pub fn hold_provers(&self) -> std::sync::MutexGuard<'_, Vec<ProverInfo>> {
+        self.provers.lock().unwrap()
+    }
+
     pub fn set_provers(&self, provers: Vec<ProverInfo>) {
         *self.provers.lock().unwrap() = provers;
     }

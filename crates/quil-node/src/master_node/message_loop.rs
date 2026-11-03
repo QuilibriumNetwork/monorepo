@@ -573,7 +573,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     // Archive endpoints in use (seeded at startup or learned);
                     // `archive_peers` counts only archives verified from their
                     // own PeerInfo since start.
+                    // An await: a step, since a section guard cannot cross it.
+                    probe::step(ProbeSection::StatusArchivePool);
                     let archive_endpoints = pool_for_recv.len().await;
+                    probe::step(ProbeSection::LoopStatus);
                     // Resolver messages delivered point-to-point instead of to
                     // the shard topic, cumulative since start.
                     let direct = p2p_for_recv.direct_stats();
@@ -595,7 +598,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                             "GLOBAL_PEER_INFO validation changed: when strict, peers forwarding invalid PeerInfo, KeyRegistry or alerts are penalised and KeyRegistry records with an unsigned timestamp are refused"
                         );
                     }
-                    peer_info_bounds.expire(&mut pic_for_recv.write(), super::peer_info_file::unix_millis());
+                    {
+                        let _write = probe::section(ProbeSection::StatusPeerInfoCache);
+                        peer_info_bounds.expire(&mut pic_for_recv.write(), super::peer_info_file::unix_millis());
+                    }
                     other_build_lines_left = OTHER_BUILD_LINES_PER_STATUS;
                     let (active, pending, total_allocs) = {
                         use quil_types::consensus::{EffectiveStatus, ProverRegistry};
@@ -717,14 +723,20 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     // ticks is the diagnosis signal.
                     let (replica_loads, replica_loads_peak) =
                         quil_store::replica_store::replica_load_bytes();
-                    let sizes = mem_sources.snapshot(
-                        archive_peers_seen.len(),
-                        peer_info_digest_cache.len(),
-                    );
+                    let sizes = {
+                        let _read = probe::section(ProbeSection::StatusMemorySnapshot);
+                        mem_sources.snapshot(
+                            archive_peers_seen.len(),
+                            peer_info_digest_cache.len(),
+                        )
+                    };
                     let proc_mem = crate::mem_stats::process_memory();
                     let host_mem = crate::mem_stats::host_memory();
                     let global_frames = clock_store_recv.global_frame_cache_stats();
-                    let global_mempool = mc_for_recv.pending_totals();
+                    let global_mempool = {
+                        let _read = probe::section(ProbeSection::StatusCollectorTotals);
+                        mc_for_recv.pending_totals()
+                    };
                     info!(
                         rss_mb = proc_mem
                             .map(|m| crate::mem_stats::fmt_mb(m.rss_bytes))

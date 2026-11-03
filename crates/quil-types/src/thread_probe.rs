@@ -138,6 +138,13 @@ sections! {
     AllocationReconcile => "worker allocation reconcile",
     ShardSizeRead => "local shard size read",
     LifecycleEvaluate => "prover lifecycle evaluation",
+    LifecycleEvaluationLockWait => "prover lifecycle evaluation lock wait",
+    LifecycleRegistryView => "prover registry lifecycle view",
+    LifecycleWorkerRead => "worker manager read",
+    StatusArchivePool => "archive endpoint pool size read",
+    StatusPeerInfoCache => "peer info cache write",
+    StatusCollectorTotals => "GLOBAL message collector totals",
+    StatusMemorySnapshot => "memory source snapshot",
     // Archive application-frame ingest.
     ArchiveIngestLockWait => "archive ingest lock wait",
     SequencedPreverify => "sequenced proof pre-verification (does not hold the ingest lock)",
