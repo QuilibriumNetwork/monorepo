@@ -46,6 +46,11 @@ pub enum Msg {
         original_status: u32,
         err: Option<String>,
     },
+    /// A leave, pause or resume waits for the next epoch to sign.
+    SigningWait {
+        action: String,
+        frames_left: u64,
+    },
     /// `toggleManualMsg` — SetManuallyManaged result for one worker.
     ToggleManual {
         core_id: u32,

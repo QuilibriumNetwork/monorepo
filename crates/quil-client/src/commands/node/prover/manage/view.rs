@@ -4312,6 +4312,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("‹Ctrl+U›", "Resume (U: unpause) — resume a Paused allocation (status 3)"),
         kv("‹Ctrl+O›", "Mode (O: own) — toggle manual / auto worker management on cursor row"),
         note("Multi-select with ‹space› or ‹a› to batch Leave/Confirm/Reject/Pause/Resume."),
+        note("In an epoch's last 10 frames, Leave, Pause and Resume wait for the next epoch to sign: every node refuses one landing in a later epoch than it was signed in. Confirm and Reject go at once, being valid only in this epoch."),
         HelpItem::Blank,
         sec("Actions — Available Shards panel"),
         kv("‹Ctrl+G›", "Join (G: go) — open worker picker for selected shard(s)"),
