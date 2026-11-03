@@ -39,3 +39,6 @@ quil-engine = { path = "../quil-engine" }
 quil-forest-migrate = { path = "../quil-forest-migrate" }
 # It reads the QUIL grid from an archive once, under a throwaway key.
 quil-rpc = { path = "../quil-rpc" }
+
+[lints]
+workspace = true

@@ -1148,3 +1148,285 @@ fn an_archive_never_accepts_a_root_its_finalized_execution_does_not_reproduce() 
         "and the finalized root accepted"
     );
 }
+
+/// A finalizer over `pipeline`, as an archive's consensus host builds it.
+fn finalizer_over(
+    rig: &Rig,
+    pipeline: &Arc<GlobalFinalizationPipeline>,
+) -> Arc<crate::cw_global_seams::GlobalSeamFinalizer> {
+    let (jobs, _) = tokio::sync::mpsc::unbounded_channel();
+    Arc::new(
+        crate::cw_global_seams::GlobalSeamFinalizer::new(
+            rig.clock.clone(),
+            jobs,
+            Arc::new(|_, _| {}),
+            None,
+            vec![],
+        )
+        .with_pipeline(Some(pipeline.clone())),
+    )
+}
+
+/// Consensus finalizes `frame` on this node from its certificate alone.
+fn finalize_without_body(
+    finalizer: &crate::cw_global_seams::GlobalSeamFinalizer,
+    frame: &GlobalFrame,
+) {
+    use quil_cw_consensus::adapters::FrameFinalizer as _;
+    finalizer.on_finalized(
+        frame.header.as_ref().unwrap().rank,
+        id(frame),
+        None,
+        None,
+        false,
+    );
+}
+
+/// The residual of the wait for publication, through the real reward path:
+/// consensus finalized the parent here from its certificate alone, so the
+/// finalizer queued nothing and nothing said the parent was finalized. Once
+/// the body arrived, the leader executed the parent privately, without the
+/// application frames its publication ingests, and proposed a prover root
+/// the published execution did not reproduce; the other archives refused it
+/// until the next view (about 1.5 an hour on one archive, 2026-10-31). The
+/// leader now hands the arrived body to publication and proposes on the
+/// published state.
+#[test]
+fn a_leader_holding_only_its_finalized_parents_certificate_proposes_on_the_published_state() {
+    use crate::outage::test_logs::CapturedLogs;
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    let global = Arc::new(quil_crypto::FalconSigner::generate());
+    let shard = quil_crypto::FalconSigner::generate();
+    let rig = Rig::over(global.clone(), rewarding_fixture(&global, &shard, false));
+    let mut parent = with_shard_header(state_frame(&rig.source, 1, 41, rig.genesis), &shard);
+    parent.header.as_mut().unwrap().prover = vec![0x42; 32];
+    certify(&mut parent, &rig.signer, 0);
+    let context = rig.context(&parent);
+    let child_of = |extra: bool| {
+        let twin = rewarding_fixture(&global, &shard, extra);
+        twin.source.materialize(&parent).unwrap();
+        state_frame(&twin.source, 2, context.view, context.parent)
+    };
+    let root = |child: &GlobalFrame| {
+        child
+            .header
+            .as_ref()
+            .unwrap()
+            .prover_tree_commitment
+            .clone()
+    };
+    let (private_root, finalized_root) = (root(&child_of(false)), root(&child_of(true)));
+    assert_ne!(
+        private_root, finalized_root,
+        "the ingest moves the reward basis"
+    );
+
+    let (pipeline, _) = pipeline(&rig, prover(&parent), 8);
+    let pipeline = Arc::new(pipeline.with_sequenced_ingest({
+        let crdt = rig.source.hypergraph.clone();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        Arc::new(move |_: &GlobalFrame| -> quil_types::error::Result<bool> {
+            if !done.swap(true, Ordering::SeqCst) {
+                let (location, value) = app_data(2);
+                crdt.add_vertex(&location, &value)?;
+                crdt.commit(0)?;
+            }
+            Ok(true)
+        })
+    }));
+    let finalizer = finalizer_over(&rig, &pipeline);
+    let seam = rig.seam(&parent).with_finalizer(finalizer.clone());
+    let finalized_child = child_of(true);
+    let vote = |seam: &GlobalSeamProposer| {
+        seam.verify_or_defer(
+            context,
+            id(&finalized_child),
+            Some(crate::consensus_wire::encode_global_frame(&finalized_child).unwrap()),
+        )
+    };
+
+    finalize_without_body(&finalizer, &parent);
+    assert_eq!(pipeline.queued(), 0, "nothing to queue without the body");
+    assert!(seam.propose_with_context(context).is_none(), "no body yet");
+    assert!(vote(&seam).is_err(), "the vote waits for the body too");
+
+    // The body arrives over the block channel.
+    rig.put(&parent);
+    for attempt in 0..3 {
+        assert!(
+            seam.propose_with_context(context).is_none(),
+            "attempt {attempt}: the leader executed its finalized parent privately before publishing it"
+        );
+        assert!(vote(&seam).is_err(), "attempt {attempt}: the vote waits");
+    }
+    assert_eq!(
+        pipeline.queued(),
+        1,
+        "the arrived body is queued to publish"
+    );
+    assert_eq!(rig.source.last_materialized_frame(), 0);
+    assert!(!rig.executor.busy(), "waiting takes no lease");
+
+    assert!(matches!(
+        pipeline.step(1),
+        FinalizationStep::Published { .. }
+    ));
+    assert_eq!(
+        vote(&seam),
+        Ok(true),
+        "then it votes on the published state"
+    );
+    let (_, bytes) = seam
+        .propose_with_context(context)
+        .expect("and proposes on it");
+    let proposed = crate::consensus_wire::decode_global_frame(&bytes).unwrap();
+    assert_eq!(
+        hex::encode(root(&proposed)),
+        hex::encode(&finalized_root),
+        "the proposal declares the published root, not the private one {}",
+        hex::encode(&private_root)
+    );
+
+    let began = logs.lines_with("holds only the certificate of: executing above it first");
+    assert_eq!(began.len(), 1, "one line for the wait: {began:?}");
+    assert!(
+        began[0].contains("INFO") && began[0].contains("finalized_view=41"),
+        "{}",
+        began[0]
+    );
+    let ended = logs.lines_with("its body arrived and was queued to publish");
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert!(
+        ended[0].contains("INFO")
+            && ended[0].contains("finalized_view=41")
+            && ended[0].contains("waited_ms=")
+            && ended[0].contains("past_patience=false"),
+        "{}",
+        ended[0]
+    );
+    assert!(logs
+        .lines_with("stop waiting for a finalized frame")
+        .is_empty());
+}
+
+/// The bound: a finalized body that never arrives holds proposals and votes
+/// at most the patience after its finalization, with one warning when it
+/// runs out; then they proceed as before, so GLOBAL never waits on a body no
+/// peer delivers. Its publication by the archive poller later ends it.
+#[test]
+fn a_finalized_body_that_never_arrives_holds_proposals_and_votes_only_until_the_patience() {
+    use crate::outage::test_logs::CapturedLogs;
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    let rig = Rig::new();
+    let parent = certified_deploy(&rig);
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let pipeline = Arc::new(sequenced_pipeline(&rig, &parent, &ready));
+    let finalizer = finalizer_over(&rig, &pipeline);
+    let patience = Duration::from_millis(300);
+    let seam = rig
+        .seam(&parent)
+        .with_finalizer(finalizer.clone())
+        .with_unheld_patience(patience);
+    let expected = Fixture::new(Some(rig.signer.public_key()));
+    expected.source.materialize(&parent).unwrap();
+    let context = rig.context(&parent);
+    let child = state_frame(&expected.source, 2, context.view, context.parent);
+    let encoded = crate::consensus_wire::encode_global_frame(&child).unwrap();
+
+    finalize_without_body(&finalizer, &parent);
+    let started = std::time::Instant::now();
+    assert!(seam.propose_with_context(context).is_none());
+    let waiting = seam.verify_or_defer(context, id(&child), Some(encoded.clone()));
+    if started.elapsed() < patience {
+        assert!(waiting.is_err(), "within the patience the vote waits");
+    }
+    std::thread::sleep(patience + Duration::from_millis(50));
+    assert_eq!(
+        seam.verify_or_defer(context, id(&child), Some(encoded.clone())),
+        Ok(false),
+        "past the patience the vote no longer waits: without the body it cannot check the proposal"
+    );
+    assert!(
+        seam.propose_with_context(context).is_none(),
+        "nor build one"
+    );
+    let stopped = logs.lines_with("stop waiting for a finalized frame");
+    assert_eq!(
+        stopped.len(),
+        1,
+        "one warning when the patience runs out: {stopped:?}"
+    );
+    assert!(
+        stopped[0].contains("WARN")
+            && stopped[0].contains("finalized_view=41")
+            && stopped[0].contains("action=\"check\""),
+        "{}",
+        stopped[0]
+    );
+
+    // A copy that later turns up (here the parent as a durable candidate,
+    // which the unheld check does not read) is executed as before.
+    rig.clock
+        .put_global_clock_frame_candidate(&parent, &crate::cw_global_seams::NoopTxn)
+        .unwrap();
+    assert_eq!(
+        seam.verify_or_defer(context, id(&child), Some(encoded)),
+        Ok(true),
+        "past the patience a vote executes the parent as before"
+    );
+    assert_eq!(rig.source.last_materialized_frame(), 0);
+
+    // The archive poller publishes it.
+    assert!(pipeline.offer_synced(&parent));
+    assert!(matches!(
+        pipeline.step(1),
+        FinalizationStep::Published { .. }
+    ));
+    assert!(seam.propose_with_context(context).is_some());
+    let ended = logs.lines_with("held only the certificate of: it published");
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert!(ended[0].contains("past_patience=true"), "{}", ended[0]);
+    assert_eq!(
+        logs.lines_with("stop waiting for a finalized frame").len(),
+        1,
+        "warned once"
+    );
+}
+
+/// The archive poller publishing the frame ends the wait at once, and a
+/// node whose publication ingests nothing never waits: there a private
+/// execution reproduces the published one.
+#[test]
+fn publication_ends_the_wait_for_a_finalized_body_and_only_ingesting_archives_wait() {
+    let rig = Rig::new();
+    let parent = certified_deploy(&rig);
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let queue = Arc::new(sequenced_pipeline(&rig, &parent, &ready));
+    let finalizer = finalizer_over(&rig, &queue);
+    let seam = rig.seam(&parent).with_finalizer(finalizer.clone());
+    let context = rig.context(&parent);
+    finalize_without_body(&finalizer, &parent);
+    assert!(seam.propose_with_context(context).is_none());
+    assert!(queue.offer_synced(&parent));
+    assert!(matches!(queue.step(1), FinalizationStep::Published { .. }));
+    assert!(
+        seam.propose_with_context(context).is_some(),
+        "published: the proposal no longer waits, well within the patience"
+    );
+
+    let rig = Rig::new();
+    let parent = certified_deploy(&rig);
+    rig.clock
+        .put_global_clock_frame_candidate(&parent, &crate::cw_global_seams::NoopTxn)
+        .unwrap();
+    let (plain, _) = pipeline(&rig, prover(&parent), 8);
+    let finalizer = finalizer_over(&rig, &Arc::new(plain));
+    let seam = rig.seam(&parent).with_finalizer(finalizer.clone());
+    finalize_without_body(&finalizer, &parent);
+    assert!(
+        seam.propose_with_context(rig.context(&parent)).is_some(),
+        "without sequenced ingest the parent is executed at once"
+    );
+}

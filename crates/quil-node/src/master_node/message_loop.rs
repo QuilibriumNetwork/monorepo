@@ -95,6 +95,10 @@ pub(crate) struct MessageLoopArgs {
     /// is enabled; every inbound gossip message is recorded for the
     /// `GET /messages` endpoint. `None` (the default) means no overhead.
     pub recent_messages: Option<Arc<quil_explorer::RecentMessageRing>>,
+    /// The most-asked effective settings (`EffectiveConfig::status_brief`),
+    /// repeated in every `node status` line so a recent log window answers
+    /// them after the startup line rotated away.
+    pub config_brief: String,
 }
 
 /// The engines a message on `bitmask` reaches as a submission: every engine
@@ -210,6 +214,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         crdt: crdt_for_recv,
         genesis_seed: genesis_seed_for_recv,
         archive_mode: archive_mode_recv,
+        config_brief,
         prover_lifecycle: pl_for_recv,
         prover_registry: pr_for_recv,
         worker_manager: wm_for_recv,
@@ -687,6 +692,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 .collect::<Vec<_>>()
                                 .join(",")
                         },
+                        config = %config_brief,
                         "node status"
                     );
                     // Resolver traffic of the shards this process runs.
@@ -774,6 +780,12 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         replica_leaf_cache_mb = %crate::mem_stats::fmt_mb(
                             quil_store::replica_store::leaf_cache_bytes() as u64
                         ),
+                        // The block cache this process's stores share
+                        // (archives keep their own): used and capacity.
+                        rocksdb_shared_cache_mb = quil_store::shared_block_cache_memory()
+                            .map(|(used, _)| crate::mem_stats::fmt_mb(used)),
+                        rocksdb_shared_cache_capacity_mb = quil_store::shared_block_cache_memory()
+                            .map(|(_, capacity)| crate::mem_stats::fmt_mb(capacity)),
                         "memory snapshot"
                     );
                     if let Some(h) = host_mem {

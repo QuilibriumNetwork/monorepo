@@ -795,6 +795,19 @@ impl RocksTreeStore {
         from: Option<&[u8]>,
         batch_records: usize,
     ) -> Result<(usize, Option<Vec<u8>>)> {
+        self.prune_batch_until(min_readable_version, from, batch_records, &|| false)
+    }
+
+    /// [`Self::prune_batch`], also ending the batch early once `stop` says so,
+    /// checked after each record collected (at least one record goes): a
+    /// caller holding a lock others wait for bounds its hold by one record.
+    pub fn prune_batch_until(
+        &self,
+        min_readable_version: Version,
+        from: Option<&[u8]>,
+        batch_records: usize,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<(usize, Option<Vec<u8>>)> {
         let batch_records = batch_records.max(1);
         let (lo, hi) = self.stale_scan_bounds();
         let vstart = self.prefix.len() + 1; // after prefix + TAG_STALE
@@ -824,7 +837,7 @@ impl RocksTreeStore {
                     // Records are version-ordered; nothing beyond is prunable.
                     break;
                 }
-                if doomed.len() == batch_records {
+                if doomed.len() == batch_records || (!doomed.is_empty() && stop()) {
                     more = true;
                     break;
                 }
@@ -1088,27 +1101,37 @@ impl RocksTreeStore {
     /// [`Self::value_prune_candidates`]), as the store holds them now, at most
     /// `budget` (decremented). Only sound at the same watermark
     /// [`ForestStore::prune`] uses, which the caller derives from the tree's
-    /// retention history under the lock that orders its commits. Returns the
-    /// number deleted.
+    /// retention history under the lock that orders its commits. Once `stop`
+    /// says so, checked after each key (at least one is judged), the rest are
+    /// left for a later call. Returns the number deleted and the number of
+    /// `key_hashes` judged.
     pub fn prune_values_of(
         &self,
         min_readable_version: Version,
         key_hashes: &[[u8; 32]],
         budget: &mut usize,
-    ) -> Result<usize> {
+        stop: &dyn Fn() -> bool,
+    ) -> Result<(usize, usize)> {
         let mut doomed: Vec<Vec<u8>> = Vec::new();
+        let mut judged = 0usize;
+        // One iterator over the span of the keys, sought to each in turn.
+        let (Some(first), Some(last)) = (key_hashes.iter().min(), key_hashes.iter().max()) else {
+            return Ok((0, 0));
+        };
+        let lower = self.value_prefix(&KeyHash(*first));
+        let mut upper = self.value_prefix(&KeyHash(*last));
+        upper.extend_from_slice(&[0xff; 8]);
+        upper.push(0);
+        let mut it = self
+            .db
+            .iterator(&lower, &upper, rocksdb::ReadOptions::default())?;
         for key_hash in key_hashes {
-            if *budget == 0 {
+            if *budget == 0 || (judged > 0 && stop()) {
                 break;
             }
+            judged += 1;
             let vp = self.value_prefix(&KeyHash(*key_hash));
-            let mut upper = vp.clone();
-            upper.extend_from_slice(&[0xff; 8]);
-            upper.push(0);
             let mut versions: Vec<(Version, Vec<u8>)> = Vec::new();
-            let mut it = self
-                .db
-                .iterator(&vp, &upper, rocksdb::ReadOptions::default())?;
             it.seek(&vp)?;
             while it.valid() {
                 let k = match it.key() {
@@ -1139,15 +1162,16 @@ impl RocksTreeStore {
                 *budget -= 1;
             }
         }
+        drop(it);
         if doomed.is_empty() {
-            return Ok(0);
+            return Ok((0, judged));
         }
         let mut wb = self.db.batch();
         for key in &doomed {
             wb.delete(key);
         }
         self.db.write(wb)?;
-        Ok(doomed.len())
+        Ok((doomed.len(), judged))
     }
 }
 

@@ -276,7 +276,10 @@ macro_rules! impl_hypergraph_storage {
                 sweep: bool,
             ) -> Result<(crate::retention::IndexedTrees, usize)> {
                 let mut trees = crate::retention::IndexedTrees::new();
-                let options = if sweep { sweep_read_options() } else { rocksdb::ReadOptions::default() };
+                let mut options = if sweep { sweep_read_options() } else { rocksdb::ReadOptions::default() };
+                if let Some(upper) = prefix_successor(prefix) {
+                    options.set_iterate_upper_bound(upper);
+                }
                 let mut read = 0usize;
                 for entry in self.db.iterator_opt(
                     rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
@@ -1139,24 +1142,35 @@ macro_rules! impl_hypergraph_storage {
                 keyspace: &quil_types::store::RetentionKeyspace,
                 vertices: &[Vec<u8>],
                 budget: &mut usize,
-            ) -> Result<usize> {
+                stop: &dyn Fn() -> bool,
+            ) -> Result<(usize, usize)> {
                 const VERTEX_KEY: usize = 64;
                 let (Some(set_s), Some(phase_s)) = (byte_set_str(keyspace.set), byte_phase_str(keyspace.phase)) else {
-                    return Ok(0);
+                    return Ok((0, vertices.len()));
                 };
                 let sprefix = crate::encoding::hypergraph_vertex_data_v2_shard_prefix(
                     set_s, phase_s, &retention_shard(&keyspace.application),
                 );
                 let watermark = keyspace.watermark;
                 let mut deleted = 0usize;
-                for vertex in vertices.iter().filter(|v| v.len() == VERTEX_KEY) {
-                    if *budget == 0 {
+                let mut judged = 0usize;
+                // One iterator bounded to the keyspace, sought to each vertex.
+                let mut options = rocksdb::ReadOptions::default();
+                if let Some(upper) = prefix_successor(&sprefix) {
+                    options.set_iterate_upper_bound(upper);
+                }
+                let mut it = self.db.raw_iterator_opt(options);
+                for vertex in vertices {
+                    if *budget == 0 || (judged > 0 && stop()) {
                         break;
+                    }
+                    judged += 1;
+                    if vertex.len() != VERTEX_KEY {
+                        continue;
                     }
                     let mut prefix = sprefix.clone();
                     prefix.extend_from_slice(vertex);
                     let mut versions: Vec<(u64, Vec<u8>)> = Vec::new();
-                    let mut it = self.db.raw_iterator_opt(rocksdb::ReadOptions::default());
                     it.seek(&prefix);
                     while let Some(k) = it.key() {
                         if !k.starts_with(&prefix) {
@@ -1180,7 +1194,7 @@ macro_rules! impl_hypergraph_storage {
                         deleted += 1;
                     }
                 }
-                Ok(deleted)
+                Ok((deleted, judged))
             }
 
             fn apply_snapshot(&self, db_path: &str) -> Result<()> {

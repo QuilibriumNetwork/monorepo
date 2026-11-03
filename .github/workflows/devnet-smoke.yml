@@ -39,6 +39,7 @@ on:
       - 'crates/quil-node/**'
       - 'crates/quil-p2p/**'
       - 'crates/quil-rpc/**'
+      - 'crates/quil-sntrup761/**'
       - 'crates/quil-store/**'
       - 'crates/quil-tries/**'
       - 'crates/quil-types/**'

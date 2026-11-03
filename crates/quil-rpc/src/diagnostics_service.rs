@@ -28,7 +28,7 @@ use quil_types::proto::diagnostics::diagnostics_service_server::{
 };
 use quil_types::proto::diagnostics::{
     Blocker, FailureCount, GetHealthReportRequest, HealthReport, Phase, RecoveryFailure,
-    RecoveryPhase, WorkerHealth,
+    RecoveryPhase, StoreIoHealth, WorkerHealth,
 };
 use quil_types::proto::node::{GlobalAppFrameHead, WorkerExecution};
 
@@ -114,7 +114,7 @@ const RECOVERY_PHASES: [(&str, RecoveryPhase); 6] = [
     ("installing_checkpoint", RecoveryPhase::InstallingCheckpoint),
 ];
 
-const FAILURES: [(&str, RecoveryFailure); 7] = [
+const FAILURES: [(&str, RecoveryFailure); 9] = [
     ("no_archive_known", RecoveryFailure::NoArchiveKnown),
     ("global_sync", RecoveryFailure::GlobalSync),
     ("connect", RecoveryFailure::Connect),
@@ -122,6 +122,8 @@ const FAILURES: [(&str, RecoveryFailure); 7] = [
     ("archive_state", RecoveryFailure::ArchiveState),
     ("replay_mismatch", RecoveryFailure::ReplayMismatch),
     ("other", RecoveryFailure::Other),
+    ("proof_verification", RecoveryFailure::ProofVerification),
+    ("engine_busy", RecoveryFailure::EngineBusy),
 ];
 
 fn lookup<T: Copy + PartialEq>(table: &[(&'static str, T)], text: &str) -> Option<T> {
@@ -305,6 +307,9 @@ pub struct HealthInputs {
     pub master_store_write_failed: bool,
     /// The configured worker count; 0 unknown.
     pub worker_capacity: u32,
+    /// The master store's latest I/O interval
+    /// ([`quil_forest::store_io::latest`]).
+    pub store_io: Option<StoreIoHealth>,
 }
 
 /// The report of `inputs` at `now_ms`: allocated workers first, by core,
@@ -320,6 +325,7 @@ pub fn build_report(inputs: &HealthInputs, build_fingerprint: &[u8], now_ms: u64
         generated_unix_ms: now_ms,
         master_store_write_failed: inputs.master_store_write_failed,
         worker_capacity: inputs.worker_capacity,
+        store_io: inputs.store_io.clone(),
         ..Default::default()
     };
     let mut entries: Vec<&WorkerEntry> = inputs.workers.iter().collect();
@@ -1083,6 +1089,36 @@ mod tests {
             ..inputs
         };
         assert!(build_report(&inputs, &[], 3_000).master_store_write_failed);
+    }
+
+    /// The master store's latest I/O interval rides the report as given,
+    /// through encoding; a node without one sends none.
+    #[test]
+    fn the_store_io_interval_is_reported() {
+        use prost::Message;
+        use quil_types::proto::diagnostics::{StoreIoReason, StoreIoVerdict};
+        let mut io = StoreIoHealth {
+            slow_secs: 120,
+            interval_secs: 60,
+            canary_reads: 58,
+            canary_p99_us: 400_000,
+            disk_read_await_us: Some(25_000),
+            ..Default::default()
+        };
+        io.set_verdict(StoreIoVerdict::Slow);
+        io.set_slow_reason(StoreIoReason::CanaryP99);
+        let inputs = HealthInputs {
+            store_io: Some(io.clone()),
+            ..Default::default()
+        };
+        let report = build_report(&inputs, &[], 3_000);
+        assert_eq!(report.store_io.as_ref(), Some(&io));
+        let decoded = HealthReport::decode(report.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.store_io, Some(io));
+        assert_eq!(
+            build_report(&HealthInputs::default(), &[], 3_000).store_io,
+            None
+        );
     }
 
     /// The configured count and each worker above it, which drains, are

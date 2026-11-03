@@ -204,6 +204,52 @@ mod tests {
         assert!(!known_to_fit(300_000_000, 12.0));
     }
 
+    /// An operation of [`BACKGROUND_VERIFY_BYTES`] or more, or a batch
+    /// shield, is never known to fit a budget, however fast its size class
+    /// measured; its estimate is at least its structure's floor.
+    #[test]
+    fn large_operations_and_batch_shields_never_fit_by_measurement() {
+        record_duration(2048, std::time::Duration::from_secs(1));
+        assert!(operation_known_to_fit(2048, 0.0, 12.0));
+        assert!(
+            !operation_known_to_fit(2048, 13.0, 12.0),
+            "a floor above the budget never fits"
+        );
+        assert_eq!(estimated_operation_secs(2048, 30.0), 30.0);
+        assert_eq!(
+            estimated_operation_secs(2048, 0.0),
+            estimated_verify_secs(2048)
+        );
+        let large = BACKGROUND_VERIFY_BYTES << 3;
+        record_duration(large, std::time::Duration::from_secs(1));
+        assert!(verification_known_to_fit(large, 12.0));
+        assert!(
+            !operation_known_to_fit(large, 0.0, 12.0),
+            "a large operation fits by measurement"
+        );
+        // A batch shield by its tags; a single shield or a transfer has no
+        // floor.
+        let tagged = |version: &[u8]| {
+            let mut bytes = TYPE_LATTICE_SHIELD.to_be_bytes().to_vec();
+            bytes.extend_from_slice(version);
+            bytes.resize(76, 0);
+            bytes
+        };
+        let batch = tagged(b"QCT3SH\0\x03");
+        let single = tagged(b"QCT3SH\0\x02");
+        assert_eq!(
+            verify_floor_secs(&batch, TYPE_LATTICE_SHIELD),
+            BATCH_SHIELD_FLOOR_SECS
+        );
+        assert_eq!(verify_floor_secs(&single, TYPE_LATTICE_SHIELD), 0.0);
+        assert_eq!(verify_floor_secs(&batch, TYPE_LATTICE_TRANSACTION), 0.0);
+        assert!(!operation_known_to_fit(
+            2048,
+            verify_floor_secs(&batch, TYPE_LATTICE_SHIELD),
+            24.0
+        ));
+    }
+
     /// A refused admission reads as `PROOF_WORKER_BUSY`, which callers tell
     /// apart from other worker failures.
     #[test]
@@ -842,10 +888,46 @@ fn invalid(message: &str) -> QuilError {
 /// verdict depends on (network, application, limits, native budget and the
 /// exact operation bytes). A verdict is a pure function of that key, so a
 /// pre-pass can verify a frame's operations concurrently and the sequential
-/// materialization loop consumes the results. Bounded; cleared when full.
-static VERDICTS: std::sync::Mutex<Option<std::collections::HashMap<[u8; 32], bool>>> =
-    std::sync::Mutex::new(None);
+/// materialization loop consumes the results. Accepted and rejected verdicts
+/// are kept apart, each bounded by [`VERDICT_CACHE_ENTRIES`] and evicting its
+/// oldest entry when full: rejections never displace an accepted verdict a
+/// proposal or frame still needs (one took minutes to compute), and a full
+/// cache never forgets everything at once.
+static VERDICTS: std::sync::Mutex<Option<Verdicts>> = std::sync::Mutex::new(None);
 const VERDICT_CACHE_ENTRIES: usize = 4096;
+
+/// One side of the verdict cache: keys in insertion order.
+#[derive(Default)]
+struct VerdictSet {
+    keys: std::collections::HashSet<[u8; 32]>,
+    order: std::collections::VecDeque<[u8; 32]>,
+}
+
+impl VerdictSet {
+    fn insert(&mut self, key: [u8; 32], capacity: usize) {
+        if !self.keys.insert(key) {
+            return;
+        }
+        self.order.push_back(key);
+        while self.order.len() > capacity.max(1) {
+            if let Some(oldest) = self.order.pop_front() {
+                self.keys.remove(&oldest);
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &[u8; 32]) {
+        if self.keys.remove(key) {
+            self.order.retain(|held| held != key);
+        }
+    }
+}
+
+#[derive(Default)]
+struct Verdicts {
+    accepted: VerdictSet,
+    rejected: VerdictSet,
+}
 /// Exponentially weighted mean of one worker verification's wall time, in
 /// microseconds; seeds at 8 s until measured.
 static VERIFY_EWMA_MICROS: std::sync::atomic::AtomicU64 =
@@ -929,6 +1011,45 @@ fn known_to_fit(class_micros: u64, budget_secs: f64) -> bool {
     class_micros > 0 && class_micros as f64 / 1e6 <= budget_secs
 }
 
+/// Operations of at least this many bytes verify in the background before
+/// a frame carries them, whatever this node measured: batch shields are
+/// about 170-210 KiB and verified for 95-470 s (mainnet and devnet,
+/// 2026-10-29..31); proofs of the other operations are tens of KiB.
+pub const BACKGROUND_VERIFY_BYTES: usize = 128 << 10;
+/// Least worker time a batch shield takes to verify, whatever its size:
+/// 95-470 s measured (mainnet and devnet, 2026-10-29..31). Its proof does
+/// not grow with its sources.
+const BATCH_SHIELD_FLOOR_SECS: f64 = 60.0;
+
+/// The least worker time verifying one confidential operation of type `tp`
+/// takes by its structure, which no measurement lowers:
+/// [`BATCH_SHIELD_FLOOR_SECS`] for a batch shield (read from its type and
+/// version tags), zero for the others, whose dimensions the policy bounds.
+pub fn verify_floor_secs(bytes: &[u8], tp: u32) -> f64 {
+    if tp == TYPE_LATTICE_SHIELD && quil_lattice_ct::confidential::shield::is_batch(bytes) {
+        BATCH_SHIELD_FLOOR_SECS
+    } else {
+        0.0
+    }
+}
+
+/// Whether verifying one confidential operation of `operation_bytes` bytes,
+/// taking at least `floor_secs` by its structure ([`verify_floor_secs`]),
+/// is known to take at most `budget_secs`: it is smaller than
+/// [`BACKGROUND_VERIFY_BYTES`], its floor fits, and its size class was
+/// measured and fits ([`verification_known_to_fit`]).
+pub fn operation_known_to_fit(operation_bytes: usize, floor_secs: f64, budget_secs: f64) -> bool {
+    operation_bytes < BACKGROUND_VERIFY_BYTES
+        && floor_secs <= budget_secs
+        && verification_known_to_fit(operation_bytes, budget_secs)
+}
+
+/// Estimated wall time of verifying one confidential operation of
+/// `operation_bytes` bytes taking at least `floor_secs` by its structure.
+pub fn estimated_operation_secs(operation_bytes: usize, floor_secs: f64) -> f64 {
+    estimated_verify_secs(operation_bytes).max(floor_secs)
+}
+
 /// The next exponentially weighted mean after `micros`, 1/4 weight on the
 /// newest; the first measurement (`previous` 0) is taken as is.
 fn ewma_next(previous: u64, micros: u64) -> u64 {
@@ -965,16 +1086,27 @@ fn verdict_key(
 }
 
 fn cached_verdict(key: &[u8; 32]) -> Option<bool> {
-    VERDICTS.lock().ok()?.as_ref()?.get(key).copied()
+    let cache = VERDICTS.lock().ok()?;
+    let verdicts = cache.as_ref()?;
+    if verdicts.accepted.keys.contains(key) {
+        Some(true)
+    } else if verdicts.rejected.keys.contains(key) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn record_verdict(key: [u8; 32], accepted: bool) {
     if let Ok(mut cache) = VERDICTS.lock() {
-        let map = cache.get_or_insert_with(std::collections::HashMap::new);
-        if map.len() >= VERDICT_CACHE_ENTRIES {
-            map.clear();
-        }
-        map.insert(key, accepted);
+        let verdicts = cache.get_or_insert_with(Verdicts::default);
+        let (into, other) = if accepted {
+            (&mut verdicts.accepted, &mut verdicts.rejected)
+        } else {
+            (&mut verdicts.rejected, &mut verdicts.accepted)
+        };
+        other.remove(&key);
+        into.insert(key, VERDICT_CACHE_ENTRIES);
     }
 }
 
@@ -1174,7 +1306,12 @@ pub(crate) fn verify_in_worker(
     Ok(())
 }
 
-/// One worker verification, its wall time recorded.
+/// One worker verification; the wall time of an accepted one is recorded.
+/// Only accepted verdicts teach the estimates: a rejected operation may stop
+/// at any point of its verification (a decoding failure ends it in
+/// milliseconds), so its time says nothing of what a valid operation of its
+/// size takes, and a few such samples priced a class verifying for minutes
+/// as fitting the frame budget.
 fn worker_verdict(
     worker: &WorkerVerifier,
     network: &[u8; 32],
@@ -1193,9 +1330,15 @@ fn worker_verdict(
             transaction: bytes,
         })
     })?;
-    record_duration(bytes.len(), start.elapsed());
+    if accepted {
+        record_duration(bytes.len(), start.elapsed());
+    }
     Ok(accepted)
 }
+
+#[cfg(test)]
+#[path = "dispatch_estimate_tests.rs"]
+mod estimate_tests;
 
 /// What [`TokenPolicy::preverify`] made of one operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1208,7 +1351,8 @@ pub enum Preverified {
     Busy,
     /// The worker failed (timeout, crash, resource cap); nothing cached.
     Unavailable,
-    /// No worker proof to verify (mint claims, unknown types).
+    /// No worker proof to verify (mint claims, unknown types, operations
+    /// dispatch refuses before native work).
     NotApplicable,
 }
 
@@ -1247,9 +1391,16 @@ impl TokenPolicy {
     }
 
     /// Whether one confidential operation needs no worker verification
-    /// before it executes: its verdict is cached, or it carries no worker
-    /// proof (mint claims, unknown types).
+    /// before it executes: its verdict is cached, it carries no worker proof
+    /// (mint claims, unknown types), or dispatch refuses it before native
+    /// work ([`Self::preflight`]: encoding, context, dimensions, fee).
     pub fn verdict_cached(&self, address: &[u8], bytes: &[u8], tp: u32) -> bool {
+        self.verdict_known(address, bytes, tp) || self.preflight(address, bytes, tp).is_err()
+    }
+
+    /// Whether one confidential operation's verdict is cached, or it carries
+    /// no worker proof.
+    pub(crate) fn verdict_known(&self, address: &[u8], bytes: &[u8], tp: u32) -> bool {
         let Some((application, limits)) = self.worker_request_shape(address, tp) else {
             return true;
         };
@@ -1286,6 +1437,10 @@ impl TokenPolicy {
         );
         if cached_verdict(&key).is_some() {
             return Preverified::Cached;
+        }
+        // Dispatch refuses it before native work: nothing to verify.
+        if self.preflight(address, bytes, tp).is_err() {
+            return Preverified::NotApplicable;
         }
         match verdict_once(key, || {
             worker_verdict(
@@ -1645,3 +1800,7 @@ impl TokenPolicy {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "dispatch_admission_tests.rs"]
+mod admission_tests;

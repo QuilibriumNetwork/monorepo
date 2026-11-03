@@ -540,8 +540,7 @@ mod tests {
             tx.statement.funding.application,
         );
         let context = parameter_context(&network, &application);
-        use pqcrypto_traits::kem::PublicKey as _;
-        let (kem, _) = pqcrypto_ntruprime::sntrup761::keypair();
+        let (kem, _) = quil_sntrup761::keypair();
         let payee = RecipientAddress::new(
             &context,
             &RecipientSecret::from_seed(&context, &[140; 32]),

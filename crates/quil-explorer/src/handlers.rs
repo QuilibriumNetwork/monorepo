@@ -30,6 +30,10 @@ use quil_types::protojson;
 use crate::production;
 use crate::ExplorerState;
 
+mod shard_frames;
+pub(crate) use shard_frames::MAX_CONCURRENT_READS as MAX_SHARD_FRAME_READS;
+pub use shard_frames::{handle_shard_frame, handle_shard_frames};
+
 const CACHE_LONG: &str = "public, max-age=31536000, immutable";
 const CACHE_180: &str = "public, max-age=180";
 const CACHE_60: &str = "public, max-age=60";

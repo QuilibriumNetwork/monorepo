@@ -267,6 +267,70 @@ pub(crate) fn label(
     receive(n, receiver, on_layer, stop)
 }
 
+/// Resume verified whole layers using the same bounded graph and columns as
+/// fresh workers. Kept layers fold once and are never handed to the writer again.
+pub(crate) fn label_resume(
+    n: usize,
+    key: Digest,
+    kept: usize,
+    read_layer: &mut dyn FnMut(usize, &mut [Digest]) -> bool,
+    on_layer: &mut dyn FnMut(usize, &[Digest]),
+    stop: &dyn Fn() -> bool,
+) -> Option<(Vec<Digest>, Vec<Digest>)> {
+    if kept == 0 {
+        return label(n, key, on_layer, stop);
+    }
+    if stop() {
+        return None;
+    }
+    let mut columns = Columns::new(n);
+    let mut prev = vec![hash::ZERO; n];
+    for layer in 0..kept {
+        if stop() || !read_layer(layer, &mut prev) {
+            return None;
+        }
+        columns.update(&prev).ok()?;
+    }
+    if kept == 11 {
+        return Some((prev, columns.finish().ok()?));
+    }
+    let graph = graph_until(
+        GraphKey {
+            n,
+            drg: 6,
+            expander: 8,
+        },
+        stop,
+    );
+    let mut cur = vec![hash::ZERO; n];
+    for layer in kept..11 {
+        for at in (0..n).step_by(BLOCK) {
+            if stop() {
+                return None;
+            }
+            let count = BLOCK.min(n - at);
+            let rows = graph.rows(at, count).ok()?;
+            for v in at..at + count {
+                let row = &rows[(v - at) * 14..(v - at + 1) * 14];
+                cur[v] = crate::storage_proof::label(
+                    &key,
+                    layer,
+                    v as u64,
+                    &mut row[..6].iter().map(|&p| cur[p as usize]),
+                    &mut row[6..].iter().map(|&p| prev[p as usize]),
+                    &sdr::SdrParams::default(),
+                );
+            }
+        }
+        columns.update(&cur).ok()?;
+        on_layer(layer, &cur);
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    drop(cur);
+    drop(graph);
+    Some((prev, columns.finish().ok()?))
+}
+
 fn launch_worker(queue: &'static Mutex<Vec<Request>>) {
     let spawned = std::thread::Builder::new().name("storage-labels".into()).spawn(move || {
         std::thread::sleep(BATCH_WAIT);

@@ -82,6 +82,8 @@ pub fn detect_store_format(path: &Path) -> StoreFormat {
 /// RocksDB-backed key-value store.
 pub struct RocksDb {
     db: quil_forest::CoordinatedDb,
+    /// Its block cache is the process's shared one ([`shared_block_cache`]).
+    shared_block_cache: bool,
 }
 
 /// Per-instance RocksDB read health. See [`RocksDb::health`].
@@ -103,19 +105,111 @@ pub struct RocksDbMemory {
     pub block_cache_pinned: u64,
     pub memtables: u64,
     pub table_readers: u64,
+    /// `block_cache` is the process's shared cache, which every store
+    /// sharing it reports ([`shared_block_cache_memory`]).
+    pub block_cache_shared: bool,
 }
 
 impl RocksDbMemory {
-    /// Total bytes this instance accounts for.
+    /// Total bytes this instance accounts for: a shared block cache is
+    /// counted once for the process, not per store.
     pub fn total(&self) -> u64 {
         // block_cache_pinned is a subset of block_cache — don't double count.
-        self.block_cache + self.memtables + self.table_readers
+        let block_cache = if self.block_cache_shared {
+            0
+        } else {
+            self.block_cache
+        };
+        block_cache + self.memtables + self.table_readers
     }
 }
 
 /// Block cache of a store that is not an archive's: enough for the hot
 /// working set of a regular node, which also runs a store per worker.
 pub(crate) const DEFAULT_BLOCK_CACHE_BYTES: usize = 256 << 20;
+/// What the stores of one process that are not an archive's share as block
+/// cache at most ([`shared_block_cache`]); `QUIL_ROCKSDB_BLOCK_CACHE_TOTAL_MB`
+/// overrides it. A cache per store took 256 MB for every worker's store: 4
+/// GB on a node of 15 workers, 7 GB on one of 28 (2026-10-31).
+const DEFAULT_SHARED_BLOCK_CACHE_BYTES: usize = 1 << 30;
+
+/// The block cache this process's stores that are not an archive's share:
+/// [`DEFAULT_BLOCK_CACHE_BYTES`] per store opened, up to the budget
+/// (`QUIL_ROCKSDB_BLOCK_CACHE_TOTAL_MB`, default 1 GB), so a process of one
+/// store keeps what it had and one of many workers holds the budget however
+/// many it runs.
+fn shared_block_cache() -> rocksdb::Cache {
+    let budget = shared_block_cache_budget();
+    let mut shared = SHARED_BLOCK_CACHE
+        .get_or_init(|| {
+            std::sync::Mutex::new(SharedBlockCache {
+                cache: rocksdb::Cache::new_lru_cache(0),
+                stores: 0,
+            })
+        })
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    shared.stores += 1;
+    let capacity = shared_capacity(shared.stores, budget);
+    shared.cache.set_capacity(capacity);
+    shared.cache.clone()
+}
+
+/// The shared cache's capacity once `stores` stores have opened on it.
+fn shared_capacity(stores: usize, budget: usize) -> usize {
+    stores.saturating_mul(DEFAULT_BLOCK_CACHE_BYTES).min(budget)
+}
+
+/// The shared cache's budget: `QUIL_ROCKSDB_BLOCK_CACHE_TOTAL_MB`, else
+/// [`DEFAULT_SHARED_BLOCK_CACHE_BYTES`].
+fn shared_block_cache_budget() -> usize {
+    std::env::var("QUIL_ROCKSDB_BLOCK_CACHE_TOTAL_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(DEFAULT_SHARED_BLOCK_CACHE_BYTES, |mb| {
+            mb.saturating_mul(1024 * 1024)
+        })
+}
+
+/// `QUIL_ROCKSDB_BLOCK_CACHE_MB`, in bytes, when it gives every store a
+/// block cache of its own of that size.
+fn own_block_cache_override() -> Option<usize> {
+    std::env::var("QUIL_ROCKSDB_BLOCK_CACHE_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+}
+
+/// The block cache `stores` stores of this process that are not an
+/// archive's hold together once open, in bytes: the shared cache's capacity
+/// for that many; `None` when `QUIL_ROCKSDB_BLOCK_CACHE_MB` gives each store
+/// its own cache instead. For reports of the effective configuration.
+pub fn shared_block_cache_bytes(stores: usize) -> Option<usize> {
+    if own_block_cache_override().is_some() {
+        return None;
+    }
+    Some(shared_capacity(stores, shared_block_cache_budget()))
+}
+
+struct SharedBlockCache {
+    cache: rocksdb::Cache,
+    /// Stores opened on it in this process (reopened ones again).
+    stores: usize,
+}
+
+static SHARED_BLOCK_CACHE: std::sync::OnceLock<std::sync::Mutex<SharedBlockCache>> =
+    std::sync::OnceLock::new();
+
+/// The shared block cache's `(usage, capacity)` bytes, once a store opened
+/// on it: what its stores' [`RocksDbMemory::total`] leave out.
+pub fn shared_block_cache_memory() -> Option<(u64, u64)> {
+    let shared = SHARED_BLOCK_CACHE
+        .get()?
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let capacity = shared_capacity(shared.stores, shared_block_cache_budget());
+    Some((shared.cache.get_usage() as u64, capacity as u64))
+}
 /// Bounds of an archive's block cache ([`archive_block_cache_bytes`]).
 const MIN_ARCHIVE_BLOCK_CACHE_BYTES: usize = DEFAULT_BLOCK_CACHE_BYTES;
 const MAX_ARCHIVE_BLOCK_CACHE_BYTES: usize = 32 << 30;
@@ -165,22 +259,67 @@ fn memory_budget_bytes() -> Option<u64> {
     Some(limit.map_or(physical, |limit| limit.min(physical)).max(1))
 }
 
+/// The block cache of a store opened with `base` bytes: `override_mb`
+/// (`QUIL_ROCKSDB_BLOCK_CACHE_MB`) replaces it when it parses.
+fn block_cache_with_override(base: usize, override_mb: Option<&str>) -> usize {
+    override_mb
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(base, |mb| mb.saturating_mul(1024 * 1024))
+}
+
+/// The block cache a store of this process opens with when it has one of
+/// its own, in bytes: an archive's memory-sized cache, or
+/// `QUIL_ROCKSDB_BLOCK_CACHE_MB` for any store. Without that override the
+/// other stores share one cache ([`shared_block_cache_bytes`]).
+pub fn effective_block_cache_bytes(archive: bool) -> usize {
+    let base = if archive {
+        archive_block_cache_bytes()
+    } else {
+        DEFAULT_BLOCK_CACHE_BYTES
+    };
+    block_cache_with_override(
+        base,
+        std::env::var("QUIL_ROCKSDB_BLOCK_CACHE_MB").ok().as_deref(),
+    )
+}
+
+/// RocksDB background flush and compaction threads per store:
+/// `QUIL_ROCKSDB_BG_THREADS`, else the CPUs available, within 2..=8.
+pub fn background_threads() -> i32 {
+    background_threads_for(std::env::var("QUIL_ROCKSDB_BG_THREADS").ok().as_deref())
+}
+
+fn background_threads_for(override_threads: Option<&str>) -> i32 {
+    override_threads
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| (n.get() as i32).clamp(2, 8))
+                .unwrap_or(4)
+        })
+}
+
 impl RocksDb {
     /// Open a RocksDB database at the given path.
     /// Runs pending migrations automatically.
+    /// Its block cache is the process's shared one ([`shared_block_cache`]),
+    /// unless `QUIL_ROCKSDB_BLOCK_CACHE_MB` gives each store its own of that
+    /// size, as before the shared cache.
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_with_block_cache(path, DEFAULT_BLOCK_CACHE_BYTES)
+        Self::open_with_block_cache(path, None)
     }
 
-    /// [`Self::open`] for an archive's store, with its block cache sized
+    /// [`Self::open`] for an archive's store, with its own block cache sized
     /// from memory ([`archive_block_cache_bytes`]).
     pub fn open_archive(path: &Path) -> Result<Self> {
-        Self::open_with_block_cache(path, archive_block_cache_bytes())
+        Self::open_with_block_cache(path, Some(archive_block_cache_bytes()))
     }
 
-    /// `QUIL_ROCKSDB_BLOCK_CACHE_MB` overrides `block_cache_bytes`.
-    fn open_with_block_cache(path: &Path, block_cache_bytes: usize) -> Result<Self> {
-        let opts = Self::store_options(block_cache_bytes);
+    /// A store with its own block cache of `block_cache_bytes`, or the
+    /// shared one (`None`); `QUIL_ROCKSDB_BLOCK_CACHE_MB` gives every store
+    /// its own of that size.
+    fn open_with_block_cache(path: &Path, block_cache_bytes: Option<usize>) -> Result<Self> {
+        let (opts, shared) = Self::store_options_for(block_cache_bytes);
         let db = rocksdb::DB::open(&opts, path)
             .map_err(|e| QuilError::Store(format!("failed to open rocksdb: {}", e)))?;
 
@@ -190,12 +329,21 @@ impl RocksDb {
 
         Ok(Self {
             db: Self::coordinated(db),
+            shared_block_cache: shared,
         })
     }
 
-    /// The options a node store opens with; tests that measure the store's
-    /// own behaviour open with them too.
+    /// The options a node store opens with, with a block cache of its own
+    /// of `block_cache_bytes`; tests that measure the store's own behaviour
+    /// open with them too.
+    #[cfg(test)]
     pub(crate) fn store_options(block_cache_bytes: usize) -> rocksdb::Options {
+        Self::store_options_for(Some(block_cache_bytes)).0
+    }
+
+    /// [`Self::store_options`], with the process's shared block cache for
+    /// `None`; and whether the cache is the shared one.
+    fn store_options_for(block_cache_bytes: Option<usize>) -> (rocksdb::Options, bool) {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
 
@@ -217,14 +365,7 @@ impl RocksDb {
         // threads to keep up, plus extra memtable headroom to absorb bursts.
         // Threads scale with cores (compaction is the bottleneck on weak HW);
         // env-overridable for constrained nodes.
-        let bg_threads: i32 = std::env::var("QUIL_ROCKSDB_BG_THREADS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| (n.get() as i32).clamp(2, 8))
-                    .unwrap_or(4)
-            });
+        let bg_threads = background_threads();
         opts.increase_parallelism(bg_threads);
         opts.set_max_background_jobs(bg_threads);
         // More memtables in flight (default 2) so a flush stall doesn't immediately
@@ -239,11 +380,12 @@ impl RocksDb {
 
         // Block-cache budget. Without an explicit cache RocksDB
         // grows an internal cache that can balloon under churn.
-        let cache_bytes = std::env::var("QUIL_ROCKSDB_BLOCK_CACHE_MB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map_or(block_cache_bytes, |mb| mb.saturating_mul(1024 * 1024));
-        let block_cache = rocksdb::Cache::new_lru_cache(cache_bytes);
+        let own_bytes = own_block_cache_override().or(block_cache_bytes);
+        let shared = own_bytes.is_none();
+        let block_cache = match own_bytes {
+            Some(bytes) => rocksdb::Cache::new_lru_cache(bytes),
+            None => shared_block_cache(),
+        };
         let mut block_opts = rocksdb::BlockBasedOptions::default();
         block_opts.set_block_cache(&block_cache);
         // Account index + filter blocks against the cache budget,
@@ -262,7 +404,7 @@ impl RocksDb {
         block_opts.set_metadata_block_size(4096);
         block_opts.set_pin_top_level_index_and_filter(true);
         opts.set_block_based_table_factory(&block_opts);
-        opts
+        (opts, shared)
     }
 
     /// Inspect an existing, stopped database without writes or migrations.
@@ -275,6 +417,7 @@ impl RocksDb {
             .map_err(|e| QuilError::Store(format!("failed to open rocksdb read-only: {e}")))?;
         Ok(Self {
             db: quil_forest::CoordinatedDb::new(db),
+            shared_block_cache: false,
         })
     }
 
@@ -292,6 +435,7 @@ impl RocksDb {
         })?;
         Ok(Self {
             db: quil_forest::CoordinatedDb::new(db),
+            shared_block_cache: false,
         })
     }
 
@@ -313,6 +457,7 @@ impl RocksDb {
         // Skip migrations on secondary — only the primary may write.
         Ok(Self {
             db: quil_forest::CoordinatedDb::new(db),
+            shared_block_cache: false,
         })
     }
 
@@ -329,6 +474,7 @@ impl RocksDb {
         std::mem::forget(tmp);
         Ok(Self {
             db: Self::coordinated(db),
+            shared_block_cache: false,
         })
     }
 
@@ -359,6 +505,7 @@ impl RocksDb {
             block_cache_pinned: prop("rocksdb.block-cache-pinned-usage"),
             memtables: prop("rocksdb.cur-size-all-mem-tables"),
             table_readers: prop("rocksdb.estimate-table-readers-mem"),
+            block_cache_shared: self.shared_block_cache,
         }
     }
 
@@ -433,6 +580,87 @@ mod read_only_tests {
         );
         assert_eq!(archive_block_cache_for(None), MIN_ARCHIVE_BLOCK_CACHE_BYTES);
         assert!(memory_budget_bytes().is_some_and(|bytes| bytes > 0));
+    }
+
+    /// The stores of a process that are not an archive's share one block
+    /// cache: what one store reads into it every store's usage shows, and
+    /// its capacity does not grow with the number of stores (workers).
+    #[test]
+    fn stores_share_one_block_cache_whatever_their_number() {
+        if std::env::var_os("QUIL_ROCKSDB_BLOCK_CACHE_MB").is_some() {
+            return; // every store has its own cache by request
+        }
+        const MB: u64 = 1 << 20;
+        let dirs: Vec<_> = (0..12).map(|_| tempfile::tempdir().unwrap()).collect();
+        let mut stores: Vec<RocksDb> = dirs[..8]
+            .iter()
+            .map(|dir| RocksDb::open(dir.path()).unwrap())
+            .collect();
+        let capacity = |stores: &[RocksDb]| stores[0].health().block_cache_capacity;
+        let with_eight = capacity(&stores);
+        let db = stores[0].inner();
+        let key = |i: u32| format!("key-{i:08}").into_bytes();
+        for i in 0..4_000 {
+            db.put(key(i), [5u8; 1024]).unwrap();
+        }
+        db.flush().unwrap();
+        let before = stores[7].memory_usage().block_cache;
+        for i in 0..4_000 {
+            assert!(db.get(key(i)).unwrap().is_some());
+        }
+        let shown = stores[7].memory_usage();
+        assert!(
+            shown.block_cache >= before + 2 * MB,
+            "another store's reads did not reach this store's block cache: {} then {} bytes",
+            before,
+            shown.block_cache
+        );
+        assert_eq!(
+            shown.total(),
+            shown.memtables + shown.table_readers,
+            "a store's total leaves the shared cache out"
+        );
+        stores.extend(
+            dirs[8..]
+                .iter()
+                .map(|dir| RocksDb::open(dir.path()).unwrap()),
+        );
+        assert_eq!(capacity(&stores), with_eight, "more stores, the same cache");
+        assert!(stores
+            .iter()
+            .all(|store| store.health().block_cache_capacity == with_eight));
+        assert!(with_eight <= 1024 * MB, "{with_eight} bytes");
+    }
+
+    #[test]
+    fn the_shared_block_cache_grows_per_store_up_to_its_budget() {
+        const MB: usize = 1 << 20;
+        assert_eq!(shared_capacity(1, 1024 * MB), 256 * MB);
+        if std::env::var_os("QUIL_ROCKSDB_BLOCK_CACHE_MB").is_none()
+            && std::env::var_os("QUIL_ROCKSDB_BLOCK_CACHE_TOTAL_MB").is_none()
+        {
+            // What a report of the configuration reads: the master and 15
+            // workers hold the 1 GB budget, a lone worker process 256 MB.
+            assert_eq!(shared_block_cache_bytes(16), Some(1024 * MB));
+            assert_eq!(shared_block_cache_bytes(1), Some(256 * MB));
+        }
+        assert_eq!(shared_capacity(3, 1024 * MB), 768 * MB);
+        assert_eq!(shared_capacity(4, 1024 * MB), 1024 * MB);
+        assert_eq!(shared_capacity(28, 1024 * MB), 1024 * MB);
+        assert_eq!(shared_capacity(28, 64 * MB), 64 * MB);
+    }
+
+    /// The cache a store opens with is the override when it parses, else the
+    /// base; the thread count is the override when it parses, else bounded.
+    #[test]
+    fn block_cache_and_thread_overrides_replace_the_defaults() {
+        let base = DEFAULT_BLOCK_CACHE_BYTES;
+        assert_eq!(block_cache_with_override(base, None), base);
+        assert_eq!(block_cache_with_override(base, Some("junk")), base);
+        assert_eq!(block_cache_with_override(base, Some("64")), 64 << 20);
+        assert_eq!(background_threads_for(Some("3")), 3);
+        assert!((2..=8).contains(&background_threads_for(None)));
+        assert!((2..=8).contains(&background_threads_for(Some("x"))));
     }
 
     /// New table files carry a partitioned index; files written without one

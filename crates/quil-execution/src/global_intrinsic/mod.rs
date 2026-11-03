@@ -45,6 +45,8 @@ pub mod prover_shard_update;
 pub mod prover_update_materialize;
 pub mod prover_verify;
 pub mod reassignment;
+#[cfg(feature = "confidential-tokens")]
+pub mod relay_coverage;
 pub mod seniority_merge;
 pub mod seniority_restoration;
 pub mod seniority_succession;

@@ -1,5 +1,7 @@
 // Pinned labrados poly.c czetas table; IBM 2026, Apache-2.0. See NOTICE.
 // Decimal constants retained verbatim; no runtime trigonometric generation.
+// Verbatim, they trip approx_constant (1/sqrt(2)) and excessive_precision.
+#[allow(clippy::approx_constant, clippy::excessive_precision)]
 pub(super) const ROOTS: [(f64, f64); 128] = [
     (0.0, 1.0),
     (0.70710678118654752440, 0.70710678118654752440),

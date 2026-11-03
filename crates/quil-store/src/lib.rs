@@ -27,8 +27,9 @@ pub use hypergraph::{
 };
 pub use key::RocksKeyStore;
 pub use rocksdb_store::{
-    detect_store_format, RocksDb, RocksDbHealth, RocksDbMemory, RocksIterator, RocksTransaction,
-    StoreFormat,
+    background_threads, detect_store_format, effective_block_cache_bytes, shared_block_cache_bytes,
+    shared_block_cache_memory, RocksDb, RocksDbHealth, RocksDbMemory, RocksIterator,
+    RocksTransaction, StoreFormat,
 };
 pub use shards::{OverlayShardsStore, RocksShardsStore, ShardMetadataBatch};
 pub use token::RocksTokenStore;

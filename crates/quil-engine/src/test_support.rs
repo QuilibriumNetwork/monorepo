@@ -282,6 +282,8 @@ pub struct TestWorkerManager {
     drain_above: Mutex<Option<u32>>,
     retired: Mutex<Vec<u32>>,
     refuse_retirement: Mutex<bool>,
+    /// Workers whose eviction requests fail, as when their channel is full.
+    failing_evictions: Mutex<Vec<u32>>,
 }
 
 impl Default for TestWorkerManager {
@@ -302,6 +304,7 @@ impl TestWorkerManager {
             drain_above: Mutex::new(None),
             retired: Mutex::new(Vec::new()),
             refuse_retirement: Mutex::new(false),
+            failing_evictions: Mutex::new(Vec::new()),
         }
     }
 
@@ -315,6 +318,12 @@ impl TestWorkerManager {
     /// Fail every retirement, as when a worker cannot be stopped.
     pub fn refuse_retirement(&self) {
         *self.refuse_retirement.lock().unwrap() = true;
+    }
+
+    /// Fail every eviction request to `cores`; failed requests are not
+    /// recorded in [`Self::evictions`].
+    pub fn fail_evictions(&self, cores: &[u32]) {
+        self.failing_evictions.lock().unwrap().extend(cores);
     }
 
     /// Workers retired so far, in order.
@@ -452,6 +461,11 @@ impl WorkerManager for TestWorkerManager {
     }
 
     fn evict_payload(&self, core_id: u32, keep: Vec<Vec<u8>>) -> Result<()> {
+        if self.failing_evictions.lock().unwrap().contains(&core_id) {
+            return Err(quil_types::error::QuilError::ExecutionUnavailable(
+                "payload eviction: channel full".into(),
+            ));
+        }
         self.evictions.lock().unwrap().push((core_id, keep));
         Ok(())
     }

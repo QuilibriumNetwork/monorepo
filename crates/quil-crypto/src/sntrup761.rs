@@ -9,22 +9,21 @@
 //! the node stores the public key as config metadata and validates its length,
 //! while wallet/config tooling generates the keypair and encapsulates to it.
 //!
-//! Sizes (PQClean, via `pqcrypto-ntruprime`): public key 1158 B, ciphertext
+//! Sizes (via `quil-sntrup761`): public key 1158 B, ciphertext
 //! 1039 B, secret key 1763 B, shared secret 32 B.
 
-use pqcrypto_ntruprime::sntrup761;
-use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SecretKey as _, SharedSecret as _};
+use quil_sntrup761 as sntrup761;
 
 use quil_types::error::{QuilError, Result};
 
 /// Encoded sntrup761 public-key length (1158 bytes) — the config read-key width.
-pub const SNTRUP761_PUBLIC_KEY_LEN: usize = 1158;
+pub const SNTRUP761_PUBLIC_KEY_LEN: usize = sntrup761::PUBLIC_KEY_LEN;
 /// Encoded sntrup761 secret-key length (1763 bytes).
-pub const SNTRUP761_SECRET_KEY_LEN: usize = 1763;
+pub const SNTRUP761_SECRET_KEY_LEN: usize = sntrup761::SECRET_KEY_LEN;
 /// Encoded sntrup761 ciphertext length (1039 bytes).
-pub const SNTRUP761_CIPHERTEXT_LEN: usize = 1039;
+pub const SNTRUP761_CIPHERTEXT_LEN: usize = sntrup761::CIPHERTEXT_LEN;
 /// KEM shared-secret length (32 bytes).
-pub const SNTRUP761_SHARED_SECRET_LEN: usize = 32;
+pub const SNTRUP761_SHARED_SECRET_LEN: usize = sntrup761::SHARED_SECRET_LEN;
 
 /// An sntrup761 keypair as raw encoded bytes (the config read key is `public`).
 #[derive(Clone)]
@@ -70,13 +69,10 @@ mod tests {
 
     #[test]
     fn sizes_match_the_scheme() {
-        assert_eq!(sntrup761::public_key_bytes(), SNTRUP761_PUBLIC_KEY_LEN);
-        assert_eq!(sntrup761::secret_key_bytes(), SNTRUP761_SECRET_KEY_LEN);
-        assert_eq!(sntrup761::ciphertext_bytes(), SNTRUP761_CIPHERTEXT_LEN);
-        assert_eq!(
-            sntrup761::shared_secret_bytes(),
-            SNTRUP761_SHARED_SECRET_LEN
-        );
+        assert_eq!(SNTRUP761_PUBLIC_KEY_LEN, 1158);
+        assert_eq!(SNTRUP761_SECRET_KEY_LEN, 1763);
+        assert_eq!(SNTRUP761_CIPHERTEXT_LEN, 1039);
+        assert_eq!(SNTRUP761_SHARED_SECRET_LEN, 32);
     }
 
     #[test]

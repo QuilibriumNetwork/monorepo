@@ -119,8 +119,10 @@ pub(crate) async fn start(
     // Shadow `config` with the filled-in version so the entire startup —
     // keys, networking, prover address, downstream peer-key reads — is
     // consistent on the very first run.
+    let store_evidence = keys::store_evidence(&hg_store, clock_store.as_ref());
     let owned_config;
     let config: &quil_config::Config = if config.p2p.peer_priv_key.is_empty() {
+        quil_keys::refuse_new_peer_key(config_dir, store_evidence)?;
         let key_hex = quil_p2p::ed448_identity::Ed448Identity::generate()
             .map_err(|e| anyhow::anyhow!("failed to generate Ed448 peer key: {}", e))?
             .to_config_hex();
@@ -138,7 +140,7 @@ pub(crate) async fn start(
         config
     };
 
-    let keys = keys::init(config, config_dir)?;
+    let keys = keys::init(config, config_dir, store_evidence)?;
     let file_key_manager = keys.file_key_manager.clone();
     let bls_pubkey = keys.bls_pubkey.clone();
     let prover_address = keys.prover_address;
@@ -436,6 +438,10 @@ pub(crate) async fn start(
     // include them.
     let pi_worker_manager: Arc<std::sync::OnceLock<Arc<dyn quil_engine::worker::WorkerManager>>> =
         Arc::new(std::sync::OnceLock::new());
+    // The master's addresses of the last published PeerInfo, for the node
+    // info RPC.
+    let (announced_tx, announced_rx) =
+        tokio::sync::watch::channel(peer_info_publisher::AnnouncedAddrs::default());
     peer_info_publisher::spawn(
         &mut sup,
         peer_info_publisher::PeerInfoPublisherArgs {
@@ -459,6 +465,7 @@ pub(crate) async fn start(
             archive_mode,
             network,
             onion_routing_enabled: !config.p2p.disable_onion_routing,
+            announced: announced_tx,
         },
     );
 
@@ -1794,6 +1801,21 @@ pub(crate) async fn start(
             spawner: detached_spawner.clone(),
             archive_app_shard_ingest,
             recent_messages: recent_messages.clone(),
+            config_brief: crate::effective_config::EffectiveConfig::resolve(
+                config,
+                &crate::effective_config::Runtime::detect(0, network, archive_mode, false),
+            )
+            .status_brief({
+                // The slots the built verifier admits, whatever chose them.
+                #[cfg(feature = "native-proof")]
+                {
+                    proof_worker.as_ref().map(|worker| worker.concurrency())
+                }
+                #[cfg(not(feature = "native-proof"))]
+                {
+                    None
+                }
+            }),
         },
     );
 
@@ -1803,6 +1825,7 @@ pub(crate) async fn start(
     grpc::spawn_all(
         &mut sup,
         grpc::GrpcArgs {
+            announced_addrs: announced_rx,
             frame_observations_path: std::path::Path::new(config_dir)
                 .join("frame-observations.bin"),
             diagnostics_spool: std::path::Path::new(config_dir)

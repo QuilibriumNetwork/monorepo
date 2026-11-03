@@ -582,11 +582,131 @@ pub(crate) struct UnvotedHold {
     pub first: bool,
 }
 
+/// Why this node's lifecycle withholds a seat's renewal, as the seat's
+/// worker names it when its lapsed seat refuses its start
+/// (`app_engine::classify_start_refusal`): no prover confirmation failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenewalWithheld {
+    /// Its worker cannot host the committee session ([`Hold::Withheld`]).
+    Unhosted,
+    /// Its worker hosts that session and sent no vote for an epoch
+    /// ([`Hold::Unvoted`]).
+    Unvoted,
+}
+
+impl RenewalWithheld {
+    pub(crate) fn of(hold: &Hold) -> Option<Self> {
+        match hold {
+            Hold::Withheld(_) => Some(Self::Unhosted),
+            Hold::Unvoted(_) => Some(Self::Unvoted),
+            Hold::Settling { .. } => None,
+        }
+    }
+
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Unhosted => "its worker could not host the committee session",
+            Self::Unvoted => {
+                "its worker sent no vote for an epoch while the session's other members voted"
+            }
+        }
+    }
+
+    /// What renews the seat, and what then seats it.
+    pub(crate) fn action(self) -> &'static str {
+        match self {
+            Self::Unhosted => {
+                "no prover confirmation failed: this node withheld the seat's renewal on purpose ('seat \
+                renewal withheld' in the master log); it renews once this worker passes its shard state \
+                checks, and the first GLOBAL session pass of the epoch after that seats it (the frame \
+                named above for a renewal this epoch); otherwise the seat stays lapsed and is left"
+            }
+            Self::Unvoted => {
+                "no prover confirmation failed: this node withheld the seat's renewal on purpose ('seat \
+                renewal withheld' in the master log); it renews once this worker votes or its engine or \
+                host restarts on the seat, and the first GLOBAL session pass of the epoch after that \
+                seats it (the frame named above for a renewal this epoch); otherwise the seat stays \
+                lapsed and is left"
+            }
+        }
+    }
+}
+
+/// The seats whose renewal this node's lifecycle withheld at its latest
+/// renewal decision, by filter, with that decision's GLOBAL frame. Workers
+/// of this process (thread workers) read it ([`renewal_withheld`]); a
+/// standalone worker process sees none, and names a lapse as before.
+static WITHHELD_RENEWALS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<Vec<u8>, (u64, RenewalWithheld)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The lifecycle's renewal decision at GLOBAL `frame` withheld `withheld`,
+/// and no other seat's renewal.
+pub(crate) fn note_renewals_withheld(
+    frame: u64,
+    withheld: impl IntoIterator<Item = (Vec<u8>, RenewalWithheld)>,
+) {
+    let mut seats = WITHHELD_RENEWALS.lock().unwrap_or_else(|e| e.into_inner());
+    seats.clear();
+    seats.extend(
+        withheld
+            .into_iter()
+            .map(|(filter, why)| (filter, (frame, why))),
+    );
+}
+
+/// Why this node withholds the renewal of its seat on `filter`, as its
+/// latest renewal decision had it, if that decision is no older than an
+/// epoch at GLOBAL `frame`.
+pub(crate) fn renewal_withheld(filter: &[u8], frame: u64) -> Option<RenewalWithheld> {
+    let epoch_frames = quil_types::consensus::epoch_length_frames();
+    WITHHELD_RENEWALS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(filter)
+        .filter(|(decided, _)| frame.saturating_sub(*decided) <= epoch_frames)
+        .map(|(_, why)| *why)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const EPOCH: u64 = 720;
+
+    /// The latest renewal decision's withheld seats are what a worker reads,
+    /// for an epoch: a later decision replaces them, and one older than an
+    /// epoch says nothing.
+    #[test]
+    fn a_withheld_renewal_is_read_from_the_latest_decision_for_an_epoch() {
+        let epoch = quil_types::consensus::epoch_length_frames();
+        let (unhosted, unvoted) = (vec![0xd1; 32], vec![0xd2; 32]);
+        note_renewals_withheld(
+            1_000,
+            [
+                (unhosted.clone(), RenewalWithheld::Unhosted),
+                (unvoted.clone(), RenewalWithheld::Unvoted),
+            ],
+        );
+        assert_eq!(
+            renewal_withheld(&unhosted, 1_000 + epoch),
+            Some(RenewalWithheld::Unhosted)
+        );
+        assert_eq!(
+            renewal_withheld(&unvoted, 1_001),
+            Some(RenewalWithheld::Unvoted)
+        );
+        assert_eq!(renewal_withheld(&unhosted, 1_001 + epoch), None, "stale");
+        assert_eq!(renewal_withheld(&[0xd3; 32], 1_001), None);
+        note_renewals_withheld(1_010, [(unvoted.clone(), RenewalWithheld::Unvoted)]);
+        assert_eq!(renewal_withheld(&unhosted, 1_010), None, "renewed since");
+        assert_eq!(
+            RenewalWithheld::of(&Hold::Settling { until: 9 }),
+            None,
+            "a settling seat is not withheld yet"
+        );
+        note_renewals_withheld(1_020, []);
+    }
 
     fn report(state: &str, observed_unix_ms: u64) -> WorkerExecution {
         WorkerExecution {

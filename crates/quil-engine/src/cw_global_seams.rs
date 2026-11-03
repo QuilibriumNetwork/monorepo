@@ -140,6 +140,10 @@ pub struct GlobalSeamProposer {
     /// This archive's wait for its finalized frames to publish
     /// ([`Self::await_sequenced_publication`]).
     sequenced_wait: Mutex<SequencedWait>,
+    /// The finalizer, which hands finalizations reported without their body
+    /// to publication once the body arrives ([`Self::await_unheld_parent`]).
+    finalizer: Option<Arc<GlobalSeamFinalizer>>,
+    unheld_patience: std::time::Duration,
 }
 
 /// Longest a proposal or vote waits per view for this node to publish its
@@ -209,6 +213,9 @@ enum Deferral<'a> {
         published: u64,
         finalized: u64,
     },
+    /// The parent descends from a finalization reported without its body
+    /// ([`GlobalSeamProposer::await_unheld_parent`]).
+    UnheldParent { finalized_view: u64 },
     /// The capture found a source in use ([`quil_execution::source_busy`]).
     BusySource {
         parent: u64,
@@ -261,6 +268,8 @@ impl GlobalSeamProposer {
             vote_waits: Mutex::default(),
             proposal_busy: Mutex::default(),
             sequenced_wait: Mutex::default(),
+            finalizer: None,
+            unheld_patience: crate::unheld_finalization::UNHELD_PATIENCE,
         }
     }
 
@@ -280,7 +289,10 @@ impl GlobalSeamProposer {
             source_logged: false,
             expected: false,
         });
-        wait.expected = matches!(why, Deferral::SequencedPublication { .. });
+        wait.expected = matches!(
+            why,
+            Deferral::SequencedPublication { .. } | Deferral::UnheldParent { .. }
+        );
         match why {
             Deferral::OwnExecution => {
                 wait.cause = "this node's own GLOBAL execution (lease or frame lock)".into();
@@ -299,6 +311,12 @@ impl GlobalSeamProposer {
                     "parent {parent} is above this archive's published frame {published} while finalized frames through {finalized} wait to publish"
                 );
                 wait.check = "expected while finalization ingests the application frames those frames sequence; it ends when they publish";
+            }
+            Deferral::UnheldParent { finalized_view } => {
+                wait.cause = format!(
+                    "the parent descends from the frame finalized at view {finalized_view}, whose body this node does not hold"
+                );
+                wait.check = "expected: it ends when that body arrives or the archive poller publishes the frame, at most 10 s after its finalization";
             }
             Deferral::BusySource { parent, error } => {
                 wait.cause = error.to_string();
@@ -466,9 +484,14 @@ impl GlobalSeamProposer {
     /// Build peer ingress without capturing the validated parent-height index.
     /// Peer bytes are candidates until consensus verifies them; the digest does
     /// not authenticate a claimed height. Only validated or recovered frames
-    /// may populate `block_meta`.
-    fn peer_ingress(self: &Arc<Self>, store: BlockStore) -> Arc<dyn Fn(Vec<u8>) + Send + Sync> {
-        Arc::new(move |bytes: Vec<u8>| {
+    /// may populate `block_meta`. `name` labels a sender in logs.
+    fn peer_ingress(
+        self: &Arc<Self>,
+        store: BlockStore,
+        name: impl Fn(&FalconPublicKey) -> String + Send + Sync + 'static,
+    ) -> Arc<dyn Fn(&FalconPublicKey, Vec<u8>) + Send + Sync> {
+        let finalizer = self.finalizer.clone();
+        Arc::new(move |from: &FalconPublicKey, bytes: Vec<u8>| {
             let Ok(frame) = decode_global_frame(&bytes) else {
                 tracing::debug!("cw block ingress: undecodable frame, dropping");
                 return;
@@ -479,9 +502,16 @@ impl GlobalSeamProposer {
             let Some(digest) = frame_digest(header) else {
                 return;
             };
-            let frame_number = header.frame_number;
+            let (frame_number, len) = (header.frame_number, bytes.len());
             store.put(digest, bytes);
-            tracing::debug!(frame = frame_number, "cw block ingress: stored peer frame");
+            tracing::debug!(
+                frame = frame_number,
+                bytes = len,
+                "cw block ingress: stored peer frame"
+            );
+            if let Some(finalizer) = &finalizer {
+                finalizer.body_arrived(&digest, len, || name(from));
+            }
         })
     }
 
@@ -501,6 +531,51 @@ impl GlobalSeamProposer {
     ) -> Self {
         self.selected_execution = Some(execution);
         self
+    }
+
+    /// Hand finalizations `finalizer` received without their body to it once
+    /// the body arrives, and wait for them ([`Self::await_unheld_parent`]).
+    pub fn with_finalizer(mut self, finalizer: Arc<GlobalSeamFinalizer>) -> Self {
+        self.finalizer = Some(finalizer);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_unheld_patience(mut self, patience: std::time::Duration) -> Self {
+        self.unheld_patience = patience;
+        self
+    }
+
+    /// [`GlobalSeamFinalizer::await_unheld`] for `context`: `Some((view,
+    /// since))` while its parent descends from the frame finalized at `view`
+    /// without its body here, reported `since` ago. Only an archive whose
+    /// publication ingests application frames first waits: elsewhere a private
+    /// execution of the parent reproduces the published one. Bounded by the
+    /// unheld patience after each such finalization, then the proposal or vote
+    /// proceeds as before. A body that arrives is queued to publish, and
+    /// [`Self::await_sequenced_publication`] then waits for it.
+    fn await_unheld_parent(
+        &self,
+        executor: &crate::frame_materializer::GlobalParentExecutor,
+        context: ProposalContext,
+    ) -> Option<(u64, std::time::Duration)> {
+        let finalizer = self.finalizer.as_ref()?;
+        if !executor.sequences_with_ingest() {
+            return None;
+        }
+        let max_bytes = executor.max_frame_bytes();
+        finalizer.await_unheld(
+            context,
+            || {
+                self.clock_store
+                    .get_global_clock_frame(executor.published_frame())
+                    .ok()
+                    .and_then(|frame| frame.header)
+                    .map_or(0, |header| header.rank)
+            },
+            |digest| self.block_store.as_ref()?.get_bounded(digest, max_bytes),
+            self.unheld_patience,
+        )
     }
 
     fn selected_parent_number(&self, digest: Digest) -> Option<u64> {
@@ -697,18 +772,21 @@ impl GlobalSeamProposer {
     }
 
     /// Warn, bounded, while proposals declare a parent state other than this
-    /// node's own execution of that parent. Nothing reconciles it: this node
-    /// keeps its executed state, so it refuses every such proposal, and when
-    /// the GLOBAL provers split this way no side reaches quorum. The likely
-    /// cause is a GLOBAL prover on a build with other activation constants.
-    /// One line when it starts, a repeat at most every ten minutes, and one
-    /// when a proposal for a later frame agrees: in a split, proposers on
-    /// this node's side still agree at the refused frame, and GLOBAL has not
-    /// moved past it.
+    /// node's own execution of that parent. This node keeps its executed
+    /// state, so it refuses every such proposal. Two causes: a proposer that
+    /// executed its finalized parent privately before that parent published
+    /// (an archive missing the parent's body, 2026-10-31), which ends at the
+    /// next proposal; or GLOBAL provers on builds with other activation
+    /// constants, which nothing reconciles and which halts GLOBAL when they
+    /// split. One line when it starts, a repeat at most every ten minutes,
+    /// and one when a proposal for a later frame agrees: in a split,
+    /// proposers on this node's side still agree at the refused frame, and
+    /// GLOBAL has not moved past it.
     pub(crate) fn note_own_parent_state(
         &self,
         view: u64,
         frame: u64,
+        proposer: Option<[u8; 32]>,
         agrees: bool,
         difference: Option<crate::frame_materializer::ParentStateDifference>,
     ) {
@@ -745,11 +823,19 @@ impl GlobalSeamProposer {
                 auxiliary_roots_differ = difference.auxiliary_roots_differ,
                 refusals = attempts,
                 since_secs = duration.as_secs(),
-                scope = "this node or the proposer",
-                check = "whether GLOBAL provers run builds with different activation constants \
-                         (such as MAINNET_EARLY_FENCE_FRAME); this does not resolve by itself: upgrade \
-                         the provers on the other build, then stop each and replace its state for this \
-                         frame (--adopt-prover-root from an upgraded prover, or a store resync)",
+                proposer = %proposer.map_or_else(
+                    || "unknown".to_string(),
+                    |address| crate::global_stall::tail(&hex::encode(address))
+                ),
+                scope = "the proposer, or this node if it refuses every proposer",
+                action = "check",
+                check = "if the line saying GLOBAL proposals agree again (refusals ended) follows \
+                         within a few views, the proposer executed its parent before that parent published \
+                         (it lacked the parent's body) and nothing is needed; if refusals continue across \
+                         frames, GLOBAL provers run builds with different activation constants (such as \
+                         MAINNET_EARLY_FENCE_FRAME), which does not resolve by itself: upgrade the provers on \
+                         the other build, then stop each and replace its state for this frame \
+                         (--adopt-prover-root from an upgraded prover, or a store resync)",
                 "GLOBAL proposal declares a parent state other than this node's own execution of its parent frame; refusing it"
             );
         }
@@ -769,6 +855,9 @@ impl GlobalProposer for GlobalSeamProposer {
         };
         if !executor.accepts_context(context) || !executor.binds_clock(self.clock_store.as_ref()) {
             return None;
+        }
+        if self.await_unheld_parent(executor, context).is_some() {
+            return None; // retried by `propose_retry`
         }
         let number = self.selected_parent_number(context.parent)?;
         if self
@@ -890,6 +979,9 @@ impl GlobalProposer for GlobalSeamProposer {
         {
             return Ok(false);
         }
+        if let Some((finalized_view, _)) = self.await_unheld_parent(executor, context) {
+            return Err(self.defer_vote(context.view, Deferral::UnheldParent { finalized_view }));
+        }
         let Some(number) = self.selected_parent_number(context.parent) else {
             return Ok(false);
         };
@@ -937,6 +1029,7 @@ impl GlobalProposer for GlobalSeamProposer {
         self.note_own_parent_state(
             context.view,
             header.frame_number,
+            context.leader,
             prepared.matches_child(header),
             prepared.own_parent_state_differs(header),
         );
@@ -1324,6 +1417,12 @@ pub struct GlobalSeamFinalizer {
     /// Atomic mode: keep the certified body as a durable candidate and queue
     /// it; the worker publishes clock and execution state together.
     pipeline: Option<Arc<crate::global_finalization::GlobalFinalizationPipeline>>,
+    /// Finalizations reported without their body
+    /// ([`Self::await_unheld`]).
+    unheld: Mutex<crate::unheld_finalization::UnheldFinalizations>,
+    /// Those finalizations and their bodies that arrived later, for the
+    /// summary line ([`Self::report_late_bodies`]).
+    late_bodies: Mutex<crate::unheld_finalization::LateBodies>,
 }
 
 impl GlobalSeamFinalizer {
@@ -1343,6 +1442,8 @@ impl GlobalSeamFinalizer {
                 local_prover_address,
             ),
             pipeline: None,
+            unheld: Mutex::default(),
+            late_bodies: Mutex::default(),
         }
     }
 
@@ -1393,6 +1494,8 @@ impl FrameFinalizer for GlobalSeamFinalizer {
         cert: Option<Vec<u8>>,
         _locally_verified: bool,
     ) {
+        let now = std::time::Instant::now();
+        self.report_late_bodies(now);
         // Certificate-only replicas may not have locally verified these bytes,
         // so retain the context-free body re-bind check below at the persistence
         // boundary regardless of `_locally_verified`.
@@ -1401,18 +1504,80 @@ impl FrameFinalizer for GlobalSeamFinalizer {
                 view,
                 "cw finalize: finalized block body not held locally; relying on peers"
             );
+            // Proposals and votes above it wait for its body or publication.
+            if let Ok(mut unheld) = self.unheld.lock() {
+                unheld.note(view, digest, cert, now);
+            }
+            if let Ok(mut late) = self.late_bodies.lock() {
+                late.unheld(now);
+            }
             return;
         };
-        let Ok(mut frame) = decode_global_frame(&bytes) else {
-            tracing::warn!(view, "cw finalize: finalized block body does not decode");
+        self.finalize_body(view, digest, &bytes, cert);
+    }
+}
+
+impl GlobalSeamFinalizer {
+    /// A body of `digest`, `bytes` long, arrived over the block channel from
+    /// the sender `name` labels: counted if its finalization was reported
+    /// without it.
+    fn body_arrived(&self, digest: &Digest, bytes: usize, name: impl FnOnce() -> String) {
+        let now = std::time::Instant::now();
+        let lag = self
+            .unheld
+            .lock()
+            .ok()
+            .and_then(|mut unheld| unheld.body_arrived(digest, now));
+        if let (Some(lag), Ok(mut late)) = (lag, self.late_bodies.lock()) {
+            late.arrived(&name(), lag, bytes, now);
+        }
+    }
+
+    /// Log the summary of late bodies once its interval has passed.
+    fn report_late_bodies(&self, now: std::time::Instant) {
+        let Some(summary) = self
+            .late_bodies
+            .lock()
+            .ok()
+            .and_then(|mut late| late.due(now))
+        else {
             return;
+        };
+        tracing::info!(
+            interval_s = summary.interval.as_secs(),
+            finalized_without_body = summary.unheld,
+            late_bodies = summary.late,
+            senders = %summary.senders,
+            scope = "link",
+            action = "check",
+            check = "each sender's blocks reached this node only after the committee finalized \
+                     them from votes; a sender with many, or with lags of seconds, has a slow link \
+                     to this node: check the round trip and the sender's uplink to it; a finalized \
+                     frame whose body did not arrive came from its publication",
+            "GLOBAL block bodies arrived after this node finalized their frame"
+        );
+    }
+
+    /// Take the finalized body `bytes` of `digest` at `view`: queue it for
+    /// atomic publication or write it canonically. False when it is refused
+    /// (it does not decode or does not match the finalized proposal).
+    fn finalize_body(
+        &self,
+        view: u64,
+        digest: Digest,
+        bytes: &[u8],
+        cert: Option<Vec<u8>>,
+    ) -> bool {
+        let Ok(mut frame) = decode_global_frame(bytes) else {
+            tracing::warn!(view, "cw finalize: finalized block body does not decode");
+            return false;
         };
         let Some(header) = frame.header.as_ref() else {
-            return;
+            return false;
         };
         if header.rank != view || frame_digest(header) != Some(digest) {
             tracing::warn!(view, "cw finalize: frame differs from finalized proposal");
-            return;
+            return false;
         }
         // Re-bind the body to the header at FINALIZE, not just at verify. The
         // block bytes are re-read from the shared (overwrite-able) BlockStore by
@@ -1426,7 +1591,7 @@ impl FrameFinalizer for GlobalSeamFinalizer {
                     frame = h.frame_number,
                     "cw finalize: request body does not match certified requests_root — dropping"
                 );
-                return;
+                return false;
             }
         }
         // Attach the simplex FINALIZATION cert to the frame header so followers
@@ -1450,7 +1615,7 @@ impl FrameFinalizer for GlobalSeamFinalizer {
         }
         let frame_number = match frame.header.as_ref() {
             Some(h) => h.frame_number,
-            None => return,
+            None => return false,
         };
         // Beyond the admission window (a stalled worker), keep the legacy
         // order so the unresolved-candidate tail stays bounded for restarts.
@@ -1467,7 +1632,7 @@ impl FrameFinalizer for GlobalSeamFinalizer {
             }
             pipeline.offer(frame.clone());
             let _ = self.mat_job_tx.send((frame, frame_number));
-            return;
+            return true;
         }
         // A journal replay after a restart finalizes again the frames the
         // canonical clock already holds (every restart re-finalized the head).
@@ -1488,7 +1653,7 @@ impl FrameFinalizer for GlobalSeamFinalizer {
                     "finalized GLOBAL frame is already canonical (journal replay)"
                 );
                 let _ = self.mat_job_tx.send((frame, frame_number));
-                return;
+                return true;
             }
             tracing::error!(frame = frame_number, view,
                 "finalized GLOBAL frame differs from the canonical record at its height; replacing the record");
@@ -1504,10 +1669,115 @@ impl FrameFinalizer for GlobalSeamFinalizer {
         // materializes in finalize order).
         if let Err(e) = self.clock_store.put_global_clock_frame(&frame, &NoopTxn) {
             tracing::warn!(error = %e, "put finalized frame failed");
-            return;
+            return false;
         }
         self.announcer.announce(&frame);
         let _ = self.mat_job_tx.send((frame, frame_number));
+        true
+    }
+}
+
+impl GlobalSeamFinalizer {
+    /// Before a proposal or vote for `context` executes its parent, on an
+    /// archive whose publication ingests application frames first: hand each
+    /// finalization below the parent that was reported without its body, and
+    /// whose body `body` now reads, to publication, and say whether to wait
+    /// for one still unheld. `published` reads the rank of the published GLOBAL
+    /// head. `Some((view, since))` while the proposal or vote waits for the
+    /// finalization at `view`, reported `since` ago, at most `patience`; then
+    /// it proceeds as before ([`crate::unheld_finalization`]).
+    pub(crate) fn await_unheld(
+        &self,
+        context: ProposalContext,
+        published: impl FnOnce() -> u64,
+        body: impl Fn(&Digest) -> Option<Vec<u8>>,
+        patience: std::time::Duration,
+    ) -> Option<(u64, std::time::Duration)> {
+        use crate::unheld_finalization::Decision;
+        let now = std::time::Instant::now();
+        let (published_ended, arrived) = {
+            let mut unheld = self.unheld.lock().ok()?;
+            if unheld.is_empty() {
+                return None;
+            }
+            let ended = unheld.published_through(published(), now);
+            (ended, unheld.arrived(context.parent_view, body))
+        };
+        // Publication takes the pipeline and clock locks: never under this one.
+        let outcomes: Vec<_> = arrived
+            .into_iter()
+            .map(|(arrived, bytes)| {
+                let taken = self.finalize_body(arrived.view, arrived.digest, &bytes, arrived.cert);
+                (arrived.view, taken, bytes)
+            })
+            .collect();
+        let mut unheld = self.unheld.lock().ok()?;
+        let mut ended: Vec<_> = published_ended
+            .into_iter()
+            .map(|ended| (ended, "it published"))
+            .collect();
+        for (view, taken, bytes) in outcomes {
+            if taken {
+                ended.extend(
+                    unheld
+                        .taken(view, now)
+                        .map(|ended| (ended, "its body arrived and was queued to publish")),
+                );
+            } else {
+                unheld.refused(view, &bytes);
+            }
+        }
+        let (decision, overran) = unheld.decide(context.parent_view, patience, now);
+        drop(unheld);
+        for (ended, how) in ended {
+            if let Some(waited) = ended.waited {
+                tracing::info!(
+                    view = context.view,
+                    finalized_view = ended.view,
+                    waited_ms = waited.as_millis() as u64,
+                    past_patience = ended.overran,
+                    "GLOBAL proposals and votes no longer wait for a finalized frame this node held only \
+                     the certificate of: {how}"
+                );
+            }
+        }
+        for (finalized_view, since) in overran {
+            tracing::warn!(
+                view = context.view,
+                parent_view = context.parent_view,
+                finalized_view,
+                waited_s = since.as_secs(),
+                scope = "local",
+                action = "check",
+                check = "this node received the frame's body neither from the block channel nor from the \
+                         archive poller; it now proposes and votes on its private execution of the parent, \
+                         which other archives may refuse until the frame publishes; check this node's \
+                         archive poller lines and its block deliveries from the other GLOBAL provers",
+                "GLOBAL proposals and votes stop waiting for a finalized frame this node holds only the certificate of"
+            );
+        }
+        match decision {
+            Decision::Proceed => None,
+            Decision::Wait {
+                view: finalized_view,
+                since,
+                began,
+            } => {
+                if began {
+                    tracing::info!(
+                        view = context.view,
+                        parent_view = context.parent_view,
+                        finalized_view,
+                        patience_s = patience.as_secs(),
+                        "GLOBAL proposals and votes wait for a finalized frame this node holds only the \
+                         certificate of: executing above it first would miss the application frames its \
+                         publication ingests; the wait ends when its body arrives or the archive poller \
+                         publishes it, at most patience_s after its finalization"
+                    );
+                }
+                Some((finalized_view, since))
+            }
+        }
     }
 }
 
@@ -1538,7 +1808,8 @@ pub trait GlobalConsensusTransport: Send + Sync + 'static {
 /// The node's handle to the running simplex-backed global consensus. On each
 /// inbound `:8340` message the node demuxes the channel id:
 /// - channels 0/1/2 (vote/cert/resolver) → `inbound[channel].send(...)`;
-/// - channel 3 (block) → `ingest_block(bytes)` (feeds the shared `BlockStore`).
+/// - channel 3 (block) → `ingest_block(sender, bytes)` (feeds the shared
+///   `BlockStore`).
 pub struct GlobalConsensusCwHandle {
     pub inbound: [tokio::sync::mpsc::UnboundedSender<
         quil_cw_consensus::p2p_bridge::Message<FalconPublicKey>,
@@ -1546,7 +1817,8 @@ pub struct GlobalConsensusCwHandle {
     /// Feed a peer-delivered frame's canonical bytes into the engine's
     /// `BlockStore` (so `verify` finds the block behind a proposed digest) and
     /// leave its parent-height metadata untouched. Drops malformed bytes.
-    pub ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+    /// Takes the sender's committee key and the bytes.
+    pub ingest_block: Arc<dyn Fn(&FalconPublicKey, Vec<u8>) + Send + Sync>,
     /// Record each inbound consensus message's sender here, for the GLOBAL
     /// stall watch ([`crate::global_stall`]).
     pub contact: Arc<crate::global_stall::GlobalContact>,
@@ -1596,6 +1868,13 @@ pub fn activate_global_consensus_cw(
     // ID tail; a member without one is named by its key's tail.
     member_labels: Vec<String>,
 ) -> quil_types::error::Result<GlobalConsensusCwHandle> {
+    // How the block ingress names a sender: by its label, as the stall watch
+    // names it.
+    let member_names: Vec<(FalconPublicKey, String)> = peers
+        .iter()
+        .cloned()
+        .zip(member_labels.iter().cloned())
+        .collect();
     // Operator signals: the GLOBAL stall watch reads the votes consensus
     // reports and when each member was last heard. Logging state only.
     let liveness = Arc::new(quil_cw_consensus::adapters::Liveness::default());
@@ -1640,6 +1919,18 @@ pub fn activate_global_consensus_cw(
         "GLOBAL",
     );
 
+    // The finalizer is built first: the proposer hands it the bodies of
+    // finalizations reported without them once they arrive.
+    let finalizer = Arc::new(
+        GlobalSeamFinalizer::new(
+            clock_store.clone(),
+            mat_job_tx,
+            head_hook,
+            global_frame_publisher,
+            local_prover_address,
+        )
+        .with_pipeline(pipeline),
+    );
     // Seams over real state. The proposer keeps a clock-store handle so it can
     // recover the parent frame number from the latest committed head when the
     // in-memory block map misses it after a restart.
@@ -1651,7 +1942,8 @@ pub fn activate_global_consensus_cw(
         on_prover_fork,
     )
     .with_block_store(store.clone())
-    .with_selected_execution(selected_execution);
+    .with_selected_execution(selected_execution)
+    .with_finalizer(finalizer.clone());
     let proposer = Arc::new(proposer);
     // Seed the parent map so the FIRST proposal resolves the genesis parent's
     // frame number (block_meta is otherwise empty → prior_frame_number 0).
@@ -1661,16 +1953,6 @@ pub fn activate_global_consensus_cw(
     tracing::info!(
         candidates = recovered.len(),
         "restored GLOBAL consensus bodies before journal replay"
-    );
-    let finalizer = Arc::new(
-        GlobalSeamFinalizer::new(
-            clock_store.clone(),
-            mat_job_tx,
-            head_hook,
-            global_frame_publisher,
-            local_prover_address,
-        )
-        .with_pipeline(pipeline),
     );
 
     // Rebuild a failed host only after it joins. The transport routes, fixed
@@ -1734,7 +2016,13 @@ pub fn activate_global_consensus_cw(
     });
 
     // Peer ingress can store candidates, but cannot change trusted heights.
-    let ingest_block = proposer.peer_ingress(store.clone());
+    let ingest_block = proposer.peer_ingress(store.clone(), move |sender| {
+        member_names
+            .iter()
+            .find(|(member, _)| member == sender)
+            .map(|(_, name)| name.clone())
+            .unwrap_or_else(|| crate::global_stall::tail(&hex::encode(sender)))
+    });
 
     Ok(GlobalConsensusCwHandle {
         inbound,
@@ -1778,7 +2066,11 @@ mod ingress_tests {
             None,
         ));
         let store = BlockStore::new();
-        let ingress = proposer.peer_ingress(store.clone());
+        let ingress = {
+            let ingress = proposer.peer_ingress(store.clone(), |_| "…peer".into());
+            let sender = FalconPublicKey::from_bytes(&[7; 897]).unwrap();
+            move |bytes: Vec<u8>| ingress(&sender, bytes)
+        };
         let mut frame = GlobalFrame {
             header: Some(GlobalFrameHeader {
                 frame_number: 7,
@@ -1807,5 +2099,63 @@ mod ingress_tests {
         let unknown = frame_digest(frame.header.as_ref().unwrap()).unwrap();
         ingress(encode_global_frame(&frame).unwrap());
         assert_eq!(proposer.selected_parent_number(unknown), None);
+    }
+
+    /// A block arriving after its frame finalized from votes alone is
+    /// counted once, for its sender, with its lag.
+    #[test]
+    fn a_block_arriving_after_its_finalization_is_counted_for_its_sender() {
+        use crate::unheld_finalization::LATE_BODY_SUMMARY_INTERVAL;
+        let (mat_job_tx, _jobs) = tokio::sync::mpsc::unbounded_channel();
+        let finalizer = Arc::new(GlobalSeamFinalizer::new(
+            Arc::new(quil_store::testing::InMemoryClockStore::new()),
+            mat_job_tx,
+            Arc::new(|_, _| {}),
+            None,
+            vec![],
+        ));
+        let proposer = Arc::new(
+            GlobalSeamProposer::new(
+                Arc::new(NoProposal),
+                Arc::new(GlobalFrameVerifier::new(Arc::new(
+                    quil_crypto::WesolowskiFrameProver::new(2048),
+                ))),
+                vec![],
+                Arc::new(quil_store::testing::InMemoryClockStore::new()),
+                None,
+            )
+            .with_finalizer(finalizer.clone()),
+        );
+        let sender = FalconPublicKey::from_bytes(&[7; 897]).unwrap();
+        let ingress = proposer.peer_ingress(BlockStore::new(), |_| "…erXRHA".into());
+        let frame = GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: 7,
+                rank: 7,
+                output: vec![3; 516],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let digest = frame_digest(frame.header.as_ref().unwrap()).unwrap();
+        let bytes = encode_global_frame(&frame).unwrap();
+
+        ingress(&sender, bytes.clone());
+        finalizer.on_finalized(7, digest, None, None, false);
+        ingress(&sender, bytes.clone());
+        ingress(&sender, bytes);
+
+        let summary = finalizer
+            .late_bodies
+            .lock()
+            .unwrap()
+            .due(std::time::Instant::now() + LATE_BODY_SUMMARY_INTERVAL)
+            .expect("a summary is due");
+        assert_eq!((summary.unheld, summary.late), (1, 1));
+        assert!(
+            summary.senders.starts_with("…erXRHA 1 max_lag="),
+            "{}",
+            summary.senders
+        );
     }
 }

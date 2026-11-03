@@ -66,3 +66,6 @@ quil-execution = { path = "../quil-execution", features = ["testing-stubs"] }
 quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }
 quil-store = { path = "../quil-store" }
 tempfile = "3"
+
+[lints]
+workspace = true

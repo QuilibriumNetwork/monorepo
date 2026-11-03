@@ -13,6 +13,11 @@
 // limitations under the License.
 
 #![cfg_attr(feature = "docinclude", feature(external_doc))]
+// Vendored from lolo32/ed448-rust 0.1.2. Its 2021 lint lists name clippy
+// lints renamed or removed since, and its pedantic and nursery denies now
+// catch newer lints. Allow those instead of restyling third-party code;
+// this allow must precede the lists it covers.
+#![allow(renamed_and_removed_lints)]
 #![deny(
     missing_docs,
     missing_copy_implementations,
@@ -113,6 +118,12 @@
     non_upper_case_globals,
     clippy::similar_names,
     clippy::module_name_repetitions
+)]
+// Newer clippy lints escalated by the denies above (see the note there).
+#![allow(
+    clippy::doc_markdown,
+    clippy::needless_borrows_for_generic_args,
+    clippy::non_std_lazy_statics
 )]
 
 //! # EdDSA implementation for ed448

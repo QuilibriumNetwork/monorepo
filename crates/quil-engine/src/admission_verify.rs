@@ -10,31 +10,43 @@
 //! computed: proposals then carry operations whose verdicts are cached, and
 //! materializing them verifies nothing.
 //!
-//! Submissions a frame waits on ([`AdmissionQueue::offer`] with `front`) are
-//! verified first, in the order frames asked for them; the rest oldest
-//! first. Every member receives a submission at about the same time and
-//! verifies in the same order, so the members finish it at about the same
-//! time and a proposal carrying it right after its leader verified it finds
-//! the others ready. The queue verifies up to [`background_threads`] at once:
-//! one fewer than the proof worker admits, so a slot stays free for the
-//! frames and proposals that verify inline. One at a time verified about 16
-//! batch shields an hour (240 s each) while more arrived, and frames waiting
-//! on them failed (mainnet, 2026-10-31); two at once on a 16-core node took
-//! 4% longer each.
+//! Three lanes, verified in this order. Submissions a finalized frame waits
+//! on ([`AdmissionQueue::offer`] with `front`), in the order frames asked for
+//! them. Then vote-time warm-ups of a proposal's long operations
+//! ([`AdmissionQueue::offer_warmup`]): speculative, since the proposal may
+//! never finalize. Then the rest, oldest first. Every member receives a
+//! submission at about the same time and verifies in the same order, so the
+//! members finish it at about the same time and a proposal carrying it right
+//! after its leader verified it finds the others ready. The queue verifies up
+//! to [`background_threads`] at once: one fewer than the proof worker admits,
+//! so a slot stays free for the frames and proposals that verify inline. One
+//! at a time verified about 16 batch shields an hour (240 s each) while more
+//! arrived, and frames waiting on them failed (mainnet, 2026-10-31); two at
+//! once on a 16-core node took 4% longer each. Across the node's processes,
+//! verifications no frame waits on stay off the first node-wide worker slot
+//! ([`verifying_for_frame`]), which frames and inline verifications share.
 //!
 //! Bounds and recovery: a submission no frame waits on is dropped from the
 //! queue past its count or byte bound and offered again by the proposal that
 //! holds it or the frame that needs it; one whose verification found no
-//! worker slot is retried [`MAX_ATTEMPTS`] times per offer. A submission a
-//! frame waits on is never dropped for the bounds (frames waiting are bounded
-//! by the frames this node holds) and is retried while the worker is busy, at
+//! worker slot is retried [`MAX_ATTEMPTS`] times per offer. Warm-ups are
+//! bounded by [`MAX_WARMUPS`] (the oldest goes first) and dropped once queued
+//! for [`WARMUP_TTL`], or once their shard materialized their frame
+//! ([`AdmissionQueue::end_warmups`]); a warm-up a finalized frame then needs
+//! is offered again by that frame and joins the frames' lane. A warm-up of a
+//! proposal that never finalizes therefore holds at most one queue thread for
+//! one verification. A submission a frame waits on is never dropped for the
+//! bounds (frames waiting are bounded by the frames this node holds: only
+//! finalized frames wait, besides one bundle per shard that its proposals
+//! held past their hold bound) and is retried while the worker is busy, at
 //! the front: a worker slot frees within one verification's wall timeout. One
 //! whose verification failed in the worker (crash, timeout, resource cap,
 //! panic) is retried until it failed [`MAX_FAILURES`] times, after which this
 //! node's proposals leave it out and it ages out of the pool unless another
 //! member's proposal carries it; a frame carrying it then verifies it inline.
 
-use std::collections::{HashSet, VecDeque};
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -49,6 +61,14 @@ pub type AdmissionJob = Arc<dyn Fn() -> PreverifyCounts + Send + Sync>;
 /// proposal or frame needs them, as before.
 pub const MAX_BUNDLES: usize = 256;
 pub const MAX_BYTES: usize = 64 << 20;
+/// Vote-time warm-ups queued at once. A member trailing its leader is the
+/// only one a warm-up helps (a leader carries a long operation only once it
+/// verified it), and the frame that finalizes asks for its own operations
+/// anyway, so a few proposals' worth suffices; past it the oldest goes.
+pub const MAX_WARMUPS: usize = 16;
+/// A warm-up still queued after this is dropped: its proposal's view has
+/// long ended, and if the proposal finalized, its frame asked for it.
+pub const WARMUP_TTL: Duration = Duration::from_secs(120);
 /// Attempts per submission no frame waits on whose verification found no
 /// worker slot.
 const MAX_ATTEMPTS: u8 = 3;
@@ -62,6 +82,12 @@ const FAILURE_ENTRIES: usize = 1024;
 const BUSY_PAUSE: Duration = Duration::from_secs(1);
 /// How often the queue logs what it did.
 const SUMMARY_INTERVAL: Duration = Duration::from_secs(600);
+/// Arrivals ([`offer_arrival`]) are verified up to the queue's threads times
+/// this much estimated worker time per this window: at most what the queue
+/// verifies meanwhile, so arrivals never queue more work than it finishes in
+/// one window ahead of the proposals and frames that offer theirs. Past it
+/// an arrival is not queued; a proposal or frame needing it verifies it.
+const ARRIVAL_WINDOW: Duration = Duration::from_secs(600);
 /// The proof worker admits at most this many verifications at once.
 const MAX_THREADS: usize = 64;
 
@@ -74,12 +100,33 @@ pub fn background_threads(concurrency: Option<usize>) -> usize {
         .clamp(1, MAX_THREADS)
 }
 
+thread_local! {
+    static FOR_FRAME: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the admission job running on this thread verifies a submission a
+/// finalized frame waits on. Jobs pass it to the proof worker: the others
+/// are background verifications, which leave the first node-wide worker slot
+/// to frames and inline verifications in every node process.
+pub fn verifying_for_frame() -> bool {
+    FOR_FRAME.with(Cell::get)
+}
+
+/// The proposal a warm-up was queued for.
+struct Warm {
+    shard: Vec<u8>,
+    frame: u64,
+    expires: Instant,
+}
+
 struct Item {
     digest: [u8; 32],
     bytes: usize,
     attempts: u8,
     operations: usize,
     job: AdmissionJob,
+    /// Set for a vote-time warm-up no frame waits on yet.
+    warm: Option<Warm>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -89,13 +136,25 @@ pub struct AdmissionStats {
     pub dropped: usize,
     /// Submissions that reached [`MAX_FAILURES`].
     pub released: usize,
+    /// Warm-ups queued, and those dropped (bound, age, frame materialized).
+    pub warmups: usize,
+    pub warmups_dropped: usize,
     pub counts: PreverifyCounts,
+    /// Arrivals not queued because they need no verification: the collector
+    /// already held them or a finalized frame consumed them, they fail
+    /// dispatch's checks before native work, or the global commit decided
+    /// them ([`note_arrival_skipped`](AdmissionQueue::note_arrival_skipped)).
+    pub arrival_skipped: usize,
+    /// Arrivals not queued past the [`ARRIVAL_WINDOW`] budget.
+    pub arrival_over_budget: usize,
+    /// Estimated worker-seconds of the arrivals admitted.
+    pub arrival_secs: u64,
 }
 
 #[derive(Default)]
 struct State {
     /// Submissions frames wait on first, in the order frames asked for
-    /// them, then the rest.
+    /// them, then warm-ups, then the rest.
     queue: VecDeque<Item>,
     /// Digests queued or verifying.
     pending: HashSet<[u8; 32]>,
@@ -107,9 +166,16 @@ struct State {
     target_threads: usize,
     window: AdmissionStats,
     summarized: Option<Instant>,
+    /// Estimated worker-seconds arrivals may still take, and when it was
+    /// last refilled (`None`: full).
+    arrival_credit: f64,
+    arrival_refilled: Option<Instant>,
     /// Digest → verifications of it that failed in the worker, oldest first.
-    failures: std::collections::HashMap<[u8; 32], u8>,
+    failures: HashMap<[u8; 32], u8>,
     failure_order: VecDeque<[u8; 32]>,
+    /// Shard filter → the latest frame it materialized: warm-ups of it and
+    /// earlier frames are no longer needed.
+    ended: HashMap<Vec<u8>, u64>,
 }
 
 impl State {
@@ -146,10 +212,64 @@ impl State {
             .count()
     }
 
+    /// Queued warm-ups: right behind the submissions frames wait on.
+    fn warm_queued(&self) -> usize {
+        self.queue
+            .iter()
+            .skip(self.wanted_queued())
+            .take_while(|item| item.warm.is_some())
+            .count()
+    }
+
     /// Queue `item` behind the submissions frames already wait on.
-    fn queue_wanted(&mut self, item: Item) {
+    fn queue_wanted(&mut self, mut item: Item) {
+        item.warm = None;
         let at = self.wanted_queued();
         self.queue.insert(at, item);
+    }
+
+    /// Queue warm-up `item` behind the others, ahead of arrivals.
+    fn queue_warm(&mut self, item: Item) {
+        let at = self.wanted_queued() + self.warm_queued();
+        self.queue.insert(at, item);
+    }
+
+    /// Whether warm-up `warm` is still worth verifying at `now`.
+    fn warm_live(&self, warm: &Warm, now: Instant) -> bool {
+        now < warm.expires
+            && self
+                .ended
+                .get(&warm.shard)
+                .is_none_or(|ended| *ended < warm.frame)
+    }
+
+    /// Remove the queued item at `index` (dropped, not verified).
+    fn drop_at(&mut self, index: usize) {
+        if let Some(dropped) = self.queue.remove(index) {
+            self.bytes -= dropped.bytes;
+            self.pending.remove(&dropped.digest);
+            self.window.dropped += 1;
+            if dropped.warm.is_some() {
+                self.window.warmups_dropped += 1;
+            }
+        }
+    }
+
+    /// Drop the queued warm-ups no longer worth verifying.
+    fn prune_warm(&mut self, now: Instant) {
+        let start = self.wanted_queued();
+        let mut index = start;
+        while index < start + self.warm_queued() {
+            let live = self.queue[index]
+                .warm
+                .as_ref()
+                .is_some_and(|warm| self.warm_live(warm, now));
+            if live {
+                index += 1;
+            } else {
+                self.drop_at(index);
+            }
+        }
     }
 
     fn finish(&mut self, digest: &[u8; 32]) {
@@ -158,13 +278,26 @@ impl State {
     }
 }
 
+/// Where an offer goes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// A finalized frame waits on it.
+    Frame,
+    /// A vote-time warm-up.
+    Warm,
+    /// Everything else.
+    Arrival,
+}
+
 /// One bounded queue of submissions whose proofs background threads verify:
-/// those frames wait on first, then the rest oldest first.
+/// those frames wait on first, then warm-ups, then the rest oldest first.
 pub struct AdmissionQueue {
     state: Mutex<State>,
     wake: Condvar,
     max_bundles: usize,
     max_bytes: usize,
+    max_warmups: usize,
+    warmup_ttl: Duration,
     failure_entries: usize,
     /// Whether offers start the background threads (tests drive it by hand).
     spawn: bool,
@@ -172,13 +305,22 @@ pub struct AdmissionQueue {
 
 impl AdmissionQueue {
     pub fn new(max_bundles: usize, max_bytes: usize, spawn: bool) -> Arc<Self> {
-        Self::with_failure_entries(max_bundles, max_bytes, FAILURE_ENTRIES, spawn)
+        Self::build(
+            max_bundles,
+            max_bytes,
+            FAILURE_ENTRIES,
+            MAX_WARMUPS,
+            WARMUP_TTL,
+            spawn,
+        )
     }
 
-    fn with_failure_entries(
+    fn build(
         max_bundles: usize,
         max_bytes: usize,
         failure_entries: usize,
+        max_warmups: usize,
+        warmup_ttl: Duration,
         spawn: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -189,9 +331,67 @@ impl AdmissionQueue {
             wake: Condvar::new(),
             max_bundles: max_bundles.max(1),
             max_bytes,
+            max_warmups: max_warmups.max(1),
+            warmup_ttl,
             failure_entries,
             spawn,
         })
+    }
+
+    /// Admit an arrival estimated at `cost_secs` worker-seconds under the
+    /// [`ARRIVAL_WINDOW`] budget: the queue's threads times the window,
+    /// refilled at one second per thread per second. One is admitted while
+    /// any credit is left, so the work admitted per window exceeds the
+    /// budget by at most one arrival. False (counted) past it.
+    pub fn admit_arrival(&self, cost_secs: f64, now: Instant) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let threads = state.target_threads.max(1) as f64;
+        let capacity = threads * ARRIVAL_WINDOW.as_secs_f64();
+        let credit = match state.arrival_refilled {
+            None => capacity,
+            Some(at) => (state.arrival_credit
+                + now.saturating_duration_since(at).as_secs_f64() * threads)
+                .min(capacity),
+        };
+        state.arrival_refilled = Some(now);
+        let admitted = credit > 0.0;
+        if admitted {
+            let cost = if cost_secs.is_finite() {
+                cost_secs.max(0.0)
+            } else {
+                capacity
+            };
+            state.arrival_credit = credit - cost;
+            state.window.arrival_secs = state
+                .window
+                .arrival_secs
+                .saturating_add(cost.round() as u64);
+        } else {
+            state.arrival_credit = credit;
+            state.window.arrival_over_budget += 1;
+        }
+        Self::summarize(&mut state);
+        admitted
+    }
+
+    /// Give back an admitted arrival's credit when it was not queued.
+    pub fn refund_arrival(&self, cost_secs: f64) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.arrival_refilled.is_some() && cost_secs.is_finite() {
+            let capacity = state.target_threads.max(1) as f64 * ARRIVAL_WINDOW.as_secs_f64();
+            state.arrival_credit = (state.arrival_credit + cost_secs.max(0.0)).min(capacity);
+            state.window.arrival_secs = state
+                .window
+                .arrival_secs
+                .saturating_sub(cost_secs.max(0.0).round() as u64);
+        }
+    }
+
+    /// Count an arrival not queued because it needs no verification.
+    pub fn note_arrival_skipped(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.window.arrival_skipped += 1;
+        Self::summarize(&mut state);
     }
 
     /// Run up to `threads` verifications at once ([`background_threads`]);
@@ -215,12 +415,12 @@ impl AdmissionQueue {
     }
 
     /// Queue a submission's verification of `operations` confidential
-    /// operations, at the back or, for a frame that waits on it (`front`),
-    /// behind the submissions frames already wait on. False when it is
-    /// already queued or verifying (a queued one a frame now waits on moves
-    /// up), when it alone exceeds the byte bound, when it was released
+    /// operations, at the back or, for a finalized frame that waits on it
+    /// (`front`), behind the submissions frames already wait on. False when
+    /// it is already queued or verifying (a queued one a frame now waits on
+    /// moves up), when it alone exceeds the byte bound, when it was released
     /// ([`Self::released`]), or when the queue is full of submissions frames
-    /// wait on and no frame waits on this one.
+    /// wait on and warm-ups and no frame waits on this one.
     pub fn offer(
         self: &Arc<Self>,
         digest: [u8; 32],
@@ -229,6 +429,55 @@ impl AdmissionQueue {
         job: AdmissionJob,
         front: bool,
     ) -> bool {
+        let lane = if front { Lane::Frame } else { Lane::Arrival };
+        self.offer_in(digest, bytes, operations, job, lane, None)
+    }
+
+    /// Queue a vote-time warm-up of a proposal for `frame` of `shard`:
+    /// behind the submissions frames wait on, ahead of arrivals, at most
+    /// [`MAX_WARMUPS`] (the oldest is dropped), dropped once queued for
+    /// [`WARMUP_TTL`] or once the shard materialized `frame`
+    /// ([`Self::end_warmups`]), and retried [`MAX_ATTEMPTS`] times while the
+    /// worker is busy. False when it is already queued or verifying (a
+    /// queued arrival moves up; a queued warm-up takes the newer proposal),
+    /// when the shard already materialized `frame`, and as [`Self::offer`].
+    pub fn offer_warmup(
+        self: &Arc<Self>,
+        digest: [u8; 32],
+        bytes: usize,
+        operations: usize,
+        job: AdmissionJob,
+        shard: &[u8],
+        frame: u64,
+    ) -> bool {
+        let warm = Warm {
+            shard: shard.to_vec(),
+            frame,
+            expires: Instant::now() + self.warmup_ttl,
+        };
+        self.offer_in(digest, bytes, operations, job, Lane::Warm, Some(warm))
+    }
+
+    /// `shard` materialized `frame`: its warm-ups of that frame and earlier
+    /// are dropped, and later offers of them refused. Those the frame needs
+    /// it asked for first, which moved them to the frames' lane.
+    pub fn end_warmups(&self, shard: &[u8], frame: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let ended = state.ended.entry(shard.to_vec()).or_insert(frame);
+        *ended = (*ended).max(frame);
+        state.prune_warm(Instant::now());
+    }
+
+    fn offer_in(
+        self: &Arc<Self>,
+        digest: [u8; 32],
+        bytes: usize,
+        operations: usize,
+        job: AdmissionJob,
+        lane: Lane,
+        warm: Option<Warm>,
+    ) -> bool {
+        let now = Instant::now();
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.failed(&digest) >= MAX_FAILURES {
             return false;
@@ -237,28 +486,35 @@ impl AdmissionQueue {
             state.window.dropped += 1;
             return false;
         }
-        if state.pending.contains(&digest) {
-            if front && state.wanted.insert(digest) {
-                // A frame now waits on it: a queued one moves up.
-                if let Some(index) = state.queue.iter().position(|item| item.digest == digest) {
-                    if let Some(item) = state.queue.remove(index) {
-                        state.queue_wanted(item);
-                    }
-                }
-            }
+        state.prune_warm(now);
+        if warm
+            .as_ref()
+            .is_some_and(|warm| !state.warm_live(warm, now))
+        {
             return false;
+        }
+        if state.pending.contains(&digest) {
+            self.promote(&mut state, digest, lane, warm);
+            return false;
+        }
+        if lane == Lane::Warm && state.warm_queued() >= self.max_warmups {
+            let oldest = state.wanted_queued();
+            state.drop_at(oldest);
         }
         while !state.queue.is_empty()
             && (state.queue.len() >= self.max_bundles || state.bytes + bytes > self.max_bytes)
         {
-            let oldest = state.wanted_queued();
-            if let Some(dropped) = state.queue.remove(oldest) {
-                state.bytes -= dropped.bytes;
-                state.pending.remove(&dropped.digest);
-                state.window.dropped += 1;
-            } else if front {
+            let frames = state.wanted_queued();
+            let warming = state.warm_queued();
+            if frames + warming < state.queue.len() {
+                // The oldest arrival goes first.
+                state.drop_at(frames + warming);
+            } else if lane != Lane::Arrival && warming > 0 {
+                // Then the oldest warm-up, for a frame or a newer warm-up.
+                state.drop_at(frames);
+            } else if lane == Lane::Frame {
                 // Only submissions frames wait on are queued, bounded by
-                // the frames this node holds: admit this one too.
+                // the finalized frames this node holds: admit this one too.
                 break;
             } else {
                 state.window.dropped += 1;
@@ -271,12 +527,18 @@ impl AdmissionQueue {
             attempts: 0,
             operations,
             job,
+            warm,
         };
-        if front {
-            state.wanted.insert(digest);
-            state.queue_wanted(item);
-        } else {
-            state.queue.push_back(item);
+        match lane {
+            Lane::Frame => {
+                state.wanted.insert(digest);
+                state.queue_wanted(item);
+            }
+            Lane::Warm => {
+                state.window.warmups += 1;
+                state.queue_warm(item);
+            }
+            Lane::Arrival => state.queue.push_back(item),
         }
         state.pending.insert(digest);
         state.bytes += bytes;
@@ -316,6 +578,38 @@ impl AdmissionQueue {
         true
     }
 
+    /// A pending `digest` offered again in `lane`: a frame now waiting on it
+    /// moves it to the frames' lane; a warm-up moves a queued arrival up
+    /// (within [`MAX_WARMUPS`]) or gives a queued warm-up its newer proposal.
+    fn promote(&self, state: &mut State, digest: [u8; 32], lane: Lane, warm: Option<Warm>) {
+        if state.wanted.contains(&digest) {
+            return;
+        }
+        let index = state.queue.iter().position(|item| item.digest == digest);
+        match lane {
+            Lane::Frame => {
+                state.wanted.insert(digest);
+                // A frame now waits on it: a queued one moves up.
+                if let Some(item) = index.and_then(|index| state.queue.remove(index)) {
+                    state.queue_wanted(item);
+                }
+            }
+            Lane::Warm => {
+                let Some(index) = index else { return };
+                if state.queue[index].warm.is_some() {
+                    state.queue[index].warm = warm;
+                } else if state.warm_queued() < self.max_warmups {
+                    if let Some(mut item) = state.queue.remove(index) {
+                        item.warm = warm;
+                        state.window.warmups += 1;
+                        state.queue_warm(item);
+                    }
+                }
+            }
+            Lane::Arrival => {}
+        }
+    }
+
     /// Whether `digest` is queued or verifying.
     pub fn pending(&self, digest: &[u8; 32]) -> bool {
         self.state
@@ -343,32 +637,45 @@ impl AdmissionQueue {
 
     /// [`Self::run_one`], with what the verification found.
     fn run_next(&self) -> Option<PreverifyCounts> {
-        let item = {
+        let (item, for_frame) = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.prune_warm(Instant::now());
             let item = state.queue.pop_front()?;
             state.bytes -= item.bytes;
-            item
+            let for_frame = state.wanted.contains(&item.digest);
+            (item, for_frame)
         };
         // A panicking verification counts as one failed in the worker, so
         // the thread keeps verifying the queue frames wait on.
-        let counts = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (item.job)()))
-            .unwrap_or_else(|_| {
-                warn!(
-                    scope = "this node",
-                    submission = %hex::encode(&item.digest[..8]),
-                    operations = item.operations,
-                    action = "counted as a failed verification and retried; a defect to report",
-                    "confidential proof verification panicked in the admission queue"
-                );
-                PreverifyCounts {
-                    operations: item.operations,
-                    unavailable: item.operations.max(1),
-                    ..Default::default()
-                }
-            });
+        let previous = FOR_FRAME.with(|cell| cell.replace(for_frame));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (item.job)()));
+        FOR_FRAME.with(|cell| cell.set(previous));
+        let counts = outcome.unwrap_or_else(|_| {
+            warn!(
+                scope = "this node",
+                submission = %hex::encode(&item.digest[..8]),
+                operations = item.operations,
+                action = "counted as a failed verification and retried; a defect to report",
+                "confidential proof verification panicked in the admission queue"
+            );
+            PreverifyCounts {
+                operations: item.operations,
+                unavailable: item.operations.max(1),
+                ..Default::default()
+            }
+        });
+        let now = Instant::now();
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.window.counts.add(counts);
         let wanted = state.wanted.contains(&item.digest);
+        // A warm-up no frame waits on goes back only while worth verifying,
+        // and within the warm-up bound.
+        let warm_back = match item.warm.as_ref() {
+            Some(warm) if !wanted => {
+                state.warm_live(warm, now) && state.warm_queued() < self.max_warmups
+            }
+            _ => true,
+        };
         let failures = if counts.unavailable > 0 {
             state.note_failure(item.digest, self.failure_entries)
         } else {
@@ -390,13 +697,20 @@ impl AdmissionQueue {
                           check this node's proof worker (proofWorker settings, memory, CPU)",
                 "confidential proofs of a submission failed to verify in this node's proof worker"
             );
+        } else if (failures > 0 || counts.busy > 0) && !warm_back {
+            // A warm-up whose proposal's time passed: left to the frame that
+            // needs it, if one does.
+            state.finish(&item.digest);
+            state.window.warmups_dropped += 1;
         } else if failures > 0 {
             // Failed in the worker (counted above): try again after the
-            // rest of the queue, or after the others frames wait on.
+            // rest of its lane.
             state.window.requeued += 1;
             state.bytes += item.bytes;
             if wanted {
                 state.queue_wanted(item);
+            } else if item.warm.is_some() {
+                state.queue_warm(item);
             } else {
                 state.queue.push_back(item);
             }
@@ -404,15 +718,20 @@ impl AdmissionQueue {
             // Found no worker slot while a frame waits on it: first again.
             state.window.requeued += 1;
             state.bytes += item.bytes;
-            state.queue.push_front(item);
+            state.queue.push_front(Item { warm: None, ..item });
         } else if counts.busy > 0 && item.attempts + 1 < MAX_ATTEMPTS {
-            // Found no worker slot: try again after the rest of the queue.
+            // Found no worker slot: try again after the rest of its lane.
             state.window.requeued += 1;
             state.bytes += item.bytes;
-            state.queue.push_back(Item {
+            let item = Item {
                 attempts: item.attempts + 1,
                 ..item
-            });
+            };
+            if item.warm.is_some() {
+                state.queue_warm(item);
+            } else {
+                state.queue.push_back(item);
+            }
         } else {
             state.finish(&item.digest);
         }
@@ -468,12 +787,22 @@ impl AdmissionQueue {
             requeued = window.requeued,
             dropped = window.dropped,
             released = window.released,
+            warmups = window.warmups,
+            warmups_dropped = window.warmups_dropped,
             pending = state.queue.len(),
             frames_waiting = state.wanted_queued(),
+            warming = state.warm_queued(),
             threads = state.threads,
+            arrival_skipped = window.arrival_skipped,
+            arrival_over_budget = window.arrival_over_budget,
+            arrival_secs = window.arrival_secs,
+            arrival_budget_secs =
+                (state.target_threads.max(1) as u64).saturating_mul(ARRIVAL_WINDOW.as_secs()),
             interval_secs = SUMMARY_INTERVAL.as_secs(),
             "confidential proof admission summary: proofs of arriving submissions verified before a frame \
-             carries them, those frames wait on first; dropped ones verify when a proposal or frame needs them"
+             carries them, those finalized frames wait on first, then vote-time warm-ups (bounded, dropped \
+             when their proposal's time passed); dropped ones, and arrivals past the budget or needing no \
+             verification (skipped), verify when a proposal or frame needs them"
         );
     }
 }
@@ -504,6 +833,38 @@ pub fn digest(canonical: &[u8]) -> [u8; 32] {
     Sha3_256::digest(canonical).into()
 }
 
+/// A canonical submission's confidential operation count, digest and
+/// verification job on `exec`'s worker, one operation at a time per queue
+/// thread; `None` without confidential operations.
+fn submission_job(
+    exec: &Arc<quil_execution::ExecutionEngineManager>,
+    application: &[u8],
+    canonical: &[u8],
+) -> Option<(usize, [u8; 32], AdmissionJob)> {
+    let application = application[..application.len().min(32)].to_vec();
+    let operations = quil_execution::ExecutionEngineManager::confidential_operation_count(
+        &application,
+        canonical,
+    );
+    if operations == 0 {
+        return None;
+    }
+    let digest = digest(canonical);
+    let pair = vec![(application, canonical.to_vec())];
+    let exec = exec.clone();
+    let job: AdmissionJob = Arc::new(move || {
+        exec.preverify_bundles_paced(
+            &pair,
+            &quil_execution::manager::PreverifyPacing {
+                parallelism: Some(1),
+                background: !verifying_for_frame(),
+                ..Default::default()
+            },
+        )
+    });
+    Some((operations, digest, job))
+}
+
 /// Queue the verification of a canonical submission's confidential proofs on
 /// `exec`'s worker, one operation at a time per queue thread (one fewer
 /// thread than the worker's slots, [`use_worker_slots`]), so the worker
@@ -516,27 +877,61 @@ pub fn offer_submission(
     canonical: &[u8],
     front: bool,
 ) -> bool {
-    let application = application[..application.len().min(32)].to_vec();
-    let operations = quil_execution::ExecutionEngineManager::confidential_operation_count(
-        &application,
-        canonical,
-    );
-    if operations == 0 {
+    let Some((operations, digest, job)) = submission_job(exec, application, canonical) else {
+        return false;
+    };
+    queue.offer(digest, canonical.len(), operations, job, front) || queue.pending(&digest)
+}
+
+/// Queue an arriving canonical submission's verification
+/// ([`offer_submission`], at the back) under the [`ARRIVAL_WINDOW`] budget.
+/// `sizes`: the bytes of each of its confidential operations still to
+/// verify (`ExecutionEngineManager::arrival_operations`), charged at their
+/// estimated verification time. True when it is queued or verifying now.
+pub fn offer_arrival(
+    queue: &Arc<AdmissionQueue>,
+    exec: &Arc<quil_execution::ExecutionEngineManager>,
+    application: &[u8],
+    canonical: &[u8],
+    sizes: &[usize],
+    now: Instant,
+) -> bool {
+    if sizes.is_empty() {
+        queue.note_arrival_skipped();
         return false;
     }
-    let digest = digest(canonical);
-    let pair = vec![(application, canonical.to_vec())];
-    let exec = exec.clone();
-    let job: AdmissionJob = Arc::new(move || {
-        exec.preverify_bundles_paced(
-            &pair,
-            &quil_execution::manager::PreverifyPacing {
-                parallelism: Some(1),
-                ..Default::default()
-            },
-        )
-    });
-    queue.offer(digest, canonical.len(), operations, job, front) || queue.pending(&digest)
+    if queue.pending(&digest(canonical)) {
+        return true;
+    }
+    let cost: f64 = sizes
+        .iter()
+        .map(|bytes| quil_execution::ExecutionEngineManager::estimated_verify_secs(*bytes))
+        .sum();
+    if !queue.admit_arrival(cost, now) {
+        return false;
+    }
+    let queued = offer_submission(queue, exec, application, canonical, false);
+    if !queued {
+        queue.refund_arrival(cost);
+    }
+    queued
+}
+
+/// [`offer_submission`] as a vote-time warm-up of a proposal for `frame` of
+/// `shard` ([`AdmissionQueue::offer_warmup`]).
+pub fn offer_warmup_submission(
+    queue: &Arc<AdmissionQueue>,
+    exec: &Arc<quil_execution::ExecutionEngineManager>,
+    application: &[u8],
+    canonical: &[u8],
+    shard: &[u8],
+    frame: u64,
+) -> bool {
+    let Some((operations, digest, job)) = submission_job(exec, application, canonical) else {
+        return false;
+    };
+    queue.offer_warmup(digest, canonical.len(), operations, job, shard, frame)
+        || queue.pending(&digest)
 }
 
 #[cfg(test)]
@@ -755,7 +1150,7 @@ mod tests {
     /// the bound the oldest is forgotten and may be verified again.
     #[test]
     fn remembered_failures_are_bounded() {
-        let queue = AdmissionQueue::with_failure_entries(8, 1 << 20, 2, false);
+        let queue = AdmissionQueue::build(8, 1 << 20, 2, MAX_WARMUPS, WARMUP_TTL, false);
         let runs = Arc::new(AtomicUsize::new(0));
         let failed = PreverifyCounts {
             operations: 1,
@@ -785,5 +1180,261 @@ mod tests {
         }
         assert!(!queue.pending(&[9; 32]));
         assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// Arrivals take at most the queue's threads times the window of
+    /// estimated verification time, refilled as time passes, one arrival
+    /// past the last credit at most; refused ones are counted, and a refund
+    /// gives credit back.
+    #[test]
+    fn arrivals_are_admitted_within_their_budget_and_refilled_over_time() {
+        let queue = AdmissionQueue::new(8, 1 << 20, false);
+        let start = Instant::now();
+        let window = ARRIVAL_WINDOW.as_secs_f64();
+        // One thread: the window's seconds, then one more past the last credit.
+        let mut admitted = 0;
+        while queue.admit_arrival(100.0, start) {
+            admitted += 1;
+            assert!(admitted < 1000, "the budget never ran out");
+        }
+        assert_eq!(admitted, (window / 100.0).ceil() as usize);
+        assert_eq!(queue.stats().arrival_over_budget, 1);
+        // Refilled at one second per thread per second: one second's credit
+        // admits one more, which overdraws it.
+        assert!(queue.admit_arrival(100.0, start + Duration::from_secs(1)));
+        assert!(!queue.admit_arrival(1.0, start + Duration::from_secs(1)));
+        assert!(queue.admit_arrival(100.0, start + Duration::from_secs(200)));
+        assert!(!queue.admit_arrival(100.0, start + Duration::from_secs(200)));
+        // A refund gives the credit back.
+        queue.refund_arrival(150.0);
+        assert!(queue.admit_arrival(100.0, start + Duration::from_secs(200)));
+        // Never more than one window ahead, however long it was idle.
+        let later = start + Duration::from_secs(100_000);
+        let mut admitted = 0;
+        while queue.admit_arrival(100.0, later) {
+            admitted += 1;
+        }
+        assert_eq!(admitted, (window / 100.0).ceil() as usize);
+        // More threads, more budget.
+        let queue = AdmissionQueue::new(8, 1 << 20, false);
+        queue.set_threads(3);
+        let mut admitted = 0;
+        while queue.admit_arrival(100.0, start) {
+            admitted += 1;
+        }
+        assert_eq!(admitted, (3.0 * window / 100.0).ceil() as usize);
+        // A non-finite estimate takes the whole budget.
+        let queue = AdmissionQueue::new(8, 1 << 20, false);
+        assert!(queue.admit_arrival(f64::INFINITY, start));
+        assert!(!queue.admit_arrival(1.0, start));
+    }
+
+    fn busy() -> PreverifyCounts {
+        PreverifyCounts {
+            operations: 1,
+            busy: 1,
+            ..Default::default()
+        }
+    }
+
+    fn order(queue: &AdmissionQueue) -> Vec<[u8; 32]> {
+        queue
+            .state
+            .lock()
+            .unwrap()
+            .queue
+            .iter()
+            .map(|item| item.digest)
+            .collect()
+    }
+
+    fn warm_queue(max_bundles: usize, max_bytes: usize, max_warmups: usize) -> Arc<AdmissionQueue> {
+        AdmissionQueue::build(
+            max_bundles,
+            max_bytes,
+            FAILURE_ENTRIES,
+            max_warmups,
+            WARMUP_TTL,
+            false,
+        )
+    }
+
+    /// Warm-ups queue behind the submissions frames wait on and ahead of
+    /// arrivals, at most `max_warmups` of them: past it the oldest goes, and
+    /// the queue takes warm-ups again once one verified.
+    #[test]
+    fn warm_ups_are_bounded_and_queue_between_frames_and_arrivals() {
+        let queue = warm_queue(16, 1 << 20, 2);
+        let runs = Arc::new(AtomicUsize::new(0));
+        assert!(queue.offer([0xa1; 32], 10, 1, job(&runs, verified()), false));
+        for n in 1..=3u8 {
+            assert!(queue.offer_warmup([n; 32], 10, 1, job(&runs, verified()), b"shard", 5));
+        }
+        assert!(
+            !queue.pending(&[1; 32]),
+            "past the bound the oldest warm-up goes"
+        );
+        assert_eq!(queue.stats().warmups_dropped, 1);
+        assert!(queue.offer([0xf1; 32], 10, 1, job(&runs, verified()), true));
+        assert_eq!(
+            order(&queue),
+            vec![[0xf1; 32], [2; 32], [3; 32], [0xa1; 32]],
+            "frames first, then warm-ups, then arrivals"
+        );
+        // An arrival offered as a warm-up moves up only within the bound;
+        // a frame waiting on a warm-up takes it into the frames' lane.
+        assert!(!queue.offer_warmup([0xa1; 32], 10, 1, job(&runs, verified()), b"shard", 5));
+        assert_eq!(queue.queued_ahead(&[0xa1; 32]), Some(3));
+        assert!(!queue.offer([3; 32], 10, 1, job(&runs, verified()), true));
+        assert_eq!(
+            order(&queue),
+            vec![[0xf1; 32], [3; 32], [2; 32], [0xa1; 32]]
+        );
+        assert!(queue.run_one() && queue.run_one());
+        assert!(!queue.offer_warmup([0xa1; 32], 10, 1, job(&runs, verified()), b"shard", 5));
+        assert_eq!(order(&queue), vec![[2; 32], [0xa1; 32]]);
+        while queue.run_one() {}
+        assert!(queue.offer_warmup([4; 32], 10, 1, job(&runs, verified()), b"shard", 6));
+        assert!(queue.run_one());
+        assert_eq!(runs.load(Ordering::SeqCst), 5);
+    }
+
+    /// Past the count or byte bound arrivals go first, then the oldest
+    /// warm-up (for a frame or a newer warm-up), never a submission a frame
+    /// waits on; an arrival never displaces a warm-up.
+    #[test]
+    fn the_bounds_drop_arrivals_then_warm_ups_never_frames() {
+        let queue = warm_queue(3, 1 << 20, 8);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let ok = || job(&runs, verified());
+        assert!(queue.offer_warmup([1; 32], 10, 1, ok(), b"shard", 5));
+        assert!(queue.offer([0xa1; 32], 10, 1, ok(), false));
+        assert!(queue.offer([0xa2; 32], 10, 1, ok(), false));
+        assert!(queue.offer_warmup([2; 32], 10, 1, ok(), b"shard", 5));
+        assert_eq!(order(&queue), vec![[1; 32], [2; 32], [0xa2; 32]]);
+        assert!(queue.offer([0xf1; 32], 10, 1, ok(), true));
+        assert_eq!(order(&queue), vec![[0xf1; 32], [1; 32], [2; 32]]);
+        assert!(
+            !queue.offer([0xa3; 32], 10, 1, ok(), false),
+            "an arrival displaced a warm-up"
+        );
+        assert!(queue.offer([0xf2; 32], 10, 1, ok(), true));
+        assert!(queue.offer([0xf3; 32], 10, 1, ok(), true));
+        assert_eq!(order(&queue), vec![[0xf1; 32], [0xf2; 32], [0xf3; 32]]);
+        assert!(
+            !queue.offer_warmup([3; 32], 10, 1, ok(), b"shard", 5),
+            "a warm-up displaced a submission a frame waits on"
+        );
+        assert!(queue.offer([0xf4; 32], 10, 1, ok(), true));
+        assert_eq!(queue.stats().warmups_dropped, 2);
+        while queue.run_one() {}
+        assert!(queue.offer_warmup([3; 32], 10, 1, ok(), b"shard", 5));
+        // The byte bound too: a frame's submission takes a warm-up's bytes.
+        let queue = warm_queue(8, 100, 8);
+        assert!(queue.offer_warmup([1; 32], 60, 1, ok(), b"shard", 5));
+        assert!(queue.offer([0xf1; 32], 60, 1, ok(), true));
+        assert!(!queue.pending(&[1; 32]) && queue.pending(&[0xf1; 32]));
+        assert!(!queue.offer_warmup([2; 32], 60, 1, ok(), b"shard", 5));
+        assert!(queue.run_one());
+        assert!(queue.offer_warmup([2; 32], 60, 1, ok(), b"shard", 5));
+    }
+
+    /// A shard that materialized a frame needs no warm-up of it or earlier
+    /// frames: those queued are dropped and later offers refused, except one
+    /// the frame waits on; other shards' and later frames' warm-ups stay.
+    #[test]
+    fn warm_ups_end_when_their_shard_materializes_their_frame() {
+        let queue = warm_queue(16, 1 << 20, 8);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let ok = || job(&runs, verified());
+        assert!(queue.offer_warmup([1; 32], 10, 1, ok(), b"a", 5));
+        assert!(queue.offer_warmup([2; 32], 10, 1, ok(), b"a", 5));
+        assert!(queue.offer_warmup([3; 32], 10, 1, ok(), b"a", 6));
+        assert!(queue.offer_warmup([4; 32], 10, 1, ok(), b"b", 5));
+        // Frame 5 of shard a finalized carrying [2]: it asks first.
+        assert!(!queue.offer([2; 32], 10, 1, ok(), true));
+        queue.end_warmups(b"a", 5);
+        assert_eq!(order(&queue), vec![[2; 32], [3; 32], [4; 32]]);
+        assert!(
+            !queue.offer_warmup([5; 32], 10, 1, ok(), b"a", 5),
+            "a warm-up of a materialized frame was queued"
+        );
+        // A queued warm-up offered again by a newer proposal takes its frame.
+        assert!(queue.offer_warmup([6; 32], 10, 1, ok(), b"a", 7));
+        assert!(!queue.offer_warmup([3; 32], 10, 1, ok(), b"a", 8));
+        queue.end_warmups(b"a", 7);
+        assert_eq!(order(&queue), vec![[2; 32], [3; 32], [4; 32]]);
+        while queue.run_one() {}
+        assert_eq!(runs.load(Ordering::SeqCst), 3);
+    }
+
+    /// A warm-up still queued after its time to live is dropped; offered
+    /// again (a newer proposal) it is queued afresh.
+    #[test]
+    fn a_warm_up_past_its_time_to_live_is_dropped() {
+        let ttl = Duration::from_secs(1);
+        let queue = AdmissionQueue::build(16, 1 << 20, FAILURE_ENTRIES, 8, ttl, false);
+        let runs = Arc::new(AtomicUsize::new(0));
+        assert!(queue.offer_warmup([1; 32], 10, 1, job(&runs, verified()), b"a", 5));
+        assert!(queue.pending(&[1; 32]));
+        std::thread::sleep(ttl + Duration::from_millis(200));
+        assert!(!queue.run_one(), "an expired warm-up was verified");
+        assert!(!queue.pending(&[1; 32]));
+        assert_eq!(queue.stats().warmups_dropped, 1);
+        assert!(queue.offer_warmup([1; 32], 10, 1, job(&runs, verified()), b"a", 5));
+        assert!(queue.run_one());
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// A warm-up that finds the worker busy is retried a bounded number of
+    /// times, like an arrival, while a submission a frame waits on is
+    /// retried first until a slot frees; only the latter verifies as a
+    /// frame's, taking any node-wide worker slot.
+    #[test]
+    fn a_busy_warm_up_is_retried_a_bounded_number_of_times_and_runs_as_background() {
+        let queue = warm_queue(16, 1 << 20, 8);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recording = |digest: u8, counts: PreverifyCounts| -> AdmissionJob {
+            let seen = seen.clone();
+            Arc::new(move || {
+                seen.lock().unwrap().push((digest, verifying_for_frame()));
+                counts
+            })
+        };
+        assert!(queue.offer_warmup([1; 32], 10, 1, recording(1, busy()), b"a", 5));
+        assert!(queue.offer([0xa1; 32], 10, 1, recording(0xa1, verified()), false));
+        while queue.run_one() {}
+        assert!(!queue.pending(&[1; 32]));
+        let seen_warm: Vec<_> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(d, _)| *d == 1)
+            .copied()
+            .collect();
+        assert_eq!(seen_warm, vec![(1, false); MAX_ATTEMPTS as usize]);
+        assert!(!verifying_for_frame());
+        seen.lock().unwrap().clear();
+        let left = Arc::new(AtomicUsize::new(MAX_ATTEMPTS as usize + 2));
+        let frame: AdmissionJob = {
+            let (seen, left) = (seen.clone(), left.clone());
+            Arc::new(move || {
+                seen.lock().unwrap().push((0xf1, verifying_for_frame()));
+                if left.fetch_sub(1, Ordering::SeqCst) > 1 {
+                    busy()
+                } else {
+                    verified()
+                }
+            })
+        };
+        assert!(queue.offer_warmup([0xf1; 32], 10, 1, frame, b"a", 6));
+        // The frame of the warm-up finalized and waits on it.
+        assert!(!queue.offer([0xf1; 32], 10, 1, recording(0, verified()), true));
+        while queue.run_one() {}
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(0xf1, true); MAX_ATTEMPTS as usize + 2]
+        );
+        assert!(!queue.pending(&[0xf1; 32]));
     }
 }

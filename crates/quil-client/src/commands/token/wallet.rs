@@ -35,6 +35,12 @@ pub(super) struct RecipientWallet {
     kem_secret: Zeroizing<Vec<u8>>,
     recipient: RecipientSecret,
     address: RecipientAddress,
+    /// Page budget of the full scan a spend's witness rebuild makes: the last
+    /// balance scan's, else the CLI default.
+    scan_pages: std::sync::atomic::AtomicUsize,
+    /// What the last spend scan kept for its witnesses; the next witness
+    /// rebuild takes it, so a spend lists the coins once.
+    prepared: std::sync::Mutex<Option<SpendScan>>,
 }
 
 /// What a settlement binds: the bundle it funds, or — when the payer does not
@@ -154,6 +160,367 @@ fn select_coins(
 /// `max_coins` answers pages of eight, which the page checks accept too.
 const SCAN_PAGE_ENTRIES: usize = quil_types::store::MAX_SCAN_PAGE_ENTRIES;
 
+/// Times a scan's read is asked again after the node could not deliver it,
+/// and the wait before each. A failed page leaves the scan where it was, so
+/// asking again costs one page, where failing costs the whole scan. A call
+/// ends at the channel's deadline (120 s), which bounds the page at 8.5 min.
+const SCAN_READ_RETRIES: usize = 3;
+#[cfg(not(test))]
+const SCAN_READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(test)]
+const SCAN_READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Whether a scan's read can succeed if asked again. A snapshot that expired
+/// or a pin that is gone says "restart": only a new scan can read it.
+fn scan_read_is_transient(status: &tonic::Status) -> bool {
+    use tonic::Code;
+    matches!(
+        status.code(),
+        Code::Unavailable
+            | Code::Unknown
+            | Code::Cancelled
+            | Code::DeadlineExceeded
+            | Code::ResourceExhausted
+            | Code::Aborted
+    ) && !status.message().contains("restart")
+}
+
+/// `read`, asked again while it fails in a way that can pass.
+async fn retry_scan_read<T, F, Fut>(what: &str, mut read: F) -> Result<T, tonic::Status>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, tonic::Status>>,
+{
+    let mut retries = 0;
+    loop {
+        let status = match read().await {
+            Ok(value) => return Ok(value),
+            Err(status) => status,
+        };
+        if retries >= SCAN_READ_RETRIES || !scan_read_is_transient(&status) {
+            return Err(status);
+        }
+        retries += 1;
+        eprintln!(
+            "confidential scan: {what} failed ({}); asking again in {} s ({retries}/{SCAN_READ_RETRIES})",
+            status.message(),
+            SCAN_READ_RETRY_DELAY.as_secs()
+        );
+        tokio::time::sleep(SCAN_READ_RETRY_DELAY).await;
+    }
+}
+
+/// Page budget of a witness rebuild's scan until a balance scan sets one: the
+/// `--max-pages` default.
+const DEFAULT_SCAN_PAGES: usize = 2048;
+/// Most coins a witness rebuild keeps: those under the subtrees the selected
+/// coins' addresses can sit in. One full block holds 65,536.
+const MAX_WITNESS_SUBTREE_COINS: usize = 1 << 16;
+/// Rebuilds a spend tries while the scanned snapshot and the accumulator
+/// records it reads are out of step, and the wait between them.
+const WITNESS_ATTEMPTS: usize = 3;
+#[cfg(not(test))]
+const WITNESS_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const WITNESS_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// A witness rebuild that a later scan or accumulator read may complete.
+#[derive(Debug)]
+struct StaleWitness(String);
+
+impl std::fmt::Display for StaleWitness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StaleWitness {}
+
+/// One subtree GLOBAL recorded from a shard's report, at its tree position.
+struct ReportedSubtree {
+    level: usize,
+    index: u64,
+    coins: u64,
+    root: quil_lattice_ct::confidential::relation::membership::Node,
+}
+
+impl ReportedSubtree {
+    /// Whether a coin at `address` can sit under this subtree. A shard's
+    /// subtree holds only blocks on its own bit path, and a block's path is
+    /// its coins' leading address bits, so the subtree's coins all start with
+    /// the shard path its sentinel-encoded index carries.
+    fn may_hold(&self, address: &[u8; 32]) -> bool {
+        if self.index == 0 {
+            return true;
+        }
+        let depth = 63 - self.index.leading_zeros();
+        let path = self.index ^ (1u64 << depth);
+        let leading = u64::from_be_bytes(address[..8].try_into().expect("eight bytes"));
+        depth == 0 || leading >> (64 - depth) == path
+    }
+}
+
+/// The canonical accumulator as GLOBAL records it: every reported subtree
+/// and the root they fold to, which is the root history's current entry.
+struct Accumulator {
+    subtrees: Vec<ReportedSubtree>,
+    root: quil_lattice_ct::confidential::coin_tree::RootRecord,
+}
+
+impl Accumulator {
+    fn lookup(&self) -> SubtreeLookup {
+        let mut by_level: std::collections::BTreeMap<usize, std::collections::HashMap<u64, usize>> =
+            Default::default();
+        for (i, subtree) in self.subtrees.iter().enumerate() {
+            by_level
+                .entry(subtree.level)
+                .or_default()
+                .insert(subtree.index, i);
+        }
+        SubtreeLookup {
+            by_level: by_level.into_iter().collect(),
+        }
+    }
+}
+
+/// Which reported subtree a position sits under. Reports are prefix-free, so
+/// at most one level matches.
+struct SubtreeLookup {
+    by_level: Vec<(usize, std::collections::HashMap<u64, usize>)>,
+}
+
+impl SubtreeLookup {
+    fn find(&self, position: u64) -> Option<usize> {
+        self.by_level
+            .iter()
+            .find_map(|(level, at)| at.get(&(position >> level)).copied())
+    }
+}
+
+/// A scanned coin under a subtree a witness rebuild needs: its packed leaf
+/// and what places it.
+#[derive(Clone)]
+struct KeptCoin {
+    subtree: usize,
+    position: u64,
+    frame: u64,
+    leaf: [u8; quil_lattice_ct::confidential::relation::membership::NODE_BYTES],
+}
+
+/// The coins a subtree's report covers, from the scanned coins under it.
+/// Positions only append, and a report covers every coin its shard held at
+/// the frame it reported, so the covered coins are the earliest `count` by
+/// creation frame. Too few coins, or a cut inside one frame, means the scan
+/// and the report disagree: retry rather than guess. The rebuilt root is
+/// checked against the report either way.
+fn covered_coins(mut coins: Vec<KeptCoin>, count: u64) -> anyhow::Result<Vec<KeptCoin>> {
+    let count =
+        usize::try_from(count).map_err(|_| anyhow::anyhow!("subtree coin count overflow"))?;
+    if coins.len() < count {
+        return Err(StaleWitness(
+            "the scanned snapshot holds fewer coins than a subtree's report".into(),
+        )
+        .into());
+    }
+    if coins.len() > count {
+        coins.sort_by_key(|coin| (coin.frame, coin.position));
+        if count > 0 && coins[count - 1].frame == coins[count].frame {
+            return Err(StaleWitness(
+                "a subtree's report ends inside one frame of scanned coins".into(),
+            )
+            .into());
+        }
+        coins.truncate(count);
+    }
+    coins.sort_by_key(|coin| coin.position);
+    Ok(coins)
+}
+
+/// A scanned coin with the accumulator position and creation frame its page
+/// carried.
+struct ScannedCoin {
+    address: [u8; 32],
+    output: Output,
+    position: u64,
+    frame: u64,
+}
+
+/// Most coins (about 11 KB each) a spend scan holds unhashed in a subtree
+/// where it has met no coin of this wallet yet. Past it the subtree's coins
+/// are hashed as they come, and dropped with it if it holds none of ours.
+#[cfg(not(test))]
+const SPEND_SCAN_PENDING_COINS: usize = 1024;
+#[cfg(test)]
+const SPEND_SCAN_PENDING_COINS: usize = 1;
+
+/// What a spend's own coin scan keeps so that its witnesses need no second
+/// scan: GLOBAL's accumulator, read before the scan, each unspent coin of
+/// this wallet's position, and the leaf of every coin under a subtree that
+/// holds one of them. It names no coin to the node: the scan is the one the
+/// balance already makes.
+struct SpendScan {
+    accumulator: Option<Accumulator>,
+    lookup: Option<SubtreeLookup>,
+    root: Option<quil_lattice_ct::confidential::coin_tree::RootRecord>,
+    owned: std::collections::HashMap<[u8; 32], u64>,
+    kept: Vec<KeptCoin>,
+}
+
+/// The subtree a spend scan is listing: whether it holds a coin of ours,
+/// whether its coins spilled past the pending bound, and those not yet hashed.
+struct OpenSubtree {
+    at: usize,
+    needed: bool,
+    spilled: bool,
+    pending: Vec<ScannedCoin>,
+}
+
+/// Builds a [`SpendScan`] page by page. Coins under one subtree share its
+/// shard's leading address bits, so a scan in address order lists them
+/// together: the open subtree's coins wait, unhashed, until a coin of this
+/// wallet shows the subtree is needed, and are dropped if the scan leaves it
+/// first. A subtree listed in two runs, or more kept coins than a rebuild
+/// takes, leaves the spend to rescan instead.
+struct SpendScanCollector {
+    scan: SpendScan,
+    key: std::sync::Arc<quil_lattice_ct::confidential::relation::membership::MembershipKey>,
+    open: Option<OpenSubtree>,
+    listed: std::collections::HashSet<usize>,
+    unusable: Option<&'static str>,
+}
+
+impl SpendScanCollector {
+    fn new(accumulator: Option<Accumulator>, context: &[u8; 32]) -> Self {
+        Self {
+            scan: SpendScan {
+                lookup: accumulator.as_ref().map(Accumulator::lookup),
+                accumulator,
+                root: None,
+                owned: Default::default(),
+                kept: Vec::new(),
+            },
+            key: std::sync::Arc::new(
+                quil_lattice_ct::confidential::relation::membership::MembershipKey::derive(context),
+            ),
+            open: None,
+            listed: Default::default(),
+            unusable: None,
+        }
+    }
+
+    /// Take one scanned page; `ours` names the coins in it this wallet owns
+    /// unspent. Returns the coins to hash now, with their subtrees.
+    fn take_page(
+        &mut self,
+        page: Vec<ScannedCoin>,
+        ours: &std::collections::HashSet<[u8; 32]>,
+    ) -> Vec<(usize, ScannedCoin)> {
+        let mut hash = Vec::new();
+        if self.unusable.is_some() {
+            return hash;
+        }
+        for coin in page {
+            let mine = ours.contains(&coin.address);
+            if mine {
+                self.scan.owned.insert(coin.address, coin.position);
+            }
+            let subtree = match &self.scan.lookup {
+                Some(lookup) => match lookup.find(coin.position) {
+                    Some(subtree) => subtree,
+                    // Under no report: no path can be built for it yet.
+                    None => continue,
+                },
+                // No index: the whole application is one tree.
+                None => 0,
+            };
+            if self.open.as_ref().map(|open| open.at) != Some(subtree) {
+                self.close(&mut hash);
+                if !self.listed.insert(subtree) {
+                    self.abandon("the scan listed one subtree's coins apart");
+                    return Vec::new();
+                }
+                self.open = Some(OpenSubtree {
+                    at: subtree,
+                    needed: false,
+                    spilled: false,
+                    pending: Vec::new(),
+                });
+            }
+            let open = self.open.as_mut().expect("opened above");
+            open.needed |= mine;
+            open.pending.push(coin);
+            if open.needed || open.pending.len() > SPEND_SCAN_PENDING_COINS {
+                open.spilled |= !open.needed;
+                let at = open.at;
+                hash.extend(open.pending.drain(..).map(|coin| (at, coin)));
+            }
+        }
+        if self.scan.kept.len() + hash.len() > MAX_WITNESS_SUBTREE_COINS {
+            self.abandon("the wallet's subtrees hold too many coins to keep");
+            return Vec::new();
+        }
+        hash
+    }
+
+    /// Leave the open subtree: hash its coins if one of ours is among them,
+    /// else drop them, with any already hashed.
+    fn close(&mut self, hash: &mut Vec<(usize, ScannedCoin)>) {
+        let Some(open) = self.open.take() else {
+            return;
+        };
+        let at = open.at;
+        if open.needed {
+            hash.extend(open.pending.into_iter().map(|coin| (at, coin)));
+        } else if open.spilled {
+            self.scan.kept.retain(|coin| coin.subtree != at);
+            hash.retain(|(subtree, _)| *subtree != at);
+        }
+    }
+
+    fn abandon(&mut self, reason: &'static str) {
+        self.unusable = Some(reason);
+        self.open = None;
+        self.scan.kept = Vec::new();
+    }
+
+    /// The scan ended: the last subtree's coins to hash.
+    fn finish(&mut self) -> Vec<(usize, ScannedCoin)> {
+        let mut hash = Vec::new();
+        if self.unusable.is_none() {
+            self.close(&mut hash);
+        }
+        hash
+    }
+}
+
+/// Each coin's leaf, off the async runtime: the hash a witness rebuild
+/// places it by.
+async fn hash_kept(
+    key: std::sync::Arc<quil_lattice_ct::confidential::relation::membership::MembershipKey>,
+    batch: Vec<(usize, ScannedCoin)>,
+) -> anyhow::Result<Vec<KeptCoin>> {
+    use quil_lattice_ct::confidential::relation::membership::Node;
+    if batch.is_empty() {
+        return Ok(Vec::new());
+    }
+    tokio::task::spawn_blocking(move || {
+        batch
+            .into_iter()
+            .map(|(subtree, coin)| {
+                let owner = Node::from_identity_bytes(&coin.output.owner)
+                    .map_err(|e| anyhow::anyhow!("scanned owner: {e:?}"))?;
+                Ok(KeptCoin {
+                    subtree,
+                    position: coin.position,
+                    frame: coin.frame,
+                    leaf: key.leaf(&owner, &coin.output.commitment).to_bytes(),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+    })
+    .await?
+}
+
 /// Bounded scan state. A failed page leaves it unchanged; an expired snapshot
 /// requires a fresh scan, never an implicit jump to a new database generation.
 pub(super) struct CoinScan {
@@ -189,6 +556,22 @@ impl ScanReport {
             self.spent_checks
         )
     }
+
+    /// The error ending a scan: which page it could not read and how far it
+    /// got, with the node's own reason. A wallet scan only reads, so nothing
+    /// was lost; the next scan starts over because it needs a fresh snapshot.
+    fn stopped(&self, error: anyhow::Error) -> anyhow::Error {
+        let reason = match error.downcast_ref::<tonic::Status>() {
+            Some(status) => status.message().to_string(),
+            None => format!("{error:#}"),
+        };
+        anyhow::anyhow!(
+            "scan stopped at page {} after {} coins in {} pages: {reason}; a scan only reads, so nothing is lost: run it again",
+            self.pages + 1,
+            self.coins,
+            self.pages
+        )
+    }
 }
 
 impl CoinScan {
@@ -205,54 +588,6 @@ impl CoinScan {
     }
     pub(super) fn finished(&self) -> bool {
         self.finished
-    }
-}
-
-/// Cold witness indexes may need synchronization before a spend can be
-/// prepared. Retry only explicit transient responses, with an overall deadline
-/// that includes individual RPC calls and capped exponential backoff.
-async fn retry_witness_request<T, F, Fut>(
-    timeout: std::time::Duration,
-    mut request: F,
-) -> Result<T, tonic::Status>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, tonic::Status>>,
-{
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut delay = std::time::Duration::from_millis(250);
-    let mut reported = false;
-    loop {
-        let result = tokio::time::timeout_at(deadline, request())
-            .await
-            .map_err(|_| {
-                tonic::Status::deadline_exceeded(
-                    "witness preparation deadline exceeded; retry after synchronization",
-                )
-            })?;
-        match result {
-            Ok(value) => return Ok(value),
-            Err(error)
-                if matches!(
-                    error.code(),
-                    tonic::Code::Unavailable | tonic::Code::ResourceExhausted
-                ) =>
-            {
-                if !reported {
-                    eprintln!("Waiting for the node to prepare spend witnesses...");
-                    reported = true;
-                }
-                tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
-                    .await
-                    .map_err(|_| {
-                        tonic::Status::deadline_exceeded(
-                            "witness preparation deadline exceeded; retry after synchronization",
-                        )
-                    })?;
-                delay = (delay * 2).min(std::time::Duration::from_secs(5));
-            }
-            Err(error) => return Err(error),
-        }
     }
 }
 
@@ -369,7 +704,7 @@ impl RecipientWallet {
         bytes: Vec<u8>,
     ) -> anyhow::Result<()> {
         let (domain, request) = self.prepare_submission(bytes.clone())?;
-        crate::send::send_message_request(client, key_manager, domain, request).await?;
+        crate::send::send_message_request_retrying(client, key_manager, domain, request).await?;
         Ok(())
     }
 
@@ -464,15 +799,20 @@ impl RecipientWallet {
     ) -> anyhow::Result<(bool, Vec<u8>)> {
         let mut address = quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS.to_vec();
         address.extend_from_slice(record);
-        let response = client
-            .clone()
-            .max_decoding_message_size(66_560)
-            .get_vertex_data(quil_types::proto::node::GetVertexDataRequest {
-                address,
-                full_data: true,
-            })
-            .await?
-            .into_inner();
+        let response = retry_scan_read("a record read", || {
+            let mut client = client.clone().max_decoding_message_size(66_560);
+            let address = address.clone();
+            async move {
+                client
+                    .get_vertex_data(quil_types::proto::node::GetVertexDataRequest {
+                        address,
+                        full_data: true,
+                    })
+                    .await
+            }
+        })
+        .await?
+        .into_inner();
         Self::decode_global_record(response)
     }
 
@@ -717,10 +1057,7 @@ impl RecipientWallet {
         // The saved authorization carries the claimed rewards and the fee in
         // the clear: the amount being claimed needs no decryption.
         if let Ok(reward) = mint.statement.total() {
-            println!(
-                "{}",
-                mint_amounts_line("Claiming", reward, mint.statement.fee)
-            );
+            super::output::line(mint_amounts_line("Claiming", reward, mint.statement.fee));
         }
         let receipt = receipt_address(&mint.statement)?;
         let response = client
@@ -734,7 +1071,10 @@ impl RecipientWallet {
             .await?
             .into_inner();
         if response.found {
-            println!("Mint claim cites global frame {}.", response.cited_frame);
+            super::output::line(format!(
+                "Mint claim cites global frame {}.",
+                response.cited_frame
+            ));
         }
         let claim = claim_from_witness(
             &mint.statement,
@@ -1887,29 +2227,44 @@ impl RecipientWallet {
         Ok((statement, relation, refund_recovery))
     }
 
-    pub(super) async fn scan_next(
+    /// The scan's next page, each coin with the position and creation frame
+    /// a private witness rebuild places it by.
+    async fn scan_next_records(
         &self,
         client: &quil_types::proto::node::node_service_client::NodeServiceClient<
             tonic::transport::Channel,
         >,
         scan: &mut CoinScan,
-    ) -> anyhow::Result<Vec<([u8; 32], Output)>> {
+    ) -> anyhow::Result<Vec<ScannedCoin>> {
+        let response = self.list_coins_page(client, scan).await?;
+        self.decode_scan_records(scan, response)
+    }
+
+    async fn list_coins_page(
+        &self,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+            tonic::transport::Channel,
+        >,
+        scan: &CoinScan,
+    ) -> anyhow::Result<quil_types::proto::node::ListCoinsResponse> {
         anyhow::ensure!(
             !scan.finished && scan.remaining_pages > 0,
             "scan ended or page budget exhausted"
         );
-        let response = client
-            .clone()
-            .max_decoding_message_size(quil_types::store::scan_page_bytes(SCAN_PAGE_ENTRIES))
-            .list_coins(quil_types::proto::node::ListCoinsRequest {
+        let response = retry_scan_read("a page", || {
+            let mut client = client
+                .clone()
+                .max_decoding_message_size(quil_types::store::scan_page_bytes(SCAN_PAGE_ENTRIES));
+            let request = quil_types::proto::node::ListCoinsRequest {
                 domain: self.application.to_vec(),
                 snapshot_id: scan.snapshot_id.map(|id| id.to_vec()).unwrap_or_default(),
                 after: scan.after.map(|id| id.to_vec()).unwrap_or_default(),
                 max_coins: SCAN_PAGE_ENTRIES as u32,
-            })
-            .await?
-            .into_inner();
-        self.decode_scan_page(scan, response)
+            };
+            async move { client.list_coins(request).await }
+        })
+        .await?;
+        Ok(response.into_inner())
     }
 
     fn recover_page(&self, page: Vec<([u8; 32], Output)>) -> anyhow::Result<Vec<OwnedCoin>> {
@@ -1965,24 +2320,112 @@ impl RecipientWallet {
         max_owned: usize,
         report: &mut ScanReport,
     ) -> anyhow::Result<Option<Vec<OwnedCoin>>> {
+        self.scan_owned(client, max_pages, max_owned, report, None)
+            .await
+    }
+
+    /// [`Self::scan_unspent`] for a spend: the same single scan also keeps
+    /// what the spend's witnesses need ([`SpendScan`]), so they take no
+    /// second scan. GLOBAL's accumulator is read first; if that read fails,
+    /// the witnesses rescan instead.
+    pub(super) async fn scan_spendable(
+        self: std::sync::Arc<Self>,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+            tonic::transport::Channel,
+        >,
+        max_pages: usize,
+        max_owned: usize,
+    ) -> anyhow::Result<Vec<OwnedCoin>> {
+        *self.prepared.lock().expect("spend scan lock") = None;
+        let collector = match self.read_accumulator(client).await {
+            Ok(accumulator) => Some(SpendScanCollector::new(accumulator, &self.context)),
+            Err(error) => {
+                println!("Spend witnesses will need a second coin scan: {error}.");
+                None
+            }
+        };
+        Ok(self
+            .scan_owned(
+                client,
+                max_pages,
+                max_owned,
+                &mut ScanReport::default(),
+                collector,
+            )
+            .await?
+            .unwrap_or_default())
+    }
+
+    async fn scan_owned(
+        self: std::sync::Arc<Self>,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+            tonic::transport::Channel,
+        >,
+        max_pages: usize,
+        max_owned: usize,
+        report: &mut ScanReport,
+        mut collector: Option<SpendScanCollector>,
+    ) -> anyhow::Result<Option<Vec<OwnedCoin>>> {
         anyhow::ensure!(max_owned > 0, "owned coin limit must be positive");
         let mut scan = CoinScan::new(max_pages)?;
+        // A spend's witness rebuild that must rescan uses the same budget.
+        self.scan_pages
+            .store(max_pages, std::sync::atomic::Ordering::Relaxed);
         let mut unspent = Vec::new();
         while !scan.finished() {
-            let page = self.scan_next(client, &mut scan).await?;
+            let records = self
+                .scan_next_records(client, &mut scan)
+                .await
+                .map_err(|error| report.stopped(error))?;
             report.pages += 1;
-            report.coins += page.len();
-            report.opened += page.len();
+            report.coins += records.len();
+            report.opened += records.len();
+            let (page, records): (Vec<_>, _) = if collector.is_some() {
+                let page = records
+                    .iter()
+                    .map(|coin| (coin.address, coin.output.clone()))
+                    .collect();
+                (page, Some(records))
+            } else {
+                let page = records
+                    .into_iter()
+                    .map(|coin| (coin.address, coin.output))
+                    .collect();
+                (page, None)
+            };
             let wallet = self.clone();
             let owned = tokio::task::spawn_blocking(move || wallet.recover_page(page)).await??;
+            let mut ours = std::collections::HashSet::new();
             for coin in owned {
                 report.spent_checks += 1;
-                if self.is_unspent_hint(client, &coin.image).await? {
+                let unspent_hint = self
+                    .is_unspent_hint(client, &coin.image)
+                    .await
+                    .map_err(|error| report.stopped(error))?;
+                if unspent_hint {
                     anyhow::ensure!(
                         unspent.len() < max_owned,
                         "owned coin limit exceeded; scan incomplete"
                     );
+                    ours.insert(coin.address);
                     unspent.push(coin);
+                }
+            }
+            if let (Some(collector), Some(records)) = (collector.as_mut(), records) {
+                let batch = collector.take_page(records, &ours);
+                let leaves = hash_kept(collector.key.clone(), batch).await?;
+                collector.scan.kept.extend(leaves);
+            }
+        }
+        if let Some(mut collector) = collector.filter(|_| !scan.rootless) {
+            let batch = collector.finish();
+            let leaves = hash_kept(collector.key.clone(), batch).await?;
+            match collector.unusable {
+                Some(reason) => println!("Spend witnesses will need a second coin scan: {reason}."),
+                None => {
+                    collector.scan.kept.extend(leaves);
+                    collector.scan.root = scan.root.clone();
+                    *self.prepared.lock().expect("spend scan lock") = Some(collector.scan);
                 }
             }
         }
@@ -2160,11 +2603,25 @@ impl RecipientWallet {
         Ok(owned)
     }
 
+    /// A page's coins without their placement, as the scan tests check them.
+    #[cfg(test)]
     fn decode_scan_page(
         &self,
         scan: &mut CoinScan,
         response: quil_types::proto::node::ListCoinsResponse,
     ) -> anyhow::Result<Vec<([u8; 32], Output)>> {
+        Ok(self
+            .decode_scan_records(scan, response)?
+            .into_iter()
+            .map(|coin| (coin.address, coin.output))
+            .collect())
+    }
+
+    fn decode_scan_records(
+        &self,
+        scan: &mut CoinScan,
+        response: quil_types::proto::node::ListCoinsResponse,
+    ) -> anyhow::Result<Vec<ScannedCoin>> {
         use quil_lattice_ct::confidential::{coin_tree::RootRecord, AmountCommitment};
         anyhow::ensure!(
             !scan.finished && scan.remaining_pages > 0,
@@ -2274,7 +2731,12 @@ impl RecipientWallet {
                     "scanned coin position does not belong to its address"
                 );
             }
-            coins.push((address, output));
+            coins.push(ScannedCoin {
+                address,
+                output,
+                position: coin.position,
+                frame: coin.frame_number,
+            });
             previous = Some(address);
         }
         scan.snapshot_id = Some(id);
@@ -2285,20 +2747,28 @@ impl RecipientWallet {
         Ok(coins)
     }
 
+    /// This config's wallet: the `q-onion-key` of its keystore. A keystore
+    /// that predates wallet keys (a pre-2.1 node's) receives one first, as
+    /// the node creates it at startup, so the coins of an identity no 2.1
+    /// node runs can still be shielded into its own wallet.
     pub(super) fn load(
         tc: &TokenCtx,
         network: &[u8; 32],
         application: &[u8; 32],
     ) -> anyhow::Result<Self> {
+        ensure_wallet_key(tc)?;
+        let keystore = || crate::keys::describe_keystore(&tc.node_config, &tc.config_dir);
         let secret = Zeroizing::new(
             tc.key_manager
-                .get_secret_key_bytes_by_id("q-onion-key")
-                .map_err(|e| anyhow::anyhow!("q-onion-key secret: {e}"))?,
+                .get_secret_key_bytes_by_id(WALLET_KEY)
+                .map_err(|e| {
+                    anyhow::anyhow!("{WALLET_KEY} secret in keystore {}: {e}", keystore())
+                })?,
         );
         let public = tc
             .key_manager
-            .get_public_key_bytes_by_id("q-onion-key")
-            .map_err(|e| anyhow::anyhow!("q-onion-key public: {e}"))?;
+            .get_public_key_bytes_by_id(WALLET_KEY)
+            .map_err(|e| anyhow::anyhow!("{WALLET_KEY} public in keystore {}: {e}", keystore()))?;
         Self::from_keys(network, application, &public, secret)
     }
     fn from_keys(
@@ -2338,6 +2808,8 @@ impl RecipientWallet {
             kem_secret: secret,
             recipient,
             address,
+            scan_pages: std::sync::atomic::AtomicUsize::new(DEFAULT_SCAN_PAGES),
+            prepared: std::sync::Mutex::new(None),
         })
     }
 
@@ -2348,9 +2820,13 @@ impl RecipientWallet {
             .unwrap_or(0)
     }
 
-    /// Fetch paths for selected public coin records through a bounded RPC and
-    /// check their canonical representation and membership in the returned root.
-    /// Admission still decides whether that root is retained by the network.
+    /// Membership paths for the selected coins against the application's
+    /// canonical root, rebuilt here from public data that names none of them:
+    /// GLOBAL's accumulator records (every reported subtree, read whole) and a
+    /// full coin scan. A node that forwards reads therefore never learns which
+    /// coins a spend consumes. The paths are checked against the root before
+    /// they are returned; admission still decides whether the network retains
+    /// that root.
     pub(super) async fn witnesses(
         &self,
         client: &quil_types::proto::node::node_service_client::NodeServiceClient<
@@ -2374,70 +2850,401 @@ impl RecipientWallet {
                 == coins.len(),
             "duplicate selected coins"
         );
-        let client = client.clone().max_decoding_message_size((1 << 20) - 1);
-        let request = quil_types::proto::node::GetCoinWitnessesRequest {
-            domain: self.application.to_vec(),
-            addresses: coins.iter().map(|(address, _)| address.to_vec()).collect(),
-        };
-        let response = retry_witness_request(std::time::Duration::from_secs(1800), || {
-            let mut client = client.clone();
-            let request = request.clone();
-            async move {
-                client
-                    .get_coin_witnesses(request)
+        let prepared = self.prepared.lock().expect("spend scan lock").take();
+        if let Some(prepared) = prepared {
+            let positions: Vec<Option<u64>> = coins
+                .iter()
+                .map(|(address, _)| prepared.owned.get(address).copied())
+                .collect();
+            if positions.iter().all(Option::is_some) {
+                let (started, kept) = (std::time::Instant::now(), prepared.kept.len());
+                match self
+                    .paths_from_scan(
+                        coins,
+                        positions,
+                        prepared.accumulator,
+                        prepared.lookup,
+                        prepared.root,
+                        prepared.kept,
+                    )
                     .await
-                    .map(tonic::Response::into_inner)
+                {
+                    Ok((root, paths)) => {
+                        self.verify_paths(coins, &root, &paths)?;
+                        println!(
+                            "Spend witnesses rebuilt from the selection scan ({kept} coins under the wallet's subtrees, {:.1} s); the node was not told which coins this spends.",
+                            started.elapsed().as_secs_f64()
+                        );
+                        return Ok((root, paths));
+                    }
+                    Err(error) if error.downcast_ref::<StaleWitness>().is_some() => {
+                        println!("Spend witnesses from the selection scan not ready ({error}).");
+                    }
+                    Err(error) => return Err(error),
+                }
             }
-        })
-        .await?;
-        self.decode_witnesses(coins, response)
+        }
+        println!(
+            "Rebuilding spend witnesses from a full coin scan; the node is not told which coins this spends."
+        );
+        let mut attempt = 1;
+        loop {
+            match self.rebuild_witnesses(client, coins).await {
+                Ok((root, paths)) => {
+                    self.verify_paths(coins, &root, &paths)?;
+                    return Ok((root, paths));
+                }
+                Err(error)
+                    if attempt < WITNESS_ATTEMPTS
+                        && error.downcast_ref::<StaleWitness>().is_some() =>
+                {
+                    println!(
+                        "Spend witnesses not ready ({error}); rescanning, attempt {} of {WITNESS_ATTEMPTS}.",
+                        attempt + 1
+                    );
+                    tokio::time::sleep(WITNESS_RETRY_DELAY).await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
-    fn decode_witnesses(
+    /// GLOBAL's accumulator: every reported subtree at its tree position and
+    /// the canonical root they fold to, read by address without naming a coin.
+    /// `None` when the application has no index (it has never reported, e.g.
+    /// one executed in the global venue).
+    async fn read_accumulator(
         &self,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+            tonic::transport::Channel,
+        >,
+    ) -> anyhow::Result<Option<Accumulator>> {
+        use quil_execution::token_intrinsic::{
+            coin_blocks, global_accumulator as records, shard_accumulator,
+        };
+        use quil_lattice_ct::confidential::coin_tree::RootRecord;
+        let (present, blob) = self
+            .global_record(client, &records::index_address(&self.application)?)
+            .await?;
+        let Some((context, index)) = present
+            .then(|| records::decode_index_record(&blob))
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            context == self.context,
+            "accumulator index context mismatch"
+        );
+        let mut subtrees = Vec::with_capacity(index.len());
+        let mut placed = Vec::with_capacity(index.len());
+        for (width, shard) in index {
+            let (present, blob) = self
+                .global_record(
+                    client,
+                    &records::subtree_address(&self.application, width, &shard)?,
+                )
+                .await?;
+            let Some((coins, root)) = present
+                .then(|| records::decode_subtree_record(&blob))
+                .transpose()?
+                .flatten()
+            else {
+                return Err(
+                    StaleWitness("an indexed accumulator subtree has no record".into()).into(),
+                );
+            };
+            let (level, index) = shard_accumulator::subtree_position(width, &shard)?;
+            placed.push((width, shard, root.clone()));
+            subtrees.push(ReportedSubtree {
+                level,
+                index,
+                coins,
+                root,
+            });
+        }
+        let (present, blob) = self
+            .global_record(client, &records::root_history_address(&self.application)?)
+            .await?;
+        let current = present
+            .then(|| records::decode_root_history_record(&blob, &self.context))
+            .transpose()?
+            .flatten()
+            .ok_or_else(|| StaleWitness("the accumulator has no published root yet".into()))?;
+        let coins = subtrees
+            .iter()
+            .try_fold(0u64, |total, subtree| total.checked_add(subtree.coins))
+            .ok_or_else(|| anyhow::anyhow!("accumulator coin count overflow"))?;
+        let root = RootRecord {
+            context: self.context,
+            depth: coin_blocks::DEPTH,
+            coins,
+            root: shard_accumulator::fold_application_root(&self.context, &placed)?,
+        };
+        // The records were read one at a time; a report materialized between
+        // reads shows here as a fold that is not the published root.
+        if root != current {
+            return Err(
+                StaleWitness("the accumulator records changed while being read".into()).into(),
+            );
+        }
+        Ok(Some(Accumulator { subtrees, root }))
+    }
+
+    /// One rebuild: read the accumulator, then scan every coin, keeping only
+    /// those under a subtree some selected coin's address could sit in, and
+    /// rebuild each selected coin's subtree from the coins its report covers.
+    async fn rebuild_witnesses(
+        &self,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+            tonic::transport::Channel,
+        >,
         coins: &[([u8; 32], &Output)],
-        response: quil_types::proto::node::GetCoinWitnessesResponse,
     ) -> anyhow::Result<(
         quil_lattice_ct::confidential::coin_tree::RootRecord,
         Vec<quil_lattice_ct::confidential::coin_tree::AuthPath>,
     )> {
-        use quil_lattice_ct::confidential::{
-            coin_tree::{AuthPath, RootRecord},
-            relation::membership::{MembershipKey, Node},
-        };
-        anyhow::ensure!(
-            response.network.as_slice() == self.network.as_slice(),
-            "witness network mismatch"
-        );
-        let root = RootRecord::decode(&response.root_record, &self.context)
-            .map_err(|e| anyhow::anyhow!("witness root: {e:?}"))?;
-        anyhow::ensure!(
-            response.witnesses.len() == coins.len(),
-            "witness count mismatch"
-        );
-        let key = MembershipKey::derive(&self.context);
-        let mut paths = Vec::with_capacity(coins.len());
-        for ((address, output), witness) in coins.iter().zip(response.witnesses) {
+        use quil_lattice_ct::confidential::relation::membership::MembershipKey;
+        let started = std::time::Instant::now();
+        // Read before the scan, so the scanned snapshot holds every coin these
+        // reports cover; a scan answered from an older snapshot is retried.
+        let accumulator = self.read_accumulator(client).await?;
+        let lookup = accumulator.as_ref().map(Accumulator::lookup);
+        let candidates: std::collections::BTreeSet<usize> = accumulator
+            .as_ref()
+            .map(|accumulator| {
+                (0..accumulator.subtrees.len())
+                    .filter(|&i| {
+                        coins
+                            .iter()
+                            .any(|(address, _)| accumulator.subtrees[i].may_hold(address))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let key = std::sync::Arc::new(MembershipKey::derive(&self.context));
+        let mut scan = CoinScan::new(self.scan_pages.load(std::sync::atomic::Ordering::Relaxed))?;
+        let mut found: Vec<Option<(u64, u64)>> = vec![None; coins.len()];
+        let mut kept: Vec<KeptCoin> = Vec::new();
+        let (mut pages, mut scanned) = (0usize, 0usize);
+        while !scan.finished() {
+            let page = self.scan_next_records(client, &mut scan).await?;
+            pages += 1;
+            scanned += page.len();
+            let mut batch = Vec::new();
+            for coin in page {
+                if let Some(i) = coins
+                    .iter()
+                    .position(|(address, _)| *address == coin.address)
+                {
+                    let output = coins[i].1;
+                    anyhow::ensure!(
+                        coin.output.owner == output.owner
+                            && coin.output.commitment == output.commitment,
+                        "the scan's record of a selected coin differs from the wallet's"
+                    );
+                    found[i] = Some((coin.position, coin.frame));
+                }
+                let subtree = match &lookup {
+                    Some(lookup) => match lookup.find(coin.position) {
+                        Some(subtree) if candidates.contains(&subtree) => subtree,
+                        _ => continue,
+                    },
+                    // No index: the whole application is one tree.
+                    None => 0,
+                };
+                batch.push((subtree, coin));
+            }
             anyhow::ensure!(
-                witness.address.as_slice() == address.as_slice() && witness.found,
-                "selected coin missing or mismatched"
+                kept.len() + batch.len() <= MAX_WITNESS_SUBTREE_COINS,
+                "the selected coins' subtrees hold more than {MAX_WITNESS_SUBTREE_COINS} coins"
             );
+            kept.extend(hash_kept(key.clone(), batch).await?);
+        }
+        anyhow::ensure!(!scan.rootless, "the application holds no confidential coin");
+        let kept_coins = kept.len();
+        let (root, paths) = self
+            .paths_from_scan(
+                coins,
+                found
+                    .into_iter()
+                    .map(|found| found.map(|(position, _)| position))
+                    .collect(),
+                accumulator,
+                lookup,
+                scan.root.clone(),
+                kept,
+            )
+            .await?;
+        println!(
+            "spend witnesses: {pages} scan pages, {scanned} coins, {kept_coins} under the inputs' subtrees, {:.1} s",
+            started.elapsed().as_secs_f64()
+        );
+        Ok((root, paths))
+    }
+
+    /// The selected coins' paths from a scan's kept coins: rebuild each
+    /// selected coin's subtree from the coins its report covers, check it
+    /// against the report, and append the fold over the other reports.
+    /// `positions` holds each selected coin's scanned position; without an
+    /// accumulator the scan's root covers one tree of every kept coin.
+    async fn paths_from_scan(
+        &self,
+        coins: &[([u8; 32], &Output)],
+        positions: Vec<Option<u64>>,
+        accumulator: Option<Accumulator>,
+        lookup: Option<SubtreeLookup>,
+        scan_root: Option<quil_lattice_ct::confidential::coin_tree::RootRecord>,
+        kept: Vec<KeptCoin>,
+    ) -> anyhow::Result<(
+        quil_lattice_ct::confidential::coin_tree::RootRecord,
+        Vec<quil_lattice_ct::confidential::coin_tree::AuthPath>,
+    )> {
+        use quil_execution::token_intrinsic::coin_blocks;
+        use quil_lattice_ct::confidential::{
+            coin_tree::AuthPath, relation::membership::Node, sharded_tree,
+        };
+        let mut placed = Vec::with_capacity(coins.len());
+        for (i, found) in positions.into_iter().enumerate() {
+            let Some(position) = found else {
+                return Err(StaleWitness(format!(
+                    "selected coin {} is not in the scanned snapshot",
+                    hex::encode(coins[i].0)
+                ))
+                .into());
+            };
+            let subtree = match &lookup {
+                Some(lookup) => lookup.find(position).ok_or_else(|| {
+                    StaleWitness("no shard has reported the subtree a selected coin is in".into())
+                })?,
+                None => 0,
+            };
+            placed.push((subtree, position));
+        }
+        let whole_tree = accumulator.is_none();
+        let (root, subtrees) = match accumulator {
+            Some(accumulator) => (accumulator.root, accumulator.subtrees),
+            None => {
+                let root = scan_root.ok_or_else(|| anyhow::anyhow!("the scan carried no root"))?;
+                let whole = ReportedSubtree {
+                    level: usize::from(root.depth),
+                    index: 0,
+                    coins: root.coins,
+                    root: root.root.clone(),
+                };
+                (root, vec![whole])
+            }
+        };
+        let context = self.context;
+        let paths = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<AuthPath>> {
+            let fold_nodes: Vec<_> = subtrees
+                .iter()
+                .map(|subtree| (subtree.level, subtree.index, subtree.root.clone()))
+                .collect();
+            let mut paths: Vec<Option<AuthPath>> = placed.iter().map(|_| None).collect();
+            let wanted: std::collections::BTreeSet<usize> =
+                placed.iter().map(|(subtree, _)| *subtree).collect();
+            for subtree_at in wanted {
+                let subtree = &subtrees[subtree_at];
+                let mask = (1u64 << subtree.level) - 1;
+                let members: Vec<KeptCoin> = kept
+                    .iter()
+                    .filter(|coin| coin.subtree == subtree_at)
+                    .cloned()
+                    .collect();
+                let covered = covered_coins(members, subtree.coins)?;
+                let leaves = covered
+                    .iter()
+                    .map(|coin| {
+                        Node::from_bytes(&coin.leaf)
+                            .map(|leaf| (coin.position & mask, leaf))
+                            .map_err(|e| anyhow::anyhow!("kept leaf: {e:?}"))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let targets: Vec<(usize, u64)> = placed
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (at, _))| *at == subtree_at)
+                    .map(|(i, (_, position))| (i, position & mask))
+                    .collect();
+                if targets
+                    .iter()
+                    .any(|(_, local)| leaves.binary_search_by_key(local, |(at, _)| *at).is_err())
+                {
+                    return Err(StaleWitness(
+                        "a selected coin is newer than its subtree's report".into(),
+                    )
+                    .into());
+                }
+                let locals: Vec<u64> = targets.iter().map(|(_, local)| *local).collect();
+                let (rebuilt, inner) =
+                    sharded_tree::subtree_paths(&context, subtree.level, &leaves, &locals)
+                        .map_err(|e| anyhow::anyhow!("subtree rebuild: {e:?}"))?;
+                if rebuilt != subtree.root {
+                    return Err(StaleWitness(
+                        "the scanned coins do not rebuild their subtree's reported root".into(),
+                    )
+                    .into());
+                }
+                // The whole application rebuilt as one tree needs no fold.
+                let fold = if whole_tree {
+                    AuthPath {
+                        siblings: Vec::new(),
+                        right: Vec::new(),
+                    }
+                } else {
+                    sharded_tree::fold_sparse_auth_path(
+                        &context,
+                        usize::from(coin_blocks::DEPTH),
+                        &fold_nodes,
+                        (subtree.level, subtree.index),
+                    )
+                    .map_err(|e| anyhow::anyhow!("fold path: {e:?}"))?
+                };
+                for ((i, _), mut path) in targets.into_iter().zip(inner) {
+                    path.siblings.extend(fold.siblings.iter().cloned());
+                    path.right.extend(fold.right.iter().copied());
+                    paths[i] = Some(path);
+                }
+            }
+            paths
+                .into_iter()
+                .map(|path| {
+                    path.ok_or_else(|| anyhow::anyhow!("selected coin left without a path"))
+                })
+                .collect()
+        })
+        .await??;
+        Ok((root, paths))
+    }
+
+    /// Check each selected coin's path leads from its committed leaf to `root`
+    /// at the root's depth.
+    fn verify_paths(
+        &self,
+        coins: &[([u8; 32], &Output)],
+        root: &quil_lattice_ct::confidential::coin_tree::RootRecord,
+        paths: &[quil_lattice_ct::confidential::coin_tree::AuthPath],
+    ) -> anyhow::Result<()> {
+        use quil_lattice_ct::confidential::relation::membership::{MembershipKey, Node};
+        anyhow::ensure!(
+            root.context == self.context,
+            "witness root context mismatch"
+        );
+        anyhow::ensure!(paths.len() == coins.len(), "witness count mismatch");
+        let key = MembershipKey::derive(&self.context);
+        for ((_, output), path) in coins.iter().zip(paths) {
             anyhow::ensure!(
-                witness.siblings.len() == usize::from(root.depth)
-                    && witness.right.len() == usize::from(root.depth),
+                path.siblings.len() == usize::from(root.depth)
+                    && path.right.len() == usize::from(root.depth),
                 "witness depth mismatch"
             );
-            let siblings = witness
-                .siblings
-                .iter()
-                .map(|bytes| {
-                    Node::from_bytes(bytes).map_err(|e| anyhow::anyhow!("witness node: {e:?}"))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
             let owner = Node::from_identity_bytes(&output.owner)
                 .map_err(|e| anyhow::anyhow!("coin owner: {e:?}"))?;
             let mut node = key.leaf(&owner, &output.commitment);
-            for (sibling, &right) in siblings.iter().zip(&witness.right) {
+            for (sibling, &right) in path.siblings.iter().zip(&path.right) {
                 node = if right {
                     key.parent(sibling, &node)
                 } else {
@@ -2448,12 +3255,8 @@ impl RecipientWallet {
                 node == root.root,
                 "witness does not authenticate selected coin"
             );
-            paths.push(AuthPath {
-                siblings,
-                right: witness.right,
-            });
         }
-        Ok((root, paths))
+        Ok(())
     }
 
     pub(super) fn address(&self) -> &RecipientAddress {
@@ -2525,28 +3328,28 @@ pub(super) async fn quoted_quil_fee_for_cost(
     let policy = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(
         tc.node_config.p2p.network,
     );
-    let quote = tc
-        .connect_submit()
-        .await?
-        .get_token_fee_quote(quil_types::proto::node::GetTokenFeeQuoteRequest {
+    let quote = crate::retry::quote(
+        &tc.connect_submit().await?,
+        quil_types::proto::node::GetTokenFeeQuoteRequest {
             application: quil_execution::domains::QUIL_TOKEN.to_vec(),
             max_payload_bytes: cost,
             global_venue,
-        })
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "fee estimate unavailable from the configured node: {e}; provide an explicit --fee"
-            )
-        })?
-        .into_inner();
+        },
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "fee estimate unavailable from the configured node: {e}; provide an explicit --fee"
+        )
+    })?
+    .into_inner();
     anyhow::ensure!(
         !global_venue || quote.global_execution,
         "global venue fee quote was not priced for global execution"
     );
     let charge = checked_quil_fee_quote(&quote, &policy.network, cost)?;
     let fee = with_fee_headroom(charge)?;
-    println!("Estimated fee: {fee} base units for {cost} bytes of state growth (snapshot frame {}; {charge} at the snapshot plus {AUTOMATIC_FEE_HEADROOM_PERCENT}% for fee-vote movement before inclusion).", quote.observed_frame);
+    super::output::line(format!("Estimated fee: {fee} base units for {cost} bytes of state growth (snapshot frame {}; {charge} at the snapshot plus {AUTOMATIC_FEE_HEADROOM_PERCENT}% for fee-vote movement before inclusion).", quote.observed_frame));
     check_automatic_fee("estimated fee", fee, tc.max_fee)?;
     Ok(fee)
 }
@@ -2642,8 +3445,13 @@ fn checked_quil_fee_quote(
         .map_err(|_| anyhow::anyhow!("fee exceeds the token amount range"))
 }
 
-/// Refresh an available venue quote after proving. Unavailable venue quotes
-/// leave explicit-fee submission possible; they do not certify affordability.
+/// Refresh an available venue quote after proving. A finished proof is never
+/// thrown away for a quote the node cannot give now: busy (retried first),
+/// unavailable, unsupported, slow or interrupted leave submission possible
+/// with the supplied fee, which the node validates; they do not certify
+/// affordability. The node's refusals of the request (invalid, failed
+/// precondition, internal, unauthenticated) and a quote that shows the fee
+/// moved ([`FeeMoved`]) fail.
 #[cfg(feature = "native-proof")]
 async fn refresh_submission_fee(
     tc: &TokenCtx,
@@ -2661,31 +3469,83 @@ async fn refresh_submission_fee(
         return Ok(());
     }
     let cost = cost::state_growth(bytes)?;
-    let quote = match client
-        .get_token_fee_quote(quil_types::proto::node::GetTokenFeeQuoteRequest {
+    let policy = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(
+        tc.node_config.p2p.network,
+    );
+    refresh_fee_quote(
+        client,
+        &policy.network,
+        application,
+        cost,
+        // Reward mint authorizations execute in the global venue.
+        tp == quil_execution::token_intrinsic::constants::TYPE_LATTICE_MINT,
+        wire::fee(bytes)?,
+    )
+    .await
+}
+
+/// Quote `cost` bytes of growth for `application` and check that `paid`
+/// still covers it.
+#[cfg(feature = "native-proof")]
+async fn refresh_fee_quote(
+    client: &mut quil_types::proto::node::node_service_client::NodeServiceClient<
+        tonic::transport::Channel,
+    >,
+    network: &[u8; 32],
+    application: [u8; 32],
+    cost: u64,
+    global_venue: bool,
+    paid: u128,
+) -> anyhow::Result<()> {
+    let quote = match crate::retry::quote(
+        client,
+        quil_types::proto::node::GetTokenFeeQuoteRequest {
             application: application.to_vec(),
             max_payload_bytes: cost,
-            // Reward mint authorizations execute in the global venue.
-            global_venue: tp == quil_execution::token_intrinsic::constants::TYPE_LATTICE_MINT,
-        })
-        .await
+            global_venue,
+        },
+    )
+    .await
     {
         Ok(response) => response.into_inner(),
-        Err(error)
-            if matches!(
-                error.code(),
-                tonic::Code::Unavailable | tonic::Code::Unimplemented
-            ) =>
-        {
-            println!("Fee refresh unavailable; submitting the supplied fee for node validation.");
+        Err(error) if crate::retry::cannot_quote(error.code()) => {
+            super::output::line(format!(
+                "Fee refresh unavailable ({}); submitting the supplied fee for node validation.",
+                error.code()
+            ));
             return Ok(());
         }
         Err(error) => return Err(error.into()),
     };
-    let policy = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(
-        tc.node_config.p2p.network,
-    );
-    check_submission_fee_quote(&quote, &policy.network, cost, wire::fee(bytes)?)
+    check_submission_fee_quote(&quote, network, cost, paid)
+}
+
+/// The fee a finished proof carries no longer covers a fresh quote. Only this
+/// failure is answered by quoting again and proving again.
+#[cfg(feature = "native-proof")]
+#[derive(Debug)]
+struct FeeMoved(String);
+
+#[cfg(feature = "native-proof")]
+impl std::fmt::Display for FeeMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(feature = "native-proof")]
+impl std::error::Error for FeeMoved {}
+
+/// Rebuilds (and re-proofs) a command makes after the fee moved.
+#[cfg(feature = "native-proof")]
+const FEE_REBUILDS: usize = 3;
+
+/// Whether to prove again after `error` on the `attempt`th build: only when an
+/// automatic fee was quoted and a fresh quote shows it moved. A failed or
+/// refused quote never costs a second proof.
+#[cfg(feature = "native-proof")]
+fn fee_moved_rebuild(requested_fee: Option<u128>, attempt: usize, error: &anyhow::Error) -> bool {
+    requested_fee.is_none() && attempt < FEE_REBUILDS && error.is::<FeeMoved>()
 }
 
 #[cfg(feature = "native-proof")]
@@ -2696,8 +3556,11 @@ fn check_submission_fee_quote(
     paid: u128,
 ) -> anyhow::Result<()> {
     let required = checked_quil_fee_quote(quote, network, cost)?;
-    anyhow::ensure!(paid >= required,
-        "fee changed while preparing transaction: supplied {paid}, snapshot requires {required} for {cost} bytes of state growth; rebuild with an adequate --fee");
+    if paid < required {
+        return Err(anyhow::Error::new(FeeMoved(format!(
+            "fee changed while preparing transaction: supplied {paid}, snapshot requires {required} for {cost} bytes of state growth; rebuild with an adequate --fee"
+        ))));
+    }
     Ok(())
 }
 
@@ -2750,6 +3613,43 @@ fn parse_recipient(value: &str, context: &[u8; 32]) -> anyhow::Result<RecipientA
         context,
     )
     .map_err(|e| anyhow::anyhow!("recipient address: {e:?}"))
+}
+
+/// The keystore entry holding a config's wallet key (sntrup761).
+const WALLET_KEY: &str = "q-onion-key";
+
+/// Create the wallet key in a keystore that has none. Only a keystore with
+/// a key that decrypts with the config's `encryptionKey` receives it: a
+/// missing or empty file most likely means a wrong `keyManagerFile.path`,
+/// and a key there would start a wallet nobody backs up. An existing key is
+/// never replaced, even one that does not decrypt.
+fn ensure_wallet_key(tc: &TokenCtx) -> anyhow::Result<()> {
+    if tc
+        .key_manager
+        .public_key_by_id(WALLET_KEY)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let keystore = crate::keys::describe_keystore(&tc.node_config, &tc.config_dir);
+    anyhow::ensure!(
+        crate::keys::keystore_access(&tc.key_manager) == crate::keys::KeystoreAccess::Readable,
+        "keystore {keystore} holds no {WALLET_KEY} wallet key, and no key that decrypts with \
+         key.keyManagerFile.encryptionKey of this config to show it is this config's \
+         keystore; qclient creates a wallet key only there: check key.keyManagerFile.path"
+    );
+    tc.key_manager
+        .create_agreement_key(WALLET_KEY, 9)
+        .map_err(|e| {
+            anyhow::anyhow!("create the {WALLET_KEY} wallet key in keystore {keystore}: {e}")
+        })?;
+    eprintln!(
+        "Created {WALLET_KEY}, the wallet key of this config, in keystore {keystore}, which \
+         predates wallet keys. Coins shielded or sent to this wallet can be spent only with this \
+         keys.yml and that config's encryptionKey: back up both."
+    );
+    Ok(())
 }
 
 /// The keystore Falcon key used as escrow and reward authority.
@@ -2889,9 +3789,9 @@ pub(super) async fn run_balance(
     }
     let network =
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
-    // An unreachable node or a keystore without wallet keys (a pre-2.1 node's)
-    // fails only the lines that need them; the unreachable node's own error,
-    // which names it and the fix, ends the output.
+    // An unreachable node or an unusable wallet key fails only the lines that
+    // need them; the unreachable node's own error, which names it and the
+    // fix, ends the output.
     let client = tc.connect().await;
     let unreachable = || anyhow::anyhow!("the node did not answer; see the error below");
     // Each phase's cost goes to stderr: a slow balance shows where it went.
@@ -3037,14 +3937,13 @@ pub(super) async fn run_transfer(
     let recipient = parse_recipient(recipient, &wallet.context)?;
     let limits = compile_limits();
     let mut client = tc.connect().await?;
-    const FEE_REBUILDS: usize = 3;
     let mut attempt = 0usize;
     let bytes = loop {
         attempt += 1;
         let fee = transfer_fee(tc, &application, requested_fee, limits.max_inputs).await?;
         let coins = wallet
             .clone()
-            .scan_unspent(&client, max_pages, max_coins)
+            .scan_spendable(&client, max_pages, max_coins)
             .await?;
         let (selected, change) = select_coins(coins, amount, fee, limits.max_inputs)?;
         let mut destinations = vec![(recipient.clone(), amount)];
@@ -3067,7 +3966,7 @@ pub(super) async fn run_transfer(
             .await?;
         match refresh_submission_fee(tc, &mut client, &bytes).await {
             Ok(()) => break bytes,
-            Err(error) if requested_fee.is_none() && attempt < FEE_REBUILDS => {
+            Err(error) if fee_moved_rebuild(requested_fee, attempt, &error) => {
                 println!("The fee moved while preparing the transfer ({error}); re-quoting and rebuilding.");
             }
             Err(error) => return Err(error),
@@ -3144,7 +4043,6 @@ pub(super) async fn run_pay(
     // larger one is answered with the price the refresh just reported, by
     // re-quoting and rebuilding rather than making the caller retry by hand.
     // An explicit fee is exact by contract and is never re-quoted.
-    const FEE_REBUILDS: usize = 3;
     let (bytes, fee) = {
         let mut attempt = 0usize;
         loop {
@@ -3168,7 +4066,7 @@ pub(super) async fn run_pay(
                 .ok_or_else(|| anyhow::anyhow!("payment exceeds the token amount range"))?;
             let coins = wallet
                 .clone()
-                .scan_unspent(&client, max_pages, max_coins)
+                .scan_spendable(&client, max_pages, max_coins)
                 .await?;
             let (selected, change) =
                 select_coins(coins, amount, fee_and_payment, limits.max_inputs)?;
@@ -3195,7 +4093,7 @@ pub(super) async fn run_pay(
                 .await?;
             match refresh_submission_fee(tc, &mut client, &bytes).await {
                 Ok(()) => break (bytes, fee),
-                Err(error) if requested_fee.is_none() && attempt < FEE_REBUILDS => {
+                Err(error) if fee_moved_rebuild(requested_fee, attempt, &error) => {
                     println!("The fee moved while proving ({error}); re-quoting and rebuilding.");
                 }
                 Err(error) => return Err(error),
@@ -3209,7 +4107,7 @@ pub(super) async fn run_pay(
     )?;
     wallet
         .submit(
-            &mut tc.connect_submit().await?,
+            &mut crate::retry::connect(|| tc.connect_submit()).await?,
             &tc.submit_key_manager,
             bytes,
         )
@@ -3513,20 +4411,14 @@ pub(super) async fn pay_for_bundle(
     // An application no shard covers (and a deploy's base domain) executes in
     // the global venue; a node that does not quote that venue for the
     // application still quotes global pricing directly.
-    let quote = match tc
-        .connect()
-        .await?
-        .get_token_fee_quote(request(false))
-        .await
-    {
+    let quote = match crate::retry::quote(&tc.connect().await?, request(false)).await {
         Ok(quote) => quote.into_inner(),
-        Err(status) if status.code() == tonic::Code::Unavailable => tc
-            .connect()
-            .await?
-            .get_token_fee_quote(request(true))
-            .await
-            .map_err(|e| anyhow::anyhow!("destination fee quote unavailable: {e}"))?
-            .into_inner(),
+        Err(status) if status.code() == tonic::Code::Unavailable => {
+            crate::retry::quote(&tc.connect().await?, request(true))
+                .await
+                .map_err(|e| anyhow::anyhow!("destination fee quote unavailable: {e}"))?
+                .into_inner()
+        }
         Err(status) => anyhow::bail!("destination fee quote unavailable: {status}"),
     };
     anyhow::ensure!(
@@ -3663,7 +4555,7 @@ async fn submit_refreshed_operation(
     if wallet.application == quil_execution::domains::QUIL_TOKEN {
         return wallet
             .submit(
-                &mut tc.connect_submit().await?,
+                &mut crate::retry::connect(|| tc.connect_submit()).await?,
                 &tc.submit_key_manager,
                 bytes,
             )
@@ -3715,7 +4607,7 @@ async fn submit_paid_operation(
         timestamp,
     };
     crate::send::send_to_venue(
-        &mut tc.connect_submit().await?,
+        &mut crate::retry::connect(|| tc.connect_submit()).await?,
         &tc.submit_key_manager,
         domain,
         global_execution,
@@ -3802,15 +4694,20 @@ pub(super) async fn settlement_claim(
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let deadline = std::time::Instant::now() + wait;
     loop {
-        let response = tc
-            .connect()
-            .await?
-            .get_mint_authorization_witness(
-                quil_types::proto::node::GetMintAuthorizationWitnessRequest {
-                    receipt: receipt.to_vec(),
-                },
-            )
-            .await;
+        // The settlement is paid and the wait has its own deadline, so a
+        // failed connection is as transient here as an unavailable node.
+        let response = match tc.connect().await {
+            Ok(mut client) => {
+                client
+                    .get_mint_authorization_witness(
+                        quil_types::proto::node::GetMintAuthorizationWitnessRequest {
+                            receipt: receipt.to_vec(),
+                        },
+                    )
+                    .await
+            }
+            Err(error) => Err(tonic::Status::unavailable(format!("{error:#}"))),
+        };
         match response {
             Ok(witness) => {
                 let witness = witness.into_inner();
@@ -3861,7 +4758,7 @@ pub(super) async fn settlement_claim(
                     return Ok(claim.encode()?);
                 }
             }
-            Err(status) if matches!(status.code(), tonic::Code::Unavailable) => {}
+            Err(status) if crate::retry::transient(status.code()) => {}
             Err(status) => return Err(anyhow::anyhow!("settlement witness: {status}")),
         }
         anyhow::ensure!(
@@ -3897,7 +4794,7 @@ pub(super) async fn run_split(
     let mut client = tc.connect().await?;
     let coins = wallet
         .clone()
-        .scan_unspent(&client, max_pages, max_coins)
+        .scan_spendable(&client, max_pages, max_coins)
         .await?;
     let source = coins
         .into_iter()
@@ -3952,7 +4849,7 @@ pub(super) async fn run_merge(
     let mut client = tc.connect().await?;
     let owned = wallet
         .clone()
-        .scan_unspent(&client, max_pages, max_coins)
+        .scan_spendable(&client, max_pages, max_coins)
         .await?;
     let (selected, total) = merge_selection(owned, &requested, limits.max_inputs)?;
     let merged = total
@@ -4020,7 +4917,7 @@ pub(super) async fn run_pending_create(
     };
     let coins = wallet
         .clone()
-        .scan_unspent(&client, max_pages, max_coins)
+        .scan_spendable(&client, max_pages, max_coins)
         .await?;
     let (selected, change) = select_coins(coins, amount, fee, limits.max_inputs)?;
     let escrow = EscrowDestination {
@@ -4072,51 +4969,147 @@ fn mint_amounts_line(verb: &str, reward: u128, fee: u128) -> String {
     )
 }
 
-/// Two-stage QUIL reward mint. Without `--claim`, discover this prover's reward,
-/// prove and submit the global authorization, and save its bytes for the claim
-/// stage. With `--claim <file>`, build the application claim from the finalized
-/// authorization and submit it. Delivery is not finality at either stage.
+/// What a reward mint reports as it goes. The CLI prints
+/// [`MintEvent::cli_line`]; the node manager shows the events itself.
 #[cfg(feature = "native-proof")]
-pub(super) async fn run_mint(
-    tc: &TokenCtx,
-    recipient: Option<&str>,
-    fee: u128,
-    claim: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
-    use quil_types::crypto::Signer;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MintEvent {
+    /// The authorization's reward and fee.
+    Amounts { reward: u128, fee: u128 },
+    /// Proving the authorization.
+    Proving,
+    /// The authorization was delivered and its bytes saved for the claim.
+    Submitted {
+        cited_frame: u64,
+        saved: std::path::PathBuf,
+    },
+    /// A claim was delivered.
+    Claimed,
+}
+
+#[cfg(feature = "native-proof")]
+impl MintEvent {
+    /// The line `token mint` prints for the event, if any.
+    pub(crate) fn cli_line(&self) -> Option<String> {
+        Some(match self {
+            Self::Amounts { reward, fee } => mint_amounts_line("Minting", *reward, *fee),
+            Self::Proving => return None,
+            Self::Submitted { cited_frame, saved } => format!(
+                "Confidential reward mint authorization submitted for global frame {cited_frame}. Once it is finalized, run `token mint --claim {}` to create the coins.",
+                saved.display()
+            ),
+            Self::Claimed => {
+                "Confidential mint claim submitted. Finalized inclusion is not yet confirmed."
+                    .into()
+            }
+        })
+    }
+}
+
+/// The fee a reward mint pays out of the minted amount: `explicit`, or the
+/// global venue's quote for one coin and the receipt marker.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn reward_mint_fee(tc: &TokenCtx, explicit: Option<u128>) -> anyhow::Result<u128> {
+    // Reward mints execute in the global venue: quote its pricing.
+    quoted_quil_fee(
+        tc,
+        explicit,
+        quil_execution::token_intrinsic::cost::Shape {
+            coins: 1,
+            markers: 1,
+            escrow: false,
+        },
+        true,
+    )
+    .await
+}
+
+/// This prover's reward, read and checked against its GLOBAL root, ready
+/// to authorize as one mint less `fee`.
+#[cfg(feature = "native-proof")]
+pub(crate) struct MintPlan {
+    pub cited_frame: u64,
+    pub reward: u128,
+    pub fee: u128,
+    reward_root: [u8; 32],
+    claim: quil_lattice_ct::confidential::mint::RewardClaim,
+    signer: std::sync::Arc<quil_crypto::FalconSigner>,
+    wallet: std::sync::Arc<RecipientWallet>,
+    client:
+        quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
+}
+
+#[cfg(feature = "native-proof")]
+impl MintPlan {
+    /// The wallet address the mint pays by default, in hex.
+    pub(crate) fn own_address(&self) -> String {
+        format!("0x{}", hex::encode(self.wallet.address().encode()))
+    }
+}
+
+/// Read this prover's claimable reward for a mint paying `fee`.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn plan_mint(tc: &TokenCtx, fee: u128) -> anyhow::Result<MintPlan> {
     let application = quil_execution::domains::QUIL_TOKEN;
     let network =
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &application)?);
-    let mut client = tc.connect().await?;
-    if let Some(path) = claim {
-        let mint_bytes = std::fs::read(path)?;
-        let bytes = wallet.create_mint_claim(&client, &mint_bytes).await?;
-        submit_operation(tc, &wallet, &mut client, bytes).await?;
-        println!("Confidential mint claim submitted. Finalized inclusion is not yet confirmed.");
-        return Ok(());
-    }
+    let client = tc.connect().await?;
     let signer = falcon_signer(tc)?;
-    let (cited_frame, reward_root, reward) = wallet.reward_claim(&client, signer.as_ref()).await?;
-    let value = reward
+    let (cited_frame, reward_root, claim) = wallet.reward_claim(&client, signer.as_ref()).await?;
+    claim
         .value
         .checked_sub(fee)
         .filter(|value| *value > 0)
         .ok_or_else(|| anyhow::anyhow!("claimable reward must exceed the fee"))?;
-    println!("{}", mint_amounts_line("Minting", reward.value, fee));
+    Ok(MintPlan {
+        cited_frame,
+        reward: claim.value,
+        fee,
+        reward_root,
+        claim,
+        signer,
+        wallet,
+        client,
+    })
+}
+
+/// Prove and submit `plan`'s authorization to `recipient` (default: this
+/// wallet), saving its bytes for the claim stage as
+/// `mint-<cited frame>.bin` in the config directory.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn execute_mint(
+    tc: &TokenCtx,
+    plan: MintPlan,
+    recipient: Option<&str>,
+    mut on_event: impl FnMut(MintEvent),
+) -> anyhow::Result<()> {
+    use quil_types::crypto::Signer;
+    let MintPlan {
+        cited_frame,
+        reward,
+        fee,
+        reward_root,
+        claim,
+        signer,
+        wallet,
+        mut client,
+    } = plan;
+    on_event(MintEvent::Amounts { reward, fee });
     let recipient = match recipient {
         Some(recipient) => parse_recipient(recipient, &wallet.context)?,
         None => wallet.address().clone(),
     };
     let signer: std::sync::Arc<dyn Signer> = signer;
+    on_event(MintEvent::Proving);
     let bytes = wallet
         .clone()
         .create_mint(
             cited_frame,
             reward_root,
-            vec![reward],
+            vec![claim],
             vec![signer],
-            vec![(recipient, value)],
+            vec![(recipient, reward - fee)],
             fee,
             1,
             1,
@@ -4126,8 +5119,151 @@ pub(super) async fn run_mint(
     let saved = tc.config_dir.join(format!("mint-{cited_frame}.bin"));
     std::fs::write(&saved, &bytes)?;
     submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential reward mint authorization submitted for global frame {cited_frame}. Once it is finalized, run `token mint --claim {}` to create the coins.", saved.display());
+    on_event(MintEvent::Submitted { cited_frame, saved });
     Ok(())
+}
+
+/// Build the claim of the authorization saved at `path` from its
+/// finalized GLOBAL witness and submit it.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn execute_mint_claim(
+    tc: &TokenCtx,
+    path: &std::path::Path,
+    mut on_event: impl FnMut(MintEvent),
+) -> anyhow::Result<()> {
+    let application = quil_execution::domains::QUIL_TOKEN;
+    let network =
+        quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &application)?);
+    let mut client = tc.connect().await?;
+    let mint_bytes = std::fs::read(path)?;
+    let bytes = wallet.create_mint_claim(&client, &mint_bytes).await?;
+    submit_operation(tc, &wallet, &mut client, bytes).await?;
+    on_event(MintEvent::Claimed);
+    Ok(())
+}
+
+/// A saved reward-mint authorization in the config directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SavedMint {
+    pub path: std::path::PathBuf,
+    /// The GLOBAL frame the authorization cites (its file name).
+    pub cited_frame: u64,
+    /// Its reward and fee in base units; `None` when the file does not
+    /// decode as a mint of this network.
+    pub amounts: Option<(u128, u128)>,
+}
+
+/// The `mint-<frame>.bin` authorizations `token mint` saved in `dir`,
+/// newest first.
+pub(crate) fn saved_mints(dir: &std::path::Path, network: u8) -> Vec<SavedMint> {
+    let network = quil_lattice_ct::confidential::transfer::network_identifier(network);
+    let mut saved: Vec<SavedMint> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let cited_frame = name
+                .strip_prefix("mint-")?
+                .strip_suffix(".bin")?
+                .parse()
+                .ok()?;
+            let amounts = std::fs::read(entry.path()).ok().and_then(|bytes| {
+                let mint = quil_lattice_ct::confidential::mint::Mint::decode(
+                    &bytes,
+                    &network,
+                    &quil_execution::domains::QUIL_TOKEN,
+                )
+                .ok()?;
+                Some((mint.statement.total().ok()?, mint.statement.fee))
+            });
+            Some(SavedMint {
+                path: entry.path(),
+                cited_frame,
+                amounts,
+            })
+        })
+        .collect();
+    saved.sort_by(|a, b| b.cited_frame.cmp(&a.cited_frame));
+    saved
+}
+
+/// Whether GLOBAL has finalized the saved authorization `mint_bytes`: the
+/// frame its witness cites, or `None` while no witness exists yet. The
+/// claim needs that witness.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn mint_claim_witness(
+    tc: &TokenCtx,
+    mint_bytes: &[u8],
+) -> anyhow::Result<Option<u64>> {
+    use quil_execution::token_intrinsic::mint_authorization::receipt_address;
+    let network =
+        quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let mint = quil_lattice_ct::confidential::mint::Mint::decode(
+        mint_bytes,
+        &network,
+        &quil_execution::domains::QUIL_TOKEN,
+    )
+    .map_err(|e| anyhow::anyhow!("invalid original mint: {e:?}"))?;
+    let response = tc
+        .connect()
+        .await?
+        .max_decoding_message_size(64 * 1024)
+        .get_mint_authorization_witness(
+            quil_types::proto::node::GetMintAuthorizationWitnessRequest {
+                receipt: receipt_address(&mint.statement)?.to_vec(),
+            },
+        )
+        .await?
+        .into_inner();
+    Ok(response.found.then_some(response.cited_frame))
+}
+
+/// Two-stage QUIL reward mint. Without `--claim`, discover this prover's reward,
+/// prove and submit the global authorization, and save its bytes for the claim
+/// stage. With `--claim <file>`, build the application claim from the finalized
+/// authorization and submit it. Delivery is not finality at either stage.
+/// `record` keeps the amounts and the submission in the private action log.
+#[cfg(feature = "native-proof")]
+pub(super) async fn run_mint(
+    tc: &TokenCtx,
+    recipient: Option<&str>,
+    fee: u128,
+    claim: Option<&std::path::Path>,
+    mut record: Option<&mut super::action_log::CliAction>,
+) -> anyhow::Result<()> {
+    let print = move |event: MintEvent| {
+        if let Some(record) = record.as_deref_mut() {
+            match &event {
+                MintEvent::Amounts { reward, fee } => record.step(
+                    "amounts",
+                    serde_json::json!({
+                        "reward": reward.to_string(),
+                        "fee": fee.to_string(),
+                        "minted": reward.saturating_sub(*fee).to_string(),
+                    }),
+                ),
+                MintEvent::Submitted { cited_frame, saved } => record.step(
+                    "submitted",
+                    serde_json::json!({
+                        "cited_frame": cited_frame,
+                        "file": saved.file_name().map(|n| n.to_string_lossy().into_owned()),
+                    }),
+                ),
+                MintEvent::Claimed => record.step("claimed", serde_json::json!({})),
+                MintEvent::Proving => {}
+            }
+        }
+        if let Some(line) = event.cli_line() {
+            println!("{line}");
+        }
+    };
+    if let Some(path) = claim {
+        return execute_mint_claim(tc, path, print).await;
+    }
+    let plan = plan_mint(tc, fee).await?;
+    execute_mint(tc, plan, recipient, print).await
 }
 
 /// Shield one transparent (legacy-owned) coin into confidential coins owned by
@@ -4212,23 +5348,12 @@ pub(super) fn shield_batches(
     (batches, uncovered)
 }
 
-/// Legacy coins this wallet submitted in a batch shield within the last hour:
-/// a resumed run leaves them for their batch to commit.
+/// Legacy coins this wallet submitted in a batch shield within the last two
+/// hours (`shield_pacing::SUBMITTED_EXCLUSION_SECS`): a resumed run leaves
+/// them for their batch to commit.
 #[cfg(feature = "native-proof")]
 fn recently_shielded(tc: &TokenCtx) -> std::collections::BTreeSet<[u8; 32]> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    std::fs::read_to_string(tc.config_dir.join("legacy-shield-journal.txt"))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| {
-            let (at, address) = line.split_once(' ')?;
-            let at: u64 = at.parse().ok()?;
-            let address: [u8; 32] = hex::decode(address).ok()?.try_into().ok()?;
-            (now.saturating_sub(at) < 3_600).then_some(address)
-        })
-        .collect()
+    super::legacy::recently_shielded(&tc.config_dir)
 }
 
 #[cfg(feature = "native-proof")]
@@ -4243,22 +5368,149 @@ fn record_shielded(
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(tc.config_dir.join("legacy-shield-journal.txt"))?;
+        .open(tc.config_dir.join(super::legacy::SHIELD_JOURNAL))?;
     for source in sources {
         writeln!(file, "{now} {}", hex::encode(source.address))?;
     }
     Ok(())
 }
 
-/// Shield every unshielded legacy coin of this identity in batches of at most
-/// `max_per_batch`, one shard per batch, each into one coin of this wallet.
+/// What `token shield-all` reports as it goes. The CLI prints
+/// [`ShieldEvent::cli_line`] and its paced batches' own lines
+/// (`shield_pacing::ShieldEvent::line`); the node manager shows the events
+/// itself.
 #[cfg(feature = "native-proof")]
-pub(super) async fn run_shield_all(
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ShieldEvent {
+    /// Nothing to shield; `pending`: some coins submitted within the last
+    /// two hours await their batch.
+    Nothing { pending: bool },
+    /// Coins no live shard covers, left for a later run.
+    Uncovered(usize),
+    /// Batch `index` (from 1) of `count` is being proved.
+    Proving {
+        index: usize,
+        count: usize,
+        coins: usize,
+    },
+    /// The batch is proved; it is submitted once the pacing allows.
+    Proved { index: usize, count: usize },
+    /// The batch's coins do not cover its fee.
+    Skipped {
+        index: usize,
+        count: usize,
+        coins: usize,
+        total: u128,
+        fee: u128,
+    },
+    /// The batch was delivered; inclusion is not yet confirmed.
+    Submitted {
+        index: usize,
+        count: usize,
+        addresses: Vec<[u8; 32]>,
+        shielded: u128,
+        fee: u128,
+    },
+}
+
+#[cfg(feature = "native-proof")]
+impl ShieldEvent {
+    /// The line `token shield-all` prints for the event, if any. Batch
+    /// events print none: the paced run prints its own line for each.
+    pub(crate) fn cli_line(&self) -> Option<String> {
+        Some(match self {
+            Self::Nothing { pending } => format!(
+                "No unshielded legacy coins to shield{}.",
+                if *pending {
+                    " (some submitted within the last two hours are awaiting their batch)"
+                } else {
+                    ""
+                }
+            ),
+            Self::Uncovered(count) => {
+                format!("{count} legacy coins lie in no live shard and are left for a later run.")
+            }
+            Self::Proving { .. }
+            | Self::Proved { .. }
+            | Self::Skipped { .. }
+            | Self::Submitted { .. } => return None,
+        })
+    }
+}
+
+/// `token shield-all`'s batches for this identity, read from its node and
+/// ready to prove: the coins it would shield, the coins it leaves, and what
+/// it signs with.
+#[cfg(feature = "native-proof")]
+pub(crate) struct ShieldAllPlan {
+    pub batches: Vec<Vec<quil_lattice_ct::confidential::shield::ShieldSource>>,
+    pub uncovered: usize,
+    /// Unshielded coins submitted within the last two hours, left out until
+    /// their batch commits.
+    pub pending: usize,
+    /// Some coin was submitted within the last two hours (the CLI says so
+    /// when nothing is left to shield).
+    pub journaled: bool,
+    /// Every listed legacy coin, those already shielded, and listings of
+    /// one address under both owner forms beyond the first: with the
+    /// batched, uncovered and pending coins they account for every coin.
+    pub listed: usize,
+    pub shielded: usize,
+    pub duplicates: usize,
+    /// Each batch's shard, short form (`shield_pacing::shard_label`).
+    shards: Vec<String>,
+    wallet: std::sync::Arc<RecipientWallet>,
+    owner: std::sync::Arc<dyn quil_types::crypto::Signer>,
+    client:
+        quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
+}
+
+#[cfg(feature = "native-proof")]
+impl ShieldAllPlan {
+    /// The wallet address the batches shield into, in hex.
+    pub(crate) fn recipient(&self) -> String {
+        format!("0x{}", hex::encode(self.wallet.address().encode()))
+    }
+
+    /// Coins in all batches and their total in base units.
+    pub(crate) fn totals(&self) -> anyhow::Result<(usize, u128)> {
+        let mut coins = 0;
+        let mut units = 0u128;
+        for source in self.batches.iter().flatten() {
+            coins += 1;
+            units = units
+                .checked_add(source.amount)
+                .ok_or_else(|| anyhow::anyhow!("legacy sources overflow u128"))?;
+        }
+        Ok((coins, units))
+    }
+}
+
+/// The quoted fee of one batch of `coins` legacy coins.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn shield_batch_fee(tc: &TokenCtx, coins: usize) -> anyhow::Result<u128> {
+    quoted_quil_fee(
+        tc,
+        None,
+        quil_execution::token_intrinsic::cost::Shape {
+            coins: 1,
+            markers: coins,
+            escrow: false,
+        },
+        false,
+    )
+    .await
+}
+
+/// Read this identity's unshielded legacy coins and cut them into
+/// `token shield-all`'s batches of at most `max_per_batch`, one shard each.
+/// Fails before any proving when shields are not yet admitted.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn plan_shield_all(
     tc: &TokenCtx,
     application: &str,
     max_per_batch: usize,
-) -> anyhow::Result<()> {
-    use quil_execution::token_intrinsic::cost::Shape;
+) -> anyhow::Result<ShieldAllPlan> {
     use quil_lattice_ct::confidential::shield::MAX_SHIELD_SOURCES;
     anyhow::ensure!(
         (1..=MAX_SHIELD_SOURCES).contains(&max_per_batch),
@@ -4273,72 +5525,324 @@ pub(super) async fn run_shield_all(
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &application)?);
     let owner = legacy_owner_signer(tc)?;
-    let mut client = tc.connect().await?;
+    let client = tc.connect().await?;
     let pending = recently_shielded(tc);
-    let coins: Vec<([u8; 32], u128)> = super::legacy::list(tc, &client, &application)
-        .await?
-        .into_iter()
+    let listed = super::legacy::list(tc, &client, &application).await?;
+    let shielded = listed.iter().filter(|coin| coin.shielded).count();
+    let waiting = listed
+        .iter()
+        .filter(|coin| !coin.shielded && pending.contains(&coin.address))
+        .count();
+    let coins: Vec<([u8; 32], u128)> = listed
+        .iter()
         .filter(|coin| !coin.shielded && !pending.contains(&coin.address))
         .map(|coin| (coin.address, coin.amount))
         .collect();
+    let mut plan = ShieldAllPlan {
+        batches: Vec::new(),
+        uncovered: 0,
+        pending: waiting,
+        journaled: !pending.is_empty(),
+        listed: listed.len(),
+        shielded,
+        duplicates: 0,
+        shards: Vec::new(),
+        wallet,
+        owner,
+        client,
+    };
     if coins.is_empty() {
-        println!(
-            "No unshielded legacy coins to shield{}.",
-            if pending.is_empty() {
-                ""
-            } else {
-                " (some submitted within the last hour are awaiting their batch)"
-            }
-        );
-        return Ok(());
+        return Ok(plan);
     }
-    super::legacy::ensure_shields_active(&client, tc.node_config.p2p.network, true).await?;
-    let shards = super::legacy::live_shard_paths(&client, &application).await?;
-    let (batches, uncovered) = shield_batches(coins, &shards, max_per_batch);
-    if !uncovered.is_empty() {
-        println!(
-            "{} legacy coins lie in no live shard and are left for a later run.",
-            uncovered.len()
-        );
+    super::legacy::ensure_shields_active(&plan.client, tc.node_config.p2p.network, true).await?;
+    let live = super::legacy::live_shards(&plan.client, &application).await?;
+    let paths: Vec<Vec<bool>> = live.iter().map(|(_, path)| path.clone()).collect();
+    let candidates = coins.len();
+    let (batches, uncovered) = shield_batches(coins, &paths, max_per_batch);
+    plan.duplicates = candidates - batches.iter().map(Vec::len).sum::<usize>() - uncovered.len();
+    plan.shards = batches
+        .iter()
+        .map(|batch| {
+            batch
+                .first()
+                .and_then(|source| super::legacy::deepest_shard(&paths, &source.address))
+                .and_then(|path| live.iter().find(|(_, live_path)| live_path == path))
+                .map_or_else(
+                    || "unknown".to_owned(),
+                    |(filter, _)| super::shield_pacing::shard_label(filter),
+                )
+        })
+        .collect();
+    plan.batches = batches;
+    plan.uncovered = uncovered.len();
+    Ok(plan)
+}
+
+/// What a paced shield-all run ([`execute_shield_all`]) tells its caller.
+#[cfg(feature = "native-proof")]
+pub(crate) enum ShieldReport<'a> {
+    /// A batch is being proved, was skipped or was submitted; skipped and
+    /// submitted batches are in the private action log.
+    Batch(&'a ShieldEvent),
+    /// The pacing's report; the CLI prints its
+    /// [`line`](super::shield_pacing::ShieldEvent::line).
+    Paced(&'a super::shield_pacing::ShieldEvent),
+    /// The private action log refused a write: why. Said once; the run
+    /// goes on.
+    LogFailed(String),
+}
+
+/// The reads, proofs and submissions of one paced `shield-all` run.
+#[cfg(feature = "native-proof")]
+struct ShieldAllIo<'a> {
+    tc: &'a TokenCtx,
+    wallet: std::sync::Arc<RecipientWallet>,
+    owner: std::sync::Arc<dyn quil_types::crypto::Signer>,
+    client:
+        quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
+    batches: Vec<Vec<quil_lattice_ct::confidential::shield::ShieldSource>>,
+    /// Each batch's shard, short form.
+    shards: Vec<String>,
+    /// The last proved batch's total and fee, for its submission record.
+    proved: Option<(u128, u128)>,
+    started: std::time::Instant,
+    record: &'a mut super::action_log::ShieldRecorder,
+    stop: Option<&'a std::sync::atomic::AtomicBool>,
+    sink: &'a mut (dyn FnMut(ShieldReport<'_>) + Send),
+}
+
+#[cfg(feature = "native-proof")]
+impl ShieldAllIo<'_> {
+    fn log_failed(&mut self, why: Option<String>) {
+        if let Some(why) = why {
+            (self.sink)(ShieldReport::LogFailed(why));
+        }
     }
-    let count = batches.len();
-    for (index, sources) in batches.into_iter().enumerate() {
-        let total = sources
+}
+
+#[cfg(feature = "native-proof")]
+impl super::shield_pacing::ShieldIo for ShieldAllIo<'_> {
+    type Proof = Vec<u8>;
+
+    fn now(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+
+    fn unix(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    }
+
+    async fn sleep(&mut self, secs: u64) {
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+    }
+
+    async fn head(&mut self) -> anyhow::Result<u64> {
+        Ok(self
+            .client
+            .get_node_info(quil_types::proto::node::GetNodeInfoRequest::default())
+            .await?
+            .into_inner()
+            .last_global_head_frame)
+    }
+
+    fn coins(&self, index: usize) -> usize {
+        self.batches[index].len()
+    }
+
+    fn shard(&self, index: usize) -> String {
+        self.shards[index].clone()
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.stop
+            .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    async fn prove(&mut self, index: usize) -> anyhow::Result<Option<Vec<u8>>> {
+        let count = self.batches.len();
+        let coins = self.batches[index].len();
+        let total = self.batches[index]
             .iter()
             .try_fold(0u128, |sum, source| sum.checked_add(source.amount))
             .ok_or_else(|| anyhow::anyhow!("legacy sources overflow u128"))?;
-        let fee = quoted_quil_fee(
-            tc,
-            None,
-            Shape {
-                coins: 1,
-                markers: sources.len(),
-                escrow: false,
-            },
-            false,
-        )
-        .await?;
+        let fee = shield_batch_fee(self.tc, coins).await?;
         if fee >= total {
-            println!("Batch {}/{count}: {} legacy coins worth {total} base units do not cover the fee {fee}; skipped.",
-                index + 1, sources.len());
-            continue;
+            (self.sink)(ShieldReport::Paced(
+                &super::shield_pacing::ShieldEvent::Skipped {
+                    index,
+                    total: count,
+                    coins,
+                    total_units: total,
+                    fee,
+                },
+            ));
+            let skipped = ShieldEvent::Skipped {
+                index: index + 1,
+                count,
+                coins,
+                total,
+                fee,
+            };
+            let why = self.record.event(&skipped);
+            self.log_failed(why);
+            (self.sink)(ShieldReport::Batch(&skipped));
+            return Ok(None);
         }
-        let bytes = wallet
+        (self.sink)(ShieldReport::Batch(&ShieldEvent::Proving {
+            index: index + 1,
+            count,
+            coins,
+        }));
+        let bytes = self
+            .wallet
             .clone()
             .create_batch_shield(
-                sources.clone(),
-                owner.clone(),
-                vec![(wallet.address().clone(), total - fee)],
+                self.batches[index].clone(),
+                self.owner.clone(),
+                vec![(self.wallet.address().clone(), total - fee)],
                 fee,
                 1,
                 native_budget(),
             )
             .await?;
-        submit_operation(tc, &wallet, &mut client, bytes).await?;
-        record_shielded(tc, &sources)?;
-        println!("Batch {}/{count}: {} legacy coins, {} base units shielded (fee {fee}). Submitted; finalized inclusion is not yet confirmed.",
-            index + 1, sources.len(), total - fee);
+        self.proved = Some((total, fee));
+        (self.sink)(ShieldReport::Batch(&ShieldEvent::Proved {
+            index: index + 1,
+            count,
+        }));
+        Ok(Some(bytes))
     }
+
+    async fn submit(&mut self, index: usize, bytes: Vec<u8>) -> anyhow::Result<()> {
+        submit_operation(self.tc, &self.wallet, &mut self.client, bytes).await?;
+        record_shielded(self.tc, &self.batches[index])?;
+        let (total, fee) = self.proved.take().unwrap_or_default();
+        let submitted = ShieldEvent::Submitted {
+            index: index + 1,
+            count: self.batches.len(),
+            addresses: self.batches[index]
+                .iter()
+                .map(|source| source.address)
+                .collect(),
+            shielded: total - fee,
+            fee,
+        };
+        let why = self.record.event(&submitted);
+        self.log_failed(why);
+        (self.sink)(ShieldReport::Batch(&submitted));
+        Ok(())
+    }
+
+    async fn included(&mut self, index: usize) -> anyhow::Result<bool> {
+        let batch = &self.batches[index];
+        let coins =
+            super::legacy::list(self.tc, &self.client, &quil_execution::domains::QUIL_TOKEN)
+                .await?;
+        Ok(!coins.iter().any(|coin| {
+            !coin.shielded && batch.iter().any(|source| source.address == coin.address)
+        }))
+    }
+
+    fn event(&mut self, event: &super::shield_pacing::ShieldEvent) {
+        (self.sink)(ShieldReport::Paced(event));
+    }
+}
+
+/// Prove and submit `plan`'s batches paced by `pacing` (`shield_pacing`):
+/// one at a time, each proved after the previous one's inclusion, each
+/// into one coin of this wallet less its quoted fee. `record` gets the
+/// plan, each batch and the outcome; `sink` every report. Once `stop` is
+/// set the run submits nothing more and ends. Stops at the first error;
+/// batches submitted before it stay submitted. Returns the batches
+/// submitted. `token shield-all` and the node manager both run this.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn execute_shield_all(
+    tc: &TokenCtx,
+    plan: ShieldAllPlan,
+    pacing: super::shield_pacing::Pacing,
+    record: &mut super::action_log::ShieldRecorder,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+    sink: &mut (dyn FnMut(ShieldReport<'_>) + Send),
+) -> anyhow::Result<usize> {
+    if let Some(why) = record.start(&plan, tc.max_fee) {
+        sink(ShieldReport::LogFailed(why));
+    }
+    let count = plan.batches.len();
+    let ShieldAllPlan {
+        batches,
+        shards,
+        wallet,
+        owner,
+        client,
+        ..
+    } = plan;
+    let mut io = ShieldAllIo {
+        tc,
+        wallet,
+        owner,
+        client,
+        batches,
+        shards,
+        proved: None,
+        started: std::time::Instant::now(),
+        record,
+        stop,
+        sink,
+    };
+    let result = super::shield_pacing::run(&mut io, count, pacing).await;
+    let outcome = result.as_ref().map(|_| ()).map_err(|e| format!("{e:#}"));
+    let why = io.record.outcome(&outcome);
+    io.log_failed(why);
+    result
+}
+
+/// Shield every unshielded legacy coin of this identity in batches of at most
+/// `max_per_batch`, one shard per batch, each into one coin of this wallet.
+/// Batches are paced (see `shield_pacing`) and printed as they progress.
+#[cfg(feature = "native-proof")]
+pub(super) async fn run_shield_all(
+    tc: &TokenCtx,
+    application: &str,
+    max_per_batch: usize,
+    pacing: super::shield_pacing::Pacing,
+) -> anyhow::Result<()> {
+    use super::action_log::{ActionLog, ShieldRecorder};
+    let print = |event: ShieldEvent| {
+        if let Some(line) = event.cli_line() {
+            println!("{line}");
+        }
+    };
+    let plan = plan_shield_all(tc, application, max_per_batch).await?;
+    if plan.batches.is_empty() && plan.uncovered == 0 {
+        print(ShieldEvent::Nothing {
+            pending: plan.journaled,
+        });
+        return Ok(());
+    }
+    if plan.uncovered > 0 {
+        print(ShieldEvent::Uncovered(plan.uncovered));
+    }
+    let mut record = ShieldRecorder::new(ActionLog::enabled(&tc.config_dir, false), "cli");
+    let count = plan.batches.len();
+    let submitted =
+        execute_shield_all(
+            tc,
+            plan,
+            pacing,
+            &mut record,
+            None,
+            &mut |report| match report {
+                ShieldReport::Paced(event) => println!("{}", event.line()),
+                ShieldReport::LogFailed(why) => {
+                    eprintln!("Action log: not written ({why}); the shield is unaffected.")
+                }
+                ShieldReport::Batch(_) => {}
+            },
+        )
+        .await?;
+    println!("Done: {submitted} of {count} batches submitted and included.");
     Ok(())
 }
 
@@ -4502,6 +6006,49 @@ pub(super) async fn run_custom_mint(
 
 #[cfg(test)]
 mod tests {
+    /// A value frozen from the pre-seam backend; see `quil-sntrup761/tests/kat.rs`.
+    fn frozen(name: &str) -> Vec<u8> {
+        const TABLE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../quil-sntrup761/tests/data/continuity.hex"
+        ));
+        let line = TABLE
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+            .unwrap();
+        (0..line.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&line[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The recipient seed hashes the raw secret key: a stored wallet key must
+    /// keep its address and open its coins, or the funds are unreachable.
+    #[test]
+    fn frozen_wallet_key_keeps_its_address_and_opens_its_coin() {
+        let wallet = super::RecipientWallet::from_keys(
+            &[63; 32],
+            &[64; 32],
+            &frozen("key_public"),
+            super::Zeroizing::new(frozen("key_secret")),
+        )
+        .unwrap();
+        assert_eq!(
+            wallet.address().encode()[..],
+            frozen("wallet_address")[..],
+            "wallet address changed"
+        );
+        let coin = super::Output {
+            commitment: quil_lattice_ct::confidential::AmountCommitment::from_bytes(&frozen(
+                "wallet_coin_commitment",
+            ))
+            .unwrap(),
+            owner: frozen("wallet_coin_owner").try_into().unwrap(),
+            memo: frozen("wallet_coin_memo").try_into().unwrap(),
+        };
+        assert_eq!(wallet.open(&coin).unwrap().amount, 1_234_567_890);
+    }
+
     #[cfg(feature = "native-proof")]
     #[test]
     fn automatic_fee_headroom_rounds_up_and_checks_range() {
@@ -4646,46 +6193,6 @@ mod tests {
             mint_amounts_line("Claiming", 8, 0),
             "Claiming 0.000000001000 QUIL (reward 0.000000001000 QUIL less fee 0.000000000000 QUIL)."
         );
-    }
-
-    #[cfg(feature = "native-proof")]
-    #[tokio::test]
-    async fn witness_retry_handles_transience_and_bounds_hung_requests() {
-        let mut attempts = 0;
-        let value = retry_witness_request(std::time::Duration::from_secs(5), || {
-            attempts += 1;
-            let attempt = attempts;
-            async move {
-                match attempt {
-                    1 => Err(tonic::Status::unavailable("index building")),
-                    2 => Err(tonic::Status::resource_exhausted("busy")),
-                    _ => Ok(7),
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!((value, attempts), (7, 3));
-        let mut attempts = 0;
-        let error = retry_witness_request(std::time::Duration::from_secs(5), || {
-            attempts += 1;
-            async { Err::<(), _>(tonic::Status::invalid_argument("bad request")) }
-        })
-        .await
-        .unwrap_err();
-        assert_eq!((error.code(), attempts), (tonic::Code::InvalidArgument, 1));
-        let error = retry_witness_request(std::time::Duration::from_millis(10), || {
-            std::future::pending::<Result<(), tonic::Status>>()
-        })
-        .await
-        .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
-        let error = retry_witness_request(std::time::Duration::from_millis(10), || async {
-            Err::<(), _>(tonic::Status::unavailable("building"))
-        })
-        .await
-        .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
     }
 
     #[test]
@@ -5884,6 +7391,74 @@ mod tests {
     /// confidential coin) answers a fresh scan with one empty, final page
     /// that has no root. The wallet takes it as a complete scan holding no
     /// coin, and refuses a rootless page that claims more.
+    /// The transient class is what a node answers when a page did not reach
+    /// it; an expired snapshot or a lost pin needs a new scan, and a refusal
+    /// of the request will not change.
+    #[test]
+    fn a_scan_read_asks_again_only_when_that_can_help() {
+        use tonic::Status;
+        for transient in [
+            Status::unavailable("no node serving application 01 answered this node: 1 peer declined: 1x Unknown: h2 protocol error: error reading a body from connection"),
+            Status::unknown("h2 protocol error: error reading a body from connection"),
+            Status::cancelled("Timeout expired"),
+            Status::resource_exhausted("coin scan workers busy; retry later"),
+        ] {
+            assert!(scan_read_is_transient(&transient), "{transient}");
+        }
+        for final_answer in [
+            Status::unavailable("coin scan snapshot unavailable or expired; restart scan"),
+            Status::unavailable("the peer serving this scan is no longer pinned; restart the scan"),
+            Status::invalid_argument("domain must be 32 bytes"),
+            Status::internal("invalid coin scan page"),
+            Status::unimplemented("coin scan is not enabled"),
+        ] {
+            assert!(!scan_read_is_transient(&final_answer), "{final_answer}");
+        }
+    }
+
+    /// The bound: three more askings of a read, then the last failure.
+    #[tokio::test]
+    async fn a_scan_read_asks_again_within_its_bound() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tonic::Status;
+        let read_failing = |failures: usize| {
+            let calls = std::sync::Arc::new(AtomicUsize::new(0));
+            let read = {
+                let calls = calls.clone();
+                move || {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if n < failures {
+                            Err(Status::unavailable(format!("attempt {n}")))
+                        } else {
+                            Ok(n)
+                        }
+                    }
+                }
+            };
+            (calls, read)
+        };
+        let (calls, read) = read_failing(SCAN_READ_RETRIES);
+        assert_eq!(
+            retry_scan_read("a page", read).await.unwrap(),
+            SCAN_READ_RETRIES,
+            "the last allowed asking recovers"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), SCAN_READ_RETRIES + 1);
+        let (calls, read) = read_failing(usize::MAX);
+        let status = retry_scan_read("a page", read).await.unwrap_err();
+        assert_eq!(status.message(), format!("attempt {SCAN_READ_RETRIES}"));
+        assert_eq!(calls.load(Ordering::SeqCst), SCAN_READ_RETRIES + 1);
+        let calls = AtomicUsize::new(0);
+        let refused: Result<(), _> = retry_scan_read("a page", || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(Status::invalid_argument("no")) }
+        })
+        .await;
+        assert!(refused.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn a_rootless_first_page_completes_the_scan_without_coins() {
         use quil_types::proto::node::ListCoinsResponse;
@@ -5996,12 +7571,11 @@ mod tests {
         }
     }
     #[test]
-    fn wallet_checks_rpc_paths_against_selected_coin_and_context() {
+    fn wallet_checks_rebuilt_paths_against_selected_coin_and_context() {
         use quil_lattice_ct::confidential::{
-            coin_tree::{CoinRecord, CoinTree},
+            coin_tree::{AuthPath, CoinRecord, CoinTree},
             relation::membership::Node,
         };
-        use quil_types::proto::node::{CoinWitness, GetCoinWitnessesResponse};
         let key = sntrup761::Sntrup761KeyPair::generate();
         let wallet =
             RecipientWallet::from_keys(&[1; 32], &[2; 32], &key.public, Zeroizing::new(key.secret))
@@ -6023,46 +7597,31 @@ mod tests {
         )
         .unwrap();
         let root = tree.root_at_depth(1).unwrap();
-        let path = tree.auth_path(&address, 1).unwrap();
-        let response = GetCoinWitnessesResponse {
-            network: vec![1; 32],
-            root_record: root.encode().unwrap().to_vec(),
-            witnesses: vec![CoinWitness {
-                address: address.to_vec(),
-                found: true,
-                siblings: path
-                    .siblings
-                    .iter()
-                    .map(|node| node.to_bytes().to_vec())
-                    .collect(),
-                right: path.right,
-            }],
+        let path = || tree.auth_path(&address, 1).unwrap();
+        let coins = [(address, &output)];
+        wallet.verify_paths(&coins, &root, &[path()]).unwrap();
+        let mut bad = root.clone();
+        bad.context[0] ^= 1;
+        assert!(wallet.verify_paths(&coins, &bad, &[path()]).is_err());
+        let mut bad = root.clone();
+        bad.depth = 2;
+        assert!(wallet.verify_paths(&coins, &bad, &[path()]).is_err());
+        let mut bad = path();
+        bad.right[0] = !bad.right[0];
+        assert!(wallet.verify_paths(&coins, &root, &[bad]).is_err());
+        let mut bad = path();
+        bad.siblings[0] = Node::from_identity_bytes(&[7; IDENTITY_BYTES]).unwrap();
+        assert!(wallet.verify_paths(&coins, &root, &[bad]).is_err());
+        let empty = AuthPath {
+            siblings: Vec::new(),
+            right: Vec::new(),
         };
-        assert!(wallet
-            .decode_witnesses(&[(address, &output)], response.clone())
-            .is_ok());
-        let mut bad = response.clone();
-        bad.network[0] ^= 1;
-        assert!(wallet.decode_witnesses(&[(address, &output)], bad).is_err());
-        let mut bad = response.clone();
-        bad.root_record[8] ^= 1;
-        assert!(wallet.decode_witnesses(&[(address, &output)], bad).is_err());
-        let mut bad = response.clone();
-        bad.witnesses[0].right[0] = !bad.witnesses[0].right[0];
-        assert!(wallet.decode_witnesses(&[(address, &output)], bad).is_err());
-        let mut bad = response.clone();
-        bad.witnesses[0].siblings[0] = Node::from_identity_bytes(&[7; IDENTITY_BYTES])
-            .unwrap()
-            .to_bytes()
-            .to_vec();
-        assert!(wallet.decode_witnesses(&[(address, &output)], bad).is_err());
-        let mut bad = response.clone();
-        bad.witnesses[0].found = false;
-        assert!(wallet.decode_witnesses(&[(address, &output)], bad).is_err());
+        assert!(wallet.verify_paths(&coins, &root, &[empty]).is_err());
+        assert!(wallet.verify_paths(&coins, &root, &[]).is_err());
         let mut other = output.clone();
         other.owner[0] ^= 1;
         assert!(wallet
-            .decode_witnesses(&[(address, &other)], response)
+            .verify_paths(&[(address, &other)], &root, &[path()])
             .is_err());
     }
 
@@ -6112,5 +7671,151 @@ mod tests {
         );
         let (only_low, left) = shield_batches(coins, &[vec![false]], 96);
         assert_eq!((only_low.len(), left.len()), (1, 4));
+    }
+}
+
+#[cfg(all(test, feature = "native-proof"))]
+mod shield_all_cli_tests {
+    use super::*;
+
+    /// The lines `token mint` printed before its events existed.
+    #[test]
+    fn mint_prints_what_it_printed_before() {
+        let lines: Vec<Option<String>> = [
+            MintEvent::Amounts {
+                reward: 100_000_000_000,
+                fee: 2_000_000_000,
+            },
+            MintEvent::Proving,
+            MintEvent::Submitted {
+                cited_frame: 42,
+                saved: "/cfg/mint-42.bin".into(),
+            },
+            MintEvent::Claimed,
+        ]
+        .iter()
+        .map(MintEvent::cli_line)
+        .collect();
+        assert_eq!(
+            lines,
+            [
+                Some(mint_amounts_line("Minting", 100_000_000_000, 2_000_000_000)),
+                None,
+                Some(
+                    "Confidential reward mint authorization submitted for global frame 42. \
+                     Once it is finalized, run `token mint --claim /cfg/mint-42.bin` to create \
+                     the coins."
+                        .into()
+                ),
+                Some(
+                    "Confidential mint claim submitted. Finalized inclusion is not yet confirmed."
+                        .into()
+                ),
+            ]
+        );
+    }
+
+    /// Saved authorizations are found by name, newest first; a file that
+    /// is not a mint lists without amounts.
+    #[test]
+    fn saved_mints_list_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["mint-7.bin", "mint-12.bin", "mint-x.bin", "other.bin"] {
+            std::fs::write(dir.path().join(name), b"not a mint").unwrap();
+        }
+        let saved = saved_mints(dir.path(), 0);
+        assert_eq!(
+            saved.iter().map(|s| s.cited_frame).collect::<Vec<_>>(),
+            [12, 7]
+        );
+        assert!(saved.iter().all(|s| s.amounts.is_none()));
+    }
+
+    /// The node manager's Shield plan rows are shield-all's own batches.
+    #[test]
+    fn the_plan_rows_are_the_batches_shield_all_cuts() {
+        use super::super::legacy::{plan_batches, Coin, OwnerForm};
+        let coins: Vec<Coin> = (0u8..=200)
+            .map(|i| Coin {
+                address: [i.wrapping_mul(37); 32],
+                amount: u128::from(i) + 1,
+                shielded: i % 7 == 0,
+                form: OwnerForm::Key,
+            })
+            .collect();
+        // Two halves of the address space, one split further, one not live.
+        let shards = vec![
+            (vec![1], vec![false]),
+            (vec![2], vec![true, false]),
+            (vec![3], vec![true, true, false]),
+        ];
+        let paths: Vec<Vec<bool>> = shards.iter().map(|(_, path)| path.clone()).collect();
+        let unshielded = coins
+            .iter()
+            .filter(|coin| !coin.shielded)
+            .map(|coin| (coin.address, coin.amount))
+            .collect();
+        let (batches, _) = shield_batches(unshielded, &paths, 5);
+        let rows = plan_batches(&coins, &shards, 5);
+        assert!(batches.len() > 3);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.coins, row.units))
+                .collect::<Vec<_>>(),
+            batches
+                .iter()
+                .map(|batch| (batch.len(), batch.iter().map(|s| s.amount).sum::<u128>()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The lines `token shield-all` printed before its events existed, for
+    /// the same inputs: its output must not change, except that the paced
+    /// run prints each batch's own line (`shield_pacing`) and a submitted
+    /// batch's coins stay out for two hours.
+    #[test]
+    fn shield_all_prints_what_it_printed_before() {
+        let lines: Vec<Option<String>> = [
+            ShieldEvent::Nothing { pending: false },
+            ShieldEvent::Nothing { pending: true },
+            ShieldEvent::Uncovered(3),
+            ShieldEvent::Proving {
+                index: 1,
+                count: 2,
+                coins: 96,
+            },
+            ShieldEvent::Skipped {
+                index: 1,
+                count: 2,
+                coins: 4,
+                total: 900,
+                fee: 1000,
+            },
+            ShieldEvent::Submitted {
+                index: 2,
+                count: 2,
+                addresses: vec![[1; 32], [2; 32]],
+                shielded: 7_000,
+                fee: 1_000,
+            },
+        ]
+        .iter()
+        .map(ShieldEvent::cli_line)
+        .collect();
+        assert_eq!(
+            lines,
+            [
+                Some("No unshielded legacy coins to shield.".to_string()),
+                Some(
+                    "No unshielded legacy coins to shield (some submitted within the last two \
+                     hours are awaiting their batch)."
+                        .to_string()
+                ),
+                Some("3 legacy coins lie in no live shard and are left for a later run.".into()),
+                None,
+                None,
+                None,
+            ]
+        );
     }
 }

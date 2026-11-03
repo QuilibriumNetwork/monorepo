@@ -12,7 +12,7 @@
 //! `approve`, `deny`) are in [`super::diagnostics_logs`].
 
 use std::fmt::Write as _;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 use clap::{Args, Subcommand};
@@ -21,7 +21,7 @@ use quil_p2p::PeerId;
 use quil_rpc::diagnostics_service as diag;
 use quil_types::proto::diagnostics::{
     Blocker, GetHealthReportRequest, HealthReport, Phase, RecoveryFailure, RecoveryPhase,
-    WorkerHealth,
+    StoreIoHealth, StoreIoVerdict, WorkerHealth,
 };
 use quil_types::proto::node::PeerInfo;
 
@@ -59,7 +59,9 @@ pub enum DiagnosticsCommand {
     /// whether GLOBAL recorded it, RECOVERY the archive recovery phase and
     /// its attempts since the engine started, with failed attempts by class
     /// and the longest wait for a recovery turn. Ages are <60s or >60s
-    /// before the report, on the target's clock.
+    /// before the report, on the target's clock. The Store I/O line gives
+    /// the latest minute's master store canary reads and disk await, and
+    /// whether they are too slow.
     Health(HealthArgs),
     /// Print the stream address (host:port) a peer publishes, for --addr.
     ///
@@ -345,8 +347,16 @@ pub(crate) fn address_reach(multiaddr: &str) -> Reach {
     let parts: Vec<&str> = multiaddr.trim_matches('/').split('/').collect();
     for pair in parts.chunks(2) {
         match pair {
-            ["ip4", host] => return host.parse().map_or(Reach::Unknown, ipv4_reach),
-            ["ip6", host] => return host.parse().map_or(Reach::Unknown, ipv6_reach),
+            ["ip4", host] => {
+                return host
+                    .parse::<Ipv4Addr>()
+                    .map_or(Reach::Unknown, |ip| ip_reach(ip.into()))
+            }
+            ["ip6", host] => {
+                return host
+                    .parse::<Ipv6Addr>()
+                    .map_or(Reach::Unknown, |ip| ip_reach(ip.into()))
+            }
             ["dns" | "dns4" | "dns6" | "dnsaddr", _] => return Reach::Unknown,
             _ => {}
         }
@@ -354,26 +364,52 @@ pub(crate) fn address_reach(multiaddr: &str) -> Reach {
     Reach::Unknown
 }
 
-fn ipv4_reach(ip: Ipv4Addr) -> Reach {
-    // 100.64.0.0/10 is shared address space for carrier-grade NAT (RFC
-    // 6598); `Ipv4Addr::is_shared` is not stable.
-    let shared = ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 0x40;
-    if ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || shared {
-        Reach::Private
-    } else {
-        Reach::Public
+/// What kind of network an IP address belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IpClass {
+    /// Globally routable (documentation ranges included).
+    Public,
+    /// A private network behind a NAT: RFC 1918 IPv4, unique-local IPv6.
+    Private,
+    /// Shared address space for carrier-grade NAT, 100.64.0.0/10 (RFC
+    /// 6598): the ISP's NAT, which the operator cannot forward ports on.
+    Shared,
+    /// Loopback, link-local or unspecified: this host or link only.
+    Local,
+}
+
+pub(crate) fn ip_class(ip: IpAddr) -> IpClass {
+    match ip {
+        IpAddr::V4(v4) => ipv4_class(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => ipv4_class(v4),
+            None if v6.is_loopback() || v6.is_unspecified() || v6.is_unicast_link_local() => {
+                IpClass::Local
+            }
+            None if v6.is_unique_local() => IpClass::Private,
+            None => IpClass::Public,
+        },
     }
 }
 
-fn ipv6_reach(ip: Ipv6Addr) -> Reach {
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return ipv4_reach(v4);
-    }
-    if ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local() || ip.is_unicast_link_local()
-    {
-        Reach::Private
+fn ipv4_class(ip: Ipv4Addr) -> IpClass {
+    // `Ipv4Addr::is_shared` is not stable.
+    let shared = ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 0x40;
+    if ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() {
+        IpClass::Local
+    } else if ip.is_private() {
+        IpClass::Private
+    } else if shared {
+        IpClass::Shared
     } else {
-        Reach::Public
+        IpClass::Public
+    }
+}
+
+fn ip_reach(ip: IpAddr) -> Reach {
+    match ip_class(ip) {
+        IpClass::Public => Reach::Public,
+        IpClass::Private | IpClass::Shared | IpClass::Local => Reach::Private,
     }
 }
 
@@ -611,6 +647,64 @@ const MASTER_STORE_WRITE_FAILED: &str =
     "Master store stopped writing (a failed write, or free space below the \
     floor): this node cannot follow GLOBAL until the store is reopened.";
 
+/// A latency in microseconds, to two significant figures or so.
+fn io_ms(us: u64) -> String {
+    match us {
+        0..=9_999 => format!("{:.1}ms", us as f64 / 1000.0),
+        10_000..=9_999_999 => format!("{}ms", us / 1000),
+        _ => format!("{}s", us / 1_000_000),
+    }
+}
+
+/// The figures of a store I/O interval that it has: the canary reads'
+/// p99 and count, a read still pending, the disk's read and write await.
+pub(crate) fn store_io_figures(io: &StoreIoHealth) -> String {
+    let mut parts = Vec::new();
+    if io.canary_reads > 0 {
+        parts.push(format!(
+            "canary p99 {} of {} reads in {}s",
+            io_ms(io.canary_p99_us),
+            io.canary_reads,
+            io.interval_secs
+        ));
+    }
+    if io.canary_pending_us > 0 {
+        parts.push(format!("a read pending {}", io_ms(io.canary_pending_us)));
+    }
+    match (io.disk_read_await_us, io.disk_write_await_us) {
+        (Some(read), Some(write)) => parts.push(format!(
+            "disk read {}/op, write {}/op",
+            io_ms(read),
+            io_ms(write)
+        )),
+        (Some(read), None) => parts.push(format!("disk read {}/op", io_ms(read))),
+        (None, Some(write)) => parts.push(format!("disk write {}/op", io_ms(write))),
+        (None, None) => {}
+    }
+    parts.join(", ")
+}
+
+/// The health report's store I/O line; `None` from nodes that predate it.
+fn store_io_line(io: Option<&StoreIoHealth>) -> Option<String> {
+    let io = io?;
+    let figures = store_io_figures(io);
+    Some(match io.verdict() {
+        StoreIoVerdict::Slow => {
+            let slow = match io.slow_secs {
+                secs @ 0..=119 => format!("{secs}s"),
+                secs @ 120..=7199 => format!("{}m", secs / 60),
+                secs => format!("{}h", secs / 3600),
+            };
+            format!(
+                "Store I/O: slow for {slow} ({figures}); this node's disk is the \
+                 cause: check TRIM, the disk's health and other I/O load."
+            )
+        }
+        StoreIoVerdict::Ok => format!("Store I/O: ok ({figures})."),
+        _ => "Store I/O: not measured.".to_string(),
+    })
+}
+
 /// The report of `target` as plain text: a summary line, then one line per
 /// worker.
 pub(crate) fn render_report(target: &str, report: &HealthReport) -> String {
@@ -641,6 +735,9 @@ pub(crate) fn render_report(target: &str, report: &HealthReport) -> String {
     );
     if report.master_store_write_failed {
         let _ = writeln!(out, "{MASTER_STORE_WRITE_FAILED}");
+    }
+    if let Some(line) = store_io_line(report.store_io.as_ref()) {
+        let _ = writeln!(out, "{line}");
     }
     if report.workers.is_empty() {
         let _ = writeln!(out, "No data workers reported.");
@@ -735,6 +832,7 @@ mod tests {
             omitted_workers,
             master_store_write_failed: false,
             worker_capacity: 0,
+            store_io: None,
         }
     }
 
@@ -915,6 +1013,64 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
             "{MASTER_STORE_WRITE_FAILED}"
         );
         assert!(!render_report("this node", &report(Vec::new(), 0)).contains("Master store"));
+    }
+
+    /// The store I/O line: the verdict, its duration while slow, the
+    /// figures the node measured and what to check; none from older nodes.
+    #[test]
+    fn the_store_io_line_names_the_verdict_and_figures() {
+        let mut slow = StoreIoHealth {
+            slow_secs: 750,
+            interval_secs: 60,
+            canary_reads: 58,
+            canary_p99_us: 412_000,
+            disk_read_await_us: Some(25_400),
+            disk_write_await_us: Some(3_100),
+            ..Default::default()
+        };
+        slow.set_verdict(StoreIoVerdict::Slow);
+        let mut with = report(Vec::new(), 0);
+        with.store_io = Some(slow.clone());
+        let text = render_report("this node", &with);
+        assert_eq!(
+            text.lines().nth(1),
+            Some(
+                "Store I/O: slow for 12m (canary p99 412ms of 58 reads in 60s, disk read \
+                 25ms/op, write 3.1ms/op); this node's disk is the cause: check TRIM, \
+                 the disk's health and other I/O load."
+            ),
+            "{text}"
+        );
+        let stalled = StoreIoHealth {
+            canary_reads: 0,
+            canary_pending_us: 95_000_000,
+            disk_read_await_us: None,
+            disk_write_await_us: None,
+            slow_secs: 30,
+            ..slow
+        };
+        assert_eq!(
+            store_io_line(Some(&stalled)).unwrap(),
+            "Store I/O: slow for 30s (a read pending 95s); this node's disk is the cause: \
+             check TRIM, the disk's health and other I/O load."
+        );
+        let mut ok = StoreIoHealth {
+            interval_secs: 60,
+            canary_reads: 60,
+            canary_p99_us: 820,
+            disk_write_await_us: Some(1_200),
+            ..Default::default()
+        };
+        ok.set_verdict(StoreIoVerdict::Ok);
+        assert_eq!(
+            store_io_line(Some(&ok)).unwrap(),
+            "Store I/O: ok (canary p99 0.8ms of 60 reads in 60s, disk write 1.2ms/op)."
+        );
+        assert_eq!(
+            store_io_line(Some(&StoreIoHealth::default())).unwrap(),
+            "Store I/O: not measured."
+        );
+        assert!(!render_report("this node", &report(Vec::new(), 0)).contains("Store I/O"));
     }
 
     #[test]

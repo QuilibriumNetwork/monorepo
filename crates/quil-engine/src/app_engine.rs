@@ -154,6 +154,13 @@ pub enum AppEngineMessage {
         descendants: Vec<quil_types::proto::global::AppShardFrame>,
         reply: tokio::sync::oneshot::Sender<Result<u64>>,
     },
+    /// Retry the materialization of the frame after the cursor when it waits
+    /// for this node's proof verification
+    /// ([`AppConsensusEngine::retry_proof_wait`]): the frame it still waits
+    /// for, if any.
+    RetryProofWait {
+        reply: tokio::sync::oneshot::Sender<Option<u64>>,
+    },
     /// A worker with no local app-shard clock head fetched an archive anchor and
     /// synced its tree to that anchor's pre-state. The engine validates the
     /// certified frames, checkpoints the predecessor, replays the anchor itself
@@ -662,6 +669,25 @@ impl AppEngineHandle {
         })
         .await
         .map_err(|_| QuilError::ExecutionUnavailable("archive replay timed out".into()))?
+    }
+
+    /// The frame after the cursor, when its materialization still waits for
+    /// this node's proof verification once retried
+    /// ([`AppConsensusEngine::retry_proof_wait`]). `None` also when the
+    /// engine does not answer within 30 s: the recovery then replays as
+    /// before.
+    pub(crate) async fn retry_proof_wait(&self) -> Option<u64> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            self.msg_tx
+                .send(AppEngineMessage::RetryProofWait { reply })
+                .await
+                .ok()?;
+            receive.await.ok().flatten()
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Tell the engine whether the network is in a coverage halt. The
@@ -1738,14 +1764,15 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // operation not known to verify within the budget (a batch shield, or
         // a size class this node has not measured) is held until its proofs
         // are verified in the background (`admission_verify`, started when it
-        // arrived, or now), however long that takes: a frame carrying it held
-        // every member's materialization, and nobody proposes past a frame it
-        // has not materialized (1,150 s without a QUIL frame on a devnet,
-        // 2026-10-29). Members verify in arrival order, so they hold its
-        // verdict when its leader does. The rest are carried while their
-        // estimated verification fits the per-frame budget, the first even
-        // when it alone exceeds it, and verify when the frame executes, as
-        // before. A bundle whose background verification failed
+        // arrived, or now; held past `MAX_PROOF_HOLD`, this node verifies it
+        // next, so arrivals queued ahead of it never hold it longer): a frame
+        // carrying it held every member's materialization, and nobody
+        // proposes past a frame it has not materialized (1,150 s without a
+        // QUIL frame on a devnet, 2026-10-29). Members verify in arrival
+        // order, so they hold its verdict when its leader does. The rest are
+        // carried while their estimated verification fits the per-frame
+        // budget, the first even when it alone exceeds it, and verify when
+        // the frame executes, as before. A bundle whose background verification failed
         // `admission_verify::MAX_FAILURES` times on this node is left out and
         // ages out of the pool; one that cannot be queued is budgeted as
         // before. Held bundles are carried forward to this rank, not dropped,
@@ -1759,6 +1786,50 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                     .map(|canon| bundle_proofs(manager, queue, application, canon, budget_secs))
                     .collect();
                 let selection = verification_budget_selection(&proofs, budget_secs);
+                // A long bundle held past `MAX_PROOF_HOLD` verifies next on
+                // this node, behind the frames waiting and ahead of the
+                // arrivals, one per shard at a time: the queue may hold
+                // arrivals ahead of it for longer than any one of them takes.
+                let held_long: Vec<[u8; 32]> = selection
+                    .iter()
+                    .zip(&proofs)
+                    .zip(&canonical_requests)
+                    .filter(|((choice, proofs), _)| {
+                        **choice == Budgeted::Hold && proofs.long && proofs.verifying
+                    })
+                    .map(|(_, canon)| crate::admission_verify::digest(canon))
+                    .collect();
+                let due = PROOF_HOLDS.lock().unwrap_or_else(|e| e.into_inner()).due(
+                    &self.filter,
+                    &held_long,
+                    |digest| queue.pending(digest),
+                    std::time::Instant::now(),
+                );
+                if let Some((digest, held_for)) = due {
+                    if let Some(canon) = canonical_requests
+                        .iter()
+                        .find(|canon| crate::admission_verify::digest(canon) == digest)
+                    {
+                        let verifying = crate::admission_verify::offer_submission(
+                            queue,
+                            manager,
+                            application,
+                            canon,
+                            true,
+                        );
+                        info!(
+                            filter = %hex::encode(&self.filter),
+                            frame = frame_number,
+                            bundle = %hex::encode(&digest[..4]),
+                            held_secs = held_for.as_secs(),
+                            verifying,
+                            scope = "this node",
+                            action = "an expected wait: a later proposal carries it once it verified",
+                            "confidential bundle held for its background verification past the hold bound \
+                             verifies next on this node"
+                        );
+                    }
+                }
                 let held: Vec<Vec<u8>> = selection
                     .iter()
                     .zip(&origins)
@@ -1805,7 +1876,13 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // The leader executes these after finalization like every member;
         // start verifying their proofs now.
         if let Some(exec) = self.execution_engine.as_ref() {
-            prewarm_proof_verdicts(exec, &self.app_address, &canonical_requests);
+            prewarm_proof_verdicts(
+                exec,
+                &self.app_address,
+                &canonical_requests,
+                &self.filter,
+                frame_number,
+            );
         }
         // Deliveries of globally committed outputs this shard owns, each its
         // own bundle, after the
@@ -2899,6 +2976,9 @@ pub struct AppConsensusEngine {
     /// Archive frames that keep failing to replay onto this worker's trees,
     /// which past a bound owe a re-anchor ([`Self::note_replay_mismatch`]).
     replay_mismatch: ReplayMismatch,
+    /// The frame after the cursor whose materialization last stopped to wait
+    /// for this node's proof verification ([`ProofWait`]).
+    proof_wait: Option<ProofWait>,
     /// Committees that certified legacy frames, when today's registry no
     /// longer reproduces them (see `historical_committee`).
     historical_committee_source: Option<crate::historical_committee::HistoricalCommitteeSource>,
@@ -2926,6 +3006,9 @@ pub struct AppConsensusEngine {
     discarded_records_dropped: bool,
     /// When the passive retry next tries a start an expected wait refused.
     start_pace: StartPace,
+    /// A read of this shard's dropped-lineage record under the forest write
+    /// barrier found none ([`Self::dropped_lineage_record`]).
+    lineage_record_absent: bool,
 
     // Identity
     local_prover_address: Vec<u8>,
@@ -3000,6 +3083,9 @@ pub struct AppConsensusEngine {
     /// Which members of the running session were heard, to name those that
     /// never voted while it lacks a quorum ([`Self::log_silent_members`]).
     session_silent: SilentMembers,
+    /// When the running session host last finalized a view, to log a
+    /// stall ([`Self::watch_view_stall`]).
+    view_stall: crate::app_stall::ViewStall,
     /// This member's own votes in the running session host against the
     /// other members' ([`Self::track_own_votes`]).
     own_votes: crate::own_votes::OwnVotes,
@@ -3179,6 +3265,7 @@ impl AppConsensusEngine {
             unrewindable_fence: UnrewindableFenceBlock::default(),
             fence_reanchor: FenceReanchor::default(),
             replay_mismatch: ReplayMismatch::default(),
+            proof_wait: None,
             historical_committee_source: None,
             predecessor_block: PredecessorBlock::default(),
             history_walk: Default::default(),
@@ -3190,6 +3277,7 @@ impl AppConsensusEngine {
             history_discarded: std::sync::OnceLock::new(),
             discarded_records_dropped: false,
             start_pace: StartPace::default(),
+            lineage_record_absent: false,
             local_prover_address: deps.local_prover_address,
             local_bls_pubkey: deps.local_bls_pubkey,
             halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3212,6 +3300,7 @@ impl AppConsensusEngine {
             ancestor_sync: AncestorSyncPacing::default(),
             lagging_voter: LaggingVoter::default(),
             session_silent: SilentMembers::default(),
+            view_stall: crate::app_stall::ViewStall::default(),
             own_votes: Default::default(),
             private_parents: None,
             sealed_session: None,
@@ -3737,7 +3826,9 @@ impl AppConsensusEngine {
     /// The caller keeps the frame and retries (`PROOF_VERIFICATION_PENDING`).
     /// A leader carries such an operation only once it verified it, and
     /// members verify in arrival order, so a member waits here only when it
-    /// trails the leader; the queue then verifies what frames wait on first.
+    /// trails the leader; the queue then verifies what frames wait on first,
+    /// ahead of vote-time warm-ups and arrivals, and its background work
+    /// leaves the first node-wide worker slot to frames.
     /// The wait lasts until the verdicts are cached, warning every
     /// [`PROOF_DEFERRAL_OVERRUN`]. `None`: materialize now — every verdict is
     /// cached, the operations left are known to verify within the budget
@@ -3756,7 +3847,7 @@ impl AppConsensusEngine {
         let budget_secs = exec.token_verification_budget();
         // Operations not known to verify within the budget; the others verify
         // when the frame executes, as before.
-        let mut unverified: Vec<usize> = Vec::new();
+        let mut unverified: Vec<quil_execution::manager::OperationEstimate> = Vec::new();
         let mut verifying = true;
         let mut restarted = false;
         // Submissions queued ahead of this frame's last one.
@@ -3778,12 +3869,16 @@ impl AppConsensusEngine {
                     || proof_prewarm_running(&canon);
             queued_ahead = queued_ahead.max(queue.queued_ahead(&digest).unwrap_or(0));
         }
+        // This frame finalized and asked for its own submissions above
+        // (moving them to the frames' lane): warm-ups of the proposals that
+        // lost this frame or an earlier one are no longer needed.
+        queue.end_warmups(&self.filter, frame_number);
         if unverified.is_empty() && !proof_deferral_known(&self.filter, frame_number) {
             return None;
         }
         let estimate_secs: f64 = unverified
             .iter()
-            .map(|bytes| quil_execution::ExecutionEngineManager::estimated_verify_secs(*bytes))
+            .map(quil_execution::ExecutionEngineManager::estimated_operation_secs)
             .sum();
         let decision = PROOF_DEFERRALS
             .lock()
@@ -3891,6 +3986,10 @@ impl AppConsensusEngine {
             None => return Ok((0, 0)),
         };
         self.prove_storage_epoch_if_due(global_frame_number);
+        #[cfg(test)]
+        if let Some(held) = held_for_proofs(&self.filter, frame_number) {
+            return Err(held);
+        }
         if let Some(pending) = self.defer_for_proof_verification(&exec, &requests, frame_number) {
             return Err(pending);
         }
@@ -4190,8 +4289,18 @@ impl AppConsensusEngine {
         if let Some(marker) = self.fence_reanchor.marker {
             return Ok(marker);
         }
-        let (marker, malformed) =
+        let loaded =
             crate::app_handoff::load_reanchor_marker(self.clock_store.as_ref(), &self.filter)?;
+        Ok(self.adopt_reanchor_marker(loaded))
+    }
+
+    /// Keep the re-anchor marker read from the store
+    /// ([`crate::app_handoff::load_reanchor_marker`]), warning once about a
+    /// malformed one, which the read cleared.
+    fn adopt_reanchor_marker(
+        &mut self,
+        (marker, malformed): (Option<crate::app_handoff::ReanchorMarker>, Option<usize>),
+    ) -> Option<crate::app_handoff::ReanchorMarker> {
         if let Some(bytes) = malformed {
             warn!(core_id = self.core_id, filter = hex::encode(&self.filter), bytes, scope = "this node",
                 action = "the marker was cleared; if the shard head still lies past its session fence the next \
@@ -4199,7 +4308,7 @@ impl AppConsensusEngine {
                 "shard re-anchor marker malformed; cleared");
         }
         self.fence_reanchor.marker = Some(marker);
-        Ok(marker)
+        marker
     }
 
     fn reanchor_gate(
@@ -4292,6 +4401,7 @@ impl AppConsensusEngine {
     fn clear_stale_reanchor(&mut self, marker: &crate::app_handoff::ReanchorMarker) -> Result<()> {
         crate::app_handoff::clear_reanchor_marker(self.clock_store.as_ref(), &self.filter)?;
         crate::app_handoff::clear_dropped_lineage(self.clock_store.as_ref(), &self.filter)?;
+        self.lineage_record_absent = true;
         self.fence_reanchor.evicted = false;
         let owed = self
             .finish_reanchor(std::time::Instant::now())
@@ -4409,15 +4519,103 @@ impl AppConsensusEngine {
             if !self.fence_reanchor.evicted
                 && marker.cause() == crate::app_handoff::ReanchorCause::ReplayMismatch
             {
-                self.fence_reanchor.evicted = crate::app_handoff::dropped_lineage(
-                    &shard,
-                    self.clock_store.as_ref(),
-                    &self.filter,
-                )? == Some(marker.from_cursor);
+                self.fence_reanchor.evicted =
+                    self.dropped_lineage_record(&shard)? == Some(marker.from_cursor);
             }
             return Ok(None);
         }
-        crate::app_handoff::dropped_lineage(&shard, self.clock_store.as_ref(), &self.filter)
+        self.dropped_lineage_record(&shard)
+    }
+
+    /// [`crate::app_handoff::dropped_lineage`] of this engine's shard, read
+    /// under the forest write barrier, until a read finds no record. The
+    /// eviction passes write one only for a shard their binding no longer
+    /// serves, and once this worker was rebound they stop before writing
+    /// ([`Self::check_evicted_lineage`]): after this engine's first look
+    /// none appears for its shard, so the consensus starts and retries that
+    /// follow read nothing. A record found is read at each check, as a shard
+    /// sync may move the cursor that keeps it current.
+    fn dropped_lineage_record(
+        &mut self,
+        shard: &quil_hypergraph::HypergraphCrdt,
+    ) -> Result<Option<u64>> {
+        if self.lineage_record_absent {
+            return Ok(None);
+        }
+        let found =
+            crate::app_handoff::dropped_lineage(shard, self.clock_store.as_ref(), &self.filter)?;
+        self.lineage_record_absent = found.is_none();
+        Ok(found)
+    }
+
+    /// Read the records the start checks consult, once per engine and off
+    /// the worker thread: the legacy history discard
+    /// ([`Self::legacy_history_discarded`]), the re-anchor marker
+    /// ([`Self::recorded_reanchor`]) and, under the forest write barrier,
+    /// the dropped-lineage record ([`Self::dropped_lineage_record`]). Each
+    /// is a point read of a consensus key, and those sort just below the
+    /// storage replicas: while a replica an earlier build stored whole (one
+    /// data block of up to 1 GB, no bloom filter to skip it) shares their
+    /// table block, each read copies the block. On a regular node of 47
+    /// workers starting together that took 7 to 14 s a read, up to 42 s per
+    /// worker thread, which runs that worker's other tasks too
+    /// (2026-11-01). What the reads find fills the engine's caches; what
+    /// they leave open (a read error, a dropped-lineage record found) the
+    /// checks read again themselves.
+    async fn prefetch_start_records(&mut self) {
+        use quil_types::consensus::LegacyHistory;
+        let history = self.history_discarded.get().is_none()
+            && quil_types::consensus::committee_handoff_policy()
+                .is_some_and(|policy| policy.legacy_history == LegacyHistory::Discard);
+        let marker = self.fence_reanchor.marker.is_none();
+        let shard = self
+            .execution_engine
+            .as_ref()
+            .filter(|_| !self.lineage_record_absent)
+            .map(|manager| manager.crdt());
+        if !history && !marker && shard.is_none() {
+            return;
+        }
+        let clock = self.clock_store.clone();
+        let filter = self.filter.clone();
+        let started = std::time::Instant::now();
+        let read = tokio::task::spawn_blocking(move || {
+            let history = history.then(|| clock.app_frame_history_discarded());
+            let marker =
+                marker.then(|| crate::app_handoff::load_reanchor_marker(clock.as_ref(), &filter));
+            let lineage = shard.map(|shard| {
+                let _barrier = shard.lock_forest_writes();
+                crate::app_handoff::dropped_lineage(&shard, clock.as_ref(), &filter)
+            });
+            (history, marker, lineage)
+        })
+        .await;
+        let (history, marker, lineage) = match read {
+            Ok(read) => read,
+            Err(error) => {
+                debug!(core_id = self.core_id, %error, "start record reads ended early; the start checks read them");
+                return;
+            }
+        };
+        if let Some(Ok(Some(frame))) = history {
+            let _ = self.history_discarded.set(frame);
+        }
+        if let Some(Ok(loaded)) = marker {
+            if self.fence_reanchor.marker.is_none() {
+                self.adopt_reanchor_marker(loaded);
+            }
+        }
+        if let Some(Ok(None)) = lineage {
+            self.lineage_record_absent = true;
+        }
+        let took = started.elapsed();
+        if took >= START_RECORDS_SLOW {
+            info!(core_id = self.core_id, filter = hex::encode(&self.filter), ms = took.as_millis() as u64,
+                scope = "this node",
+                action = "no action needed: read off the worker thread; expected while this worker's store holds a \
+                    storage replica an earlier build stored whole, until its conversion compacts it away",
+                "shard start records read slowly");
+        }
     }
 
     /// Record the re-anchor a shard owes at once when this worker's store
@@ -5207,13 +5405,79 @@ impl AppConsensusEngine {
         if number <= materialized {
             return;
         }
-        self.predecessor_block.refusal = result.as_ref().err().map(|error| AnchorRefusal {
+        // A frame waiting for this node's proof verification passed every
+        // check: nothing refused it.
+        let refused = result.as_ref().err().filter(|error| {
+            !crate::worker_execution::waits_for_proof_verification(&error.to_string())
+        });
+        self.predecessor_block.refusal = refused.map(|error| AnchorRefusal {
             frame: Some(unanchored.map_or(number, |(frame, _)| frame)),
             global_frame: unanchored.map(|(_, global)| global),
             at_unix_ms: crate::worker_execution::now_ms(),
             cause: "archive replay frame refused",
             error: error.to_string(),
         });
+    }
+
+    /// Retry materializing the frame after the cursor when its last attempt
+    /// stopped to wait for this node's proof verification ([`ProofWait`]),
+    /// a frame an archive replay or consensus committed and kept: the frame
+    /// it still waits for, if any. A recovery finding one fetches and
+    /// validates nothing, as an archive's copy would wait for the same
+    /// proofs. The wait ends as the materialization's does: with the
+    /// verdicts cached, or with the proofs verified inline once the
+    /// background verification cannot finish them; any other stop ends it
+    /// too, and the recovery replays as before.
+    async fn retry_proof_wait(&mut self) -> Option<u64> {
+        let next = self.last_materialized_frame + 1;
+        self.proof_wait.filter(|wait| wait.frame == next)?;
+        self.try_materialize_follower_frames().await;
+        let wait = self
+            .proof_wait
+            .filter(|wait| wait.frame == self.last_materialized_frame + 1)?;
+        self.log_proof_wait(std::time::Instant::now());
+        Some(wait.frame)
+    }
+
+    /// Log [`Self::proof_wait`] for an archive recovery: when it starts,
+    /// then every [`PROOF_WAIT_REPEAT`] with the time waited; the frame's
+    /// materialization logs its end.
+    fn log_proof_wait(&mut self, now: std::time::Instant) {
+        let Some(wait) = self.proof_wait.filter(|wait| {
+            wait.logged
+                .is_none_or(|at| now.saturating_duration_since(at) >= PROOF_WAIT_REPEAT)
+        }) else {
+            return;
+        };
+        let operations = match (
+            self.execution_engine.as_ref(),
+            self.received_full_frames.get(&wait.frame),
+        ) {
+            (Some(exec), Some(frame)) => {
+                let application = self.app_address[..self.app_address.len().min(32)].to_vec();
+                let bundles: Vec<(Vec<u8>, Vec<u8>)> = frame
+                    .requests
+                    .iter()
+                    .filter_map(|bundle| {
+                        crate::consensus_wire::app_bundle_to_canonical_bytes(bundle).ok()
+                    })
+                    .map(|canon| (application.clone(), canon))
+                    .collect();
+                exec.unverified_confidential_operations(&bundles).len()
+            }
+            _ => 0,
+        };
+        info!(core_id = self.core_id, filter = hex::encode(&self.filter), frame = wait.frame, operations,
+            waited_secs = now.saturating_duration_since(wait.since).as_secs(),
+            cause = wait.cause(), class = crate::worker_execution::PROOF_VERIFICATION,
+            scope = "this node's proof worker",
+            action = "an expected wait: the frame is authenticated and committed, and materializes once its \
+                proofs verify, without another archive fetch; its recovery defers meanwhile and counts no \
+                failure; if it lasts hours, check this node's CPU and proofWorker settings",
+            "archive replay frame waits for its proof verification");
+        if let Some(wait) = self.proof_wait.as_mut() {
+            wait.logged = Some(now);
+        }
     }
 
     /// Replay `frame`, which has no certificate of its own and no certified
@@ -5458,6 +5722,13 @@ impl AppConsensusEngine {
         self.received_full_frames.insert(number, frame);
         self.try_materialize_follower_frames().await;
         if self.last_materialized_frame < number {
+            // Authenticated, committed and kept: it materializes once its
+            // proofs verify, on the retry timer or at the next recovery's
+            // `retry_proof_wait`, without being fetched again.
+            if let Some(wait) = self.proof_wait.filter(|wait| wait.frame == number) {
+                self.log_proof_wait(std::time::Instant::now());
+                return Err(QuilError::ExecutionUnavailable(wait.reason()));
+            }
             return Err(QuilError::ExecutionUnavailable(
                 "archive replay materialization did not commit".into(),
             ));
@@ -5976,7 +6247,8 @@ impl AppConsensusEngine {
         {
             return;
         }
-        let refusal = classify_start_refusal(error, &self.start_context);
+        let refusal = classify_start_refusal(error, &self.start_context)
+            .naming_withheld_renewal(self.renewal_withheld());
         let Some(log) = self.start_block.observe(now, &refusal) else {
             return;
         };
@@ -6022,6 +6294,19 @@ impl AppConsensusEngine {
             info!(core_id = self.core_id, filter = hex::encode(&self.filter), session_generation = %generation,
                 blocked_secs = secs, "app consensus started after {secs}s blocked");
         }
+    }
+
+    /// Why this node's lifecycle withheld the renewal of this worker's
+    /// lapsed seat, when the start context holds one
+    /// (`provers::session_hosting::renewal_withheld`).
+    fn renewal_withheld(&self) -> Option<crate::provers::session_hosting::RenewalWithheld> {
+        let seat = self.start_context.not_seated.as_ref()?;
+        seat.allocations
+            .contains(&quil_types::consensus::EffectiveStatus::ExpiredEpoch)
+            .then(|| {
+                crate::provers::session_hosting::renewal_withheld(&self.filter, seat.global_frame)
+            })
+            .flatten()
     }
 
     /// This prover's allocations for the shard at the latest GLOBAL frame,
@@ -6537,6 +6822,7 @@ impl AppConsensusEngine {
         // leaves cursor < clock height, healed by gossip replay of the
         // missing full frame or a shard sync).
         // Early: a shard layout not loaded yet defers the check to consensus start.
+        self.prefetch_start_records().await;
         match self.rewind_past_fence() {
             Err(error @ QuilError::ExecutionUnavailable(_)) => {
                 debug!(core_id = self.core_id, %error, "fence rewind check deferred to consensus start");
@@ -6721,6 +7007,12 @@ impl AppConsensusEngine {
                             if !reply.is_closed() {
                                 let result = self.replay_archive_frame_for_sync(frame, descendants).await;
                                 let _ = reply.send(result);
+                            }
+                        }
+                        Some(AppEngineMessage::RetryProofWait { reply }) => {
+                            if !reply.is_closed() {
+                                let waiting = self.retry_proof_wait().await;
+                                let _ = reply.send(waiting);
                             }
                         }
                         Some(AppEngineMessage::DiscardedBaseRoots { frame, reply }) => {
@@ -7493,6 +7785,7 @@ impl AppConsensusEngine {
     /// `blocked` counts messages consensus discarded as invalid.
     fn log_session_liveness(&mut self) {
         let _probe = probe::section(probe::Section::SessionLiveness);
+        self.watch_view_stall();
         let (Some(liveness), Some(session)) =
             (self.session_liveness.as_ref(), self.cw_session.as_ref())
         else {
@@ -7579,6 +7872,140 @@ impl AppConsensusEngine {
             inbound_from_nonmembers = self.cw_nonmember,
             "app session liveness");
         self.log_silent_members(&seen, best_signers, quorum);
+    }
+
+    /// While the running session host finalizes nothing, say so
+    /// ([`crate::app_stall`]): once past [`crate::app_stall::STALL_AFTER`],
+    /// again every [`crate::app_stall::STALL_REPEAT`], and when a view
+    /// finalizes. Each line names the members by their vote in the stalled
+    /// view closest to a quorum and counts this member's own refusals and
+    /// declined turns since the last finalization, by reason. Runs on every
+    /// retry tick from the tallies the session's liveness already keeps.
+    fn watch_view_stall(&mut self) {
+        use crate::app_stall::{indices, stall_votes, Look, StallCause, StallLog};
+        let now = std::time::Instant::now();
+        let hosting = self.cw_handle.as_ref().is_some_and(|host| !host.is_dead())
+            && self.sealed_session.is_none()
+            && !self.halted.load(std::sync::atomic::Ordering::Relaxed);
+        let (liveness, generation) = match (
+            hosting,
+            self.session_liveness.clone(),
+            self.cw_session.as_ref(),
+        ) {
+            (true, Some(liveness), Some(session)) => (Some(liveness), session.generation),
+            _ => (None, 0),
+        };
+        let seen = liveness.as_ref().map(|liveness| liveness.snapshot());
+        let decided = liveness
+            .as_ref()
+            .map(|liveness| liveness.decisions())
+            .unwrap_or_default();
+        let look = seen.map(|seen| Look {
+            host: (generation, self.cw_host_epoch),
+            finalized: seen.finalized,
+            decided: &decided,
+        });
+        let Some(log) = self.view_stall.check(now, look) else {
+            return;
+        };
+        let filter = hex::encode(&self.filter);
+        let materialized = self.last_materialized_frame;
+        let head = materialized.max(self.lagging_voter.known_tip.unwrap_or(0));
+        let (stalled, repeat, since_view, own) = match log {
+            StallLog::Ended { stalled, how } => {
+                info!(core_id = self.core_id, filter = %filter, generation, frame = head, materialized,
+                    finalized_view = seen.map_or(0, |seen| seen.finalized), stalled_secs = stalled.as_secs(), how,
+                    "app shard consensus stall ended");
+                return;
+            }
+            StallLog::Stalled {
+                stalled,
+                repeat,
+                since_view,
+                own,
+            } => (stalled, repeat, since_view, own),
+        };
+        let (Some(liveness), Some(seen), Some(session)) =
+            (liveness, seen, self.cw_session.as_ref())
+        else {
+            return;
+        };
+        let members = session.members.len();
+        let quorum = members - members.saturating_sub(1) / 3;
+        let votes = stall_votes(members, since_view, seen.view, |view| {
+            liveness.view_signers(view)
+        });
+        let me = self.session_silent.me;
+        let cause = StallCause::of(
+            &votes,
+            quorum,
+            me.and_then(|me| u32::try_from(me).ok()),
+            &own,
+        );
+        let held: Vec<(usize, &'static str)> = votes
+            .nullified
+            .iter()
+            .map(|&member| (member as usize, "nullified"))
+            .chain(
+                votes
+                    .silent
+                    .iter()
+                    .map(|&member| (member as usize, "no vote")),
+            )
+            .collect();
+        let holding_back = list_missing(&session.members, &held, me);
+        let in_stall = |outcome: &Option<quil_cw_consensus::adapters::Outcome>| {
+            outcome
+                .as_ref()
+                .filter(|outcome| outcome.view > since_view)
+                .map_or_else(String::new, |o| {
+                    format!("view {}: {} ({})", o.view, o.reason, o.detail)
+                })
+        };
+        let (scope, action, message) = match cause {
+            StallCause::NoProposal => (
+                "network",
+                "its leaders did not propose, or their proposals did not reach this node; own_declined and \
+                 last_declined say why this node skipped its own turns ('leader not ready to build on the parent' \
+                 waits for the parent frame or for the GLOBAL head to advance); check that GLOBAL advances; ends when \
+                 a view finalizes (logged)",
+                "app shard consensus stalled: no proposal drew a vote in its recent views",
+            ),
+            StallCause::NotFinalizing => (
+                "network",
+                "the members' finalize votes fall short of the quorum or do not reach this node; check this node's \
+                 transport warnings; if it persists, report this line with its shard to the maintainer",
+                "app shard consensus stalled although a proposal drew a quorum of notarize votes",
+            ),
+            StallCause::ThisNode => (
+                "this node",
+                "own_refused says why: 'not at the parent frame' and 'anchored GLOBAL frame missing' mean this worker \
+                 has not applied the parent frame or its GLOBAL anchor yet (check its proof verification and catch-up \
+                 lines); other reasons name the proposal's contents: report this line with its shard to the \
+                 maintainer; holding_back also names the other members that hold back",
+                "app shard consensus stalled, and this worker refuses its proposals",
+            ),
+            StallCause::Members => (
+                "peer",
+                "nothing to fix on this node; holding_back names the members that nullified (a nullify vote carries no \
+                 reason: most often the member has not applied the parent frame yet, as while it verifies a proof, or \
+                 runs another build) and those whose votes did not reach this node; ends when enough of them vote for \
+                 a proposal (logged); if it persists, report this line with its shard to the maintainer",
+                "app shard consensus stalled: too few members notarize the proposals this worker accepted",
+            ),
+        };
+        warn!(core_id = self.core_id, filter = %filter, generation, frame = head + 1, materialized, view = seen.view,
+            stalled_secs = stalled.as_secs(), repeat, members, quorum,
+            best_view = %votes.view.map_or_else(|| "none".to_string(), |view| view.to_string()),
+            notarized = votes.notarized.len(), nullified = votes.nullified.len(), silent = votes.silent.len(),
+            notarized_members = %indices(&votes.notarized), nullified_members = %indices(&votes.nullified),
+            silent_members = %indices(&votes.silent),
+            member = %me.map_or_else(|| "none".to_string(), |me| me.to_string()), holding_back = %holding_back,
+            views = votes.views, proposed_views = votes.proposed_views, own_accepted = own.accepted,
+            own_refused = %by_reason(&own.refused), own_proposed = own.proposed,
+            own_declined = %by_reason(&own.declined), last_refused = %in_stall(&decided.last_refused),
+            last_declined = %in_stall(&decided.last_declined), cause = cause.label(), scope, action,
+            "{message}");
     }
 
     /// Publish whether this worker is a lagging voter ([`LaggingVoter`]): a
@@ -8747,6 +9174,7 @@ impl AppConsensusEngine {
         let app_address = self.app_address.clone();
         self.start_context = StartContext::default();
         self.history_walk.clear();
+        self.prefetch_start_records().await;
         self.discard_legacy_history_if_due().await?;
         self.drop_discarded_finalized_records()?;
         self.rewind_past_fence()?;
@@ -10779,33 +11207,62 @@ impl AppConsensusEngine {
     /// about 190 KB in 8 h on one node) and no proposal read them.
     fn add_app_message(&mut self, data: &[u8]) {
         let data = canonical_app_message(data);
-        stamp_arrival(&self.routing_seen, &data, std::time::Instant::now());
-        // Verify its confidential proofs now, in the background, so the
-        // proposal that carries it and the frame that executes it find the
-        // verdicts cached instead of verifying for minutes. Only on the shard
-        // that proposes it: every shard of the application collects it.
-        if let Some(exec) = self.execution_engine.as_ref() {
-            if quil_execution::ExecutionEngineManager::confidential_operation_count(
-                &self.app_address,
-                &data,
-            ) > 0
-                && arrival_designated(
-                    &self.filter,
-                    routing_shards(&self.app_address).as_deref(),
-                    &crate::admission_verify::digest(&data),
-                    quil_execution::ExecutionEngineManager::shield_source(&data),
-                )
-            {
-                crate::admission_verify::offer_submission(
-                    crate::admission_verify::global(),
+        let now = std::time::Instant::now();
+        stamp_arrival(&self.routing_seen, &data, now);
+        let collected = self.message_collector.add_message_newest(data.clone());
+        self.verify_on_arrival(&data, collected, now);
+    }
+
+    /// Verify an arriving submission's confidential proofs now, in the
+    /// background, so the proposal that carries it and the frame that
+    /// executes it find the verdicts cached instead of verifying for
+    /// minutes. Only on the shard that proposes it (every shard of the
+    /// application collects it), and only what may still execute: one the
+    /// collector did not take as new (`collected`: a finalized frame
+    /// consumed it, the collector holds it, or its rank is full), one that
+    /// fails dispatch's checks before native work, and one the global
+    /// commit already decided are not queued; nor arrivals past the
+    /// admission budget ([`crate::admission_verify::offer_arrival`]). A
+    /// proposal or frame carrying any of them queues it then.
+    fn verify_on_arrival(&self, data: &[u8], collected: bool, now: std::time::Instant) {
+        let Some(exec) = self.execution_engine.as_ref() else {
+            return;
+        };
+        if quil_execution::ExecutionEngineManager::confidential_operation_count(
+            &self.app_address,
+            data,
+        ) == 0
+            || !arrival_designated(
+                &self.filter,
+                routing_shards(&self.app_address).as_deref(),
+                &crate::admission_verify::digest(data),
+                quil_execution::ExecutionEngineManager::shield_source(data),
+            )
+        {
+            return;
+        }
+        let queue = crate::admission_verify::global();
+        if !collected {
+            queue.note_arrival_skipped();
+            return;
+        }
+        let global = self
+            .storage_source_hypergraph
+            .clone()
+            .unwrap_or_else(|| exec.crdt());
+        match exec.arrival_operations(&global, &self.app_address, data) {
+            Ok(sizes) => {
+                crate::admission_verify::offer_arrival(
+                    queue,
                     exec,
                     &self.app_address,
-                    &data,
-                    false,
+                    data,
+                    &sizes,
+                    now,
                 );
             }
+            Err(_) => queue.note_arrival_skipped(),
         }
-        self.message_collector.add_message_newest(data);
     }
 
     // ---------------------------------------------------------------
@@ -10856,6 +11313,9 @@ impl AppConsensusEngine {
         }
         loop {
             let next = self.last_materialized_frame + 1;
+            // Kept only while this attempt stops to wait again: any other
+            // outcome ends the wait.
+            let waiting = self.proof_wait.take().filter(|wait| wait.frame == next);
             let trusted_root = match self.finalized_requests_roots.get(&next) {
                 Some(r) => r.clone(),
                 None => break, // not finalized through consensus yet
@@ -10971,6 +11431,15 @@ impl AppConsensusEngine {
                     }
                     self.received_full_frames.remove(&next);
                     self.materialize_failures.remove(&next);
+                    if let Some(wait) = waiting.filter(|wait| wait.logged.is_some()) {
+                        info!(
+                            core_id = self.core_id,
+                            filter = hex::encode(&self.filter),
+                            frame = next,
+                            waited_secs = wait.since.elapsed().as_secs(),
+                            "archive replay frame materialized after its proof verification wait"
+                        );
+                    }
                     debug!(
                         core_id = self.core_id,
                         frame = next,
@@ -10982,9 +11451,11 @@ impl AppConsensusEngine {
                 // Its proofs verify in the background: the frame is kept and
                 // retried on the retry timer; the wait is logged where it starts.
                 Err(e) if quil_execution::token_intrinsic::is_proof_verification_pending(&e) => {
-                    break
+                    self.proof_wait = Some(ProofWait::at(next, false, waiting));
+                    break;
                 }
                 Err(e) if quil_execution::token_intrinsic::is_proof_worker_busy(&e) => {
+                    self.proof_wait = Some(ProofWait::at(next, true, waiting));
                     // Local contention for the proof worker: the frame is
                     // fine and a shard sync would not relieve it. Keep the
                     // frame and retry without counting toward the drop;
@@ -11341,7 +11812,8 @@ fn message_step(message: &Option<AppEngineMessage>) -> probe::Section {
     use probe::Section;
     match message {
         Some(AppEngineMessage::Frame(_)) => Section::EngineFrameMessage,
-        Some(AppEngineMessage::ReplayArchiveFrame { .. }) => Section::EngineReplayArchiveFrame,
+        Some(AppEngineMessage::ReplayArchiveFrame { .. })
+        | Some(AppEngineMessage::RetryProofWait { .. }) => Section::EngineReplayArchiveFrame,
         Some(AppEngineMessage::ValidateShardSyncAnchor { .. }) => Section::EngineSyncAnchor,
         Some(AppEngineMessage::ShardSyncCompleted { .. }) => Section::EngineSyncCompleted,
         Some(AppEngineMessage::ShardBootstrapCompleted { .. }) => Section::EngineBootstrapCompleted,
@@ -12004,9 +12476,6 @@ pub(crate) fn build_requests_root_check(
                 Ok(_) => return Err(("requests root differs from the body", format!("frame {}", header.frame_number))),
                 Err(error) => return Err(("requests root not computable", format!("frame {}: {error}", header.frame_number))),
             }
-            // The body is bound to its root: its proofs are what this frame
-            // will execute if finalized.
-            prewarm_proof_verdicts(&exec, &app_addr, &canonical);
             // (b) Pre-state `state_roots` check. FAIL-CLOSED: a voter
             // must be EXACTLY at N-1 to
             // validate the declared pre-state via the deterministic
@@ -12147,6 +12616,16 @@ pub(crate) fn build_requests_root_check(
                     }
                 }
             }
+            // Every check passed: this member votes for the body, whose
+            // proofs are what this frame executes if finalized. Warm up only
+            // now; a proposal honest members refuse can never finalize.
+            prewarm_proof_verdicts(
+                &exec,
+                &app_addr,
+                &canonical,
+                &filter_for_verify,
+                header.frame_number,
+            );
             Ok(())
         },
     )
@@ -12200,13 +12679,18 @@ static PROOF_PREWARM_THREADS: std::sync::atomic::AtomicUsize =
 /// next frame that relays its spend. Verdicts are deterministic; this changes
 /// only when they are computed. Bounded: at most [`MAX_PROOF_PREWARMS`] threads,
 /// and a body already warming is not warmed again. A body with an operation
-/// not known to verify within the budget goes to the front of the admission
-/// queue ([`crate::admission_verify`]) instead, behind the submissions frames
-/// already wait on.
+/// not known to verify within the budget is queued as a warm-up of `frame`
+/// of `shard` in the admission queue ([`crate::admission_verify`]) instead:
+/// behind the submissions finalized frames wait on, bounded, and dropped
+/// once its time passed or `shard` materialized `frame`, since the proposal
+/// may never finalize (a leader could otherwise queue unbounded work ahead
+/// of every honest frame).
 pub(crate) fn prewarm_proof_verdicts(
     exec: &Arc<quil_execution::ExecutionEngineManager>,
     app_address: &[u8],
     canonical: &[Vec<u8>],
+    shard: &[u8],
+    frame: u64,
 ) {
     let addr = app_address[..app_address.len().min(32)].to_vec();
     let bundles: Vec<Vec<u8>> = canonical
@@ -12217,7 +12701,7 @@ pub(crate) fn prewarm_proof_verdicts(
         .cloned()
         .collect();
     // A bundle with an operation not known to verify within the budget (a
-    // batch shield) goes to the front of the node's one admission queue
+    // batch shield) goes to the node's one admission queue as a warm-up
     // instead: verified beside the queue's own verification, each ran at
     // half speed (devnet, 2026-10-29).
     let budget = exec.token_verification_budget();
@@ -12228,12 +12712,13 @@ pub(crate) fn prewarm_proof_verdicts(
         )
     });
     for bundle in &long {
-        crate::admission_verify::offer_submission(
+        crate::admission_verify::offer_warmup_submission(
             crate::admission_verify::global(),
             exec,
             &addr,
             bundle,
-            true,
+            shard,
+            frame,
         );
     }
     if bundles.is_empty() {
@@ -12411,7 +12896,7 @@ fn lagging_tip(
 /// rejected, its join expired). The worker stays only to vote until the
 /// seat departs. A seat joining, activating, active, paused, leaving
 /// unconfirmed, lapsed or reassigned does not depart.
-fn seat_departs(
+pub(crate) fn seat_departs(
     allocations: &[quil_types::consensus::ProverAllocationInfo],
     filter: &[u8],
     frame: u64,
@@ -12899,15 +13384,19 @@ struct BundleProofs {
     released: bool,
 }
 
-/// Whether a bundle whose unverified confidential operations are `sizes`
-/// bytes each is verified in the background before a frame carries it: one
-/// of them is not known to verify within `budget_secs` (a batch shield, or a
-/// size class this node has not measured). Never without a proof worker
-/// (`None`), whose verifications are not budgeted.
-fn verifies_in_background(sizes: &[usize], budget_secs: Option<f64>) -> bool {
+/// Whether a bundle whose unverified confidential operations are
+/// `operations` is verified in the background before a frame carries it:
+/// one of them is not known to verify within `budget_secs` (a batch shield
+/// by its size or sources, or a size class this node has not measured from
+/// accepted verdicts). Never without a proof worker (`None`), whose
+/// verifications are not budgeted.
+fn verifies_in_background(
+    operations: &[quil_execution::manager::OperationEstimate],
+    budget_secs: Option<f64>,
+) -> bool {
     budget_secs.is_some_and(|budget| {
-        sizes.iter().any(|bytes| {
-            !quil_execution::ExecutionEngineManager::verification_known_to_fit(*bytes, budget)
+        operations.iter().any(|operation| {
+            !quil_execution::ExecutionEngineManager::operation_known_to_fit(operation, budget)
         })
     })
 }
@@ -12953,7 +13442,7 @@ fn bundle_proofs(
         unverified: unverified.len(),
         unverified_secs: unverified
             .iter()
-            .map(|bytes| quil_execution::ExecutionEngineManager::estimated_verify_secs(*bytes))
+            .map(quil_execution::ExecutionEngineManager::estimated_operation_secs)
             .sum(),
         long,
         verifying,
@@ -12965,7 +13454,8 @@ fn bundle_proofs(
 /// proof-verification budget (`budget_secs` worker-seconds). Bundles whose
 /// proofs need no more verification are carried. A released bundle is left
 /// out. A long one verifying in the background is held until it is
-/// verified, however long that takes. The rest are taken in collection
+/// verified; held past [`MAX_PROOF_HOLD`], it verifies next on this node
+/// ([`ProofHolds::due`]). The rest are taken in collection
 /// (arrival) order while their estimated verification fits the budget, the
 /// first even when it alone exceeds it. Every shard of the application
 /// collects the same submissions in much the same order, so the shards a
@@ -13042,6 +13532,81 @@ fn arrival_designated(
 /// Whether a proposal of shard `filter` may log the bundles it defers: at
 /// most once a minute per shard, since a held bundle is deferred by every
 /// proposal while it verifies.
+/// How long a proposal holds a long bundle verifying in the background
+/// before this node verifies it next ([`ProofHolds::due`]). Two batch-shield
+/// verifications and more (240-470 s each, mainnet and devnet,
+/// 2026-10-29..31), well under the 30 min a frame waits between warnings.
+const MAX_PROOF_HOLD: std::time::Duration = std::time::Duration::from_secs(600);
+/// Held bundles remembered across shards; past it the least recently held
+/// are forgotten (their hold starts again).
+const PROOF_HOLD_ENTRIES: usize = 4096;
+
+/// When each shard's proposals started holding each long bundle, and the
+/// one each shard last sent ahead in the admission queue.
+#[derive(Default)]
+struct ProofHolds {
+    /// `(filter, submission)` → when first and last held.
+    held: HashMap<(Vec<u8>, [u8; 32]), (std::time::Instant, std::time::Instant)>,
+    /// `filter` → the submission it sent ahead.
+    promoted: HashMap<Vec<u8>, [u8; 32]>,
+}
+
+static PROOF_HOLDS: std::sync::LazyLock<std::sync::Mutex<ProofHolds>> =
+    std::sync::LazyLock::new(Default::default);
+
+impl ProofHolds {
+    /// Note that a proposal of shard `filter` holds the long bundles `held`
+    /// at `now`; the one to verify next, and how long it was held: the
+    /// longest held at least [`MAX_PROOF_HOLD`], unless the one this shard
+    /// sent ahead is still held and verifying (`pending`). A bundle not held
+    /// for [`MAX_PROOF_HOLD`] is forgotten.
+    fn due(
+        &mut self,
+        filter: &[u8],
+        held: &[[u8; 32]],
+        pending: impl Fn(&[u8; 32]) -> bool,
+        now: std::time::Instant,
+    ) -> Option<([u8; 32], std::time::Duration)> {
+        for digest in held {
+            self.held
+                .entry((filter.to_vec(), *digest))
+                .and_modify(|(_, seen)| *seen = now)
+                .or_insert((now, now));
+        }
+        self.held
+            .retain(|_, (_, seen)| now.saturating_duration_since(*seen) < MAX_PROOF_HOLD);
+        if self.held.len() > PROOF_HOLD_ENTRIES {
+            let mut by_seen: Vec<_> = self
+                .held
+                .iter()
+                .map(|(key, (_, seen))| (*seen, key.clone()))
+                .collect();
+            by_seen.sort_by_key(|(seen, _)| *seen);
+            let excess = self.held.len() - PROOF_HOLD_ENTRIES;
+            for (_, key) in by_seen.into_iter().take(excess) {
+                self.held.remove(&key);
+            }
+        }
+        if let Some(promoted) = self.promoted.get(filter) {
+            if held.contains(promoted) && pending(promoted) {
+                return None;
+            }
+            self.promoted.remove(filter);
+        }
+        let (digest, since) = held
+            .iter()
+            .filter_map(|digest| {
+                self.held
+                    .get(&(filter.to_vec(), *digest))
+                    .map(|(since, _)| (*digest, *since))
+            })
+            .filter(|(_, since)| now.saturating_duration_since(*since) >= MAX_PROOF_HOLD)
+            .min_by_key(|(_, since)| *since)?;
+        self.promoted.insert(filter.to_vec(), digest);
+        Some((digest, now.saturating_duration_since(since)))
+    }
+}
+
 fn budget_note_due(filter: &[u8], now: std::time::Instant) -> bool {
     static NOTES: std::sync::LazyLock<
         std::sync::Mutex<std::collections::HashMap<Vec<u8>, std::time::Instant>>,
@@ -14152,6 +14717,10 @@ const PREDECESSOR_BLOCKED_REPEAT: Duration = Duration::from_secs(30 * 60);
 /// ([`paced_start_wait`]), unless the materialized cursor moves first.
 const START_WAIT_RETRY: Duration = Duration::from_secs(60);
 
+/// A read of an engine's start records
+/// ([`AppConsensusEngine::prefetch_start_records`]) this slow is logged.
+const START_RECORDS_SLOW: Duration = Duration::from_secs(2);
+
 /// An expected wait the passive retry paces ([`paced_start_wait`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PacedWait {
@@ -14714,6 +15283,51 @@ struct StartRefusal {
     repeats: bool,
 }
 
+/// The advice for a worker whose seat lapsed to `ExpiredEpoch`, unless this
+/// node withheld its renewal ([`StartRefusal::naming_withheld_renewal`]).
+const MISSED_RECONFIRM: &str = "this worker's allocation missed its epoch reconfirm: check this worker's \
+    prover confirmation (dispatch and publish in the master log); it starts only once a later session seats it";
+
+impl StartRefusal {
+    /// This refusal, when it advises a missed reconfirm ([`MISSED_RECONFIRM`])
+    /// and this node's lifecycle withheld the seat's renewal on purpose
+    /// (`withheld`): no confirmation failed, so it names that decision, what
+    /// renews the seat, and the first GLOBAL session pass of the next epoch,
+    /// which seats it once renewed. Its key is unchanged.
+    fn naming_withheld_renewal(
+        mut self,
+        withheld: Option<crate::provers::session_hosting::RenewalWithheld>,
+    ) -> Self {
+        let Some(withheld) = withheld.filter(|_| self.action == MISSED_RECONFIRM) else {
+            return self;
+        };
+        let frame = self
+            .reason
+            .split("at GLOBAL frame ")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .and_then(|frame| frame.parse::<u64>().ok());
+        let pass = frame.map_or_else(String::new, |frame| {
+            let epoch = quil_types::consensus::epoch_for_frame(frame) + 1;
+            format!(
+                ", and once it renews, the first GLOBAL session pass of epoch {epoch}, at GLOBAL \
+                 frame {}, seats it",
+                quil_types::consensus::epoch_start_frame(epoch)
+            )
+        });
+        self.reason = self.reason.replacen(
+            "); start refused with: ",
+            &format!(
+                "); this node withheld its renewal: {}{pass}; start refused with: ",
+                withheld.reason()
+            ),
+            1,
+        );
+        self.action = withheld.action();
+        self
+    }
+}
+
 fn refusal_key(reason: &str) -> String {
     let mut key = String::with_capacity(reason.len());
     let mut digits = false;
@@ -14818,8 +15432,7 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
             "the prover registry holds no allocation of this prover for the shard: check this worker's \
                 allocation (join and confirm); it starts only once a committee session seats it"
         } else if seat.allocations.contains(&EffectiveStatus::ExpiredEpoch) {
-            "this worker's allocation missed its epoch reconfirm: check this worker's prover confirmation \
-                (dispatch and publish in the master log); it starts only once a later session seats it"
+            MISSED_RECONFIRM
         } else {
             "this worker is not a member of the shard's committee session: check the reconfirm and renewal \
                 of this worker's allocation; it starts only once a later session seats it"
@@ -15412,6 +16025,49 @@ mod start_block_tests {
             lapsed.action.contains("missed its epoch reconfirm"),
             "{}",
             lapsed.action
+        );
+        assert_eq!(
+            lapsed.clone().naming_withheld_renewal(None),
+            lapsed,
+            "nothing withheld: unchanged"
+        );
+        // This node's lifecycle withheld the renewal: no confirmation
+        // failed, and the next epoch's first session pass is named.
+        use crate::provers::session_hosting::RenewalWithheld;
+        let epoch = quil_types::consensus::epoch_for_frame(918_900) + 1;
+        let pass = quil_types::consensus::epoch_start_frame(epoch);
+        for why in [RenewalWithheld::Unhosted, RenewalWithheld::Unvoted] {
+            let withheld = lapsed.clone().naming_withheld_renewal(Some(why));
+            assert_eq!(withheld.scope, StartScope::ThisNode);
+            assert_eq!(withheld.key, lapsed.key, "one refusal for the lapsed seat");
+            assert!(
+                !withheld.action.contains("missed its epoch reconfirm")
+                    && withheld
+                        .action
+                        .contains("withheld the seat's renewal on purpose"),
+                "{}",
+                withheld.action
+            );
+            assert!(
+                withheld.reason.contains(why.reason())
+                    && withheld.reason.contains(&format!(
+                        "first GLOBAL session pass of epoch {epoch}, at GLOBAL frame {pass}, seats it"
+                    ))
+                    && withheld.reason.contains("; start refused with: "),
+                "{}",
+                withheld.reason
+            );
+        }
+        // Withholding names nothing for a refusal that is not a lapse.
+        let active = classify_start_refusal(
+            &committee_build_failed(),
+            &seat(vec![EffectiveStatus::Active], None),
+        );
+        assert_eq!(
+            active
+                .clone()
+                .naming_withheld_renewal(Some(RenewalWithheld::Unhosted)),
+            active
         );
         let unread = classify_start_refusal(
             &committee_build_failed(),
@@ -16425,6 +17081,96 @@ impl UnrewindableFenceBlock {
     }
 }
 
+/// How often an archive recovery that keeps finding its frame waiting for
+/// this node's proof verification logs the wait again.
+const PROOF_WAIT_REPEAT: Duration = Duration::from_secs(10 * 60);
+
+/// The frame after the cursor whose materialization stopped to wait for this
+/// node's proof verification: its proofs verify in the background
+/// (`PROOF_VERIFICATION_PENDING`) or the proof worker refused it busy
+/// (`PROOF_WORKER_BUSY`). Kept by
+/// [`AppConsensusEngine::try_materialize_follower_frames`] only while each
+/// attempt stops so again.
+#[derive(Clone, Copy, Debug)]
+struct ProofWait {
+    frame: u64,
+    /// When the frame first stopped so.
+    since: std::time::Instant,
+    /// The proof worker refused it busy.
+    busy: bool,
+    /// When an archive recovery last logged the wait.
+    logged: Option<std::time::Instant>,
+}
+
+impl ProofWait {
+    /// `frame` stops to wait now; `previous`, its wait so far, keeps its start.
+    fn at(frame: u64, busy: bool, previous: Option<ProofWait>) -> Self {
+        let previous = previous.filter(|wait| wait.frame == frame);
+        Self {
+            frame,
+            since: previous.map_or_else(std::time::Instant::now, |wait| wait.since),
+            busy,
+            logged: previous.and_then(|wait| wait.logged),
+        }
+    }
+
+    fn cause(&self) -> &'static str {
+        if self.busy {
+            quil_execution::token_intrinsic::PROOF_WORKER_BUSY
+        } else {
+            quil_execution::token_intrinsic::PROOF_VERIFICATION_PENDING
+        }
+    }
+
+    /// The replay's error, which names the cause
+    /// (`worker_execution::waits_for_proof_verification`).
+    fn reason(&self) -> String {
+        format!(
+            "archive replay of frame {} waits for this node's proof verification ({})",
+            self.frame,
+            self.cause()
+        )
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Frames whose materialization a test on this thread holds as a proof
+    /// verification would: `(filter, frame, busy)`.
+    static HELD_FOR_PROOFS: std::cell::RefCell<Vec<(Vec<u8>, u64, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Hold (`Some(busy)`) or release (`None`) the materialization of `frame`
+/// of `filter`.
+#[cfg(test)]
+fn hold_for_proofs(filter: &[u8], frame: u64, held: Option<bool>) {
+    HELD_FOR_PROOFS.with_borrow_mut(|frames| {
+        frames.retain(|(f, n, _)| !(f == filter && *n == frame));
+        if let Some(busy) = held {
+            frames.push((filter.to_vec(), frame, busy));
+        }
+    });
+}
+
+#[cfg(test)]
+fn held_for_proofs(filter: &[u8], frame: u64) -> Option<QuilError> {
+    let busy = HELD_FOR_PROOFS.with_borrow(|frames| {
+        frames
+            .iter()
+            .find(|(f, n, _)| f == filter && *n == frame)
+            .map(|(_, _, busy)| *busy)
+    })?;
+    Some(QuilError::ExecutionUnavailable(
+        if busy {
+            quil_execution::token_intrinsic::PROOF_WORKER_BUSY
+        } else {
+            quil_execution::token_intrinsic::PROOF_VERIFICATION_PENDING
+        }
+        .to_string(),
+    ))
+}
+
 /// Failed replays of one archive frame onto this worker's trees, and how
 /// long they must persist, before the shard owes a re-anchor: a mismatch
 /// while the trees are mid-write passes within minutes, one in the trees
@@ -17341,6 +18087,78 @@ mod fence_reanchor_tests {
         assert!(engine.replay_mismatch.since.is_none());
     }
 
+    /// A replayed frame whose materialization waits for this node's proof
+    /// verification is its own outcome, no mismatch: it stays committed and
+    /// kept, counts nothing toward a re-anchor however often it is replayed,
+    /// and materializes once its proofs verify, retried in place without
+    /// another replay; the proof worker refusing it busy keeps the wait and
+    /// its start. A frame no longer kept ends the wait, and the recovery
+    /// replays as before.
+    #[tokio::test]
+    async fn a_replayed_frame_waiting_for_its_proofs_materializes_once_they_verify() {
+        let (mut engine, _events, crdt) = shard_engine();
+        let frame = first_frame(&engine, &crdt).await;
+        let filter = engine.filter.clone();
+        hold_for_proofs(&filter, 1, Some(false));
+        for _ in 0..12 {
+            let error = engine
+                .replay_archive_frame_with(frame.clone(), None, |_| Ok(true))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                crate::worker_execution::failure_class(&error),
+                crate::worker_execution::PROOF_VERIFICATION,
+                "{error}"
+            );
+            assert!(error.contains("frame 1 waits"), "{error}");
+        }
+        assert_eq!(engine.last_materialized_frame, 0);
+        assert!(engine.received_full_frames.contains_key(&1), "kept");
+        let wait = engine.proof_wait.expect("the wait is noted");
+        assert_eq!((wait.frame, wait.busy), (1, false));
+        assert!(wait.logged.is_some(), "the replay logged the wait");
+        assert_eq!(engine.replay_mismatch.failures, 0, "no mismatch counted");
+        assert!(engine.replay_mismatch.since.is_none());
+        assert!(
+            !matches!(engine.fence_reanchor.marker, Some(Some(_))),
+            "no re-anchor recorded"
+        );
+        hold_for_proofs(&filter, 1, Some(true));
+        assert_eq!(engine.retry_proof_wait().await, Some(1));
+        let busy = engine.proof_wait.unwrap();
+        assert!(busy.busy);
+        assert_eq!(busy.since, wait.since, "the wait keeps its start");
+        hold_for_proofs(&filter, 1, None);
+        assert_eq!(engine.retry_proof_wait().await, None, "the verdicts are in");
+        assert_eq!(engine.last_materialized_frame, 1, "materialized in place");
+        assert!(engine.proof_wait.is_none());
+        assert_eq!(
+            engine
+                .replay_archive_frame_with(frame.clone(), None, |_| Ok(true))
+                .await
+                .unwrap(),
+            1
+        );
+
+        let (mut engine, _events, crdt) = shard_engine();
+        let frame = first_frame(&engine, &crdt).await;
+        hold_for_proofs(&engine.filter.clone(), 1, Some(false));
+        assert!(engine
+            .replay_archive_frame_with(frame, None, |_| Ok(true))
+            .await
+            .is_err());
+        assert!(engine.proof_wait.is_some());
+        engine.received_full_frames.remove(&1);
+        assert_eq!(
+            engine.retry_proof_wait().await,
+            None,
+            "a frame no longer kept waits no more"
+        );
+        assert!(engine.proof_wait.is_none());
+        hold_for_proofs(&engine.filter.clone(), 1, None);
+    }
+
     /// A persistent mismatch records a re-anchor at the frame GLOBAL
     /// committed above the stored cursor, durably and once, and arms its
     /// attempt without a request the failing sync would drop; the next
@@ -17613,6 +18431,13 @@ mod fence_reanchor_tests {
         assert_eq!(
             engine.evicted_lineage().unwrap(),
             None,
+            "an engine that found none does not look again"
+        );
+        // As a later engine on this store would.
+        engine.lineage_record_absent = false;
+        assert_eq!(
+            engine.evicted_lineage().unwrap(),
+            None,
             "the cursor is not the dropped one"
         );
         assert_eq!(
@@ -17622,7 +18447,18 @@ mod fence_reanchor_tests {
         );
 
         write_dropped_lineage(&engine, 1);
+        engine.lineage_record_absent = false;
+        engine.prefetch_start_records().await;
+        assert!(
+            !engine.lineage_record_absent,
+            "a record found is not taken for none"
+        );
         assert_eq!(engine.evicted_lineage().unwrap(), Some(1));
+        assert_eq!(
+            engine.evicted_lineage().unwrap(),
+            Some(1),
+            "a record found is read at each check"
+        );
         let now = std::time::Instant::now();
         assert!(
             !engine
@@ -18945,6 +19781,80 @@ mod tests {
             None,
             "no attempt was claimed"
         );
+    }
+
+    /// From the stable replica key epoch, the next epoch's sealed
+    /// registration frees no labels: the leaf's labels, kept once for every
+    /// epoch from it, are the ones the epoch after next registers from
+    /// (#749 review: `forget` wiped them every frame once the next epoch
+    /// was sealed).
+    #[tokio::test]
+    async fn a_sealed_next_epoch_keeps_the_stable_labels_of_the_epoch_after() {
+        use quil_types::consensus::{
+            epoch_start_frame, set_hash_storage_proof_epoch_for_thread,
+            set_stable_replica_key_epoch_for_thread,
+        };
+        set_hash_storage_proof_epoch_for_thread(Some(0));
+        set_stable_replica_key_epoch_for_thread(Some(6));
+        let dir =
+            std::env::temp_dir().join(format!("quil-labels-sealed-next-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::storage_labels::install_with_space(
+            dir.clone(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry.clone());
+        engine.kv_db = Some(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        engine.hypergraph = Some(crdt);
+        let member = [1u8; 32];
+        let current = 7;
+        let prefix = vec![0u32];
+        let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&engine.filter, &prefix);
+        let kept = store
+            .admit(
+                current + 2,
+                &member,
+                &leaf_id,
+                64,
+                crate::storage_labels::Stage::Ahead,
+            )
+            .unwrap()
+            .label(&quil_crypto::sdr::SdrParams::default())
+            .unwrap();
+        assert!(kept.kept);
+        registry.set_storage_seat_slot(
+            &member,
+            &engine.filter,
+            quil_types::consensus::StorageSeatSlot {
+                epoch: current + 1,
+                leaves: vec![prefix.clone()],
+                registered_at: 1,
+                sealed_at: Some(2),
+                frames: 0,
+                accumulator: [0; 32],
+                chained: vec![],
+                open: true,
+            },
+        );
+        for frame in [20, 21] {
+            engine.label_storage_ahead(epoch_start_frame(current) + frame);
+        }
+        assert!(
+            store
+                .find(current + 2, &member, &leaf_id, |n| n == 64)
+                .is_some(),
+            "the labels the epoch after next registers from"
+        );
+        set_stable_replica_key_epoch_for_thread(None);
+        set_hash_storage_proof_epoch_for_thread(None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A settlement due when its job was queued, whose window closed and
@@ -20322,10 +21232,14 @@ mod tests {
     /// operations or without a proof worker's budget.
     #[test]
     fn unmeasured_operations_verify_in_the_background() {
-        assert!(verifies_in_background(&[177_490], Some(12.0)));
-        assert!(verifies_in_background(&[2048, 177_490], Some(12.0)));
+        let op = |bytes| quil_execution::manager::OperationEstimate {
+            bytes,
+            floor_secs: 0.0,
+        };
+        assert!(verifies_in_background(&[op(177_490)], Some(12.0)));
+        assert!(verifies_in_background(&[op(2048), op(177_490)], Some(12.0)));
         assert!(!verifies_in_background(&[], Some(12.0)));
-        assert!(!verifies_in_background(&[177_490], None));
+        assert!(!verifies_in_background(&[op(177_490)], None));
     }
 
     /// An arriving confidential bundle is verified on the shard that
@@ -20489,6 +21403,68 @@ mod tests {
             wait(true)
         );
         assert!(!deferrals.entries.contains_key(&(filter.to_vec(), 6)));
+    }
+
+    /// A long bundle a shard's proposals hold for its background
+    /// verification is sent ahead after [`MAX_PROOF_HOLD`], the longest
+    /// held first and one per shard while it verifies; a bundle no longer
+    /// held is forgotten, and its hold starts again.
+    #[test]
+    fn a_long_bundle_held_past_the_bound_verifies_next() {
+        let start = std::time::Instant::now();
+        let at = |secs: u64| start + std::time::Duration::from_secs(secs);
+        let bound = MAX_PROOF_HOLD.as_secs();
+        let (shard, other) = ([1u8; 4], [2u8; 4]);
+        let (a, b, c) = ([0xa; 32], [0xb; 32], [0xc; 32]);
+        let mut holds = ProofHolds::default();
+        let pending = |digest: &[u8; 32]| digest == &a;
+        assert_eq!(holds.due(&shard, &[a], pending, at(0)), None);
+        assert_eq!(holds.due(&shard, &[a, b], pending, at(60)), None);
+        assert_eq!(holds.due(&other, &[c], pending, at(60)), None);
+        assert_eq!(holds.due(&shard, &[a, b], pending, at(bound - 1)), None);
+        assert_eq!(holds.due(&other, &[c], pending, at(bound - 1)), None);
+        assert_eq!(
+            holds.due(&shard, &[a, b], pending, at(bound)),
+            Some((a, std::time::Duration::from_secs(bound))),
+            "a bundle held past the bound stays behind the queue's arrivals"
+        );
+        // One per shard while it still verifies; other shards go on.
+        assert_eq!(holds.due(&shard, &[a, b], pending, at(bound + 70)), None);
+        assert_eq!(
+            holds.due(&other, &[c], pending, at(bound + 70)),
+            Some((c, std::time::Duration::from_secs(bound + 10)))
+        );
+        // Once it verified (no longer held), the next longest held goes.
+        assert_eq!(
+            holds.due(&shard, &[b], pending, at(bound + 80)),
+            Some((b, std::time::Duration::from_secs(bound + 20)))
+        );
+        // Released or verified elsewhere: no longer pending, the next goes
+        // even while it is still held.
+        let mut holds = ProofHolds::default();
+        assert_eq!(holds.due(&shard, &[a, b], |_| false, at(0)), None);
+        assert_eq!(
+            holds
+                .due(&shard, &[a, b], |_| false, at(bound))
+                .map(|d| d.0),
+            Some(a)
+        );
+        assert_eq!(
+            holds
+                .due(&shard, &[a, b], |_| false, at(bound + 1))
+                .map(|d| d.0),
+            Some(a)
+        );
+        // A bundle not held for the bound is forgotten.
+        let mut holds = ProofHolds::default();
+        assert_eq!(holds.due(&shard, &[a], pending, at(0)), None);
+        assert_eq!(holds.due(&shard, &[], pending, at(bound)), None);
+        assert!(holds.held.is_empty());
+        assert_eq!(holds.due(&shard, &[a], pending, at(bound + 1)), None);
+        assert_eq!(holds.due(&shard, &[a], pending, at(2 * bound)), None);
+        assert!(holds
+            .due(&shard, &[a], pending, at(2 * bound + 1))
+            .is_some());
     }
 
     /// The collector holds a submission in the encoding a finalized frame's
@@ -25262,3 +26238,7 @@ mod storage_attestation_pause_tests {
 #[cfg(test)]
 #[path = "app_engine_proof_backlog_tests.rs"]
 mod proof_backlog_tests;
+
+#[cfg(test)]
+#[path = "app_engine_arrival_tests.rs"]
+mod arrival_tests;

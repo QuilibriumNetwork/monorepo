@@ -100,7 +100,7 @@ pub(super) fn format_confidential_coins(
 }
 
 /// `units` of QUIL as a decimal QUIL amount, as the rewards line shows it.
-pub(super) fn quil_amount(units: u128) -> String {
+pub(crate) fn quil_amount(units: u128) -> String {
     crate::util::float_string_12(
         &num_bigint::BigInt::from(units),
         &crate::util::conversion_factor(),
@@ -117,4 +117,4 @@ fn reason(error: &anyhow::Error) -> String {
 
 #[cfg(test)]
 #[path = "balance_tests.rs"]
-mod tests;
+pub(crate) mod tests;

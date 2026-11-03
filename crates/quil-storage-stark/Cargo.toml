@@ -32,3 +32,6 @@ sha3 = "0.10"
 
 [dev-dependencies]
 rand = "0.8"
+
+[lints]
+workspace = true

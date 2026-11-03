@@ -36,3 +36,11 @@ features = ["js"]
 # Scope cosmetic warnings here; retain soundness diagnostics.
 [lints.rust]
 unused_imports = "allow"
+
+# Clippy findings in code taken from 0xCarbon/DKLs23: allowed
+# here, not restyled. Unlisted lints keep their defaults.
+[lints.clippy]
+iter_kv_map = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+useless_vec = "allow"

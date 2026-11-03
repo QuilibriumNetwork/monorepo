@@ -112,3 +112,6 @@ tokio = { version = "1", features = ["test-util"] }
 [build-dependencies]
 sha2 = "0.10"
 toml = "0.9"
+
+[lints]
+workspace = true

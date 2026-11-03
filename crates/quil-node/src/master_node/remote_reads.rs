@@ -37,6 +37,23 @@ const MAX_ATTEMPTS: usize = 3;
 /// fail within seconds while several wallets prove at the same time.
 const READ_RETRY_BUDGET: Duration = Duration::from_secs(60);
 const READ_RETRY_DELAY: Duration = Duration::from_secs(3);
+/// The most one peer gets to deliver one attempt at a coin page, its body
+/// included: the 15 s request deadline ends at the answer's headers. A page
+/// is 0.98 MB of 64 coins, so this asks for 24 KB/s; a slower path is cut here
+/// and asked for less. Mainnet's first slow path ran at 40 KB/s (34 s a page).
+const PAGE_ATTEMPT: Duration = Duration::from_secs(40);
+/// The answer to a wallet comes within [`READ_RETRY_BUDGET`] (the last attempt
+/// starts by then) plus [`PAGE_ATTEMPT`], under the deadline of a wallet's call
+/// to its node (`qclient`'s channel timeout, 120 s).
+const _: () = assert!(READ_RETRY_BUDGET.as_secs() + PAGE_ATTEMPT.as_secs() < 120);
+/// A coin page's next attempt after its transfer failed asks for this share of
+/// the coins, down to the page every node answers, whatever its build.
+const PAGE_SHRINK: u32 = 4;
+const SMALLEST_PAGE: u32 = quil_types::store::DEFAULT_SCAN_PAGE_ENTRIES as u32;
+
+fn smaller_page(entries: u32) -> u32 {
+    (entries / PAGE_SHRINK).max(SMALLEST_PAGE).min(entries)
+}
 
 /// Run `attempt` until it yields a value or `budget` would run out before the
 /// next try, `delay` apart.
@@ -82,6 +99,10 @@ const SCAN_PIN_TTL: Duration = Duration::from_secs(300);
 /// at a time, and a fresh PQNoise dial per page took about 0.8 s of each
 /// 0.86 s page on mainnet.
 const CONNECTION_IDLE: Duration = Duration::from_secs(60);
+/// A kept connection that fails sooner than this was closed while unused, and
+/// the call goes again at once. One failing later died under the transfer; a
+/// retry of the same size at once would only take as long again.
+const STALE_CONNECTION_FAILURE: Duration = Duration::from_secs(2);
 /// Endpoints with a kept connection; the least recently used goes first.
 const MAX_CONNECTIONS: usize = 16;
 /// A forwarded scan or listing taking longer than this ends with a warning.
@@ -158,6 +179,37 @@ type Dial<C> = Arc<
         + Sync,
 >;
 
+/// Why a peer did not deliver a coin page.
+struct Decline {
+    reason: String,
+    /// The transfer failed or ran out of time, rather than the peer refusing:
+    /// a smaller page can get through where this one did not.
+    transfer: bool,
+}
+
+/// Why nobody delivered a coin page on one attempt.
+struct PageRefusal {
+    reasons: String,
+    transfer: bool,
+}
+
+/// A status with its causes: tonic's message for a connection lost under an
+/// answer is "h2 protocol error: error reading a body from connection", and
+/// what lost it is only in the source chain.
+fn status_reason(status: &tonic::Status) -> String {
+    let mut text = format!("{:?}: {}", status.code(), status.message());
+    let mut cause = std::error::Error::source(status);
+    while let Some(next) = cause {
+        let part = next.to_string();
+        if !text.contains(&part) {
+            text.push_str(": ");
+            text.push_str(&part);
+        }
+        cause = next.source();
+    }
+    text
+}
+
 /// Why a call through [`ReadConnections`] failed.
 enum CallError {
     /// No connection to the endpoint could be made.
@@ -185,6 +237,7 @@ struct ReadConnections<C> {
     dial: Dial<C>,
     idle: Duration,
     capacity: usize,
+    stale_failure: Duration,
     open: Arc<parking_lot::Mutex<OpenConnections<C>>>,
 }
 
@@ -213,6 +266,7 @@ impl<C: Clone + Send + 'static> ReadConnections<C> {
             dial,
             idle,
             capacity,
+            stale_failure: STALE_CONNECTION_FAILURE,
             open: Arc::new(parking_lot::Mutex::new(OpenConnections {
                 by_endpoint: HashMap::new(),
                 next_id: 0,
@@ -302,8 +356,8 @@ impl<C: Clone + Send + 'static> ReadConnections<C> {
         });
     }
 
-    /// `call` on a connection to `endpoint`. A kept connection that fails in
-    /// the transport (the peer closed it while unused) is replaced and the
+    /// `call` on a connection to `endpoint`. A kept connection that soon fails
+    /// in the transport (the peer closed it while unused) is replaced and the
     /// call made once more at once; any connection that failed is dropped.
     async fn call<T, F, Fut>(
         &self,
@@ -319,6 +373,7 @@ impl<C: Clone + Send + 'static> ReadConnections<C> {
             .connect(endpoint, dials)
             .await
             .map_err(CallError::Dial)?;
+        let started = Instant::now();
         let error = match call(client).await {
             Ok(value) => return Ok(value),
             Err(error) => error,
@@ -327,7 +382,7 @@ impl<C: Clone + Send + 'static> ReadConnections<C> {
             return Err(CallError::Call(error));
         }
         self.discard(endpoint, id);
-        if !kept || error.is_timeout() {
+        if !kept || error.is_timeout() || started.elapsed() >= self.stale_failure {
             return Err(CallError::Call(error));
         }
         let (client, id, _) = self
@@ -351,6 +406,8 @@ struct PageCost {
     has_more: bool,
     dials: u64,
     took: Duration,
+    /// Attempts at this page that failed before one delivered it.
+    failed_attempts: u64,
 }
 
 /// What a forwarded scan or listing cost so far, for the line its end logs.
@@ -364,6 +421,7 @@ struct ScanStats {
     short_pages: u64,
     dials: u64,
     page_time: Duration,
+    failed_attempts: u64,
 }
 
 impl ScanStats {
@@ -376,6 +434,7 @@ impl ScanStats {
             short_pages: 0,
             dials: 0,
             page_time: Duration::ZERO,
+            failed_attempts: 0,
         }
     }
 
@@ -388,6 +447,7 @@ impl ScanStats {
         }
         self.dials += page.dials;
         self.page_time += page.took;
+        self.failed_attempts += page.failed_attempts;
     }
 }
 
@@ -425,23 +485,28 @@ fn log_scan_end(
     let mean_page_ms = (stats.page_time.as_millis() / u128::from(pages)) as u64;
     let elapsed_s = format!("{:.1}", elapsed.as_secs_f64());
     let application = hex::encode(application);
-    let (pages, coins, asked_per_page, dials) =
-        (stats.pages, stats.entries, stats.asked, stats.dials);
+    let (pages, coins, asked_per_page, dials, failed_attempts) = (
+        stats.pages,
+        stats.entries,
+        stats.asked,
+        stats.dials,
+        stats.failed_attempts,
+    );
     match stats.anomaly(elapsed) {
         Some(ScanAnomaly::ShortPages) => tracing::warn!(
             %application, %endpoint, served_by, pages, coins, asked_per_page,
-            %mean_per_page, short_pages = stats.short_pages, dials, mean_page_ms,
-            %elapsed_s, scope = "peer",
+            %mean_per_page, short_pages = stats.short_pages, dials, failed_attempts,
+            mean_page_ms, %elapsed_s, scope = "peer",
             "forwarded {what} got pages smaller than asked: the serving peer runs a build without full pages; nothing to fix on this node"
         ),
         Some(ScanAnomaly::Slow) => tracing::warn!(
             %application, %endpoint, served_by, pages, coins, asked_per_page,
-            %mean_per_page, dials, mean_page_ms, %elapsed_s,
-            "forwarded {what} took over 10 s: a high mean_page_ms means a slow serving peer or path; dials near pages means this node's connections to it keep failing; otherwise the wallet's own work between pages took the time"
+            %mean_per_page, dials, failed_attempts, mean_page_ms, %elapsed_s,
+            "forwarded {what} took over 10 s: a high mean_page_ms means a slow serving peer or path; dials or failed_attempts near pages means this node's connections to it keep failing; otherwise the wallet's own work between pages took the time"
         ),
         None => tracing::info!(
             %application, %endpoint, served_by, pages, coins, asked_per_page,
-            %mean_per_page, dials, mean_page_ms, %elapsed_s,
+            %mean_per_page, dials, failed_attempts, mean_page_ms, %elapsed_s,
             "forwarded {what} finished"
         ),
     }
@@ -484,6 +549,8 @@ pub struct PeerCoinReader {
     listings: parking_lot::Mutex<HashMap<([u8; 32], [u8; 32]), (ScanStats, Instant)>>,
     /// `(budget, delay)` of each forwarded read's retries.
     read_retry: (Duration, Duration),
+    /// The most one peer gets for one attempt at a coin page.
+    page_attempt: Duration,
     /// Endpoint → when its last decline was logged at info.
     declines_logged: parking_lot::Mutex<HashMap<String, Instant>>,
 }
@@ -510,6 +577,7 @@ impl PeerCoinReader {
             served_by: parking_lot::Mutex::new(HashMap::new()),
             listings: parking_lot::Mutex::new(HashMap::new()),
             read_retry: (READ_RETRY_BUDGET, READ_RETRY_DELAY),
+            page_attempt: PAGE_ATTEMPT,
             declines_logged: parking_lot::Mutex::new(HashMap::new()),
         }
     }
@@ -517,6 +585,12 @@ impl PeerCoinReader {
     #[cfg(test)]
     fn with_read_retry(mut self, budget: Duration, delay: Duration) -> Self {
         self.read_retry = (budget, delay);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_page_attempt(mut self, attempt: Duration) -> Self {
+        self.page_attempt = attempt;
         self
     }
 
@@ -585,6 +659,15 @@ impl PeerCoinReader {
                 .take(MAX_ATTEMPTS),
         );
         endpoints
+    }
+
+    /// The coins a scan's last page asked for: a path that could not carry
+    /// more once is not asked for more until the scan ends.
+    fn pinned_page_entries(&self, kind: ScanKind, domain: [u8; 32], id: [u8; 32]) -> Option<u32> {
+        self.served_by
+            .lock()
+            .get(&(kind, domain, id))
+            .map(|pin| pin.stats.asked)
     }
 
     fn pinned_endpoint(&self, kind: ScanKind, domain: [u8; 32], id: [u8; 32]) -> Option<String> {
@@ -699,7 +782,9 @@ impl PeerCoinReader {
     /// Ask one endpoint for a page. `Err` is that peer's reason for not
     /// answering (it does not serve the application, could not be reached,
     /// or sent a malformed page): try the next one. It is never read as
-    /// "the application is empty".
+    /// "the application is empty". An attempt ends after `page_attempt` or at
+    /// `deadline`, whichever comes first.
+    #[allow(clippy::too_many_arguments)] // the wire request, its bounds and the dial count
     async fn page_from(
         &self,
         endpoint: &str,
@@ -708,30 +793,53 @@ impl PeerCoinReader {
         after: Option<&[u8; 32]>,
         max_coins: u32,
         dials: &AtomicU64,
-    ) -> Result<CoinPageData, String> {
-        let page = self
-            .connections
-            .call(endpoint, dials, |mut client| {
-                let request = (
-                    domain.to_vec(),
-                    snapshot_id.map(|id| id.to_vec()).unwrap_or_default(),
-                    after.map(|a| a.to_vec()).unwrap_or_default(),
-                );
-                async move {
-                    client
-                        .list_shard_coins(request.0, request.1, request.2, max_coins)
-                        .await
-                }
-            })
-            .await
-            .map_err(|error| match error {
-                CallError::Dial(error) => format!("dial failed: {}", with_causes(&error)),
-                CallError::Call(ArchiveClientError::Rpc(status)) => {
-                    format!("{:?}: {}", status.code(), status.message())
-                }
-                CallError::Call(other) => with_causes(&other),
-            })?;
-        let malformed = || "malformed coin page".to_string();
+        deadline: Instant,
+    ) -> Result<CoinPageData, Decline> {
+        let attempt = self
+            .page_attempt
+            .min(deadline.saturating_duration_since(Instant::now()));
+        let call = self.connections.call(endpoint, dials, |mut client| {
+            let request = (
+                domain.to_vec(),
+                snapshot_id.map(|id| id.to_vec()).unwrap_or_default(),
+                after.map(|a| a.to_vec()).unwrap_or_default(),
+            );
+            async move {
+                client
+                    .list_shard_coins(request.0, request.1, request.2, max_coins)
+                    .await
+            }
+        });
+        let page = match tokio::time::timeout(attempt, call).await {
+            Ok(Ok(page)) => page,
+            Ok(Err(CallError::Dial(error))) => {
+                return Err(Decline {
+                    reason: format!("dial failed: {}", with_causes(&error)),
+                    transfer: false,
+                })
+            }
+            Ok(Err(CallError::Call(error))) => {
+                let transfer = connection_failed(&error);
+                let reason = match &error {
+                    ArchiveClientError::Rpc(status) => status_reason(status),
+                    other => with_causes(other),
+                };
+                return Err(Decline { reason, transfer });
+            }
+            Err(_) => {
+                return Err(Decline {
+                    reason: format!(
+                        "page of {max_coins} coins not delivered in {:.0} s",
+                        attempt.as_secs_f64()
+                    ),
+                    transfer: true,
+                })
+            }
+        };
+        let malformed = || Decline {
+            reason: "malformed coin page".to_string(),
+            transfer: false,
+        };
         let network: [u8; 32] = page.network.try_into().map_err(|_| malformed())?;
         let snapshot: [u8; 32] = page.snapshot_id.try_into().map_err(|_| malformed())?;
         let coins = page
@@ -890,10 +998,39 @@ impl PeerCoinReader {
         let started = Instant::now();
         let dials = AtomicU64::new(0);
         let (budget, delay) = self.read_retry;
-        let (page, endpoint) = retry_until_ok(budget, delay, || {
-            self.coin_page_once(domain, snapshot_id, after, max_coins, &dials)
-        })
-        .await?;
+        let mut entries = snapshot_id
+            .and_then(|id| self.pinned_page_entries(ScanKind::Coins, domain, id))
+            .map_or(max_coins, |asked| asked.min(max_coins));
+        let (attempts_until, deadline) = (started + budget, started + budget + self.page_attempt);
+        let mut failed_attempts = 0;
+        let (page, endpoint) = loop {
+            let refusal = match self
+                .coin_page_once(domain, snapshot_id, after, entries, &dials, deadline)
+                .await
+            {
+                Ok(page) => break page,
+                Err(refusal) => refusal,
+            };
+            failed_attempts += 1;
+            if refusal.transfer && smaller_page(entries) < entries {
+                entries = smaller_page(entries);
+                tracing::info!(
+                    application = %hex::encode(domain), entries,
+                    reason = %bounded_reason(&refusal.reasons),
+                    "forwarded coin scan: the path to the serving peer did not carry the page; \
+                     asking for fewer coins a page for the rest of this scan"
+                );
+            }
+            if Instant::now() + delay > attempts_until {
+                return Err(self.page_given_up(
+                    domain,
+                    snapshot_id,
+                    (failed_attempts, entries, started),
+                    refusal.reasons,
+                ));
+            }
+            tokio::time::sleep(delay).await;
+        };
         // A rootless answer is final and pins nothing.
         let Some(endpoint) = endpoint else {
             return Ok(page);
@@ -901,10 +1038,11 @@ impl PeerCoinReader {
         let cost = PageCost {
             started,
             entries: page.coins.len(),
-            asked: max_coins,
+            asked: entries,
             has_more: page.has_more,
             dials: dials.load(Ordering::Relaxed),
             took: started.elapsed(),
+            failed_attempts,
         };
         if let Some(stats) = self.remember_scan(
             ScanKind::Coins,
@@ -923,6 +1061,50 @@ impl PeerCoinReader {
         Ok(page)
     }
 
+    /// The refusal for a page no attempt delivered, and the line it logs. The
+    /// wallet may ask for the page again: the scan and its pin stay as they
+    /// were, but for the smaller page size it should start from.
+    fn page_given_up(
+        &self,
+        domain: [u8; 32],
+        snapshot_id: Option<[u8; 32]>,
+        (attempts, entries, started): (u64, u32, Instant),
+        reasons: String,
+    ) -> String {
+        let elapsed_s = format!("{:.1}", started.elapsed().as_secs_f64());
+        let pin = snapshot_id.and_then(|id| {
+            self.served_by
+                .lock()
+                .get_mut(&(ScanKind::Coins, domain, id))
+                .map(|pin| {
+                    pin.stats.asked = entries;
+                    (pin.endpoint.clone(), pin.stats)
+                })
+        });
+        let application = hex::encode(domain);
+        let reason = bounded_reason(&reasons);
+        match pin {
+            Some((endpoint, stats)) => {
+                tracing::warn!(
+                    %application, %endpoint, attempts, entries, %elapsed_s, %reason,
+                    pages_done = stats.pages, coins_done = stats.entries,
+                    scope = "peer or path",
+                    "forwarded coin scan: no attempt delivered this page; its snapshot is on this peer alone, so no other is asked. The wallet may ask again: check this node's link to the peer if it recurs"
+                );
+                format!(
+                    "{reasons} (the scan is pinned to the one peer holding its snapshot, {attempts} attempts in {elapsed_s} s, the last for {entries} coins)"
+                )
+            }
+            None => {
+                tracing::warn!(
+                    %application, attempts, entries, %elapsed_s, %reason, scope = "peer or path",
+                    "forwarded coin scan: no peer delivered its first page. The wallet may ask again: check this node's link to the peers if it recurs"
+                );
+                reasons
+            }
+        }
+    }
+
     /// A page and the endpoint that served it; `None` for a rootless answer.
     async fn coin_page_once(
         &self,
@@ -931,14 +1113,19 @@ impl PeerCoinReader {
         after: Option<[u8; 32]>,
         max_coins: u32,
         dials: &AtomicU64,
-    ) -> Result<(CoinPageData, Option<String>), String> {
+        deadline: Instant,
+    ) -> Result<(CoinPageData, Option<String>), PageRefusal> {
         let endpoints = match snapshot_id {
             Some(id) => vec![self
                 .pinned_endpoint(ScanKind::Coins, domain, id)
-                .ok_or_else(lost_pin)?],
+                .ok_or_else(|| PageRefusal {
+                    reasons: lost_pin(),
+                    transfer: false,
+                })?],
             None => self.read_endpoints(&domain).await,
         };
         let mut declines = Declines::default();
+        let mut transfer = false;
         // A peer's answer that the application has no coin root yet is held
         // back while another peer may still list coins: a lagging or
         // withholding peer must not hide what another can show.
@@ -952,6 +1139,7 @@ impl PeerCoinReader {
                     after.as_ref(),
                     max_coins,
                     dials,
+                    deadline,
                 )
                 .await
             {
@@ -967,13 +1155,17 @@ impl PeerCoinReader {
                     );
                     return Ok((page, Some(endpoint)));
                 }
-                Err(reason) => {
-                    self.log_decline(&endpoint, &domain, &reason);
-                    declines.push(&reason);
+                Err(decline) => {
+                    self.log_decline(&endpoint, &domain, &decline.reason);
+                    declines.push(&decline.reason);
+                    transfer |= decline.transfer;
                 }
             }
         }
-        rootless.ok_or_else(|| declines.summary())
+        rootless.ok_or_else(|| PageRefusal {
+            reasons: declines.summary(),
+            transfer,
+        })
     }
 
     /// One page of `owner`'s legacy coins from an archive: only an archive
@@ -999,6 +1191,7 @@ impl PeerCoinReader {
             has_more: page.has_more,
             dials: dials.load(Ordering::Relaxed),
             took: started.elapsed(),
+            failed_attempts: 0,
         };
         if let Some(stats) = self.listing_page(domain, owner, after.is_none(), &cost) {
             log_scan_end("legacy listing", &domain, &endpoint, "archive", &stats);
@@ -1148,6 +1341,7 @@ impl PeerCoinReader {
                     has_more: page.has_more,
                     dials: dials.load(Ordering::Relaxed),
                     took: started.elapsed(),
+                    failed_attempts: 0,
                 };
                 self.remember_scan(ScanKind::Escrows, domain, page.snapshot_id, endpoint, &cost);
                 return Some(page);
@@ -1180,6 +1374,7 @@ mod tests {
             has_more,
             dials: 0,
             took: Duration::ZERO,
+            failed_attempts: 0,
         }
     }
 
@@ -1187,6 +1382,24 @@ mod tests {
     /// vertex and an empty legacy listing.
     struct Peer {
         pages: u8,
+        /// Sizes a page by the request, with coins of this many memo bytes;
+        /// zero serves pages of two empty coins as a peer without the field.
+        memo_bytes: usize,
+        /// The sizes asked for.
+        asked: Arc<parking_lot::Mutex<Vec<u32>>>,
+        /// A request for more coins than this is never answered.
+        stall_above: u32,
+    }
+
+    impl Peer {
+        fn of_pages(pages: u8) -> Self {
+            Self {
+                pages,
+                memo_bytes: 0,
+                asked: Arc::default(),
+                stall_above: u32::MAX,
+            }
+        }
     }
 
     #[tonic::async_trait]
@@ -1209,9 +1422,19 @@ mod tests {
             &self,
             request: Request<ListShardCoinsRequest>,
         ) -> Result<Response<ListShardCoinsResponse>, Status> {
-            let after = request.into_inner().after;
+            let request = request.into_inner();
+            let after = request.after;
+            self.asked.lock().push(request.max_coins);
+            if request.max_coins > self.stall_above {
+                std::future::pending::<()>().await;
+            }
             let start = after.first().map_or(0, |last| last + 1);
-            let end = (start + 2).min(2 * self.pages);
+            let step = if self.memo_bytes == 0 {
+                2
+            } else {
+                request.max_coins as u8
+            };
+            let end = start.saturating_add(step).min(2 * self.pages);
             Ok(Response::new(ListShardCoinsResponse {
                 network: vec![0; 32],
                 snapshot_id: vec![7; 32],
@@ -1219,6 +1442,7 @@ mod tests {
                 coins: (start..end)
                     .map(|i| ShardCoin {
                         address: vec![i; 32],
+                        memo: vec![i; self.memo_bytes],
                         ..Default::default()
                     })
                     .collect(),
@@ -1269,6 +1493,10 @@ mod tests {
     /// Serve [`Peer`] over plaintext on a local port; returns its endpoint
     /// and the count of connections it accepted.
     async fn serve_peer(pages: u8) -> (String, Arc<AtomicU64>) {
+        serve(Peer::of_pages(pages)).await
+    }
+
+    async fn serve(peer: Peer) -> (String, Arc<AtomicU64>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = listener.local_addr().unwrap().to_string();
         let accepted = Arc::new(AtomicU64::new(0));
@@ -1284,7 +1512,7 @@ mod tests {
         );
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(AppShardServiceServer::new(Peer { pages }))
+                .add_service(AppShardServiceServer::new(peer))
                 .serve_with_incoming(Box::pin(incoming)),
         );
         (endpoint, accepted)
@@ -1430,6 +1658,7 @@ mod tests {
             has_more,
             dials,
             took: Duration::from_millis(10),
+            failed_attempts: 1,
         };
         let (domain, id) = ([1; 32], [2; 32]);
         assert!(reader
@@ -1455,6 +1684,7 @@ mod tests {
             (2, 11, 1, 1)
         );
         assert_eq!(stats.page_time, Duration::from_millis(20));
+        assert_eq!(stats.failed_attempts, 2);
         assert_eq!(stats.anomaly(Duration::ZERO), Some(ScanAnomaly::ShortPages));
         let id = [3; 32];
         reader.remember_scan(
@@ -1831,5 +2061,257 @@ mod tests {
         assert!(reader
             .pinned_endpoint(ScanKind::Coins, domain, [0; 32])
             .is_none());
+    }
+
+    /// A path to `target` that closes each connection once it has carried
+    /// `limit` bytes of answers: what a peer or this node does when keepalive
+    /// pings go unanswered behind a slow transfer, so the call fails with the
+    /// real tonic error, not a stand-in.
+    async fn cutting_path(target: String, limit: Arc<AtomicU64>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (client, _) = listener.accept().await.unwrap();
+                let upstream = tokio::net::TcpStream::connect(&target).await.unwrap();
+                let limit = limit.clone();
+                tokio::spawn(async move {
+                    let (mut client_read, mut client_write) = client.into_split();
+                    let (mut upstream_read, mut upstream_write) = upstream.into_split();
+                    let requests = tokio::spawn(async move {
+                        let _ = tokio::io::copy(&mut client_read, &mut upstream_write).await;
+                    });
+                    let mut carried = 0;
+                    let mut buffer = vec![0; 16 * 1024];
+                    while let Ok(read) = upstream_read.read(&mut buffer).await {
+                        carried += read as u64;
+                        if read == 0
+                            || carried > limit.load(Ordering::SeqCst)
+                            || client_write.write_all(&buffer[..read]).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    requests.abort();
+                });
+            }
+        });
+        address
+    }
+
+    async fn plaintext_reader(endpoint: &str, budget: Duration) -> PeerCoinReader {
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO));
+        pool.add(endpoint.to_string()).await;
+        let dial: Dial<quil_rpc::ArchiveClient> = Arc::new(|endpoint: String| {
+            Box::pin(async move { quil_rpc::ArchiveClient::connect_plaintext(&endpoint).await })
+        });
+        PeerCoinReader::new(
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            pool,
+            vec![0; 32],
+            1,
+        )
+        .with_read_retry(budget, Duration::from_millis(5))
+        .with_dial(dial)
+    }
+
+    /// Page through a scan from `snapshot`/`after`, returning the coin bytes.
+    async fn read_scan(
+        reader: &PeerCoinReader,
+        mut snapshot: Option<[u8; 32]>,
+        mut after: Option<[u8; 32]>,
+    ) -> Result<Vec<u8>, String> {
+        let mut coins = Vec::new();
+        loop {
+            let page = reader.coin_page([3; 32], snapshot, after, 64).await?;
+            coins.extend(page.coins.iter().map(|coin| coin.address[0]));
+            if !page.has_more {
+                return Ok(coins);
+            }
+            snapshot = Some(page.snapshot_id);
+            after = page.cursor;
+        }
+    }
+
+    /// neon, Nov 2: a 0.98 MB page over a 40 KB/s path was cut, and every
+    /// attempt asked for the same size until a wallet's scan died on one h2
+    /// body error, minutes in. A cut transfer now asks for less, for the rest
+    /// of the scan, and the scan goes on from its cursor on the same peer.
+    #[tokio::test]
+    async fn a_page_cut_on_the_path_is_asked_again_smaller_and_the_scan_finishes() {
+        let asked: Arc<parking_lot::Mutex<Vec<u32>>> = Arc::default();
+        let (peer, _) = serve(Peer {
+            pages: 96,
+            memo_bytes: 4 * 1024,
+            asked: asked.clone(),
+            stall_above: u32::MAX,
+        })
+        .await;
+        // 256 KiB for 64 coins does not fit a connection; 64 KiB for 16 does.
+        let path = cutting_path(peer, Arc::new(AtomicU64::new(100 * 1024))).await;
+        let reader = plaintext_reader(&path, Duration::from_secs(20)).await;
+        let coins = read_scan(&reader, None, None).await.expect("the scan ends");
+        assert_eq!(coins, (0..192).map(|i| i as u8).collect::<Vec<_>>());
+        let asked = asked.lock().clone();
+        assert_eq!(asked[..2], [64, 16], "a quarter after the cut: {asked:?}");
+        // A connection that later dies between 16-coin pages fails at once as
+        // a kept one and is replaced at the same size: no smaller page needed.
+        assert!(
+            asked[1..].iter().all(|size| *size <= 16),
+            "a smaller page stays smaller for the scan: {asked:?}"
+        );
+        assert!(
+            reader.served_by.lock().is_empty(),
+            "the finished scan left no pin"
+        );
+    }
+
+    /// The first bound: a peer that never finishes answering a large page is
+    /// cut after the attempt's time, which the request deadline does not do
+    /// once headers came, and a smaller page gets through.
+    #[tokio::test]
+    async fn a_stalled_page_attempt_is_cut_and_asked_again_smaller() {
+        let asked: Arc<parking_lot::Mutex<Vec<u32>>> = Arc::default();
+        let (peer, _) = serve(Peer {
+            pages: 8,
+            memo_bytes: 1024,
+            asked: asked.clone(),
+            stall_above: 8,
+        })
+        .await;
+        let reader = plaintext_reader(&peer, Duration::from_secs(5))
+            .await
+            .with_page_attempt(Duration::from_millis(100));
+        let scan = tokio::time::timeout(Duration::from_secs(20), read_scan(&reader, None, None));
+        let coins = scan.await.expect("the attempts are bounded").unwrap();
+        assert_eq!(coins, (0..16).map(|i| i as u8).collect::<Vec<_>>());
+        assert_eq!(
+            asked.lock()[..3],
+            [64, 16, 8],
+            "each step a quarter, then 8"
+        );
+    }
+
+    /// The second bound: every attempt failing ends within the budget plus
+    /// one attempt, which stays under the wallet's own call deadline.
+    #[tokio::test]
+    async fn a_page_nobody_delivers_ends_within_the_page_bound() {
+        let (peer, _) = serve(Peer {
+            pages: 8,
+            memo_bytes: 1024,
+            asked: Arc::default(),
+            stall_above: 0,
+        })
+        .await;
+        let reader = plaintext_reader(&peer, Duration::from_millis(250))
+            .await
+            .with_page_attempt(Duration::from_millis(100));
+        let page = tokio::time::timeout(
+            Duration::from_secs(5),
+            reader.coin_page([3; 32], None, None, 64),
+        );
+        let Err(reasons) = page.await.expect("the attempts are bounded") else {
+            panic!("the peer never answers");
+        };
+        assert!(reasons.contains("not delivered in"), "{reasons}");
+    }
+
+    /// The third bound and its recovery: a continuation whose every attempt
+    /// is cut says which page it could not get and why, keeps the scan's pin,
+    /// and the wallet asking again goes on from its cursor.
+    #[tokio::test]
+    async fn a_cut_continuation_names_its_attempts_and_cause_and_can_be_asked_again() {
+        let asked: Arc<parking_lot::Mutex<Vec<u32>>> = Arc::default();
+        let (peer, _) = serve(Peer {
+            pages: 16,
+            memo_bytes: 8 * 1024,
+            asked: asked.clone(),
+            stall_above: u32::MAX,
+        })
+        .await;
+        let limit = Arc::new(AtomicU64::new(u64::MAX));
+        let path = cutting_path(peer, limit.clone()).await;
+        let reader = plaintext_reader(&path, Duration::from_millis(300)).await;
+        let first = reader.coin_page([3; 32], None, None, 16).await.unwrap();
+        // Room for an answer's headers and a part of its body: 8 coins' 64 KiB
+        // is cut.
+        limit.store(30 * 1024, Ordering::SeqCst);
+        let (id, cursor) = (Some(first.snapshot_id), first.cursor);
+        let Err(reasons) = reader.coin_page([3; 32], id, cursor, 8).await else {
+            panic!("no attempt fits the path");
+        };
+        assert!(
+            reasons.starts_with(
+                "1 peer declined: 1x Unknown: h2 protocol error: error reading a body from connection"
+            ),
+            "{reasons}"
+        );
+        assert!(reasons.contains("pinned"), "{reasons}");
+        assert!(reasons.contains("attempts"), "{reasons}");
+        limit.store(u64::MAX, Ordering::SeqCst);
+        asked.lock().clear();
+        let rest = read_scan(&reader, id, cursor).await.expect("asked again");
+        assert_eq!(rest, (16..32).map(|i| i as u8).collect::<Vec<_>>());
+        assert_eq!(
+            *asked.lock(),
+            [8, 8],
+            "the wallet's next asking keeps the size the path could carry"
+        );
+    }
+
+    /// A reason keeps the causes under tonic's message, or a body error reads
+    /// the same whatever ended the connection.
+    #[test]
+    fn a_status_reason_names_the_causes_under_it() {
+        let mut status = Status::unknown("h2 protocol error: error reading a body");
+        status.set_source(Arc::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection closed",
+        )));
+        assert_eq!(
+            status_reason(&status),
+            "Unknown: h2 protocol error: error reading a body: connection closed"
+        );
+        assert_eq!(
+            status_reason(&Status::unavailable("busy")),
+            "Unavailable: busy"
+        );
+    }
+
+    #[test]
+    fn a_page_shrinks_by_a_quarter_down_to_what_every_node_answers() {
+        assert_eq!(smaller_page(64), 16);
+        assert_eq!(smaller_page(16), 8);
+        assert_eq!(smaller_page(8), 8);
+        assert_eq!(smaller_page(2), 2, "never asks for more than it did");
+    }
+
+    /// A connection dying under a transfer is not a stale kept one: the same
+    /// request again at once would only cost the same time again.
+    #[tokio::test]
+    async fn a_kept_connection_failing_late_is_not_called_again_at_once() {
+        let mut connections = numbered_connections(Duration::from_secs(60), 2);
+        connections.stale_failure = Duration::from_millis(20);
+        let dials = AtomicU64::new(0);
+        let number = |client: Arc<u64>| async move { Ok::<_, ArchiveClientError>(*client) };
+        assert_eq!(connections.call("a", &dials, number).await.ok(), Some(1));
+        let calls = AtomicU64::new(0);
+        let late = connections
+            .call("a", &dials, |_: Arc<u64>| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    Err::<u64, _>(closed())
+                }
+            })
+            .await;
+        assert!(matches!(late, Err(CallError::Call(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            connections.call("a", &dials, number).await.ok(),
+            Some(2),
+            "the failed connection is gone"
+        );
     }
 }

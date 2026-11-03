@@ -4,6 +4,8 @@
 //! `QUIL_ANCHORED_ISSUANCE_EPOCH=0`, so they expect the anchored issuance
 //! rules from GLOBAL frame 0; a build without them prices and credits as
 //! the header says. Real Falcon certificates and an authorized session.
+//! Also the warning GLOBAL logs when a shard's executed headers leave source
+//! frames outside every spend relay window.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -86,11 +88,18 @@ fn session(keys: &[FalconPrivateKey]) -> Session {
     }
 }
 
-/// A finalization of `digest` at `view` by three of the four `keys`.
-fn sign(session: &Session, keys: &[FalconPrivateKey], view: u64, digest: [u8; 32]) -> Vec<u8> {
+/// A finalization of `digest` at `view`, extending `parent`, by three of the
+/// four `keys`.
+fn sign(
+    session: &Session,
+    keys: &[FalconPrivateKey],
+    view: u64,
+    parent: u64,
+    digest: [u8; 32],
+) -> Vec<u8> {
     let proposal = Proposal::new(
         Round::new(Epoch::new(session.generation), View::new(view)),
-        View::new(0),
+        View::new(parent),
         Digest(digest),
     );
     let participants: Set<_> = keys
@@ -125,22 +134,30 @@ fn sign(session: &Session, keys: &[FalconPrivateKey], view: u64, digest: [u8; 32
     })
 }
 
-/// The session's first frame, anchored to GLOBAL frame `anchor` whose output
-/// is `anchor_output`, at the leader's difficulty, as GLOBAL receives it.
-fn anchored_first_header(
+/// The session's frame `frame_number`, anchored to GLOBAL frame `anchor`
+/// whose output is `anchor_output`, at the leader's difficulty, as GLOBAL
+/// receives it: certified at view `frame_number + 4` over the view before it,
+/// the first frame over the session's genesis.
+fn anchored_header(
     session: &Session,
     keys: &[FalconPrivateKey],
+    frame_number: u64,
     anchor: u64,
     anchor_output: &[u8],
 ) -> CanonicalHeader {
+    let first = frame_number == session.base_frame + 1;
     let mut header = FrameHeader {
         address: session.filter.clone(),
-        frame_number: session.base_frame + 1,
-        rank: 5,
+        frame_number,
+        rank: frame_number + 4,
         difficulty: LEADER_DIFFICULTY,
         timestamp: 1_700_000_000_000,
         global_frame_number: anchor,
-        parent_selector: session.genesis.to_vec(),
+        parent_selector: if first {
+            session.genesis.to_vec()
+        } else {
+            vec![0x51; 32]
+        },
         requests_root: vec![0; 32],
         state_roots: vec![vec![0; 32]; 4],
         ..Default::default()
@@ -166,6 +183,7 @@ fn anchored_first_header(
         session,
         keys,
         header.rank,
+        if first { 0 } else { header.rank - 1 },
         quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap(),
     );
     header.public_key_signature_bls48581 = Some(Bls48581AggregateSignature {
@@ -207,6 +225,15 @@ fn commit(state: &HypergraphState, number: u64) {
 /// [`ANCHOR_DIFFICULTY`], in each GLOBAL frame of `frames`, and returns the
 /// difficulty of every issuance calculation, in order.
 fn priced_difficulties(frames: &[u64]) -> Vec<u64> {
+    let executions: Vec<_> = frames.iter().map(|&frame| (frame, 1)).collect();
+    execute_headers(&executions).0
+}
+
+/// Executes the session's certified header `shard_frame`, anchored to a
+/// GLOBAL frame of [`ANCHOR_DIFFICULTY`], in GLOBAL frame `frame`, for each
+/// `(frame, shard_frame)` in order. Returns the difficulty of every issuance
+/// calculation, in order, and what was logged at warn and above.
+fn execute_headers(executions: &[(u64, u64)]) -> (Vec<u64>, String) {
     // A localnet process, as the node starts one, with the anchored issuance
     // rules from epoch 0.
     std::env::set_var("QUIL_ANCHORED_ISSUANCE_EPOCH", "0");
@@ -271,9 +298,6 @@ fn priced_difficulties(frames: &[u64]) -> Vec<u64> {
             .unwrap();
         txn.commit().unwrap();
     }
-    let wire = anchored_first_header(&session, &keys, 2, &anchor_output)
-        .to_canonical_bytes()
-        .unwrap();
 
     let probe = Arc::new(DifficultyProbe::default());
     let intrinsic = GlobalIntrinsic::new_with_stores(
@@ -289,12 +313,42 @@ fn priced_difficulties(frames: &[u64]) -> Vec<u64> {
         inclusion,
     )
     .with_frame_header_deps(registry, probe.clone());
-    for &frame in frames {
-        intrinsic.invoke_step(frame, &wire, &state).unwrap();
-        commit(&state, frame);
-    }
+    let log = warnings(|| {
+        for &(frame, shard_frame) in executions {
+            let wire = anchored_header(&session, &keys, shard_frame, 2, &anchor_output)
+                .to_canonical_bytes()
+                .unwrap();
+            intrinsic.invoke_step(frame, &wire, &state).unwrap();
+            commit(&state, frame);
+        }
+    });
     let difficulties = probe.0.lock().unwrap().clone();
-    difficulties
+    (difficulties, log)
+}
+
+/// Everything logged at warn and above while `run` runs on this thread.
+fn warnings(run: impl FnOnce()) -> String {
+    #[derive(Clone, Default)]
+    struct Buffer(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buffer = Buffer::default();
+    let writer = buffer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, run);
+    let out = buffer.0.lock().unwrap().clone();
+    String::from_utf8(out).unwrap()
 }
 
 /// The leader's difficulty, bound into the certified output but compared
@@ -323,4 +377,37 @@ fn reproduces_repeated_header_credit() {
         priced.len(),
         priced,
     );
+}
+
+/// Header 15 after header 1 relays source frames 7..=14 only: GLOBAL warns
+/// that frames 1..=6 are relayed by no executed header, naming the shard,
+/// both headers and the GLOBAL frame.
+#[test]
+fn a_header_past_the_relay_window_warns_of_the_uncovered_frames() {
+    let (credited, log) = execute_headers(&[(3, 1), (4, 15)]);
+    assert_eq!(credited.len(), 2, "both headers executed: {log}");
+    let line = log
+        .lines()
+        .find(|line| line.contains("spend relay coverage skipped"))
+        .unwrap_or_else(|| panic!("no relay coverage warning in: {log}"));
+    for field in [
+        "frame=4",
+        &format!("shard={}", hex::encode([0x68; 32])),
+        "shard_frame=15",
+        "previous_shard_frame=1",
+        "uncovered_first=1",
+        "uncovered_last=6",
+        "uncovered_frames=6",
+    ] {
+        assert!(line.contains(field), "{field} missing from: {line}");
+    }
+}
+
+/// Header 9 after header 1 relays source frames 1..=8: every frame is
+/// covered, and nothing is logged about relay coverage.
+#[test]
+fn a_header_within_the_relay_window_does_not_warn() {
+    let (credited, log) = execute_headers(&[(3, 1), (4, 9)]);
+    assert_eq!(credited.len(), 2, "both headers executed: {log}");
+    assert!(!log.contains("spend relay coverage"), "{log}");
 }

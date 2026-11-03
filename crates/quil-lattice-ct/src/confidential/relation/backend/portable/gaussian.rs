@@ -2,6 +2,7 @@
 //! Matches its CDF, binary64 approximation and byte/bit buffering. The upstream
 //! approximation has a FIXME about its interval. The sampler is not constant-time.
 use super::expansion::{CounterExpander, ExpansionError, SQUEEZE_BYTES};
+use std::f64::consts::{LN_2, LOG2_E};
 use zeroize::{Zeroize, Zeroizing};
 
 const CDF: [(u64, u64); 21] = [
@@ -110,12 +111,12 @@ fn bernoulli_exp(
         return Err(GaussianError::Numeric);
     }
     let words = buffer.words(stream, 2)?;
-    let exponent = x * 1.4426950408889634;
+    let exponent = x * LOG2_E;
     if exponent >= u64::MAX as f64 {
         return Err(GaussianError::Numeric);
     }
     let exponent = exponent as u64;
-    x -= 0.6931471805599453 * exponent as f64;
+    x -= LN_2 * exponent as f64;
     let shift = exponent.min(63);
     let low_bits = words[0] ^ ((words[0] >> shift) << shift);
     let threshold = exp_small(-x) * (1u64 << 53) as f64;

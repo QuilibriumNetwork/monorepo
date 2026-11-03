@@ -7,13 +7,15 @@
 //! pairing or a trusted setup. Every hash is [`crate::storage_hash`]'s
 //! Poseidon2, so a STARK can recompute it.
 //!
-//! Per member and leaf (with an epoch-specific key before mandatory sealing):
+//! Per member and leaf (with an epoch-specific key before the stable key epoch):
 //! - `D`: the leaf's canonical data, 30 bytes per node packed into 8 field
 //!   elements ([`data_nodes`]);
 //! - labels: the stacked depth-robust labelling over [`crate::sdr`]'s graph,
-//!   keyed by [`sdr::replica_key`]`(member, leaf_id, epoch)`;
-//! - `R = D + labels[L-1]` element-wise, unique to the member and leaf;
-//!   unchanged data can reuse its replica after the stable-key cutover;
+//!   keyed by [`sdr::replica_key`]`(member, leaf_id, epoch)`, which from the
+//!   stable replica key epoch no longer depends on the epoch: a leaf's labels
+//!   then depend on the member, the leaf and its node count alone;
+//! - `R = D + labels[L-1]` element-wise, unique to the member and leaf (and,
+//!   before that epoch, the epoch);
 //! - `comm_D`, `comm_C`, `comm_R`: Merkle commitments over `D`, over the column
 //!   digests (each node's labels on every layer, chained) and over `R`. The
 //!   member registers all three.
@@ -24,7 +26,10 @@
 //! node's labels with the member's own key. A replica copied from another
 //! member, shared between identities or filled with cheap junk does not pass.
 //! Each frame a member then opens one beacon-chosen node of `R` per query,
-//! against its registered `comm_R`.
+//! against its registered `comm_R`. Both bind the epoch ([`seal_challenges`],
+//! [`opening_index`]): with a stable key an unchanged leaf registers the same
+//! commitments every epoch, and only the epoch and the beacon set one epoch's
+//! proofs apart from another's.
 //!
 //! A node serializes as 32 bytes ([`NODE_BYTES`]): its 8 elements as
 //! little-endian canonical `u32`s.
@@ -474,24 +479,28 @@ fn label_layers(
     params: &SdrParams,
     on_layer: &mut dyn FnMut(usize, &[Digest]),
 ) -> Vec<Digest> {
-    label_layers_until(n, key, params, on_layer, &|| false)
+    label_layers_until(n, key, params, 0, vec![hash::ZERO; n], on_layer, &|| false)
         .expect("labelling that never stops ends")
 }
 
-/// [`label_layers`], given up (`None`) once `stop` says so, looked at every
-/// [`STOP_CHECK_NODES`] nodes.
+/// [`label_layers`] from layer `start`, `below` holding layer `start - 1`'s
+/// labels (any `n` digests for layer 0, which reads no layer below), given
+/// up (`None`) once `stop` says so, looked at every [`STOP_CHECK_NODES`]
+/// nodes. Hands `on_layer` the layers from `start` on.
 fn label_layers_until(
     n: usize,
     key: &Digest,
     params: &SdrParams,
+    start: usize,
+    below: Vec<Digest>,
     on_layer: &mut dyn FnMut(usize, &[Digest]),
     stop: &dyn Fn() -> bool,
 ) -> Option<Vec<Digest>> {
     let (parents, drg, width) =
         sdr::graph_parents(n, params).expect("a leaf's node indices fit in u32");
-    let mut prev = vec![hash::ZERO; n];
+    let mut prev = below;
     let mut cur = vec![hash::ZERO; n];
-    for layer in 0..params.layers {
+    for layer in start..params.layers {
         for v in 0..n {
             if v % STOP_CHECK_NODES == 0 && stop() {
                 return None;
@@ -624,6 +633,17 @@ pub fn labelling_peak_bytes(n: u64, params: &SdrParams) -> u64 {
     }
 }
 
+/// Bytes [`label_leaf`] holds at its peak, including its bounded graph and
+/// column scratch. Excludes the data, replica and trees used for encoding.
+pub fn label_leaf_peak_bytes(n: u64, params: &SdrParams) -> u64 {
+    if params.drg_degree == 6 && params.expander_degree == 8 && params.layers == 11 {
+        label_working_bytes(n, params)
+    } else {
+        let parents = 4 * (params.drg_degree.max(1) + params.expander_degree);
+        n.saturating_mul((3 * NODE_BYTES + parents) as u64)
+    }
+}
+
 /// Nodes a registration may pad a leaf's data with, with zeros, beyond its
 /// own ([`data_node_count`]): an eighth of them and this many more. A member
 /// labels a leaf ahead of its snapshot ([`label_leaf`]) at a count it picks
@@ -689,13 +709,34 @@ pub fn label_leaf(
     label_leaf_until(n, key, params, on_layer, &|| false).expect("labelling that never stops ends")
 }
 
-/// [`label_leaf`], given up (`None`, the layers handed to `on_layer` so far
-/// partial) once `stop` says so, looked at every [`STOP_CHECK_NODES`] nodes:
-/// for work that must give its memory back to other work.
+/// [`label_leaf`], given up (`None`) once `stop` says so: for work that
+/// must give its memory back to other work. The standard worker polls while
+/// waiting and between layer callbacks; scalar labelling checks every
+/// [`STOP_CHECK_NODES`] nodes. Every layer handed to `on_layer` is whole, and
+/// [`label_leaf_resume`] goes on from those.
 pub fn label_leaf_until(
     n: u64,
     key: &[u8],
     params: &SdrParams,
+    on_layer: &mut dyn FnMut(usize, &[Digest]),
+    stop: &dyn Fn() -> bool,
+) -> Option<(Vec<Digest>, Vec<Digest>)> {
+    label_leaf_resume(n, key, params, 0, &mut |_, _| false, on_layer, stop)
+}
+
+/// [`label_leaf_until`] going on from the first `kept` layers an earlier
+/// attempt keyed alike labelled: `read_layer` fills each of them back, in
+/// order, false when it cannot (then `None`). They fold into the column
+/// digests as they are read, the last of them is the layer below the first
+/// labelled now, and `on_layer` gets the layers from `kept` on. Holds no
+/// more than [`label_leaf_until`]: each layer is read into the buffer the
+/// layer below the next is kept in.
+pub fn label_leaf_resume(
+    n: u64,
+    key: &[u8],
+    params: &SdrParams,
+    kept: usize,
+    read_layer: &mut dyn FnMut(usize, &mut [Digest]) -> bool,
     on_layer: &mut dyn FnMut(usize, &[Digest]),
     stop: &dyn Fn() -> bool,
 ) -> Option<(Vec<Digest>, Vec<Digest>)> {
@@ -704,15 +745,36 @@ pub fn label_leaf_until(
         (MIN_NODES as u64..MAX_NODES).contains(&n),
         "a leaf of {n} nodes"
     );
+    assert!(
+        kept <= params.layers,
+        "{kept} layers kept of {}",
+        params.layers
+    );
     let n = n as usize;
     if params.drg_degree == 6 && params.expander_degree == 8 && params.layers == 11 {
-        return crate::storage_labels_compute::label(n, hash::key_digest(key), on_layer, stop);
+        return crate::storage_labels_compute::label_resume(
+            n,
+            hash::key_digest(key),
+            kept,
+            read_layer,
+            on_layer,
+            stop,
+        );
     }
     let mut columns = vec![hash::ZERO; n];
+    let mut below = vec![hash::ZERO; n];
+    for layer in 0..kept {
+        if stop() || !read_layer(layer, &mut below) {
+            return None;
+        }
+        fold_layer(&mut columns, &below);
+    }
     let last = label_layers_until(
         n,
         &hash::key_digest(key),
         params,
+        kept,
+        below,
         &mut |index, layer| {
             fold_layer(&mut columns, layer);
             on_layer(index, layer);

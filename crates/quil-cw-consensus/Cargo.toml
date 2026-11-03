@@ -41,3 +41,6 @@ commonware-consensus = { version = "=2026.7.0", features = ["mocks"] }
 commonware-p2p = "=2026.7.0"
 futures = "0.3"
 hex = "0.4"
+
+[lints]
+workspace = true

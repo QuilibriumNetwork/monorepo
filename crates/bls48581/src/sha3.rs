@@ -16,6 +16,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+// Vendored MIRACL Core code: clippy findings allowed, not restyled.
+#![allow(clippy::manual_rotate, clippy::unnecessary_cast)]
 
 pub const HASH224: usize = 28;
 pub const HASH256: usize = 32;

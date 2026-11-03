@@ -253,4 +253,35 @@ mod tests {
         assert!(seal_capped(&payload(101), &key.public, b"", 100).is_err());
         assert!(seal_capped(&payload(100), &key.public, b"", 100).is_ok());
     }
+
+    /// A value frozen from the pre-seam backend; see `quil-sntrup761/tests/kat.rs`.
+    fn frozen(name: &str) -> Vec<u8> {
+        const TABLE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../quil-sntrup761/tests/data/continuity.hex"
+        ));
+        let line = TABLE
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+            .unwrap();
+        (0..line.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&line[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Sealed by the pre-seam backend: must still open, or cross-build
+    /// diagnostics requests fail.
+    #[test]
+    fn frozen_sealed_payload_opens() {
+        assert_eq!(
+            open(
+                &frozen("sealed_payload"),
+                &frozen("key_secret"),
+                b"frozen aad"
+            )
+            .unwrap(),
+            b"frozen sealed payload"
+        );
+    }
 }

@@ -31,3 +31,6 @@ harness = false
 [[bench]]
 name = "bench_commit_scheduling"
 harness = false
+
+[lints]
+workspace = true

@@ -8,10 +8,45 @@ use std::path::Path;
 
 use crate::{release, system};
 
+/// The lock `node install` and `node update` hold while they change the
+/// node install, so auto-update runs (every 10 minutes) and manual runs
+/// never overlap.
+const UPDATE_LOCK: &str = "/var/quilibrium/.auto-update.lock";
+
+/// Take the exclusive lock at `path` (created 0600 if absent) until the
+/// returned file closes; fail at once if another run holds it.
+fn lock_node_updates(path: &Path) -> anyhow::Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| anyhow::anyhow!("create {}: {e} (root required)", dir.display()))?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("open {}: {e} (root required)", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "another qclient node install or update is running (it holds {}); nothing done",
+            path.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => {
+            anyhow::bail!("lock {}: {e}", path.display())
+        }
+    }
+}
+
 /// `node install [version]` — download+verify+install the node binary, then
 /// install the system service. An older version than the linked one needs
 /// `allow_downgrade`.
 pub async fn install(version: Option<&str>, allow_downgrade: bool) -> anyhow::Result<()> {
+    let _lock = lock_node_updates(Path::new(UPDATE_LOCK))?;
     let version = resolve_version(version).await?;
     println!("Installing Quilibrium node {version}...");
     let installed = release::download_and_install(
@@ -34,6 +69,7 @@ pub async fn update(
     restart: bool,
     allow_downgrade: bool,
 ) -> anyhow::Result<()> {
+    let _lock = lock_node_updates(Path::new(UPDATE_LOCK))?;
     let version = resolve_version(version).await?;
     println!("Updating Quilibrium node to {version}...");
     let installed = release::download_and_install(
@@ -97,14 +133,33 @@ pub fn uninstall() -> anyhow::Result<()> {
 const CRON_MARKER: &str = "# quilibrium-auto-update";
 
 /// `node auto-update [enable|disable|status]` — manage a cron job that runs
-/// `qclient node update --restart` every 10 minutes.
+/// `qclient node update --restart` every 10 minutes. The job lives in
+/// root's crontab, so each action needs root.
 pub fn auto_update(action: &str) -> anyhow::Result<()> {
-    match action {
-        "enable" => cron_enable(),
-        "disable" => cron_disable(),
-        "status" => cron_status(),
+    let run: fn() -> anyhow::Result<()> = match action {
+        "enable" => cron_enable,
+        "disable" => cron_disable,
+        "status" => cron_status,
         other => anyhow::bail!("must specify 'enable', 'disable', or 'status' (got {other:?})"),
+    };
+    require_root(action, system::is_root())?;
+    run()
+}
+
+/// Fail unless `is_root`. The job installs node releases and restarts the
+/// service, which needs root, so it lives in root's crontab; without root,
+/// `crontab` would edit or read the invoking user's, whose job fails on
+/// every run.
+fn require_root(action: &str, is_root: bool) -> anyhow::Result<()> {
+    if !is_root {
+        anyhow::bail!(
+            "auto-update {action} needs root: the job installs node releases under {} and \
+             restarts the node service, so it runs from root's crontab; run 'sudo qclient \
+             node auto-update {action}'",
+            system::BINARY_PATH
+        );
     }
+    Ok(())
 }
 
 fn current_crontab() -> String {
@@ -286,6 +341,20 @@ fn latest_version_in(data: &Path) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
+    /// Without root, `auto-update enable` wrote the invoking user's
+    /// crontab, whose `node update --restart` then failed on every run.
+    #[test]
+    fn auto_update_needs_root() {
+        for action in ["enable", "disable", "status"] {
+            let err = require_root(action, false).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("run 'sudo qclient node auto-update {action}'")),
+                "{err}"
+            );
+        }
+        require_root("enable", true).unwrap();
+    }
+
     #[test]
     fn cron_entry_runs_the_installed_qclient() {
         assert_eq!(
@@ -327,5 +396,25 @@ mod tests {
         }
         std::fs::write(tmp.path().join("2.1.0.30"), b"not a directory").unwrap();
         assert_eq!(latest_version_in(tmp.path()).unwrap(), "2.1.0.25");
+    }
+
+    /// While one install or update holds the lock, another fails at once;
+    /// it runs once the first ends.
+    #[cfg(unix)]
+    #[test]
+    fn overlapping_node_updates_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("quilibrium").join(".auto-update.lock");
+        let held = lock_node_updates(&path).unwrap();
+        let err = lock_node_updates(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("another qclient node install or update is running"),
+            "{err}"
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        drop(held);
+        lock_node_updates(&path).unwrap();
     }
 }

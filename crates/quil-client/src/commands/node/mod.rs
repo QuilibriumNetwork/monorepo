@@ -1,7 +1,7 @@
 //! `qclient node …` — node management.
 //!
-//! The `prover` subgroup (status/lifecycle) and the install/update/
-//! service/config/log subcommands (OS plumbing).
+//! The `manage` TUI, the `prover` subgroup (status/lifecycle) and the
+//! install/update/service/config/log subcommands (OS plumbing).
 
 use clap::Subcommand;
 
@@ -11,6 +11,7 @@ pub mod archive;
 pub mod diagnostics;
 pub mod diagnostics_dial;
 pub mod diagnostics_logs;
+pub mod doctor;
 pub mod lifecycle;
 pub mod log;
 pub mod nodeconfig;
@@ -19,6 +20,8 @@ pub mod service;
 
 #[derive(Debug, Subcommand)]
 pub enum NodeCommand {
+    /// Interactive node management TUI; `node prover manage` opens the same.
+    Manage(prover::ManageArgs),
     /// Prover management.
     Prover {
         #[command(subcommand)]
@@ -40,6 +43,26 @@ pub enum NodeCommand {
         #[command(subcommand)]
         command: diagnostics::DiagnosticsCommand,
     },
+    /// Check whether peers can dial this node, and say what to change if
+    /// they cannot.
+    ///
+    /// Asks this node over its local RPC for its p2p listeners, AutoNAT's
+    /// view of it (status, confirmed external addresses, failing probes)
+    /// and the addresses its PeerInfo announces, and gives one verdict per
+    /// address family (IPv4, and IPv6 when the node has an IPv6 address)
+    /// and transport (TCP, QUIC): reachable when an AutoNAT server dialed
+    /// the node back on it; not reachable when servers on distinct IPs
+    /// could not, when AutoNAT holds the node private without a confirmed
+    /// address, or when the host's address is behind carrier-grade NAT;
+    /// unknown otherwise. For a family that is not reachable it advises by
+    /// the host's address: forward the ports on the router (private),
+    /// get a public IP address or a VPS (carrier-grade NAT), or open the
+    /// ports, with ufw, nftables and firewalld commands (public). It only
+    /// reads: it never enables UPnP and never changes a firewall.
+    ///
+    /// Exit status: 0 reachable, 1 not reachable, 2 unknown (also when the
+    /// node cannot be asked).
+    Doctor(doctor::DoctorArgs),
     /// Node log management.
     Log {
         #[command(subcommand)]
@@ -101,8 +124,10 @@ pub enum NodeCommand {
 
 pub async fn run(global: GlobalArgs, cmd: &NodeCommand) -> anyhow::Result<()> {
     match cmd {
+        NodeCommand::Manage(args) => prover::manage_command(global, args).await,
         NodeCommand::Prover { command } => prover::run(global, command).await,
         NodeCommand::Config { command } => nodeconfig::run(global, command),
+        NodeCommand::Doctor(args) => doctor::run(global, args).await,
         NodeCommand::Log { command } => log::run(global, command),
         NodeCommand::Archive { command } => archive::run(global, command).await,
         NodeCommand::Diagnostics { command } => diagnostics::run(global, command).await,

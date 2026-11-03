@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
@@ -74,6 +74,33 @@ fn parse_keystore(
         keys.insert(id, serde_yaml::from_value(entry)?);
     }
     Ok(keys)
+}
+
+/// The prover address of the `q-prover-key` stored in the keystore at
+/// `path`, read from its plaintext public key, or `None` when the file or
+/// the entry is missing.
+pub fn stored_prover_address(path: &Path) -> Result<Option<[u8; 32]>> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let keys = parse_keystore(&contents).map_err(|e| {
+        QuilError::Crypto(format!("failed to parse keystore {}: {e}", path.display()))
+    })?;
+    let Some(stored) = keys.get(PROVER_KEY_ID) else {
+        return Ok(None);
+    };
+    let public_key = hex::decode(&stored.public_key)
+        .map_err(|e| QuilError::Crypto(format!("invalid public key hex: {e}")))?;
+    quil_crypto::poseidon::hash_bytes_to_32(&public_key).map(Some)
+}
+
+/// What [`FileKeyManager::ensure_standard_keys`] would do to the prover key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProverKeyChange {
+    Create,
+    Replace { old_type: u8 },
 }
 
 /// A keystore entry summary returned by [`FileKeyManager::list_keys`].
@@ -590,6 +617,43 @@ impl FileKeyManager {
             s.create_agreement_key("q-device-pre-key", 4)
         })?;
         Ok(())
+    }
+
+    /// What [`Self::ensure_standard_keys`] would do to the prover key: nothing
+    /// for a usable key, and for one that does not decrypt, which it refuses.
+    pub(crate) fn prover_key_change(&self) -> Option<ProverKeyChange> {
+        let existing = self.stored_keys.read().unwrap().get(PROVER_KEY_ID).cloned();
+        let Some(key) = existing else {
+            return Some(ProverKeyChange::Create);
+        };
+        if self.decrypt_private_key(&key.private_key).is_err()
+            || (key.key_type == 8 && self.stored_key_is_usable(&key))
+        {
+            return None;
+        }
+        Some(ProverKeyChange::Replace {
+            old_type: key.key_type,
+        })
+    }
+
+    /// An entry an earlier replacement of the prover key preserved, if any.
+    pub(crate) fn replaced_prover_key_entry(&self) -> Option<String> {
+        let prefix = format!("{PROVER_KEY_ID}-legacy-");
+        let keys = self.stored_keys.read().unwrap();
+        let mut ids: Vec<_> = keys.keys().filter(|id| id.starts_with(&prefix)).collect();
+        ids.sort();
+        ids.first().map(|id| id.to_string())
+    }
+
+    /// The prover address of the stored prover key.
+    pub(crate) fn prover_address_hex(&self) -> Option<String> {
+        let public_key = self.public_key_by_id(PROVER_KEY_ID).ok()??;
+        let address = quil_crypto::poseidon::hash_bytes_to_32(&public_key).ok()?;
+        Some(hex::encode(address))
+    }
+
+    pub(crate) fn keys_path(&self) -> &Path {
+        &self.keys_path
     }
 
     /// Warn once per created `q-prover-key`: the node now signs as a new

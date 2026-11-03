@@ -3497,6 +3497,18 @@ impl GlobalIntrinsic {
             Some(session) if anchored_issuance => super::handoff::session_tip(state, &session)?,
             _ => None,
         };
+        // Logging only: a header that leaves source frames below its relay
+        // window after the shard's previous executed header is warned about.
+        #[cfg(feature = "confidential-tokens")]
+        if let Some(tip) = &executed_tip {
+            super::relay_coverage::check(
+                frame_number,
+                &op.address,
+                op.global_frame_number,
+                tip.frame,
+                op.frame_number,
+            );
+        }
         let credit = !executed_tip.is_some_and(|tip| tip.frame >= op.frame_number);
 
         // The authorized session's executed tip: a seal is accepted only once
@@ -4143,6 +4155,8 @@ impl GlobalIntrinsic {
         // Logging only: the stale seal-drain copy summary is written once its
         // interval ends, also when no further copy arrives.
         super::handoff::superseded::flush_due(frame_number);
+        #[cfg(feature = "confidential-tokens")]
+        super::relay_coverage::flush_due(frame_number);
         state.stage_records([quil_types::store::RecordMutation {
             key: DUE_FRAME_KEY.to_vec(),
             value: Some(frame_number.to_be_bytes().to_vec()),

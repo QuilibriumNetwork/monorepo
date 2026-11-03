@@ -879,3 +879,169 @@ fn a_tree_without_a_head_is_warned_about_once_a_pass() {
     assert_eq!(pass.refused_trees, 1, "{pass:?}");
     assert_eq!((pass.trees, pass.nodes, pass.values), (0, 0, 0), "{pass:?}");
 }
+
+/// `count` vertices beside the record's, each with blob versions 1..=3,
+/// below the watermark `commit_frames(1..=10)` leaves at a retention of 3
+/// frames: a pass deletes versions 1 and 2 of each, one vertex at a time.
+fn write_low_blob_versions(fixture: &Fixture, count: u64) {
+    let shard = quil_hypergraph::shard_key_for_location(&record());
+    let txn = fixture.store.new_transaction(false).unwrap();
+    for i in 0..count {
+        let mut id = [0u8; 64];
+        id[..32].copy_from_slice(&APP);
+        id[32..40].copy_from_slice(&i.to_be_bytes());
+        id[63] = 0x5B;
+        for version in 1..=3 {
+            fixture
+                .store
+                .save_vertex_underlying_versioned(
+                    txn.as_ref(),
+                    "vertex",
+                    "adds",
+                    &shard,
+                    &id,
+                    b"low blob",
+                    version,
+                )
+                .unwrap();
+        }
+    }
+    txn.commit().unwrap();
+}
+
+/// A reader asking for the commit lock while a pass deletes waits for about
+/// one record, however large the pass's unit of work: the hold ends as soon
+/// as anybody waits. Here one unit spans every vertex and a hold may last
+/// 10 s, so only a waiter can end a hold early (the long-hold outcome of a
+/// slow store: GLOBAL-view readers waited minutes for one hold). The bound is
+/// relative to the pass's time under the lock, not wall-clock absolute: a
+/// pass in one hold makes its reader wait about all of it, while a slow or
+/// oversubscribed machine stretches records and scheduling alike.
+#[test]
+fn a_reader_waits_for_one_record_while_a_retention_pass_deletes() {
+    use quil_hypergraph::RetentionStep;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    const VERTICES: u64 = 200_000;
+    let fixture = Fixture::new();
+    let crdt = fixture.crdt();
+    commit_frames(&crdt, 1..=10);
+    write_low_blob_versions(&fixture, VERTICES);
+    let pacing = quil_hypergraph::RetentionPacing {
+        hold: Duration::from_secs(10),
+        pause: Duration::from_millis(1),
+        chunk: 1 << 20,
+        node_batch: 1 << 20,
+    };
+    let (deleting, done) = (AtomicBool::new(false), AtomicBool::new(false));
+    let (pass, waits) = std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            let mut waits: Vec<Duration> = Vec::new();
+            while !done.load(Ordering::SeqCst) {
+                if deleting.load(Ordering::SeqCst) {
+                    let asked = Instant::now();
+                    crdt.read_execution_record(b"reader").unwrap();
+                    waits.push(asked.elapsed());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            waits
+        });
+        let pass =
+            crdt.prune_retaining_paced(3, usize::MAX, Some(usize::MAX), pacing, &mut |step| {
+                // The deletions, under the lock, follow the scans.
+                if matches!(step, RetentionStep::Scanned { .. }) {
+                    deleting.store(true, Ordering::SeqCst);
+                }
+            });
+        done.store(true, Ordering::SeqCst);
+        (pass.unwrap(), reader.join().unwrap())
+    });
+    let longest = waits.iter().max().copied().unwrap_or_default();
+    eprintln!(
+        "reader calls={} longest_wait_ms={} holds={} max_hold_ms={} held_ms={} blobs={}",
+        waits.len(),
+        longest.as_millis(),
+        pass.holds,
+        pass.max_hold.as_millis(),
+        pass.held.as_millis(),
+        pass.blobs
+    );
+    assert!(
+        pass.blobs as u64 >= 2 * VERTICES,
+        "the pass deleted the low versions: {pass:?}"
+    );
+    assert!(
+        !waits.is_empty() && longest * 3 < pass.held,
+        "a reader waited {longest:?} for the commit lock while the pass deleted, which held it \
+         {:?} in {} holds (longest {:?}): a hold must end within one record once anybody waits",
+        pass.held,
+        pass.holds,
+        pass.max_hold
+    );
+}
+
+/// A pass whose every hold ends after one record (a zero budget; units of a
+/// whole tree or keyspace) deletes exactly the keys a pass in one hold
+/// deletes: each kind of work resumes at the record where its hold ended.
+#[test]
+fn a_pass_holding_the_lock_one_record_at_a_time_deletes_what_one_hold_does() {
+    use std::time::Duration;
+    const LOW: u64 = 50;
+    let run = |hold: Duration| {
+        let fixture = Fixture::new();
+        let crdt = fixture.crdt();
+        commit_many(&crdt, 1..=10, 6);
+        write_low_blob_versions(&fixture, LOW);
+        let pacing = quil_hypergraph::RetentionPacing {
+            hold,
+            pause: Duration::ZERO,
+            chunk: 1 << 20,
+            node_batch: 1 << 20,
+        };
+        let pass = crdt
+            .prune_retaining_paced(3, usize::MAX, Some(usize::MAX), pacing, &mut |_| {})
+            .unwrap();
+        let keys: Vec<Box<[u8]>> = fixture
+            .db
+            .iterator(rocksdb::IteratorMode::Start)
+            .map(|entry| entry.unwrap().0)
+            .collect();
+        (pass, keys)
+    };
+    let (whole, whole_keys) = run(Duration::from_secs(60));
+    let (paced, paced_keys) = run(Duration::ZERO);
+    assert!(
+        whole.blobs as u64 > 2 * LOW && whole.nodes > 1 && whole.values > 1,
+        "{whole:?}"
+    );
+    assert_eq!(
+        (
+            paced.blobs,
+            paced.nodes,
+            paced.values,
+            paced.roots,
+            paced.trees
+        ),
+        (
+            whole.blobs,
+            whole.nodes,
+            whole.values,
+            whole.roots,
+            whole.trees
+        ),
+        "(blobs, nodes, values, roots, trees)"
+    );
+    assert!(
+        paced_keys == whole_keys,
+        "the paced pass left {} keys, the pass in one hold {}",
+        paced_keys.len(),
+        whole_keys.len()
+    );
+    // One hold per vertex with low versions, per stale node record and per
+    // rewritten leaf key at least.
+    assert!(
+        paced.holds as u64 >= LOW + whole.nodes as u64 + 6,
+        "a hold ended at its budget only after a whole unit of work: {paced:?}"
+    );
+}

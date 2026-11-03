@@ -15,11 +15,23 @@ use crate::context::{Context, GlobalArgs};
 use crate::rpc::ConnectOpts;
 
 mod account;
+pub(crate) mod action_log;
 #[cfg(feature = "confidential-tokens")]
 pub(crate) mod balance;
-mod legacy;
+pub(crate) mod legacy;
+pub(crate) mod output;
+#[cfg(feature = "native-proof")]
+pub(crate) mod shield_pacing;
 #[cfg(feature = "confidential-tokens")]
 mod wallet;
+#[cfg(feature = "confidential-tokens")]
+pub(crate) use wallet::saved_mints;
+#[cfg(feature = "native-proof")]
+pub(crate) use wallet::{
+    execute_mint, execute_mint_claim, execute_shield_all, mint_claim_witness, plan_mint,
+    plan_shield_all, reward_mint_fee, shield_batch_fee, MintEvent, MintPlan, ShieldAllPlan,
+    ShieldEvent, ShieldReport,
+};
 
 /// Flags shared by every `token` subcommand (Go `TokenCmd` persistent
 /// flags).
@@ -268,16 +280,22 @@ pub(crate) fn short_peer(peer: &str) -> String {
     format!("\u{2026}{}", tail.into_iter().rev().collect::<String>())
 }
 
+/// The fix `qclient token` offers for a submission signed by another config.
+pub(crate) const SUBMIT_CONFIG_REMEDY: &str =
+    "pass --submit-config <DIR> with the running node's config directory";
+
 /// Why the node at `node` would refuse submissions signed by the config in
 /// `signer_dir`: a node verifies a submission's authentication against its
 /// own peer key, so only its own config can sign one. `None` when the
 /// identities match, or when either side has none to compare (an older node
-/// reports no peer ID; then the node's own check is the only one).
+/// reports no peer ID; then the node's own check is the only one). `remedy`
+/// is the fix the caller's options offer.
 pub(crate) fn submit_identity_mismatch(
     node: &str,
     node_peer: &str,
     signer_dir: &std::path::Path,
     signer: &ConfigIdentity,
+    remedy: &str,
 ) -> Option<String> {
     let signer_peer = signer.shown()?;
     if node_peer.is_empty() || signer.holds(node_peer) {
@@ -285,8 +303,7 @@ pub(crate) fn submit_identity_mismatch(
     }
     Some(format!(
         "the node at {node} is peer {}, but submissions would be signed by {} (peer {}), \
-         and a node accepts only submissions signed with its own peer key; pass \
-         --submit-config <DIR> with the running node's config directory",
+         and a node accepts only submissions signed with its own peer key; {remedy}",
         short_peer(node_peer),
         signer_dir.display(),
         short_peer(signer_peer)
@@ -382,11 +399,36 @@ pub enum TokenCommand {
     /// shields are refused ("source owner mismatch"), so this command refuses
     /// to start before the node's GLOBAL head reaches it. Batches themselves
     /// are admitted from frame 864,000. `token legacy` shows the plan.
+    ///
+    /// Batches are paced so a run cannot load GLOBAL faster than archives
+    /// verify the proofs (each batch costs an archive tens of seconds). One
+    /// batch at a time: after submitting, the run waits for the batch's
+    /// coins to stop reading unshielded before proving the next, and stops
+    /// naming the check if that takes longer than `--inclusion-timeout`
+    /// (time GLOBAL is paused does not count; the default, an hour, outlasts
+    /// the shard stalls of up to 30 minutes seen after frames carrying
+    /// batches: a batch commits with its shard's next frame). A submitted
+    /// batch's coins stay out of new runs for two hours. Submissions are at
+    /// least `--min-interval` seconds apart (default 300, at most 12 per
+    /// hour).
+    /// The run pauses while GLOBAL is degraded (head not advancing for 60 s,
+    /// or under 330 frames per hour as the head advanced across the sampled
+    /// window, judged once 10 minutes are sampled) and resumes after 10
+    /// minutes of healthy advance. Each pause, resume, submission and
+    /// inclusion is printed with the projected end.
     #[cfg(feature = "native-proof")]
     ShieldAll {
         /// Legacy coins per batch (1 to 96).
         #[arg(long, default_value_t = 96)]
         max_per_batch: usize,
+        /// Minimum seconds between two submissions. 0 disables the spacing
+        /// (devnets only; it can slow GLOBAL on mainnet).
+        #[arg(long, default_value_t = shield_pacing::DEFAULT_MIN_INTERVAL_SECS)]
+        min_interval: u64,
+        /// Seconds of healthy GLOBAL to wait for a submitted batch to be
+        /// included before stopping the run.
+        #[arg(long, default_value_t = shield_pacing::DEFAULT_INCLUSION_TIMEOUT_SECS)]
+        inclusion_timeout: u64,
     },
     /// Mint a custom token under its deployed policy.
     #[cfg(feature = "native-proof")]
@@ -657,6 +699,13 @@ impl TokenCtx {
     /// nothing when the node cannot be asked or reports no peer ID; the
     /// submission then meets the node's own check as before.
     pub(crate) async fn check_submit_identity(&self) -> anyhow::Result<()> {
+        self.check_submit_identity_advising(SUBMIT_CONFIG_REMEDY)
+            .await
+    }
+
+    /// [`Self::check_submit_identity`], with `remedy` as the advice when it
+    /// refuses: a caller without `--submit-config` names its own fix.
+    pub(crate) async fn check_submit_identity_advising(&self, remedy: &str) -> anyhow::Result<()> {
         if self.submit_opts.is_light_node() {
             return Ok(());
         }
@@ -678,10 +727,28 @@ impl TokenCtx {
             &info.into_inner().peer_id,
             &self.submit_config_dir,
             &self.submit_identity,
+            remedy,
         ) {
             Some(mismatch) => Err(anyhow::anyhow!(mismatch)),
             None => Ok(()),
         }
+    }
+
+    /// The context `qclient token` builds for the default node config and
+    /// no read or public RPC: the node manager's coin actions use it, so
+    /// they read, quote and submit as the CLI does.
+    pub(crate) fn for_manager(global: GlobalArgs, max_fee: u128) -> anyhow::Result<Self> {
+        Self::load(
+            global,
+            &TokenCommonArgs {
+                public_rpc: false,
+                config: Vec::new(),
+                submit_config: None,
+                read_rpc: None,
+                insecure_read_rpc: false,
+                max_fee,
+            },
+        )
     }
 
     fn load(global: GlobalArgs, common: &TokenCommonArgs) -> anyhow::Result<Self> {
@@ -689,7 +756,7 @@ impl TokenCtx {
     }
 
     fn from_context(ctx: &Context, common: &TokenCommonArgs) -> anyhow::Result<Self> {
-        println!("Loading node config...");
+        output::line("Loading node config...".into());
         let config_arg = common.single_config()?;
         let (node_config, config_dir) = ctx.load_node_config(config_arg)?;
 
@@ -708,18 +775,15 @@ impl TokenCtx {
         // absent (a pre-migration keystore).
         let config_identity = ConfigIdentity::of(&node_config, &key_manager);
         match config_identity.shown() {
-            Some(peer) => println!("{peer}"),
-            None => println!("(no network identity configured)"),
+            Some(peer) => output::line(peer.to_string()),
+            None => output::line("(no network identity configured)".into()),
         }
         if config_arg.is_empty() || config_arg == "default" {
             let unused = std::env::current_dir()
                 .ok()
                 .and_then(|cwd| crate::nodeconfig::unused_local_config(&config_dir, &cwd));
             if unused.is_some() {
-                eprintln!(
-                    "{}",
-                    local_config_notice(&config_dir, config_identity.shown())
-                );
+                output::err_line(local_config_notice(&config_dir, config_identity.shown()));
             }
         }
         let (submit_opts, submit_key_manager, submit_config_dir, submit_identity) =
@@ -1044,29 +1108,41 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                     decoded == quil_execution::domains::QUIL_TOKEN,
                     "reward mint requires the QUIL application; use custom-mint for custom tokens"
                 );
-                // The mint pays its own state-growth charge (one coin and the
-                // receipt marker) out of the minted amount.
-                let mint_fee = if claim.is_some() {
-                    0
-                } else {
-                    // Reward mints execute in the global venue: quote its pricing.
-                    wallet::quoted_quil_fee(
+                // Recorded in the private action log, with the operator lines.
+                let mut action = action_log::CliAction::start(&tc.config_dir, &args.command);
+                let result = async {
+                    // The mint pays its own state-growth charge (one coin and
+                    // the receipt marker) out of the minted amount.
+                    let mint_fee = if claim.is_some() {
+                        0
+                    } else {
+                        wallet::reward_mint_fee(&tc, *fee).await?
+                    };
+                    wallet::run_mint(
                         &tc,
-                        *fee,
-                        Shape {
-                            coins: 1,
-                            markers: 1,
-                            escrow: false,
-                        },
-                        true,
+                        recipient.as_deref(),
+                        mint_fee,
+                        claim.as_deref(),
+                        action.as_mut(),
                     )
-                    .await?
+                    .await
+                }
+                .await;
+                return match action {
+                    Some(action) => action.finish(result),
+                    None => result,
                 };
-                return wallet::run_mint(&tc, recipient.as_deref(), mint_fee, claim.as_deref())
-                    .await;
             }
-            TokenCommand::ShieldAll { max_per_batch } => {
-                return wallet::run_shield_all(&tc, &application, *max_per_batch).await
+            TokenCommand::ShieldAll {
+                max_per_batch,
+                min_interval,
+                inclusion_timeout,
+            } => {
+                let pacing = shield_pacing::Pacing {
+                    min_interval: *min_interval,
+                    inclusion_timeout: *inclusion_timeout,
+                };
+                return wallet::run_shield_all(&tc, &application, *max_per_batch, pacing).await;
             }
             TokenCommand::Shield {
                 source,
@@ -1572,6 +1648,7 @@ pub(crate) mod test_nodes {
                 public_rpc,
                 custom_rpc: String::new(),
                 node_symlink_name: String::new(),
+                no_action_log: false,
             },
         }
     }
@@ -1607,8 +1684,14 @@ mod submit_tests {
             ed448: Some("12D3KooWEd448CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCed4483".into()),
         };
         let dir = std::path::Path::new("prover").join(".config");
-        let error =
-            submit_identity_mismatch("/ip4/127.0.0.1/tcp/8337", node, &dir, &signer).unwrap();
+        let error = submit_identity_mismatch(
+            "/ip4/127.0.0.1/tcp/8337",
+            node,
+            &dir,
+            &signer,
+            SUBMIT_CONFIG_REMEDY,
+        )
+        .unwrap();
         assert_eq!(
             error,
             format!(
@@ -1624,14 +1707,26 @@ mod submit_tests {
         for own in [signer.falcon.clone(), signer.ed448.clone()] {
             let own = own.unwrap();
             assert_eq!(
-                submit_identity_mismatch("/ip4/127.0.0.1/tcp/8337", &own, &dir, &signer),
+                submit_identity_mismatch(
+                    "/ip4/127.0.0.1/tcp/8337",
+                    &own,
+                    &dir,
+                    &signer,
+                    SUBMIT_CONFIG_REMEDY
+                ),
                 None
             );
         }
         // Nothing to compare: an older node reports no peer ID, or the config
         // holds no identity.
         assert_eq!(
-            submit_identity_mismatch("/ip4/127.0.0.1/tcp/8337", "", &dir, &signer),
+            submit_identity_mismatch(
+                "/ip4/127.0.0.1/tcp/8337",
+                "",
+                &dir,
+                &signer,
+                SUBMIT_CONFIG_REMEDY
+            ),
             None
         );
         assert_eq!(
@@ -1639,7 +1734,8 @@ mod submit_tests {
                 "/ip4/127.0.0.1/tcp/8337",
                 node,
                 &dir,
-                &ConfigIdentity::default()
+                &ConfigIdentity::default(),
+                SUBMIT_CONFIG_REMEDY
             ),
             None
         );
@@ -1799,5 +1895,215 @@ mod submit_tests {
             .to_string();
             assert!(error.starts_with("--submit-config names a node"), "{error}");
         }
+    }
+}
+
+/// `token shield-all --config <pre-2.1 identity> --submit-config <running
+/// node>` up to the wallet it shields into.
+#[cfg(all(test, feature = "confidential-tokens"))]
+mod old_keystore_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::wallet::RecipientWallet;
+    use super::*;
+
+    /// A pre-2.1 identity's config directory: its Ed448 peer key from
+    /// `seed`, the generated relative keystore path `.config/keys.yml` and
+    /// a keystore of keys without the wallet key.
+    fn write_pre_2_1(dir: &Path, seed: u8) -> Vec<u8> {
+        let mut config = quil_config::Config::default();
+        config.listen_grpc_multiaddr = "/ip4/127.0.0.1/tcp/38337".into();
+        config.key.key_store_file.path = ".config/keys.yml".into();
+        config.key.key_store_file.encryption_key = hex::encode([seed; 32]);
+        let ed448_seed = [seed; 57];
+        let ed448_public = quil_crypto::Ed448Signer::derive_public(&ed448_seed)
+            .unwrap()
+            .to_vec();
+        let mut peer_key = ed448_seed.to_vec();
+        peer_key.extend_from_slice(&ed448_public);
+        config.p2p.peer_priv_key = hex::encode(peer_key);
+        quil_config::save_config(dir, &config).unwrap();
+        let km = quil_keys::FileKeyManager::new(
+            dir.join("keys.yml"),
+            &config.key.key_store_file.encryption_key,
+            "default-proving-key".into(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )
+        .unwrap();
+        km.create_bls_key("q-prover-key").unwrap();
+        km.create_bls_key("default-proving-key").unwrap();
+        km.create_agreement_key("q-device-key", 4).unwrap();
+        km.create_agreement_key("q-device-pre-key", 4).unwrap();
+        ed448_public
+    }
+
+    fn wallet_of(tc: &TokenCtx) -> anyhow::Result<String> {
+        let network =
+            quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+        let wallet = RecipientWallet::load(tc, &network, &quil_execution::domains::QUIL_TOKEN)?;
+        Ok(hex::encode(wallet.address().encode()))
+    }
+
+    fn keys_of(path: &Path) -> Vec<(String, Vec<u8>)> {
+        let km = quil_keys::FileKeyManager::new(
+            path.to_path_buf(),
+            "",
+            "default-proving-key".into(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )
+        .unwrap();
+        km.list_keys()
+            .into_iter()
+            .map(|key| (key.id, key.public_key))
+            .collect()
+    }
+
+    struct Layout {
+        _tmp: tempfile::TempDir,
+        running: PathBuf,
+        old: PathBuf,
+        old_public: Vec<u8>,
+    }
+
+    /// The running node at `<node>/.config`, the old identity copied to
+    /// `<node>/.config-old`.
+    fn layout() -> Layout {
+        let tmp = tempfile::tempdir().unwrap();
+        let running = tmp.path().join("node").join(".config");
+        let old = tmp.path().join("node").join(".config-old");
+        test_nodes::write(&running, 41, "/ip4/127.0.0.1/tcp/18337");
+        let old_public = write_pre_2_1(&old, 42);
+        Layout {
+            _tmp: tmp,
+            running,
+            old,
+            old_public,
+        }
+    }
+
+    /// Reproducer of the operator's failure: the old identity's wallet was
+    /// read from the running node's keystore (`q-onion-key secret: crypto
+    /// error: decryption failed`), and its own keystore has no wallet key.
+    /// Now the wallet comes from the old identity's keystore, which receives
+    /// a wallet key; the running node's keystore is untouched.
+    #[test]
+    fn shield_all_from_a_pre_2_1_identity_shields_into_its_own_wallet() {
+        let layout = layout();
+        let running_keys = std::fs::read(layout.running.join("keys.yml")).unwrap();
+        let old_keys = keys_of(&layout.old.join("keys.yml"));
+        let tc = TokenCtx::from_context(
+            &test_nodes::context(false),
+            &test_nodes::common(&layout.old, Some(&layout.running), false),
+        )
+        .unwrap();
+        let wallet = wallet_of(&tc).unwrap_or_else(|e| panic!("{e:#}"));
+
+        // The legacy owner and the wallet are both the old identity's.
+        assert_eq!(
+            super::legacy::config_public_key(&tc.node_config.p2p.peer_priv_key)
+                .unwrap()
+                .to_vec(),
+            layout.old_public
+        );
+        let mut now = keys_of(&layout.old.join("keys.yml"));
+        let created = now.iter().position(|(id, _)| id == "q-onion-key").unwrap();
+        now.remove(created);
+        assert_eq!(now, old_keys, "existing keys are kept as they were");
+        assert_eq!(
+            std::fs::read(layout.running.join("keys.yml")).unwrap(),
+            running_keys
+        );
+
+        // The key persists: the same wallet on the next run, distinct from
+        // the running node's.
+        let again = TokenCtx::from_context(
+            &test_nodes::context(false),
+            &test_nodes::common(&layout.old, Some(&layout.running), false),
+        )
+        .unwrap();
+        assert_eq!(wallet_of(&again).unwrap(), wallet);
+        let node = TokenCtx::from_context(
+            &test_nodes::context(false),
+            &test_nodes::common(&layout.running, None, false),
+        )
+        .unwrap();
+        assert_ne!(wallet_of(&node).unwrap(), wallet);
+    }
+
+    /// A wallet key is created only in a keystore shown to be this config's,
+    /// and a wallet key that does not decrypt is named with its keystore and
+    /// left in place.
+    #[test]
+    fn a_wallet_key_is_created_only_in_this_configs_keystore() {
+        let layout = layout();
+        let tc = |dir: &Path| {
+            TokenCtx::from_context(
+                &test_nodes::context(false),
+                &test_nodes::common(dir, Some(&layout.running), false),
+            )
+            .unwrap()
+        };
+        // A keystore path naming no file: nothing is created there.
+        let missing = layout.old.join("elsewhere").join("keys.yml");
+        let mut config = quil_config::load_config(&layout.old).unwrap();
+        config.key.key_store_file.path = missing.to_string_lossy().into_owned();
+        quil_config::save_config(&layout.old, &config).unwrap();
+        let error = format!("{:#}", wallet_of(&tc(&layout.old)).unwrap_err());
+        assert!(error.contains(missing.to_str().unwrap()), "{error}");
+        assert!(!missing.exists(), "no keystore is created at a wrong path");
+
+        // A keystore holding this config's keys and a wallet key encrypted
+        // under another key: named, never replaced.
+        let own = layout.old.join("keys.yml");
+        let other = quil_keys::FileKeyManager::new(
+            own.clone(),
+            &hex::encode([43u8; 32]),
+            "default-proving-key".into(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )
+        .unwrap();
+        other.create_agreement_key("q-onion-key", 9).unwrap();
+        config.key.key_store_file.path = own.to_string_lossy().into_owned();
+        quil_config::save_config(&layout.old, &config).unwrap();
+        let before = std::fs::read(&own).unwrap();
+        let error = format!("{:#}", wallet_of(&tc(&layout.old)).unwrap_err());
+        assert!(error.contains("decryption failed"), "{error}");
+        assert!(error.contains(own.to_str().unwrap()), "{error}");
+        assert!(
+            error.contains(layout.old.join("config.yml").to_str().unwrap()),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&own).unwrap(), before);
+    }
+
+    /// Workaround on releases without this fix: a copy of the old config
+    /// whose keyManagerFile names the running node's keystore (absolute path
+    /// and encryptionKey) lists and signs for the old identity's legacy
+    /// coins and shields them into the running node's wallet.
+    #[test]
+    fn the_old_peer_key_with_the_nodes_keystore_shields_into_the_nodes_wallet() {
+        let layout = layout();
+        let node_config = quil_config::load_config(&layout.running).unwrap();
+        let mut config = quil_config::load_config(&layout.old).unwrap();
+        config.key.key_store_file = node_config.key.key_store_file.clone();
+        let copy = layout.old.parent().unwrap().join("shield-old");
+        quil_config::save_config(&copy, &config).unwrap();
+        let tc = TokenCtx::from_context(
+            &test_nodes::context(false),
+            &test_nodes::common(&copy, Some(&layout.running), false),
+        )
+        .unwrap();
+        assert_eq!(
+            super::legacy::config_public_key(&tc.node_config.p2p.peer_priv_key)
+                .unwrap()
+                .to_vec(),
+            layout.old_public
+        );
+        let node = TokenCtx::from_context(
+            &test_nodes::context(false),
+            &test_nodes::common(&layout.running, None, false),
+        )
+        .unwrap();
+        assert_eq!(wallet_of(&tc).unwrap(), wallet_of(&node).unwrap());
     }
 }

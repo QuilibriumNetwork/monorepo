@@ -56,7 +56,7 @@ fn peer_keys(configs: &[String]) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
 }
 
 fn peer_key(dir: &str) -> anyhow::Result<(String, Vec<u8>)> {
-    let cfg = quil_config::load_config(std::path::Path::new(dir))
+    let cfg = crate::nodeconfig::load_existing_node_config(std::path::Path::new(dir), true)
         .map_err(|e| anyhow::anyhow!("invalid config directory: {dir}: {e}"))?;
     let id = Ed448Identity::from_config_hex(&cfg.p2p.peer_priv_key)
         .map_err(|e| anyhow::anyhow!("derive peer id for {dir}: {e}"))?;
@@ -67,8 +67,9 @@ fn peer_key(dir: &str) -> anyhow::Result<(String, Vec<u8>)> {
 /// `engine.multisigProverEnrollmentPaths`, in the node's order, then any
 /// further configs given (which the merge would enroll), without repeats.
 fn node_keys(configs: &[String]) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
-    let primary = quil_config::load_config(std::path::Path::new(&configs[0]))
-        .map_err(|e| anyhow::anyhow!("invalid config directory: {}: {e}", configs[0]))?;
+    let primary =
+        crate::nodeconfig::load_existing_node_config(std::path::Path::new(&configs[0]), true)
+            .map_err(|e| anyhow::anyhow!("invalid config directory: {}: {e}", configs[0]))?;
     let mut dirs: Vec<String> = vec![configs[0].clone()];
     dirs.extend(
         primary
@@ -180,7 +181,7 @@ impl RetroTable {
 
 fn merge_configs(primary: &str, others: &[String]) -> anyhow::Result<()> {
     let dir = std::path::Path::new(primary);
-    let mut cfg = quil_config::load_config(dir)
+    let mut cfg = crate::nodeconfig::load_existing_node_config(dir, true)
         .map_err(|e| anyhow::anyhow!("invalid config directory: {primary}: {e}"))?;
     for p in others {
         cfg.engine.multisig_prover_enrollment_paths.push(p.clone());
@@ -617,6 +618,19 @@ mod tests {
         // The dry run's output for the fixture, for review.
         println!("{rendered}");
         rendered
+    }
+
+    #[test]
+    fn a_merge_on_a_wrong_directory_writes_no_config() {
+        let wrong = tempfile::tempdir().unwrap();
+
+        let outcome = peer_key(wrong.path().to_str().unwrap());
+
+        assert!(
+            !wrong.path().join("config.yml").exists(),
+            "prover merge wrote a new config, with a new identity, into a directory without one"
+        );
+        assert!(outcome.is_err());
     }
 
     #[test]

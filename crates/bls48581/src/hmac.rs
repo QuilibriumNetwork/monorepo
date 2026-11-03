@@ -16,6 +16,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+// Vendored MIRACL Core code: clippy findings allowed, not restyled.
+#![allow(
+    clippy::manual_is_multiple_of,
+    clippy::needless_borrow,
+    clippy::unnecessary_cast
+)]
 
 use crate::hash256::HASH256;
 use crate::hash384::HASH384;

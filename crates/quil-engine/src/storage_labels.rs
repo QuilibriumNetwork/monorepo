@@ -21,15 +21,54 @@
 //! leaf refused room is labelled where it is needed instead, as by a process
 //! that keeps no labels, and leaves nothing on disk.
 //!
-//! Labelling ahead gives its memory back while work due now waits for memory
-//! (`crate::storage_jobs::Reservation::yield_requested`): the leaf being
-//! labelled is given up, and labelled again from its start once that work is
-//! done (`crate::storage_jobs::wait_for_due_work`), unless its snapshot has
-//! labelled it meanwhile.
+//! Labelling ahead gives its memory back while more urgent work waits for
+//! memory it holds (`crate::storage_jobs::Reservation::yield_requested`): the
+//! whole layers it labelled stay on disk, marked for the next attempt at the
+//! leaf's count (`<n>.kept`), which reads them back and goes on from the next
+//! as soon as its memory fits again, unless its snapshot has labelled the
+//! leaf meanwhile. Labelling a leaf of 32 million nodes takes most of the
+//! window labelling ahead has, so labelling it again from its start after
+//! each yield never ended (2026-11-01). The leaves wait for memory in an
+//! order (`crate::storage_jobs::AheadOrder`): those its snapshot could not
+//! label within the renewal's grace first ([`ahead_orders`]). Only two are
+//! labelled at once (`crate::storage_jobs::AHEAD_JOBS`), and while a
+//! renewal's leaf is labelled now only one goes on beside it; the other
+//! pauses, keeping its memory and layers, until that labelling ends
+//! (`crate::storage_jobs::Reservation::wait_while_paused`).
 //!
 //! Labelling ahead for an epoch gives up once GLOBAL reaches the epoch's
-//! snapshot frame ([`expired`]): the snapshot labels what is left itself, and
-//! past the renewal's grace its seat renews without it.
+//! snapshot frame ([`expired`]): the snapshot labels what is left itself,
+//! going on from the whole layers labelled ahead, and past the renewal's
+//! grace its seat renews without it.
+//!
+//! Whatever labels a leaf, ahead or at its snapshot, keeps each whole layer
+//! on disk as it ends, synced, with a manifest of the labels it belongs to
+//! and each layer's SHA-256 (`<n>.kept`, [`Manifest`]): a restart, a crash,
+//! a yield or the snapshot frame costs at most the layer in progress
+//! (2026-11-01: a restart while a seat's leaf was labelled at its snapshot
+//! labelled it again from its first layer, past the renewal's grace, and
+//! labelling ahead dropped its layers at the snapshot frame). The next
+//! attempt at the leaf's count checks each kept layer against its digest
+//! before going on from them ([`LabelStore::admit`]): from a layer cut
+//! short or changed, the leaf is labelled again.
+//!
+//! From the stable replica key epoch
+//! (`quil_types::consensus::stable_replica_keys_at`) the key no longer
+//! depends on the epoch, so labels made for one epoch serve every later one
+//! while the leaf's data stays registrable at their count (issue #749). They
+//! are kept in one directory for all those epochs ([`STABLE_DIR`]), each
+//! count with the latest epoch a registration, a seal or labelling ahead
+//! looked for it, and a count goes at the first sweep of a later epoch
+//! ([`LabelStore::sweep`]), never when one registration is sealed
+//! ([`LabelStore::forget`]). A leaf is then labelled again only when its node
+//! count leaves its padding band or its id changes.
+//! Labelling ahead, a snapshot and a seal may then work in one leaf's
+//! directory at once: one labelling writes a count at a time
+//! ([`LabelStore::admit`]), `ready` last, so nothing finds it before it is
+//! complete, and removing a count's files and opening its labels hold the
+//! leaf's lock ([`leaf_lock`]). The whole layers kept of a count serve those
+//! epochs too: labelling given up for one epoch goes on for a later one, and
+//! only the sweep removes them ([`LabelStore::discard`]).
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -45,7 +84,8 @@ use quil_crypto::storage_proof::{LabelSource, Node, NODE_BYTES};
 use quil_forest::storage_health::FsUsage;
 use quil_hypergraph::HypergraphCrdt;
 use quil_types::error::{QuilError, Result};
-use tracing::info;
+use sha2::{Digest as _, Sha256};
+use tracing::{info, warn};
 
 /// Percent of the labels' filesystem that labels leave free, unless
 /// [`DISK_FLOOR_MIN_BYTES`] is more. The stores sharing the filesystem stop
@@ -68,6 +108,34 @@ const REFUSED_RETRY: Duration = Duration::from_secs(30 * 60);
 /// The free space labels leave on a filesystem of `total_bytes`.
 pub fn disk_floor(total_bytes: u64) -> u64 {
     (total_bytes / 100 * DISK_FLOOR_PERCENT).max(DISK_FLOOR_MIN_BYTES)
+}
+
+/// Bytes of the buffer a leaf's layers are written through.
+const WRITE_BUFFER_BYTES: usize = 1 << 22;
+
+/// Bytes of a kept layer read back at once, to resume a leaf's labelling
+/// ([`Admitted::label_ahead`]).
+const READ_CHUNK_BYTES: usize = 1 << 20;
+
+/// How long writing a leaf's labels and building its column tree after its
+/// last layer may take before it is logged ([`Admitted::label_until`]):
+/// seconds on an idle node; a leaf of 32 million nodes wrote its column
+/// digests and no commitment for over three minutes (2026-11-01).
+const FINISH_LOGGED_FROM: Duration = Duration::from_secs(60);
+
+/// Percent [`label_ahead_bytes`] adds to what labelling holds, for the
+/// allocator: jemalloc rounds a large allocation up to its size class (it
+/// counted 157.8 bytes a node allocated for 152.2 resident, 2026-11-01), and
+/// keeps freed pages a while before it returns them, so a leaf labelled
+/// again soon after it gave its memory back may still find them held.
+const LABEL_AHEAD_MARGIN_PERCENT: u64 = 10;
+
+/// Bytes labelling a leaf ahead reserves: bounded graph and column scratch,
+/// the worker's layer buffers, allocator margin and the layer write buffer.
+pub(crate) fn label_ahead_bytes(n: u64) -> u64 {
+    let peak = quil_crypto::storage_proof::label_leaf_peak_bytes(n, &SdrParams::default());
+    peak.saturating_add(peak / 100 * LABEL_AHEAD_MARGIN_PERCENT)
+        .saturating_add(WRITE_BUFFER_BYTES as u64)
 }
 
 /// Bytes a leaf's labels at `n` nodes take on disk: every layer, and a
@@ -137,16 +205,100 @@ fn io(what: &str, path: &Path, error: std::io::Error) -> QuilError {
     ))
 }
 
-/// Leaves' labels on disk: `<dir>/<epoch>/<leaf>/<n>.{layers,columns,ready}`,
+/// The directory under which the labels of every epoch from the stable
+/// replica key epoch on are kept, in place of one per epoch.
+pub const STABLE_DIR: &str = "stable";
+
+/// The directory `epoch`'s labels are kept under: the epoch's own before the
+/// stable replica key epoch, whose keys differ every epoch; [`STABLE_DIR`]
+/// from it.
+fn epoch_dir(epoch: u64) -> String {
+    if quil_types::consensus::stable_replica_keys_at(epoch) {
+        STABLE_DIR.to_string()
+    } else {
+        epoch.to_string()
+    }
+}
+
+/// The lock of the leaf directory `dir`: held while a count's files are
+/// removed and while its labels are opened.
+fn leaf_lock(dir: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(dir.to_path_buf())
+        .or_default()
+        .clone()
+}
+
+/// A name part no other writer in this or another process uses.
+fn unique_tag() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// The file of count `n` in a leaf's directory under [`STABLE_DIR`] naming
+/// the latest epoch it was looked for or labelled for (`u64`, big-endian).
+fn used_path(dir: &Path, n: u64) -> PathBuf {
+    dir.join(format!("{n}.used"))
+}
+
+/// The epoch count `n` under `dir` was last used for.
+fn used_epoch(dir: &Path, n: u64) -> Option<u64> {
+    let bytes: [u8; 8] = fs::read(used_path(dir, n)).ok()?.try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
+}
+
+/// Record that count `n` under `dir` was used for `epoch`. The caller holds
+/// the leaf's lock.
+fn write_used(dir: &Path, n: u64, epoch: u64) {
+    if fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let staged = dir.join(format!("{n}.used.{}.tmp", unique_tag()));
+    if fs::write(&staged, epoch.to_be_bytes()).is_ok()
+        && fs::rename(&staged, used_path(dir, n)).is_err()
+    {
+        let _ = fs::remove_file(staged);
+    }
+}
+
+/// Note that count `n` under `dir` serves `epoch`, when `epoch` keeps its
+/// labels under [`STABLE_DIR`] and no later epoch was noted. The caller
+/// holds the leaf's lock.
+fn note_used(dir: &Path, n: u64, epoch: u64) {
+    if quil_types::consensus::stable_replica_keys_at(epoch)
+        && used_epoch(dir, n).is_none_or(|used| used < epoch)
+    {
+        write_used(dir, n, epoch);
+    }
+}
+
+/// Leaves' labels on disk: `<dir>/<epoch>/<leaf>/<n>.{layers,columns,ready}`
+/// (`<dir>/stable/…` from the stable replica key epoch, [`epoch_dir`]),
 /// `<leaf>` naming the member and the leaf. `layers` holds every layer in
 /// order, `columns` every node's column digest, and `ready`, written last,
-/// the column commitment.
+/// the column commitment. `kept`, beside the `layers` of a labelling not
+/// ended, is the manifest of its whole layers ([`Manifest`]), rewritten
+/// after each layer is synced.
 pub struct LabelStore {
     dir: PathBuf,
     space: SpaceSource,
     /// Bytes the leaves being labelled have still to write.
     pending: Mutex<u64>,
-    busy: Mutex<HashSet<PathBuf>>,
+    /// Leaves' counts admitted and being labelled ([`Self::admit`]): no
+    /// other labelling writes them, and nothing removes them meanwhile.
+    busy: Mutex<HashSet<(PathBuf, u64)>>,
+    /// Leaves admitted with layers kept on disk, and from how many, for
+    /// tests.
+    #[cfg(test)]
+    resumed: Mutex<Vec<(Vec<u8>, u64, usize)>>,
     /// Leaves refused room, by epoch and stage, each logged once.
     refused: Mutex<HashSet<(u64, PathBuf, Stage)>>,
     /// The epoch before which labels were last removed ([`Self::sweep`]).
@@ -177,6 +329,8 @@ impl LabelStore {
             space,
             pending: Mutex::new(0),
             busy: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            resumed: Mutex::new(Vec::new()),
             refused: Mutex::new(HashSet::new()),
             swept: AtomicU64::new(0),
             #[cfg(test)]
@@ -215,21 +369,19 @@ impl LabelStore {
         }
     }
 
-    // A cheap pre-read disk check must not extend an obsolete count's
-    // lifetime. Only `find` with the exact padding predicate marks it used.
-    fn has_ready(&self, epoch: u64, member: &[u8], leaf_id: &[u8]) -> bool {
-        fs::read_dir(self.leaf_dir(epoch, member, leaf_id)).is_ok_and(|entries| {
-            entries.flatten().any(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.ends_with(".ready"))
-            })
-        })
-    }
-
     fn pending(&self) -> MutexGuard<'_, u64> {
         self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn busy(&self) -> MutexGuard<'_, HashSet<(PathBuf, u64)>> {
+        self.busy.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Leaves admitted with layers kept on disk ([`Self::admit`]): the leaf,
+    /// its count and the layers resumed from.
+    #[cfg(test)]
+    pub(crate) fn resumed(&self) -> Vec<(Vec<u8>, u64, usize)> {
+        self.resumed.lock().unwrap().clone()
     }
 
     /// Whether the labels' filesystem has room for `bytes` beside the
@@ -257,11 +409,16 @@ impl LabelStore {
     }
 
     /// Admit `member`'s leaf `leaf_id` for `epoch` at `n` nodes to be
-    /// labelled and kept ([`Admitted::label`]) when its filesystem has room:
-    /// [`DISK_MARGIN`] times its [`label_bytes`]. What an earlier attempt at
-    /// that count left is removed first. `None` when refused, logged once a
-    /// leaf, epoch and stage: the leaf is then labelled where it is needed, as by a
-    /// process that keeps no labels.
+    /// labelled and kept ([`Admitted::label_kept`]) when its filesystem has
+    /// room: [`DISK_MARGIN`] times the [`label_bytes`] it has still to write.
+    /// The whole layers an earlier attempt at that count kept, in this
+    /// process or one before it, stay for this one to resume from
+    /// ([`Admitted::resumes_from`]) as far as each matches its digest
+    /// ([`verify_kept`]); whatever else an attempt left is removed first.
+    /// `None` when refused, leaving none of its files, logged once a leaf,
+    /// epoch and stage: the leaf is then labelled where it is needed, as by
+    /// a process that keeps no labels. `None` too, silently, while that
+    /// count is being labelled.
     pub fn admit(
         &self,
         epoch: u64,
@@ -271,20 +428,56 @@ impl LabelStore {
         stage: Stage,
     ) -> Option<Admitted<'_>> {
         let dir = self.leaf_dir(epoch, member, leaf_id);
-        let identity = dir.join(n.to_string());
-        let mut busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
-        if busy.contains(&identity) {
+        if !self.busy().insert((dir.clone(), n)) {
             return None;
         }
-        for path in paths(&dir, n) {
+        let key = quil_crypto::sdr::replica_key(member, leaf_id, epoch);
+        // Not under the leaf's lock: checking a large leaf's layers takes a
+        // while, and being busy keeps every removal off them. What a sweep
+        // that looked before this count was busy removes is seen below.
+        let mut verified = verify_kept(&dir, n, &key);
+        let lock = leaf_lock(&dir);
+        let held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let [layers, columns, ready] = paths(&dir, n);
+        for path in [
+            columns,
+            ready,
+            staged(&dir, n),
+            manifest_staged(&dir, n),
+            dir.join(format!("{n}.cap")),
+        ] {
             let _ = fs::remove_file(path);
         }
-        let bytes = label_bytes(n);
+        let whole = verified.layers.len() as u64 * layer_bytes(n);
+        let cut = whole > 0
+            && fs::OpenOptions::new()
+                .write(true)
+                .open(&layers)
+                .and_then(|file| file.set_len(whole))
+                .is_ok();
+        if !cut {
+            verified.layers.clear();
+            let _ = fs::remove_file(&layers);
+            let _ = fs::remove_file(kept_path(&dir, n));
+        }
+        log_verified(epoch, leaf_id, n, stage, &verified);
+        let kept = verified.layers.len();
+        #[cfg(test)]
+        {
+            if kept > 0 {
+                self.resumed
+                    .lock()
+                    .unwrap()
+                    .push((leaf_id.to_vec(), n, kept));
+            }
+        }
+        let bytes = label_bytes(n).saturating_sub(kept as u64 * layer_bytes(n));
         let mut pending = self.pending();
         match self.room(*pending, bytes.saturating_mul(DISK_MARGIN)) {
             Ok(()) => {
                 *pending = pending.saturating_add(bytes);
-                busy.insert(identity);
+                note_used(&dir, n, epoch);
+                drop(held);
                 Some(Admitted {
                     store: self,
                     dir,
@@ -293,13 +486,88 @@ impl LabelStore {
                     leaf_id: leaf_id.to_vec(),
                     n,
                     stage,
+                    kept,
+                    resumed: (kept > 0).then(|| Resumed {
+                        layers: kept,
+                        bytes: verified.bytes,
+                        took: verified.took,
+                        kept_by: verified.kept_by.unwrap_or(stage),
+                    }),
+                    digests: verified.layers,
                     remaining: bytes,
                 })
             }
             Err(shortfall) => {
                 drop(pending);
+                let _ = fs::remove_file(&layers);
+                let _ = fs::remove_file(kept_path(&dir, n));
+                self.busy().remove(&(dir.clone(), n));
                 self.refuse(epoch, &dir, leaf_id, n, stage, shortfall);
                 None
+            }
+        }
+    }
+
+    /// The count at which `member`'s leaf `leaf_id` for `epoch` has the most
+    /// whole layers kept on disk, among those `accept` takes, and how many
+    /// its manifest lists ([`Self::admit`] checks them); none when no such
+    /// count has any. A count whose labels are complete ([`Self::find`]) or
+    /// being labelled is not one.
+    pub fn resumable(
+        &self,
+        epoch: u64,
+        member: &[u8],
+        leaf_id: &[u8],
+        accept: impl Fn(u64) -> bool,
+    ) -> Option<(u64, usize)> {
+        let dir = self.leaf_dir(epoch, member, leaf_id);
+        let counts = counts_with(&dir, ".kept");
+        let busy = self.busy();
+        counts
+            .into_iter()
+            .filter(|&n| accept(n) && !busy.contains(&(dir.clone(), n)))
+            .filter(|&n| !paths(&dir, n)[2].exists())
+            .filter_map(|n| {
+                let text = fs::read_to_string(kept_path(&dir, n)).ok()?;
+                let layers = Manifest::parse(&text)?.layers.len();
+                (layers > 0).then_some((n, layers))
+            })
+            .max_by_key(|&(n, layers)| (layers, std::cmp::Reverse(n)))
+    }
+
+    /// Remove what an attempt at labelling `member`'s leaf `leaf_id` for
+    /// `epoch` at `n` nodes left, kept layers included: nothing goes on from
+    /// them. Labels complete at that count, or being labelled, stay. Nothing
+    /// from the stable replica key epoch on, where a later epoch goes on from
+    /// them: only [`Self::sweep`] removes those.
+    pub fn discard(&self, epoch: u64, member: &[u8], leaf_id: &[u8], n: u64) {
+        if quil_types::consensus::stable_replica_keys_at(epoch) {
+            return;
+        }
+        let dir = self.leaf_dir(epoch, member, leaf_id);
+        let lock = leaf_lock(&dir);
+        let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let busy = self.busy();
+        if busy.contains(&(dir.clone(), n)) || paths(&dir, n)[2].exists() {
+            return;
+        }
+        for path in paths(&dir, n).into_iter().chain([
+            staged(&dir, n),
+            kept_path(&dir, n),
+            manifest_staged(&dir, n),
+            dir.join(format!("{n}.cap")),
+        ]) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    /// [`Self::discard`] the layers kept for `member`'s leaf `leaf_id` for
+    /// `epoch` at every count but `n`, which its snapshot encoded it at.
+    pub fn discard_others(&self, epoch: u64, member: &[u8], leaf_id: &[u8], n: u64) {
+        let dir = self.leaf_dir(epoch, member, leaf_id);
+        for count in counts_with(&dir, ".layers") {
+            if count != n {
+                self.discard(epoch, member, leaf_id, count);
             }
         }
     }
@@ -341,23 +609,53 @@ impl LabelStore {
         }
     }
 
+    /// The directory of `member`'s leaf `leaf_id` for `epoch`. Under
+    /// [`STABLE_DIR`] its name also hashes the leaf's replica key and the
+    /// labelling's parameters, so labels a later key or parameters would
+    /// not reproduce are never found.
     fn leaf_dir(&self, epoch: u64, member: &[u8], leaf_id: &[u8]) -> PathBuf {
         use sha3::Digest as _;
         let mut h = sha3::Sha3_256::new();
         h.update((member.len() as u32).to_be_bytes());
         h.update(member);
         h.update(leaf_id);
+        if quil_types::consensus::stable_replica_keys_at(epoch) {
+            let params = SdrParams::default();
+            h.update(quil_crypto::sdr::replica_key(member, leaf_id, epoch));
+            for value in [
+                params.layers,
+                params.drg_degree,
+                params.expander_degree,
+                params.node_bytes,
+            ] {
+                h.update((value as u32).to_be_bytes());
+            }
+        }
         self.dir
-            .join(if quil_types::consensus::sealed_storage_required(epoch) {
-                "stable".to_string()
-            } else {
-                epoch.to_string()
-            })
+            .join(epoch_dir(epoch))
             .join(hex::encode(h.finalize()))
     }
 
+    /// Whether `member`'s leaf `leaf_id` has labels of any count kept for
+    /// `epoch`. Unlike [`Self::find`], it notes no use.
+    pub fn holds(&self, epoch: u64, member: &[u8], leaf_id: &[u8]) -> bool {
+        let dir = self.leaf_dir(epoch, member, leaf_id);
+        fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_suffix(".ready"))
+                    .is_some_and(|n| n.parse::<u64>().is_ok())
+            })
+    }
+
     /// The labels kept for `member`'s leaf `leaf_id` for `epoch` at a node
-    /// count `accept` takes, if any.
+    /// count `accept` takes, if any, noting that count's use for `epoch`.
+    /// Its files are opened here, so labels removed after it are still read.
     pub fn find(
         &self,
         epoch: u64,
@@ -366,14 +664,15 @@ impl LabelStore {
         accept: impl Fn(u64) -> bool,
     ) -> Option<Kept> {
         let dir = self.leaf_dir(epoch, member, leaf_id);
-        let busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
+        let lock = leaf_lock(&dir);
+        let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
         let mut counts: Vec<u64> = fs::read_dir(&dir)
             .ok()?
             .filter_map(|entry| {
                 let name = entry.ok()?.file_name().into_string().ok()?;
                 name.strip_suffix(".ready")?.parse().ok()
             })
-            .filter(|&n| accept(n) && !busy.contains(&dir.join(n.to_string())))
+            .filter(|&n| accept(n))
             .collect();
         counts.sort_unstable();
         let n = *counts.first()?;
@@ -388,15 +687,7 @@ impl LabelStore {
         if columns_file.metadata().ok()?.len() != n * NODE_BYTES as u64 {
             return None;
         }
-        if quil_types::consensus::sealed_storage_required(epoch) {
-            let used = dir.join(format!("{n}.used"));
-            let previous = fs::read(&used)
-                .ok()
-                .and_then(|b| <[u8; 8]>::try_from(b).ok())
-                .map(u64::from_be_bytes)
-                .unwrap_or(0);
-            fs::write(&used, epoch.max(previous).to_be_bytes()).ok()?;
-        }
+        note_used(&dir, n, epoch);
         Some(Kept {
             n,
             comm_c,
@@ -410,17 +701,17 @@ impl LabelStore {
         })
     }
 
-    /// A sealed legacy registration no longer needs its labels. Stable labels
-    /// remain available for future epochs and are removed by the unused sweep.
+    /// Remove the labels kept for `member`'s leaf `leaf_id` for `epoch`: its
+    /// registration is sealed, and nothing opens them again. Nothing from
+    /// the stable replica key epoch on, where the same labels serve the
+    /// later epochs: only [`Self::sweep`] removes those.
     pub fn forget(&self, epoch: u64, member: &[u8], leaf_id: &[u8]) {
-        if quil_types::consensus::sealed_storage_required(epoch) {
+        if quil_types::consensus::stable_replica_keys_at(epoch) {
             return;
         }
         let dir = self.leaf_dir(epoch, member, leaf_id);
-        let busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
-        if busy.iter().any(|path| path.starts_with(&dir)) {
-            return;
-        }
+        let lock = leaf_lock(&dir);
+        let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
         if dir.exists() {
             let _ = fs::remove_dir_all(dir);
         }
@@ -428,10 +719,72 @@ impl LabelStore {
 
     /// Remove the labels of epochs before `current`, once an epoch: their
     /// registrations were sealed before they began. Labels a crash, a
-    /// restart or a lost seat left behind go with them.
+    /// restart or a lost seat left behind go with them. Under
+    /// [`STABLE_DIR`], each count goes once nothing looked for it or
+    /// labelled it for `current` or a later epoch ([`Self::sweep_stable`]).
     pub fn sweep(&self, current: u64) {
         if self.swept.fetch_max(current, Ordering::Relaxed) < current {
             self.evict_before(current);
+            self.sweep_stable(current);
+        }
+    }
+
+    /// The part of [`Self::sweep`] under [`STABLE_DIR`]: each count whose
+    /// latest use is an epoch before `current` goes, every file of it (its
+    /// registrations were sealed before `current` began), unless this process
+    /// is labelling it. A count with no record of use, which a crash may
+    /// leave, is kept for one more epoch. A leaf left with no file goes too.
+    fn sweep_stable(&self, current: u64) {
+        let Ok(leaves) = fs::read_dir(self.dir.join(STABLE_DIR)) else {
+            return;
+        };
+        let (mut counts_removed, mut leaves_removed) = (0u64, 0u64);
+        for leaf in leaves.flatten() {
+            let dir = leaf.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let lock = leaf_lock(&dir);
+            let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut files: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+            for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let count = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.split('.').next()?.parse::<u64>().ok());
+                if let Some(n) = count {
+                    files.entry(n).or_default().push(entry.path());
+                }
+            }
+            for (n, paths) in files {
+                if self.busy().contains(&(dir.clone(), n)) {
+                    continue;
+                }
+                match used_epoch(&dir, n) {
+                    None => write_used(&dir, n, current),
+                    Some(used) if used < current => {
+                        for path in paths {
+                            let _ = fs::remove_file(path);
+                        }
+                        counts_removed += 1;
+                    }
+                    Some(_) => {}
+                }
+            }
+            if fs::read_dir(&dir).is_ok_and(|mut entries| entries.next().is_none())
+                && fs::remove_dir(&dir).is_ok()
+            {
+                leaves_removed += 1;
+            }
+        }
+        if counts_removed > 0 {
+            info!(
+                epoch = current,
+                counts_removed,
+                leaves_removed,
+                "storage labels kept across epochs removed: no registration, seal or labelling \
+                 ahead looked for them this epoch or later; an expected cleanup"
+            );
         }
     }
 
@@ -441,37 +794,6 @@ impl LabelStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|(e, _, _)| *e >= epoch);
-        let busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Ok(leaves) = fs::read_dir(self.dir.join("stable")) {
-            for leaf in leaves.flatten() {
-                let Ok(counts) = fs::read_dir(leaf.path()) else {
-                    continue;
-                };
-                for ready in counts.flatten() {
-                    let name = ready.file_name();
-                    let Some(n) = name
-                        .to_str()
-                        .and_then(|s| s.strip_suffix(".layers"))
-                        .and_then(|s| s.parse::<u64>().ok())
-                    else {
-                        continue;
-                    };
-                    if busy.contains(&leaf.path().join(n.to_string())) {
-                        continue;
-                    }
-                    let used = fs::read(leaf.path().join(format!("{n}.used")))
-                        .ok()
-                        .and_then(|b| <[u8; 8]>::try_from(b).ok())
-                        .map(u64::from_be_bytes)
-                        .unwrap_or(0);
-                    if used < epoch {
-                        for kind in ["layers", "columns", "cap", "ready", "used"] {
-                            let _ = fs::remove_file(leaf.path().join(format!("{n}.{kind}")));
-                        }
-                    }
-                }
-            }
-        }
         let Ok(entries) = fs::read_dir(&self.dir) else {
             return;
         };
@@ -495,6 +817,34 @@ pub enum Stage {
     Snapshot,
 }
 
+impl Stage {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ahead => "ahead",
+            Self::Snapshot => "snapshot",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        [Self::Ahead, Self::Snapshot]
+            .into_iter()
+            .find(|stage| stage.name() == name)
+    }
+}
+
+/// The whole layers kept on disk a leaf's labelling goes on from
+/// ([`Admitted::resumed`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Resumed {
+    pub layers: usize,
+    /// Bytes read to check them against their digests, and how long it
+    /// took.
+    pub bytes: u64,
+    pub took: Duration,
+    /// When they were labelled.
+    pub kept_by: Stage,
+}
+
 /// A leaf admitted to be labelled and kept ([`LabelStore::admit`]): what it
 /// has still to write counts against its filesystem's room until it is
 /// labelled or dropped.
@@ -506,7 +856,23 @@ pub struct Admitted<'a> {
     leaf_id: Vec<u8>,
     n: u64,
     stage: Stage,
+    /// Whole layers an earlier attempt kept, resumed from.
+    kept: usize,
+    /// Those layers' digests.
+    digests: Vec<[u8; 32]>,
+    resumed: Option<Resumed>,
     remaining: u64,
+}
+
+/// How labelling an admitted leaf ahead ended ([`Admitted::label_ahead`]).
+pub enum Labelling {
+    /// To its end.
+    Labelled(Labelled),
+    /// Given up when told to, keeping its first `layers` whole layers on
+    /// disk (none when it labelled none, or ran out of room) for the next
+    /// attempt at its count to resume from, in this process or the next,
+    /// unless its caller discards them ([`LabelStore::discard`]).
+    Stopped { layers: usize },
 }
 
 /// A labelled leaf ([`Admitted::label`]): its column commitment and last
@@ -540,25 +906,61 @@ impl Admitted<'_> {
             .ok_or_else(|| QuilError::Internal("labelling that never stops stopped".into()))
     }
 
-    /// Label the leaf at its count and keep its layers while the filesystem
-    /// has room for them, checked before each layer and the columns are
-    /// written. A leaf that runs out of room is labelled to the end but not
-    /// kept: its files are removed and the refusal logged as
-    /// [`LabelStore::admit`] logs one. Given up once `stop` says so
-    /// (`quil_crypto::storage_proof::label_leaf_until`): `None`, and none of
-    /// its files remain.
-    pub fn label_until(
-        mut self,
+    /// Whole layers an earlier attempt at the leaf's count kept, which its
+    /// labelling resumes from ([`LabelStore::admit`]).
+    pub fn resumes_from(&self) -> usize {
+        self.kept
+    }
+
+    /// The whole layers kept on disk the labelling goes on from, if any,
+    /// and what checking them took.
+    pub fn resumed(&self) -> Option<Resumed> {
+        self.resumed
+    }
+
+    /// [`Self::label_kept`], `None` when given up.
+    #[cfg(test)]
+    pub(crate) fn label_until(
+        self,
         params: &SdrParams,
         stop: &dyn Fn() -> bool,
     ) -> Result<Option<Labelled>> {
+        Ok(match self.label_kept(params, stop, &|_| {})? {
+            Labelling::Labelled(labelled) => Some(labelled),
+            Labelling::Stopped { .. } => None,
+        })
+    }
+
+    /// Label the leaf at its count, going on from the whole layers an
+    /// earlier attempt kept ([`Self::resumes_from`]), and keep its layers
+    /// while the filesystem has room for them, checked before each layer and
+    /// the columns are written: each whole layer is synced and listed in the
+    /// leaf's manifest as it ends. A leaf that runs out of room is labelled
+    /// to the end but not kept: its files are removed and the refusal logged
+    /// as [`LabelStore::admit`] logs one. Given up once `stop` says so
+    /// (`quil_crypto::storage_proof::label_leaf_until`), it keeps its whole
+    /// layers for the next attempt at its count, unless it ran out of room.
+    /// `layers` hears each layer's end with the layers labelled so far.
+    pub fn label_kept(
+        mut self,
+        params: &SdrParams,
+        stop: &dyn Fn() -> bool,
+        layers: &dyn Fn(usize),
+    ) -> Result<Labelling> {
         let paths = paths(&self.dir, self.n);
-        let result = self.write(params, &paths, stop);
-        if !matches!(result, Ok(Some(Labelled { kept: true, .. }))) {
+        let result = self.write(params, &paths, stop, layers);
+        let keep = match &result {
+            Ok(Labelling::Labelled(labelled)) => labelled.kept,
+            Ok(Labelling::Stopped { layers }) => *layers > 0,
+            Err(_) => false,
+        };
+        if !keep {
             let [layers, columns, _] = &paths;
             let _ = fs::remove_file(layers);
             let _ = fs::remove_file(columns);
-            let _ = fs::remove_file(self.dir.join(format!("{}.ready.tmp", self.n)));
+            let _ = fs::remove_file(staged(&self.dir, self.n));
+            let _ = fs::remove_file(kept_path(&self.dir, self.n));
+            let _ = fs::remove_file(manifest_staged(&self.dir, self.n));
             let _ = fs::remove_file(self.dir.join(format!("{}.cap", self.n)));
         }
         result
@@ -569,18 +971,64 @@ impl Admitted<'_> {
         params: &SdrParams,
         paths: &[PathBuf; 3],
         stop: &dyn Fn() -> bool,
-    ) -> Result<Option<Labelled>> {
+        on_layers: &dyn Fn(usize),
+    ) -> Result<Labelling> {
         let [layers_path, columns_path, ready_path] = paths;
         fs::create_dir_all(&self.dir).map_err(|e| io("create", &self.dir, e))?;
-        let file = File::create(layers_path).map_err(|e| io("create", layers_path, e))?;
-        let mut writer = Some(BufWriter::with_capacity(1 << 22, file));
-        let (mut failure, mut shortfall) = (None, None);
+        let (kept, layer_size) = (self.kept, layer_bytes(self.n));
         let key = quil_crypto::sdr::replica_key(&self.member, &self.leaf_id, self.epoch);
-        let labelled = quil_crypto::storage_proof::label_leaf_until(
+        let mut manifest = Manifest {
+            n: self.n,
+            params: params_text(params),
+            key: hex::encode(key),
+            stage: self.stage,
+            layers: std::mem::take(&mut self.digests),
+        };
+        // The kept layers were checked against the default parameters.
+        if kept > 0 && manifest.params != params_text(&SdrParams::default()) {
+            return Err(QuilError::Internal(
+                "storage labels: layers kept for other labelling parameters".into(),
+            ));
+        }
+        let (dir, n) = (self.dir.clone(), self.n);
+        let file = if kept > 0 {
+            fs::OpenOptions::new().append(true).open(layers_path)
+        } else {
+            File::create(layers_path)
+        }
+        .map_err(|e| io("open", layers_path, e))?;
+        let mut reader = match kept {
+            0 => None,
+            _ => Some(File::open(layers_path).map_err(|e| io("open", layers_path, e))?),
+        };
+        let mut writer = Some(BufWriter::with_capacity(WRITE_BUFFER_BYTES, file));
+        let (mut failure, mut shortfall, mut unread) = (None, None, None);
+        // Whole layers on disk.
+        let mut whole = kept;
+        let labelled = quil_crypto::storage_proof::label_leaf_resume(
             self.n,
             &key,
             params,
-            &mut |_, layer| {
+            kept,
+            &mut |index, into| {
+                let read = reader
+                    .as_mut()
+                    .map(|file| read_layer(file, index as u64 * layer_size, into));
+                match read {
+                    Some(Ok(true)) => true,
+                    Some(Ok(false)) => {
+                        unread = Some(std::io::Error::other("a kept label is not a digest"));
+                        false
+                    }
+                    Some(Err(error)) => {
+                        unread = Some(error);
+                        false
+                    }
+                    None => false,
+                }
+            },
+            &mut |index, layer| {
+                on_layers(index + 1);
                 if writer.is_none() {
                     return;
                 }
@@ -590,8 +1038,26 @@ impl Admitted<'_> {
                     writer = None;
                     return;
                 }
-                match writer.as_mut().map(|writer| write_digests(writer, layer)) {
-                    Some(Ok(())) => self.wrote((layer.len() * NODE_BYTES) as u64),
+                // Synced, then listed: a listed layer is whole on disk.
+                let written = writer.as_mut().map(|writer| {
+                    let digest = write_layer(writer, layer)?;
+                    writer.flush()?;
+                    writer.get_ref().sync_data()?;
+                    Ok::<_, std::io::Error>(digest)
+                });
+                match written {
+                    Some(Ok(digest)) => {
+                        self.wrote((layer.len() * NODE_BYTES) as u64);
+                        manifest.layers.truncate(index);
+                        manifest.layers.push(digest);
+                        match write_manifest(&dir, n, &manifest) {
+                            Ok(()) => whole = index + 1,
+                            Err(error) => {
+                                failure = Some(error);
+                                writer = None;
+                            }
+                        }
+                    }
                     Some(Err(error)) => {
                         failure = Some(error);
                         writer = None;
@@ -601,11 +1067,18 @@ impl Admitted<'_> {
             },
             stop,
         );
+        drop(reader);
         if let Some(error) = failure {
             return Err(io("write", layers_path, error));
         }
+        if let Some(error) = unread {
+            return Err(io("read back", layers_path, error));
+        }
         let Some((last, columns)) = labelled else {
-            return Ok(None);
+            // Each whole layer was synced and listed as it ended; out of
+            // room, none is kept.
+            let layers = if writer.is_some() { whole } else { 0 };
+            return Ok(Labelling::Stopped { layers });
         };
         let commitment = |columns: Vec<Digest>| {
             quil_crypto::storage_proof::MerkleCap::from_digests(
@@ -614,6 +1087,10 @@ impl Admitted<'_> {
             )
             .commitment(quil_crypto::storage_proof::Tree::Column)
         };
+        // Past its last layer the leaf is not given up: what is left is
+        // written in moments, unless disk or the parallel pool its column
+        // tree is built on is slow, which this then logs.
+        let finishing = Instant::now();
         if let Some(writer) = writer {
             writer
                 .into_inner()
@@ -626,14 +1103,14 @@ impl Admitted<'_> {
             let (epoch, n, stage) = (self.epoch, self.n, self.stage);
             self.store
                 .refuse(epoch, &self.dir, &self.leaf_id, n, stage, shortfall);
-            return Ok(Some(Labelled {
+            return Ok(Labelling::Labelled(Labelled {
                 comm_c: commitment(columns),
                 last,
                 kept: false,
             }));
         }
         let mut writer = BufWriter::with_capacity(
-            1 << 22,
+            WRITE_BUFFER_BYTES,
             File::create(columns_path).map_err(|e| io("create", columns_path, e))?,
         );
         write_digests(&mut writer, &columns).map_err(|e| io("write", columns_path, e))?;
@@ -643,6 +1120,7 @@ impl Admitted<'_> {
             .sync_all()
             .map_err(|e| io("sync", columns_path, e))?;
         self.wrote((columns.len() * NODE_BYTES) as u64);
+        let written = finishing.elapsed();
         let cap = quil_crypto::storage_proof::MerkleCap::from_digests(
             &columns,
             quil_crypto::storage_proof::seal_cap_height(self.n),
@@ -650,14 +1128,22 @@ impl Admitted<'_> {
         let comm_c = cap.commitment(quil_crypto::storage_proof::Tree::Column);
         let cap_path = self.dir.join(format!("{}.cap", self.n));
         fs::write(&cap_path, cap.to_bytes()).map_err(|e| io("write", &cap_path, e))?;
-        if quil_types::consensus::sealed_storage_required(self.epoch) {
-            let used = self.dir.join(format!("{}.used", self.n));
-            fs::write(&used, self.epoch.to_be_bytes()).map_err(|e| io("write", &used, e))?;
-        }
-        let staged = self.dir.join(format!("{}.ready.tmp", self.n));
+        let staged = staged(&self.dir, self.n);
         fs::write(&staged, comm_c).map_err(|e| io("write", &staged, e))?;
         fs::rename(&staged, ready_path).map_err(|e| io("rename", ready_path, e))?;
-        Ok(Some(Labelled {
+        // Complete: `ready` stands for the layers from now on.
+        let _ = fs::remove_file(kept_path(&self.dir, self.n));
+        let finished = finishing.elapsed();
+        if finished >= FINISH_LOGGED_FROM {
+            info!(epoch = self.epoch, leaf = %hex::encode(&self.leaf_id), nodes = self.n,
+                seconds = finished.as_secs_f64(), writing_seconds = written.as_secs_f64(),
+                commitment_seconds = finished.saturating_sub(written).as_secs_f64(),
+                scope = "local",
+                "storage labels took long to finish after their last layer: writing the layers \
+                 and column digests to disk, then building the column tree on the shared \
+                 parallel pool; check this node's disk and CPU load if this recurs");
+        }
+        Ok(Labelling::Labelled(Labelled {
             comm_c,
             last,
             kept: true,
@@ -668,14 +1154,11 @@ impl Admitted<'_> {
 impl Drop for Admitted<'_> {
     fn drop(&mut self) {
         let remaining = std::mem::take(&mut self.remaining);
-        let mut pending = self.store.pending();
-        *pending = pending.saturating_sub(remaining);
-        drop(pending);
-        self.store
-            .busy
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.dir.join(self.n.to_string()));
+        {
+            let mut pending = self.store.pending();
+            *pending = pending.saturating_sub(remaining);
+        }
+        self.store.busy().remove(&(self.dir.clone(), self.n));
     }
 }
 
@@ -683,11 +1166,254 @@ fn paths(dir: &Path, n: u64) -> [PathBuf; 3] {
     ["layers", "columns", "ready"].map(|kind| dir.join(format!("{n}.{kind}")))
 }
 
+/// Where the column commitment is written before it is renamed `ready`.
+fn staged(dir: &Path, n: u64) -> PathBuf {
+    dir.join(format!("{n}.ready.tmp"))
+}
+
+/// The manifest of the whole layers a labelling not ended kept
+/// ([`Manifest`]).
+fn kept_path(dir: &Path, n: u64) -> PathBuf {
+    dir.join(format!("{n}.kept"))
+}
+
+/// Where a manifest is written before it is renamed `kept`.
+fn manifest_staged(dir: &Path, n: u64) -> PathBuf {
+    dir.join(format!("{n}.kept.tmp"))
+}
+
+/// The counts of the files in `dir` named `<n><suffix>`.
+fn counts_with(dir: &Path, suffix: &str) -> Vec<u64> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            name.strip_suffix(suffix)?.parse().ok()
+        })
+        .collect()
+}
+
+/// Bytes one layer of a leaf of `n` nodes takes.
+fn layer_bytes(n: u64) -> u64 {
+    n.saturating_mul(NODE_BYTES as u64)
+}
+
+/// The first line of a manifest ([`Manifest`]).
+const MANIFEST_FORMAT: &str = "quil storage labels kept v1";
+
+/// What the whole layers a labelling not ended kept on disk label, and each
+/// one's SHA-256, in order (`<n>.kept`): its node count, labelling
+/// parameters and replica key, which a labelling resumed from them must
+/// share, and the stage that labelled them. Rewritten after each layer is
+/// synced, through a synced file renamed over it.
+struct Manifest {
+    n: u64,
+    params: String,
+    key: String,
+    stage: Stage,
+    layers: Vec<[u8; 32]>,
+}
+
+impl Manifest {
+    fn text(&self) -> String {
+        let mut text = format!(
+            "{MANIFEST_FORMAT}\nn {}\nparams {}\nkey {}\nstage {}\n",
+            self.n,
+            self.params,
+            self.key,
+            self.stage.name()
+        );
+        for layer in &self.layers {
+            text.push_str("layer ");
+            text.push_str(&hex::encode(layer));
+            text.push('\n');
+        }
+        text
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        let mut lines = text.lines();
+        if lines.next()? != MANIFEST_FORMAT {
+            return None;
+        }
+        let mut field = |name: &str| Some(lines.next()?.strip_prefix(name)?.to_string());
+        let n = field("n ")?.parse().ok()?;
+        let params = field("params ")?;
+        let key = field("key ")?;
+        let stage = Stage::from_name(&field("stage ")?)?;
+        let layers = lines
+            .map(|line| {
+                hex::decode(line.strip_prefix("layer ")?)
+                    .ok()?
+                    .try_into()
+                    .ok()
+            })
+            .collect::<Option<Vec<[u8; 32]>>>()?;
+        Some(Self {
+            n,
+            params,
+            key,
+            stage,
+            layers,
+        })
+    }
+}
+
+/// The labelling parameters, as a manifest names them.
+fn params_text(params: &SdrParams) -> String {
+    format!(
+        "{} {} {} {}",
+        params.drg_degree, params.expander_degree, params.layers, params.node_bytes
+    )
+}
+
+/// Write `manifest` as the one of the leaf's layers at `n` nodes in `dir`:
+/// to a file synced, then renamed over the last, the directory synced.
+fn write_manifest(dir: &Path, n: u64, manifest: &Manifest) -> std::io::Result<()> {
+    let staged = manifest_staged(dir, n);
+    let mut file = File::create(&staged)?;
+    file.write_all(manifest.text().as_bytes())?;
+    file.sync_all()?;
+    fs::rename(&staged, kept_path(dir, n))?;
+    File::open(dir)?.sync_all()
+}
+
+/// The whole layers kept on disk a labelling at a leaf's count may go on
+/// from ([`verify_kept`]).
+#[derive(Default)]
+struct Verified {
+    /// The digests of the layers that matched, from the first.
+    layers: Vec<[u8; 32]>,
+    kept_by: Option<Stage>,
+    /// Bytes read, and how long reading and hashing them took.
+    bytes: u64,
+    took: Duration,
+    /// The first layer listed that did not match, and how.
+    failed: Option<(usize, &'static str)>,
+    /// Why no layer listed was looked at: they label something else.
+    unusable: Option<&'static str>,
+}
+
+/// Check the whole layers its manifest lists for the leaf at `n` nodes in
+/// `dir`, keyed `key`, against their digests, from the first: those before
+/// the first one cut short or changed may be resumed from. None when there
+/// is no manifest, or it is not one for these labels (another format, node
+/// count, parameters or key). Reads each layer once, a chunk at a time.
+fn verify_kept(dir: &Path, n: u64, key: &[u8; 32]) -> Verified {
+    let started = Instant::now();
+    let mut verified = Verified::default();
+    let Ok(text) = fs::read_to_string(kept_path(dir, n)) else {
+        return verified;
+    };
+    let params = SdrParams::default();
+    let Some(manifest) = Manifest::parse(&text) else {
+        verified.unusable = Some("its manifest is of an unknown format, from another build");
+        return verified;
+    };
+    if manifest.n != n
+        || manifest.params != params_text(&params)
+        || manifest.key != hex::encode(key)
+        || manifest.layers.len() > params.layers
+    {
+        verified.unusable =
+            Some("its manifest names another node count, labelling parameters or key");
+        return verified;
+    }
+    verified.kept_by = Some(manifest.stage);
+    let [layers, _, _] = paths(dir, n);
+    let Ok(mut file) = File::open(&layers) else {
+        verified.failed = Some((0, "its layers file cannot be read"));
+        return verified;
+    };
+    let size = layer_bytes(n);
+    let mut chunk = vec![0u8; READ_CHUNK_BYTES];
+    for (index, digest) in manifest.layers.iter().enumerate() {
+        let mut hasher = Sha256::new();
+        let mut left = size;
+        while left > 0 {
+            let len = left.min(chunk.len() as u64) as usize;
+            if file.read_exact(&mut chunk[..len]).is_err() {
+                break;
+            }
+            hasher.update(&chunk[..len]);
+            verified.bytes += len as u64;
+            left -= len as u64;
+        }
+        if left > 0 {
+            verified.failed = Some((index, "cut short"));
+            break;
+        }
+        if hasher.finalize().as_slice() != digest {
+            verified.failed = Some((index, "its digest differs"));
+            break;
+        }
+        verified.layers.push(*digest);
+    }
+    verified.took = started.elapsed();
+    verified
+}
+
+/// Log a kept leaf's layers not reused ([`verify_kept`]): written for other
+/// labels (info), or a layer that did not match its digest (warn).
+fn log_verified(epoch: u64, leaf_id: &[u8], n: u64, stage: Stage, verified: &Verified) {
+    let leaf = hex::encode(leaf_id);
+    if let Some(reason) = verified.unusable {
+        info!(epoch, leaf = %leaf, nodes = n, stage = stage.name(), reason, scope = "local",
+            "storage labels kept on disk not reused: they label something else, as after an \
+             upgrade; the leaf is labelled from its first layer");
+    }
+    if let Some((layer, reason)) = verified.failed {
+        warn!(epoch, leaf = %leaf, nodes = n, stage = stage.name(), layer, reason,
+            layers_reused = verified.layers.len(), scope = "local",
+            action = "check this node's disk and its kernel log for I/O errors if this recurs: \
+                      a layer is synced before it is listed, so a crash or restart leaves only \
+                      the layer it was labelling unlisted",
+            "storage labels kept on disk failed their check: the leaf is labelled again from \
+             that layer");
+    }
+}
+
+/// Read the layer at byte `offset` of a leaf's `layers` back into `into`:
+/// false when a label read is not a digest.
+fn read_layer(file: &mut File, offset: u64, into: &mut [Digest]) -> std::io::Result<bool> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut chunk = vec![0u8; READ_CHUNK_BYTES.min(into.len() * NODE_BYTES)];
+    for labels in into.chunks_mut(chunk.len() / NODE_BYTES) {
+        let bytes = &mut chunk[..labels.len() * NODE_BYTES];
+        file.read_exact(bytes)?;
+        for (label, node) in labels.iter_mut().zip(bytes.chunks_exact(NODE_BYTES)) {
+            match hash::from_bytes(node) {
+                Some(digest) => *label = digest,
+                None => return Ok(false),
+            }
+        }
+    }
+    Ok(true)
+}
+
 fn write_digests(writer: &mut impl Write, digests: &[Digest]) -> std::io::Result<()> {
     for digest in digests {
         writer.write_all(&hash::to_bytes(digest))?;
     }
     Ok(())
+}
+
+/// [`write_digests`] for a layer: its SHA-256, as its manifest lists it.
+fn write_layer(writer: &mut impl Write, layer: &[Digest]) -> std::io::Result<[u8; 32]> {
+    const LABELS: usize = 64;
+    let mut hasher = Sha256::new();
+    let mut chunk = [0u8; LABELS * NODE_BYTES];
+    for labels in layer.chunks(LABELS) {
+        let bytes = &mut chunk[..labels.len() * NODE_BYTES];
+        for (label, node) in labels.iter().zip(bytes.chunks_exact_mut(NODE_BYTES)) {
+            node.copy_from_slice(&hash::to_bytes(label));
+        }
+        hasher.update(&*bytes);
+        writer.write_all(bytes)?;
+    }
+    Ok(hasher.finalize().into())
 }
 
 /// One leaf's kept labels.
@@ -886,19 +1612,56 @@ fn log_expired(epoch: u64, filter: &[u8], leaf_id: &[u8], at: &'static str) {
         snapshot_frame = quil_types::consensus::storage_snapshot_frame(epoch),
         global_frame = crate::storage_snapshot::global_frame().unwrap_or(0), scope = "local",
         "storage labels computed ahead given up: GLOBAL reached the epoch's snapshot frame, from \
-         which the snapshot labels this leaf itself; an expected skip");
+         which the snapshot labels this leaf itself, going on from the whole layers labelled \
+         ahead; an expected skip");
+}
+
+/// Where each of a seat's leaves of `sizes` (`Captured::leaf_size`, bytes)
+/// waits for memory to be labelled ahead for `epoch`
+/// (`crate::storage_jobs::AheadOrder`), the seat having place `seat`: a leaf
+/// whose snapshot could not label it within the renewal's grace even at the
+/// fewest nodes its values take
+/// (`crate::storage_snapshot::labels_within_grace`) goes before every leaf
+/// that it could, with the other such leaves of its seat, a seat with fewer
+/// of them first: such leaves register only from labels computed ahead,
+/// and a seat registers only once all of its leaves do.
+pub(crate) fn ahead_orders(
+    epoch: u64,
+    seat: u64,
+    sizes: &[u128],
+) -> Vec<crate::storage_jobs::AheadOrder> {
+    use quil_crypto::storage_proof::data_node_count;
+    let deferrable: Vec<bool> = sizes
+        .iter()
+        .map(|&size| {
+            let least = data_node_count(u64::try_from(size).unwrap_or(u64::MAX));
+            crate::storage_snapshot::labels_within_grace(epoch, least)
+        })
+        .collect();
+    let seat_leaves = deferrable.iter().filter(|&&deferrable| !deferrable).count();
+    deferrable
+        .into_iter()
+        .enumerate()
+        .map(|(leaf, deferrable)| crate::storage_jobs::AheadOrder {
+            deferrable,
+            seat_leaves: u32::try_from(seat_leaves).unwrap_or(u32::MAX),
+            seat,
+            leaf: leaf as u64,
+        })
+        .collect()
 }
 
 /// Label ahead the leaves `member` will register for `epoch` on shard
 /// `filter`: the leaves of the shard's data in `crdt` now, each at
 /// `precompute_nodes` of its node count, side by side
-/// (`storage_jobs::for_each_parallel`). A leaf already labelled at a count
-/// its data allows is left, and one its filesystem has no room for is not
-/// labelled ([`LabelStore::admit`]). A leaf whose memory work due now waits
-/// for is given up and labelled again once that work is done
-/// ([`label_leaf_ahead`]). Nothing is labelled once GLOBAL reached the
-/// epoch's snapshot frame ([`expired`]). Removes the labels of epochs that
-/// have begun.
+/// (`storage_jobs::for_each_parallel`), each waiting for memory in its order
+/// ([`ahead_orders`]). A leaf already labelled at a count its data allows is
+/// left, and one its filesystem has no room for is not labelled
+/// ([`LabelStore::admit`]). A leaf whose memory more urgent work waits for
+/// gives it back, keeping its whole layers, and goes on from them once its
+/// memory fits again ([`label_leaf_ahead`]). Nothing is labelled once GLOBAL
+/// reached the epoch's snapshot frame ([`expired`]). Removes the labels of
+/// epochs that have begun.
 pub fn precompute(
     store: &LabelStore,
     crdt: &Arc<HypergraphCrdt>,
@@ -924,25 +1687,33 @@ pub fn precompute(
     let captured = crate::storage_snapshot::capture_at(crdt, filter, epoch, &[source])?;
     let params = SdrParams::default();
     let started = std::time::Instant::now();
-    let labelled = crate::storage_jobs::for_each_parallel(&captured.prefixes, |prefix| {
+    let sizes = captured
+        .prefixes
+        .iter()
+        .map(|prefix| captured.leaf_size(prefix))
+        .collect::<Result<Vec<u128>>>()?;
+    let orders = ahead_orders(epoch, crate::storage_jobs::ahead_place(), &sizes);
+    let leaves: Vec<usize> = (0..captured.prefixes.len()).collect();
+    let labelled = crate::storage_jobs::for_each_parallel(&leaves, |&index| {
+        let (prefix, size, order) = (&captured.prefixes[index], sizes[index], orders[index]);
         let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(filter, prefix);
         // Past the epoch's snapshot frame, leaves not started yet are skipped.
         if expired(epoch) {
             return Ok(Some(0));
         }
-        let size = captured.leaf_size(prefix)?;
         // A leaf's data is at least its values (`leaf_size`): one whose
         // labels at that count have no room is refused before its read,
         // which would hold memory the epoch's snapshots wait for.
         let least = precompute_nodes(data_node_count(u64::try_from(size).unwrap_or(u64::MAX)));
-        if !store.has_ready(epoch, member, &leaf_id)
+        if !store.holds(epoch, member, &leaf_id)
             && !store.may_admit(epoch, member, &leaf_id, least, Stage::Ahead)
         {
             return Ok(None);
         }
         let exact = {
-            let memory = crate::storage_jobs::reserve_ahead(
+            let memory = crate::storage_jobs::reserve_ahead_brief(
                 crate::storage_snapshot::leaf_read_bytes(size),
+                order,
                 &|| expired(epoch),
             );
             if memory.is_none() || expired(epoch) {
@@ -964,7 +1735,13 @@ pub fn precompute(
         {
             return Ok(Some(0));
         }
-        label_leaf_ahead(store, member, filter, &leaf_id, epoch, exact, &params)
+        let leaf = Leaf {
+            member,
+            filter,
+            leaf_id: &leaf_id,
+            epoch,
+        };
+        label_leaf_ahead(store, &leaf, exact, order, &params)
     })?;
     let refused = labelled.iter().filter(|n| n.is_none()).count();
     let outcome = if expired(epoch) {
@@ -988,38 +1765,56 @@ pub fn precompute(
     Ok(())
 }
 
-/// Label `member`'s leaf `leaf_id` of shard `filter`, whose data takes
-/// `exact` nodes, ahead for `epoch` ([`precompute`]): `Some` of the count it
-/// was labelled and kept at (0 when it was labelled meanwhile, or given up),
-/// `None` when refused room. While work due now waits for memory
-/// (`crate::storage_jobs::Reservation::yield_requested`) the labelling gives
-/// up the leaf and its memory, waits until that work is done
-/// (`crate::storage_jobs::wait_for_due_work`), and labels it again from its
-/// start, unless the epoch's snapshot of the shard labelled it meanwhile.
-/// Once GLOBAL reaches the epoch's snapshot frame ([`expired`]), looked at
-/// while the leaf waits for its memory and once it has it, while it is
-/// labelled and once work due now is done, the leaf is given up.
+/// A member's leaf of a shard, labelled ahead for an epoch.
+struct Leaf<'a> {
+    member: &'a [u8],
+    filter: &'a [u8],
+    leaf_id: &'a [u8],
+    epoch: u64,
+}
+
+/// Label `leaf`, whose data takes `exact` nodes, ahead ([`precompute`]),
+/// waiting for its memory in `order`: `Some` of the count it was labelled
+/// and kept at (0 when it was labelled meanwhile, or given up), `None` when
+/// refused room. Asked to give its memory back to more urgent work
+/// (`crate::storage_jobs::Reservation::yield_requested`), the labelling
+/// keeps the whole layers it labelled ([`Admitted::label_ahead`]), asks for
+/// the memory again at once, in its place
+/// (`crate::storage_jobs::reserve_ahead`), and goes on from them once it
+/// fits, unless the epoch's snapshot of the shard labelled the leaf
+/// meanwhile. Once GLOBAL reaches the epoch's snapshot frame ([`expired`]),
+/// looked at while the leaf waits for its memory and once it has it, and
+/// while it is labelled, the leaf is given up, its whole layers kept for its
+/// snapshot to go on from.
 fn label_leaf_ahead(
     store: &LabelStore,
-    member: &[u8],
-    filter: &[u8],
-    leaf_id: &[u8],
-    epoch: u64,
+    leaf: &Leaf<'_>,
     exact: u64,
+    order: crate::storage_jobs::AheadOrder,
     params: &SdrParams,
 ) -> Result<Option<u64>> {
     use crate::storage_snapshot::LeafOutcome;
     use quil_crypto::storage_proof::{padded_nodes_allowed, precompute_nodes};
+    let Leaf {
+        member,
+        filter,
+        leaf_id,
+        epoch,
+    } = *leaf;
     let stopping = || QuilError::ExecutionUnavailable("the node is stopping".into());
     let n = precompute_nodes(exact);
+    let layers = params.layers;
+    // When the leaf last gave its memory back, with the layers it kept.
+    let mut yielded: Option<(Instant, usize)> = None;
     loop {
-        let Some(admitted) = store.admit(epoch, member, leaf_id, n, Stage::Ahead) else {
-            return Ok(None);
-        };
-        let bytes = quil_crypto::storage_proof::label_working_bytes(n, params);
-        let memory = crate::storage_jobs::reserve_ahead(bytes, &|| expired(epoch))
-            .filter(|_| !expired(epoch));
+        let bytes = label_ahead_bytes(n);
+        let gone = || expired(epoch) || crate::storage_jobs::stopping();
+        let memory = crate::storage_jobs::reserve_ahead(bytes, order, &gone).filter(|_| !gone());
         let Some(memory) = memory else {
+            if crate::storage_jobs::stopping() {
+                return Err(stopping());
+            }
+            // What it kept stays for the snapshot to go on from.
             log_expired(
                 epoch,
                 filter,
@@ -1028,6 +1823,38 @@ fn label_leaf_ahead(
             );
             return Ok(Some(0));
         };
+        let resumed = yielded.take();
+        if resumed.is_some()
+            && (store
+                .find(epoch, member, leaf_id, |n| padded_nodes_allowed(exact, n))
+                .is_some()
+                || crate::storage_snapshot::snapshot_encoded(filter, epoch))
+        {
+            info!(epoch, filter = %hex::encode(filter), leaf = %hex::encode(leaf_id), nodes = n,
+                scope = "local",
+                "storage labels computed ahead not resumed: the leaf was labelled meanwhile");
+            store.discard(epoch, member, leaf_id, n);
+            return Ok(Some(0));
+        }
+        let Some(admitted) = store.admit(epoch, member, leaf_id, n, Stage::Ahead) else {
+            return Ok(None);
+        };
+        let from = admitted.resumes_from();
+        if let Some((at, kept)) = resumed {
+            info!(epoch, filter = %hex::encode(filter), leaf = %hex::encode(leaf_id), nodes = n,
+                waited_seconds = at.elapsed().as_secs(), layers_kept = kept, from_layer = from,
+                layers, scope = "local",
+                "storage labels computed ahead resume: their memory fits again; the leaf goes on \
+                 from the whole layers it kept");
+        } else if let Some(kept) = admitted.resumed() {
+            info!(epoch, filter = %hex::encode(filter), leaf = %hex::encode(leaf_id), nodes = n,
+                layers_reused = kept.layers, layers, verified_bytes = kept.bytes,
+                verify_seconds = kept.took.as_secs_f64(), kept_by = kept.kept_by.name(),
+                scope = "local",
+                "storage labels computed ahead go on from the whole layers kept on disk before, \
+                 as after a restart, each checked against its digest");
+        }
+        memory.progress(from as u64, layers as u64);
         let progress = crate::storage_snapshot::leaf_started(
             epoch,
             filter,
@@ -1035,49 +1862,83 @@ fn label_leaf_ahead(
             n,
             crate::storage_snapshot::LeafWork::LabellingAhead,
         );
+        progress.layers(from, layers);
         let started = Instant::now();
-        let labelled = admitted.label_until(params, &|| {
-            memory.yield_requested() || crate::storage_jobs::stopping() || expired(epoch)
-        })?;
-        if let Some(labelled) = labelled {
-            progress.end(LeafOutcome::Completed);
-            return Ok(labelled.kept.then_some(n));
-        }
+        // Beside a renewal's leaf labelled now it may pause, keeping its
+        // memory and layers (`crate::storage_jobs::AHEAD_JOBS_BESIDE_DUE`).
+        let pause = || {
+            if !memory.paused() {
+                return;
+            }
+            info!(epoch, filter = %hex::encode(filter), leaf = %hex::encode(leaf_id), nodes = n,
+                from_layer = from, layers, scope = "local",
+                "storage labels computed ahead pause while a renewal's leaf is labelled now: they \
+                 keep their memory and the layers labelled and go on once that labelling ends, \
+                 which has this node's cores meanwhile: an expected wait");
+            let paused = memory.wait_while_paused(&gone);
+            progress.paused(paused);
+            let then = if memory.yield_requested() {
+                "giving their memory back to more urgent work"
+            } else if gone() {
+                "stopping"
+            } else {
+                "going on"
+            };
+            info!(epoch, filter = %hex::encode(filter), leaf = %hex::encode(leaf_id), nodes = n,
+                paused_seconds = paused.as_secs(), then, scope = "local",
+                "storage labels computed ahead pause ends");
+        };
+        let labelled = admitted.label_kept(
+            params,
+            &|| {
+                pause();
+                memory.yield_requested() || gone()
+            },
+            &|done| {
+                memory.progress(done as u64, layers as u64);
+                progress.layers(done, layers);
+            },
+        )?;
+        let kept = match labelled {
+            Labelling::Labelled(labelled) => {
+                if expired(epoch) {
+                    // Past its last layer it was not given up: kept, the
+                    // seal opens it, and the snapshot of a leaf not started
+                    // yet encodes from it.
+                    info!(epoch, filter = %hex::encode(filter), leaf = %hex::encode(leaf_id),
+                        nodes = n, kept = labelled.kept,
+                        snapshot_frame = quil_types::consensus::storage_snapshot_frame(epoch),
+                        global_frame = crate::storage_snapshot::global_frame().unwrap_or(0),
+                        scope = "local",
+                        "storage labels computed ahead ended after GLOBAL reached the epoch's \
+                         snapshot frame: their last layer was labelled before it");
+                }
+                progress.end(LeafOutcome::Completed);
+                return Ok(labelled.kept.then_some(n));
+            }
+            Labelling::Stopped { layers } => layers,
+        };
         drop(memory);
         if crate::storage_jobs::stopping() {
             progress.end(LeafOutcome::Stopping);
             return Err(stopping());
         }
         if expired(epoch) {
+            // What it kept stays for the snapshot to go on from.
             log_expired(epoch, filter, leaf_id, "labelling the leaf");
             progress.end(LeafOutcome::Expired);
             return Ok(Some(0));
         }
         info!(epoch, filter = %hex::encode(filter), leaf = %hex::encode(leaf_id), nodes = n,
-            seconds = started.elapsed().as_secs(), scope = "local",
-            "storage labels computed ahead give their memory back to work due now (a renewal's \
-             snapshot or an epoch proof) waiting for it; this leaf is labelled ahead again from its \
-             start once that work is done, unless GLOBAL reaches the epoch's snapshot frame first: \
+            seconds = started.elapsed().as_secs(), from_layer = from, layers_kept = kept, layers,
+            scope = "local",
+            "storage labels computed ahead give their memory back to more urgent work waiting \
+             for it (a renewal's snapshot, an epoch proof, or a leaf only labelling ahead can \
+             register); the whole layers labelled stay on disk and the leaf goes on from them \
+             once its memory fits again, unless GLOBAL reaches the epoch's snapshot frame first: \
              an expected wait");
         progress.end(LeafOutcome::Yielded);
-        let yielded = Instant::now();
-        if !crate::storage_jobs::wait_for_due_work() {
-            return Err(stopping());
-        }
-        if expired(epoch) {
-            log_expired(epoch, filter, leaf_id, "waiting for work due now to end");
-            return Ok(Some(0));
-        }
-        let done = store
-            .find(epoch, member, leaf_id, |n| padded_nodes_allowed(exact, n))
-            .is_some()
-            || crate::storage_snapshot::snapshot_encoded(filter, epoch);
-        info!(epoch, filter = %hex::encode(filter), leaf = %hex::encode(leaf_id), nodes = n,
-            waited_seconds = yielded.elapsed().as_secs(), labelled_meanwhile = done, scope = "local",
-            "storage labels computed ahead resume: no work due now waits for memory");
-        if done {
-            return Ok(Some(0));
-        }
+        yielded = Some((Instant::now(), kept));
     }
 }
 
@@ -1111,6 +1972,227 @@ mod tests {
         let labelled = admitted.label(&SdrParams::default()).unwrap();
         assert!(labelled.kept);
         labelled
+    }
+
+    /// Labelling a leaf ahead holds no more than it reserves
+    /// ([`label_ahead_bytes`]), and reserves no more than its margin above
+    /// it ([`LABEL_AHEAD_MARGIN_PERCENT`]): reserving the snapshot's encode
+    /// instead (`crate::storage_snapshot::encoding_bytes`) labelled two large
+    /// leaves ahead at a time where the memory allowed three (2026-11-01).
+    #[test]
+    fn labelling_ahead_reserves_what_it_holds() {
+        let dir = temp_dir("peak");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let n = 20_000u64;
+        let admitted = store
+            .admit(9, &[8u8; 32], b"peak", n, Stage::Ahead)
+            .unwrap();
+        let (labelled, peak) = crate::test_alloc::peak_by(|| admitted.label(&SdrParams::default()));
+        assert!(labelled.unwrap().kept);
+        // Fresh workers allocate on other threads, so this counter only
+        // bounds the caller. Resumed labelling below runs on this thread.
+        let (peak, reserved) = (peak as u64, label_ahead_bytes(n));
+        assert!(
+            peak <= reserved,
+            "labelling {n} nodes ahead held {peak} bytes at its peak and reserves {reserved}"
+        );
+        // Resumed from kept layers, read back into the buffers labelling
+        // fills, it holds no more.
+        let stopped = stop_after(&store, b"resumed", n, 9);
+        assert!(matches!(stopped, Labelling::Stopped { layers: 9 }));
+        let admitted = store
+            .admit(9, &[8u8; 32], b"resumed", n, Stage::Ahead)
+            .unwrap();
+        assert_eq!(admitted.resumes_from(), 9);
+        let (labelled, resumed_peak) =
+            crate::test_alloc::peak_by(|| admitted.label(&SdrParams::default()));
+        assert!(labelled.unwrap().kept);
+        assert!(
+            resumed_peak as u64 <= reserved,
+            "labelling {n} nodes resumed held {resumed_peak} bytes at its peak and reserves {reserved}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Label `[8; 32]`'s leaf `leaf` of `n` nodes ahead for epoch 9 into
+    /// `store`, told to stop once `layers` layers are labelled.
+    fn stop_after(store: &LabelStore, leaf: &[u8], n: u64, layers: usize) -> Labelling {
+        let admitted = store.admit(9, &[8u8; 32], leaf, n, Stage::Ahead).unwrap();
+        let done = AtomicU64::new(0);
+        admitted
+            .label_kept(
+                &SdrParams::default(),
+                &|| done.load(Ordering::SeqCst) >= layers as u64,
+                &|labelled| done.store(labelled as u64, Ordering::SeqCst),
+            )
+            .unwrap()
+    }
+
+    /// Labelling ahead told to stop keeps its whole layers, synced and
+    /// listed, and the next attempt at the leaf's count goes on from them:
+    /// its labels, column digests and column commitment are the leaf
+    /// labelled at once (2026-11-01: labelling a leaf of 32 million nodes
+    /// again from its start after each yield never ended). What the next
+    /// attempt cannot resume from is removed, and labelling at the snapshot
+    /// keeps its whole layers too until they are discarded.
+    #[test]
+    fn labelling_ahead_given_up_resumes_from_its_whole_layers() {
+        let dir = temp_dir("resume");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let params = SdrParams::default();
+        let (member, leaf, n) = ([8u8; 32], b"leaf".as_slice(), 3_000u64);
+        let stopped = stop_after(&store, leaf, n, 4);
+        assert!(matches!(stopped, Labelling::Stopped { layers: 4 }));
+        let leaf_dir = store.leaf_dir(9, &member, leaf);
+        let layers_path = leaf_dir.join(format!("{n}.layers"));
+        let layer = n * NODE_BYTES as u64;
+        assert_eq!(fs::metadata(&layers_path).unwrap().len(), 4 * layer);
+        let manifest = |leaf_dir: &Path| {
+            Manifest::parse(&fs::read_to_string(leaf_dir.join(format!("{n}.kept"))).unwrap())
+                .unwrap()
+        };
+        assert_eq!(manifest(&leaf_dir).layers.len(), 4);
+        assert_eq!(
+            *store.pending(),
+            0,
+            "what it wrote is on disk, the rest no more pending"
+        );
+        assert!(
+            store.find(9, &member, leaf, |_| true).is_none(),
+            "not labelled yet"
+        );
+        // A crash midway through the next layer left part of it.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&layers_path)
+            .unwrap();
+        file.write_all(&[0xFF; 100]).unwrap();
+        drop(file);
+
+        let admitted = store.admit(9, &member, leaf, n, Stage::Ahead).unwrap();
+        assert_eq!(admitted.resumes_from(), 4);
+        assert_eq!(
+            *store.pending(),
+            label_bytes(n) - 4 * layer,
+            "only the rest to write"
+        );
+        assert_eq!(
+            manifest(&leaf_dir).layers.len(),
+            4,
+            "listed until the next layer is"
+        );
+        let handed = Mutex::new(Vec::new());
+        let labelled = admitted
+            .label_kept(&params, &|| false, &|done| {
+                handed.lock().unwrap().push(done)
+            })
+            .unwrap();
+        let Labelling::Labelled(Labelled { comm_c, last, kept }) = labelled else {
+            panic!("labelled to its end");
+        };
+        assert!(kept);
+        assert_eq!(
+            *handed.lock().unwrap(),
+            (5..=params.layers).collect::<Vec<_>>()
+        );
+        let mut layers = Vec::new();
+        let key = quil_crypto::sdr::replica_key(&member, leaf, 9);
+        let (expected_last, columns) =
+            quil_crypto::storage_proof::label_leaf(n, &key, &params, &mut |_, layer| {
+                layers.push(layer.to_vec())
+            });
+        let expected_comm_c = quil_crypto::storage_proof::MerkleTree::from_digests(columns.clone())
+            .commitment(quil_crypto::storage_proof::Tree::Column);
+        assert_eq!((last, comm_c), (expected_last.clone(), expected_comm_c));
+        let found = store.find(9, &member, leaf, |count| count == n).unwrap();
+        assert_eq!(found.comm_c, expected_comm_c);
+        assert_eq!(found.columns().unwrap(), columns);
+        assert_eq!(found.last_layer().unwrap(), expected_last);
+        for (layer, v) in [(0usize, 0u64), (3, 2_999), (4, 0), (7, 1_234), (10, n - 1)] {
+            assert_eq!(
+                found.label(layer, v),
+                Some(hash::to_bytes(&layers[layer][v as usize])),
+                "layer {layer} node {v}"
+            );
+        }
+        assert_eq!(*store.pending(), 0);
+
+        assert!(
+            !leaf_dir.join(format!("{n}.kept")).exists(),
+            "complete, `ready` stands for the layers"
+        );
+        // A manifest listing more layers than were written resumes from
+        // those written; one of an earlier build's format, from none.
+        let other = b"other".as_slice();
+        assert!(matches!(
+            stop_after(&store, other, n, 2),
+            Labelling::Stopped { layers: 2 }
+        ));
+        let other_dir = store.leaf_dir(9, &member, other);
+        let mut listed = manifest(&other_dir);
+        listed.layers.push([7u8; 32]);
+        write_manifest(&other_dir, n, &listed).unwrap();
+        let admitted = store.admit(9, &member, other, n, Stage::Ahead).unwrap();
+        assert_eq!(admitted.resumes_from(), 2);
+        drop(admitted);
+        fs::write(other_dir.join(format!("{n}.kept")), "2").unwrap();
+        let admitted = store.admit(9, &member, other, n, Stage::Ahead).unwrap();
+        assert_eq!(admitted.resumes_from(), 0);
+        drop(admitted);
+        // Given up for good, nothing stays.
+        assert!(matches!(
+            stop_after(&store, other, n, 1),
+            Labelling::Stopped { layers: 1 }
+        ));
+        store.discard(9, &member, other, n);
+        assert_eq!(files_under(&other_dir), Vec::<PathBuf>::new());
+        // At the snapshot, a stopped labelling keeps its whole layers too,
+        // until discarded.
+        let admitted = store.admit(9, &member, other, n, Stage::Snapshot).unwrap();
+        let done = AtomicU64::new(0);
+        let stopped = admitted
+            .label_kept(&params, &|| done.load(Ordering::SeqCst) >= 2, &|labelled| {
+                done.store(labelled as u64, Ordering::SeqCst)
+            })
+            .unwrap();
+        assert!(matches!(stopped, Labelling::Stopped { layers: 2 }));
+        assert_eq!(manifest(&other_dir).stage, Stage::Snapshot);
+        store.discard(9, &member, other, n);
+        assert_eq!(files_under(&other_dir), Vec::<PathBuf>::new());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A seat's leaves its snapshot could not label within the renewal's
+    /// grace wait for memory before every leaf it could, a seat's together,
+    /// seats with fewer of them first.
+    #[test]
+    fn leaves_only_labelling_ahead_registers_wait_first() {
+        use quil_crypto::storage_proof::data_node_count;
+        // At 10 s frames, the grace of 320 frames labels about 21 million
+        // nodes.
+        let epoch = 1317;
+        let bytes = |nodes: u64| u128::from(nodes) * 30;
+        assert_eq!(data_node_count(bytes(10_000_000) as u64), 10_000_000);
+        let (small, large) = (bytes(10_000_000), bytes(30_000_000));
+        let mut orders = ahead_orders(epoch, 10, &[small, large]);
+        let pair = ahead_orders(epoch, 5, &[large, large]);
+        assert_eq!(
+            orders
+                .iter()
+                .map(|order| (order.deferrable, order.seat_leaves))
+                .collect::<Vec<_>>(),
+            vec![(true, 1), (false, 1)]
+        );
+        orders.extend(pair);
+        orders.sort();
+        assert_eq!(
+            orders
+                .iter()
+                .map(|order| (order.deferrable, order.seat, order.leaf))
+                .collect::<Vec<_>>(),
+            vec![(false, 10, 1), (false, 5, 0), (false, 5, 1), (true, 10, 0)],
+            "the one-leaf seat's large leaf, then the pair's, then the small one"
+        );
     }
 
     #[test]
@@ -1268,31 +2350,149 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A leaf whose labelling is given up midway leaves none of its files,
-    /// and what it had still to write counts against the room no more.
+    /// A leaf whose labelling is given up midway keeps only its whole
+    /// layers and their manifest, what it had still to write counts against
+    /// the room no more, and a discard leaves none of its files.
     #[test]
-    fn a_leaf_given_up_midway_leaves_no_files() {
-        use std::sync::atomic::AtomicUsize;
+    fn a_leaf_given_up_midway_keeps_only_its_whole_layers() {
         let dir = temp_dir("given-up");
         let store = LabelStore::with_space(dir.clone(), ample_space());
         let (member, leaf, n) = ([7u8; 32], b"leaf".as_slice(), 1_500u64);
         let admitted = store.admit(9, &member, leaf, n, Stage::Ahead).unwrap();
-        let looks = AtomicUsize::new(0);
-        // Past the first layer, written to disk, then stopped.
-        let per_layer = (n as usize).div_ceil(quil_crypto::storage_proof::STOP_CHECK_NODES);
+        let done = AtomicU64::new(0);
         let stopped = admitted
-            .label_until(&SdrParams::default(), &|| {
-                looks.fetch_add(1, Ordering::SeqCst) > per_layer
-            })
+            .label_kept(
+                &SdrParams::default(),
+                &|| done.load(Ordering::SeqCst) >= 1,
+                &|layers| done.store(layers as u64, Ordering::SeqCst),
+            )
             .unwrap();
-        assert!(stopped.is_none());
-        assert_eq!(files_under(&dir), Vec::<PathBuf>::new());
+        assert!(matches!(stopped, Labelling::Stopped { layers: 1 }));
+        let leaf_dir = store.leaf_dir(9, &member, leaf);
+        let mut files = files_under(&dir);
+        files.sort();
+        assert_eq!(
+            files,
+            vec![
+                leaf_dir.join(format!("{n}.kept")),
+                leaf_dir.join(format!("{n}.layers"))
+            ]
+        );
+        assert_eq!(
+            fs::metadata(leaf_dir.join(format!("{n}.layers")))
+                .unwrap()
+                .len(),
+            layer_bytes(n),
+            "the first layer, whole"
+        );
         assert_eq!(*store.pending(), 0);
         assert!(store.find(9, &member, leaf, |_| true).is_none());
+        assert_eq!(store.resumable(9, &member, leaf, |_| true), Some((n, 1)));
+        store.discard(9, &member, leaf, n);
+        assert_eq!(files_under(&dir), Vec::<PathBuf>::new());
         assert!(
             keep(&store, 9, &member, leaf, n).kept,
             "labelled again from its start"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The leaf labelled at once at `n` nodes, keyed for `[8; 32]`'s `leaf`
+    /// in epoch 9: its last layer and column commitment.
+    fn labelled_at_once(leaf: &[u8], n: u64) -> (Vec<Digest>, Node) {
+        let key = quil_crypto::sdr::replica_key(&[8u8; 32], leaf, 9);
+        let (last, columns) =
+            quil_crypto::storage_proof::label_leaf(n, &key, &SdrParams::default(), &mut |_, _| {});
+        let comm_c = quil_crypto::storage_proof::MerkleTree::from_digests(columns)
+            .commitment(quil_crypto::storage_proof::Tree::Column);
+        (last, comm_c)
+    }
+
+    /// Kept layers are reused only as far as each matches the digest its
+    /// manifest lists, and only for the labels the manifest names: a layer
+    /// changed or cut short on disk (a crash, a torn write) is labelled
+    /// again from there, and layers of another node count, parameters or
+    /// key from none. Whatever was reused, the leaf's labels are those
+    /// labelled at once.
+    #[test]
+    fn kept_layers_are_checked_against_their_digests_before_reuse() {
+        let dir = temp_dir("checked");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let member = [8u8; 32];
+        let n = 1_000u64;
+        let layer = layer_bytes(n);
+        let label_rest = |leaf: &[u8], from: usize| {
+            let admitted = store.admit(9, &member, leaf, n, Stage::Ahead).unwrap();
+            assert_eq!(admitted.resumes_from(), from, "{leaf:?}");
+            assert_eq!(admitted.resumed().map_or(0, |r| r.layers), from);
+            let labelled = admitted.label(&SdrParams::default()).unwrap();
+            assert!(labelled.kept);
+            assert_eq!((labelled.last, labelled.comm_c), labelled_at_once(leaf, n));
+            let found = store.find(9, &member, leaf, |count| count == n).unwrap();
+            assert_eq!(found.comm_c, labelled_at_once(leaf, n).1);
+        };
+
+        // A byte changed in the third layer: the first two are reused.
+        assert!(matches!(
+            stop_after(&store, b"changed", n, 6),
+            Labelling::Stopped { layers: 6 }
+        ));
+        assert_eq!(
+            store.resumable(9, &member, b"changed", |_| true),
+            Some((n, 6))
+        );
+        let layers_path = store
+            .leaf_dir(9, &member, b"changed")
+            .join(format!("{n}.layers"));
+        let mut bytes = fs::read(&layers_path).unwrap();
+        bytes[(2 * layer + 100) as usize] ^= 1;
+        fs::write(&layers_path, bytes).unwrap();
+        label_rest(b"changed", 2);
+
+        // Cut short midway through the fifth layer: the first four are.
+        assert!(matches!(
+            stop_after(&store, b"cut", n, 6),
+            Labelling::Stopped { layers: 6 }
+        ));
+        let cut_dir = store.leaf_dir(9, &member, b"cut");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(cut_dir.join(format!("{n}.layers")))
+            .unwrap()
+            .set_len(4 * layer + layer / 2)
+            .unwrap();
+        label_rest(b"cut", 4);
+
+        // Labels of other parameters, another key or another count: none.
+        for (leaf, change) in [
+            (b"params".as_slice(), 0usize),
+            (b"key".as_slice(), 1),
+            (b"count".as_slice(), 2),
+        ] {
+            assert!(matches!(
+                stop_after(&store, leaf, n, 3),
+                Labelling::Stopped { layers: 3 }
+            ));
+            let leaf_dir = store.leaf_dir(9, &member, leaf);
+            let path = leaf_dir.join(format!("{n}.kept"));
+            let mut manifest = Manifest::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+            match change {
+                0 => manifest.params = "6 8 12 32".into(),
+                1 => manifest.key = hex::encode([9u8; 32]),
+                _ => manifest.n = n + 1,
+            }
+            write_manifest(&leaf_dir, n, &manifest).unwrap();
+            label_rest(leaf, 0);
+        }
+        assert_eq!(
+            store
+                .resumed()
+                .into_iter()
+                .map(|(leaf, _, from)| (leaf, from))
+                .collect::<Vec<_>>(),
+            vec![(b"changed".to_vec(), 2), (b"cut".to_vec(), 4)]
+        );
+        assert_eq!(*store.pending(), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1317,6 +2517,376 @@ mod tests {
                 "frame {frame}: labelling ahead {lead} frames before the snapshot frame"
             );
         }
+    }
+
+    /// Before the stable replica key epoch (mainnet: 1393) a leaf's labels
+    /// are kept under their epoch's directory, byte for byte as before it
+    /// existed, and serve that epoch alone.
+    #[test]
+    fn labels_before_the_stable_key_epoch_keep_their_epochs_layout() {
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(10));
+        let dir = temp_dir("epoch-layout");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let (member, leaf, n) = ([7u8; 32], b"leaf".as_slice(), 64u64);
+        keep(&store, 9, &member, leaf, n);
+        let leaf_dir = store.leaf_dir(9, &member, leaf);
+        assert_eq!(leaf_dir.parent().unwrap(), dir.join("9"));
+        let mut files = files_under(&dir);
+        files.sort();
+        assert_eq!(
+            files,
+            ["cap", "columns", "layers", "ready"].map(|kind| leaf_dir.join(format!("{n}.{kind}")))
+        );
+        assert!(store.find(9, &member, leaf, |_| true).is_some());
+        assert!(store.find(10, &member, leaf, |_| true).is_none());
+        assert_eq!(files_under(&dir).len(), 4, "looking marks nothing");
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// From the stable replica key epoch a leaf's labels serve every later
+    /// epoch: kept apart from an earlier epoch's, swept with neither the
+    /// epochs before nor while each epoch looks for them, and removed at the
+    /// first sweep of an epoch nothing looked for them for.
+    #[test]
+    fn stable_labels_serve_later_epochs_and_go_once_unused() {
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(9));
+        let dir = temp_dir("stable");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let (member, leaf, n) = ([7u8; 32], b"leaf".as_slice(), 64u64);
+        let early = keep(&store, 8, &member, leaf, n);
+        let stable = keep(&store, 9, &member, leaf, n);
+        assert_ne!(early.comm_c, stable.comm_c, "another key");
+        assert_eq!(
+            store.leaf_dir(12, &member, leaf).parent().unwrap(),
+            dir.join(STABLE_DIR)
+        );
+        let found = store.find(10, &member, leaf, |count| count == n).unwrap();
+        assert_eq!(found.comm_c, stable.comm_c, "labelled for 9, found for 10");
+        assert_eq!(
+            store.find(8, &member, leaf, |_| true).unwrap().comm_c,
+            early.comm_c
+        );
+        store.sweep(9);
+        assert!(store.find(8, &member, leaf, |_| true).is_none());
+        store.sweep(10);
+        assert!(
+            store
+                .leaf_dir(10, &member, leaf)
+                .join(format!("{n}.ready"))
+                .exists(),
+            "looked for for the epoch the sweep begins"
+        );
+        assert!(store.find(11, &member, leaf, |_| true).is_some());
+        store.sweep(11);
+        assert!(store.leaf_dir(11, &member, leaf).exists());
+        store.sweep(12);
+        assert!(
+            !store.leaf_dir(12, &member, leaf).exists(),
+            "nothing looked for them for 12"
+        );
+        assert!(store.find(12, &member, leaf, |_| true).is_none());
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Each count under the stable directory goes at the first sweep of an
+    /// epoch after the latest one it was looked for or labelled for: an
+    /// older count still looked for outlives a newer one labelled after it,
+    /// a count with no record of use (a crash) is kept one more epoch, and
+    /// every file of a count goes with it, staged ones too.
+    #[test]
+    fn each_stable_count_goes_once_nothing_looks_for_it() {
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(9));
+        let dir = temp_dir("per-count");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let member = [7u8; 32];
+        let leaf = b"leaf".as_slice();
+        keep(&store, 9, &member, leaf, 64);
+        assert!(store.find(10, &member, leaf, |n| n == 64).is_some());
+        keep(&store, 10, &member, leaf, 96);
+        keep(&store, 10, &member, b"other", 64);
+        let leaf_dir = store.leaf_dir(10, &member, leaf);
+        fs::write(leaf_dir.join("64.kept.tmp"), [0u8; 32]).unwrap();
+        fs::write(leaf_dir.join("128.layers"), [1u8; 64]).unwrap();
+        let names = || {
+            let mut names: Vec<String> = fs::read_dir(&leaf_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        store.sweep(10);
+        assert_eq!(
+            names(),
+            [
+                "128.layers",
+                "128.used",
+                "64.cap",
+                "64.columns",
+                "64.kept.tmp",
+                "64.layers",
+                "64.ready",
+                "64.used",
+                "96.cap",
+                "96.columns",
+                "96.layers",
+                "96.ready",
+                "96.used"
+            ],
+            "the older count still looked for stays, and the unrecorded one"
+        );
+        assert!(store.find(11, &member, leaf, |n| n == 96).is_some());
+        store.sweep(11);
+        assert_eq!(
+            names(),
+            ["96.cap", "96.columns", "96.layers", "96.ready", "96.used"]
+        );
+        assert!(
+            store.find(11, &member, b"other", |_| true).is_none(),
+            "another leaf nothing looked for since 10"
+        );
+        assert!(!store.leaf_dir(11, &member, b"other").exists());
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A sealed registration's labels are forgotten before the stable key
+    /// epoch, and not from it, where they serve the epochs after.
+    #[test]
+    fn forgetting_a_sealed_epoch_keeps_stable_labels() {
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(9));
+        let dir = temp_dir("forget");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let (member, leaf, n) = ([7u8; 32], b"leaf".as_slice(), 64u64);
+        keep(&store, 8, &member, leaf, n);
+        store.forget(8, &member, leaf);
+        assert!(store.find(8, &member, leaf, |_| true).is_none());
+        keep(&store, 9, &member, leaf, n);
+        assert!(store.find(10, &member, leaf, |_| true).is_some());
+        store.forget(9, &member, leaf);
+        store.forget(10, &member, leaf);
+        assert!(
+            store.find(10, &member, leaf, |count| count == n).is_some(),
+            "the labels for 10 and later stay"
+        );
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// While a count is labelled, a later epoch, which looks in the same
+    /// directory from the stable replica key epoch, neither finds it nor
+    /// labels it again: it finds it once complete.
+    #[test]
+    fn a_count_is_found_only_once_complete() {
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(9));
+        let dir = temp_dir("complete");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let (member, leaf, n) = ([7u8; 32], b"leaf".as_slice(), 1_500u64);
+        let leaf_dir = store.leaf_dir(9, &member, leaf);
+        let admitted = store.admit(9, &member, leaf, n, Stage::Ahead).unwrap();
+        let seen = std::cell::Cell::new(None);
+        let labelled = admitted
+            .label_kept(&SdrParams::default(), &|| false, &|layers| {
+                if layers == 3 {
+                    let [_, columns, ready] = paths(&leaf_dir, n);
+                    seen.set(Some((
+                        columns.exists() || ready.exists(),
+                        store.find(10, &member, leaf, |_| true).is_some(),
+                        store.admit(10, &member, leaf, n, Stage::Snapshot).is_some(),
+                    )));
+                }
+            })
+            .unwrap();
+        let Labelling::Labelled(labelled) = labelled else {
+            panic!("labelling never stops");
+        };
+        assert!(labelled.kept);
+        assert_eq!(
+            seen.get(),
+            Some((false, false, false)),
+            "mid-labelling: final files, found, admitted again"
+        );
+        let mut files = files_under(&dir);
+        files.sort();
+        let mut expected = paths(&leaf_dir, n).to_vec();
+        expected.push(used_path(&leaf_dir, n));
+        expected.push(leaf_dir.join(format!("{n}.cap")));
+        expected.sort();
+        assert_eq!(files, expected);
+        let kept = store.find(10, &member, leaf, |count| count == n).unwrap();
+        assert_eq!(kept.comm_c, labelled.comm_c);
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A count admitted for an epoch is not swept while it is labelled, by
+    /// the sweeps of the epochs before it or after: it lands whole and is
+    /// found.
+    #[test]
+    fn a_count_being_labelled_survives_the_sweeps_meanwhile() {
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(9));
+        let dir = temp_dir("mid-sweep");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let (member, leaf, n) = ([7u8; 32], b"leaf".as_slice(), 1_500u64);
+        let admitted = store.admit(12, &member, leaf, n, Stage::Ahead).unwrap();
+        let labelled = admitted
+            .label_kept(&SdrParams::default(), &|| false, &|layers| {
+                if layers == 3 {
+                    store.sweep(10);
+                    store.sweep(11);
+                    store.sweep(13);
+                }
+            })
+            .unwrap();
+        let Labelling::Labelled(labelled) = labelled else {
+            panic!("labelling never stops");
+        };
+        assert!(labelled.kept);
+        let kept = store.find(12, &member, leaf, |count| count == n).unwrap();
+        assert_eq!(kept.comm_c, labelled.comm_c);
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// From the stable replica key epoch the whole layers kept for one epoch
+    /// serve a later one, whose labelling goes on from them to the labels
+    /// labelling at once makes.
+    #[test]
+    fn stable_kept_layers_resume_for_a_later_epoch() {
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(9));
+        let dir = temp_dir("stable-resume");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let (member, leaf, n) = ([8u8; 32], b"leaf".as_slice(), 1_500u64);
+        assert!(matches!(
+            stop_after(&store, leaf, n, 3),
+            Labelling::Stopped { layers: 3 }
+        ));
+        assert_eq!(store.resumable(11, &member, leaf, |_| true), Some((n, 3)));
+        let admitted = store.admit(11, &member, leaf, n, Stage::Snapshot).unwrap();
+        assert_eq!(admitted.resumes_from(), 3);
+        let labelled = admitted.label(&SdrParams::default()).unwrap();
+        let (last, comm_c) = labelled_at_once(leaf, n);
+        assert!(labelled.kept);
+        assert_eq!(labelled.comm_c, comm_c);
+        assert_eq!(labelled.last, last);
+        assert_eq!(
+            store
+                .find(12, &member, leaf, |count| count == n)
+                .unwrap()
+                .comm_c,
+            comm_c
+        );
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Before the stable replica key epoch (mainnet: 1393) the whole layers
+    /// kept for an epoch are kept as with no such epoch: under the epoch's
+    /// directory with nothing beside them, resumed for that epoch alone,
+    /// removed when discarded and with their epoch.
+    #[test]
+    fn kept_layers_before_the_stable_key_epoch_serve_their_epoch_alone() {
+        for stable in [None, Some(10)] {
+            quil_types::consensus::set_stable_replica_key_epoch_for_thread(stable);
+            let dir = temp_dir("epoch-kept");
+            let store = LabelStore::with_space(dir.clone(), ample_space());
+            let (member, leaf, n) = ([8u8; 32], b"leaf".as_slice(), 1_500u64);
+            assert!(matches!(
+                stop_after(&store, leaf, n, 3),
+                Labelling::Stopped { layers: 3 }
+            ));
+            let leaf_dir = store.leaf_dir(9, &member, leaf);
+            assert_eq!(leaf_dir.parent().unwrap(), dir.join("9"));
+            let kept = || {
+                let mut files = files_under(&leaf_dir);
+                files.sort();
+                files
+            };
+            let layers = vec![
+                leaf_dir.join(format!("{n}.kept")),
+                leaf_dir.join(format!("{n}.layers")),
+            ];
+            assert_eq!(kept(), layers);
+            assert_eq!(store.resumable(9, &member, leaf, |_| true), Some((n, 3)));
+            assert_eq!(store.resumable(10, &member, leaf, |_| true), None);
+            let later = store.admit(10, &member, leaf, n, Stage::Ahead).unwrap();
+            assert_eq!(later.resumes_from(), 0, "another epoch's key");
+            drop(later);
+            let again = store.admit(9, &member, leaf, n, Stage::Snapshot).unwrap();
+            assert_eq!(again.resumes_from(), 3);
+            drop(again);
+            assert_eq!(kept(), layers);
+            store.discard(9, &member, leaf, n);
+            assert_eq!(kept(), Vec::<PathBuf>::new());
+            assert!(matches!(
+                stop_after(&store, leaf, n, 3),
+                Labelling::Stopped { layers: 3 }
+            ));
+            assert_eq!(kept(), layers);
+            store.sweep(10);
+            assert!(!dir.join("9").exists(), "gone with their epoch");
+            quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// From the stable replica key epoch only the sweep removes whole layers
+    /// kept: a snapshot given up on or encoded at another count discards
+    /// them for its epoch, and a later one goes on from them. They go at the
+    /// first sweep after the epoch they were admitted for.
+    #[test]
+    fn stable_kept_layers_go_only_at_the_sweep() {
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(9));
+        let dir = temp_dir("stable-discard");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let (member, leaf, n) = ([8u8; 32], b"leaf".as_slice(), 1_500u64);
+        let done = AtomicU64::new(0);
+        let stopped = store
+            .admit(12, &member, leaf, n, Stage::Ahead)
+            .unwrap()
+            .label_kept(
+                &SdrParams::default(),
+                &|| done.load(Ordering::SeqCst) >= 3,
+                &|labelled| done.store(labelled as u64, Ordering::SeqCst),
+            )
+            .unwrap();
+        assert!(matches!(stopped, Labelling::Stopped { layers: 3 }));
+        store.discard(12, &member, leaf, n);
+        store.discard_others(12, &member, leaf, n + 1);
+        assert_eq!(store.resumable(13, &member, leaf, |_| true), Some((n, 3)));
+        for epoch in [10, 11, 12] {
+            store.sweep(epoch);
+            assert_eq!(
+                store.resumable(13, &member, leaf, |_| true),
+                Some((n, 3)),
+                "admitted for 12, swept for {epoch}"
+            );
+        }
+        store.sweep(13);
+        assert_eq!(store.resumable(13, &member, leaf, |_| true), None);
+        assert!(!store.leaf_dir(13, &member, leaf).exists());
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Labels found stay readable when their files are removed after: a
+    /// seal reading them while the sweep or an admission at the count
+    /// removes them reads them whole.
+    #[test]
+    fn found_labels_stay_readable_when_their_files_go() {
+        let dir = temp_dir("open");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let (member, leaf, n) = ([7u8; 32], b"leaf".as_slice(), 64u64);
+        keep(&store, 9, &member, leaf, n);
+        let kept = store.find(9, &member, leaf, |count| count == n).unwrap();
+        let (columns, last) = (kept.columns().unwrap(), kept.last_layer().unwrap());
+        drop(store.admit(9, &member, leaf, n, Stage::Snapshot));
+        assert!(!paths(&store.leaf_dir(9, &member, leaf), n)[1].exists());
+        assert_eq!(kept.columns(), Some(columns));
+        assert_eq!(kept.last_layer(), Some(last));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The labels of epochs before the current one go at its first sweep,
@@ -1350,8 +2920,8 @@ mod tests {
     }
     #[test]
     fn stable_labels_survive_seals_and_expire_only_when_unused() {
-        quil_types::consensus::set_sealed_storage_epoch_for_thread(Some(1393));
-        let dir = temp_dir("stable");
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(1393));
+        let dir = temp_dir("stable-lifetime");
         let store = LabelStore::with_space(dir.clone(), ample_space());
         let member = [7; 32];
         let leaf = b"stable-leaf";
@@ -1359,16 +2929,16 @@ mod tests {
         assert!(store.find(1392, &member, leaf, |_| true).is_none());
         let kept = store.find(1394, &member, leaf, |n| n == 73).unwrap();
         store.forget(1393, &member, leaf);
-        store.evict_before(1394);
+        store.sweep(1394);
         assert!(store.find(1394, &member, leaf, |_| true).is_some());
         assert!(store.find(1394, &[8; 32], leaf, |_| true).is_none());
-        store.evict_before(1395);
+        store.sweep(1395);
         assert!(store.find(1395, &member, leaf, |_| true).is_none());
         // Open files stay usable even after the unused cache is evicted.
         assert_eq!(kept.last_layer().unwrap().len(), 73);
         assert_eq!(kept.columns().unwrap().len(), 73);
         let _ = fs::remove_dir_all(&dir);
-        quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
     }
 
     #[test]

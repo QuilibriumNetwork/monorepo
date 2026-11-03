@@ -18,29 +18,82 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use quil_config::{signatory_quorum, SIGNATORIES};
 
 use crate::system;
 
-/// Fetch a URL's body as bytes.
+/// Time limits of a release fetch.
+#[derive(Clone, Copy, Debug)]
+pub struct HttpTimeouts {
+    /// Connection setup, TLS included.
+    pub connect: Duration,
+    /// The longest wait for the next bytes of a response.
+    pub read: Duration,
+    /// The whole fetch, body included.
+    pub total: Duration,
+}
+
+/// The limits of every release fetch, so an unreachable or stalled server
+/// fails the fetch instead of holding the command, and the auto-update
+/// job, forever. The total admits a node binary (~270 MB) at ~150 kB/s.
+pub const HTTP_TIMEOUTS: HttpTimeouts = HttpTimeouts {
+    connect: Duration::from_secs(30),
+    read: Duration::from_secs(60),
+    total: Duration::from_secs(30 * 60),
+};
+
+/// An HTTP client enforcing `timeouts`.
+fn http_client(timeouts: HttpTimeouts) -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(timeouts.connect)
+        .read_timeout(timeouts.read)
+        .timeout(timeouts.total)
+        .build()
+        .map_err(|e| anyhow::anyhow!("build the HTTP client: {e}"))
+}
+
+/// Fetch a URL's body as bytes, within [`HTTP_TIMEOUTS`].
 pub async fn http_get_bytes(url: &str) -> anyhow::Result<Vec<u8>> {
-    let resp = reqwest::get(url)
+    http_get_bytes_with(HTTP_TIMEOUTS, url).await
+}
+
+/// [`http_get_bytes`] within `timeouts`.
+async fn http_get_bytes_with(timeouts: HttpTimeouts, url: &str) -> anyhow::Result<Vec<u8>> {
+    let failed = |what: &str, e: reqwest::Error| {
+        if e.is_timeout() {
+            anyhow::anyhow!(
+                "{what} {url}: timed out (limits: {}s to connect, {}s without data, {}s in \
+                 all)",
+                timeouts.connect.as_secs(),
+                timeouts.read.as_secs(),
+                timeouts.total.as_secs()
+            )
+        } else {
+            anyhow::anyhow!("{what} {url}: {e}")
+        }
+    };
+    let resp = http_client(timeouts)?
+        .get(url)
+        .send()
         .await
-        .map_err(|e| anyhow::anyhow!("GET {url}: {e}"))?;
+        .map_err(|e| failed("GET", e))?;
     if !resp.status().is_success() {
         anyhow::bail!("GET {url}: HTTP {}", resp.status());
     }
-    Ok(resp
-        .bytes()
-        .await
-        .map_err(|e| anyhow::anyhow!("read {url}: {e}"))?
-        .to_vec())
+    Ok(resp.bytes().await.map_err(|e| failed("read", e))?.to_vec())
 }
 
-/// Whether a remote file exists (HEAD-ish via GET status).
+/// Whether a remote file exists (HEAD-ish via GET status), within
+/// [`HTTP_TIMEOUTS`].
 pub async fn remote_exists(url: &str) -> bool {
-    reqwest::get(url)
+    let Ok(client) = http_client(HTTP_TIMEOUTS) else {
+        return false;
+    };
+    client
+        .get(url)
+        .send()
         .await
         .map(|r| r.status().is_success())
         .unwrap_or(false)
@@ -152,16 +205,51 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
 }
 
 /// The version of the release binary `symlink` points to, when it points to
-/// a `<release_type>-<version>-<os>-<arch>` file.
+/// a `<release_type>-<version>-<os>-<arch>` file, directly or at the end of
+/// a chain of links (an operator's own link to a release file).
 pub fn linked_version(symlink: &Path, release_type: &str) -> Option<String> {
     let target = std::fs::read_link(symlink).ok()?;
-    let rest = target
+    named_version(&target, release_type)
+        .or_else(|| named_version(&std::fs::canonicalize(symlink).ok()?, release_type))
+}
+
+/// The version in a `<release_type>-<version>-<os>-<arch>` file name.
+fn named_version(path: &Path, release_type: &str) -> Option<String> {
+    let rest = path
         .file_name()?
         .to_str()?
         .strip_prefix(release_type)?
         .strip_prefix('-')?;
     let version = rest.split('-').next()?;
     is_release_version(version).then(|| version.to_string())
+}
+
+/// Refuse to replace `symlink` with the release `target` unless
+/// `allow_downgrade` when it holds a binary whose version
+/// [`linked_version`] cannot read, such as a link to an operator's own
+/// build or a copied file: that binary may be newer than `target`.
+pub fn check_unversioned_link(
+    symlink: &Path,
+    release_type: &str,
+    target: &str,
+    allow_downgrade: bool,
+) -> anyhow::Result<()> {
+    if allow_downgrade || linked_version(symlink, release_type).is_some() {
+        return Ok(());
+    }
+    let held = match std::fs::read_link(symlink) {
+        Ok(to) => format!("links {}", to.display()),
+        Err(_) => match std::fs::symlink_metadata(symlink) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => anyhow::bail!("stat {}: {e}", symlink.display()),
+            Ok(_) => "is not a symlink".to_string(),
+        },
+    };
+    anyhow::bail!(
+        "refusing to replace {}, which {held}: it names no {release_type} release version, so \
+         {target} may be older; pass --allow-downgrade to replace it on purpose",
+        symlink.display()
+    )
 }
 
 /// Refuse to replace `installed` with the older `target` unless
@@ -491,9 +579,9 @@ pub struct Installed {
 /// `symlink` to it. Shared by `qclient update` and `node install`/`update`.
 /// Install paths require root.
 ///
-/// Refuses a `version` older than the one `symlink` points to unless
-/// `allow_downgrade`, and leaves an already linked, verified release as it
-/// is.
+/// Refuses a `version` older than the one `symlink` points to, or to
+/// replace a `symlink` naming no release version, unless `allow_downgrade`,
+/// and leaves an already linked, verified release as it is.
 pub async fn download_and_install(
     release_type: &str,
     version: &str,
@@ -503,6 +591,7 @@ pub async fn download_and_install(
     let base = release_filename(release_type, version)?;
     let installed = linked_version(symlink, release_type);
     check_downgrade(installed.as_deref(), version, allow_downgrade)?;
+    check_unversioned_link(symlink, release_type, version, allow_downgrade)?;
     let dest_dir = Path::new(system::BINARY_PATH)
         .join(release_type)
         .join(version);
@@ -543,6 +632,28 @@ mod tests {
     #[test]
     fn quorum_threshold_is_seven() {
         assert_eq!(quil_config::signatory_quorum(), 7);
+    }
+
+    /// A server that takes the connection but never answers fails the
+    /// fetch within the limits, rather than holding it forever.
+    #[tokio::test]
+    async fn silent_release_server_times_out() {
+        // Never accepted: the kernel completes the handshake, nothing
+        // answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/release", listener.local_addr().unwrap());
+        let timeouts = HttpTimeouts {
+            connect: Duration::from_secs(1),
+            read: Duration::from_secs(1),
+            total: Duration::from_secs(3),
+        };
+        let fetch = http_get_bytes_with(timeouts, &url);
+        let Ok(result) = tokio::time::timeout(Duration::from_secs(20), fetch).await else {
+            panic!("GET {url} still waits on a silent server after 20 s");
+        };
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("timed out"), "{err}");
+        drop(listener);
     }
 
     #[test]
@@ -968,5 +1079,52 @@ mod tests {
             result.is_err() && !dest.join(BASE).exists(),
             "older signed release node-2.1.0.24 installed as {BASE}: {result:?}"
         );
+    }
+
+    /// A link to a binary whose version qclient cannot read (an operator's
+    /// own build, a copied file) is not replaced without the flag; a link
+    /// chain ending at a release file compares by that file's version.
+    #[cfg(unix)]
+    #[test]
+    fn unversioned_link_needs_the_flag() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (bin, opt) = (tmp.path().join("bin"), tmp.path().join("opt"));
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&opt).unwrap();
+        let link = bin.join("quilibrium-node");
+        // A fresh install.
+        check_unversioned_link(&link, "node", "2.1.0.24", false).unwrap();
+
+        let own = opt.join("quil-node");
+        std::fs::write(&own, b"bin").unwrap();
+        symlink(&own, &link).unwrap();
+        let err = check_unversioned_link(&link, "node", "2.1.0.24", false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("quil-node") && err.contains("--allow-downgrade"),
+            "{err}"
+        );
+        check_unversioned_link(&link, "node", "2.1.0.24", true).unwrap();
+
+        let copied = bin.join("qclient");
+        std::fs::write(&copied, b"bin").unwrap();
+        let err = check_unversioned_link(&copied, "qclient", "2.1.0.23", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not a symlink"), "{err}");
+
+        // bin/quilibrium-node -> opt/quilibrium-node -> opt/node-2.1.0.25-*
+        let release = opt.join("node-2.1.0.25-linux-amd64");
+        std::fs::write(&release, b"bin").unwrap();
+        let own_link = opt.join("quilibrium-node");
+        symlink(&release, &own_link).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        symlink(&own_link, &link).unwrap();
+        assert_eq!(linked_version(&link, "node").as_deref(), Some("2.1.0.25"));
+        check_unversioned_link(&link, "node", "2.1.0.24", false).unwrap();
+        let installed = linked_version(&link, "node");
+        assert!(check_downgrade(installed.as_deref(), "2.1.0.24", false).is_err());
     }
 }

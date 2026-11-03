@@ -43,6 +43,8 @@ pub struct RetentionPass {
     pub held: Duration,
     /// Holds of [`LONG_HOLD`] or longer.
     pub long_holds: usize,
+    /// Holds that ended with another thread waiting for the lock.
+    pub yields: usize,
     /// How long the scans without the lock took.
     pub scan: Duration,
     /// Live replans of a scope's index under the lock, and the longest.
@@ -327,9 +329,9 @@ pub fn spawn_retention_pruner(crdt: &Arc<HypergraphCrdt>, policy: RetentionPolic
                 let max_hold_ms = pass.max_hold.as_millis() as u64;
                 if announced || pass.notable() {
                     let RetentionPass { trees, nodes, values, blobs, roots, scanned, holds, long_holds, abandoned,
-                        replans, .. } = pass;
+                        replans, yields, .. } = pass;
                     tracing::info!(store = %label, trees, nodes, values, blobs, roots, scanned, holds, max_hold_ms,
-                        long_holds, held_ms = pass.held.as_millis() as u64, replans, max_replan_ms = pass.max_replan.as_millis() as u64,
+                        long_holds, yields, held_ms = pass.held.as_millis() as u64, replans, max_replan_ms = pass.max_replan.as_millis() as u64,
                         scan_ms = pass.scan.as_millis() as u64, abandoned, ms, "pruned retained versions");
                 }
                 if pass.long_holds > 0 {

@@ -137,6 +137,8 @@ pub(crate) struct GrpcArgs {
     pub inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver>,
     pub peer_id: quil_p2p::PeerId,
     pub p2p_handle: quil_p2p::node::P2PHandle,
+    /// The master's addresses of the last published PeerInfo.
+    pub announced_addrs: tokio::sync::watch::Receiver<super::peer_info_publisher::AnnouncedAddrs>,
     pub file_key_manager: Arc<quil_keys::FileKeyManager>,
     pub mtls_seed: Option<[u8; 57]>,
     pub crdt: Arc<quil_hypergraph::HypergraphCrdt>,
@@ -1579,6 +1581,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         inclusion_prover,
         peer_id,
         p2p_handle,
+        announced_addrs,
         file_key_manager,
         mtls_seed,
         crdt,
@@ -2429,6 +2432,18 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         let pic = peer_info_cache.clone();
         node_rpc_builder = node_rpc_builder
             .with_peer_info_snapshot(Arc::new(move || pic.read().values().cloned().collect()));
+    }
+    {
+        let p2p = p2p_handle.clone();
+        let external = p2p_handle.watch_external_addresses();
+        node_rpc_builder = node_rpc_builder.with_node_reachability(Arc::new(move || {
+            super::peer_info_publisher::node_reachability(
+                p2p.listen_addresses(),
+                &external.borrow(),
+                &announced_addrs.borrow(),
+                std::time::Instant::now(),
+            )
+        }));
     }
     {
         let p2p_handle_for_score = p2p_handle.clone();
@@ -4052,7 +4067,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                     yield Ok::<_, std::io::Error>(tls);
                 }
             };
-            let mut builder = tonic::transport::Server::builder()
+            let mut builder = quil_rpc::pqnoise_channel::peer_server()
                 // h2 PING-based reaping of dead peers. This server faces
                 // the whole network; without keepalive every peer that
                 // disappears without FIN (crash, NAT timeout) leaks one
@@ -4201,6 +4216,7 @@ fn health_inputs(
         master_store_write_failed,
         // The configured count is the worker manager's; the source sets it.
         worker_capacity: 0,
+        store_io: quil_forest::store_io::latest().map(|report| report.to_proto()),
     }
 }
 
@@ -4306,7 +4322,7 @@ mod onion_exit_tests {
             1
         );
         assert_eq!(source.matches("DiagnosticsServer::new").count(), 1);
-        let peer = at("let mut builder = tonic::transport::Server::builder()");
+        let peer = at("let mut builder = quil_rpc::pqnoise_channel::peer_server()");
         let added = at(".add_service(diagnostics_service)");
         let served = peer
             + source[peer..]

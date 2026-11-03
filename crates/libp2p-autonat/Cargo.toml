@@ -137,6 +137,10 @@ manual_let_else = "warn"
 type_complexity = "allow"
 unnecessary_wraps = "warn"
 used_underscore_binding = "warn"
+# Findings in rust-libp2p code: allowed here, not restyled.
+cloned_ref_to_slice_refs = "allow"
+collapsible_match = "allow"
+explicit_auto_deref = "allow"
 
 [lints.clippy.pedantic]
 level = "allow"

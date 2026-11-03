@@ -715,6 +715,13 @@ impl TokenExecutionEngine {
         if operations.is_empty() {
             return counts;
         }
+        let background;
+        let worker = if pacing.background {
+            background = worker.background();
+            &background
+        } else {
+            worker
+        };
         let parallelism = pacing
             .parallelism
             .unwrap_or_else(|| worker.concurrency())
@@ -756,17 +763,21 @@ impl TokenExecutionEngine {
         counts
     }
 
-    /// Byte sizes of the confidential operations in `bundles` whose verdicts
-    /// `policy` has not cached yet: what executing them would still verify.
+    /// The confidential operations in `bundles` whose verdicts `policy` has
+    /// not cached yet, with their structure's verification floor: what
+    /// executing them would still verify.
     #[cfg(feature = "native-proof")]
-    pub fn unverified_operation_sizes(
+    pub fn unverified_operation_estimates(
         policy: &crate::token_intrinsic::dispatch::TokenPolicy,
         bundles: &[(Vec<u8>, Vec<u8>)],
-    ) -> Vec<usize> {
+    ) -> Vec<crate::manager::OperationEstimate> {
         Self::confidential_operations(bundles)
             .into_iter()
             .filter(|(address, bytes, tp)| !policy.verdict_cached(address, bytes, *tp))
-            .map(|(_, bytes, _)| bytes.len())
+            .map(|(_, bytes, tp)| crate::manager::OperationEstimate {
+                bytes: bytes.len(),
+                floor_secs: crate::token_intrinsic::dispatch::verify_floor_secs(&bytes, tp),
+            })
             .collect()
     }
 

@@ -139,7 +139,8 @@ mod tests {
             vec![vec![9; 4]]
         );
         assert!(decode_relay(1, &[]).unwrap().is_empty());
-        assert_eq!(relay_window(1), 1..=0);
+        // Frame 1 has no earlier frame to relay: an empty window.
+        assert_eq!(relay_window(1), std::ops::RangeInclusive::new(1, 0));
         assert_eq!(relay_window(20), 12..=19);
     }
 }

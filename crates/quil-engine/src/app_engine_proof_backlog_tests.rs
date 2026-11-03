@@ -224,3 +224,374 @@ fn frames_waiting_on_the_admission_queue_are_served_in_the_order_they_asked() {
          behind every frame that asked after it"
     );
 }
+
+/// A member voting on a view whose leader is a committee member: the voter
+/// check passes the proposal, then warms up its long confidential
+/// operations in the node's admission queue. Every verification finds the
+/// proof worker's node-wide slots taken (other worker processes hold them).
+struct BusyVoter {
+    manager: Arc<quil_execution::ExecutionEngineManager>,
+    check: crate::cw_app_seams::AppRequestsRootCheck,
+    outflows: Arc<FrameOutflows>,
+    clock: Arc<quil_store::RocksClockStore>,
+    filter: Vec<u8>,
+    _db: Arc<quil_store::RocksDb>,
+    /// The node-wide slot locks, held for the test.
+    _slots: Vec<std::fs::File>,
+    dir: std::path::PathBuf,
+}
+
+impl Drop for BusyVoter {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn busy_voter() -> BusyVoter {
+    use quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier;
+    let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+    let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+    let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+    let prover = Arc::new(quil_tries::ShaInclusionProver);
+    let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(store, prover.clone()));
+    crdt.set_forest(quil_forest::Forest::with_namespace(
+        db.inner(),
+        quil_store::FOREST_NAMESPACE,
+    ));
+    crdt.set_unified_tree(true);
+    crdt.warm_sizes(&[]).unwrap();
+    let crypto = quil_execution::testing::NoopExecutionCrypto::new();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let dir = std::env::temp_dir().join(format!(
+        "quil-admission-busy-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let slots = dir.join("slots");
+    let worker = WorkerVerifier::new(dir.join("absent-worker"), 1, Duration::from_secs(2))
+        .unwrap()
+        .with_concurrency(2)
+        .unwrap()
+        .with_shared_admission(slots.clone())
+        .unwrap();
+    let held: Vec<std::fs::File> = [slots.clone(), dir.join("slots.1")]
+        .into_iter()
+        .map(|path| {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            file.try_lock().unwrap();
+            file
+        })
+        .collect();
+    let manager = Arc::new(
+        quil_execution::ExecutionEngineManager::new_with_shards(
+            prover,
+            crypto.key_manager,
+            crdt.clone(),
+            crypto.circuit_compiler,
+            clock.clone(),
+            Arc::new(quil_execution::hypergraph_intrinsic::CrdtHypergraphConfigResolver::new(crdt)),
+            false,
+            None,
+            None,
+        )
+        .with_token_worker(
+            quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(0),
+            worker,
+        )
+        .unwrap(),
+    );
+    // Jobs the node's admission queue still holds keep this manager, and
+    // its stores, alive; its thread may drop the last one while the test
+    // process exits, closing RocksDB during static teardown ("pthread lock:
+    // Invalid argument"). Keep it for the process instead, as the node's
+    // own exit does.
+    std::mem::forget(manager.clone());
+    let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+    let outflows: Arc<FrameOutflows> = Arc::new(std::sync::Mutex::new(Default::default()));
+    let check = build_requests_root_check(
+        manager.clone(),
+        Arc::new(quil_tries::ShaInclusionProver),
+        manager.crdt(),
+        filter.clone(),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        outflows.clone(),
+        clock.clone(),
+        filter.clone(),
+        None,
+        None,
+    );
+    BusyVoter {
+        manager,
+        check,
+        outflows,
+        clock,
+        filter,
+        _db: db,
+        _slots: held,
+        dir,
+    }
+}
+
+/// A bundle of one shield of a legacy coin, distinct per `n`, structurally
+/// valid as a replayed one is (it passes dispatch's checks before native
+/// work; authorization and proof are not valid). Its proofs are not known to
+/// verify within the budget on a node that has not measured its size class,
+/// so members verify it in the background.
+fn shield_bundle(n: u32) -> quil_types::proto::global::MessageBundle {
+    use quil_lattice_ct::confidential::{
+        relation::membership::IDENTITY_BYTES,
+        shield::{Shield, ShieldStatement},
+        transfer::{parameter_context, Output, MEMO_BYTES},
+        AmountOpening, CommitmentKey,
+    };
+    use quil_types::proto::global::{message_request::Request, MessageBundle, MessageRequest};
+    let network = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(0).network;
+    let application = quil_execution::domains::QUIL_TOKEN;
+    let context = parameter_context(&network, &application);
+    let key = CommitmentKey::derive(&context);
+    let opening = AmountOpening::from_seed(&context, &[2; 32]);
+    let mut proof = vec![0; 40];
+    proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
+    let mut transparent_address = [3; 32];
+    transparent_address[..4].copy_from_slice(&n.to_be_bytes());
+    let op = Shield {
+        statement: ShieldStatement {
+            network,
+            application,
+            transparent_address,
+            owner_public_key: [4; 57],
+            amount: 12,
+            fee: 2,
+            outputs: vec![Output {
+                commitment: key.commit(10, &opening),
+                owner: [5; IDENTITY_BYTES],
+                memo: [6; MEMO_BYTES],
+            }],
+        },
+        signature: [0; 114],
+        proof,
+    }
+    .encode()
+    .unwrap();
+    MessageBundle {
+        requests: vec![MessageRequest {
+            timestamp: 0,
+            request: Some(Request::TokenOperation(
+                quil_types::proto::token::TokenOperation {
+                    canonical_bytes: op,
+                },
+            )),
+        }],
+        timestamp: i64::from(n),
+    }
+}
+
+fn canonical(bundle: &quil_types::proto::global::MessageBundle) -> Vec<u8> {
+    crate::consensus_wire::app_bundle_to_canonical_bytes(bundle).unwrap()
+}
+
+/// A proposal for app frame 1 over the genesis state carrying `requests`,
+/// which every voter check passes (body root, pre-state, fee total, relays).
+fn proposal(
+    voter: &BusyVoter,
+    rank: u64,
+    requests: Vec<quil_types::proto::global::MessageBundle>,
+) -> quil_types::proto::global::AppShardFrame {
+    let crdt = voter.manager.crdt();
+    let zero = vec![0u8; if crdt.has_forest() { 32 } else { 64 }];
+    let state_roots = [
+        ("vertex", "adds"),
+        ("vertex", "removes"),
+        ("hyperedge", "adds"),
+        ("hyperedge", "removes"),
+    ]
+    .iter()
+    .map(|(set, phase)| {
+        let root = crdt.sub_shard_commitment_for_filter(set, phase, &voter.filter);
+        if root.is_empty() {
+            zero.clone()
+        } else {
+            root
+        }
+    })
+    .collect();
+    let bodies: Vec<Vec<u8>> = requests.iter().map(canonical).collect();
+    let requests_root = compute_requests_root(
+        &bodies,
+        &voter.filter,
+        1,
+        Some(voter.manager.as_ref()),
+        Some(&quil_tries::ShaInclusionProver),
+        crdt.has_forest(),
+    )
+    .unwrap();
+    let (outflows, clock) = (voter.outflows.as_ref(), voter.clock.as_ref());
+    quil_types::proto::global::AppShardFrame {
+        header: Some(quil_types::proto::global::FrameHeader {
+            address: voter.filter.clone(),
+            frame_number: 1,
+            rank,
+            requests_root,
+            state_roots,
+            fee_total: materialized_fee_total(outflows, clock, &voter.filter, 0)
+                .expect("setup: genesis fee total")
+                .to_be_bytes()
+                .to_vec(),
+            settlements: settlement_relay(outflows, clock, &voter.filter, 1)
+                .expect("setup: settlement relay of frame 1"),
+            accumulator: accumulator_field(outflows, clock, &voter.filter, 1)
+                .expect("setup: accumulator field of frame 1"),
+            spends: spend_relay(outflows, clock, &voter.filter, 1)
+                .expect("setup: spend relay of frame 1"),
+            ..Default::default()
+        }),
+        requests,
+        ..Default::default()
+    }
+}
+
+/// R113-E-1. A committee member leading a run of views proposes bodies of
+/// replayed long confidential operations (public bytes of historic batch
+/// shields); none of its proposals finalizes. Every honest member's vote
+/// warms them up in its admission queue while the proof worker is busy.
+/// Then an honest finalized frame waits on a batch shield. The warm-ups
+/// must stay within the queue's bound, and the frame's submission, the
+/// only one a frame waits on, must not queue behind them. Uses only
+/// release-base interfaces: the voter check, the node's queue, and
+/// `offer_submission` as a deferred frame calls it.
+#[test]
+fn proposal_warm_ups_neither_grow_without_bound_nor_queue_ahead_of_a_finalized_frame() {
+    use crate::admission_verify::{self, MAX_BUNDLES};
+    const PROPOSALS: u32 = 30;
+    const BUNDLES: u32 = 10;
+    let voter = busy_voter();
+    let queue = admission_verify::global();
+    let mut warmed = Vec::new();
+    for view in 0..PROPOSALS {
+        let requests: Vec<_> = (0..BUNDLES)
+            .map(|i| shield_bundle(view * BUNDLES + i))
+            .collect();
+        warmed.extend(
+            requests
+                .iter()
+                .map(|bundle| admission_verify::digest(&canonical(bundle))),
+        );
+        let frame = proposal(&voter, u64::from(view) + 1, requests);
+        assert_eq!(
+            (voter.check)(&frame),
+            Ok(()),
+            "setup: the leader's proposal passes every voter check"
+        );
+    }
+    // The finalized frame's materialization defers on its batch shield
+    // (`defer_for_proof_verification`).
+    let honest = canonical(&shield_bundle(u32::MAX));
+    assert!(admission_verify::offer_submission(
+        queue,
+        &voter.manager,
+        &voter.filter,
+        &honest,
+        true
+    ));
+    let held = warmed.iter().filter(|digest| queue.pending(digest)).count();
+    let ahead = queue
+        .queued_ahead(&admission_verify::digest(&honest))
+        .unwrap_or(0);
+    assert!(
+        held <= MAX_BUNDLES && ahead == 0,
+        "vulnerable: unbounded lane growth and an honest frame starved behind speculative entries: \
+         {held} of {} vote-time warm-ups of {PROPOSALS} proposals that never finalized are held in \
+         the admission queue (its bound is {MAX_BUNDLES}), and the honest finalized frame's \
+         submission is queued behind {ahead} of them",
+        warmed.len()
+    );
+}
+
+/// R113-E-2. The other node processes' background verifications hold every
+/// node-wide worker slot but the first. A finalized frame's verification
+/// takes that slot (here it then fails, the worker executable being absent),
+/// while a warm-up and an arrival, background work, find the worker busy.
+#[test]
+fn a_finalized_frames_verification_takes_the_slot_background_work_leaves_free() {
+    use crate::admission_verify::{self, AdmissionQueue, MAX_FAILURES};
+    let voter = busy_voter();
+    // Only the second slot stays held by "another process".
+    voter._slots[0].unlock().unwrap();
+    let queue = AdmissionQueue::new(8, 1 << 20, false);
+    let (frame, warm, arrival) = (
+        canonical(&shield_bundle(1)),
+        canonical(&shield_bundle(2)),
+        canonical(&shield_bundle(3)),
+    );
+    assert!(admission_verify::offer_submission(
+        &queue,
+        &voter.manager,
+        &voter.filter,
+        &frame,
+        true
+    ));
+    assert!(admission_verify::offer_warmup_submission(
+        &queue,
+        &voter.manager,
+        &voter.filter,
+        &warm,
+        &voter.filter,
+        1
+    ));
+    assert!(admission_verify::offer_submission(
+        &queue,
+        &voter.manager,
+        &voter.filter,
+        &arrival,
+        false
+    ));
+    assert!(queue.run_one());
+    let after_frame = queue.stats().counts;
+    assert_eq!(
+        (after_frame.busy, after_frame.unavailable),
+        (0, 1),
+        "the finalized frame's verification found no node-wide slot although one was left free"
+    );
+    // It is retried first until released; then the background work runs.
+    assert!(queue.run_one() && queue.run_one());
+    assert!(queue.released(&admission_verify::digest(&frame)));
+    while queue.run_one() {}
+    let counts = queue.stats().counts;
+    assert!(
+        counts.busy > 0 && counts.unavailable == usize::from(MAX_FAILURES),
+        "background work took the node-wide slot left for frames: {counts:?}"
+    );
+}
+
+/// A proposal a voter refuses (here: a false fee total) can never finalize
+/// with this member's vote: its operations are not warmed up.
+#[test]
+fn a_refused_proposal_warms_up_nothing() {
+    use crate::admission_verify;
+    let voter = busy_voter();
+    let queue = admission_verify::global();
+    let requests: Vec<_> = (0..4).map(shield_bundle).collect();
+    let digests: Vec<_> = requests
+        .iter()
+        .map(|bundle| admission_verify::digest(&canonical(bundle)))
+        .collect();
+    let mut frame = proposal(&voter, 1, requests);
+    frame.header.as_mut().unwrap().fee_total = 7u128.to_be_bytes().to_vec();
+    assert_eq!(
+        (voter.check)(&frame).map_err(|(reason, _)| reason),
+        Err("fee total differs")
+    );
+    assert!(
+        digests.iter().all(|digest| !queue.pending(digest)),
+        "a refused proposal's operations were queued for verification"
+    );
+    frame.header.as_mut().unwrap().fee_total = 0u128.to_be_bytes().to_vec();
+    assert_eq!((voter.check)(&frame), Ok(()));
+    assert!(digests.iter().any(|digest| queue.pending(digest)));
+}
