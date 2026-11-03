@@ -379,14 +379,27 @@ pub fn init_pre_registration_frame(network: u8) -> Option<u64> {
     })
 }
 
-/// Shards that a split or merge recorded to apply at `epoch` creates from any
-/// of `confirmed`: every child of a split whose parent is confirmed, and the
-/// target of a merge one of whose sources is confirmed. A member confirming
-/// its shard in the epoch before the change registers leaves for these too,
-/// so it holds a registration for the shard it is on when the change
-/// applies; otherwise it proves nothing for that epoch. A split assigns each
-/// member its child when it applies, so every child is named. Sorted, without
-/// the confirmed filters themselves.
+/// Whether a recorded split or merge may apply at `epoch`, so the shards it
+/// creates are registered for it and read their data from its sources: at
+/// its effective epoch and, from the sealed storage epoch, at every later
+/// epoch it is still pending in. A committee handoff keeps a due change
+/// pending until its sources seal or are fenced, and from that epoch a
+/// member counts on a shard only with a seat sealed there: a change applying
+/// late must find its members registered and sealed for the epoch it
+/// applies in, or the shards it creates never produce.
+pub fn applies_at(change: &quil_types::store::PendingShardChange, epoch: u64) -> bool {
+    change.effective_epoch == epoch
+        || (change.effective_epoch < epoch && quil_types::consensus::sealed_storage_required(epoch))
+}
+
+/// Shards that a split or merge recorded to apply at `epoch` ([`applies_at`])
+/// creates from any of `confirmed`: every child of a split whose parent is
+/// confirmed, and the target of a merge one of whose sources is confirmed. A
+/// member confirming its shard in the epoch before the change registers
+/// leaves for these too, so it holds a registration for the shard it is on
+/// when the change applies; otherwise it proves nothing for that epoch. A
+/// split assigns each member its child when it applies, so every child is
+/// named. Sorted, without the confirmed filters themselves.
 pub fn pre_registration_targets(
     changes: &[quil_types::store::PendingShardChange],
     confirmed: &[Vec<u8>],
@@ -395,7 +408,7 @@ pub fn pre_registration_targets(
     use quil_types::store::ShardChangeKind;
     let mut targets: Vec<Vec<u8>> = changes
         .iter()
-        .filter(|change| change.effective_epoch == epoch)
+        .filter(|change| applies_at(change, epoch))
         .flat_map(|change| match change.kind {
             ShardChangeKind::Split if confirmed.contains(&change.parent) => change.children.clone(),
             ShardChangeKind::Merge if change.children.iter().any(|c| confirmed.contains(c)) => {
@@ -466,6 +479,57 @@ mod tests {
             pre_registration_targets(&changes, &[vec![1], vec![10], vec![11]], 8).is_empty(),
             "filters already confirmed are not repeated"
         );
+    }
+
+    /// From the sealed storage epoch a change a committee handoff keeps
+    /// pending past its effective epoch still names the shards it creates,
+    /// at every epoch until it applies; before that epoch only its effective
+    /// epoch does.
+    #[test]
+    fn a_change_still_pending_names_its_shards_from_the_sealed_storage_epoch() {
+        use quil_types::consensus::set_sealed_storage_epoch_for_thread;
+        use quil_types::store::{PendingShardChange, ShardChangeKind};
+        let changes = vec![
+            PendingShardChange {
+                kind: ShardChangeKind::Split,
+                parent: vec![1],
+                children: vec![vec![10], vec![11]],
+                effective_epoch: 8,
+                proposed_frame: 0,
+            },
+            PendingShardChange {
+                kind: ShardChangeKind::Merge,
+                parent: vec![2],
+                children: vec![vec![20], vec![21]],
+                effective_epoch: 8,
+                proposed_frame: 0,
+            },
+        ];
+        set_sealed_storage_epoch_for_thread(Some(9));
+        assert_eq!(
+            pre_registration_targets(&changes, &[vec![1]], 10),
+            vec![vec![10], vec![11]],
+            "a split still pending two epochs after its effective epoch"
+        );
+        assert_eq!(
+            pre_registration_targets(&changes, &[vec![20]], 9),
+            vec![vec![2]],
+            "a merge still pending"
+        );
+        assert!(
+            pre_registration_targets(&changes, &[vec![1]], 7).is_empty(),
+            "not before its effective epoch"
+        );
+        set_sealed_storage_epoch_for_thread(Some(11));
+        assert!(
+            pre_registration_targets(&changes, &[vec![1]], 10).is_empty(),
+            "before the sealed storage epoch, only at its effective epoch"
+        );
+        assert_eq!(
+            pre_registration_targets(&changes, &[vec![1]], 8),
+            vec![vec![10], vec![11]]
+        );
+        set_sealed_storage_epoch_for_thread(None);
     }
 
     /// `check_confirm_leaf_roots` admits exactly the groups a confirm

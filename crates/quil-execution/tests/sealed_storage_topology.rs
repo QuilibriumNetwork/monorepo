@@ -22,10 +22,10 @@
 //!   `invoke_frame_header` does after verifying.
 //! - A registration seals once GLOBAL can find its data
 //!   (`storage_snapshot::sources`, which `storage_epoch_proof::check_seat`
-//!   requires before the STARK), for the shards the member's engines run:
-//!   the shards it holds an allocation on (`AppEngine` seals only its own
-//!   filter), or with [`Seal::PreRegistered`] also the shards it
-//!   pre-registered.
+//!   requires before the STARK), for the shards the member's engines seal:
+//!   with [`Seal::Engine`] as `AppEngine` does, its own shard's and those
+//!   its shard's data was read for (`storage_snapshot::seals_pre_registered`),
+//!   or with [`Seal::PreRegistered`] every shard it pre-registered.
 //!
 //! The global settings are process-wide: these tests rely on nextest running
 //! each test in its own process.
@@ -111,12 +111,15 @@ fn row(bits: &[bool]) -> ShardInfo {
     }
 }
 
-/// The engines that seal a member's registrations.
+/// Which of a member's registrations its engines seal.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Seal {
-    /// Those of the shards it holds an active allocation on.
-    HeldShards,
-    /// Those too of the shards it pre-registered for a change.
+    /// As `AppEngine` does: those of the shards it holds an active allocation
+    /// on, and those of the shards it pre-registered whose data is its
+    /// shard's (`storage_snapshot::seals_pre_registered`).
+    Engine,
+    /// Those of the shards it holds an active allocation on and of every
+    /// shard it pre-registered for a change.
     PreRegistered,
 }
 
@@ -286,7 +289,21 @@ impl World {
                     continue;
                 }
                 let sealing: Vec<Vec<u8>> = match self.seal {
-                    Seal::HeldShards => vec![filter.clone()],
+                    Seal::Engine => std::iter::once(filter.clone())
+                        .chain(
+                            targets
+                                .iter()
+                                .filter(|shard| {
+                                    storage_snapshot::sources(shard, next, &pending, lookup)
+                                        .is_some_and(|sources| {
+                                            storage_snapshot::seals_pre_registered(
+                                                filter, shard, &sources, next,
+                                            )
+                                        })
+                                })
+                                .cloned(),
+                        )
+                        .collect(),
                     Seal::PreRegistered => {
                         std::iter::once(filter).chain(&targets).cloned().collect()
                     }
@@ -574,20 +591,14 @@ const MERGE_SEEDS: &[(u8, &[bool])] = &[(0x10, C0), (0x11, C0), (0x12, C1), (0x1
 /// Members confirm and seal as their engines do.
 #[test]
 fn a_split_child_produces_with_its_moved_members_past_the_sealed_storage_epoch() {
-    let (applied, trace) = run(SPLIT_ROWS, SPLIT_SEEDS, p_split(), false, Seal::HeldShards);
+    let (applied, trace) = run(SPLIT_ROWS, SPLIT_SEEDS, p_split(), false, Seal::Engine);
     assert_produces("the split of 1", applied, &trace);
 }
 
 /// (b) The same for a merge.
 #[test]
 fn a_merged_shard_produces_with_its_moved_members_past_the_sealed_storage_epoch() {
-    let (applied, trace) = run(
-        MERGE_ROWS,
-        MERGE_SEEDS,
-        branch_merge(),
-        false,
-        Seal::HeldShards,
-    );
+    let (applied, trace) = run(MERGE_ROWS, MERGE_SEEDS, branch_merge(), false, Seal::Engine);
     assert_produces("the merge into 1‖1", applied, &trace);
 }
 
@@ -619,10 +630,11 @@ fn a_merge_through_committee_handoff_keeps_the_merged_shard_producing() {
     assert_produces("the merge into 1‖1 through handoff", applied, &trace);
 }
 
-/// Control for (a): when members also seal the child seats they
+/// Control for (a): when members seal every child seat they
 /// pre-registered, which GLOBAL admits from the parent's snapshot, the
-/// children produce from the split's epoch on. It differs from (a) only in
-/// that, so (a) is its mutation.
+/// children produce from the split's epoch on. (a) differs from it only in
+/// sealing by the engines' rule, so it fails when that rule leaves a seat
+/// the children need unsealed.
 #[test]
 fn sealing_pre_registered_seats_keeps_a_split_child_producing() {
     let (applied, trace) = run(

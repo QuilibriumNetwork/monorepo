@@ -163,9 +163,11 @@ pub struct Source {
 }
 
 /// Where `filter`'s data for `epoch` is read from: the parent of a split
-/// applying at `epoch` that creates it, each shard a merge applying then
-/// joins into it, or else its own snapshot. `None` until every one of them
-/// is recorded (`lookup`).
+/// that may apply at `epoch` and creates it, each shard a merge that may
+/// apply then joins into it ([`applies_at`]), or else its own snapshot.
+/// `None` until every one of them is recorded (`lookup`).
+///
+/// [`applies_at`]: super::leaf_root_registration::applies_at
 pub fn sources(
     filter: &[u8],
     epoch: u64,
@@ -175,7 +177,7 @@ pub fn sources(
     use quil_types::store::ShardChangeKind;
     let mut parents: Vec<Vec<u8>> = changes
         .iter()
-        .filter(|change| change.effective_epoch == epoch)
+        .filter(|change| super::leaf_root_registration::applies_at(change, epoch))
         .find_map(|change| match change.kind {
             ShardChangeKind::Split if change.children.iter().any(|child| child == filter) => {
                 Some(vec![change.parent.clone()])
@@ -200,6 +202,21 @@ pub fn sources(
                 })
         })
         .collect()
+}
+
+/// Whether the engine of a member's shard `own` seals its registration on
+/// `shard` for `epoch`, read from `sources` ([`sources`]): from the sealed
+/// storage epoch, a shard other than its own whose data is its own shard's,
+/// the child of a split of it or the target of a merge of it, which its
+/// confirm registered (`pre_registration_targets`). A member counts on a
+/// shard only with a seat sealed there, and no engine runs such a shard
+/// before the change applies: without this, a shard a split or merge creates
+/// has no sealed member when it starts, so no header of it is admitted, no
+/// snapshot of it is recorded and no later seal is possible either.
+pub fn seals_pre_registered(own: &[u8], shard: &[u8], sources: &[Source], epoch: u64) -> bool {
+    shard != own
+        && quil_types::consensus::sealed_storage_required(epoch)
+        && sources.iter().any(|source| source.filter == own)
 }
 
 /// Encode each shard's snapshot sources, as a master sends them to the
@@ -483,5 +500,94 @@ mod tests {
             ],
             "a merge reads each source"
         );
+    }
+
+    /// From the sealed storage epoch a shard a change creates reads its
+    /// sources at every epoch the change is still pending in, as a committee
+    /// handoff keeps a due change until its sources seal or are fenced.
+    #[test]
+    fn a_shard_a_change_still_pending_creates_reads_its_sources() {
+        use quil_types::consensus::set_sealed_storage_epoch_for_thread;
+        let (parent, left, right) = (vec![0xA0], vec![0xA0, 0], vec![0xA0, 1]);
+        let lookup = |filter: &[u8]| match filter {
+            [0xA0] => Some(snapshot(11, 1)),
+            [0xA0, 0] => Some(snapshot(11, 2)),
+            [0xA0, 1] => Some(snapshot(11, 3)),
+            _ => None,
+        };
+        let change = |kind| PendingShardChange {
+            kind,
+            parent: parent.clone(),
+            children: vec![left.clone(), right.clone()],
+            effective_epoch: 9,
+            proposed_frame: 1,
+        };
+        let (split, merge) = (
+            change(ShardChangeKind::Split),
+            change(ShardChangeKind::Merge),
+        );
+        let from = |filter: &Vec<u8>, seed| Source {
+            filter: filter.clone(),
+            snapshot: snapshot(11, seed),
+        };
+        set_sealed_storage_epoch_for_thread(Some(10));
+        assert_eq!(
+            sources(&right, 11, std::slice::from_ref(&split), |filter| {
+                (filter == parent.as_slice()).then(|| snapshot(11, 1))
+            }),
+            Some(vec![from(&parent, 1)]),
+            "a split child two epochs after the split's effective epoch"
+        );
+        assert_eq!(
+            sources(&parent, 11, std::slice::from_ref(&merge), lookup),
+            Some(vec![from(&left, 2), from(&right, 3)]),
+            "a merge target"
+        );
+        set_sealed_storage_epoch_for_thread(Some(12));
+        assert_eq!(
+            sources(&parent, 11, std::slice::from_ref(&merge), lookup),
+            Some(vec![from(&parent, 1)]),
+            "before the sealed storage epoch, its own snapshot as before"
+        );
+        set_sealed_storage_epoch_for_thread(None);
+    }
+
+    /// A member's engine seals, beside its own seat, the seats its shard's
+    /// data was read for: a split child's, a merge target's.
+    #[test]
+    fn an_engine_seals_the_registrations_read_from_its_shard() {
+        use quil_types::consensus::set_sealed_storage_epoch_for_thread;
+        let (own, child, other) = (vec![0xA0], vec![0xA0, 1], vec![0xB0]);
+        let from = |filters: Vec<Vec<u8>>| -> Vec<Source> {
+            filters
+                .into_iter()
+                .map(|filter| Source {
+                    filter,
+                    snapshot: snapshot(9, 1),
+                })
+                .collect()
+        };
+        set_sealed_storage_epoch_for_thread(Some(9));
+        assert!(
+            seals_pre_registered(&own, &child, &from(vec![own.clone()]), 9),
+            "a split child of its shard"
+        );
+        assert!(
+            seals_pre_registered(&own, &child, &from(vec![own.clone(), other.clone()]), 9),
+            "a merge target one of whose sources is its shard"
+        );
+        assert!(
+            !seals_pre_registered(&own, &own, &from(vec![own.clone()]), 9),
+            "its own seat, sealed as its own"
+        );
+        assert!(
+            !seals_pre_registered(&own, &other, &from(vec![other.clone()]), 9),
+            "a shard read from another shard's data"
+        );
+        assert!(
+            !seals_pre_registered(&own, &child, &from(vec![own.clone()]), 8),
+            "before the sealed storage epoch"
+        );
+        set_sealed_storage_epoch_for_thread(None);
     }
 }
