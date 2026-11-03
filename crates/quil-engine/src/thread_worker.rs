@@ -1954,18 +1954,8 @@ mod tests {
     async fn a_stopped_worker_restarts_with_its_allocation() {
         let mgr = Arc::new(ThreadWorkerManager::new());
         let mut rx = mgr.take_master_rx().unwrap();
-        async fn ready(rx: &mut mpsc::Receiver<WorkerToMaster>) -> bool {
-            let wait = std::time::Duration::from_secs(5);
-            loop {
-                match tokio::time::timeout(wait, rx.recv()).await {
-                    Ok(Some(WorkerToMaster::Ready { core_id: 1 })) => return true,
-                    Ok(Some(_)) => continue,
-                    _ => return false,
-                }
-            }
-        }
         mgr.set_worker_filter(1, b"active-filter", true).unwrap();
-        assert!(ready(&mut rx).await);
+        assert!(worker_ready(&mgr, &mut rx).await);
         let stopping = mgr.clone();
         let stopped = tokio::task::spawn_blocking(move || {
             stopping.stop_worker(1, std::time::Duration::from_secs(5))
@@ -2011,9 +2001,9 @@ mod tests {
             "a stopped worker runs nothing"
         );
         mgr.restart_worker(1).unwrap();
-        assert!(ready(&mut rx).await, "the new thread starts");
+        assert!(worker_ready(&mgr, &mut rx).await, "the new thread starts");
         assert!(
-            ready(&mut rx).await,
+            worker_ready(&mgr, &mut rx).await,
             "and applies the allocation it has now"
         );
         assert!(
@@ -2027,14 +2017,31 @@ mod tests {
         assert!(running.await.unwrap().is_empty());
     }
 
-    /// The next `Ready` from worker 1 within five seconds, if any.
-    async fn worker_ready(rx: &mut mpsc::Receiver<WorkerToMaster>) -> bool {
-        let wait = std::time::Duration::from_secs(5);
+    /// The next `Ready` from worker 1, waited for while its thread runs:
+    /// false once the thread has ended without one. A fixed bound would be a
+    /// bound on the runner's load: a start takes about 0.1 s beside other
+    /// tests, and over 5 s on a host loaded past its CPUs (2026-11-03). The
+    /// deadline only catches a thread that neither starts nor ends.
+    async fn worker_ready(
+        mgr: &ThreadWorkerManager,
+        rx: &mut mpsc::Receiver<WorkerToMaster>,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
-            match tokio::time::timeout(wait, rx.recv()).await {
+            let poll = std::time::Duration::from_millis(50);
+            match tokio::time::timeout(poll, rx.recv()).await {
                 Ok(Some(WorkerToMaster::Ready { core_id: 1 })) => return true,
                 Ok(Some(_)) => continue,
-                _ => return false,
+                Ok(None) => return false,
+                // What it sent before it ended is still queued.
+                Err(_) if !mgr.worker_running(1) => {
+                    return std::iter::from_fn(|| rx.try_recv().ok())
+                        .any(|m| matches!(m, WorkerToMaster::Ready { core_id: 1 }));
+                }
+                Err(_) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "worker 1's thread neither started nor ended"
+                ),
             }
         }
     }
@@ -2163,7 +2170,7 @@ mod tests {
 
         mgr.set_worker_filter(1, b"pinned-filter", false).unwrap();
         assert!(
-            worker_ready(&mut rx).await,
+            worker_ready(&mgr, &mut rx).await,
             "the worker starts on its own store"
         );
         assert!(store_open_becomes(true).await);
@@ -2176,7 +2183,7 @@ mod tests {
 
         mgr.restart_worker(1).unwrap();
         assert!(
-            worker_ready(&mut rx).await && worker_ready(&mut rx).await,
+            worker_ready(&mgr, &mut rx).await && worker_ready(&mgr, &mut rx).await,
             "restarted on its allocation"
         );
         assert!(store_open_becomes(true).await, "the store is reopened");
@@ -2193,7 +2200,7 @@ mod tests {
         fail.store(true, std::sync::atomic::Ordering::SeqCst);
         mgr.restart_worker(1).unwrap();
         assert!(
-            !worker_ready(&mut rx).await,
+            !worker_ready(&mgr, &mut rx).await,
             "no worker runs without its own store"
         );
         assert!(!mgr.worker_running(1), "its thread ended");
