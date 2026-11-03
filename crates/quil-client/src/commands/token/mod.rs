@@ -467,7 +467,15 @@ pub enum TokenCommand {
         #[arg(long, value_name = "SECS", default_value_t = 0)]
         wait: u64,
     },
-    /// Print this wallet's confidential (lattice) receiving address.
+    /// Print this wallet's two confidential addresses: receiving, then escrow.
+    ///
+    /// Line 1: the receiving address, for `token transfer`.
+    ///
+    /// Line 2: the escrow address (the receiving address and this node's
+    /// Falcon claim key), for `token pending-transfer`: the recipient
+    /// accepts it; after expiry the sender may reject it to refund.
+    ///
+    /// Each line is labelled on stderr; stdout carries the bare addresses.
     ConfidentialAddress,
     /// Report the global commit's decision on a submitted confidential
     /// operation: `inclusion <Operation>`, the id its submission printed.

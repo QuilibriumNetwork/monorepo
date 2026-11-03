@@ -33,6 +33,11 @@ struct GlobalFlags {
     /// Auto-approve prompts.
     #[arg(short = 'y', long = "yes", global = true, default_value_t = false)]
     yes: bool,
+
+    /// Also print how each result was derived (frames, sizes, margins,
+    /// page counts, timings, base units), as a bug report needs.
+    #[arg(short = 'v', long = "verbose", global = true, default_value_t = false)]
+    verbose: bool,
 }
 
 impl From<&GlobalFlags> for GlobalArgs {
@@ -140,6 +145,7 @@ fn real_main() -> anyhow::Result<()> {
 
     // After parsing: `--help` and `--version` exit there, usable by any build.
     let cli = Cli::parse();
+    quil_client::verbosity::set(cli.global.verbose);
     signature_check(&cli)?;
     let global = GlobalArgs::from(&cli.global);
 
@@ -288,6 +294,20 @@ mod tests {
             &["node", "update"],
         ] {
             assert!(super::wants_signature_check(&parse(args)), "{args:?}");
+        }
+    }
+
+    /// `-v` parses before or after the subcommand and is off unless given.
+    #[test]
+    fn the_verbose_flag_is_global_and_off_by_default() {
+        use clap::Parser;
+        for (args, verbose) in [
+            (&["qclient", "-v", "config", "print"][..], true),
+            (&["qclient", "config", "print", "--verbose"][..], true),
+            (&["qclient", "config", "print"][..], false),
+        ] {
+            let cli = super::Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.global.verbose, verbose, "{args:?}");
         }
     }
 
