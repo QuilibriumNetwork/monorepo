@@ -790,7 +790,18 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         "starting quil-node"
     );
 
-    info!(config_dir = %args.config.display(), "loaded configuration");
+    // Canonical paths: `--config` may be relative or a symlink, and an
+    // operator comparing against the client needs the files actually read.
+    let config_dir = std::fs::canonicalize(&args.config).unwrap_or_else(|_| args.config.clone());
+    let keystore = quil_keys::resolve_keystore_path(&config.key.key_store_file, &args.config)
+        .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "unresolved".to_string());
+    info!(
+        config_dir = %config_dir.display(),
+        keystore = %keystore,
+        "loaded configuration"
+    );
     // The master reports, once, config keys the node does not know, the
     // settings of earlier releases and, on mainnet, a configured bootstrap
     // list that the built-in one replaced.

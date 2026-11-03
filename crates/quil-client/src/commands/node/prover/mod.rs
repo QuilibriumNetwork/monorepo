@@ -100,9 +100,23 @@ pub struct ProverCtx {
 
 impl ProverCtx {
     fn load(global: GlobalArgs) -> anyhow::Result<Self> {
+        Self::load_with(global, false)
+    }
+
+    /// For a CLI command: refuses an empty keystore. The node manager uses
+    /// `load`.
+    fn load_cli(global: GlobalArgs) -> anyhow::Result<Self> {
+        Self::load_with(global, true)
+    }
+
+    fn load_with(global: GlobalArgs, cli: bool) -> anyhow::Result<Self> {
         let ctx = crate::context::Context::load(global)?;
         let (node_config, dir) = ctx.load_node_config("default")?;
-        let key_manager = ctx.key_manager(&node_config, &dir)?;
+        let key_manager = if cli {
+            ctx.cli_key_manager(&node_config, &dir)?
+        } else {
+            ctx.key_manager(&node_config, &dir)?
+        };
         // Prover commands always use the local node (Go passes
         // lightNode=false unconditionally).
         let connect_opts = ConnectOpts {
@@ -165,7 +179,7 @@ pub async fn run(global: GlobalArgs, cmd: &ProverCommand) -> anyhow::Result<()> 
         return manage::command(global, args).await;
     }
 
-    let pc = ProverCtx::load(global)?;
+    let pc = ProverCtx::load_cli(global)?;
     match cmd {
         ProverCommand::Status => status::run(&pc).await,
         ProverCommand::Shards => shards::run(&pc).await,

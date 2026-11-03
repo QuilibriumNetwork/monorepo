@@ -59,6 +59,18 @@ impl Context {
         keys::build_key_manager(node_config, config_dir)
     }
 
+    /// The key manager for a CLI command that signs; refuses a keystore
+    /// with no keys, naming it and its config.
+    pub fn cli_key_manager(
+        &self,
+        node_config: &Config,
+        config_dir: &Path,
+    ) -> anyhow::Result<Arc<FileKeyManager>> {
+        let key_manager = self.key_manager(node_config, config_dir)?;
+        keys::require_keys(&key_manager, node_config, config_dir, false)?;
+        Ok(key_manager)
+    }
+
     /// Derive connection options from the client + node configs and an
     /// explicit `--public-rpc` flag (from a subcommand). Port of the
     /// light-node decision in `client/cmd/token/token.go`.

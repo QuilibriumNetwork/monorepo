@@ -101,7 +101,7 @@ pub async fn dry_run(global: GlobalArgs, configs: &[String]) -> anyhow::Result<(
         .map(|(_, key)| key)
         .collect();
     let keys = node_keys(configs)?;
-    let pc = super::ProverCtx::load(global)?;
+    let pc = super::ProverCtx::load_cli(global)?;
     let retro = match pc.connect().await {
         Ok(mut client) => RetroTable::fetch(&mut client, &keys).await,
         Err(error) => Err(error),

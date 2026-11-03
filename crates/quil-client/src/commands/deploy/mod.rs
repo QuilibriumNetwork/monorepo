@@ -123,7 +123,7 @@ impl DeployCtx {
     fn load(global: GlobalArgs) -> anyhow::Result<Self> {
         let ctx = Context::load(global.clone())?;
         let (node_config, config_dir) = ctx.load_node_config("default")?;
-        let key_manager = ctx.key_manager(&node_config, &config_dir)?;
+        let key_manager = ctx.cli_key_manager(&node_config, &config_dir)?;
         let alias_store = crate::alias_store::try_load_for_config_dir(&config_dir);
         let connect_opts = ConnectOpts {
             public_rpc: false,

@@ -755,8 +755,13 @@ impl TokenCtx {
         Self::from_context(&Context::load(global)?, common)
     }
 
+    /// Refuse a keystore with no keys, for the commands that sign or read
+    /// a wallet key (`token account` and `token legacy` read none).
+    pub(crate) fn require_keys(&self) -> anyhow::Result<()> {
+        crate::keys::require_keys(&self.key_manager, &self.node_config, &self.config_dir, true)
+    }
+
     fn from_context(ctx: &Context, common: &TokenCommonArgs) -> anyhow::Result<Self> {
-        output::line("Loading node config...".into());
         let config_arg = common.single_config()?;
         let (node_config, config_dir) = ctx.load_node_config(config_arg)?;
 
@@ -774,10 +779,7 @@ impl TokenCtx {
         // The legacy Ed448 peer id is shown only if the Falcon network key is
         // absent (a pre-migration keystore).
         let config_identity = ConfigIdentity::of(&node_config, &key_manager);
-        match config_identity.shown() {
-            Some(peer) => output::line(peer.to_string()),
-            None => output::line("(no network identity configured)".into()),
-        }
+        output::line(crate::keys::node_line(config_identity.shown(), &config_dir));
         if config_arg.is_empty() || config_arg == "default" {
             let unused = std::env::current_dir()
                 .ok()
@@ -888,6 +890,7 @@ pub(crate) async fn pay_for_bundle(
         max_fee: max_fee_from_env()?,
     };
     let tc = TokenCtx::load(global, &common)?;
+    tc.require_keys()?;
     wallet::pay_for_bundle(&tc, destination, rest, None, wait).await
 }
 
@@ -898,6 +901,9 @@ pub async fn run(global: GlobalArgs, args: &TokenArgs) -> anyhow::Result<()> {
         return legacy::run(global, &args.common, &application(args)?, listing).await;
     }
     let tc = TokenCtx::load(global, &args.common)?;
+    if !matches!(args.command, TokenCommand::Account) {
+        tc.require_keys()?;
+    }
     run_with_context(&tc, args).await
 }
 
