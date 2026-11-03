@@ -57,8 +57,25 @@ pub enum Cmd {
 
 // ── Message application ──────────────────────────────────────────────────
 
+/// The notice while a leave, pause or resume waits to sign: what it waits for
+/// and why. The next action message replaces it.
+fn signing_wait_text(action: &str, frames_left: u64) -> String {
+    format!(
+        "{action} waits for the next epoch to sign: this one ends in {frames_left} frames, and \
+         an operation landing after it is refused."
+    )
+}
+
 pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
     match msg {
+        Msg::SigningWait {
+            action,
+            frames_left,
+        } => {
+            m.status_msg = signing_wait_text(&action, frames_left);
+            m.status_is_error = false;
+            vec![]
+        }
         Msg::LegacyRefresh {
             answer,
             took,
@@ -1900,6 +1917,38 @@ mod tests {
     use super::super::model::FilterOutcome;
     use super::*;
     use quil_types::proto::node::{NodeInfoResponse, ShardAllocationInfo};
+
+    /// The wait to sign shows while the action is in flight, as a notice and
+    /// not an error, and a refresh does not clear it.
+    #[test]
+    fn the_manager_says_why_a_leave_waits_to_sign() {
+        let mut m = Model::new();
+        m.action_in_flight = true;
+        let cmds = apply_msg(
+            &mut m,
+            Msg::SigningWait {
+                action: "Leave".into(),
+                frames_left: 7,
+            },
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(
+            m.status_msg,
+            "Leave waits for the next epoch to sign: this one ends in 7 frames, and an operation \
+             landing after it is refused."
+        );
+        assert!(!m.status_is_error);
+        apply_msg(
+            &mut m,
+            Msg::DataRefresh {
+                node_info: None,
+                shard_info: None,
+                worker_info: None,
+                err: None,
+            },
+        );
+        assert!(m.status_msg.starts_with("Leave waits"), "{}", m.status_msg);
+    }
 
     fn operational_model(status: u32) -> Model {
         let mut m = Model::new();

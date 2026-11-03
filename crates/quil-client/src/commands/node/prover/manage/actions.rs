@@ -973,6 +973,7 @@ pub async fn do_lifecycle(
     action: String,
     filters: Vec<Vec<u8>>,
     original_status: u32,
+    progress: tokio::sync::mpsc::UnboundedSender<Msg>,
 ) -> Msg {
     let label = if action == "Pause" || action == "Resume" {
         trunc_hex(&hex::encode(filters.first().cloned().unwrap_or_default()))
@@ -981,6 +982,27 @@ pub async fn do_lifecycle(
     };
 
     let _ = label; // label mirrors Go's status string; unused in the Rust flow.
+
+    // Every node refuses one of these landing in a later epoch than it was
+    // signed in, so it signs clear of the epoch's end. A confirm or reject is
+    // valid only in this epoch and goes at once.
+    if matches!(action.as_str(), "Leave" | "Pause" | "Resume") {
+        if let Err(e) = super::super::frame_clear_of_epoch_end(
+            &mut client,
+            super::super::EPOCH_END_WAIT_CAP,
+            super::super::EPOCH_END_POLL,
+            |frames_left| {
+                let _ = progress.send(Msg::SigningWait {
+                    action: action.clone(),
+                    frames_left,
+                });
+            },
+        )
+        .await
+        {
+            return broadcast_err(&action, &filters, original_status, e.to_string());
+        }
+    }
 
     let frame = match get_frame_number(&mut client).await {
         Ok(f) => f,
@@ -1706,6 +1728,86 @@ mod mint_action_tests {
             assert!(!error.contains("--submit-config"), "{error}");
         }
         stop.send(()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod epoch_end_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+
+    /// The manager holds a leave, pause or resume near the epoch's end, and a
+    /// confirm or reject, valid only in this epoch, goes on at once (here to the
+    /// frame read, which this node has no provider for).
+    #[tokio::test]
+    async fn the_manager_signs_clear_of_the_end_of_an_epoch() {
+        let directory = tempfile::tempdir().unwrap();
+        let km = Arc::new(
+            FileKeyManager::new(
+                directory.path().join("keys.yml"),
+                "",
+                "q-prover-key".into(),
+                Box::new(quil_crypto::FalconKeyConstructor),
+            )
+            .unwrap(),
+        );
+        let length = quil_types::consensus::epoch_length_frames();
+        let mut server = quil_rpc::NodeRpcServer::default();
+        server.last_global_head_frame = Arc::new(AtomicU64::new(length - 1));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let multiaddr = format!(
+            "/ip4/127.0.0.1/tcp/{}",
+            listener.local_addr().unwrap().port()
+        );
+        let incoming = futures::stream::unfold(listener, |listener| async {
+            let result = listener.accept().await.map(|(socket, _)| socket);
+            Some((result, listener))
+        });
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    quil_types::proto::node::node_service_server::NodeServiceServer::new(server),
+                )
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+        let client = crate::rpc::connect_node_service(&crate::rpc::ConnectOpts {
+            listen_grpc_multiaddr: multiaddr,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let (progress, mut notices) = tokio::sync::mpsc::unbounded_channel();
+        let run = |action: &str| {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                do_lifecycle(
+                    client.clone(),
+                    km.clone(),
+                    action.to_string(),
+                    vec![vec![0xAA; 32]],
+                    2,
+                    progress.clone(),
+                ),
+            )
+        };
+        for held in ["Leave", "Pause", "Resume"] {
+            assert!(run(held).await.is_err(), "{held} waits for the next epoch");
+            match notices.try_recv() {
+                Ok(Msg::SigningWait {
+                    action,
+                    frames_left,
+                }) => assert_eq!((action.as_str(), frames_left), (held, 1)),
+                _ => panic!("{held} says nothing while it waits"),
+            }
+            assert!(notices.try_recv().is_err(), "{held} says it once");
+        }
+        for at_once in ["Confirm", "Reject"] {
+            assert!(run(at_once).await.is_ok(), "{at_once} does not wait");
+            assert!(notices.try_recv().is_err(), "{at_once} has no wait to tell");
+        }
     }
 }
 

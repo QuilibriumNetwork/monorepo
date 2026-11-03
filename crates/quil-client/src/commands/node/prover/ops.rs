@@ -125,7 +125,7 @@ pub async fn leave(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()>
 pub async fn confirm(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()> {
     let filters = parse_filters(filter_args)?;
     let mut client = pc.connect().await?;
-    let frame = pc.last_global_head_frame(&mut client).await?;
+    let frame = pc.frame_in_this_epoch(&mut client, "confirm").await?;
     send_split(pc, &mut client, "confirm", &filters, |chunk| {
         Ok(Request::Confirm(sign::confirm_op(
             &pc.key_manager,
@@ -144,7 +144,7 @@ pub async fn confirm(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<(
 pub async fn reject(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()> {
     let filters = parse_filters(filter_args)?;
     let mut client = pc.connect().await?;
-    let frame = pc.last_global_head_frame(&mut client).await?;
+    let frame = pc.frame_in_this_epoch(&mut client, "reject").await?;
     send_split(pc, &mut client, "reject", &filters, |chunk| {
         let sig = sign::reject_sig(&pc.key_manager, chunk, frame)?;
         Ok(Request::Reject(ProverReject {
@@ -212,9 +212,8 @@ pub async fn delegate(pc: &ProverCtx, address: &str) -> anyhow::Result<()> {
     // From the prover operation replay guard epoch the update signs the head
     // frame, so it cannot be submitted again later; before it the signature
     // covers the delegate address alone (frame 0).
-    let frame = quil_execution::global_intrinsic::prover_ops::ProverUpdate::signed_frame(
-        info.last_global_head_frame,
-    );
+    let head = pc.last_global_head_frame(&mut client).await?;
+    let frame = quil_execution::global_intrinsic::prover_ops::ProverUpdate::signed_frame(head);
     let sig = sign::update_sig(&pc.key_manager, &delegate_address, frame)?;
     let op = ProverUpdate {
         delegate_address: delegate_address.clone(),
@@ -254,7 +253,7 @@ pub async fn alt_shard_update(pc: &ProverCtx, roots_hex: &[String]) -> anyhow::R
     }
 
     let mut client = pc.connect().await?;
-    let frame = pc.last_global_head_frame(&mut client).await?;
+    let frame = pc.head_frame(&mut client).await?;
 
     let signer: Box<dyn Signer> = pc
         .key_manager

@@ -635,9 +635,11 @@ fn spawn_action(
             filters,
             original_status,
         } => {
+            let progress = tx.clone();
             tokio::spawn(async move {
                 let _ = tx.send(
-                    actions::do_lifecycle(client, km, action, filters, original_status).await,
+                    actions::do_lifecycle(client, km, action, filters, original_status, progress)
+                        .await,
                 );
             });
         }
