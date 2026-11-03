@@ -67,6 +67,12 @@ fn signing_wait_text(action: &str, frames_left: u64) -> String {
 }
 
 pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
+    apply_msg_at(m, msg, Instant::now())
+}
+
+/// [`apply_msg`] with the node's answers received at `now`: the clock the
+/// refresh observations (progress stalls, RPC freshness) count from.
+pub fn apply_msg_at(m: &mut Model, msg: Msg, now: Instant) -> Vec<Cmd> {
     match msg {
         Msg::SigningWait {
             action,
@@ -110,13 +116,13 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
             m.reward_loaded = true;
             m.reward_error = result.as_ref().err().cloned();
             m.claimable_reward = result.ok().flatten();
-            m.reward_last_success = m.claimable_reward.map(|_| Instant::now());
+            m.reward_last_success = m.claimable_reward.map(|_| now);
             vec![]
         }
         Msg::ShardLoading => {
             m.shard_loading = true;
             m.shard_message_time = Some(std::time::SystemTime::now());
-            m.shard_fetch_started = Some(Instant::now());
+            m.shard_fetch_started = Some(now);
             vec![]
         }
         Msg::ShardRefresh(result) => {
@@ -128,11 +134,11 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
                 .map(|started| started.elapsed());
             match result {
                 Ok(shards) => {
-                    m.observe_app_intervals(&shards, Instant::now());
-                    m.observe_reported_app_heads(&shards, Instant::now());
-                    m.observe_committed_app_heads(&shards, Instant::now());
+                    m.observe_app_intervals(&shards, now);
+                    m.observe_reported_app_heads(&shards, now);
+                    m.observe_committed_app_heads(&shards, now);
                     m.shard_error = None;
-                    m.shard_last_success = Some(Instant::now());
+                    m.shard_last_success = Some(now);
                     m.shard_last_duration = elapsed;
                     // Node status can arrive after shard data on initial load.
                     m.cached_shard_info = Some(shards.clone());
@@ -158,14 +164,14 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
             }
             if let Some(node) = &node_info {
                 m.node_global_cadence = node.frame_cadence.clone();
-                m.observe_global_head(node.last_received_frame, Instant::now());
+                m.observe_global_head(node.last_received_frame, now);
             }
             if let Some(shards) = &shard_info {
-                m.observe_app_intervals(shards, Instant::now());
-                m.observe_reported_app_heads(shards, Instant::now());
-                m.observe_committed_app_heads(shards, Instant::now());
+                m.observe_app_intervals(shards, now);
+                m.observe_reported_app_heads(shards, now);
+                m.observe_committed_app_heads(shards, now);
             }
-            m.last_fetch_success = Some(Instant::now());
+            m.last_fetch_success = Some(now);
             if m.consecutive_failures > 0 && m.status_msg.starts_with("Refresh failed: ") {
                 m.status_msg.clear();
                 m.status_sticky = false;

@@ -66,6 +66,8 @@ quil-execution = { path = "../quil-execution", features = ["testing-stubs"] }
 quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }
 quil-store = { path = "../quil-store" }
 tempfile = "3"
+# Paused time drives `--observe` through its polls in tests.
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true

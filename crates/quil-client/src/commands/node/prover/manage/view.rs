@@ -4064,6 +4064,48 @@ pub(super) fn render_text(m: &mut Model, width: u16, height: u16) -> String {
         .collect()
 }
 
+/// The Notifications lines of both tabs, as `manage --render --notices`
+/// prints them: one notice per line, unwrapped, as
+/// `[HH:MM:SS UTC] <ERROR|WARN|INFO> <text>`, the severity its color shows
+/// on screen. A line both tabs show (the status line) prints once.
+pub(super) fn notice_text(m: &mut Model) -> String {
+    update_message_lifetime(m);
+    let (_, status) = footer_lines(m);
+    let mut lines = message_lines(m, status, u16::MAX);
+    lines.extend(coins_view::notice_lines(m, u16::MAX));
+    let mut printed = std::collections::HashSet::new();
+    lines
+        .iter()
+        .filter_map(notice_entry)
+        .filter(|entry| printed.insert(entry.clone()))
+        .map(|entry| entry + "\n")
+        .collect()
+}
+
+/// One Notifications line as `[HH:MM:SS UTC] <SEVERITY> <text>`; a line
+/// without its own timestamp takes the current time. `None` for a blank.
+fn notice_entry(line: &Line<'static>) -> Option<String> {
+    let text = line.to_string();
+    if text.trim().is_empty() {
+        return None;
+    }
+    let color = line.spans.iter().find_map(|span| span.style.fg);
+    let severity = if color == Some(ERROR) {
+        "ERROR"
+    } else if color == Some(WARNING) {
+        "WARN"
+    } else {
+        "INFO"
+    };
+    let stamped = text.starts_with('[') && text.get(9..15) == Some(" UTC] ");
+    let (stamp, body) = if stamped {
+        (text[..15].to_string(), &text[15..])
+    } else {
+        (message_timestamp(None), text.as_str())
+    };
+    Some(format!("{stamp}{severity} {body}"))
+}
+
 /// The help screen at `width`, as plain text without colors.
 pub(super) fn help_text(width: u16) -> String {
     help_lines(width, false)
