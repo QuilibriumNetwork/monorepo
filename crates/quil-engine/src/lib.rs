@@ -60,6 +60,7 @@ pub mod prover_pipeline;
 pub mod prover_tree_syncer;
 pub mod provers;
 mod recovery_turns;
+mod relay_reoffer;
 pub mod remote_worker;
 pub mod resolver_traffic;
 pub mod rewards;

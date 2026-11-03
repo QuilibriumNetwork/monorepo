@@ -2855,6 +2855,8 @@ pub struct AppConsensusEngine {
     /// materialized twice (mirrors Go `lastMaterializedFrame`,
     /// app_consensus_engine.go:1444-1449).
     last_materialized_frame: u64,
+    /// Spend relays GLOBAL skipped (`crate::relay_reoffer`).
+    relay_watch: crate::relay_reoffer::RelayWatch,
     /// Thread-safe mirror of `last_materialized_frame` for the CW proposal
     /// check, which runs on the simplex thread. Bumped alongside the
     /// field via [`Self::set_materialized_frame`] wherever the materialized
@@ -3220,6 +3222,7 @@ impl AppConsensusEngine {
             retry_parent_seals: std::collections::BTreeSet::new(),
             pending_seal_rank: None,
             last_materialized_frame: 0,
+            relay_watch: Default::default(),
             shard_mat_frame,
             execution,
             data_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -8643,6 +8646,7 @@ impl AppConsensusEngine {
         }
         if matches!(status, Ok(true)) {
             self.observe_session_view_lag(&global, &session, now, &filter);
+            self.reoffer_unrelayed_spends(&global);
         }
         match status {
             Ok(true) => {}
@@ -8666,6 +8670,89 @@ impl AppConsensusEngine {
             }
             // Logged above, at its transitions.
             Err(_) => {}
+        }
+    }
+
+    /// Put back in the mempool the confidential bundles GLOBAL's executed
+    /// headers skipped the spend relay of (`crate::relay_reoffer`), from the
+    /// tip this tick's view read. Reads no store unless the tip jumped past
+    /// the relay window, or on the first tick after a start.
+    fn reoffer_unrelayed_spends(&mut self, global: &Arc<quil_hypergraph::HypergraphCrdt>) {
+        use crate::message_collector::SubmitOutcome;
+        use crate::relay_reoffer::{unrelayed_bundles, MAX_REOFFERS, REOFFER_HORIZON_FRAMES};
+        use sha3::Digest;
+        let Some(tip) = self.lagging_voter.global_tip else {
+            return;
+        };
+        let Some(application) = self
+            .app_address
+            .get(..32)
+            .and_then(|address| <[u8; 32]>::try_from(address).ok())
+        else {
+            return;
+        };
+        let filter = hex::encode(&self.filter);
+        let expired = self.relay_watch.observe_tip(tip);
+        if expired > 0 {
+            // Most such frames carry nothing; GLOBAL's own coverage warning
+            // names actual skips.
+            info!(filter = %filter, executed_tip = tip, frames = expired,
+                horizon_frames = REOFFER_HORIZON_FRAMES,
+                "source frames left the spend re-offer horizon without being examined: \
+                 a spend GLOBAL skipped there stays uncommitted until its sender submits it again");
+        }
+        for frame in self.relay_watch.due() {
+            let bundles = match unrelayed_bundles(
+                self.clock_store.as_ref(),
+                global,
+                &application,
+                &self.filter,
+                frame,
+                self.last_materialized_frame,
+            ) {
+                Ok(bundles) => bundles,
+                Err(error) => {
+                    // Another member holds it, or the next jump's pass reads it.
+                    info!(filter = %filter, source_frame = frame, executed_tip = tip, error = %error,
+                        "cannot examine a frame GLOBAL skipped the spend relay of on this node");
+                    self.relay_watch.examined(frame);
+                    continue;
+                }
+            };
+            let mut retry = false;
+            for canonical in bundles {
+                let hash: [u8; 32] = sha3::Sha3_256::digest(&canonical).into();
+                let bundle = hex::encode(&hash[..4]);
+                if !self.relay_watch.may_reoffer(&hash) {
+                    if self.relay_watch.note_given_up(&hash) {
+                        warn!(filter = %filter, source_frame = frame, executed_tip = tip, bundle = %bundle,
+                            reoffers = MAX_REOFFERS, scope = "network: GLOBAL keeps skipping this bundle's relay",
+                            action = "it stays uncommitted and consumed nothing: its sender submits it again",
+                            "giving up re-offering a confidential bundle");
+                    }
+                    continue;
+                }
+                match self.message_collector.readmit(canonical) {
+                    SubmitOutcome::Accepted => {
+                        let attempt = self.relay_watch.note_reoffered(hash);
+                        info!(filter = %filter, source_frame = frame, executed_tip = tip, bundle = %bundle,
+                            attempt, max_attempts = MAX_REOFFERS,
+                            "re-offering a confidential bundle: GLOBAL executed past every header \
+                             relaying it without deciding it; a later frame executes it again");
+                    }
+                    SubmitOutcome::Duplicate => {}
+                    SubmitOutcome::Filtered(refusal) => {
+                        // The collector logs a full rank; the frame waits for
+                        // room, within the horizon.
+                        retry = retry || refusal.retryable();
+                        debug!(filter = %filter, source_frame = frame, bundle = %bundle,
+                            reason = refusal.reason(), "mempool refused a re-offered bundle");
+                    }
+                }
+            }
+            if !retry {
+                self.relay_watch.examined(frame);
+            }
         }
     }
 
@@ -26194,3 +26281,7 @@ mod proof_backlog_tests;
 #[cfg(test)]
 #[path = "app_engine_arrival_tests.rs"]
 mod arrival_tests;
+
+#[cfg(test)]
+#[path = "app_engine_relay_tests.rs"]
+mod relay_tests;

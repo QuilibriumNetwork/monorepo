@@ -152,6 +152,12 @@ impl FinalizedSet {
             }
         }
     }
+
+    fn remove(&mut self, h: &[u8; 32]) {
+        if self.set.remove(h) {
+            self.order.retain(|held| held != h);
+        }
+    }
 }
 
 /// Outcome of adding a message to a [`RankBuffer`].
@@ -1667,6 +1673,25 @@ impl MessageCollector {
         buffers.retain(|_, b| !b.is_empty());
     }
 
+    /// Take back `data`, a message a finalized frame consumed that has to run
+    /// again (`crate::relay_reoffer`), as the newest message. A refusal, such
+    /// as a full rank, leaves it consumed for the caller to try again.
+    pub(crate) fn readmit(&self, data: Vec<u8>) -> SubmitOutcome {
+        let hash = message_key(&data);
+        let consumed = {
+            let mut finalized = self.finalized.write().unwrap();
+            let consumed = finalized.contains(&hash);
+            finalized.remove(&hash);
+            consumed
+        };
+        let rank = self.newest_rank.load(std::sync::atomic::Ordering::Acquire);
+        let outcome = self.add_message_outcome(rank, data);
+        if consumed && matches!(outcome, SubmitOutcome::Filtered(_)) {
+            self.finalized.write().unwrap().insert(hash);
+        }
+        outcome
+    }
+
     /// Hold `raw_msgs` at `rank`, for a retention window starting there, in
     /// the order given and ahead of what arrived at `rank` itself. A proposal
     /// that holds collected messages back (an application shard's
@@ -1983,6 +2008,53 @@ mod tests {
         // included in a finalized frame).
         assert!(!mc.add_message(3, b"tx-1".to_vec()));
         assert!(mc.collect_for_rank(3).is_empty());
+    }
+
+    /// A consumed message taken back is collected again, stays one message
+    /// however often it arrives, and a later finalized frame consumes it again.
+    #[test]
+    fn a_readmitted_message_is_collected_and_consumed_again() {
+        let mc = MessageCollector::new();
+        let data = b"bundle".to_vec();
+        assert!(mc.add_message(1, data.clone()));
+        mc.mark_finalized(std::slice::from_ref(&data));
+        assert!(!mc.add_message(1, data.clone()), "consumed");
+        assert!(mc.collect_for_rank(1).is_empty());
+
+        assert_eq!(mc.readmit(data.clone()), SubmitOutcome::Accepted);
+        assert_eq!(mc.readmit(data.clone()), SubmitOutcome::Duplicate);
+        assert_eq!(mc.collect_for_rank(1), vec![data.clone()]);
+
+        mc.mark_finalized(std::slice::from_ref(&data));
+        assert!(mc.collect_for_rank(1).is_empty());
+        assert!(!mc.add_message(1, data), "consumed again");
+    }
+
+    /// Readmission meets the rank's cap like any arrival: refused, the message
+    /// stays consumed, and it goes in once there is room.
+    #[test]
+    fn a_readmission_a_full_rank_refuses_stays_consumed_until_there_is_room() {
+        let mc = MessageCollector::new();
+        let data = b"bundle".to_vec();
+        mc.mark_finalized(std::slice::from_ref(&data));
+        let fillers: Vec<Vec<u8>> = (0..MAX_MESSAGES_PER_RANK as u64)
+            .map(|i| i.to_be_bytes().to_vec())
+            .collect();
+        for filler in &fillers {
+            assert!(mc.add_message_newest(filler.clone()));
+        }
+        assert_eq!(
+            mc.readmit(data.clone()),
+            SubmitOutcome::Filtered(Refusal::RankFull)
+        );
+        assert_eq!(
+            mc.add_message_outcome(0, data.clone()),
+            SubmitOutcome::Duplicate,
+            "still consumed: another copy arriving does not bring it back"
+        );
+        mc.remove(&fillers);
+        assert_eq!(mc.readmit(data.clone()), SubmitOutcome::Accepted);
+        assert_eq!(mc.collect_for_rank(0), vec![data]);
     }
 
     #[test]
