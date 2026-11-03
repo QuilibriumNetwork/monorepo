@@ -20,6 +20,16 @@
 //! leaf refused room is labelled where it is needed instead, as by a process
 //! that keeps no labels, and leaves nothing on disk.
 //!
+//! Labels kept are a cache: the node's stores and logs on the filesystem
+//! must not starve for them (2026-11-03: a regular node's labels held 175
+//! of its 207 GB used and every store failed its writes once the stores'
+//! growth ate the floor). Once free space falls below the floor, labels not
+//! in use are released until it is back [`release_band`] above it, latest
+//! needed first ([`LabelStore::keep_floor`], checked every
+//! [`FLOOR_CHECK_EVERY`]), and labelling ahead waits until free space is
+//! back at [`resume_free`]; their snapshots and seals label those leaves at
+//! need.
+//!
 //! Labelling ahead gives its memory back while more urgent work waits for
 //! memory it holds (`crate::storage_jobs::Reservation::yield_requested`): the
 //! whole layers it labelled stay on disk, marked for the next attempt at the
@@ -96,13 +106,43 @@ pub const DISK_FLOOR_MIN_BYTES: u64 = 8 << 30;
 
 /// A leaf is labelled and kept only with this many times its labels' bytes
 /// free above the floor: room for whatever else writes to the filesystem
-/// meanwhile, the stores and the logs among them.
+/// meanwhile, the stores and the logs among them. What they take of the
+/// floor later, labels give back ([`LabelStore::keep_floor`]).
 pub const DISK_MARGIN: u64 = 2;
 
 /// How long a shard whose leaves were refused room waits before it is
 /// labelled ahead again: the labels of the epoch before free their room once
 /// their registration is sealed.
 const REFUSED_RETRY: Duration = Duration::from_secs(30 * 60);
+
+/// How often a process that keeps labels checks their filesystem for free
+/// space below the floor ([`LabelStore::keep_floor`]): the stores and logs
+/// beside them grow by gigabytes an hour at most.
+pub const FLOOR_CHECK_EVERY: Duration = Duration::from_secs(60);
+
+/// How often a release of labels that goes on is logged again.
+const SHORT_LOGGED_EVERY: Duration = Duration::from_secs(60 * 60);
+
+/// The file under the labels' directory marking that labels were released
+/// for free space and labelling ahead waits ([`LabelStore::keep_floor`]),
+/// shared by every process keeping labels there.
+const SHORT_MARKER: &str = "short-of-space";
+
+/// Free space a release of labels restores above a `floor`
+/// ([`disk_floor`]): a quarter of it, so the stores beside them grow a while
+/// before the next.
+pub fn release_band(floor: u64) -> u64 {
+    floor / 4
+}
+
+/// Free space on a filesystem of `total_bytes` from which labelling ahead
+/// resumes after labels were released ([`LabelStore::keep_floor`]): the
+/// floor and twice [`release_band`], so labels just released are not
+/// labelled again for the next release to take.
+pub fn resume_free(total_bytes: u64) -> u64 {
+    let floor = disk_floor(total_bytes);
+    floor.saturating_add(release_band(floor).saturating_mul(2))
+}
 
 /// The free space labels leave on a filesystem of `total_bytes`.
 pub fn disk_floor(total_bytes: u64) -> u64 {
@@ -159,10 +199,27 @@ pub type SpaceSource = Box<dyn Fn(&Path) -> Option<FsUsage> + Send + Sync>;
 
 static STORE: OnceLock<LabelStore> = OnceLock::new();
 
-/// Keep this process's labels under `dir`. The first call decides; a process
-/// that never calls it labels nothing ahead and relabels for its seals.
+/// Keep this process's labels under `dir`, checking their filesystem's free
+/// space every [`FLOOR_CHECK_EVERY`] ([`LabelStore::keep_floor`]). The first
+/// call decides; a process that never calls it labels nothing ahead and
+/// relabels for its seals.
 pub fn install(dir: PathBuf) {
-    let _ = STORE.set(LabelStore::new(dir));
+    if STORE.set(LabelStore::new(dir)).is_err() {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("storage-labels-floor".into())
+        .spawn(|| loop {
+            if let Some(store) = installed() {
+                store.keep_floor();
+            }
+            std::thread::sleep(FLOOR_CHECK_EVERY);
+        });
+    if let Err(error) = spawned {
+        warn!(%error, scope = "local",
+            "storage labels' free space check not started: labels kept are not released when \
+             this node's disk runs short; a defect to report");
+    }
 }
 
 /// [`install`], reading free space from `space`.
@@ -288,6 +345,142 @@ fn note_used(dir: &Path, n: u64, epoch: u64) {
     }
 }
 
+/// Whether `file` is the file at `path` now: a release removes a count's
+/// files under their lock ([`LabelStore::keep_floor`]), so a lock taken
+/// after it is on a file gone from the directory.
+#[cfg(unix)]
+fn is_at(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), fs::metadata(path)) {
+        (Ok(held), Ok(there)) => held.dev() == there.dev() && held.ino() == there.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_at(_file: &File, path: &Path) -> bool {
+    path.exists()
+}
+
+/// A shared lock on the layers file at `path`, made first when `create`:
+/// while it is held, by this process or another, a release passes the
+/// count's labels by ([`LabelStore::keep_floor`]). Labelling a count and
+/// opening its labels hold one. `None` when there is no such file and not
+/// `create`, or when it cannot be locked.
+fn hold_layers(path: &Path, create: bool) -> Option<File> {
+    // A release between the open and the lock removed the file: made again.
+    for _ in 0..8 {
+        let file = if create {
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
+        } else {
+            File::open(path)
+        }
+        .ok()?;
+        file.lock_shared().ok()?;
+        if is_at(&file, path) {
+            return Some(file);
+        }
+        if !create {
+            return None;
+        }
+    }
+    None
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// A release of labels for free space, from its first release until free
+/// space is back at [`resume_free`] ([`LabelStore::keep_floor`]), kept in
+/// [`SHORT_MARKER`] so that every process keeping labels in the directory
+/// sees it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Shortage {
+    /// When it began and was last logged, in Unix seconds.
+    since: u64,
+    logged: u64,
+    /// Releases, the bytes and counts they released, and the epochs those
+    /// labels were for.
+    releases: u64,
+    bytes: u64,
+    counts: u64,
+    epochs: Vec<u64>,
+}
+
+impl Shortage {
+    fn epochs_text(&self) -> String {
+        let epochs: Vec<String> = self.epochs.iter().map(u64::to_string).collect();
+        epochs.join(",")
+    }
+
+    fn text(&self) -> String {
+        format!(
+            "since={} logged={} releases={} bytes={} counts={} epochs={}\n",
+            self.since,
+            self.logged,
+            self.releases,
+            self.bytes,
+            self.counts,
+            self.epochs_text()
+        )
+    }
+
+    /// A marker that does not parse, cut short say, still marks a release.
+    fn parse(text: &str) -> Self {
+        let mut shortage = Self::default();
+        for (key, value) in text
+            .split_whitespace()
+            .filter_map(|pair| pair.split_once('='))
+        {
+            let number = || value.parse::<u64>().unwrap_or(0);
+            match key {
+                "since" => shortage.since = number(),
+                "logged" => shortage.logged = number(),
+                "releases" => shortage.releases = number(),
+                "bytes" => shortage.bytes = number(),
+                "counts" => shortage.counts = number(),
+                "epochs" => {
+                    shortage.epochs = value.split(',').filter_map(|e| e.parse().ok()).collect()
+                }
+                _ => {}
+            }
+        }
+        shortage
+    }
+}
+
+/// A count's labels a release may take ([`LabelStore::keep_floor`]).
+struct Candidate {
+    dir: PathBuf,
+    n: u64,
+    /// The epoch they are needed for: their directory's, or under
+    /// [`STABLE_DIR`] the latest one that looked for them (0 when none
+    /// did).
+    epoch: u64,
+    /// Before the epoch of the last sweep ([`LabelStore::sweep`]): no seal
+    /// needs them.
+    stale: bool,
+    bytes: u64,
+}
+
+/// What one check of the labels' free space released
+/// ([`LabelStore::keep_floor`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Released {
+    pub bytes: u64,
+    pub counts: u64,
+    /// Counts passed by because they are being labelled or read.
+    pub in_use: u64,
+    pub epochs: Vec<u64>,
+}
+
 /// Leaves' labels on disk: `<dir>/<epoch>/<leaf>/<n>.{layers,columns,ready}`
 /// (`<dir>/stable/…` from the stable replica key epoch, [`epoch_dir`]),
 /// `<leaf>` naming the member and the leaf. `layers` holds every layer in
@@ -311,6 +504,9 @@ pub struct LabelStore {
     refused: Mutex<HashSet<(u64, PathBuf, Stage)>>,
     /// The epoch before which labels were last removed ([`Self::sweep`]).
     swept: AtomicU64,
+    /// The release of labels for free space this process last saw
+    /// ([`Self::keep_floor`]).
+    seen: Mutex<Option<Shortage>>,
     /// Leaves whose data [`precompute`] read, for tests.
     #[cfg(test)]
     leaves_read: AtomicU64,
@@ -341,6 +537,7 @@ impl LabelStore {
             resumed: Mutex::new(Vec::new()),
             refused: Mutex::new(HashSet::new()),
             swept: AtomicU64::new(0),
+            seen: Mutex::new(None),
             #[cfg(test)]
             leaves_read: AtomicU64::new(0),
         }
@@ -366,7 +563,11 @@ impl LabelStore {
         stage: Stage,
     ) -> bool {
         let pending = self.pending();
-        match self.room(*pending, label_bytes(least).saturating_mul(DISK_MARGIN)) {
+        match self.admission(
+            *pending,
+            label_bytes(least).saturating_mul(DISK_MARGIN),
+            stage,
+        ) {
             Ok(()) => true,
             Err(shortfall) => {
                 drop(pending);
@@ -396,13 +597,44 @@ impl LabelStore {
     /// `pending` bytes the leaves being labelled have still to write, above
     /// the floor. Free space that cannot be read leaves no room.
     fn room(&self, pending: u64, bytes: u64) -> std::result::Result<(), Shortfall> {
+        self.room_from(pending, bytes, false)
+    }
+
+    /// [`Self::room`] for a leaf labelled at `stage`: labelling ahead also
+    /// waits, while labels are released for free space, until it is back at
+    /// [`resume_free`] ([`Self::keep_floor`]).
+    fn admission(
+        &self,
+        pending: u64,
+        bytes: u64,
+        stage: Stage,
+    ) -> std::result::Result<(), Shortfall> {
+        let waits = stage == Stage::Ahead && self.shortage().is_some();
+        self.room_from(pending, bytes, waits)
+    }
+
+    /// The size and free space of the labels' filesystem.
+    fn usage(&self) -> Option<FsUsage> {
         // The directory is made at the first label: until then its nearest
         // existing parent is on the filesystem it will be on.
-        let usage = self.dir.ancestors().find_map(|dir| (self.space)(dir));
+        self.dir.ancestors().find_map(|dir| (self.space)(dir))
+    }
+
+    /// [`Self::room`], and when `resuming` no less than [`resume_free`].
+    fn room_from(
+        &self,
+        pending: u64,
+        bytes: u64,
+        resuming: bool,
+    ) -> std::result::Result<(), Shortfall> {
+        let usage = self.usage();
         let needed = pending.saturating_add(bytes);
         match usage {
             Some(usage) => {
-                let needed = needed.saturating_add(disk_floor(usage.total_bytes));
+                let mut needed = needed.saturating_add(disk_floor(usage.total_bytes));
+                if resuming {
+                    needed = needed.max(resume_free(usage.total_bytes));
+                }
                 if usage.free_bytes >= needed {
                     Ok(())
                 } else {
@@ -440,13 +672,20 @@ impl LabelStore {
             return None;
         }
         let key = quil_crypto::sdr::replica_key(member, leaf_id, epoch);
+        let [layers, columns, ready] = paths(&dir, n);
+        // Held until the leaf is labelled or dropped: a release in another
+        // process passes its layers by ([`Self::keep_floor`]). One that
+        // removed them first leaves none to resume from.
+        let mut in_use = hold_layers(&layers, false);
         // Not under the leaf's lock: checking a large leaf's layers takes a
         // while, and being busy keeps every removal off them. What a sweep
         // that looked before this count was busy removes is seen below.
         let mut verified = verify_kept(&dir, n, &key);
+        if in_use.is_none() {
+            verified.layers.clear();
+        }
         let lock = leaf_lock(&dir);
         let held = lock.lock().unwrap_or_else(PoisonError::into_inner);
-        let [layers, columns, ready] = paths(&dir, n);
         for path in [columns, ready, staged(&dir, n), manifest_staged(&dir, n)] {
             let _ = fs::remove_file(path);
         }
@@ -461,6 +700,8 @@ impl LabelStore {
             verified.layers.clear();
             let _ = fs::remove_file(&layers);
             let _ = fs::remove_file(kept_path(&dir, n));
+            // Made again when the leaf is written.
+            in_use = None;
         }
         log_verified(epoch, leaf_id, n, stage, &verified);
         let kept = verified.layers.len();
@@ -475,7 +716,7 @@ impl LabelStore {
         }
         let bytes = label_bytes(n).saturating_sub(kept as u64 * layer_bytes(n));
         let mut pending = self.pending();
-        match self.room(*pending, bytes.saturating_mul(DISK_MARGIN)) {
+        match self.admission(*pending, bytes.saturating_mul(DISK_MARGIN), stage) {
             Ok(()) => {
                 *pending = pending.saturating_add(bytes);
                 note_used(&dir, n, epoch);
@@ -497,6 +738,7 @@ impl LabelStore {
                     }),
                     digests: verified.layers,
                     remaining: bytes,
+                    in_use,
                 })
             }
             Err(shortfall) => {
@@ -680,6 +922,11 @@ impl LabelStore {
         let [layers, columns, ready] = paths(&dir, n);
         let comm_c: Node = fs::read(ready).ok()?.try_into().ok()?;
         let layers_file = File::open(&layers).ok()?;
+        // Held while they are read: a release passes them by.
+        layers_file.lock_shared().ok()?;
+        if !is_at(&layers_file, &layers) {
+            return None;
+        }
         let expected = n * (SdrParams::default().layers * NODE_BYTES) as u64;
         if layers_file.metadata().ok()?.len() != expected {
             return None;
@@ -782,6 +1029,290 @@ impl LabelStore {
         }
     }
 
+    /// Release labels kept while free space on their filesystem is below
+    /// the floor ([`disk_floor`]): they are a cache, and the node's stores
+    /// and logs beside them must not fail for them. Every count no
+    /// labelling or seal of this process or another holds ([`hold_layers`])
+    /// may go, until free space is [`release_band`] above the floor: those
+    /// of epochs already swept first, then the latest needed, the smallest
+    /// first within an epoch. A seal opens its labels within the hour after
+    /// its snapshot, too soon to label a large leaf again, while labels for
+    /// a later epoch may be labelled ahead again before their snapshot; and
+    /// small leaves are labelled again at their snapshot within the
+    /// renewal's grace, where large ones may not be. From the first release
+    /// until free space is back at [`resume_free`], labelling ahead waits
+    /// ([`Self::admit`]) and the episode is logged once, again every
+    /// [`SHORT_LOGGED_EVERY`] while it goes on, and at its end, after which
+    /// the shards whose labels went are labelled ahead again. One process
+    /// releases at a time. What a check released; `None` when free space is
+    /// above the floor or unknown, or another process is releasing.
+    pub fn keep_floor(&self) -> Option<Released> {
+        let usage = self.usage()?;
+        let floor = disk_floor(usage.total_bytes);
+        let marked = self.shortage();
+        self.saw(marked.as_ref());
+        if usage.free_bytes >= floor {
+            if marked.is_some() && usage.free_bytes >= resume_free(usage.total_bytes) {
+                self.end_shortage();
+            } else if marked.is_some_and(|marked| {
+                unix_now().saturating_sub(marked.logged) >= SHORT_LOGGED_EVERY.as_secs()
+            }) {
+                self.log_waiting(&usage);
+            }
+            return None;
+        }
+        let dir = File::open(&self.dir).ok()?;
+        dir.try_lock().ok()?;
+        // What another process released meanwhile counts.
+        let usage = self.usage()?;
+        if usage.free_bytes >= floor {
+            return None;
+        }
+        let target = floor.saturating_add(release_band(floor));
+        let released = self.release(usage.free_bytes, target);
+        let now = unix_now();
+        let marked = self.shortage();
+        let first = marked.is_none();
+        let mut shortage = marked.unwrap_or(Shortage {
+            since: now,
+            ..Shortage::default()
+        });
+        if released.counts > 0 {
+            shortage.releases += 1;
+        }
+        shortage.bytes = shortage.bytes.saturating_add(released.bytes);
+        shortage.counts = shortage.counts.saturating_add(released.counts);
+        shortage.epochs.extend(&released.epochs);
+        shortage.epochs.sort_unstable();
+        shortage.epochs.dedup();
+        let log = first || now.saturating_sub(shortage.logged) >= SHORT_LOGGED_EVERY.as_secs();
+        if log {
+            shortage.logged = now;
+        }
+        self.mark_shortage(&shortage);
+        self.saw(Some(&shortage));
+        drop(dir);
+        if !log {
+            return Some(released);
+        }
+        let free_after = self
+            .usage()
+            .map_or(usage.free_bytes, |usage| usage.free_bytes);
+        let resume = resume_free(usage.total_bytes);
+        if first {
+            warn!(free_bytes = usage.free_bytes, floor_bytes = floor, free_after_bytes = free_after,
+                released_bytes = released.bytes, released_counts = released.counts,
+                in_use_counts = released.in_use, epochs = %shortage.epochs_text(),
+                resume_bytes = resume, scope = "local",
+                "storage labels kept ahead released: free disk space on this node fell below the \
+                 labels' floor, and the node's stores and logs come first; the snapshots and seals \
+                 of those leaves label them again when needed (about an hour per GiB on a core; a \
+                 leaf not labelled in time leaves its seat without that epoch's registration), and \
+                 labelling ahead waits until free space is back at resume_bytes; check what fills \
+                 this node's disk (worker stores, logs, other files)");
+        } else {
+            log_still(&usage, free_after, &released, &shortage, now);
+        }
+        Some(released)
+    }
+
+    /// Log again, once [`SHORT_LOGGED_EVERY`] passed, a release of labels
+    /// for free space that goes on with free space above the floor and below
+    /// [`resume_free`]: labelling ahead still waits.
+    fn log_waiting(&self, usage: &FsUsage) {
+        let Ok(dir) = File::open(&self.dir) else {
+            return;
+        };
+        if dir.try_lock().is_err() {
+            return;
+        }
+        let now = unix_now();
+        let Some(mut shortage) = self.shortage() else {
+            return;
+        };
+        if now.saturating_sub(shortage.logged) < SHORT_LOGGED_EVERY.as_secs() {
+            return;
+        }
+        shortage.logged = now;
+        self.mark_shortage(&shortage);
+        drop(dir);
+        log_still(
+            usage,
+            usage.free_bytes,
+            &Released::default(),
+            &shortage,
+            now,
+        );
+    }
+
+    /// Release the counts [`Self::keep_floor`] may take, in its order, until
+    /// `free` and what they held reach `target`.
+    fn release(&self, free: u64, target: u64) -> Released {
+        let mut released = Released::default();
+        let mut free = free;
+        for candidate in self.candidates() {
+            if free >= target {
+                break;
+            }
+            let lock = leaf_lock(&candidate.dir);
+            let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            if self.busy().contains(&(candidate.dir.clone(), candidate.n)) {
+                released.in_use += 1;
+                continue;
+            }
+            let layers = paths(&candidate.dir, candidate.n)[0].clone();
+            // Locked against the labellings and seals that hold them, in this
+            // process or another, while they go.
+            let _exclusive = match File::open(&layers) {
+                Ok(file) => match file.try_lock() {
+                    Ok(()) if is_at(&file, &layers) => Some(file),
+                    _ => {
+                        released.in_use += 1;
+                        continue;
+                    }
+                },
+                Err(_) => None,
+            };
+            let mut bytes = 0u64;
+            for path in count_files(&candidate.dir, candidate.n) {
+                let len = fs::metadata(&path).map_or(0, |meta| meta.len());
+                if fs::remove_file(&path).is_ok() {
+                    bytes = bytes.saturating_add(len);
+                }
+            }
+            free = free.saturating_add(bytes);
+            released.bytes = released.bytes.saturating_add(bytes);
+            released.counts += 1;
+            if !released.epochs.contains(&candidate.epoch) {
+                released.epochs.push(candidate.epoch);
+            }
+        }
+        released.epochs.sort_unstable();
+        released
+    }
+
+    /// Every count with labels on disk, in the order [`Self::keep_floor`]
+    /// releases them.
+    fn candidates(&self) -> Vec<Candidate> {
+        let swept = self.swept.load(Ordering::Relaxed);
+        let mut candidates = Vec::new();
+        for entry in fs::read_dir(&self.dir).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let epoch = match name.parse::<u64>() {
+                Ok(epoch) => Some(epoch),
+                Err(_) if name == STABLE_DIR => None,
+                Err(_) => continue,
+            };
+            for leaf in fs::read_dir(entry.path()).into_iter().flatten().flatten() {
+                let dir = leaf.path();
+                if !dir.is_dir() {
+                    continue;
+                }
+                let mut counts: HashMap<u64, (u64, bool)> = HashMap::new();
+                for file in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                    let name = file.file_name();
+                    let Some(name) = name.to_str() else {
+                        continue;
+                    };
+                    let Some(n) = name.split('.').next().and_then(|n| n.parse::<u64>().ok()) else {
+                        continue;
+                    };
+                    let count = counts.entry(n).or_default();
+                    count.0 = count
+                        .0
+                        .saturating_add(file.metadata().map_or(0, |meta| meta.len()));
+                    count.1 |= name.ends_with(".layers") || name.ends_with(".columns");
+                }
+                for (n, (bytes, labels)) in counts {
+                    if !labels {
+                        continue;
+                    }
+                    let epoch = epoch.unwrap_or_else(|| used_epoch(&dir, n).unwrap_or(0));
+                    candidates.push(Candidate {
+                        dir: dir.clone(),
+                        n,
+                        epoch,
+                        stale: epoch < swept,
+                        bytes,
+                    });
+                }
+            }
+        }
+        candidates.sort_by(|a, b| {
+            b.stale
+                .cmp(&a.stale)
+                .then(b.epoch.cmp(&a.epoch))
+                .then(a.bytes.cmp(&b.bytes))
+                .then(a.dir.cmp(&b.dir))
+                .then(a.n.cmp(&b.n))
+        });
+        candidates
+    }
+
+    /// The release of labels for free space going on, if any
+    /// ([`SHORT_MARKER`]).
+    fn shortage(&self) -> Option<Shortage> {
+        let text = fs::read_to_string(self.dir.join(SHORT_MARKER)).ok()?;
+        Some(Shortage::parse(&text))
+    }
+
+    fn mark_shortage(&self, shortage: &Shortage) {
+        let staged = self
+            .dir
+            .join(format!("{SHORT_MARKER}.{}.tmp", unique_tag()));
+        if fs::write(&staged, shortage.text()).is_err()
+            || fs::rename(&staged, self.dir.join(SHORT_MARKER)).is_err()
+        {
+            let _ = fs::remove_file(staged);
+        }
+    }
+
+    /// End the release of labels for free space: free space is back at
+    /// [`resume_free`].
+    fn end_shortage(&self) {
+        let Ok(dir) = File::open(&self.dir) else {
+            return;
+        };
+        if dir.try_lock().is_err() {
+            return;
+        }
+        let Some(shortage) = self.shortage() else {
+            return;
+        };
+        if fs::remove_file(self.dir.join(SHORT_MARKER)).is_err() {
+            return;
+        }
+        drop(dir);
+        let usage = self.usage().unwrap_or_default();
+        info!(free_bytes = usage.free_bytes, resume_bytes = resume_free(usage.total_bytes),
+            released_bytes = shortage.bytes, released_counts = shortage.counts,
+            releases = shortage.releases, epochs = %shortage.epochs_text(),
+            episode_seconds = unix_now().saturating_sub(shortage.since), scope = "local",
+            "storage labels released for free disk space no more: free space on this node is \
+             back at resume_bytes; labelling ahead resumes, and the shards whose labels were \
+             released are labelled ahead again while their snapshot is still to come");
+        self.saw(Some(&shortage));
+        self.saw(None);
+    }
+
+    /// Note the release of labels for free space this check saw: once one
+    /// this process saw has ended, the shards it labelled ahead for its
+    /// epochs are labelled ahead again ([`precomputed`]).
+    fn saw(&self, shortage: Option<&Shortage>) {
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        match shortage {
+            Some(shortage) => *seen = Some(shortage.clone()),
+            None => {
+                if let Some(ended) = seen.take() {
+                    precomputed_set().retain(|(_, _, epoch), _| !ended.epochs.contains(epoch));
+                }
+            }
+        }
+    }
+
     /// Remove the labels of every epoch before `epoch`.
     pub fn evict_before(&self, epoch: u64) {
         self.refused
@@ -856,6 +1387,9 @@ pub struct Admitted<'a> {
     digests: Vec<[u8; 32]>,
     resumed: Option<Resumed>,
     remaining: u64,
+    /// The shared lock on the leaf's layers file ([`hold_layers`]), once it
+    /// exists.
+    in_use: Option<File>,
 }
 
 /// How labelling an admitted leaf ahead ended ([`Admitted::label_ahead`]).
@@ -984,6 +1518,14 @@ impl Admitted<'_> {
             ));
         }
         let (dir, n) = (self.dir.clone(), self.n);
+        if self.in_use.is_none() {
+            self.in_use = Some(hold_layers(layers_path, true).ok_or_else(|| {
+                QuilError::Internal(format!(
+                    "storage labels: could not lock {}",
+                    layers_path.display()
+                ))
+            })?);
+        }
         let file = if kept > 0 {
             fs::OpenOptions::new().append(true).open(layers_path)
         } else {
@@ -1164,6 +1706,39 @@ fn kept_path(dir: &Path, n: u64) -> PathBuf {
 /// Where a manifest is written before it is renamed `kept`.
 fn manifest_staged(dir: &Path, n: u64) -> PathBuf {
     dir.join(format!("{n}.kept.tmp"))
+}
+
+/// Log a release of labels for free space that goes on ([`LabelStore::keep_floor`]):
+/// `released` by this check, from `usage` to `free_after` free bytes.
+fn log_still(usage: &FsUsage, free_after: u64, released: &Released, shortage: &Shortage, now: u64) {
+    warn!(free_bytes = usage.free_bytes, floor_bytes = disk_floor(usage.total_bytes),
+        free_after_bytes = free_after, released_bytes = released.bytes,
+        released_counts = released.counts, in_use_counts = released.in_use,
+        total_released_bytes = shortage.bytes, total_released_counts = shortage.counts,
+        releases = shortage.releases, epochs = %shortage.epochs_text(),
+        episode_seconds = now.saturating_sub(shortage.since),
+        resume_bytes = resume_free(usage.total_bytes), scope = "local",
+        "storage labels kept ahead still released: free disk space on this node stays below \
+         resume_bytes, and labelling ahead waits; check what fills this node's disk (worker \
+         stores, logs, other files)");
+}
+
+/// The files of count `n` in `dir`: every one named `<n>.<kind>`.
+fn count_files(dir: &Path, n: u64) -> Vec<PathBuf> {
+    fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.split('.').next())
+                .and_then(|count| count.parse::<u64>().ok())
+                == Some(n)
+        })
+        .map(|entry| entry.path())
+        .collect()
 }
 
 /// The counts of the files in `dir` named `<n><suffix>`.
@@ -2785,6 +3360,246 @@ mod tests {
         assert!(store.find(7, &member, b"leaf", |_| true).is_none());
         assert!(store.find(8, &member, b"leaf", |_| true).is_none());
         assert!(store.find(9, &member, b"leaf", |_| true).is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Bytes of the files under `dir`, by their length.
+    fn bytes_under(dir: &Path) -> u64 {
+        files_under(dir)
+            .iter()
+            .map(|file| fs::metadata(file).map_or(0, |meta| meta.len()))
+            .sum()
+    }
+
+    /// A filesystem of [`TOTAL`] bytes whose free space is `base` less what
+    /// the files under `dir` take: what a release removes comes back.
+    fn space_less_files(base: &Arc<AtomicU64>, dir: &Path) -> SpaceSource {
+        let (base, dir) = (base.clone(), dir.to_path_buf());
+        Box::new(move |_| {
+            Some(FsUsage {
+                total_bytes: TOTAL,
+                free_bytes: base
+                    .load(Ordering::SeqCst)
+                    .saturating_sub(bytes_under(&dir)),
+                ..FsUsage::default()
+            })
+        })
+    }
+
+    /// Labels of `n` nodes kept for `member`'s `leaf` for `epoch`, their
+    /// files sparse at their full size: what a release weighs.
+    fn kept_sparse(store: &LabelStore, epoch: u64, member: &[u8], leaf: &[u8], n: u64) -> PathBuf {
+        let dir = store.leaf_dir(epoch, member, leaf);
+        fs::create_dir_all(&dir).unwrap();
+        let [layers, columns, ready] = paths(&dir, n);
+        let depth = SdrParams::default().layers as u64;
+        File::create(layers)
+            .unwrap()
+            .set_len(n * depth * NODE_BYTES as u64)
+            .unwrap();
+        File::create(columns)
+            .unwrap()
+            .set_len(n * NODE_BYTES as u64)
+            .unwrap();
+        fs::write(ready, [0u8; 32]).unwrap();
+        assert!(store
+            .find(epoch, member, leaf, |count| count == n)
+            .is_some());
+        dir
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    /// Nodes whose labels take 3/8 GiB on disk ([`label_bytes`]).
+    const EIGHTH_NODES: u64 = 1 << 20;
+
+    /// Labels kept are a cache: once free space falls below the floor, the
+    /// counts no labelling or seal holds go until free space is
+    /// [`release_band`] above it, those of epochs already swept first, then
+    /// the latest needed, the smallest first, and those needed soonest last
+    /// (2026-11-03: labels held 175 of a node's 207 GB used, and every store
+    /// failed its writes). Labelling ahead then waits until free space is
+    /// back at [`resume_free`], where the release ends.
+    #[test]
+    fn kept_labels_go_latest_needed_first_while_free_space_is_below_the_floor() {
+        let dir = temp_dir("floor");
+        let base = Arc::new(AtomicU64::new(1 << 50));
+        let store = LabelStore::with_space(dir.clone(), space_less_files(&base, &dir));
+        let floor = disk_floor(TOTAL);
+        assert_eq!(
+            (floor, release_band(floor), resume_free(TOTAL)),
+            (10 * GIB, 10 * GIB / 4, 15 * GIB)
+        );
+        let member = [7u8; 32];
+        store.sweep(9);
+        let stale = kept_sparse(&store, 8, &member, b"stale", EIGHTH_NODES);
+        let soonest = kept_sparse(&store, 9, &member, b"soonest", 4 * EIGHTH_NODES);
+        let small = kept_sparse(&store, 10, &member, b"small", 2 * EIGHTH_NODES);
+        let large = kept_sparse(&store, 10, &member, b"large", 8 * EIGHTH_NODES);
+        assert_eq!(label_bytes(EIGHTH_NODES), 3 * GIB / 8);
+        let held = bytes_under(&dir);
+
+        base.store(floor + held, Ordering::SeqCst);
+        assert_eq!(store.keep_floor(), None, "at the floor, nothing goes");
+        assert_eq!(bytes_under(&dir), held);
+
+        base.store(floor - 1 + held, Ordering::SeqCst);
+        let released = store.keep_floor().expect("below the floor");
+        assert_eq!(released.counts, 3, "{released:?}");
+        assert_eq!(released.in_use, 0);
+        assert_eq!(released.epochs, vec![8, 10]);
+        assert_eq!(
+            released.bytes,
+            label_bytes(EIGHTH_NODES) + label_bytes(10 * EIGHTH_NODES) + 3 * 32
+        );
+        for gone in [&stale, &small, &large] {
+            assert_eq!(files_under(gone), Vec::<PathBuf>::new(), "{gone:?}");
+        }
+        assert_eq!(files_under(&soonest).len(), 3, "needed soonest, kept");
+        assert!(store.find(9, &member, b"soonest", |_| true).is_some());
+        let free = store.usage().unwrap().free_bytes;
+        assert!(free >= floor + release_band(floor) && free < resume_free(TOTAL));
+
+        // Labelling ahead waits until free space is back at `resume_free`;
+        // a snapshot keeps its labels as before.
+        let n = 3_000u64;
+        assert!(!store.may_admit(11, &member, b"next", n, Stage::Ahead));
+        assert!(store.admit(11, &member, b"next", n, Stage::Ahead).is_none());
+        drop(
+            store
+                .admit(11, &member, b"now", n, Stage::Snapshot)
+                .expect("room for a snapshot's labels"),
+        );
+        assert_eq!(store.keep_floor(), None);
+        assert!(store.shortage().is_some(), "short of resume_free");
+        assert!(store.admit(11, &member, b"next", n, Stage::Ahead).is_none());
+
+        base.fetch_add(resume_free(TOTAL) - free, Ordering::SeqCst);
+        assert_eq!(store.keep_floor(), None);
+        assert!(store.shortage().is_none(), "ended at resume_free");
+        assert!(store.may_admit(11, &member, b"next", n, Stage::Ahead));
+        drop(
+            store
+                .admit(11, &member, b"next", n, Stage::Ahead)
+                .expect("labelling ahead resumes"),
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A release passes by the labels in use: a count being labelled, one
+    /// a seal has open, and one another process holds; each goes at a
+    /// later check once let go.
+    #[test]
+    fn labels_in_use_are_not_released() {
+        let dir = temp_dir("in-use");
+        let base = Arc::new(AtomicU64::new(1 << 50));
+        let store = LabelStore::with_space(dir.clone(), space_less_files(&base, &dir));
+        let floor = disk_floor(TOTAL);
+        let member = [8u8; 32];
+        // Labelled ahead for epoch 9, given up after two layers and resumed.
+        let n = 3_000u64;
+        assert!(matches!(
+            stop_after(&store, b"labelling", n, 2),
+            Labelling::Stopped { layers: 2 }
+        ));
+        let labelling = store
+            .admit(9, &member, b"labelling", n, Stage::Ahead)
+            .expect("resumed");
+        assert_eq!(labelling.resumes_from(), 2);
+        let open = kept_sparse(&store, 10, &member, b"open", EIGHTH_NODES);
+        let seal = store.find(10, &member, b"open", |_| true).unwrap();
+        let elsewhere = kept_sparse(&store, 10, &member, b"elsewhere", EIGHTH_NODES);
+        // Another process's lock: one on a file description of its own.
+        let other = File::open(paths(&elsewhere, EIGHTH_NODES)[0].clone()).unwrap();
+        other.lock_shared().unwrap();
+        let free = kept_sparse(&store, 10, &member, b"free", EIGHTH_NODES);
+        let labelling_dir = store.leaf_dir(9, &member, b"labelling");
+        let labelling_files = files_under(&labelling_dir).len();
+
+        base.store(floor - 1 + bytes_under(&dir), Ordering::SeqCst);
+        let released = store.keep_floor().expect("below the floor");
+        assert_eq!((released.counts, released.in_use), (1, 3), "{released:?}");
+        assert_eq!(files_under(&free), Vec::<PathBuf>::new());
+        assert_eq!(files_under(&open).len(), 3);
+        assert_eq!(files_under(&elsewhere).len(), 3);
+        assert_eq!(files_under(&labelling_dir).len(), labelling_files);
+
+        drop((labelling, seal, other));
+        base.store(floor - 1 + bytes_under(&dir), Ordering::SeqCst);
+        let released = store.keep_floor().expect("below the floor");
+        assert_eq!((released.counts, released.in_use), (3, 0), "{released:?}");
+        assert_eq!(released.epochs, vec![9, 10]);
+        for gone in [&open, &elsewhere, &labelling_dir] {
+            assert_eq!(files_under(gone), Vec::<PathBuf>::new(), "{gone:?}");
+        }
+        // Nothing left to release: labelling ahead still waits.
+        base.store(floor - 1 + bytes_under(&dir), Ordering::SeqCst);
+        assert_eq!(store.keep_floor().map(|released| released.counts), Some(0));
+        assert!(store.admit(11, &member, b"next", n, Stage::Ahead).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A release that goes on is logged again once [`SHORT_LOGGED_EVERY`]
+    /// passed, not at each check, and once it ends the shards whose labels
+    /// went are labelled ahead again ([`precomputed`]).
+    #[test]
+    fn a_release_is_logged_again_hourly_and_its_shards_labelled_ahead_after() {
+        let dir = temp_dir("episode");
+        let base = Arc::new(AtomicU64::new(1 << 50));
+        let store = LabelStore::with_space(dir.clone(), space_less_files(&base, &dir));
+        let floor = disk_floor(TOTAL);
+        let (member, filter, other) = ([91u8; 32], b"released".as_slice(), b"kept".as_slice());
+        for (filter, epoch) in [(filter, 12u64), (other, 13)] {
+            precomputed_set().insert((member.to_vec(), filter.to_vec(), epoch), None);
+        }
+        assert!(precomputed(&member, filter, 12));
+        let now = unix_now();
+        kept_sparse(&store, 12, &member, b"first", EIGHTH_NODES);
+        store.mark_shortage(&Shortage {
+            since: now - 7_200,
+            logged: now - SHORT_LOGGED_EVERY.as_secs() - 1,
+            releases: 1,
+            ..Shortage::default()
+        });
+
+        base.store(floor - 1 + bytes_under(&dir), Ordering::SeqCst);
+        assert_eq!(store.keep_floor().unwrap().counts, 1);
+        let logged = store.shortage().unwrap();
+        assert!(logged.logged >= now, "logged again past the hour");
+        assert_eq!((logged.since, logged.releases), (now - 7_200, 2));
+        assert_eq!(logged.epochs, vec![12]);
+
+        kept_sparse(&store, 12, &member, b"second", EIGHTH_NODES);
+        base.store(floor - 1 + bytes_under(&dir), Ordering::SeqCst);
+        assert_eq!(store.keep_floor().unwrap().counts, 1);
+        let again = store.shortage().unwrap();
+        assert_eq!(again.logged, logged.logged, "not again within the hour");
+        assert_eq!(again.releases, 3);
+        assert_eq!(again.bytes, 2 * (label_bytes(EIGHTH_NODES) + 32));
+        assert!(precomputed(&member, filter, 12), "not while it goes on");
+
+        // Above the floor, short of `resume_free`: labelling ahead still
+        // waits, logged again once the hour passed.
+        base.store(floor + bytes_under(&dir), Ordering::SeqCst);
+        assert_eq!(store.keep_floor(), None);
+        assert_eq!(store.shortage().unwrap().logged, logged.logged);
+        store.mark_shortage(&Shortage {
+            logged: now - SHORT_LOGGED_EVERY.as_secs() - 1,
+            ..again.clone()
+        });
+        assert_eq!(store.keep_floor(), None);
+        let waiting = store.shortage().unwrap();
+        assert!(waiting.logged >= now);
+        assert_eq!(waiting.releases, again.releases, "nothing released");
+
+        base.store(resume_free(TOTAL) + bytes_under(&dir), Ordering::SeqCst);
+        assert_eq!(store.keep_floor(), None);
+        assert!(store.shortage().is_none());
+        assert!(
+            !precomputed(&member, filter, 12),
+            "labelled ahead again once it ended"
+        );
+        assert!(precomputed(&member, other, 13), "no labels of it went");
         let _ = fs::remove_dir_all(&dir);
     }
 }
