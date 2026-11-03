@@ -73,7 +73,7 @@ impl MessageCtx {
             rpc::local_stream_addr(&node_config)?
         };
 
-        let key_manager = ctx.key_manager(&node_config, &dir)?;
+        let key_manager = ctx.cli_key_manager(&node_config, &dir)?;
         let signer = key_manager
             .get_signer_by_id("q-prover-key")
             .map_err(|e| anyhow::anyhow!("get q-prover-key for transport auth: {e}"))?;

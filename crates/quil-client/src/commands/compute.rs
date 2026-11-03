@@ -92,7 +92,7 @@ async fn execute(global: GlobalArgs, address: &str, rest: &[String]) -> anyhow::
     let ctx = Context::load(global)?;
     let (node_config, dir) = ctx.load_node_config("default")?;
     let alias_store = alias_store::try_load_for_config_dir(&dir);
-    let key_manager = ctx.key_manager(&node_config, &dir)?;
+    let key_manager = ctx.cli_key_manager(&node_config, &dir)?;
 
     let domain = resolve(&alias_store, address, 32)?;
 

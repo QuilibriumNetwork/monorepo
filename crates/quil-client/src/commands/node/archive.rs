@@ -52,7 +52,7 @@ async fn shards(global: GlobalArgs, args: &ShardsArgs) -> anyhow::Result<()> {
     let ctx = Context::load(global)?;
     let (node_config, dir) = ctx.load_node_config("default")?;
     let key = ctx
-        .key_manager(&node_config, &dir)?
+        .cli_key_manager(&node_config, &dir)?
         .get_signer_by_id("q-prover-key")
         .map_err(|e| anyhow::anyhow!("get q-prover-key for transport auth: {e}"))?
         .private_key()

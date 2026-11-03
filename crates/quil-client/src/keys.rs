@@ -129,6 +129,48 @@ pub fn describe_keystore(config: &Config, config_dir: &Path) -> String {
     )
 }
 
+/// `path` made absolute against the current directory, without touching
+/// the file system.
+fn absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The one header line of a token command: the node's peer ID (none for a
+/// config without a network identity) and the absolute config directory
+/// it was loaded from, so an operator whose default resolution picked
+/// another config sees it.
+pub fn node_line(peer: Option<&str>, config_dir: &Path) -> String {
+    let dir = absolute(config_dir).display().to_string();
+    match peer {
+        Some(peer) => format!("Node {peer} (config {dir})"),
+        None => format!("Node without network identity (config {dir})"),
+    }
+}
+
+/// Refuse a keystore that holds no keys, for a command that signs or reads
+/// a key: the later `no key with id` error does not say which keystore was
+/// read. `config_flag` says whether the command takes `--config`.
+pub fn require_keys(
+    key_manager: &FileKeyManager,
+    config: &Config,
+    config_dir: &Path,
+    config_flag: bool,
+) -> anyhow::Result<()> {
+    if keystore_access(key_manager) != KeystoreAccess::Empty {
+        return Ok(());
+    }
+    let fix = if config_flag {
+        "pass --config with the node's .config directory"
+    } else {
+        "run qclient where it finds the node's .config directory"
+    };
+    anyhow::bail!(
+        "keystore {} (from {}) holds no keys: that is not this node's config, or its keystore          lies elsewhere; {fix}, or set key.keyManagerFile.path in that config.yml to the          node's keys.yml",
+        absolute(&keystore_path(config, config_dir)).display(),
+        absolute(&config_dir.join("config.yml")).display(),
+    )
+}
+
 /// Build a `FileKeyManager` for the given node config + directory.
 ///
 /// Does NOT auto-create the standard keys — the client reads existing
@@ -344,5 +386,56 @@ mod tests {
             .unwrap()
             .list_keys()
             .is_empty());
+    }
+
+    /// The header names the peer (or its absence) and the absolute config
+    /// directory, in one line.
+    #[test]
+    fn node_line_names_the_peer_and_the_config_directory() {
+        let dir = std::env::current_dir().unwrap().join(".config");
+        assert_eq!(
+            node_line(Some("QmPeer"), &dir),
+            format!("Node QmPeer (config {})", dir.display())
+        );
+        assert_eq!(
+            node_line(None, Path::new(".config")),
+            format!("Node without network identity (config {})", dir.display())
+        );
+    }
+
+    /// A config directory with config.yml and no keys.yml is refused at once
+    /// by naming the keystore, the config and the fix; a keystore holding a
+    /// key passes. Before, the first key read failed with `no key with id`.
+    #[test]
+    fn a_keystore_without_keys_is_refused_naming_it_and_the_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".config");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.yml"), "{}\n").unwrap();
+        let config = config_naming("");
+        let empty = build_key_manager(&config, &dir).unwrap();
+
+        let error = require_keys(&empty, &config, &dir, true)
+            .expect_err("an empty keystore was accepted")
+            .to_string();
+        for part in [
+            dir.join("keys.yml").to_str().unwrap(),
+            dir.join("config.yml").to_str().unwrap(),
+            "holds no keys",
+            "pass --config with the node's .config directory",
+            "key.keyManagerFile.path",
+        ] {
+            assert!(error.contains(part), "{part:?} missing from: {error}");
+        }
+        let error = require_keys(&empty, &config, &dir, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("run qclient where it finds"), "{error}");
+
+        write_keystore(&dir.join("keys.yml"), 3, &[]);
+        let mut config = config_naming("");
+        config.key.key_store_file.encryption_key = hex::encode([3u8; 32]);
+        let full = build_key_manager(&config, &dir).unwrap();
+        require_keys(&full, &config, &dir, true).expect("a keystore with keys was refused");
     }
 }
