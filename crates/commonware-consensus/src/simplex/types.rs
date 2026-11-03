@@ -492,6 +492,18 @@ impl<S: Scheme, D: Digest> Read for Certificate<S, D> {
     }
 }
 
+/// QUILIBRIUM: the round of an encoded [Certificate], read from its header
+/// alone. Decoding a whole certificate bounds its signers by the receiver's
+/// committee, so one from an epoch with a larger committee fails to decode
+/// although its round is well formed. The round is unauthenticated: use it
+/// only to label a message that is being discarded.
+pub fn encoded_certificate_round(mut bytes: &[u8]) -> Option<Round> {
+    if !matches!(u8::read(&mut bytes).ok()?, 0..=2) {
+        return None;
+    }
+    Round::read(&mut bytes).ok()
+}
+
 impl<S: Scheme, D: Digest> Epochable for Certificate<S, D> {
     fn epoch(&self) -> Epoch {
         match self {

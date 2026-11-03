@@ -8,6 +8,12 @@
 //! errors in three hours, 97% of its warnings. The peers are still blocked as
 //! before; this counts what was discarded and logs the first discard at once
 //! and then a summary at most once per [`SUMMARY_EVERY`].
+//!
+//! A certificate of another epoch counts as of that epoch even when it does
+//! not decode: its signers are bounded by this epoch's committee, so every
+//! handoff to a smaller committee used to read as undecodable traffic. The
+//! foreign view range tells a sender still running the old session (rising
+//! between lines) from the old session's traffic arriving late (it does not).
 
 use std::{
     collections::BTreeSet,
@@ -44,6 +50,8 @@ pub(super) struct Summary {
     pub undecodable_peers: usize,
     /// Lowest and highest foreign epoch seen.
     pub epochs: Option<(u64, u64)>,
+    /// Lowest and highest view of those messages.
+    pub views: Option<(u64, u64)>,
 }
 
 /// Discarded peer messages, summarized at most once per interval.
@@ -80,9 +88,9 @@ impl<P: Ord + Clone> Discards<P> {
         self.record(now, peer)
     }
 
-    /// A message from `peer` of epoch `theirs`, not this member's `ours`;
-    /// returns a summary to log.
-    pub(super) fn epoch(&mut self, now: SystemTime, peer: &P, theirs: u64, ours: u64) -> Option<Summary> {
+    /// A message from `peer` of epoch `theirs` and view `view`, not this
+    /// member's `ours`; returns a summary to log.
+    pub(super) fn epoch(&mut self, now: SystemTime, peer: &P, theirs: u64, view: u64, ours: u64) -> Option<Summary> {
         if theirs < ours {
             self.pending.earlier += 1;
         } else {
@@ -90,6 +98,8 @@ impl<P: Ord + Clone> Discards<P> {
         }
         let (low, high) = self.pending.epochs.unwrap_or((theirs, theirs));
         self.pending.epochs = Some((low.min(theirs), high.max(theirs)));
+        let (low, high) = self.pending.views.unwrap_or((view, view));
+        self.pending.views = Some((low.min(view), high.max(view)));
         self.record(now, peer)
     }
 
@@ -126,6 +136,7 @@ impl Summary {
     /// undecodable ones are the sender's problem).
     pub(super) fn log(&self, partition: &str, ours: u64) {
         let (low, high) = self.epochs.unwrap_or_default();
+        let (low_view, high_view) = self.views.unwrap_or_default();
         if self.warns() {
             tracing::warn!(
                 scope = "this node or its peers",
@@ -138,6 +149,8 @@ impl Summary {
                 peers = self.peers,
                 lowest_epoch = low,
                 highest_epoch = high,
+                lowest_view = low_view,
+                highest_view = high_view,
                 secs = self.secs,
                 action = "check with `qclient node info` that this node runs the current release and \
                           update it if not; if it does, report this line to the maintainer",
@@ -155,6 +168,8 @@ impl Summary {
                 peers = self.peers,
                 lowest_epoch = low,
                 highest_epoch = high,
+                lowest_view = low_view,
+                highest_view = high_view,
                 secs = self.secs,
                 warn_from = UNDECODABLE_WARN,
                 action = "no action needed: usually a peer on another build; it warns past the bound \
@@ -171,6 +186,8 @@ impl Summary {
                 peers = self.peers,
                 lowest_epoch = low,
                 highest_epoch = high,
+                lowest_view = low_view,
+                highest_view = high_view,
                 secs = self.secs,
                 "discarded consensus messages of another epoch from peers (expected for a while after a committee handoff)"
             );
@@ -189,14 +206,14 @@ mod tests {
     #[test]
     fn a_burst_logs_its_start_then_one_summary_per_interval() {
         let mut d = Discards::<u8>::default();
-        let first = d.epoch(at(0), &1, 26, 27).expect("a burst begins with a line");
-        assert_eq!(first, Summary { secs: 0, earlier: 1, peers: 1, epochs: Some((26, 26)), ..Summary::default() });
+        let first = d.epoch(at(0), &1, 26, 40, 27).expect("a burst begins with a line");
+        assert_eq!(first, Summary { secs: 0, earlier: 1, peers: 1, epochs: Some((26, 26)), views: Some((40, 40)), ..Summary::default() });
         for n in 1..=1_000u64 {
-            assert_eq!(d.epoch(at(n / 2), &((n % 7) as u8), 26 - n % 2, 27), None);
+            assert_eq!(d.epoch(at(n / 2), &((n % 7) as u8), 26 - n % 2, 30 + n % 3, 27), None);
         }
         assert_eq!(d.undecodable(at(599), &9), None);
-        let summary = d.epoch(at(600), &1, 28, 27).expect("one summary per interval");
-        assert_eq!(summary, Summary { secs: 600, undecodable: 1, earlier: 1_000, later: 1, peers: 8, undecodable_peers: 1, epochs: Some((25, 28)) });
+        let summary = d.epoch(at(600), &1, 28, 2, 27).expect("one summary per interval");
+        assert_eq!(summary, Summary { secs: 600, undecodable: 1, earlier: 1_000, later: 1, peers: 8, undecodable_peers: 1, epochs: Some((25, 28)), views: Some((2, 32)) });
     }
 
     #[test]
@@ -258,7 +275,7 @@ mod tests {
         let mut d = Discards::<u8>::default();
         d.partition = "app-00a2080".into();
         tracing::subscriber::with_default(subscriber, || {
-            d.epoch(at(0), &1, 17, 18).expect("a burst begins with a line").log(&d.partition, 18);
+            d.epoch(at(0), &1, 17, 5, 18).expect("a burst begins with a line").log(&d.partition, 18);
             d.undecodable(at(600), &2).expect("one summary per interval").log(&d.partition, 18);
         });
         let out = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
