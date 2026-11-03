@@ -38,15 +38,47 @@ fn stub_worker(directory: &std::path::Path) -> std::path::PathBuf {
     path
 }
 
-/// A batch shield of the QUIL token as the wire carries it: its type, version
-/// and application. Its proof is the stub's to judge.
+/// A well-formed batch shield of the QUIL token as a wallet submits it: this
+/// network's and the token's context, one legacy coin, one output and a fee
+/// the coin covers, so it decodes and fits the token's dimensions like a real
+/// one. Its signature and proof are placeholders: the stub judges the proof.
 fn shield(application: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&0x0516u32.to_be_bytes());
-    bytes.extend_from_slice(b"QCT3SH\0\x03");
-    bytes.extend_from_slice(&[0u8; 32]);
-    bytes.extend_from_slice(application);
-    bytes.extend_from_slice(&[7u8; 64]);
+    use quil_lattice_ct::confidential::{
+        relation::membership::IDENTITY_BYTES,
+        shield::{AnyShield, BatchShield, BatchShieldStatement, ShieldSource},
+        transfer::{parameter_context, Output, MEMO_BYTES},
+        AmountOpening, CommitmentKey,
+    };
+    let policy = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(1);
+    let network = policy.network;
+    let application: [u8; 32] = application.try_into().unwrap();
+    let context = parameter_context(&network, &application);
+    let opening = AmountOpening::from_seed(&context, &[2; 32]);
+    let mut proof = vec![0; 40];
+    proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
+    let bytes = BatchShield {
+        statement: BatchShieldStatement {
+            network,
+            application,
+            owner_public_key: [4; 57],
+            sources: vec![ShieldSource {
+                address: [3; 32],
+                amount: 12,
+            }],
+            fee: 2,
+            outputs: vec![Output {
+                commitment: CommitmentKey::derive(&context).commit(10, &opening),
+                owner: [5; IDENTITY_BYTES],
+                memo: [6; MEMO_BYTES],
+            }],
+        },
+        signature: [0; 114],
+        proof,
+    }
+    .encode()
+    .unwrap();
+    let decoded = AnyShield::decode(&bytes, &network, &application).unwrap();
+    assert!(decoded.is_batch() && decoded.outputs().len() <= policy.limits.max_outputs);
     bytes
 }
 
@@ -139,5 +171,46 @@ fn materializing_an_admitted_frame_does_not_verify_proofs_under_the_ingest() {
         "the archive ingest was held {held:?} while GLOBAL materialization verified a \
          confidential proof ({VERIFY:?} per proof): gossip ingest and the gap fetch wait \
          behind it"
+    );
+}
+
+/// A GLOBAL proposal holds back the header of a shard whose admitted frame
+/// carries a batch shield this archive has not verified yet (its size class
+/// was never measured here, so it is not known to fit the per-frame budget),
+/// and carries it once the shield verified here and the margin for slower
+/// archives passed: GLOBAL then finds its verdict cached instead of waiting
+/// for it. Vulnerable outcome: the header rides at once.
+#[test]
+fn a_global_proposal_holds_a_shard_until_its_shield_verified_on_this_archive() {
+    let directory = tempfile::tempdir().unwrap();
+    let application = quil_execution::domains::QUIL_TOKEN.to_vec();
+    let mut ingest = archive_ingest(stub_worker(directory.path()));
+    let start = Instant::now();
+    ingest.admit_verified(frame_with_shield(&application, 1), true);
+    let settlement = ingest.proof_prewarm().unwrap().settlement();
+    assert!(
+        settlement.check(&application, 0, 1).holds(),
+        "a GLOBAL proposal would carry the header of a frame whose shield no archive \
+         verified yet, and GLOBAL execution would wait for it"
+    );
+    let released = loop {
+        let decision = settlement.check(&application, 0, 1);
+        if !decision.holds() {
+            assert_eq!(
+                decision,
+                quil_engine::archive_preverify::Settlement::Settled
+            );
+            break start.elapsed();
+        }
+        assert!(start.elapsed() < VERIFY * 10, "never released");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        released >= VERIFY,
+        "released after {released:?}, before it verified"
+    );
+    assert!(
+        !settlement.check(&application, 0, 0).holds(),
+        "a header below the frame was never held"
     );
 }
