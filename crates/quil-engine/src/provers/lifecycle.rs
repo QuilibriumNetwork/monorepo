@@ -683,6 +683,9 @@ pub struct ProverLifecycle {
     /// Capacity leaves the halt-risk shield kept, with the epoch they were
     /// last reported in (`report_capacity_shield`).
     capacity_shield_reported: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
+    /// Silent seats a shield keeps renewing, with the epoch they were last
+    /// reported in (`report_silence_shield`).
+    silence_shield_reported: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
     /// Per-filter "last frame we proposed Join on this filter."
     /// Worker-level `pending_filter_frame` already prevents re-using
     /// the same worker slot mid-flight, but it times out after 10
@@ -778,6 +781,7 @@ impl ProverLifecycle {
             unlanded_leaves_reported: Default::default(),
             storage_shed_spared: std::sync::Mutex::new(HashMap::new()),
             capacity_shield_reported: std::sync::Mutex::new(HashMap::new()),
+            silence_shield_reported: std::sync::Mutex::new(HashMap::new()),
             last_join_attempt: RwLock::new(HashMap::new()),
             shard_info_loaded: AtomicBool::new(false),
             submission_attempts,
@@ -1304,6 +1308,64 @@ impl ProverLifecycle {
             scope = "local",
             "capacity shed spares end: these seats may be shed again (seat:reason:frames spared)"
         );
+    }
+
+    /// What keeps the seat on `filter` renewing however silent its worker is
+    /// (`super::session_hosting`).
+    fn silence_shield(
+        &self,
+        filter: &[u8],
+        workers: &[crate::worker::WorkerInfo],
+        descriptors: &[ShardDescriptor],
+    ) -> Option<super::session_hosting::SilenceShield> {
+        use super::session_hosting::SilenceShield;
+        if workers
+            .iter()
+            .any(|w| w.manually_managed && w.filter == filter)
+        {
+            return Some(SilenceShield::Pinned);
+        }
+        if self.halt_state.any_halted() {
+            return Some(SilenceShield::CoverageHalt);
+        }
+        match descriptors.iter().find(|d| d.filter == filter) {
+            Some(d) if d.size > 0 && d.active_count > proposer::HALT_RISK_PROVER_COUNT + 1 => None,
+            Some(d) if d.size > 0 => Some(SilenceShield::HaltRisk {
+                active: d.active_count,
+            }),
+            _ => Some(SilenceShield::ShardUnknown),
+        }
+    }
+
+    /// Report a seat silent for an epoch that keeps renewing under `why`,
+    /// once per seat per epoch.
+    fn report_silence_shield(
+        &self,
+        frame_number: u64,
+        filter: &[u8],
+        run: &super::session_hosting::Unvoted,
+        why: super::session_hosting::SilenceShield,
+    ) {
+        use super::session_hosting::SilenceShield;
+        let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        let Ok(mut reported) = self.silence_shield_reported.lock() else {
+            return;
+        };
+        reported.retain(|_, last| *last >= epoch);
+        if reported.insert(filter.to_vec(), epoch).is_some() {
+            return;
+        }
+        let active = match why {
+            SilenceShield::HaltRisk { active } => active,
+            _ => 0,
+        };
+        tracing::warn!(frame = frame_number, epoch, filter = hex::encode(filter),
+            core_id = run.core_id, silent_since = run.since, silent_frames = run.silent_frames,
+            silent_secs = run.silent_ms / 1000, peer_votes = run.peer_votes, shield = why.describe(),
+            active, scope = "local", action = "check",
+            "seat renews although its worker has sent no vote for an epoch while the session's other \
+             members voted: withholding it would cost the network more. Check this worker: restart it \
+             if it stays silent (reported once per seat per epoch)");
     }
 
     /// Report the leaves rejected at `frame_number` because the halt-risk
@@ -2466,7 +2528,11 @@ impl ProverLifecycle {
                         }),
                     observed => observed,
                 };
-                if observed.seen_unable(seat) {
+                let observed = hosting.stopped_voting(filter, report, observed, now);
+                // A seat withheld for silence: its worker may be refused only
+                // for the seat, but the leave must stand, or the seat comes
+                // back silent.
+                if observed.seen_unable(seat) || hosting.withheld_for_silence(filter) {
                     unable_seats.insert(filter.clone());
                 }
                 if !membership_known {
@@ -2699,8 +2765,8 @@ impl ProverLifecycle {
         // seen unable to host is given a settle period, not a fresh epoch.
         // Nor does a seat whose worker's host has been seen an epoch sending
         // no vote in that session while the other members vote (decided
-        // 2026-10-22): it renews once the worker votes or its engine or host
-        // restarts, and until then the worker takes no new seats.
+        // 2026-10-22): it renews once the worker votes or its engine restarts,
+        // or under a shield, and until then the worker takes no new seats.
         // Bound seats whose renewal has not landed and whose storage for it
         // is being encoded or is encoded: the capacity shed spares them
         // until the renewal lands or its grace frame passes.
@@ -2724,7 +2790,8 @@ impl ProverLifecycle {
                 .filter(|f| worker_bound_filters.contains(f))
                 .filter(|f| !self.renewal_awaits_leave(f, frame_number))
                 .filter(|f| {
-                    let hold = hosting.withhold(f, frame_number, epoch_frames);
+                    let shield = self.silence_shield(f, &workers, &decide_all_descriptors);
+                    let hold = hosting.withhold(f, frame_number, epoch_frames, shield);
                     // The seat's worker names this decision, not a failed
                     // confirmation, when its lapsed seat refuses its start.
                     if let Some(why) = hold.as_ref().and_then(super::session_hosting::RenewalWithheld::of) {
@@ -2735,6 +2802,10 @@ impl ProverLifecycle {
                     Some(Hold::Settling { until }) => {
                         settling.push((f.clone(), until));
                         false
+                    }
+                    Some(Hold::Shielded { run, why }) => {
+                        self.report_silence_shield(frame_number, f, &run, why);
+                        true
                     }
                     Some(Hold::Withheld(withheld)) => {
                         if withheld.first {
@@ -2757,7 +2828,7 @@ impl ProverLifecycle {
                                 scope = "local", action = "check",
                                 "seat renewal withheld: its worker hosts the committee session that counts this \
                                  prover but has sent no vote for an epoch while the other members voted; the seat \
-                                 renews once the worker votes or its engine or host restarts on it, otherwise it \
+                                 renews once the worker votes, its engine restarts on it or four epochs pass, otherwise it \
                                  lapses and is left. The worker takes no new seats until it votes, restarts while \
                                  still on this seat, or four epochs pass (see the worker's warning that this member \
                                  has sent no consensus vote)");
@@ -6551,7 +6622,7 @@ mod proposal_loop_tests {
                 hosting.observe_votes(frame, epoch, &lapsed, 1, Seat::Member, &silent, instance);
             }
             assert!(matches!(
-                hosting.withhold(&lapsed, epoch, epoch),
+                hosting.withhold(&lapsed, epoch, epoch, None),
                 Some(Hold::Unvoted(_))
             ));
         };
@@ -6688,6 +6759,230 @@ mod proposal_loop_tests {
         }
         commit(2);
         global
+    }
+
+    /// The leave of a seat withheld for silence stands although its worker
+    /// could host: the score rule rejected it, and the seat came back silent
+    /// every four epochs. Without the withholding the same leave is rejected.
+    #[test]
+    fn a_silent_seats_leave_is_confirmed_though_its_worker_could_host() {
+        use crate::provers::session_hosting::{epoch_ms, Hosting, Instance, Seat};
+        use quil_types::proto::node::WorkerExecution;
+
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let better_held = filter_bytes(0xA2);
+        let available = filter_bytes(0xA3);
+        for withheld in [false, true] {
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            wm.add(allocated_worker(1, held.clone()));
+            wm.add(allocated_worker(2, better_held.clone()));
+            wm.set_execution(
+                1,
+                &held,
+                WorkerExecution {
+                    state: "blocked".into(),
+                    blocker: "committee admission unavailable".into(),
+                    observed_unix_ms: crate::worker_execution::now_ms(),
+                    ..Default::default()
+                },
+            );
+            let reg = Arc::new(ConfigurableRegistry::new());
+            let mut leaving = alloc(held.clone(), ProverStatus::Leaving, 10);
+            leaving.ring = 1;
+            leaving.leave_frame_number = 730;
+            leaving.epoch = 0;
+            reg.set_prover(prover(
+                address.clone(),
+                vec![
+                    leaving,
+                    alloc(better_held.clone(), ProverStatus::Active, 10),
+                ],
+            ));
+            reg.set_summaries(vec![
+                shard_summary(held.clone(), 53),
+                shard_summary(better_held.clone(), 59),
+                shard_summary(available.clone(), 8),
+            ]);
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            lc.set_remote_shard_metrics(HashMap::from([
+                (held.clone(), (1_000_000, 1)),
+                (better_held.clone(), (100_000_000, 1)),
+                (available.clone(), (100_000, 1)),
+            ]));
+            if withheld {
+                let epoch = quil_types::consensus::epoch_length_frames();
+                let mut hosting = lc.session_hosting.lock().unwrap();
+                let silent = Hosting::Silent {
+                    peer_votes: 7,
+                    silent_ms: epoch_ms(epoch),
+                };
+                for frame in (0..=epoch).step_by(60) {
+                    hosting.observe_votes(
+                        frame,
+                        epoch,
+                        &held,
+                        1,
+                        Seat::Member,
+                        &silent,
+                        Instance::default(),
+                    );
+                }
+                assert!(hosting.withhold(&held, epoch, epoch, None).is_some());
+            }
+            lc.set_prover_root_verified_frame(1440);
+            let actions = lc
+                .evaluate(1440, 50_000, reg.as_ref(), wm.as_ref())
+                .unwrap();
+            let rejects = actions.iter().any(|a| {
+                matches!(a, LifecycleAction::RejectLeaves { filters, .. } if filters.contains(&held))
+            });
+            let confirms = actions.iter().any(|a| {
+                matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters.contains(&held))
+            });
+            assert_eq!(
+                (confirms, rejects),
+                (withheld, !withheld),
+                "withheld {withheld}: {actions:?}"
+            );
+        }
+    }
+
+    /// A seat of this prover and another, whose worker's hosts have sent no
+    /// vote since each session's start, 15 frames after each boundary,
+    /// evaluated through to the second boundary, GLOBAL frame 1440: no one
+    /// host lasted an epoch by then, the silence has. Whether it renewed
+    /// there, with the lifecycle and an evaluation for later frames.
+    fn silent_across_hosts_to_the_second_boundary(
+        pinned: bool,
+        halted: bool,
+        active: u32,
+    ) -> (
+        bool,
+        Arc<ProverLifecycle>,
+        Box<dyn Fn(&ProverLifecycle, u64) -> bool>,
+    ) {
+        use quil_types::crypto::Signer as _;
+        use quil_types::proto::node::WorkerExecution;
+
+        let signers: Vec<_> = (0..2)
+            .map(|_| quil_crypto::FalconSigner::generate())
+            .collect();
+        let [local, other] = [0, 1].map(|i| signers[i].public_key().to_vec());
+        let address = vec![0xCD; 32];
+        let held = vec![0xB5; 32];
+        let authority = session_authority(&[(&held, vec![local.clone(), other])]);
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(ProverInfo {
+            public_key: local,
+            ..prover(
+                address.clone(),
+                vec![ProverAllocationInfo {
+                    // Due from the second boundary.
+                    epoch: 2,
+                    ..alloc(held.clone(), ProverStatus::Active, 10)
+                }],
+            )
+        });
+        reg.set_summaries(vec![shard_summary(held.clone(), active)]);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(crate::worker::WorkerInfo {
+            manually_managed: pinned,
+            ..allocated_worker(1, held.clone())
+        });
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        lc.allocator.set_session_authority(authority);
+        let evaluate = move |lc: &ProverLifecycle, frame: u64| {
+            let frame_ms = crate::provers::session_hosting::epoch_ms(720) / 720;
+            let started = if frame < 735 { 15 } else { 735 };
+            let now = crate::worker_execution::now_ms();
+            wm.set_execution(
+                1,
+                &held,
+                WorkerExecution {
+                    state: "serving".into(),
+                    observed_unix_ms: now,
+                    own_votes: Some(0),
+                    peer_votes: 90,
+                    last_peer_vote_unix_ms: now,
+                    silent_ms: (frame - started) * frame_ms,
+                    host_started_unix_ms: started,
+                    engine_started_unix_ms: 1,
+                    ..Default::default()
+                },
+            );
+            lc.set_prover_root_verified_frame(frame);
+            let actions = lc
+                .evaluate(frame, 50_000, reg.as_ref(), wm.as_ref())
+                .unwrap();
+            actions.iter().any(|a| {
+                matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held))
+            })
+        };
+        for frame in (15..720).step_by(60).chain((735..1440).step_by(60)) {
+            evaluate(&lc, frame);
+        }
+        if halted {
+            lc.halt_state().mark_halted(vec![0xB5; 32]);
+        }
+        (evaluate(&lc, 1440), lc, Box::new(evaluate))
+    }
+
+    /// Silent across the hosts of its rotating sessions, a seat is withheld
+    /// at the boundary where that has lasted an epoch, and its worker takes
+    /// no new seats, also just above the halt-risk count.
+    #[test]
+    fn a_seat_silent_across_its_session_hosts_is_withheld() {
+        use crate::provers::session_hosting::{renewal_withheld, RenewalWithheld};
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let (renewed, lc, _) = silent_across_hosts_to_the_second_boundary(false, false, 50);
+        assert!(!renewed);
+        assert_eq!(
+            renewal_withheld(&[0xB5; 32], 1440),
+            Some(RenewalWithheld::Unvoted)
+        );
+        assert_eq!(
+            lc.session_hosting.lock().unwrap().held_back(),
+            std::collections::HashSet::from([1])
+        );
+    }
+
+    #[test]
+    fn a_silent_seat_just_above_the_halt_risk_count_is_withheld() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        assert!(!silent_across_hosts_to_the_second_boundary(false, false, 5).0);
+    }
+
+    #[test]
+    fn a_silent_seat_at_the_halt_risk_count_renews() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        assert!(silent_across_hosts_to_the_second_boundary(false, false, 4).0);
+    }
+
+    #[test]
+    fn a_pinned_silent_seat_renews() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        assert!(silent_across_hosts_to_the_second_boundary(true, false, 50).0);
+    }
+
+    #[test]
+    fn a_silent_seat_renews_during_a_coverage_halt() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        assert!(silent_across_hosts_to_the_second_boundary(false, true, 50).0);
+    }
+
+    /// A seat already withheld for silence renews once a shield applies, and
+    /// its worker takes seats again.
+    #[test]
+    fn a_withheld_silent_seat_renews_once_a_coverage_halt_begins() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let (renewed, lc, evaluate) = silent_across_hosts_to_the_second_boundary(false, false, 50);
+        assert!(!renewed);
+        assert!(!evaluate(&lc, 1441), "still withheld");
+        lc.halt_state().mark_halted(vec![0xB5; 32]);
+        assert!(evaluate(&lc, 1442));
+        assert!(lc.session_hosting.lock().unwrap().held_back().is_empty());
     }
 
     /// A seat whose renewal was withheld because its worker cannot host

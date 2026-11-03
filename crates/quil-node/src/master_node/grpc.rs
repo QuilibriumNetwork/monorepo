@@ -4186,10 +4186,13 @@ fn worker_entries(wm: &dyn quil_engine::worker::WorkerManager) -> Vec<quil_rpc::
         .map(|w| quil_rpc::WorkerEntry {
             execution: quil_engine::worker_execution::with_store_state(
                 w.core_id,
-                execution
-                    .iter()
-                    .find(|(id, filter, _)| *id == w.core_id && *filter == w.filter)
-                    .map(|(_, _, s)| s.clone()),
+                quil_engine::worker_execution::with_renewal_state(
+                    &w.filter,
+                    execution
+                        .iter()
+                        .find(|(id, filter, _)| *id == w.core_id && *filter == w.filter)
+                        .map(|(_, _, s)| s.clone()),
+                ),
             ),
             core_id: w.core_id,
             filter: w.filter.clone(),
