@@ -1344,10 +1344,11 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     match outcome {
                         Ok(()) => valid.push(raw),
                         Err(e) => {
+                            let error = e.to_string();
+                            crate::storage_proof_refusal::note(frame_number, &raw, &error);
                             // Normalize the reason (digit runs → '#') so per-epoch /
                             // per-frame variants group into one bucket.
-                            let reason: String = e
-                                .to_string()
+                            let reason: String = error
                                 .chars()
                                 .map(|c| if c.is_ascii_digit() { '#' } else { c })
                                 .take(90)

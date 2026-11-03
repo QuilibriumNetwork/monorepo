@@ -595,5 +595,6 @@ pub mod bitmasks {
 }
 pub mod shard_drain;
 pub(crate) mod stage_clock;
+pub(crate) mod storage_proof_refusal;
 pub(crate) mod storage_registration_landed;
 pub(crate) mod submission_attempts;
