@@ -10,12 +10,18 @@
 //! smallest first, each once it fits in the jobs' share of the memory
 //! available to the node ([`MEMORY_SHARE_PERCENT`]) and a core is free of
 //! them. A node with the memory encodes every seat at once; one without
-//! encodes as many as fit, then the next as each finishes. A job alone runs
-//! whatever its size. One that does not fit lets later ones that do pass it,
-//! a bounded number of times ([`PASS_LIMIT`], [`PASS_WINDOW`]): a large leaf
-//! labelled ahead at the head of the queue kept smaller ones that fit waiting
-//! for an hour while one job held memory (2026-10-29). A job whose work's
-//! window passes while it waits leaves the queue ([`reserve_until`]).
+//! encodes as many as fit, then the next as each finishes. Work due now
+//! alone runs whatever its size; work done ahead of when it is needed
+//! ([`reserve_ahead`]) runs, alone too, only within the jobs' share of what
+//! is available ([`Admission::fits`]): admitted alone whatever its size, a
+//! leaf labelled ahead reserving 8.0 GB started on a 16 GB host with 0.54 GB
+//! available and held its resident memory at 13.1 to 13.5 GB, the host
+//! almost unresponsive (2026-11-03). One that does not fit lets later ones
+//! that do pass it, a bounded number of times ([`PASS_LIMIT`],
+//! [`PASS_WINDOW`]): a large leaf labelled ahead at the head of the queue
+//! kept smaller ones that fit waiting for an hour while one job held memory
+//! (2026-10-29). A job whose work's window passes while it waits leaves the
+//! queue ([`reserve_until`]).
 //!
 //! Labelling a leaf is one chain of hashes, a core's work for about 80
 //! minutes per GiB. With one job at a time for the whole node, a node's
@@ -116,6 +122,14 @@ const PASS_LIMIT: u32 = 8;
 /// it ([`PASS_LIMIT`]): a few small jobs a while apart do not keep a large
 /// one waiting for hours.
 const PASS_WINDOW: Duration = Duration::from_secs(600);
+
+/// How long work ahead may stay held back for memory before a warning says
+/// so, and how often at most it repeats ([`Admission::fits`]): a storage
+/// epoch at the ideal frame time, after which the epoch's snapshots have
+/// labelled their leaves themselves.
+const AHEAD_HELD_BACK_WARN: Duration = Duration::from_millis(
+    quil_types::consensus::EPOCH_LENGTH_FRAMES * quil_types::consensus::IDEAL_FRAME_TIME_MS,
+);
 
 type Job = Box<dyn FnOnce() + Send>;
 
@@ -565,6 +579,13 @@ fn available_memory() -> Option<u64> {
     Some(container.map_or(host, |container| container.min(host)))
 }
 
+/// Bytes that must be available for `bytes` of work ahead to fit with no
+/// job holding memory ([`Admission::fits`], [`MEMORY_SHARE_PERCENT`]).
+fn needs_available(bytes: u64) -> u64 {
+    let needed = u128::from(bytes) * 100 / u128::from(MEMORY_SHARE_PERCENT);
+    u64::try_from(needed).unwrap_or(u64::MAX)
+}
+
 /// Memory a job holds while it works, granted by [`reserve`] and given back
 /// when dropped.
 #[must_use = "the memory is given back when the reservation drops"]
@@ -703,6 +724,8 @@ pub struct Admission {
     available: Box<dyn Fn() -> Option<u64> + Send + Sync>,
     /// [`LOOK_WINDOW`], shorter in tests.
     window: Duration,
+    /// [`AHEAD_HELD_BACK_WARN`], shorter in tests.
+    held_back_warn: Duration,
 }
 
 #[derive(Default)]
@@ -744,6 +767,20 @@ struct State {
     labelling_now: usize,
     /// Labelling ahead pausing ([`Reservation::wait_while_paused`]).
     pausing: usize,
+    /// Since when work ahead is held back for memory ([`Admission::fits`]),
+    /// until some is granted or none waits.
+    held_back: Option<HeldBack>,
+}
+
+/// Work ahead held back for memory ([`State::held_back`]).
+#[derive(Debug, Clone, Copy)]
+struct HeldBack {
+    since: Instant,
+    /// The bytes of the last work ahead that did not fit with no job
+    /// holding memory.
+    bytes: u64,
+    /// When it was last warned of ([`AHEAD_HELD_BACK_WARN`]).
+    warned: Option<Instant>,
 }
 
 /// A reservation waiting ([`State::waiting`]).
@@ -811,6 +848,7 @@ impl Admission {
             ahead_jobs: AHEAD_JOBS,
             available,
             window: LOOK_WINDOW,
+            held_back_warn: AHEAD_HELD_BACK_WARN,
         }
     }
 
@@ -1003,7 +1041,8 @@ impl Admission {
     /// - nothing of its rank passes one passed [`PASS_LIMIT`] times by its
     ///   rank, or first passed [`PASS_WINDOW`] ago. It holds its place until
     ///   it fits beside the jobs holding memory, at the latest once they end
-    ///   and it runs alone.
+    ///   and it runs alone. Work ahead that does not fit with no job holding
+    ///   memory holds no place: no job ending will make it fit.
     ///
     /// Then asks work ahead holding memory to give it back, as much as the
     /// first in line lack ([`Self::ask_yields`]).
@@ -1016,6 +1055,9 @@ impl Admission {
         // The rank of one holding its place: nothing of its rank passes it.
         let mut holding: Option<u8> = None;
         let mut granted = false;
+        // Work ahead granted, and the bytes of work ahead that did not fit
+        // with no job holding memory.
+        let (mut ahead_granted, mut alone_short) = (false, None);
         let mut index = 0;
         while index < state.waiting.len() && state.holders < self.slots {
             let waiting = state.waiting[index];
@@ -1033,7 +1075,9 @@ impl Admission {
                 index += 1;
                 continue;
             }
-            if self.fits(state, waiting.bytes) {
+            let alone = state.holders == 0;
+            if self.fits(state, waiting.bytes, waiting.urgency) {
+                ahead_granted |= waiting.urgency == Urgency::Ahead;
                 state.waiting.remove(index);
                 state.reserved = state.reserved.saturating_add(waiting.bytes);
                 state.holders += 1;
@@ -1061,16 +1105,110 @@ impl Admission {
                 granted = true;
                 continue;
             }
-            if self.holds_place(state, waiting.ticket, waiting.urgency, waiting.bytes) {
+            if alone && waiting.urgency == Urgency::Ahead {
+                alone_short.get_or_insert(waiting.bytes);
+            } else if self.holds_place(state, waiting.ticket, waiting.urgency, waiting.bytes) {
                 holding = Some(rank);
             }
             skipped.push((waiting.ticket, rank));
             index += 1;
         }
+        self.note_held_back(state, ahead_granted, alone_short);
         if granted {
             self.ask_yields(state);
             self.changed.notify_all();
         }
+    }
+
+    /// Note work ahead held back for memory ([`State::held_back`]) after a
+    /// pass: it began to be when work ahead of `alone_short` bytes did not
+    /// fit with no job holding memory, and ends once work ahead is granted
+    /// or none waits. Logged as it begins and ends, and warned of once it
+    /// lasted [`AHEAD_HELD_BACK_WARN`], at most once as long.
+    fn note_held_back(&self, state: &mut State, ahead_granted: bool, alone_short: Option<u64>) {
+        let ahead_waits = state
+            .waiting
+            .iter()
+            .any(|waiting| waiting.urgency == Urgency::Ahead);
+        if ahead_granted || !ahead_waits {
+            let outcome = if ahead_granted {
+                "work ahead has its memory"
+            } else {
+                "no work ahead waits: done, or given up at its epoch's snapshot frame"
+            };
+            self.end_held_back(state, outcome);
+            return;
+        }
+        let look = state.last_look;
+        let (available, share) = (look.map(|look| look.available), look.map(|look| look.share));
+        match (state.held_back.is_some(), alone_short) {
+            (true, Some(bytes)) => {
+                if let Some(held_back) = state.held_back.as_mut() {
+                    held_back.bytes = bytes;
+                }
+            }
+            (true, None) => {}
+            (false, None) => return,
+            (false, Some(bytes)) => {
+                info!(
+                    bytes,
+                    available,
+                    share,
+                    needs_available = needs_available(bytes),
+                    waiting_ahead = state
+                        .waiting
+                        .iter()
+                        .filter(|waiting| waiting.urgency == Urgency::Ahead)
+                        .count(),
+                    "storage jobs ahead held back for memory: no job holds memory, yet the work \
+                     ahead needs more than the jobs' share of what this host has available; work \
+                     due now still runs whatever its size. It starts once this host has \
+                     needs_available bytes available, or is given up at its epoch's snapshot \
+                     frame, from which the snapshot labels its leaves itself: an expected wait \
+                     on a host short of memory"
+                );
+                state.held_back = Some(HeldBack {
+                    since: Instant::now(),
+                    bytes,
+                    warned: None,
+                });
+            }
+        }
+        let Some(held_back) = state.held_back.as_mut() else {
+            return;
+        };
+        let last = held_back.warned.unwrap_or(held_back.since);
+        if last.elapsed() < self.held_back_warn {
+            return;
+        }
+        held_back.warned = Some(Instant::now());
+        warn!(
+            bytes = held_back.bytes,
+            available,
+            share,
+            needs_available = needs_available(held_back.bytes),
+            seconds = held_back.since.elapsed().as_secs_f64(),
+            "storage jobs ahead held back for memory for a whole epoch: this host has too little \
+             memory available to label leaves ahead, so each snapshot labels its leaves itself \
+             within its renewal's grace, and a seat whose leaf cannot be labelled in time misses \
+             that epoch's storage share; free memory on this host (fewer data workers, other \
+             processes) so that needs_available bytes are available"
+        );
+    }
+
+    /// End work ahead held back for memory ([`Self::note_held_back`]),
+    /// logged with `outcome`.
+    fn end_held_back(&self, state: &mut State, outcome: &'static str) {
+        let Some(held_back) = state.held_back.take() else {
+            return;
+        };
+        info!(
+            seconds = held_back.since.elapsed().as_secs_f64(),
+            bytes = held_back.bytes,
+            available = state.last_look.map(|look| look.available),
+            outcome,
+            "storage jobs ahead no longer held back for memory"
+        );
     }
 
     /// Ask work ahead holding memory ([`State::yielding`]) less urgent than
@@ -1127,7 +1265,11 @@ impl Admission {
             let holders = holders.saturating_sub(jobs);
             let reserved = u128::from(reserved.saturating_sub(freed));
             if holders == 0 {
-                return count == 1
+                // Alone, work due now runs whatever its size; work ahead
+                // only within the share ([`Self::fits`]).
+                let alone = count == 1
+                    && (head == 0 || share.is_none_or(|share| wanted <= u128::from(share)));
+                return alone
                     || (count <= slots && share.is_some_and(|share| wanted <= u128::from(share)));
             }
             holders + count <= slots
@@ -1267,6 +1409,16 @@ impl Admission {
         }
         state.passed.remove(&ticket);
         state.stale = true;
+        if !state
+            .waiting
+            .iter()
+            .any(|waiting| waiting.urgency == Urgency::Ahead)
+        {
+            self.end_held_back(
+                &mut state,
+                "no work ahead waits: given up at its epoch's snapshot frame",
+            );
+        }
         let (waiting, jobs) = (state.waiting.len(), state.holders);
         drop(state);
         info!(
@@ -1309,12 +1461,17 @@ impl Admission {
         }
     }
 
-    /// Whether `bytes` more fit beside the reservations held.
+    /// Whether `bytes` more for work of `urgency` fit beside the reservations
+    /// held.
     ///
-    /// Alone, a job runs whatever its size, and what is available then is
-    /// the most the jobs could have. Beside others, the jobs share
-    /// [`MEMORY_SHARE_PERCENT`] of the less of two bounds, looked at again
-    /// whenever a reservation asks or waits:
+    /// Alone, work due now runs whatever its size, and what is available then
+    /// is the most the jobs could have. Work ahead is optional: alone, it
+    /// runs only within the share of what is available then, as beside
+    /// others, or one at a time when the node cannot tell its memory; held
+    /// back, it holds no memory, so work due now never waits for it, and it
+    /// starts once the memory is available ([`RECHECK`]). Beside others, the
+    /// jobs share [`MEMORY_SHARE_PERCENT`] of the less of two bounds, looked
+    /// at again whenever a reservation asks or waits:
     /// - the most the jobs could have, raised whenever more is available
     ///   beside the ones held (the node gave memory back);
     /// - the lowest look within [`LOOK_WINDOW`] at what was available plus
@@ -1328,7 +1485,7 @@ impl Admission {
     /// taken when the last job alone was granted decided for as long as any
     /// job held memory, too high once the node had grown, too low once it
     /// had given memory back).
-    fn fits(&self, state: &mut State, bytes: u64) -> bool {
+    fn fits(&self, state: &mut State, bytes: u64, urgency: Urgency) -> bool {
         let now = Instant::now();
         if state.holders == 0 {
             state.idle_available = (self.available)();
@@ -1336,7 +1493,11 @@ impl Admission {
             if let Some(idle) = state.idle_available {
                 state.looks.push_back((now, idle));
             }
-            return true;
+            return urgency == Urgency::Due
+                || state.idle_available.is_none()
+                || self
+                    .share(state)
+                    .is_none_or(|share| u128::from(bytes) <= u128::from(share));
         }
         if state.holders >= self.slots {
             return false;
@@ -2125,6 +2286,174 @@ mod tests {
         assert!(granted(&second));
     }
 
+    /// Work ahead is optional: with no job holding memory it runs only
+    /// within the jobs' share of what is available, reading a leaf as
+    /// labelling one; work due now still runs alone whatever its size, and
+    /// the work ahead starts once the memory is there (2026-11-03: a leaf
+    /// labelled ahead reserving 8.0 GB started on a 16 GB host with 0.54 GB
+    /// available, and held the host's memory for hours).
+    #[test]
+    fn work_ahead_alone_runs_only_within_the_share_of_what_is_available() {
+        // 2 GiB available: the jobs share 1.5.
+        let (admission, memory) = admission(8, 2 * GIB);
+        let labelling = hold_with_order(admission, 8 * GIB, ahead(false, 1, 0));
+        assert!(
+            still_waiting(&labelling),
+            "over-admission: 8 GiB of labelling ahead granted with 2 GiB available and no job \
+             holding memory"
+        );
+        let read = hold_brief(admission, 4 * GIB, ahead(false, 1, 1));
+        assert!(
+            still_waiting(&read),
+            "over-admission: 4 GiB of reading a leaf ahead granted with 2 GiB available and no \
+             job holding memory"
+        );
+        let due = hold(admission, 8 * GIB);
+        assert!(granted(&due), "work due now runs alone whatever its size");
+        assert!(still_waiting(&labelling), "nothing runs beside it");
+        drop(due.release);
+        assert!(
+            still_waiting(&labelling),
+            "alone, 8 GiB still do not fit in 1.5"
+        );
+        // The host frees memory: 12 GiB available, the jobs share 9.
+        memory.store(12 * GIB, Ordering::SeqCst);
+        assert!(granted(&labelling), "it starts once the memory is there");
+        assert!(still_waiting(&read), "12 GiB do not fit in 9");
+        drop(labelling.release);
+        assert!(granted(&read), "it starts once the labelling ends");
+        drop(read.release);
+    }
+
+    /// Work ahead that could be done when needed is not asked to give its
+    /// memory back to more urgent work ahead that would not fit even alone:
+    /// it would give it back for nothing.
+    #[test]
+    fn work_ahead_does_not_yield_to_work_ahead_too_large_for_what_is_available() {
+        // 8 GiB available: the jobs share 6.
+        let (admission, _) = admission(8, 8 * GIB);
+        let filler = reserve_now(admission, GIB, ahead(true, 1, 0));
+        let urgent = hold_with_order(admission, 7 * GIB, ahead(false, 2, 0));
+        until_waiting(admission, 1);
+        assert!(still_waiting(&urgent), "8 GiB do not fit in 6");
+        assert!(
+            !filler.yield_requested(),
+            "asked to give its memory back to 7 GiB of work ahead that do not fit in 6 even \
+             alone"
+        );
+        drop(filler);
+        assert!(still_waiting(&urgent), "alone, 7 GiB still do not fit in 6");
+    }
+
+    /// Work ahead that does not fit with no job holding memory holds no
+    /// place, however long ago it was first passed: no job ending would let
+    /// it fit, and smaller work ahead that fits goes on.
+    #[test]
+    fn work_ahead_held_back_for_memory_holds_no_place() {
+        let window = Duration::from_millis(100);
+        // 8 GiB available: the jobs share 6.
+        let admission = admission_passing(8, 8 * GIB, window);
+        let large = hold_with_order(admission, 7 * GIB, ahead(false, 1, 0));
+        until_waiting(admission, 1);
+        let small = hold_with_order(admission, GIB, ahead(false, 1, 1));
+        assert!(granted(&small), "it passes the large one");
+        std::thread::sleep(window * 2);
+        drop(small.release);
+        let late = hold_with_order(admission, GIB, ahead(false, 1, 2));
+        assert!(
+            granted(&late),
+            "the large one was first passed a window ago, but holds no place while no job \
+             ending would let it fit"
+        );
+        assert!(still_waiting(&large), "8 GiB do not fit in 6");
+        drop(late.release);
+    }
+
+    /// An admission of `slots` jobs sharing what the returned bytes say is
+    /// available, warning of work ahead held back for memory after `period`
+    /// ([`AHEAD_HELD_BACK_WARN`]).
+    fn admission_warning(
+        slots: usize,
+        available: u64,
+        period: Duration,
+    ) -> (&'static Admission, Arc<AtomicU64>) {
+        let memory = Arc::new(AtomicU64::new(available));
+        let probe = memory.clone();
+        let mut admission = Admission::new(
+            slots,
+            Box::new(move || Some(probe.load(Ordering::SeqCst)).filter(|&bytes| bytes > 0)),
+        );
+        admission.held_back_warn = period;
+        (Box::leak(Box::new(admission)), memory)
+    }
+
+    /// When the warning of work ahead held back for memory was last given.
+    fn held_back_warned(admission: &Admission) -> Option<Instant> {
+        let mut state = admission.state();
+        admission.admit_waiting(&mut state);
+        state.held_back.expect("work ahead is held back").warned
+    }
+
+    /// Work ahead held back for memory is noted from the first look that
+    /// finds it too large with no job holding memory, warned of once it
+    /// lasted [`AHEAD_HELD_BACK_WARN`] (a storage epoch), at most once as
+    /// long, and no longer held back once it has its memory.
+    #[test]
+    fn work_ahead_held_back_for_memory_is_warned_of_at_most_once_an_epoch() {
+        let period = Duration::from_millis(300);
+        let (admission, memory) = admission_warning(8, 2 * GIB, period);
+        let labelling = hold_with_order(admission, 8 * GIB, ahead(false, 1, 0));
+        until_waiting(admission, 1);
+        assert_eq!(held_back_warned(admission), None, "not warned of at once");
+        std::thread::sleep(period + period / 2);
+        let first = held_back_warned(admission).expect("warned of once it lasted the period");
+        assert_eq!(
+            held_back_warned(admission),
+            Some(first),
+            "warned of at most once a period"
+        );
+        std::thread::sleep(period + period / 2);
+        let second = held_back_warned(admission).expect("still held back");
+        assert!(second > first, "warned of again a period later");
+        memory.store(12 * GIB, Ordering::SeqCst);
+        // Look now: the looks above count as the waiting one's own.
+        admission.admit_waiting(&mut admission.state());
+        assert!(granted(&labelling), "it starts once the memory is there");
+        assert!(
+            admission.state().held_back.is_none(),
+            "no longer held back once it has its memory"
+        );
+        drop(labelling.release);
+    }
+
+    /// Work ahead held back for memory whose window passes leaves the
+    /// queue, and with no other work ahead waiting nothing is held back.
+    #[test]
+    fn work_ahead_is_no_longer_held_back_once_none_waits() {
+        let (admission, _) = admission(8, 2 * GIB);
+        let expired = Arc::new(AtomicBool::new(false));
+        let flag = expired.clone();
+        let (left_tx, left) = mpsc::channel();
+        std::thread::spawn(move || {
+            let reservation = admission.reserve_ordered(
+                8 * GIB,
+                Urgency::Ahead,
+                Some(ahead(false, 1, 0)),
+                true,
+                &|| flag.load(Ordering::SeqCst),
+            );
+            left_tx.send(reservation.is_none()).unwrap();
+        });
+        until_waiting(admission, 1);
+        assert!(admission.state().held_back.is_some(), "it is held back");
+        expired.store(true, Ordering::SeqCst);
+        assert_eq!(left.recv_timeout(SOON), Ok(true), "it leaves the queue");
+        assert!(
+            admission.state().held_back.is_none(),
+            "nothing is held back once no work ahead waits"
+        );
+    }
+
     /// An admission of `slots` jobs sharing a constant `available`, whose
     /// waiting reservations may be passed for `window` after first being.
     fn admission_passing(slots: usize, available: u64, window: Duration) -> &'static Admission {
@@ -2188,7 +2517,8 @@ mod tests {
         let (admission, _) = admission(PASS_LIMIT as usize + 4, 40 * GIB);
         let first = hold(admission, 20 * GIB);
         assert!(granted(&first));
-        let large = hold_with(admission, 35 * GIB, Urgency::Ahead);
+        // Work ahead alone runs within the share (30 GiB): it takes all of it.
+        let large = hold_with(admission, 30 * GIB, Urgency::Ahead);
         until_waiting(admission, 1);
         let passers: Vec<Held> = (0..PASS_LIMIT)
             .map(|_| {
@@ -2203,13 +2533,13 @@ mod tests {
             "29 GiB fit in 30, but nothing passes the large one any more"
         );
         drop(first.release);
-        assert!(still_waiting(&large), "43 GiB do not fit in 30");
+        assert!(still_waiting(&large), "38 GiB do not fit in 30");
         assert!(still_waiting(&late), "nor does anything pass it");
         drop(passers);
         assert!(granted(&large), "it runs alone once no job holds memory");
         assert!(
             still_waiting(&late),
-            "nothing runs beside a job larger than the share"
+            "nothing runs beside a job that takes the whole share"
         );
         drop(large.release);
         assert!(granted(&late));
