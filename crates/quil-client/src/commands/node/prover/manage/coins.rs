@@ -533,14 +533,13 @@ pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
         })
     };
     match (&m.claimable_reward, &m.reward_error) {
-        (Some((units, frame)), _) if *units > 0 => push(
+        // The amount and its frame are the claimable row's; the notice,
+        // counted from the Provers tab too, names the condition and key.
+        (Some((units, _)), _) if *units > 0 => push(
             "coins-claimable",
             NoticeSeverity::Info,
             true,
-            format!(
-                "Claimable: {} Q at f{frame}; ‹M› authorizes a mint.",
-                fmt_amount(*units)
-            ),
+            "Reward claimable: ‹M› authorizes a mint.".into(),
         ),
         (None, Some(error)) => push(
             "coins-claimable-failed",
@@ -551,17 +550,14 @@ pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
         _ => {}
     }
     let legacy = &m.coins.legacy;
+    // The legacy row's `As of` marks how old its figures are.
     if let (Some(error), Some(since)) = (&legacy.error, legacy.failing_since) {
-        let figures = match &legacy.answer {
-            Some((_, at, _)) => format!("; figures as of {}", utc_hm(*at)),
-            None => String::new(),
-        };
         push(
             "coins-legacy-failed",
             NoticeSeverity::Warning,
             false,
             format!(
-                "Legacy coins: read failed {} since {} ({error}){figures}.",
+                "Legacy coins: read failed {} since {} ({error}).",
                 plural(legacy.failures as usize, "time", "times"),
                 utc_hm(since)
             ),
@@ -574,37 +570,22 @@ pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
     if unshielded == 0 {
         return out;
     }
-    let counts = format!(
-        "{unshielded} unshielded, {} shielded",
-        snapshot.tally.shielded
-    );
+    // Counts are the legacy row's, the batches and the frame shields open
+    // at the Shield plan's: these notices name the condition and the key.
     match (shields_open_at(snapshot), snapshot.plan) {
-        (Some((frame, left)), _) => push(
+        (Some(_), _) => push(
             "coins-shield-gate",
             NoticeSeverity::Info,
             false,
-            format!(
-                "Shields open at f{frame}, in {}.",
-                plural(left as usize, "frame", "frames")
-            ),
+            "Legacy coins: shields are not open yet; the Shield plan gives the frame.".into(),
         ),
-        (None, Some(plan)) if !busy => push(
+        (None, Some(_)) if !busy => push(
             "coins-unshielded",
             NoticeSeverity::Info,
             true,
-            format!(
-                "Legacy coins: {counts}; {}{}; ‹S› shields the rest.",
-                if plan.exact { "" } else { "≥" },
-                plural(plan.batches, "batch", "batches")
-            ),
+            "Legacy coins unshielded: ‹S› shields them.".into(),
         ),
-        (None, Some(_)) => {}
-        (None, None) => push(
-            "coins-unshielded",
-            NoticeSeverity::Info,
-            true,
-            format!("Legacy coins: {counts}."),
-        ),
+        (None, _) => {}
     }
     if let Some(plan) = snapshot.plan {
         if plan.outside > 0 {
@@ -612,10 +593,7 @@ pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
                 "coins-outside",
                 NoticeSeverity::Info,
                 false,
-                format!(
-                    "Legacy coins: {} on no live shard; a later run covers them.",
-                    plan.outside
-                ),
+                "Legacy coins on no live shard wait for a later run.".into(),
             );
         }
         if !plan.exact {
@@ -623,10 +601,7 @@ pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
                 "coins-plan-inexact",
                 NoticeSeverity::Warning,
                 false,
-                format!(
-                    "Shield plan: shard list unavailable; batches may exceed {}.",
-                    plan.batches
-                ),
+                "Shield plan: shard list unavailable; the batch count is a lower bound.".into(),
             );
         }
     }
@@ -1003,8 +978,8 @@ mod coins_tests {
         assert_eq!(
             texts,
             [
-                "Claimable: 7 Q at f120; ‹M› authorizes a mint.",
-                "Legacy coins: 4 unshielded, 2 shielded; 3 batches; ‹S› shields the rest.",
+                "Reward claimable: ‹M› authorizes a mint.",
+                "Legacy coins unshielded: ‹S› shields them.",
             ],
             "the outside-shard note is info and hides at the default level"
         );
@@ -1027,11 +1002,11 @@ mod coins_tests {
         assert_eq!(
             texts,
             [
-                "Shields open at f1000, in 10 frames.",
-                "Shield plan: shard list unavailable; batches may exceed 3.",
+                "Legacy coins: shields are not open yet; the Shield plan gives the frame.",
+                "Shield plan: shard list unavailable; the batch count is a lower bound.",
             ]
         );
-        // A failing read keeps the last figures and says how old they are.
+        // A failing read keeps the last figures; their row says how old.
         apply_legacy(&mut m, Err("unavailable".into()), Duration::from_secs(1));
         apply_legacy(&mut m, Err("unavailable".into()), Duration::from_secs(1));
         let failed = notices(&m, fmt)
@@ -1040,6 +1015,6 @@ mod coins_tests {
             .unwrap();
         assert_eq!(failed.severity, NoticeSeverity::Warning);
         assert!(failed.text.contains("read failed 2 times since "));
-        assert!(failed.text.contains("; figures as of "));
+        assert!(!failed.text.contains("figures as of"), "{}", failed.text);
     }
 }

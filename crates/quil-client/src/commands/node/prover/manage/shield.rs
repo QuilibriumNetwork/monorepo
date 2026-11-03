@@ -583,10 +583,7 @@ pub fn notices(m: &Model, fmt_amount: &dyn Fn(u128) -> String) -> Vec<Notice> {
                 NoticeSeverity::Info,
                 false,
                 false,
-                format!(
-                    "Shield: {} submitted <2h ago are hidden from the plan.",
-                    plural(snapshot.pending, "coin", "coins")
-                ),
+                "Shield: coins submitted <2h ago are hidden from the plan.".into(),
             );
         }
     }
