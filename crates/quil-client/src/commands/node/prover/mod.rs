@@ -21,6 +21,7 @@ use crate::util::UNITS_PER_QUIL;
 pub mod epoch;
 mod gossip_traffic;
 mod join;
+mod leave_check;
 pub(crate) mod local_execution;
 mod manage;
 mod merge;
