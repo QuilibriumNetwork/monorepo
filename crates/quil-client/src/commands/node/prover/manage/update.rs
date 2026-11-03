@@ -453,12 +453,12 @@ fn finish_confirmed(m: &mut Model, frame: u64) -> Vec<Cmd> {
         m.status_is_error = false;
     } else if confirmed == 0 {
         m.status_msg = format!(
-            "{action} broadcast at frame {send_frame} but {unchanged}/{total} filter(s) did not change (e.g. {first_unchanged})"
+            "{action} broadcast at frame {send_frame} but {unchanged}/{total} filter(s) did not change yet (e.g. {first_unchanged}); this node's registry may show it only by the next epoch boundary"
         );
         m.status_is_error = true;
     } else {
         m.status_msg = format!(
-            "{action} partial: {confirmed}/{total} confirmed, {unchanged} unchanged (e.g. {first_unchanged})"
+            "{action} partial: {confirmed}/{total} confirmed, {unchanged} unchanged yet (e.g. {first_unchanged}); this node's registry may show them only by the next epoch boundary"
         );
         m.status_is_error = confirmed == 0;
     }

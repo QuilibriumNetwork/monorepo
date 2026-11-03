@@ -1217,6 +1217,52 @@ mod shield_action_tests {
         }
     }
 
+    /// The manager's leave, as it builds it, passes the verifier every node
+    /// runs: it signs through the command's `leave_sig`.
+    #[test]
+    fn the_managers_leave_passes_the_network_verifier() {
+        use quil_execution::global_intrinsic::{
+            conversions, prover_filter_ops::ProverLeave as CanonicalLeave, verify,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let km = FileKeyManager::new(
+            directory.path().join("keys.yml"),
+            "",
+            "q-prover-key".into(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )
+        .unwrap();
+        km.create_falcon_key("q-prover-key").unwrap();
+        let pubkey = km
+            .get_signer_by_id("q-prover-key")
+            .unwrap()
+            .public_key()
+            .to_vec();
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        quil_execution::global_schema::write_type(&mut tree, "prover:Prover").unwrap();
+        quil_execution::global_schema::write_field(
+            &mut tree,
+            "prover:Prover",
+            "PublicKey",
+            &pubkey,
+        )
+        .unwrap();
+        let filters = vec![vec![0x08; 32], vec![0x09; 40]];
+        let request = super::build_request(&km, "Leave", &filters, 777).unwrap();
+        let Some(quil_types::proto::global::message_request::Request::Leave(pb)) = request.request
+        else {
+            panic!("a leave request");
+        };
+        let wire = conversions::prover_leave_from_proto(&pb)
+            .to_canonical_bytes()
+            .unwrap();
+        let op = CanonicalLeave::from_canonical_bytes(&wire).unwrap();
+        assert!(
+            verify::verify_prover_leave(&op, &tree, &quil_crypto::DefaultKeyManager::new())
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn s_previews_and_runs_through_the_cli_functions() {
         let directory = tempfile::tempdir().unwrap();
