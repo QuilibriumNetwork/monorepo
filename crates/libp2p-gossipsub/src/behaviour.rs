@@ -3271,12 +3271,34 @@ where
     }
 }
 
+/// QUILIBRIUM: the IP a connected peer counts under for the colocation penalty
+/// (P6): an IPv6 address by its /64, which one site or host typically holds
+/// whole, as one IPv4 address counts once.
 fn get_ip_addr(addr: &Multiaddr) -> Option<IpAddr> {
     addr.iter().find_map(|p| match p {
         Ip4(addr) => Some(IpAddr::V4(addr)),
-        Ip6(addr) => Some(IpAddr::V6(addr)),
+        Ip6(addr) => Some(IpAddr::V6(std::net::Ipv6Addr::from(
+            u128::from(addr) & !((1u128 << 64) - 1),
+        ))),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod colocation_ip_tests {
+    use super::get_ip_addr;
+
+    #[test]
+    fn an_ipv6_peer_counts_by_its_64_and_an_ipv4_peer_by_its_address() {
+        let ip = |addr: &str| get_ip_addr(&addr.parse().unwrap()).unwrap().to_string();
+        assert_eq!(ip("/ip4/203.0.113.7/tcp/8336"), "203.0.113.7");
+        assert_eq!(
+            ip("/ip6/2001:db8:1:2:3:4:5:6/udp/8336/quic-v1"),
+            "2001:db8:1:2::"
+        );
+        assert_eq!(ip("/ip6/2001:db8:1:2:ffff::1/tcp/8336"), "2001:db8:1:2::");
+        assert_eq!(ip("/ip6/2001:db8:1:3::1/tcp/8336"), "2001:db8:1:3::");
+    }
 }
 
 impl<C, F> NetworkBehaviour for Behaviour<C, F>

@@ -420,6 +420,22 @@ rewardStrategy: "custom-strategy"
     }
 
     #[test]
+    fn additional_listen_multiaddrs_are_optional_and_stay_out_of_saved_configs() {
+        let p: P2PConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(p.additional_listen_multiaddrs.is_empty());
+        assert!(!serde_yaml::to_string(&p)
+            .unwrap()
+            .contains("additionalListenMultiaddrs"));
+        let p: P2PConfig = serde_yaml::from_str(
+            "listenMultiaddr: /ip4/0.0.0.0/udp/8336/quic-v1\n\
+             additionalListenMultiaddrs:\n\
+             - /ip6/::/udp/8336/quic-v1\n",
+        )
+        .unwrap();
+        assert_eq!(p.additional_listen_multiaddrs, ["/ip6/::/udp/8336/quic-v1"]);
+    }
+
+    #[test]
     fn apply_defaults_populates_p2p_stream_addr_when_empty() {
         let mut p = P2PConfig::default();
         p.stream_listen_multiaddr = String::new();
