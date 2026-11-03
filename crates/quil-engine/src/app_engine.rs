@@ -39,6 +39,9 @@ pub use app_parent::{AppParentExecutor, PrivateAppParent};
 use app_parent::{PRIVATE_PARENT_MESSAGE_BYTES, PRIVATE_PARENT_MESSAGE_ITEMS};
 
 const CONSENSUS_QUEUE_SIZE: usize = 1000;
+
+/// How often an engine reports consensus messages its full queue dropped.
+const INBOUND_DROPS_REPORT_EVERY: Duration = Duration::from_secs(60);
 /// Full frames peers publish on the shard's frame topic, queued apart from
 /// consensus and control messages so a flood of them cannot fill that queue.
 const GOSSIP_FRAME_QUEUE_SIZE: usize = 64;
@@ -350,6 +353,8 @@ pub struct AppEngineHandle {
     /// The engine's queue of [`AppEngineMessage::Frame`]s (frame-topic
     /// gossip); `None` sends them with every other message.
     frame_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Consensus messages dropped because the engine's queue was full.
+    inbound_dropped: Arc<std::sync::atomic::AtomicU64>,
     sizes: SharedAppEngineSizes,
     execution: crate::worker_execution::SharedWorkerExecution,
     fee_snapshot: Arc<std::sync::Mutex<Option<quil_execution::pricing::AppFeeSnapshot>>>,
@@ -388,6 +393,7 @@ impl AppEngineHandle {
             filter,
             msg_tx,
             frame_tx: None,
+            inbound_dropped: Default::default(),
             sizes: SharedAppEngineSizes::new(),
             execution: Default::default(),
             fee_snapshot: Arc::new(std::sync::Mutex::new(None)),
@@ -409,7 +415,13 @@ impl AppEngineHandle {
                 let _ = frames.try_send(data);
             }
             (msg, _) => {
-                let _ = self.msg_tx.try_send(msg);
+                if matches!(
+                    self.msg_tx.try_send(msg),
+                    Err(mpsc::error::TrySendError::Full(_))
+                ) {
+                    self.inbound_dropped
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
     }
@@ -3043,6 +3055,10 @@ pub struct AppConsensusEngine {
     /// logged ([`Self::log_session_liveness`]).
     session_liveness: Option<Arc<quil_cw_consensus::adapters::Liveness>>,
     session_liveness_logged: Option<std::time::Instant>,
+    /// What [`AppEngineHandle::send`] dropped ([`Self::log_inbound_drops`]).
+    inbound_dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// The total last reported, and when.
+    inbound_drops_reported: (u64, std::time::Instant),
     /// When the materialized height was last logged at info
     /// ([`MaterializedLog`]).
     materialized_log: MaterializedLog,
@@ -3162,6 +3178,7 @@ impl AppConsensusEngine {
         let execution = crate::worker_execution::SharedWorkerExecution::default();
         execution.engine_started();
         execution.state("starting", "waiting for transport");
+        let inbound_dropped: Arc<std::sync::atomic::AtomicU64> = Default::default();
         let handle = AppEngineHandle {
             core_id,
             execution: execution.clone(),
@@ -3171,6 +3188,7 @@ impl AppConsensusEngine {
             filter: filter.clone(),
             msg_tx: msg_tx.clone(),
             frame_tx: Some(frame_tx.clone()),
+            inbound_dropped: inbound_dropped.clone(),
             sizes: sizes.clone(),
         };
 
@@ -3276,6 +3294,8 @@ impl AppConsensusEngine {
             session_closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_liveness: None,
             session_liveness_logged: None,
+            inbound_dropped,
+            inbound_drops_reported: (0, std::time::Instant::now()),
             materialized_log: MaterializedLog::default(),
             presence: Default::default(),
             cw_inbound: [0; 4],
@@ -3524,13 +3544,13 @@ impl AppConsensusEngine {
                 return;
             };
             let store = self.global_anchor_store.clone();
-            runtime.spawn(async move {
+            runtime.spawn(probe::probed(probe::Section::GlobalAnchorRecovery, async move {
                 for number in numbers {
                     if let Err(error) = crate::global_anchor::ensure_global_anchor(store.as_ref(), &source, number).await {
                         debug!(frame = number, %error, "GLOBAL frame for a storage epoch proof not recovered yet");
                     }
                 }
-            });
+            }));
         };
         let missing = |number: u64| {
             self.global_anchor_store
@@ -7755,6 +7775,26 @@ impl AppConsensusEngine {
         }
     }
 
+    /// Warn, at most every [`INBOUND_DROPS_REPORT_EVERY`], of consensus
+    /// messages dropped because this engine did not read its queue in time:
+    /// a dropped frame body leaves this worker refusing what is built on it
+    /// until archive replay brings the frame.
+    fn log_inbound_drops(&mut self, now: std::time::Instant) {
+        let total = self
+            .inbound_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let (reported, at) = self.inbound_drops_reported;
+        if total == reported || now.saturating_duration_since(at) < INBOUND_DROPS_REPORT_EVERY {
+            return;
+        }
+        self.inbound_drops_reported = (total, now);
+        warn!(core_id = self.core_id, filter = hex::encode(&self.filter),
+            dropped = total - reported, total,
+            secs = now.saturating_duration_since(at).as_secs(), scope = "this node's worker",
+            action = "this worker's engine fell behind its queue: look for 'worker thread blocked' lines of this worker; it follows the shard by archive replay until the frames it missed arrive",
+            "consensus messages for this worker were dropped: its engine's queue was full");
+    }
+
     /// Once a minute, what the running session's consensus has seen: whether
     /// views advance, which end in a certificate, how many members voted
     /// recently against the quorum, and whether this member's data is staged.
@@ -7769,6 +7809,7 @@ impl AppConsensusEngine {
     /// `blocked` counts messages consensus discarded as invalid.
     fn log_session_liveness(&mut self) {
         let _probe = probe::section(probe::Section::SessionLiveness);
+        self.log_inbound_drops(std::time::Instant::now());
         self.watch_view_stall();
         let (Some(liveness), Some(session)) =
             (self.session_liveness.as_ref(), self.cw_session.as_ref())
@@ -10886,17 +10927,20 @@ impl AppConsensusEngine {
         let frames = self.self_frame_tx.clone();
         let data = data.to_vec();
         let core_id = self.core_id;
-        tokio::spawn(async move {
-            let prepared = validator.prepare_storage_history(&frame).await;
-            running.store(false, std::sync::atomic::Ordering::Release);
-            match prepared {
-                Ok(()) => {
-                    let _ = frames.try_send(data);
-                }
-                Err(error) => debug!(core_id, frame = number, %error,
+        tokio::spawn(probe::probed(
+            probe::Section::FrameHistoryPreparation,
+            async move {
+                let prepared = validator.prepare_storage_history(&frame).await;
+                running.store(false, std::sync::atomic::Ordering::Release);
+                match prepared {
+                    Ok(()) => {
+                        let _ = frames.try_send(data);
+                    }
+                    Err(error) => debug!(core_id, frame = number, %error,
                     "app frame from a peer could not be prepared — dropped"),
-            }
-        });
+                }
+            },
+        ));
     }
 
     /// Count a frame from a peer refused on the frame topic: a warning when
@@ -14774,6 +14818,43 @@ impl StartPace {
 #[cfg(test)]
 mod start_pace_tests {
     use super::*;
+
+    /// A full engine queue drops a message and counts it; room again in the
+    /// queue counts nothing.
+    #[test]
+    fn a_full_engine_queue_counts_what_it_drops() {
+        let (handle, mut receiver) = AppEngineHandle::for_test(vec![7; 32]);
+        let cw = || AppEngineMessage::CwIn {
+            channel: 3,
+            from: Vec::new(),
+            data: vec![1],
+        };
+        for _ in 0..16 {
+            handle.send(cw());
+        }
+        assert_eq!(
+            handle
+                .inbound_dropped
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        handle.send(cw());
+        handle.send(cw());
+        assert_eq!(
+            handle
+                .inbound_dropped
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        receiver.try_recv().unwrap();
+        handle.send(cw());
+        assert_eq!(
+            handle
+                .inbound_dropped
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
 
     /// An expected wait no attempt hastens is retried once a minute, or as
     /// soon as the cursor moves; any other refusal at the next tick.
@@ -21909,6 +21990,7 @@ mod tests {
             filter: vec![7; 32],
             msg_tx,
             frame_tx: None,
+            inbound_dropped: Default::default(),
             sizes: SharedAppEngineSizes::new(),
             materialized: materialized.clone(),
             fee_snapshot: stored.clone(),
