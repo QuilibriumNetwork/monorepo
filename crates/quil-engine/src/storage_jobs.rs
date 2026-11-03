@@ -338,6 +338,13 @@ pub(crate) fn wait_lane_idle(lane: &[u8], timeout: Duration) -> bool {
     true
 }
 
+/// Bytes the storage jobs hold now through their reservations: the labelling
+/// buffers of the leaves labelled now and ahead, and the replicas of seals
+/// and settlements. A job holds its reservation, as a peak, from its grant.
+pub fn held_bytes() -> u64 {
+    admission().held_bytes()
+}
+
 /// Reserve `bytes` for a job's work: waits, behind the smaller reservations
 /// and those of its size asked for before it, until it fits beside the ones
 /// held.
@@ -875,6 +882,11 @@ impl Admission {
 
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Bytes the reservations held come to now.
+    pub fn held_bytes(&self) -> u64 {
+        self.state().reserved
     }
 
     /// Reserve `bytes` ([`reserve`]).
@@ -1661,6 +1673,28 @@ mod tests {
             assert!(Instant::now() < deadline, "no reservation waits");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn the_bytes_held_are_those_of_the_reservations_granted() {
+        let (admission, _) = admission(8, 40 * GIB);
+        assert_eq!(admission.held_bytes(), 0);
+        let first = hold(admission, 3 * GIB);
+        assert!(granted(&first));
+        let second = hold(admission, 2 * GIB);
+        assert!(granted(&second));
+        assert_eq!(admission.held_bytes(), 5 * GIB);
+        drop(first.release);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while admission.held_bytes() != 2 * GIB {
+            assert!(
+                Instant::now() < deadline,
+                "{} bytes still held",
+                admission.held_bytes()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(second.release);
     }
 
     #[test]
