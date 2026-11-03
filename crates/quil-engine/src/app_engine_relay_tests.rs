@@ -136,7 +136,6 @@ fn member(frames: u64) -> Member {
         execution_engine: None,
         inclusion_prover: None,
         kv_db: None,
-        app_consensus_cw: false,
         db_config: Default::default(),
         unified_cutover_hook: None,
     };

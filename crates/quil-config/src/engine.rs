@@ -85,12 +85,6 @@ pub struct EngineConfig {
     /// Default 30; raise for higher difficulty / slower CPUs.
     #[serde(default = "default_consensus_leader_timeout_secs")]
     pub consensus_leader_timeout_secs: u64,
-    /// Drive APP-SHARD consensus with commonware-simplex + Falcon (EQUAL
-    /// VOTES) instead of the legacy quil-consensus HotStuff loop. Off by default;
-    /// the legacy per-shard path is unchanged until this is set. Independent of
-    /// [`consensus_committee`] (which gates GLOBAL consensus).
-    #[serde(default)]
-    pub app_consensus_cw: bool,
 }
 
 fn default_consensus_leader_timeout_secs() -> u64 {

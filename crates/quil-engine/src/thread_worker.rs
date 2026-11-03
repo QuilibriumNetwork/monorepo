@@ -171,8 +171,6 @@ pub struct WorkerConsensusDeps {
     /// testnet=1 (single-prover clusters still progress). See
     /// `AppLeaderProvider::min_active_provers_for_propose`.
     pub min_active_provers_for_propose: u64,
-    /// Drive app-shard consensus with commonware-simplex + Falcon.
-    pub app_consensus_cw: bool,
     /// DB config → persistent per-shard simplex-journal dir (Go parity).
     pub db_config: quil_config::DbConfig,
     /// Callback that publishes finalized canonical FrameHeader bytes
@@ -1017,7 +1015,6 @@ impl ThreadWorkerManager {
                                                         execution_engine,
                                                         inclusion_prover,
                                                         kv_db,
-                                                        app_consensus_cw: deps.app_consensus_cw,
                                                         db_config: deps.db_config.clone(),
                                                         // Per-worker consolidation hook (bound to this
                                                         // worker's CRDT/store by worker_state_builder).
@@ -2107,7 +2104,6 @@ mod tests {
             }),
             reward_greedy: false,
             min_active_provers_for_propose: 1,
-            app_consensus_cw: false,
             db_config: quil_config::DbConfig::default(),
             coverage_publish: None,
             hypergraph: None,

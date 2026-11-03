@@ -689,7 +689,7 @@ impl AppShardHarness {
     }
 
     /// Build `n` workers driving the shard with commonware-simplex + Falcon
-    /// (`app_consensus_cw = true`). For `n == 1` the single committee member
+    /// (`app_cw = true`). For `n == 1` the single committee member
     /// self-proposes + self-finalizes (the `NoopAppTransport` in the engine has
     /// no peers to reach); multi-worker CW needs the gossip transport wired.
     pub fn build_cw(n: usize) -> Self {
@@ -951,7 +951,6 @@ impl AppShardHarness {
                     Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>
                 ),
                 kv_db: kv_db_dep,
-                app_consensus_cw: app_cw,
                 db_config: quil_config::DbConfig {
                     path: String::new(),
                     worker_path_prefix: String::new(),

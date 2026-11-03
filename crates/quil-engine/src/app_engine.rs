@@ -2600,10 +2600,6 @@ pub struct AppEngineDeps {
     /// stub — fine for tests, dangerous in production because a
     /// restart can re-vote for a conflicting QC after a crash.
     pub kv_db: Option<Arc<dyn quil_types::store::KvDb>>,
-    /// When true, drive this shard's consensus with commonware-simplex +
-    /// Falcon (EQUAL VOTES) instead of the legacy quil-consensus HotStuff loop.
-    /// Off by default → legacy path unchanged.
-    pub app_consensus_cw: bool,
     /// DB config used to derive the PERSISTENT per-shard simplex-journal
     /// directory (Go parity: `app_consensus_engine.go:718` — core 0 →
     /// `db.path`, worker core N → `worker_paths[N-1]` / `worker_path_prefix`).
@@ -3013,10 +3009,6 @@ pub struct AppConsensusEngine {
     /// Backing KV store for persistent consensus + liveness state.
     /// `None` falls back to the in-memory stub.
     kv_db: Option<Arc<dyn quil_types::store::KvDb>>,
-    /// Drive this shard with commonware-simplex + Falcon instead of legacy.
-    // Retained configuration field; simplex startup selects the active engine.
-    #[allow(dead_code)]
-    app_consensus_cw: bool,
     /// Handle to the running simplex engine (kept alive; the outbound drain
     /// + block ingress live in it). Populated by `start_consensus_cw`.
     cw_handle: Option<crate::cw_app_seams::AppConsensusCwHandle>,
@@ -3270,7 +3262,6 @@ impl AppConsensusEngine {
             halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             coverage_publish: deps.coverage_publish,
             kv_db: deps.kv_db,
-            app_consensus_cw: deps.app_consensus_cw,
             cw_handle: None,
             cw_host_epoch: 0,
             cw_discarded_through_epoch: None,
@@ -17862,7 +17853,6 @@ mod fence_reanchor_tests {
             execution_engine: None,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -18038,7 +18028,6 @@ mod fence_reanchor_tests {
             execution_engine: Some(manager),
             inclusion_prover: Some(prover),
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -19164,7 +19153,6 @@ mod frame_gap_tests {
             execution_engine: None,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -19240,7 +19228,6 @@ mod tests {
             execution_engine: None,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -22311,7 +22298,6 @@ mod tests {
             execution_engine: None,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -23001,7 +22987,6 @@ mod tests {
             execution_engine: None,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -23869,7 +23854,6 @@ mod tests {
             execution_engine: None,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -23987,7 +23971,6 @@ mod tests {
             execution_engine: Some(manager),
             inclusion_prover: Some(prover),
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -24134,7 +24117,6 @@ mod tests {
             execution_engine: Some(manager),
             inclusion_prover: Some(prover),
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -24254,7 +24236,6 @@ mod tests {
             execution_engine: None,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -24360,7 +24341,6 @@ mod tests {
             execution_engine: None,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -24436,7 +24416,6 @@ mod tests {
             execution_engine: None,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -24567,7 +24546,6 @@ mod tests {
             execution_engine: Some(manager),
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -24632,7 +24610,6 @@ mod tests {
                 execution_engine: Some(manager),
                 inclusion_prover: None,
                 kv_db: None,
-                app_consensus_cw: false,
                 db_config: Default::default(),
                 unified_cutover_hook: None,
             };
@@ -25235,7 +25212,6 @@ mod tests {
                     execution_engine: None,
                     inclusion_prover: None,
                     kv_db: None,
-                    app_consensus_cw: false,
                     db_config: Default::default(),
                     unified_cutover_hook: None,
                 };
@@ -25702,7 +25678,6 @@ mod gossip_frame_tests {
             execution_engine,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -26018,7 +25993,6 @@ mod gossip_frame_repro_tests {
             execution_engine,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
