@@ -39,8 +39,16 @@ impl GlobalExecution {
         if executed == 0 {
             return None;
         }
+        // Hysteresis: once behind, it is caught up only at half the lag, so
+        // a lag hovering at the threshold is one outage, not a start each
+        // time it dips under.
+        let caught_up = if self.outage.is_active() {
+            LAG_FRAMES / 2
+        } else {
+            LAG_FRAMES
+        };
         self.outage
-            .observe(now, head.saturating_sub(executed) <= LAG_FRAMES)
+            .observe(now, head.saturating_sub(executed) <= caught_up)
     }
 
     /// [`Self::assess`], logging the outage's start, repeats and end.
@@ -102,6 +110,54 @@ mod tests {
                 failures: 6
             })
         );
+    }
+
+    /// A lag hovering at the threshold is one outage: it ends only once the
+    /// lag is down to half the threshold.
+    #[test]
+    fn a_lag_hovering_at_the_threshold_is_one_outage() {
+        let mut g = GlobalExecution::default();
+        let t = Instant::now();
+        let tick = |n: u64| t + Duration::from_secs(30 * n);
+        let mut began = 0;
+        for n in 0..12 {
+            let head = 1_000
+                + if n % 2 == 0 {
+                    LAG_FRAMES + 1
+                } else {
+                    LAG_FRAMES - 1
+                };
+            if g.assess(tick(n), 1_000, head) == Some(OutageEvent::Began) {
+                began += 1;
+            }
+        }
+        // Four ticks in a row over the threshold begin it; the dips between
+        // them are not four in a row, so the first start needs a longer run.
+        for n in 12..16 {
+            if g.assess(tick(n), 1_000, 1_000 + LAG_FRAMES + 1) == Some(OutageEvent::Began) {
+                began += 1;
+            }
+        }
+        for n in 16..28 {
+            let head = 1_000
+                + if n % 2 == 0 {
+                    LAG_FRAMES + 1
+                } else {
+                    LAG_FRAMES - 1
+                };
+            assert!(
+                !matches!(
+                    g.assess(tick(n), 1_000, head),
+                    Some(OutageEvent::Ended { .. })
+                ),
+                "a dip under the threshold ended the outage at tick {n}"
+            );
+        }
+        assert_eq!(began, 1);
+        assert!(matches!(
+            g.assess(tick(28), 1_000, 1_000 + LAG_FRAMES / 2),
+            Some(OutageEvent::Ended { .. })
+        ));
     }
 
     #[test]
