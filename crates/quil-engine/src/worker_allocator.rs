@@ -1811,6 +1811,15 @@ impl WorkerAllocator {
                     frame = frame_number,
                     pending_since = pending,
                     frames_elapsed = frame_number - pending,
+                    registry_synced_from_frame = self
+                        .registry_synced_from_frame
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    registry_awaits_sync = self
+                        .pending_joins_await_sync
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    action = "a registry synced from a frame before the join's inclusion cannot \
+                              show it: compare registry_synced_from_frame with pending_since; \
+                              if it is past it, the archive dropped the bundle",
                     "join submitted but no alloc landed in registry within 10 frames \
                      — archive likely dropped the bundle silently"
                 ),
@@ -3480,8 +3489,16 @@ mod tests {
         );
         let logged = reconcile_logged(&alloc, 100 + PROPOSAL_TIMEOUT_FRAMES);
         assert!(!logged.contains(DROPPED), "within the timeout: {logged}");
+        alloc
+            .registry_synced_from_frame
+            .store(77, std::sync::atomic::Ordering::SeqCst);
         let logged = reconcile_logged(&alloc, 129);
         assert!(logged.contains(DROPPED), "{logged}");
+        assert!(
+            logged.contains("registry_synced_from_frame=77"),
+            "the warning names the registry's frame beside the head: {logged}"
+        );
+        assert!(logged.contains("registry_awaits_sync="), "{logged}");
         let workers = wm.range_workers().unwrap();
         assert_eq!(workers[0].pending_filter_frame, 0);
     }
