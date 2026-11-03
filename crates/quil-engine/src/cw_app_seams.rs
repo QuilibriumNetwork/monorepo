@@ -242,17 +242,32 @@ impl SealedBodies {
     }
 
     /// Write-then-rename, synced: a torn file must never be read back as a body.
+    ///
+    /// Each call stages under a name of its own ([`STAGED_SUFFIX`]): two calls
+    /// for one body (the proposer's and the verifier's) must not share a file,
+    /// and [`Self::prune_through`] leaves staged files alone. A rename that
+    /// finds its file gone while the body is in place is a success.
     fn persist(&self, digest: &Digest, bytes: &[u8]) -> std::io::Result<()> {
         use std::io::Write;
+        static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = self.path(digest);
         if path.exists() {
             return Ok(());
         }
-        let staged = path.with_extension("tmp");
+        let staged = path.with_extension(format!(
+            "{}.{}{STAGED_SUFFIX}",
+            std::process::id(),
+            STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let mut file = std::fs::File::create(&staged)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        std::fs::rename(&staged, &path)?;
+        if let Err(error) = std::fs::rename(&staged, &path) {
+            let _ = std::fs::remove_file(&staged);
+            if !path.exists() {
+                return Err(error);
+            }
+        }
         std::fs::File::open(&self.directory)?.sync_all()
     }
 
@@ -294,6 +309,10 @@ impl SealedBodies {
             return;
         };
         for path in entries.flatten().map(|entry| entry.path()) {
+            // A file being staged belongs to the persist writing it.
+            if path.to_str().is_some_and(|p| p.ends_with(STAGED_SUFFIX)) {
+                continue;
+            }
             let stale = std::fs::read(&path)
                 .ok()
                 .and_then(|bytes| decode_app_frame(&bytes))
@@ -305,6 +324,10 @@ impl SealedBodies {
         }
     }
 }
+
+/// What a body's staging file name ends in; [`SealedBodies::load`] removes
+/// any left by a crash, as it does any file not named for its contents.
+const STAGED_SUFFIX: &str = ".staged";
 
 /// Durable copies of finalized data frames, with their finalization
 /// certificates, kept until the engine has materialized them.
@@ -3416,6 +3439,108 @@ mod tests {
                 encode_app_frame(&frames[2])
             )]
         );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    fn sealed_bodies_test_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "quil-sealed-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::Instant::now()
+        ))
+    }
+
+    fn sealed_bodies_test_pairs(count: u64) -> Vec<(Digest, Vec<u8>)> {
+        (1..=count)
+            .map(|n| {
+                let frame = finalized_test_frame(n);
+                (app_frame_digest(&frame).unwrap(), encode_app_frame(&frame))
+            })
+            .collect()
+    }
+
+    /// The proposer and the verifier persist one body: neither may fail
+    /// because the other renamed the staging file first (a live node logged
+    /// "No such file or directory" and abstained from the view).
+    #[test]
+    fn two_persists_of_one_sealed_body_both_succeed() {
+        let directory = sealed_bodies_test_dir("twice");
+        let bodies = Arc::new(SealedBodies::open(directory.clone()).unwrap());
+        let pairs = Arc::new(sealed_bodies_test_pairs(400));
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let writers: Vec<_> = (0..2)
+            .map(|_| {
+                let (bodies, pairs, start) = (bodies.clone(), pairs.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    pairs
+                        .iter()
+                        .filter_map(|(digest, bytes)| bodies.persist(digest, bytes).err())
+                        .map(|error| error.to_string())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let errors: Vec<String> = writers
+            .into_iter()
+            .flat_map(|writer| writer.join().unwrap())
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "a persist of an already-persisting body failed {} times, first: {:?}",
+            errors.len(),
+            errors.first()
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// The finalizer prunes while the automaton persists the next body: a
+    /// prune must not take the file a persist is still staging.
+    #[test]
+    fn a_prune_does_not_take_a_body_being_staged() {
+        let directory = sealed_bodies_test_dir("prune");
+        let bodies = Arc::new(SealedBodies::open(directory.clone()).unwrap());
+        let pairs = sealed_bodies_test_pairs(400);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pruner = {
+            let (bodies, stop) = (bodies.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    bodies.prune_through(u64::MAX);
+                }
+            })
+        };
+        let errors: Vec<String> = pairs
+            .iter()
+            .filter_map(|(digest, bytes)| bodies.persist(digest, bytes).err())
+            .map(|error| error.to_string())
+            .collect();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        pruner.join().unwrap();
+        assert!(
+            errors.is_empty(),
+            "a prune took a body mid-persist {} times, first: {:?}",
+            errors.len(),
+            errors.first()
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A staging file a crash left is not a body: a reopen removes it.
+    #[test]
+    fn a_crash_left_staging_file_is_removed_on_load() {
+        let directory = sealed_bodies_test_dir("crash");
+        let bodies = SealedBodies::open(directory.clone()).unwrap();
+        let pairs = sealed_bodies_test_pairs(2);
+        bodies.persist(&pairs[0].0, &pairs[0].1).unwrap();
+        let name = hex::encode(digest_to_identity(&pairs[1].0));
+        std::fs::write(
+            directory.join(format!("{name}.1.2{STAGED_SUFFIX}")),
+            &pairs[1].1,
+        )
+        .unwrap();
+        assert_eq!(bodies.load().unwrap().len(), 1);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
