@@ -509,6 +509,11 @@ pub struct MessageCollector {
     rank_full_active: std::sync::atomic::AtomicBool,
     /// The log of submits refused for a full rank buffer.
     rank_full: std::sync::Mutex<RankFullLog>,
+    /// Set while shard-frame submits are being rejected, so an admitted
+    /// shard frame takes `rejects` only to end the stretch.
+    rejects_active: std::sync::atomic::AtomicBool,
+    /// The log of rejected shard-frame submits.
+    rejects: std::sync::Mutex<RejectLog>,
 }
 
 /// How often submits refused for a full rank buffer are logged while they
@@ -516,6 +521,153 @@ pub struct MessageCollector {
 /// reaches the collector, and a stalled rank refuses thousands per minute
 /// (2026-10-27: ~40,000 lines per archive in 2.75 h).
 const RANK_FULL_LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// How often rejected shard-frame submits are logged while they continue.
+/// A node whose committed shard set is behind the network's rejects every live
+/// frame of the shards it lacks: about 6,800 lines an hour on each of four
+/// nodes were logged one per message (2026-11-02).
+const REJECT_LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// Distinct rejected addresses counted per line; more are counted as this many.
+const REJECT_ADDRESSES_COUNTED: usize = 256;
+
+/// Longest verification reason a line carries.
+const REJECT_REASON_CHARS: usize = 200;
+
+/// Why a shard-frame submit was rejected.
+#[derive(Clone, Copy)]
+enum RejectKind {
+    /// The address is not in the committed valid-shard set.
+    UnknownShard,
+    /// The frame failed verification.
+    Verification,
+}
+
+/// One rejected shard-frame submit, for [`MessageCollector::note_reject`].
+struct Reject {
+    kind: RejectKind,
+    address: Vec<u8>,
+    frame_number: u64,
+    valid_shard_count: usize,
+    /// The verifier's reason, for [`RejectKind::Verification`].
+    reason: String,
+}
+
+/// A stretch of rejected shard-frame submits.
+struct RejectLog {
+    /// When the stretch began and when its last line was written.
+    since: Option<(Instant, Instant)>,
+    /// When the stretch last saw a rejection.
+    last: Instant,
+    total: u64,
+    unknown_shard: u64,
+    verification: u64,
+    addresses: HashSet<Vec<u8>>,
+    latest: Option<Reject>,
+}
+
+impl RejectLog {
+    fn new() -> Self {
+        Self {
+            since: None,
+            last: Instant::now(),
+            total: 0,
+            unknown_shard: 0,
+            verification: 0,
+            addresses: HashSet::new(),
+            latest: None,
+        }
+    }
+
+    /// The counts since the last line, cleared.
+    fn take_window(&mut self) -> (u64, u64, usize, Option<Reject>) {
+        let window = (
+            std::mem::take(&mut self.unknown_shard),
+            std::mem::take(&mut self.verification),
+            self.addresses.len(),
+            self.latest.take(),
+        );
+        self.addresses.clear();
+        window
+    }
+}
+
+impl MessageCollector {
+    /// Count a rejected shard-frame submit; log the first of a stretch, then
+    /// one line per [`REJECT_LOG_EVERY`] with the counts.
+    fn note_reject(&self, now: Instant, reject: Reject) {
+        self.rejects_active
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut log = self.rejects.lock().unwrap();
+        log.total += 1;
+        log.last = now;
+        match reject.kind {
+            RejectKind::UnknownShard => log.unknown_shard += 1,
+            RejectKind::Verification => log.verification += 1,
+        }
+        if log.addresses.len() < REJECT_ADDRESSES_COUNTED {
+            log.addresses.insert(reject.address.clone());
+        }
+        log.latest = Some(reject);
+        let prior = log.since;
+        let (began, logged) = match prior {
+            None => {
+                log.since = Some((now, now));
+                (now, None)
+            }
+            Some((began, logged)) => (began, Some(logged)),
+        };
+        if logged.is_some_and(|logged| now.duration_since(logged) < REJECT_LOG_EVERY) {
+            return;
+        }
+        log.since = Some((began, now));
+        let total = log.total;
+        let (unknown_shard, verification, distinct, latest) = log.take_window();
+        let Some(latest) = latest else { return };
+        tracing::warn!(
+            scope = "local",
+            action = "check",
+            unknown_shard,
+            verification_failed = verification,
+            distinct_addresses = distinct,
+            latest_address = %hex::encode(&latest.address),
+            latest_frame = latest.frame_number,
+            valid_shard_count = latest.valid_shard_count,
+            latest_reason = %latest.reason.chars().take(REJECT_REASON_CHARS).collect::<String>(),
+            for_secs = now.duration_since(began).as_secs(),
+            total,
+            "message collector: shard-frame submits REJECTED; the counts are since the previous line (the first line of a stretch counts one). unknown_shard: the frame names an address outside this node's committed shard set (valid_shard_count addresses). On an archive the set is stale while its GLOBAL execution trails (compare the gRPC refusal line's executed with its head); otherwise the sender's address is wrong. verification_failed: the frame failed verification. Senders are told and do not retry; ends when the frames stop or the shard set catches up"
+        );
+    }
+
+    /// An admitted shard frame passed the address check: end the stretch of
+    /// rejections if none came for a whole interval.
+    fn note_shard_frame_admitted(&self, now: Instant) {
+        if !self
+            .rejects_active
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        let mut log = self.rejects.lock().unwrap();
+        let Some((began, _)) = log.since else { return };
+        if now.duration_since(log.last) < REJECT_LOG_EVERY {
+            return;
+        }
+        let total = log.total;
+        let lasted_secs = log.last.duration_since(began).as_secs();
+        let (unknown_shard, verification, _, _) = log.take_window();
+        *log = RejectLog::new();
+        self.rejects_active
+            .store(false, std::sync::atomic::Ordering::Release);
+        tracing::info!(
+            rejected_total = total,
+            rejected_since_last_line = unknown_shard + verification,
+            lasted_secs,
+            "message collector: shard-frame submits are no longer rejected"
+        );
+    }
+}
 
 /// A stretch of refusals for a full rank buffer, for [`RankFullLog::refuse`].
 struct RankFullLog {
@@ -612,6 +764,8 @@ impl MessageCollector {
             included_frames: std::sync::Mutex::new(HashMap::new()),
             rank_full_active: std::sync::atomic::AtomicBool::new(false),
             rank_full: std::sync::Mutex::new(RankFullLog::new()),
+            rejects_active: std::sync::atomic::AtomicBool::new(false),
+            rejects: std::sync::Mutex::new(RejectLog::new()),
         }
     }
 
@@ -943,15 +1097,20 @@ impl MessageCollector {
                 if !valid.is_empty() && !valid.contains(&c.address) {
                     // The whole address: every shard of an application shares
                     // its first 32 bytes, so a prefix names none of them.
-                    tracing::warn!(
-                        address = %hex::encode(&c.address),
-                        frame_number = c.frame_number,
-                        valid_shard_count = valid.len(),
-                        "message collector: shard-frame submit REJECTED — address not in current valid-shard set (stale / pre-split / wrong-grid address)"
+                    self.note_reject(
+                        Instant::now(),
+                        Reject {
+                            kind: RejectKind::UnknownShard,
+                            address: c.address.clone(),
+                            frame_number: c.frame_number,
+                            valid_shard_count: valid.len(),
+                            reason: String::new(),
+                        },
                     );
                     return SubmitOutcome::Filtered(Refusal::UnknownShard);
                 }
             }
+            self.note_shard_frame_admitted(Instant::now());
         }
 
         // A frame at or below a verified frame of its shard adds nothing: the
@@ -1021,11 +1180,22 @@ impl MessageCollector {
                     match verdict {
                         ShardFrameVerdict::Valid => message.verified = true,
                         ShardFrameVerdict::Invalid(reason) => {
-                            tracing::warn!(
-                                shards = %keys.iter().map(|(a, f)| format!("{}@{f}", hex::encode(a))).collect::<Vec<_>>().join(","),
-                                %reason,
-                                "message collector: shard-frame submit REJECTED — verification failed"
-                            );
+                            if let Some((address, frame_number)) = keys.first() {
+                                self.note_reject(
+                                    Instant::now(),
+                                    Reject {
+                                        kind: RejectKind::Verification,
+                                        address: address.clone(),
+                                        frame_number: *frame_number,
+                                        valid_shard_count: self
+                                            .valid_shard_addresses
+                                            .read()
+                                            .unwrap()
+                                            .len(),
+                                        reason: reason.to_string(),
+                                    },
+                                );
+                            }
                             return SubmitOutcome::Filtered(Refusal::InvalidShardFrame);
                         }
                         ShardFrameVerdict::Unavailable(reason) => {
@@ -2984,5 +3154,61 @@ mod tests {
             assert!(ended[0].contains(field), "{field}: {}", ended[0]);
         }
         assert_eq!(logs.lines_with("rank buffer full").len(), 2);
+    }
+
+    /// Frames of shards outside this node's committed set are rejected thousands of times: the
+    /// log shows the first, one line per interval with the counts, and the end.
+    #[test]
+    fn rejected_shard_frames_log_a_bounded_summary() {
+        use crate::outage::test_logs::CapturedLogs;
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        let mc = MessageCollector::new();
+        mc.set_valid_shard_addresses(HashSet::from([vec![0x11u8; 32]]));
+        for frame in 0..1_000u64 {
+            assert_eq!(
+                mc.add_message_outcome(1, shard_bundle(0x22, frame, 0, 0)),
+                SubmitOutcome::Filtered(Refusal::UnknownShard)
+            );
+        }
+        let first = logs.lines_with("shard-frame submits REJECTED");
+        assert_eq!(first.len(), 1, "{first:?}");
+        for field in [
+            "WARN",
+            "unknown_shard=1 ",
+            "distinct_addresses=1",
+            "valid_shard_count=1",
+            "scope=\"local\"",
+        ] {
+            assert!(first[0].contains(field), "{field}: {}", first[0]);
+        }
+        // After the interval, the next rejection writes one line with the counts.
+        let reject = |frame| Reject {
+            kind: RejectKind::UnknownShard,
+            address: vec![0x33; 32],
+            frame_number: frame,
+            valid_shard_count: 1,
+            reason: String::new(),
+        };
+        let now = Instant::now();
+        mc.note_reject(now + REJECT_LOG_EVERY / 2, reject(1));
+        assert_eq!(logs.lines_with("shard-frame submits REJECTED").len(), 1);
+        mc.note_reject(now + REJECT_LOG_EVERY + Duration::from_secs(1), reject(2));
+        let lines = logs.lines_with("shard-frame submits REJECTED");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].contains("unknown_shard=1001 "), "{}", lines[1]);
+        assert!(lines[1].contains("distinct_addresses=2"), "{}", lines[1]);
+        // A valid shard frame right after a rejection does not end the stretch.
+        mc.note_shard_frame_admitted(now + REJECT_LOG_EVERY + Duration::from_secs(2));
+        assert!(logs.lines_with("no longer rejected").is_empty());
+        // A real one after a quiet interval does, once.
+        let quiet = now + REJECT_LOG_EVERY * 3;
+        mc.note_shard_frame_admitted(quiet);
+        mc.note_shard_frame_admitted(quiet + Duration::from_secs(1));
+        let ended = logs.lines_with("no longer rejected");
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        for field in ["INFO", "rejected_total=1002", "rejected_since_last_line=0"] {
+            assert!(ended[0].contains(field), "{field}: {}", ended[0]);
+        }
     }
 }
