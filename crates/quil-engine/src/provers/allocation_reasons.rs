@@ -156,6 +156,20 @@ impl AllocationReasons {
             })
     }
 
+    /// The leaves an operator sent through this node signed at frames in
+    /// `lo..=hi`, as (filter, signed frame). The send handler records them.
+    pub fn operator_leaves_between(&self, lo: u64, hi: u64) -> Vec<(Vec<u8>, u64)> {
+        let Ok(state) = self.0.lock() else {
+            return Vec::new();
+        };
+        state
+            .entries
+            .iter()
+            .filter(|e| !e.joining && e.reason == "M" && (lo..=hi).contains(&e.frame))
+            .map(|e| (e.filter.clone(), e.frame))
+            .collect()
+    }
+
     /// A local intent cannot establish a reason for an older request or for a
     /// future epoch's unrelated request. Exact matches take precedence.
     pub fn reason(&self, filter: &[u8], joining: bool, request_frame: u64) -> Option<String> {

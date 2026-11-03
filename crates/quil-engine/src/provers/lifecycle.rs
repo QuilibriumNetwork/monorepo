@@ -38,6 +38,12 @@ use crate::worker_allocator::WorkerAllocator;
 /// [`ProverLifecycle::set_confirm_window_frames`] so a 4-node smoke
 /// test doesn't need to wait an hour for each join cycle.
 pub const DEFAULT_CONFIRM_WINDOW_FRAMES: u64 = 360;
+
+/// Frames into an epoch by which this node's registry has refreshed for the
+/// boundary (it refreshes on events, so sooner it may not show a leave that
+/// landed). A leave signed in the last epoch has landed or never will: every
+/// node refuses one landing in a later epoch.
+const OPERATOR_LEAVE_SETTLE_FRAMES: u64 = 5;
 /// Cap on join filters per cycle (matches Go's 100).
 pub const MAX_PROPOSALS_PER_CYCLE: usize = 100;
 /// Max proposals per single PlanAndAllocate call in Go (worker_allocator.go:215).
@@ -668,6 +674,9 @@ pub struct ProverLifecycle {
     /// under way, with the epoch they were last warned of in
     /// (`renewal_awaits_leave`).
     storage_skips_warned: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
+    /// Operator leaves already reported as never landed, by filter and signed
+    /// frame (`report_unlanded_operator_leaves`).
+    unlanded_leaves_reported: std::sync::Mutex<std::collections::HashSet<(Vec<u8>, u64)>>,
     /// Seats the capacity shed spares while their storage renewal is under
     /// way, with the frame it first did (`report_storage_spared`).
     storage_shed_spared: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
@@ -766,6 +775,7 @@ impl ProverLifecycle {
             renewal_skips_reported: std::sync::Mutex::new(HashMap::new()),
             renewal_storage: super::renewal_storage::RenewalStorageNotes::default(),
             storage_skips_warned: std::sync::Mutex::new(HashMap::new()),
+            unlanded_leaves_reported: Default::default(),
             storage_shed_spared: std::sync::Mutex::new(HashMap::new()),
             capacity_shield_reported: std::sync::Mutex::new(HashMap::new()),
             last_join_attempt: RwLock::new(HashMap::new()),
@@ -1447,6 +1457,48 @@ impl ProverLifecycle {
         ))
     }
 
+    /// Warn once about a leave an operator sent through this node that never
+    /// landed. The sender was told only that it went out, and the node that
+    /// drops it may be another: a bad signature or a seat that cannot leave
+    /// says so nowhere this operator reads. Checked for a few frames once the
+    /// registry has refreshed for the next epoch, for the leaves of the last one,
+    /// so a restart later on does not replay old ones.
+    fn report_unlanded_operator_leaves(
+        &self,
+        allocations: &[quil_types::consensus::ProverAllocationInfo],
+        frame_number: u64,
+    ) {
+        let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        let length = quil_types::consensus::epoch_length_frames();
+        let into = frame_number - epoch * length;
+        if epoch == 0
+            || !(OPERATOR_LEAVE_SETTLE_FRAMES..2 * OPERATOR_LEAVE_SETTLE_FRAMES).contains(&into)
+        {
+            return;
+        }
+        let (lo, hi) = ((epoch - 1) * length, epoch * length - 1);
+        let Ok(mut reported) = self.unlanded_leaves_reported.lock() else {
+            return;
+        };
+        reported.retain(|(_, signed)| *signed >= lo);
+        for (filter, signed) in self.allocation_reasons.operator_leaves_between(lo, hi) {
+            // Execution writes the frame including the leave, and a later
+            // reject or confirm keeps it.
+            let landed = allocations
+                .iter()
+                .any(|a| a.confirmation_filter == filter && a.leave_frame_number >= signed);
+            if landed || !reported.insert((filter.clone(), signed)) {
+                continue;
+            }
+            tracing::warn!(frame = frame_number, filter = %hex::encode(&filter), signed_frame = signed,
+                scope = "this prover",
+                action = "the leave had no effect: check the seat with qclient node prover status, \
+                          update qclient to this node's version, and send it again; report it if \
+                          this repeats",
+                "lifecycle: an operator's leave never landed, and no longer can");
+        }
+    }
+
     /// Release the published joins GLOBAL refuses, so their retry fences do
     /// not hold the allocation already on their filter off its confirm or
     /// leave. GLOBAL refuses a join of a filter while this prover's
@@ -2046,6 +2098,10 @@ impl ProverLifecycle {
                 "lifecycle allocation buckets"
             );
         }
+        self.report_unlanded_operator_leaves(
+            prover_info.as_ref().map_or(&[][..], |p| &p.allocations),
+            frame_number,
+        );
         // Seniority penalties (#976): warn about a fall of this prover's
         // committed seniority no executed penalty explains (the aggregated
         // per-epoch warning reports those), and tell the operator once when a
@@ -9429,6 +9485,83 @@ mod proposal_loop_tests {
             "orphan leave must NOT be rejected; got {:?}",
             actions
         );
+    }
+
+    /// A leave an operator sent that never reached the registry is reported
+    /// once, after the next epoch's refresh, and not before; one that landed or
+    /// the planner's own is not, and old records do not speak after a restart.
+    #[test]
+    fn an_operator_leave_that_never_landed_warns_once() {
+        let line = "an operator's leave never landed";
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, held.clone()));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(
+            address.clone(),
+            vec![alloc(held.clone(), ProverStatus::Active, 10)],
+        ));
+        reg.set_summaries(vec![shard_summary(held.clone(), 53)]);
+        let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+        lc.allocation_reasons
+            .record(std::slice::from_ref(&held), false, 100, "M")
+            .unwrap();
+        let logged_at = |lc: &ProverLifecycle, frame| {
+            lc.set_prover_root_verified_frame(frame);
+            evaluate_logged(lc, frame, reg.as_ref(), wm.as_ref()).1
+        };
+        // Until the registry has refreshed for the boundary it may not show one.
+        let length = quil_types::consensus::epoch_length_frames();
+        let last_chance = length + OPERATOR_LEAVE_SETTLE_FRAMES - 1;
+        let logged = logged_at(&lc, 200);
+        assert_eq!(logged.matches(line).count(), 0, "same epoch: {logged}");
+        let logged = logged_at(&lc, last_chance);
+        assert_eq!(logged.matches(line).count(), 0, "too early: {logged}");
+        let logged = logged_at(&lc, last_chance + 1);
+        assert_eq!(logged.matches(line).count(), 1, "{logged}");
+        let at = logged.lines().find(|l| l.contains(line)).unwrap();
+        for text in [
+            " WARN ".to_string(),
+            format!("filter={}", hex::encode(&held)),
+            "signed_frame=100".to_string(),
+            "update qclient".to_string(),
+        ] {
+            assert!(at.contains(&text), "{text} in {at}");
+        }
+        let logged = logged_at(&lc, last_chance + 2);
+        assert_eq!(logged.matches(line).count(), 0, "once: {logged}");
+
+        // Past the bounded span a fresh start says nothing of it.
+        let restarted = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+        restarted
+            .allocation_reasons
+            .record(std::slice::from_ref(&held), false, 100, "M")
+            .unwrap();
+        let far = length + 2 * OPERATOR_LEAVE_SETTLE_FRAMES;
+        let logged = logged_at(&restarted, far);
+        assert_eq!(logged.matches(line).count(), 0, "old record: {logged}");
+
+        // Landed, even if later rejected: the seat keeps the frame.
+        let landed = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+        landed
+            .allocation_reasons
+            .record(std::slice::from_ref(&held), false, 100, "M")
+            .unwrap();
+        let mut seat = alloc(held.clone(), ProverStatus::Active, 10);
+        seat.leave_frame_number = 103;
+        reg.set_prover(prover(address.clone(), vec![seat]));
+        let logged = logged_at(&landed, last_chance + 1);
+        assert_eq!(logged.matches(line).count(), 0, "landed: {logged}");
+
+        // The planner's own leave has its own reason and its own lines.
+        let planner = make_lifecycle(address, wm.clone(), reg.clone());
+        planner
+            .allocation_reasons
+            .record(std::slice::from_ref(&held), false, 100, "$")
+            .unwrap();
+        let logged = logged_at(&planner, last_chance + 1);
+        assert_eq!(logged.matches(line).count(), 0, "planner: {logged}");
     }
 
     #[test]
