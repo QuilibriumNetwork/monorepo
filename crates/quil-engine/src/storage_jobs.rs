@@ -417,6 +417,10 @@ pub enum Urgency {
 /// thread asking is often a data worker's, pinned to one core, and counting
 /// its CPUs ran every node's jobs one at a time (2026-10-29).
 pub fn job_slots() -> usize {
+    #[cfg(test)]
+    if let Some(slots) = Some(TEST_SLOTS.load(Ordering::SeqCst)).filter(|&s| s > 0) {
+        return slots;
+    }
     static SLOTS: OnceLock<usize> = OnceLock::new();
     *SLOTS.get_or_init(|| {
         let counted = std::thread::scope(|scope| {
@@ -516,6 +520,26 @@ pub fn for_each_parallel<T: Sync, R: Send>(
         }
     }
     Ok(out)
+}
+
+/// Jobs a test lets the node's admission hold at once
+/// ([`set_job_slots_for_test`]); 0 for the host's count ([`job_slots`]).
+#[cfg(test)]
+static TEST_SLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Make the node's admission ([`reserve`]) hold `slots` jobs at once
+/// whatever this host's CPUs: a test of leaves side by side needs as many
+/// places on a 3-CPU runner as on a larger one. Call it before the
+/// process's first storage job, as the admission counts its slots once. For
+/// tests that run in a process of their own (nextest).
+#[cfg(test)]
+pub(crate) fn set_job_slots_for_test(slots: usize) {
+    TEST_SLOTS.store(slots, Ordering::SeqCst);
+    assert_eq!(
+        admission().slots,
+        slots.max(1),
+        "the job slots are set before the process's first storage job"
+    );
 }
 
 /// Memory a test sizes the node's jobs against ([`set_available_for_test`]);
