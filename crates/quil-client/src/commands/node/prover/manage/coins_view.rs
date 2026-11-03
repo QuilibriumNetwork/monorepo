@@ -123,17 +123,12 @@ fn legacy_row(m: &Model) -> [Cell; 5] {
 /// The cursor row's detail.
 fn detail(m: &Model) -> String {
     if m.coins.cursor == 0 {
-        return match m.claimable_reward {
-            Some((_, frame)) => format!(
-                "Claimable: reward balance at f{frame}, from the GLOBAL reward witness; read with \
-                 each Provers refresh ({}s).",
-                m.refresh_seconds
-            ),
-            None => match &m.reward_error {
-                Some(error) => format!("Claimable: read failed ({error})."),
-                None => "Claimable: read with each Provers refresh.".into(),
-            },
-        };
+        // The cells carry the amount and its frame, Notifications a failure.
+        return format!(
+            "Claimable: the reward balance of the GLOBAL reward witness, read with each Provers \
+             refresh ({}s).",
+            m.refresh_seconds
+        );
     }
     let legacy = &m.coins.legacy;
     let mut parts = Vec::new();
@@ -333,7 +328,7 @@ fn confirm_lines(preview: &Preview, width: u16, mask: bool) -> Vec<Line<'static>
     }
     if preview.pending > 0 {
         left.push(format!(
-            "{} submitted <1h ago, awaiting their batch",
+            "{} submitted <2h ago, awaiting their batch",
             preview.pending
         ));
     }
@@ -423,33 +418,23 @@ fn claim_lines(m: &Model, width: u16, height: u16) -> Vec<Line<'static>> {
             Span::styled(text, Style::new().fg(TEXT)),
         ])
     };
-    let claimable = match (&m.claimable_reward, &m.reward_error) {
-        _ if !m.reward_loaded => "not read yet; it comes with the first Provers refresh".into(),
-        (Some((units, frame)), _) if *units > 0 => format!(
-            "{} Q at f{frame}, the reward balance of the GLOBAL reward witness",
-            exact_amount(*units)
-        ),
-        (Some((_, frame)), _) => format!("none at f{frame}"),
-        (None, Some(error)) => format!("read failed ({error})"),
-        (None, None) => "none".into(),
-    };
+    // The claimable amount and its frame are the Balances row's; this
+    // panel adds what to do with them.
     let authorization = if super::super::mint::running(m) {
         "a mint or claim is under way; Notifications follow it"
+    } else if !m.reward_loaded {
+        "waits for the first Provers refresh to read the reward"
     } else {
-        match m.claimable_reward {
-            Some((units, _)) if units > 0 => {
-                "‹M› authorizes a mint of it, as `qclient token mint` does"
+        match (&m.claimable_reward, &m.reward_error) {
+            (Some((units, _)), _) if *units > 0 => {
+                "‹M› authorizes a mint of the claimable reward, as `qclient token mint` does"
             }
+            (None, Some(_)) => "waits for a reward read to succeed",
             _ => "nothing to authorize",
         }
     };
-    let mut lines: Vec<Line<'static>> = [
-        row("Claimable", claimable),
-        row("Authorization", authorization.into()),
-    ]
-    .into_iter()
-    .flat_map(|line| wrap_message(line, width))
-    .collect();
+    let mut lines: Vec<Line<'static>> =
+        wrap_message(row("Authorization", authorization.into()), width);
     let rest = usize::from(height).saturating_sub(lines.len());
     lines.extend(saved_lines(m, width, rest));
     lines
@@ -625,13 +610,10 @@ fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'stat
             "Batches: {} of ≤{max} coins; {} coins on no live shard",
             plan.batches, plan.outside
         ),
-        Some(plan) => format!(
-            "Batches: ≥{}; the shard list is unavailable, so no rows",
-            plan.batches
-        ),
+        Some(plan) => format!("Batches: ≥{}; no rows", plan.batches),
     };
     if snapshot.pending > 0 {
-        summary.push_str(&format!("; {} submitted <1h ago hidden", snapshot.pending));
+        summary.push_str(&format!("; {} submitted <2h ago hidden", snapshot.pending));
     }
     footer.push(Line::from(Span::styled(summary, help)));
     let rows = &snapshot.batches;
@@ -1016,7 +998,7 @@ mod coins_render_tests {
         assert!(!legacy.contains("shielded ·"), "{legacy}");
         assert!(legacy.contains("◆ unshielded"), "{legacy}");
         assert!(
-            text.contains("◆ Legacy coins: 4 unshielded, 6 shielded; 2 batches; ‹S› shields the"),
+            text.contains("◆ Legacy coins unshielded: ‹S› shields them."),
             "{text}"
         );
         // The claimable row is selected: the legacy keys are left out.
@@ -1120,14 +1102,11 @@ mod coins_render_tests {
             let text = render_text(&mut m, width, 40);
             assert!(text.contains("╭ Claim status"), "{width}\n{text}");
             assert!(!text.contains("Shield plan"), "{width}\n{text}");
+            // The amount is the Balances row's alone.
+            assert!(!text.contains("312500.000000000000"), "{text}");
+            assert_eq!(text.matches("312500").count(), 1, "{text}");
             assert!(
-                text.contains("Claimable: 312500.000000000000 Q at f1200"),
-                "{text}"
-            );
-            assert!(
-                text.contains(
-                    "Authorization: ‹M› authorizes a mint of it, as `qclient token mint`"
-                ),
+                text.contains("Authorization: ‹M› authorizes a mint of the claimable reward"),
                 "{text}"
             );
             m.coins.cursor = 1;
@@ -1306,6 +1285,79 @@ mod coins_render_tests {
             revealed_after.contains("included: 1 coins, 875 Q shielded."),
             "{revealed_after}"
         );
+    }
+
+    /// The Balances and middle panels' text of a render, Notifications
+    /// left out.
+    fn upper_panels(text: &str) -> String {
+        text.lines()
+            .take_while(|line| !line.starts_with("╭ Notifications"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The claimable amount shows once on the tab, in its Balances row;
+    /// the Claim status adds the action, not the amount.
+    #[test]
+    fn the_claimable_amount_shows_in_its_row_only() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.coins.cursor = 0;
+        for width in [80, 120, 200] {
+            let text = render_text(&mut m, width, 40);
+            let panels = upper_panels(&text);
+            assert_eq!(panels.matches("312500").count(), 1, "{text}");
+            assert!(text.contains("╭ Claim status"), "{text}");
+            assert!(
+                text.contains("Authorization: ‹M› authorizes a mint of the claimable reward"),
+                "{text}"
+            );
+        }
+    }
+
+    /// The claimable frame shows once, in the row's `As of`; its detail
+    /// says where the figure comes from.
+    #[test]
+    fn the_claimable_frame_shows_in_its_row_only() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.coins.cursor = 0;
+        for width in [80, 120, 200] {
+            let text = render_text(&mut m, width, 40);
+            assert_eq!(upper_panels(&text).matches("f1200").count(), 1, "{text}");
+            assert!(
+                detail(&m).starts_with("Claimable: the reward balance"),
+                "{text}"
+            );
+        }
+    }
+
+    /// Coins notices name a condition and its key, never a figure their
+    /// rows or panels show: amount, frame, counts or batches.
+    #[test]
+    fn coins_notices_name_conditions_not_figures() {
+        let mut m = loaded();
+        m.notice_minimum = NoticeSeverity::Info;
+        let texts: Vec<String> = coins::notices(&m, fmt_claimable)
+            .into_iter()
+            .map(|notice| notice.text)
+            .collect();
+        assert!(
+            texts.contains(&"Reward claimable: ‹M› authorizes a mint.".to_string()),
+            "{texts:?}"
+        );
+        for text in &texts {
+            for figure in [
+                "312500",
+                "f1200",
+                "4 unshielded",
+                "6 shielded",
+                "2 batches",
+                "1 on",
+            ] {
+                assert!(!text.contains(figure), "{figure} in {text}");
+            }
+        }
     }
 
     #[test]
@@ -1766,7 +1818,7 @@ mod coins_render_tests {
             "Recipient: this node's wallet, 0xabababababab…abababababab (40 bytes;",
             "Fee: 16000 base units (0.000002000000 Q) in total as quoted now, up to 9000 per batch",
             "Cap: 0.1 Q per batch (--max-fee); a higher quote stops the run",
-            "Left out: 2 already shielded; 1 on no live shard, for a later run; 1 submitted <1h",
+            "Left out: 2 already shielded; 1 on no live shard, for a later run; 1 submitted <2h",
             "Confirm: ‹y› shield  any other key cancels",
         ] {
             assert!(text.contains(line), "{line}\n{text}");
