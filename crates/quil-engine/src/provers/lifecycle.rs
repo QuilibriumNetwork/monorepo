@@ -1467,6 +1467,8 @@ impl ProverLifecycle {
                     filter = %hex::encode(filter),
                     frame = frame_number,
                     proposed_frame = *proposed,
+                    last_inclusion_frame =
+                        crate::worker_allocator::last_join_inclusion_frame(*proposed),
                     reason,
                     "lifecycle: a join this node proposed is not in its registry; \
                      the shard is a join candidate again"
@@ -1487,7 +1489,8 @@ impl ProverLifecycle {
     /// chain refuses a re-join, and a rejection or expiry frees it as usual.
     /// The registry may lack it for `JOIN_FILTER_COOLDOWN_FRAMES`, and on a
     /// node whose registry shows a landed join only after a prover-tree
-    /// sync, until a sync begun after the join's inclusion has refreshed it.
+    /// sync, until a sync begun after the last frame that can include the
+    /// join (`last_join_inclusion_frame`) has refreshed it.
     /// Proposing the filter again before then puts a second worker on it,
     /// and GLOBAL refuses that join (`existing allocation still active`).
     /// The hold never outlasts the chain's re-join window: a join that had
@@ -1515,7 +1518,7 @@ impl ProverLifecycle {
             return None;
         }
         Some(JoinHoldEnd::NotShown(
-            "a registry refreshed since its inclusion lacks it",
+            "a registry refreshed since the last frame that can include it lacks it",
         ))
     }
 
@@ -8749,6 +8752,38 @@ mod proposal_loop_tests {
         );
     }
 
+    /// GLOBAL includes a join until `JOIN_FRESHNESS_WINDOW` frames after it
+    /// is signed, so a prover-tree sync begun between the proposal and a late
+    /// inclusion completes without it. Ending the shard's hold there, the
+    /// lifecycle proposed the shard again with a free worker, and GLOBAL
+    /// refused that join (`existing allocation still active`; 2026-11-03).
+    #[test]
+    fn a_sync_begun_before_a_late_join_inclusion_keeps_the_shard_held() {
+        use quil_execution::global_intrinsic::verify::JOIN_FRESHNESS_WINDOW;
+        let node = LaggingJoin::new();
+        let proposed = LaggingJoin::PROPOSED;
+        let last_inclusion = proposed + JOIN_FRESHNESS_WINDOW;
+        let early = proposed + 5;
+        node.lifecycle.current_frame.observe(early);
+        let sync = node.lifecycle.begin_registry_sync();
+        node.lifecycle.note_registry_synced(sync);
+        let lagging = proposed + JOIN_FILTER_COOLDOWN_FRAMES;
+        assert!(
+            !node.proposes_shard(lagging),
+            "shard {} proposed again at frame {lagging}: GLOBAL can still include its join, proposed \
+             at frame {proposed}, through frame {last_inclusion}, and the only registry sync completed \
+             began at frame {early}, before then",
+            hex::encode(&node.shard)
+        );
+        node.lifecycle.current_frame.observe(last_inclusion + 1);
+        let since = node.lifecycle.begin_registry_sync();
+        node.lifecycle.note_registry_synced(since);
+        assert!(
+            node.proposes_shard(lagging + 1),
+            "a registry synced since the last inclusion frame without the join frees the shard"
+        );
+    }
+
     /// GLOBAL refuses a join of a shard while this prover's allocation there
     /// is inside its re-join window. Such a join, published before the
     /// registry showed the allocation, must not hold the allocation's own
@@ -12066,9 +12101,10 @@ mod proposal_loop_tests {
 
     /// A regular node's registry shows a landed join only with the next
     /// prover-tree sync, five minutes apart. The join's worker stays reserved
-    /// until a sync begun after the join's inclusion has refreshed the
-    /// registry; freed after `PROPOSAL_TIMEOUT_FRAMES` alone, it was proposed
-    /// for a second shard 11 frames after the first in every epoch.
+    /// until a sync begun after the last frame that can include the join has
+    /// refreshed the registry; freed after `PROPOSAL_TIMEOUT_FRAMES` alone, it
+    /// was proposed for a second shard 11 frames after the first in every
+    /// epoch.
     #[test]
     fn a_proposed_join_holds_its_worker_until_a_registry_sync_begun_since() {
         use crate::worker_allocator::PROPOSAL_TIMEOUT_FRAMES;
@@ -12091,15 +12127,17 @@ mod proposal_loop_tests {
         };
         let timed_out = proposed + PROPOSAL_TIMEOUT_FRAMES + 1;
 
-        lifecycle.current_frame.observe(proposed + 1);
+        let last_inclusion =
+            proposed + quil_execution::global_intrinsic::verify::JOIN_FRESHNESS_WINDOW;
+        lifecycle.current_frame.observe(last_inclusion);
         let before = lifecycle.begin_registry_sync();
         lifecycle.note_registry_synced(before);
         assert_eq!(
             pending(timed_out),
             proposed,
-            "a sync anchored before the join's inclusion cannot show it"
+            "a sync anchored before the last frame that can include the join cannot show it"
         );
-        lifecycle.current_frame.observe(proposed + 2);
+        lifecycle.current_frame.observe(last_inclusion + 1);
         let since = lifecycle.begin_registry_sync();
         assert_eq!(pending(timed_out + 1), proposed, "nor one still running");
         lifecycle.note_registry_synced(since);

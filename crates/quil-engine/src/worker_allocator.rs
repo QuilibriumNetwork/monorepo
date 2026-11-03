@@ -395,6 +395,18 @@ pub const PROPOSAL_TIMEOUT_FRAMES: u64 = 10;
 /// `WorkerAllocator::hold_pending_joins_for_registry_sync`), so failing
 /// syncs cannot pin it: about three five-minute syncs.
 pub const PROPOSAL_SYNC_CEILING_FRAMES: u64 = 60;
+
+/// The last GLOBAL frame that can include a join this node proposed at
+/// `proposed_frame`. The join is signed at the head this node reads when it
+/// submits it (`ProverPipeline::submit_join`), the proposal frame on a node
+/// in step with the archives, and GLOBAL accepts it until
+/// `JOIN_FRESHNESS_WINDOW` frames later (`validate_prover_join_structural`),
+/// not only at the next frame: a registry sync begun before then may lack a
+/// join included later (2026-11-03).
+pub(crate) fn last_join_inclusion_frame(proposed_frame: u64) -> u64 {
+    proposed_frame.saturating_add(quil_execution::global_intrinsic::verify::JOIN_FRESHNESS_WINDOW)
+}
+
 /// Pending join/leave not confirmed within this many frames → clear.
 pub const PENDING_FILTER_GRACE_FRAMES: u64 = 720;
 // Confirm window lives on `ProverLifecycle` so testnet bootstraps can
@@ -907,6 +919,10 @@ pub struct WorkerAllocator {
     /// it was logged at, for the rate limiter in `log_rebind_outcome`.
     last_rebind_outcome: std::sync::atomic::AtomicU64,
     last_rebind_outcome_frame: std::sync::atomic::AtomicU64,
+    /// The workers [`WorkerAllocator::join_awaits_registry_sync`] keeps
+    /// reserved past `PROPOSAL_TIMEOUT_FRAMES`, with their join's proposal
+    /// frame, for the lines that report a hold's start and end.
+    join_sync_holds: std::sync::Mutex<HashMap<u32, u64>>,
     /// See `hold_pending_joins_for_registry_sync`.
     pending_joins_await_sync: std::sync::atomic::AtomicBool,
     /// Frame at which each running prover-tree sync began.
@@ -1403,6 +1419,7 @@ impl WorkerAllocator {
             last_priority_review_frame: std::sync::atomic::AtomicU64::new(0),
             last_rebind_outcome: std::sync::atomic::AtomicU64::new(0),
             last_rebind_outcome_frame: std::sync::atomic::AtomicU64::new(0),
+            join_sync_holds: std::sync::Mutex::new(HashMap::new()),
             pending_joins_await_sync: std::sync::atomic::AtomicBool::new(false),
             registry_syncs_running: std::sync::Mutex::new(HashMap::new()),
             registry_synced_from_frame: std::sync::atomic::AtomicU64::new(0),
@@ -1708,7 +1725,8 @@ impl WorkerAllocator {
     /// For a node whose registry shows a landed join only after the next
     /// prover-tree sync (every five minutes, about 20 frames on mainnet):
     /// keep a proposal's worker reserved past `PROPOSAL_TIMEOUT_FRAMES` until
-    /// a sync begun after the join's inclusion has refreshed the registry.
+    /// a sync begun after the last frame that can include the join
+    /// ([`last_join_inclusion_frame`]) has refreshed the registry.
     /// Freed earlier, the worker is proposed for a second shard while the
     /// first join is still on its way.
     pub fn hold_pending_joins_for_registry_sync(&self) {
@@ -1735,9 +1753,9 @@ impl WorkerAllocator {
         running.retain(|later, _| *later > sync);
     }
 
-    /// Whether a join proposed at `pending_frame` (included at the next
-    /// frame) may still appear with the next registry sync, holding its
-    /// worker for at most `PROPOSAL_SYNC_CEILING_FRAMES`.
+    /// Whether a join proposed at `pending_frame` may still appear with the
+    /// next registry sync, holding its worker for at most
+    /// `PROPOSAL_SYNC_CEILING_FRAMES`.
     fn join_awaits_registry_sync(&self, pending_frame: u64, frame_number: u64) -> bool {
         pending_frame > 0
             && frame_number <= pending_frame + PROPOSAL_SYNC_CEILING_FRAMES
@@ -1745,17 +1763,23 @@ impl WorkerAllocator {
     }
 
     /// Whether the registry may still lack a join proposed at
-    /// `proposed_frame` (included at the next frame): on a node whose
-    /// registry shows a landed join only after a prover-tree sync, no sync
-    /// begun after the inclusion has refreshed it yet. A sync anchors at the
-    /// frame before its begin frame.
+    /// `proposed_frame`: on a node whose registry shows a landed join only
+    /// after a prover-tree sync, no sync begun after the last frame that can
+    /// include it ([`last_join_inclusion_frame`]) has refreshed it yet. A
+    /// sync anchors at the frame before its begin frame.
     pub(crate) fn registry_may_lack_join(&self, proposed_frame: u64) -> bool {
+        self.registry_may_lack_inclusion(last_join_inclusion_frame(proposed_frame))
+    }
+
+    /// Whether the registry may still lack an operation included at
+    /// `included_frame`, as [`Self::registry_may_lack_join`].
+    pub(crate) fn registry_may_lack_inclusion(&self, included_frame: u64) -> bool {
         self.pending_joins_await_sync
             .load(std::sync::atomic::Ordering::SeqCst)
             && self
                 .registry_synced_from_frame
                 .load(std::sync::atomic::Ordering::SeqCst)
-                <= proposed_frame + 1
+                <= included_frame
     }
 
     /// Clear the pending-join marker of a worker still idle after the bind
@@ -1819,6 +1843,64 @@ impl WorkerAllocator {
                 .worker_manager
                 .set_pending_filter_frame(worker.core_id, 0);
         }
+        Ok(())
+    }
+
+    /// Report where [`Self::join_awaits_registry_sync`] starts and stops
+    /// keeping a worker reserved past `PROPOSAL_TIMEOUT_FRAMES`: a worker
+    /// whose join the registry does not show on it yet.
+    fn log_join_sync_holds(
+        &self,
+        frame: u64,
+        allocations: &[quil_types::consensus::ProverAllocationInfo],
+    ) -> Result<()> {
+        let workers = self.worker_manager.range_workers()?;
+        let shown = |w: &crate::worker::WorkerInfo| {
+            !w.filter.is_empty()
+                && allocations
+                    .iter()
+                    .any(|a| a.confirmation_filter == w.filter)
+        };
+        let held: HashMap<u32, u64> = workers
+            .iter()
+            .filter(|w| {
+                let pending = w.pending_filter_frame;
+                pending > 0
+                    && frame > pending + PROPOSAL_TIMEOUT_FRAMES
+                    && !shown(w)
+                    && self.join_awaits_registry_sync(pending, frame)
+            })
+            .map(|w| (w.core_id, w.pending_filter_frame))
+            .collect();
+        let mut logged = self
+            .join_sync_holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (core_id, proposed) in held.iter().filter(|(c, p)| logged.get(*c) != Some(*p)) {
+            info!(frame, core_id, proposed_frame = proposed,
+                last_inclusion_frame = last_join_inclusion_frame(*proposed),
+                ceiling_frame = proposed + PROPOSAL_SYNC_CEILING_FRAMES, scope = "local",
+                "join keeps its worker past the proposal timeout: GLOBAL can include it through the last \
+                 inclusion frame, and this node's registry shows it only after a prover-tree sync begun after \
+                 that frame; held until such a sync completes or the ceiling frame");
+        }
+        for (core_id, proposed) in logged.iter().filter(|(c, p)| held.get(*c) != Some(*p)) {
+            let worker = workers.iter().find(|w| w.core_id == *core_id);
+            let ended = if worker.is_some_and(|w| w.pending_filter_frame == *proposed && shown(w)) {
+                "shown"
+            } else if !self.registry_may_lack_join(*proposed) {
+                "synced"
+            } else if frame > proposed + PROPOSAL_SYNC_CEILING_FRAMES {
+                "ceiling"
+            } else {
+                "cleared"
+            };
+            info!(frame, core_id, proposed_frame = proposed,
+                last_inclusion_frame = last_join_inclusion_frame(*proposed), ended, scope = "local",
+                "join's registry-sync hold ended: shown keeps the worker on the join; otherwise its \
+                 reservation is released");
+        }
+        *logged = held;
         Ok(())
     }
 
@@ -2690,6 +2772,13 @@ impl WorkerAllocator {
                 .map(|p| p.allocations.as_slice())
                 .unwrap_or(&[]),
         )?;
+        self.log_join_sync_holds(
+            frame_number,
+            prover_info
+                .as_ref()
+                .map(|p| p.allocations.as_slice())
+                .unwrap_or(&[]),
+        )?;
 
         let _ = self.watch_orphans(frame_number, &orphan_filters, draining.len());
 
@@ -3303,6 +3392,102 @@ mod tests {
             "no sync has refreshed the registry since"
         );
         assert_eq!(pending(100 + PROPOSAL_SYNC_CEILING_FRAMES + 1), 0);
+    }
+
+    /// GLOBAL includes a join until `JOIN_FRESHNESS_WINDOW` frames after the
+    /// frame it is signed at, not only at the next one, so a prover-tree sync
+    /// begun between the proposal and a late inclusion completes without it.
+    /// The join's worker stays reserved until a sync begun after the last
+    /// frame that can include it completes; freed at the first sync begun
+    /// after the proposal, it was offered for a second shard while the join
+    /// could still land (2026-11-03).
+    #[test]
+    fn a_join_held_for_a_registry_sync_outlasts_a_sync_begun_before_a_late_inclusion() {
+        use quil_execution::global_intrinsic::verify::{
+            validate_prover_join_structural, JOIN_FRESHNESS_WINDOW,
+        };
+        let proposed = 100;
+        let last_inclusion = proposed + JOIN_FRESHNESS_WINDOW;
+        // The network's verifier takes a join signed at the proposal frame
+        // through `last_inclusion` and refuses it one frame later.
+        let join = quil_execution::global_intrinsic::prover_join::ProverJoin {
+            filters: vec![vec![0x01; 32]],
+            frame_number: proposed,
+            public_key_signature_bls48581: Some(
+                quil_execution::global_intrinsic::SignatureWithPop {
+                    signature: vec![0xAA; 74],
+                    public_key: Some(vec![0xBB; 585]),
+                    pop_signature: vec![0xCC; 74],
+                },
+            ),
+            delegate_address: vec![],
+            merge_targets: vec![],
+            proof: vec![],
+        };
+        assert!(validate_prover_join_structural(&join, last_inclusion).is_ok());
+        assert!(validate_prover_join_structural(&join, last_inclusion + 1).is_err());
+
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.add(crate::worker::WorkerInfo {
+            core_id: 1,
+            filter: Vec::new(),
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: proposed,
+            allocated: false,
+        });
+        let alloc = WorkerAllocator::new(
+            wm.clone(),
+            Arc::new(TestProverRegistry::new()),
+            vec![0xAAu8; 32],
+        );
+        alloc.hold_pending_joins_for_registry_sync();
+        let early = proposed + 5;
+        alloc.note_registry_sync_begun(1, early);
+        alloc.note_registry_synced(1);
+        // Begun at the last inclusion frame, a sync anchors before it.
+        alloc.note_registry_sync_begun(2, last_inclusion);
+        let pending = || wm.range_workers().unwrap()[0].pending_filter_frame;
+        let timed_out = proposed + PROPOSAL_TIMEOUT_FRAMES + 1;
+        let logged = reconcile_logged(&alloc, timed_out);
+        assert_eq!(
+            pending(),
+            proposed,
+            "worker core 1 freed at frame {timed_out}: GLOBAL can still include its join, proposed at \
+             frame {proposed}, through frame {last_inclusion}, and the only registry sync completed \
+             began at frame {early}, before then"
+        );
+        let start = "join keeps its worker past the proposal timeout";
+        assert_eq!(logged.matches(start).count(), 1, "{logged}");
+        let ceiling = proposed + PROPOSAL_SYNC_CEILING_FRAMES;
+        assert!(
+            logged.contains(&format!("last_inclusion_frame={last_inclusion}"))
+                && logged.contains(&format!("ceiling_frame={ceiling}")),
+            "{logged}"
+        );
+        alloc.note_registry_synced(2);
+        let logged = reconcile_logged(&alloc, timed_out + 1);
+        assert_eq!(
+            pending(),
+            proposed,
+            "a sync begun at the last inclusion frame cannot show the join"
+        );
+        assert!(!logged.contains(start), "reported once: {logged}");
+        alloc.note_registry_sync_begun(3, last_inclusion + 1);
+        alloc.note_registry_synced(3);
+        let logged = reconcile_logged(&alloc, timed_out + 2);
+        assert_eq!(
+            pending(),
+            0,
+            "a registry synced since the last inclusion frame without the join frees the worker"
+        );
+        assert!(
+            logged.contains("join's registry-sync hold ended")
+                && logged.contains("ended=\"synced\"")
+                && logged.contains(&format!("last_inclusion_frame={last_inclusion}")),
+            "{logged}"
+        );
     }
 
     /// A node loads its prover registry in the background at startup. A
