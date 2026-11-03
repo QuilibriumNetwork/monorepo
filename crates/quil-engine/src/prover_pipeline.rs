@@ -2782,14 +2782,29 @@ fn prune_confirmation_replicas(
 ) {
     let keep_from = crate::app_shard_metadata::replica_keep_from(current_epoch);
     crate::storage_snapshot::note_replica_eviction(current_epoch);
+    let master = master.map(|store| ("master".to_owned(), store.clone()));
     let workers = filters.iter().filter_map(|filter| {
         worker
             .and_then(|resolve| resolve(filter))
-            .map(|(_, replicas)| replicas)
+            .map(|(_, replicas)| (hex::encode(filter), replicas))
     });
-    for (store_index, store) in master.cloned().into_iter().chain(workers).enumerate() {
-        if let Err(error) = store.evict_below_epoch(keep_from) {
-            warn!(store_index, keep_from_epoch = keep_from, %error, "replica cleanup failed");
+    // Once per boundary per store: a reconfirmation dispatches every few
+    // frames until it publishes, and each eviction writes range deletions
+    // and starts a compaction.
+    for (store, replicas) in master.into_iter().chain(workers) {
+        match replicas.evict_below_epoch_once(keep_from, &store) {
+            Ok(true) => tracing::info!(
+                store = %store,
+                keep_from_epoch = keep_from,
+                "evicted storage replicas no frame can challenge"
+            ),
+            Ok(false) => {}
+            Err(error) => warn!(
+                store = %store,
+                keep_from_epoch = keep_from,
+                %error,
+                "replica cleanup failed; retrying at the next confirmation"
+            ),
         }
     }
 }
@@ -2799,6 +2814,61 @@ mod tests {
     use super::confirm_encoding_plan;
     use crate::submission_attempts::OpKind;
     use quil_types::store::{PendingShardChange, ShardChangeKind};
+
+    /// A reconfirmation dispatches every few frames until it publishes (our
+    /// node: 420-492 in 2.5 h), and each evicted every store it encodes:
+    /// six range deletions per store per dispatch. Each store is evicted
+    /// once per boundary: a replica written below the boundary after its
+    /// eviction (a stand-in for a second eviction's work) stays until the
+    /// next boundary evicts it.
+    #[test]
+    fn confirmation_evicts_each_store_once_per_boundary() {
+        use quil_store::replica_store::ReplicaStore;
+        use std::sync::Arc;
+        let make = || ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let master = make();
+        let worker = make();
+        for store in [&master, &worker] {
+            for epoch in 5..=8 {
+                store.put(epoch, b"leaf", &[epoch as u8]).unwrap();
+            }
+        }
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_tries::ShaInclusionProver),
+        ));
+        // A store handle per call, as the node's resolver makes one.
+        let resolve = |filter: &[u8]| (filter == [1u8]).then(|| (crdt.clone(), worker.clone()));
+        let prune = |current_epoch| {
+            super::prune_confirmation_replicas(
+                Some(&master),
+                Some(&resolve),
+                &[vec![1]],
+                current_epoch,
+            )
+        };
+        prune(7);
+        for store in [&master, &worker] {
+            assert_eq!(store.get(5, b"leaf").unwrap(), None, "the boundary evicts");
+            store.put(5, b"late", b"late").unwrap();
+        }
+        for _frame in 0..3 {
+            prune(7);
+        }
+        for store in [&master, &worker] {
+            assert_eq!(
+                store.get(5, b"late").unwrap().as_deref(),
+                Some(&b"late"[..]),
+                "a boundary already applied to a store is not evicted again"
+            );
+        }
+        prune(8);
+        for store in [&master, &worker] {
+            assert_eq!(store.get(5, b"late").unwrap(), None, "the next boundary");
+            assert_eq!(store.get(6, b"leaf").unwrap(), None);
+            assert_eq!(store.get(7, b"leaf").unwrap(), Some(vec![7]));
+        }
+    }
 
     #[test]
     fn confirmation_prunes_worker_stores_and_keeps_boundary_replicas() {
