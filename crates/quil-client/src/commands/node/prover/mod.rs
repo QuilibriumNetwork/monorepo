@@ -56,7 +56,7 @@ pub enum ProverCommand {
     /// filter is on an auto worker, whose leave the node would decide by score:
     /// switch it to manual in `prover manage` first.
     Leave {
-        /// Hex-encoded 32-byte shard filters (default: all-0xFF).
+        /// Hex-encoded 32-byte shard filters; at least one.
         filters: Vec<String>,
     },
     /// Confirm prover shard allocations for the given filters.
