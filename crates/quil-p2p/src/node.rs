@@ -1557,6 +1557,9 @@ impl P2PHandle {
     /// subscribed to the bitmask).
     pub async fn publish(&self, bitmask: Vec<u8>, data: Vec<u8>) -> quil_types::error::Result<()> {
         let (ack_tx, ack_rx) = oneshot::channel();
+        let queued = self.cmd_tx.max_capacity() - self.cmd_tx.capacity();
+        let capacity = self.cmd_tx.max_capacity();
+        let sent = std::time::Instant::now();
         self.cmd_tx
             .send(P2PCommand::Publish {
                 bitmask,
@@ -1569,9 +1572,11 @@ impl P2PHandle {
             })?;
         match ack_rx.await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(reason)) => Err(QuilError::P2p(format!(
-                "blossomsub publish failed: {}",
-                reason
+            Ok(Err(reason)) => Err(QuilError::P2p(publish_failure(
+                &reason,
+                queued,
+                capacity,
+                sent.elapsed(),
             ))),
             Err(_) => Err(QuilError::P2p(
                 "p2p swarm dropped publish ack (event loop exited)".into(),
@@ -2018,6 +2023,39 @@ pub(crate) fn is_routable(addr: &Multiaddr) -> bool {
         }
     }
     false
+}
+
+/// The text of a refused publish. A refusal because every recipient's send
+/// queue is full (`AllQueuesFull`) has two causes this separates: a swarm loop
+/// too busy to drain its queues (its command queue deep, its answer slow) and
+/// peers that read slowly while the loop is prompt (a shallow command queue,
+/// a fast answer).
+fn publish_failure(reason: &str, queued: usize, capacity: usize, answered_in: Duration) -> String {
+    format!(
+        "blossomsub publish failed: {reason} (swarm command queue {queued}/{capacity} \
+         when sent, swarm answered after {} ms)",
+        answered_in.as_millis()
+    )
+}
+
+#[cfg(test)]
+mod publish_failure_tests {
+    use super::publish_failure;
+    use std::time::Duration;
+
+    /// A refused publish names the swarm's command queue depth and how long
+    /// the swarm took to answer, and keeps the reason the retry check reads.
+    #[test]
+    fn a_refused_publish_names_the_swarm_queue_and_answer_time() {
+        let text = publish_failure("AllQueuesFull(5)", 37, 256, Duration::from_millis(1840));
+        assert_eq!(
+            text,
+            "blossomsub publish failed: AllQueuesFull(5) (swarm command queue 37/256 \
+             when sent, swarm answered after 1840 ms)"
+        );
+        let none = publish_failure("NoPeersSubscribedToTopic", 0, 256, Duration::ZERO);
+        assert!(none.contains("NoPeersSubscribedToTopic"), "{none}");
+    }
 }
 
 #[cfg(test)]
