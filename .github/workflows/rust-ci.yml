@@ -38,7 +38,7 @@ jobs:
   # -----------------------------------------------------------------
   scope:
     name: scope
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     outputs:
@@ -69,7 +69,7 @@ jobs:
   # -----------------------------------------------------------------
   build:
     name: build (cargo check)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: scope
     if: needs.scope.outputs.run == 'true'
     steps:
@@ -126,7 +126,7 @@ jobs:
   # -----------------------------------------------------------------
   clippy:
     name: clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: scope
     if: needs.scope.outputs.run == 'true'
     steps:
@@ -168,7 +168,7 @@ jobs:
   # -----------------------------------------------------------------
   test:
     name: test (cargo nextest ${{ matrix.partition }}/3)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: scope
     if: needs.scope.outputs.run == 'true'
     permissions:
@@ -256,7 +256,7 @@ jobs:
   # would count as passed.
   test-result:
     name: test (cargo nextest)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [scope, test]
     if: ${{ !cancelled() && needs.scope.outputs.run != 'false' }}
     steps:
@@ -276,7 +276,7 @@ jobs:
   # -----------------------------------------------------------------
   lattice-native:
     name: lattice-native (x86-64)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: scope
     if: needs.scope.outputs.run == 'true' && github.event_name != 'merge_group'
     steps:
@@ -370,7 +370,7 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64
-            runs-on: ubuntu-latest
+            runs-on: ubuntu-24.04
             quil_platform: amd64_linux
           - name: linux-arm64
             runs-on: ubuntu-24.04-arm
