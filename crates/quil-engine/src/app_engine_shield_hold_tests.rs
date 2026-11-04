@@ -449,6 +449,65 @@ async fn control_what_nobody_holds_back_ages_out() {
     assert_eq!(rig.collector.total_pending(), 0);
 }
 
+/// Bytes no proposal decodes and bundles without a confidential operation take
+/// the mempool's room only until they age out, like any message nobody holds
+/// back; but only a confidential bundle the mempool holds needs an arrival
+/// stamp, and only a turn holding one prunes the stamps. No other arrival may
+/// leave one, nor a copy a full rank refused.
+#[tokio::test]
+async fn arrivals_no_turn_routes_leave_no_routing_stamp() {
+    const COUNT_CAP: usize = 65_536;
+    let mut rig = rig(half(true), Proofs::Unconfigured);
+    let stamps = |rig: &Rig| rig.engine.routing_seen.lock().unwrap().len();
+    let mut sent = 0usize;
+    // Decodable bundles without a confidential operation.
+    for n in 0..100u32 {
+        let mut inner = 0x0000_0e01u32.to_be_bytes().to_vec();
+        inner.extend_from_slice(&n.to_be_bytes());
+        rig.engine.handle_prover_message(&bundle(vec![inner]));
+        sent += 1;
+    }
+    // Bytes no proposal decodes, past the count cap.
+    for n in 0..(COUNT_CAP as u64 + 1_000) {
+        let mut junk = vec![0xa5; 16];
+        junk[8..].copy_from_slice(&n.to_be_bytes());
+        rig.engine.handle_prover_message(&junk);
+        sent += 1;
+    }
+    let held = rig.collector.total_pending();
+    assert_eq!(held, COUNT_CAP, "the rank's count cap holds");
+    // Shields of this shard the full rank refuses.
+    for n in 0..100u64 {
+        rig.engine
+            .handle_prover_message(&bundle(vec![junk_shield(n, [0xbf; 32], 0)]));
+        sent += 1;
+    }
+    assert_eq!(rig.collector.total_pending(), held);
+    let start = std::time::Instant::now();
+    for rank in [1000, 2000] {
+        turn(&rig.leader, rank);
+    }
+    eprintln!("two turns over {held} held: {:?}", start.elapsed());
+    assert_eq!(
+        rig.collector.total_pending(),
+        0,
+        "what nobody holds back ages out"
+    );
+    let left = stamps(&rig);
+    assert_eq!(
+        left, 0,
+        "arrival stamps retained without limit: {left} routing stamps stay for {sent} \
+         submissions no turn routes (undecodable bytes, bundles without a confidential \
+         operation, copies a full rank refused) after the mempool let all of them go, and \
+         only a turn holding a confidential bundle prunes them"
+    );
+    // The stamp's purpose stays: a confidential bundle the mempool takes has one.
+    rig.engine
+        .handle_prover_message(&bundle(vec![junk_shield(1, [0xbf; 32], 64)]));
+    assert_eq!(rig.collector.total_pending(), 1);
+    assert_eq!(stamps(&rig), 1);
+}
+
 /// What is left open: a well-formed non-shield waits for its routing
 /// fallback on a shard its hash does not designate, so it is held up to about
 /// shards x `ROUTED_FALLBACK`. Bounded: the fallback ends the hold.

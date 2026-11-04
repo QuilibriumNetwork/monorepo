@@ -11263,12 +11263,13 @@ impl AppConsensusEngine {
     /// on each of one node's 15 workers, 200-266 refusals each in 37 min).
     fn add_app_message(&mut self, data: &[u8]) {
         let data = canonical_app_message(data);
+        let operations = quil_execution::ExecutionEngineManager::confidential_operation_count(
+            &self.app_address,
+            &data,
+        );
         if shield_proposed_elsewhere(
             &self.filter,
-            quil_execution::ExecutionEngineManager::confidential_operation_count(
-                &self.app_address,
-                &data,
-            ),
+            operations,
             quil_execution::ExecutionEngineManager::shield_source(&data),
         ) {
             self.shields_elsewhere.note(&self.filter, data.len());
@@ -11285,8 +11286,14 @@ impl AppConsensusEngine {
             return;
         }
         let now = std::time::Instant::now();
-        stamp_arrival(&self.routing_seen, &data, now);
         let collected = self.message_collector.add_message_newest(data.clone());
+        // Only a confidential bundle the mempool holds waits for its routing
+        // fallback, and only a turn holding one prunes the stamps: any other
+        // arrival's stamp, bytes no proposal decodes or a copy a full rank
+        // refused, stayed while the mempool let it go.
+        if collected && operations > 0 {
+            stamp_arrival(&self.routing_seen, &data, now);
+        }
         self.verify_on_arrival(&data, collected, now);
     }
 
