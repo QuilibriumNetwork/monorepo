@@ -60,6 +60,18 @@
 //! its estimated pace and missed its grace, where three leaves at a time ran
 //! at 85 to 94% (2026-11-01).
 //!
+//! A node's processes on one host (a master and its standalone workers)
+//! admit their jobs together ([`install_host_ledger`],
+//! [`crate::storage_ledger`]): each counts what the others' reservations
+//! hold against the jobs' share and the others' leaves labelled ahead
+//! against [`ahead_jobs_for`]; work due now waiting in one asks the others'
+//! labelling ahead to give its memory back and start no more; and one
+//! process at a time runs work due now beyond the share alone. Each
+//! process admitting its own, several could hold the share of the host's
+//! memory, label leaves ahead up to the cap and run work due now beyond
+//! the share at once: a process sees another's jobs only once they have
+//! allocated.
+//!
 //! A stopping node stops its jobs ([`shut_down`]) before it exits: they use
 //! its stores, which exit tears down under a thread still using them.
 
@@ -70,6 +82,8 @@ use std::time::{Duration, Instant};
 
 use quil_types::error::{QuilError, Result};
 use tracing::{info, warn};
+
+use crate::storage_ledger::HostLedger;
 
 /// The lane of the node's epoch proofs (`storage_epoch_batch`).
 pub const EPOCH_PROOF_LANE: &[u8] = b"epoch proofs";
@@ -475,6 +489,25 @@ fn admission() -> &'static Admission {
     })
 }
 
+/// Admit this process's storage jobs together with the node's other
+/// processes on this host that use `dir` ([`crate::storage_ledger`]). The
+/// first call decides; a process that never calls it admits its own alone.
+pub fn install_host_ledger(dir: &std::path::Path) {
+    match HostLedger::open(dir) {
+        Ok(ledger) => {
+            if admission().use_ledger(ledger) {
+                info!(dir = %dir.display(),
+                    "storage jobs are admitted with the node's other processes on this host: \
+                     what their jobs hold counts against the jobs' share of the memory");
+            }
+        }
+        Err(error) => warn!(dir = %dir.display(), %error, scope = "this node",
+            action = "check that this directory is writable by every process of the node",
+            "storage jobs of this process are admitted without the node's other processes on \
+             this host: their jobs together may exceed the share of the memory"),
+    }
+}
+
 /// Whether a reservation's work is due now (a snapshot a renewal waits for,
 /// an epoch proof) or done ahead of when it is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -712,6 +745,7 @@ impl Reservation {
             yielding.bytes = bytes;
         }
         state.stale = true;
+        self.admission.publish(&state);
         drop(state);
         self.admission.changed.notify_all();
     }
@@ -722,8 +756,9 @@ impl Reservation {
     /// ([`Admission::ask_yields`]). Never for work due now, nor for a brief
     /// reservation ([`reserve_ahead_brief`]).
     pub fn yield_requested(&self) -> bool {
-        self.admission
-            .state()
+        let mut state = self.admission.state();
+        self.admission.look_elsewhere(&mut state);
+        state
             .yielding
             .get(&self.ticket)
             .is_some_and(|yielding| yielding.asked)
@@ -805,7 +840,15 @@ impl Drop for Reservation {
         if self.labelling {
             state.labelling_now = state.labelling_now.saturating_sub(1);
         }
+        if state
+            .alone
+            .as_ref()
+            .is_some_and(|(holder, _)| *holder == self.ticket)
+        {
+            state.alone = None;
+        }
         state.stale = true;
+        self.admission.publish(&state);
         drop(state);
         self.admission.changed.notify_all();
     }
@@ -829,10 +872,28 @@ pub struct Admission {
     window: Duration,
     /// [`AHEAD_HELD_BACK_WARN`], shorter in tests.
     held_back_warn: Duration,
+    /// The host's other processes' jobs ([`install_host_ledger`]).
+    ledger: OnceLock<HostLedger>,
+    /// Whether a failed write of this process's record was logged.
+    ledger_warned: AtomicBool,
 }
 
 #[derive(Default)]
 struct State {
+    /// What the host's other processes' jobs hold, read at each pass
+    /// ([`Admission::admit_waiting`]).
+    others: crate::storage_ledger::Held,
+    /// Whether another process holds the host's alone lock, read with
+    /// [`State::others`].
+    alone_elsewhere: bool,
+    /// The host's alone lock and the reservation holding it: work due now
+    /// beyond the jobs' share, alone in this process ([`Admission::fits`]).
+    alone: Option<(u64, std::fs::File)>,
+    /// The alone lock taken by the fit being granted.
+    alone_pending: Option<std::fs::File>,
+    /// Whether this process's labelling ahead gives memory back to another
+    /// process's work due now, logged as it begins and ends.
+    yielding_elsewhere: bool,
     /// Bytes the reservations held come to.
     reserved: u64,
     /// Reservations held.
@@ -974,7 +1035,92 @@ impl Admission {
             available,
             window: LOOK_WINDOW,
             held_back_warn: AHEAD_HELD_BACK_WARN,
+            ledger: OnceLock::new(),
+            ledger_warned: AtomicBool::new(false),
         }
+    }
+
+    /// Admit with the host's other processes from now on; false when a
+    /// ledger was in use already.
+    pub fn use_ledger(&self, ledger: HostLedger) -> bool {
+        self.ledger.set(ledger).is_ok()
+    }
+
+    /// Read what the host's other processes hold ([`State::others`]).
+    fn read_others(&self, state: &mut State) {
+        let Some(ledger) = self.ledger.get() else {
+            return;
+        };
+        state.others = ledger.others();
+        state.alone_elsewhere = state.alone.is_none() && ledger.alone_elsewhere();
+    }
+
+    /// Write what this process's jobs hold to its record, for the host's
+    /// other processes.
+    fn publish(&self, state: &State) {
+        let Some(ledger) = self.ledger.get() else {
+            return;
+        };
+        let held = crate::storage_ledger::Held {
+            bytes: state.reserved,
+            ahead: state.yielding.len() as u64,
+            due_waiting: state.holders < self.slots
+                && state
+                    .waiting
+                    .iter()
+                    .any(|waiting| waiting.urgency == Urgency::Due),
+        };
+        if let Err(error) = ledger.publish(held) {
+            if !self.ledger_warned.swap(true, Ordering::Relaxed) {
+                warn!(dir = %ledger.dir().display(), %error, scope = "this node",
+                    action = "check the free space and permissions of this directory",
+                    "storage job admission record not written: the node's other processes on \
+                     this host admit their jobs without what this one holds; logged once");
+            }
+        }
+    }
+
+    /// With the host's other processes ([`install_host_ledger`]), a pass
+    /// over the waiting reservations ([`Self::admit_waiting`]) once
+    /// [`RECHECK`] passed since the last, also with none waiting here: work
+    /// due now in another process asks labelling ahead here to give its
+    /// memory back.
+    fn look_elsewhere(&self, state: &mut State) {
+        if self.ledger.get().is_some() && state.last_pass.is_none_or(|at| at.elapsed() >= RECHECK) {
+            self.admit_waiting(state);
+        }
+    }
+
+    /// While work due now in another process waits for memory, or runs
+    /// alone beyond the share, ask this process's labelling ahead to give
+    /// its memory back ([`Reservation::yield_requested`]).
+    fn yield_to_elsewhere(&self, state: &mut State) {
+        let wanted = state.others.due_waiting || state.alone_elsewhere;
+        if wanted {
+            let mut asked = 0usize;
+            for yielding in state.yielding.values_mut() {
+                if !yielding.asked {
+                    yielding.asked = true;
+                    asked += 1;
+                }
+            }
+            if asked > 0 || !state.yielding_elsewhere {
+                info!(
+                    asked,
+                    other_processes_bytes = state.others.bytes,
+                    alone_elsewhere = state.alone_elsewhere,
+                    "storage jobs ahead give memory back to another process of the node on this \
+                     host: its work due now waits for memory or runs alone; no more labelling \
+                     ahead starts here until it has its memory: an expected wait"
+                );
+            }
+        } else if state.yielding_elsewhere {
+            info!(
+                "storage jobs ahead may start again: no other process of the node on this \
+                   host waits for memory for work due now"
+            );
+        }
+        state.yielding_elsewhere = wanted;
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -1092,7 +1238,7 @@ impl Admission {
                     let limit = binding_limit(
                         state.holders,
                         self.slots,
-                        state.reserved,
+                        state.reserved.saturating_add(state.others.bytes),
                         bytes,
                         look.map(|look| look.share),
                     );
@@ -1100,6 +1246,7 @@ impl Admission {
                         bytes,
                         limit,
                         reserved = state.reserved,
+                        other_processes_bytes = state.others.bytes,
                         jobs = state.holders,
                         slots = self.slots,
                         available = look.map(|look| look.available),
@@ -1192,6 +1339,8 @@ impl Admission {
     fn admit_waiting(&self, state: &mut State) {
         state.stale = false;
         state.last_pass = Some(Instant::now());
+        self.read_others(state);
+        self.yield_to_elsewhere(state);
         self.ask_yields(state);
         let asked = state.yielding.values().any(|yielding| yielding.asked);
         let mut skipped: Vec<(u64, u8)> = Vec::new();
@@ -1225,6 +1374,9 @@ impl Admission {
                 state.reserved = state.reserved.saturating_add(waiting.bytes);
                 state.holders += 1;
                 state.granted.insert(waiting.ticket);
+                if let Some(lock) = state.alone_pending.take() {
+                    state.alone = Some((waiting.ticket, lock));
+                }
                 if waiting.yields {
                     state.yielding.insert(
                         waiting.ticket,
@@ -1261,6 +1413,7 @@ impl Admission {
             self.ask_yields(state);
             self.changed.notify_all();
         }
+        self.publish(state);
     }
 
     /// Note work ahead held back for memory ([`State::held_back`]) after a
@@ -1468,11 +1621,13 @@ impl Admission {
     /// ([`ahead_jobs_for`]): [`ahead_beside_due`] while a leaf is labelled
     /// now ([`Reservation::labelling_now`]).
     fn ahead_cap(&self, state: &State) -> usize {
-        if state.labelling_now > 0 {
+        let cap = if state.labelling_now > 0 {
             self.ahead_jobs.min(self.ahead_beside_due)
         } else {
             self.ahead_jobs
-        }
+        };
+        let others = usize::try_from(state.others.ahead).unwrap_or(usize::MAX);
+        cap.saturating_sub(others)
     }
 
     /// Whether the labelling ahead holding `ticket` pauses
@@ -1549,9 +1704,17 @@ impl Admission {
             state.reserved = state.reserved.saturating_sub(bytes);
             state.holders = state.holders.saturating_sub(1);
             state.yielding.remove(&ticket);
+            if state
+                .alone
+                .as_ref()
+                .is_some_and(|(holder, _)| *holder == ticket)
+            {
+                state.alone = None;
+            }
         }
         state.passed.remove(&ticket);
         state.stale = true;
+        self.publish(&state);
         if !state
             .waiting
             .iter()
@@ -1594,6 +1757,7 @@ impl Admission {
         }
         state.reserved = state.reserved.saturating_add(bytes);
         state.holders += 1;
+        self.publish(&state);
         drop(state);
         self.changed.notify_all();
         Reservation {
@@ -1628,26 +1792,61 @@ impl Admission {
     /// taken when the last job alone was granted decided for as long as any
     /// job held memory, too high once the node had grown, too low once it
     /// had given memory back).
+    ///
+    /// The host's other processes' reservations count as held
+    /// ([`install_host_ledger`]). Work due now beyond the share runs alone
+    /// on the host: while no other process's jobs hold memory and it holds
+    /// the host's alone lock, so one process at a time decides it. Work
+    /// ahead starts nowhere while another process's work due now waits for
+    /// memory or runs alone.
     fn fits(&self, state: &mut State, bytes: u64, urgency: Urgency) -> bool {
         let now = Instant::now();
+        let others = state.others.bytes;
+        if urgency == Urgency::Ahead && (state.others.due_waiting || state.alone_elsewhere) {
+            return false;
+        }
         if state.holders == 0 {
             state.idle_available = (self.available)();
             state.looks.clear();
             if let Some(idle) = state.idle_available {
                 state.looks.push_back((now, idle));
             }
-            return urgency == Urgency::Due
-                || state.idle_available.is_none()
-                || self
-                    .share(state)
-                    .is_none_or(|share| u128::from(bytes) <= u128::from(share));
+            let within = state.idle_available.is_some()
+                && self.share(state).is_none_or(|share| {
+                    u128::from(others) + u128::from(bytes) <= u128::from(share)
+                });
+            return match urgency {
+                // Alone on the host, beyond the share: one process at a time.
+                Urgency::Due => within || (others == 0 && self.take_alone(state)),
+                // Unknown memory: one at a time on the host.
+                Urgency::Ahead => within || (state.idle_available.is_none() && others == 0),
+            };
         }
         if state.holders >= self.slots {
             return false;
         }
         self.share(state).is_some_and(|share| {
-            u128::from(state.reserved) + u128::from(bytes) <= u128::from(share)
+            u128::from(state.reserved) + u128::from(others) + u128::from(bytes) <= u128::from(share)
         })
+    }
+
+    /// Take the host's alone lock for work due now beyond the share
+    /// ([`Self::fits`]), bound to its reservation once granted; true
+    /// without a ledger, as this process alone decides then.
+    fn take_alone(&self, state: &mut State) -> bool {
+        let Some(ledger) = self.ledger.get() else {
+            return true;
+        };
+        if state.alone.is_some() {
+            return false;
+        }
+        match ledger.try_alone() {
+            Some(lock) => {
+                state.alone_pending = Some(lock);
+                true
+            }
+            None => false,
+        }
     }
 
     /// The jobs' share beside reservations held ([`Self::fits`]), looked at
@@ -1660,8 +1859,11 @@ impl Admission {
             .map_or(available, |idle| idle.max(available));
         state.idle_available = Some(idle);
         // The reservations held are mostly allocated, so what is available
-        // now plus them is what the jobs could have.
-        let bound = available.saturating_add(state.reserved);
+        // now plus them is what the jobs could have: the other processes'
+        // too, which the window's lowest look holds to what they allocated.
+        let bound = available
+            .saturating_add(state.reserved)
+            .saturating_add(state.others.bytes);
         while state
             .looks
             .front()
@@ -1770,6 +1972,88 @@ mod tests {
             assert!(Instant::now() < deadline, "no reservation waits");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Two processes of a node on one host ([`install_host_ledger`]):
+    /// admissions of `slots` jobs, each seeing a constant `available`, their
+    /// records in one directory.
+    fn host_pair(
+        name: &str,
+        slots: usize,
+        available: u64,
+    ) -> (&'static Admission, &'static Admission, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("quil-storage-host-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let [a, b] = ["a", "b"].map(|id| {
+            let admission = admission_capped(slots, available);
+            assert!(admission.use_ledger(HostLedger::open_as(&dir, id).unwrap()));
+            admission
+        });
+        (a, b, dir)
+    }
+
+    /// Work due now in a second process waits while the first holds the
+    /// jobs' share of the host's memory, though the memory available does
+    /// not show it yet, and starts once the first gives it back.
+    #[test]
+    fn a_second_process_waits_for_the_share_the_first_holds() {
+        let (a, b, dir) = host_pair("share", 4, 10 * GIB);
+        let first = hold(a, 6 * GIB);
+        assert!(granted(&first));
+        let second = hold(b, 6 * GIB);
+        assert!(
+            still_waiting(&second),
+            "two processes together hold more than the jobs' share of the host"
+        );
+        drop(first.release);
+        assert!(granted(&second), "the second starts once the first ends");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Work due now beyond the share runs alone on the host: a second
+    /// process's waits until the first one's ends.
+    #[test]
+    fn work_due_now_beyond_the_share_runs_alone_on_the_host() {
+        let (a, b, dir) = host_pair("alone", 4, 10 * GIB);
+        let first = hold(a, 9 * GIB);
+        assert!(granted(&first), "alone, it runs whatever its size");
+        let second = hold(b, 9 * GIB);
+        assert!(
+            still_waiting(&second),
+            "one runs beyond the share at a time"
+        );
+        drop(first.release);
+        assert!(granted(&second));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Labelling ahead in one process gives its memory back to work due now
+    /// waiting in another, which then starts, and labelling ahead starts
+    /// again once that has its memory.
+    #[test]
+    fn labelling_ahead_gives_memory_back_to_another_processs_work_due_now() {
+        let (a, b, dir) = host_pair("yield", 4, 10 * GIB);
+        let ahead_work = reserve_now(a, 6 * GIB, ahead(false, 1, 0));
+        let due = hold(b, 6 * GIB);
+        assert!(still_waiting(&due));
+        let deadline = Instant::now() + SOON;
+        while !ahead_work.yield_requested() {
+            assert!(
+                Instant::now() < deadline,
+                "labelling ahead was not asked to give memory back"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(ahead_work);
+        assert!(
+            granted(&due),
+            "work due now starts once the memory is given back"
+        );
+        let again = reserve_now(a, GIB, ahead(false, 1, 1));
+        assert!(!again.yield_requested(), "no work due now waits any more");
+        drop(due.release);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

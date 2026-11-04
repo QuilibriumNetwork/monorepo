@@ -201,13 +201,17 @@ pub type SpaceSource = Box<dyn Fn(&Path) -> Option<FsUsage> + Send + Sync>;
 static STORE: OnceLock<LabelStore> = OnceLock::new();
 
 /// Keep this process's labels under `dir`, checking their filesystem's free
-/// space every [`FLOOR_CHECK_EVERY`] ([`LabelStore::keep_floor`]). The first
+/// space every [`FLOOR_CHECK_EVERY`] ([`LabelStore::keep_floor`]), and admit
+/// its storage jobs with the node's other processes that label there
+/// ([`crate::storage_jobs::install_host_ledger`], beside `dir`). The first
 /// call decides; a process that never calls it labels nothing ahead and
 /// relabels for its seals.
 pub fn install(dir: PathBuf) {
+    let ledger = dir.with_file_name("storage-admission");
     if STORE.set(LabelStore::new(dir)).is_err() {
         return;
     }
+    crate::storage_jobs::install_host_ledger(&ledger);
     let spawned = std::thread::Builder::new()
         .name("storage-labels-floor".into())
         .spawn(|| loop {
