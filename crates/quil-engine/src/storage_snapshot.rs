@@ -436,6 +436,9 @@ pub enum LeafOutcome {
     Stopping,
     /// An error ended it.
     Failed,
+    /// Labelling ahead ran out of room: its labels would not be kept, and
+    /// its snapshot labels the leaf.
+    Refused,
 }
 
 impl LeafOutcome {
@@ -447,6 +450,7 @@ impl LeafOutcome {
             Self::Grace => "grace",
             Self::Stopping => "stopping",
             Self::Failed => "failed",
+            Self::Refused => "refused",
         }
     }
 }
@@ -996,6 +1000,11 @@ fn encode_member_until(
                             .label_kept(&params, stop, &|done| progress.layers(done, layers))?;
                         match labelling {
                             Labelling::Labelled(labelled) => Some((count, labelled)),
+                            Labelling::Refused => {
+                                return Err(QuilError::Internal(
+                                    "storage labels: a snapshot's labelling refused room".into(),
+                                ))
+                            }
                             Labelling::Stopped { .. } => {
                                 // Kept for the next attempt unless the seat
                                 // renews without them.

@@ -1401,6 +1401,11 @@ pub enum Labelling {
     /// attempt at its count to resume from, in this process or the next,
     /// unless its caller discards them ([`LabelStore::discard`]).
     Stopped { layers: usize },
+    /// Labelling ahead ran out of room before its last layer: stopped at
+    /// the layer the room ran out after, none of its files kept, the refusal
+    /// logged as [`LabelStore::admit`] logs one. Its labels would not be
+    /// kept, and the snapshot labels the leaf again.
+    Refused,
 }
 
 /// A labelled leaf ([`Admitted::label`]): its column commitment and last
@@ -1455,7 +1460,7 @@ impl Admitted<'_> {
     ) -> Result<Option<Labelled>> {
         Ok(match self.label_kept(params, stop, &|_| {})? {
             Labelling::Labelled(labelled) => Some(labelled),
-            Labelling::Stopped { .. } => None,
+            Labelling::Stopped { .. } | Labelling::Refused => None,
         })
     }
 
@@ -1463,11 +1468,14 @@ impl Admitted<'_> {
     /// earlier attempt kept ([`Self::resumes_from`]), and keep its layers
     /// while the filesystem has room for them, checked before each layer and
     /// the columns are written: each whole layer is synced and listed in the
-    /// leaf's manifest as it ends. A leaf that runs out of room is labelled
-    /// to the end but not kept: its files are removed and the refusal logged
-    /// as [`LabelStore::admit`] logs one. Given up once `stop` says so
-    /// (`quil_crypto::storage_proof::label_leaf_until`), it keeps its whole
-    /// layers for the next attempt at its count, unless it ran out of room.
+    /// leaf's manifest as it ends. A leaf that runs out of room is not kept:
+    /// its files are removed and the refusal logged as [`LabelStore::admit`]
+    /// logs one. Labelled at its snapshot, it is labelled to the end, for its
+    /// caller to encode from; labelled ahead, it stops there
+    /// ([`Labelling::Refused`]): no layer after it is of use. Given up once
+    /// `stop` says so (`quil_crypto::storage_proof::label_leaf_until`), it
+    /// keeps its whole layers for the next attempt at its count, unless it
+    /// ran out of room.
     /// `layers` hears each layer's end with the layers labelled so far.
     pub fn label_kept(
         mut self,
@@ -1480,7 +1488,7 @@ impl Admitted<'_> {
         let keep = match &result {
             Ok(Labelling::Labelled(labelled)) => labelled.kept,
             Ok(Labelling::Stopped { layers }) => *layers > 0,
-            Err(_) => false,
+            Ok(Labelling::Refused) | Err(_) => false,
         };
         if !keep {
             let [layers, columns, _] = &paths;
@@ -1540,6 +1548,8 @@ impl Admitted<'_> {
         let (mut failure, mut shortfall, mut unread) = (None, None, None);
         // Whole layers on disk.
         let mut whole = kept;
+        // Labelling ahead out of room stops: its labels would not be kept.
+        let refused = std::cell::Cell::new(false);
         let labelled = quil_crypto::storage_proof::label_leaf_resume(
             self.n,
             &key,
@@ -1568,9 +1578,11 @@ impl Admitted<'_> {
                     return;
                 }
                 if let Err(short) = self.room() {
-                    // Out of room: the rest is labelled, not written.
+                    // Out of room: the rest is labelled, not written, when
+                    // the snapshot needs the labels.
                     shortfall = Some(short);
                     writer = None;
+                    refused.set(self.stage == Stage::Ahead);
                     return;
                 }
                 // Synced, then listed: a listed layer is whole on disk.
@@ -1600,7 +1612,7 @@ impl Admitted<'_> {
                     None => {}
                 }
             },
-            stop,
+            &|| refused.get() || stop(),
         );
         drop(reader);
         if let Some(error) = failure {
@@ -1608,6 +1620,14 @@ impl Admitted<'_> {
         }
         if let Some(error) = unread {
             return Err(io("read back", layers_path, error));
+        }
+        if refused.get() {
+            if let Some(shortfall) = shortfall {
+                let (epoch, n, stage) = (self.epoch, self.n, self.stage);
+                self.store
+                    .refuse(epoch, &self.dir, &self.leaf_id, n, stage, shortfall);
+            }
+            return Ok(Labelling::Refused);
         }
         let Some((last, columns)) = labelled else {
             // Each whole layer was synced and listed as it ended; out of
@@ -2363,6 +2383,10 @@ fn label_leaf_ahead(
                 progress.end(LeafOutcome::Completed);
                 return Ok(labelled.kept.then_some(n));
             }
+            Labelling::Refused => {
+                progress.end(LeafOutcome::Refused);
+                return Ok(None);
+            }
             Labelling::Stopped { layers } => layers,
         };
         drop(memory);
@@ -2792,6 +2816,81 @@ mod tests {
         assert!(store.find(9, &member, leaf, |_| true).is_none());
         assert_eq!(*store.pending(), 0);
         assert_eq!(store.refused.lock().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A leaf labelled ahead that runs out of room midway stops at the layer
+    /// the room ran out after, instead of labelling its other layers for
+    /// labels it would not keep: it leaves no files, logs its refusal and
+    /// frees its room. Once room returns the leaf is admitted again and
+    /// labelled and kept to its end.
+    #[test]
+    fn a_leaf_labelled_ahead_out_of_room_midway_stops_there() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        let dir = temp_dir("ahead-midway");
+        let reads = Arc::new(AtomicU64::new(0));
+        let full = Arc::new(AtomicBool::new(false));
+        // Room for the admission and the first three layers, then none until
+        // the filesystem is no longer full.
+        let space: SpaceSource = {
+            let (reads, full) = (reads.clone(), full.clone());
+            Box::new(move |_| {
+                let read = reads.fetch_add(1, Ordering::SeqCst);
+                if read == 4 {
+                    full.store(true, Ordering::SeqCst);
+                }
+                Some(FsUsage {
+                    total_bytes: TOTAL,
+                    free_bytes: if full.load(Ordering::SeqCst) {
+                        0
+                    } else {
+                        TOTAL
+                    },
+                    ..FsUsage::default()
+                })
+            })
+        };
+        let store = LabelStore::with_space(dir.clone(), space);
+        let params = SdrParams::default();
+        let (member, leaf, n) = ([7u8; 32], b"leaf".as_slice(), 3_000u64);
+        let admitted = store.admit(9, &member, leaf, n, Stage::Ahead).unwrap();
+        let labelled = AtomicUsize::new(0);
+        let ended = admitted
+            .label_kept(&params, &|| false, &|done| {
+                labelled.fetch_max(done, Ordering::SeqCst);
+            })
+            .unwrap();
+        assert_eq!(
+            labelled.load(Ordering::SeqCst),
+            4,
+            "labelled past the layer the room ran out after, of {}",
+            params.layers
+        );
+        assert!(matches!(ended, Labelling::Refused));
+        assert_eq!(files_under(&dir), Vec::<PathBuf>::new());
+        assert!(store.find(9, &member, leaf, |_| true).is_none());
+        assert_eq!(*store.pending(), 0, "its room is freed");
+        assert_eq!(
+            store.refused.lock().unwrap().len(),
+            1,
+            "the refusal is logged"
+        );
+
+        // Room again: admitted, labelled and kept to its end.
+        full.store(false, Ordering::SeqCst);
+        let admitted = store.admit(9, &member, leaf, n, Stage::Ahead).unwrap();
+        let labelled = AtomicUsize::new(0);
+        let ended = admitted
+            .label_kept(&params, &|| false, &|done| {
+                labelled.fetch_max(done, Ordering::SeqCst);
+            })
+            .unwrap();
+        let Labelling::Labelled(Labelled { kept, .. }) = ended else {
+            panic!("the leaf was not labelled once room returned");
+        };
+        assert!(kept);
+        assert_eq!(labelled.load(Ordering::SeqCst), params.layers);
+        assert!(store.find(9, &member, leaf, |count| count == n).is_some());
         let _ = fs::remove_dir_all(&dir);
     }
 
