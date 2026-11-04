@@ -755,8 +755,12 @@ impl SettlementLedger {
 /// frame. Frames beyond either verify under the lock, as before.
 pub const PREPASS_MAX_FRAMES: usize = 1024;
 pub const PREPASS_MAX_BYTES: usize = 128 << 20;
-/// How long a pass retries operations that found no worker slot. Past it the
-/// locked materialization verifies them, as before.
+/// How long a pass retries operations that found no worker slot while no
+/// round verifies anything. Past it the locked materialization verifies them,
+/// as before. A round that verified some restarts it: a round outlasts the
+/// window whenever a frame carries more operations than there are slots and
+/// one takes longer than the window (2026-11-04: four of about 290 s on two
+/// slots), and the locked pass then held the ingest for the rest.
 pub const PREPASS_BUSY_WINDOW: Duration = Duration::from_secs(300);
 const PREPASS_BUSY_PAUSE: Duration = Duration::from_millis(500);
 /// A pass longer than this is logged at info.
@@ -947,6 +951,7 @@ pub fn preverify_through_within(
                 }
             })
             .expect("spawn the pre-pass progress thread");
+        let mut progressed = Instant::now();
         loop {
             report.rounds += 1;
             done.store(0, Ordering::Relaxed);
@@ -968,7 +973,10 @@ pub fn preverify_through_within(
                 report.counts.busy = counts.busy;
                 report.counts.unavailable = counts.unavailable;
             }
-            if counts.busy == 0 || start.elapsed() >= limits.busy_window {
+            if counts.verified > 0 {
+                progressed = Instant::now();
+            }
+            if counts.busy == 0 || progressed.elapsed() >= limits.busy_window {
                 break;
             }
             std::thread::sleep(limits.busy_pause);
