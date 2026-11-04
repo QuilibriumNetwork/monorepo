@@ -99,6 +99,11 @@ enum Commands {
     /// Compute operations.
     Compute(commands::compute::ComputeArgs),
     /// Download and install the latest (or a specific) qclient release.
+    ///
+    /// Installs to /var/quilibrium/bin/qclient/<version> on Linux and
+    /// /opt/quilibrium/bin/qclient/<version> on macOS (/var/quilibrium while
+    /// an earlier install there exists and /opt/quilibrium does not), and
+    /// links /usr/local/bin/qclient to it.
     Update {
         version: Option<String>,
         /// Install a version older than the linked one.

@@ -2,9 +2,10 @@
 //!
 //! Port of `client/cmd/update.go` + `client/cmd/download-signatures.go`.
 //! Download the qclient release + its signatory signatures, verify the
-//! quorum, install to `/var/quilibrium/bin/qclient/{version}`, and symlink
-//! `/usr/local/bin/qclient`. (Install paths require root.) Nothing reaches
-//! the install path before it verifies.
+//! quorum, install to `<root>/bin/qclient/{version}`, and symlink
+//! `/usr/local/bin/qclient`. The root is `/var/quilibrium` on Linux and
+//! `/opt/quilibrium` on macOS ([`system::InstallLayout`]). (Install paths
+//! require root.) Nothing reaches the install path before it verifies.
 
 use std::path::{Path, PathBuf};
 

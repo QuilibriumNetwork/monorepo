@@ -100,6 +100,13 @@ pub enum NodeCommand {
         node: bool,
     },
     /// Download, verify, and install the node binary (+ system service).
+    ///
+    /// Installs to /var/quilibrium/bin/node/<version> on Linux and
+    /// /opt/quilibrium/bin/node/<version> on macOS (/var/quilibrium while
+    /// an earlier install there exists and /opt/quilibrium does not), and
+    /// links /usr/local/bin/quilibrium-node to it. On macOS the service
+    /// logs to /opt/quilibrium/log (/var/log/quilibrium with the
+    /// /var/quilibrium root). Configs stay in ~/.quilibrium/configs.
     Install {
         version: Option<String>,
         /// Install a version older than the linked one.
