@@ -18,9 +18,9 @@ use super::*;
 const COLUMNS: [&str; 5] = ["Kind", "Coins", "Amount [Q]", "State", "As of"];
 
 /// Lines the Balances panel reserves under its rows for the cursor row's
-/// detail; a longer detail ends in the enlarge marker until an edge key
-/// gives the panel more.
-const BALANCE_DETAIL: u16 = 2;
+/// detail: the `cursor` rule and two lines; a longer detail ends in the
+/// enlarge marker until an edge key gives the panel more.
+const BALANCE_DETAIL: u16 = 3;
 
 /// Lines the Notifications panel takes inside its borders on a tall
 /// terminal before an edge key moves it: the most it took when it grew
@@ -1449,10 +1449,7 @@ pub(super) fn render(f: &mut Frame, m: &mut Model, area: Rect) {
     let actions = pad_key_rows(actions, reserved);
     let inner_width = area.width.saturating_sub(2);
     let balances = table_lines(m, inner_width);
-    let balance_detail = wrap_message(
-        Line::from(Span::styled(detail(m), Style::new().fg(HELP))),
-        inner_width,
-    );
+    let balance_detail = Line::from(Span::styled(detail(m), Style::new().fg(HELP)));
     let notices = notice_lines(m, inner_width);
     let fixed = header.len() as u16 + actions.len() as u16;
     let rest = area.height.saturating_sub(fixed);
@@ -1492,15 +1489,23 @@ pub(super) fn render(f: &mut Frame, m: &mut Model, area: Rect) {
     let block = bordered("Balances".into(), m.coins.focus == CoinsFocus::Balances);
     let inner = block.inner(chunks[1]);
     f.render_widget(block, chunks[1]);
-    // The cursor row's detail keeps to the panel's bottom, as in
-    // Allocations; the rows do not scroll, so it never displaces one.
+    // The cursor row's detail keeps to the panel's bottom under the
+    // cursor rule, as in Allocations; the rows do not scroll, so it never
+    // displaces one.
     let keep = balances.len() as u16;
-    let balance_detail = fit_detail(balance_detail, inner.width, inner.height, keep);
+    let balance_detail = cursor_detail(balance_detail, inner.width, inner.height, keep);
+    let detail_rows = balance_detail.len();
     let balances = fit_lines(balances, inner.width, inner.height);
     f.render_widget(
         Paragraph::new(pin_detail(balances, balance_detail, inner.height)),
         inner,
     );
+    let border = Style::new().fg(if m.coins.focus == CoinsFocus::Balances {
+        PRIMARY
+    } else {
+        DIM
+    });
+    render_cursor_rule(f, chunks[1], inner, detail_rows, border);
     let plan_area = chunks[2];
     let (title, lines, scroll) = middle_lines(
         m,
@@ -1576,7 +1581,9 @@ mod coins_render_tests {
     fn coins_tab_shows_balances_attention_and_its_keys() {
         let mut m = loaded();
         m.color_coding = false;
-        let text = render_text(&mut m, 120, 24);
+        // 25 lines: Balances' cursor rule takes one, and Notifications
+        // keeps both attention notices in view.
+        let text = render_text(&mut m, 120, 25);
         let row = |kind: &str| {
             text.lines()
                 .find(|line| line.trim_start_matches('│').trim_start().starts_with(kind))
@@ -2639,10 +2646,11 @@ mod coins_render_tests {
             pending: 1,
             duplicates: 0,
         }));
-        // At 32 lines the rows read below stay in view beside a taller
-        // Balances panel; a shorter terminal ends the question in the marker.
-        let text = render_text(&mut m, 120, 32);
-        dump("offline-shield-confirm-120x32", &text);
+        // At 33 lines the rows read below stay in view beside a taller
+        // Balances panel (its rows and the cursor rule); a shorter terminal
+        // ends the question in the marker.
+        let text = render_text(&mut m, 120, 33);
+        dump("offline-shield-confirm-120x33", &text);
         for line in [
             "Confirm shield",
             "Coins: 4 of 8 listed legacy coins, in 2 batches of up to 96 coins, one shard each",
@@ -2971,15 +2979,17 @@ mod coins_render_tests {
     }
 
     /// A Balances panel too short for its detail keeps every row: with no
-    /// line beyond the rows it shows none, with one it shows the marker.
+    /// line beyond the rows it shows none; with one, the `cursor:` label
+    /// and the marker; with two, the `cursor` rule and the marker.
     #[test]
     fn a_short_balances_panel_keeps_its_rows_before_the_detail() {
         let mut m = loaded();
         m.color_coding = false;
         m.coins.cursor = 0;
         let width = 80;
+        let marker = "… enlarge panel for details";
         assert!(wrap_message(Line::from(detail(&m)), width - 2).len() > 1);
-        for (edge, last) in [(-2, None), (-1, Some("… enlarge panel for details"))] {
+        for (edge, shown) in [(-3, 0), (-2, 1), (-1, 2)] {
             m.coins.edges = [edge, 0];
             let text = render_text(&mut m, width, 40);
             let inner = panel_inner(&text, "Balances");
@@ -2987,9 +2997,17 @@ mod coins_render_tests {
             assert!(inner[0].starts_with("Kind"), "{text}");
             assert!(inner[1].starts_with("claimable"), "{text}");
             assert!(inner[2].starts_with("legacy"), "{text}");
-            match last {
-                None => assert_eq!(inner.len(), rows, "{text}"),
-                Some(marker) => assert_eq!(inner[rows..], [marker.to_string()], "{text}"),
+            assert_eq!(inner.len(), rows + shown, "{text}");
+            match shown {
+                0 => {}
+                1 => assert_eq!(inner[rows], format!("cursor: {marker}"), "{text}"),
+                _ => {
+                    assert!(
+                        inner[rows].starts_with("├─ cursor ─") && inner[rows].ends_with('┤'),
+                        "{text}"
+                    );
+                    assert_eq!(inner[rows + 1], marker, "{text}");
+                }
             }
         }
     }

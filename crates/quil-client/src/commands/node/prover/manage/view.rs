@@ -555,11 +555,12 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     );
     update_app_progress_warning(m);
     let alloc_heading = alloc_heading_lines(m, &sorted_allocs, chunks[1].width.saturating_sub(4));
+    let alloc_border = Style::new().fg(if m.focus.is_alloc() { PRIMARY } else { DIM });
     let alloc_block = Block::default()
         .title(panel_title(alloc_heading[0].to_string()))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if m.focus.is_alloc() { PRIMARY } else { DIM }));
+        .border_style(alloc_border);
     let alloc_inner = alloc_block.inner(chunks[1]);
     f.render_widget(alloc_block, chunks[1]);
     // Keep room for the table header and a data row on small panels.
@@ -624,6 +625,13 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
                 detail_h,
             ),
         );
+        render_cursor_rule(
+            f,
+            chunks[1],
+            alloc_inner,
+            usize::from(detail_h),
+            alloc_border,
+        );
     }
     render_scroll_hint(
         f,
@@ -639,39 +647,54 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         m.horizontal_limits[0],
     );
 
+    let avail_border = Style::new().fg(if m.focus == PanelFocus::Available {
+        PRIMARY
+    } else {
+        DIM
+    });
     let avail_block = Block::default()
         .title(avail_title(m, &sorted_avail))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if m.focus == PanelFocus::Available {
-            PRIMARY
-        } else {
-            DIM
-        }));
+        .border_style(avail_border);
     let avail_inner = avail_block.inner(chunks[2]);
     f.render_widget(avail_block, chunks[2]);
-    let avail_lines = render_avail_panel(m, &sorted_avail, avail_inner, Some(&avail_widths));
-    let mut avail_lines = avail_lines;
-    let detail = if !sorted_avail.is_empty() && avail_inner.height >= 3 {
-        avail_lines.pop()
-    } else {
-        None
+    // As in Allocations: the table renderer reserves one detail row, the
+    // cursor block takes the rest from the bottom of the table's area.
+    let avail_detail = available_detail_lines(m, &sorted_avail, avail_inner);
+    let avail_table = Rect {
+        height: avail_inner
+            .height
+            .saturating_sub(avail_detail.len().saturating_sub(1) as u16),
+        ..avail_inner
     };
-    let detail_rows = u16::from(detail.is_some());
+    let mut avail_lines = render_avail_panel(m, &sorted_avail, avail_table, Some(&avail_widths));
+    if !avail_detail.is_empty() {
+        avail_lines.pop();
+    }
+    let detail_rows = u16::from(!sorted_avail.is_empty() && avail_table.height >= 3);
     let horizontal = table_horizontal_offset(m, 1, &avail_lines, avail_inner.width);
     f.render_widget(
         Paragraph::new(avail_lines).scroll((0, horizontal)),
         avail_inner,
     );
-    if let Some(detail) = detail {
+    if !avail_detail.is_empty() {
+        let detail_h = avail_detail.len() as u16;
         f.render_widget(
-            Paragraph::new(detail),
+            Paragraph::new(avail_detail),
             Rect::new(
                 avail_inner.x,
-                avail_inner.y + avail_inner.height - 1,
+                avail_inner.y + avail_inner.height - detail_h,
                 avail_inner.width,
-                1,
+                detail_h,
             ),
+        );
+        render_cursor_rule(
+            f,
+            chunks[2],
+            avail_inner,
+            usize::from(detail_h),
+            avail_border,
         );
     }
     render_scroll_hint(
@@ -680,7 +703,7 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         m.avail_offset,
         sorted_avail.len(),
         usize::from(
-            avail_inner
+            avail_table
                 .height
                 .saturating_sub(1 + detail_rows + u16::from(m.shard_error.is_some())),
         ),
@@ -2014,27 +2037,18 @@ fn global_snapshot_label<'a>(
     }
 }
 
+/// The cursor row's detail: only what the row lacks. Its cells and the
+/// help already say what Status `bound`, Execution `unknown`, `cached`
+/// or `stale` and LocalMat `0!` mean, so the detail never repeats them.
 fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
-    let binding_detail = if a.status_name == "bound" {
-        "Worker bound; no live allocation reported. "
-    } else {
-        ""
-    };
     let Some(execution) = a.execution.as_ref() else {
         if matches!(a.status_name.as_str(), "joining" | "activating") {
             return peer_materialization_detail(a.materialized_frame, a.latest_frame);
         }
-        return Line::from(Span::styled(
-            format!("{binding_detail}Local execution details unavailable"),
-            Style::new().fg(if binding_detail.is_empty() {
-                HELP
-            } else {
-                WARNING
-            }),
-        ));
+        return Line::default();
     };
     let mut text = format!(
-        "{binding_detail}Last advance: {}",
+        "Last advance: {}",
         if execution.last_advance_unix_ms == 0 {
             "not observed since start"
         } else {
@@ -2054,9 +2068,6 @@ fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
     }
     if let Some(coverage) = cadence_coverage(m, &a.filter) {
         text += &format!(" | {coverage}");
-    }
-    if local_warning(m, a) {
-        text += " | Local app frames: none materialized.";
     }
     if let Some(r) = execution.recovery.as_ref() {
         text += &format!(
@@ -2080,15 +2091,9 @@ fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
             }
         );
     }
-    if matches!(state, "cached" | "stale") {
-        text += &format!(" | Observation: {state}");
-    }
-    let color = if matches!(state, "cached" | "stale") {
-        HELP
-    } else if matches!(state, "blocked" | "stopped") {
+    // A cached or stale observation is `cached` / `stale`, not `blocked`.
+    let color = if matches!(state, "blocked" | "stopped") {
         ERROR
-    } else if local_warning(m, a) {
-        WARNING
     } else {
         HELP
     };
@@ -2102,12 +2107,7 @@ fn allocation_detail_lines(m: &Model, sorted: &[AllocationRow], area: Rect) -> V
     let Some(row) = sorted.get(m.alloc_cursor) else {
         return vec![];
     };
-    fit_detail(
-        wrap_message(allocation_detail(m, row), area.width),
-        area.width,
-        area.height,
-        2,
-    )
+    cursor_detail(allocation_detail(m, row), area.width, area.height, 2)
 }
 
 /// The detail lines a panel `width` by `height` inside its borders pins
@@ -2122,17 +2122,121 @@ fn fit_detail(
     height: u16,
     keep: u16,
 ) -> Vec<Line<'static>> {
-    if height <= keep || width == 0 {
+    let limit = detail_limit(width, height, keep);
+    if limit == 0 {
         return vec![];
     }
-    let limit = usize::from(height - keep)
-        .min(usize::from(height / 2))
-        .max(1);
     if lines.len() > limit {
         lines.truncate(limit);
         lines[limit - 1] = enlarge_marker(width);
     }
     lines
+}
+
+/// The rows [`fit_detail`] gives a detail in a panel `width` by `height`
+/// inside its borders under `keep` lines it never displaces.
+fn detail_limit(width: u16, height: u16, keep: u16) -> usize {
+    if height <= keep || width == 0 {
+        return 0;
+    }
+    usize::from(height - keep)
+        .min(usize::from(height / 2))
+        .max(1)
+}
+
+/// The label of the rule over a cursor row's pinned detail (user Nov4:
+/// `cursor`, not `selected`), as in dash.sh.
+const CURSOR_LABEL: &str = "cursor";
+
+/// A pinned detail line's style: italic and dim, so it never reads as a
+/// table row; on the warning and error colors italic only, so they stay
+/// bright.
+fn detail_style(style: Style) -> Style {
+    if style.fg == Some(WARNING) || style.fg == Some(ERROR) {
+        style.add_modifier(Modifier::ITALIC)
+    } else {
+        style.add_modifier(Modifier::ITALIC | Modifier::DIM)
+    }
+}
+
+/// `line` in [`detail_style`], span by span.
+fn detail_line(line: Line<'static>) -> Line<'static> {
+    let base = line.style;
+    Line::from(
+        line.spans
+            .into_iter()
+            .map(|span| Span::styled(span.content, detail_style(base.patch(span.style))))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The cursor row's `detail`, unwrapped, as the lines a panel `width` by
+/// `height` inside its borders pins to its bottom under `keep` lines, in
+/// the rows [`detail_limit`] gives it, as [`detail_line`]s. With two rows
+/// or more the first is left blank for the `├─ cursor ─┤` rule
+/// [`render_cursor_rule`] draws over it and the borders; with one, a dim
+/// `cursor:` label starts it. A detail too long for its rows ends in the
+/// enlarge marker; an empty one leaves its row blank.
+fn cursor_detail(detail: Line<'static>, width: u16, height: u16, keep: u16) -> Vec<Line<'static>> {
+    match detail_limit(width, height, keep) {
+        0 => vec![],
+        1 => {
+            let label = format!("{CURSOR_LABEL}: ");
+            let room = width.saturating_sub(printed_width(&label) as u16);
+            let mut text = wrap_message(detail, room);
+            let first = if text.len() > 1 {
+                enlarge_marker(room)
+            } else {
+                text.pop().unwrap_or_default()
+            };
+            let mut spans = vec![Span::styled(label, detail_style(Style::new().fg(HELP)))];
+            spans.extend(detail_line(first).spans);
+            vec![Line::from(spans)]
+        }
+        rows => {
+            let mut text = wrap_message(detail, width);
+            if text.is_empty() {
+                text.push(Line::default());
+            }
+            let mut lines = vec![Line::default()];
+            lines.extend(
+                fit_lines(text, width, (rows - 1) as u16)
+                    .into_iter()
+                    .map(detail_line),
+            );
+            lines
+        }
+    }
+}
+
+/// The `├─ cursor ─┤` rule `width` columns wide, borders included: the
+/// panel's `border` style, the label dim.
+fn cursor_rule(width: u16, border: Style) -> Line<'static> {
+    let inner = usize::from(width.saturating_sub(2));
+    let label = format!(" {CURSOR_LABEL} ");
+    let label_width = printed_width(&label);
+    if inner < label_width + 2 {
+        return Line::from(Span::styled(format!("├{}┤", "─".repeat(inner)), border));
+    }
+    Line::from(vec![
+        Span::styled("├─", border),
+        Span::styled(label, Style::new().fg(HELP)),
+        Span::styled(format!("{}┤", "─".repeat(inner - 1 - label_width)), border),
+    ])
+}
+
+/// Draws the cursor rule over the first of the `rows` lines a
+/// [`cursor_detail`] takes at the bottom of `inner`, across the panel's
+/// `outer` area and its borders; a block of one row has no rule.
+fn render_cursor_rule(f: &mut Frame, outer: Rect, inner: Rect, rows: usize, border: Style) {
+    if rows < 2 || rows > usize::from(inner.height) {
+        return;
+    }
+    let y = inner.y + inner.height - rows as u16;
+    f.render_widget(
+        Paragraph::new(cursor_rule(outer.width, border)),
+        Rect::new(outer.x, y, outer.width, 1),
+    );
 }
 
 /// A panel's `lines` in `height` lines `width` wide inside its borders:
@@ -2627,15 +2731,36 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
     (widths, fw)
 }
 
+/// The cursor row's detail: only what the row lacks. PeerState already
+/// says `current`, `unmat` or `unknown`; a lag adds its frames.
 fn available_detail(m: &Model, s: &ShardRow) -> Line<'static> {
-    let mut line = peer_materialization_detail(s.materialized_frame, s.latest_frame);
+    let mut line = if materialization_state(s.materialized_frame, s.latest_frame) == "lag" {
+        peer_materialization_detail(s.materialized_frame, s.latest_frame)
+    } else {
+        Line::default()
+    };
     if let Some(coverage) = cadence_coverage(m, &s.filter) {
+        let separator = if line.spans.is_empty() { "" } else { " | " };
         line.spans.push(Span::styled(
-            format!(" | {coverage}"),
+            format!("{separator}{coverage}"),
             Style::new().fg(HELP),
         ));
     }
     line
+}
+
+/// The Available panel's cursor block in `area` inside its borders, as
+/// Allocations': the header and a row, and the cached-shards warning
+/// above them, stay in view.
+fn available_detail_lines(m: &Model, sorted: &[ShardRow], area: Rect) -> Vec<Line<'static>> {
+    if area.height < 3 || area.width == 0 {
+        return vec![];
+    }
+    let Some(row) = sorted.get(m.avail_cursor) else {
+        return vec![];
+    };
+    let keep = 2 + u16::from(m.shard_error.is_some());
+    cursor_detail(available_detail(m, row), area.width, area.height, keep)
 }
 
 fn peer_materialization_detail(materialized: u64, latest: u64) -> Line<'static> {
@@ -4372,7 +4497,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("Interval [s]", "Node-observed mean seconds per committed app frame. ‹b› exposes `60m`/`24h` sub-items under Interval [s] in Columns and Global interval in Top header; these selections are independent. Sort/filter uses the first visible interval. Coverage needs 60s; gaps/downtime excluded; includes pauses/catch-up. `-` unavailable or no advances"),
         note("Thresholds read `in Nf` (frames from the received GLOBAL frame; `now` once reached) or `@f<frame>`; ‹e› switches. Expanded relative thresholds add a `~` time estimate from the measured GLOBAL interval; `~` marks estimates. Q/d is whole QUIL per day, GB is decimal gigabytes. Available Shards shows the same columns, minus the ones that only exist once a shard is allocated to you."),
         sec("Footers and notifications"),
-        kv("Details", "Selected allocation footer shows reason/blocker, last advance as `<60s` / `>60s`, and Local app frames warnings; no ticking timers. PeerHead is peer-reported metadata"),
+        kv("Details", "The cursor row's detail sits at the bottom of Allocations, Available Shards and Balances under a `├─ cursor ─┤` rule (a `cursor:` label when the panel leaves it one row), in dim italics, warning colors italic only, so it never reads as a row. It adds only what the row's cells lack, never its key or values: in Allocations the last advance as `<60s` / `>60s`, the reason or blocker, the coverage, recovery and seal; in Available Shards the frames PeerMat trails PeerHead by and the coverage. No ticking timers; a cursor move or a longer detail never resizes a panel. PeerHead is peer-reported metadata"),
         kv("Recovery footer", "Compact shows phase and fixed age buckets; expand for archive, attempt, leaf and outcome details. `unobserved` means no timestamp; `<60s` / `>60s` are fixed age buckets. Detail wraps within the panel; enlarge it for omitted lines"),
         kv("Freshness", "Age of the worker state shown; poll delays do not age the received state, and startup restoration is not an advance:"),
         item("`stale`: node observation already >30s old at receipt"),
@@ -4425,7 +4550,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("‹tab›", "Cycle Allocations, Available Shards and Notifications; ‹Shift+tab› reverses"),
         kv("‹space›", "Toggle selection on cursor row (advances cursor)"),
         kv("‹a›", "Select all / deselect all rows in current table"),
-        kv("Cursor", "Inactive cursor stays visible to bind the detail below to its row"),
+        kv("Cursor", "Inactive cursor stays visible to bind the detail under the `cursor` rule to its row"),
         kv("Boundaries", "Top of Allocations and bottom of Notifications remain fixed"),
         sec("Notifications"),
         kv("‹v›", "Cycle minimum severity (v: verbosity): warnings/errors (default), errors only, all"),
@@ -6063,9 +6188,10 @@ mod tests {
         assert!(local_warning(&m, &worker));
         assert_eq!(alloc_cell(&m, &worker, 6, 12), "0!");
         assert_eq!(local_color(&m, &worker), Color::Yellow);
-        assert!(allocation_detail(&m, &worker)
+        // LocalMat's `0!` says it; the detail does not repeat it.
+        assert!(!allocation_detail(&m, &worker)
             .to_string()
-            .contains("Local app frames: none materialized."));
+            .contains("materialized"));
         worker.execution.as_mut().unwrap().recovery =
             Some(quil_types::proto::node::ShardRecovery {
                 phase: "installing_leaves".into(),
@@ -6076,10 +6202,7 @@ mod tests {
                 ..Default::default()
             });
         let detail = allocation_detail(&m, &worker).to_string();
-        assert!(
-            detail.contains("Local app frames: none materialized.")
-                && detail.contains("Recovery: installing_leaves")
-        );
+        assert!(detail.contains("Recovery: installing_leaves"));
         assert!(detail.contains("131072/2517449"));
         worker.execution.as_mut().unwrap().state = "blocked".into();
         worker.execution.as_mut().unwrap().blocker = "awaiting successor".into();
@@ -6375,11 +6498,8 @@ mod tests {
         assert!(peers[1].to_string().contains("unmat"));
         assert!(!peers[1].to_string().contains("unmat!"));
         assert_eq!(peers[1].spans[20].style.fg, Some(WARNING));
-        assert!(peers
-            .last()
-            .unwrap()
-            .to_string()
-            .contains("Peer app frames: none materialized."));
+        // PeerState's `unmat` says it; the detail does not repeat it.
+        assert!(peers.last().unwrap().to_string().is_empty());
         peer.materialized_frame = 15;
         assert!(available_detail(&m, &peer)
             .to_string()
@@ -6388,9 +6508,7 @@ mod tests {
         assert!(!available_detail(&m, &peer).to_string().contains("Warning"));
         peer.latest_frame = 0;
         peer.materialized_frame = 0;
-        assert!(available_detail(&m, &peer)
-            .to_string()
-            .contains("Peer app frame heights unavailable."));
+        assert!(available_detail(&m, &peer).to_string().is_empty());
     }
 
     #[test]
@@ -7210,7 +7328,8 @@ mod tests {
         assert_eq!(alloc_cell(&m, &bound, 12, 12), "bound");
         assert_eq!(status_color("bound"), WARNING);
         let detail = allocation_detail(&m, &bound).to_string();
-        assert!(detail.contains("Worker bound; no live allocation reported."));
+        // Status `bound` and its help say it; the detail does not repeat it.
+        assert!(!detail.contains("bound") && !detail.contains("no live allocation"));
         assert!(detail.contains("Blocker: closing session"));
         let title = alloc_title(&m, &m.allocations).to_string();
         assert!(title.contains("Status: bound 1"));
@@ -7219,9 +7338,7 @@ mod tests {
             "worker-only estimates do not enter reward totals"
         );
         bound.execution = None;
-        assert!(allocation_detail(&m, &bound)
-            .to_string()
-            .contains("no live allocation reported"));
+        assert!(allocation_detail(&m, &bound).to_string().is_empty());
         let help = help_body()
             .iter()
             .map(|l| l.to_string())
@@ -7263,7 +7380,8 @@ mod tests {
                 a
             })
             .collect();
-        let compact = render_text(&mut m, 160, 24);
+        // Tall enough for all nine rows above the cursor rule and its row.
+        let compact = render_text(&mut m, 160, 40);
         assert_eq!(compact.matches("leaving(W)").count(), 3, "{compact}");
         m.compact_actions = false;
         let leaving = m.allocations[8].clone();
@@ -7271,7 +7389,7 @@ mod tests {
             allocation_status_text(&m, &leaving),
             "leaving(worker shortage)"
         );
-        let expanded = render_text(&mut m, 200, 24);
+        let expanded = render_text(&mut m, 200, 40);
         assert!(expanded.contains("leaving(worker shortage)"), "{expanded}");
     }
 
@@ -9445,6 +9563,270 @@ mod visibility_grid_tests {
         assert!(
             !alloc[0].to_string().contains("ProverPhases")
                 && !avail[0].to_string().contains("ProverPhases")
+        );
+    }
+}
+
+#[cfg(test)]
+mod cursor_rule_tests {
+    use super::tests::{row, shard};
+    use super::*;
+    use quil_types::proto::node::WorkerExecution;
+    use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    /// Two allocations, one serving (a `HELP` detail) and one blocked (a
+    /// red one), and two available shards, one 5 frames behind its head
+    /// (a yellow detail) and one current.
+    fn model() -> Model {
+        let now = now_ms();
+        let mut m = Model::new();
+        m.data_loaded = true;
+        m.compact_actions = false;
+        let mut serving = row(&format!("{:064x}", 1), 3, 1, 4, "", "");
+        serving.status_name = "active".into();
+        serving.execution = Some(WorkerExecution {
+            state: "serving".into(),
+            observed_unix_ms: now,
+            materialized_frame: Some(10),
+            last_advance_unix_ms: now - 5_000,
+            ..Default::default()
+        });
+        let mut blocked = row(&format!("{:064x}", 2), 3, 1, 5, "", "");
+        blocked.status_name = "active".into();
+        blocked.execution = Some(WorkerExecution {
+            state: "blocked".into(),
+            blocker: "closing session".into(),
+            observed_unix_ms: now,
+            materialized_frame: Some(10),
+            ..Default::default()
+        });
+        m.allocations = vec![serving, blocked];
+        let mut lagging = shard(&format!("{:064x}", 3), 1, 1);
+        lagging.materialized_frame = 15;
+        lagging.latest_frame = 20;
+        let mut current = shard(&format!("{:064x}", 4), 1, 1);
+        current.materialized_frame = 20;
+        current.latest_frame = 20;
+        m.available = vec![lagging, current];
+        m
+    }
+
+    /// Puts each panel's cursor on the row whose filter ends in `alloc` /
+    /// `avail`.
+    fn point(m: &mut Model, alloc: char, avail: char) {
+        m.alloc_cursor = m
+            .sorted_allocations()
+            .iter()
+            .position(|a| a.filter_hex.ends_with(alloc))
+            .unwrap();
+        m.avail_cursor = m
+            .sorted_available()
+            .iter()
+            .position(|s| s.filter_hex.ends_with(avail))
+            .unwrap();
+    }
+
+    fn frame(m: &mut Model, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw(f, m)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn lines(buffer: &Buffer) -> Vec<String> {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn borders(lines: &[String]) -> Vec<usize> {
+        (0..lines.len())
+            .filter(|&i| lines[i].starts_with('╭') || lines[i].starts_with('╰'))
+            .collect()
+    }
+
+    /// Each panel's cursor row's detail sits under a `├─ cursor ─┤` rule
+    /// across the panel, borders included, on the panel's last lines; a
+    /// cursor move or a longer detail moves no border.
+    #[test]
+    fn the_cursor_detail_sits_under_a_rule_across_the_panel() {
+        let mut m = model();
+        point(&mut m, '2', '3');
+        let width = 200;
+        let buffer = frame(&mut m, width, 50);
+        let text = lines(&buffer);
+        let all = text.join("\n");
+        let rules: Vec<usize> = (0..text.len())
+            .filter(|&i| {
+                text[i].starts_with("├─ cursor ─")
+                    && text[i].ends_with('┤')
+                    && text[i].chars().count() == usize::from(width)
+            })
+            .collect();
+        assert_eq!(rules.len(), 2, "one rule per table panel\n{all}");
+        assert!(
+            text[rules[0] + 1].contains("Blocker: closing session"),
+            "{all}"
+        );
+        assert!(text[rules[0] + 2].starts_with('╰'), "{all}");
+        assert!(
+            text[rules[1] + 1].contains("trails its head by 5 frames"),
+            "{all}"
+        );
+        assert!(text[rules[1] + 2].starts_with('╰'), "{all}");
+        // The rule takes the border's color, its label the dim one.
+        assert_eq!(buffer[(0, rules[0] as u16)].fg, PRIMARY);
+        assert_eq!(buffer[(3, rules[0] as u16)].fg, HELP);
+        assert_eq!(buffer[(0, rules[1] as u16)].fg, DIM);
+        let before = borders(&text);
+        point(&mut m, '1', '4');
+        assert_eq!(borders(&lines(&frame(&mut m, width, 50))), before);
+        m.allocations[0].execution.as_mut().unwrap().blocker = "x ".repeat(150);
+        point(&mut m, '1', '3');
+        assert_eq!(borders(&lines(&frame(&mut m, width, 50))), before);
+    }
+
+    /// With one row left for it, the detail follows a dim `cursor:` label
+    /// on that row instead of a rule; one too long for it is the marker.
+    #[test]
+    fn one_row_left_puts_a_cursor_label_on_it() {
+        let text = |lines: &[Line<'static>]| -> Vec<String> {
+            lines.iter().map(|l| l.to_string()).collect()
+        };
+        let short = || Line::from(Span::styled("Last advance: <60s", Style::new().fg(HELP)));
+        let long = || Line::from("word ".repeat(20));
+        assert!(cursor_detail(short(), 40, 2, 2).is_empty());
+        let one = cursor_detail(short(), 40, 3, 2);
+        assert_eq!(text(&one), ["cursor: Last advance: <60s"]);
+        assert_eq!(one[0].spans[0].style.fg, Some(HELP));
+        assert!(one[0].spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::DIM | Modifier::ITALIC));
+        assert_eq!(
+            text(&cursor_detail(long(), 40, 3, 2)),
+            ["cursor: … enlarge panel for details"]
+        );
+        // Two rows: the first left for the rule, the detail under it.
+        assert_eq!(
+            text(&cursor_detail(short(), 40, 4, 2)),
+            ["", "Last advance: <60s"]
+        );
+        assert_eq!(
+            text(&cursor_detail(long(), 40, 4, 2)),
+            ["", "… enlarge panel for details"]
+        );
+        assert_eq!(text(&cursor_detail(Line::default(), 40, 4, 2)), ["", ""]);
+    }
+
+    /// Detail lines are dim italics, on the warning and error colors
+    /// italics only; table rows, the cursor row included, are neither.
+    #[test]
+    fn detail_lines_are_dim_italics_and_table_rows_are_not() {
+        let width = 200;
+        let check = |m: &mut Model, needle: &str, fg: Color, dim: bool| {
+            let buffer = frame(m, width, 50);
+            let text = lines(&buffer);
+            let y = text
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle} in\n{}", text.join("\n")));
+            let cells: Vec<_> = (1..width - 1)
+                .map(|x| &buffer[(x, y as u16)])
+                .filter(|cell| cell.symbol() != " ")
+                .collect();
+            assert!(!cells.is_empty());
+            for cell in cells {
+                assert_eq!(cell.fg, fg, "{needle}");
+                assert!(cell.modifier.contains(Modifier::ITALIC), "{needle}");
+                assert_eq!(cell.modifier.contains(Modifier::DIM), dim, "{needle}");
+            }
+            // The table's rows, the cursor row among them.
+            let header = text
+                .iter()
+                .position(|line| line.contains("Select Filter"))
+                .unwrap();
+            for y in [header + 1, header + 2] {
+                for x in 1..width - 1 {
+                    let cell = &buffer[(x, y as u16)];
+                    assert!(
+                        !cell.modifier.intersects(Modifier::ITALIC | Modifier::DIM),
+                        "table row {y} column {x}"
+                    );
+                }
+            }
+        };
+        let mut m = model();
+        point(&mut m, '1', '3');
+        check(&mut m, "Last advance: <60s", HELP, true);
+        check(&mut m, "trails its head by 5 frames", WARNING, false);
+        point(&mut m, '2', '3');
+        check(&mut m, "Blocker: closing session", ERROR, false);
+    }
+
+    /// A row's detail adds what its cells lack: never its filter, LocalMat,
+    /// Execution, Status or PeerState, which the help explains.
+    #[test]
+    fn the_cursor_detail_never_repeats_the_rows_key_or_values() {
+        let now = now_ms();
+        let m = model();
+        let mut rows = m.allocations.clone();
+        let mut bound = row(&format!("{:064x}", 7), 3, 1, 6, "", "");
+        bound.status_name = "bound".into();
+        bound.execution = Some(WorkerExecution {
+            state: "blocked".into(),
+            blocker: "closing session".into(),
+            observed_unix_ms: now,
+            materialized_frame: Some(0),
+            ..Default::default()
+        });
+        rows.push(bound.clone());
+        bound.execution = None;
+        rows.push(bound);
+        for a in &rows {
+            let detail = allocation_detail(&m, a).to_string();
+            for col in [1, 6, 9, 12] {
+                let cell = alloc_cell(&m, a, col, 64);
+                let cell = cell.trim_end_matches('!');
+                if cell.len() >= 3 {
+                    assert!(
+                        !detail.contains(cell),
+                        "column {col} `{cell}` in `{detail}`"
+                    );
+                }
+            }
+        }
+        let mut shards = m.available.clone();
+        let mut unmat = shard(&format!("{:064x}", 8), 1, 1);
+        unmat.latest_frame = 20;
+        shards.push(unmat);
+        shards.push(shard(&format!("{:064x}", 9), 1, 1));
+        for s in &shards {
+            let detail = available_detail(&m, s).to_string();
+            for col in [1, 9] {
+                let cell = avail_cell(&m, s, col, 64);
+                let cell = cell.trim_end_matches('!');
+                assert!(
+                    !detail.contains(cell),
+                    "column {col} `{cell}` in `{detail}`"
+                );
+            }
+        }
+        assert_eq!(
+            available_detail(&m, &shards[0]).to_string(),
+            "Peer materialization trails its head by 5 frames."
         );
     }
 }
