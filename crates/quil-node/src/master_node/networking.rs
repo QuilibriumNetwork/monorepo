@@ -285,26 +285,67 @@ pub(crate) async fn register_mesh_checks(p2p: &quil_p2p::node::P2PHandle, role: 
     .await;
 }
 
-/// The mesh verdict on a message of a topic without a validator of its own.
-/// On a shard CW topic (`0x01 ‖ appFilter`) a transmission must split into one
-/// of the CW channels with a payload
-/// ([`quil_engine::bitmasks::shard_cw_split_payload`]): the receive loop drops
-/// anything else unread, so it is not forwarded either. It is ignored, not
-/// rejected: releases before this check forward such messages. Messages of
-/// other topics are accepted, as before.
-pub(crate) fn shard_gossip_verdict(bitmask: &[u8], data: &[u8]) -> quil_p2p::ValidationResult {
-    let shard_cw_topic = bitmask.len() == 33 && bitmask[0] == 0x01;
-    if !shard_cw_topic {
-        return quil_p2p::ValidationResult::Accept;
+/// The kinds of shard topic a node subscribes, by bitmask (`appFilter` is a
+/// shard's 32-byte bloom, [`quil_engine::bitmasks::shard_app_filter`]), and
+/// what the mesh makes of their messages ([`shard_gossip_verdict`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShardTopic {
+    /// `appFilter`: finalized frames, accepted. A frame's check is its full
+    /// verification, left to its reader.
+    Frame,
+    /// `0x00 ‖ appFilter`: the legacy consensus topic, ignored. Engines drop
+    /// its messages unread, and no release publishes there.
+    Consensus,
+    /// `0x00 0x00 ‖ appFilter`: dispatch, accepted and left to the shard's
+    /// engine.
+    Dispatch,
+    /// `0x00 0x00 0x00 ‖ appFilter`: prover messages and an application's
+    /// submissions, accepted and left to the shard's engines.
+    Prover,
+    /// `0x01 ‖ appFilter`: consensus transmissions, accepted when they frame
+    /// one of the CW channels.
+    Cw,
+    /// `[0xFF; len]` ([`ARCHIVE_BULK_LENGTHS`]): an archive's bulk
+    /// subscriptions, accepted.
+    ArchiveBulk,
+}
+
+/// The kind of shard topic `bitmask` is, if it is one.
+pub(crate) fn shard_topic(bitmask: &[u8]) -> Option<ShardTopic> {
+    const FILTER: usize = 32;
+    if ARCHIVE_BULK_LENGTHS.contains(&bitmask.len()) && bitmask.iter().all(|byte| *byte == 0xFF) {
+        return Some(ShardTopic::ArchiveBulk);
     }
-    match quil_engine::bitmasks::shard_cw_split_payload(data) {
-        Some((channel, cw_bytes))
-            if channel <= quil_engine::cw_app_seams::CW_APP_BLOCK_CHANNEL
-                && !cw_bytes.is_empty() =>
-        {
-            quil_p2p::ValidationResult::Accept
-        }
-        _ => quil_p2p::ValidationResult::Ignore,
+    match bitmask {
+        filter if filter.len() == FILTER => Some(ShardTopic::Frame),
+        [0x00, filter @ ..] if filter.len() == FILTER => Some(ShardTopic::Consensus),
+        [0x01, filter @ ..] if filter.len() == FILTER => Some(ShardTopic::Cw),
+        [0x00, 0x00, filter @ ..] if filter.len() == FILTER => Some(ShardTopic::Dispatch),
+        [0x00, 0x00, 0x00, filter @ ..] if filter.len() == FILTER => Some(ShardTopic::Prover),
+        _ => None,
+    }
+}
+
+/// The mesh verdict on a message of a topic without a validator of its own.
+/// On a shard CW topic a transmission must split into one of the CW channels
+/// with a payload ([`quil_engine::bitmasks::shard_cw_split_payload`]): the
+/// receive loop drops anything else unread, so it is not forwarded either.
+/// Nothing on the legacy shard consensus topic is forwarded: no release reads
+/// it. Both are ignored, not rejected: releases before these checks forward
+/// such messages. Messages of other topics are accepted, as before.
+pub(crate) fn shard_gossip_verdict(bitmask: &[u8], data: &[u8]) -> quil_p2p::ValidationResult {
+    match shard_topic(bitmask) {
+        Some(ShardTopic::Cw) => match quil_engine::bitmasks::shard_cw_split_payload(data) {
+            Some((channel, cw_bytes))
+                if channel <= quil_engine::cw_app_seams::CW_APP_BLOCK_CHANNEL
+                    && !cw_bytes.is_empty() =>
+            {
+                quil_p2p::ValidationResult::Accept
+            }
+            _ => quil_p2p::ValidationResult::Ignore,
+        },
+        Some(ShardTopic::Consensus) => quil_p2p::ValidationResult::Ignore,
+        _ => quil_p2p::ValidationResult::Accept,
     }
 }
 
@@ -340,6 +381,25 @@ mod tests {
         let frame_topic = quil_engine::bitmasks::shard_frame_bitmask(&filter);
         assert_eq!(shard_gossip_verdict(&frame_topic, &[]), Accept);
         assert_eq!(shard_gossip_verdict(&[0x01; 33], b"anything"), Ignore);
+    }
+
+    /// The legacy shard consensus topic is dropped at the mesh without
+    /// penalty, whatever it carries; the other shard topics are unaffected.
+    #[test]
+    fn legacy_shard_consensus_gossip_is_ignored_at_the_mesh() {
+        let filter = [7u8; 32];
+        let consensus = quil_engine::bitmasks::shard_consensus_bitmask(&filter);
+        assert_eq!(shard_topic(&consensus), Some(ShardTopic::Consensus));
+        for data in [&b""[..], &b"vote"[..], &[0x80u8; 64][..]] {
+            assert_eq!(shard_gossip_verdict(&consensus, data), Ignore);
+        }
+        for topic in [
+            quil_engine::bitmasks::shard_frame_bitmask(&filter),
+            quil_engine::bitmasks::shard_dispatch_bitmask(&filter),
+            quil_engine::bitmasks::app_prover_bitmask(&filter),
+        ] {
+            assert_eq!(shard_gossip_verdict(&topic, b"vote"), Accept);
+        }
     }
 
     fn free_port() -> u16 {
@@ -560,6 +620,54 @@ mod tests {
         assert!(
             sender < 0.0,
             "the worker's p2p did not reject the stale PeerInfo (its sender scores {sender})"
+        );
+    }
+
+    /// The legacy shard consensus topic (`0x00 ‖ appFilter`), subscribed for
+    /// every shard a node serves, carries nothing any release reads, so a
+    /// master must not forward what anyone publishes there: it reached every
+    /// mesh peer and their engines' queues, beside the shard's votes.
+    #[tokio::test]
+    async fn reproduces_legacy_shard_consensus_gossip_relayed() {
+        let consensus = quil_engine::bitmasks::shard_consensus_bitmask(&[7u8; 32]);
+        let alert = quil_engine::bitmasks::GLOBAL_ALERT;
+        let mut chain = chain(&[consensus.as_slice(), alert], Some(MeshRole::Master), None).await;
+        chain.wait_for_meshes().await;
+
+        chain
+            .source
+            .publish(consensus.clone(), b"read by no release".to_vec())
+            .await
+            .expect("publish on the legacy shard consensus topic");
+        let last = control_alert(u32::MAX);
+        chain
+            .source
+            .publish(alert.to_vec(), last.clone())
+            .await
+            .expect("publish the last control alert");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut received: Vec<quil_p2p::node::ReceivedMessage> = Vec::new();
+        while !received.iter().any(|message| message.data == last) {
+            match tokio::time::timeout_at(deadline, chain.sink_rx.recv()).await {
+                Ok(Some(message)) => received.push(message),
+                Ok(None) => panic!("the sink stopped"),
+                Err(_) => panic!("the relay never forwarded the last control alert"),
+            }
+        }
+        // Anything the relay forwarded before the last alert has arrived.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        while let Ok(message) = chain.sink_rx.try_recv() {
+            received.push(message);
+        }
+        let relayed = received
+            .iter()
+            .filter(|message| message.bitmask == consensus)
+            .count();
+        assert_eq!(
+            relayed, 0,
+            "VULNERABLE: a master forwarded {relayed} message(s) published on the legacy \
+             shard consensus topic, which no release reads"
         );
     }
 }
