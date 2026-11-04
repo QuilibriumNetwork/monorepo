@@ -141,21 +141,137 @@ fn submission_engines<'a, H>(bitmask: &[u8], entries: &'a [(Vec<u8>, H)]) -> Vec
 /// without this, cluster reads hit an empty master store (thread-mode/local
 /// frames are mirrored by the worker drain). The filter is the frame header's
 /// `address`; the bitmask check confirms this really is a shard-frame message
-/// for it (and that non-frame mesh traffic is skipped). This mirror is not
-/// verified.
+/// for it (and that non-frame mesh traffic is skipped). Only a frame that
+/// verifies is mirrored ([`mirror_admits`]): any peer can publish on the
+/// topic, and one unverified far-future frame pinned the head this node
+/// serves, as it did an archive's.
 fn unrouted_shard_message(
     bitmask: &[u8],
     data: &[u8],
     clock_store: &dyn quil_types::store::ClockStore,
+    validator: &quil_engine::frame_validator::BlsAppFrameValidator,
 ) {
     if let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(data) {
         if let Some(addr) = frame.header.as_ref().map(|h| h.address.clone()) {
             if !addr.is_empty()
                 && bitmask == quil_engine::bitmasks::shard_frame_bitmask(&addr).as_slice()
             {
-                super::worker_manager::mirror_shard_frame_to_clock_store(clock_store, &addr, data);
+                match mirror_admits(validator, &frame) {
+                    Ok(()) => super::worker_manager::mirror_shard_frame_to_clock_store(
+                        clock_store,
+                        &addr,
+                        data,
+                    ),
+                    Err(reason) => {
+                        MIRROR_REFUSALS.note(&frame, reason, std::time::Instant::now());
+                    }
+                }
             }
         }
+    }
+}
+
+/// The validator a node without an archive ingest checks gossiped shard
+/// frames with before it mirrors them, built as the archive ingest builds
+/// its own ([`quil_engine::archive_ingest::ArchiveAppShardIngest::new`]).
+fn shard_mirror_validator(
+    prover_registry: Arc<dyn quil_types::consensus::ProverRegistry>,
+    clock_store: Arc<dyn quil_types::store::ClockStore>,
+    crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+) -> quil_engine::frame_validator::BlsAppFrameValidator {
+    quil_engine::frame_validator::BlsAppFrameValidator::new(
+        prover_registry,
+        Arc::new(quil_crypto::FalconKeyConstructor),
+        Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+    )
+    .with_clock_store(clock_store)
+    .with_handoff_authority(crdt)
+}
+
+/// Whether a gossiped shard frame may be mirrored for serving, else why not:
+/// the checks the archive ingest makes of a frame's header. A frame with a
+/// certificate needs its committee's certificate and the output its anchored
+/// GLOBAL frame determines; one without, to be the frame GLOBAL committed.
+/// Possession is not checked: the quorum checked it, and serving needs none.
+fn mirror_admits(
+    validator: &quil_engine::frame_validator::BlsAppFrameValidator,
+    frame: &quil_types::proto::global::AppShardFrame,
+) -> Result<(), String> {
+    let certified = frame
+        .header
+        .as_ref()
+        .and_then(|header| header.public_key_signature_bls48581.as_ref())
+        .is_some_and(|signature| !signature.signature.is_empty());
+    let verified = if certified {
+        validator.validate_certified_without_storage(frame)
+    } else if validator.committed_by_global(frame) {
+        validator.validate_linked_without_storage(frame)
+    } else {
+        return Err("no certificate, and not the frame GLOBAL committed".into());
+    };
+    match verified {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("certificate refused".into()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// How often the gossiped shard frames refused for the mirror are summarized.
+const MIRROR_REFUSAL_SUMMARY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Gossiped shard frames this node refused to mirror: one line at the first,
+/// then at most one per [`MIRROR_REFUSAL_SUMMARY`] with the count since.
+static MIRROR_REFUSALS: MirrorRefusals = MirrorRefusals::new();
+
+struct MirrorRefusals {
+    state: std::sync::Mutex<(u64, Option<std::time::Instant>)>,
+}
+
+impl MirrorRefusals {
+    const fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new((0, None)),
+        }
+    }
+
+    /// `frame` was refused for `reason` at `now`; the count logged, if a
+    /// line is due.
+    fn note(
+        &self,
+        frame: &quil_types::proto::global::AppShardFrame,
+        reason: String,
+        now: std::time::Instant,
+    ) -> Option<u64> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.0 += 1;
+        if state
+            .1
+            .is_some_and(|last| now.saturating_duration_since(last) < MIRROR_REFUSAL_SUMMARY)
+        {
+            return None;
+        }
+        let refused = std::mem::take(&mut state.0);
+        let since = state.1.replace(now);
+        drop(state);
+        let header = frame.header.as_ref();
+        info!(
+            refused,
+            interval_s = since.map(|last| now.saturating_duration_since(last).as_secs()),
+            filter = %hex::encode(header.map(|h| h.address.as_slice()).unwrap_or_default()),
+            frame = header.map(|h| h.frame_number),
+            %reason,
+            scope = "peer",
+            check = "frames that verify later are mirrored as they arrive; many refusals with \
+                     a missing anchored GLOBAL frame mean this node's GLOBAL view lags; a \
+                     certificate refused or a missing certificate is a peer's forged or \
+                     unfinished frame",
+            "gossiped shard frames were not mirrored for serving: they did not verify (the \
+             latest named)"
+        );
+        Some(refused)
     }
 }
 
@@ -373,6 +489,13 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         );
         (queue, admits)
     });
+    // A node without an archive ingest (a cluster master) mirrors the shard
+    // frames gossiped for shards no local engine runs, once they verify.
+    let mirror_validator = shard_mirror_validator(
+        pr_for_recv.clone(),
+        clock_store_recv.clone(),
+        crdt_for_recv.clone(),
+    );
     // GLOBAL_FRAME admission state shared with the gossip gate: a frame this
     // loop accepted is neither forwarded nor checked again, and a header whose
     // certificate and VDF verified skips both checks on later copies.
@@ -2190,6 +2313,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             bm,
                                             &received.data,
                                             clock_store_recv.as_ref(),
+                                            &mirror_validator,
                                         ),
                                     }
                                 }
@@ -2225,36 +2349,12 @@ mod tests {
     /// no certificate, numbered `u64::MAX`, the head it serves.
     #[test]
     fn reproduces_a_forged_far_future_shard_frame_becoming_the_mirrored_head() {
-        use quil_types::store::ClockStore as _;
-        let dir = tempfile::tempdir().unwrap();
-        let db = quil_store::RocksDb::open(dir.path()).unwrap();
-        let clock = quil_store::RocksClockStore::new(db.inner().clone());
-        let filter = vec![0x33u8; 32];
-        let frame = |number: u64| quil_types::proto::global::AppShardFrame {
-            header: Some(quil_types::proto::global::FrameHeader {
-                address: filter.clone(),
-                frame_number: number,
-                output: vec![number as u8; 516],
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let latest = || {
-            clock
-                .get_latest_shard_clock_frame(&filter)
-                .ok()
-                .and_then(|frame| frame.header)
-                .map(|header| header.frame_number)
-        };
-        let topic = quil_engine::bitmasks::shard_frame_bitmask(&filter);
-        unrouted_shard_message(
-            &topic,
-            &prost::Message::encode_to_vec(&frame(u64::MAX)),
-            &clock,
-        );
-        let forged = latest();
-        unrouted_shard_message(&topic, &prost::Message::encode_to_vec(&frame(8)), &clock);
-        let after_next = latest();
+        let shard = Shard::new();
+        let topic = shard.topic();
+        shard.hear(&topic, &shard.frame(u64::MAX));
+        let forged = shard.latest();
+        shard.hear(&topic, &shard.frame(8));
+        let after_next = shard.latest();
         assert_ne!(
             forged,
             Some(u64::MAX),
@@ -2291,43 +2391,237 @@ mod tests {
         );
     }
 
-    /// A cluster master (no archive ingest) mirrors a frame on its shard's
-    /// frame topic for serving, and not a message on another topic. An archive
-    /// queues the frame for its ingest instead; a frame it fetched to fill a
-    /// gap arrives under the frame's own topic, which the queue takes.
-    #[test]
-    fn only_a_cluster_master_mirrors_a_frame_unverified() {
-        use quil_types::store::ClockStore as _;
-        let dir = tempfile::tempdir().unwrap();
-        let db = quil_store::RocksDb::open(dir.path()).unwrap();
-        let clock = quil_store::RocksClockStore::new(db.inner().clone());
-        let filter = quil_forest::encode_shard_bit_path(&[0x33u8; 32], &[true, false]);
-        let frame = |number: u64| quil_types::proto::global::AppShardFrame {
-            header: Some(quil_types::proto::global::FrameHeader {
-                address: filter.clone(),
-                frame_number: number,
-                output: vec![number as u8; 516],
+    /// A shard of one committee member, and the validator a cluster master
+    /// checks its gossiped frames with, over a prover registry and a clock
+    /// store holding the member and the GLOBAL anchor.
+    struct Shard {
+        signer: quil_crypto::FalconSigner,
+        filter: Vec<u8>,
+        global_frame: u64,
+        global_output: Vec<u8>,
+        clock: Arc<quil_store::testing::InMemoryClockStore>,
+        validator: quil_engine::frame_validator::BlsAppFrameValidator,
+    }
+
+    impl Shard {
+        fn new() -> Self {
+            use quil_types::consensus::{ProverAllocationInfo, ProverInfo, ProverStatus};
+            use quil_types::crypto::Signer as _;
+            quil_crypto::init();
+            let filter = vec![0x33; 32];
+            let global_frame = quil_types::consensus::epoch_length_frames() * 11 + 3;
+            let epoch = quil_types::consensus::epoch_for_frame(global_frame);
+            let global_output = vec![9; 516];
+            let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+            clock.seed_frame(quil_types::proto::global::GlobalFrame {
+                header: Some(quil_types::proto::global::GlobalFrameHeader {
+                    frame_number: global_frame,
+                    output: global_output.clone(),
+                    ..Default::default()
+                }),
+                requests: vec![],
+            });
+            let signer = quil_crypto::FalconSigner::generate();
+            let registry = Arc::new(quil_engine::test_support::TestProverRegistry::with_prover(
+                ProverInfo {
+                    public_key: signer.public_key().to_vec(),
+                    address: vec![7; 32],
+                    status: ProverStatus::Active,
+                    kick_frame_number: 0,
+                    allocations: vec![ProverAllocationInfo {
+                        status: ProverStatus::Active,
+                        confirmation_filter: filter.clone(),
+                        rejection_filter: vec![],
+                        join_frame_number: 1,
+                        leave_frame_number: 0,
+                        pause_frame_number: 0,
+                        resume_frame_number: 0,
+                        kick_frame_number: 0,
+                        join_confirm_frame_number: 0,
+                        join_reject_frame_number: 0,
+                        leave_confirm_frame_number: 0,
+                        leave_reject_frame_number: 0,
+                        last_active_frame_number: global_frame,
+                        epoch,
+                        ring: 0,
+                        vertex_address: vec![],
+                        last_signed_frame_number: 0,
+                    }],
+                    available_storage: 0,
+                    seniority: 0,
+                    delegate_address: vec![],
+                },
+            ));
+            let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                Arc::new(quil_hypergraph::testing::MemStore::new()),
+                Arc::new(quil_types::crypto::NoopInclusionProver),
+            ));
+            let validator = shard_mirror_validator(registry, clock.clone(), crdt);
+            Self {
+                signer,
+                filter,
+                global_frame,
+                global_output,
+                clock,
+                validator,
+            }
+        }
+
+        /// Frame `number`, anchored to the GLOBAL frame, without a
+        /// certificate.
+        fn frame(&self, number: u64) -> quil_types::proto::global::AppShardFrame {
+            quil_types::proto::global::AppShardFrame {
+                header: Some(quil_types::proto::global::FrameHeader {
+                    address: self.filter.clone(),
+                    frame_number: number,
+                    rank: number,
+                    global_frame_number: self.global_frame,
+                    timestamp: 1,
+                    state_roots: vec![vec![0; 32]; 4],
+                    prover: vec![7; 32],
+                    output: vec![number as u8; 516],
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let topic = quil_engine::bitmasks::shard_frame_bitmask(&filter);
-        unrouted_shard_message(&topic, &prost::Message::encode_to_vec(&frame(7)), &clock);
+            }
+        }
+
+        /// Frame `number` with its deterministic output and the member's
+        /// finalization certificate.
+        fn certified(&self, number: u64) -> quil_types::proto::global::AppShardFrame {
+            use quil_cw_consensus::{
+                _consensus::{
+                    simplex::{
+                        scheme::Namespace,
+                        types::{Finalization, Proposal, Subject},
+                    },
+                    types::{Epoch, Round, View},
+                },
+                _crypto::{sha256::Digest, Signer as _},
+                _utils::{ordered::Set, N3f1},
+                app_cert::{encode_finalization, wrap_cert_for_header},
+                falcon_base::FalconPrivateKey,
+                falcon_scheme::Generic,
+                falcon_simplex::SimplexFalconScheme,
+            };
+            use quil_types::crypto::Signer as _;
+            let mut frame = self.frame(number);
+            let h = frame.header.as_mut().unwrap();
+            let rho = quil_crypto::porep::derive_storage_beacon(
+                h.global_frame_number,
+                &self.global_output,
+            );
+            h.output = quil_crypto::porep::deterministic_app_frame_output(
+                &h.parent_selector,
+                &h.requests_root,
+                &h.state_roots,
+                &rho,
+                h.frame_number,
+                h.rank,
+                &h.prover,
+                h.difficulty,
+                h.fee_multiplier_vote,
+                h.timestamp,
+                &h.storage_attestation_root,
+                quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(&h.fee_total),
+                &h.settlements,
+                &h.accumulator,
+                &h.spends,
+            );
+            let key =
+                FalconPrivateKey::from_bytes(self.signer.private_key(), self.signer.public_key())
+                    .unwrap();
+            let participants: Set<_> = vec![key.public_key()].try_into().unwrap();
+            let mut namespace = b"appshard".to_vec();
+            namespace.extend_from_slice(&h.address);
+            let scheme = Generic::<Namespace>::signer(&namespace, participants, key).unwrap();
+            let proposal = Proposal::new(
+                Round::new(Epoch::new(0), View::new(h.rank)),
+                View::new(h.rank - 1),
+                Digest(quil_crypto::poseidon::hash_bytes_to_32(&h.output).unwrap()),
+            );
+            let vote = scheme
+                .sign::<SimplexFalconScheme, Digest>(Subject::Finalize {
+                    proposal: &proposal,
+                })
+                .unwrap();
+            let certificate = scheme
+                .assemble::<SimplexFalconScheme, _, N3f1>(vec![vote])
+                .unwrap();
+            h.public_key_signature_bls48581 =
+                Some(quil_types::proto::keys::Bls48581AggregateSignature {
+                    signature: wrap_cert_for_header(&encode_finalization(&Finalization {
+                        proposal,
+                        certificate,
+                    })),
+                    bitmask: vec![1],
+                    ..Default::default()
+                });
+            frame
+        }
+
+        fn hear(&self, bitmask: &[u8], frame: &quil_types::proto::global::AppShardFrame) {
+            unrouted_shard_message(
+                bitmask,
+                &prost::Message::encode_to_vec(frame),
+                self.clock.as_ref(),
+                &self.validator,
+            );
+        }
+
+        fn topic(&self) -> Vec<u8> {
+            quil_engine::bitmasks::shard_frame_bitmask(&self.filter)
+        }
+
+        fn latest(&self) -> Option<u64> {
+            use quil_types::store::ClockStore as _;
+            self.clock
+                .get_latest_shard_clock_frame(&self.filter)
+                .ok()
+                .and_then(|frame| frame.header)
+                .map(|header| header.frame_number)
+        }
+    }
+
+    /// A cluster master (no archive ingest) mirrors a certified frame on its
+    /// shard's frame topic for serving, and not a message on another topic. An
+    /// archive queues the frame for its ingest instead; a frame it fetched to
+    /// fill a gap arrives under the frame's own topic, which the queue takes.
+    #[test]
+    fn only_a_cluster_master_mirrors_a_verified_frame() {
+        use quil_types::store::ClockStore as _;
+        let shard = Shard::new();
+        let topic = shard.topic();
+        let frame = shard.certified(7);
+        assert_eq!(mirror_admits(&shard.validator, &frame), Ok(()));
+        shard.hear(&topic, &frame);
         assert_eq!(
-            clock.get_shard_clock_frame(&filter, 7, false).unwrap(),
-            frame(7)
+            shard
+                .clock
+                .get_shard_clock_frame(&shard.filter, 7, false)
+                .unwrap(),
+            frame
         );
-        assert_eq!(
-            clock.get_latest_shard_clock_frame(&filter).unwrap(),
-            frame(7)
-        );
-        unrouted_shard_message(&[], &prost::Message::encode_to_vec(&frame(8)), &clock);
+        assert_eq!(shard.latest(), Some(7));
+        shard.hear(&[], &shard.certified(8));
         assert!(
-            clock.get_shard_clock_frame(&filter, 8, false).is_err(),
+            shard
+                .clock
+                .get_shard_clock_frame(&shard.filter, 8, false)
+                .is_err(),
             "not a shard-frame message"
         );
+        shard.hear(&topic, &shard.certified(8));
+        assert_eq!(
+            shard.latest(),
+            Some(8),
+            "the next certified frame is mirrored"
+        );
 
-        let fetched = gap_fetched_frame_message(&filter, prost::Message::encode_to_vec(&frame(9)));
+        let fetched = gap_fetched_frame_message(
+            &shard.filter,
+            prost::Message::encode_to_vec(&shard.certified(9)),
+        );
         assert_eq!(fetched.bitmask, topic);
         assert!(super::super::archive_ingest_queue::may_carry_shard_frame(
             &fetched.bitmask
@@ -2405,6 +2699,55 @@ mod tests {
             quil_rpc::archive_client::pinned_archive_peer("203.0.113.21:8340"),
             Some(peer),
             "R112-D-2: the gossip handler added an archive endpoint unpinned"
+        );
+    }
+
+    /// Any peer can publish on a shard's frame topic: a frame without a
+    /// certificate, with one that does not verify, or one whose header the
+    /// certificate does not cover is not mirrored, so a forged far-future
+    /// frame cannot pin the head this node serves.
+    #[test]
+    fn a_gossiped_shard_frame_that_does_not_verify_is_not_mirrored() {
+        let shard = Shard::new();
+        let topic = shard.topic();
+        shard.hear(&topic, &shard.certified(7));
+        let unsigned = shard.frame(u64::MAX);
+        let mut altered = shard.certified(8);
+        altered.header.as_mut().unwrap().frame_number = u64::MAX;
+        let mut garbage = shard.frame(u64::MAX);
+        garbage
+            .header
+            .as_mut()
+            .unwrap()
+            .public_key_signature_bls48581 =
+            Some(quil_types::proto::keys::Bls48581AggregateSignature {
+                signature: quil_cw_consensus::app_cert::wrap_cert_for_header(&[0xab; 64]),
+                bitmask: vec![1],
+                ..Default::default()
+            });
+        for forged in [&unsigned, &altered, &garbage] {
+            assert!(mirror_admits(&shard.validator, forged).is_err());
+            shard.hear(&topic, forged);
+            assert_eq!(shard.latest(), Some(7), "the forged frame is not mirrored");
+        }
+        shard.hear(&topic, &shard.certified(8));
+        assert_eq!(shard.latest(), Some(8), "the honest chain still advances");
+    }
+
+    /// Refusals log one line at once, then at most one per interval with the
+    /// count since the last.
+    #[test]
+    fn mirror_refusals_are_summarized_per_interval() {
+        let refusals = MirrorRefusals::new();
+        let frame = quil_types::proto::global::AppShardFrame::default();
+        let start = std::time::Instant::now();
+        assert_eq!(refusals.note(&frame, "first".into(), start), Some(1));
+        for _ in 0..3 {
+            assert_eq!(refusals.note(&frame, "again".into(), start), None);
+        }
+        assert_eq!(
+            refusals.note(&frame, "later".into(), start + MIRROR_REFUSAL_SUMMARY),
+            Some(4)
         );
     }
 }
