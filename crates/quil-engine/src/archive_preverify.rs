@@ -913,37 +913,40 @@ pub fn preverify_through_within(
     let finished = Mutex::new(false);
     let finished_signal = Condvar::new();
     std::thread::scope(|scope| {
-        let progress = scope.spawn(|| {
-            let mut warned: Option<Instant> = None;
-            let mut finished_guard = finished.lock().unwrap_or_else(|p| p.into_inner());
-            loop {
-                if *finished_guard {
-                    return;
+        let progress = std::thread::Builder::new()
+            .name("prepass-watch".into())
+            .spawn_scoped(scope, || {
+                let mut warned: Option<Instant> = None;
+                let mut finished_guard = finished.lock().unwrap_or_else(|p| p.into_inner());
+                loop {
+                    if *finished_guard {
+                        return;
+                    }
+                    let elapsed = start.elapsed();
+                    if elapsed >= PREPASS_WARN
+                        && warned.is_none_or(|at| at.elapsed() >= PREPASS_PROGRESS_INTERVAL)
+                    {
+                        warned = Some(Instant::now());
+                        warn!(
+                            scope = "this archive",
+                            frame = global_frame,
+                            shards,
+                            frames,
+                            bundles,
+                            done = done.load(Ordering::Relaxed),
+                            secs = elapsed.as_secs(),
+                            action = "GLOBAL execution of this frame waits for these proofs; the archive ingest stays free; \
+                                      it ends when they verify (raise proofWorker.maxConcurrent if CPU allows)",
+                            "archive GLOBAL frame proof pre-verification still running"
+                        );
+                    }
+                    finished_guard = match finished_signal.wait_timeout(finished_guard, Duration::from_secs(1)) {
+                        Ok((guard, _)) => guard,
+                        Err(poisoned) => poisoned.into_inner().0,
+                    };
                 }
-                let elapsed = start.elapsed();
-                if elapsed >= PREPASS_WARN
-                    && warned.is_none_or(|at| at.elapsed() >= PREPASS_PROGRESS_INTERVAL)
-                {
-                    warned = Some(Instant::now());
-                    warn!(
-                        scope = "this archive",
-                        frame = global_frame,
-                        shards,
-                        frames,
-                        bundles,
-                        done = done.load(Ordering::Relaxed),
-                        secs = elapsed.as_secs(),
-                        action = "GLOBAL execution of this frame waits for these proofs; the archive ingest stays free; \
-                                  it ends when they verify (raise proofWorker.maxConcurrent if CPU allows)",
-                        "archive GLOBAL frame proof pre-verification still running"
-                    );
-                }
-                finished_guard = match finished_signal.wait_timeout(finished_guard, Duration::from_secs(1)) {
-                    Ok((guard, _)) => guard,
-                    Err(poisoned) => poisoned.into_inner().0,
-                };
-            }
-        });
+            })
+            .expect("spawn the pre-pass progress thread");
         loop {
             report.rounds += 1;
             done.store(0, Ordering::Relaxed);

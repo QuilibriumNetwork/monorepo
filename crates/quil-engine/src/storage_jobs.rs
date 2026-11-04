@@ -506,22 +506,29 @@ pub fn for_each_parallel<T: Sync, R: Send>(
     // A test's stable replica key epoch, for the work's threads too.
     let stable_key = quil_types::consensus::stable_replica_key_epoch_thread_override();
     std::thread::scope(|scope| {
-        for _ in 0..job_slots().min(items.len()) {
-            scope.spawn(|| {
-                quil_types::consensus::set_stable_replica_key_epoch_for_thread(stable_key);
-                on_process_cpus();
-                loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    if index >= items.len() || failed.load(Ordering::Relaxed) || jobs().stopping() {
-                        break;
+        for slot in 0..job_slots().min(items.len()) {
+            std::thread::Builder::new()
+                .name(format!("stor-leaf-{slot}"))
+                .spawn_scoped(scope, || {
+                    quil_types::consensus::set_stable_replica_key_epoch_for_thread(stable_key);
+                    on_process_cpus();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        if index >= items.len()
+                            || failed.load(Ordering::Relaxed)
+                            || jobs().stopping()
+                        {
+                            break;
+                        }
+                        let result = work(&items[index]);
+                        if result.is_err() {
+                            failed.store(true, Ordering::Relaxed);
+                        }
+                        results.lock().unwrap_or_else(PoisonError::into_inner)[index] =
+                            Some(result);
                     }
-                    let result = work(&items[index]);
-                    if result.is_err() {
-                        failed.store(true, Ordering::Relaxed);
-                    }
-                    results.lock().unwrap_or_else(PoisonError::into_inner)[index] = Some(result);
-                }
-            });
+                })
+                .expect("spawn a storage leaf thread");
         }
     });
     let mut out = Vec::with_capacity(items.len());
@@ -3079,5 +3086,22 @@ mod tests {
             leaves.iter().all(|&cpus| cpus == process),
             "the leaves' threads run on {leaves:?} of {process} CPUs"
         );
+    }
+
+    /// A seat's leaves run on named threads, so a crash on one (a stack
+    /// overflow, say) names the work it ran.
+    #[test]
+    fn a_seats_leaves_run_on_named_threads() {
+        let names = for_each_parallel(&[(); 4], |_| {
+            Ok(std::thread::current().name().map(str::to_owned))
+        })
+        .unwrap();
+        for name in &names {
+            assert!(
+                name.as_deref()
+                    .is_some_and(|name| name.starts_with("stor-leaf-")),
+                "the leaves ran on threads named {names:?}"
+            );
+        }
     }
 }

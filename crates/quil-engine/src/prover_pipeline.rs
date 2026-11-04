@@ -979,38 +979,41 @@ where
     let answers = Mutex::new(HashMap::with_capacity(requests.len()));
     let threads = parallel.max(1).min(requests.len());
     std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| loop {
-                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some((filter, targets)) = requests.get(index) else {
-                    break;
-                };
-                let timeout = deadline
-                    .saturating_duration_since(std::time::Instant::now())
-                    .min(REMOTE_PREPARATION_TIMEOUT);
-                let answer = if timeout.is_zero() {
-                    Err((
-                        LeftOutCause::Unasked,
-                        QuilError::ExecutionUnavailable(
-                            "not asked before the confirm round's deadline".into(),
-                        ),
-                    ))
-                } else {
-                    let asked = std::time::Instant::now();
-                    query(filter, targets, timeout).map_err(|error| {
-                        let cause = if asked.elapsed() >= timeout {
-                            LeftOutCause::Late
-                        } else {
-                            LeftOutCause::Failed
-                        };
-                        (cause, error)
-                    })
-                };
-                answers
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(filter.clone(), answer);
-            });
+        for lane in 0..threads {
+            std::thread::Builder::new()
+                .name(format!("remote-prep-{lane}"))
+                .spawn_scoped(scope, || loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((filter, targets)) = requests.get(index) else {
+                        break;
+                    };
+                    let timeout = deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .min(REMOTE_PREPARATION_TIMEOUT);
+                    let answer = if timeout.is_zero() {
+                        Err((
+                            LeftOutCause::Unasked,
+                            QuilError::ExecutionUnavailable(
+                                "not asked before the confirm round's deadline".into(),
+                            ),
+                        ))
+                    } else {
+                        let asked = std::time::Instant::now();
+                        query(filter, targets, timeout).map_err(|error| {
+                            let cause = if asked.elapsed() >= timeout {
+                                LeftOutCause::Late
+                            } else {
+                                LeftOutCause::Failed
+                            };
+                            (cause, error)
+                        })
+                    };
+                    answers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(filter.clone(), answer);
+                })
+                .expect("spawn a remote preparation query thread");
         }
     });
     answers.into_inner().unwrap_or_else(|e| e.into_inner())
