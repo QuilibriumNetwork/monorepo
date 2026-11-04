@@ -445,8 +445,8 @@ mod tests {
         assert!(op.leaf_roots.is_empty() && op.filter.is_empty());
         assert_eq!(
             prover_release::confirm_release_frame(),
-            u64::MAX,
-            "the environment is not read"
+            1423 * quil_types::consensus::EPOCH_LENGTH_FRAMES,
+            "the environment is not read: the mainnet frame"
         );
 
         let pubkey = km
