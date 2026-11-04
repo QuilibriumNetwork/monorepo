@@ -99,9 +99,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           # Check artifacts must not win the immutable test-cache key race.
-          shared-key: rust-check
+          shared-key: rust-check-native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           cache-on-failure: true
           # Only pushes to a base branch save caches. Pull requests and
           # merge groups restore the base's, but caches they saved under
@@ -151,8 +150,7 @@ jobs:
       # Its own cache: the check job's RUSTFLAGS change every unit hash.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
-          shared-key: rust-clippy
+          shared-key: rust-clippy-native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           cache-on-failure: true
           save-if: ${{ github.event_name == 'push' }}
 
@@ -202,8 +200,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
-          shared-key: rust-test
+          shared-key: rust-test-native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           # The partitions build the same artifacts; one saves them.
           save-if: ${{ github.event_name == 'push' && matrix.partition == 1 }}
 
@@ -305,8 +302,7 @@ jobs:
       # the test job's: restore its dependencies, never save.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
-          shared-key: rust-test
+          shared-key: rust-test-native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           save-if: false
 
       - uses: taiki-e/install-action@v2
@@ -399,11 +395,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           # Per-target cache key — release target/ dirs don't overlap
           # with the debug target/ used by build+test, and the three
           # release targets don't overlap with each other.
-          shared-key: rust-release-${{ matrix.name }}
+          shared-key: rust-release-${{ matrix.name }}-native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           cache-on-failure: true
           save-if: ${{ github.event_name == 'push' }}
 

@@ -98,8 +98,7 @@ jobs:
       # the repository's 10 GB and pull requests never add their own.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
-          shared-key: rust-devnet
+          shared-key: rust-devnet-native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           cache-on-failure: true
           save-if: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
