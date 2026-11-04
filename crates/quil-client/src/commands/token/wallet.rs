@@ -4342,8 +4342,17 @@ fn prefund_journal(tc: &TokenCtx) -> std::path::PathBuf {
     tc.config_dir.join("wallet-prefunded-settlements.txt")
 }
 
+/// The journal's entries, none when it cannot be read (listing only).
 #[cfg(feature = "native-proof")]
 fn read_prefunded(tc: &TokenCtx) -> Vec<PrefundedSettlement> {
+    read_prefunded_checked(tc).unwrap_or_default()
+}
+
+/// The journal's entries; a missing journal holds none. Rewrites read
+/// through this, so a journal that cannot be read is never replaced by
+/// one without its other entries.
+#[cfg(feature = "native-proof")]
+fn read_prefunded_checked(tc: &TokenCtx) -> anyhow::Result<Vec<PrefundedSettlement>> {
     let parse = |line: &str| -> Option<PrefundedSettlement> {
         let field: Vec<&str> = line.split_whitespace().collect();
         if field.len() != 6 {
@@ -4358,11 +4367,12 @@ fn read_prefunded(tc: &TokenCtx) -> Vec<PrefundedSettlement> {
             used: field[5].parse().ok()?,
         })
     };
-    std::fs::read_to_string(prefund_journal(tc))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(parse)
-        .collect()
+    let text = match std::fs::read_to_string(prefund_journal(tc)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(anyhow::anyhow!("pre-funded settlement journal: {e}")),
+    };
+    Ok(text.lines().filter_map(parse).collect())
 }
 
 #[cfg(feature = "native-proof")]
@@ -4381,14 +4391,14 @@ fn write_prefunded(tc: &TokenCtx, entries: &[PrefundedSettlement]) -> anyhow::Re
             )
         })
         .collect();
-    std::fs::write(prefund_journal(tc), body)
+    quil_config::atomic_write(&prefund_journal(tc), body.as_bytes(), 0o644)
         .map_err(|e| anyhow::anyhow!("pre-funded settlement journal: {e}"))
 }
 
 /// Replace (or add) one entry, keyed by receipt.
 #[cfg(feature = "native-proof")]
 fn record_prefunded(tc: &TokenCtx, entry: PrefundedSettlement) -> anyhow::Result<()> {
-    let mut entries: Vec<PrefundedSettlement> = read_prefunded(tc)
+    let mut entries: Vec<PrefundedSettlement> = read_prefunded_checked(tc)?
         .into_iter()
         .filter(|e| e.receipt != entry.receipt)
         .collect();
@@ -4398,7 +4408,7 @@ fn record_prefunded(tc: &TokenCtx, entry: PrefundedSettlement) -> anyhow::Result
 
 #[cfg(feature = "native-proof")]
 fn forget_prefunded(tc: &TokenCtx, receipt: &[u8; 32]) -> anyhow::Result<()> {
-    let entries: Vec<PrefundedSettlement> = read_prefunded(tc)
+    let entries: Vec<PrefundedSettlement> = read_prefunded_checked(tc)?
         .into_iter()
         .filter(|e| &e.receipt != receipt)
         .collect();
@@ -5356,7 +5366,7 @@ async fn submit_mint(
         )
         .await?;
     let saved = tc.config_dir.join(format!("mint-{cited_frame}.bin"));
-    std::fs::write(&saved, &bytes)?;
+    quil_config::atomic_write(&saved, &bytes, 0o644)?;
     let statement = quil_lattice_ct::confidential::mint::Mint::decode(
         &bytes,
         &wallet.network,

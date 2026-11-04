@@ -127,9 +127,7 @@ impl Store {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no path set for autosave"))?;
         let yaml = serde_yaml::to_string(&self.data)?;
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, yaml)?;
-        std::fs::rename(&tmp, path)?;
+        quil_config::atomic_write(path, yaml.as_bytes(), 0o644)?;
         Ok(())
     }
 
