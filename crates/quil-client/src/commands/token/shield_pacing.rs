@@ -37,6 +37,14 @@ const HEALTH_WINDOW_SECS: u64 = 3_600;
 const MIN_RATE_SPAN_SECS: u64 = 600;
 /// Spacing of head reads and inclusion reads while waiting.
 pub(crate) const POLL_SECS: u64 = 15;
+/// While a batch waits for inclusion, its shard is read this often in the
+/// node's shard list (every 8th poll): a shard without an active prover
+/// makes no frame, so its batch cannot commit.
+pub(crate) const SHARD_CHECK_SECS: u64 = 120;
+/// Reads in a row showing the shard without an active prover before the
+/// run leaves its batch, so one odd read does not leave a batch that could
+/// still commit.
+const SHARD_GONE_READS: u32 = 2;
 /// A pause repeats its notice this often; a wait for inclusion reports this often.
 const NOTICE_SECS: u64 = 600;
 const WAIT_NOTICE_SECS: u64 = 300;
@@ -248,6 +256,15 @@ pub(crate) enum ShieldEvent {
         waited: u64,
         head: Option<u64>,
     },
+    /// The batch's shard has no active prover in the node's shard list, so
+    /// the batch cannot commit until provers return: the run leaves it and
+    /// goes on. `submitted` is set when it was left waiting for inclusion.
+    ShardGone {
+        index: usize,
+        total: usize,
+        shard: String,
+        submitted: Option<Unconfirmed>,
+    },
     /// After each batch: how many are done and the projected end.
     Progress {
         done: usize,
@@ -257,6 +274,16 @@ pub(crate) enum ShieldEvent {
     /// The run was asked to stop ([`ShieldIo::stop_requested`]) and ended
     /// before submitting anything more.
     Stopped { submitted: usize, total: usize },
+}
+
+/// A submitted batch the run stopped waiting for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Unconfirmed {
+    /// Seconds since its submission.
+    pub waited: u64,
+    /// When new runs include its coins again, in Unix seconds
+    /// ([`SUBMITTED_EXCLUSION_SECS`] after its submission).
+    pub rejoins: u64,
 }
 
 impl ShieldEvent {
@@ -347,6 +374,34 @@ impl ShieldEvent {
                 index + 1,
                 frame(*head)
             ),
+            Self::ShardGone {
+                index,
+                total,
+                shard,
+                submitted,
+            } => {
+                let next = if index + 1 < *total {
+                    " The run goes on with the next batch."
+                } else {
+                    ""
+                };
+                match submitted {
+                    Some(Unconfirmed { waited, rejoins }) => format!(
+                        "Batch {}/{total}: shard {shard} has no active provers in the node's \
+                         shard list, so the batch cannot commit; stopped waiting after {waited} \
+                         s. It may still land if provers return; a new run includes its coins \
+                         from {} and plans them onto the live shard covering them.{next}",
+                        index + 1,
+                        utc(*rejoins)
+                    ),
+                    None => format!(
+                        "Batch {}/{total}: shard {shard} has no active provers in the node's \
+                         shard list; not proved. A rerun plans its coins onto the live shard \
+                         covering them.{next}",
+                        index + 1
+                    ),
+                }
+            }
             Self::Progress {
                 done,
                 total,
@@ -427,6 +482,9 @@ pub(crate) trait ShieldIo {
     async fn submit(&mut self, index: usize, proof: Self::Proof) -> anyhow::Result<()>;
     /// Whether none of batch `index`'s coins still reads unshielded.
     async fn included(&mut self, index: usize) -> anyhow::Result<bool>;
+    /// Whether batch `index`'s shard has an active prover in the node's
+    /// shard list. An error is no evidence either way.
+    async fn shard_live(&mut self, index: usize) -> anyhow::Result<bool>;
     fn event(&mut self, event: &ShieldEvent);
     /// Whether the run should end before its next submission (the node
     /// manager's stop key). Checked before each proof, before each
@@ -469,7 +527,50 @@ async fn sample<I: ShieldIo>(io: &mut I, health: &mut Health, index: usize, tota
     }
 }
 
-/// Run `total` batches under `pacing`. Returns the batches submitted.
+/// A batch the run left: its index, shard and, if it was submitted, the
+/// wait it stopped.
+type Left = (usize, String, Option<Unconfirmed>);
+
+/// The run's end when it left batches for shards without provers
+/// ([`ShieldEvent::ShardGone`]): which, and what a rerun does with them.
+fn left_error(left: &[Left], total: usize, unix: u64) -> String {
+    let mut shards: Vec<&str> = left.iter().map(|(_, shard, _)| shard.as_str()).collect();
+    shards.sort_unstable();
+    shards.dedup();
+    let batches: Vec<String> = left
+        .iter()
+        .map(|(index, ..)| (index + 1).to_string())
+        .collect();
+    let rejoins = left
+        .iter()
+        .filter_map(|(.., submitted)| submitted.map(|s| s.rejoins))
+        .max()
+        .filter(|rejoins| *rejoins > unix)
+        .map_or(String::new(), |rejoins| {
+            format!(
+                "; coins of the submitted ones rejoin new runs from {}, unless provers return \
+                 and they land first",
+                utc(rejoins)
+            )
+        });
+    format!(
+        "{} of {total} left (batch {}): shard {} had no active provers in the node's shard \
+         list. Check `qclient token legacy`, then rerun: it plans their coins onto the live \
+         shard covering them{rejoins}.",
+        if left.len() == 1 {
+            "1 batch".to_owned()
+        } else {
+            format!("{} batches", left.len())
+        },
+        batches.join(", "),
+        shards.join(", ")
+    )
+}
+
+/// Run `total` batches under `pacing`. Returns the batches submitted. A
+/// batch whose shard has no active prover is left, before its proof or
+/// while it waits for inclusion, and the run goes on with the next; a run
+/// that left any ends with an error naming them.
 pub(crate) async fn run<I: ShieldIo>(
     io: &mut I,
     total: usize,
@@ -483,11 +584,25 @@ pub(crate) async fn run<I: ShieldIo>(
     let mut health = Health::default();
     let mut last_submit: Option<u64> = None;
     let mut submitted = 0usize;
+    let mut left: Vec<Left> = Vec::new();
     for index in 0..total {
         if io.stop_requested() {
             return stopped(io, submitted, total);
         }
         sample(io, &mut health, index, total).await;
+        // The shard may have lost its provers since the plan: its batch
+        // could not commit, and a rerun plans its coins onto a live one.
+        if matches!(io.shard_live(index).await, Ok(false)) {
+            let shard = io.shard(index);
+            io.event(&ShieldEvent::ShardGone {
+                index,
+                total,
+                shard: shard.clone(),
+                submitted: None,
+            });
+            left.push((index, shard, None));
+            continue;
+        }
         let Some(proof) = io.prove(index).await? else {
             continue;
         };
@@ -536,6 +651,8 @@ pub(crate) async fn run<I: ShieldIo>(
         let mut noticed = sent;
         let mut last = sent;
         let mut last_error: Option<String>;
+        let mut shard_read = sent;
+        let mut gone_reads = 0u32;
         loop {
             io.sleep(POLL_SECS).await;
             if io.stop_requested() {
@@ -560,6 +677,29 @@ pub(crate) async fn run<I: ShieldIo>(
                 Ok(false) => last_error = None,
                 Err(error) => last_error = Some(error.to_string()),
             }
+            if now - shard_read >= SHARD_CHECK_SECS {
+                shard_read = now;
+                gone_reads = match io.shard_live(index).await {
+                    Ok(true) => 0,
+                    Ok(false) => gone_reads + 1,
+                    Err(_) => gone_reads,
+                };
+                if gone_reads >= SHARD_GONE_READS {
+                    let shard = io.shard(index);
+                    let unconfirmed = Unconfirmed {
+                        waited: now - sent,
+                        rejoins: sent_unix + SUBMITTED_EXCLUSION_SECS,
+                    };
+                    io.event(&ShieldEvent::ShardGone {
+                        index,
+                        total,
+                        shard: shard.clone(),
+                        submitted: Some(unconfirmed),
+                    });
+                    left.push((index, shard, Some(unconfirmed)));
+                    break;
+                }
+            }
             if active >= pacing.inclusion_timeout {
                 let excluded_until = sent_unix + SUBMITTED_EXCLUSION_SECS;
                 let exclusion = if io.unix() < excluded_until {
@@ -573,15 +713,26 @@ pub(crate) async fn run<I: ShieldIo>(
                         utc(excluded_until)
                     )
                 };
+                let shard = io.shard(index);
+                let why = if matches!(io.shard_live(index).await, Ok(false)) {
+                    format!(
+                        "Shard {shard} has no active provers in the node's shard list now, so \
+                         it makes no frame to commit the batch; the batch may still land if \
+                         provers return. Check `qclient token legacy` before rerunning; \
+                         {exclusion}, and a rerun plans them onto the live shard covering them."
+                    )
+                } else {
+                    format!(
+                        "The batch may still land: it commits with shard {shard}'s next frame, \
+                         and shards have stalled 30 min or more after a frame carrying a batch. \
+                         Check `qclient token legacy` before rerunning; {exclusion}."
+                    )
+                };
                 anyhow::bail!(
                     "batch {}/{total}: its coins still read unshielded after {active} s of \
-                     healthy GLOBAL since submission{}; stopping. The batch may still land: it \
-                     commits with shard {}'s next frame, and shards have stalled 30 min or more \
-                     after a frame carrying a batch. Check `qclient token legacy` before \
-                     rerunning; {exclusion}.",
+                     healthy GLOBAL since submission{}; stopping. {why}",
                     index + 1,
                     last_error.map_or(String::new(), |e| format!(" (last read error: {e})")),
-                    io.shard(index)
                 );
             }
             if now - noticed >= WAIT_NOTICE_SECS {
@@ -600,6 +751,9 @@ pub(crate) async fn run<I: ShieldIo>(
             total,
             projected_end: io.unix() + per_batch * (total - done) as u64,
         });
+    }
+    if !left.is_empty() {
+        anyhow::bail!(left_error(&left, total, io.unix()));
     }
     Ok(submitted)
 }

@@ -5812,6 +5812,9 @@ pub(crate) struct ShieldAllPlan {
     pub duplicates: usize,
     /// Each batch's shard, short form (`shield_pacing::shard_label`).
     shards: Vec<String>,
+    /// Each batch's shard filter, when the plan found it among the live
+    /// shards: the run reads whether it still has an active prover.
+    filters: Vec<Option<Vec<u8>>>,
     /// Who the batches pay. Boxed: an address is over a kilobyte, and the
     /// plan lives in the node manager's futures.
     payee: Box<ShieldRecipient>,
@@ -5909,6 +5912,7 @@ pub(crate) async fn plan_shield_all(
         shielded,
         duplicates: 0,
         shards: Vec::new(),
+        filters: Vec::new(),
         payee,
         paths: Vec::new(),
         wallet,
@@ -5937,17 +5941,23 @@ pub(crate) async fn plan_shield_all(
         );
     }
     plan.duplicates = candidates - batches.iter().map(Vec::len).sum::<usize>() - uncovered.len();
-    plan.shards = batches
+    plan.filters = batches
         .iter()
         .map(|batch| {
             batch
                 .first()
                 .and_then(|source| super::legacy::deepest_shard(&paths, &source.address))
                 .and_then(|path| live.iter().find(|(_, live_path)| live_path == path))
-                .map_or_else(
-                    || "unknown".to_owned(),
-                    |(filter, _)| super::shield_pacing::shard_label(filter),
-                )
+                .map(|(filter, _)| filter.clone())
+        })
+        .collect();
+    plan.shards = plan
+        .filters
+        .iter()
+        .map(|filter| {
+            filter
+                .as_deref()
+                .map_or_else(|| "unknown".to_owned(), super::shield_pacing::shard_label)
         })
         .collect();
     plan.batches = batches;
@@ -5982,6 +5992,8 @@ struct ShieldAllIo<'a> {
     batches: Vec<Vec<quil_lattice_ct::confidential::shield::ShieldSource>>,
     /// Each batch's shard, short form.
     shards: Vec<String>,
+    /// Each batch's shard filter, if known.
+    filters: Vec<Option<Vec<u8>>>,
     /// The live shards' bit paths: each batch's route.
     paths: Vec<Vec<bool>>,
     /// `Some(waits)`: print what identifies each submitted batch, and keep
@@ -6140,6 +6152,22 @@ impl super::shield_pacing::ShieldIo for ShieldAllIo<'_> {
         }))
     }
 
+    async fn shard_live(&mut self, index: usize) -> anyhow::Result<bool> {
+        let filter = self.filters[index]
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("batch {}'s shard is not known", index + 1))?;
+        let shards =
+            super::legacy::app_shards(&self.client, &quil_execution::domains::QUIL_TOKEN).await?;
+        // An empty list is no evidence about this shard.
+        anyhow::ensure!(
+            !shards.is_empty(),
+            "the node's shard list has no shard of the application"
+        );
+        Ok(super::legacy::live_of(&shards)
+            .iter()
+            .any(|(live, _)| live.as_slice() == filter))
+    }
+
     fn event(&mut self, event: &super::shield_pacing::ShieldEvent) {
         (self.sink)(ShieldReport::Paced(event));
     }
@@ -6187,6 +6215,7 @@ async fn submit_shield_all(
     let ShieldAllPlan {
         batches,
         shards,
+        filters,
         payee,
         paths,
         wallet,
@@ -6202,6 +6231,7 @@ async fn submit_shield_all(
         client,
         batches,
         shards,
+        filters,
         paths,
         announce,
         submissions: Vec::new(),

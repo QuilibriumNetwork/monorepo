@@ -23,6 +23,10 @@ struct Fake {
     frames: Box<dyn Fn(u64) -> u64>,
     /// Seconds after submission at which a batch reads included, or never.
     inclusion: Box<dyn Fn(usize) -> Option<u64>>,
+    /// The time from which a batch's shard has no active prover, or never.
+    gone: Box<dyn Fn(usize) -> Option<u64>>,
+    /// Each read of a batch's shard, and when.
+    shard_reads: Vec<(usize, u64)>,
     proves: Vec<(usize, u64)>,
     submits: Vec<(usize, u64)>,
     events: Vec<ShieldEvent>,
@@ -37,6 +41,8 @@ impl Fake {
             now: START,
             frames: Box::new(frames),
             inclusion: Box::new(inclusion),
+            gone: Box::new(|_| None),
+            shard_reads: Vec::new(),
             proves: Vec::new(),
             submits: Vec::new(),
             events: Vec::new(),
@@ -88,6 +94,10 @@ impl ShieldIo for Fake {
     async fn included(&mut self, index: usize) -> anyhow::Result<bool> {
         let sent = self.submits.iter().find(|(i, _)| *i == index).unwrap().1;
         Ok((self.inclusion)(index).is_some_and(|after| self.now >= sent + after))
+    }
+    async fn shard_live(&mut self, index: usize) -> anyhow::Result<bool> {
+        self.shard_reads.push((index, self.now));
+        Ok((self.gone)(index).is_none_or(|from| self.now < from))
     }
     fn event(&mut self, event: &ShieldEvent) {
         self.events.push(event.clone());
@@ -175,6 +185,176 @@ async fn shield_pacing_stops_when_inclusion_times_out() {
     assert_eq!(io.proves.len(), 1, "the next batch must not be proved");
     let waited = io.now - io.submits[0].1;
     let timeout = DEFAULT_INCLUSION_TIMEOUT_SECS;
+    assert!(
+        (timeout..timeout + 2 * POLL_SECS).contains(&waited),
+        "{waited}"
+    );
+}
+
+/// A batch whose shard loses its last active prover while it waits is left
+/// within two shard reads, not after the hour: the line names the shard,
+/// says the batch may still land and when its coins rejoin new runs; the
+/// run goes on with the next batches and ends with an error naming the
+/// batch left and the rerun.
+#[tokio::test]
+async fn shield_pacing_leaves_a_batch_whose_shard_lost_its_provers() {
+    let mut io = Fake::healthy(|index| (index > 0).then_some(30));
+    // Batch 1 is submitted at START + 150; its shard empties 10 min on.
+    io.gone = Box::new(|index| (index == 0).then_some(START + 750));
+    let error = run(&mut io, 3, pacing(0)).await.unwrap_err().to_string();
+    let sent = io.submits[0].1;
+    assert_eq!(sent, START + 150);
+    let Some(gone) = io
+        .events
+        .iter()
+        .find(|e| matches!(e, ShieldEvent::ShardGone { index: 0, .. }))
+    else {
+        panic!("no ShardGone event in {:#?}", io.events);
+    };
+    let ShieldEvent::ShardGone {
+        submitted: Some(Unconfirmed { waited, rejoins }),
+        ..
+    } = gone
+    else {
+        panic!("batch 1 was submitted: {gone:?}");
+    };
+    assert!(
+        *waited <= 600 + u64::from(SHARD_GONE_READS) * SHARD_CHECK_SECS,
+        "left after {waited} s"
+    );
+    let sent_unix = 1_700_000_000 + sent;
+    assert_eq!(*rejoins, sent_unix + SUBMITTED_EXCLUSION_SECS);
+    let line = gone.line();
+    for part in [
+        "Batch 1/3: shard ...feedbeef00 has no active provers in the node's shard list",
+        "stopped waiting after",
+        "It may still land if provers return",
+        &format!(
+            "a new run includes its coins from {}",
+            utc(sent_unix + SUBMITTED_EXCLUSION_SECS)
+        ),
+        "plans them onto the live shard covering them",
+        "The run goes on with the next batch.",
+    ] {
+        assert!(line.contains(part), "{part:?} not in {line}");
+    }
+    assert_eq!(io.submits.len(), 3, "{:?}", io.submits);
+    let included = io
+        .events
+        .iter()
+        .filter(|e| matches!(e, ShieldEvent::Included { .. }))
+        .count();
+    assert_eq!(included, 2);
+    assert!(
+        error.starts_with("1 batch of 3 left (batch 1): shard ...feedbeef00 had no active provers"),
+        "{error}"
+    );
+    assert!(
+        error.contains("Check `qclient token legacy`, then rerun"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!(
+            "rejoin new runs from {}",
+            utc(sent_unix + SUBMITTED_EXCLUSION_SECS)
+        )),
+        "{error}"
+    );
+}
+
+/// A batch whose shard has no active prover by its turn is neither proved
+/// nor submitted (its coins stay free for a rerun); the next is.
+#[tokio::test]
+async fn shield_pacing_skips_a_batch_whose_shard_is_gone_before_its_proof() {
+    let mut io = Fake::healthy(|_| Some(30));
+    io.gone = Box::new(|index| (index == 1).then_some(START));
+    let error = run(&mut io, 3, pacing(0)).await.unwrap_err().to_string();
+    let proved: Vec<usize> = io.proves.iter().map(|(index, _)| *index).collect();
+    assert_eq!(proved, [0, 2]);
+    let submitted: Vec<usize> = io.submits.iter().map(|(index, _)| *index).collect();
+    assert_eq!(submitted, [0, 2]);
+    let gone = io
+        .events
+        .iter()
+        .find(|e| matches!(e, ShieldEvent::ShardGone { .. }))
+        .expect("a ShardGone event");
+    assert!(
+        matches!(
+            gone,
+            ShieldEvent::ShardGone {
+                index: 1,
+                submitted: None,
+                ..
+            }
+        ),
+        "{gone:?}"
+    );
+    assert_eq!(
+        gone.line(),
+        "Batch 2/3: shard ...feedbeef01 has no active provers in the node's shard list; not \
+         proved. A rerun plans its coins onto the live shard covering them. The run goes on \
+         with the next batch."
+    );
+    assert_eq!(
+        error,
+        "1 batch of 3 left (batch 2): shard ...feedbeef01 had no active provers in the node's \
+         shard list. Check `qclient token legacy`, then rerun: it plans their coins onto the \
+         live shard covering them."
+    );
+}
+
+/// A live shard changes nothing: the run waits for the inclusion as
+/// before, and reads the shard list once per batch and once every
+/// [`SHARD_CHECK_SECS`] while waiting, not at every poll.
+#[tokio::test]
+async fn shield_pacing_live_shard_reads_are_bounded() {
+    let mut io = Fake::healthy(|_| Some(1_864));
+    assert_eq!(run(&mut io, 1, pacing(0)).await.unwrap(), 1);
+    assert!(!io
+        .events
+        .iter()
+        .any(|e| matches!(e, ShieldEvent::ShardGone { .. })));
+    let sent = io.submits[0].1;
+    let waiting = io.shard_reads.iter().filter(|(_, at)| *at > sent).count() as u64;
+    let polls = 1_864 / POLL_SECS + 1;
+    assert_eq!(waiting, 1_864 / SHARD_CHECK_SECS, "{:?}", io.shard_reads);
+    assert!(waiting * 4 < polls, "{waiting} reads over {polls} polls");
+    assert_eq!(
+        io.shard_reads.iter().filter(|(_, at)| *at <= sent).count(),
+        1
+    );
+}
+
+/// A timeout whose shard has no active prover by then says so: the batch
+/// cannot commit until provers return, and a rerun plans its coins onto
+/// the live shard covering them. One such read alone does not leave the
+/// batch early.
+#[tokio::test]
+async fn shield_pacing_timeout_names_a_shard_without_provers() {
+    let mut io = Fake::healthy(|_| None);
+    // Submitted at START + 150: the shard empties 10 s before the timeout.
+    let timeout = DEFAULT_INCLUSION_TIMEOUT_SECS;
+    io.gone = Box::new(move |_| Some(START + 150 + timeout - 10));
+    let error = run(&mut io, 1, pacing(0)).await.unwrap_err().to_string();
+    assert!(
+        !io.events
+            .iter()
+            .any(|e| matches!(e, ShieldEvent::ShardGone { .. })),
+        "{:#?}",
+        io.events
+    );
+    for part in [
+        "batch 1/1: its coins still read unshielded after",
+        "Shard ...feedbeef00 has no active provers in the node's shard list now",
+        "the batch may still land if provers return",
+        "Check `qclient token legacy` before rerunning",
+        "a new run leaves its coins out until",
+        "a rerun plans them onto the live shard covering them",
+    ] {
+        assert!(error.contains(part), "{part:?} not in {error}");
+    }
+    assert!(!error.contains("shards have stalled"), "{error}");
+    let waited = io.now - io.submits[0].1;
     assert!(
         (timeout..timeout + 2 * POLL_SECS).contains(&waited),
         "{waited}"

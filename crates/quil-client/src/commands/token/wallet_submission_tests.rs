@@ -1529,6 +1529,7 @@ async fn a_paced_batch_is_kept_for_its_wait_with_its_route() {
         client: tc.connect().await.unwrap(),
         batches: vec![sources],
         shards: vec!["1".into()],
+        filters: vec![None],
         paths: vec![vec![false], vec![true]],
         announce: Some(true),
         submissions: Vec::new(),
