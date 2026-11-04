@@ -394,7 +394,9 @@ pub(crate) fn init(
             .with_shard_admission_refresh({
                 let store = shards_store.clone();
                 let collector = message_collector.clone();
-                Arc::new(move || collector.refresh_valid_shard_addresses(store.as_ref()))
+                Arc::new(move |frame| {
+                    collector.refresh_valid_shard_addresses(store.as_ref(), frame)
+                })
             })
             // MAINNET-ONLY 2.1.0.25 frozen-era recovery: no-op-materialize the
             // frozen range so the wedged fleet un-sticks deterministically. Off

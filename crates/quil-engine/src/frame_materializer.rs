@@ -215,7 +215,7 @@ pub struct FrameMaterializer {
 
     /// Publish committed shard topology to ingress before announcing progress.
     /// This is a local cache refresh; failures retry on the next frame.
-    shard_admission_refresh: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
+    shard_admission_refresh: Option<Arc<dyn Fn(u64) -> Result<()> + Send + Sync>>,
 
     /// Frame prover + BLS constructor used to BATCH-verify a frame's
     /// shard-`FrameHeader` aggregate signatures before the per-bundle
@@ -387,9 +387,9 @@ impl FrameMaterializer {
 
     pub fn with_shard_admission_refresh(
         mut self,
-        refresh: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        refresh: Arc<dyn Fn(u64) -> Result<()> + Send + Sync>,
     ) -> Self {
-        if let Err(error) = refresh() {
+        if let Err(error) = refresh(0) {
             warn!(%error, "initial shard admission refresh failed; will retry after commit");
         }
         self.shard_admission_refresh = Some(refresh);
@@ -1305,7 +1305,7 @@ impl FrameMaterializer {
         // workers learn the new global height and submit their first child
         // headers. The remote shard-size task must not overwrite this cache.
         if let Some(refresh) = &self.shard_admission_refresh {
-            if let Err(error) = refresh() {
+            if let Err(error) = refresh(frame_number) {
                 warn!(frame = frame_number, %error, "committed shard admission refresh failed; will retry next frame");
             }
         }
@@ -3036,7 +3036,7 @@ mod tests {
         .with_shard_admission_refresh({
             let calls = calls.clone();
             let current = current.clone();
-            Arc::new(move || {
+            Arc::new(move |_frame| {
                 assert_eq!(
                     current.materialized(),
                     0,
