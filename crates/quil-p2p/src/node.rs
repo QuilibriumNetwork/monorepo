@@ -1513,18 +1513,13 @@ impl P2PHandle {
     /// then size, full decode and the Falcon signatures. The Ed448 half of a
     /// KeyRegistry binding is still verified by the receive loop.
     ///
-    /// The response is GRADUATED by how stale the timestamp is:
-    /// - fresh → `Accept`;
-    /// - moderately stale, or future-skewed → `Ignore` (drop, NO peer
-    ///   penalty) — a message can legitimately age in transit through an honest
-    ///   relayer, who must not be punished for it;
-    /// - grossly stale (older than about 5 min) → `Reject`, which feeds
-    ///   gossipsub's P₄ invalid-message peer score. An honest,
-    ///   roughly-NTP-synced relayer never forwards a 5-minute-old PeerInfo (it
-    ///   would `Ignore` it too), so reaching us with one means the sender is
-    ///   replaying / grossly clock-skewed / flooding — a sustained stream of
-    ///   these graylists the peer (see the topic-score params in
-    ///   `set_signing_identity`).
+    /// A fresh record is accepted. One aged in transit, dated ahead of this
+    /// node's clock or stale (older than about 5 min) is dropped without a
+    /// peer penalty (`Ignore`), so it is not forwarded either. Staleness
+    /// depends on the receiver's clock, and a `Reject` feeds gossipsub's P₄
+    /// invalid-message score on every topic: rejecting stale records
+    /// graylisted honest relays and originators a few minutes slow, and
+    /// releases that forward records unchecked.
     ///
     /// A message no release accepts (malformed, oversized, unknown type, bad
     /// signature) is dropped without penalty until strict validation

@@ -202,8 +202,8 @@ pub(crate) fn global_topics(role: MeshRole) -> Vec<(&'static [u8], GlobalCheck)>
 /// Registers the mesh checks of a node of `role`, then subscribes its
 /// global topics ([`global_topics`]), so that nothing a topic carries is
 /// delivered or forwarded unchecked. A standalone worker's p2p gets the
-/// master's checks: without them it forwarded what masters refuse, a stale
-/// PeerInfo among it, and their scores of it fell.
+/// master's checks: without them it forwarded what masters refuse, an
+/// invalid PeerInfo among it, and their scores of it fell.
 pub(crate) async fn join_global_topics(p2p: &quil_p2p::node::P2PHandle, role: MeshRole) {
     register_mesh_checks(p2p, role).await;
     for (topic, _) in global_topics(role) {
@@ -607,11 +607,14 @@ mod tests {
     }
 
     /// A standalone worker's own p2p must check what it forwards as a master
-    /// does. Unchecked, it forwarded a stale PeerInfo anyone may send, and the
-    /// masters it relays to rejected it and lowered the worker's score as an
-    /// attacker's (repeats graylist it, its consensus messages with it).
+    /// does. Unchecked, it forwarded an invalid PeerInfo anyone may send, and
+    /// the masters it relays to rejected it under strict validation and
+    /// lowered the worker's score as an attacker's (repeats graylist it, its
+    /// consensus messages with it). Each test runs in its own process under
+    /// nextest, so the strict switch stays within this one.
     #[tokio::test]
     async fn reproduces_worker_relay_penalised_for_unchecked_gossip() {
+        quil_p2p::set_strict_peer_info_validation(true);
         let peer_info = quil_engine::bitmasks::GLOBAL_PEER_INFO;
         let alert = quil_engine::bitmasks::GLOBAL_ALERT;
         let mut chain = chain(
@@ -622,29 +625,29 @@ mod tests {
         .await;
         chain.wait_for_meshes().await;
 
-        // Ten minutes old, with junk keys and signatures.
+        // Fresh, with junk keys and signatures.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let stale = quil_p2p::encode_canonical_peer_info(
+        let invalid = quil_p2p::encode_canonical_peer_info(
             &quil_p2p::CanonicalPeerInfo {
                 peer_id: vec![1; 38],
-                timestamp: now_ms - 600_000,
+                timestamp: now_ms,
                 ..Default::default()
             },
             &[2; 897],
             &[3; 666],
         );
         assert_eq!(
-            quil_p2p::peer_info::peer_info_gossip_verdict(&stale, now_ms),
-            quil_p2p::peer_info::PeerInfoVerdict::Stale
+            quil_p2p::peer_info::peer_info_gossip_verdict(&invalid, now_ms),
+            quil_p2p::peer_info::PeerInfoVerdict::Invalid
         );
         chain
             .source
-            .publish(peer_info.to_vec(), stale)
+            .publish(peer_info.to_vec(), invalid)
             .await
-            .expect("publish the stale PeerInfo");
+            .expect("publish the invalid PeerInfo");
         let last = control_alert(u32::MAX);
         chain
             .source
@@ -658,7 +661,7 @@ mod tests {
             let score = chain.sink.get_peer_score(chain.relay_id).await;
             assert!(
                 score >= 0.0,
-                "VULNERABLE: the worker's p2p forwarded a stale PeerInfo it never checked, \
+                "VULNERABLE: the worker's p2p forwarded an invalid PeerInfo it never checked, \
                  and the master it relays to scored it {score}"
             );
             if let Ok(Some(message)) =
@@ -674,13 +677,80 @@ mod tests {
         let score = chain.sink.get_peer_score(chain.relay_id).await;
         assert!(
             score >= 0.0,
-            "VULNERABLE: the worker's p2p forwarded a stale PeerInfo it never checked, \
+            "VULNERABLE: the worker's p2p forwarded an invalid PeerInfo it never checked, \
              and the master it relays to scored it {score}"
         );
         let sender = chain.relay.get_peer_score(chain.source_id).await;
         assert!(
             sender < 0.0,
-            "the worker's p2p did not reject the stale PeerInfo (its sender scores {sender})"
+            "the worker's p2p did not reject the invalid PeerInfo (its sender scores {sender})"
+        );
+    }
+
+    /// Whether a PeerInfo is stale depends on the receiver's clock, so a
+    /// master must drop a stale one without lowering its forwarder's score:
+    /// rejecting it graylisted, on every topic, relays and originators whose
+    /// clocks run a few minutes slow and releases that forward unchecked.
+    #[tokio::test]
+    async fn reproduces_stale_peer_info_penalising_its_forwarder() {
+        let peer_info = quil_engine::bitmasks::GLOBAL_PEER_INFO;
+        let alert = quil_engine::bitmasks::GLOBAL_ALERT;
+        let mut chain = chain(&[peer_info, alert], Some(MeshRole::Master), None).await;
+        chain.wait_for_meshes().await;
+
+        // Six minutes old, with junk keys and signatures: dropped for its age
+        // before anything else is checked.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let stale = quil_p2p::encode_canonical_peer_info(
+            &quil_p2p::CanonicalPeerInfo {
+                peer_id: vec![1; 38],
+                timestamp: now_ms - 360_000,
+                ..Default::default()
+            },
+            &[2; 897],
+            &[3; 666],
+        );
+        assert_eq!(
+            quil_p2p::peer_info::peer_info_gossip_verdict(&stale, now_ms),
+            quil_p2p::peer_info::PeerInfoVerdict::Stale
+        );
+        chain
+            .source
+            .publish(peer_info.to_vec(), stale.clone())
+            .await
+            .expect("publish the stale PeerInfo");
+        let last = control_alert(u32::MAX);
+        chain
+            .source
+            .publish(alert.to_vec(), last.clone())
+            .await
+            .expect("publish the last control alert");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut received: Vec<quil_p2p::node::ReceivedMessage> = Vec::new();
+        while !received.iter().any(|message| message.data == last) {
+            match tokio::time::timeout_at(deadline, chain.sink_rx.recv()).await {
+                Ok(Some(message)) => received.push(message),
+                Ok(None) => panic!("the sink stopped"),
+                Err(_) => panic!("the relay never forwarded the last control alert"),
+            }
+        }
+        let score = chain.relay.get_peer_score(chain.source_id).await;
+        assert!(
+            score >= 0.0,
+            "VULNERABLE: a master rejected a stale PeerInfo, which depends on its own \
+             clock, and scored its forwarder {score}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        while let Ok(message) = chain.sink_rx.try_recv() {
+            received.push(message);
+        }
+        assert!(
+            !received.iter().any(|message| message.data == stale),
+            "the master forwarded the stale PeerInfo"
         );
     }
 
