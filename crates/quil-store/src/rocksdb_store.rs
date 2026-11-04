@@ -96,6 +96,8 @@ pub struct RocksDbHealth {
     pub delayed_write_rate: u64,
     pub block_cache: u64,
     pub block_cache_capacity: u64,
+    /// Open snapshots: each keeps every later deletion on disk.
+    pub snapshots: store::OpenSnapshots,
 }
 
 /// Per-instance RocksDB memory accounting (bytes). See [`RocksDb::memory_usage`].
@@ -199,6 +201,37 @@ struct SharedBlockCache {
 
 static SHARED_BLOCK_CACHE: std::sync::OnceLock<std::sync::Mutex<SharedBlockCache>> =
     std::sync::OnceLock::new();
+
+/// Every store opened in this process that is still open, for
+/// [`open_stores_memory`].
+fn open_stores() -> &'static std::sync::Mutex<Vec<quil_forest::WeakCoordinatedDb>> {
+    static OPEN: std::sync::OnceLock<std::sync::Mutex<Vec<quil_forest::WeakCoordinatedDb>>> =
+        std::sync::OnceLock::new();
+    OPEN.get_or_init(Default::default)
+}
+
+/// `(stores, memtable bytes, table-reader bytes)` summed over every RocksDB
+/// store open in this process: the master's and each thread worker's. The
+/// shared block cache is left out ([`shared_block_cache_memory`]).
+pub fn open_stores_memory() -> (usize, u64, u64) {
+    let mut open = open_stores()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let live: Vec<_> = open.iter().filter_map(|weak| weak.upgrade()).collect();
+    // Drop the closed stores' entries.
+    open.retain(|weak| weak.upgrade().is_some());
+    drop(open);
+    let sum = |name: &str| -> u64 {
+        live.iter()
+            .map(|db| db.property_int_value(name).ok().flatten().unwrap_or(0))
+            .sum()
+    };
+    (
+        live.len(),
+        sum("rocksdb.cur-size-all-mem-tables"),
+        sum("rocksdb.estimate-table-readers-mem"),
+    )
+}
 
 /// The shared block cache's `(usage, capacity)` bytes, once a store opened
 /// on it: what its stores' [`RocksDbMemory::total`] leave out.
@@ -481,10 +514,15 @@ impl RocksDb {
     /// A writable store watches the prover registry's keys, so execution
     /// branches can reuse a registry scan no write has changed.
     fn coordinated(db: rocksdb::DB) -> quil_forest::CoordinatedDb {
-        quil_forest::CoordinatedDb::with_watched_prefixes(
+        let db = quil_forest::CoordinatedDb::with_watched_prefixes(
             db,
             crate::encoding::prover_registry_key_prefixes(),
-        )
+        );
+        open_stores()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(db.downgrade());
+        db
     }
 
     /// Share the database and its write barrier across store implementations.
@@ -522,6 +560,28 @@ impl RocksDb {
             delayed_write_rate: prop("rocksdb.actual-delayed-write-rate"),
             block_cache: prop("rocksdb.block-cache-usage"),
             block_cache_capacity: prop("rocksdb.block-cache-capacity"),
+            snapshots: self.snapshots(),
+        }
+    }
+
+    /// Open snapshots and the age of the oldest. A snapshot held since
+    /// startup keeps every deletion since on disk, so a store grows until
+    /// restart; this shows one held past the snapshot manager's pin window.
+    pub fn snapshots(&self) -> store::OpenSnapshots {
+        let prop = |name: &str| self.db.property_int_value(name).ok().flatten().unwrap_or(0);
+        let count = prop("rocksdb.num-snapshots");
+        // Unix seconds of the oldest snapshot's creation; 0 with none.
+        let oldest = prop("rocksdb.oldest-snapshot-time");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        store::OpenSnapshots {
+            count,
+            oldest_age_secs: if count == 0 || oldest == 0 {
+                0
+            } else {
+                now.saturating_sub(oldest)
+            },
         }
     }
 
@@ -560,6 +620,25 @@ mod read_only_tests {
             Some(b"checkpoint".to_vec())
         );
         assert_eq!(reopened.iterator(rocksdb::IteratorMode::Start).count(), 1);
+    }
+
+    /// The snapshot fields of the per-minute store lines read real RocksDB
+    /// properties: a misspelt name would read 0 and hide a held snapshot.
+    #[test]
+    fn open_snapshots_counts_held_snapshots_and_ages_the_oldest() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RocksDb::open(directory.path()).unwrap();
+        let none = store::OpenSnapshots::default();
+        assert_eq!(store::KvDb::open_snapshots(&store), Some(none));
+        let db = store.inner();
+        let first = db.snapshot();
+        let second = db.snapshot();
+        let held = store.snapshots();
+        assert_eq!(held.count, 2);
+        assert!(held.oldest_age_secs < 60, "{held:?}");
+        assert_eq!(store.health().snapshots.count, 2);
+        drop((first, second));
+        assert_eq!(store.snapshots(), none);
     }
 
     #[test]
@@ -711,6 +790,48 @@ mod read_only_tests {
         assert_eq!(reopened.get(key(7)).unwrap(), Some(vec![7u8; 64]));
         assert_eq!(reopened.get(key(30_000)).unwrap(), Some(vec![9u8; 64]));
     }
+
+    /// The open stores' memtables and table readers are summed over every
+    /// store still open, and a closed store leaves the sum.
+    #[test]
+    fn open_stores_memory_counts_stores_that_are_open() {
+        let (before_stores, before_memtables, _) = open_stores_memory();
+        let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+        let stores: Vec<RocksDb> = dirs
+            .iter()
+            .map(|dir| RocksDb::open(dir.path()).unwrap())
+            .collect();
+        let db = stores[0].inner();
+        for i in 0..2_000u32 {
+            db.put(format!("key-{i:08}").into_bytes(), [5u8; 1024])
+                .unwrap();
+        }
+        let (stores_open, memtables, _) = open_stores_memory();
+        assert!(
+            stores_open >= before_stores + 2,
+            "{stores_open} stores open after opening two beside {before_stores}"
+        );
+        assert!(
+            memtables >= before_memtables + (1 << 20),
+            "{memtables} memtable bytes after writing 2 MB beside {before_memtables}"
+        );
+        drop(db);
+        drop(stores);
+        let (stores_after, _, _) = open_stores_memory();
+        assert!(
+            stores_after < stores_open,
+            "closed stores still counted: {stores_after} of {stores_open}"
+        );
+    }
+}
+
+/// Whether `file`'s keys span into `[start, end)`: its first key is below
+/// `end` and its last at or past `start`.
+fn file_overlaps(file: &rocksdb::LiveFile, start: &[u8], end: &[u8]) -> bool {
+    match (file.start_key.as_deref(), file.end_key.as_deref()) {
+        (Some(first), Some(last)) => first < end && last >= start,
+        _ => false,
+    }
 }
 
 impl store::KvDb for RocksDb {
@@ -761,13 +882,21 @@ impl store::KvDb for RocksDb {
             .db
             .live_files()
             .map_err(|e| QuilError::Store(e.to_string()))?;
-        Ok(files.iter().any(|file| {
-            file.size as u64 >= min_file_bytes
-                && match (file.start_key.as_deref(), file.end_key.as_deref()) {
-                    (Some(first), Some(last)) => first < end && last >= start,
-                    _ => false,
-                }
-        }))
+        Ok(files
+            .iter()
+            .any(|file| file.size as u64 >= min_file_bytes && file_overlaps(file, start, end)))
+    }
+
+    fn live_file_bytes(&self, range: Option<(&[u8], &[u8])>) -> Result<u64> {
+        let files = self
+            .db
+            .live_files()
+            .map_err(|e| QuilError::Store(e.to_string()))?;
+        Ok(files
+            .iter()
+            .filter(|file| range.is_none_or(|(start, end)| file_overlaps(file, start, end)))
+            .map(|file| file.size as u64)
+            .sum())
     }
 
     fn compact_reclaiming(&self, start: &[u8], end: &[u8], min_file_bytes: u64) -> Result<bool> {
@@ -800,6 +929,10 @@ impl store::KvDb for RocksDb {
 
     fn approximate_memory_bytes(&self) -> u64 {
         self.memory_usage().total()
+    }
+
+    fn open_snapshots(&self) -> Option<store::OpenSnapshots> {
+        Some(self.snapshots())
     }
 }
 

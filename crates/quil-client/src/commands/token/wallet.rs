@@ -23,6 +23,12 @@ mod native_tests;
 #[path = "wallet_submission_tests.rs"]
 mod submission_tests;
 
+#[cfg(feature = "native-proof")]
+#[path = "wallet_mint_status.rs"]
+mod mint_status;
+#[cfg(feature = "native-proof")]
+pub(super) use mint_status::run_mint_status;
+
 // Shared by mint, shield and transfer preparation as well as native work. A permit
 // stays in the blocking worker when its async caller is cancelled.
 #[cfg(feature = "native-proof")]
@@ -201,11 +207,11 @@ where
             return Err(status);
         }
         retries += 1;
-        eprintln!(
+        super::output::err_line(format!(
             "confidential scan: {what} failed ({}); asking again in {} s ({retries}/{SCAN_READ_RETRIES})",
             status.message(),
             SCAN_READ_RETRY_DELAY.as_secs()
-        );
+        ));
         tokio::time::sleep(SCAN_READ_RETRY_DELAY).await;
     }
 }
@@ -1060,6 +1066,8 @@ impl RecipientWallet {
             super::output::line(mint_amounts_line("Claiming", reward, mint.statement.fee));
         }
         let receipt = receipt_address(&mint.statement)?;
+        #[cfg(feature = "native-proof")]
+        mint_status::note_consumed(client, &self.application, &receipt).await;
         let response = client
             .clone()
             .max_decoding_message_size(64 * 1024)
@@ -2340,7 +2348,9 @@ impl RecipientWallet {
         let collector = match self.read_accumulator(client).await {
             Ok(accumulator) => Some(SpendScanCollector::new(accumulator, &self.context)),
             Err(error) => {
-                println!("Spend witnesses will need a second coin scan: {error}.");
+                super::output::line(format!(
+                    "Spend witnesses will need a second coin scan: {error}."
+                ));
                 None
             }
         };
@@ -2421,7 +2431,9 @@ impl RecipientWallet {
             let batch = collector.finish();
             let leaves = hash_kept(collector.key.clone(), batch).await?;
             match collector.unusable {
-                Some(reason) => println!("Spend witnesses will need a second coin scan: {reason}."),
+                Some(reason) => super::output::line(format!(
+                    "Spend witnesses will need a second coin scan: {reason}."
+                )),
                 None => {
                     collector.scan.kept.extend(leaves);
                     collector.scan.root = scan.root.clone();
@@ -2871,21 +2883,24 @@ impl RecipientWallet {
                 {
                     Ok((root, paths)) => {
                         self.verify_paths(coins, &root, &paths)?;
-                        println!(
+                        super::output::line(format!(
                             "Spend witnesses rebuilt from the selection scan ({kept} coins under the wallet's subtrees, {:.1} s); the node was not told which coins this spends.",
                             started.elapsed().as_secs_f64()
-                        );
+                        ));
                         return Ok((root, paths));
                     }
                     Err(error) if error.downcast_ref::<StaleWitness>().is_some() => {
-                        println!("Spend witnesses from the selection scan not ready ({error}).");
+                        super::output::line(format!(
+                            "Spend witnesses from the selection scan not ready ({error})."
+                        ));
                     }
                     Err(error) => return Err(error),
                 }
             }
         }
-        println!(
+        super::output::line(
             "Rebuilding spend witnesses from a full coin scan; the node is not told which coins this spends."
+                .into(),
         );
         let mut attempt = 1;
         loop {
@@ -2898,10 +2913,10 @@ impl RecipientWallet {
                     if attempt < WITNESS_ATTEMPTS
                         && error.downcast_ref::<StaleWitness>().is_some() =>
                 {
-                    println!(
+                    super::output::line(format!(
                         "Spend witnesses not ready ({error}); rescanning, attempt {} of {WITNESS_ATTEMPTS}.",
                         attempt + 1
-                    );
+                    ));
                     tokio::time::sleep(WITNESS_RETRY_DELAY).await;
                     attempt += 1;
                 }
@@ -3078,10 +3093,10 @@ impl RecipientWallet {
                 kept,
             )
             .await?;
-        println!(
+        super::output::line(format!(
             "spend witnesses: {pages} scan pages, {scanned} coins, {kept_coins} under the inputs' subtrees, {:.1} s",
             started.elapsed().as_secs_f64()
-        );
+        ));
         Ok((root, paths))
     }
 
@@ -3652,6 +3667,76 @@ fn ensure_wallet_key(tc: &TokenCtx) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Short public fingerprint of a confidential address: 12 hex digits of a
+/// domain-separated hash. Names a recipient in output without printing the
+/// full address.
+pub(super) fn address_fingerprint(address: &RecipientAddress) -> String {
+    let mut hash = Shake256::default();
+    hash.update(b"quil/client/address-fingerprint/v1\0");
+    hash.update(&address.encode());
+    let mut out = [0u8; 6];
+    hash.finalize_xof().read(&mut out);
+    hex::encode(out)
+}
+
+#[cfg(all(test, feature = "native-proof"))]
+impl TokenCtx {
+    /// A new wallet's QUIL address on this network, as `--recipient` takes it.
+    pub(crate) fn another_quil_address(&self) -> String {
+        let network = quil_lattice_ct::confidential::transfer::network_identifier(
+            self.node_config.p2p.network,
+        );
+        let keys = sntrup761::Sntrup761KeyPair::generate();
+        let wallet = RecipientWallet::from_keys(
+            &network,
+            &quil_execution::domains::QUIL_TOKEN,
+            &keys.public,
+            Zeroizing::new(keys.secret),
+        )
+        .unwrap();
+        format!("0x{}", hex::encode(wallet.address().encode()))
+    }
+}
+
+/// Who a shield pays: the `--recipient` address, or this wallet.
+pub(super) struct ShieldRecipient {
+    pub(super) address: RecipientAddress,
+    /// Output label: names the recipient by fingerprint only.
+    pub(super) label: String,
+}
+
+/// Resolve `--recipient` for a shield. The address must decode under this
+/// node's network and token context; any failure is returned before a proof
+/// is made. `None` pays `wallet`. The error never echoes the input.
+pub(super) fn shield_recipient(
+    wallet: &RecipientWallet,
+    value: Option<&str>,
+) -> anyhow::Result<ShieldRecipient> {
+    use quil_lattice_ct::confidential::address::AddressError;
+    let Some(value) = value else {
+        let address = wallet.address().clone();
+        let label = format!("this wallet ({})", address_fingerprint(&address));
+        return Ok(ShieldRecipient { address, label });
+    };
+    let value = value.trim();
+    let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(value)).map_err(|_| {
+        anyhow::anyhow!(
+            "--recipient must be the hexadecimal address printed by `token confidential-address`"
+        )
+    })?;
+    let address = RecipientAddress::decode(&bytes, &wallet.context).map_err(|e| match e {
+        AddressError::Context => anyhow::anyhow!(
+            "--recipient is an address for a different network or token than this node"
+        ),
+        AddressError::Version => anyhow::anyhow!("--recipient is not a confidential address"),
+        AddressError::Length => {
+            anyhow::anyhow!("--recipient has the wrong length for a confidential address")
+        }
+    })?;
+    let label = format!("recipient {}", address_fingerprint(&address));
+    Ok(ShieldRecipient { address, label })
+}
+
 /// The keystore Falcon key used as escrow and reward authority.
 fn falcon_signer(tc: &TokenCtx) -> anyhow::Result<std::sync::Arc<quil_crypto::FalconSigner>> {
     let secret = Zeroizing::new(tc.key_manager.get_secret_key_bytes_by_id("q-prover-key")?);
@@ -3849,12 +3934,71 @@ pub(super) async fn run_balance(
     Ok(())
 }
 
-pub(super) async fn run_escrows(
+/// Check `recipient` as `token transfer` (`escrow` false) or `token
+/// pending-transfer` (`escrow` true) parses it, without building anything.
+pub(crate) fn check_recipient(tc: &TokenCtx, recipient: &str, escrow: bool) -> anyhow::Result<()> {
+    let network =
+        quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let wallet = RecipientWallet::load(tc, &network, &quil_execution::domains::QUIL_TOKEN)?;
+    if escrow {
+        parse_escrow_address(recipient, &wallet.context).map(|_| ())
+    } else {
+        parse_recipient(recipient, &wallet.context).map(|_| ())
+    }
+}
+
+/// The coins `token merge all` would merge and their total: a wallet scan
+/// with `token`'s default bounds.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn merge_preview(tc: &TokenCtx) -> anyhow::Result<(usize, u128)> {
+    let network =
+        quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let wallet = std::sync::Arc::new(RecipientWallet::load(
+        tc,
+        &network,
+        &quil_execution::domains::QUIL_TOKEN,
+    )?);
+    let client = tc.connect().await?;
+    let owned = wallet
+        .scan_unspent(&client, super::SCAN_MAX_PAGES, super::SCAN_MAX_COINS)
+        .await?;
+    let (selected, total) = merge_selection(owned, &[], compile_limits().max_inputs)?;
+    Ok((selected.len(), total))
+}
+
+/// A pending transfer this wallet can act on, as `token escrows` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Escrow {
+    pub address: [u8; 32],
+    pub amount: u128,
+    /// This wallet funded it and holds the refund branch; otherwise it is
+    /// the recipient.
+    pub refund: bool,
+    /// The GLOBAL frame from which the refund branch is admitted.
+    pub refund_after: u64,
+}
+
+impl Escrow {
+    /// Its line in `token escrows`.
+    pub(crate) fn cli_line(&self) -> String {
+        format!(
+            "0x{} {} branch={} refund_after_global_frame={}",
+            hex::encode(self.address),
+            self.amount,
+            if self.refund { "refund" } else { "recipient" },
+            self.refund_after
+        )
+    }
+}
+
+/// The unconsumed escrows whose recipient or refund authority is this
+/// wallet's prover key: a scan of every escrow, with trial decryption.
+pub(crate) async fn list_escrows(
     tc: &TokenCtx,
     application: &str,
     max_pages: usize,
     max_escrows: usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<Escrow>> {
     let network =
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let wallet = std::sync::Arc::new(RecipientWallet::load(
@@ -3864,21 +4008,63 @@ pub(super) async fn run_escrows(
     )?);
     let authority = tc.key_manager.get_public_key_bytes_by_id("q-prover-key")?;
     let client = tc.connect().await?;
-    let escrows = wallet
+    Ok(wallet
         .scan_escrows(&client, authority, max_pages, max_escrows)
+        .await?
+        .into_iter()
+        .map(|(address, amount, refund, refund_after)| Escrow {
+            address,
+            amount: *amount,
+            refund,
+            refund_after,
+        })
+        .collect())
+}
+
+/// This wallet's unspent confidential QUIL coins and their total, as
+/// `token balance` counts them: a full scan of the coins, recovered here,
+/// each recovered coin's spent marker read from the configured node's
+/// GLOBAL state. `None` while the application holds no coin at all.
+pub(crate) async fn confidential_balance(
+    tc: &TokenCtx,
+    max_pages: usize,
+    max_coins: usize,
+) -> anyhow::Result<Option<(usize, u128)>> {
+    let network =
+        quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let wallet = std::sync::Arc::new(RecipientWallet::load(
+        tc,
+        &network,
+        &quil_execution::domains::QUIL_TOKEN,
+    )?);
+    let client = tc.connect().await?;
+    let coins = wallet
+        .scan_unspent_or_rootless(&client, max_pages, max_coins, &mut ScanReport::default())
         .await?;
+    coins
+        .map(|coins| {
+            let total = coins
+                .iter()
+                .try_fold(0u128, |sum, coin| sum.checked_add(*coin.amount))
+                .ok_or_else(|| anyhow::anyhow!("balance overflows u128"))?;
+            Ok((coins.len(), total))
+        })
+        .transpose()
+}
+
+pub(super) async fn run_escrows(
+    tc: &TokenCtx,
+    application: &str,
+    max_pages: usize,
+    max_escrows: usize,
+) -> anyhow::Result<()> {
+    let escrows = list_escrows(tc, application, max_pages, max_escrows).await?;
     println!(
         "{} recovered escrow authorities reported unconsumed by the configured node:",
         escrows.len()
     );
-    for (address, amount, refund, deadline) in escrows {
-        println!(
-            "0x{} {} branch={} refund_after_global_frame={}",
-            hex::encode(address),
-            *amount,
-            if refund { "refund" } else { "recipient" },
-            deadline
-        );
+    for escrow in escrows {
+        println!("{}", escrow.cli_line());
     }
     Ok(())
 }
@@ -3916,7 +4102,7 @@ pub(super) async fn run_coins(
 /// headroom covers a small move; a larger one is answered with the price the
 /// refresh just reported, by re-quoting and rebuilding rather than making the
 /// caller retry by hand. An explicit fee is exact by contract, never re-quoted.
-pub(super) async fn run_transfer(
+pub(crate) async fn run_transfer(
     tc: &TokenCtx,
     application: &str,
     recipient: &str,
@@ -3967,20 +4153,22 @@ pub(super) async fn run_transfer(
         match refresh_submission_fee(tc, &mut client, &bytes).await {
             Ok(()) => break bytes,
             Err(error) if fee_moved_rebuild(requested_fee, attempt, &error) => {
-                println!("The fee moved while preparing the transfer ({error}); re-quoting and rebuilding.");
+                super::output::line(format!("The fee moved while preparing the transfer ({error}); re-quoting and rebuilding."));
             }
             Err(error) => return Err(error),
         }
     };
     submit_refreshed_operation(tc, &wallet, bytes).await?;
-    println!("Confidential transfer submitted. Finalized inclusion is not yet confirmed.");
+    super::output::line(
+        "Confidential transfer submitted. Finalized inclusion is not yet confirmed.".into(),
+    );
     Ok(())
 }
 
 /// The fee a transfer pays: the caller's, or a quote for two coins and the
 /// input limit's markers. Custom-token outflow carries no QUIL fee.
 #[cfg(feature = "native-proof")]
-async fn transfer_fee(
+pub(crate) async fn transfer_fee(
     tc: &TokenCtx,
     application: &[u8; 32],
     explicit: Option<u128>,
@@ -4824,7 +5012,7 @@ pub(super) async fn run_split(
 /// Merge the named coins (or the largest unspent coins) into one coin owned by
 /// this wallet. One transaction consumes at most the circuit's input count.
 #[cfg(feature = "native-proof")]
-pub(super) async fn run_merge(
+pub(crate) async fn run_merge(
     tc: &TokenCtx,
     application: &str,
     coins: &[String],
@@ -4871,7 +5059,9 @@ pub(super) async fn run_merge(
         )
         .await?;
     submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential merge submitted. Finalized inclusion is not yet confirmed.");
+    super::output::line(
+        "Confidential merge submitted. Finalized inclusion is not yet confirmed.".into(),
+    );
     Ok(())
 }
 
@@ -4879,7 +5069,7 @@ pub(super) async fn run_merge(
 /// Falcon key is the refund authority; the refund frame defaults to the node's
 /// current global head plus about one day. Delivery is not finality.
 #[cfg(feature = "native-proof")]
-pub(super) async fn run_pending_create(
+pub(crate) async fn run_pending_create(
     tc: &TokenCtx,
     application: &str,
     recipient: &str,
@@ -4953,7 +5143,7 @@ pub(super) async fn run_pending_create(
         )
         .await?;
     submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential escrow funding submitted; refund authority becomes eligible at global frame {refund_after_global_frame}. Finalized inclusion is not yet confirmed.");
+    super::output::line(format!("Confidential escrow funding submitted; refund authority becomes eligible at global frame {refund_after_global_frame}. Finalized inclusion is not yet confirmed."));
     Ok(())
 }
 
@@ -5266,8 +5456,8 @@ pub(super) async fn run_mint(
     execute_mint(tc, plan, recipient, print).await
 }
 
-/// Shield one transparent (legacy-owned) coin into confidential coins owned by
-/// this wallet. Admission authenticates the source's value and owner.
+/// Shield one transparent (legacy-owned) coin into a confidential coin owned by
+/// `recipient` (default: this wallet). Admission authenticates the source's value and owner.
 #[cfg(feature = "native-proof")]
 pub(super) async fn run_shield(
     tc: &TokenCtx,
@@ -5275,6 +5465,7 @@ pub(super) async fn run_shield(
     source: &str,
     amount: u128,
     fee: u128,
+    recipient: Option<&str>,
 ) -> anyhow::Result<()> {
     let application = identifier(application)?;
     let source = identifier(source)?;
@@ -5289,6 +5480,7 @@ pub(super) async fn run_shield(
     let network =
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &application)?);
+    let payee = shield_recipient(&wallet, recipient)?;
     let owner = legacy_owner_signer(tc)?;
     let mut client = tc.connect().await?;
     super::legacy::ensure_shields_active(&client, tc.node_config.p2p.network, false).await?;
@@ -5298,14 +5490,14 @@ pub(super) async fn run_shield(
             source,
             amount,
             owner,
-            vec![(wallet.address().clone(), shielded)],
+            vec![(payee.address, shielded)],
             fee,
             1,
             native_budget(),
         )
         .await?;
     submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential shield submitted. Finalized inclusion is not yet confirmed.");
+    println!("Confidential shield of {shielded} base units to {} submitted. Finalized inclusion is not yet confirmed.", payee.label);
     Ok(())
 }
 
@@ -5459,6 +5651,9 @@ pub(crate) struct ShieldAllPlan {
     pub duplicates: usize,
     /// Each batch's shard, short form (`shield_pacing::shard_label`).
     shards: Vec<String>,
+    /// Who the batches pay. Boxed: an address is over a kilobyte, and the
+    /// plan lives in the node manager's futures.
+    payee: Box<ShieldRecipient>,
     wallet: std::sync::Arc<RecipientWallet>,
     owner: std::sync::Arc<dyn quil_types::crypto::Signer>,
     client:
@@ -5467,9 +5662,9 @@ pub(crate) struct ShieldAllPlan {
 
 #[cfg(feature = "native-proof")]
 impl ShieldAllPlan {
-    /// The wallet address the batches shield into, in hex.
+    /// The address the batches shield into, in hex.
     pub(crate) fn recipient(&self) -> String {
-        format!("0x{}", hex::encode(self.wallet.address().encode()))
+        format!("0x{}", hex::encode(self.payee.address.encode()))
     }
 
     /// Coins in all batches and their total in base units.
@@ -5503,13 +5698,16 @@ pub(crate) async fn shield_batch_fee(tc: &TokenCtx, coins: usize) -> anyhow::Res
 }
 
 /// Read this identity's unshielded legacy coins and cut them into
-/// `token shield-all`'s batches of at most `max_per_batch`, one shard each.
-/// Fails before any proving when shields are not yet admitted.
+/// `token shield-all`'s batches of at most `max_per_batch`, one shard each,
+/// paying `recipient` (`--recipient`; default: this wallet). Fails before
+/// any proving when shields are not yet admitted, and before any read when
+/// the recipient does not decode.
 #[cfg(feature = "native-proof")]
 pub(crate) async fn plan_shield_all(
     tc: &TokenCtx,
     application: &str,
     max_per_batch: usize,
+    recipient: Option<&str>,
 ) -> anyhow::Result<ShieldAllPlan> {
     use quil_lattice_ct::confidential::shield::MAX_SHIELD_SOURCES;
     anyhow::ensure!(
@@ -5524,6 +5722,7 @@ pub(crate) async fn plan_shield_all(
     let network =
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &application)?);
+    let payee = Box::new(shield_recipient(&wallet, recipient)?);
     let owner = legacy_owner_signer(tc)?;
     let client = tc.connect().await?;
     let pending = recently_shielded(tc);
@@ -5547,6 +5746,7 @@ pub(crate) async fn plan_shield_all(
         shielded,
         duplicates: 0,
         shards: Vec::new(),
+        payee,
         wallet,
         owner,
         client,
@@ -5596,6 +5796,7 @@ pub(crate) enum ShieldReport<'a> {
 #[cfg(feature = "native-proof")]
 struct ShieldAllIo<'a> {
     tc: &'a TokenCtx,
+    payee: Box<ShieldRecipient>,
     wallet: std::sync::Arc<RecipientWallet>,
     owner: std::sync::Arc<dyn quil_types::crypto::Signer>,
     client:
@@ -5701,7 +5902,7 @@ impl super::shield_pacing::ShieldIo for ShieldAllIo<'_> {
             .create_batch_shield(
                 self.batches[index].clone(),
                 self.owner.clone(),
-                vec![(self.wallet.address().clone(), total - fee)],
+                vec![(self.payee.address.clone(), total - fee)],
                 fee,
                 1,
                 native_budget(),
@@ -5752,7 +5953,7 @@ impl super::shield_pacing::ShieldIo for ShieldAllIo<'_> {
 
 /// Prove and submit `plan`'s batches paced by `pacing` (`shield_pacing`):
 /// one at a time, each proved after the previous one's inclusion, each
-/// into one coin of this wallet less its quoted fee. `record` gets the
+/// into one coin of its recipient less its quoted fee. `record` gets the
 /// plan, each batch and the outcome; `sink` every report. Once `stop` is
 /// set the run submits nothing more and ends. Stops at the first error;
 /// batches submitted before it stay submitted. Returns the batches
@@ -5773,6 +5974,7 @@ pub(crate) async fn execute_shield_all(
     let ShieldAllPlan {
         batches,
         shards,
+        payee,
         wallet,
         owner,
         client,
@@ -5780,6 +5982,7 @@ pub(crate) async fn execute_shield_all(
     } = plan;
     let mut io = ShieldAllIo {
         tc,
+        payee,
         wallet,
         owner,
         client,
@@ -5798,15 +6001,30 @@ pub(crate) async fn execute_shield_all(
     result
 }
 
+/// The line `token shield-all` prints for a paced report; a submitted batch's
+/// also names who it pays ([`ShieldRecipient::label`]).
+#[cfg(feature = "native-proof")]
+fn paced_cli_line(event: &super::shield_pacing::ShieldEvent, recipient: &str) -> String {
+    let line = event.line();
+    match event {
+        super::shield_pacing::ShieldEvent::Submitted { .. } => {
+            format!("{line} Pays {recipient}.")
+        }
+        _ => line,
+    }
+}
+
 /// Shield every unshielded legacy coin of this identity in batches of at most
-/// `max_per_batch`, one shard per batch, each into one coin of this wallet.
-/// Batches are paced (see `shield_pacing`) and printed as they progress.
+/// `max_per_batch`, one shard per batch, each into one coin of the recipient
+/// (default: this wallet). Batches are paced (see `shield_pacing`) and
+/// printed as they progress.
 #[cfg(feature = "native-proof")]
 pub(super) async fn run_shield_all(
     tc: &TokenCtx,
     application: &str,
     max_per_batch: usize,
     pacing: super::shield_pacing::Pacing,
+    recipient: Option<&str>,
 ) -> anyhow::Result<()> {
     use super::action_log::{ActionLog, ShieldRecorder};
     let print = |event: ShieldEvent| {
@@ -5814,7 +6032,8 @@ pub(super) async fn run_shield_all(
             println!("{line}");
         }
     };
-    let plan = plan_shield_all(tc, application, max_per_batch).await?;
+    let plan = plan_shield_all(tc, application, max_per_batch, recipient).await?;
+    let label = plan.payee.label.clone();
     if plan.batches.is_empty() && plan.uncovered == 0 {
         print(ShieldEvent::Nothing {
             pending: plan.journaled,
@@ -5824,6 +6043,11 @@ pub(super) async fn run_shield_all(
     if plan.uncovered > 0 {
         print(ShieldEvent::Uncovered(plan.uncovered));
     }
+    println!(
+        "Plan: {} legacy coins in {} batches, paid to {label}.",
+        plan.batches.iter().map(Vec::len).sum::<usize>(),
+        plan.batches.len()
+    );
     let mut record = ShieldRecorder::new(ActionLog::enabled(&tc.config_dir, false), "cli");
     let count = plan.batches.len();
     let submitted =
@@ -5834,7 +6058,7 @@ pub(super) async fn run_shield_all(
             &mut record,
             None,
             &mut |report| match report {
-                ShieldReport::Paced(event) => println!("{}", event.line()),
+                ShieldReport::Paced(event) => println!("{}", paced_cli_line(event, &label)),
                 ShieldReport::LogFailed(why) => {
                     eprintln!("Action log: not written ({why}); the shield is unaffected.")
                 }
@@ -5848,7 +6072,7 @@ pub(super) async fn run_shield_all(
 
 /// Explicit CLI submission; a successful RPC response is delivery, not finality.
 #[cfg(feature = "native-proof")]
-pub(super) async fn run_claim(
+pub(crate) async fn run_claim(
     tc: &TokenCtx,
     application: &str,
     escrow: &str,
@@ -5925,7 +6149,9 @@ pub(super) async fn run_claim(
         )
         .await?;
     submit_operation(tc, &wallet, &mut client, bytes).await?;
-    println!("Confidential escrow claim submitted. Finalized inclusion is not yet confirmed.");
+    super::output::line(
+        "Confidential escrow claim submitted. Finalized inclusion is not yet confirmed.".into(),
+    );
     Ok(())
 }
 
@@ -7021,6 +7247,100 @@ mod tests {
         ));
     }
 
+    fn shield_test_wallet(network: [u8; 32]) -> RecipientWallet {
+        let keys = sntrup761::Sntrup761KeyPair::generate();
+        RecipientWallet::from_keys(
+            &network,
+            &[2; 32],
+            &keys.public,
+            Zeroizing::new(keys.secret),
+        )
+        .unwrap()
+    }
+
+    fn address_hex(wallet: &RecipientWallet) -> String {
+        format!("0x{}", hex::encode(wallet.address().encode()))
+    }
+
+    /// `--recipient` pays the named wallet: the shielded coin opens with the
+    /// recipient's keys and not with the sender's.
+    #[test]
+    fn shield_recipient_coin_opens_for_the_recipient_only() {
+        let sender = shield_test_wallet([1; 32]);
+        let recipient = shield_test_wallet([1; 32]);
+        let payee = shield_recipient(&sender, Some(&address_hex(&recipient))).unwrap();
+        assert_eq!(&payee.address, recipient.address());
+        assert_ne!(&payee.address, sender.address());
+        let public = quil_crypto::Ed448Signer::derive_public(&[3; 57]).unwrap();
+        let signer = quil_crypto::Ed448Signer::from_bytes(&[3; 57], &public).unwrap();
+        let (statement, _, relation) = sender
+            .prepare_shield([4; 32], 102, &signer, &[(payee.address, 100)], 2, 1)
+            .unwrap();
+        assert!(relation.validate_local_witness());
+        assert_eq!(recipient.open(&statement.outputs[0]).unwrap().amount, 100);
+        assert!(sender.open(&statement.outputs[0]).is_err());
+    }
+
+    /// Output names the recipient by a short fingerprint, never the address.
+    #[test]
+    fn shield_recipient_is_named_by_a_short_fingerprint() {
+        let sender = shield_test_wallet([1; 32]);
+        let recipient = shield_test_wallet([1; 32]);
+        let full = address_hex(&recipient);
+        let payee = shield_recipient(&sender, Some(&full)).unwrap();
+        let fingerprint = address_fingerprint(recipient.address());
+        assert_eq!(fingerprint.len(), 12);
+        assert_eq!(payee.label, format!("recipient {fingerprint}"));
+        assert!(payee.label.len() < 40);
+        assert!(!payee.label.contains(&full[2..40]));
+        assert_ne!(fingerprint, address_fingerprint(sender.address()));
+    }
+
+    /// A malformed, truncated, foreign-network or non-address `--recipient`
+    /// is refused without echoing it, before any proof is prepared.
+    #[test]
+    fn shield_recipient_refuses_bad_addresses() {
+        let sender = shield_test_wallet([1; 32]);
+        let good = address_hex(&sender);
+        let foreign = address_hex(&shield_test_wallet([9; 32]));
+        let mut versioned = hex::decode(&good[2..]).unwrap();
+        versioned[0] ^= 1;
+        let cases = [
+            ("not hex".to_string(), "hexadecimal"),
+            (String::new(), "wrong length"),
+            (good[..good.len() - 2].to_string(), "wrong length"),
+            (format!("{good}00"), "wrong length"),
+            (hex::encode(versioned), "not a confidential address"),
+            (foreign, "different network"),
+        ];
+        for (value, expected) in cases {
+            let error = match shield_recipient(&sender, Some(&value)) {
+                Ok(_) => panic!("accepted {expected} case"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(expected), "{error}");
+            assert!(value.len() < 16 || !error.contains(&value[..16]), "{error}");
+        }
+    }
+
+    /// Without `--recipient` a shield still pays this wallet.
+    #[test]
+    fn shield_recipient_defaults_to_this_wallet() {
+        let sender = shield_test_wallet([1; 32]);
+        let payee = shield_recipient(&sender, None).unwrap();
+        assert_eq!(&payee.address, sender.address());
+        assert_eq!(
+            payee.label,
+            format!("this wallet ({})", address_fingerprint(sender.address()))
+        );
+        assert_eq!(
+            shield_recipient(&sender, Some(&address_hex(&sender)))
+                .unwrap()
+                .address,
+            payee.address
+        );
+    }
+
     #[test]
     fn wallet_prepares_owned_transfer_and_rejects_invalid_selection() {
         use quil_lattice_ct::confidential::{
@@ -7416,6 +7736,36 @@ mod tests {
         }
     }
 
+    /// A retry's line under the node manager goes to its sink: a print would
+    /// write over the manager's screen.
+    #[tokio::test]
+    async fn a_scan_retry_line_goes_to_the_sink() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let (sink, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        let answer = crate::commands::token::output::capture(
+            sink,
+            retry_scan_read("a page", || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        Err(tonic::Status::unavailable("busy"))
+                    } else {
+                        Ok(n)
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer, 1);
+        let line = lines.try_recv().expect("the retry's line reaches the sink");
+        assert!(
+            line.contains("confidential scan: a page failed (busy)"),
+            "{line}"
+        );
+    }
+
     /// The bound: three more askings of a read, then the last failure.
     #[tokio::test]
     async fn a_scan_read_asks_again_within_its_bound() {
@@ -7712,6 +8062,34 @@ mod shield_all_cli_tests {
                         .into()
                 ),
             ]
+        );
+    }
+
+    /// A submitted batch's line names who it pays, by the recipient's label;
+    /// the paced run's other lines stay as they are.
+    #[test]
+    fn a_submitted_batch_names_its_recipient() {
+        use crate::commands::token::shield_pacing::ShieldEvent as Paced;
+        let submitted = Paced::Submitted {
+            index: 0,
+            total: 2,
+            coins: 4,
+            shard: "ab12".into(),
+            unix: 0,
+            head: Some(7),
+        };
+        assert_eq!(
+            paced_cli_line(&submitted, "recipient 0123456789ab"),
+            format!("{} Pays recipient 0123456789ab.", submitted.line())
+        );
+        let waiting = Paced::WaitingInclusion {
+            index: 0,
+            total: 2,
+            waited: 300,
+        };
+        assert_eq!(
+            paced_cli_line(&waiting, "recipient 0123456789ab"),
+            waiting.line()
         );
     }
 

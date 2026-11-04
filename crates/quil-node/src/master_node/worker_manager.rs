@@ -710,6 +710,20 @@ pub(crate) fn init(
             remote_workers = config.engine.data_worker_stream_multiaddrs.len(),
             "remote worker manager ready (cluster mode)"
         );
+        // Before `data_worker_filters`, where a saved seat wins as on a local
+        // worker, and before the allocator runs: an operator's manual worker
+        // must not reach it as auto. Archives run no app-shard workers.
+        if !archive_mode {
+            match remote_mgr.restore_manual_workers(db_arc.clone()) {
+                Ok(restored) => {
+                    info!(restored, scope = "local", "restored manual remote workers")
+                }
+                Err(error) => warn!(%error, scope = "this node",
+                    action = "every remote worker starts auto until switched: switch them to \
+                              manual again in qclient node prover manage",
+                    "could not restore the manual remote workers"),
+            }
+        }
         // Publish to the halt broadcaster spawned above so it can
         // SetHalted across standalone workers when coverage halts.
         let _ = remote_worker_manager_for_halt.set(remote_mgr.clone());
@@ -1119,7 +1133,6 @@ pub(crate) fn init(
             }),
             reward_greedy,
             min_active_provers_for_propose,
-            app_consensus_cw: config.engine.app_consensus_cw,
             // Persistent per-shard simplex-journal base (Go parity): master
             // core 0 → db.path, worker core N → worker path. Threaded so
             // app-shard consensus resumes across restarts.

@@ -22,6 +22,7 @@ mod model;
 mod msg;
 mod settings;
 mod shield;
+mod transfer;
 mod update;
 mod util;
 mod view;
@@ -31,7 +32,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Args;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -52,7 +56,7 @@ use crate::context::GlobalArgs;
 
 use self::model::Model;
 use self::msg::Msg;
-use self::update::{apply_msg, handle_key, Cmd};
+use self::update::{apply_msg, handle_key, handle_paste, Cmd};
 use super::ProverCtx;
 
 type Client = NodeServiceClient<Channel>;
@@ -101,9 +105,10 @@ pub struct ManageArgs {
     /// defaults, then start.
     #[arg(long)]
     pub reset_ui: bool,
-    /// Largest fee in base units a shield batch or a mint pays from the
+    /// Largest fee in base units one shield batch, mint or transfer action
+    /// (transfer, pending transfer, accept, refund, merge) pays from the
     /// node's quote (default: 0.1 QUIL); a larger quote stops a shield run
-    /// and refuses a mint, as in `qclient token`.
+    /// and refuses the others, as in `qclient token`.
     #[arg(
         long,
         env = "QUILIBRIUM_MAX_FEE",
@@ -176,7 +181,7 @@ async fn run(pc: &ProverCtx, refresh_state: RefreshState) -> anyhow::Result<()> 
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -184,7 +189,11 @@ async fn run(pc: &ProverCtx, refresh_state: RefreshState) -> anyhow::Result<()> 
 
     // Restore the terminal regardless of the loop outcome.
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     res
@@ -218,6 +227,10 @@ async fn event_loop(
                 match maybe_event {
                     Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
                         handle_key(&mut model, key)
+                    }
+                    Some(Ok(Event::Paste(text))) => {
+                        handle_paste(&mut model, &text);
+                        Vec::new()
                     }
                     Some(Ok(Event::Resize(_, _))) => Vec::new(),
                     Some(Err(_)) | None => break,
@@ -346,6 +359,8 @@ async fn render(
                 Cmd::MintPrepare | Cmd::ClaimPrepare(..) => {
                     |msg| matches!(msg, Msg::MintPreview(_))
                 }
+                Cmd::FetchShielded => |msg| matches!(msg, Msg::Shielded(_)),
+                Cmd::TransferPrepare(_) => |msg| matches!(msg, Msg::TransferPreview(_)),
                 other => {
                     dropped.push(other);
                     continue;
@@ -459,6 +474,9 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::ClaimPrepare(..) => "mint claim reads",
         Cmd::MintRun(_) => "mint",
         Cmd::ShieldStop => "shield stop",
+        Cmd::FetchShielded => "shielded coins read",
+        Cmd::TransferPrepare(_) => "transfer reads and quote",
+        Cmd::TransferRun(_) => "transfer action",
         Cmd::Join(_) => "join",
         Cmd::Lifecycle { .. } => "lifecycle operation",
         Cmd::ToggleManual { .. } | Cmd::MarkManual(_) => "worker mode change",
@@ -479,8 +497,8 @@ struct RefreshState {
     /// What the shield action loads `qclient token`'s context from, and
     /// its `--max-fee`.
     token: Option<(GlobalArgs, u128)>,
-    /// The private action log a shield or a mint records itself in,
-    /// unless off.
+    /// The private action log a shield, a mint or a transfer action
+    /// records itself in, unless off.
     action_log: Option<crate::commands::token::action_log::ActionLog>,
     /// Set to stop the running shield before its next submission; one
     /// runs at a time, and each run starts with it cleared.
@@ -592,6 +610,26 @@ fn spawn_action(
                 let _ = tx.send(actions::shield_prepare(token).await);
             });
         }
+        Cmd::FetchShielded => {
+            let token = refresh.token.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(actions::fetch_shielded(token).await);
+            });
+        }
+        Cmd::TransferPrepare(kind) => {
+            let token = refresh.token.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(actions::transfer_prepare(token, kind).await);
+            });
+        }
+        Cmd::TransferRun(preview) => {
+            let token = refresh.token.clone();
+            let log = refresh.action_log.clone();
+            tokio::spawn(async move {
+                let progress = tx.clone();
+                let _ = tx.send(actions::transfer_run(token, preview, progress, log).await);
+            });
+        }
         Cmd::MintPrepare => {
             let token = refresh.token.clone();
             tokio::spawn(async move {
@@ -635,9 +673,11 @@ fn spawn_action(
             filters,
             original_status,
         } => {
+            let progress = tx.clone();
             tokio::spawn(async move {
                 let _ = tx.send(
-                    actions::do_lifecycle(client, km, action, filters, original_status).await,
+                    actions::do_lifecycle(client, km, action, filters, original_status, progress)
+                        .await,
                 );
             });
         }

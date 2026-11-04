@@ -154,8 +154,9 @@ fn without_peer_id(addr: &Multiaddr) -> Multiaddr {
 /// What [`ExternalAddrTracker::on_confirmed`] did with an address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConfirmOutcome {
-    /// Not usable as our address: names no TCP/QUIC transport, a port we do
-    /// not listen on, or an IP peers cannot route to.
+    /// Not usable as our address: names no TCP/QUIC transport, an address
+    /// family PeerInfo does not announce, a port we do not listen on, or an IP
+    /// peers cannot route to.
     Rejected(&'static str),
     /// Already the current address of its transport.
     Unchanged,
@@ -423,6 +424,8 @@ impl Held {
 pub(crate) struct ExternalAddrTracker {
     tcp_port: Option<u16>,
     quic_port: Option<u16>,
+    /// Whether `listenMultiaddr`, the family PeerInfo announces, is IPv6.
+    listen_v6: bool,
     routable: fn(&Multiaddr) -> bool,
     /// Most recently accepted first; at most one per transport.
     current: Vec<Held>,
@@ -446,16 +449,20 @@ pub(crate) struct ExternalAddrTracker {
 }
 
 impl ExternalAddrTracker {
-    /// `tcp_port`/`quic_port` are the ports of our listeners; `routable`
-    /// decides which IPs peers can reach.
+    /// `tcp_port`/`quic_port` are the ports of our listeners; `listen_v6`
+    /// whether their family is IPv6, the only one tracked, so an address of
+    /// another listener never moves the announced one; `routable` decides
+    /// which IPs peers can reach.
     pub(crate) fn new(
         tcp_port: Option<u16>,
         quic_port: Option<u16>,
+        listen_v6: bool,
         routable: fn(&Multiaddr) -> bool,
     ) -> Self {
         Self {
             tcp_port,
             quic_port,
+            listen_v6,
             routable,
             current: Vec::new(),
             pending: Vec::new(),
@@ -601,6 +608,9 @@ impl ExternalAddrTracker {
         let Some((transport, port)) = transport_and_port(&addr) else {
             return ConfirmOutcome::Rejected("transport");
         };
+        if crate::autonat_servers::ip_of(&addr).is_some_and(|ip| ip.is_ipv6() != self.listen_v6) {
+            return ConfirmOutcome::Rejected("family");
+        }
         let listen_port = match transport {
             ExternalTransport::Tcp => self.tcp_port,
             ExternalTransport::Quic => self.quic_port,
@@ -783,7 +793,7 @@ mod tests {
     }
 
     fn tracker() -> ExternalAddrTracker {
-        ExternalAddrTracker::new(Some(8336), Some(8336), routable)
+        ExternalAddrTracker::new(Some(8336), Some(8336), false, routable)
     }
 
     fn ma(s: &str) -> Multiaddr {
@@ -1011,9 +1021,43 @@ mod tests {
         );
     }
 
+    /// A dual-stack node announces the family of `listenMultiaddr`: a
+    /// dial-back on its other listener neither moves that address nor counts
+    /// against it.
+    #[test]
+    fn tracks_only_the_family_of_the_listen_address() {
+        const V4: &str = "/ip4/203.0.113.7/tcp/8336";
+        const V6: &str = "/ip6/2001:db8::7/tcp/8336";
+        let server = any_server();
+
+        let mut t = ExternalAddrTracker::new(Some(8336), None, false, routable);
+        assert_eq!(
+            t.on_confirmed(&ma(V6), server),
+            ConfirmOutcome::Rejected("family")
+        );
+        assert!(t.current.is_empty());
+        assert_eq!(t.on_confirmed(&ma(V4), server), ConfirmOutcome::Accepted);
+        assert_eq!(
+            t.on_confirmed(&ma(V6), server),
+            ConfirmOutcome::Rejected("family")
+        );
+        assert_eq!(t.current[0].addr, ma(V4));
+        assert_eq!(t.current[0].unreachable_probes, 0);
+        assert!(t.pending.is_empty());
+
+        let mut t = ExternalAddrTracker::new(Some(8336), None, true, routable);
+        assert_eq!(
+            t.on_confirmed(&ma(V4), server),
+            ConfirmOutcome::Rejected("family")
+        );
+        assert_eq!(t.on_confirmed(&ma(V6), server), ConfirmOutcome::Accepted);
+        assert_eq!(t.on_confirmed(&ma(V6), server), ConfirmOutcome::Unchanged);
+        assert_eq!(t.current[0].addr, ma(V6));
+    }
+
     #[test]
     fn rejects_other_ports_and_transports() {
-        let mut t = ExternalAddrTracker::new(Some(8336), None, routable);
+        let mut t = ExternalAddrTracker::new(Some(8336), None, false, routable);
         let server = any_server();
         assert_eq!(
             t.on_confirmed(&ma("/ip4/203.0.113.7/tcp/40123"), server),

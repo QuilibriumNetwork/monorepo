@@ -29,14 +29,22 @@ pub(crate) mod peer_info_publisher;
 pub(crate) mod remote_reads;
 pub(crate) mod reward_proofs;
 pub(crate) mod runtime_state;
+mod shard_cw_lane;
 mod shard_sender;
 pub(crate) mod stall_watch;
 pub(crate) mod storage;
+mod store_latency;
 pub(crate) mod worker_manager;
 
 /// How long shutdown waits for the worker threads to stop before the
 /// process arms its forced-exit watchdog.
 const WORKER_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Whether this node takes part in GLOBAL consensus: archives, and on a
+/// localnet every node. Any other node proposes no GLOBAL frames.
+pub(crate) fn global_consensus_participant(archive_mode: bool, network: u8) -> bool {
+    archive_mode || network == 99
+}
 
 pub(crate) async fn start(
     mut sup: Supervisor<anyhow::Error>,
@@ -477,7 +485,12 @@ pub(crate) async fn start(
         coverage_monitor,
         halt_state,
         remote_worker_manager_for_halt,
-    } = runtime_state::init(&mut sup, hg_store.clone(), shard_engines.clone());
+    } = runtime_state::init(
+        &mut sup,
+        global_consensus_participant(archive_mode, network),
+        hg_store.clone(),
+        shard_engines.clone(),
+    );
 
     // EMPTY-SPLIT GUARD: give the coverage monitor a data-bearing test for a
     // shard's proposed children, read from the unified app tree. A split is only

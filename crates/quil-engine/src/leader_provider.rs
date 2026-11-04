@@ -143,6 +143,8 @@ pub struct ShardBodyNeed {
     pub address: Vec<u8>,
     pub frame_number: u64,
     pub empty: bool,
+    /// The GLOBAL frame the header anchors to (0: none).
+    pub anchor: u64,
 }
 
 /// Whether this GLOBAL prover holds the application frame bodies each need
@@ -151,6 +153,30 @@ pub struct ShardBodyNeed {
 /// application frames archives materialize executing the header (those above
 /// the shard's cursor through it), `None` when a body is not held.
 pub type ShardBodyAvailability = Arc<dyn Fn(&[ShardBodyNeed]) -> Vec<Option<u64>> + Send + Sync>;
+
+/// Whether this GLOBAL prover holds a shard's header back while archives
+/// verify the expensive confidential operations of the frames it would make
+/// them materialize, `(address, cursor, through)`, so GLOBAL does not wait
+/// for those proofs ([`GlobalLeaderProvider::with_proof_settlement`],
+/// `crate::archive_preverify::ProofSettlement`). Every hold ends, within the
+/// spend relay window of a shard that keeps producing.
+pub type ShardProofSettlement = Arc<dyn Fn(&[u8], u64, u64) -> bool + Send + Sync>;
+
+/// A settlement hold ends this many GLOBAL frames before the header's anchor
+/// leaves `STORAGE_ANCHOR_LOCKSTEP_WINDOW`: a shard that stopped producing
+/// offers no newer header, and past the window this one could never ride, so
+/// the spends it relays would wait for the shard to resume.
+pub const SETTLE_ANCHOR_MARGIN: u64 = 2;
+
+/// The header anchored at `anchor` may no longer wait for proofs at GLOBAL
+/// frame `frame_number`: it would soon leave the anchor window. An unanchored
+/// header (0, genesis or legacy) never leaves it.
+fn anchor_closing(anchor: u64, frame_number: u64) -> bool {
+    use quil_execution::global_intrinsic::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW;
+    anchor != 0
+        && frame_number.saturating_sub(1).saturating_sub(anchor)
+            >= STORAGE_ANCHOR_LOCKSTEP_WINDOW.saturating_sub(SETTLE_ANCHOR_MARGIN)
+}
 
 /// Application frames the shard headers one GLOBAL proposal carries make
 /// archives materialize, at most, beyond the one header furthest behind of
@@ -196,8 +222,19 @@ pub(crate) fn shard_body_needs(raw: &[u8]) -> Vec<ShardBodyNeed> {
             empty: crate::archive_ingest::requests_root_is_empty(&header.requests_root),
             address: header.address,
             frame_number: header.frame_number,
+            anchor: header.global_frame_number,
         })
         .collect()
+}
+
+/// A GLOBAL proposal's settlement check of the shard tips it may carry
+/// ([`hold_back_unavailable_shard_proofs`]).
+#[derive(Clone, Copy)]
+pub(crate) struct SettlementCheck<'a> {
+    /// The GLOBAL frame being proposed.
+    pub frame_number: u64,
+    /// Whether archives still settle `(address, cursor, through)`.
+    pub settling: &'a dyn Fn(&[u8], u64, u64) -> bool,
 }
 
 /// The shard proofs a GLOBAL proposal carries
@@ -208,6 +245,9 @@ pub(crate) struct ShardProofSelection {
     pub ready: Vec<Vec<u8>>,
     /// The needs whose bodies are not held.
     pub missing: Vec<ShardBodyNeed>,
+    /// Proofs whose bodies are held, left in the mempool while archives
+    /// verify the expensive confidential operations they would sequence.
+    pub settling: usize,
     /// Application frames the proofs that ride make archives materialize.
     pub frames: u64,
     /// Proofs whose bodies are held, left for a later proposal by the budget.
@@ -261,9 +301,16 @@ pub(crate) struct HeldShard {
 /// first, so each rides within `d + 1` GLOBAL frames, and a backlog of `n`
 /// shards drains furthest behind first within `n`. A proposal then makes
 /// archives materialize at most the budget plus `(d + 1)·r` frames.
+///
+/// Before the budget, a proof of a shard that `settlement` reports still
+/// settling (`(address, cursor, through)`) stays in the mempool too, and
+/// counts against no budget: archives are verifying the expensive proofs its
+/// frames carry, and GLOBAL would wait for them. It rides once its anchor is
+/// about to leave the anchor window ([`SETTLE_ANCHOR_MARGIN`]).
 pub(crate) fn hold_back_unavailable_shard_proofs(
     proofs: Vec<Vec<u8>>,
     available: &dyn Fn(&[ShardBodyNeed]) -> Vec<Option<u64>>,
+    settlement: Option<SettlementCheck<'_>>,
     budget: u64,
 ) -> ShardProofSelection {
     let needs: Vec<Vec<ShardBodyNeed>> = proofs.iter().map(|raw| shard_body_needs(raw)).collect();
@@ -274,6 +321,11 @@ pub(crate) fn hold_back_unavailable_shard_proofs(
     let mut held: Vec<(Vec<u8>, u64, Vec<HeldShard>)> = Vec::with_capacity(proofs.len());
     for (raw, needs) in proofs.into_iter().zip(needs) {
         let before = selection.missing.len();
+        let closing = settlement.is_some_and(|check| {
+            needs
+                .iter()
+                .any(|need| anchor_closing(need.anchor, check.frame_number))
+        });
         // A shard materializes once, through its highest header.
         let mut shards: Vec<HeldShard> = Vec::new();
         for need in needs {
@@ -298,6 +350,20 @@ pub(crate) fn hold_back_unavailable_shard_proofs(
             }
         }
         if selection.missing.len() == before {
+            if !closing
+                && settlement.is_some_and(|check| {
+                    shards.iter().any(|shard| {
+                        (check.settling)(
+                            &shard.address,
+                            shard.cursor,
+                            shard.cursor.saturating_add(shard.frames),
+                        )
+                    })
+                })
+            {
+                selection.settling += 1;
+                continue;
+            }
             let frames = shards
                 .iter()
                 .fold(0u64, |sum, shard| sum.saturating_add(shard.frames));
@@ -405,6 +471,10 @@ pub struct GlobalLeaderProvider {
     /// headers need ([`ShardBodyAvailability`]). `None` proposes every
     /// verified proof, as a node without an archive ingest does.
     body_availability: Option<ShardBodyAvailability>,
+    /// Whether a shard's header waits for archives to verify the expensive
+    /// proofs it would sequence ([`ShardProofSettlement`]). `None` never
+    /// waits.
+    proof_settlement: Option<ShardProofSettlement>,
 }
 
 impl GlobalLeaderProvider {
@@ -484,6 +554,7 @@ impl GlobalLeaderProvider {
         );
         leader.rejected = self.rejected.clone();
         leader.body_availability = self.body_availability.clone();
+        leader.proof_settlement = self.proof_settlement.clone();
         Ok(leader)
     }
 
@@ -514,6 +585,7 @@ impl GlobalLeaderProvider {
             rejected: Default::default(),
             hypergraph,
             body_availability: None,
+            proof_settlement: None,
         }
     }
 
@@ -524,6 +596,17 @@ impl GlobalLeaderProvider {
     /// `None` proposes every verified proof.
     pub fn with_body_availability(mut self, available: Option<ShardBodyAvailability>) -> Self {
         self.body_availability = available;
+        self
+    }
+
+    /// Hold a shard's header back while `settlement` reports archives still
+    /// verifying the expensive confidential operations it would sequence:
+    /// each archive verifies them before it executes the GLOBAL frame
+    /// carrying the header, and GLOBAL waits for the third of four. A header
+    /// with bodies held but not reported settled stays in the mempool, within
+    /// the spend relay window. `None` never holds.
+    pub fn with_proof_settlement(mut self, settlement: Option<ShardProofSettlement>) -> Self {
+        self.proof_settlement = settlement;
         self
     }
 
@@ -1261,10 +1344,11 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     match outcome {
                         Ok(()) => valid.push(raw),
                         Err(e) => {
+                            let error = e.to_string();
+                            crate::storage_proof_refusal::note(frame_number, &raw, &error);
                             // Normalize the reason (digit runs → '#') so per-epoch /
                             // per-frame variants group into one bucket.
-                            let reason: String = e
-                                .to_string()
+                            let reason: String = error
                                 .chars()
                                 .map(|c| if c.is_ascii_digit() { '#' } else { c })
                                 .take(90)
@@ -1365,9 +1449,18 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     let kept = std::mem::take(&mut tips.kept);
                     let offered = kept.len();
                     let budget = proposal_app_frame_budget();
-                    let selection = hold_back_unavailable_shard_proofs(kept, &**available, budget);
+                    let settlement =
+                        self.proof_settlement
+                            .as_ref()
+                            .map(|settling| SettlementCheck {
+                                frame_number,
+                                settling: &**settling,
+                            });
+                    let selection =
+                        hold_back_unavailable_shard_proofs(kept, &**available, settlement, budget);
                     tips.kept = selection.ready;
-                    let held_back = offered - tips.kept.len() - selection.deferred;
+                    let held_back =
+                        offered - tips.kept.len() - selection.deferred - selection.settling;
                     let first = selection.missing.first();
                     // Counted into one summary line per interval
                     // ([`crate::inclusion_summary`]), not logged per proposal.
@@ -1398,6 +1491,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         deferred = selection.deferred,
                         deferred_app_frames = selection.deferred_frames,
                         largest_deferred_gap = selection.largest_deferred,
+                        settling = selection.settling,
                         budget,
                         "shard tips selected for this GLOBAL proposal: those whose application frame bodies this \
                          archive holds, smallest gap first within the application frame budget, and the furthest \
@@ -2492,6 +2586,7 @@ mod tests {
             address: vec![addr; 32],
             frame_number,
             empty: false,
+            anchor: 99,
         };
         // Shard 0x22's frame 9 body was never released.
         let available = |needs: &[ShardBodyNeed]| -> Vec<Option<u64>> {
@@ -2514,7 +2609,7 @@ mod tests {
         assert_eq!(superseded.len(), 1);
         let ShardProofSelection {
             mut ready, missing, ..
-        } = hold_back_unavailable_shard_proofs(kept, &available, u64::MAX);
+        } = hold_back_unavailable_shard_proofs(kept, &available, None, u64::MAX);
         ready.sort();
         let mut want = vec![held, junk];
         want.sort();
@@ -2539,7 +2634,7 @@ mod tests {
         // Nothing held: every proof with a shard header stays back.
         let none_held = |needs: &[ShardBodyNeed]| vec![None; needs.len()];
         let ShardProofSelection { ready, missing, .. } =
-            hold_back_unavailable_shard_proofs(vec![withheld], &none_held, u64::MAX);
+            hold_back_unavailable_shard_proofs(vec![withheld], &none_held, None, u64::MAX);
         assert!(ready.is_empty());
         assert_eq!(missing, vec![need(0x22, 9)]);
     }
@@ -2567,7 +2662,7 @@ mod tests {
         // Budget 100: 10 + 20 + 30 = 60 fit, 200 does not; of 200, 480 and
         // 640, the furthest behind rides and the others wait. 0x05 is held
         // back for its body.
-        let selection = hold_back_unavailable_shard_proofs(with_junk, &available, 100);
+        let selection = hold_back_unavailable_shard_proofs(with_junk, &available, None, 100);
         assert_eq!(
             selection.ready,
             vec![
@@ -2614,6 +2709,7 @@ mod tests {
                 address: vec![0x05; 32],
                 frame_number: 7,
                 empty: false,
+                anchor: 99,
             }]
         );
 
@@ -2621,16 +2717,216 @@ mod tests {
         let selection = hold_back_unavailable_shard_proofs(
             vec![proofs[5].clone(), proofs[0].clone()],
             &available,
+            None,
             100,
         );
         assert_eq!(selection.ready, vec![proofs[5].clone()]);
         assert_eq!((selection.deferred, selection.largest_deferred), (1, 480));
 
         // Within the budget everything rides and nothing is deferred.
-        let selection = hold_back_unavailable_shard_proofs(proofs.clone(), &available, u64::MAX);
+        let selection =
+            hold_back_unavailable_shard_proofs(proofs.clone(), &available, None, u64::MAX);
         assert_eq!(selection.ready.len(), proofs.len() - 1);
         assert_eq!(selection.deferred, 0);
         assert_eq!(selection.furthest, None);
+    }
+
+    /// A shard whose frames still settle stays in the mempool, is not
+    /// counted as a missing body and takes no budget; once it settles it
+    /// rides. Without a settlement every held proof rides.
+    #[test]
+    fn a_shard_tip_waits_in_the_mempool_while_its_expensive_proofs_settle() {
+        // Shard `addr` is `addr` frames behind.
+        let available = |needs: &[ShardBodyNeed]| -> Vec<Option<u64>> {
+            needs.iter().map(|n| Some(n.address[0] as u64)).collect()
+        };
+        let proofs: Vec<Vec<u8>> = [0x02u8, 0x03, 0x04]
+            .iter()
+            .map(|&a| make_shard_frame(a, 7))
+            .collect();
+        let asked = std::sync::Mutex::new(Vec::new());
+        let settled = std::sync::atomic::AtomicBool::new(false);
+        let settling = |address: &[u8], cursor: u64, through: u64| {
+            asked.lock().unwrap().push((address[0], cursor, through));
+            address[0] == 0x03 && !settled.load(std::sync::atomic::Ordering::SeqCst)
+        };
+        let settlement = Some(SettlementCheck {
+            frame_number: 100,
+            settling: &settling,
+        });
+        // Budget 6: 0x02 and 0x04 fit; 0x03 would not, but it settles and
+        // takes none of it.
+        let selection =
+            hold_back_unavailable_shard_proofs(proofs.clone(), &available, settlement, 6);
+        assert_eq!(selection.ready, vec![proofs[0].clone(), proofs[2].clone()]);
+        assert_eq!(
+            (selection.settling, selection.deferred, selection.frames),
+            (1, 0, 6)
+        );
+        assert!(
+            selection.missing.is_empty(),
+            "settling is not a missing body"
+        );
+        assert!(selection
+            .shards
+            .iter()
+            .all(|shard| shard.address[0] != 0x03));
+        assert!(
+            asked.lock().unwrap().contains(&(0x03, 7 - 3, 7)),
+            "asked with the shard's cursor and the header's frame"
+        );
+        settled.store(true, std::sync::atomic::Ordering::SeqCst);
+        let selection =
+            hold_back_unavailable_shard_proofs(proofs.clone(), &available, settlement, 9);
+        assert_eq!(selection.ready, proofs, "once settled it rides");
+        assert_eq!(selection.settling, 0);
+        settled.store(false, std::sync::atomic::Ordering::SeqCst);
+        let selection = hold_back_unavailable_shard_proofs(proofs.clone(), &available, None, 9);
+        assert_eq!(selection.ready, proofs);
+    }
+
+    /// A shard proof carrying one header of shard `address`.
+    fn shard_proof(address: u8, frame: u64, anchor: u64) -> Vec<u8> {
+        use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let header = FrameHeader {
+            address: vec![address; 32],
+            frame_number: frame,
+            global_frame_number: anchor,
+            ..Default::default()
+        };
+        CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest {
+                inner_type_prefix: TYPE_FRAME_HEADER,
+                inner_bytes: header.to_canonical_bytes().unwrap(),
+            })],
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// A shard that keeps producing while its expensive proofs never verify
+    /// here: a new header every GLOBAL frame (the mempool keeps only the
+    /// highest), the real prewarm's ledger deciding. Every source frame stays
+    /// in the relay window of a carried header, so its spends commit, and the
+    /// shard both waits and rides again and again. Vulnerable outcome: the
+    /// hold outlasts the window and frames leave it uncovered.
+    #[test]
+    fn a_settlement_hold_keeps_every_frame_in_a_carried_headers_relay_window() {
+        use crate::archive_preverify::{OperationCost, ProofPrewarm};
+        use quil_execution::manager::{PreverifyCounts, PreverifyPacing};
+        use quil_execution::token_intrinsic::spend_relay::{relay_window, RELAY_WINDOW_FRAMES};
+        use quil_types::proto::global::MessageBundle;
+        type Pairs = [(Vec<u8>, Vec<u8>)];
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let verifier_gate = gate.clone();
+        let prewarm = ProofPrewarm::new(Arc::new(move |_: &Pairs, _: &PreverifyPacing<'_>| {
+            let (open, opened) = &*verifier_gate;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = opened.wait(open).unwrap();
+            }
+            PreverifyCounts::default()
+        }))
+        .with_classifier(Arc::new(|pairs: &Pairs| OperationCost {
+            operations: pairs.len(),
+            expensive: pairs.len(),
+        }));
+        let ledger = prewarm.settlement();
+        let settling = |address: &[u8], cursor: u64, through: u64| {
+            ledger.check(address, cursor, through).holds()
+        };
+        let address = vec![0x42u8; 32];
+        let (first, mut carried, mut held) = (100u64, vec![100u64], 0);
+        let mut covered: std::collections::BTreeSet<u64> = Default::default();
+        for step in 1..=300u64 {
+            let frame = first + step;
+            let global = 1000 + step;
+            prewarm.offer(
+                &address,
+                frame,
+                &[MessageBundle {
+                    requests: Vec::new(),
+                    timestamp: frame as i64,
+                }],
+            );
+            let cursor = *carried.last().unwrap();
+            let available = |needs: &[ShardBodyNeed]| -> Vec<Option<u64>> {
+                needs
+                    .iter()
+                    .map(|need| Some(need.frame_number.saturating_sub(cursor)))
+                    .collect()
+            };
+            let selection = hold_back_unavailable_shard_proofs(
+                vec![shard_proof(0x42, frame, global - 1)],
+                &available,
+                Some(SettlementCheck {
+                    frame_number: global,
+                    settling: &settling,
+                }),
+                u64::MAX,
+            );
+            held += selection.settling;
+            if !selection.ready.is_empty() {
+                carried.push(frame);
+                covered.extend(relay_window(frame));
+            }
+        }
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        assert!(held > 0, "the shard was held at all");
+        assert!(carried.len() > 20, "it kept riding: {carried:?}");
+        for pair in carried.windows(2) {
+            assert!(
+                pair[1] - pair[0] <= RELAY_WINDOW_FRAMES,
+                "a header {} frames above the one before: a hold outlasted the relay window",
+                pair[1] - pair[0]
+            );
+        }
+        for frame in first..*carried.last().unwrap() {
+            assert!(
+                covered.contains(&frame),
+                "frame {frame} left every carried header's relay window: its spends never commit"
+            );
+        }
+    }
+
+    /// A shard that stopped producing offers no newer header: a held one
+    /// rides before its anchor leaves the window. A header without an anchor
+    /// is left to the wall-clock limit.
+    #[test]
+    fn a_held_tip_rides_before_its_anchor_leaves_the_window() {
+        use quil_execution::global_intrinsic::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW;
+        let available = |needs: &[ShardBodyNeed]| vec![Some(1); needs.len()];
+        let always = |_: &[u8], _: u64, _: u64| true;
+        let rides = |anchor: u64, frame_number: u64| {
+            !hold_back_unavailable_shard_proofs(
+                vec![shard_proof(0x42, 7, anchor)],
+                &available,
+                Some(SettlementCheck {
+                    frame_number,
+                    settling: &always,
+                }),
+                u64::MAX,
+            )
+            .ready
+            .is_empty()
+        };
+        let anchor = 1000;
+        // `frame - 1 - anchor` is the anchor's age; the window admits up to W.
+        let last_held = anchor + STORAGE_ANCHOR_LOCKSTEP_WINDOW - SETTLE_ANCHOR_MARGIN;
+        assert!(!rides(anchor, anchor + 1), "a fresh header is held");
+        assert!(!rides(anchor, last_held), "still inside the margin");
+        assert!(rides(anchor, last_held + 1), "the margin reached");
+        assert!(
+            crate::message_collector::anchor_in_lockstep(
+                anchor,
+                last_held + 1 + SETTLE_ANCHOR_MARGIN
+            ),
+            "the proposals of the margin can still carry it"
+        );
+        assert!(!rides(0, anchor + 1_000), "no anchor, no margin");
     }
 
     /// What [`drive_budget`] saw.
@@ -2689,7 +2985,7 @@ mod tests {
                     .map(|need| Some(now[need.address[0] as usize - 1]))
                     .collect()
             };
-            let selection = hold_back_unavailable_shard_proofs(offered, &available, budget);
+            let selection = hold_back_unavailable_shard_proofs(offered, &available, None, budget);
             if proposal >= settle {
                 run.most_behind = run
                     .most_behind

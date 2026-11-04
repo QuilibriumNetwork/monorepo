@@ -3,7 +3,7 @@
 # Install script for Quilibrium client
 
 # This is intended to be run via url:
-# curl -sSL https://raw.githubusercontent.com/QuilibriumNetwork/ceremonyclient/refs/heads/develop/install-qclient.sh | sudo bash
+# curl -sSL https://raw.githubusercontent.com/QuilibriumNetwork/monorepo/refs/heads/v2.1.0.25/install-qclient.sh | sudo bash
 #
 # The release is verified before anything is installed: the binary must
 # match its SHA3-256 digest file, a quorum of the release signatories (the

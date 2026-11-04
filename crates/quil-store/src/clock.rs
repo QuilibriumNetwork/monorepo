@@ -165,6 +165,92 @@ struct GlobalFrameMemory {
     // generations prevent a fill racing a commit/reset from caching old data.
     loads: [Mutex<()>; 32],
     writes: Mutex<()>,
+    writer_hold: Mutex<WriterHoldLog>,
+}
+
+/// A hold of the GLOBAL frame writer lock this long is reported, as it stalls
+/// every other GLOBAL frame store: past a worker thread's 6 s budget, with a
+/// margin below it.
+const LONG_WRITER_HOLD: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often long writer holds are reported, as one line.
+const WRITER_HOLD_REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Who holds the GLOBAL frame writer lock, and the long holds since the last
+/// report, per holder: its count, total and longest.
+#[derive(Default)]
+struct WriterHoldLog {
+    current: Option<(&'static str, std::time::Instant)>,
+    long: BTreeMap<&'static str, (u64, std::time::Duration, std::time::Duration)>,
+    reported: Option<std::time::Instant>,
+}
+
+impl WriterHoldLog {
+    /// `holder` released the lock after `held`, at `now`. The report due
+    /// now, if one is: the first long hold at once, then at most every
+    /// [`WRITER_HOLD_REPORT_EVERY`].
+    fn released(
+        &mut self,
+        holder: &'static str,
+        held: std::time::Duration,
+        now: std::time::Instant,
+    ) -> Option<String> {
+        self.current = None;
+        if held >= LONG_WRITER_HOLD {
+            let entry = self.long.entry(holder).or_default();
+            entry.0 += 1;
+            entry.1 += held;
+            entry.2 = entry.2.max(held);
+        }
+        if self.long.is_empty()
+            || self.reported.is_some_and(|reported| {
+                now.saturating_duration_since(reported) < WRITER_HOLD_REPORT_EVERY
+            })
+        {
+            return None;
+        }
+        self.reported = Some(now);
+        Some(
+            std::mem::take(&mut self.long)
+                .into_iter()
+                .map(|(name, (count, total, longest))| {
+                    format!(
+                        "{name}: {count} holds, {}s in all, longest {}s",
+                        total.as_secs(),
+                        longest.as_secs()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    }
+}
+
+/// The GLOBAL frame writer lock, held by a named writer.
+struct WriterHold<'a> {
+    memory: &'a GlobalFrameMemory,
+    holder: &'static str,
+    since: std::time::Instant,
+    _writes: MutexGuard<'a, ()>,
+}
+
+impl Drop for WriterHold<'_> {
+    fn drop(&mut self) {
+        let now = std::time::Instant::now();
+        let held = now.saturating_duration_since(self.since);
+        let report = self
+            .memory
+            .writer_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .released(self.holder, held, now);
+        if let Some(holders) = report {
+            tracing::warn!(holders = %holders, bound_secs = LONG_WRITER_HOLD.as_secs(),
+                scope = "this node",
+                action = "every other GLOBAL frame store waits while one of these holds the lock: compare the 'store latency' line's fsync_probe_ms and max_write_ms; slow there is this node's disk, fast there means the named holder's own work: report this line",
+                "GLOBAL frame writer lock held for seconds");
+        }
+    }
 }
 
 // Each lock is tried first: only a contended wait is marked, so that a
@@ -186,12 +272,44 @@ impl GlobalFrameMemory {
         self.cache.write().unwrap()
     }
 
-    fn lock_writes(&self) -> MutexGuard<'_, ()> {
-        if let Ok(writes) = self.writes.try_lock() {
-            return writes;
+    /// Take the writer lock as `holder`, the name reports give it. A wait
+    /// names who holds it now in what a blocked master task reports.
+    fn lock_writes(&self, holder: &'static str) -> WriterHold<'_> {
+        let writes = match self.writes.try_lock() {
+            Ok(writes) => writes,
+            Err(_) => {
+                let _wait = thread_probe::section(Section::ClockWriterWait);
+                let _holder = self
+                    .writer_hold
+                    .lock()
+                    .unwrap()
+                    .current
+                    .map(|(name, since)| {
+                        thread_probe::detail(format_args!(
+                            "held by {name} since {}s ago",
+                            since.elapsed().as_secs()
+                        ))
+                    });
+                self.writes.lock().unwrap()
+            }
+        };
+        self.hold_writes(writes, holder)
+    }
+
+    /// Record `holder` as holding the writer lock from now.
+    fn hold_writes<'a>(
+        &'a self,
+        writes: MutexGuard<'a, ()>,
+        holder: &'static str,
+    ) -> WriterHold<'a> {
+        let since = std::time::Instant::now();
+        self.writer_hold.lock().unwrap().current = Some((holder, since));
+        WriterHold {
+            memory: self,
+            holder,
+            since,
+            _writes: writes,
         }
-        let _wait = thread_probe::section(Section::ClockWriterWait);
-        self.writes.lock().unwrap()
     }
 
     fn lock_load(&self, frame_number: u64) -> MutexGuard<'_, ()> {
@@ -211,7 +329,7 @@ pub struct RocksClockStore {
 }
 
 struct ClockPublication<'a> {
-    _writes: std::sync::MutexGuard<'a, ()>,
+    _writes: WriterHold<'a>,
     cache: std::sync::RwLockWriteGuard<'a, GlobalFrameCache>,
 }
 
@@ -517,7 +635,7 @@ impl RocksClockStore {
             return Ok(());
         }
 
-        let _writes = self.global_memory.lock_writes();
+        let _writes = self.global_memory.lock_writes("GLOBAL frame store");
         // No caller txn: use a local batch so 2+N+2 writes are atomic.
         let mut batch = rocksdb::WriteBatch::default();
         batch.put(&header_key, &header_bytes);
@@ -557,7 +675,7 @@ impl RocksClockStore {
 
     /// Delete global frames in a range.
     pub fn delete_global_frame_range(&self, min_frame: u64, max_frame: u64) -> Result<()> {
-        let _writes = self.global_memory.lock_writes();
+        let _writes = self.global_memory.lock_writes("GLOBAL frame range delete");
         let mut batch = rocksdb::WriteBatch::default();
 
         let start = encoding::clock_global_frame_key(min_frame);
@@ -786,6 +904,69 @@ impl RocksClockStore {
 #[path = "clock_retention.rs"]
 mod retention;
 pub use retention::{CandidatePrune, StagedFrameCleanup};
+
+#[cfg(test)]
+mod writer_hold_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A long hold is reported at once by name; further ones gather until
+    /// the next report, per holder; a short one is never named.
+    #[test]
+    fn long_writer_holds_are_named_and_bounded() {
+        let mut log = WriterHoldLog::default();
+        let start = Instant::now();
+        assert_eq!(log.released("short", Duration::from_secs(1), start), None);
+        let first = log
+            .released("publication", Duration::from_secs(991), start)
+            .expect("the first long hold is reported");
+        assert_eq!(first, "publication: 1 holds, 991s in all, longest 991s");
+        let later = start + Duration::from_secs(60);
+        assert_eq!(log.released("store", Duration::from_secs(7), later), None);
+        assert_eq!(log.released("store", Duration::from_secs(9), later), None);
+        assert_eq!(log.released("short", Duration::from_secs(1), later), None);
+        let due = start + WRITER_HOLD_REPORT_EVERY;
+        assert_eq!(
+            log.released("short", Duration::from_secs(1), due)
+                .as_deref(),
+            Some("store: 2 holds, 16s in all, longest 9s")
+        );
+    }
+
+    /// While a writer holds the lock the log names it; it is gone after.
+    #[test]
+    fn the_writer_lock_knows_its_holder() {
+        let memory = GlobalFrameMemory::default();
+        let hold = memory.lock_writes("GLOBAL frame store");
+        let current = memory.writer_hold.lock().unwrap().current;
+        assert_eq!(current.map(|(name, _)| name), Some("GLOBAL frame store"));
+        drop(hold);
+        assert!(memory.writer_hold.lock().unwrap().current.is_none());
+    }
+
+    /// A master task waiting for the lock says who holds it.
+    #[test]
+    fn a_wait_for_the_writer_lock_names_its_holder() {
+        use quil_types::thread_probe::{install, ThreadProbe};
+        let memory = GlobalFrameMemory::default();
+        let probe = ThreadProbe::new();
+        let hold = memory.lock_writes("execution publication");
+        std::thread::scope(|scope| {
+            let waiter = probe.clone();
+            let memory = &memory;
+            scope.spawn(move || {
+                let _installed = install(waiter);
+                drop(memory.lock_writes("GLOBAL frame store"));
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !probe.detail().contains("execution publication") {
+                assert!(Instant::now() < deadline, "the wait never named its holder");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            drop(hold);
+        });
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1887,7 +2068,7 @@ impl store::Transaction for RocksClockTxn {
         Ok(())
     }
     fn commit(self: Box<Self>) -> Result<()> {
-        let _writes = self.global_memory.lock_writes();
+        let _writes = self.global_memory.lock_writes("clock transaction commit");
         let batch = self.batch.into_inner().unwrap();
         self.db
             .write(batch)
@@ -1965,7 +2146,9 @@ impl store::ClockStore for RocksClockStore {
             QuilError::ExecutionUnavailable("clock publication cache is busy or poisoned".into())
         })?;
         Ok(Box::new(ClockPublication {
-            _writes: writes,
+            _writes: self
+                .global_memory
+                .hold_writes(writes, "execution publication"),
             cache,
         }))
     }
@@ -2373,7 +2556,7 @@ impl store::ClockStore for RocksClockStore {
     fn delete_global_clock_frame_range(&self, min_frame: u64, max_frame: u64) -> Result<()> {
         let lower = encoding::clock_global_frame_key(min_frame);
         let upper = encoding::clock_global_frame_key(max_frame);
-        let _writes = self.global_memory.lock_writes();
+        let _writes = self.global_memory.lock_writes("GLOBAL frame range delete");
         let mut batch = rocksdb::WriteBatch::default();
         batch.delete_range(&lower, &upper);
         self.db
@@ -2392,7 +2575,7 @@ impl store::ClockStore for RocksClockStore {
         let hi = encoding::clock_global_frame_key(20_000_000);
         let earliest = encoding::clock_global_earliest_index();
         let latest = encoding::clock_global_latest_index();
-        let _writes = self.global_memory.lock_writes();
+        let _writes = self.global_memory.lock_writes("GLOBAL frame reset");
         let mut batch = rocksdb::WriteBatch::default();
         batch.delete_range(&lo, &hi);
         batch.delete(&earliest);

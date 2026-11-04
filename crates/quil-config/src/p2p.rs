@@ -55,6 +55,14 @@ pub struct P2PConfig {
     pub listen_multiaddr: String,
     #[serde(default = "default_stream_listen")]
     pub stream_listen_multiaddr: String,
+    /// More addresses the p2p swarm of the master listens on, in the address
+    /// family `listenMultiaddr` does not name, each bound as written, e.g.
+    /// `/ip6/::/udp/8336/quic-v1` beside `/ip4/0.0.0.0/udp/8336/quic-v1`. The
+    /// swarm's IPv6 sockets take IPv6 only, so a dual-stack host names both
+    /// families. PeerInfo and AutoNAT stay on the family of `listenMultiaddr`;
+    /// peers learn these addresses from identify.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_listen_multiaddrs: Vec<String>,
     #[serde(default)]
     pub announce_listen_multiaddr: String,
     #[serde(default)]

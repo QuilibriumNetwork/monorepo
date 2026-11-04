@@ -15,6 +15,7 @@ use super::model::{
 use super::msg::Msg;
 use super::settings;
 use super::shield;
+use super::transfer;
 
 const MAX_AWAIT_RETRIES: u32 = 3;
 
@@ -36,6 +37,13 @@ pub enum Cmd {
     MintRun(super::mint::Preview),
     /// End the running shield before its next submission.
     ShieldStop,
+    /// Read this wallet's shielded coins and the pending transfers it can
+    /// act on.
+    FetchShielded,
+    /// Check and quote a transfer action for its confirmation.
+    TransferPrepare(super::transfer::Kind),
+    /// Run the confirmed transfer action.
+    TransferRun(super::transfer::Preview),
     Join(Vec<Vec<u8>>),
     Lifecycle {
         action: String,
@@ -57,8 +65,25 @@ pub enum Cmd {
 
 // ── Message application ──────────────────────────────────────────────────
 
+/// The notice while a leave, pause or resume waits to sign: what it waits for
+/// and why. The next action message replaces it.
+fn signing_wait_text(action: &str, frames_left: u64) -> String {
+    format!(
+        "{action} waits for the next epoch to sign: this one ends in {frames_left} frames, and \
+         an operation landing after it is refused."
+    )
+}
+
 pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
     match msg {
+        Msg::SigningWait {
+            action,
+            frames_left,
+        } => {
+            m.status_msg = signing_wait_text(&action, frames_left);
+            m.status_is_error = false;
+            vec![]
+        }
         Msg::LegacyRefresh {
             answer,
             took,
@@ -79,6 +104,18 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
         }
         Msg::Mint(progress) => {
             mint::apply_progress(m, progress);
+            vec![]
+        }
+        Msg::Shielded(read) => {
+            transfer::apply_read(m, read);
+            vec![]
+        }
+        Msg::TransferPreview(preview) => {
+            transfer::apply_preview(m, preview);
+            vec![]
+        }
+        Msg::Transfer(progress) => {
+            transfer::apply_progress(m, progress);
             vec![]
         }
         Msg::ShieldPreview(preview) => {
@@ -453,12 +490,12 @@ fn finish_confirmed(m: &mut Model, frame: u64) -> Vec<Cmd> {
         m.status_is_error = false;
     } else if confirmed == 0 {
         m.status_msg = format!(
-            "{action} broadcast at frame {send_frame} but {unchanged}/{total} filter(s) did not change (e.g. {first_unchanged})"
+            "{action} broadcast at frame {send_frame} but {unchanged}/{total} filter(s) did not change yet (e.g. {first_unchanged}); this node's registry may show it only by the next epoch boundary"
         );
         m.status_is_error = true;
     } else {
         m.status_msg = format!(
-            "{action} partial: {confirmed}/{total} confirmed, {unchanged} unchanged (e.g. {first_unchanged})"
+            "{action} partial: {confirmed}/{total} confirmed, {unchanged} unchanged yet (e.g. {first_unchanged}); this node's registry may show them only by the next epoch boundary"
         );
         m.status_is_error = confirmed == 0;
     }
@@ -537,6 +574,32 @@ fn is_quit(ev: &KeyEvent) -> bool {
         || (ev.code == KeyCode::Char('c') && ev.modifiers.contains(KeyModifiers::CONTROL))
 }
 
+/// A terminal's bracketed paste, delivered whole: text for the input in focus
+/// (a transfer form's field, a filter being edited), as if typed. Anywhere
+/// else it is ignored, so pasted text cannot fire a key or answer a prompt.
+/// Keys read one by one would leave a long paste's tail unread in the
+/// terminal until further keys arrive. A paste never presses Enter or Tab:
+/// its newlines and control characters are dropped.
+pub fn handle_paste(m: &mut Model, text: &str) {
+    if m.coins.shield.stop_pending
+        || m.coins.shield.quit_pending
+        || m.column_picker_active
+        || m.operation_confirmation.is_some()
+    {
+        return;
+    }
+    if m.tab == Tab::Coins {
+        transfer::form_paste(m, text);
+    } else if !m.join_picker_active
+        && !m.show_help
+        && m.filter_edit_active
+        && m.active_filter_col_kind(m.filter_edit_col_idx) != FilterColKind::Select
+    {
+        m.filter_edit_input
+            .extend(text.chars().filter(|c| !c.is_control()));
+    }
+}
+
 pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     if ev.kind != KeyEventKind::Press {
         return vec![];
@@ -579,6 +642,16 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         }
         if matches!(m.coins.mint.dialog, Some(mint::Dialog::Confirm(_))) {
             return mint::dialog_key(m, ev);
+        }
+        // A form takes every key as text but Ctrl+C, which quits.
+        if matches!(m.coins.transfer.dialog, Some(transfer::Dialog::Form(_))) {
+            if ev.code == KeyCode::Char('c') && ev.modifiers.contains(KeyModifiers::CONTROL) {
+                return vec![Cmd::Quit];
+            }
+            return transfer::form_key(m, ev);
+        }
+        if matches!(m.coins.transfer.dialog, Some(transfer::Dialog::Confirm(_))) {
+            return transfer::dialog_key(m, ev);
         }
         if m.show_help {
             return handle_help_key(m, ev);
@@ -757,7 +830,7 @@ fn worker_action_refusal(m: &Model, command: char) -> Option<String> {
     } else if m.selected_alloc_rows().is_empty() {
         "no allocation selected.".to_string()
     } else if matches!(command, 'l' | 'y' | 'r')
-        && m.selected_alloc_rows().iter().any(|r| !r.manually_managed)
+        && m.selected_alloc_rows().iter().any(|r| r.auto_worker())
     {
         "join/leave/confirm/reject require manual mode; AUTO allows pause/resume and mode \
          changes."
@@ -1131,7 +1204,7 @@ fn operation_targets(m: &Model, command: char) -> Vec<(String, u32, i64, bool)> 
 }
 
 fn manual_actions_allowed(m: &mut Model) -> bool {
-    if m.focus.is_alloc() && m.selected_alloc_rows().iter().any(|r| !r.manually_managed) {
+    if m.focus.is_alloc() && m.selected_alloc_rows().iter().any(|r| r.auto_worker()) {
         m.status_msg = "Join/leave/confirm/reject require manual mode; AUTO allows pause/resume and mode changes.".into();
         m.status_is_error = true;
         m.status_sticky = true;
@@ -1901,6 +1974,58 @@ mod tests {
     use super::*;
     use quil_types::proto::node::{NodeInfoResponse, ShardAllocationInfo};
 
+    /// The wait to sign shows while the action is in flight, as a notice and
+    /// not an error, and a refresh does not clear it.
+    #[test]
+    fn the_manager_says_why_a_leave_waits_to_sign() {
+        let mut m = Model::new();
+        m.action_in_flight = true;
+        let cmds = apply_msg(
+            &mut m,
+            Msg::SigningWait {
+                action: "Leave".into(),
+                frames_left: 7,
+            },
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(
+            m.status_msg,
+            "Leave waits for the next epoch to sign: this one ends in 7 frames, and an operation \
+             landing after it is refused."
+        );
+        assert!(!m.status_is_error);
+        apply_msg(
+            &mut m,
+            Msg::DataRefresh {
+                node_info: None,
+                shard_info: None,
+                worker_info: None,
+                err: None,
+            },
+        );
+        assert!(m.status_msg.starts_with("Leave waits"), "{}", m.status_msg);
+    }
+
+    /// A seat with no worker has no mode, so the operator's actions reach it;
+    /// a seat on an auto worker stays refused.
+    #[test]
+    fn actions_on_a_seat_with_no_worker_are_not_refused_as_auto() {
+        for (status, command, action) in [(2, 'l', "Leave"), (4, 'r', "Reject")] {
+            let mut m = operational_model(status);
+            m.allocations[0].manually_managed = false;
+            assert_eq!(m.allocations[0].worker_id, -1);
+            assert!(!m.allocations[0].auto_worker());
+            assert!(manual_actions_allowed(&mut m), "{action}");
+            assert!(!m.status_msg.contains("manual mode"), "{}", m.status_msg);
+
+            m.allocations[0].worker_id = 1;
+            assert!(m.allocations[0].auto_worker());
+            assert!(!manual_actions_allowed(&mut m), "{action}");
+            assert!(m.status_msg.contains("manual mode"), "{}", m.status_msg);
+            assert!(dispatch_operation(&mut m, command).is_empty(), "{action}");
+        }
+    }
+
     fn operational_model(status: u32) -> Model {
         let mut m = Model::new();
         m.process_refresh_data(
@@ -2249,6 +2374,7 @@ mod tests {
         let mut auto = m.allocations[0].clone();
         auto.filter_key = "auto".into();
         auto.manually_managed = false;
+        auto.worker_id = 1;
         m.allocations.push(auto);
         m.alloc_selected
             .extend([m.allocations[0].filter_key.clone(), "auto".into()]);
@@ -2261,6 +2387,7 @@ mod tests {
         let key = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
         let mut m = operational_model(2);
         m.allocations[0].manually_managed = false;
+        m.allocations[0].worker_id = 1;
         assert_eq!(
             m.applicable_alloc_actions(),
             ["Pause".to_string()].into_iter().collect()
@@ -2274,6 +2401,7 @@ mod tests {
         assert!(!m.allocations[0].manually_managed);
         let mut m = operational_model(3);
         m.allocations[0].manually_managed = false;
+        m.allocations[0].worker_id = 1;
         assert_eq!(
             m.applicable_alloc_actions(),
             ["Resume".to_string()].into_iter().collect()
@@ -2293,6 +2421,7 @@ mod tests {
         auto.filter_key = "auto".into();
         auto.filter = vec![2];
         auto.manually_managed = false;
+        auto.worker_id = 1;
         m.allocations.push(auto);
         m.alloc_selected
             .extend([m.allocations[0].filter_key.clone(), "auto".into()]);
@@ -2336,6 +2465,7 @@ mod tests {
         m.join_picker_active = true;
         m.join_picker_selected.insert(2);
         m.allocations[0].manually_managed = false;
+        m.allocations[0].worker_id = 1;
         assert!(
             handle_join_picker_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 .is_empty()
@@ -2956,5 +3086,55 @@ mod tests {
         handle_key(&mut m, key(KeyCode::Char(' ')));
         assert!(!m.header_kpi_visible("Notification level"));
         assert!(m.header_kpi_visible("Notification position"));
+    }
+
+    /// A paste lands in the filter being edited, as typed: spaces stay, line
+    /// breaks and control characters go, and it applies nothing.
+    #[test]
+    fn a_paste_lands_in_the_filter_being_edited() {
+        let mut m = operational_model(2);
+        m.filter_edit_active = true;
+        m.filter_edit_col_idx = 1;
+        handle_paste(&mut m, "ab\r\ncd e\t\x1b");
+        assert_eq!(m.filter_edit_input, "abcd e");
+        assert!(m.filter_edit_active);
+        assert!(m.active_filter_col(1).text.is_empty());
+    }
+
+    /// Outside an input a paste changes nothing: its letters fire no key and
+    /// answer no prompt, on either tab.
+    #[test]
+    fn a_paste_outside_an_input_changes_nothing() {
+        let text = "qsfJhy TPESMCj";
+        let mut m = operational_model(2);
+        m.status_msg.clear();
+        let cursor = m.alloc_cursor;
+        handle_paste(&mut m, text);
+        assert!(!m.sort_mode && !m.alloc_filter_mode && !m.avail_filter_mode);
+        assert!(!m.show_help && !m.join_picker_active);
+        assert!(m.filter_edit_input.is_empty() && m.status_msg.is_empty());
+        assert_eq!(m.alloc_cursor, cursor);
+        // A filter column of fixed choices takes no text.
+        m.filter_edit_active = true;
+        m.filter_edit_col_idx = 9;
+        handle_paste(&mut m, text);
+        assert!(m.filter_edit_input.is_empty() && m.filter_edit_select_state.is_empty());
+        m.filter_edit_active = false;
+        // A prompt keeps waiting for its own key.
+        m.operation_confirmation = Some(('y', Vec::new()));
+        handle_paste(&mut m, text);
+        assert!(m.operation_confirmation.is_some());
+        m.operation_confirmation = None;
+        coins::open(&mut m);
+        m.status_msg.clear();
+        m.coins.shield.stop_pending = true;
+        handle_paste(&mut m, text);
+        assert!(m.coins.shield.stop_pending);
+        m.coins.shield.stop_pending = false;
+        handle_paste(&mut m, text);
+        assert!(m.coins.transfer.dialog.is_none());
+        assert!(m.coins.shield.dialog.is_none() && m.coins.mint.dialog.is_none());
+        assert_eq!(m.tab, Tab::Coins);
+        assert!(m.status_msg.is_empty());
     }
 }

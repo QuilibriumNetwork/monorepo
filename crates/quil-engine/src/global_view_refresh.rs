@@ -16,7 +16,8 @@
 //! while a hash storage proof record this node waits for is not in its view:
 //! its shard's snapshot, which a renewal encodes, its own registration, which
 //! it seals, or a seal or settlement it sent (its proposals commit roots only
-//! once it sees its seal). Early
+//! once it sees its seal), and after this node's operator sends a prover
+//! operation, whose outcome the node and its operator read from this view. Early
 //! pulls are capped per epoch, with sub-caps for seals and successors; they
 //! start [`MIN_GAP`] after the previous pull ended, except once for each frame
 //! a waiting seal needs.
@@ -53,6 +54,11 @@ pub const SUCCESSOR_INTERVAL: Duration = Duration::from_secs(60);
 /// must reach; requests add up, and [`MIN_GAP`] spaces the pulls.
 pub const STORAGE_PER_EPOCH: u32 = 12;
 
+/// Of [`MAX_PER_EPOCH`], the pulls an operator's prover operations may use, so
+/// a script sending many cannot spend the pulls of the epoch's handoffs. Each
+/// is one more read from an archive.
+pub const OPERATOR_PER_EPOCH: u32 = 4;
+
 /// How often the sync task checks whether an early pull is due.
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -62,6 +68,28 @@ pub enum Reason {
     SealBeforeClosingRequest,
     SealedSessionAwaitsSuccessor,
     StorageRecordAwaited,
+    OperatorOpSent,
+}
+
+/// The frame this node's view must reach to show the outcome of an operator's
+/// prover operation sent at head `frame`, if `inner_type` is one: every node
+/// refuses one landing later than the freshness window. Read too late, a reject
+/// that landed still reads as a leave at the epoch boundary: the node releases
+/// the seat's worker, the seat misses its renewal and the node leaves it again.
+pub fn operator_op_view_frame(inner_type: u32, frame: u64) -> Option<u64> {
+    use quil_execution::global_intrinsic::prover_filter_ops::{
+        TYPE_PROVER_LEAVE, TYPE_PROVER_PAUSE, TYPE_PROVER_RESUME,
+    };
+    use quil_execution::global_intrinsic::prover_ops::{TYPE_PROVER_CONFIRM, TYPE_PROVER_REJECT};
+    matches!(
+        inner_type,
+        TYPE_PROVER_LEAVE
+            | TYPE_PROVER_PAUSE
+            | TYPE_PROVER_RESUME
+            | TYPE_PROVER_CONFIRM
+            | TYPE_PROVER_REJECT
+    )
+    .then(|| frame + quil_execution::global_intrinsic::verify::PROVER_OP_FRESHNESS_WINDOW + 1)
 }
 
 impl Reason {
@@ -73,6 +101,7 @@ impl Reason {
             Self::StorageRecordAwaited => {
                 "storage snapshot, seal or settlement not in the view yet"
             }
+            Self::OperatorOpSent => "an operator's prover operation sent",
         }
     }
 }
@@ -107,6 +136,7 @@ struct State {
     successor: Option<u64>,
     successor_asked: Option<Instant>,
     storage: Option<u64>,
+    operator: Option<u64>,
     /// The frame the pull in progress reaches.
     running: Option<u64>,
     last_end: Option<Instant>,
@@ -115,11 +145,12 @@ struct State {
     successor_used: u32,
     seal_used: u32,
     storage_used: u32,
+    operator_used: u32,
     /// The highest seal frame a pull already skipped the gap for.
     seal_skipped: Option<u64>,
     /// Spent budgets reported this epoch: all early pulls, the successors',
-    /// the seals', the storage records'.
-    reported: [bool; 4],
+    /// the seals', the storage records', the operator's.
+    reported: [bool; 5],
 }
 
 /// The sync task's early-pull state, shared with the sessions that ask.
@@ -184,6 +215,7 @@ impl ViewRefresh {
                 &mut state.successor
             }
             Reason::StorageRecordAwaited => &mut state.storage,
+            Reason::OperatorOpSent => &mut state.operator,
         };
         let wanted = slot.map_or(through, |frame| frame.max(through));
         *slot = Some(wanted);
@@ -199,6 +231,7 @@ impl ViewRefresh {
             .map_or(true, |end| now.saturating_duration_since(end) >= MIN_GAP);
         state.used < MAX_PER_EPOCH
             && (reason != Reason::StorageRecordAwaited || state.storage_used < STORAGE_PER_EPOCH)
+            && (reason != Reason::OperatorOpSent || state.operator_used < OPERATOR_PER_EPOCH)
             && (reason != Reason::SealBeforeClosingRequest
                 || (state.seal_used < SEAL_PER_EPOCH
                     && (gap_over || state.seal_skipped.map_or(true, |skipped| wanted > skipped))))
@@ -212,6 +245,7 @@ impl ViewRefresh {
             Reason::SealBeforeClosingRequest => state.seal,
             Reason::SealedSessionAwaitsSuccessor => state.successor,
             Reason::StorageRecordAwaited => state.storage,
+            Reason::OperatorOpSent => state.operator,
         }
     }
 
@@ -219,7 +253,12 @@ impl ViewRefresh {
     pub fn settle(&self, view: u64) {
         let mut guard = self.lock();
         let state = &mut *guard;
-        for slot in [&mut state.seal, &mut state.successor, &mut state.storage] {
+        for slot in [
+            &mut state.seal,
+            &mut state.successor,
+            &mut state.storage,
+            &mut state.operator,
+        ] {
             if slot.is_some_and(|through| through <= view) {
                 *slot = None;
             }
@@ -269,7 +308,8 @@ impl ViewRefresh {
             state.successor_used = 0;
             state.seal_used = 0;
             state.storage_used = 0;
-            state.reported = [false; 4];
+            state.operator_used = 0;
+            state.reported = [false; 5];
         }
         let boundary = epoch * length;
         let pending =
@@ -294,6 +334,11 @@ impl ViewRefresh {
                 reason: Reason::StorageRecordAwaited,
                 through,
             }
+        } else if let Some(through) = pending(state.operator) {
+            EarlyPull {
+                reason: Reason::OperatorOpSent,
+                through,
+            }
         } else {
             return Decision::Idle;
         };
@@ -314,6 +359,7 @@ impl ViewRefresh {
         let successor = wanted.reason == Reason::SealedSessionAwaitsSuccessor;
         let seal = wanted.reason == Reason::SealBeforeClosingRequest;
         let storage = wanted.reason == Reason::StorageRecordAwaited;
+        let operator = wanted.reason == Reason::OperatorOpSent;
         // A sub-budget that is spent drops its request, so it does not wait
         // ahead of the epoch's other handoffs.
         let spent = if state.used >= MAX_PER_EPOCH {
@@ -327,6 +373,9 @@ impl ViewRefresh {
         } else if storage && state.storage_used >= STORAGE_PER_EPOCH {
             state.storage = None;
             Some((3, STORAGE_PER_EPOCH))
+        } else if operator && state.operator_used >= OPERATOR_PER_EPOCH {
+            state.operator = None;
+            Some((4, OPERATOR_PER_EPOCH))
         } else {
             None
         };
@@ -345,6 +394,9 @@ impl ViewRefresh {
         }
         if storage {
             state.storage_used += 1;
+        }
+        if operator {
+            state.operator_used += 1;
         }
         if !gap_over {
             state.seal_skipped = seal_skip;
@@ -403,6 +455,81 @@ mod tests {
     /// frame asked for, [`MIN_GAP`] after the last pull and at most
     /// [`STORAGE_PER_EPOCH`] times an epoch; a view holding that frame drops
     /// the request.
+    /// An operator's prover operation brings the view past the last frame it
+    /// can land in, without waiting for the periodic pull; other messages ask
+    /// for nothing.
+    #[test]
+    fn an_operators_prover_op_names_the_frame_its_outcome_needs() {
+        use quil_execution::global_intrinsic::prover_filter_ops::{
+            TYPE_PROVER_LEAVE, TYPE_PROVER_PAUSE, TYPE_PROVER_RESUME,
+        };
+        use quil_execution::global_intrinsic::prover_ops::{
+            TYPE_PROVER_CONFIRM, TYPE_PROVER_REJECT, TYPE_PROVER_UPDATE,
+        };
+        for op in [
+            TYPE_PROVER_LEAVE,
+            TYPE_PROVER_PAUSE,
+            TYPE_PROVER_RESUME,
+            TYPE_PROVER_CONFIRM,
+            TYPE_PROVER_REJECT,
+        ] {
+            assert_eq!(operator_op_view_frame(op, 100), Some(111));
+        }
+        assert_eq!(operator_op_view_frame(TYPE_PROVER_UPDATE, 100), None);
+    }
+
+    /// The pull comes once the frame is bindable, within its own budget: a
+    /// budget spent drops the request and leaves the epoch's others untouched,
+    /// and the next epoch has its own.
+    #[test]
+    fn an_operators_prover_op_pulls_early_within_its_budget() {
+        const OP: Reason = Reason::OperatorOpSent;
+        let refresh = enabled();
+        let mut now = Instant::now();
+        let base = 922330;
+        assert!(refresh.request(OP, base + 11, now));
+        assert_eq!(
+            refresh.decide(Some(base), Some(base + 11), now),
+            Decision::Idle,
+            "not bindable yet"
+        );
+        assert_eq!(
+            refresh.decide(Some(base), Some(base + 12), now),
+            pull(OP, base + 11)
+        );
+        refresh.begin(base + 11);
+        refresh.end(now);
+        refresh.settle(base + 11);
+        assert_eq!(refresh.requested(OP), None, "the view reached it");
+        for pulls in 1..OPERATOR_PER_EPOCH {
+            now += MIN_GAP;
+            let through = base + 11 + u64::from(pulls);
+            refresh.request(OP, through, now);
+            assert_eq!(
+                refresh.decide(Some(through - 1), Some(through + 1), now),
+                pull(OP, through)
+            );
+            refresh.begin(through);
+            refresh.end(now);
+            refresh.settle(through);
+        }
+        now += MIN_GAP;
+        let through = base + 11 + u64::from(OPERATOR_PER_EPOCH);
+        assert!(!refresh.request(OP, through, now), "its budget is spent");
+        assert!(matches!(
+            refresh.decide(Some(through - 1), Some(through + 1), now),
+            Decision::Exhausted {
+                max: OPERATOR_PER_EPOCH,
+                ..
+            }
+        ));
+        assert_eq!(refresh.requested(OP), None, "the request is dropped");
+        assert!(
+            refresh.request(SUCCESSOR, through, now),
+            "the epoch's other pulls remain"
+        );
+    }
+
     #[test]
     fn an_awaited_storage_record_pulls_early_within_its_budget() {
         const SNAPSHOT: Reason = Reason::StorageRecordAwaited;

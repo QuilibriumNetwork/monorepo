@@ -105,8 +105,10 @@ const CONNECTION_IDLE: Duration = Duration::from_secs(60);
 const STALE_CONNECTION_FAILURE: Duration = Duration::from_secs(2);
 /// Endpoints with a kept connection; the least recently used goes first.
 const MAX_CONNECTIONS: usize = 16;
-/// A forwarded scan or listing taking longer than this ends with a warning.
-const SLOW_SCAN: Duration = Duration::from_secs(10);
+/// A forwarded page taking longer than this makes its scan or listing end with
+/// a warning. The scan's total says nothing: it grows with the wallet's coins,
+/// so a healthy scan of thousands takes minutes.
+const SLOW_PAGE: Duration = Duration::from_secs(10);
 /// A peer's decline is logged at info at most this often per endpoint.
 const DECLINE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// Distinct decline reasons named in a refusal, and each reason's length.
@@ -421,6 +423,7 @@ struct ScanStats {
     short_pages: u64,
     dials: u64,
     page_time: Duration,
+    slowest_page: Duration,
     failed_attempts: u64,
 }
 
@@ -434,6 +437,7 @@ impl ScanStats {
             short_pages: 0,
             dials: 0,
             page_time: Duration::ZERO,
+            slowest_page: Duration::ZERO,
             failed_attempts: 0,
         }
     }
@@ -447,6 +451,7 @@ impl ScanStats {
         }
         self.dials += page.dials;
         self.page_time += page.took;
+        self.slowest_page = self.slowest_page.max(page.took);
         self.failed_attempts += page.failed_attempts;
     }
 }
@@ -459,10 +464,10 @@ enum ScanAnomaly {
 }
 
 impl ScanStats {
-    fn anomaly(&self, elapsed: Duration) -> Option<ScanAnomaly> {
+    fn anomaly(&self) -> Option<ScanAnomaly> {
         if self.short_pages > 0 {
             Some(ScanAnomaly::ShortPages)
-        } else if elapsed > SLOW_SCAN {
+        } else if self.slowest_page > SLOW_PAGE {
             Some(ScanAnomaly::Slow)
         } else {
             None
@@ -471,7 +476,7 @@ impl ScanStats {
 }
 
 /// The one line a forwarded scan or listing logs at its end: info, or a warn
-/// when it was slow or its pages came back smaller than asked.
+/// when a page was slow or its pages came back smaller than asked.
 fn log_scan_end(
     what: &str,
     application: &[u8; 32],
@@ -483,6 +488,7 @@ fn log_scan_end(
     let pages = stats.pages.max(1);
     let mean_per_page = format!("{:.1}", stats.entries as f64 / pages as f64);
     let mean_page_ms = (stats.page_time.as_millis() / u128::from(pages)) as u64;
+    let slowest_page_ms = stats.slowest_page.as_millis() as u64;
     let elapsed_s = format!("{:.1}", elapsed.as_secs_f64());
     let application = hex::encode(application);
     let (pages, coins, asked_per_page, dials, failed_attempts) = (
@@ -492,21 +498,21 @@ fn log_scan_end(
         stats.dials,
         stats.failed_attempts,
     );
-    match stats.anomaly(elapsed) {
+    match stats.anomaly() {
         Some(ScanAnomaly::ShortPages) => tracing::warn!(
             %application, %endpoint, served_by, pages, coins, asked_per_page,
             %mean_per_page, short_pages = stats.short_pages, dials, failed_attempts,
-            mean_page_ms, %elapsed_s, scope = "peer",
+            mean_page_ms, slowest_page_ms, %elapsed_s, scope = "peer",
             "forwarded {what} got pages smaller than asked: the serving peer runs a build without full pages; nothing to fix on this node"
         ),
         Some(ScanAnomaly::Slow) => tracing::warn!(
             %application, %endpoint, served_by, pages, coins, asked_per_page,
-            %mean_per_page, dials, failed_attempts, mean_page_ms, %elapsed_s,
-            "forwarded {what} took over 10 s: a high mean_page_ms means a slow serving peer or path; dials or failed_attempts near pages means this node's connections to it keep failing; otherwise the wallet's own work between pages took the time"
+            %mean_per_page, dials, failed_attempts, mean_page_ms, slowest_page_ms, %elapsed_s,
+            "forwarded {what} had a page over 10 s: a high mean_page_ms means a slow serving peer or path, a low one a single slow page; dials or failed_attempts near pages means this node's connections to it keep failing"
         ),
         None => tracing::info!(
             %application, %endpoint, served_by, pages, coins, asked_per_page,
-            %mean_per_page, dials, failed_attempts, mean_page_ms, %elapsed_s,
+            %mean_per_page, dials, failed_attempts, mean_page_ms, slowest_page_ms, %elapsed_s,
             "forwarded {what} finished"
         ),
     }
@@ -1643,6 +1649,52 @@ mod tests {
         assert_eq!(dials.load(Ordering::SeqCst), 5);
     }
 
+    /// The stats of a scan whose full pages took these times.
+    fn stats_of_pages(pages: &[Duration]) -> ScanStats {
+        let reader = PeerCoinReader::new(
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO)),
+            vec![],
+            1,
+        );
+        let mut end = None;
+        for (index, took) in pages.iter().enumerate() {
+            end = reader.remember_scan(
+                ScanKind::Coins,
+                [1; 32],
+                [2; 32],
+                "peer".into(),
+                &PageCost {
+                    started: Instant::now(),
+                    entries: 64,
+                    asked: 64,
+                    has_more: index + 1 < pages.len(),
+                    dials: 0,
+                    took: *took,
+                    failed_attempts: 0,
+                },
+            );
+        }
+        end.expect("the last page ends the scan")
+    }
+
+    #[test]
+    fn a_long_scan_of_quick_pages_ends_without_a_warning() {
+        // A wallet of thousands of coins: minutes in total, under 3 s a page.
+        let stats = stats_of_pages(&[Duration::from_millis(2_700); 51]);
+        assert_eq!(stats.page_time, Duration::from_millis(137_700));
+        assert_eq!(stats.anomaly(), None);
+    }
+
+    #[test]
+    fn one_slow_page_warns_however_short_the_scan() {
+        let quick = Duration::from_millis(100);
+        assert_eq!(stats_of_pages(&[quick, SLOW_PAGE, quick]).anomaly(), None);
+        let stats = stats_of_pages(&[quick, SLOW_PAGE + Duration::from_secs(1), quick]);
+        assert_eq!(stats.slowest_page, Duration::from_secs(11));
+        assert_eq!(stats.anomaly(), Some(ScanAnomaly::Slow));
+    }
+
     #[test]
     fn a_scan_end_reports_its_cost_and_short_pages() {
         let reader = PeerCoinReader::new(
@@ -1685,7 +1737,7 @@ mod tests {
         );
         assert_eq!(stats.page_time, Duration::from_millis(20));
         assert_eq!(stats.failed_attempts, 2);
-        assert_eq!(stats.anomaly(Duration::ZERO), Some(ScanAnomaly::ShortPages));
+        assert_eq!(stats.anomaly(), Some(ScanAnomaly::ShortPages));
         let id = [3; 32];
         reader.remember_scan(
             ScanKind::Coins,
@@ -1703,11 +1755,7 @@ mod tests {
                 &cost(5, false, 0),
             )
             .unwrap();
-        assert_eq!(stats.anomaly(Duration::from_secs(1)), None);
-        assert_eq!(
-            stats.anomaly(Duration::from_secs(11)),
-            Some(ScanAnomaly::Slow)
-        );
+        assert_eq!(stats.anomaly(), None);
         // A legacy listing counts from its first page; a continuation whose
         // start this node did not see is not counted.
         let owner = [4; 32];

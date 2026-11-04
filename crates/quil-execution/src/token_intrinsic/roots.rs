@@ -660,15 +660,63 @@ pub fn fold_placed(
     application: &[u8; 32],
     limits: SnapshotLimits,
 ) -> Result<Option<RootRecord>> {
+    fold_placed_slow_at(state, frame, network, application, limits, FOLD_SLOW)
+}
+
+/// [`fold_placed`], warning at `slow` instead of [`FOLD_SLOW`].
+fn fold_placed_slow_at(
+    state: &HypergraphState,
+    frame: u64,
+    network: &[u8; 32],
+    application: &[u8; 32],
+    limits: SnapshotLimits,
+    slow: std::time::Duration,
+) -> Result<Option<RootRecord>> {
     let placed = read_placed(state, application)?;
     let coins = placed.len();
     if coins == 0 {
         return Ok(None);
     }
     let started = std::time::Instant::now();
-    let root = refresh(state, network, application, placed, None, limits)?;
-    note_fold(application, frame, coins, started.elapsed(), FOLD_SLOW);
+    let mut phases = FoldPhases::default();
+    let root = refresh(
+        state,
+        network,
+        application,
+        placed,
+        None,
+        limits,
+        &mut phases,
+    )?;
+    note_fold(application, frame, coins, started.elapsed(), slow, &phases);
     Ok(Some(root))
+}
+
+/// Where a fold's time went, so that a slow fold of a single coin says
+/// whether it waited on the summary, the coin and block reads, the writes or
+/// the root's publication.
+#[derive(Debug, Default, Clone, Copy)]
+struct FoldPhases {
+    /// The summary tree, upgraded or rebuilt (see [`prepare`]).
+    prepare: std::time::Duration,
+    /// The pending and placed coins' reads, and grouping them by block.
+    read: std::time::Duration,
+    /// Each touched block's frontier loaded.
+    frontier: std::time::Duration,
+    /// Each block's new coins appended and its frontier and root written.
+    blocks: std::time::Duration,
+    /// The summary tree updated with the blocks' roots.
+    tree: std::time::Duration,
+    /// The coin count read and the root published.
+    publish: std::time::Duration,
+}
+
+/// The time since `since`, which then restarts.
+fn lap(since: &mut std::time::Instant) -> std::time::Duration {
+    let now = std::time::Instant::now();
+    let took = now.duration_since(*since);
+    *since = now;
+    took
 }
 
 /// A fold taking this long logs a warning. The frame's commit waits for its
@@ -681,18 +729,27 @@ fn note_fold(
     coins: usize,
     elapsed: std::time::Duration,
     slow: std::time::Duration,
+    phases: &FoldPhases,
 ) {
     if elapsed < slow {
         return;
     }
+    let ms = |d: std::time::Duration| d.as_millis() as u64;
     tracing::warn!(
         application = %hex::encode(application),
         frame,
         coins,
-        duration_ms = elapsed.as_millis() as u64,
+        duration_ms = ms(elapsed),
+        prepare_ms = ms(phases.prepare),
+        read_ms = ms(phases.read),
+        frontier_ms = ms(phases.frontier),
+        blocks_ms = ms(phases.blocks),
+        tree_ms = ms(phases.tree),
+        publish_ms = ms(phases.publish),
         scope = "this node",
         action = "report this line to the maintainers: the frame's commit waited for this \
-                  fold of its placed coins into the coin root",
+                  fold of its placed coins into the coin root; the phase times (prepare, read, \
+                  frontier, blocks, tree, publish) name where it waited",
         "coin root fold slow"
     );
 }
@@ -931,7 +988,15 @@ pub fn refresh_root(
 ) -> Result<RootRecord> {
     let placed = read_placed(state, application)?;
     let rebuild: Option<&[bool]> = placed.is_empty().then_some(&[][..]);
-    refresh(state, network, application, placed, rebuild, limits)
+    refresh(
+        state,
+        network,
+        application,
+        placed,
+        rebuild,
+        limits,
+        &mut FoldPhases::default(),
+    )
 }
 
 /// [`refresh_root`] with the frame's `placed` coins already read, rebuilding
@@ -943,11 +1008,14 @@ fn refresh(
     placed: Vec<(u64, [u8; 32])>,
     rebuild: Option<&[bool]>,
     limits: SnapshotLimits,
+    phases: &mut FoldPhases,
 ) -> Result<RootRecord> {
+    let mut clock = std::time::Instant::now();
     let context = parameter_context(network, application);
     let disc = vertex_adds_discriminator()?;
     let subtree = usize::from(super::coin_blocks::SUBTREE_BITS);
     let tree = prepare(state, &context, application, rebuild, limits)?;
+    phases.prepare = lap(&mut clock);
 
     // The coins this fold may take, once each: the placed ones are already
     // committed to the frame's staging, and anything else a caller staged is
@@ -990,6 +1058,7 @@ fn refresh(
         by_block.entry(block).or_default().push(record);
     }
 
+    phases.read = lap(&mut clock);
     let held = super::summary_tree::top(state, application)?.map_or(0, |top| top.coins);
     // Load each touched block's frontier and separate the genuinely new coins:
     // a changeset may be refreshed several times, so coins already folded into
@@ -1007,6 +1076,7 @@ fn refresh(
         touched.push((block, frontier, records));
     }
     check_coin_cap(held, incoming, limits)?;
+    phases.frontier = lap(&mut clock);
     let mut leaves = Vec::with_capacity(touched.len());
     for (block, mut frontier, fresh) in touched {
         // Each new coin must continue its block's sequence exactly, so a gap
@@ -1035,12 +1105,16 @@ fn refresh(
         }
         leaves.push((block, frontier.count(), root.root));
     }
+    phases.blocks = lap(&mut clock);
     tree.update(&leaves)?;
     if !placed.is_empty() {
         remove_local(state, application, &PLACED_ADDRESS);
     }
+    phases.tree = lap(&mut clock);
     let coins = super::summary_tree::top(state, application)?.map_or(0, |top| top.coins);
-    publish_root(state, network, application, tree.root()?, coins)
+    let root = publish_root(state, network, application, tree.root()?, coins);
+    phases.publish = lap(&mut clock);
+    root
 }
 
 /// Publish `root`, the top of the summary tree, into the root history.
@@ -2673,10 +2747,11 @@ mod tests {
                 3,
                 slow - std::time::Duration::from_millis(1),
                 slow,
+                &FoldPhases::default(),
             )
         });
         assert_eq!(under, Vec::<String>::new());
-        let at = logged(|| note_fold(&application, 7, 3, slow, slow));
+        let at = logged(|| note_fold(&application, 7, 3, slow, slow, &FoldPhases::default()));
         assert_eq!(at.len(), 1, "{at:?}");
         assert!(at[0].starts_with("WARN"), "{}", at[0]);
         assert!(at[0].contains(" message=coin root fold slow"), "{}", at[0]);
@@ -2685,5 +2760,90 @@ mod tests {
             "{}",
             at[0]
         );
+    }
+
+    /// A real fold of one placed coin, warned about at a zero bound, names
+    /// the six phases, which add up to no more than the fold took.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn a_slow_fold_names_where_it_waited() {
+        use super::super::{coin_blocks, delivery::place_committed, state::coin_identity};
+        use quil_lattice_ct::confidential::{
+            transfer::{Output, MEMO_BYTES},
+            AmountOpening, CommitmentKey,
+        };
+        let (network, application) = ([71u8; 32], [72u8; 32]);
+        let context = parameter_context(&network, &application);
+        let key = CommitmentKey::derive(&context);
+        let limits = SnapshotLimits {
+            max_coins: 64,
+            max_depth: 32,
+            max_nodes: 1 << 14,
+        };
+        let state = mem_state();
+        let output = Output {
+            owner: [3; IDENTITY_BYTES],
+            commitment: key.commit(9, &AmountOpening::from_seed(&context, &[3; 32])),
+            memo: [3; MEMO_BYTES],
+        };
+        let (address, tree) = coin_identity(&context, 5, &output).unwrap();
+        let block =
+            coin_blocks::block_for_address(coin_blocks::INITIAL_BLOCK_BITS, &address).unwrap();
+        place_committed(
+            &state,
+            5,
+            &network,
+            &application,
+            &address,
+            tree,
+            block,
+            0,
+            &[],
+            limits,
+        )
+        .unwrap();
+        state.commit().unwrap();
+        state.abort();
+        let end = HypergraphState::new(state.crdt().clone());
+        let lines = logged(|| {
+            fold_placed_slow_at(
+                &end,
+                9,
+                &network,
+                &application,
+                limits,
+                std::time::Duration::ZERO,
+            )
+            .unwrap()
+            .expect("a coin was placed");
+        });
+        let line = lines
+            .iter()
+            .find(|line| line.contains(" message=coin root fold slow"))
+            .unwrap_or_else(|| panic!("no slow-fold line in {lines:?}"));
+        let field = |name: &str| -> u64 {
+            let at = line
+                .find(&format!(" {name}="))
+                .unwrap_or_else(|| panic!("{name} missing from {line}"));
+            line[at + name.len() + 2..]
+                .split(' ')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} is not a number in {line}"))
+        };
+        let parts: u64 = [
+            "prepare_ms",
+            "read_ms",
+            "frontier_ms",
+            "blocks_ms",
+            "tree_ms",
+            "publish_ms",
+        ]
+        .iter()
+        .map(|name| field(name))
+        .sum();
+        assert!(parts <= field("duration_ms"), "{line}");
+        assert!(line.contains(" coins=1 "), "{line}");
     }
 }

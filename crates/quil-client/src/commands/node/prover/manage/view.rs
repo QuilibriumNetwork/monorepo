@@ -450,6 +450,28 @@ fn sync_panel_heights(m: &mut Model, total: u16) -> [u16; 3] {
     heights
 }
 
+/// The key rows' height, whatever the selection, focus or mode: compact
+/// mode leaves out keys that do not apply and a mode swaps in its prompt,
+/// so the rows take the height `rows` gives with every key shown, as
+/// expanded mode draws them, or the one row `?` leaves. Panel borders then
+/// move only with the terminal and the edge keys.
+fn key_rows_height(m: &mut Model, rows: impl Fn(&Model) -> usize) -> usize {
+    if !m.show_key_rows {
+        return 1;
+    }
+    let compact = std::mem::replace(&mut m.compact_actions, false);
+    let height = rows(m);
+    m.compact_actions = compact;
+    height
+}
+
+/// Key `rows` on the last of `height` lines, blank lines above them.
+fn pad_key_rows(rows: Vec<Line<'static>>, height: usize) -> Vec<Line<'static>> {
+    let mut padded = vec![Line::default(); height.saturating_sub(rows.len())];
+    padded.extend(rows);
+    padded
+}
+
 /// The single key row `?` leaves in place of the UI and Workers rows.
 fn collapsed_keys_line() -> Line<'static> {
     let style = Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD);
@@ -461,6 +483,11 @@ fn collapsed_keys_line() -> Line<'static> {
         command_hint("q", "quit", style),
     ])
 }
+
+/// Panel content lines that leave the Notifications panel its full three
+/// lines (`base_panel_heights`): the key rows reserved beyond the keys
+/// shown never take them.
+const MIN_PANELS_FOR_NOTICES: u16 = 8;
 
 fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     let (actions, status) = footer_lines(m);
@@ -481,9 +508,22 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         actions.truncate(max_actions);
         actions[max_actions - 1] = Line::from("‹h› all keys  ‹q› quit");
     }
-    let actions_h = actions.len() as u16;
+    let reserved = key_rows_height(m, |m| {
+        wrap_actions(help_line(m), area.width).len()
+            + wrap_actions(worker_commands_line(m), area.width).len()
+    });
     let header = header_lines(m, area.width);
     let header_height = header.len() as u16;
+    // On a terminal too short to give the panels `MIN_PANELS_FOR_NOTICES`
+    // lines beside the reserved key rows, the rows shown are all the keys
+    // take, so a wrapped notice keeps the lines it needs.
+    let room = usize::from(
+        area.height
+            .saturating_sub(6 + header_height + MIN_PANELS_FOR_NOTICES),
+    );
+    let reserved = reserved.min(max_actions).min(room.max(actions.len()));
+    let actions = pad_key_rows(actions, reserved);
+    let actions_h = actions.len() as u16;
     // Content height depends only on terminal geometry and explicit resize keys.
     let [alloc_h, avail_h, notice_h] =
         sync_panel_heights(m, area.height.saturating_sub(6 + header_height + actions_h));
@@ -2062,22 +2102,77 @@ fn allocation_detail_lines(m: &Model, sorted: &[AllocationRow], area: Rect) -> V
     let Some(row) = sorted.get(m.alloc_cursor) else {
         return vec![];
     };
-    let mut lines = wrap_message(allocation_detail(m, row), area.width);
-    let limit = usize::from(area.height.saturating_sub(2))
-        .min(usize::from(area.height / 2))
+    fit_detail(
+        wrap_message(allocation_detail(m, row), area.width),
+        area.width,
+        area.height,
+        2,
+    )
+}
+
+/// The detail lines a panel `width` by `height` inside its borders pins
+/// to its bottom, under content whose first `keep` lines (a table's
+/// header and the rows it must show) the detail never displaces: none in
+/// a panel of `keep` lines or fewer, else at most half the panel, a
+/// longer detail ending in a marker. Every panel follows the Allocations
+/// panel's rule, `keep` 2 for a table that scrolls.
+fn fit_detail(
+    mut lines: Vec<Line<'static>>,
+    width: u16,
+    height: u16,
+    keep: u16,
+) -> Vec<Line<'static>> {
+    if height <= keep || width == 0 {
+        return vec![];
+    }
+    let limit = usize::from(height - keep)
+        .min(usize::from(height / 2))
         .max(1);
     if lines.len() > limit {
         lines.truncate(limit);
-        lines[limit - 1] = Line::from(Span::styled(
-            "… enlarge panel for details",
-            Style::new().fg(HELP),
-        ));
-        lines[limit - 1] = wrap_message(lines[limit - 1].clone(), area.width)
-            .into_iter()
-            .next()
-            .unwrap_or_default();
+        lines[limit - 1] = enlarge_marker(width);
     }
     lines
+}
+
+/// A panel's `lines` in `height` lines `width` wide inside its borders:
+/// all of them when they fit, else the first lines and the enlarge
+/// marker last, so a panel never drops lines unmarked.
+fn fit_lines(mut lines: Vec<Line<'static>>, width: u16, height: u16) -> Vec<Line<'static>> {
+    let height = usize::from(height);
+    if height > 0 && lines.len() > height {
+        lines.truncate(height);
+        lines[height - 1] = enlarge_marker(width);
+    }
+    lines
+}
+
+/// The line that ends a panel too short for its lines.
+fn enlarge_marker(width: u16) -> Line<'static> {
+    wrap_message(
+        Line::from(Span::styled(
+            "… enlarge panel for details",
+            Style::new().fg(HELP),
+        )),
+        width,
+    )
+    .into_iter()
+    .next()
+    .unwrap_or_default()
+}
+
+/// A panel's `height` lines: `content` from the top and `detail` (from
+/// [`fit_detail`]) on the last lines, blank lines between; content past
+/// the room the detail leaves is cut.
+fn pin_detail(
+    mut content: Vec<Line<'static>>,
+    detail: Vec<Line<'static>>,
+    height: u16,
+) -> Vec<Line<'static>> {
+    let room = usize::from(height).saturating_sub(detail.len());
+    content.resize(room, Line::default());
+    content.extend(detail);
+    content
 }
 
 fn render_alloc_panel(
@@ -3240,6 +3335,28 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
             ),
         ));
     }
+    let withheld = allocations
+        .iter()
+        .filter(|a| {
+            !matches!(
+                m.execution_state(a.execution.as_ref()),
+                "unknown" | "stale" | "cached"
+            ) && a
+                .execution
+                .as_ref()
+                .is_some_and(|e| e.blocker == quil_types::consensus::SILENT_RENEWAL_BLOCKER)
+        })
+        .count();
+    if withheld > 0 {
+        notices.push((
+            "renewal-withheld-no-vote",
+            NoticeSeverity::Warning,
+            format!(
+                "Renewal withheld, no vote sent: {withheld}/{} allocations.",
+                allocations.len()
+            ),
+        ));
+    }
     let workers: Vec<_> = m
         .allocations
         .iter()
@@ -3276,6 +3393,17 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
             } else {
                 format!("Store reads slow (this node's disk): {figures}.")
             },
+        ));
+    }
+    if m.cached_node_info
+        .as_ref()
+        .and_then(|info| info.node_reachability.as_ref())
+        .is_some_and(crate::commands::node::doctor::not_reachable)
+    {
+        notices.push((
+            "peers-cannot-dial",
+            NoticeSeverity::Warning,
+            "Reachability: peers cannot dial this node; run qclient node doctor.".to_string(),
         ));
     }
     notices
@@ -4261,7 +4389,9 @@ fn help_items() -> Vec<HelpItem> {
         item("`Allocations without a worker`: active, leaving, departing or `re-confirm!` allocations with Worker `-1`; they do no work and earn nothing until a worker is bound"),
         item("`Local execution blocked or stopped`: staffed earning allocations whose Execution is `blocked` or `stopped`, of those with fresh observations; the row footer names the blocker"),
         item("`Allocation epoch stale (re-confirm!)`: allocations whose epoch is older than the current one. The node reconfirms each allocation during every epoch, so its reconfirm has not been recorded; check the node's prover confirmation log lines"),
+        item("`Renewal withheld, no vote sent`: local allocations whose worker hosts its committee session but has sent no vote for an epoch while the other members voted, of all allocations. The node leaves them to lapse: check the worker, and restart it if it stays silent. A seat renews once its worker votes or restarts, or at the latest four epochs on; the master log names each (`seat renewal withheld`)"),
         item("`Last recovery attempt failed`: workers whose latest archive recovery attempt failed and whose LocalMat is still below PeerHead, of workers with fresh observations (it ends once the worker catches up); the Recovery footer gives the error and the failure streak"),
+        kv("Reachability notice", "`Reachability: peers cannot dial this node`: the verdict of `qclient node doctor`, from the node's own view: AutoNAT servers on 2 or more IPs could not dial it back, AutoNAT holds it private with no confirmed address, or its address is behind carrier-grade NAT. It ends once AutoNAT confirms an address. Missing or unsettled AutoNAT results show nothing. The doctor gives a verdict per address family and what to change; it changes nothing itself."),
         kv("Store notice", "`Store reads slow (this node's disk)`: the node reads one entry of its master store a second (the canary) and, on Linux, times its disk's reads and writes. Shown once a minute's canary p99 reaches 50ms, a read stays unfinished 1s, or the disk takes 20ms a read or 100ms a write (of 20+), two minutes in a row; it clears after three minutes under all of them. Work that reads the store falls behind and allocations may lapse. The cause is this node's disk: check that TRIM runs (fstrim.timer or the discard mount option), the disk's health (SMART) and other I/O load on it. `qclient node diagnostics health --self` and the node's `store i/o` log lines give the figures"),
         kv("Command legends", "Compact mode shows applicable UI/worker commands only; expanded mode also shows disabled commands. Usable commands share one highlight; labels show colors on/off and relative/absolute thresholds. `filter*` means a column filter is active"),
         kv("Scroll hints", "Bottom border counts hidden rows `↑`/`↓` and columns `←`/`→`"),
@@ -4312,6 +4442,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("‹Ctrl+U›", "Resume (U: unpause) — resume a Paused allocation (status 3)"),
         kv("‹Ctrl+O›", "Mode (O: own) — toggle manual / auto worker management on cursor row"),
         note("Multi-select with ‹space› or ‹a› to batch Leave/Confirm/Reject/Pause/Resume."),
+        note("In an epoch's last 10 frames, Leave, Pause and Resume wait for the next epoch to sign: every node refuses one landing in a later epoch than it was signed in. Confirm and Reject go at once, being valid only in this epoch."),
         HelpItem::Blank,
         sec("Actions — Available Shards panel"),
         kv("‹Ctrl+G›", "Join (G: go) — open worker picker for selected shard(s)"),
@@ -4351,32 +4482,41 @@ fn help_items() -> Vec<HelpItem> {
         kv("‹esc›", "Cancel without changing the filter"),
         HelpItem::Blank,
         sec(COINS_HELP_SECTION),
-        note("This node's claimable rewards and legacy coins, as `qclient token legacy` lists them, the shield action and the reward mint. The middle panel follows the Balances row under the cursor: Claim status for `claimable`, Shield plan for `legacy`. ‹h› on this tab opens the help here."),
+        note("This node's claimable rewards, legacy coins (as `qclient token legacy` lists them) and shielded coins, the shield action, the reward mint and transfers. The middle panel follows the Balances row under the cursor: Claim status for `claimable`, Shield plan for `legacy`, Transfers for `shielded`. ‹h› on this tab opens the help here."),
         kv("Balances", "One row per kind; the cursor row's detail follows the table:"),
         item("`claimable`: the reward balance the GLOBAL reward witness shows at the `As of` frame, read with each Provers refresh; ‹M› authorizes a mint of it"),
-        item("`legacy`: Coins `U unshielded · S shielded` count the listed legacy coins of each kind, Amount is the unshielded total. Read in the background when the manager starts, every 10 min while the tab is open and on ‹r›; `As of` is the read's UTC time, a spinner beside it marks a read in progress. The detail gives the `qclient token shield-all` plan (batches of up to 96 coins from one shard each; coins on no live shard wait for a later run), when shields open, and the read's pages and duration"),
+        item("`legacy`: Coins `U/T` counts the U unshielded of the T listed legacy coins, `0` once none is unshielded; Amount is the unshielded total. Read in the background when the manager starts, every 10 min while the tab is open and on ‹r›; `As of` is the read's UTC time, a spinner beside it marks a read in progress. The detail gives the shielded count and the read's pages and duration; the Shield plan beside it gives the `qclient token shield-all` plan and when shields open"),
+        item("`shielded`: this wallet's unspent confidential coins (Coins) and their total (Amount), read on ‹E› with the pending transfers: full scans of the coins and escrows, matched on this machine (about a minute, never on a timer). Their spent and consumed checks read this node's GLOBAL state; no coin or escrow is looked up anywhere else. `As of` is the read's UTC time"),
         kv("State", "What the row needs:"),
         item("`◆ claimable` / `◆ unshielded`: waiting for your action; `blue`, and the `◆` marker keeps the meaning with colors off"),
         item("`unshielded` without `◆`: shields are not open yet, an expected wait; the notice gives the frame"),
         item("`shielding i/N`: a shield run is proving, holding or submitting batch i of N, or waiting for its inclusion, whichever panel is on screen; its notices follow it in Notifications"),
         item("`shielded`: every listed legacy coin is shielded; `none`: nothing to show"),
+        item("`◆ incoming` / `◆ refundable` (shielded row): a pending transfer to this wallet waits for ‹A›, or one of yours is past its refund frame and waits for ‹R›; `held`: coins and nothing pending; `not read`: ‹E› reads them; `in progress`: a transfer action runs"),
         item("`loading`: the first read is in progress; `unavailable`: the read failed (`yellow`, or `!` with colors off); `no key`: the node config has no Ed448 key, so it owns no legacy coins"),
-        kv("Coins notices", "`Claimable: …` and `Legacy coins: U unshielded, S shielded; N batches` carry `◆` and show from the default level. `Shields open at f…` and `… on no live shard` are expected waits (info). A failing read is a warning that says since when it fails and how old the figures are; `Shield plan: shard list unavailable` means the batch count is a lower bound"),
-        kv("Claim status", "With the claimable row selected, or while a mint is prepared or confirmed: the claimable reward to the base unit and the frame of its GLOBAL reward witness, its mint, and one row per authorization `qclient token mint` or ‹M› saved as `mint-<frame>.bin` in the node config directory, newest first: the GLOBAL frame it Cited, the Amount it mints and its Fee. State is `unavailable`: this node reports no authorization status, so ‹C› asks GLOBAL for the finalized witness the claim needs before it confirms"),
+        kv("Coins notices", "Each names a condition and its key, not a figure on screen: the amounts, counts and frames are the rows' and panels'. `Reward claimable: ‹M› …` and `Legacy coins unshielded: ‹S› …` carry `◆` and show from the default level. `shields are not open yet` and `… on no live shard …` are expected waits (info); the Shield plan gives the frame and the counts. A failing read is a warning that says since when it fails; the row's `As of` marks how old its figures are. `Shield plan: shard list unavailable` means the batch count is a lower bound"),
+        kv("Claim status", "With the claimable row selected, or while a mint is prepared or confirmed: what authorizes a mint of the claimable reward (the amount and its frame are the Balances row's), and one row per authorization `qclient token mint` or ‹M› saved as `mint-<frame>.bin` in the node config directory, newest first: the GLOBAL frame it Cited, the Amount it mints and its Fee. State is `unavailable`: this node reports no authorization status, so ‹C› asks GLOBAL for the finalized witness the claim needs before it confirms"),
         kv("Shield plan", "With the legacy row selected, or while a shield is prepared: one row per `qclient token shield-all` batch, in its order: Batch `i/N`, the Shard whose members verify it (its filter shortened from the middle), its Coins and Amount. The footer counts batches of up to 96 coins and coins on no live shard, which wait for a later run; coins submitted within the last two hours are hidden until their batch commits. `Shields open at f…` shows while shields are not yet admitted"),
         kv("‹S›", "Shield, with the legacy row or the Shield plan selected: read the coins and quote each batch's fee, then confirm. The confirmation names the coins and batches, the amount, the recipient (this wallet, in full), the quoted fees and the `--max-fee` cap; ‹y› starts, any other key cancels. Batches are proved here and submitted to this node, paced as `qclient token shield-all` paces them, since each batch costs every archive tens of seconds of verification on GLOBAL's critical path: one at a time, each proved after the previous one's inclusion (stopping if that takes an hour of healthy GLOBAL), submissions at least 5 min apart, held while GLOBAL is degraded (head unchanged for 60 s, or under 330 frames an hour) until it has been healthy for 10 min. One action runs at a time; quitting during it asks first"),
         kv("‹M›", "Mint, with the claimable row or its Claim status selected: read the claimable reward and quote the fee, then confirm. The confirmation names the reward and the frame it cites, the amount, the fee, the `--max-fee` cap, the recipient (this wallet) and the file the authorization is saved as; ‹y› proves it here and submits it to this node, any other key cancels. The run reads the reward and quotes the fee again: at a later frame it goes on; a larger reward (rewards grow every GLOBAL frame) is minted in full to this wallet; a changed fee opens the confirmation again with it; a smaller reward stops the run"),
         kv("‹C›", "Claim, in the Claim status, the saved authorization under its cursor once GLOBAL has finalized it: the confirmation names the file, its witness frame and the amount; ‹y› builds and submits the claim, which creates the coins"),
-        kv("‹esc›", "With a shield running: stop it before its next submission (‹y› confirms, any other key keeps it running); a batch being proved is not submitted, submitted batches stay submitted. While a shield or a mint is prepared: cancel it"),
+        kv("‹esc›", "With a shield running: stop it before its next submission (‹y› confirms, any other key keeps it running); a batch being proved is not submitted, submitted batches stay submitted. While a shield, a mint or a transfer action is prepared: cancel it"),
         kv("Mint notices", "`Mint: reading the reward …` / `Mint claim: reading its GLOBAL witness …`; `Mint f…: proving … <60s` / `>60s`; `authorization … submitted; inclusion not yet confirmed`, with `(confirmed … Q; the reward grew)` when the run minted more than the confirmation showed; `Mint claim f…: … submitted`; `Mint: the fee quote changed from … to … base units; confirm again` (`◆`): the run found the fee quoted otherwise since the confirmation and proved nothing. A refusal or failure (`red`) says why; nothing more was submitted. `Action log: not written (…)` (`yellow`), as for shields; the mint runs on. One action runs at a time, shields included"),
         kv("Node config", "Coin actions are signed with the node config the manager loaded (`--network <name>`: `~/.quilibrium/configs/<name>`; else the default config; else the node directory's `.config`), and a node accepts only submissions signed with its own peer key. An action signed with another config is refused before any read, naming the fix"),
         kv("Shield notices", "`Shield batch i/N: proving … <60s` / `>60s` while a batch is proved; `proved; submits at …` while it waits out the 5 min spacing; `submitted at …; inclusion not yet confirmed` until the run or a legacy read sees its coins shielded, then `included` (`green`) with the projected end of the run (`~`, from the pace so far). `Shield paused since …` (`yellow`) names the GLOBAL signal that holds submissions and the 10 min of healthy GLOBAL that ends it; `Shield resumed at …` follows. `stopping` / `stopped on request` after ‹esc› ‹y›. A failure (`red`) names the batch; batches before it stay submitted. `--render` reads and quotes for the confirmation but never runs it. `Action log: not written (…)` (`yellow`): the private action log refused the write, e.g. its file is open to other users; the shield runs on"),
-        kv("Logs", "A shield run, a mint and a claim each log one line at the start and one with the outcome (target `qclient::action`, at info; `RUST_LOG=qclient::action=info` shows them on stderr, so redirect it to a file): counts, frames, the duration and an error class, never amounts, the recipient, coin addresses or hashes, so they can be shared. The details (amounts, fees, recipient, coin addresses, the error) go only to the private action log `wallet/actions.jsonl` in the node config directory: one JSON line per step, owner-only (a wider mode refuses the write), never in the node's `.log/`, log exports or renders, kept a year within 4 MiB. `--no-action-log`, or `noActionLog: true` in the qclient config, turns it off; `qclient token shield-all` and `token mint` record there too, and log the two lines with `source=\"cli\"`"),
-        kv("--render", "A render may be shared, so it hides private wallet fields (a confirmation's amount, the recipient's address, shielded amounts) as `hidden in this render`; `--reveal` shows them. Amounts the network lists publicly under this node's key (legacy coins, the claimable reward) show either way"),
+        kv("Logs", "A shield run, a mint, a claim and each transfer action log one line at the start and one with the outcome (target `qclient::action`, at info; `RUST_LOG=qclient::action=info` shows them on stderr, so redirect it to a file): counts, frames, the duration and an error class, never amounts, the recipient, coin addresses or hashes, so they can be shared. The details (amounts, fees, recipient, coin addresses, the error) go only to the private action log `wallet/actions.jsonl` in the node config directory: one JSON line per step, owner-only (a wider mode refuses the write), never in the node's `.log/`, log exports or renders, kept a year within 4 MiB. `--no-action-log`, or `noActionLog: true` in the qclient config, turns it off; `qclient token shield-all`, `token mint` and the transfer commands (`transfer`, `pending-transfer`, `accept`, `reject`, `merge`) record there too, and log the two lines with `source=\"cli\"`"),
+        kv("--render", "A render may be shared, so it hides private wallet fields (a confirmation's amounts, the recipient's address, escrow addresses, shielded and pending amounts, typed form fields) as `hidden in this render`; `--reveal` shows them. Amounts the network lists publicly under this node's key (legacy coins, the claimable reward) show either way"),
+        kv("Transfers", "With the shielded row selected, or while a transfer form or confirmation is open: the pending transfers (escrows) this wallet can act on, from the last ‹E› read: the Escrow (`…` and its last six characters, in full with ‹n›), its Direction (`in`: to this wallet, `out`: funded by it), its Amount and, for an outgoing one, the frame from which its refund opens (`open` once passed)"),
+        kv("‹E›", "Read the shielded coins and the pending transfers, with the shielded row or the Transfers panel selected; one read at a time. A qclient config that reads through a public or custom RPC is refused, since that RPC would learn this wallet's coins"),
+        kv("‹T› / ‹P›", "Transfer / pending transfer, with the shielded row or the Transfers panel selected: a form takes the recipient (pasted), the amount in Q and, for a pending transfer, the refund frame (empty: the GLOBAL head plus about a day). Every key is text there; ‹tab› moves between fields, ‹enter› checks them and quotes the fee, ‹esc› cancels, ‹Ctrl+C› quits"),
+        kv("‹A› / ‹R›", "In the Transfers panel: accept the incoming pending transfer under its cursor, or refund an outgoing one once its refund frame passes (`qclient token accept` / `reject`)"),
+        kv("‹J›", "Merge coins, with the shielded row or the Transfers panel selected: a wallet scan selects the coins `qclient token merge all` would take, then confirm"),
+        kv("Transfer confirmations", "Each names the action, the amount to the base unit, the quoted fee, the `--max-fee` cap and, last, the recipient in full; ‹y› proves it here and submits it to this node, any other key cancels. A transfer's fee is quoted again before submission, as the CLI does. One action runs at a time, shields and mints included"),
+        kv("Transfer notices", "`Shielded coins: reading …`; `<action>: proving and submitting <60s` / `>60s`; `submitted; finalized inclusion is not yet confirmed`. A refusal or failure (`red`) says why. `Pending transfers incoming: ‹A› …` and `Pending transfers of yours unclaimed past their refund frame: ‹R› …` (`◆`) name the condition and its key; the Transfers panel gives the transfers, their amounts and refund frames. `Action log: not written (…)` (`yellow`), as for shields; the action runs on"),
         kv("‹r›", "Read legacy coins now, with the legacy row or the Shield plan selected; one read at a time"),
         kv("‹[/]› / ‹{/}›", "Move the focused panel's upper edge up/down / its lower edge up/down; every panel keeps 3 rows. The Coins tab's edges are kept between runs apart from the Provers tab's"),
-        kv("‹tab›", "Move between Balances, the middle panel (Claim status or Shield plan) and Notifications"),
-        kv("‹↑/k› / ‹↓/j›", "Move the Balances, Shield plan or Claim status cursor; scroll Notifications when it is focused"),
+        kv("‹tab›", "Move between Balances, the middle panel (Claim status, Shield plan or Transfers) and Notifications"),
+        kv("‹↑/k› / ‹↓/j›", "Move the Balances, Shield plan, Claim status or Transfers cursor; scroll Notifications when it is focused"),
         HelpItem::Blank,
     ]
 }
@@ -4614,12 +4754,15 @@ fn render_join_picker(f: &mut Frame, m: &mut Model, area: Rect) {
             lines.push(Line::from(text));
         }
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  space: toggle  enter: confirm join  esc: cancel",
-        Style::new().fg(HELP),
-    )));
-    f.render_widget(Paragraph::new(lines), area);
+    // The keys keep to the screen's bottom, as on every other screen.
+    let keys = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  space: toggle  enter: confirm join  esc: cancel",
+            Style::new().fg(HELP),
+        )),
+    ];
+    f.render_widget(Paragraph::new(pin_detail(lines, keys, area.height)), area);
 }
 
 #[cfg(test)]
@@ -4785,6 +4928,61 @@ mod tests {
         assert!(store(&m).is_empty());
     }
 
+    #[test]
+    fn a_node_peers_cannot_dial_shows_one_notice_pointing_to_the_doctor() {
+        use quil_types::proto::node::{AutonatProbeFailure, NodeInfoResponse, NodeReachability};
+        use std::time::{Duration, Instant};
+        let report = |unreachable: bool, confirmed: &[&str]| NodeInfoResponse {
+            node_reachability: Some(NodeReachability {
+                listen_multiaddrs: vec!["/ip4/192.168.1.20/tcp/8336".to_string()],
+                nat_status: "unknown".to_string(),
+                confirmed_multiaddrs: confirmed.iter().map(|a| a.to_string()).collect(),
+                probe_failure: Some(AutonatProbeFailure {
+                    class: "dial_error".to_string(),
+                    probes: 14,
+                    failing_secs: 1_920,
+                    unreachable,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut m = Model::new();
+        m.compact_actions = false;
+        m.data_loaded = true;
+        m.allocations = joining_table();
+        m.last_fetch_success = Some(Instant::now());
+        m.cached_node_info = Some(report(true, &[]));
+        let shown = |m: &Model| {
+            condition_notices(m)
+                .into_iter()
+                .filter(|(key, ..)| *key == "peers-cannot-dial")
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            shown(&m),
+            vec![(
+                "peers-cannot-dial",
+                NoticeSeverity::Warning,
+                "Reachability: peers cannot dial this node; run qclient node doctor.".to_string()
+            )]
+        );
+        update_message_lifetime(&mut m);
+        let text = render_text(&mut m, 160, 30);
+        assert!(text.contains("peers cannot dial this node"), "{text}");
+        m.last_fetch_success = Some(Instant::now() - Duration::from_secs(3600));
+        assert!(shown(&m).is_empty(), "stale status establishes nothing");
+        m.last_fetch_success = Some(Instant::now());
+        // Failing probes that do not settle it yet, a confirmed address, and
+        // a node that predates the report are no claim.
+        m.cached_node_info = Some(report(false, &[]));
+        assert!(shown(&m).is_empty(), "unsettled probes");
+        m.cached_node_info = Some(report(true, &["/ip4/203.0.113.7/tcp/8336"]));
+        assert!(shown(&m).is_empty(), "confirmed by AutoNAT");
+        m.cached_node_info = Some(NodeInfoResponse::default());
+        assert!(shown(&m).is_empty(), "no report");
+    }
+
     /// The help as text keeps every section heading and has no styling.
     #[test]
     fn help_text_lists_the_help_sections() {
@@ -4941,6 +5139,7 @@ mod tests {
         let mut a = row("01", 1, 1, 1, "", "");
         a.status = 2;
         a.manually_managed = false;
+        a.worker_id = 1;
         m.allocations = vec![a];
         for (status, enabled, disabled) in [
             (2, "‹P› pause", "‹U› resume"),
@@ -4969,6 +5168,7 @@ mod tests {
         let mut a = row("01", 1, 1, 1, "", "");
         a.status = 2;
         a.manually_managed = false;
+        a.worker_id = 1;
         m.allocations = vec![a];
         assert_eq!(
             worker_commands_line(&m).to_string(),
@@ -5671,6 +5871,8 @@ mod tests {
             consecutive_failures: 1,
             ..Default::default()
         });
+        m.allocations[2].execution.as_mut().unwrap().blocker =
+            quil_types::consensus::SILENT_RENEWAL_BLOCKER.into();
         // A bound worker's stopped engine is a lifecycle wait, not an allocation's failure.
         let mut bound = row("w9", 1, 1, 9, "", "");
         bound.status = 0;
@@ -5699,6 +5901,11 @@ mod tests {
             (
                 "allocation-epoch-stale",
                 "Allocation epoch stale (re-confirm!): 1/4 allocations.",
+                WARNING,
+            ),
+            (
+                "renewal-withheld-no-vote",
+                "Renewal withheld, no vote sent: 1/4 allocations.",
                 WARNING,
             ),
             (
@@ -5739,6 +5946,7 @@ mod tests {
         m.allocations[1].execution = execution("serving");
         m.allocations[2].epoch = 3;
         m.allocations[2].status_name = "active".into();
+        m.allocations[2].execution = execution("serving");
         m.allocations[3].execution = execution("serving");
         assert!(condition_notices(&m).is_empty());
         update_message_lifetime(&mut m);
@@ -7860,6 +8068,7 @@ mod tests {
             "Global app notice",
             "Reward notice",
             "Allocation notices",
+            "Reachability notice",
             "Store notice",
             "Command legends",
             "Scroll hints",
@@ -7881,6 +8090,9 @@ mod tests {
             "Shield plan",
             "Shield notices",
             "Mint notices",
+            "Transfers",
+            "Transfer confirmations",
+            "Transfer notices",
             "Logs",
             "--render",
             "Node config",
@@ -8253,6 +8465,112 @@ mod tests {
         assert!(handle_key(&mut m, key(KeyCode::Esc)).is_empty());
         assert!(!m.show_help);
         assert_eq!(m.help_offset, 0);
+    }
+
+    /// Every panel's detail follows the Allocations rule: none in a
+    /// panel of `keep` lines or fewer, else at most half the panel and
+    /// never the kept lines, a longer detail ending in the marker; the
+    /// detail lands on the panel's last lines under its content.
+    #[test]
+    fn panel_detail_fits_by_the_allocations_rule_and_keeps_to_the_bottom() {
+        let detail = || {
+            (0..6)
+                .map(|i| Line::from(format!("d{i}")))
+                .collect::<Vec<_>>()
+        };
+        let text = |lines: &[Line<'static>]| lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        assert!(fit_detail(detail(), 40, 2, 2).is_empty());
+        assert!(fit_detail(detail(), 40, 3, 3).is_empty());
+        assert!(fit_detail(detail(), 0, 20, 2).is_empty());
+        assert_eq!(
+            text(&fit_detail(detail(), 40, 3, 2)),
+            ["… enlarge panel for details"]
+        );
+        assert_eq!(
+            text(&fit_detail(detail(), 40, 4, 3)),
+            ["… enlarge panel for details"]
+        );
+        assert_eq!(
+            text(&fit_detail(detail(), 40, 8, 2)),
+            ["d0", "d1", "d2", "… enlarge panel for details"]
+        );
+        assert_eq!(text(&fit_detail(detail(), 40, 20, 2)).len(), 6);
+        let content = vec![Line::from("h"), Line::from("r")];
+        assert_eq!(
+            text(&pin_detail(content.clone(), vec![Line::from("d")], 5)),
+            ["h", "r", "", "", "d"]
+        );
+        assert_eq!(
+            text(&pin_detail(content, vec![Line::from("d")], 2)),
+            ["h", "d"]
+        );
+    }
+
+    /// The Provers panels keep their borders while the cursor walks the
+    /// Allocations rows and the focus moves: compact mode leaves out the
+    /// keys that do not apply there, and the key rows keep their height.
+    #[test]
+    fn provers_panel_borders_stay_put_across_cursor_and_focus_moves() {
+        let mut m = Model::new();
+        m.data_loaded = true;
+        m.color_coding = false;
+        m.allocations = joining_table();
+        m.cached_shard_info = Some(Default::default());
+        let borders = |text: &str| {
+            text.lines()
+                .enumerate()
+                .filter(|(_, line)| line.starts_with('╭') || line.starts_with('╰'))
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>()
+        };
+        let last = m.allocations.len() - 1;
+        for compact in [true, false] {
+            m.compact_actions = compact;
+            for (width, height) in [(80, 24), (120, 40), (200, 60)] {
+                m.focus = PanelFocus::Allocations;
+                m.alloc_cursor = 0;
+                let text = render_text(&mut m, width, height);
+                let base = borders(&text);
+                assert_eq!(base.len(), 6, "{text}");
+                for (focus, cursor) in [
+                    (PanelFocus::Allocations, 1),
+                    (PanelFocus::Allocations, last),
+                    (PanelFocus::Available, 0),
+                    (PanelFocus::Notifications, 0),
+                ] {
+                    m.focus = focus;
+                    m.alloc_cursor = cursor;
+                    let moved = render_text(&mut m, width, height);
+                    assert_eq!(
+                        borders(&moved),
+                        base,
+                        "{width}x{height} {focus:?} row {cursor}\n{text}\n{moved}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The worker picker keeps its keys on the screen's last line, as
+    /// every other screen does, however few workers it lists.
+    #[test]
+    fn the_join_picker_keeps_its_keys_on_the_last_line() {
+        let mut m = Model::new();
+        m.join_picker_active = true;
+        m.join_picker_filters = vec![vec![0xab; 3]];
+        m.join_picker_workers = vec![2, 3];
+        for (width, height) in [(80, 24), (100, 70)] {
+            let text = render_text(&mut m, width, height);
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(lines.len(), usize::from(height), "{text}");
+            assert_eq!(
+                lines.last().unwrap().trim(),
+                "space: toggle  enter: confirm join  esc: cancel",
+                "{text}"
+            );
+            assert!(lines[5].contains("Worker 3"), "{text}");
+            assert!(lines[6].is_empty(), "{text}");
+        }
     }
 }
 

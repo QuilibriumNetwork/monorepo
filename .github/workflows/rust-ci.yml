@@ -73,7 +73,7 @@ jobs:
     needs: scope
     if: needs.scope.outputs.run == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           lfs: true
 
@@ -99,9 +99,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           # Check artifacts must not win the immutable test-cache key race.
-          shared-key: rust-check
+          shared-key: rust-check-native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           cache-on-failure: true
           # Only pushes to a base branch save caches. Pull requests and
           # merge groups restore the base's, but caches they saved under
@@ -130,7 +129,7 @@ jobs:
     needs: scope
     if: needs.scope.outputs.run == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           lfs: true
 
@@ -151,8 +150,7 @@ jobs:
       # Its own cache: the check job's RUSTFLAGS change every unit hash.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
-          shared-key: rust-clippy
+          shared-key: rust-clippy-native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           cache-on-failure: true
           save-if: ${{ github.event_name == 'push' }}
 
@@ -179,12 +177,16 @@ jobs:
       matrix:
         partition: [1, 2, 3]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           lfs: true
 
       - name: Pull LFS files
         run: git lfs pull
+
+      # The test binaries fill most of a runner's disk and some runners
+      # have less; the action prints which, frees space and moves target/.
+      - uses: ./.github/actions/free-runner-disk
 
       - id: native-deps
         uses: ./.github/actions/setup-native-deps
@@ -198,8 +200,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
-          shared-key: rust-test
+          shared-key: rust-test-native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           # The partitions build the same artifacts; one saves them.
           save-if: ${{ github.event_name == 'push' && matrix.partition == 1 }}
 
@@ -238,6 +239,13 @@ jobs:
               --partition "count:$PARTITION/3"
           fi
 
+      # The space the build left, for sizing the step that frees it.
+      - name: disk usage
+        if: always()
+        run: |
+          df -h /
+          du -sh target || true
+
   # test-result — the required check `test (cargo nextest)`: passes only
   # when every partition passed. It runs unless the run was cancelled or
   # scope skipped the tests, so a failed or skipped partition, or a
@@ -269,12 +277,16 @@ jobs:
     needs: scope
     if: needs.scope.outputs.run == 'true' && github.event_name != 'merge_group'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           lfs: true
 
       - name: Pull LFS files
         run: git lfs pull
+
+      # The test binaries fill most of a runner's disk and some runners
+      # have less; the action prints which, frees space and moves target/.
+      - uses: ./.github/actions/free-runner-disk
 
       - id: native-deps
         uses: ./.github/actions/setup-native-deps
@@ -290,8 +302,7 @@ jobs:
       # the test job's: restore its dependencies, never save.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
-          shared-key: rust-test
+          shared-key: rust-test-native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           save-if: false
 
       - uses: taiki-e/install-action@v2
@@ -331,6 +342,12 @@ jobs:
           fi
           cargo nextest run "${args[@]}" --no-fail-fast
 
+      - name: disk usage
+        if: always()
+        run: |
+          df -h /
+          du -sh target || true
+
   # ------------------------------------------------------------------
   # release-build — verify `node/build.sh` succeeds on every supported
   # deployment target.
@@ -359,7 +376,7 @@ jobs:
             quil_platform: arm64_macos
     runs-on: ${{ matrix.runs-on }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           lfs: true
 
@@ -378,11 +395,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           # Per-target cache key — release target/ dirs don't overlap
           # with the debug target/ used by build+test, and the three
           # release targets don't overlap with each other.
-          shared-key: rust-release-${{ matrix.name }}
+          shared-key: rust-release-${{ matrix.name }}-native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           cache-on-failure: true
           save-if: ${{ github.event_name == 'push' }}
 

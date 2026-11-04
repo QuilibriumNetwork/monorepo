@@ -170,6 +170,18 @@ pub enum DiagnosticsCommand {
     /// the peer then sees a Tor exit, which observed shows. Tor carries TCP
     /// only; a QUIC dial under torsocks fails.
     Dial(super::diagnostics_dial::DialArgs),
+    /// Let a peer fetch this node's health report for a time.
+    ///
+    /// Sets diagnostics.healthReport.enabled and adds the peer to its
+    /// allowedPeers, with the end of the grant in allowedUntil, in the
+    /// default node config; every other line stays as written. It prints
+    /// what the peer gets. The node reads this at start: restart it to apply
+    /// the change. This command restarts nothing.
+    Allow(super::diagnostics_grants::AllowArgs),
+    /// Take a peer off the health report list (restart the node to apply).
+    Revoke(super::diagnostics_grants::RevokeArgs),
+    /// List the peers this node's config lets ask for its diagnostics.
+    List,
 }
 
 #[derive(Debug, Args)]
@@ -210,6 +222,9 @@ pub async fn run(global: GlobalArgs, cmd: &DiagnosticsCommand) -> anyhow::Result
         DiagnosticsCommand::Approve(args) => super::diagnostics_logs::approve(global, args).await,
         DiagnosticsCommand::Deny(args) => super::diagnostics_logs::deny(global, args).await,
         DiagnosticsCommand::Resolve(args) => resolve(global, args).await,
+        DiagnosticsCommand::Allow(args) => super::diagnostics_grants::allow(&global, args),
+        DiagnosticsCommand::Revoke(args) => super::diagnostics_grants::revoke(&global, args),
+        DiagnosticsCommand::List => super::diagnostics_grants::list(&global),
     }
 }
 
@@ -261,7 +276,7 @@ async fn resolve(global: GlobalArgs, args: &ResolveArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse_peer(peer: &str) -> anyhow::Result<PeerId> {
+pub(super) fn parse_peer(peer: &str) -> anyhow::Result<PeerId> {
     PeerId::from_str(peer.trim()).map_err(|e| anyhow::anyhow!("{peer} is not a peer ID: {e}"))
 }
 

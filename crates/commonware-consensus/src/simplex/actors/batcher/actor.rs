@@ -6,13 +6,14 @@ use crate::{
         interesting,
         metrics::{Inbound, Peer, TimeoutReason},
         scheme::Scheme,
-        types::{Activity, Certificate, Proposal, Vote},
+        types::{encoded_certificate_round, Activity, Certificate, Proposal, Vote},
         Plan,
     },
     types::{Epoch, Participant, Round as Rnd, View, ViewDelta},
     Epochable, Relay, Reporter, Viewable,
 };
 use commonware_actor::mailbox;
+use commonware_codec::Decode as _;
 use commonware_cryptography::Digest;
 use commonware_macros::select_loop;
 use commonware_p2p::{utils::codec::WrappedReceiver, Blocker, Receiver, Recipients};
@@ -274,13 +275,14 @@ where
         mut self,
         mut voter: voter::Mailbox<S, D>,
         vote_receiver: impl Receiver<PublicKey = S::PublicKey>,
-        certificate_receiver: impl Receiver<PublicKey = S::PublicKey>,
+        mut certificate_receiver: impl Receiver<PublicKey = S::PublicKey>,
     ) {
         // Wrap channels
         let mut vote_receiver: WrappedReceiver<_, Vote<S, D>> =
             WrappedReceiver::new((), vote_receiver);
-        let mut certificate_receiver: WrappedReceiver<_, Certificate<S, D>> =
-            WrappedReceiver::new(self.scheme.certificate_codec_config(), certificate_receiver);
+        // QUILIBRIUM: certificates are decoded below, where the bytes can
+        // still name the epoch of one that does not decode.
+        let certificate_codec = self.scheme.certificate_codec_config();
 
         // Initialize view data structures
         let mut current = Current {
@@ -397,11 +399,24 @@ where
                 }
             },
             // Handle certificates from the network
-            Ok((sender, message)) = certificate_receiver.recv() else break => {
+            Ok((sender, bytes)) = certificate_receiver.recv() else break => {
                 // If there is a decoding error, block
-                let Ok(message) = message else {
+                let Ok(message) = Certificate::<S, D>::decode_cfg(bytes.as_ref(), &certificate_codec) else {
                     // QUILIBRIUM: summarized instead of a warning per message (discards.rs).
-                    if let Some(summary) = self.discards.undecodable(self.context.as_ref().current(), &sender) {
+                    // Signers are bounded by this epoch's committee, so a certificate of an
+                    // earlier, larger committee lands here: count it as what it is.
+                    let now = self.context.as_ref().current();
+                    let summary = match encoded_certificate_round(bytes.as_ref()) {
+                        Some(round) if round.epoch() != self.epoch => self.discards.epoch(
+                            now,
+                            &sender,
+                            round.epoch().get(),
+                            round.view().get(),
+                            self.epoch.get(),
+                        ),
+                        _ => self.discards.undecodable(now, &sender),
+                    };
+                    if let Some(summary) = summary {
                         summary.log(&self.discards.partition, self.epoch.get());
                     }
                     #[allow(clippy::disallowed_methods)]
@@ -421,7 +436,7 @@ where
                 if message.epoch() != self.epoch {
                     // QUILIBRIUM: summarized instead of a warning per message (discards.rs).
                     let now = self.context.as_ref().current();
-                    if let Some(summary) = self.discards.epoch(now, &sender, message.epoch().get(), self.epoch.get()) {
+                    if let Some(summary) = self.discards.epoch(now, &sender, message.epoch().get(), message.view().get(), self.epoch.get()) {
                         summary.log(&self.discards.partition, self.epoch.get());
                     }
                     #[allow(clippy::disallowed_methods)]
@@ -549,7 +564,7 @@ where
                 if message.epoch() != self.epoch {
                     // QUILIBRIUM: summarized instead of a warning per message (discards.rs).
                     let now = self.context.as_ref().current();
-                    if let Some(summary) = self.discards.epoch(now, &sender, message.epoch().get(), self.epoch.get()) {
+                    if let Some(summary) = self.discards.epoch(now, &sender, message.epoch().get(), message.view().get(), self.epoch.get()) {
                         summary.log(&self.discards.partition, self.epoch.get());
                     }
                     #[allow(clippy::disallowed_methods)]

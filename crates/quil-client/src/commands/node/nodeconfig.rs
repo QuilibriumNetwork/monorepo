@@ -477,7 +477,7 @@ fn clean_config_file(path: &Path, dry_run: bool) -> anyhow::Result<(PathBuf, Cle
 }
 
 /// `permissions` without any access for group and others.
-fn owner_only(permissions: std::fs::Permissions) -> std::fs::Permissions {
+pub(super) fn owner_only(permissions: std::fs::Permissions) -> std::fs::Permissions {
     #[cfg(unix)]
     let permissions = {
         use std::os::unix::fs::PermissionsExt as _;
@@ -529,7 +529,7 @@ fn write_backup(
 
 /// Replace `path` atomically: write a temporary file beside it with the
 /// given permissions, then rename it over `path`.
-fn replace_file(
+pub(super) fn replace_file(
     path: &Path,
     contents: &str,
     permissions: &std::fs::Permissions,
@@ -845,7 +845,7 @@ mod tests {
         let refused = "p2p:\n  network: 1\n  d: &degree 8\n";
         std::fs::write(&path, refused).unwrap();
         let error = clean_config_file(&path, false).unwrap_err().to_string();
-        assert!(error.contains("cannot safely comment out p2p.d"), "{error}");
+        assert!(error.contains("cannot safely change p2p.d"), "{error}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), refused);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }

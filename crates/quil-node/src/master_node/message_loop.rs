@@ -17,6 +17,10 @@ pub(crate) static SHARD_FRAME_VERIFY_TASKS: quil_engine::spawn_gate::SpawnGate =
 /// so a mainnet node of about 100 peers logs about two per interval.
 const OTHER_BUILD_LINES_PER_STATUS: u32 = 32;
 
+/// Messages queued for the loop, after the shard consensus lane took its own:
+/// as many as the network task queues for the lane.
+const LOOP_QUEUE: usize = 4096;
+
 pub(crate) struct MessageLoopArgs {
     /// Standalone workers, when this node runs them: direct shard consensus
     /// messages for their shards are handed to them.
@@ -184,7 +188,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         local_cw_tag,
         clock_store: clock_store_recv,
         exec_manager: exec_mgr_for_recv,
-        mut msg_rx,
+        msg_rx,
         mut consensus_loopback_rx,
         remote_consensus:
             super::consensus_intake::RemoteConsensusQueues {
@@ -228,6 +232,64 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         global_finalization: global_finalization_for_recv,
         activation_waits: activation_waits_for_recv,
     } = args;
+    // Shard consensus messages go to their engines from their own task, so
+    // that the loop's GLOBAL work holds back only the loop's messages.
+    let shard_sender_keys = Arc::new(std::sync::Mutex::new(
+        super::shard_sender::ShardSenderKeys::default(),
+    ));
+    let loop_queue_drops = Arc::new(super::shard_cw_lane::LoopQueueDrops::default());
+    let inbound = msg_rx;
+    let (to_loop, mut msg_rx) = tokio::sync::mpsc::channel(LOOP_QUEUE);
+    {
+        let engines = shard_engines_for_recv.clone();
+        let peer_infos = pic_for_recv.clone();
+        let global = crdt_for_recv.clone();
+        let keys = shard_sender_keys.clone();
+        let ring = recent_messages_for_recv.clone();
+        let drops = loop_queue_drops.clone();
+        sup.run_until_cancelled("shard-cw-lane", move |_| async move {
+            super::shard_cw_lane::run(inbound, to_loop, drops, move |received| {
+                let Some((filter, handle)) = engines.read().iter().find_map(|(filter, handle)| {
+                    (quil_engine::bitmasks::shard_cw_bitmask(filter) == received.bitmask)
+                        .then(|| (filter.clone(), handle.clone()))
+                }) else {
+                    return false;
+                };
+                if let Some(ring) = &ring {
+                    ring.push_received(&received.from, &received.bitmask, &received.data);
+                }
+                // A transmission naming another member is dropped here, unread.
+                if let Some((channel, cw_bytes)) =
+                    quil_engine::bitmasks::shard_cw_admit(&filter, &received.data, &local_cw_tag)
+                {
+                    let peer_info_key = peer_infos
+                        .read()
+                        .get(&received.from)
+                        .map(|info| info.public_key.clone());
+                    let from_key = shard_sender_key(
+                        &mut keys
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        &received.from,
+                        peer_info_key,
+                        &global,
+                        &filter,
+                    );
+                    tracing::debug!(filter = %hex::encode(&filter), channel,
+                        sender_known = !from_key.is_empty(), bytes = cw_bytes.len(),
+                        "routing shard CW message to its engine");
+                    handle.send(quil_engine::app_engine::AppEngineMessage::CwIn {
+                        channel,
+                        from: from_key,
+                        data: cw_bytes.to_vec(),
+                    });
+                }
+                true
+            })
+            .await;
+            Ok(())
+        });
+    }
     // Gossiped application frames and the ingest's retry pass run on their
     // own thread: GLOBAL execution holds the ingest while it sequences
     // application frames, and this loop must never wait for it.
@@ -334,7 +396,6 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         // validators' drops are lumped into `router_drops` and we
         // can't distinguish a peer-info flood from a frame flood
         // from per-shard noise.
-        let mut shard_sender_keys = super::shard_sender::ShardSenderKeys::default();
         let mut router_drops_peer_info: u64 = 0;
         let mut router_drops_prover: u64 = 0;
         let mut router_drops_frame: u64 = 0;
@@ -573,10 +634,17 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     // Archive endpoints in use (seeded at startup or learned);
                     // `archive_peers` counts only archives verified from their
                     // own PeerInfo since start.
+                    // An await: a step, since a section guard cannot cross it.
+                    probe::step(ProbeSection::StatusArchivePool);
                     let archive_endpoints = pool_for_recv.len().await;
+                    probe::step(ProbeSection::LoopStatus);
                     // Resolver messages delivered point-to-point instead of to
                     // the shard topic, cumulative since start.
                     let direct = p2p_for_recv.direct_stats();
+                    let sender_keys = {
+                        let keys = shard_sender_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        (keys.peer_info, keys.session, keys.cached, keys.unresolved)
+                    };
                     let latest_frame = {
                         let _read = probe::section(ProbeSection::LatestGlobalFrameRead);
                         clock_store_recv.get_latest_global_frame()
@@ -595,7 +663,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                             "GLOBAL_PEER_INFO validation changed: when strict, peers forwarding invalid PeerInfo, KeyRegistry or alerts are penalised and KeyRegistry records with an unsigned timestamp are refused"
                         );
                     }
-                    peer_info_bounds.expire(&mut pic_for_recv.write(), super::peer_info_file::unix_millis());
+                    {
+                        let _write = probe::section(ProbeSection::StatusPeerInfoCache);
+                        peer_info_bounds.expire(&mut pic_for_recv.write(), super::peer_info_file::unix_millis());
+                    }
                     other_build_lines_left = OTHER_BUILD_LINES_PER_STATUS;
                     let (active, pending, total_allocs) = {
                         use quil_types::consensus::{EffectiveStatus, ProverRegistry};
@@ -637,10 +708,11 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         pending_joins = pending,
                         total_allocations = total_allocs,
                         peer_infos = peer_infos_received,
-                        cw_sender_peer_info = shard_sender_keys.peer_info,
-                        cw_sender_session = shard_sender_keys.session,
-                        cw_sender_cached = shard_sender_keys.cached,
-                        cw_sender_unresolved = shard_sender_keys.unresolved,
+                        cw_sender_peer_info = sender_keys.0,
+                        cw_sender_session = sender_keys.1,
+                        cw_sender_cached = sender_keys.2,
+                        cw_sender_unresolved = sender_keys.3,
+                        loop_queue_full = loop_queue_drops.total(),
                         archive_endpoints,
                         archive_peers = archive_peers_seen.len(),
                         consensus_msgs = consensus_msgs_received,
@@ -717,14 +789,22 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     // ticks is the diagnosis signal.
                     let (replica_loads, replica_loads_peak) =
                         quil_store::replica_store::replica_load_bytes();
-                    let sizes = mem_sources.snapshot(
-                        archive_peers_seen.len(),
-                        peer_info_digest_cache.len(),
-                    );
+                    let sizes = {
+                        let _read = probe::section(ProbeSection::StatusMemorySnapshot);
+                        mem_sources.snapshot(
+                            archive_peers_seen.len(),
+                            peer_info_digest_cache.len(),
+                        )
+                    };
                     let proc_mem = crate::mem_stats::process_memory();
                     let host_mem = crate::mem_stats::host_memory();
+                    let (rocksdb_stores, rocksdb_memtables, rocksdb_table_readers) =
+                        quil_store::open_stores_memory();
                     let global_frames = clock_store_recv.global_frame_cache_stats();
-                    let global_mempool = mc_for_recv.pending_totals();
+                    let global_mempool = {
+                        let _read = probe::section(ProbeSection::StatusCollectorTotals);
+                        mc_for_recv.pending_totals()
+                    };
                     info!(
                         rss_mb = proc_mem
                             .map(|m| crate::mem_stats::fmt_mb(m.rss_bytes))
@@ -786,6 +866,18 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                             .map(|(used, _)| crate::mem_stats::fmt_mb(used)),
                         rocksdb_shared_cache_capacity_mb = quil_store::shared_block_cache_memory()
                             .map(|(_, capacity)| crate::mem_stats::fmt_mb(capacity)),
+                        // Every RocksDB store open in this process (the
+                        // master's and each thread worker's): memtables and
+                        // table readers, beside jemalloc's `allocated_mb`.
+                        rocksdb_open_stores = rocksdb_stores,
+                        rocksdb_memtables_mb = %crate::mem_stats::fmt_mb(rocksdb_memtables),
+                        rocksdb_table_readers_mb = %crate::mem_stats::fmt_mb(rocksdb_table_readers),
+                        // What storage jobs hold through their admission
+                        // reservations (mostly labelling buffers), which a
+                        // memory watch subtracts from `allocated_mb`.
+                        labelling_buffers_mb = %crate::mem_stats::fmt_mb(
+                            quil_engine::storage_jobs::held_bytes()
+                        ),
                         "memory snapshot"
                     );
                     if let Some(h) = host_mem {
@@ -1741,7 +1833,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                                 match evaluated {
                                                                     Ok(actions) => {
                                                                         for action in actions {
-                                                                            info!(frame = exec_num, ?action, "prover lifecycle action");
+                                                                            if pl_for_recv.action_is_new(&action) { info!(frame = exec_num, ?action, "prover lifecycle action"); }
                                                                             pp_for_recv.dispatch(action);
                                                                         }
                                                                     }
@@ -1932,8 +2024,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         {
                                             let peer_info_key = pic_for_recv.read().get(&received.from)
                                                 .map(|info| info.public_key.clone());
-                                            let from_key = shard_sender_key(&mut shard_sender_keys, &received.from,
-                                                peer_info_key, &crdt_for_recv, filter);
+                                            let from_key = shard_sender_key(
+                                                &mut shard_sender_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+                                                &received.from, peer_info_key, &crdt_for_recv, filter);
                                             tracing::debug!(filter = %hex::encode(filter), channel,
                                                 sender_known = !from_key.is_empty(), bytes = cw_bytes.len(),
                                                 "routing shard CW message to its engine");
@@ -1966,8 +2059,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             {
                                                 let peer_info_key = pic_for_recv.read().get(&received.from)
                                                     .map(|info| info.public_key.clone());
-                                                let from_key = shard_sender_key(&mut shard_sender_keys, &received.from,
-                                                    peer_info_key, &crdt_for_recv, &filter);
+                                                let from_key = shard_sender_key(
+                                                    &mut shard_sender_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+                                                    &received.from, peer_info_key, &crdt_for_recv, &filter);
                                                 let data = cw_bytes.to_vec();
                                                 let topic = bm.to_vec();
                                                 let p2p = p2p_for_recv.clone();

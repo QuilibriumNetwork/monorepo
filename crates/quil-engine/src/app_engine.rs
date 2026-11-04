@@ -2616,10 +2616,6 @@ pub struct AppEngineDeps {
     /// stub — fine for tests, dangerous in production because a
     /// restart can re-vote for a conflicting QC after a crash.
     pub kv_db: Option<Arc<dyn quil_types::store::KvDb>>,
-    /// When true, drive this shard's consensus with commonware-simplex +
-    /// Falcon (EQUAL VOTES) instead of the legacy quil-consensus HotStuff loop.
-    /// Off by default → legacy path unchanged.
-    pub app_consensus_cw: bool,
     /// DB config used to derive the PERSISTENT per-shard simplex-journal
     /// directory (Go parity: `app_consensus_engine.go:718` — core 0 →
     /// `db.path`, worker core N → `worker_paths[N-1]` / `worker_path_prefix`).
@@ -2871,6 +2867,8 @@ pub struct AppConsensusEngine {
     /// materialized twice (mirrors Go `lastMaterializedFrame`,
     /// app_consensus_engine.go:1444-1449).
     last_materialized_frame: u64,
+    /// Spend relays GLOBAL skipped (`crate::relay_reoffer`).
+    relay_watch: crate::relay_reoffer::RelayWatch,
     /// Thread-safe mirror of `last_materialized_frame` for the CW proposal
     /// check, which runs on the simplex thread. Bumped alongside the
     /// field via [`Self::set_materialized_frame`] wherever the materialized
@@ -3027,10 +3025,6 @@ pub struct AppConsensusEngine {
     /// Backing KV store for persistent consensus + liveness state.
     /// `None` falls back to the in-memory stub.
     kv_db: Option<Arc<dyn quil_types::store::KvDb>>,
-    /// Drive this shard with commonware-simplex + Falcon instead of legacy.
-    // Retained configuration field; simplex startup selects the active engine.
-    #[allow(dead_code)]
-    app_consensus_cw: bool,
     /// Handle to the running simplex engine (kept alive; the outbound drain
     /// + block ingress live in it). Populated by `start_consensus_cw`.
     cw_handle: Option<crate::cw_app_seams::AppConsensusCwHandle>,
@@ -3236,6 +3230,7 @@ impl AppConsensusEngine {
             retry_parent_seals: std::collections::BTreeSet::new(),
             pending_seal_rank: None,
             last_materialized_frame: 0,
+            relay_watch: Default::default(),
             shard_mat_frame,
             execution,
             data_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3283,7 +3278,6 @@ impl AppConsensusEngine {
             halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             coverage_publish: deps.coverage_publish,
             kv_db: deps.kv_db,
-            app_consensus_cw: deps.app_consensus_cw,
             cw_handle: None,
             cw_host_epoch: 0,
             cw_discarded_through_epoch: None,
@@ -7726,7 +7720,8 @@ impl AppConsensusEngine {
             .unwrap_or_default();
         let (state, began) = match stall {
             RecordStall::Ended { state, outcome } => {
-                info!(core_id = self.core_id, filter = %filter, session = %session,
+                info!(core_id = self.core_id, filter = %filter, session = %session, committed_frame,
+                    latest_global_frame = self.latest_global_header_frame(),
                     global_executed = state.executed, checkpoint = state.checkpoint,
                     copies = state.copies, waited_secs = state.waited_secs, outcome,
                     "closing session's seal record stall ended");
@@ -8615,6 +8610,7 @@ impl AppConsensusEngine {
         } else if !timer_due(&self.seal_follow, self.seal_published_at) {
             return;
         }
+        let view_frame = view.as_ref().ok().map(handoff::CommittedView::frame);
         match view.and_then(|view| handoff::schedule::seal_submitted(&view, session)) {
             Ok(false) => {
                 self.publish_seal(&submission, trigger);
@@ -8625,7 +8621,7 @@ impl AppConsensusEngine {
                 let stall = self.seal_drain_progress.clear(now);
                 self.log_seal_drain_stall(stall, None);
                 let record = self.seal_record.clear("recorded", now);
-                self.log_seal_record_stall(record, None);
+                self.log_seal_record_stall(record, view_frame);
             }
             Err(_) => {}
         }
@@ -8658,7 +8654,12 @@ impl AppConsensusEngine {
             let stall = self.seal_drain_progress.clear(now);
             self.log_seal_drain_stall(stall, None);
             let record = self.seal_record.clear("cleared", now);
-            self.log_seal_record_stall(record, None);
+            let view_frame = if record.is_some() {
+                handoff_view_frame(&global)
+            } else {
+                None
+            };
+            self.log_seal_record_stall(record, view_frame);
             self.sealed_session = None;
             self.seal_published_at = None;
             self.seal_published_head = None;
@@ -8702,6 +8703,7 @@ impl AppConsensusEngine {
         }
         if matches!(status, Ok(true)) {
             self.observe_session_view_lag(&global, &session, now, &filter);
+            self.reoffer_unrelayed_spends(&global);
         }
         match status {
             Ok(true) => {}
@@ -8725,6 +8727,89 @@ impl AppConsensusEngine {
             }
             // Logged above, at its transitions.
             Err(_) => {}
+        }
+    }
+
+    /// Put back in the mempool the confidential bundles GLOBAL's executed
+    /// headers skipped the spend relay of (`crate::relay_reoffer`), from the
+    /// tip this tick's view read. Reads no store unless the tip jumped past
+    /// the relay window, or on the first tick after a start.
+    fn reoffer_unrelayed_spends(&mut self, global: &Arc<quil_hypergraph::HypergraphCrdt>) {
+        use crate::message_collector::SubmitOutcome;
+        use crate::relay_reoffer::{unrelayed_bundles, MAX_REOFFERS, REOFFER_HORIZON_FRAMES};
+        use sha3::Digest;
+        let Some(tip) = self.lagging_voter.global_tip else {
+            return;
+        };
+        let Some(application) = self
+            .app_address
+            .get(..32)
+            .and_then(|address| <[u8; 32]>::try_from(address).ok())
+        else {
+            return;
+        };
+        let filter = hex::encode(&self.filter);
+        let expired = self.relay_watch.observe_tip(tip);
+        if expired > 0 {
+            // Most such frames carry nothing; GLOBAL's own coverage warning
+            // names actual skips.
+            info!(filter = %filter, executed_tip = tip, frames = expired,
+                horizon_frames = REOFFER_HORIZON_FRAMES,
+                "source frames left the spend re-offer horizon without being examined: \
+                 a spend GLOBAL skipped there stays uncommitted until its sender submits it again");
+        }
+        for frame in self.relay_watch.due() {
+            let bundles = match unrelayed_bundles(
+                self.clock_store.as_ref(),
+                global,
+                &application,
+                &self.filter,
+                frame,
+                self.last_materialized_frame,
+            ) {
+                Ok(bundles) => bundles,
+                Err(error) => {
+                    // Another member holds it, or the next jump's pass reads it.
+                    info!(filter = %filter, source_frame = frame, executed_tip = tip, error = %error,
+                        "cannot examine a frame GLOBAL skipped the spend relay of on this node");
+                    self.relay_watch.examined(frame);
+                    continue;
+                }
+            };
+            let mut retry = false;
+            for canonical in bundles {
+                let hash: [u8; 32] = sha3::Sha3_256::digest(&canonical).into();
+                let bundle = hex::encode(&hash[..4]);
+                if !self.relay_watch.may_reoffer(&hash) {
+                    if self.relay_watch.note_given_up(&hash) {
+                        warn!(filter = %filter, source_frame = frame, executed_tip = tip, bundle = %bundle,
+                            reoffers = MAX_REOFFERS, scope = "network: GLOBAL keeps skipping this bundle's relay",
+                            action = "it stays uncommitted and consumed nothing: its sender submits it again",
+                            "giving up re-offering a confidential bundle");
+                    }
+                    continue;
+                }
+                match self.message_collector.readmit(canonical) {
+                    SubmitOutcome::Accepted => {
+                        let attempt = self.relay_watch.note_reoffered(hash);
+                        info!(filter = %filter, source_frame = frame, executed_tip = tip, bundle = %bundle,
+                            attempt, max_attempts = MAX_REOFFERS,
+                            "re-offering a confidential bundle: GLOBAL executed past every header \
+                             relaying it without deciding it; a later frame executes it again");
+                    }
+                    SubmitOutcome::Duplicate => {}
+                    SubmitOutcome::Filtered(refusal) => {
+                        // The collector logs a full rank; the frame waits for
+                        // room, within the horizon.
+                        retry = retry || refusal.retryable();
+                        debug!(filter = %filter, source_frame = frame, bundle = %bundle,
+                            reason = refusal.reason(), "mempool refused a re-offered bundle");
+                    }
+                }
+            }
+            if !retry {
+                self.relay_watch.examined(frame);
+            }
         }
     }
 
@@ -16308,6 +16393,13 @@ pub(crate) fn validate_app_frame_panic_safe(
     }
 }
 
+/// The frame of this worker's committed GLOBAL view, `None` when unreadable.
+fn handoff_view_frame(global: &Arc<quil_hypergraph::HypergraphCrdt>) -> Option<u64> {
+    quil_execution::global_intrinsic::handoff::CommittedView::capture(global)
+        .ok()
+        .map(|view| view.frame())
+}
+
 /// Whether a session's committed GLOBAL view, at `committed_frame`, trails
 /// the latest GLOBAL frame the node holds by more than an epoch.
 fn session_view_behind(committed_frame: u64, latest_global_frame: u64, epoch_frames: u64) -> bool {
@@ -17866,7 +17958,6 @@ mod fence_reanchor_tests {
             execution_engine: None,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -18042,7 +18133,6 @@ mod fence_reanchor_tests {
             execution_engine: Some(manager),
             inclusion_prover: Some(prover),
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -19168,7 +19258,6 @@ mod frame_gap_tests {
             execution_engine: None,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -19244,7 +19333,6 @@ mod tests {
             execution_engine: None,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -22423,7 +22511,6 @@ mod tests {
             execution_engine: None,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -23113,7 +23200,6 @@ mod tests {
             execution_engine: None,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -23981,7 +24067,6 @@ mod tests {
             execution_engine: None,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -24099,7 +24184,6 @@ mod tests {
             execution_engine: Some(manager),
             inclusion_prover: Some(prover),
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -24246,7 +24330,6 @@ mod tests {
             execution_engine: Some(manager),
             inclusion_prover: Some(prover),
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -24366,7 +24449,6 @@ mod tests {
             execution_engine: None,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -24472,7 +24554,6 @@ mod tests {
             execution_engine: None,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -24548,7 +24629,6 @@ mod tests {
             execution_engine: None,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -24679,7 +24759,6 @@ mod tests {
             execution_engine: Some(manager),
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -24744,7 +24823,6 @@ mod tests {
                 execution_engine: Some(manager),
                 inclusion_prover: None,
                 kv_db: None,
-                app_consensus_cw: false,
                 db_config: Default::default(),
                 unified_cutover_hook: None,
             };
@@ -25347,7 +25425,6 @@ mod tests {
                     execution_engine: None,
                     inclusion_prover: None,
                     kv_db: None,
-                    app_consensus_cw: false,
                     db_config: Default::default(),
                     unified_cutover_hook: None,
                 };
@@ -25683,7 +25760,13 @@ mod tests {
         engine.maintain_committee_session().await;
         let ended = logs.lines_with("seal record stall ended");
         assert_eq!(ended.len(), 1, "{ended:?}");
-        for field in ["INFO", "cleared", "copies=1", session.as_str()] {
+        for field in [
+            "INFO",
+            "cleared",
+            "copies=1",
+            "committed_frame=2",
+            session.as_str(),
+        ] {
             assert!(ended[0].contains(field), "{field}: {}", ended[0]);
         }
         assert!(!engine.seal_record.waiting());
@@ -25814,7 +25897,6 @@ mod gossip_frame_tests {
             execution_engine,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -26130,7 +26212,6 @@ mod gossip_frame_repro_tests {
             execution_engine,
             inclusion_prover: None,
             kv_db: None,
-            app_consensus_cw: false,
             db_config: Default::default(),
             unified_cutover_hook: None,
         };
@@ -26393,3 +26474,7 @@ mod proof_backlog_tests;
 #[cfg(test)]
 #[path = "app_engine_arrival_tests.rs"]
 mod arrival_tests;
+
+#[cfg(test)]
+#[path = "app_engine_relay_tests.rs"]
+mod relay_tests;

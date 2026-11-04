@@ -398,6 +398,42 @@ mod tests {
             .collect()
     }
 
+    /// The status tick's waits are named: the awaited pool read as a step,
+    /// the synchronous reads as sections.
+    #[test]
+    fn the_status_tick_names_its_waits() {
+        let probe = ThreadProbe::new();
+        let t0 = now_ms();
+        probe.beat_at(t0);
+        let watch_for = |probe: &Arc<ThreadProbe>| {
+            let mut watch = StallWatch::new(REPEAT);
+            watch.add(
+                Section::MessageLoop,
+                MESSAGE_LOOP_IMPACT,
+                MESSAGE_LOOP_STALL_AFTER,
+                probe,
+            );
+            watch
+        };
+        let _installed = install(probe.clone());
+        step(Section::StatusArchivePool);
+        let reports = watch_for(&probe).poll(t0 + 60_000);
+        assert_eq!(blocked(&reports)[0].2, "archive endpoint pool size read");
+        step(Section::LoopStatus);
+        for (wait, label) in [
+            (Section::StatusPeerInfoCache, "peer info cache write"),
+            (
+                Section::StatusCollectorTotals,
+                "GLOBAL message collector totals",
+            ),
+            (Section::StatusMemorySnapshot, "memory source snapshot"),
+        ] {
+            let _wait = section(wait);
+            let reports = watch_for(&probe).poll(t0 + 60_000);
+            assert_eq!(blocked(&reports)[0].2, format!("status tick / {label}"));
+        }
+    }
+
     #[test]
     fn a_blocked_task_warns_once_repeats_after_the_interval_and_logs_its_end() {
         let probe = ThreadProbe::new();

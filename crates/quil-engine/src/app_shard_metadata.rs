@@ -418,7 +418,8 @@ pub fn replica_keep_from(current_epoch: u64) -> u64 {
 /// it encodes. A standalone worker's store has no other eviction, so it kept
 /// one replica set per epoch. `retired_below` holds the boundary already
 /// applied to this store: each boundary is evicted and logged once, and a
-/// failure leaves it for the next encoding. Returns whether this call evicted.
+/// failure leaves it for the next encoding. Returns whether this call evicted
+/// (not when the master's confirmation already evicted this store for it).
 pub fn retire_unchallengeable_replicas(
     replica_store: &quil_store::replica_store::ReplicaStore,
     retired_below: &std::sync::atomic::AtomicU64,
@@ -433,8 +434,12 @@ pub fn retire_unchallengeable_replicas(
         return false;
     }
     crate::storage_snapshot::note_replica_eviction(current_epoch);
-    match replica_store.evict_below_epoch(keep_from) {
-        Ok(()) => {
+    match replica_store.evict_below_epoch_once(keep_from, &hex::encode(filter)) {
+        Ok(false) => {
+            retired_below.fetch_max(keep_from, Ordering::AcqRel);
+            false
+        }
+        Ok(true) => {
             retired_below.fetch_max(keep_from, Ordering::AcqRel);
             // `since_epoch` 0: the first eviction since start, which also
             // drops any backlog an earlier build left.

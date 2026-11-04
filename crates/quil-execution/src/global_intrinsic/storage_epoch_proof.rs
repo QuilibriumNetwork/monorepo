@@ -52,6 +52,13 @@ pub use quil_storage_stark::seal::Opened;
 
 pub const TYPE_STORAGE_EPOCH_PROOF: u32 = 0x0324;
 
+/// How a refusal names a seal or settlement GLOBAL already applied. Its
+/// deadline is checked first, so a late copy names both.
+pub const REFUSED_DUPLICATE: &str = "a duplicate";
+/// How a refusal names a seal or settlement past its deadline that GLOBAL
+/// has not applied.
+pub const REFUSED_LATE: &str = "a deadline miss";
+
 const MAX_SHARD_FILTER_LEN: u32 = 64;
 /// More than a seat commits in an epoch: one per app frame it proposed.
 pub const MAX_FRAMES: u32 = 1 << 16;
@@ -736,18 +743,33 @@ fn check_seat(
         }
         let begins = seal_epoch.saturating_mul(quil_types::consensus::epoch_length_frames());
         if frame_number >= begins {
-            return Err(invalid(format!(
-                "epoch {seal_epoch} began at frame {begins}, before this seal"
-            )));
+            let past = frame_number + 1 - begins;
+            let sealed = seat.slot(seal_epoch).and_then(|slot| slot.sealed_at);
+            return Err(invalid(match sealed {
+                Some(at) => format!(
+                    "epoch {seal_epoch} began at frame {begins}, before this seal: \
+                     {REFUSED_DUPLICATE}, sealed at frame {at}; frames past the deadline: {past}"
+                ),
+                None => format!(
+                    "epoch {seal_epoch} began at frame {begins}, before this seal: \
+                     {REFUSED_LATE}, frames past the deadline: {past}"
+                ),
+            }));
         }
         let slot = seat.slot(seal_epoch).ok_or_else(|| {
             invalid(format!(
                 "the seat has no registration for epoch {seal_epoch}"
             ))
         })?;
-        if slot.leaves.is_empty() || slot.sealed_at.is_some() {
+        if let Some(at) = slot.sealed_at {
             return Err(invalid(format!(
-                "the seat's registration for epoch {seal_epoch} is empty or sealed"
+                "the seat's registration for epoch {seal_epoch} is sealed: \
+                 {REFUSED_DUPLICATE}, sealed at frame {at}"
+            )));
+        }
+        if slot.leaves.is_empty() {
+            return Err(invalid(format!(
+                "the seat's registration for epoch {seal_epoch} is empty"
             )));
         }
         let beacon_frame = slot.registered_at + 1;
@@ -843,10 +865,23 @@ fn check_seat(
     if part.settles {
         let (from, until) = storage_seat::settlement_window(part.epoch);
         if !(from..until).contains(&frame_number) {
-            return Err(invalid(format!(
-                "epoch {} settles in frames [{from}, {until})",
-                part.epoch
-            )));
+            let settled = seat.slot(part.epoch).and_then(|slot| match slot.outcome {
+                Outcome::Settled(at) => Some(at),
+                _ => None,
+            });
+            let window = format!("epoch {} settles in frames [{from}, {until})", part.epoch);
+            return Err(invalid(if frame_number < from {
+                window
+            } else {
+                let past = frame_number + 1 - until;
+                match settled {
+                    Some(at) => format!(
+                        "{window}: {REFUSED_DUPLICATE}, settled at frame {at}; frames past \
+                         the deadline: {past}"
+                    ),
+                    None => format!("{window}: {REFUSED_LATE}, frames past the deadline: {past}"),
+                }
+            }));
         }
         let slot = seat.slot(part.epoch).ok_or_else(|| {
             invalid(format!(
@@ -854,6 +889,12 @@ fn check_seat(
                 part.epoch
             ))
         })?;
+        if let Outcome::Settled(at) = slot.outcome {
+            return Err(invalid(format!(
+                "epoch {} is settled: {REFUSED_DUPLICATE}, settled at frame {at}",
+                part.epoch
+            )));
+        }
         if !slot.is_sealed() || slot.outcome != Outcome::Open || slot.frames == 0 {
             return Err(invalid(format!(
                 "epoch {} has nothing to settle",

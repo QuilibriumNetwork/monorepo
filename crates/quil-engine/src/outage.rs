@@ -69,6 +69,12 @@ impl Outage {
         }
     }
 
+    /// Whether the outage has begun and not yet ended, so a caller that
+    /// compares one threshold can end it at a lower one (hysteresis).
+    pub fn is_active(&self) -> bool {
+        self.failing.as_ref().is_some_and(|f| f.began)
+    }
+
     /// Record one attempt's outcome at `now`; returns the transition to log.
     pub fn observe(&mut self, now: Instant, ok: bool) -> Option<OutageEvent> {
         if ok {

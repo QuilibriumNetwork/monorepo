@@ -65,7 +65,6 @@ fn engine_on(clock: Arc<dyn ClockStore>) -> AppConsensusEngine {
         execution_engine: None,
         inclusion_prover: None,
         kv_db: None,
-        app_consensus_cw: false,
         db_config: Default::default(),
         unified_cutover_hook: None,
     };
@@ -184,7 +183,6 @@ fn shard_engine_on(
         execution_engine: Some(manager),
         inclusion_prover: Some(prover),
         kv_db: None,
-        app_consensus_cw: false,
         db_config: Default::default(),
         unified_cutover_hook: None,
     };

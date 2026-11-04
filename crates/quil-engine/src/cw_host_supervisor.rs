@@ -446,9 +446,12 @@ mod tests {
         )));
         std::fs::create_dir(&directory.0).unwrap();
 
-        struct Proposer;
+        // Counts the hosts' work: proposals, verifications and reports.
+        let progress = Arc::new(AtomicUsize::new(0));
+        struct Proposer(Arc<AtomicUsize>);
         impl GlobalProposer for Proposer {
             fn propose(&self, view: u64, parent: Digest) -> Option<(Digest, Vec<u8>)> {
+                self.0.fetch_add(1, Ordering::SeqCst);
                 let mut hash = Sha256::new();
                 hash.update(view.to_be_bytes());
                 hash.update(parent.as_ref());
@@ -473,9 +476,12 @@ mod tests {
         struct Finalizer {
             failed: AtomicBool,
             reported: mpsc::UnboundedSender<u64>,
+            progress: Arc<AtomicUsize>,
         }
         impl FrameFinalizer for Finalizer {
-            fn on_notarized(&self, _: u64, _: Digest, _: Option<Vec<u8>>) {}
+            fn on_notarized(&self, _: u64, _: Digest, _: Option<Vec<u8>>) {
+                self.progress.fetch_add(1, Ordering::SeqCst);
+            }
             fn on_finalized(
                 &self,
                 view: u64,
@@ -484,6 +490,7 @@ mod tests {
                 _: Option<Vec<u8>>,
                 _: bool,
             ) {
+                self.progress.fetch_add(1, Ordering::SeqCst);
                 if !self.failed.swap(true, Ordering::SeqCst) {
                     panic!("injected reporter failure");
                 }
@@ -502,6 +509,7 @@ mod tests {
         let finalizer = Arc::new(Finalizer {
             failed: AtomicBool::new(false),
             reported: tx,
+            progress: progress.clone(),
         });
         let starts = Arc::new(AtomicUsize::new(0));
         let (tx, _outbound) = mpsc::unbounded_channel();
@@ -510,6 +518,7 @@ mod tests {
                 let starts = starts.clone();
                 let path = directory.0.clone();
                 let store = BlockStore::new();
+                let progress = progress.clone();
                 move |shutdown| {
                     if starts.fetch_add(1, Ordering::SeqCst) > 0 {
                         assert!(
@@ -523,7 +532,7 @@ mod tests {
                     spawn_global_host(
                         committee.scheme.clone(),
                         committee.peers.clone(),
-                        Arc::new(Proposer),
+                        Arc::new(Proposer(progress.clone())),
                         Arc::new(Sink),
                         finalizer.clone(),
                         store.clone(),
@@ -536,16 +545,44 @@ mod tests {
             Arc::new(Transport(tx)),
             policy(),
         );
-        let result = tokio::time::timeout(Duration::from_secs(20), async {
-            while rx.recv().await.unwrap() < 5 {}
-        })
-        .await;
+        // Wait while the hosts work, failing once they have done nothing for
+        // `STALL`: a bound on the whole run is a bound on the runner's load.
+        // It takes about 0.4 s beside other tests, and over 20 s on a host
+        // loaded past its CPUs (2026-11-03). A replacement that stops
+        // finalizing, or one failing again, still fails the test.
+        const STALL: Duration = Duration::from_secs(20);
+        let mut last = (progress.load(Ordering::SeqCst), Instant::now());
+        let mut finalized = 0;
+        let result = loop {
+            if let Ok(view) = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
+                finalized = view.unwrap();
+                if finalized >= 5 {
+                    break Ok(());
+                }
+            }
+            let started = starts.load(Ordering::SeqCst);
+            let work = progress.load(Ordering::SeqCst);
+            if started > 2 {
+                break Err(format!("the replacement failed too: {started} starts"));
+            } else if work != last.0 {
+                last = (work, Instant::now());
+            } else if last.1.elapsed() >= STALL {
+                break Err(format!(
+                    "no progress for {STALL:?}, after {started} starts, {work} steps \
+                     and view {finalized} finalized"
+                ));
+            }
+        };
         drop(inputs);
-        tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .unwrap()
+        // The host reads its flag every 250 ms, then drains its runtime; the
+        // bound only catches a host or supervisor that never stops.
+        let stopped = tokio::time::timeout(Duration::from_secs(60), task).await;
+        if let Err(stalled) = result {
+            panic!("replacement must continue finalizing after the injected failure: {stalled}");
+        }
+        stopped
+            .expect("the supervisor stops its host once its inputs close")
             .unwrap();
-        result.expect("replacement must continue finalizing after the injected failure");
         assert_eq!(starts.load(Ordering::SeqCst), 2);
     }
 }

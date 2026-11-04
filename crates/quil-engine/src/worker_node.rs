@@ -70,12 +70,6 @@ pub struct WorkerNodeConfig {
     pub channel_tls_key_pem: Option<String>,
     /// Parent process ID (for monitoring).
     pub parent_pid: Option<u32>,
-    /// Whether app-shard consensus runs on commonware-simplex (CW) rather than
-    /// the legacy path — mirrors thread mode's `config.engine.app_consensus_cw`.
-    /// Threaded here so a cluster (separate-process) worker's `AppConsensusEngine`
-    /// activates the same CW path the in-process thread worker does, instead of
-    /// the previously hardcoded `false` (which pinned cluster workers to legacy).
-    pub app_consensus_cw: bool,
     /// This worker's on-disk data directory. Used as the base for the app-shard
     /// commonware-simplex journal (`<data_dir>/cw-app-consensus/app-<addr>`) so a
     /// cluster worker's CW journal is PERSISTENT — matching thread mode. With no
@@ -1175,11 +1169,6 @@ impl WorkerOnlyNode {
             // gated on `Some(kv)`) was skipped, so the worker NEVER attested and
             // its shard reward was silently zeroed by the global gate.
             kv_db: self.kv_db.clone(),
-            // Cluster-mode app-shard CW: mirror thread mode by honoring the
-            // configured flag. The worker's own p2p subscribes to
-            // `shard_cw_bitmask` and routes inbound CW to the engine (see
-            // `route_message` / `subscribe_to_shard_bitmasks`).
-            app_consensus_cw: self.config.app_consensus_cw,
             // App-shard CW journal path for THIS cluster worker. A cluster worker
             // is its OWN process with a UNIQUE on-disk data dir, and is ALWAYS
             // core_id 1. `DbConfig::default().worker_path_prefix` is the RELATIVE
@@ -1314,8 +1303,8 @@ impl WorkerOnlyNode {
             // publishes CW out (`CwOut` → `shard_cw_bitmask`) to a topic it
             // never joined ("not subscribed to bitmask") AND never receives
             // peers' votes/certs/blocks → its simplex engine can't reach
-            // quorum. Gating this on `config.app_consensus_cw` (default false,
-            // a vestige of the removed legacy path) was the bug.
+            // quorum. It was once gated on a config flag, a vestige of the
+            // removed legacy path; that gating was the bug.
             crate::bitmasks::shard_cw_bitmask(filter),
         ];
         for bm in &bitmasks {
@@ -3571,7 +3560,6 @@ mod respawn_queue_tests {
             channel_tls_leaf_pem: None,
             channel_tls_key_pem: None,
             parent_pid: None,
-            app_consensus_cw: false,
             data_dir: None,
             channel_factory: None,
         };

@@ -223,6 +223,8 @@ pub fn running(m: &Model) -> bool {
 fn busy(m: &Model) -> bool {
     running(m)
         || super::shield::running(m)
+        || super::transfer::running(m)
+        || m.coins.transfer.dialog.is_some()
         || m.coins.mint.dialog.is_some()
         || m.coins.shield.dialog.is_some()
 }

@@ -1044,7 +1044,6 @@ async fn tier2_composite_end_to_end() {
                 Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>
             ),
             kv_db: None,
-            app_consensus_cw: false,
             db_config: quil_config::DbConfig {
                 path: String::new(),
                 worker_path_prefix: String::new(),

@@ -8,7 +8,7 @@ use libp2p::swarm::NetworkBehaviour;
 use libp2p::{Multiaddr, PeerId, SwarmBuilder};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::autonat_health::{AutonatHealth, ProbeContext, ProbeFailure};
 use crate::external_addr::{ConfirmedExternalAddrs, ExternalAddrTracker};
@@ -43,6 +43,8 @@ pub struct P2PNode {
     /// only the handful of global archives and relayed by no one else —
     /// keep propagating even when the broader swarm churns.
     direct_peers: Vec<(PeerId, Multiaddr)>,
+    /// `p2p.additionalListenMultiaddrs`; none on a worker's swarm.
+    additional_listen: Vec<String>,
     network: u8,
     /// If a new Ed448 key was generated, the hex-encoded config key (228 chars).
     /// The caller should persist this in the config file.
@@ -209,6 +211,7 @@ impl P2PNode {
             keypair,
             bootstrap_peers,
             direct_peers,
+            additional_listen: config.additional_listen_multiaddrs.clone(),
             network: config.network,
             generated_key_hex,
             blossomsub_params: crate::BlossomsubParams::from_p2p_config(config),
@@ -296,6 +299,7 @@ impl P2PNode {
         // `new_with_options` first, then swap in the worker-specific
         // identity + signing config.
         let mut base = Self::new_with_options(p2p, false, None)?;
+        base.additional_listen = Vec::new();
         base.keypair = worker_keypair;
         base.peer_id = worker_peer_id;
         base.pubsub_signing_keypair = Some(real_keypair);
@@ -540,23 +544,53 @@ impl P2PNode {
             want_quic = Some(port);
         }
 
+        // A configured IPv6 address binds as written; any other address names
+        // only a port and transport and binds `0.0.0.0`.
+        let bind = bind_ip(&listen_multiaddr);
+        let listen_v6 = matches!(bind, Protocol::Ip6(_));
+        let mut listeners: Vec<Multiaddr> = Vec::new();
         if let Some(port) = want_quic {
-            let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", port)
-                .parse()
-                .unwrap();
-            match swarm.listen_on(quic_addr.clone()) {
-                Ok(_) => debug!(%quic_addr, "QUIC listener starting"),
-                Err(e) => debug!(error = format!("{:?}", e), "failed to start QUIC listener"),
-            }
+            listeners.push(quic_listener(&bind, port));
         }
         if let Some(port) = want_tcp {
-            let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port).parse().unwrap();
-            match swarm.listen_on(tcp_addr.clone()) {
-                Ok(_) => debug!(%tcp_addr, "TCP listener starting"),
-                Err(e) => debug!(error = format!("{:?}", e), "failed to start TCP listener"),
+            listeners.push(tcp_listener(&bind, port));
+        }
+        for raw in &self.additional_listen {
+            match additional_listener(raw, listen_v6) {
+                Ok(addr) => listeners.push(addr),
+                Err(reason) => warn!(
+                    configured = %raw,
+                    reason,
+                    "ignoring an entry of p2p.additionalListenMultiaddrs; it must be \
+                     /ip4/HOST/... or /ip6/HOST/... in the address family listenMultiaddr \
+                     does not name, over TCP or QUIC"
+                ),
             }
         }
+        let mut started = 0usize;
+        for addr in listeners {
+            match swarm.listen_on(addr.clone()) {
+                Ok(_) => {
+                    debug!(%addr, "p2p listener starting");
+                    started += 1;
+                }
+                Err(e) => warn!(
+                    %addr,
+                    error = format!("{:?}", e),
+                    "a p2p listener failed to start, so peers cannot dial this address; check \
+                     that the host has the address family and the port is free"
+                ),
+            }
+        }
+        if started == 0 {
+            warn!(
+                listen = %listen_multiaddr,
+                "no p2p listener started, so this node dials no bootstrap peer and peers cannot \
+                 dial it; fix p2p.listenMultiaddr and restart"
+            );
+        }
 
+        let configured_listen = listen_multiaddr.clone();
         let peer_id = self.peer_id;
         let bootstrap_peers = self.bootstrap_peers.clone();
         let direct_peers = self.direct_peers.clone();
@@ -566,16 +600,21 @@ impl P2PNode {
         let pc_writer = peer_count.clone();
         // The current AutoNAT-confirmed external address of each listener
         // transport (see `external_addr`), published to the handle.
-        let mut external_tracker =
-            crate::external_addr::ExternalAddrTracker::new(want_tcp, want_quic, is_routable);
+        let mut external_tracker = crate::external_addr::ExternalAddrTracker::new(
+            want_tcp,
+            want_quic,
+            listen_v6,
+            is_routable,
+        );
         let (external_tx, external_addrs) =
             tokio::sync::watch::channel(crate::external_addr::ConfirmedExternalAddrs::default());
         // The listeners' current addresses, one per bound interface address.
         let (listen_tx, listen_addrs) = tokio::sync::watch::channel(Vec::<String>::new());
         // AutoNAT's servers: peers that serve it, one per remote IP, and the
         // configured bootstrap and direct peers.
-        // The listeners bind IPv4 only (see above).
-        let mut probe_servers = crate::autonat_servers::ProbeServers::new(is_routable, true, false);
+        // Those of the family of `listenMultiaddr`, which PeerInfo announces.
+        let mut probe_servers =
+            crate::autonat_servers::ProbeServers::new(is_routable, !listen_v6, listen_v6);
         // Operator lines on AutoNAT's status and failing probes.
         let mut autonat_health = AutonatHealth::new(std::time::Instant::now());
         // P2P prometheus registry: the blossomsub behaviour owns it (its
@@ -618,6 +657,7 @@ impl P2PNode {
             let mut discovery_timer = tokio::time::interval(Duration::from_secs(30));
             discovery_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut discovery_count = 0u32;
+            let mut ticks_without_listener = 0u32;
             let mut autonat_server_summary_at = std::time::Instant::now();
             // Throttle NeedPeers-driven Kademlia discovery. BlossomSub
             // can fire `NeedPeers` repeatedly when the mesh is short
@@ -673,6 +713,21 @@ impl P2PNode {
                                      limits, usually two connections already held to the requester; \
                                      throttled: rate limits); background work for the network, no action \
                                      needed"
+                                );
+                            }
+                        }
+                        // Everything below waits for a first listen address: a
+                        // listener can bind and hold none, as `::` on a host with
+                        // IPv6 disabled does. The first tick fires at once.
+                        if !bootstrapped {
+                            ticks_without_listener = ticks_without_listener.saturating_add(1);
+                            if ticks_without_listener % 120 == 2 {
+                                warn!(
+                                    listen = %configured_listen,
+                                    waited_secs = u64::from(ticks_without_listener - 1) * 30,
+                                    "no p2p listener has an address, so this node dials no peer \
+                                     and peers cannot dial it; check that the host has an address \
+                                     in the family of p2p.listenMultiaddr, and that its port is free"
                                 );
                             }
                         }
@@ -753,7 +808,7 @@ impl P2PNode {
                     event = swarm.select_next_some() => {
                         match event {
                             libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
-                                debug!(%address, "listening");
+                                info!(%address, "p2p listener bound");
                                 listen_tx.send_if_modified(|addrs| add_listen_addr(addrs, &address));
                                 // Dial bootstrap peers and start DHT bootstrap
                                 if !bootstrapped {
@@ -818,11 +873,19 @@ impl P2PNode {
                                 }
                             }
                             libp2p::swarm::SwarmEvent::ExpiredListenAddr { address, .. } => {
-                                debug!(%address, "no longer listening");
+                                info!(%address, "p2p listener address gone");
                                 listen_tx.send_if_modified(|addrs| remove_listen_addrs(addrs, std::slice::from_ref(&address)));
                             }
-                            libp2p::swarm::SwarmEvent::ListenerClosed { addresses, .. } => {
-                                debug!(?addresses, "listener closed");
+                            libp2p::swarm::SwarmEvent::ListenerClosed { addresses, reason, .. } => {
+                                match reason {
+                                    Ok(()) => info!(?addresses, "p2p listener closed"),
+                                    Err(e) => warn!(
+                                        ?addresses,
+                                        error = %e,
+                                        "a p2p listener closed on an error, so peers cannot dial \
+                                         these addresses until a restart"
+                                    ),
+                                }
                                 listen_tx.send_if_modified(|addrs| remove_listen_addrs(addrs, &addresses));
                             }
                             libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
@@ -1557,6 +1620,9 @@ impl P2PHandle {
     /// subscribed to the bitmask).
     pub async fn publish(&self, bitmask: Vec<u8>, data: Vec<u8>) -> quil_types::error::Result<()> {
         let (ack_tx, ack_rx) = oneshot::channel();
+        let queued = self.cmd_tx.max_capacity() - self.cmd_tx.capacity();
+        let capacity = self.cmd_tx.max_capacity();
+        let sent = std::time::Instant::now();
         self.cmd_tx
             .send(P2PCommand::Publish {
                 bitmask,
@@ -1569,9 +1635,11 @@ impl P2PHandle {
             })?;
         match ack_rx.await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(reason)) => Err(QuilError::P2p(format!(
-                "blossomsub publish failed: {}",
-                reason
+            Ok(Err(reason)) => Err(QuilError::P2p(publish_failure(
+                &reason,
+                queued,
+                capacity,
+                sent.elapsed(),
             ))),
             Err(_) => Err(QuilError::P2p(
                 "p2p swarm dropped publish ack (event loop exited)".into(),
@@ -1912,6 +1980,49 @@ pub fn message_id(data: &[u8]) -> Vec<u8> {
     id
 }
 
+/// The IP the swarm binds for the configured listen address: an IPv6 address
+/// as written, `::` for a `/dns6` name; any other address `0.0.0.0`, whatever
+/// IP it names.
+fn bind_ip(listen: &Multiaddr) -> Protocol<'static> {
+    match listen.iter().next() {
+        Some(Protocol::Ip6(ip)) => Protocol::Ip6(ip),
+        Some(Protocol::Dns6(_)) => Protocol::Ip6(std::net::Ipv6Addr::UNSPECIFIED),
+        _ => Protocol::Ip4(std::net::Ipv4Addr::UNSPECIFIED),
+    }
+}
+
+fn quic_listener(ip: &Protocol<'static>, port: u16) -> Multiaddr {
+    Multiaddr::empty()
+        .with(ip.clone())
+        .with(Protocol::Udp(port))
+        .with(Protocol::QuicV1)
+}
+
+fn tcp_listener(ip: &Protocol<'static>, port: u16) -> Multiaddr {
+    Multiaddr::empty()
+        .with(ip.clone())
+        .with(Protocol::Tcp(port))
+}
+
+/// The listener of a `p2p.additionalListenMultiaddrs` entry, bound as written,
+/// or why it cannot be one. It serves the address family `listenMultiaddr` does
+/// not name; the swarm's IPv6 sockets take IPv6 only, whatever
+/// `net.ipv6.bindv6only` says.
+fn additional_listener(raw: &str, listen_v6: bool) -> Result<Multiaddr, &'static str> {
+    let addr: Multiaddr = raw.parse().map_err(|_| "not a multiaddr")?;
+    let ip = match addr.iter().next() {
+        Some(Protocol::Ip4(ip)) if listen_v6 => Protocol::Ip4(ip),
+        Some(Protocol::Ip6(ip)) if !listen_v6 => Protocol::Ip6(ip),
+        Some(Protocol::Ip4(_) | Protocol::Ip6(_)) => return Err("same address family"),
+        _ => return Err("names no IP address"),
+    };
+    match crate::external_addr::transport_and_port(&addr) {
+        Some((crate::external_addr::ExternalTransport::Quic, port)) => Ok(quic_listener(&ip, port)),
+        Some((crate::external_addr::ExternalTransport::Tcp, port)) => Ok(tcp_listener(&ip, port)),
+        None => Err("names no TCP or QUIC transport"),
+    }
+}
+
 /// Add a listener's new address; whether the list changed.
 fn add_listen_addr(addrs: &mut Vec<String>, address: &Multiaddr) -> bool {
     let address = address.to_string();
@@ -2020,13 +2131,121 @@ pub(crate) fn is_routable(addr: &Multiaddr) -> bool {
     false
 }
 
+/// The text of a refused publish. A refusal because every recipient's send
+/// queue is full (`AllQueuesFull`) has two causes this separates: a swarm loop
+/// too busy to drain its queues (its command queue deep, its answer slow) and
+/// peers that read slowly while the loop is prompt (a shallow command queue,
+/// a fast answer).
+fn publish_failure(reason: &str, queued: usize, capacity: usize, answered_in: Duration) -> String {
+    format!(
+        "blossomsub publish failed: {reason} (swarm command queue {queued}/{capacity} \
+         when sent, swarm answered after {} ms)",
+        answered_in.as_millis()
+    )
+}
+
+#[cfg(test)]
+mod publish_failure_tests {
+    use super::publish_failure;
+    use std::time::Duration;
+
+    /// A refused publish names the swarm's command queue depth and how long
+    /// the swarm took to answer, and keeps the reason the retry check reads.
+    #[test]
+    fn a_refused_publish_names_the_swarm_queue_and_answer_time() {
+        let text = publish_failure("AllQueuesFull(5)", 37, 256, Duration::from_millis(1840));
+        assert_eq!(
+            text,
+            "blossomsub publish failed: AllQueuesFull(5) (swarm command queue 37/256 \
+             when sent, swarm answered after 1840 ms)"
+        );
+        let none = publish_failure("NoPeersSubscribedToTopic", 0, 256, Duration::ZERO);
+        assert!(none.contains("NoPeersSubscribedToTopic"), "{none}");
+    }
+}
+
 #[cfg(test)]
 mod listen_addr_tests {
-    use super::{add_listen_addr, remove_listen_addrs};
+    use super::{
+        add_listen_addr, additional_listener, bind_ip, quic_listener, remove_listen_addrs,
+        tcp_listener,
+    };
     use libp2p::Multiaddr;
 
     fn ma(s: &str) -> Multiaddr {
         s.parse().unwrap()
+    }
+
+    /// IPv4 configs keep today's listeners exactly; IPv6 binds as written.
+    #[test]
+    fn listeners_bind_ipv6_as_written_and_everything_else_on_the_ipv4_wildcard() {
+        for (listen, tcp, quic) in [
+            (
+                "/ip4/0.0.0.0/udp/8336/quic-v1",
+                "/ip4/0.0.0.0/tcp/8336",
+                "/ip4/0.0.0.0/udp/8336/quic-v1",
+            ),
+            (
+                "/ip4/192.0.2.10/tcp/8336",
+                "/ip4/0.0.0.0/tcp/8336",
+                "/ip4/0.0.0.0/udp/8336/quic-v1",
+            ),
+            (
+                "/dns4/node.example.com/tcp/8336",
+                "/ip4/0.0.0.0/tcp/8336",
+                "/ip4/0.0.0.0/udp/8336/quic-v1",
+            ),
+            (
+                "/dns/proxy/udp/8336/quic-v1",
+                "/ip4/0.0.0.0/tcp/8336",
+                "/ip4/0.0.0.0/udp/8336/quic-v1",
+            ),
+            (
+                "/ip6/::/udp/8336/quic-v1",
+                "/ip6/::/tcp/8336",
+                "/ip6/::/udp/8336/quic-v1",
+            ),
+            (
+                "/ip6/2001:db8::7/tcp/8336",
+                "/ip6/2001:db8::7/tcp/8336",
+                "/ip6/2001:db8::7/udp/8336/quic-v1",
+            ),
+            (
+                "/dns6/node.example.com/tcp/8336",
+                "/ip6/::/tcp/8336",
+                "/ip6/::/udp/8336/quic-v1",
+            ),
+        ] {
+            let bind = bind_ip(&ma(listen));
+            assert_eq!(tcp_listener(&bind, 8336), ma(tcp), "{listen}");
+            assert_eq!(quic_listener(&bind, 8336), ma(quic), "{listen}");
+        }
+    }
+
+    #[test]
+    fn additional_listener_takes_the_other_family_as_written() {
+        for (raw, listen_v6) in [
+            ("/ip6/::/udp/8336/quic-v1", false),
+            ("/ip6/2001:db8::7/tcp/8340", false),
+            ("/ip4/0.0.0.0/udp/8336/quic-v1", true),
+            ("/ip4/192.0.2.10/tcp/8336", true),
+        ] {
+            assert_eq!(additional_listener(raw, listen_v6), Ok(ma(raw)), "{raw}");
+        }
+        for (raw, listen_v6, reason) in [
+            ("/ip4/0.0.0.0/tcp/8336", false, "same address family"),
+            ("/ip6/::/tcp/8336", true, "same address family"),
+            (
+                "/dns6/node.example.com/tcp/8336",
+                false,
+                "names no IP address",
+            ),
+            ("/ip6/::", false, "names no TCP or QUIC transport"),
+            ("/ip6/::/udp/8336", false, "names no TCP or QUIC transport"),
+            ("not a multiaddr", false, "not a multiaddr"),
+        ] {
+            assert_eq!(additional_listener(raw, listen_v6), Err(reason), "{raw}");
+        }
     }
 
     #[test]

@@ -11,3 +11,11 @@ Vendored from `libp2p-gossipsub` 0.49.4 as published on crates.io (rust-libp2p).
 `src/behaviour.rs`: the sender gets a behaviour penalty (P7) of 10, which at the default weight scores it below any usual graylist threshold until the penalty decays. `Behaviour::rejected_rpc_stats` counts the dropped RPCs and their bytes, with the latest sender and reason, for the node's operator log (the crate's own logs are capped at error in normal runs).
 
 Regression tests: `protocol::tests` (`rpc_over_an_entry_limit_is_dropped_before_decoding`, `malformed_rpc_is_dropped_before_decoding`, `largest_legitimate_rpcs_are_decoded`) and `behaviour::tests::rejected_rpc_penalises_its_sender`.
+
+## IPv6 peers in the colocation penalty
+
+`src/behaviour.rs` (`get_ip_addr`): upstream counts each connected peer under its exact remote IP for the IP-colocation penalty (P6). One IPv6 host or site typically holds a whole /64, so a single operator could connect any number of peers under distinct addresses without crossing the threshold. An IPv6 address now counts by its /64; IPv4 is unchanged. Regression test: `behaviour::colocation_ip_tests::an_ipv6_peer_counts_by_its_64_and_an_ipv4_peer_by_its_address`.
+
+## RPCs for peers that left
+
+`src/behaviour.rs` (`send_message`): an RPC addressed to a peer that is no longer in the connected peer list was logged at `error` once per message (up to 681 lines an hour on one node). It is dropped for that peer alone, logged at `debug` and counted: `Behaviour::unsent_rpc_stats` gives the count and the latest peer, for the node's operator log.

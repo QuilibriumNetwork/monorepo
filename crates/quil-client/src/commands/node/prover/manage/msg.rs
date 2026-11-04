@@ -21,6 +21,13 @@ pub enum Msg {
     MintPreview(Result<super::mint::Preview, String>),
     /// A running mint's or claim's report.
     Mint(super::mint::Progress),
+    /// The shielded coins and pending transfers read, or why the read
+    /// failed.
+    Shielded(Result<super::transfer::Read, String>),
+    /// A transfer action's confirmation, or why there is none.
+    TransferPreview(Result<super::transfer::Preview, String>),
+    /// A running transfer action's report.
+    Transfer(super::transfer::Progress),
     RewardRefresh(Result<Option<(u128, u64)>, String>),
     ShardLoading,
     ShardRefresh(Result<GetShardInfoResponse, String>),
@@ -45,6 +52,11 @@ pub enum Msg {
         send_frame: u64,
         original_status: u32,
         err: Option<String>,
+    },
+    /// A leave, pause or resume waits for the next epoch to sign.
+    SigningWait {
+        action: String,
+        frames_left: u64,
     },
     /// `toggleManualMsg` — SetManuallyManaged result for one worker.
     ToggleManual {

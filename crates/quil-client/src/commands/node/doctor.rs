@@ -350,6 +350,16 @@ impl Diagnosis {
 
 const TRANSPORTS: [Transport; 2] = [Transport::Tcp, Transport::Quic];
 
+/// Whether the doctor calls the node of `report` not reachable, for a notice
+/// elsewhere: the stream port it reads from the config changes no verdict.
+pub(crate) fn not_reachable(report: &NodeReachability) -> bool {
+    let observation = Observation {
+        report: report.clone(),
+        ..Default::default()
+    };
+    diagnose(&observation).verdict == Verdict::NotReachable
+}
+
 /// The verdicts and advice for `obs`.
 pub(crate) fn diagnose(obs: &Observation) -> Diagnosis {
     let report = &obs.report;
@@ -506,6 +516,13 @@ pub(crate) fn diagnose(obs: &Observation) -> Diagnosis {
     if listeners.is_empty() {
         notes.push("The node reports no p2p listener; see its startup log lines.".to_string());
     }
+    notes.extend(ipv6_note(
+        &listeners,
+        &confirmed,
+        &announced,
+        report.announced,
+        verdict,
+    ));
     if verdict != Verdict::Reachable {
         notes.push(
             "This command changes nothing. AutoNAT probes again within 15 min; rerun it after \
@@ -524,6 +541,42 @@ pub(crate) fn diagnose(obs: &Observation) -> Diagnosis {
         stream_port: stream.map(|s| s.port),
         notes,
         error: None,
+    }
+}
+
+/// What this node binds and publishes on IPv6, when that decides whether
+/// IPv6 carries dials to it. It states what the node does now, so it holds
+/// for any build: a node that binds and publishes IPv6 gets its checks.
+fn ipv6_note(
+    listeners: &[Endpoint],
+    confirmed: &[Endpoint],
+    announced: &[Endpoint],
+    has_published: bool,
+    verdict: Verdict,
+) -> Option<String> {
+    let is_v6 = |e: &&Endpoint| e.family() == Family::Ipv6;
+    let bound = listeners
+        .iter()
+        .filter(is_v6)
+        .find(|e| ip_class(e.ip) != IpClass::Local);
+    let published = announced.iter().any(|e| e.family() == Family::Ipv6);
+    match bound {
+        None if !published && verdict != Verdict::Reachable => Some(
+            "IPv6: this node binds no address peers could dial and publishes none.".to_string(),
+        ),
+        Some(e) if !published && has_published => Some(format!(
+            "IPv6: this node binds {} but publishes no IPv6 address, so peers do not learn it.",
+            e.host_port()
+        )),
+        _ if confirmed.iter().any(|e| e.family() == Family::Ipv6)
+            && confirmed.iter().all(|e| e.family() == Family::Ipv6) =>
+        {
+            Some(
+                "AutoNAT confirmed IPv6 only, so peers with IPv4 alone may not reach this node."
+                    .to_string(),
+            )
+        }
+        _ => None,
     }
 }
 
@@ -803,9 +856,12 @@ pub(crate) fn render(d: &Diagnosis) -> String {
                      runs one.\n",
                     ports_text(ports)
                 );
-                out += "If the router's own WAN address is in 100.64.0.0/10, the ISP uses \
-                        carrier-grade NAT and no forward helps: ask it for a public IP address, \
-                        or run the node on a VPS.\n";
+                if family.family == Family::Ipv4 {
+                    out += "If the router's own WAN address is in 100.64.0.0/10, or it has no \
+                            public IPv4 address (DS-Lite), the ISP uses carrier-grade NAT and no \
+                            forward helps: ask it for a public IPv4 address, or run the node on \
+                            a VPS.\n";
+                }
             }
             Advice::CarrierGradeNat { host_address } => {
                 out += &format!(
@@ -1106,6 +1162,111 @@ mod tests {
         let d = diagnose(&obs);
         assert_eq!(d.verdict, Verdict::Unknown);
         assert_eq!(state(&d, Family::Ipv6, Transport::Tcp), CheckState::Unknown);
+    }
+
+    /// The notes that speak about IPv6.
+    fn ipv6_notes(d: &Diagnosis) -> Vec<&str> {
+        d.notes
+            .iter()
+            .map(String::as_str)
+            .filter(|note| note.contains("IPv6"))
+            .collect()
+    }
+
+    #[test]
+    fn a_node_that_binds_no_ipv6_says_so_and_promises_nothing() {
+        // DS-Lite: a private IPv4 address behind the ISP's NAT.
+        let mut obs = observation(
+            &["/ip4/127.0.0.1/tcp/8336", "/ip4/192.168.1.20/tcp/8336"],
+            "private",
+            &[],
+        );
+        obs.report.probe_failure = failing("dial_error", 14, 1_920, true);
+        let d = diagnose(&obs);
+        assert_eq!(
+            ipv6_notes(&d),
+            ["IPv6: this node binds no address peers could dial and publishes none."]
+        );
+        let text = render(&d);
+        assert!(
+            text.contains("no public IPv4 address (DS-Lite)")
+                && text.contains("ask it for a public IPv4 address"),
+            "{text}"
+        );
+        // A loopback IPv6 listener is no address peers could dial.
+        let d = diagnose(&observation(
+            &["/ip4/192.168.1.20/tcp/8336", "/ip6/::1/tcp/8336"],
+            "private",
+            &[],
+        ));
+        assert_eq!(
+            ipv6_notes(&d),
+            ["IPv6: this node binds no address peers could dial and publishes none."]
+        );
+        // A node peers reach over IPv4 needs no word about IPv6.
+        let d = diagnose(&observation(
+            &["/ip4/203.0.113.7/tcp/8336"],
+            "public",
+            &["/ip4/203.0.113.7/tcp/8336"],
+        ));
+        assert!(ipv6_notes(&d).is_empty(), "{:?}", d.notes);
+    }
+
+    #[test]
+    fn a_bound_ipv6_address_is_never_called_unbound() {
+        let listen = [
+            "/ip4/192.168.1.20/tcp/8336",
+            "/ip6/2001:db8::7/tcp/8336",
+            "/ip6/2001:db8::7/udp/8336/quic-v1",
+        ];
+        // Bound, not published: named, whatever the verdict.
+        let mut obs = observation(&listen, "unknown", &[]);
+        let d = diagnose(&obs);
+        assert_eq!(
+            ipv6_notes(&d),
+            ["IPv6: this node binds [2001:db8::7]:8336 but publishes no IPv6 address, so peers do not learn it."]
+        );
+        // No PeerInfo yet says nothing about what it will publish.
+        obs.report.announced = false;
+        assert!(ipv6_notes(&diagnose(&obs)).is_empty());
+        // Bound, published, not confirmed: the checks speak; no note.
+        let mut obs = observation(&listen, "unknown", &[]);
+        obs.report
+            .announced_pubsub_multiaddrs
+            .push("/ip6/2001:db8::7/tcp/8336".to_string());
+        let d = diagnose(&obs);
+        assert!(ipv6_notes(&d).is_empty(), "{:?}", d.notes);
+        assert_eq!(d.verdict, Verdict::Unknown);
+        // Confirmed on IPv6 alone: reachable, with who cannot dial it.
+        let d = diagnose(&observation(
+            &listen,
+            "public",
+            &["/ip6/2001:db8::7/udp/8336/quic-v1"],
+        ));
+        assert_eq!(d.verdict, Verdict::Reachable);
+        assert_eq!(
+            ipv6_notes(&d),
+            ["AutoNAT confirmed IPv6 only, so peers with IPv4 alone may not reach this node."]
+        );
+        // Confirmed on both: nothing to add.
+        let d = diagnose(&observation(
+            &listen,
+            "public",
+            &[
+                "/ip6/2001:db8::7/udp/8336/quic-v1",
+                "/ip4/203.0.113.7/tcp/8336",
+            ],
+        ));
+        assert!(ipv6_notes(&d).is_empty(), "{:?}", d.notes);
+    }
+
+    #[test]
+    fn a_private_ipv6_address_gets_no_ipv4_nat_advice() {
+        let mut obs = observation(&["/ip6/fd00::7/tcp/8336"], "private", &[]);
+        obs.report.probe_failure = failing("dial_error", 14, 1_920, true);
+        let text = render(&diagnose(&obs));
+        assert!(text.contains("To make IPv6 reachable"), "{text}");
+        assert!(!text.contains("DS-Lite"), "{text}");
     }
 
     #[test]

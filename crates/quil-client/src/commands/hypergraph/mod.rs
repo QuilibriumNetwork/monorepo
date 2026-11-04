@@ -63,7 +63,7 @@ impl HypergraphCtx {
         let ctx = Context::load(global.clone())?;
         let (node_config, config_dir) = ctx.load_node_config("default")?;
         let alias_store = alias_store::try_load_for_config_dir(&config_dir);
-        let key_manager = ctx.key_manager(&node_config, &config_dir)?;
+        let key_manager = ctx.cli_key_manager(&node_config, &config_dir)?;
         // Hypergraph commands use the local node.
         let connect_opts = ConnectOpts {
             public_rpc: false,

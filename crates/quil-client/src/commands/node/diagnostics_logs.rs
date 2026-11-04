@@ -217,8 +217,9 @@ fn network_key(
     node_config: &quil_config::Config,
     dir: &Path,
 ) -> anyhow::Result<(Vec<u8>, PeerId)> {
-    let key = ctx
-        .key_manager(node_config, dir)?
+    let key_manager = ctx.key_manager(node_config, dir)?;
+    crate::keys::require_keys(&key_manager, node_config, dir, false)?;
+    let key = key_manager
         .get_signer_by_id("q-prover-key")
         .map_err(|e| anyhow::anyhow!("get q-prover-key for transport auth: {e}"))?
         .private_key()

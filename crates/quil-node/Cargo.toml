@@ -64,7 +64,6 @@ chrono = "0.4"
 serde_json = "1"
 file-rotate = "0.7"
 anyhow = "1"
-thiserror = "2"
 sha2 = "0.10"
 sha3 = "0.10"
 num-bigint = "0.4"
@@ -81,6 +80,8 @@ futures = "0.3"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 async-stream = "0.3"
 parking_lot = "0.12"
+# The `::` peer gRPC socket takes both address families (util/stream_listener.rs).
+socket2 = "0.6"
 
 [target.'cfg(unix)'.dependencies]
 # RLIMIT_NOFILE raise at startup (raise_fd_limit in main.rs).

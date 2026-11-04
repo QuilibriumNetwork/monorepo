@@ -401,6 +401,7 @@ async fn submit_to_archives_with(
     let submit = move |stream_addr: String, bytes: Vec<u8>| {
         let seed = seed.clone();
         async move {
+            let dialing = Instant::now();
             match ArchiveClient::connect_mtls_for_submit(&stream_addr, &seed, bytes.len()).await {
                 Ok(mut client) => match client.submit_global_message(bytes).await {
                     Ok(()) => Ok(stream_addr),
@@ -417,7 +418,7 @@ async fn submit_to_archives_with(
                 Err(e) => {
                     debug!(addr = %stream_addr, error = %e, "prover bundle submit: archive connect failed");
                     let retry = asks_for_retry(&e, proof);
-                    Err((stream_addr, format!("connect failed: {e}"), retry))
+                    Err((stream_addr, connect_failure(dialing.elapsed(), &e), retry))
                 }
             }
         }
@@ -698,7 +699,7 @@ where
     for addr in archive_addrs {
         // Archive peer-info multiaddrs use the pubsub port (:8336);
         // the gRPC stream service listens on :8340.
-        let stream_addr = addr.replace(":8336", ":8340");
+        let stream_addr = crate::util::multiaddr::pubsub_to_stream_endpoint(&addr);
         let bytes = bundle_bytes.clone();
         let submit = submit.clone();
         // Parallel fan-out: each handle's result is awaited below, so
@@ -810,6 +811,21 @@ fn archive_refusals() -> &'static std::sync::Mutex<ArchiveRefusals> {
 
 /// An archive's refusal without the transport's metadata: the gRPC code and
 /// the archive's message.
+/// Why a dial to an archive failed, for the line that names it: the time it
+/// took and the causes beneath the error. A refusal at once (the archive's
+/// connection cap or a closed port) reads apart from a handshake that ran to
+/// its 10 s bound (this node starved of CPU, or the path), and a reset or a
+/// rejected handshake names itself.
+fn connect_failure(took: Duration, error: &(dyn std::error::Error + 'static)) -> String {
+    let causes = quil_rpc::archive_client::error_chain(error);
+    let took_ms = took.as_millis();
+    if causes.is_empty() {
+        format!("connect failed after {took_ms} ms: {error}")
+    } else {
+        format!("connect failed after {took_ms} ms: {error} ({causes})")
+    }
+}
+
 fn refusal_reason(error: &quil_rpc::archive_client::ArchiveClientError) -> String {
     match error {
         quil_rpc::archive_client::ArchiveClientError::Rpc(status) => {
@@ -1478,6 +1494,37 @@ mod tests {
         assert!(asks_for_retry(&full, false) && asks_for_retry(&full, true));
     }
 
+    #[derive(Debug)]
+    struct Outer(std::io::Error);
+    impl std::fmt::Display for Outer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "transport error")
+        }
+    }
+    impl std::error::Error for Outer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    /// The reason of a failed dial carries the time to the failure and the
+    /// causes beneath the error, which "transport error" alone hides.
+    #[test]
+    fn a_failed_dial_names_its_time_and_its_cause() {
+        let error = Outer(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        ));
+        let reason = super::connect_failure(Duration::from_millis(10_004), &error);
+        assert_eq!(
+            reason,
+            "connect failed after 10004 ms: transport error (connection reset by peer)"
+        );
+        let bare =
+            super::connect_failure(Duration::from_millis(3), &std::io::Error::other("no route"));
+        assert_eq!(bare, "connect failed after 3 ms: no route");
+    }
+
     /// Over the real transport: an archive refusing connections leaves a
     /// storage epoch proof queued to retry, and any other message not.
     #[tokio::test]
@@ -1491,7 +1538,13 @@ mod tests {
         let proof = storage_proof_bundle(1, &[(7, 1335, false, true)], 64);
         let (_, delivery) = submit_to_archives(&pool, Some(key.clone()), proof).await;
         assert_eq!((delivery.accepted, delivery.retry), (0, 1), "{delivery:?}");
-        assert!(delivery.refusal.unwrap().contains("connect failed"));
+        let refusal = delivery.refusal.unwrap();
+        assert!(refusal.contains("connect failed after "), "{refusal}");
+        assert!(refusal.contains(" ms: "), "{refusal}");
+        assert!(
+            refusal.to_lowercase().contains("refused"),
+            "the cause beneath the transport error is named: {refusal}"
+        );
         let header = crate::master_node::reward_proofs::prover_bundle(
             quil_execution::global_intrinsic::frame_header::FrameHeader::default()
                 .to_canonical_bytes()

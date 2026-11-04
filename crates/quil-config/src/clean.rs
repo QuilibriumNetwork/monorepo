@@ -37,9 +37,9 @@ pub struct CleanedConfig {
 pub enum CleanError {
     #[error("the config does not parse: {0}")]
     Parse(String),
-    #[error("cannot safely comment out {key}: {reason}; nothing was changed, edit it by hand")]
+    #[error("cannot safely change {key}: {reason}; nothing was changed, edit it by hand")]
     Unsafe { key: String, reason: String },
-    #[error("the cleaned config failed verification: {0}")]
+    #[error("the edited config failed verification: {0}")]
     Verification(String),
 }
 
@@ -199,12 +199,12 @@ fn remove_path(value: &mut Value, path: &str) -> bool {
 }
 
 /// A line without its ending, and the ending (`\n`, `\r\n` or none).
-struct Line<'a> {
-    text: &'a str,
-    eol: &'a str,
+pub(crate) struct Line<'a> {
+    pub(crate) text: &'a str,
+    pub(crate) eol: &'a str,
 }
 
-fn split_lines(contents: &str) -> Vec<Line<'_>> {
+pub(crate) fn split_lines(contents: &str) -> Vec<Line<'_>> {
     contents
         .split_inclusive('\n')
         .map(|piece| {
@@ -230,16 +230,16 @@ fn is_content(line: &Line<'_>, continuation: bool) -> bool {
 }
 
 /// A mapping key on a line of its own.
-struct KeyLine {
-    line: usize,
-    indent: usize,
-    path: String,
+pub(crate) struct KeyLine {
+    pub(crate) line: usize,
+    pub(crate) indent: usize,
+    pub(crate) path: String,
     /// Byte offset of the text after the key's colon.
-    value_offset: usize,
+    pub(crate) value_offset: usize,
 }
 
-struct Scan {
-    keys: Vec<KeyLine>,
+pub(crate) struct Scan {
+    pub(crate) keys: Vec<KeyLine>,
     /// Lines inside a multi-line value started on an earlier line.
     continuation: Vec<bool>,
     /// Lines whose value opens a flow collection closed on a later line.
@@ -258,7 +258,7 @@ enum Continues {
     Quoted(char),
 }
 
-fn scan(lines: &[Line<'_>]) -> Scan {
+pub(crate) fn scan(lines: &[Line<'_>]) -> Scan {
     let mut keys = Vec::new();
     let mut continuation = vec![false; lines.len()];
     let mut flow_start = vec![false; lines.len()];
@@ -356,7 +356,7 @@ fn continues_after(value: &str, indent: usize) -> Continues {
 }
 
 /// The last line of the value of the key on line `start`.
-fn block_end(lines: &[Line<'_>], scan: &Scan, start: usize, key_indent: usize) -> usize {
+pub(crate) fn block_end(lines: &[Line<'_>], scan: &Scan, start: usize, key_indent: usize) -> usize {
     let mut last = start;
     for j in start + 1..lines.len() {
         let trimmed = lines[j].text.trim_start_matches(' ');
@@ -476,7 +476,7 @@ fn flow_depth(text: &str) -> i64 {
 
 /// Whether a value starts a token with an anchor (`&`), alias (`*`) or
 /// tag (`!`), outside quotes and comments.
-fn has_node_property(text: &str) -> bool {
+pub(crate) fn has_node_property(text: &str) -> bool {
     let mut quote: Option<char> = None;
     let mut at_token = true;
     for c in text.chars() {

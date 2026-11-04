@@ -60,6 +60,7 @@ pub mod prover_pipeline;
 pub mod prover_tree_syncer;
 pub mod provers;
 mod recovery_turns;
+mod relay_reoffer;
 pub mod remote_worker;
 pub mod resolver_traffic;
 pub mod rewards;
@@ -594,5 +595,6 @@ pub mod bitmasks {
 }
 pub mod shard_drain;
 pub(crate) mod stage_clock;
+pub(crate) mod storage_proof_refusal;
 pub(crate) mod storage_registration_landed;
 pub(crate) mod submission_attempts;

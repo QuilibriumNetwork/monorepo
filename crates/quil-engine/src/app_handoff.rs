@@ -2866,6 +2866,36 @@ mod successor_tests {
             .unwrap();
     }
 
+    /// On a real store, while a holder keeps the GLOBAL commit lock, the
+    /// committed view is the last release's: `still_current` answers at once
+    /// from another thread, as a worker thread's status check does, and sees
+    /// the holder's commit only once it released.
+    #[test]
+    fn a_committed_view_waits_for_no_holder_of_the_global_commit_lock() {
+        let (global, state) = global_state();
+        commit(&global, &state, 1);
+        assert_eq!(CommittedView::capture(&global).unwrap().frame(), 1);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let holder = global.clone();
+            scope.spawn(move || {
+                let _held = holder.hold_commit_lock();
+                held_tx.send(()).unwrap();
+                done_rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .unwrap();
+            });
+            held_rx.recv().unwrap();
+            let asked = std::time::Instant::now();
+            assert_eq!(CommittedView::capture(&global).unwrap().frame(), 1);
+            assert!(asked.elapsed() < std::time::Duration::from_secs(5));
+            done_tx.send(()).unwrap();
+        });
+        commit(&global, &state, 2);
+        assert_eq!(CommittedView::capture(&global).unwrap().frame(), 2);
+    }
+
     /// A first session on `filter` with a successor scheduled at frame 3.
     fn closing_session(
         global: &Arc<HypergraphCrdt>,

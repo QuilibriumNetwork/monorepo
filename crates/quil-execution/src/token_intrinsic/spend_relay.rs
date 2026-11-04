@@ -11,8 +11,9 @@
 //! ```
 //!
 //! Re-carried for [`RELAY_WINDOW_FRAMES`]. A relay lost past the window is
-//! safe: nothing happens until the global commit, so the operation simply never
-//! committed and can be submitted again.
+//! safe: nothing happens until the global commit, so the operation simply has
+//! not committed. The shard's members offer it again for a while
+//! (`quil_engine`'s `relay_reoffer`), and it can always be submitted again.
 use quil_types::error::{QuilError, Result};
 
 /// Frames every header re-carries.

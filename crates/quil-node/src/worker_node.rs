@@ -315,7 +315,6 @@ pub(crate) async fn start(
             None
         },
         channel_factory: Some(channel_factory),
-        app_consensus_cw: config.engine.app_consensus_cw,
         // Persist the app-shard CW journal under the worker's resolved data dir
         // (else the ephemeral temp journal panics on prune once a real committee
         // starts producing views).
@@ -635,6 +634,7 @@ pub(crate) async fn start(
     // thread-worker's `"worker rocksdb memory"` lines. Every 60s.
     {
         let db_for_mem = db_arc.clone();
+        let crdt_for_mem = crdt.clone();
         sup.run_until_cancelled("worker-mem-telemetry", move |token| async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -646,6 +646,13 @@ pub(crate) async fn start(
                             .map(|m| crate::mem_stats::fmt_mb(m.rss_bytes))
                             .unwrap_or_else(|| "?".to_string());
                         let dbm = db_for_mem.memory_usage();
+                        // Releases a published generation's store snapshot
+                        // past its window when this worker no longer
+                        // publishes; open snapshots keep every later deletion
+                        // on disk, and the generation pins and wallet scans
+                        // name two holders.
+                        let held = crdt_for_mem.release_expired_snapshots();
+                        let snapshots = db_for_mem.snapshots();
                         // As the master's "memory snapshot" gives them.
                         let (replica_loads, replica_loads_peak) =
                             quil_store::replica_store::replica_load_bytes();
@@ -663,6 +670,10 @@ pub(crate) async fn start(
                                 replica_loads_peak_mb = %replica_loads_peak,
                                 rocksdb_shared_cache_mb = quil_store::shared_block_cache_memory()
                                     .map(|(used, _)| crate::mem_stats::fmt_mb(used)),
+                                rocksdb_snapshots = snapshots.count,
+                                oldest_snapshot_age_secs = snapshots.oldest_age_secs,
+                                generation_pins = held.map(|h| h.generations),
+                                scan_snapshots = held.map(|h| h.scans),
                                 "worker process memory",
                             );
                             let br = crate::mem_stats::jemalloc_size_classes();
@@ -680,6 +691,10 @@ pub(crate) async fn start(
                                 replica_loads_peak_mb = %replica_loads_peak,
                                 rocksdb_shared_cache_mb = quil_store::shared_block_cache_memory()
                                     .map(|(used, _)| crate::mem_stats::fmt_mb(used)),
+                                rocksdb_snapshots = snapshots.count,
+                                oldest_snapshot_age_secs = snapshots.oldest_age_secs,
+                                generation_pins = held.map(|h| h.generations),
+                                scan_snapshots = held.map(|h| h.scans),
                                 "worker process memory",
                             );
                         }

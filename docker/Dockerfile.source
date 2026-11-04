@@ -230,6 +230,9 @@ RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=lo
 # Stage: node-only
 # -----------------------------------------------------------------------------
 FROM ubuntu:24.04 AS node-only
+# Source builds aren't signed, so signature check is off for node and qclient.
+ENV QUILIBRIUM_SIGNATURE_CHECK=false
+
 ARG NODE_VERSION
 ARG GIT_REPO
 ARG GIT_BRANCH
@@ -280,6 +283,9 @@ RUN apt-get update && apt-get install -y \
     libgmp10 \
     libmpfr6 \
     && rm -rf /var/lib/apt/lists/*
+
+# Source builds aren't signed, so signature check is off for node and qclient.
+ENV QUILIBRIUM_SIGNATURE_CHECK=false
 
 ARG NODE_VERSION
 ARG GIT_REPO

@@ -19,8 +19,14 @@ pub(crate) enum OpKind {
     Reject,
 }
 
+/// The attempts, and the frame each filter's confirm begun in an epoch was
+/// last published at, kept for one epoch boundary
+/// ([`SubmissionAttempts::confirm_published_in`]).
 #[derive(Default)]
-pub(crate) struct SubmissionAttempts(Mutex<HashMap<Key, Attempt>>);
+pub(crate) struct SubmissionAttempts(
+    Mutex<HashMap<Key, Attempt>>,
+    Mutex<HashMap<(u64, Vec<u8>), u64>>,
+);
 
 struct Attempt {
     frame: u64,
@@ -87,6 +93,14 @@ impl SubmissionAttempts {
                 *k == OpKind::Confirm && owned.as_slice() == filter && a.owns(*e, epoch, frame)
             })
         })
+    }
+
+    /// The frame `filter`'s latest confirm begun in `epoch` was published
+    /// at, kept until the epoch after it ends: a later attempt that fails
+    /// does not erase it. A renewal published late in its recovery epoch
+    /// may reach this node's registry only after the boundary.
+    pub(crate) fn confirm_published_in(&self, filter: &[u8], epoch: u64) -> Option<u64> {
+        self.1.lock().ok()?.get(&(epoch, filter.to_vec())).copied()
     }
 
     /// Release the published joins of each `(filter, frames)` whose attempt
@@ -219,6 +233,13 @@ impl Drop for SubmissionAttempt {
                         a.frame = a.frame.max(frame);
                         a.for_epoch |= self.epoch_fenced.contains(&key.1);
                     }
+                    if key.2 == OpKind::Confirm {
+                        if let Ok(mut published) = self.owner.1.lock() {
+                            published.retain(|(epoch, _), _| epoch.saturating_add(1) >= key.0);
+                            let last = published.entry((key.0, key.1.clone())).or_insert(frame);
+                            *last = (*last).max(frame);
+                        }
+                    }
                 } else {
                     attempts.remove(key);
                 }
@@ -230,6 +251,42 @@ impl Drop for SubmissionAttempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A confirm's publication frame outlives its attempt for one epoch
+    /// boundary: a later attempt that fails does not erase it, a leave does
+    /// not count, and the epoch after next forgets it.
+    #[test]
+    fn a_published_confirm_is_remembered_across_one_epoch_boundary() {
+        let e = quil_types::consensus::epoch_length_frames();
+        let attempts = Arc::new(SubmissionAttempts::default());
+        let (renewed, left, other) = (vec![1], vec![2], vec![3]);
+        attempts
+            .begin(std::slice::from_ref(&renewed), e + 10, OpKind::Confirm)
+            .unwrap()
+            .published(e + 12);
+        drop(attempts.begin(std::slice::from_ref(&renewed), e + 50, OpKind::Confirm));
+        assert_eq!(attempts.confirm_published_in(&renewed, 1), Some(e + 12));
+        assert_eq!(attempts.confirm_published_in(&renewed, 2), None);
+        attempts
+            .begin(std::slice::from_ref(&left), e + 10, OpKind::Leave)
+            .unwrap()
+            .published(e + 11);
+        assert_eq!(attempts.confirm_published_in(&left, 1), None);
+        attempts
+            .begin(std::slice::from_ref(&other), 2 * e + 1, OpKind::Confirm)
+            .unwrap()
+            .published(2 * e + 1);
+        assert_eq!(attempts.confirm_published_in(&renewed, 1), Some(e + 12));
+        attempts
+            .begin(std::slice::from_ref(&other), 3 * e + 1, OpKind::Confirm)
+            .unwrap()
+            .published(3 * e + 1);
+        assert_eq!(
+            attempts.confirm_published_in(&renewed, 1),
+            None,
+            "forgotten the epoch after next"
+        );
+    }
 
     #[test]
     fn in_flight_failure_success_and_epoch_retry() {

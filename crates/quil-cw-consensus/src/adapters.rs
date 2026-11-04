@@ -1575,7 +1575,10 @@ impl Liveness {
 
 /// `Blocker` that blocks nobody (as [`crate::p2p_bridge::NoopBlocker`]) but
 /// counts, in [`Liveness`], what consensus discarded: a vote with a bad
-/// signature, from a non-member, or signed by someone other than its sender.
+/// signature, from a non-member, or signed by someone other than its sender,
+/// and undecodable messages. It also counts every message of another epoch,
+/// which honest members send around a handoff, so a real blocker here would
+/// cut them off; the batcher's discard summary tells these apart.
 pub struct CountingBlocker {
     liveness: Option<Arc<Liveness>>,
 }

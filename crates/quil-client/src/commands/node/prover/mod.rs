@@ -21,6 +21,7 @@ use crate::util::UNITS_PER_QUIL;
 pub mod epoch;
 mod gossip_traffic;
 mod join;
+mod leave_check;
 pub(crate) mod local_execution;
 mod manage;
 mod merge;
@@ -43,17 +44,21 @@ pub enum ProverCommand {
     Shardinfo,
     /// Interactive prover shard management TUI.
     Manage(ManageArgs),
-    /// Joins the prover to the network for the given shard filters.
+    /// Joins the prover to the network for the given shard filters. Refused
+    /// unless a free manual worker waits for each: an auto worker's join is
+    /// decided by score. Switch workers to manual in `prover manage` first.
     Join {
-        /// Hex-encoded 32-byte shard filters (default: all-0xFF).
+        /// Hex-encoded 32-byte shard filters; at least one.
         filters: Vec<String>,
         /// Optional 32-byte hex reward delegate address.
         #[arg(long, default_value = "")]
         delegate: String,
     },
-    /// Initiate a prover leave for the given shard filters.
+    /// Initiate a prover leave for the given shard filters. Refused while a
+    /// filter is on an auto worker, whose leave the node would decide by score:
+    /// switch it to manual in `prover manage` first.
     Leave {
-        /// Hex-encoded 32-byte shard filters (default: all-0xFF).
+        /// Hex-encoded 32-byte shard filters; at least one.
         filters: Vec<String>,
     },
     /// Confirm prover shard allocations for the given filters.
@@ -100,9 +105,23 @@ pub struct ProverCtx {
 
 impl ProverCtx {
     fn load(global: GlobalArgs) -> anyhow::Result<Self> {
+        Self::load_with(global, false)
+    }
+
+    /// For a CLI command: refuses an empty keystore. The node manager uses
+    /// `load`.
+    fn load_cli(global: GlobalArgs) -> anyhow::Result<Self> {
+        Self::load_with(global, true)
+    }
+
+    fn load_with(global: GlobalArgs, cli: bool) -> anyhow::Result<Self> {
         let ctx = crate::context::Context::load(global)?;
         let (node_config, dir) = ctx.load_node_config("default")?;
-        let key_manager = ctx.key_manager(&node_config, &dir)?;
+        let key_manager = if cli {
+            ctx.cli_key_manager(&node_config, &dir)?
+        } else {
+            ctx.key_manager(&node_config, &dir)?
+        };
         // Prover commands always use the local node (Go passes
         // lightNode=false unconditionally).
         let connect_opts = ConnectOpts {
@@ -122,12 +141,42 @@ impl ProverCtx {
         crate::rpc::connect_node_service(&self.connect_opts).await
     }
 
-    /// The current global head frame (`GetNodeInfo.last_global_head_frame`),
-    /// used as the frame number for prover-op signatures.
+    /// The frame to sign a pause, resume, leave or update with: the global
+    /// head, once it is clear of the epoch's end. Every node refuses such an op
+    /// landing in a later epoch than it was signed in, with nothing reported
+    /// here, and it can sign in the next epoch just as well. Says so if it waits.
     pub async fn last_global_head_frame(
         &self,
         client: &mut NodeServiceClient<Channel>,
     ) -> anyhow::Result<u64> {
+        frame_clear_of_epoch_end(client, EPOCH_END_WAIT_CAP, EPOCH_END_POLL, |left| {
+            println!(
+                "The epoch ends in {left} frames, and an op signed now may land after it, where \
+                 every node refuses it: waiting for the next epoch to sign."
+            );
+        })
+        .await
+    }
+
+    /// The frame to sign a confirm or reject with: the global head at once, as
+    /// each is valid only in this epoch. Warns when it may land too late.
+    pub async fn frame_in_this_epoch(
+        &self,
+        client: &mut NodeServiceClient<Channel>,
+        op: &str,
+    ) -> anyhow::Result<u64> {
+        let (head, epoch_length) = head_and_epoch_length(client).await?;
+        if let Some(left) = frames_left_if_close(head, epoch_length) {
+            println!(
+                "The epoch ends in {left} frames and this {op} is valid only in it: if it lands \
+                 later every node refuses it. Check with `qclient node prover status`."
+            );
+        }
+        Ok(head)
+    }
+
+    /// The global head as it stands (`GetNodeInfo.last_global_head_frame`).
+    pub async fn head_frame(&self, client: &mut NodeServiceClient<Channel>) -> anyhow::Result<u64> {
         let info = client
             .get_node_info(tonic::Request::new(
                 quil_types::proto::node::GetNodeInfoRequest::default(),
@@ -150,6 +199,66 @@ impl ProverCtx {
     }
 }
 
+/// Frames an op takes to land at most: every node refuses one older.
+const EPOCH_END_MARGIN_FRAMES: u64 =
+    quil_execution::global_intrinsic::verify::PROVER_OP_FRESHNESS_WINDOW;
+/// How long to wait for the next epoch: ten mainnet frames many times over, so
+/// reaching it means GLOBAL is not advancing, or this node is not following it.
+pub(crate) const EPOCH_END_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(600);
+pub(crate) const EPOCH_END_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The frames left in the epoch, if an op signed at `head` may not land in it.
+/// At most half of an epoch, so a short devnet epoch keeps a time to sign.
+fn frames_left_if_close(head: u64, epoch_length: u64) -> Option<u64> {
+    let length = epoch::epoch_len(epoch_length);
+    let left = length - head % length;
+    (left <= EPOCH_END_MARGIN_FRAMES.min(length / 2)).then_some(left)
+}
+
+async fn head_and_epoch_length(
+    client: &mut NodeServiceClient<Channel>,
+) -> anyhow::Result<(u64, u64)> {
+    let info = client
+        .get_node_info(tonic::Request::new(
+            quil_types::proto::node::GetNodeInfoRequest::default(),
+        ))
+        .await
+        .map_err(|e| anyhow::anyhow!("get node info: {e}"))?
+        .into_inner();
+    Ok((info.last_global_head_frame, info.epoch_length_frames))
+}
+
+/// The global head once it is clear of the epoch's end. `on_wait` hears the
+/// frames left, once, if this waits; past `cap` nothing has been signed and the
+/// error says why.
+pub(crate) async fn frame_clear_of_epoch_end(
+    client: &mut NodeServiceClient<Channel>,
+    cap: std::time::Duration,
+    poll: std::time::Duration,
+    mut on_wait: impl FnMut(u64),
+) -> anyhow::Result<u64> {
+    let started = std::time::Instant::now();
+    let mut told = false;
+    loop {
+        let (head, epoch_length) = head_and_epoch_length(client).await?;
+        let Some(left) = frames_left_if_close(head, epoch_length) else {
+            return Ok(head);
+        };
+        if !told {
+            on_wait(left);
+            told = true;
+        }
+        if started.elapsed() >= cap {
+            anyhow::bail!(
+                "not sent: waited {}s for the next epoch and the global head stays at frame \
+                 {head}; check that this node follows GLOBAL",
+                cap.as_secs()
+            );
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
 pub async fn run(global: GlobalArgs, cmd: &ProverCommand) -> anyhow::Result<()> {
     // `merge` operates directly on config files; its dry run also reads
     // GLOBAL state from the local node.
@@ -165,7 +274,7 @@ pub async fn run(global: GlobalArgs, cmd: &ProverCommand) -> anyhow::Result<()> 
         return manage::command(global, args).await;
     }
 
-    let pc = ProverCtx::load(global)?;
+    let pc = ProverCtx::load_cli(global)?;
     match cmd {
         ProverCommand::Status => status::run(&pc).await,
         ProverCommand::Shards => shards::run(&pc).await,
@@ -297,6 +406,129 @@ pub(crate) fn observed_quil_daily(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Only the last frames of an epoch, where an op may land in the next one:
+    /// the freshness window on a mainnet epoch, half of a short devnet one.
+    #[test]
+    fn only_the_end_of_an_epoch_is_too_close_to_sign() {
+        assert_eq!(frames_left_if_close(720 - 11, 720), None);
+        assert_eq!(frames_left_if_close(720 - 10, 720), Some(10));
+        assert_eq!(frames_left_if_close(719, 720), Some(1));
+        assert_eq!(frames_left_if_close(720, 720), None);
+        assert_eq!(frames_left_if_close(89, 30), Some(1));
+        assert_eq!(frames_left_if_close(79, 30), None);
+        assert_eq!(frames_left_if_close(80, 30), Some(10));
+        assert_eq!(frames_left_if_close(4, 10), None);
+        assert_eq!(frames_left_if_close(5, 10), Some(5));
+    }
+
+    /// A client on a node whose global head is `head`.
+    async fn client_at(head: Arc<AtomicU64>) -> NodeServiceClient<Channel> {
+        let mut server = quil_rpc::NodeRpcServer::default();
+        server.last_global_head_frame = head;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let multiaddr = format!(
+            "/ip4/127.0.0.1/tcp/{}",
+            listener.local_addr().unwrap().port()
+        );
+        let incoming = futures::stream::unfold(listener, |listener| async {
+            let result = listener.accept().await.map(|(socket, _)| socket);
+            Some((result, listener))
+        });
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    quil_types::proto::node::node_service_server::NodeServiceServer::new(server),
+                )
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+        crate::rpc::connect_node_service(&ConnectOpts {
+            listen_grpc_multiaddr: multiaddr,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Near the epoch's end the frame comes only from the next epoch, and the
+    /// wait is announced once; clear of it, at once and in silence.
+    #[tokio::test]
+    async fn signing_waits_out_the_end_of_an_epoch() {
+        let length = quil_types::consensus::epoch_length_frames();
+        let head = Arc::new(AtomicU64::new(length - 1));
+        let mut client = client_at(head.clone()).await;
+        let advance = head.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            advance.store(length + 3, Ordering::SeqCst);
+        });
+        let mut told = Vec::new();
+        let frame = tokio::time::timeout(
+            Duration::from_secs(20),
+            frame_clear_of_epoch_end(
+                &mut client,
+                Duration::from_secs(15),
+                Duration::from_millis(50),
+                |left| told.push(left),
+            ),
+        )
+        .await
+        .expect("the wait ends with the epoch")
+        .unwrap();
+        assert_eq!(frame, length + 3);
+        assert_eq!(told, vec![1]);
+
+        told.clear();
+        let frame = frame_clear_of_epoch_end(
+            &mut client,
+            Duration::from_secs(15),
+            Duration::from_millis(50),
+            |left| told.push(left),
+        )
+        .await
+        .unwrap();
+        assert_eq!(frame, length + 3);
+        assert!(told.is_empty());
+    }
+
+    /// The bound and its recovery: a head that stays near the end stops the
+    /// wait with the reason, nothing signed, and the next call goes on.
+    #[tokio::test]
+    async fn a_stalled_head_ends_the_wait_with_the_reason() {
+        let length = quil_types::consensus::epoch_length_frames();
+        let head = Arc::new(AtomicU64::new(length - 1));
+        let mut client = client_at(head.clone()).await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(20),
+            frame_clear_of_epoch_end(
+                &mut client,
+                Duration::from_millis(200),
+                Duration::from_millis(50),
+                |_| {},
+            ),
+        )
+        .await
+        .expect("the wait is bounded")
+        .unwrap_err()
+        .to_string();
+        assert!(error.starts_with("not sent: waited"), "{error}");
+        assert!(error.contains(&format!("frame {}", length - 1)), "{error}");
+        head.store(length, Ordering::SeqCst);
+        let frame = frame_clear_of_epoch_end(
+            &mut client,
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(frame, length);
+    }
 
     #[test]
     fn format_storage_units() {

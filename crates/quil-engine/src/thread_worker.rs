@@ -171,8 +171,6 @@ pub struct WorkerConsensusDeps {
     /// testnet=1 (single-prover clusters still progress). See
     /// `AppLeaderProvider::min_active_provers_for_propose`.
     pub min_active_provers_for_propose: u64,
-    /// Drive app-shard consensus with commonware-simplex + Falcon.
-    pub app_consensus_cw: bool,
     /// DB config → persistent per-shard simplex-journal dir (Go parity).
     pub db_config: quil_config::DbConfig,
     /// Callback that publishes finalized canonical FrameHeader bytes
@@ -862,12 +860,27 @@ impl ThreadWorkerManager {
                     loop {
                         tokio::select! {
                             _ = mem_tick.tick() => {
+                                // Also releases a published generation's store
+                                // snapshot past its window when this worker no
+                                // longer publishes (idle, or its shard halted).
+                                let held = worker_owned
+                                    .as_ref()
+                                    .and_then(|o| o.hypergraph.release_expired_snapshots());
                                 if let Some(db) = worker_db.as_ref() {
                                     let bytes = db.approximate_memory_bytes();
+                                    // Open snapshots keep every later deletion on
+                                    // disk; the generation pins and wallet scans
+                                    // name two holders, any rest is a sync or
+                                    // execution view.
+                                    let snapshots = db.open_snapshots();
                                     info!(
                                         core_id,
                                         worker_db_mb = bytes as f64 / (1024.0 * 1024.0),
                                         filter = hex::encode(&current_filter),
+                                        rocksdb_snapshots = snapshots.map(|s| s.count),
+                                        oldest_snapshot_age_secs = snapshots.map(|s| s.oldest_age_secs),
+                                        generation_pins = held.map(|h| h.generations),
+                                        scan_snapshots = held.map(|h| h.scans),
                                         "worker rocksdb memory",
                                     );
                                 }
@@ -1017,7 +1030,6 @@ impl ThreadWorkerManager {
                                                         execution_engine,
                                                         inclusion_prover,
                                                         kv_db,
-                                                        app_consensus_cw: deps.app_consensus_cw,
                                                         db_config: deps.db_config.clone(),
                                                         // Per-worker consolidation hook (bound to this
                                                         // worker's CRDT/store by worker_state_builder).
@@ -1954,18 +1966,8 @@ mod tests {
     async fn a_stopped_worker_restarts_with_its_allocation() {
         let mgr = Arc::new(ThreadWorkerManager::new());
         let mut rx = mgr.take_master_rx().unwrap();
-        async fn ready(rx: &mut mpsc::Receiver<WorkerToMaster>) -> bool {
-            let wait = std::time::Duration::from_secs(5);
-            loop {
-                match tokio::time::timeout(wait, rx.recv()).await {
-                    Ok(Some(WorkerToMaster::Ready { core_id: 1 })) => return true,
-                    Ok(Some(_)) => continue,
-                    _ => return false,
-                }
-            }
-        }
         mgr.set_worker_filter(1, b"active-filter", true).unwrap();
-        assert!(ready(&mut rx).await);
+        assert!(worker_ready(&mgr, &mut rx).await);
         let stopping = mgr.clone();
         let stopped = tokio::task::spawn_blocking(move || {
             stopping.stop_worker(1, std::time::Duration::from_secs(5))
@@ -2011,9 +2013,9 @@ mod tests {
             "a stopped worker runs nothing"
         );
         mgr.restart_worker(1).unwrap();
-        assert!(ready(&mut rx).await, "the new thread starts");
+        assert!(worker_ready(&mgr, &mut rx).await, "the new thread starts");
         assert!(
-            ready(&mut rx).await,
+            worker_ready(&mgr, &mut rx).await,
             "and applies the allocation it has now"
         );
         assert!(
@@ -2027,14 +2029,31 @@ mod tests {
         assert!(running.await.unwrap().is_empty());
     }
 
-    /// The next `Ready` from worker 1 within five seconds, if any.
-    async fn worker_ready(rx: &mut mpsc::Receiver<WorkerToMaster>) -> bool {
-        let wait = std::time::Duration::from_secs(5);
+    /// The next `Ready` from worker 1, waited for while its thread runs:
+    /// false once the thread has ended without one. A fixed bound would be a
+    /// bound on the runner's load: a start takes about 0.1 s beside other
+    /// tests, and over 5 s on a host loaded past its CPUs (2026-11-03). The
+    /// deadline only catches a thread that neither starts nor ends.
+    async fn worker_ready(
+        mgr: &ThreadWorkerManager,
+        rx: &mut mpsc::Receiver<WorkerToMaster>,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
-            match tokio::time::timeout(wait, rx.recv()).await {
+            let poll = std::time::Duration::from_millis(50);
+            match tokio::time::timeout(poll, rx.recv()).await {
                 Ok(Some(WorkerToMaster::Ready { core_id: 1 })) => return true,
                 Ok(Some(_)) => continue,
-                _ => return false,
+                Ok(None) => return false,
+                // What it sent before it ended is still queued.
+                Err(_) if !mgr.worker_running(1) => {
+                    return std::iter::from_fn(|| rx.try_recv().ok())
+                        .any(|m| matches!(m, WorkerToMaster::Ready { core_id: 1 }));
+                }
+                Err(_) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "worker 1's thread neither started nor ended"
+                ),
             }
         }
     }
@@ -2107,7 +2126,6 @@ mod tests {
             }),
             reward_greedy: false,
             min_active_provers_for_propose: 1,
-            app_consensus_cw: false,
             db_config: quil_config::DbConfig::default(),
             coverage_publish: None,
             hypergraph: None,
@@ -2163,7 +2181,7 @@ mod tests {
 
         mgr.set_worker_filter(1, b"pinned-filter", false).unwrap();
         assert!(
-            worker_ready(&mut rx).await,
+            worker_ready(&mgr, &mut rx).await,
             "the worker starts on its own store"
         );
         assert!(store_open_becomes(true).await);
@@ -2176,7 +2194,7 @@ mod tests {
 
         mgr.restart_worker(1).unwrap();
         assert!(
-            worker_ready(&mut rx).await && worker_ready(&mut rx).await,
+            worker_ready(&mgr, &mut rx).await && worker_ready(&mgr, &mut rx).await,
             "restarted on its allocation"
         );
         assert!(store_open_becomes(true).await, "the store is reopened");
@@ -2193,7 +2211,7 @@ mod tests {
         fail.store(true, std::sync::atomic::Ordering::SeqCst);
         mgr.restart_worker(1).unwrap();
         assert!(
-            !worker_ready(&mut rx).await,
+            !worker_ready(&mgr, &mut rx).await,
             "no worker runs without its own store"
         );
         assert!(!mgr.worker_running(1), "its thread ended");
@@ -2679,20 +2697,67 @@ mod tests {
         assert_eq!(reads.done.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
+    /// What the self-test's time budget protects: it runs once on each worker
+    /// thread before the worker serves, so a signer that takes seconds (a key
+    /// generated per message, a hang) delays every worker's startup. A good
+    /// signer needs about 25 ms; the bound is 40 times that, because a bound
+    /// near the cost fails under a loaded CI host.
+    const SELF_TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// The fastest of up to `attempts` self-test runs whose signer waits
+    /// `sign_delay` per message, stopping at the first within the budget. A
+    /// slow signer is slow in every attempt; descheduling by parallel load
+    /// hits one attempt at a time.
+    fn fastest_self_test(
+        key: &quil_crypto::FalconSigner,
+        attempts: u32,
+        sign_delay: std::time::Duration,
+    ) -> std::time::Duration {
+        use quil_types::crypto::Signer as _;
+        let mut fastest = std::time::Duration::MAX;
+        for _ in 0..attempts {
+            let started = std::time::Instant::now();
+            let failures = falcon_self_test_failures(
+                |m| {
+                    std::thread::sleep(sign_delay);
+                    key.sign_with_domain(m, FALCON_SELF_TEST_DOMAIN).ok()
+                },
+                |m, sig| {
+                    quil_crypto::falcon_verify(key.public_key(), sig, m, FALCON_SELF_TEST_DOMAIN)
+                },
+            );
+            assert_eq!(failures, 0);
+            fastest = fastest.min(started.elapsed());
+            if fastest < SELF_TEST_BUDGET {
+                break;
+            }
+        }
+        fastest
+    }
+
     #[test]
     fn falcon_self_test_passes_a_good_signer_quickly() {
         let started = std::time::Instant::now();
         let key = self_test_key();
         let keygen = started.elapsed();
-        let started = std::time::Instant::now();
-        assert_eq!(self_test_with(&key, |_| false), 0);
-        let test = started.elapsed();
+        let test = fastest_self_test(&key, 5, std::time::Duration::ZERO);
         eprintln!(
             "falcon self-test: keygen {keygen:?}, {FALCON_SELF_TEST_MESSAGES} sign+verify {test:?}"
         );
         assert!(
-            test < std::time::Duration::from_millis(100),
-            "self-test took {test:?}"
+            test < SELF_TEST_BUDGET,
+            "the fastest of 5 self-test runs took {test:?}, budget {SELF_TEST_BUDGET:?}"
+        );
+    }
+
+    #[test]
+    fn falcon_self_test_budget_fails_a_slow_signer() {
+        let key = self_test_key();
+        let slow = std::time::Duration::from_millis(150);
+        let test = fastest_self_test(&key, 1, slow);
+        assert!(
+            test >= SELF_TEST_BUDGET,
+            "a signer taking {slow:?} per message fit the budget: {test:?}"
         );
     }
 

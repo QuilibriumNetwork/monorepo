@@ -530,7 +530,7 @@ async fn shield_preview(tc: &crate::commands::token::TokenCtx) -> anyhow::Result
     use crate::commands::token::{plan_shield_all, shield_batch_fee};
     // Before any listing or proof: a submission the node would refuse.
     check_identity(tc).await?;
-    let plan = plan_shield_all(tc, &quil_token(), shield::BATCH_COINS).await?;
+    let plan = plan_shield_all(tc, &quil_token(), shield::BATCH_COINS, None).await?;
     anyhow::ensure!(
         !plan.batches.is_empty(),
         "no unshielded legacy coins on a live shard to shield"
@@ -728,7 +728,7 @@ async fn confirmed_plan(
     preview: &shield::Preview,
 ) -> anyhow::Result<crate::commands::token::ShieldAllPlan> {
     use crate::commands::token::plan_shield_all;
-    let plan = plan_shield_all(tc, &quil_token(), shield::BATCH_COINS).await?;
+    let plan = plan_shield_all(tc, &quil_token(), shield::BATCH_COINS, None).await?;
     let (coins, units) = plan.totals()?;
     anyhow::ensure!(
         plan.batches.len() == preview.batches && coins == preview.coins && units == preview.units,
@@ -760,6 +760,310 @@ pub async fn shield_run(
 ) -> Msg {
     Msg::Shield(shield::Progress::Done(Err(
         "this qclient build has no shield commands".into(),
+    )))
+}
+
+/// Wallet reads that check a coin's or an escrow's state by its address
+/// go to this node only: a public or custom RPC the qclient config names
+/// would learn which coins and escrows are this wallet's.
+#[cfg(feature = "confidential-tokens")]
+fn own_node_only(tc: &crate::commands::token::TokenCtx) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !tc.connect_opts.is_light_node(),
+        "the qclient config reads through a public or custom RPC (publicRpc, customRpc), which \
+         would learn this wallet's coins; the manager reads them from this node only"
+    );
+    Ok(())
+}
+
+/// The shielded side of this wallet: its unspent confidential coins and
+/// the pending transfers it can act on, as `token balance` and `token
+/// escrows` read them. Both are full scans matched on this machine; the
+/// spent and consumed checks of what matched read this node's GLOBAL
+/// state, never another node.
+pub async fn fetch_shielded(token: Option<(GlobalArgs, u128)>) -> Msg {
+    #[cfg(feature = "confidential-tokens")]
+    let result = {
+        use crate::commands::token::{output, TokenCtx};
+        let (notes, _ignored) = tokio::sync::mpsc::unbounded_channel();
+        output::capture(notes, async {
+            let (global, max_fee) = token.ok_or_else(|| anyhow::anyhow!("no node config"))?;
+            shielded_read(&TokenCtx::for_manager(global, max_fee)?).await
+        })
+        .await
+        .map_err(|e| format!("{e:#}"))
+    };
+    #[cfg(not(feature = "confidential-tokens"))]
+    let result = {
+        let _ = token;
+        Err("this qclient build has no confidential tokens".into())
+    };
+    Msg::Shielded(result)
+}
+
+#[cfg(feature = "confidential-tokens")]
+async fn shielded_read(
+    tc: &crate::commands::token::TokenCtx,
+) -> anyhow::Result<super::transfer::Read> {
+    use crate::commands::token::{
+        confidential_balance, list_escrows, SCAN_MAX_COINS, SCAN_MAX_PAGES,
+    };
+    own_node_only(tc)?;
+    let coins = confidential_balance(tc, SCAN_MAX_PAGES, SCAN_MAX_COINS).await?;
+    let application = hex::encode(quil_execution::domains::QUIL_TOKEN);
+    let escrows = list_escrows(tc, &application, SCAN_MAX_PAGES, SCAN_MAX_COINS).await?;
+    Ok(super::transfer::Read {
+        coins,
+        escrows: escrows
+            .into_iter()
+            .map(|escrow| super::transfer::Escrow {
+                address: escrow.address,
+                amount: escrow.amount,
+                outgoing: escrow.refund,
+                refund_after: escrow.refund_after,
+            })
+            .collect(),
+    })
+}
+
+/// A transfer action's confirmation: its inputs checked and its fee quoted
+/// as `qclient token` would; a merge also scans the coins it would take.
+#[cfg(feature = "native-proof")]
+pub async fn transfer_prepare(
+    token: Option<(GlobalArgs, u128)>,
+    kind: super::transfer::Kind,
+) -> Msg {
+    use crate::commands::token::{output, TokenCtx};
+    let (notes, _ignored) = tokio::sync::mpsc::unbounded_channel();
+    let result = output::capture(notes, async {
+        let (global, max_fee) = token.ok_or_else(|| anyhow::anyhow!("no node config"))?;
+        transfer_preview(&TokenCtx::for_manager(global, max_fee)?, kind).await
+    })
+    .await;
+    Msg::TransferPreview(result.map_err(|e| format!("{e:#}")))
+}
+
+#[cfg(feature = "native-proof")]
+async fn transfer_preview(
+    tc: &crate::commands::token::TokenCtx,
+    kind: super::transfer::Kind,
+) -> anyhow::Result<super::transfer::Preview> {
+    use super::transfer::Kind;
+    use crate::commands::token::{
+        check_recipient, claim_fee, max_inputs, merge_fee, merge_preview, pending_fee, transfer_fee,
+    };
+    // Before any request: reads that would name this wallet's coins to
+    // another node; then before any check or quote, a submission the node
+    // would refuse.
+    own_node_only(tc)?;
+    check_identity(tc).await?;
+    let app = quil_token();
+    let mut merge = None;
+    let fee = match &kind {
+        Kind::Transfer { recipient, .. } => {
+            check_recipient(tc, recipient, false)?;
+            transfer_fee(
+                tc,
+                &quil_execution::domains::QUIL_TOKEN,
+                None,
+                max_inputs(tc),
+            )
+            .await?
+        }
+        Kind::Pending { recipient, .. } => {
+            check_recipient(tc, recipient, true)?;
+            pending_fee(tc, &app, None).await?
+        }
+        Kind::Accept { .. } | Kind::Refund { .. } => claim_fee(tc, &app, None).await?,
+        Kind::Merge => {
+            let fee = merge_fee(tc, &app, None).await?;
+            let (coins, total) = merge_preview(tc).await?;
+            anyhow::ensure!(
+                coins >= 2,
+                "{coins} coin(s) to merge; a merge needs two or more"
+            );
+            anyhow::ensure!(total > fee, "the coins to merge do not cover the fee");
+            merge = Some((coins, total));
+            fee
+        }
+    };
+    Ok(super::transfer::Preview {
+        kind,
+        fee,
+        max_fee: tc.max_fee,
+        merge,
+    })
+}
+
+/// Run the confirmed action through `qclient token`'s own function,
+/// reporting its lines on `progress` and recording it in the private action
+/// `log`.
+#[cfg(feature = "native-proof")]
+pub async fn transfer_run(
+    token: Option<(GlobalArgs, u128)>,
+    preview: super::transfer::Preview,
+    progress: tokio::sync::mpsc::UnboundedSender<Msg>,
+    log: Option<ActionLog>,
+) -> Msg {
+    use crate::commands::token::action_log::ActionRecorder;
+    use crate::commands::token::{output, TokenCtx};
+    let (notes, mut lines) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let forward = progress.clone();
+    tokio::spawn(async move {
+        while let Some(line) = lines.recv().await {
+            let _ = forward.send(Msg::Transfer(super::transfer::Progress::Note(line)));
+        }
+    });
+    let result = output::capture(notes, async {
+        let (global, max_fee) = token.ok_or_else(|| anyhow::anyhow!("no node config"))?;
+        let tc = TokenCtx::for_manager(global, max_fee)?;
+        let mut record = ActionRecorder::new(log, preview.kind.log_name(), "manager");
+        transfer_execute(&tc, &preview, &progress, &mut record).await
+    })
+    .await;
+    Msg::Transfer(super::transfer::Progress::Done(
+        result.map_err(|e| format!("{e:#}")),
+    ))
+}
+
+/// The private action log's start record of a transfer action: what was
+/// confirmed, to the base unit.
+#[cfg(feature = "native-proof")]
+fn transfer_record(preview: &super::transfer::Preview) -> serde_json::Value {
+    use super::transfer::Kind;
+    let mut fields = serde_json::json!({
+        "fee": preview.fee.to_string(),
+        "max_fee": preview.max_fee.to_string(),
+    });
+    match &preview.kind {
+        Kind::Transfer { recipient, amount } => {
+            fields["recipient"] = recipient.clone().into();
+            fields["amount"] = amount.to_string().into();
+        }
+        Kind::Pending {
+            recipient,
+            amount,
+            refund_after,
+        } => {
+            fields["recipient"] = recipient.clone().into();
+            fields["amount"] = amount.to_string().into();
+            fields["refund_after"] = (*refund_after).into();
+        }
+        Kind::Accept { escrow, amount } | Kind::Refund { escrow, amount } => {
+            fields["escrow"] = hex::encode(escrow).into();
+            fields["amount"] = amount.to_string().into();
+        }
+        Kind::Merge => {
+            if let Some((coins, total)) = preview.merge {
+                fields["coins"] = coins.into();
+                fields["amount"] = total.to_string().into();
+            }
+        }
+    }
+    fields
+}
+
+/// [`transfer_run`]'s work with `tc`'s node and keys, recorded by `record`:
+/// the confirmed inputs and the outcome.
+#[cfg(feature = "native-proof")]
+async fn transfer_execute(
+    tc: &crate::commands::token::TokenCtx,
+    preview: &super::transfer::Preview,
+    progress: &tokio::sync::mpsc::UnboundedSender<Msg>,
+    record: &mut crate::commands::token::action_log::ActionRecorder,
+) -> anyhow::Result<()> {
+    let failed = |why: Option<String>| {
+        if let Some(why) = why {
+            let _ = progress.send(Msg::Transfer(super::transfer::Progress::LogFailed(why)));
+        }
+    };
+    failed(record.write("start", transfer_record(preview)));
+    let result = transfer_action(tc, preview).await;
+    let outcome = result.as_ref().map(|_| ()).map_err(|e| format!("{e:#}"));
+    failed(record.outcome(&outcome));
+    result
+}
+
+#[cfg(feature = "native-proof")]
+async fn transfer_action(
+    tc: &crate::commands::token::TokenCtx,
+    preview: &super::transfer::Preview,
+) -> anyhow::Result<()> {
+    use super::transfer::Kind;
+    use crate::commands::token::{
+        run_claim, run_merge, run_pending_create, run_transfer, SCAN_MAX_COINS, SCAN_MAX_PAGES,
+    };
+    own_node_only(tc)?;
+    let app = quil_token();
+    match &preview.kind {
+        // As `token transfer` without --fee: quoted again, rebuilt if the
+        // price moves, always under --max-fee.
+        Kind::Transfer { recipient, amount } => {
+            run_transfer(
+                tc,
+                &app,
+                recipient,
+                *amount,
+                None,
+                SCAN_MAX_PAGES,
+                SCAN_MAX_COINS,
+            )
+            .await
+        }
+        Kind::Pending {
+            recipient,
+            amount,
+            refund_after,
+        } => {
+            run_pending_create(
+                tc,
+                &app,
+                recipient,
+                *amount,
+                preview.fee,
+                *refund_after,
+                SCAN_MAX_PAGES,
+                SCAN_MAX_COINS,
+            )
+            .await
+        }
+        Kind::Accept { escrow, .. } => {
+            run_claim(tc, &app, &hex::encode(escrow), preview.fee, false).await
+        }
+        Kind::Refund { escrow, .. } => {
+            run_claim(tc, &app, &hex::encode(escrow), preview.fee, true).await
+        }
+        Kind::Merge => {
+            run_merge(
+                tc,
+                &app,
+                &["all".to_string()],
+                preview.fee,
+                SCAN_MAX_PAGES,
+                SCAN_MAX_COINS,
+            )
+            .await
+        }
+    }
+}
+
+#[cfg(not(feature = "native-proof"))]
+pub async fn transfer_prepare(
+    _token: Option<(GlobalArgs, u128)>,
+    _kind: super::transfer::Kind,
+) -> Msg {
+    Msg::TransferPreview(Err("this qclient build has no transfer commands".into()))
+}
+
+#[cfg(not(feature = "native-proof"))]
+pub async fn transfer_run(
+    _token: Option<(GlobalArgs, u128)>,
+    _preview: super::transfer::Preview,
+    _progress: tokio::sync::mpsc::UnboundedSender<Msg>,
+    _log: Option<ActionLog>,
+) -> Msg {
+    Msg::Transfer(super::transfer::Progress::Done(Err(
+        "this qclient build has no transfer commands".into(),
     )))
 }
 
@@ -973,6 +1277,7 @@ pub async fn do_lifecycle(
     action: String,
     filters: Vec<Vec<u8>>,
     original_status: u32,
+    progress: tokio::sync::mpsc::UnboundedSender<Msg>,
 ) -> Msg {
     let label = if action == "Pause" || action == "Resume" {
         trunc_hex(&hex::encode(filters.first().cloned().unwrap_or_default()))
@@ -981,6 +1286,27 @@ pub async fn do_lifecycle(
     };
 
     let _ = label; // label mirrors Go's status string; unused in the Rust flow.
+
+    // Every node refuses one of these landing in a later epoch than it was
+    // signed in, so it signs clear of the epoch's end. A confirm or reject is
+    // valid only in this epoch and goes at once.
+    if matches!(action.as_str(), "Leave" | "Pause" | "Resume") {
+        if let Err(e) = super::super::frame_clear_of_epoch_end(
+            &mut client,
+            super::super::EPOCH_END_WAIT_CAP,
+            super::super::EPOCH_END_POLL,
+            |frames_left| {
+                let _ = progress.send(Msg::SigningWait {
+                    action: action.clone(),
+                    frames_left,
+                });
+            },
+        )
+        .await
+        {
+            return broadcast_err(&action, &filters, original_status, e.to_string());
+        }
+    }
 
     let frame = match get_frame_number(&mut client).await {
         Ok(f) => f,
@@ -1217,6 +1543,52 @@ mod shield_action_tests {
         }
     }
 
+    /// The manager's leave, as it builds it, passes the verifier every node
+    /// runs: it signs through the command's `leave_sig`.
+    #[test]
+    fn the_managers_leave_passes_the_network_verifier() {
+        use quil_execution::global_intrinsic::{
+            conversions, prover_filter_ops::ProverLeave as CanonicalLeave, verify,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let km = FileKeyManager::new(
+            directory.path().join("keys.yml"),
+            "",
+            "q-prover-key".into(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )
+        .unwrap();
+        km.create_falcon_key("q-prover-key").unwrap();
+        let pubkey = km
+            .get_signer_by_id("q-prover-key")
+            .unwrap()
+            .public_key()
+            .to_vec();
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        quil_execution::global_schema::write_type(&mut tree, "prover:Prover").unwrap();
+        quil_execution::global_schema::write_field(
+            &mut tree,
+            "prover:Prover",
+            "PublicKey",
+            &pubkey,
+        )
+        .unwrap();
+        let filters = vec![vec![0x08; 32], vec![0x09; 40]];
+        let request = super::build_request(&km, "Leave", &filters, 777).unwrap();
+        let Some(quil_types::proto::global::message_request::Request::Leave(pb)) = request.request
+        else {
+            panic!("a leave request");
+        };
+        let wire = conversions::prover_leave_from_proto(&pb)
+            .to_canonical_bytes()
+            .unwrap();
+        let op = CanonicalLeave::from_canonical_bytes(&wire).unwrap();
+        assert!(
+            verify::verify_prover_leave(&op, &tree, &quil_crypto::DefaultKeyManager::new())
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn s_previews_and_runs_through_the_cli_functions() {
         let directory = tempfile::tempdir().unwrap();
@@ -1425,6 +1797,41 @@ mod shield_action_tests {
         assert_eq!(last["phase"], "outcome");
         assert_eq!(last["outcome"], "failed");
         assert!(last["error"].as_str().unwrap().contains("the plan changed"));
+
+        // `--recipient`, as `token shield-all` passes it: the plan and the
+        // paced run's private log name that address, not this wallet's.
+        let address = tc.another_quil_address();
+        assert_ne!(address, preview.recipient);
+        let plan = crate::commands::token::plan_shield_all(
+            &tc,
+            &quil_token(),
+            shield::BATCH_COINS,
+            Some(&address),
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.recipient(), address);
+        let (notes, _lines) = tokio::sync::mpsc::unbounded_channel();
+        let submitted = crate::commands::token::output::capture(
+            notes,
+            crate::commands::token::execute_shield_all(
+                &tc,
+                plan,
+                PACING,
+                &mut recorder(),
+                None,
+                &mut |_| {},
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(submitted, 0);
+        let written = records();
+        let start = written
+            .iter()
+            .rfind(|r| r["phase"] == "start")
+            .expect("the run logged its start");
+        assert_eq!(start["recipient"], address.as_str());
 
         // Signed as another peer, the confirmation is refused before any
         // listing, as `token shield-all` refuses it.
@@ -1706,6 +2113,178 @@ mod mint_action_tests {
             assert!(!error.contains("--submit-config"), "{error}");
         }
         stop.send(()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod epoch_end_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+
+    /// The manager holds a leave, pause or resume near the epoch's end, and a
+    /// confirm or reject, valid only in this epoch, goes on at once (here to the
+    /// frame read, which this node has no provider for).
+    #[tokio::test]
+    async fn the_manager_signs_clear_of_the_end_of_an_epoch() {
+        let directory = tempfile::tempdir().unwrap();
+        let km = Arc::new(
+            FileKeyManager::new(
+                directory.path().join("keys.yml"),
+                "",
+                "q-prover-key".into(),
+                Box::new(quil_crypto::FalconKeyConstructor),
+            )
+            .unwrap(),
+        );
+        let length = quil_types::consensus::epoch_length_frames();
+        let mut server = quil_rpc::NodeRpcServer::default();
+        server.last_global_head_frame = Arc::new(AtomicU64::new(length - 1));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let multiaddr = format!(
+            "/ip4/127.0.0.1/tcp/{}",
+            listener.local_addr().unwrap().port()
+        );
+        let incoming = futures::stream::unfold(listener, |listener| async {
+            let result = listener.accept().await.map(|(socket, _)| socket);
+            Some((result, listener))
+        });
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    quil_types::proto::node::node_service_server::NodeServiceServer::new(server),
+                )
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+        let client = crate::rpc::connect_node_service(&crate::rpc::ConnectOpts {
+            listen_grpc_multiaddr: multiaddr,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let (progress, mut notices) = tokio::sync::mpsc::unbounded_channel();
+        let run = |action: &str| {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                do_lifecycle(
+                    client.clone(),
+                    km.clone(),
+                    action.to_string(),
+                    vec![vec![0xAA; 32]],
+                    2,
+                    progress.clone(),
+                ),
+            )
+        };
+        for held in ["Leave", "Pause", "Resume"] {
+            assert!(run(held).await.is_err(), "{held} waits for the next epoch");
+            match notices.try_recv() {
+                Ok(Msg::SigningWait {
+                    action,
+                    frames_left,
+                }) => assert_eq!((action.as_str(), frames_left), (held, 1)),
+                _ => panic!("{held} says nothing while it waits"),
+            }
+            assert!(notices.try_recv().is_err(), "{held} says it once");
+        }
+        for at_once in ["Confirm", "Reject"] {
+            assert!(run(at_once).await.is_ok(), "{at_once} does not wait");
+            assert!(notices.try_recv().is_err(), "{at_once} has no wait to tell");
+        }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_request_tests {
+    use super::*;
+    use quil_execution::global_intrinsic::{conversions, prover_filter_ops, prover_ops, verify};
+
+    fn prover_tree(pubkey: &[u8]) -> quil_tries::VectorCommitmentTree {
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        quil_execution::global_schema::write_type(&mut tree, "prover:Prover").unwrap();
+        quil_execution::global_schema::write_field(&mut tree, "prover:Prover", "PublicKey", pubkey)
+            .unwrap();
+        tree
+    }
+
+    fn allocation_tree(status: u8) -> quil_tries::VectorCommitmentTree {
+        let class = "allocation:ProverAllocation";
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        quil_execution::global_schema::write_type(&mut tree, class).unwrap();
+        quil_execution::global_schema::write_field(&mut tree, class, "Status", &[status]).unwrap();
+        tree
+    }
+
+    /// Confirm, reject, pause and resume as the manager builds them, through
+    /// their wire encoding and the verifier every node runs.
+    #[test]
+    fn the_managers_requests_pass_the_network_verifier() {
+        let directory = tempfile::tempdir().unwrap();
+        let km = FileKeyManager::new(
+            directory.path().join("keys.yml"),
+            "",
+            "q-prover-key".into(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )
+        .unwrap();
+        km.create_falcon_key("q-prover-key").unwrap();
+        let pubkey = km
+            .get_signer_by_id("q-prover-key")
+            .unwrap()
+            .public_key()
+            .to_vec();
+        let tree = prover_tree(&pubkey);
+        let verifier = quil_crypto::DefaultKeyManager::new();
+        let filters = vec![vec![0x08; 32], vec![0x09; 35]];
+        let build = |action, filters: &[Vec<u8>]| {
+            build_request(&km, action, filters, 777)
+                .unwrap()
+                .request
+                .unwrap()
+        };
+
+        let Request::Confirm(pb) = build("Confirm", &filters) else {
+            panic!("a confirm");
+        };
+        let wire = conversions::prover_confirm_from_proto(&pb)
+            .to_canonical_bytes()
+            .unwrap();
+        let op = prover_ops::ProverConfirm::from_canonical_bytes(&wire).unwrap();
+        assert_eq!(op.filters, filters);
+        assert!(verify::verify_prover_confirm(&op, &tree, &verifier).unwrap());
+
+        let Request::Reject(pb) = build("Reject", &filters) else {
+            panic!("a reject");
+        };
+        let wire = conversions::prover_reject_from_proto(&pb)
+            .to_canonical_bytes()
+            .unwrap();
+        let op = prover_ops::ProverReject::from_canonical_bytes(&wire).unwrap();
+        assert_eq!(op.filters, filters);
+        assert!(verify::verify_prover_reject(&op, &tree, &verifier).unwrap());
+
+        let single = &filters[1..];
+        let Request::Pause(pb) = build("Pause", single) else {
+            panic!("a pause");
+        };
+        let wire = conversions::prover_pause_from_proto(&pb)
+            .to_canonical_bytes()
+            .unwrap();
+        let op = prover_filter_ops::ProverPause::from_canonical_bytes(&wire).unwrap();
+        let active = allocation_tree(1);
+        assert!(verify::verify_prover_pause(&op, &tree, Some(&active), &verifier).unwrap());
+
+        let Request::Resume(pb) = build("Resume", single) else {
+            panic!("a resume");
+        };
+        let wire = conversions::prover_resume_from_proto(&pb)
+            .to_canonical_bytes()
+            .unwrap();
+        let op = prover_filter_ops::ProverResume::from_canonical_bytes(&wire).unwrap();
+        let paused = allocation_tree(2);
+        assert!(verify::verify_prover_resume(&op, &tree, Some(&paused), &verifier).unwrap());
     }
 }
 
@@ -2172,5 +2751,247 @@ mod paced_shield_tests {
         assert!(run.stopped && run.done == Some(Ok(())));
         let stopped = "Shield: stopped on request after 1 batch of 3 submitted; the rest were not.";
         assert!(io.texts().iter().any(|t| t == stopped), "{:#?}", io.texts());
+    }
+}
+
+/// The transfer actions' confirmations against a node double that quotes
+/// fees: a malformed recipient is refused before any quote, an accept is
+/// quoted as `token accept` quotes it. Nothing is proved or submitted.
+#[cfg(all(test, feature = "native-proof"))]
+mod transfer_action_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn previews_check_the_recipient_and_quote_the_fee() {
+        let directory = tempfile::tempdir().unwrap();
+        let km = Arc::new(
+            FileKeyManager::new(
+                directory.path().join("keys.yml"),
+                &hex::encode([9; 32]),
+                "q-prover-key".into(),
+                Box::new(quil_crypto::FalconKeyConstructor),
+            )
+            .unwrap(),
+        );
+        km.create_agreement_key("q-onion-key", 9).unwrap();
+        let network =
+            quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(0).network;
+        // The node reports a peer ID, so a context signing as another peer
+        // is refused.
+        let server = quil_rpc::node_service::NodeRpcServer::new()
+            .with_peer_id("the-node-peer".into())
+            .with_token_fee_provider(Arc::new(move |_, _| {
+                Ok(quil_rpc::node_service::TokenFeeSnapshot {
+                    network,
+                    observed_frame: 42,
+                    global_execution: true,
+                    difficulty: 50_000,
+                    world_state_bytes: 1 << 40,
+                    fee_multiplier_vote: 1,
+                })
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let multiaddr = format!(
+            "/ip4/127.0.0.1/tcp/{}",
+            listener.local_addr().unwrap().port()
+        );
+        let incoming = futures::stream::unfold(listener, |listener| async {
+            let result = listener.accept().await.map(|(socket, _)| socket);
+            Some((result, listener))
+        });
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    quil_types::proto::node::node_service_server::NodeServiceServer::new(server),
+                )
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        let opts = crate::rpc::ConnectOpts {
+            listen_grpc_multiaddr: multiaddr,
+            ..Default::default()
+        };
+        let tc = crate::commands::token::TokenCtx {
+            node_config: quil_config::Config::default(),
+            config_dir: directory.path().to_path_buf(),
+            key_manager: km.clone(),
+            connect_opts: opts.clone(),
+            submit_opts: opts,
+            submit_key_manager: km,
+            submit_config_dir: directory.path().to_path_buf(),
+            submit_identity: Default::default(),
+            peer_id_bytes: Vec::new(),
+            max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
+        };
+        let capture = |kind| {
+            let (notes, _lines) = tokio::sync::mpsc::unbounded_channel();
+            crate::commands::token::output::capture(notes, transfer_preview(&tc, kind))
+        };
+        use super::super::transfer::Kind;
+        for kind in [
+            Kind::Transfer {
+                recipient: "0x1234".into(),
+                amount: 5,
+            },
+            Kind::Pending {
+                recipient: "0x1234".into(),
+                amount: 5,
+                refund_after: None,
+            },
+        ] {
+            assert!(
+                capture(kind).await.is_err(),
+                "a malformed recipient is refused"
+            );
+        }
+        let preview = capture(Kind::Accept {
+            escrow: [7; 32],
+            amount: 50,
+        })
+        .await
+        .unwrap();
+        let quoted = crate::commands::token::claim_fee(&tc, &quil_token(), None)
+            .await
+            .unwrap();
+        assert_eq!(preview.fee, quoted);
+        assert!(preview.fee > 0 && preview.merge.is_none());
+        // Signed as another peer, every action is refused before any check
+        // or quote, as `qclient token` refuses it.
+        let other = crate::commands::token::TokenCtx {
+            submit_identity: crate::commands::token::ConfigIdentity {
+                falcon: Some("another-peer".into()),
+                ed448: None,
+            },
+            ..tc
+        };
+        for kind in [
+            Kind::Accept {
+                escrow: [7; 32],
+                amount: 50,
+            },
+            Kind::Merge,
+        ] {
+            let (notes, _lines) = tokio::sync::mpsc::unbounded_channel();
+            let error =
+                crate::commands::token::output::capture(notes, transfer_preview(&other, kind))
+                    .await
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains("own peer key"), "{error}");
+            assert!(!error.contains("--submit-config"), "{error}");
+        }
+        stop.send(()).unwrap();
+    }
+
+    /// With the qclient config reading through a public or custom RPC, the
+    /// shielded read, every transfer confirmation and every run are refused
+    /// before any request, and the refused run is recorded in the private
+    /// action log with its confirmed inputs.
+    #[tokio::test]
+    async fn wallet_reads_go_to_this_node_only() {
+        use super::super::transfer::{Kind, Preview};
+        let directory = tempfile::tempdir().unwrap();
+        let km = Arc::new(
+            FileKeyManager::new(
+                directory.path().join("keys.yml"),
+                &hex::encode([9; 32]),
+                "q-prover-key".into(),
+                Box::new(quil_crypto::FalconKeyConstructor),
+            )
+            .unwrap(),
+        );
+        // Nothing listens there: a request would fail with a transport
+        // error, not the refusal.
+        let public = crate::rpc::ConnectOpts {
+            public_rpc: true,
+            listen_grpc_multiaddr: "/ip4/127.0.0.1/tcp/9".into(),
+            ..Default::default()
+        };
+        let custom = crate::rpc::ConnectOpts {
+            custom_rpc: "127.0.0.1:9".into(),
+            ..Default::default()
+        };
+        for opts in [public, custom] {
+            assert!(opts.is_light_node());
+            let tc = crate::commands::token::TokenCtx {
+                node_config: quil_config::Config::default(),
+                config_dir: directory.path().to_path_buf(),
+                key_manager: km.clone(),
+                connect_opts: opts.clone(),
+                submit_opts: opts,
+                submit_key_manager: km.clone(),
+                submit_config_dir: directory.path().to_path_buf(),
+                submit_identity: Default::default(),
+                peer_id_bytes: Vec::new(),
+                max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
+            };
+            let refused = |error: String| {
+                assert!(
+                    error.contains("public or custom RPC") && error.contains("this node only"),
+                    "{error}"
+                );
+            };
+            let (notes, _lines) = tokio::sync::mpsc::unbounded_channel();
+            refused(
+                crate::commands::token::output::capture(notes, shielded_read(&tc))
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+            );
+            let (notes, _lines) = tokio::sync::mpsc::unbounded_channel();
+            refused(
+                crate::commands::token::output::capture(notes, transfer_preview(&tc, Kind::Merge))
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+            );
+            let log = ActionLog::new(directory.path());
+            let _ = std::fs::remove_file(log.path());
+            let preview = Preview {
+                kind: Kind::Accept {
+                    escrow: [7; 32],
+                    amount: 50,
+                },
+                fee: 9,
+                max_fee: 10,
+                merge: None,
+            };
+            let (progress, _reports) = tokio::sync::mpsc::unbounded_channel();
+            let mut record = crate::commands::token::action_log::ActionRecorder::new(
+                Some(log.clone()),
+                "accept",
+                "manager",
+            );
+            let (notes, _lines) = tokio::sync::mpsc::unbounded_channel();
+            refused(
+                crate::commands::token::output::capture(
+                    notes,
+                    transfer_execute(&tc, &preview, &progress, &mut record),
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+            );
+            let records: Vec<serde_json::Value> = std::fs::read_to_string(log.path())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let phases: Vec<&str> = records
+                .iter()
+                .map(|r| r["phase"].as_str().unwrap())
+                .collect();
+            assert_eq!(phases, ["start", "outcome"]);
+            assert!(records
+                .iter()
+                .all(|r| r["kind"] == "accept" && r["source"] == "manager"));
+            assert_eq!(records[0]["escrow"], hex::encode([7; 32]));
+            assert_eq!(records[0]["amount"], "50");
+            assert_eq!(records[1]["outcome"], "failed");
+        }
     }
 }

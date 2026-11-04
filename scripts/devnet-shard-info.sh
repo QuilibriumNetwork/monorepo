@@ -39,7 +39,7 @@
 #                (default 2400, 1800, 900, 900)
 #   COMPARE_TRIES, COMPARE_GAP   (default 6, 10)
 #   QUIL_EPOCH_LENGTH_FRAMES (default 30) and the other settings of
-#                scripts/localnet.sh; APP_CW is always 1
+#                scripts/localnet.sh
 #
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -56,7 +56,7 @@ CLAIM_BOUND="${CLAIM_BOUND:-900}"
 DELIVERY_BOUND="${DELIVERY_BOUND:-900}"
 COMPARE_TRIES="${COMPARE_TRIES:-6}"
 COMPARE_GAP="${COMPARE_GAP:-10}"
-export APP_CW=1 QUIL_EPOCH_LENGTH_FRAMES="${QUIL_EPOCH_LENGTH_FRAMES:-30}"
+export QUIL_EPOCH_LENGTH_FRAMES="${QUIL_EPOCH_LENGTH_FRAMES:-30}"
 OUT="$NET_DIR/results"
 MATERIALIZED_RE='archive materialized shard frame'
 
@@ -74,11 +74,13 @@ elapsed() { echo $(( $(date +%s) - $1 )); }
 # qclient for node $1. Prover commands read the node config from ./.config,
 # so each node gets a directory whose .config is its own and a HOME without
 # a default node config; token commands name it with --config as well.
+# Source builds aren't signed, so signature check is off.
 qc() { # node args...
   local node=$1 d="$OUT/qclient-$1"; shift
   mkdir -p "$d/home"
   [[ -e "$d/.config" ]] || ln -s "$NET_DIR/$node" "$d/.config"
-  ( cd "$d" && HOME="$d/home" QUILIBRIUM_NETWORK='' timeout 900 "$QCLIENT" "$@" ) 2>&1
+  ( cd "$d" && HOME="$d/home" QUILIBRIUM_NETWORK='' QUILIBRIUM_SIGNATURE_CHECK=false \
+    timeout 900 "$QCLIENT" "$@" ) 2>&1
 }
 # `node prover shardinfo` of node $1, saved as shardinfo.$1.$2.txt; prints
 # "<shard count> <world state>", then the shard filters with their sizes.

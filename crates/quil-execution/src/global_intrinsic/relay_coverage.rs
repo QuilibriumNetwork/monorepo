@@ -4,9 +4,10 @@
 //! ([`spend_relay::relay_window`]), and GLOBAL commits spends only from the
 //! headers it executes. When the header GLOBAL executes for a shard lies more
 //! than [`RELAY_WINDOW_FRAMES`] frames above the one it executed before, no
-//! executed header relays the source frames between: their spends never
-//! commit, and a shield is never routed to another shard. Nothing else reports
-//! it, so each such gap gets one warning. Logging only: no state is written.
+//! executed header relays the source frames between: their spends do not
+//! commit unless the shard's members execute them again, and a shield is never
+//! routed to another shard. Nothing else reports it, so each such gap gets one
+//! warning. Logging only: no state is written.
 //!
 //! A gap seen again (the same headers executed on a tentative branch and then
 //! for real, or replayed) is not logged again. Further gaps of a shard within
@@ -250,8 +251,9 @@ pub fn check(frame: u64, filter: &[u8], anchor: u64, previous: u64, shard_frame:
             earlier_frames_quieted = suppressed_frames,
             scope = "network: GLOBAL leaders carried no header of this shard for the uncovered \
                 frames; not this node",
-            action = "spends of the shard's uncovered frames never commit and shields there are \
-                not re-routed: their senders must resubmit; check the GLOBAL leaders' carry of \
+            action = "spends of the shard's uncovered frames commit only if its members offer \
+                them again, within a bound; shields there are not re-routed, so past that their \
+                senders must resubmit; check the GLOBAL leaders' carry of \
                 this shard (budget deferrals, body holdbacks, refused tips) around these frames, \
                 and report it to the maintainers if it repeats",
             "spend relay coverage skipped: GLOBAL executed a shard header more than the relay \
@@ -286,8 +288,9 @@ fn log(frame: u64, report: Option<Report>) {
         by_shard = %report.by_shard,
         unlisted_shards = report.unlisted_shards,
         scope = "network: GLOBAL leaders' carry of shard headers, not this node",
-        action = "spends of the uncovered shard frames never commit: their senders must \
-            resubmit; check the GLOBAL leaders' carry of these shards",
+        action = "spends of the uncovered shard frames commit only if the shards' members offer \
+            them again, within a bound; past that their senders must resubmit; check the GLOBAL \
+            leaders' carry of these shards",
         "spend relay coverage: shard frames no executed header relayed",
     );
 }

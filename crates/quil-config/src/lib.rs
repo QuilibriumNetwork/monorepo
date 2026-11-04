@@ -4,6 +4,7 @@ mod db;
 mod diagnostics;
 mod engine;
 mod explorer;
+mod health_report_edit;
 mod keys;
 mod logger;
 mod p2p;
@@ -19,6 +20,7 @@ pub use db::*;
 pub use diagnostics::*;
 pub use engine::*;
 pub use explorer::*;
+pub use health_report_edit::*;
 pub use keys::*;
 pub use logger::*;
 pub use p2p::*;
@@ -417,6 +419,22 @@ rewardStrategy: "custom-strategy"
         assert_eq!(d.notice_percentage, 70);
         assert_eq!(d.warn_percentage, 90);
         assert_eq!(d.terminate_percentage, 95);
+    }
+
+    #[test]
+    fn additional_listen_multiaddrs_are_optional_and_stay_out_of_saved_configs() {
+        let p: P2PConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(p.additional_listen_multiaddrs.is_empty());
+        assert!(!serde_yaml::to_string(&p)
+            .unwrap()
+            .contains("additionalListenMultiaddrs"));
+        let p: P2PConfig = serde_yaml::from_str(
+            "listenMultiaddr: /ip4/0.0.0.0/udp/8336/quic-v1\n\
+             additionalListenMultiaddrs:\n\
+             - /ip6/::/udp/8336/quic-v1\n",
+        )
+        .unwrap();
+        assert_eq!(p.additional_listen_multiaddrs, ["/ip6/::/udp/8336/quic-v1"]);
     }
 
     #[test]

@@ -421,6 +421,183 @@ mod tests {
         );
     }
 
+    /// QUILIBRIUM: a certificate of an earlier epoch whose committee was larger
+    /// than this one's fails to decode, because its signers are bounded by this
+    /// committee. It counts as a message of that epoch, not as undecodable
+    /// traffic; a message that really is undecodable still does. Every discard
+    /// still goes to the blocker, as upstream.
+    #[test]
+    fn a_larger_earlier_committees_certificate_counts_as_its_epoch() {
+        use commonware_cryptography::certificate::Scheme as _;
+
+        #[derive(Clone)]
+        struct Blocked(Arc<Mutex<Vec<PublicKey>>>);
+
+        impl commonware_p2p::Blocker for Blocked {
+            type PublicKey = PublicKey;
+
+            fn block(&mut self, peer: Self::PublicKey) -> Feedback {
+                self.0.lock().push(peer);
+                Feedback::Ok
+            }
+        }
+
+        #[derive(Clone, Default)]
+        struct Lines(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn decodes<S: Scheme<Sha256Digest>>(cert: &Certificate<S, Sha256Digest>, scheme: &S) -> bool {
+            use commonware_codec::Decode as _;
+            Certificate::<S, Sha256Digest>::decode_cfg(
+                cert.encode(),
+                &scheme.certificate_codec_config(),
+            )
+            .is_ok()
+        }
+
+        let lines = Lines::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let namespace = b"batcher_test".to_vec();
+        let epoch = Epoch::new(333);
+        let executor = deterministic::Runner::timed(Duration::from_secs(3_600));
+        tracing::subscriber::with_default(subscriber, || {
+            executor.start(|mut context| async move {
+                let Fixture {
+                    participants,
+                    schemes,
+                    ..
+                } = ed25519::fixture(&mut context, &namespace, 5);
+                let Fixture {
+                    schemes: larger, ..
+                } = ed25519::fixture(&mut context, &namespace, 7);
+
+                let oracle =
+                    start_test_network_with_peers(context.child("network"), participants.clone())
+                        .await;
+                let reporter_cfg = mocks::reporter::Config {
+                    participants: schemes[0].participants().clone(),
+                    scheme: schemes[0].clone(),
+                    elector: <RoundRobin>::default(),
+                };
+                let reporter =
+                    mocks::reporter::Reporter::new(context.child("reporter"), reporter_cfg);
+                let blocked = Arc::new(Mutex::new(Vec::new()));
+                let me = participants[0].clone();
+                let batcher_cfg = Config {
+                    scheme: schemes[0].clone(),
+                    blocker: Blocked(blocked.clone()),
+                    reporter: reporter.clone(),
+                    relay: MockRelay::new(),
+                    strategy: Sequential,
+                    activity_timeout: ViewDelta::new(10),
+                    skip_timeout: ViewDelta::new(5),
+                    epoch,
+                    mailbox_size: NZUsize!(128),
+                    forwarding: ForwardingPolicy::Disabled,
+                };
+                let (batcher, mut batcher_mailbox) =
+                    Actor::new(context.child("actor"), batcher_cfg);
+                let (voter_sender, _voter_receiver) =
+                    mailbox::new::<voter::Message<_, Sha256Digest>>(
+                        context.child("mailbox"),
+                        NZUsize!(1024),
+                    );
+                let voter_mailbox = voter::Mailbox::new(voter_sender);
+                let (_vote_sender, vote_receiver) = oracle
+                    .control(me.clone())
+                    .register(0, TEST_QUOTA)
+                    .await
+                    .unwrap();
+                let (_certificate_sender, certificate_receiver) = oracle
+                    .control(me.clone())
+                    .register(1, TEST_QUOTA)
+                    .await
+                    .unwrap();
+                let peer = participants[1].clone();
+                let (mut sender, _receiver) = oracle
+                    .control(peer.clone())
+                    .register(1, TEST_QUOTA)
+                    .await
+                    .unwrap();
+                let link = Link {
+                    latency: Duration::from_millis(1),
+                    jitter: Duration::from_millis(0),
+                    success_rate: 1.0,
+                };
+                oracle.add_link(peer, me.clone(), link).await.unwrap();
+                batcher.start(voter_mailbox, vote_receiver, certificate_receiver);
+                batcher_mailbox.update(
+                    Span::none(),
+                    View::new(1),
+                    Participant::new(1),
+                    View::zero(),
+                    None,
+                );
+
+                let notarization = |round: Round| {
+                    let proposal = Proposal::new(round, View::new(8), Sha256::hash(b"payload"));
+                    Certificate::Notarization(build_notarization(&larger, &proposal, 5))
+                };
+
+                // A certificate of the previous epoch's larger committee.
+                let earlier = notarization(Round::new(Epoch::new(332), View::new(9)));
+                assert!(!decodes(&earlier, &schemes[0]), "over this committee's bound");
+                sender.send(Recipients::One(me.clone()), earlier.encode(), true);
+                context.sleep(Duration::from_millis(50)).await;
+                assert_eq!(blocked.lock().len(), 1, "the discard still goes to the blocker");
+
+                // Bytes with no certificate header, a summary interval later.
+                context.sleep(super::discards::SUMMARY_EVERY).await;
+                sender.send(Recipients::One(me.clone()), vec![255u8], true);
+                context.sleep(Duration::from_millis(50)).await;
+                assert_eq!(blocked.lock().len(), 2);
+
+                // A certificate of this epoch over this committee's bound.
+                context.sleep(super::discards::SUMMARY_EVERY).await;
+                let oversized = notarization(Round::new(epoch, View::new(9)));
+                assert!(!decodes(&oversized, &schemes[0]), "over this committee's bound");
+                sender.send(Recipients::One(me.clone()), oversized.encode(), true);
+                context.sleep(Duration::from_millis(50)).await;
+                assert_eq!(blocked.lock().len(), 3);
+            })
+        });
+
+        let out = String::from_utf8(lines.0.lock().clone()).unwrap();
+        let discards: Vec<_> = out.lines().filter(|line| line.contains("epoch=333")).collect();
+        assert_eq!(discards.len(), 3, "one line per discard: {out}");
+        assert!(
+            discards[0].contains("of another epoch") && discards[0].contains("earlier=1"),
+            "a certificate of the previous, larger committee must count as an earlier-epoch \
+             message, not as undecodable: {}",
+            discards[0]
+        );
+        assert!(
+            discards[0].contains("lowest_view=9") && discards[0].contains("highest_view=9"),
+            "{}",
+            discards[0]
+        );
+        for line in &discards[1..] {
+            assert!(
+                line.contains("could not be read") && line.contains("undecodable=1"),
+                "a message that names no other epoch stays undecodable: {line}"
+            );
+        }
+    }
+
     fn certificate_forwarding_from_network<S, F>(mut fixture: F)
     where
         S: Scheme<Sha256Digest, PublicKey = PublicKey>,

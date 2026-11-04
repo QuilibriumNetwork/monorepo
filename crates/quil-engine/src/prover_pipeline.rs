@@ -385,6 +385,26 @@ fn stopped_mid_encode(
     }
 }
 
+/// Ask for an early registry pull that can show a shard snapshot `epoch`'s
+/// renewal at `frame_number` waits for. GLOBAL writes the record in the first
+/// frame at or after the snapshot frame, so a view below that frame cannot
+/// hold it; and a pull reaches the state before the head, so the frame before
+/// this one is the latest one asked for.
+fn ask_for_snapshot_record(
+    view: &crate::global_view_refresh::ViewRefresh,
+    frame_number: u64,
+    epoch: u64,
+    now: std::time::Instant,
+) -> bool {
+    view.request(
+        crate::global_view_refresh::Reason::StorageRecordAwaited,
+        frame_number
+            .saturating_sub(1)
+            .max(quil_types::consensus::storage_snapshot_frame(epoch)),
+        now,
+    )
+}
+
 /// How often the seats a confirm leaves out pending their storage snapshot
 /// are reported while the same ones stay pending.
 const PENDING_SNAPSHOT_REPORT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -415,6 +435,13 @@ fn report_pending_snapshots(frame_number: u64, prepared: &PreparedConfirm) {
     if pending.is_empty() {
         return;
     }
+    crate::storage_registration_landed::note_waiting(
+        &pending
+            .iter()
+            .map(|seat| seat.filter.clone())
+            .collect::<Vec<_>>(),
+        frame_number,
+    );
     // A confirm in epoch E registers the snapshot for E + 1.
     let epoch = quil_types::consensus::epoch_for_frame(frame_number) + 1;
     let grace_frame = quil_types::consensus::storage_snapshot_frame(epoch)
@@ -1840,17 +1867,29 @@ impl ProverPipeline {
         frame_number: u64,
     ) -> Option<crate::submission_attempts::SubmissionAttempt> {
         let requested = filters.len();
+        let repeats = self.lifecycle.plan_repeats_filters(filters);
         let attempts = &self.lifecycle.submission_attempts;
         retain_paired(filters, worker_ids.as_deref_mut(), |filter| {
             !attempts.owned(filter, frame_number, kind)
         });
         let Some(mut attempt) = attempts.begin(filters, frame_number, kind) else {
-            info!(
-                op,
-                frame = frame_number,
-                filters = requested,
-                "shard submission deferred: another operation owns its filters"
-            );
+            // A repeated plan's retry fence defers it nearly every frame; the
+            // plan's repeat lines cover that.
+            if repeats {
+                debug!(
+                    op,
+                    frame = frame_number,
+                    filters = requested,
+                    "shard submission deferred: another operation owns its filters"
+                );
+            } else {
+                info!(
+                    op,
+                    frame = frame_number,
+                    filters = requested,
+                    "shard submission deferred: another operation owns its filters"
+                );
+            }
             return None;
         };
         let over_long: Vec<Vec<u8>> = filters
@@ -2189,9 +2228,10 @@ impl ProverPipeline {
                     .iter()
                     .any(|(shard, _)| shard.as_slice() == filter)
             {
-                crate::global_view_refresh::shared().request(
-                    crate::global_view_refresh::Reason::StorageRecordAwaited,
-                    frame_number.saturating_sub(1),
+                ask_for_snapshot_record(
+                    &crate::global_view_refresh::shared(),
+                    frame_number,
+                    epoch,
                     std::time::Instant::now(),
                 );
             }
@@ -2763,14 +2803,29 @@ fn prune_confirmation_replicas(
 ) {
     let keep_from = crate::app_shard_metadata::replica_keep_from(current_epoch);
     crate::storage_snapshot::note_replica_eviction(current_epoch);
+    let master = master.map(|store| ("master".to_owned(), store.clone()));
     let workers = filters.iter().filter_map(|filter| {
         worker
             .and_then(|resolve| resolve(filter))
-            .map(|(_, replicas)| replicas)
+            .map(|(_, replicas)| (hex::encode(filter), replicas))
     });
-    for (store_index, store) in master.cloned().into_iter().chain(workers).enumerate() {
-        if let Err(error) = store.evict_below_epoch(keep_from) {
-            warn!(store_index, keep_from_epoch = keep_from, %error, "replica cleanup failed");
+    // Once per boundary per store: a reconfirmation dispatches every few
+    // frames until it publishes, and each eviction writes range deletions
+    // and starts a compaction.
+    for (store, replicas) in master.into_iter().chain(workers) {
+        match replicas.evict_below_epoch_once(keep_from, &store) {
+            Ok(true) => tracing::info!(
+                store = %store,
+                keep_from_epoch = keep_from,
+                "evicted storage replicas no frame can challenge"
+            ),
+            Ok(false) => {}
+            Err(error) => warn!(
+                store = %store,
+                keep_from_epoch = keep_from,
+                %error,
+                "replica cleanup failed; retrying at the next confirmation"
+            ),
         }
     }
 }
@@ -2780,6 +2835,61 @@ mod tests {
     use super::confirm_encoding_plan;
     use crate::submission_attempts::OpKind;
     use quil_types::store::{PendingShardChange, ShardChangeKind};
+
+    /// A reconfirmation dispatches every few frames until it publishes (our
+    /// node: 420-492 in 2.5 h), and each evicted every store it encodes:
+    /// six range deletions per store per dispatch. Each store is evicted
+    /// once per boundary: a replica written below the boundary after its
+    /// eviction (a stand-in for a second eviction's work) stays until the
+    /// next boundary evicts it.
+    #[test]
+    fn confirmation_evicts_each_store_once_per_boundary() {
+        use quil_store::replica_store::ReplicaStore;
+        use std::sync::Arc;
+        let make = || ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let master = make();
+        let worker = make();
+        for store in [&master, &worker] {
+            for epoch in 5..=8 {
+                store.put(epoch, b"leaf", &[epoch as u8]).unwrap();
+            }
+        }
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_tries::ShaInclusionProver),
+        ));
+        // A store handle per call, as the node's resolver makes one.
+        let resolve = |filter: &[u8]| (filter == [1u8]).then(|| (crdt.clone(), worker.clone()));
+        let prune = |current_epoch| {
+            super::prune_confirmation_replicas(
+                Some(&master),
+                Some(&resolve),
+                &[vec![1]],
+                current_epoch,
+            )
+        };
+        prune(7);
+        for store in [&master, &worker] {
+            assert_eq!(store.get(5, b"leaf").unwrap(), None, "the boundary evicts");
+            store.put(5, b"late", b"late").unwrap();
+        }
+        for _frame in 0..3 {
+            prune(7);
+        }
+        for store in [&master, &worker] {
+            assert_eq!(
+                store.get(5, b"late").unwrap().as_deref(),
+                Some(&b"late"[..]),
+                "a boundary already applied to a store is not evicted again"
+            );
+        }
+        prune(8);
+        for store in [&master, &worker] {
+            assert_eq!(store.get(5, b"late").unwrap(), None, "the next boundary");
+            assert_eq!(store.get(6, b"leaf").unwrap(), None);
+            assert_eq!(store.get(7, b"leaf").unwrap(), Some(vec![7]));
+        }
+    }
 
     #[test]
     fn confirmation_prunes_worker_stores_and_keeps_boundary_replicas() {
@@ -4148,6 +4258,32 @@ mod tests {
             succession.public_key_signature_bls48581, merge.public_key_signature_bls48581,
             "the prover signs the targets as for a merge"
         );
+    }
+
+    /// A renewal waiting for its shard's snapshot record asks for a pull that
+    /// reaches the snapshot frame, the earliest frame GLOBAL records it in:
+    /// a pull through the frame before it cannot hold the record, yet it
+    /// spends the early-pull gap. Later frames ask for the frame before.
+    #[test]
+    fn a_renewal_awaiting_a_snapshot_record_asks_for_a_pull_reaching_its_frame() {
+        use crate::global_view_refresh::{Reason, ViewRefresh};
+        let epoch = 7u64;
+        let at = quil_types::consensus::storage_snapshot_frame(epoch);
+        let asked = |frame: u64| {
+            let view = ViewRefresh::default();
+            view.enable(quil_types::consensus::epoch_length_frames());
+            super::ask_for_snapshot_record(&view, frame, epoch, std::time::Instant::now());
+            view.requested(Reason::StorageRecordAwaited)
+                .expect("the renewal asked")
+        };
+        for frame in [at, at + 1] {
+            assert!(
+                asked(frame) >= at,
+                "at frame {frame} the pull must reach the snapshot frame {at}, asked for {}",
+                asked(frame)
+            );
+        }
+        assert_eq!(asked(at + 9), at + 8, "later, the frame before this one");
     }
 
     #[test]

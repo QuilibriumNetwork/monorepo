@@ -43,9 +43,72 @@ pub(crate) struct DatabaseInner {
     /// later database, even one reopened at the same path.
     instance: u64,
     watched: Option<Vec<Vec<u8>>>,
+    /// How long this store's writes took ([`CoordinatedDb::take_write_times`]).
+    times: WriteTimes,
 }
 
 static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+/// How long writes took, since last read. A slow disk shows in `max_write`
+/// with no `max_barrier_wait` of its own; a writer holding the barrier shows
+/// in `max_barrier_hold` beyond any write.
+#[derive(Default)]
+pub(crate) struct WriteTimes {
+    writes: AtomicU64,
+    write_us: AtomicU64,
+    max_write_us: AtomicU64,
+    max_barrier_wait_us: AtomicU64,
+    max_barrier_hold_us: AtomicU64,
+}
+
+/// A read of [`WriteTimes`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteTimesSample {
+    pub writes: u64,
+    pub write_ms: u64,
+    pub max_write_ms: u64,
+    pub max_barrier_wait_ms: u64,
+    pub max_barrier_hold_ms: u64,
+}
+
+impl WriteTimes {
+    const fn new() -> Self {
+        Self {
+            writes: AtomicU64::new(0),
+            write_us: AtomicU64::new(0),
+            max_write_us: AtomicU64::new(0),
+            max_barrier_wait_us: AtomicU64::new(0),
+            max_barrier_hold_us: AtomicU64::new(0),
+        }
+    }
+
+    fn take(&self) -> WriteTimesSample {
+        let take = |counter: &AtomicU64| counter.swap(0, Ordering::Relaxed);
+        WriteTimesSample {
+            writes: take(&self.writes),
+            write_ms: take(&self.write_us) / 1000,
+            max_write_ms: take(&self.max_write_us) / 1000,
+            max_barrier_wait_ms: take(&self.max_barrier_wait_us) / 1000,
+            max_barrier_hold_ms: take(&self.max_barrier_hold_us) / 1000,
+        }
+    }
+
+    fn wrote(&self, took: std::time::Duration) {
+        let us = took.as_micros() as u64;
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        self.write_us.fetch_add(us, Ordering::Relaxed);
+        self.max_write_us.fetch_max(us, Ordering::Relaxed);
+    }
+}
+
+/// Every store's write times in this process: a node's workers write their
+/// own stores, usually on the disk the master's is on.
+static ALL_STORES: WriteTimes = WriteTimes::new();
+
+/// [`ALL_STORES`] since the last read, which resets them.
+pub fn take_all_stores_write_times() -> WriteTimesSample {
+    ALL_STORES.take()
+}
 
 /// Sequence numbers recorded under the write barrier. A write confined to
 /// declared two-byte prefixes is recorded per prefix; every other write is
@@ -282,6 +345,7 @@ impl CoordinatedDb {
             state,
             instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
             watched,
+            times: WriteTimes::default(),
         }))
     }
 
@@ -310,18 +374,34 @@ impl CoordinatedDb {
     /// Lock order: the caller's frame/forest/commit/engine/cache locks first,
     /// then this barrier. Never call another DB writer while holding the guard.
     pub fn lock_writes(&self) -> Result<DatabaseWriteGuard<'_>, DatabaseCommitError> {
+        let asked = std::time::Instant::now();
         let guard = self
             .0
             .writes
             .lock()
             .map_err(|_| DatabaseCommitError::Poisoned)?;
+        let since = std::time::Instant::now();
+        let waited = since.duration_since(asked).as_micros() as u64;
+        self.0
+            .times
+            .max_barrier_wait_us
+            .fetch_max(waited, Ordering::Relaxed);
+        ALL_STORES
+            .max_barrier_wait_us
+            .fetch_max(waited, Ordering::Relaxed);
         if self.0.state.is_latched() {
             return Err(self.refuse_write());
         }
         Ok(DatabaseWriteGuard {
             database: self,
             ledger: guard,
+            since,
         })
+    }
+
+    /// This store's write times since the last read, which resets them.
+    pub fn take_write_times(&self) -> WriteTimesSample {
+        self.0.times.take()
     }
 
     /// Count a write refused after an earlier failure; the store repeats
@@ -564,6 +644,21 @@ impl CoordinatedDb {
 pub struct DatabaseWriteGuard<'a> {
     database: &'a CoordinatedDb,
     ledger: MutexGuard<'a, WriteLedger>,
+    since: std::time::Instant,
+}
+
+impl Drop for DatabaseWriteGuard<'_> {
+    fn drop(&mut self) {
+        let held = self.since.elapsed().as_micros() as u64;
+        self.database
+            .0
+            .times
+            .max_barrier_hold_us
+            .fetch_max(held, Ordering::Relaxed);
+        ALL_STORES
+            .max_barrier_hold_us
+            .fetch_max(held, Ordering::Relaxed);
+    }
 }
 
 impl DatabaseWriteGuard<'_> {
@@ -585,10 +680,14 @@ impl DatabaseWriteGuard<'_> {
             .map_or(WatchedWrite::None, |prefixes| {
                 watched_writes(batch.data(), prefixes, list)
             });
+        let started = std::time::Instant::now();
         let written = match self.database.0.state.take_fault() {
             Some(fault) => Err(fault),
             None => self.database.0.db.write_opt(batch, options),
         };
+        let took = started.elapsed();
+        self.database.0.times.wrote(took);
+        ALL_STORES.wrote(took);
         if !matches!(watched, WatchedWrite::None) {
             // Recorded even for a failed write, whose durable effect is unknown.
             let sequence = self.database.0.db.latest_sequence_number();
@@ -1085,5 +1184,39 @@ mod prefix_set_tests {
         let mut key = KeyPrefixSet::default();
         key.mark_key(&[0x12]);
         assert!(key.contains([0x12, 0x00]) && !key.contains([0x12, 0x01]));
+    }
+}
+
+#[cfg(test)]
+mod write_times_tests {
+    use super::*;
+
+    /// A store's writes are counted and timed, a read resets them, and a
+    /// holder of the write barrier shows in the wait of the next writer and
+    /// in its own hold.
+    #[test]
+    fn a_store_reports_its_writes_and_who_held_its_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = rocksdb::Options::default();
+        options.create_if_missing(true);
+        let db = CoordinatedDb::new(DB::open(&options, dir.path()).unwrap());
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        let first = db.take_write_times();
+        assert_eq!(first.writes, 2);
+        assert_eq!(db.take_write_times(), WriteTimesSample::default());
+
+        let hold = std::time::Duration::from_millis(200);
+        std::thread::scope(|scope| {
+            let guard = db.lock_writes().unwrap();
+            scope.spawn(|| db.put(b"c", b"3").unwrap());
+            std::thread::sleep(hold);
+            drop(guard);
+        });
+        let held = db.take_write_times();
+        assert_eq!(held.writes, 1);
+        assert!(held.max_barrier_hold_ms >= 150, "{held:?}");
+        assert!(held.max_barrier_wait_ms >= 100, "{held:?}");
+        assert!(take_all_stores_write_times().writes >= 1);
     }
 }

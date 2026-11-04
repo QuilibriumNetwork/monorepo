@@ -511,12 +511,13 @@ fn node_service_bind(configured: String, allow_remote: bool) -> NodeServiceBind 
 const SUBMIT_REFUSAL_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The message collector's refusal reasons, as the summary names them.
-const SUBMIT_REFUSAL_NAMES: [&str; 5] = [
+const SUBMIT_REFUSAL_NAMES: [&str; 6] = [
     "prover_only",
     "unknown_shard",
     "rank_full",
     "invalid_shard_frame",
     "awaiting_execution",
+    "no_proposer",
 ];
 
 fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usize {
@@ -527,6 +528,7 @@ fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usiz
         Refusal::RankFull => 2,
         Refusal::InvalidShardFrame => 3,
         Refusal::AwaitingExecution => 4,
+        Refusal::NoProposer => 5,
     }
 }
 
@@ -534,7 +536,7 @@ fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usiz
 /// first is logged at once, the rest at most once per
 /// [`SUBMIT_REFUSAL_REPORT_INTERVAL`], with the next refusal after it.
 struct SubmitRefusals {
-    counts: [u64; 5],
+    counts: [u64; 6],
     latest_peer: String,
     latest_reason: &'static str,
     logged_at: Option<std::time::Instant>,
@@ -542,7 +544,7 @@ struct SubmitRefusals {
 
 #[derive(Debug, PartialEq, Eq)]
 struct SubmitRefusalSummary {
-    counts: [u64; 5],
+    counts: [u64; 6],
     latest_peer: String,
     latest_reason: &'static str,
     since_previous: Option<std::time::Duration>,
@@ -551,7 +553,7 @@ struct SubmitRefusalSummary {
 impl SubmitRefusals {
     const fn new() -> Self {
         Self {
-            counts: [0; 5],
+            counts: [0; 6],
             latest_peer: String::new(),
             latest_reason: "",
             logged_at: None,
@@ -578,6 +580,26 @@ impl SubmitRefusals {
             latest_reason: self.latest_reason,
             since_previous,
         })
+    }
+}
+
+/// What a refused submitter is told. A node that proposes no GLOBAL frames
+/// keeps no rank and executes no GLOBAL frame: "rank 76982, executed 0" would
+/// read as a stalled node.
+fn submit_refusal_reason(
+    refusal: quil_engine::message_collector::Refusal,
+    rank: u64,
+    executed: u64,
+    head: u64,
+) -> String {
+    match refusal {
+        quil_engine::message_collector::Refusal::NoProposer => {
+            format!("message collector rejected: {}", refusal.reason())
+        }
+        _ => format!(
+            "message collector rejected: {} (rank {rank}, executed {executed}, head {head})",
+            refusal.reason(),
+        ),
     }
 }
 
@@ -612,7 +634,19 @@ fn log_submit_refusals(summary: &SubmitRefusalSummary, executed: u64, head: u64)
         None => "startup".to_string(),
     };
     let (latest_peer, latest_reason) = (&summary.latest_peer, summary.latest_reason);
-    if summary.counts[submit_refusal_slot(quil_engine::message_collector::Refusal::RankFull)] > 0 {
+    if summary.counts[submit_refusal_slot(quil_engine::message_collector::Refusal::NoProposer)] > 0
+    {
+        info!(
+            scope = "peer",
+            action = "nothing to fix on this node; the submitting node's operator should remove \
+                      this node from its engine.archiveEndpoints",
+            %latest_peer,
+            "gRPC submits refused since {window}: {counts}; a peer sends GLOBAL messages to this \
+             node as if it were an archive, and this node proposes no GLOBAL frames"
+        );
+    } else if summary.counts[submit_refusal_slot(quil_engine::message_collector::Refusal::RankFull)]
+        > 0
+    {
         warn!(
             executed,
             head,
@@ -1764,12 +1798,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                         let (executed, head) = (submit_cf.materialized(), submit_cf.effective());
                         note_submit_refusal(refusal, auth.peer_id.to_string(), executed, head);
                         Err(SubmitRefusal {
-                        reason: format!(
-                            "message collector rejected: {} (rank {rank}, executed {executed}, head {head})",
-                            refusal.reason(),
-                        ),
-                        retry: refusal.retryable(),
-                    })
+                            reason: submit_refusal_reason(refusal, rank, executed, head),
+                            retry: refusal.retryable(),
+                        })
                     }
                 }
             })
@@ -1880,13 +1911,30 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
     // this shows whether the store itself was behind when that happens.
     {
         let db = db_arc.clone();
+        let crdt = crdt.clone();
         sup.spawn("rocksdb-health", move |token| async move {
+            let mut latency = super::store_latency::StoreLatency::default();
+            let probe = super::store_latency::FsyncProbe::new(db.inner().path());
             loop {
                 tokio::select! {
                     _ = token.cancelled() => return Ok(()),
                     _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
                 }
+                // Releases a published generation's store snapshot past its
+                // window if GLOBAL publication stalls; open snapshots keep
+                // every later deletion on disk, and the generation pins and
+                // wallet scans name two holders.
+                let held = crdt.release_expired_snapshots();
                 let health = db.health();
+                latency.observe(super::store_latency::Sample {
+                    fsync_ms: probe.measure().await,
+                    pressure: super::store_latency::Pressure::read(),
+                    master: db.inner().take_write_times(),
+                    all_stores: quil_forest::take_all_stores_write_times(),
+                    pending_compaction_mb: health.pending_compaction_bytes >> 20,
+                    level0_files: health.level0_files,
+                    write_stopped: health.write_stopped,
+                });
                 info!(
                     level0_files = health.level0_files,
                     pending_compaction_mb = health.pending_compaction_bytes >> 20,
@@ -1895,6 +1943,10 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                     delayed_write_rate = health.delayed_write_rate,
                     block_cache_mb = health.block_cache >> 20,
                     block_cache_capacity_mb = health.block_cache_capacity >> 20,
+                    rocksdb_snapshots = health.snapshots.count,
+                    oldest_snapshot_age_secs = health.snapshots.oldest_age_secs,
+                    generation_pins = held.map(|h| h.generations),
+                    scan_snapshots = held.map(|h| h.scans),
                     "rocksdb health"
                 );
             }
@@ -2106,9 +2158,17 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                 let copy = request.clone();
                 let bundle = prover_bundle(request)?;
                 let tracked = track_worker_request(&copy, Some(frames.effective()));
+                let is_reward_proof = kind == WorkerSubmission::FrameHeader;
                 let failed = move |error: &dyn std::fmt::Display| {
                     unpublished(&copy, tracked);
                     let (kind, filter) = describe_request(&copy);
+                    if is_reward_proof {
+                        // Counted in the interval's summary, a warn.
+                        super::reward_proofs::reward_proof_failed();
+                        tracing::debug!(core_id, kind, filter = %filter, error = %error,
+                            "standalone worker submission: transport submission failed");
+                        return;
+                    }
                     tracing::warn!(core_id, kind, filter = %filter, error = %error,
                         "standalone worker submission: transport submission failed");
                 };
@@ -2559,6 +2619,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         let send_transport = prover_pipeline.transport.clone();
         let send_lifecycle = prover_pipeline.lifecycle.clone();
         let send_owner = prover_address.to_vec();
+        let send_frame = current_frame.clone();
         let send_handler: quil_rpc::SendHandler = Arc::new(
             move |domain: Vec<u8>,
                   payload: Vec<u8>,
@@ -2571,6 +2632,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                 let transport = send_transport.clone();
                 let lifecycle = send_lifecycle.clone();
                 let owner = send_owner.clone();
+                let frame = send_frame.clone();
                 let ed448_pub = peer_ed448_pub.clone();
                 Box::pin(async move {
                     if domain.len() != 32 {
@@ -2604,6 +2666,16 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                     if domain.iter().all(|&b| b == 0xff) {
                         if let Ok(bundle) = quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(&payload) {
                             for request in bundle.requests.into_iter().flatten() {
+                                // Its outcome is read from this node's view: bring
+                                // the view past the op instead of waiting for the
+                                // periodic pull.
+                                if let Some(through) = quil_engine::global_view_refresh::operator_op_view_frame(request.inner_type_prefix, frame.effective()) {
+                                    quil_engine::global_view_refresh::shared().request(
+                                        quil_engine::global_view_refresh::Reason::OperatorOpSent,
+                                        through,
+                                        std::time::Instant::now(),
+                                    );
+                                }
                                 if request.inner_type_prefix == quil_execution::global_intrinsic::prover_filter_ops::TYPE_PROVER_LEAVE {
                                     if let Ok(leave) = quil_execution::global_intrinsic::prover_filter_ops::ProverLeave::from_canonical_bytes(&request.inner_bytes) {
                                         if leave.public_key_signature_bls48581.as_ref().is_some_and(|sig| sig.address == owner) {
@@ -3384,19 +3456,34 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
     }
     let node_rpc = node_rpc_builder;
 
-    let stream_addr = {
-        let parts: Vec<&str> = config
-            .p2p
-            .stream_listen_multiaddr
-            .trim_start_matches('/')
-            .split('/')
-            .collect();
-        if parts.len() >= 4 && parts[0] == "ip4" && parts[2] == "tcp" {
-            format!("{}:{}", parts[1], parts[3])
-        } else {
+    let stream_addr = match crate::util::multiaddr::stream_listen_host_port(
+        &config.p2p.stream_listen_multiaddr,
+    ) {
+        Some(addr) => addr,
+        None => {
+            warn!(
+                configured = %config.p2p.stream_listen_multiaddr,
+                fallback = "0.0.0.0:8340",
+                "p2p.streamListenMultiaddr is not /ip4/HOST/tcp/PORT or /ip6/HOST/tcp/PORT, so \
+                 the peer gRPC listener takes the fallback address, on IPv4 only; fix the setting"
+            );
             "0.0.0.0:8340".to_string()
         }
     };
+    if crate::util::multiaddr::ipv6_p2p_without_stream(
+        &config.p2p.listen_multiaddr,
+        &config.p2p.stream_listen_multiaddr,
+        &config.p2p.announce_stream_listen_multiaddr,
+    ) {
+        warn!(
+            listen = %config.p2p.listen_multiaddr,
+            stream_listen = %config.p2p.stream_listen_multiaddr,
+            "the p2p listener takes IPv6 but the peer gRPC listener IPv4 only, so PeerInfo \
+             carries no stream address and peers cannot reach this node's stream port; set \
+             p2p.streamListenMultiaddr to /ip6/::/tcp/8340, or \
+             p2p.announceStreamListenMultiaddr"
+        );
+    }
 
     if let Ok(addr) = grpc_addr.parse::<std::net::SocketAddr>() {
         let node_rpc_service = tonic::service::interceptor::InterceptedService::new(
@@ -3946,9 +4033,15 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                     .map_err(anyhow::Error::from)?;
                 let res = rt.block_on(async move {
             info!(addr = %addr, "starting peer gRPC (mTLS) on dedicated runtime");
-            let listener = tokio::net::TcpListener::bind(addr)
-                .await
-                .map_err(anyhow::Error::from)?;
+            let listener = crate::util::stream_listener::bind(addr).await.map_err(|e| {
+                anyhow::anyhow!("binding the peer gRPC listener on {addr} failed: {e}")
+            })?;
+            let bound = listener.local_addr().map_err(anyhow::Error::from)?;
+            info!(
+                addr = %bound,
+                both_families = crate::util::stream_listener::takes_both_families(addr),
+                "peer gRPC listener bound"
+            );
             // Post-quantum :8340 transport: each connection runs a sntrup761
             // PQNoise handshake (replacing Ed448-mTLS) that authenticates the
             // peer's identity by its signature over the channel-binding hash.
@@ -4142,10 +4235,13 @@ fn worker_entries(wm: &dyn quil_engine::worker::WorkerManager) -> Vec<quil_rpc::
         .map(|w| quil_rpc::WorkerEntry {
             execution: quil_engine::worker_execution::with_store_state(
                 w.core_id,
-                execution
-                    .iter()
-                    .find(|(id, filter, _)| *id == w.core_id && *filter == w.filter)
-                    .map(|(_, _, s)| s.clone()),
+                quil_engine::worker_execution::with_renewal_state(
+                    &w.filter,
+                    execution
+                        .iter()
+                        .find(|(id, filter, _)| *id == w.core_id && *filter == w.filter)
+                        .map(|(_, _, s)| s.clone()),
+                ),
             ),
             core_id: w.core_id,
             filter: w.filter.clone(),
@@ -5317,8 +5413,8 @@ mod committed_app_head_tests {
 #[cfg(test)]
 mod rpc_bound_tests {
     use super::{
-        node_service_bind, NodeServiceBind, SubmitRefusalSummary, SubmitRefusals,
-        SUBMIT_REFUSAL_REPORT_INTERVAL,
+        node_service_bind, submit_refusal_reason, NodeServiceBind, SubmitRefusalSummary,
+        SubmitRefusals, SUBMIT_REFUSAL_REPORT_INTERVAL,
     };
     use quil_engine::message_collector::Refusal;
     use std::time::{Duration, Instant};
@@ -5361,6 +5457,15 @@ mod rpc_bound_tests {
         );
     }
 
+    #[test]
+    fn a_submit_a_regular_node_refuses_does_not_read_as_a_stall() {
+        let reason = submit_refusal_reason(Refusal::NoProposer, 76_982, 0, 990_000);
+        assert!(reason.contains("not an archive"), "{reason}");
+        assert!(!reason.contains("executed"), "{reason}");
+        assert!(submit_refusal_reason(Refusal::RankFull, 5, 6, 7)
+            .contains("(rank 5, executed 6, head 7)"));
+    }
+
     /// The first refused submit is logged at once, the rest summarized with
     /// the first refusal at least a minute after the previous line.
     #[test]
@@ -5370,7 +5475,7 @@ mod rpc_bound_tests {
         assert_eq!(
             refusals.record(Refusal::InvalidShardFrame, "a".into(), start),
             Some(SubmitRefusalSummary {
-                counts: [0, 0, 0, 1, 0],
+                counts: [0, 0, 0, 1, 0, 0],
                 latest_peer: "a".into(),
                 latest_reason: Refusal::InvalidShardFrame.reason(),
                 since_previous: None,
@@ -5390,7 +5495,7 @@ mod rpc_bound_tests {
                 start + SUBMIT_REFUSAL_REPORT_INTERVAL
             ),
             Some(SubmitRefusalSummary {
-                counts: [0, 99, 1, 0, 0],
+                counts: [0, 99, 1, 0, 0, 0],
                 latest_peer: "b".into(),
                 latest_reason: Refusal::RankFull.reason(),
                 since_previous: Some(SUBMIT_REFUSAL_REPORT_INTERVAL),

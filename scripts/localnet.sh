@@ -143,23 +143,21 @@ NETWORK="${NETWORK:-1}"
 PROOF_MAX_CONCURRENT="${PROOF_MAX_CONCURRENT:-1}"
 PROOF_NATIVE_THREADS="${PROOF_NATIVE_THREADS:-2}"
 PROOF_VERIFY_BUDGET_SECS="${PROOF_VERIFY_BUDGET_SECS:-6}"
-# P3: drive app-shard consensus with commonware-simplex when APP_CW=1.
-APP_CW_BOOL=$([[ "${APP_CW:-0}" == "1" || "${APP_CW:-0}" == "true" ]] && echo true || echo false)
-# With app-CW on, shrink the epoch so a joined prover reaches Active (confirm in
-# the epoch after join) in a handful of frames instead of ~60 — makes the
-# app-shard lifecycle observable within a localnet run. Uniform across all nodes.
-if [[ "$APP_CW_BOOL" == "true" ]]; then
-  # Wide enough that the confirm (must materialize in the epoch AFTER join)
-  # lands in-window despite include→finalize→materialize latency, yet small
-  # enough to reach the epoch-1 boundary within a localnet run.
-  export QUIL_EPOCH_LENGTH_FRAMES="${QUIL_EPOCH_LENGTH_FRAMES:-30}"
-  # A joining prover only learns its own on-chain allocation via the incremental
-  # prover-tree sync, and must see it in time to emit a ProverConfirm within the
-  # one-epoch window. The production default (300s) is far longer than a
-  # shortened localnet epoch (~seconds), so every joiner would miss its confirm
-  # slot. Poll the prover tree every few seconds here to match the short epoch.
-  export QUIL_PROVER_TREE_SYNC_SECS="${QUIL_PROVER_TREE_SYNC_SECS:-5}"
-fi
+# Short epoch: shrink it so a joined prover reaches Active (confirm in the
+# epoch after join) in a handful of frames instead of ~60, which makes the
+# app-shard lifecycle observable within a localnet run. Uniform across all
+# nodes. Set QUIL_EPOCH_LENGTH_FRAMES=60 for the production-length epoch.
+# (App shards always run commonware-simplex; the old `APP_CW` switch is gone.)
+# Wide enough that the confirm (must materialize in the epoch AFTER join)
+# lands in-window despite include→finalize→materialize latency, yet small
+# enough to reach the epoch-1 boundary within a localnet run.
+export QUIL_EPOCH_LENGTH_FRAMES="${QUIL_EPOCH_LENGTH_FRAMES:-30}"
+# A joining prover only learns its own on-chain allocation via the incremental
+# prover-tree sync, and must see it in time to emit a ProverConfirm within the
+# one-epoch window. The production default (300s) is far longer than a
+# shortened localnet epoch (~seconds), so every joiner would miss its confirm
+# slot. Poll the prover tree every few seconds here to match the short epoch.
+export QUIL_PROVER_TREE_SYNC_SECS="${QUIL_PROVER_TREE_SYNC_SECS:-5}"
 
 # DEV: induce shard splits for testing. Lowers the split-rebalance trigger's
 # max-provers threshold (mainnet=32, never tripped by a handful of localnet
@@ -403,7 +401,6 @@ engine:
   genesisSeed: "$seed"
   dataWorkerCount: $workers
   dataWorkerStreamMultiaddrs:$cluster_yaml
-  appConsensusCw: $APP_CW_BOOL
   archiveEndpoints:$archive_endpoints_yaml
   consensusCommittee:$committee_yaml
   consensusCommitteePeerIds:$committee_pid_yaml

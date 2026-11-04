@@ -366,7 +366,7 @@ Master-worker communication design:
 #### 4. Binary Verification
 
 - Multi-signature verification of release digests against the signatories
-  (`quil-node/src/release_check.rs`, `signers/`)
+  (`quil-crypto/src/release_check.rs`, `signers/`)
 
 ### System Boundaries
 

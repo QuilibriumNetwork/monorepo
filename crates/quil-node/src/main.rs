@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use quil_crypto::release_check::{self, SelfCheck};
 use tracing::{error, info, warn};
 
 use quil_lifecycle::{ShutdownReason, Supervisor};
@@ -24,8 +25,6 @@ mod logging;
 mod forest_sync;
 mod prover_message_transport_prod;
 mod prover_tree_syncer_prod;
-
-mod release_check;
 
 mod util;
 
@@ -790,7 +789,18 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         "starting quil-node"
     );
 
-    info!(config_dir = %args.config.display(), "loaded configuration");
+    // Canonical paths: `--config` may be relative or a symlink, and an
+    // operator comparing against the client needs the files actually read.
+    let config_dir = std::fs::canonicalize(&args.config).unwrap_or_else(|_| args.config.clone());
+    let keystore = quil_keys::resolve_keystore_path(&config.key.key_store_file, &args.config)
+        .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "unresolved".to_string());
+    info!(
+        config_dir = %config_dir.display(),
+        keystore = %keystore,
+        "loaded configuration"
+    );
     // The master reports, once, config keys the node does not know, the
     // settings of earlier releases and, on mainnet, a configured bootstrap
     // list that the built-in one replaced.
@@ -943,36 +953,24 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     // Verify the binary against `.dgst` + per-signatory `.dgst.sig.N`
     // using hardcoded Ed448 public keys. Fails closed; skipped on
     // Windows and when --signature-check=false.
-    if args.signature_check {
-        if cfg!(target_os = "windows") {
-            info!("signature check not available for windows yet, skipping");
-        } else {
-            match std::env::current_exe() {
-                Ok(exe) => match release_check::verify_release_signatures(&exe) {
-                    Ok(count) => info!(
-                        valid_signatures = count,
-                        total_signatories = release_check::SIGNATORIES.len(),
-                        "signature check passed"
-                    ),
-                    Err(e) => {
-                        error!(
-                            error = %e,
-                            "signature check failed — are you running this from source? \
-                             (use --signature-check=false or QUILIBRIUM_SIGNATURE_CHECK=false)"
-                        );
-                        return Err(anyhow::anyhow!("signature check failed: {}", e));
-                    }
-                },
-                Err(e) => {
-                    return Err(anyhow::anyhow!(
-                        "could not determine executable path for signature check: {}",
-                        e
-                    ));
-                }
-            }
+    match release_check::self_check(args.signature_check) {
+        Ok(SelfCheck::Verified(count)) => info!(
+            valid_signatures = count,
+            total_signatories = quil_config::SIGNATORIES.len(),
+            "signature check passed"
+        ),
+        Ok(SelfCheck::Unavailable) => {
+            info!("signature check not available for windows yet, skipping")
         }
-    } else {
-        info!("signature check disabled, skipping");
+        Ok(SelfCheck::Disabled) => info!("signature check disabled, skipping"),
+        Err(e) => {
+            error!(
+                error = %e,
+                "signature check failed — {}",
+                release_check::SELF_CHECK_HINT
+            );
+            return Err(anyhow::anyhow!("signature check failed: {}", e));
+        }
     }
 
     // Handle --import-db before anything else.

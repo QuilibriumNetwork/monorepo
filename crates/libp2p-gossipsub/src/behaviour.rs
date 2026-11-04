@@ -354,6 +354,20 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
 
     /// QUILIBRIUM: inbound RPCs dropped before decoding.
     rejected_rpcs: RejectedRpcStats,
+
+    /// QUILIBRIUM: RPCs not queued because the peer was no longer connected.
+    unsent_rpcs: UnsentRpcStats,
+}
+
+/// QUILIBRIUM: RPCs the behaviour did not queue because their peer was not in its connected
+/// peer list (a peer that disconnected after the RPC was addressed to it), counted since the
+/// behaviour was built.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UnsentRpcStats {
+    /// RPCs dropped.
+    pub unsent: u64,
+    /// The peer of the latest.
+    pub last: Option<PeerId>,
 }
 
 /// QUILIBRIUM: the behaviour penalty (P7) of a peer per RPC dropped before decoding. P7 is
@@ -478,6 +492,7 @@ where
             failed_messages: Default::default(),
             gossip_promises: Default::default(),
             rejected_rpcs: RejectedRpcStats::default(),
+            unsent_rpcs: UnsentRpcStats::default(),
         })
     }
 
@@ -545,6 +560,12 @@ where
     /// than an RPC may or were malformed (see [`RejectedRpcStats`]).
     pub fn rejected_rpc_stats(&self) -> RejectedRpcStats {
         self.rejected_rpcs
+    }
+
+    /// QUILIBRIUM: RPCs dropped because their peer had left the connected peer list (see
+    /// [`UnsentRpcStats`]).
+    pub fn unsent_rpc_stats(&self) -> UnsentRpcStats {
+        self.unsent_rpcs
     }
 
     /// Returns the gossipsub score for a given peer, if one exists.
@@ -3038,7 +3059,12 @@ where
         }
 
         let Some(peer) = &mut self.connected_peers.get_mut(&peer_id) else {
-            tracing::error!(peer = %peer_id,
+            // QUILIBRIUM: a peer that disconnected while a message was addressed to it; the
+            // message is dropped for it alone. Counted (`unsent_rpc_stats`) and summarized by
+            // the node, not logged per message.
+            self.unsent_rpcs.unsent += 1;
+            self.unsent_rpcs.last = Some(peer_id);
+            tracing::debug!(peer = %peer_id,
                     "Could not send rpc to connection handler, peer doesn't exist in connected peer list");
             return false;
         };
@@ -3271,12 +3297,34 @@ where
     }
 }
 
+/// QUILIBRIUM: the IP a connected peer counts under for the colocation penalty
+/// (P6): an IPv6 address by its /64, which one site or host typically holds
+/// whole, as one IPv4 address counts once.
 fn get_ip_addr(addr: &Multiaddr) -> Option<IpAddr> {
     addr.iter().find_map(|p| match p {
         Ip4(addr) => Some(IpAddr::V4(addr)),
-        Ip6(addr) => Some(IpAddr::V6(addr)),
+        Ip6(addr) => Some(IpAddr::V6(std::net::Ipv6Addr::from(
+            u128::from(addr) & !((1u128 << 64) - 1),
+        ))),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod colocation_ip_tests {
+    use super::get_ip_addr;
+
+    #[test]
+    fn an_ipv6_peer_counts_by_its_64_and_an_ipv4_peer_by_its_address() {
+        let ip = |addr: &str| get_ip_addr(&addr.parse().unwrap()).unwrap().to_string();
+        assert_eq!(ip("/ip4/203.0.113.7/tcp/8336"), "203.0.113.7");
+        assert_eq!(
+            ip("/ip6/2001:db8:1:2:3:4:5:6/udp/8336/quic-v1"),
+            "2001:db8:1:2::"
+        );
+        assert_eq!(ip("/ip6/2001:db8:1:2:ffff::1/tcp/8336"), "2001:db8:1:2::");
+        assert_eq!(ip("/ip6/2001:db8:1:3::1/tcp/8336"), "2001:db8:1:3::");
+    }
 }
 
 impl<C, F> NetworkBehaviour for Behaviour<C, F>

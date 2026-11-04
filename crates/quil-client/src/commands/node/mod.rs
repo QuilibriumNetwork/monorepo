@@ -10,6 +10,7 @@ use crate::context::GlobalArgs;
 pub mod archive;
 pub mod diagnostics;
 pub mod diagnostics_dial;
+pub mod diagnostics_grants;
 pub mod diagnostics_logs;
 pub mod doctor;
 pub mod lifecycle;
