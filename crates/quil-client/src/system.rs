@@ -96,13 +96,7 @@ pub fn system_info() -> anyhow::Result<(&'static str, &'static str)> {
 /// root under sudo we resolve `$SUDO_USER`'s home so config files land in
 /// the operator's `~/.quilibrium`, not root's.
 pub fn current_user_home() -> anyhow::Result<PathBuf> {
-    // euid: only meaningful on unix; on non-unix fall back to $HOME.
-    #[cfg(unix)]
-    let is_root = unsafe { libc_geteuid() } == 0;
-    #[cfg(not(unix))]
-    let is_root = false;
-
-    if is_root {
+    if is_root() {
         if let Ok(sudo_user) = std::env::var("SUDO_USER") {
             if !sudo_user.is_empty() && sudo_user != "root" {
                 if let Some(home) = home_of_user(&sudo_user) {
@@ -119,15 +113,14 @@ pub fn current_user_home() -> anyhow::Result<PathBuf> {
 
 /// The name of the invoking (sudo-aware) user, by the rule of
 /// [`current_user_home`]: `$SUDO_USER` when root runs under sudo for a
-/// user listed in `/etc/passwd`, else the effective user.
+/// user the user database knows, else the effective user.
 #[cfg(unix)]
 pub fn current_user_name() -> anyhow::Result<String> {
-    let euid = unsafe { libc_geteuid() };
-    let passwd = std::fs::read_to_string("/etc/passwd")
-        .map_err(|e| anyhow::anyhow!("read /etc/passwd: {e}"))?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
     let sudo_user = std::env::var("SUDO_USER").ok();
-    user_name_for(euid, sudo_user.as_deref(), &passwd)
-        .ok_or_else(|| anyhow::anyhow!("no /etc/passwd entry for user id {euid}"))
+    user_name_for(euid, sudo_user.as_deref(), &user_by_name, &user_by_uid)
+        .ok_or_else(|| anyhow::anyhow!("no user database entry for user id {euid}"))
 }
 
 #[cfg(not(unix))]
@@ -135,20 +128,23 @@ pub fn current_user_name() -> anyhow::Result<String> {
     anyhow::bail!("no user database on this platform")
 }
 
-/// [`current_user_name`] for the effective user id `euid`, `$SUDO_USER`
-/// `sudo_user` and the `/etc/passwd` text `passwd`.
+/// [`current_user_name`] for the effective user id `euid` and `$SUDO_USER`
+/// `sudo_user`, looking users up by name with `by_name` and by id with
+/// `by_uid`.
 #[cfg(unix)]
-fn user_name_for(euid: u32, sudo_user: Option<&str>, passwd: &str) -> Option<String> {
+fn user_name_for(
+    euid: libc::uid_t,
+    sudo_user: Option<&str>,
+    by_name: &dyn Fn(&str) -> Option<UserEntry>,
+    by_uid: &dyn Fn(libc::uid_t) -> Option<UserEntry>,
+) -> Option<String> {
     match sudo_user {
         Some(user)
-            if euid == 0
-                && !user.is_empty()
-                && user != "root"
-                && passwd_home(passwd, user).is_some() =>
+            if euid == 0 && !user.is_empty() && user != "root" && by_name(user).is_some() =>
         {
             Some(user.to_string())
         }
-        _ => passwd_name(passwd, euid),
+        _ => by_uid(euid).map(|entry| entry.name),
     }
 }
 
@@ -163,38 +159,11 @@ pub fn node_config_home_dir() -> anyhow::Result<PathBuf> {
     Ok(user_quilibrium_dir()?.join("configs"))
 }
 
-/// Look up a user's home directory from `/etc/passwd` without pulling in a
-/// crate. Returns `None` if not found.
+/// A user's home directory, from the user database. Returns `None` if not
+/// found.
 #[cfg(unix)]
 fn home_of_user(username: &str) -> Option<PathBuf> {
-    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
-    passwd_home(&passwd, username)
-}
-
-/// The fields of each well-formed `/etc/passwd` line:
-/// `name:password:uid:gid:gecos:home:shell`.
-#[cfg(unix)]
-fn passwd_entries(passwd: &str) -> impl Iterator<Item = Vec<&str>> {
-    passwd
-        .lines()
-        .map(|line| line.split(':').collect::<Vec<_>>())
-        .filter(|fields| fields.len() == 7)
-}
-
-/// The home directory of `username` in the `/etc/passwd` text `passwd`.
-#[cfg(unix)]
-fn passwd_home(passwd: &str, username: &str) -> Option<PathBuf> {
-    passwd_entries(passwd)
-        .find(|fields| fields[0] == username)
-        .map(|fields| PathBuf::from(fields[5]))
-}
-
-/// The name of the user with id `uid` in the `/etc/passwd` text `passwd`.
-#[cfg(unix)]
-fn passwd_name(passwd: &str, uid: u32) -> Option<String> {
-    passwd_entries(passwd)
-        .find(|fields| fields[2].parse() == Ok(uid))
-        .map(|fields| fields[0].to_string())
+    user_by_name(username).map(|entry| entry.home)
 }
 
 #[cfg(not(unix))]
@@ -202,16 +171,87 @@ fn home_of_user(_username: &str) -> Option<PathBuf> {
     None
 }
 
+/// A user database entry: the fields qclient reads.
 #[cfg(unix)]
-extern "C" {
-    #[link_name = "geteuid"]
-    fn libc_geteuid() -> u32;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UserEntry {
+    name: String,
+    home: PathBuf,
+}
+
+/// The user database entry of `name` (`getpwnam_r`). The C library
+/// answers from the system's user database, which on macOS is Directory
+/// Services rather than `/etc/passwd`.
+#[cfg(unix)]
+fn user_by_name(name: &str) -> Option<UserEntry> {
+    let name = std::ffi::CString::new(name).ok()?;
+    user_entry(|pwd, buf, len, result| {
+        // SAFETY: `name` is NUL-terminated and outlives the call; the
+        // other pointers come from `user_entry`, valid for `len` bytes.
+        unsafe { libc::getpwnam_r(name.as_ptr(), pwd, buf, len, result) }
+    })
+}
+
+/// The user database entry of user id `uid` (`getpwuid_r`).
+#[cfg(unix)]
+fn user_by_uid(uid: libc::uid_t) -> Option<UserEntry> {
+    user_entry(|pwd, buf, len, result| {
+        // SAFETY: the pointers come from `user_entry`, valid for `len`
+        // bytes.
+        unsafe { libc::getpwuid_r(uid, pwd, buf, len, result) }
+    })
+}
+
+/// The largest buffer [`user_entry`] offers a lookup, 1 MiB.
+#[cfg(unix)]
+const USER_ENTRY_MAX_BUF: usize = 1 << 20;
+
+/// Run a `getpw*_r` style `lookup` (entry, buffer, buffer length, result),
+/// doubling its buffer from 1 KiB while it reports `ERANGE`. `None` when
+/// the user is unknown, the lookup fails, or the name is not UTF-8.
+#[cfg(unix)]
+fn user_entry(
+    lookup: impl Fn(
+        *mut libc::passwd,
+        *mut libc::c_char,
+        libc::size_t,
+        *mut *mut libc::passwd,
+    ) -> libc::c_int,
+) -> Option<UserEntry> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    let mut len = 1024;
+    loop {
+        let mut buf: Vec<libc::c_char> = vec![0; len];
+        let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = lookup(pwd.as_mut_ptr(), buf.as_mut_ptr(), buf.len(), &mut result);
+        if rc == libc::ERANGE && len < USER_ENTRY_MAX_BUF {
+            len *= 2;
+            continue;
+        }
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+        // SAFETY: on success `result` points at the filled `pwd`, whose
+        // strings are NUL-terminated within `buf`; both live to the end of
+        // this iteration.
+        let entry = unsafe { &*result };
+        let field = |p: *mut libc::c_char| {
+            // SAFETY: as above, a non-null field is a NUL-terminated string.
+            (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_bytes())
+        };
+        let name = std::str::from_utf8(field(entry.pw_name)?).ok()?.to_string();
+        let home = PathBuf::from(OsStr::from_bytes(field(entry.pw_dir)?));
+        return Some(UserEntry { name, home });
+    }
 }
 
 /// Whether this process runs as root (effective user id 0).
 #[cfg(unix)]
 pub fn is_root() -> bool {
-    unsafe { libc_geteuid() == 0 }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() == 0 }
 }
 
 /// Whether this process runs as root: never off unix.
@@ -477,46 +517,101 @@ mod tests {
         assert!(err.contains("from the node directory"), "{err}");
     }
 
+    /// A user database of `(name, uid, home)` rows.
     #[cfg(unix)]
-    const PASSWD: &str = "root:x:0:0:root:/root:/bin/bash\n\
-        daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n\
-        op:x:1000:1000:Node Operator,,,:/home/op:/bin/bash\n\
-        bare:x:1001:1001::/srv/bare:/bin/sh\n";
+    const USERS: &[(&str, libc::uid_t, &str)] = &[
+        ("root", 0, "/root"),
+        ("op", 1000, "/Users/op"),
+        ("bare", 1001, "/srv/bare"),
+    ];
 
-    /// The home directory is the sixth field, not the comment (GECOS)
-    /// field before it.
     #[cfg(unix)]
-    #[test]
-    fn passwd_home_is_the_home_field() {
-        assert_eq!(passwd_home(PASSWD, "op"), Some(PathBuf::from("/home/op")));
-        assert_eq!(
-            passwd_home(PASSWD, "bare"),
-            Some(PathBuf::from("/srv/bare"))
-        );
-        assert_eq!(passwd_home(PASSWD, "root"), Some(PathBuf::from("/root")));
-        assert_eq!(passwd_home(PASSWD, "nobody"), None);
+    fn entry(&(name, _, home): &(&str, libc::uid_t, &str)) -> UserEntry {
+        UserEntry {
+            name: name.to_string(),
+            home: PathBuf::from(home),
+        }
+    }
+
+    #[cfg(unix)]
+    fn by_name(name: &str) -> Option<UserEntry> {
+        USERS.iter().find(|row| row.0 == name).map(entry)
+    }
+
+    #[cfg(unix)]
+    fn by_uid(uid: libc::uid_t) -> Option<UserEntry> {
+        USERS.iter().find(|row| row.1 == uid).map(entry)
     }
 
     /// The service user is the operator who ran `sudo`, else the effective
-    /// user; never a user the passwd file lacks.
+    /// user; never a user the user database lacks.
     #[cfg(unix)]
     #[test]
     fn invoking_user_name_is_the_sudo_user_or_the_effective_user() {
-        assert_eq!(user_name_for(0, Some("op"), PASSWD).as_deref(), Some("op"));
-        assert_eq!(user_name_for(0, None, PASSWD).as_deref(), Some("root"));
+        let name = |euid, sudo| user_name_for(euid, sudo, &by_name, &by_uid);
+        assert_eq!(name(0, Some("op")).as_deref(), Some("op"));
+        assert_eq!(name(0, None).as_deref(), Some("root"));
+        assert_eq!(name(0, Some("root")).as_deref(), Some("root"));
+        assert_eq!(name(0, Some("ghost")).as_deref(), Some("root"));
+        assert_eq!(name(0, Some("")).as_deref(), Some("root"));
+        assert_eq!(name(1000, Some("bare")).as_deref(), Some("op"));
+        assert_eq!(name(1001, None).as_deref(), Some("bare"));
+        assert_eq!(name(4242, None), None);
+    }
+
+    /// The C library's user database answers for root by id and by name,
+    /// with its home directory, not its comment (GECOS) field; an unknown
+    /// or malformed name has no entry.
+    #[cfg(unix)]
+    #[test]
+    fn the_user_database_answers_for_root() {
+        let root = user_by_uid(0).expect("user id 0 has an entry");
+        assert_eq!(root.name, "root");
+        let home = if cfg!(target_os = "macos") {
+            "/var/root"
+        } else {
+            "/root"
+        };
+        assert_eq!(root.home, PathBuf::from(home));
+        assert_eq!(user_by_name("root"), Some(root));
+        assert_eq!(home_of_user("root"), Some(PathBuf::from(home)));
+        assert_eq!(user_by_name("qclient-test-no-such-user"), None);
+        assert_eq!(user_by_name("ro\0ot"), None);
+    }
+
+    /// A lookup reporting `ERANGE` gets a doubled buffer until its entry
+    /// fits; an unknown user (no result) is `None`.
+    #[cfg(unix)]
+    #[test]
+    fn a_lookup_grows_its_buffer_until_the_entry_fits() {
+        let lens = std::cell::RefCell::new(Vec::new());
+        let found = user_entry(|pwd, buf, len, result| {
+            lens.borrow_mut().push(len);
+            if len < 4096 {
+                return libc::ERANGE;
+            }
+            let text = b"op\0/Users/op\0";
+            // SAFETY: `buf` holds `len` >= 4096 bytes, `pwd` and `result`
+            // are valid for writes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(text.as_ptr().cast(), buf, text.len());
+                let mut entry: libc::passwd = std::mem::zeroed();
+                entry.pw_name = buf;
+                entry.pw_dir = buf.add(3);
+                pwd.write(entry);
+                *result = pwd;
+            }
+            0
+        });
         assert_eq!(
-            user_name_for(0, Some("root"), PASSWD).as_deref(),
-            Some("root")
+            found,
+            Some(UserEntry {
+                name: "op".to_string(),
+                home: PathBuf::from("/Users/op"),
+            })
         );
-        assert_eq!(
-            user_name_for(0, Some("ghost"), PASSWD).as_deref(),
-            Some("root")
-        );
-        assert_eq!(
-            user_name_for(1000, Some("bare"), PASSWD).as_deref(),
-            Some("op")
-        );
-        assert_eq!(user_name_for(1001, None, PASSWD).as_deref(), Some("bare"));
-        assert_eq!(user_name_for(4242, None, PASSWD), None);
+        assert_eq!(*lens.borrow(), [1024, 2048, 4096]);
+        assert_eq!(user_entry(|_, _, _, _| 0), None);
+        assert_eq!(user_entry(|_, _, _, _| libc::EIO), None);
     }
 }

@@ -58,6 +58,9 @@ reqwest = "0.13"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
+# The user database (`getpwnam_r`, `getpwuid_r`), which on macOS is
+# Directory Services, not `/etc/passwd`. Already in the build.
+libc = "0.2"
 
 [dev-dependencies]
 quil-forest = { path = "../quil-forest" }

@@ -6230,6 +6230,7 @@ dependencies = [
  "flate2",
  "futures",
  "hex 0.4.3",
+ "libc",
  "libp2p",
  "libp2p-identity",
  "num-bigint 0.4.6",
