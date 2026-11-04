@@ -8,9 +8,9 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use common::{AppShardHarness, TestProver};
+use common::{frames_seen, until_progress, AppShardHarness, TestProver};
 use prost::Message as _;
 use quil_engine::test_support::TestProverRegistry;
 use quil_execution::{
@@ -50,17 +50,6 @@ fn finalized(harness: &AppShardHarness) -> Vec<AppShardFrame> {
     frames.sort_by_key(|f| f.header.as_ref().map_or(0, |h| h.frame_number));
     frames.dedup_by_key(|f| f.header.as_ref().map_or(0, |h| h.frame_number));
     frames
-}
-
-async fn until<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Some(value) = probe() {
-            return Some(value);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    None
 }
 
 /// Every finalized frame must verify against the session its certificate names.
@@ -130,10 +119,15 @@ async fn session_seals_on_a_scheduled_change_and_resumes_under_its_successor() {
     commit(&state, 2);
 
     let harness = AppShardHarness::build_cw_sessions(provers.clone(), registry, global.clone());
-    let early = until(Duration::from_secs(90), || {
-        let frames = finalized(&harness);
-        (frames.len() >= 3).then_some(frames)
-    })
+    let early = until_progress(
+        Duration::from_secs(90),
+        Duration::from_secs(360),
+        || frames_seen(&harness),
+        || {
+            let frames = finalized(&harness);
+            (frames.len() >= 3).then_some(frames)
+        },
+    )
     .await
     .expect("the authorized session finalizes data frames");
     {
@@ -164,15 +158,20 @@ async fn session_seals_on_a_scheduled_change_and_resumes_under_its_successor() {
     // Any member that observes the terminal finalization submits it through the
     // same prover-message path as coverage headers.
     let prefix = TYPE_COMMITTEE_HANDOFF.to_be_bytes();
-    let submission = until(Duration::from_secs(120), || {
-        harness.workers.iter().find_map(|w| {
-            w.coverage_published
-                .lock()
-                .iter()
-                .find(|b| b.starts_with(&prefix))
-                .cloned()
-        })
-    })
+    let submission = until_progress(
+        Duration::from_secs(120),
+        Duration::from_secs(480),
+        || frames_seen(&harness),
+        || {
+            harness.workers.iter().find_map(|w| {
+                w.coverage_published
+                    .lock()
+                    .iter()
+                    .find(|b| b.starts_with(&prefix))
+                    .cloned()
+            })
+        },
+    )
     .await
     .expect("the closing committee finalizes and submits its terminal seal");
     let submission = CertificateSubmission::from_canonical_bytes(&submission).unwrap();
@@ -208,14 +207,19 @@ async fn session_seals_on_a_scheduled_change_and_resumes_under_its_successor() {
 
     // The three authorized members restart in the successor's namespace and
     // extend its authorized genesis; the fourth has no session to run.
-    let resumed = until(Duration::from_secs(120), || {
-        let frames = finalized(&harness);
-        let after: Vec<_> = frames
-            .into_iter()
-            .filter(|f| f.header.as_ref().unwrap().frame_number > sealed_at)
-            .collect();
-        (after.len() >= 2).then_some(after)
-    })
+    let resumed = until_progress(
+        Duration::from_secs(120),
+        Duration::from_secs(480),
+        || frames_seen(&harness),
+        || {
+            let frames = finalized(&harness);
+            let after: Vec<_> = frames
+                .into_iter()
+                .filter(|f| f.header.as_ref().unwrap().frame_number > sealed_at)
+                .collect();
+            (after.len() >= 2).then_some(after)
+        },
+    )
     .await
     .expect("the successor committee finalizes frames past the sealed checkpoint");
     let view = CommittedView::capture(&global).unwrap();

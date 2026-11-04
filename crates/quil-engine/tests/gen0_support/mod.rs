@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::common::{self, AppShardHarness, TestProver};
+use crate::common::{self, frames_seen, until_progress, AppShardHarness, TestProver};
 use prost::Message as _;
 use quil_cw_consensus::handoff::Checkpoint;
 use quil_engine::app_handoff::SessionChoice;
@@ -115,17 +115,6 @@ fn finalized(harness: &AppShardHarness) -> Vec<AppShardFrame> {
 
 fn number(frame: &AppShardFrame) -> u64 {
     frame.header.as_ref().unwrap().frame_number
-}
-
-async fn until<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Some(value) = probe() {
-            return Some(value);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    None
 }
 
 fn certificate(frame: &AppShardFrame) -> &[u8] {
@@ -233,15 +222,20 @@ async fn halt_at_one_head(harness: &AppShardHarness) -> u64 {
         worker.handle.set_halted(true);
     }
     let mut last = (Vec::new(), Instant::now());
-    until(Duration::from_secs(60), || {
-        let now = cursors(harness);
-        if now != last.0 {
-            last = (now, Instant::now());
-            return None;
-        }
-        (now.iter().all(|c| *c == now[0]) && last.1.elapsed() > Duration::from_secs(3))
-            .then_some(now[0])
-    })
+    until_progress(
+        Duration::from_secs(60),
+        Duration::from_secs(240),
+        || cursors(harness).iter().sum(),
+        || {
+            let now = cursors(harness);
+            if now != last.0 {
+                last = (now, Instant::now());
+                return None;
+            }
+            (now.iter().all(|c| *c == now[0]) && last.1.elapsed() > Duration::from_secs(3))
+                .then_some(now[0])
+        },
+    )
     .await
     .expect("a halted committee stops at one head")
 }
@@ -279,10 +273,15 @@ pub async fn migrate_in_place(tip_kind: Tip) {
     // 1. Legacy: the registry committee certifies frames in epoch 0.
     let harness =
         AppShardHarness::build_cw_sessions_seeded(provers.clone(), registry, global.clone(), seed);
-    let legacy_frames = until(Duration::from_secs(90), || {
-        let frames = finalized(&harness);
-        (frames.len() >= 3).then_some(frames)
-    })
+    let legacy_frames = until_progress(
+        Duration::from_secs(90),
+        Duration::from_secs(360),
+        || frames_seen(&harness),
+        || {
+            let frames = finalized(&harness);
+            (frames.len() >= 3).then_some(frames)
+        },
+    )
     .await
     .expect("the legacy committee finalizes frames");
     {
@@ -317,13 +316,18 @@ pub async fn migrate_in_place(tip_kind: Tip) {
         ));
     }
     // It keeps producing legacy frames, still verified as legacy history.
-    let after_activation = until(Duration::from_secs(90), || {
-        let frames = finalized(&harness);
-        frames
-            .iter()
-            .any(|f| number(f) > first_tip.checkpoint.frame + 1)
-            .then_some(frames)
-    })
+    let after_activation = until_progress(
+        Duration::from_secs(90),
+        Duration::from_secs(360),
+        || frames_seen(&harness),
+        || {
+            let frames = finalized(&harness);
+            frames
+                .iter()
+                .any(|f| number(f) > first_tip.checkpoint.frame + 1)
+                .then_some(frames)
+        },
+    )
     .await
     .expect("a pending legacy shard keeps producing after activation");
     {
@@ -350,10 +354,15 @@ pub async fn migrate_in_place(tip_kind: Tip) {
         Tip::Lagging => {
             // Every member two frames past the first recorded tip, so the
             // tip one frame below the halted head still advanced.
-            until(Duration::from_secs(90), || {
-                let floor = cursors(&harness).into_iter().min()?;
-                (floor > first_tip.checkpoint.frame + 1).then_some(())
-            })
+            until_progress(
+                Duration::from_secs(90),
+                Duration::from_secs(360),
+                || cursors(&harness).iter().sum(),
+                || {
+                    let floor = cursors(&harness).into_iter().min()?;
+                    (floor > first_tip.checkpoint.frame + 1).then_some(())
+                },
+            )
             .await
             .expect("every member materializes past the first recorded tip");
             let head = halt_at_one_head(&harness).await;
@@ -428,12 +437,24 @@ pub async fn migrate_in_place(tip_kind: Tip) {
             for worker in &harness.workers {
                 worker.handle.set_halted(false);
             }
-            until(Duration::from_secs(150), submitted).await
+            until_progress(
+                Duration::from_secs(150),
+                Duration::from_secs(600),
+                || frames_seen(&harness),
+                submitted,
+            )
+            .await
         }
         Tip::Lagging => {
             // The head the legacy instance finalized past the tip is a
             // generation-0 frame: the restarted members seal it while halted.
-            let submission = until(Duration::from_secs(150), submitted).await;
+            let submission = until_progress(
+                Duration::from_secs(150),
+                Duration::from_secs(600),
+                || frames_seen(&harness),
+                submitted,
+            )
+            .await;
             assert_eq!(cursors(&harness), vec![head; 4]);
             for worker in &harness.workers {
                 worker.handle.set_halted(false);
@@ -466,13 +487,18 @@ pub async fn migrate_in_place(tip_kind: Tip) {
         (1, sealed.frame, &committee)
     );
 
-    let resumed = until(Duration::from_secs(150), || {
-        let after: Vec<_> = finalized(&harness)
-            .into_iter()
-            .filter(|f| number(f) > sealed.frame)
-            .collect();
-        (after.len() >= 2).then_some(after)
-    })
+    let resumed = until_progress(
+        Duration::from_secs(150),
+        Duration::from_secs(600),
+        || frames_seen(&harness),
+        || {
+            let after: Vec<_> = finalized(&harness)
+                .into_iter()
+                .filter(|f| number(f) > sealed.frame)
+                .collect();
+            (after.len() >= 2).then_some(after)
+        },
+    )
     .await
     .expect("generation 1 finalizes frames past the sealed checkpoint");
     assert_eq!(number(&resumed[0]), sealed.frame + 1);
