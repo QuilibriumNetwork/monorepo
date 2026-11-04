@@ -315,7 +315,6 @@ pub(crate) async fn start(
             None
         },
         channel_factory: Some(channel_factory),
-        app_consensus_cw: config.engine.app_consensus_cw,
         // Persist the app-shard CW journal under the worker's resolved data dir
         // (else the ephemeral temp journal panics on prune once a real committee
         // starts producing views).

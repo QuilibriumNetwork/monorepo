@@ -445,7 +445,7 @@ async fn worker_activates_after_confirm_and_emits_proof() {
 }
 
 /// A single-prover shard driven by commonware-simplex + Falcon
-/// (`app_consensus_cw = true`, EQUAL VOTES, quorum 1) self-proposes and
+/// (EQUAL VOTES, quorum 1) self-proposes and
 /// self-finalizes app frames end-to-end: `start_consensus_cw` builds the
 /// committee (this node's Falcon key, the only active prover), the seam
 /// proposer proves + assembles + verifies each frame, simplex finalizes it,
@@ -2434,7 +2434,6 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
                 Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>
             ),
             kv_db: None,
-            app_consensus_cw: false,
             db_config: quil_config::DbConfig {
                 path: String::new(),
                 worker_path_prefix: String::new(),

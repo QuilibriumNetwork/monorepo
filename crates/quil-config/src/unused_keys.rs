@@ -33,6 +33,7 @@ const RETIRED_KEYS: &[&str] = &[
     "engine.syncMessageLimits",
     "engine.rewardsAddress",
     "engine.framePublish",
+    "engine.appConsensusCw",
     "engine.allowExcessiveGOMAXPROCS",
     "engine.autoMergeCoins",
     "engine.dataWorkerBaseListenPort",
@@ -477,6 +478,16 @@ listenRESTMultiaddr: /ip4/127.0.0.1/tcp/8338
                 retired("listenRESTMultiaddr"),
             ]
         );
+    }
+
+    /// `engine.appConsensusCw` was removed (app shards always run
+    /// commonware-simplex). A config that still sets it must load, and the
+    /// key is reported as retired rather than as a typo.
+    #[test]
+    fn a_config_with_the_removed_app_consensus_flag_still_loads() {
+        let yaml = "engine:\n  appConsensusCw: true\n";
+        serde_yaml::from_str::<Config>(yaml).expect("the old key must not fail the parse");
+        assert_eq!(unused_keys(yaml), vec![retired("engine.appConsensusCw")]);
     }
 
     /// A config of known keys only, in their written, alias or Go spelling,

@@ -39,7 +39,7 @@
 #                (default 2400, 1800, 900, 900)
 #   COMPARE_TRIES, COMPARE_GAP   (default 6, 10)
 #   QUIL_EPOCH_LENGTH_FRAMES (default 30) and the other settings of
-#                scripts/localnet.sh; APP_CW is always 1
+#                scripts/localnet.sh
 #
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -56,7 +56,7 @@ CLAIM_BOUND="${CLAIM_BOUND:-900}"
 DELIVERY_BOUND="${DELIVERY_BOUND:-900}"
 COMPARE_TRIES="${COMPARE_TRIES:-6}"
 COMPARE_GAP="${COMPARE_GAP:-10}"
-export APP_CW=1 QUIL_EPOCH_LENGTH_FRAMES="${QUIL_EPOCH_LENGTH_FRAMES:-30}"
+export QUIL_EPOCH_LENGTH_FRAMES="${QUIL_EPOCH_LENGTH_FRAMES:-30}"
 OUT="$NET_DIR/results"
 MATERIALIZED_RE='archive materialized shard frame'
 

@@ -33,7 +33,7 @@
 #   ROUNDS       space separated rounds (default "all stagger all+delay stagger+delay")
 #   DELAY_MS     registry load delay of the +delay rounds (default 15000)
 #   GLOBAL_BOUND, PROPOSAL_BOUND, ACTIVATION_BOUND, SETTLE, STOP_GRACE   seconds
-#   NETWORK, LOGFILTER, APP_CW, CLUSTER_REGULARS and the other settings of
+#   NETWORK, LOGFILTER, CLUSTER_REGULARS and the other settings of
 #                scripts/localnet.sh: `localnet.sh up` reads them, and every
 #                restart runs with the same ones
 #
@@ -81,7 +81,7 @@ lines() { wc -l < "$(alog "$1")"; }
 regcount() { cat "$NET_DIR"/reg1/.log/*.log 2>/dev/null | grep -ac "$1"; }
 
 # Restarts reuse the settings `localnet.sh up` saved in runtime.env (the
-# network id and the consensus settings, including those APP_CW=1 exports),
+# network id and the consensus settings, including the short-epoch ones),
 # its log filter, and its cluster-mode worker processes.
 COMMON=()
 load_launch_settings() {

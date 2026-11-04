@@ -55,7 +55,6 @@ fn engine_with_execution() -> (AppConsensusEngine, Arc<MessageCollector>) {
         execution_engine: Some(manager),
         inclusion_prover: Some(prover),
         kv_db: None,
-        app_consensus_cw: false,
         db_config: Default::default(),
         unified_cutover_hook: None,
     };
