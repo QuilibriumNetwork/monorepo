@@ -671,9 +671,11 @@ pub trait GlobalProposer: Send + Sync + 'static {
     }
 
     /// How long this node paces itself before it produces the proposal for
-    /// `context`. The adapter waits it out before calling
+    /// `context`. The adapter waits it out before each call of
     /// [`Self::propose_with_context`], so nothing the proposal holds (an
-    /// execution lease, a runtime thread) is held through the wait.
+    /// execution lease, a runtime thread) is held through the wait. `None`
+    /// once the wait is over, or while it cannot be told yet: the adapter
+    /// asks again before the next attempt.
     fn proposal_pacing(&self, _context: ProposalContext) -> Option<std::time::Duration> {
         None
     }
@@ -831,17 +833,25 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton for Falc
             }
         };
         self.context.child("propose").spawn(move |ctx| async move {
-            if let Some(pacing) = proposer.proposal_pacing(proposal_context) {
-                ctx.sleep(pacing).await;
-                if tx.is_closed() {
-                    settle(false);
-                    return;
-                }
-            }
             // Bounded under `leader_timeout` (30s); simplex drops the receiver
             // when the view ends.
             let mut waited = std::time::Duration::ZERO;
             loop {
+                // Asked before every attempt, not once per view: a leader
+                // that cannot tell its pacing when the view starts (its
+                // parent's height or timestamp is not known here yet) learns
+                // it while it retries. Asked once, such a leader built as
+                // soon as its parent published and then paced inside the
+                // build, on a mempool copy taken seconds before the frame was
+                // due: an archive publishing late carried about 10 shard
+                // headers where the others carried about 95 (2026-11-04).
+                if let Some(pacing) = proposer.proposal_pacing(proposal_context) {
+                    ctx.sleep(pacing).await;
+                    if tx.is_closed() {
+                        settle(false);
+                        return;
+                    }
+                }
                 if let Some((digest, bytes)) = proposer.propose_with_context(proposal_context) {
                     // Locally-produced bytes came directly from the application
                     // proposer and are the value Simplex is about to certify — seal
