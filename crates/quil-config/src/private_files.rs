@@ -141,6 +141,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A write that fails part way, here at the file size limit, leaves the
+    /// previous config whole and no temporary file behind.
+    #[test]
+    fn a_failed_write_keeps_the_previous_file() {
+        if let Ok(path) = std::env::var(FAILING_WRITE) {
+            // The child: write past the limit its parent set.
+            let result = write_private_file(Path::new(&path), &[b'n'; 64 * 1024]);
+            assert!(result.is_err(), "the write must hit the file size limit");
+            return;
+        }
+        let dir = tempdir("failing");
+        let path = dir.join("config.yml");
+        let old = b"encryptionKey: the only copy\n".repeat(4);
+        write_private_file(&path, &old).unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' XFSZ; ulimit -f 8; exec \"$0\" --exact \"$1\" --nocapture")
+            .arg(std::env::current_exe().unwrap())
+            .arg("private_files::tests::a_failed_write_keeps_the_previous_file")
+            .env(FAILING_WRITE, &path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "the child write failed as planned");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            old,
+            "the previous config.yml survives a failed write whole"
+        );
+        assert_eq!(mode(&path), 0o600);
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("config.yml")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const FAILING_WRITE: &str = "QUIL_CONFIG_TEST_FAILING_WRITE";
+
     /// New directories, parents included, are owner-only; an existing one
     /// keeps its mode.
     #[test]
