@@ -487,6 +487,17 @@ impl StallWatch {
     }
 }
 
+/// A worker thread's current-thread runtime: it marks the thread while parked,
+/// so that a stall with no task running names a thread that was not run, a
+/// host's problem, apart from one in a task the probe does not mark.
+pub(crate) fn worker_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .on_thread_park(quil_types::thread_probe::parked)
+        .on_thread_unpark(quil_types::thread_probe::unparked)
+        .build()
+}
+
 /// Beat `probe` every `period` while it lives; spawn on the worker thread's
 /// runtime, so that the beat stops while anything blocks the thread.
 pub async fn heartbeat(probe: Weak<ThreadProbe>, period: Duration) {
@@ -633,6 +644,27 @@ fn log(report: &StallReport) {
 mod tests {
     use super::*;
     use quil_types::thread_probe::{install, probed, section, step};
+
+    /// A worker thread with nothing to run is marked parked, not as an
+    /// unmarked task: a stall there is not any task's.
+    #[test]
+    fn an_idle_worker_thread_is_marked_parked() {
+        let probe = ThreadProbe::new();
+        let worker_probe = probe.clone();
+        let worker = std::thread::spawn(move || {
+            let rt = worker_runtime().unwrap();
+            let _installed = install(worker_probe);
+            rt.block_on(async { tokio::time::sleep(Duration::from_millis(1500)).await });
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut seen = String::new();
+        while std::time::Instant::now() < deadline && seen != Section::ThreadParked.label() {
+            seen = Place::of(&probe.snapshot()).describe();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(seen, Section::ThreadParked.label());
+        worker.join().unwrap();
+    }
 
     /// Poll `watch` every 20 ms until `found` picks a report, for at most 5 s.
     fn await_report(

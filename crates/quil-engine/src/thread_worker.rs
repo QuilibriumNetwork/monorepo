@@ -349,7 +349,10 @@ impl ShardData {
         crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
     ) -> tokio::task::JoinHandle<crate::worker_payload_eviction::Publish> {
         let ticket = self.begin(core_id);
-        tokio::spawn(self.clone().read(core_id, ticket, crdt.clone()))
+        tokio::spawn(probed(
+            ProbeSection::ShardDataRead,
+            self.clone().read(core_id, ticket, crdt.clone()),
+        ))
     }
 
     /// Number a read of worker `core_id`'s shards as its latest.
@@ -807,9 +810,7 @@ impl ThreadWorkerManager {
                 }
 
                 // Create per-thread tokio runtime
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
+                let rt = crate::worker_stall::worker_runtime()
                     .expect("failed to create worker tokio runtime");
 
                 // A watchdog on another thread names what blocks this one
@@ -958,7 +959,7 @@ impl ThreadWorkerManager {
                                             };
                                             retained_mempool = Some((application, mempool.clone()));
                                             // TODO
-                                            tokio::spawn(async move {
+                                            tokio::spawn(probed(ProbeSection::EngineSetup, async move {
                                                 info!(core_id, filter = hex::encode(&filter_clone), "app engine spawned");
 
                                                 if let Some(ref deps) = deps {
@@ -1294,7 +1295,7 @@ impl ThreadWorkerManager {
                                                         }
                                                     }
                                                 }
-                                            });
+                                            }));
                                         }
                                         let _ = master_tx
                                             .send(WorkerToMaster::Ready { core_id })

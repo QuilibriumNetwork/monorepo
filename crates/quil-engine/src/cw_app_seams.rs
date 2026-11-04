@@ -1917,6 +1917,9 @@ impl AppSeamFinalizer {
         // Durable before the queue send: a restart between the send and the
         // engine's commit must not lose a finalized frame.
         if let (Some(records), Some(number)) = (self.finalized_records.as_ref(), delivered) {
+            let _write = quil_types::thread_probe::section(
+                quil_types::thread_probe::Section::FinalizedRecordWrite,
+            );
             self.persist_implied(&implied);
             if let Err(error) = records.persist(number, cert, locally_verified, &bytes) {
                 tracing::warn!(frame = number, %error, "could not record a finalized app frame; delivering it anyway");
@@ -2653,19 +2656,22 @@ pub fn activate_app_consensus_cw(
 
     // Drain the engine's outbound (votes/certs/resolver) onto the shard transport.
     let retry_finalizer = finalizer.clone();
-    let outbound_task = tokio::spawn(async move {
-        let mut retry = tokio::time::interval(std::time::Duration::from_millis(250));
-        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                ob = outbound.recv() => match ob {
-                    Some(ob) => transport.deliver(ob.channel, ob.recipients, ob.bytes),
-                    None => break,
-                },
-                _ = retry.tick() => retry_finalizer.retry_pending(),
+    let outbound_task = tokio::spawn(quil_types::thread_probe::probed(
+        quil_types::thread_probe::Section::ConsensusOutbound,
+        async move {
+            let mut retry = tokio::time::interval(std::time::Duration::from_millis(250));
+            retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    ob = outbound.recv() => match ob {
+                        Some(ob) => transport.deliver(ob.channel, ob.recipients, ob.bytes),
+                        None => break,
+                    },
+                    _ = retry.tick() => retry_finalizer.retry_pending(),
+                }
             }
-        }
-    });
+        },
+    ));
 
     // Peer ingress can store candidates, but cannot change trusted heights.
     let ingress = proposer.peer_ingress(store.clone());

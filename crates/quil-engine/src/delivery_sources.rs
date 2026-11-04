@@ -199,12 +199,15 @@ impl DeliverySources {
         {
             return;
         }
-        self.sweep = Some(tokio::spawn(run_sweep(
-            collect,
-            fetch,
-            clock_store,
-            self.unobtained.clone(),
-            self.collected_tx.clone(),
+        self.sweep = Some(tokio::spawn(quil_types::thread_probe::probed(
+            quil_types::thread_probe::Section::DeliverySweep,
+            run_sweep(
+                collect,
+                fetch,
+                clock_store,
+                self.unobtained.clone(),
+                self.collected_tx.clone(),
+            ),
         )));
     }
 }
