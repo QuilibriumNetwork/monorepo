@@ -1299,6 +1299,100 @@ mod lending_tests {
         );
     }
 
+    /// Past the limit a waiter is served within a bounded number of ended
+    /// turns, even while every holder comes back from its local work at once
+    /// and queues again for another batch. Holders back from local work take
+    /// every ended turn before any waiter, but none joins them meanwhile,
+    /// and each ends its turn after its batch: once no more hold, lend or
+    /// wait to take one back than there are turns, the next ended turn
+    /// reaches a waiter, and of two in a row at most one goes to a holder
+    /// queued again in its first place ([`TurnQueue::next`]). So at most
+    /// [`MAX_LENT_TURNS`] + 2 turns end before it is served: its wait is
+    /// bounded by the holders' batches.
+    #[tokio::test]
+    async fn a_waiter_past_the_lending_limit_is_served_once_the_holders_batches_end() {
+        use std::sync::atomic::AtomicUsize;
+        // Frames per batch, each an archive read and a lent replay.
+        const FRAMES: usize = 3;
+        let turns = leaked(RECOVERY_TURNS);
+        let mut gates = Vec::new();
+        for core in 0..RECOVERY_TURNS as u32 {
+            gates.push(turns.acquire(replay(1000 + core)).await);
+        }
+        let (hold, ended, served) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (mut holders, mut in_work) = (Vec::new(), Vec::new());
+        // Queued behind the gates: each takes its turn in order and lends it,
+        // up to the limit, in its first frame's work, which lasts until every
+        // holder is in one; later work ends at once, so each comes back while
+        // another's turn is lent.
+        for core in 0..(RECOVERY_TURNS + MAX_LENT_TURNS) as u32 {
+            let (hold, ended, served) = (hold.clone(), ended.clone(), served.clone());
+            let (tx, rx) = oneshot::channel();
+            let mut first = Some(tx);
+            holders.push(tokio::spawn(async move {
+                let mut ticket = None;
+                while !served.load(Ordering::Relaxed) {
+                    let turn = turns
+                        .acquire(Claim {
+                            ticket,
+                            ..replay(core)
+                        })
+                        .await;
+                    for _ in 0..FRAMES {
+                        tokio::task::yield_now().await;
+                        let (first, hold) = (first.take(), &hold);
+                        lent_during(Some(&turn), async move {
+                            if let Some(tx) = first {
+                                tx.send(()).unwrap();
+                                hold.notified().await;
+                            }
+                            tokio::task::yield_now().await;
+                        })
+                        .await;
+                    }
+                    ticket = Some(turn.ticket());
+                    // Counted while the waiter (core 99) still queues.
+                    let waits = turns.lock().queue.waiters.iter().any(|w| w.core == 99);
+                    ended.fetch_add(usize::from(waits), Ordering::Relaxed);
+                    drop(turn);
+                }
+            }));
+            tokio::task::yield_now().await;
+            in_work.push(rx);
+        }
+        let (waiter, got, end) = taking(turns, 99);
+        tokio::task::yield_now().await;
+        drop(gates);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        let working = in_work
+            .iter_mut()
+            .filter_map(|rx| rx.try_recv().ok())
+            .count();
+        assert_eq!(turns.lock().queue.lent, MAX_LENT_TURNS);
+        assert_eq!(working, RECOVERY_TURNS + MAX_LENT_TURNS);
+        assert_eq!(turns.waiting(), 1, "only the waiter queues");
+        hold.notify_waiters();
+        settles(got).await.unwrap();
+        served.store(true, Ordering::Relaxed);
+        let ended_before = ended.load(Ordering::Relaxed);
+        assert!(
+            ended_before <= MAX_LENT_TURNS + 2,
+            "the waiter was served after {ended_before} turns ended"
+        );
+        end.send(()).unwrap();
+        settles(waiter).await.unwrap();
+        for holder in holders {
+            settles(holder).await.unwrap();
+        }
+        assert_eq!(turns.lock().queue.lent, 0);
+    }
+
     /// A holder stopped in its local work owns no turn: none is released
     /// twice, and the count of lent turns comes back.
     #[tokio::test]
