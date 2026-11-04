@@ -151,11 +151,29 @@ pub struct MemStore {
     /// transaction and successive CRDT instances on the same store see the same
     /// data — needed to exercise the persisted size-bucket cache.
     kv: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
+    /// Captures of [`HypergraphStore::capture_tree_snapshot`], counted once
+    /// [`Self::capture_snapshots`] turned them on.
+    snapshots: Mutex<Option<usize>>,
+}
+
+/// A copy of [`MemStore`]'s kv map at its capture.
+struct MemSnapshot(HashMap<Vec<u8>, Vec<u8>>);
+
+impl quil_types::store::SnapshotReadable for MemSnapshot {
+    fn read_record(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self.0.get(key).cloned())
+    }
+
+    /// It copies only the kv map: tree blobs read as absent.
+    fn load_tree_blob(&self, _: &str, _: &str, _: &ShardKey) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
 }
 
 impl MemStore {
     pub fn new() -> Self {
         Self {
+            snapshots: Mutex::new(None),
             read_failure_phase: Mutex::new(None),
             commit_setup_failures: Mutex::new((false, false)),
             nodes: Mutex::new(HashMap::new()),
@@ -163,6 +181,17 @@ impl MemStore {
             per_vertex: Mutex::new(HashMap::new()),
             kv: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Capture committed snapshots of the kv map; test utility only (a plain
+    /// `MemStore` has none, which its other users rely on).
+    pub fn capture_snapshots(&self) {
+        *self.snapshots.lock().unwrap() = Some(0);
+    }
+
+    /// Snapshots captured since [`Self::capture_snapshots`].
+    pub fn snapshots_captured(&self) -> usize {
+        self.snapshots.lock().unwrap().unwrap_or(0)
     }
 
     /// Inject underlying-blob I/O failures for one phase; test utility only.
@@ -199,6 +228,17 @@ impl MemStore {
 }
 
 impl HypergraphStore for MemStore {
+    fn capture_tree_snapshot(
+        &self,
+    ) -> Result<Option<Arc<dyn quil_types::store::SnapshotReadable>>> {
+        let mut snapshots = self.snapshots.lock().unwrap();
+        let Some(count) = snapshots.as_mut() else {
+            return Ok(None);
+        };
+        *count += 1;
+        Ok(Some(Arc::new(MemSnapshot(self.kv.lock().unwrap().clone()))))
+    }
+
     fn new_transaction(&self, _: bool) -> Result<Box<dyn Transaction>> {
         if self.commit_setup_failures.lock().unwrap().0 {
             return Err(QuilError::Store(
