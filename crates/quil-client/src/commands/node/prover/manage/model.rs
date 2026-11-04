@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 use num_bigint::{BigInt, Sign};
 
 use quil_types::proto::node::{
-    GetShardInfoResponse, NodeInfoResponse, ShardAllocationInfo, ShardProverCounts,
-    WorkerInfoResponse,
+    CertificateShare, GetShardInfoResponse, NodeInfoResponse, ShardAllocationInfo,
+    ShardProverCounts, WorkerInfoResponse,
 };
 
 use super::super::epoch::{
@@ -19,7 +19,7 @@ use super::super::epoch::{
 
 // ── Column metadata (shared between rendering and filtering) ─────────────
 
-pub const ALLOC_COL_NAMES: [&str; 18] = [
+pub const ALLOC_COL_NAMES: [&str; 19] = [
     "Select",
     "Filter",
     "Provers",
@@ -38,6 +38,7 @@ pub const ALLOC_COL_NAMES: [&str; 18] = [
     "DefaultAction",
     "Interval [s]",
     "ProverPhases",
+    "Cert",
 ];
 pub const AVAIL_COL_NAMES: [&str; 13] = [
     "Select",
@@ -56,9 +57,10 @@ pub const AVAIL_COL_NAMES: [&str; 13] = [
 ];
 
 // Keep the new measurement beside its committed source without renumbering action columns,
-// and ProverPhases beside the Provers count it breaks down.
-pub const ALLOC_DISPLAY_COLS: &[usize] =
-    &[0, 1, 2, 17, 3, 4, 5, 6, 7, 8, 16, 9, 10, 11, 12, 13, 14, 15];
+// ProverPhases beside the Provers count it breaks down, and Cert beside the Reward it scales.
+pub const ALLOC_DISPLAY_COLS: &[usize] = &[
+    0, 1, 2, 17, 3, 4, 5, 6, 7, 8, 16, 9, 10, 18, 11, 12, 13, 14, 15,
+];
 pub const AVAIL_DISPLAY_COLS: &[usize] = &[0, 1, 2, 12, 3, 4, 5, 6, 7, 8, 11, 9, 10];
 
 /// The optional ProverPhases column in each panel; one visibility setting,
@@ -72,6 +74,15 @@ pub const AVAIL_PROVER_PHASES_COL: usize = 12;
 /// `provers::proposer::HALT_RISK_PROVER_COUNT`, which the client cannot
 /// import.
 pub const HALT_RISK_PROVER_COUNT: u32 = 3;
+
+/// The allocations-only Cert column: the seat's share of its shard's
+/// certificates over the last 60m (`ShardRewardInfo.certificate_share`).
+pub const ALLOC_CERT_COL: usize = 18;
+
+/// Frames the last hour must hold before a low certificate share is judged.
+/// Mirrors quil-node's `seat_certificates::LOW_MIN_FRAMES`, which the client
+/// cannot import.
+pub const CERT_LOW_MIN_FRAMES: u64 = 30;
 
 pub const INTERVAL_WINDOW_NAMES: &[&str] = &["  60m window", "  24h window"];
 /// The Global KPI's fields, in printed order; picker names, and the expanded
@@ -232,6 +243,9 @@ pub struct AllocationRow {
     /// The shard's provers by lifecycle phase; `None` when the node did not
     /// report them (older server, or no shard-info row).
     pub prover_counts: Option<ShardProverCounts>,
+    /// This node's seat's share of the shard's certificates; `None` when the
+    /// node did not report one (older server, no seat, or no shard-info row).
+    pub certificate_share: Option<CertificateShare>,
     pub shard_size: BigInt,
     pub data_shards: u64,
     pub materialized_frame: u64,
@@ -1214,6 +1228,7 @@ impl Model {
                 ring: UNKNOWN_REWARD_RING,
                 active_provers: 0,
                 prover_counts: None,
+                certificate_share: None,
                 shard_size: BigInt::from(0),
                 data_shards: 0,
                 materialized_frame: 0,
@@ -1238,6 +1253,7 @@ impl Model {
                 row.allocation_reason = info.allocation_reason.clone();
                 row.active_provers = info.active_provers;
                 row.prover_counts = info.prover_counts.clone();
+                row.certificate_share = info.certificate_share;
                 row.shard_size = BigInt::from_bytes_be(Sign::Plus, &info.shard_size);
                 row.data_shards = info.data_shards;
                 row.materialized_frame = info.materialized_frame;
@@ -1275,6 +1291,7 @@ impl Model {
                         ring: UNKNOWN_REWARD_RING,
                         active_provers: 0,
                         prover_counts: None,
+                        certificate_share: None,
                         shard_size: BigInt::from(0),
                         data_shards: 0,
                         materialized_frame: 0,
@@ -1459,6 +1476,9 @@ impl Model {
                 // ALLOC_PROVER_PHASES_COL; the sort column is an i32.
                 17 => prover_phase_order(a.prover_counts.as_ref())
                     .cmp(&prover_phase_order(b.prover_counts.as_ref())),
+                // ALLOC_CERT_COL.
+                18 => cert_share_percent(a.certificate_share.as_ref())
+                    .cmp(&cert_share_percent(b.certificate_share.as_ref())),
                 11 => a.worker_id.cmp(&b.worker_id),
                 12 => a.status.cmp(&b.status),
                 13 => a.manually_managed.cmp(&b.manually_managed),
@@ -2181,6 +2201,29 @@ fn committee_sizes(shards: &GetShardInfoResponse) -> HashMap<Vec<u8>, u32> {
         .collect()
 }
 
+/// A seat's certificate share over the last 60m, in whole percent; `None`
+/// while the node reports none or counted no frame in the hour.
+pub fn cert_share_percent(share: Option<&CertificateShare>) -> Option<u64> {
+    let hour = share?.hour.as_ref()?;
+    (hour.frames > 0).then(|| hour.signed_frames.saturating_mul(100) / hour.frames)
+}
+
+/// The node's low-share condition (quil-node `seat_certificates::low_share`):
+/// a full hour counted with at least [`CERT_LOW_MIN_FRAMES`] frames, of which
+/// the seat signed under half the share a member voting in time signs,
+/// `quorum / committee`.
+pub fn cert_share_low(share: Option<&CertificateShare>) -> bool {
+    let Some(share) = share else { return false };
+    let Some(hour) = share.hour.as_ref() else {
+        return false;
+    };
+    hour.observed_seconds >= hour.window_seconds
+        && hour.frames >= CERT_LOW_MIN_FRAMES
+        && share.committee > 0
+        && u128::from(hour.signed_frames) * 2 * u128::from(share.committee)
+            < u128::from(hour.frames) * u128::from(share.quorum)
+}
+
 /// ProverPhases sorts by the provers serving after the next boundary, then
 /// by active ones; unreported counts sort first ascending.
 fn prover_phase_order(counts: Option<&ShardProverCounts>) -> Option<(u32, u32)> {
@@ -2562,6 +2605,43 @@ mod tests {
             None,
         );
         assert_eq!(model.allocations[0].prover_counts, None);
+    }
+
+    #[test]
+    fn certificate_shares_reach_allocation_rows_and_absent_ones_stay_absent() {
+        use quil_types::proto::node::{CertificateShare, CertificateWindow};
+        let share = CertificateShare {
+            hour: Some(CertificateWindow {
+                window_seconds: 3600,
+                observed_seconds: 3600,
+                frames: 10,
+                signed_frames: 7,
+            }),
+            day: None,
+            committee: 4,
+            quorum: 3,
+        };
+        let mut shards = shard_info(vec![0xab], 1);
+        shards.shards[0].certificate_share = Some(share);
+        let mut model = Model::new();
+        model.process_refresh_data(
+            Some(node_info(allocation(vec![0xab], 3))),
+            Some(shards),
+            None,
+        );
+        assert_eq!(model.allocations[0].certificate_share, Some(share));
+        assert_eq!(
+            cert_share_percent(model.allocations[0].certificate_share.as_ref()),
+            Some(70)
+        );
+        // An older server leaves the share absent.
+        let mut model = Model::new();
+        model.process_refresh_data(
+            Some(node_info(allocation(vec![0xab], 3))),
+            Some(shard_info(vec![0xab], 1)),
+            None,
+        );
+        assert_eq!(model.allocations[0].certificate_share, None);
     }
 
     #[test]

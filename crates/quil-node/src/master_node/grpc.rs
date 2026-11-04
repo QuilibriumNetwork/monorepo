@@ -3361,6 +3361,8 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
             state.snapshot(filter, super::frame_observations::unix_seconds())
         }));
     }
+    node_rpc_builder = node_rpc_builder
+        .with_certificate_share_provider(Arc::new(super::seat_certificates::snapshot));
     {
         let state = cadence.clone();
         let registry = prover_registry.clone();
@@ -3397,6 +3399,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                             .filter(|w| !w.filter.is_empty())
                             .map(|w| w.filter),
                     );
+                    let seats = filters.clone();
                     {
                         let mut cache = state.lock().unwrap_or_else(|e| e.into_inner());
                         cache.expire(now);
@@ -3435,6 +3438,25 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                             }
                             Err(e) => warn!(error = %e, "frame observation cache save failed"),
                         }
+                    }
+                    drop(cache);
+                    // Each seat's head session, for its certificate share; a
+                    // failed read leaves the seats as they were.
+                    if let Some(heads) = heads.as_ref() {
+                        let seat_heads: Vec<(Vec<u8>, u64)> = filters
+                            .iter()
+                            .zip(heads)
+                            .filter(|(filter, _)| seats.contains(*filter))
+                            .filter_map(|(filter, head)| {
+                                head.as_ref().map(|head| (filter.clone(), head.generation))
+                            })
+                            .collect();
+                        super::seat_certificates::refresh(
+                            &committed,
+                            &prover_address,
+                            &seat_heads,
+                            now,
+                        );
                     }
                 })
                 .await?;

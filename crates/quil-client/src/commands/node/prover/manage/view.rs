@@ -1449,6 +1449,17 @@ fn fmt_materialized(materialized: u64, latest: u64) -> String {
     }
 }
 
+/// The Cert cell: the seat's 60m certificate share in percent, `-` while
+/// the node reports none or counted no frame in the hour. A trailing `!`
+/// marks the node's low-share condition for `warning_slot`.
+fn cert_cell(share: Option<&quil_types::proto::node::CertificateShare>) -> String {
+    match cert_share_percent(share) {
+        None => "-".into(),
+        Some(percent) if cert_share_low(share) => format!("{percent}%!"),
+        Some(percent) => format!("{percent}%"),
+    }
+}
+
 /// The ProverPhases cell: the shard's provers by lifecycle phase, symbols in
 /// compact mode and names in expanded mode. Zero fields are omitted except
 /// active, so an empty shard reads `a0`; unreported counts read `-`. A
@@ -1553,6 +1564,7 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
         14 => next_action_text(m, &a.next_action),
         16 => interval_values(m, m.node_app_cadence.get(&a.filter), m.interval_mask()),
         ALLOC_PROVER_PHASES_COL => prover_phases_cell(m, a.prover_counts.as_ref(), &a.shard_size),
+        ALLOC_CERT_COL => cert_cell(a.certificate_share.as_ref()),
         _ => a
             .default_action
             .render(m.threshold_unit, m.threshold_clock()),
@@ -1597,7 +1609,10 @@ pub(super) fn allocation_status_text(m: &Model, a: &AllocationRow) -> String {
 
 fn alloc_display_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
     let text = alloc_cell(m, a, col, fw);
-    if matches!(col, 6 | 7 | 8 | 12 | ALLOC_PROVER_PHASES_COL) {
+    if matches!(
+        col,
+        6 | 7 | 8 | 12 | ALLOC_PROVER_PHASES_COL | ALLOC_CERT_COL
+    ) {
         warning_slot(&text, m.color_coding)
     } else {
         text
@@ -1646,7 +1661,7 @@ fn alloc_header(m: &Model, idx: usize) -> String {
         text +=
             snapshot_suffix(m, m.allocations.iter().map(|a| a.global_head.as_ref())).trim_start();
     }
-    if matches!(idx, 6 | 12 | ALLOC_PROVER_PHASES_COL) {
+    if matches!(idx, 6 | 12 | ALLOC_PROVER_PHASES_COL | ALLOC_CERT_COL) {
         warning_slot(&text, true)
     } else {
         text
@@ -1813,6 +1828,17 @@ fn alloc_widths_fixed(
     } else {
         0
     };
+    // Cert likewise, shown unless the picker hides it.
+    let cert_w = if m.alloc_column_visible(ALLOC_CERT_COL) {
+        col_width(
+            &alloc_header(m, ALLOC_CERT_COL),
+            sorted
+                .iter()
+                .map(|row| printed_width(&alloc_display_cell(m, row, ALLOC_CERT_COL, 0))),
+        )
+    } else {
+        0
+    };
     // Whatever the wide columns took comes out of the flexible Filter column.
     let grown = (status_w - STATUS_WIDTH)
         + (global_head_w - GLOBAL_HEAD_WIDTH)
@@ -1821,7 +1847,9 @@ fn alloc_widths_fixed(
         + (next_w - NEXT_ACTION_WIDTH)
         + (default_w - DEFAULT_ACTION_WIDTH)
         + phases_w
-        + usize::from(phases_w > 0);
+        + usize::from(phases_w > 0)
+        + cert_w
+        + usize::from(cert_w > 0);
     let mut fw = content_width.saturating_sub(ALLOC_FIXED_WIDTH + grown);
     for &col in &ALLOC_FILTERABLE_COLS {
         if col == 1 {
@@ -1860,6 +1888,7 @@ fn alloc_widths_fixed(
                 .map(|a| printed_width(&alloc_display_cell(m, a, 16, 0))),
         ),
         phases_w,
+        cert_w,
     ];
     for &col in &ALLOC_FILTERABLE_COLS {
         if col == 1 {
@@ -1891,7 +1920,7 @@ fn alloc_widths_fixed(
         fw = filter_width(
             content_width,
             &widths,
-            widths.len() - usize::from(phases_w == 0),
+            widths.len() - usize::from(phases_w == 0) - usize::from(cert_w == 0),
             FILTER_WIDTH,
         );
         widths[1] = fw;
@@ -2384,6 +2413,16 @@ fn render_alloc_panel(
                     && prover_halt_risk(a.prover_counts.as_ref(), &a.shard_size)
                 {
                     WARNING
+                } else if ci == ALLOC_CERT_COL
+                    && m.color_coding
+                    && cert_share_low(a.certificate_share.as_ref())
+                {
+                    WARNING
+                } else if ci == ALLOC_CERT_COL
+                    && m.color_coding
+                    && cert_share_percent(a.certificate_share.as_ref()).is_none()
+                {
+                    DIM
                 } else if ci == 10 && m.color_coding && a.worker_id < 0 {
                     ERROR
                 } else if ci == 12 && m.color_coding {
@@ -2438,6 +2477,17 @@ fn render_alloc_panel(
                             && prover_halt_risk(a.prover_counts.as_ref(), &a.shard_size) =>
                     {
                         Span::styled(cell.clone(), Style::new().fg(WARNING))
+                    }
+                    ALLOC_CERT_COL
+                        if m.color_coding && cert_share_low(a.certificate_share.as_ref()) =>
+                    {
+                        Span::styled(cell.clone(), Style::new().fg(WARNING))
+                    }
+                    ALLOC_CERT_COL
+                        if m.color_coding
+                            && cert_share_percent(a.certificate_share.as_ref()).is_none() =>
+                    {
+                        Span::styled(cell.clone(), Style::new().fg(DIM))
                     }
                     11 if m.color_coding => match worker_color(a.worker_id) {
                         Some(color) => Span::styled(cell.clone(), Style::new().fg(color)),
@@ -3482,6 +3532,24 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
             ),
         ));
     }
+    let counted: Vec<_> = allocations
+        .iter()
+        .filter(|a| a.certificate_share.is_some())
+        .collect();
+    let low = counted
+        .iter()
+        .filter(|a| cert_share_low(a.certificate_share.as_ref()))
+        .count();
+    if low > 0 {
+        notices.push((
+            "cert-share-low",
+            NoticeSeverity::Warning,
+            format!(
+                "Low certificate share (60m): {low}/{} allocations.",
+                counted.len()
+            ),
+        ));
+    }
     let workers: Vec<_> = m
         .allocations
         .iter()
@@ -4488,6 +4556,9 @@ fn help_items() -> Vec<HelpItem> {
         item("`p` / `paused`: paused provers"),
         item("`-` alone: unavailable from this node (older server or no shard info)"),
         item("`yellow` (or `!` with colors off): halt risk by count; the shard holds data and at most 3 of its provers are active or activating, so losing one risks its quorum"),
+        kv("Cert", "This node's share of its shard's certificates over the last 60m: of the shard frames GLOBAL included from committee sessions this node sits in, the percent whose certificate it signed, as the node counts them from the GLOBAL frames it receives. Only a frame's signers earn its reward, and a certificate carries the first votes to reach quorum, committee - floor((committee - 1) / 3) of them, so a member voting in time signs about 70%. Less means its votes arrive after the quorum, or its worker is blocked or behind its shard; the master log has each seat's hourly counts (`this seat's share of its shard's certificates`)"),
+        item("`yellow` (or `!` with colors off): low; an hour counted with at least 30 frames, of which this node signed under half the in-time share (quorum / committee); the node warns (`this seat signed under half the shard certificates`)"),
+        item("`-`: no frame counted in the last 60m, or a node that predates the count"),
         kv("Ring", "Committed rank; `~` marks a join forecast with one ring of competing admissions"),
         kv("Size [GB]", "Shard size in decimal gigabytes, one decimal; `<0.1` preserves small nonzero sizes"),
         kv("Shards", "Data shards the filter covers"),
@@ -4557,6 +4628,7 @@ fn help_items() -> Vec<HelpItem> {
         item("`Local execution blocked or stopped`: staffed earning allocations whose Execution is `blocked` or `stopped`, of those with fresh observations; the row footer names the blocker"),
         item("`Allocation epoch stale (re-confirm!)`: allocations whose epoch is older than the current one. The node reconfirms each allocation during every epoch, so its reconfirm has not been recorded; check the node's prover confirmation log lines"),
         item("`Renewal withheld, no vote sent`: local allocations whose worker hosts its committee session but has sent no vote for an epoch while the other members voted, of all allocations. The node leaves them to lapse: check the worker, and restart it if it stays silent. A seat renews once its worker votes or restarts, or at the latest four epochs on; the master log names each (`seat renewal withheld`)"),
+        item("`Low certificate share (60m)`: allocations whose Cert is low, of those reporting one. Frames a seat does not sign earn it nothing: check its worker's Execution and LocalMat, the node's CPU load and its peer connections"),
         item("`Last recovery attempt failed`: workers whose latest archive recovery attempt failed and whose LocalMat is still below PeerHead, of workers with fresh observations (it ends once the worker catches up); the Recovery footer gives the error and the failure streak"),
         kv("Reachability notice", "`Reachability: peers cannot dial this node`: the verdict of `qclient node doctor`, from the node's own view: AutoNAT servers on 2 or more IPs could not dial it back, AutoNAT holds it private with no confirmed address, or its address is behind carrier-grade NAT. It ends once AutoNAT confirms an address. Missing or unsettled AutoNAT results show nothing. The doctor gives a verdict per address family and what to change; it changes nothing itself."),
         kv("Store notice", "`Store reads slow (this node's disk)`: the node reads one entry of its master store a second (the canary) and, on Linux, times its disk's reads and writes. Shown once a minute's canary p99 reaches 50ms, a read stays unfinished 1s, or the disk takes 20ms a read or 100ms a write (of 20+), two minutes in a row; it clears after three minutes under all of them. Work that reads the store falls behind and allocations may lapse. The cause is this node's disk: check that TRIM runs (fstrim.timer or the discard mount option), the disk's health (SMART) and other I/O load on it. `qclient node diagnostics health --self` and the node's `store i/o` log lines give the figures"),
@@ -6970,6 +7042,7 @@ mod tests {
             ring: 5,
             active_provers: provers,
             prover_counts: None,
+            certificate_share: None,
             shard_size: BigInt::from(0),
             data_shards: shards,
             materialized_frame: 0,
@@ -7266,7 +7339,7 @@ mod tests {
         for mode in [ColumnSizing::Fixed, ColumnSizing::Dynamic] {
             m.column_sizing = mode;
             let (alloc, avail) = shared_col_widths(&m, 260, &[a.clone()], &[peer.clone()]);
-            assert_eq!(alloc.len(), 18);
+            assert_eq!(alloc.len(), 19);
             assert_eq!(avail.len(), 13);
             assert_eq!(alloc[16], avail[11]);
             assert!(alloc[16] >= "15.0".len());
@@ -7690,7 +7763,7 @@ mod tests {
             );
         }
         assert_eq!(
-            colored_a[1].spans[26].style.fg,
+            colored_a[1].spans[28].style.fg,
             Some(status_color("re-confirm!"))
         );
         for row in 1..=2 {
@@ -7733,7 +7806,7 @@ mod tests {
         m.compact_actions = false;
         m.compact_units = false; // Dynamic, sorted ascending on Worker
         let rows = joining_table();
-        let (w, fw) = alloc_col_widths(&m, 208, &rows);
+        let (w, fw) = alloc_col_widths(&m, 214, &rows);
 
         assert_eq!(
             w,
@@ -7756,11 +7829,12 @@ mod tests {
                 16, // "activate@f699840", wider than "DefaultAction"
                 20, // "Interval [s 60m/24h]"
                 0,  // "ProverPhases", hidden by default
+                5,  // "Cert" plus marker position
             ]
         );
         assert_eq!(fw, 15);
-        // 17 columns + 16 separators + 2 borders fill the pane exactly.
-        assert_eq!(w.iter().sum::<usize>() + 16 + 2, 208);
+        // 18 columns + 17 separators + 2 borders fill the pane exactly.
+        assert_eq!(w.iter().sum::<usize>() + 17 + 2, 214);
     }
 
     #[test]
@@ -7768,10 +7842,10 @@ mod tests {
         let (w, fw) = alloc_col_widths(&fixed(), 165, &joining_table());
         assert_eq!(
             w,
-            vec![6, 12, 7, 5, 10, 8, 9, 8, 10, 9, 28, 8, 12, 4, 26, 18, 20, 0]
+            vec![6, 12, 7, 5, 10, 8, 9, 8, 10, 9, 28, 8, 12, 4, 26, 18, 20, 0, 5]
         );
         assert_eq!(fw, 12);
-        assert_eq!(w.iter().sum::<usize>() + 16, 216);
+        assert_eq!(w.iter().sum::<usize>() + 17, 222);
         // 26 columns of Next Action for a 13-column value in the fixed layout.
         assert_eq!(w[14], NEXT_ACTION_WIDTH);
     }
@@ -7808,15 +7882,15 @@ mod tests {
         m.compact_actions = false;
         m.compact_units = false;
         let mut rows = joining_table();
-        let (before, before_fw) = alloc_col_widths(&m, 208, &rows);
+        let (before, before_fw) = alloc_col_widths(&m, 214, &rows);
         rows[3].next_action = ActionHint::text("(reject|confirm)");
-        let (after, after_fw) = alloc_col_widths(&m, 208, &rows);
+        let (after, after_fw) = alloc_col_widths(&m, 214, &rows);
 
         assert_eq!(before[14], 13);
         assert_eq!(after[14], 16);
         // Filter gives back exactly what Next Action took; the row still fits.
         assert_eq!(before_fw - after_fw, 3);
-        assert_eq!(after.iter().sum::<usize>() + 16 + 2, 208);
+        assert_eq!(after.iter().sum::<usize>() + 17 + 2, 214);
     }
 
     #[test]
@@ -7827,9 +7901,9 @@ mod tests {
         let rows = joining_table();
         // Wide pane: Filter stops at the longest hex rather than padding on.
         assert_eq!(alloc_col_widths(&m, 300, &rows).1, 64);
-        assert_eq!(alloc_col_widths(&m, 221, &rows).1, 28);
+        assert_eq!(alloc_col_widths(&m, 227, &rows).1, 28);
         // Narrower: Filter absorbs the shortfall…
-        assert_eq!(alloc_col_widths(&m, 208, &rows).1, 15);
+        assert_eq!(alloc_col_widths(&m, 214, &rows).1, 15);
         assert_eq!(alloc_col_widths(&m, 121, &rows).1, 12);
         // …down to the floor, past which the row is clipped rather than shrunk.
         assert_eq!(alloc_col_widths(&m, 118, &rows).1, MIN_FILTER_WIDTH);
@@ -8076,6 +8150,119 @@ mod tests {
             assert_eq!(fg(&lines, r, "a2 +1"), Some(WARNING));
             assert_ne!(fg(&lines, h, "a4"), Some(WARNING));
         }
+    }
+
+    fn cert_share(
+        observed: u64,
+        frames: u64,
+        signed: u64,
+    ) -> Option<quil_types::proto::node::CertificateShare> {
+        Some(quil_types::proto::node::CertificateShare {
+            hour: Some(quil_types::proto::node::CertificateWindow {
+                window_seconds: 3600,
+                observed_seconds: observed,
+                frames,
+                signed_frames: signed,
+            }),
+            day: None,
+            committee: 24,
+            quorum: 17,
+        })
+    }
+
+    #[test]
+    fn cert_cells_show_the_60m_share_and_mark_a_low_one() {
+        let mut m = Model::new();
+        let mut a = row("aa", 24, 1, 1, "", "");
+        assert_eq!(alloc_cell(&m, &a, ALLOC_CERT_COL, 0), "-", "an older node");
+        a.certificate_share = cert_share(3600, 0, 0);
+        assert_eq!(
+            alloc_cell(&m, &a, ALLOC_CERT_COL, 0),
+            "-",
+            "no frame counted"
+        );
+        a.certificate_share = cert_share(3600, 340, 241);
+        assert_eq!(alloc_cell(&m, &a, ALLOC_CERT_COL, 0), "70%");
+        // Under half of 17/24 is low once a full hour holds 30 frames.
+        a.certificate_share = cert_share(3600, 340, 120);
+        assert_eq!(alloc_cell(&m, &a, ALLOC_CERT_COL, 0), "35%!");
+        a.certificate_share = cert_share(3599, 340, 120);
+        assert_eq!(
+            alloc_cell(&m, &a, ALLOC_CERT_COL, 0),
+            "35%",
+            "under an hour"
+        );
+        a.certificate_share = cert_share(3600, 29, 0);
+        assert_eq!(
+            alloc_cell(&m, &a, ALLOC_CERT_COL, 0),
+            "0%",
+            "too few frames"
+        );
+        a.certificate_share = cert_share(3600, 340, 121);
+        assert_eq!(alloc_cell(&m, &a, ALLOC_CERT_COL, 0), "35%");
+        assert!(m.alloc_column_visible(ALLOC_CERT_COL), "shown by default");
+        assert_eq!(alloc_header(&m, ALLOC_CERT_COL), "Cert ");
+
+        let mut low = row("bb", 24, 1, 2, "", "");
+        low.certificate_share = cert_share(3600, 340, 30);
+        let older = row("cc", 24, 1, 3, "", "");
+        m.color_coding = false;
+        assert_eq!(alloc_display_cell(&m, &low, ALLOC_CERT_COL, 0), "8%!");
+        m.color_coding = true;
+        assert_eq!(alloc_display_cell(&m, &low, ALLOC_CERT_COL, 0), "8% ");
+        let rows = [a.clone(), low.clone(), older.clone()];
+        let lines = render_alloc_panel(&mut m, &rows, Rect::new(0, 0, 300, 7), None);
+        let styled = |line: usize, text: &str, color| {
+            lines[line]
+                .spans
+                .iter()
+                .any(|span| span.content.trim() == text && span.style.fg == Some(color))
+        };
+        assert!(lines[0].to_string().contains("Cert"));
+        assert!(styled(2, "8%", WARNING), "{}", lines[2]);
+        assert!(!styled(1, "35%", WARNING), "{}", lines[1]);
+        assert!(styled(3, "-", DIM), "{}", lines[3]);
+        // The cursor row colors it too.
+        low.worker_id = 0;
+        let rows = [low.clone(), a.clone()];
+        let lines = render_alloc_panel(&mut m, &rows, Rect::new(0, 0, 300, 6), None);
+        assert!(
+            lines[1]
+                .spans
+                .iter()
+                .any(|span| span.content.trim() == "8%" && span.style.fg == Some(WARNING)),
+            "{}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn a_low_cert_share_raises_one_notice_over_the_seats_reporting_one() {
+        let mut m = Model::new();
+        m.reachable = true;
+        m.last_fetch_success = Some(std::time::Instant::now());
+        let seat = |hex: &str, share| {
+            let mut a = row(hex, 24, 1, 1, "", "");
+            a.certificate_share = share;
+            a
+        };
+        m.allocations = vec![
+            seat("aa", cert_share(3600, 340, 241)),
+            seat("bb", cert_share(3600, 340, 30)),
+            seat("cc", None),
+        ];
+        let low = |m: &Model| {
+            condition_notices(m)
+                .into_iter()
+                .find(|(key, ..)| *key == "cert-share-low")
+        };
+        let (_, severity, text) = low(&m).expect("a low seat raises the notice");
+        assert_eq!(severity, NoticeSeverity::Warning);
+        assert_eq!(text, "Low certificate share (60m): 1/2 allocations.");
+        assert!(text.chars().count() + 15 <= 80);
+        m.allocations[1].certificate_share = cert_share(1800, 340, 30);
+        assert!(low(&m).is_none(), "under an hour counted is no verdict");
+        assert!(help_text().contains("Low certificate share (60m)"));
     }
 
     fn help_text() -> String {
