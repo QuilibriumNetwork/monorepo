@@ -189,6 +189,34 @@ mod repro_tests {
             );
         }
     }
+
+    /// Root's cron entry ran `/usr/local/bin/qclient`, a link in a
+    /// directory that is not always root's: Homebrew on Intel macOS gives
+    /// `/usr/local/bin` to the admin user. That user repoints the link and
+    /// root runs their file within 10 minutes. On a host with an installed
+    /// qclient, every directory above the path the entry names must be
+    /// owned by root and writable by no one else.
+    #[cfg(unix)]
+    #[test]
+    fn reproduces_root_cron_runs_a_link_others_can_write() {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(line) = cron_line() else {
+            return;
+        };
+        println!("root's auto-update cron entry: {line}");
+        let exe = line.split_whitespace().nth(5).unwrap().to_string();
+        for dir in Path::new(&exe).ancestors().skip(1) {
+            let meta = std::fs::metadata(dir).unwrap();
+            assert!(
+                meta.uid() == 0 && meta.mode() & 0o022 == 0,
+                "root's auto-update cron entry runs {exe} from {}, which uid {} owns with \
+                 mode {:o}: whoever can write it makes root run their file: {line}",
+                dir.display(),
+                meta.uid(),
+                meta.mode() & 0o7777
+            );
+        }
+    }
 }
 
 fn write_crontab(contents: &str) -> anyhow::Result<()> {
