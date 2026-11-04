@@ -366,6 +366,11 @@ pub type AppHypergraphStores = Arc<
 pub type CertificateShareProvider =
     Arc<dyn Fn(&[u8]) -> Option<node::CertificateShare> + Send + Sync>;
 
+/// The seat concentration of a shard's session this node sits in, by shard
+/// filter.
+pub type SeatConcentrationProvider =
+    Arc<dyn Fn(&[u8]) -> Option<node::SeatConcentration> + Send + Sync>;
+
 pub struct NodeRpcServer {
     pub peer_id: String,
     pub version: Vec<u8>,
@@ -380,6 +385,8 @@ pub struct NodeRpcServer {
     pub reachable: bool,
     pub frame_cadence_provider:
         Option<Arc<dyn Fn(&[u8]) -> Option<node::FrameCadence> + Send + Sync>>,
+    /// The seat concentration of a shard's session this node sits in.
+    pub seat_concentration_provider: Option<SeatConcentrationProvider>,
     /// This node's seat's share of a shard's certificates
     /// (`ShardRewardInfo.certificate_share`); `None` for no seat.
     pub certificate_share_provider: Option<CertificateShareProvider>,
@@ -503,6 +510,7 @@ impl NodeRpcServer {
             prover_address: Vec::new(),
             reachable: false,
             frame_cadence_provider: None,
+            seat_concentration_provider: None,
             certificate_share_provider: None,
             prover_registry: None,
             shard_info_provider: None,
@@ -571,6 +579,10 @@ impl NodeRpcServer {
         provider: Arc<dyn Fn(&[u8]) -> Option<node::FrameCadence> + Send + Sync>,
     ) -> Self {
         self.frame_cadence_provider = Some(provider);
+        self
+    }
+    pub fn with_seat_concentration_provider(mut self, provider: SeatConcentrationProvider) -> Self {
+        self.seat_concentration_provider = Some(provider);
         self
     }
     pub fn with_certificate_share_provider(mut self, provider: CertificateShareProvider) -> Self {
@@ -1836,6 +1848,10 @@ impl NodeService for NodeRpcServer {
                 }),
                 certificate_share: self
                     .certificate_share_provider
+                    .as_ref()
+                    .and_then(|p| p(&d.filter)),
+                seat_concentration: self
+                    .seat_concentration_provider
                     .as_ref()
                     .and_then(|p| p(&d.filter)),
             });
@@ -3389,6 +3405,49 @@ mod shard_world_size_tests {
             (decoded.active_provers, decoded.certificate_share),
             (8, None)
         );
+    }
+
+    #[tokio::test]
+    async fn shard_rows_carry_the_seat_concentration_of_sessions_this_node_sits_in() {
+        let request = || Request::new(node::GetShardInfoRequest { include_all: true });
+        let server = NodeRpcServer::new()
+            .with_shard_info_provider(Arc::new(Provider))
+            .with_seat_concentration_provider(Arc::new(|filter| {
+                (filter == [1]).then_some(node::SeatConcentration {
+                    members: 17,
+                    quorum: 12,
+                    largest_group_seats: 5,
+                    own_group_seats: 5,
+                    unaddressed_members: 1,
+                    concentration_seats: 4,
+                    epoch: 1393,
+                })
+            }));
+        let response = server.get_shard_info(request()).await.unwrap().into_inner();
+        let response = <node::GetShardInfoResponse as prost::Message>::decode(
+            prost::Message::encode_to_vec(&response).as_slice(),
+        )
+        .unwrap();
+        let seats = response.shards[0].seat_concentration.as_ref().unwrap();
+        assert_eq!(
+            (
+                seats.members,
+                seats.own_group_seats,
+                seats.concentration_seats,
+                seats.epoch
+            ),
+            (17, 5, 4, 1393)
+        );
+        assert!(
+            response.shards[1].seat_concentration.is_none(),
+            "not a member"
+        );
+        let server = NodeRpcServer::new().with_shard_info_provider(Arc::new(Provider));
+        let response = server.get_shard_info(request()).await.unwrap().into_inner();
+        assert!(response
+            .shards
+            .iter()
+            .all(|s| s.seat_concentration.is_none()));
     }
 }
 
