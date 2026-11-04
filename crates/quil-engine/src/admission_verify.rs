@@ -781,6 +781,7 @@ impl AdmissionQueue {
             queued = window.queued,
             operations = window.counts.operations,
             verified = window.counts.verified,
+            joined = window.counts.joined,
             cached = window.counts.cached,
             busy = window.counts.busy,
             failed = window.counts.unavailable,
