@@ -34,13 +34,13 @@ Regression tests: `protocol::tests` (`reproduces_ed448_signed_gossip_verified`, 
 
 ## Per-peer state: GRAFT topics, queued bytes, stalled peers
 
-`src/behaviour.rs` (`handle_graft`): upstream records every topic a GRAFT names as a subscription of its sender, past the subscription filter. Only topics the node subscribes to are now recorded; the others are pruned as before.
+`src/behaviour.rs` (`handle_graft`): upstream records every topic a GRAFT names as a subscription of its sender, past the subscription filter. As upstream fixed it in 0.49.5 (GHSA-g3g5-x568-qvqx), a GRAFT records nothing, and one for a topic its sender has not subscribed to is dropped without a mesh link or a PRUNE; the backoff and score checks before it still apply.
 
 `src/rpc.rs` (`Sender::send_message`): upstream bounds a peer's send queues by message count only, so a peer that stops reading holds thousands of messages of up to the frame size each until it disconnects. Published and forwarded messages queued for one peer are now limited to 64 MiB (`MAX_QUEUED_MESSAGE_BYTES`); a message is always queued when none is.
 
 `src/behaviour.rs` (`heartbeat`): the connections of a peer whose messages failed at every heartbeat for 60 s (`SLOW_PEER_DISCONNECT_AFTER`), or whose priority queue holds more than 10,000 messages (`MAX_PRIORITY_QUEUE_LEN`), are closed; nothing else frees what is queued for it.
 
-Regression tests: `behaviour::tests` (`reproduces_graft_topics_recorded_without_subscription`, `stalled_peer_connections_are_closed`) and `rpc::tests` (`reproduces_unbounded_queued_message_bytes`, `queued_message_bytes_are_released_on_receipt`).
+Regression tests: `behaviour::tests` (`reproduces_graft_topics_recorded_without_subscription`, `grafts_for_topics_the_peer_did_not_subscribe_to_are_dropped`, `stalled_peer_connections_are_closed`) and `rpc::tests` (`reproduces_unbounded_queued_message_bytes`, `queued_message_bytes_are_released_on_receipt`).
 
 ## PRUNE backoffs for topics the node has not joined
 

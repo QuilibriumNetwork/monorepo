@@ -4502,7 +4502,7 @@ fn test_opportunistic_grafting() {
     let (mut gs, peers, _receivers, topics) = inject_nodes1()
         .peer_no(5)
         .topics(vec!["test".into()])
-        .to_subscribe(false)
+        .to_subscribe(true)
         .gs_config(config)
         .explicit(0)
         .outbound(0)
@@ -4811,7 +4811,7 @@ fn test_limit_number_of_message_ids_inside_ihave() {
     let (mut gs, peers, mut receivers, topics) = inject_nodes1()
         .peer_no(config.mesh_n_high())
         .topics(vec!["test".into()])
-        .to_subscribe(false)
+        .to_subscribe(true)
         .gs_config(config)
         .create_network();
 
@@ -7296,4 +7296,47 @@ fn explicit_peer_grafts_back_off_only_joined_topics() {
         peer_id == &peers[0] && matches!(m, RpcOut::Prune(_))
     });
     assert_eq!(prunes, 1, "only the joined topic is pruned");
+}
+
+/// A GRAFT for a topic the node serves but its sender never subscribed to is
+/// dropped, as upstream 0.49.5 drops it (GHSA-g3g5-x568-qvqx): no mesh link,
+/// no recorded subscription, no PRUNE. After the subscription it is taken.
+#[test]
+fn grafts_for_topics_the_peer_did_not_subscribe_to_are_dropped() {
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(false)
+        .create_network();
+
+    gs.handle_graft(&peers[0], topic_hashes.clone());
+
+    assert!(
+        !gs.mesh[&topic_hashes[0]].contains(&peers[0]),
+        "a GRAFT without a subscription added its sender to the mesh"
+    );
+    assert!(
+        !gs.connected_peers[&peers[0]]
+            .topics
+            .contains(&topic_hashes[0]),
+        "a GRAFT was recorded as a subscription"
+    );
+    let (prunes, _) = count_control_msgs(receivers, |peer_id, m| {
+        peer_id == &peers[0] && matches!(m, RpcOut::Prune(_))
+    });
+    assert_eq!(prunes, 0, "a dropped GRAFT is not answered");
+
+    gs.handle_received_subscriptions(
+        &[Subscription {
+            action: SubscriptionAction::Subscribe,
+            topic_hash: topic_hashes[0].clone(),
+        }],
+        &peers[0],
+    );
+    gs.mesh.get_mut(&topic_hashes[0]).unwrap().remove(&peers[0]);
+    gs.handle_graft(&peers[0], topic_hashes.clone());
+    assert!(
+        gs.mesh[&topic_hashes[0]].contains(&peers[0]),
+        "a GRAFT after the subscription is taken"
+    );
 }

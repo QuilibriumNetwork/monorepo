@@ -1491,26 +1491,16 @@ where
 
         let mut do_px = self.config.do_px();
 
-        let Some(connected_peer) = self.connected_peers.get_mut(peer_id) else {
+        // QUILIBRIUM: as upstream 0.49.5 (GHSA-g3g5-x568-qvqx), a GRAFT no longer records its
+        // topics as subscriptions of its sender: it is not one and is not filtered like one, so
+        // recording them let a peer grow its entry without limit. A GRAFT for a topic the peer
+        // has not subscribed to is dropped below.
+        let Some(connected_peer) = self.connected_peers.get(peer_id) else {
             tracing::error!(peer_id = %peer_id, "Peer non-existent when handling graft");
             return;
         };
         // Needs to be here to comply with the borrow checker.
         let is_outbound = connected_peer.outbound;
-
-        // For each topic, if a peer has grafted us, then we necessarily must be in their mesh
-        // and they must be subscribed to the topic. Ensure we have recorded the mapping.
-        // QUILIBRIUM: only for topics we are subscribed to. The others are pruned below, and a
-        // GRAFT is not a subscription: recording its topics let a peer grow its entry past the
-        // subscription filter.
-        for topic in topics.iter().filter(|topic| self.mesh.contains_key(*topic)) {
-            if connected_peer.topics.insert(topic.clone()) {
-                #[cfg(feature = "metrics")]
-                if let Some(m) = self.metrics.as_mut() {
-                    m.inc_topic_peers(topic);
-                }
-            }
-        }
 
         // we don't GRAFT to/from explicit peers; complain loudly if this happens
         if self.explicit_peers.contains(peer_id) {
@@ -1599,6 +1589,18 @@ where
                         to_prune_topics.insert(topic_hash.clone());
                         // but we won't PX to them
                         do_px = false;
+                        continue;
+                    }
+
+                    // QUILIBRIUM: discard the GRAFT if the peer has not subscribed to the topic,
+                    // as upstream 0.49.5 does.
+                    if !connected_peer.topics.contains(&topic_hash) {
+                        do_px = false;
+                        tracing::debug!(
+                            peer=%peer_id,
+                            topic=%topic_hash,
+                            "GRAFT: dropping unsubscribed topic from peer"
+                        );
                         continue;
                     }
 
