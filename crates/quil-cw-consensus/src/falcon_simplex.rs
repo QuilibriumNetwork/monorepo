@@ -75,6 +75,19 @@ impl SimplexFalconScheme {
             .verify_attestation::<Self, D>(Subject::Notarize { proposal }, attestation)
     }
 
+    /// Verify one member's FINALIZE vote for `proposal`, outside the engine:
+    /// a finalization certificate is extended with votes that arrived after
+    /// it was built ([`crate::app_cert::extend_finalization`]). An attestation
+    /// whose signer index lies outside the committee fails.
+    pub fn verify_finalize<D: Digest>(
+        &self,
+        proposal: &Proposal<D>,
+        attestation: &Attestation<Self>,
+    ) -> bool {
+        self.generic
+            .verify_attestation::<Self, D>(Subject::Finalize { proposal }, attestation)
+    }
+
     /// Verify a FINALIZATION certificate over `proposal` against this committee.
     /// No rng needed — Falcon verify is deterministic (non‑batchable). Used for
     /// off‑engine cert verification (reward attribution at the global level),

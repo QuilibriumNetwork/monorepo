@@ -2500,6 +2500,7 @@ pub struct FalconReporter<Fin: FrameFinalizer> {
     finalizer: Arc<Fin>,
     store: BlockStore,
     liveness: Option<Arc<Liveness>>,
+    late: Option<Arc<crate::late_finalize::LateFinalizes>>,
 }
 
 impl<Fin: FrameFinalizer> Clone for FalconReporter<Fin> {
@@ -2508,6 +2509,7 @@ impl<Fin: FrameFinalizer> Clone for FalconReporter<Fin> {
             finalizer: self.finalizer.clone(),
             store: self.store.clone(),
             liveness: self.liveness.clone(),
+            late: self.late.clone(),
         }
     }
 }
@@ -2518,7 +2520,18 @@ impl<Fin: FrameFinalizer> FalconReporter<Fin> {
             finalizer,
             store,
             liveness: None,
+            late: None,
         }
+    }
+
+    /// Also keep every finalize vote, notarization and finalization in
+    /// `late`, which extends the certificates published to GLOBAL.
+    pub fn with_late_finalizes(
+        mut self,
+        late: Option<Arc<crate::late_finalize::LateFinalizes>>,
+    ) -> Self {
+        self.late = late;
+        self
     }
 
     /// Also record every vote and certificate in `liveness`, which reads the
@@ -2562,6 +2575,9 @@ impl<Fin: FrameFinalizer> Reporter for FalconReporter<Fin> {
             Activity::Notarization(n) => {
                 let digest = n.proposal.payload;
                 let view: u64 = n.proposal.round.view().get();
+                if let Some(late) = self.late.as_ref() {
+                    late.notarized(view, std::time::Instant::now());
+                }
                 self.store.certified(&digest, view);
                 let (bytes, _) = self.certified_body(view, &digest);
                 self.finalizer.on_notarized(view, digest, bytes);
@@ -2576,6 +2592,11 @@ impl<Fin: FrameFinalizer> Reporter for FalconReporter<Fin> {
             Activity::Finalization(f) => {
                 let digest = f.proposal.payload;
                 let view: u64 = f.proposal.round.view().get();
+                // Before the finalizer can hand the certificate to the
+                // engine, which asks for its window.
+                if let Some(late) = self.late.as_ref() {
+                    late.finalized(&f, std::time::Instant::now());
+                }
                 self.store.certified(&digest, view);
                 // Distinguish "we sealed the exact validated/built bytes" from
                 // "we only learned the finalization cert" (bytes present but
@@ -2597,8 +2618,16 @@ impl<Fin: FrameFinalizer> Reporter for FalconReporter<Fin> {
             | Activity::NullifyFinalize(_) => {
                 self.finalizer.on_equivocation(0);
             }
-            // Individual votes and nullifies are not surfaced to the
-            // Quilibrium layer (simplex handles quorum internally).
+            // Each member's first finalize vote of a view, unverified: one
+            // that missed the certificate can still sign the copy published
+            // to GLOBAL.
+            Activity::Finalize(vote) => {
+                if let Some(late) = self.late.as_ref() {
+                    late.vote(vote, std::time::Instant::now());
+                }
+            }
+            // Other votes are not surfaced to the Quilibrium layer (simplex
+            // handles quorum internally).
             _ => {}
         }
         Feedback::Ok

@@ -5056,6 +5056,151 @@ mod tests {
         record_committee_absence(state, global, &header, committee, &present).unwrap();
     }
 
+    /// A certificate a member extended with late finalize votes, as GLOBAL
+    /// receives it: the unchanged header verifier reads every signer, and
+    /// materialization pays each its ring share (output / RING_GROUP_SIZE)
+    /// and counts none of them absent.
+    #[test]
+    fn an_extended_certificate_pays_every_signer() {
+        use crate::global_intrinsic::materialize::materialize_prover_join;
+        use quil_cw_consensus::{
+            _consensus::{
+                simplex::{
+                    scheme::Namespace,
+                    types::{Finalization, Finalize, Proposal, Subject},
+                },
+                types::{Epoch, Round, View},
+            },
+            _crypto::{sha256::Digest, Signer as _},
+            _utils::{ordered::Set, N3f1},
+            app_cert::{encode_finalization, extend_finalization, wrap_cert_for_header},
+            falcon_base::FalconPrivateKey,
+            falcon_scheme::Generic,
+            falcon_simplex::SimplexFalconScheme,
+        };
+        use quil_types::crypto::Signer as _;
+        quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(Some(0));
+        let state = make_state();
+        let filter = vec![0xC4u8; 32];
+        let va_disc = vertex_adds_discriminator().unwrap();
+        let keys: Vec<FalconPrivateKey> = (0..7)
+            .map(|_| {
+                let key = quil_crypto::FalconSigner::generate();
+                FalconPrivateKey::from_bytes(key.private_key(), key.public_key()).unwrap()
+            })
+            .collect();
+        // The committee: seven members with prover vertices under their keys.
+        let committee: Vec<ProverInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                let mut prover = fake_prover(i as u8 + 1, 1, 1_000, &filter);
+                prover.public_key = key.public_key().as_ref().to_vec();
+                let output = materialize_prover_join(
+                    &prover.public_key,
+                    std::slice::from_ref(&filter),
+                    1,
+                    1_000,
+                )
+                .unwrap();
+                prover.address = output.prover_address.to_vec();
+                state
+                    .set(
+                        &GLOBAL_INTRINSIC_ADDRESS[..],
+                        &output.prover_address,
+                        &va_disc,
+                        1,
+                        vertex_tree_to_blob(&output.prover_tree),
+                    )
+                    .unwrap();
+                seed_alloc_blob(&state, &prover, &filter);
+                prover
+            })
+            .collect();
+        let set: Set<_> = keys
+            .iter()
+            .map(|key| key.public_key())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let mut namespace = b"appshard".to_vec();
+        namespace.extend_from_slice(&filter);
+        let members: Vec<_> = keys
+            .into_iter()
+            .map(|key| Generic::<Namespace>::signer(&namespace, set.clone(), key).unwrap())
+            .collect();
+        let mut header = fake_header(filter.clone(), 10);
+        header.rank = 12;
+        header.global_frame_number = 99;
+        header.output = vec![5; 516];
+        let proposal = Proposal::new(
+            Round::new(Epoch::new(0), View::new(12)),
+            View::new(11),
+            Digest(quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap()),
+        );
+        let sign = |member: usize| {
+            members[member]
+                .sign::<SimplexFalconScheme, Digest>(Subject::Finalize {
+                    proposal: &proposal,
+                })
+                .unwrap()
+        };
+        // Built at quorum (five of seven); two votes came later.
+        let quorum = Finalization {
+            proposal: proposal.clone(),
+            certificate: members[0]
+                .assemble::<SimplexFalconScheme, _, N3f1>((0..5).map(sign))
+                .unwrap(),
+        };
+        let late = (5..7).map(|member| Finalize {
+            proposal: proposal.clone(),
+            attestation: sign(member),
+        });
+        let (extended, extension) = extend_finalization(
+            &SimplexFalconScheme::verifier(&namespace, set),
+            &quorum,
+            late,
+        );
+        assert_eq!(extension.added, 2);
+        header.public_key_signature_bls48581 =
+            wrap_cert_for_header(&encode_finalization(&extended));
+        let bitmask = verify_frame_header_attestation(
+            &header,
+            noop_frame_prover().as_ref(),
+            &quil_crypto::FalconKeyConstructor,
+            &committee,
+        )
+        .unwrap();
+        let indices: Vec<usize> = quil_consensus::bitmask::set_bit_indices(&bitmask).collect();
+        assert_eq!(indices, (0..7).collect::<Vec<_>>(), "every signer read");
+        let reward_issuance: Arc<dyn RewardIssuance> = Arc::new(StubReward(BigInt::from(8_000)));
+        materialize_prover_shard_update(
+            &header,
+            1_000,
+            &state,
+            &noop_registry(),
+            &noop_frame_prover(),
+            &reward_issuance,
+            4096,
+            committee.clone(),
+            &indices,
+            ShardMetadata {
+                state_size: 1024,
+                shard_count: 1,
+            },
+        )
+        .unwrap();
+        for (i, prover) in committee.iter().enumerate() {
+            assert_eq!(
+                reward_balance(&state, prover),
+                BigInt::from(8_000 / RING_GROUP_SIZE),
+                "member {i} paid its share"
+            );
+            assert_eq!(missed(&state, prover, &filter), 0, "member {i} absent");
+        }
+        quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(None);
+    }
+
     /// A member that misses 721 consecutive frames its committee produced is
     /// charged for the 721st and each one after, once per frame.
     #[test]

@@ -38,6 +38,9 @@ pub mod app_cert;
 /// compile-time proof that `simplex::Engine` accepts it.
 pub mod falcon_simplex;
 pub mod handoff;
+/// Finalize votes that arrive after a view's certificate, and the extended
+/// certificate an application shard publishes to GLOBAL.
+pub mod late_finalize;
 
 /// Quilibrium adapters (Automaton / Relay / Reporter) over three narrow seam
 /// traits, plus the shared block store — the global-consensus glue.
