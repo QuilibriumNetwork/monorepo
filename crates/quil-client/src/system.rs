@@ -94,21 +94,53 @@ pub fn system_info() -> anyhow::Result<(&'static str, &'static str)> {
 ///
 /// When `euid != 0` we use the current user's `$HOME`. When running as
 /// root under sudo we resolve `$SUDO_USER`'s home so config files land in
-/// the operator's `~/.quilibrium`, not root's.
+/// the operator's `~/.quilibrium`, not root's. With `$HOME` unset or empty
+/// the home is the effective user's in the user database.
+#[cfg(unix)]
 pub fn current_user_home() -> anyhow::Result<PathBuf> {
-    if is_root() {
-        if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-            if !sudo_user.is_empty() && sudo_user != "root" {
-                if let Some(home) = home_of_user(&sudo_user) {
-                    return Ok(home);
-                }
-            }
-        }
-    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let sudo_user = std::env::var("SUDO_USER").ok();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    home_for(
+        euid,
+        sudo_user.as_deref(),
+        home,
+        &user_by_name,
+        &user_by_uid,
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not determine home directory: $HOME is unset or empty and the user \
+             database has no entry for user id {euid}"
+        )
+    })
+}
 
+#[cfg(not(unix))]
+pub fn current_user_home() -> anyhow::Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("could not determine home directory ($HOME unset)"))
+}
+
+/// [`current_user_home`] for the effective user id `euid`, `$SUDO_USER`
+/// `sudo_user` and `$HOME` `home`, looking users up by name with `by_name`
+/// and by id with `by_uid`.
+#[cfg(unix)]
+fn home_for(
+    euid: libc::uid_t,
+    sudo_user: Option<&str>,
+    home: Option<PathBuf>,
+    by_name: &dyn Fn(&str) -> Option<UserEntry>,
+    by_uid: &dyn Fn(libc::uid_t) -> Option<UserEntry>,
+) -> Option<PathBuf> {
+    sudo_user
+        .filter(|user| euid == 0 && !user.is_empty() && *user != "root")
+        .and_then(by_name)
+        .map(|entry| entry.home)
+        .or_else(|| home.filter(|home| !home.as_os_str().is_empty()))
+        .or_else(|| by_uid(euid).map(|entry| entry.home))
 }
 
 /// The name of the invoking (sudo-aware) user, by the rule of
@@ -157,18 +189,6 @@ pub fn user_quilibrium_dir() -> anyhow::Result<PathBuf> {
 /// (`client/utils/node.go:GetNodeConfigHomeDir`).
 pub fn node_config_home_dir() -> anyhow::Result<PathBuf> {
     Ok(user_quilibrium_dir()?.join("configs"))
-}
-
-/// A user's home directory, from the user database. Returns `None` if not
-/// found.
-#[cfg(unix)]
-fn home_of_user(username: &str) -> Option<PathBuf> {
-    user_by_name(username).map(|entry| entry.home)
-}
-
-#[cfg(not(unix))]
-fn home_of_user(_username: &str) -> Option<PathBuf> {
-    None
 }
 
 /// A user database entry: the fields qclient reads.
@@ -559,6 +579,32 @@ mod tests {
         assert_eq!(name(4242, None), None);
     }
 
+    /// The home is the operator's under sudo, else `$HOME`, else, with
+    /// `$HOME` unset or empty, the effective user's in the user database.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_home_falls_back_to_the_user_database() {
+        let home = |euid, sudo, env: Option<&str>| {
+            home_for(euid, sudo, env.map(PathBuf::from), &by_name, &by_uid)
+        };
+        let op = Some(PathBuf::from("/Users/op"));
+        assert_eq!(home(1000, None, None), op);
+        assert_eq!(home(1000, None, Some("")), op);
+        assert_eq!(
+            home(1000, None, Some("/tmp/h")),
+            Some(PathBuf::from("/tmp/h"))
+        );
+        assert_eq!(home(0, Some("op"), Some("/var/root")), op);
+        assert_eq!(home(0, Some("op"), None), op);
+        assert_eq!(
+            home(0, Some("ghost"), Some("/var/root")),
+            Some(PathBuf::from("/var/root"))
+        );
+        assert_eq!(home(0, Some("ghost"), None), Some(PathBuf::from("/root")));
+        assert_eq!(home(1000, Some("bare"), None), op);
+        assert_eq!(home(4242, None, None), None);
+    }
+
     /// The C library's user database answers for root by id and by name,
     /// with its home directory, not its comment (GECOS) field; an unknown
     /// or malformed name has no entry.
@@ -574,7 +620,6 @@ mod tests {
         };
         assert_eq!(root.home, PathBuf::from(home));
         assert_eq!(user_by_name("root"), Some(root));
-        assert_eq!(home_of_user("root"), Some(PathBuf::from(home)));
         assert_eq!(user_by_name("qclient-test-no-such-user"), None);
         assert_eq!(user_by_name("ro\0ot"), None);
     }
