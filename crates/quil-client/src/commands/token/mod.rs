@@ -379,7 +379,8 @@ pub enum TokenCommand {
         #[arg(long, default_value_t = 1024)]
         max_escrows: usize,
     },
-    /// Shield a transparent coin into a confidential coin owned by this wallet.
+    /// Shield a transparent coin into a confidential coin owned by this wallet,
+    /// or by `--recipient`.
     #[cfg(feature = "native-proof")]
     Shield {
         /// Transparent coin address in hexadecimal.
@@ -389,6 +390,10 @@ pub enum TokenCommand {
         /// Fee in base units (default: node estimate for QUIL, zero for custom tokens).
         #[arg(long)]
         fee: Option<u128>,
+        /// Confidential address (from `confidential-address`) to receive the
+        /// coin instead of this wallet. Must be for this node's network.
+        #[arg(long)]
+        recipient: Option<String>,
     },
     /// Shield every unshielded legacy coin of this identity, in batches of up
     /// to 96 legacy coins from one shard each.
@@ -429,6 +434,10 @@ pub enum TokenCommand {
         /// included before stopping the run.
         #[arg(long, default_value_t = shield_pacing::DEFAULT_INCLUSION_TIMEOUT_SECS)]
         inclusion_timeout: u64,
+        /// Confidential address (from `confidential-address`) to receive the
+        /// coins instead of this wallet. Must be for this node's network.
+        #[arg(long)]
+        recipient: Option<String>,
     },
     /// Mint a custom token under its deployed policy.
     #[cfg(feature = "native-proof")]
@@ -1151,17 +1160,26 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                 max_per_batch,
                 min_interval,
                 inclusion_timeout,
+                recipient,
             } => {
                 let pacing = shield_pacing::Pacing {
                     min_interval: *min_interval,
                     inclusion_timeout: *inclusion_timeout,
                 };
-                return wallet::run_shield_all(&tc, &application, *max_per_batch, pacing).await;
+                return wallet::run_shield_all(
+                    &tc,
+                    &application,
+                    *max_per_batch,
+                    pacing,
+                    recipient.as_deref(),
+                )
+                .await;
             }
             TokenCommand::Shield {
                 source,
                 amount,
                 fee,
+                recipient,
             } => {
                 return wallet::run_shield(
                     &tc,
@@ -1179,6 +1197,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                         },
                     )
                     .await?,
+                    recipient.as_deref(),
                 )
                 .await
             }
@@ -1329,6 +1348,25 @@ mod tests {
         #[cfg(feature = "native-proof")]
         {
             assert!(TokenCli::try_parse_from(["token", "shield", "coin", "9"]).is_ok());
+            let recipient = |args: &[&str]| {
+                let mut argv = vec!["token"];
+                argv.extend_from_slice(args);
+                match TokenCli::try_parse_from(argv).unwrap().token.command {
+                    TokenCommand::Shield { recipient, .. }
+                    | TokenCommand::ShieldAll { recipient, .. } => recipient,
+                    other => panic!("not a shield: {other:?}"),
+                }
+            };
+            assert_eq!(recipient(&["shield", "coin", "9"]), None);
+            assert_eq!(recipient(&["shield-all"]), None);
+            assert_eq!(
+                recipient(&["shield", "coin", "9", "--recipient", "0xab"]).as_deref(),
+                Some("0xab")
+            );
+            assert_eq!(
+                recipient(&["shield-all", "--recipient", "0xab"]).as_deref(),
+                Some("0xab")
+            );
             assert!(
                 TokenCli::try_parse_from(["token", "custom-mint", "9", "--application", &app])
                     .is_ok()
