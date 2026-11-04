@@ -75,11 +75,13 @@ fetch() {
         --connect-timeout 30 --speed-limit 1 --speed-time 60 --max-time 1800 "$@"
 }
 
-# Function to detect OS and architecture
-detect_os_arch() {
+# The release platform `<os>-<arch>` of kernel name $1 and machine $2, as
+# `uname -s` and `uname -m` print them; the release files are named
+# qclient-<version>-<os>-<arch>.
+os_arch_of() {
     local os arch
-    os=$(uname -s | tr '[:upper:]' '[:lower:]')
-    arch=$(uname -m)
+    os=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    arch=$2
     case $os in
         linux | darwin) ;;
         *) die "Unsupported OS: $os" ;;
@@ -90,6 +92,29 @@ detect_os_arch() {
         *) die "Unsupported architecture: $arch" ;;
     esac
     echo "$os-$arch"
+}
+
+# Function to detect OS and architecture
+detect_os_arch() {
+    os_arch_of "$(uname -s)" "$(uname -m)"
+}
+
+# Point $SYMLINK.dgst and $SYMLINK.dgst.sig.N at the files of the release
+# $2 installed in directory $1, dropping links to signatures it lacks.
+# qclient 2.1.0.23 and older, still the released client, look for these
+# files beside the path they were started by; on macOS that is the link,
+# not the release file, so without them every command stops at the
+# signature check.
+link_release_files() {
+    local dir=$1 base=$2 i
+    ln -sfn -- "$dir/$base.dgst" "$SYMLINK.dgst"
+    for ((i = 1; i <= ${#SIGNATORIES[@]}; i++)); do
+        if [ -f "$dir/$base.dgst.sig.$i" ]; then
+            ln -sfn -- "$dir/$base.dgst.sig.$i" "$SYMLINK.dgst.sig.$i"
+        elif [ -L "$SYMLINK.dgst.sig.$i" ]; then
+            rm -f -- "$SYMLINK.dgst.sig.$i"
+        fi
+    done
 }
 
 # A release version: two to five dot-separated decimal parts, such as
@@ -335,9 +360,16 @@ main() {
     fi
     ln -sfn -- "$dir/$base" "$SYMLINK"
     echo "Symlink created to the latest version: $SYMLINK -> $dir/$base"
+    case $os_arch in
+        darwin-*)
+            link_release_files "$dir" "$base"
+            echo "Linked $SYMLINK.dgst and its signatures to the release's files"
+            ;;
+    esac
 
     echo "Installation complete. You can now start the Quilibrium client with the following command:"
     echo "qclient --version"
 }
 
-main "$@"
+# INSTALL_QCLIENT_LIB=1 defines the functions only, for tests.
+[ -n "${INSTALL_QCLIENT_LIB:-}" ] || main "$@"
