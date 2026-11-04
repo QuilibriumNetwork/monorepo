@@ -8,6 +8,9 @@ mod selected_parent_tests;
 #[path = "frame_materializer_publication_tests.rs"]
 mod publication_tests;
 
+#[path = "frame_materializer_uncitable_citation_tests.rs"]
+mod uncitable_citation_tests;
+
 fn limits() -> MaterializerBranchLimits {
     MaterializerBranchLimits {
         execution: ExecutionBranchLimits {

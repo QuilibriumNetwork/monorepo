@@ -177,6 +177,9 @@ impl MarkerCache {
     }
 }
 
+#[cfg(all(test, feature = "native-proof"))]
+mod uncitable_citation_tests;
+
 #[cfg(test)]
 mod tests {
     use super::MarkerCache;
