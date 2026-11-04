@@ -298,7 +298,7 @@ pub fn key_refusal(m: &Model, key: &str) -> Option<String> {
         ),
         "S" => super::shield::refusal(m),
         "M" if !matches!(selection(m), Selection::Claimable | Selection::Claim) => Some(
-            "Mint: ‹M› mints the claimable reward; select the claimable row or its Claim status."
+            "Mint: ‹M› mints the claimable reward; select the reward row or its Claim status."
                 .into(),
         ),
         "M" => super::mint::mint_refusal(m),
@@ -652,7 +652,7 @@ pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
             "coins-claimable-failed",
             NoticeSeverity::Warning,
             false,
-            format!("Claimable: read failed ({error})."),
+            format!("Reward: read failed ({error})."),
         ),
         _ => {}
     }
@@ -956,8 +956,7 @@ mod coins_tests {
             assert!(handle_key(&mut m, key('M')).is_empty());
             assert_eq!(
                 m.status_msg,
-                "Mint: ‹M› mints the claimable reward; select the claimable row or its Claim \
-                 status."
+                "Mint: ‹M› mints the claimable reward; select the reward row or its Claim status."
             );
             assert!(handle_key(&mut m, key('C')).is_empty());
             assert_eq!(

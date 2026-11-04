@@ -28,7 +28,7 @@ const BALANCE_DETAIL: u16 = 2;
 const NOTICE_LINES: u16 = 6;
 
 /// Lines the middle panel keeps inside its borders before Notifications
-/// takes more than one: the Claim status at 80 columns.
+/// takes more than one.
 const MIDDLE_LINES: u16 = 5;
 
 /// A cell's text and color; `None` keeps the table's text color.
@@ -59,7 +59,7 @@ fn claimable_row(m: &Model) -> [Cell; 5] {
         _ => plain("none"),
     };
     [
-        plain("claimable"),
+        plain("reward"),
         plain("-"),
         plain(
             m.claimable_reward
@@ -120,7 +120,7 @@ fn legacy_row(m: &Model) -> [Cell; 5] {
             attention("unshielded")
         }
     } else if total > 0 {
-        ("shielded".into(), Some(SUCCESS))
+        ("done".into(), Some(SUCCESS))
     } else {
         plain("none")
     };
@@ -195,20 +195,20 @@ fn shielded_row(m: &Model) -> [Cell; 5] {
 /// The shielded row's detail.
 fn shielded_detail(m: &Model) -> String {
     let transfers = &m.coins.transfer;
+    // The State says `not read` or `reading`, the cells carry the count,
+    // total and `As of`, the Transfers panel the pending transfers,
+    // Notifications a read's progress, or its failure with ‹E›.
+    let read = "This wallet's unspent confidential coins, read with the pending \
+                transfers by full scans matched on this machine (about a minute)";
     if transfers.reading.is_some() {
-        return "Shielded coins: reading the coins and pending transfers now (full scans matched \
-                on this machine, about a minute)."
-            .into();
+        return format!("{read}.");
     }
     match &transfers.read {
-        None => "Shielded coins: not read yet; ‹E› reads them with full scans of the coins and \
-                 pending transfers, matched on this machine (about a minute)."
+        None => "‹E› reads this wallet's unspent confidential coins with the pending transfers by \
+                 full scans matched on this machine (about a minute)."
             .into(),
-        // The cells carry the count, total and `As of`, the Transfers
-        // panel the pending transfers, Notifications a failure.
-        Some(_) => "Shielded coins: this wallet's unspent confidential coins, read with the \
-                    pending transfers by full scans matched on this machine; ‹E› reads again."
-            .into(),
+        Some(Ok(_)) => format!("{read}; ‹E› reads again."),
+        Some(Err(_)) => format!("{read}."),
     }
 }
 
@@ -220,8 +220,8 @@ fn detail(m: &Model) -> String {
     if m.coins.cursor == 0 {
         // The cells carry the amount and its frame, Notifications a failure.
         return format!(
-            "Claimable: the reward balance of the GLOBAL reward witness, read with each Provers \
-             refresh ({}s).",
+            "The balance of the GLOBAL reward witness, read with each Provers refresh \
+             ({}s).",
             m.refresh_seconds
         );
     }
@@ -246,7 +246,13 @@ fn detail(m: &Model) -> String {
             + (start + coins::LEGACY_REFRESH).saturating_duration_since(Instant::now());
         parts.push(format!("next read ~{}; ‹r› reads now", coins::utc_hm(next)));
     }
-    format!("Legacy coins: {}.", parts.join("; "))
+    if parts.is_empty() {
+        return "Not read yet.".into();
+    }
+    let text = parts.join("; ");
+    let mut chars = text.chars();
+    let first = chars.next().map(|c| c.to_uppercase().collect::<String>());
+    format!("{}{}.", first.unwrap_or_default(), chars.as_str())
 }
 
 /// The Balances table, its rows padded to shared column widths, for a
@@ -538,35 +544,33 @@ fn keep_in_view(
 /// Rows the panel scrolls: first shown, total and shown.
 type Scroll = Option<(usize, usize, usize)>;
 
-/// The Claim status panel in `height` rows: the claimable reward at its
-/// frame, its mint, and the authorizations saved for a claim.
+/// A panel's `notes` with no rows above them, pinned to its last lines
+/// as a detail under rows is; a panel too short for them ends in the
+/// enlarge marker.
+fn pinned_notes(notes: Vec<Line<'static>>, width: u16, height: u16) -> Vec<Line<'static>> {
+    pin_detail(Vec::new(), fit_lines(notes, width, height), height)
+}
+
+/// The Claim status panel in `height` rows: a mint or claim under way and
+/// the authorizations saved for a claim. The reward's amount, frame and
+/// state are its Balances row's, ‹M› the `Reward claimable` notice's.
 fn claim_lines(m: &Model, width: u16, height: u16) -> Vec<Line<'static>> {
-    let row = |label: &str, text: String| {
-        Line::from(vec![
-            Span::styled(
-                format!("{label}: "),
-                Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(text, Style::new().fg(TEXT)),
-        ])
-    };
-    // The claimable amount and its frame are the Balances row's; this
-    // panel adds what to do with them.
-    let authorization = if super::super::mint::running(m) {
-        "a mint or claim is under way; Notifications follow it"
-    } else if !m.reward_loaded {
-        "waits for the first Provers refresh to read the reward"
-    } else {
-        match (&m.claimable_reward, &m.reward_error) {
-            (Some((units, _)), _) if *units > 0 => {
-                "‹M› authorizes a mint of the claimable reward, as `qclient token mint` does"
-            }
-            (None, Some(_)) => "waits for a reward read to succeed",
-            _ => "nothing to authorize",
-        }
-    };
-    let mut lines: Vec<Line<'static>> =
-        wrap_message(row("Authorization", authorization.into()), width);
+    let mut lines = Vec::new();
+    if super::super::mint::running(m) {
+        lines = wrap_message(
+            Line::from(vec![
+                Span::styled(
+                    "Authorization: ",
+                    Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "a mint or claim is under way; Notifications follow it",
+                    Style::new().fg(TEXT),
+                ),
+            ]),
+            width,
+        );
+    }
     let rest = usize::from(height).saturating_sub(lines.len());
     lines.extend(saved_lines(m, width, rest));
     lines
@@ -578,13 +582,14 @@ fn saved_lines(m: &Model, width: u16, rows: usize) -> Vec<Line<'static>> {
     let help = Style::new().fg(HELP);
     let saved = &m.coins.mint.saved;
     if saved.is_empty() {
-        return wrap_message(
+        let note = wrap_message(
             Line::from(Span::styled(
                 "Saved authorizations: none; a mint saves one as mint-<frame>.bin for its claim.",
                 help,
             )),
             width,
         );
+        return pinned_notes(note, width, u16::try_from(rows).unwrap_or(u16::MAX));
     }
     let cell = |amount: Option<u128>| amount.map_or("-".to_string(), fixed_amount);
     let cells: Vec<[String; 4]> = saved
@@ -750,37 +755,29 @@ fn transfer_lines(m: &Model, width: u16, height: u16) -> Vec<Line<'static>> {
     let transfers = &m.coins.transfer;
     let note =
         |text: String, style: Style| wrap_message(Line::from(Span::styled(text, style)), width);
+    // A read under way is the row's `reading` and its progress notice; ‹A›
+    // and ‹R› are the incoming and refundable notices', which show whenever
+    // a row they act on does: the panel's note adds the other actions.
     let actions = "‹T› transfers, ‹P› makes a pending transfer, ‹J› merges coins.";
     let rows = match &transfers.read {
-        None if transfers.reading.is_some() => {
-            return note(
-                format!(
-                    "{} Reading the shielded coins and pending transfers (full scans, about a \
-                     minute)…",
-                    spinner(m)
-                ),
-                Style::new().fg(PRIMARY),
-            );
-        }
-        None => {
-            return note(
-                format!(
-                    "Pending transfers are not read yet; ‹E› reads them with the shielded coins \
-                     (full scans matched on this machine, about a minute). {actions}"
-                ),
-                help,
-            );
-        }
+        None => return pinned_notes(note(actions.into(), help), width, height),
         Some(Err(_)) => {
-            return note(
-                "Pending transfers: unavailable, the read failed (Notifications says why); ‹E› \
-                 reads again."
-                    .into(),
-                Style::new().fg(WARNING),
+            return pinned_notes(
+                note(
+                    "Pending transfers: unavailable, the read failed (Notifications says why)."
+                        .into(),
+                    Style::new().fg(WARNING),
+                ),
+                width,
+                height,
             );
         }
         Some(Ok((read, _))) if read.escrows.is_empty() => {
-            return note(format!("No pending transfers to act on. {actions}"), help);
+            return pinned_notes(
+                note(format!("No pending transfers to act on. {actions}"), help),
+                width,
+                height,
+            );
         }
         Some(Ok((read, _))) => &read.escrows,
     };
@@ -826,12 +823,7 @@ fn transfer_lines(m: &Model, width: u16, height: u16) -> Vec<Line<'static>> {
         )
     };
     // The read's time is the shielded row's `As of`.
-    let footer = note(
-        "‹A› accepts an incoming one; ‹R› refunds an outgoing one once its refund frame passes; \
-         ‹E› reads again."
-            .into(),
-        help,
-    );
+    let footer = fit_detail(note(actions.into(), help), width, height, 2);
     let mut lines = vec![Line::from(Span::styled(
         line(headers),
         Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
@@ -853,8 +845,7 @@ fn transfer_lines(m: &Model, width: u16, height: u16) -> Vec<Line<'static>> {
             style,
         )));
     }
-    lines.extend(footer);
-    lines
+    pin_detail(lines, footer, height)
 }
 
 /// A long address by its ends and length; the form and confirmation keep
@@ -1087,16 +1078,10 @@ fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'stat
         None => {}
     }
     let help = Style::new().fg(HELP);
+    // Before a read or with no key, the legacy row's `loading`,
+    // `unavailable` or `no key` says why there is no plan.
     let Some((Some(snapshot), _, _)) = &m.coins.legacy.answer else {
-        let text = match &m.coins.legacy.answer {
-            Some((None, _, _)) => "No Ed448 key in the node config: no legacy coins.",
-            _ => "Legacy coins are not read yet.",
-        };
-        return (
-            "Shield plan".into(),
-            vec![Line::from(Span::styled(text, help))],
-            None,
-        );
+        return ("Shield plan".into(), Vec::new(), None);
     };
     let mut footer = Vec::new();
     if let Some((frame, left)) = coins::shields_open_at(snapshot) {
@@ -1121,8 +1106,7 @@ fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'stat
     footer.push(Line::from(Span::styled(summary, help)));
     let rows = &snapshot.batches;
     let count = rows.len();
-    // Under batch rows the footer keeps to the panel's bottom; without
-    // rows it is the panel's content.
+    // The footer keeps to the panel's bottom, under batch rows or alone.
     if count > 0 {
         footer = fit_detail(footer, width, height, 2);
     }
@@ -1178,7 +1162,7 @@ fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'stat
     let lines = if count > 0 {
         pin_detail(lines, footer, height)
     } else {
-        footer
+        pinned_notes(footer, width, height)
     };
     let scroll = (count > visible).then_some((m.coins.plan_offset, count, visible));
     ("Shield plan".into(), lines, scroll)
@@ -1588,7 +1572,7 @@ mod coins_render_tests {
             "{text}"
         );
         assert!(text.contains("Balances"));
-        assert!(row("claimable").contains("◆ claimable"), "{text}");
+        assert!(row("reward").contains("◆ claimable"), "{text}");
         let legacy = row("legacy");
         assert!(legacy.contains("4/10"), "{legacy}");
         assert!(!legacy.contains("shielded ·"), "{legacy}");
@@ -1613,10 +1597,7 @@ mod coins_render_tests {
             crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Down),
         );
         let text = render_text(&mut m, 200, 24);
-        assert!(
-            text.contains("Legacy coins: 6 shielded; read 8 pages in 6.2s"),
-            "{text}"
-        );
+        assert!(text.contains("6 shielded; read 8 pages in 6.2s"), "{text}");
         assert!(
             text.contains("‹r› read legacy") && text.contains("‹S› shield"),
             "{text}"
@@ -1635,7 +1616,7 @@ mod coins_render_tests {
         m.coins.cursor = 1;
         for (unshielded, shielded, coins, state) in [
             (4, 6, "4/10", "◆ unshielded"),
-            (0, 6, "0", "shielded"),
+            (0, 6, "0", "done"),
             (0, 0, "0", "none"),
         ] {
             if let Some((Some(snapshot), _, _)) = m.coins.legacy.answer.as_mut() {
@@ -1682,10 +1663,10 @@ mod coins_render_tests {
                 "{text}"
             );
             if shielded > 0 {
-                let split = format!("Legacy coins: {shielded} shielded; read 8 pages");
+                let split = format!("{shielded} shielded; read 8 pages");
                 assert!(text.starts_with(&split), "{text}");
             } else {
-                assert!(text.starts_with("Legacy coins: read 8 pages"), "{text}");
+                assert!(text.starts_with("Read 8 pages"), "{text}");
             }
         }
     }
@@ -1703,10 +1684,7 @@ mod coins_render_tests {
             // The amount is the Balances row's alone.
             assert!(!text.contains("312500.000000000000"), "{text}");
             assert_eq!(text.matches("312500").count(), 1, "{text}");
-            assert!(
-                text.contains("Authorization: ‹M› authorizes a mint of the claimable reward"),
-                "{text}"
-            );
+            assert!(!upper_panels(&text).contains("‹M›"), "{text}");
             m.coins.cursor = 1;
             let text = render_text(&mut m, width, 40);
             assert!(text.contains("╭ Shield plan"), "{width}\n{text}");
@@ -1906,10 +1884,6 @@ mod coins_render_tests {
             let panels = upper_panels(&text);
             assert_eq!(panels.matches("312500").count(), 1, "{text}");
             assert!(text.contains("╭ Claim status"), "{text}");
-            assert!(
-                text.contains("Authorization: ‹M› authorizes a mint of the claimable reward"),
-                "{text}"
-            );
         }
     }
 
@@ -1924,10 +1898,262 @@ mod coins_render_tests {
             let text = render_text(&mut m, width, 40);
             assert_eq!(upper_panels(&text).matches("f1200").count(), 1, "{text}");
             assert!(
-                detail(&m).starts_with("Claimable: the reward balance"),
+                detail(&m).starts_with("The balance of the GLOBAL reward witness"),
                 "{text}"
             );
         }
+    }
+
+    /// The Balances table's words show once: the reward row's Kind names
+    /// the balance and its State the condition, so `claimable` shows in
+    /// one column.
+    #[test]
+    fn the_reward_row_says_claimable_once() {
+        let mut m = loaded();
+        m.color_coding = false;
+        for width in [80, 120, 200] {
+            let text = render_text(&mut m, width, 40);
+            let table = panel_inner(&text, "Balances")[..4].join(" ");
+            let words = table.split_whitespace();
+            assert_eq!(words.filter(|w| *w == "claimable").count(), 1, "{text}");
+            assert!(table.contains("reward"), "{text}");
+        }
+    }
+
+    /// Legacy coins all shielded are `done`, so `shielded` in the table is
+    /// the shielded row's Kind alone; the legacy Coins cell stays a count.
+    #[test]
+    fn the_legacy_row_leaves_shielded_to_the_shielded_row() {
+        let mut m = loaded();
+        m.color_coding = false;
+        if let Some((Some(snapshot), _, _)) = m.coins.legacy.answer.as_mut() {
+            snapshot.tally.unshielded = 0;
+            snapshot.tally.shielded = 3248;
+        }
+        for width in [80, 120, 200] {
+            let text = render_text(&mut m, width, 40);
+            let table = panel_inner(&text, "Balances")[..4].to_vec();
+            let words = table.iter().flat_map(|line| line.split_whitespace());
+            assert_eq!(words.filter(|w| *w == "shielded").count(), 1, "{text}");
+            let legacy: Vec<&str> = table[2].split_whitespace().collect();
+            assert_eq!(legacy[..2], ["legacy", "0"], "{text}");
+            assert!(legacy.contains(&"done"), "{text}");
+        }
+    }
+
+    /// With the reward row selected the Claim status's note keeps to the
+    /// panel's last lines, blank lines above it, at every size.
+    #[test]
+    fn the_claim_status_note_keeps_to_the_bottom() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.show_key_rows = false;
+        m.coins.cursor = 0;
+        for (width, height) in [(80, 30), (120, 40), (200, 60)] {
+            let text = render_text(&mut m, width, height);
+            let claim = panel_inner(&text, "Claim status");
+            let note = claim_text(&m, width);
+            assert!(note[0].starts_with("Saved authorizations: none"), "{text}");
+            assert!(claim.len() > note.len(), "{text}");
+            assert_eq!(claim[claim.len() - note.len()..], note[..], "{text}");
+            assert!(claim[claim.len() - note.len() - 1].is_empty(), "{text}");
+        }
+    }
+
+    /// ‹M› shows once on the screen, in the `Reward claimable` notice; the
+    /// Claim status repeats neither the key nor the row's state.
+    #[test]
+    fn the_mint_key_shows_once_in_its_notice() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.show_key_rows = false;
+        m.coins.cursor = 0;
+        for (width, height) in [(80, 30), (200, 60)] {
+            let text = render_text(&mut m, width, height);
+            assert_eq!(text.matches("‹M›").count(), 1, "{text}");
+            let notices = panel_inner(&text, "Notifications").join(" ");
+            assert!(
+                notices.contains("◆ Reward claimable: ‹M› authorizes a mint."),
+                "{text}"
+            );
+        }
+    }
+
+    /// A Shield plan with no batch rows keeps its note to the panel's
+    /// bottom, as under rows.
+    #[test]
+    fn a_shield_plan_note_keeps_to_the_bottom() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.coins.cursor = 1;
+        if let Some((Some(snapshot), _, _)) = m.coins.legacy.answer.as_mut() {
+            snapshot.tally.unshielded = 0;
+            snapshot.plan = None;
+        }
+        let text = render_text(&mut m, 120, 50);
+        let plan = panel_inner(&text, "Shield plan");
+        assert!(plan.len() > 2, "{text}");
+        assert_eq!(plan.last().unwrap(), "Nothing to shield.", "{text}");
+        assert!(plan[0].is_empty(), "{text}");
+    }
+
+    /// With the shielded row selected ‹E› shows once, in the row's
+    /// detail; the Transfers panel's note keeps to its bottom.
+    #[test]
+    fn the_read_key_shows_once_in_the_shielded_detail() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.show_key_rows = false;
+        m.coins.cursor = 2;
+        let text = render_text(&mut m, 120, 50);
+        assert_eq!(text.matches("‹E›").count(), 1, "{text}");
+        assert!(
+            detail(&m).contains("‹E› reads this wallet's unspent confidential coins"),
+            "{text}"
+        );
+        let transfers = panel_inner(&text, "Transfers");
+        assert!(transfers[0].is_empty(), "{text}");
+        assert!(
+            transfers.last().unwrap().starts_with("‹T› transfers"),
+            "{text}"
+        );
+        // A failed read: its notice gives ‹E›, the detail and panel do not.
+        super::super::super::transfer::apply_read(&mut m, Err("timed out".into()));
+        m.notice_minimum = NoticeSeverity::Info;
+        let text = render_text(&mut m, 120, 50);
+        assert_eq!(text.matches("‹E›").count(), 1, "{text}");
+        assert!(
+            panel_inner(&text, "Notifications")
+                .join(" ")
+                .contains("read failed (timed out); ‹E› reads them again."),
+            "{text}"
+        );
+    }
+
+    /// Shielded coins read with an incoming and a refundable transfer.
+    fn with_transfers() -> Model {
+        use super::super::super::transfer::{self, Escrow, Read};
+        let mut m = loaded();
+        m.color_coding = false;
+        m.show_key_rows = false;
+        m.last_global_head = 2000;
+        m.coins.cursor = 2;
+        transfer::apply_read(
+            &mut m,
+            Ok(Read {
+                coins: Some((4, 24_000_000_000)),
+                escrows: vec![
+                    Escrow {
+                        address: [0xab; 32],
+                        amount: 16_000_000_000,
+                        outgoing: false,
+                        refund_after: 3000,
+                    },
+                    Escrow {
+                        address: [0xcd; 32],
+                        amount: 8_000_000_000,
+                        outgoing: true,
+                        refund_after: 1900,
+                    },
+                ],
+            }),
+        );
+        m
+    }
+
+    /// ‹A› and ‹R› show once, in the incoming and refundable notices; the
+    /// Transfers panel's last line names the other actions.
+    #[test]
+    fn the_transfer_keys_show_once_in_their_notices() {
+        let mut m = with_transfers();
+        let text = render_text(&mut m, 120, 50);
+        assert_eq!(text.matches("‹A›").count(), 1, "{text}");
+        assert_eq!(text.matches("‹R›").count(), 1, "{text}");
+        let notices = panel_inner(&text, "Notifications").join(" ");
+        assert!(
+            notices.contains("◆ Pending transfers incoming: ‹A›"),
+            "{text}"
+        );
+        let transfers = panel_inner(&text, "Transfers");
+        assert!(transfers[0].starts_with("Escrow"), "{text}");
+        assert!(
+            transfers.last().unwrap().starts_with("‹T› transfers"),
+            "{text}"
+        );
+    }
+
+    /// A first read under way shows as the row's `reading` and its
+    /// progress notice; the Transfers panel keeps only its actions note.
+    #[test]
+    fn a_first_read_shows_in_the_row_and_its_notice_only() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.show_key_rows = false;
+        m.coins.cursor = 2;
+        m.coins.transfer.reading = Some(Instant::now());
+        let text = render_text(&mut m, 120, 50);
+        let transfers = non_blank(&panel_inner(&text, "Transfers"));
+        assert_eq!(transfers.len(), 1, "{text}");
+        assert!(transfers[0].starts_with("‹T› transfers"), "{text}");
+        let notices = panel_inner(&text, "Notifications").join(" ");
+        assert!(
+            notices.contains("Shielded coins: reading the coins and pending transfers"),
+            "{text}"
+        );
+    }
+
+    /// A submitted transfer's notice names the state; ‹E› shows once, in
+    /// the shielded row's detail.
+    #[test]
+    fn a_submitted_transfer_leaves_the_read_key_to_the_detail() {
+        use super::super::super::transfer::{Kind, Preview, Run};
+        let mut m = with_transfers();
+        m.coins.transfer.run = Some(Run {
+            preview: Preview {
+                kind: Kind::Accept {
+                    escrow: [0xab; 32],
+                    amount: 16_000_000_000,
+                },
+                fee: 4_000,
+                max_fee: 800_000_000,
+                merge: None,
+            },
+            started: Instant::now(),
+            start_frame: 2000,
+            note: None,
+            done: Some(Ok(())),
+        });
+        let text = render_text(&mut m, 120, 50);
+        assert!(
+            panel_inner(&text, "Notifications")
+                .join(" ")
+                .contains("submitted; finalized inclusion is not yet confirmed."),
+            "{text}"
+        );
+        assert_eq!(text.matches("‹E›").count(), 1, "{text}");
+        assert!(detail(&m).ends_with("‹E› reads again."), "{text}");
+    }
+
+    /// Before a legacy read, or with no Ed448 key, the legacy row's State
+    /// says why there is no plan; the Shield plan adds nothing.
+    #[test]
+    fn a_shield_plan_without_a_read_adds_nothing() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.coins.cursor = 1;
+        m.coins.legacy.answer = None;
+        let text = render_text(&mut m, 120, 50);
+        assert!(
+            non_blank(&panel_inner(&text, "Shield plan")).is_empty(),
+            "{text}"
+        );
+        m.coins.legacy.answer = Some((None, SystemTime::now(), Duration::from_millis(5)));
+        let text = render_text(&mut m, 120, 50);
+        assert!(text.contains("no key"), "{text}");
+        assert!(
+            non_blank(&panel_inner(&text, "Shield plan")).is_empty(),
+            "{text}"
+        );
     }
 
     /// Coins notices name a condition and its key, never a figure their
@@ -2340,7 +2566,9 @@ mod coins_render_tests {
         let text = render_text(&mut m, 120, 40);
         assert!(text.contains("╭ Transfers"), "{text}");
         assert!(
-            text.contains("Pending transfers are not read yet; ‹E› reads them"),
+            text.contains(
+                "‹E› reads this wallet's unspent confidential coins with the pending transfers"
+            ),
             "{text}"
         );
         transfer::apply_read(
@@ -2374,12 +2602,15 @@ mod coins_render_tests {
             // Each figure once: the count and `As of` are the row's, the
             // transfers the panel's.
             assert!(
-                text.contains("Shielded coins: this wallet's unspent confidential coins"),
+                text.contains("This wallet's unspent confidential coins"),
                 "{text}"
             );
             assert!(!text.contains("4 unspent"), "{text}");
             assert!(
-                text.contains("‹A› accepts an incoming one; ‹R› refunds an outgoing one"),
+                panel_inner(&text, "Transfers")
+                    .last()
+                    .unwrap()
+                    .starts_with("‹T› transfers"),
                 "{text}"
             );
             assert!(
@@ -2985,7 +3216,7 @@ mod coins_render_tests {
             let inner = panel_inner(&text, "Balances");
             let rows = table_lines(&m, width - 2).len();
             assert!(inner[0].starts_with("Kind"), "{text}");
-            assert!(inner[1].starts_with("claimable"), "{text}");
+            assert!(inner[1].starts_with("reward"), "{text}");
             assert!(inner[2].starts_with("legacy"), "{text}");
             match last {
                 None => assert_eq!(inner.len(), rows, "{text}"),
@@ -3023,11 +3254,22 @@ mod coins_render_tests {
         }
     }
 
-    /// The Claim status lines at `width` columns, each trimmed.
+    /// The Claim status lines at `width` columns, each trimmed, without
+    /// the blank lines above its pinned note.
     fn claim_text(m: &Model, width: u16) -> Vec<String> {
-        claim_lines(m, width - 2, u16::MAX)
+        non_blank(
+            &claim_lines(m, width - 2, 200)
+                .iter()
+                .map(|line| line.to_string().trim().to_string())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn non_blank(lines: &[String]) -> Vec<String> {
+        lines
             .iter()
-            .map(|line| line.to_string().trim().to_string())
+            .filter(|line| !line.is_empty())
+            .cloned()
             .collect()
     }
 
@@ -3048,7 +3290,7 @@ mod coins_render_tests {
         for show in [false, true] {
             m.show_key_rows = show;
             let text = render_text(&mut m, 80, 24);
-            let claim = panel_inner(&text, "Claim status");
+            let claim = non_blank(&panel_inner(&text, "Claim status"));
             if !show || claim.len() >= want.len() {
                 assert!(claim.len() >= want.len(), "{text}");
                 assert_eq!(claim[..want.len()], want[..], "{text}");
@@ -3113,8 +3355,14 @@ mod coins_render_tests {
         m.show_key_rows = false;
         m.coins.cursor = 0;
         let want = claim_text(&m, 80);
-        m.coins.edges = [0, -3];
-        let text = render_text(&mut m, 80, 24);
+        let mut text = String::new();
+        for lower in (-8..=0).rev() {
+            m.coins.edges = [0, lower];
+            text = render_text(&mut m, 80, 24);
+            if panel_inner(&text, "Claim status").len() < want.len() {
+                break;
+            }
+        }
         let claim = panel_inner(&text, "Claim status");
         assert!(claim.len() < want.len(), "{text}");
         let shown = claim.len() - 1;
@@ -3155,7 +3403,7 @@ mod coins_render_tests {
             // The live case, and any split that leaves the middle panel
             // the Claim status's lines.
             if upper <= 1 || middle >= want.len() {
-                let claim = panel_inner(&text, "Claim status");
+                let claim = non_blank(&panel_inner(&text, "Claim status"));
                 assert!(claim.len() >= want.len(), "edges [{upper}, 0]\n{text}");
                 assert_eq!(claim[..want.len()], want[..], "{text}");
             }
