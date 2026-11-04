@@ -418,6 +418,12 @@ impl CoordinatedDb {
         crate::storage_health::register(&self.0.state, Arc::downgrade(&self.0), role)
     }
 
+    /// The role this database was named with ([`Self::register_store`]),
+    /// or `None` for one never named.
+    pub fn store_role(&self) -> Option<StoreRole> {
+        self.0.state.role()
+    }
+
     /// Whether a write failed, so the database refuses every later write
     /// until it is reopened.
     pub fn write_failed(&self) -> bool {
