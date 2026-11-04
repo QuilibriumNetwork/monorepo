@@ -44,13 +44,22 @@ const WAIT_NOTICE_SECS: u64 = 300;
 /// A change in GLOBAL's health that the run reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Change {
+    /// The run pauses, for this reason.
     Paused(String),
-    StillPaused { secs: u64, reason: String },
-    Resumed { paused_secs: u64 },
+    /// The pause goes on; `reason` is GLOBAL's state at `secs`, not the
+    /// one that started the pause.
+    StillPaused {
+        secs: u64,
+        reason: String,
+    },
+    Resumed {
+        paused_secs: u64,
+    },
 }
 
 #[derive(Debug)]
 struct Degraded {
+    /// What started the pause.
     reason: String,
     since: u64,
     notice_at: u64,
@@ -107,7 +116,7 @@ impl Health {
         self.evaluate(now)
     }
 
-    /// The reason the run is paused, if it is.
+    /// What started the run's pause, if it is paused.
     pub(crate) fn degraded(&self) -> Option<&str> {
         self.degraded.as_ref().map(|d| d.reason.as_str())
     }
@@ -140,8 +149,11 @@ impl Health {
             });
             return Some(Change::Paused(reason));
         };
-        if stalled {
+        // Where the recovery stands: `(seconds, frames)` advancing since it
+        // (re)started, none while GLOBAL stalls.
+        let recovery = if stalled {
             degraded.healthy_since = None;
+            None
         } else {
             let (from, from_head) = *degraded.healthy_since.get_or_insert((now, head));
             let span = now - from;
@@ -156,13 +168,29 @@ impl Health {
                 }
                 // Advancing, but too slowly: judge again from here.
                 degraded.healthy_since = Some((now, head));
+                Some((0, 0))
+            } else {
+                Some((span, head.saturating_sub(from_head)))
             }
-        }
+        };
         if now.saturating_sub(degraded.notice_at) >= NOTICE_SECS {
             degraded.notice_at = now;
+            // The state the decision uses now; the pause's start was
+            // reported when it began.
+            let reason = match (recovery, self.sparse_gap.clone()) {
+                (Some((span, frames)), _) => format!(
+                    "GLOBAL head {head}, advancing for {span} s ({frames} frames) of the \
+                     {RECOVERY_SECS} s needed"
+                ),
+                (None, Some(gap)) if !silent => gap,
+                (None, _) => format!(
+                    "GLOBAL head {head} has not advanced for {} s",
+                    now - advanced_at
+                ),
+            };
             return Some(Change::StillPaused {
                 secs: now - degraded.since,
-                reason: degraded.reason.clone(),
+                reason,
             });
         }
         None

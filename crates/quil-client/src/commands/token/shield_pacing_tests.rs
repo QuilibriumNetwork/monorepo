@@ -342,6 +342,82 @@ fn shield_pacing_resume_restarts_the_window() {
     assert_eq!(health.degraded(), None);
 }
 
+/// A repeated pause notice names GLOBAL's state as the decision reads it
+/// then, not the stall that started the pause (2026-11-03: "head 708 has
+/// not advanced for 60 s" with GLOBAL near 813).
+#[test]
+fn shield_pacing_still_paused_names_the_current_head() {
+    let mut health = Health::default();
+    let (mut t, mut head) = (0, 700);
+    // One frame per 10 s up to head 708, which then stands still.
+    while head < 708 {
+        assert_eq!(health.observe(t, head), None, "t={t}");
+        t += 10;
+        head += 1;
+    }
+    let paused = loop {
+        if let Some(change) = health.observe(t, head) {
+            break change;
+        }
+        t += 15;
+    };
+    assert_eq!(
+        paused,
+        Change::Paused("GLOBAL head 708 has not advanced for 60 s".into())
+    );
+    assert_eq!(t, 140);
+    // GLOBAL moves again at one frame per 12 s, below 330/h.
+    let still = loop {
+        t += 12;
+        head += 1;
+        if let Some(change) = health.observe(t, head) {
+            break change;
+        }
+    };
+    assert_eq!(t, 740);
+    let Change::StillPaused { secs, reason } = still else {
+        panic!("{still:?}");
+    };
+    assert_eq!(secs, 600);
+    assert_eq!(
+        reason,
+        "GLOBAL head 758, advancing for 588 s (49 frames) of the 600 s needed"
+    );
+    assert_eq!(
+        ShieldEvent::StillPaused {
+            index: 0,
+            total: 1,
+            secs,
+            reason,
+        }
+        .line(),
+        "Batch 1/1: still paused after 10 min, GLOBAL head 758, advancing for 588 s \
+         (49 frames) of the 600 s needed."
+    );
+    // 50 frames in 600 s is too slow: the recovery starts again at 752.
+    t += 12;
+    head += 1;
+    assert_eq!(health.observe(t, head), None);
+    // Then GLOBAL stands still at head 759: the next notice says so.
+    let still = loop {
+        t += 15;
+        if let Some(change) = health.observe(t, head) {
+            break change;
+        }
+    };
+    assert_eq!(
+        still,
+        Change::StillPaused {
+            secs: 1_212,
+            reason: "GLOBAL head 759 has not advanced for 600 s".into(),
+        }
+    );
+    assert_eq!(
+        health.degraded(),
+        Some("GLOBAL head 708 has not advanced for 60 s")
+    );
+}
+
 /// An unreadable head counts as no advance.
 #[test]
 fn shield_pacing_unreadable_head_stalls_after_the_stall_time() {
