@@ -7958,10 +7958,7 @@ impl AppConsensusEngine {
             ),
             StallCause::ThisNode => (
                 "this node",
-                "own_refused says why: 'not at the parent frame' and 'anchored GLOBAL frame missing' mean this worker \
-                 has not applied the parent frame or its GLOBAL anchor yet (check its proof verification and catch-up \
-                 lines); other reasons name the proposal's contents: report this line with its shard to the \
-                 maintainer; holding_back also names the other members that hold back",
+                own.refusal_action(),
                 "app shard consensus stalled, and this worker refuses its proposals",
             ),
             StallCause::Members => (

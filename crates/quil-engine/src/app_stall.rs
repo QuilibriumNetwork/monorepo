@@ -54,9 +54,36 @@ pub(crate) struct OwnDecisions {
     pub declined: BTreeMap<&'static str, u64>,
 }
 
+/// The refusal reason of a parent that is not readable yet.
+const PARENT_UNAVAILABLE: &str = "parent unavailable";
+
+/// What an operator does about a stall this member causes by refusing.
+const THIS_NODE_ACTION: &str = "own_refused says why: 'not at the parent frame' and 'anchored GLOBAL frame missing' \
+     mean this worker has not applied the parent frame or its GLOBAL anchor yet (check its proof verification and \
+     catch-up lines); other reasons name the proposal's contents: report this line with its shard to the \
+     maintainer; holding_back also names the other members that hold back";
+
+/// The same, when the only refusal reason is [`PARENT_UNAVAILABLE`].
+const PARENT_WAIT_ACTION: &str = "nothing to fix on this node; own_refused is 'parent unavailable': this worker \
+     waits for the parent frame's state, either a GLOBAL state sync installing its last chunk or the canonical \
+     execution of the next frame (last_refused names which); it lasts a few minutes and ends by itself when the \
+     parent is applied and a view finalizes (logged); report this line with its shard to the maintainer only if \
+     the stall lasts over 15 minutes; holding_back also names the other members that hold back";
+
 impl OwnDecisions {
     pub(crate) fn refused_total(&self) -> u64 {
         self.refused.values().sum()
+    }
+
+    /// The action text of a stall caused by this member's refusals: a wait
+    /// when every refusal is an unreadable parent, else the generic text.
+    pub(crate) fn refusal_action(&self) -> &'static str {
+        let waiting = self.refused.keys().all(|r| *r == PARENT_UNAVAILABLE);
+        if waiting {
+            PARENT_WAIT_ACTION
+        } else {
+            THIS_NODE_ACTION
+        }
     }
 }
 
@@ -504,6 +531,27 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn a_stall_whose_only_refusal_is_an_unreadable_parent_is_a_wait() {
+        let refused = OwnDecisions {
+            refused: [("not at the parent frame", 3)].into(),
+            ..Default::default()
+        };
+        let waiting = OwnDecisions {
+            refused: [(PARENT_UNAVAILABLE, 5)].into(),
+            ..Default::default()
+        };
+        assert_eq!(waiting.refusal_action(), PARENT_WAIT_ACTION);
+        assert!(waiting.refusal_action().contains("ends by itself"));
+        assert_eq!(refused.refusal_action(), THIS_NODE_ACTION);
+        assert!(refused.refusal_action().contains("report this line"));
+        let mixed = OwnDecisions {
+            refused: [(PARENT_UNAVAILABLE, 5), ("block not delivered", 1)].into(),
+            ..Default::default()
+        };
+        assert_eq!(mixed.refusal_action(), THIS_NODE_ACTION);
     }
 
     /// Only the views of the stall that liveness still keeps are examined.
