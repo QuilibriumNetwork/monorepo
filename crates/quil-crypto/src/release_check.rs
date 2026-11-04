@@ -451,7 +451,7 @@ mod tests {
             let exe = tmp.path().join(file);
             std::fs::write(&exe, b"release").unwrap();
             std::fs::write(append_suffix(&exe, ".dgst"), &dgst).unwrap();
-            std::fs::write(append_suffix(&exe, ".dgst.sig.1"), &sig).unwrap();
+            std::fs::write(append_suffix(&exe, ".dgst.sig.1"), sig).unwrap();
             exe
         };
 

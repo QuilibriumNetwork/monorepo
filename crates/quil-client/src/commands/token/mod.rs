@@ -1172,7 +1172,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                 return action_log::CliAction::close(action, result);
             }
             TokenCommand::Inclusion { operation, wait } => {
-                return wallet::inclusion::run_inclusion(&tc, &application, operation, secs(*wait))
+                return wallet::inclusion::run_inclusion(tc, &application, operation, secs(*wait))
                     .await
             }
             TokenCommand::Split {
