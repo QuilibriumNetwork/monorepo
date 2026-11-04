@@ -378,11 +378,32 @@ pub(crate) fn format_quil_daily_units(v: &BigInt) -> String {
     };
     format!("~{}{text}", if negative { "-" } else { "" })
 }
+/// Signers a shard frame's finalization certificate carries for an
+/// `n`-member committee: simplex stops verifying finalize votes at its
+/// `N3f1` quorum, `n - (n - 1) / 3`, and a frame credits only those signers.
+pub(crate) fn quorum_signers(n: u32) -> u32 {
+    n - n.saturating_sub(1) / 3
+}
+
+/// A shard's frame committee: its active provers and seated leavers
+/// (`get_active_provers`); joining and paused provers do not sign. Servers
+/// without phase counts give only the live count, which includes them.
+pub(crate) fn committee_size(shard: &quil_types::proto::node::ShardRewardInfo) -> u32 {
+    shard
+        .prover_counts
+        .as_ref()
+        .map_or(shard.active_provers, |c| c.active + c.leaving + c.departing)
+}
+
+/// Observed QUIL/day of a seat on a shard whose frames credit
+/// [`quorum_signers`] of its `committee` members: the expected share of
+/// frames that pay this seat. A committee of 0 or 1 pays every frame.
 pub(crate) fn observed_quil_daily(
     per_frame: &BigInt,
     cadence: &quil_types::proto::node::FrameCadence,
     day: bool,
     now: u64,
+    committee: u32,
 ) -> Option<BigInt> {
     if now < cadence.last_observed_unix_seconds || now - cadence.last_observed_unix_seconds > 90 {
         return None;
@@ -395,9 +416,13 @@ pub(crate) fn observed_quil_daily(
     if w.observed_seconds < 60 || w.observed_seconds > w.window_seconds {
         return None;
     }
+    let n = committee.max(1);
     Some(
-        per_frame * BigInt::from(w.advanced_frames) * BigInt::from(86400)
-            / BigInt::from(w.observed_seconds),
+        per_frame
+            * BigInt::from(w.advanced_frames)
+            * BigInt::from(86400)
+            * BigInt::from(quorum_signers(n))
+            / (BigInt::from(w.observed_seconds) * BigInt::from(n)),
     )
 }
 

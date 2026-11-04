@@ -56,10 +56,15 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
                 let value = if shard.ring_known == Some(false) {
                     None
                 } else {
-                    shard
-                        .frame_cadence
-                        .as_ref()
-                        .and_then(|c| super::observed_quil_daily(&reward, c, *day, now))
+                    shard.frame_cadence.as_ref().and_then(|c| {
+                        super::observed_quil_daily(
+                            &reward,
+                            c,
+                            *day,
+                            now,
+                            super::committee_size(shard),
+                        )
+                    })
                 };
                 if let Some(v) = value {
                     adjusted[i] += &v;
