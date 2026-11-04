@@ -95,6 +95,10 @@ pub struct PreverifyCounts {
     pub operations: usize,
     pub cached: usize,
     pub verified: usize,
+    /// Of `verified`, those another caller in this process was verifying
+    /// already (a background pre-verification, say): this pass waited for
+    /// that verification instead of running its own.
+    pub joined: usize,
     pub busy: usize,
     pub unavailable: usize,
 }
@@ -115,6 +119,7 @@ impl PreverifyCounts {
         self.operations += other.operations;
         self.cached += other.cached;
         self.verified += other.verified;
+        self.joined += other.joined;
         self.busy += other.busy;
         self.unavailable += other.unavailable;
     }

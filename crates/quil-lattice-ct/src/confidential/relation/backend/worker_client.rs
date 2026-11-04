@@ -21,6 +21,41 @@ pub enum ClientError {
     Process(WorkerError),
 }
 
+/// Slot time this process's verifications held, summed over slots, in
+/// microseconds, and the longest one since it was last taken
+/// ([`slot_busy_total`], [`take_longest_slot_hold`]).
+static SLOT_BUSY_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SLOT_LONGEST_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A verification holding its slots, counted when it ends.
+struct SlotHeld(Instant);
+
+impl Drop for SlotHeld {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let micros = self.0.elapsed().as_micros();
+        let micros = u64::try_from(micros).unwrap_or(u64::MAX);
+        SLOT_BUSY_MICROS.fetch_add(micros, Relaxed);
+        SLOT_LONGEST_MICROS.fetch_max(micros, Relaxed);
+    }
+}
+
+/// How long this process's verifications have held verifier slots since it
+/// started, summed over slots: from admission to the worker's exit, whatever
+/// the verdict. An interval's difference over its length and the slot count
+/// is the slots' utilization.
+pub fn slot_busy_total() -> Duration {
+    use std::sync::atomic::Ordering::Relaxed;
+    Duration::from_micros(SLOT_BUSY_MICROS.load(Relaxed))
+}
+
+/// The longest single verification since the last call, which starts the
+/// next interval.
+pub fn take_longest_slot_hold() -> Duration {
+    use std::sync::atomic::Ordering::Relaxed;
+    Duration::from_micros(SLOT_LONGEST_MICROS.swap(0, Relaxed))
+}
+
 /// Waiters admitted per slot before further callers are refused outright, so
 /// a stalled verifier cannot accumulate blocked threads without bound.
 const MAX_WAITERS_PER_SLOT: usize = 4;
@@ -392,6 +427,7 @@ impl WorkerVerifier {
             .as_deref()
             .map(|shared| acquire_shared_until(shared, deadline, self.background))
             .transpose()?;
+        let _held = SlotHeld(Instant::now());
         let bytes = request.encode().map_err(ClientError::Request)?;
         run_worker_capped(
             self.command(),
@@ -482,6 +518,34 @@ fn test_limit_secs(value: Option<&str>, default: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::confidential::transfer::CompileLimits;
+
+    /// Each verification's slot time adds to the busy total when it ends,
+    /// and the longest is kept until taken, which resets it.
+    #[test]
+    fn verifications_holding_a_slot_add_to_busy_time_and_the_longest() {
+        fn ago(millis: u64) -> Instant {
+            Instant::now() - Duration::from_millis(millis)
+        }
+        let before = slot_busy_total();
+        take_longest_slot_hold();
+        drop(SlotHeld(ago(1500)));
+        drop(SlotHeld(ago(400)));
+        let busy = slot_busy_total() - before;
+        assert!(
+            busy >= Duration::from_millis(1900),
+            "slot busy time lost a verification: {busy:?}"
+        );
+        let longest = take_longest_slot_hold();
+        assert!(
+            longest >= Duration::from_millis(1500) && longest < busy,
+            "the longest verification was not recorded: {longest:?} of {busy:?}"
+        );
+        assert_eq!(
+            take_longest_slot_hold(),
+            Duration::ZERO,
+            "taking the longest verification did not start a new interval"
+        );
+    }
 
     #[test]
     fn the_worker_command_names_this_process_as_its_parent() {

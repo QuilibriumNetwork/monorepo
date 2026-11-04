@@ -295,15 +295,18 @@ impl EffectiveConfig {
     }
 
     /// The few values operators ask for most, short enough for every
-    /// `node status` line.
+    /// `node status` line. It repeats the proof worker's sizing (`cpus`,
+    /// `proof_slots`, `proof_threads`), which the startup `token proof worker
+    /// configured` line carries once and log rotation drops.
     ///
     /// `proof_slots` is the built verifier's concurrency (`None`: no verifier,
     /// the suite is disabled or not compiled in).
     pub(crate) fn status_brief(&self, proof_slots: Option<usize>) -> String {
         format!(
-            "mode={} workers={} proof_slots={} proof_slots_configured={} proof_threads={} block_cache_mb={} overrides={}",
+            "mode={} workers={} cpus={} proof_slots={} proof_slots_configured={} proof_threads={} block_cache_mb={} overrides={}",
             self.mode,
             self.workers,
+            self.cpus,
             proof_slots.map_or_else(|| "none".to_string(), |slots| slots.to_string()),
             self.proof_slots_configured,
             self.proof_native_threads,
@@ -428,6 +431,23 @@ mod tests {
     /// 1 GB.
     fn default_shared_cache(stores: usize) -> Option<usize> {
         Some((stores << 28).min(1 << 30))
+    }
+
+    /// `node status` repeats what sized the proof worker: the CPUs, the
+    /// slots in use and the native threads per child.
+    #[test]
+    fn node_status_repeats_the_proof_worker_sizing() {
+        let config = config_from("proofWorker:\n  maxConcurrent: 6\n  nativeThreads: 2\n");
+        let effective = EffectiveConfig::resolve(&config, &runtime(&[]));
+        let brief = effective.status_brief(Some(6));
+        assert!(
+            brief.contains(" cpus=8 "),
+            "node status no longer repeats the node's CPUs: {brief}"
+        );
+        assert!(
+            brief.contains(" proof_slots=6 ") && brief.contains(" proof_threads=2 "),
+            "node status no longer repeats the proof slots and threads: {brief}"
+        );
     }
 
     fn archive_brief_has_no_slots(effective: &EffectiveConfig) -> bool {
