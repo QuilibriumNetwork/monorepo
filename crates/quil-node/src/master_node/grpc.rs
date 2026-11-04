@@ -2421,12 +2421,16 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         })
         .flatten()
     {
-        let reader = Arc::new(crate::master_node::remote_reads::PeerCoinReader::new(
+        // Covering nodes are the registered provers serving the shards.
+        let registry: Arc<dyn quil_types::consensus::ProverRegistry> = prover_registry.clone();
+        let reader = crate::master_node::remote_reads::PeerCoinReader::new(
             peer_info_cache.clone(),
             archive_pool.clone(),
             falcon,
             network,
-        ));
+        )
+        .with_prover_registry(registry);
+        let reader = Arc::new(reader);
         tracing::info!(
             "state reads for uncovered applications will be forwarded to covering nodes"
         );

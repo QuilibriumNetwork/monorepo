@@ -259,7 +259,10 @@ pub(crate) async fn start(
                     // self-identity gate on worker-privileged RPCs enforces.
                     // (Was Ed448/X.509 mTLS via QuilTlsConnector — a transport
                     // mismatch against the pqnoise server + not post-quantum.)
-                    let connector = quil_rpc::QuilPqNoiseConnector::new(seed);
+                    // The master holds the same identity, so a node answering
+                    // at its address as another is refused.
+                    let connector = quil_rpc::QuilPqNoiseConnector::to_own_master(seed)
+                        .map_err(|e| e as Box<dyn std::error::Error + Send + Sync>)?;
                     let channel = endpoint
                         .connect_with_connector(connector)
                         .await
