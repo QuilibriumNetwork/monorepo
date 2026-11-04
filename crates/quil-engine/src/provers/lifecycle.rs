@@ -276,6 +276,53 @@ pub(crate) fn orphaned_allocation_filters(
         .collect()
 }
 
+/// The unbound Active seats a split or merge moved off a shard a worker of
+/// this node still serves, each with that shard's filter. The move left this
+/// prover's allocation there Historic, registered for the current epoch or
+/// later, with no live allocation of ours on it, and the seat's shard
+/// descends from it (a split) or covers it (a merge). Such a worker stays
+/// on the shard it left while the committee session there closes
+/// (`app_handoff::worker_retention`), to the end of the epoch, and the
+/// allocator then rebinds it to the seat. The renewal renews these seats
+/// although no worker is bound to them yet: skipped, the seat lapsed at the
+/// boundary and started its new shard outside its committee. A seat still
+/// held over once the left allocation's registration has passed is not one.
+pub(crate) fn held_over_seats(
+    allocations: &[quil_types::consensus::ProverAllocationInfo],
+    bound_filters: &std::collections::HashSet<Vec<u8>>,
+    frame_number: u64,
+) -> HashMap<Vec<u8>, Vec<u8>> {
+    let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+    let vacated: Vec<&[u8]> = allocations
+        .iter()
+        .filter(|a| a.status == ProverStatus::Historic && a.epoch >= epoch)
+        .map(|a| a.confirmation_filter.as_slice())
+        .filter(|f| !f.is_empty() && bound_filters.contains(*f))
+        .filter(|f| {
+            !allocations.iter().any(|b| {
+                b.confirmation_filter == *f
+                    && b.status != ProverStatus::Historic
+                    && !b.effective_status(frame_number).is_terminal()
+            })
+        })
+        .collect();
+    allocations
+        .iter()
+        .filter(|a| a.status == ProverStatus::Active)
+        .filter(|a| !bound_filters.contains(&a.confirmation_filter))
+        .filter_map(|a| {
+            let seat = a.confirmation_filter.as_slice();
+            vacated
+                .iter()
+                .find(|left| {
+                    quil_forest::shard_filter_extends(seat, left, 32)
+                        || quil_forest::shard_filter_extends(left, seat, 32)
+                })
+                .map(|left| (seat.to_vec(), left.to_vec()))
+        })
+        .collect()
+}
+
 /// Allocations partitioned by their effective status at a given
 /// frame. Lifecycle's `evaluate` collects these once and dispatches
 /// each downstream subroutine against the appropriate slice. Pulling
@@ -698,6 +745,10 @@ pub struct ProverLifecycle {
     /// under way, with the epoch they were last warned of in
     /// (`renewal_awaits_leave`).
     storage_skips_warned: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
+    /// Unbound seats due for renewal, with whether they were held over
+    /// (`held_over_seats`) and the epoch last reported
+    /// (`note_unbound_renewal`).
+    unbound_renewals_reported: std::sync::Mutex<HashMap<(Vec<u8>, bool), u64>>,
     /// Operator leaves already reported as never landed, by filter and signed
     /// frame (`report_unlanded_operator_leaves`).
     unlanded_leaves_reported: std::sync::Mutex<std::collections::HashSet<(Vec<u8>, u64)>>,
@@ -807,6 +858,7 @@ impl ProverLifecycle {
             renewal_skips_reported: std::sync::Mutex::new(HashMap::new()),
             renewal_storage: super::renewal_storage::RenewalStorageNotes::default(),
             storage_skips_warned: std::sync::Mutex::new(HashMap::new()),
+            unbound_renewals_reported: std::sync::Mutex::new(HashMap::new()),
             unlanded_leaves_reported: Default::default(),
             storage_shed_spared: std::sync::Mutex::new(HashMap::new()),
             rejected_joins_reported: Default::default(),
@@ -1364,6 +1416,50 @@ impl ProverLifecycle {
                 active: d.active_count,
             }),
             _ => Some(SilenceShield::ShardUnknown),
+        }
+    }
+
+    /// Report, once per seat and epoch, a renewal due for a seat no worker is
+    /// bound to: renewed when a split or merge moved it off the shard its
+    /// worker still serves (`from`, see `held_over_seats`), else skipped.
+    fn note_unbound_renewal(
+        &self,
+        frame_number: u64,
+        allocations: &[quil_types::consensus::ProverAllocationInfo],
+        filter: &[u8],
+        from: Option<&[u8]>,
+    ) {
+        let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        let due = self
+            .unbound_renewals_reported
+            .lock()
+            .is_ok_and(|mut reported| {
+                let key = (filter.to_vec(), from.is_some());
+                if reported.get(&key).is_some_and(|last| *last >= epoch) {
+                    return false;
+                }
+                reported.retain(|_, last| last.saturating_add(1) >= epoch);
+                reported.insert(key, epoch);
+                true
+            });
+        if !due {
+            return;
+        }
+        let seat_epoch = allocations
+            .iter()
+            .find(|a| a.confirmation_filter == filter && a.status == ProverStatus::Active)
+            .map(|a| a.epoch);
+        match from {
+            Some(from) => info!(frame = frame_number, epoch, ?seat_epoch, filter = hex::encode(filter),
+                from = hex::encode(from), scope = "local",
+                "renewing a seat a split or merge moved off the shard its worker still serves: the worker \
+                 stays on that shard's closing committee session and binds to this seat when the session \
+                 closes (reported once per seat per epoch)"),
+            None => info!(frame = frame_number, epoch, ?seat_epoch, filter = hex::encode(filter),
+                reason = "no worker bound", scope = "local",
+                "seat renewal skipped: no worker serves this seat, and a seat nothing serves is not renewed. \
+                 Expected while the allocator binds a free worker to it, which renews it then; a seat still \
+                 unbound past its recovery epoch is left (reported once per seat per epoch)"),
         }
     }
 
@@ -2969,6 +3065,12 @@ impl ProverLifecycle {
         // allocator releases the worker and the orphan sweep leaves it.
         // Lapsing does not lift it (2026-10-21), and after a restart a worker
         // seen unable to host is given a settle period, not a fresh epoch.
+        // A seat a split or merge moved off the shard its worker still serves
+        // renews unbound (decided 2026-11-03, `held_over_seats`): the worker
+        // closes the committee session there until the epoch ends and then
+        // binds to the seat. Skipped, every member of a splitting shard's
+        // closing committee lapsed at the boundary, its new shard starting
+        // without them.
         // Nor does a seat whose worker's host has been seen an epoch sending
         // no vote in that session while the other members vote (decided
         // 2026-10-22): it renews once the worker votes or its engine restarts,
@@ -2986,14 +3088,25 @@ impl ProverLifecycle {
         let epoch_frames = quil_types::consensus::epoch_length_frames();
         let mut settling: Vec<(Vec<u8>, u64)> = Vec::new();
         let mut withheld_renewals = Vec::new();
+        let held_over = held_over_seats(own_allocations, &worker_bound_filters, frame_number);
+        let mut held_over_renewals: Vec<Vec<u8>> = Vec::new();
         let renewal_filters: Vec<Vec<u8>> = {
             use super::session_hosting::Hold;
+            let (bound_due, unbound_due): (Vec<Vec<u8>>, Vec<Vec<u8>>) = expired_epoch_filters
+                .into_iter()
+                .partition(|f| worker_bound_filters.contains(f));
+            for filter in unbound_due {
+                let from = held_over.get(&filter).map(Vec::as_slice);
+                self.note_unbound_renewal(frame_number, own_allocations, &filter, from);
+                if from.is_some() && !self.renewal_awaits_leave(&filter, frame_number) {
+                    held_over_renewals.push(filter);
+                }
+            }
             let mut hosting = self
                 .session_hosting
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let renewals = expired_epoch_filters.into_iter()
-                .filter(|f| worker_bound_filters.contains(f))
+            let renewals = bound_due.into_iter()
                 .filter(|f| !self.renewal_awaits_leave(f, frame_number))
                 .filter(|f| {
                     let shield = self.silence_shield(f, &workers, &decide_all_descriptors);
@@ -3065,6 +3178,15 @@ impl ProverLifecycle {
             // is retried without claiming registration or valid storage.
             actions.push(LifecycleAction::ReconfirmEpoch {
                 filters: renewal_filters,
+                frame_number,
+            });
+        }
+        // In a confirm of their own: an unbound seat's storage is prepared
+        // from the master's store, and a seat whose preparation fails holds
+        // off every seat of its confirm.
+        if !held_over_renewals.is_empty() {
+            actions.push(LifecycleAction::ReconfirmEpoch {
+                filters: held_over_renewals,
                 frame_number,
             });
         }
@@ -8061,6 +8183,135 @@ mod proposal_loop_tests {
             );
         }
         drop(renewal);
+    }
+
+    /// Every seat the confirms planned at `frame` renew.
+    fn renewed_at(
+        lc: &ProverLifecycle,
+        reg: &ConfigurableRegistry,
+        wm: &ConfigurableWorkerManager,
+        frame: u64,
+    ) -> Vec<Vec<u8>> {
+        lc.set_prover_root_verified_frame(frame);
+        lc.evaluate(frame, 50_000, reg, wm)
+            .unwrap()
+            .into_iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ReconfirmEpoch { filters, .. } => Some(filters),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// In epoch 1 a split moved this prover's seat off the shard worker 1
+    /// serves, whose closing committee session keeps the worker there. The
+    /// seat is registered for epoch 1 only.
+    fn held_over_split(
+        address: &[u8],
+    ) -> (
+        Vec<u8>,
+        Arc<ConfigurableWorkerManager>,
+        Arc<ConfigurableRegistry>,
+    ) {
+        let app = [0x11u8; 32];
+        let parent = quil_forest::encode_shard_bit_path(&app, &[false]);
+        let child = quil_forest::encode_shard_bit_path(&app, &[false, true]);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, parent.clone()));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let seat = |filter: &Vec<u8>, status: ProverStatus| ProverAllocationInfo {
+            epoch: 1,
+            ..alloc(filter.clone(), status, 10)
+        };
+        reg.set_prover(prover(
+            address.to_vec(),
+            vec![
+                seat(&parent, ProverStatus::Historic),
+                seat(&child, ProverStatus::Active),
+            ],
+        ));
+        reg.set_summaries(vec![shard_summary(child.clone(), 50)]);
+        (child, wm, reg)
+    }
+
+    /// The seat a split moved off the shard its worker still serves renews
+    /// in the epoch of the move, unbound: skipped, it lapsed at the boundary,
+    /// outside its new shard's committee, and the planner left it (devnet,
+    /// 2026-11-03).
+    #[test]
+    fn a_seat_a_split_moved_off_its_serving_worker_renews_unbound() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let (child, wm, reg) = held_over_split(&address);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        let renewed = renewed_at(&lc, &reg, &wm, 725);
+        assert!(
+            renewed.contains(&child),
+            "the seat a split moved off the shard its worker still serves was not renewed in the \
+             epoch of the move: it lapses at the boundary, outside its new shard's committee, and \
+             the planner leaves it; renewed {renewed:?}"
+        );
+    }
+
+    /// Bound: once the registration the move left behind has passed, a
+    /// seat still held over renews no more without a worker, as any other.
+    #[test]
+    fn a_held_over_seat_renews_unbound_only_while_the_left_registration_lasts() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let (child, wm, reg) = held_over_split(&address);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        let renewed = renewed_at(&lc, &reg, &wm, 1445);
+        assert!(
+            !renewed.contains(&child),
+            "a seat held over past the epoch its move left registered renewed unbound: {renewed:?}"
+        );
+    }
+
+    /// Which seats count as held over: a split's or a merge's, off a bound
+    /// worker's shard where this prover holds nothing live; not a seat on
+    /// another app's shard, nor one beside a live seat on the worker's shard.
+    #[test]
+    fn held_over_seats_follow_splits_and_merges_off_a_bound_worker() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let app = [0x11u8; 32];
+        let parent = quil_forest::encode_shard_bit_path(&app, &[true]);
+        let child = quil_forest::encode_shard_bit_path(&app, &[true, false]);
+        let elsewhere = quil_forest::encode_shard_bit_path(&[0x22u8; 32], &[true, false]);
+        let seat = |filter: &Vec<u8>, status: ProverStatus| ProverAllocationInfo {
+            epoch: 1,
+            ..alloc(filter.clone(), status, 10)
+        };
+        let bound = |filter: &Vec<u8>| std::collections::HashSet::from([filter.clone()]);
+        let split = [
+            seat(&parent, ProverStatus::Historic),
+            seat(&child, ProverStatus::Active),
+        ];
+        assert_eq!(
+            held_over_seats(&split, &bound(&parent), 725),
+            HashMap::from([(child.clone(), parent.clone())])
+        );
+        let merge = [
+            seat(&child, ProverStatus::Historic),
+            seat(&parent, ProverStatus::Active),
+        ];
+        assert_eq!(
+            held_over_seats(&merge, &bound(&child), 725),
+            HashMap::from([(parent.clone(), child.clone())])
+        );
+        let unrelated = [
+            seat(&parent, ProverStatus::Historic),
+            seat(&elsewhere, ProverStatus::Active),
+        ];
+        assert!(held_over_seats(&unrelated, &bound(&parent), 725).is_empty());
+        let still_held = [
+            seat(&parent, ProverStatus::Historic),
+            seat(&parent, ProverStatus::Active),
+            seat(&child, ProverStatus::Active),
+        ];
+        assert!(held_over_seats(&still_held, &bound(&parent), 725).is_empty());
+        assert!(held_over_seats(&split, &std::collections::HashSet::new(), 725).is_empty());
     }
 
     #[test]
