@@ -1,7 +1,6 @@
 FROM golang:1.20.14-alpine3.19 AS build
 
 ARG NODE_VERSION
-ARG MAX_KEY_ID
 
 ENV GOEXPERIMENT=arenas
 
@@ -9,24 +8,26 @@ WORKDIR /opt/ceremonyclient
 
 COPY . .
 
-RUN cp "node/node-${NODE_VERSION}-linux-amd64" "node/node"
-RUN cp "node/node-${NODE_VERSION}-linux-amd64.dgst" "node/node.dgst"
-RUN for i in $(seq 1 ${MAX_KEY_ID}); do \
-      if [ -f node/node-${NODE_VERSION}-linux-amd64.dgst.sig.${i} ]; then \
-        cp "node/node-${NODE_VERSION}-linux-amd64.dgst.sig.${i}" "node/node.dgst.sig.${i}"; \
-      fi \
-    done
-
 # qclient is now the Rust `crates/quil-client` binary (the Go client was
 # retired). Like the node, the release image assembles a pre-built qclient
 # release binary — built by the `build_qclient_*` Taskfile targets via
 # Dockerfile.source — rather than compiling from source here (this stage is a
-# golang-alpine image with no Rust/FLINT toolchain).
-RUN cp "qclient-${NODE_VERSION}-linux-amd64" "qclient"
+# golang-alpine image with no Rust/FLINT toolchain). The context holds each
+# binary with its .dgst and .dgst.sig.N files.
+RUN for f in "node/node-${NODE_VERSION}-linux-amd64" "qclient-${NODE_VERSION}-linux-amd64"; do \
+      test -f "$f" && test -f "$f.dgst" || { echo "missing $f or $f.dgst" >&2; exit 1; }; \
+    done
 
 RUN go install github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.1
 
-FROM alpine:3.19
+# The release binaries link glibc, as those of Dockerfile.source do.
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libgmp10 \
+    libmpfr6 \
+    && rm -rf /var/lib/apt/lists/*
 
 ARG NODE_VERSION
 ARG GIT_REPO
@@ -45,11 +46,12 @@ LABEL org.opencontainers.image.source=$GIT_REPO
 LABEL org.opencontainers.image.ref.name=$GIT_BRANCH
 LABEL org.opencontainers.image.revision=$GIT_COMMIT
 
-COPY --from=build /opt/ceremonyclient/node/node /usr/local/bin
-COPY --from=build /opt/ceremonyclient/node/node.dgst /usr/local/bin
-COPY --from=build /opt/ceremonyclient/node/node.dgst.sig.* /usr/local/bin
-
-COPY --from=build /opt/ceremonyclient/qclient /usr/local/bin
+# The signed digest names the release file, so each binary keeps that name
+# beside its release files, and the commands link it.
+COPY --from=build /opt/ceremonyclient/node/node-${NODE_VERSION}-linux-amd64* /usr/local/bin/
+COPY --from=build /opt/ceremonyclient/qclient-${NODE_VERSION}-linux-amd64* /usr/local/bin/
+RUN ln -s "node-${NODE_VERSION}-linux-amd64" /usr/local/bin/node && \
+    ln -s "qclient-${NODE_VERSION}-linux-amd64" /usr/local/bin/qclient
 
 COPY --from=build /go/bin/grpcurl /usr/local/bin
 
