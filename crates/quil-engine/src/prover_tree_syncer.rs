@@ -653,6 +653,13 @@ pub(crate) trait ShardRecoveryTarget: Send + Sync {
     async fn retry_proof_wait(&self) -> Option<u64> {
         None
     }
+    /// Why the worker's recovery installs the shard's checkpoint although it
+    /// holds a lineage of the shard, which a replay cannot bring to the
+    /// shard's state (`app_engine::AppConsensusEngine::recovery_installs`);
+    /// `None` (also when the engine does not answer): it replays.
+    async fn installs_over_lineage(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 #[async_trait]
@@ -723,6 +730,9 @@ impl ShardRecoveryTarget for crate::app_engine::AppEngineHandle {
     }
     async fn retry_proof_wait(&self) -> Option<u64> {
         crate::app_engine::AppEngineHandle::retry_proof_wait(self).await
+    }
+    async fn installs_over_lineage(&self) -> Option<&'static str> {
+        self.recovery_installs().await
     }
 }
 
@@ -906,9 +916,32 @@ where
     }
 }
 
+/// `local`, the lineage of the shard the worker holds, as its recovery
+/// replays it: `None` when the worker installs the shard's checkpoint over
+/// it ([`ShardRecoveryTarget::installs_over_lineage`]), which is logged.
+async fn replayed_lineage(
+    filter: &[u8],
+    local: Option<AppShardFrame>,
+    target: &dyn ShardRecoveryTarget,
+) -> Option<AppShardFrame> {
+    let local = local?;
+    let Some(reason) = target.installs_over_lineage().await else {
+        return Some(local);
+    };
+    tracing::info!(core_id = target.core_id(), filter = %hex::encode(filter),
+        local_head = local.header.as_ref().map_or(0, |header| header.frame_number),
+        materialized = target.materialized(), reason,
+        "archive recovery installs the shard's checkpoint instead of replaying this worker's lineage");
+    None
+}
+
 /// Common recovery path for thread and separate-process workers. A saved
 /// lineage replays certified bodies; an empty worker fetches and authenticates
 /// the archive checkpoint before tree writes, then waits for actor installation.
+/// So does a worker whose lineage no replay brings to the shard's state: the
+/// target says so ([`ShardRecoveryTarget::installs_over_lineage`]), or the
+/// shard's first frame does not apply to the state of a worker that has
+/// materialized none.
 ///
 /// `keep_turn`: the successor-blocked and lagging-voter flags of a worker
 /// holding a recovery turn (none without one). A turn replays one batch, and
@@ -956,7 +989,14 @@ pub(crate) async fn recover_shard_from_latest(
         return yielded(install_sealed_state(syncer, filter, mismatch, target).await);
     }
     let sync_wait = &GlobalSyncWait::default();
-    if let Some(local) = local {
+    let local = replayed_lineage(filter, local, target).await;
+    // A worker that has materialized no frame and whose state is not the
+    // pre-state of the shard's first frame has nothing a replay can reach:
+    // it installs the checkpoint below instead.
+    'replay: {
+        let Some(local) = local else {
+            break 'replay;
+        };
         recovery_phase("replaying_frames");
         let committed_tip = target.committed_tip().await;
         let (started, from, replay_us) =
@@ -1015,6 +1055,16 @@ pub(crate) async fn recover_shard_from_latest(
                     ) =>
                 {
                     return Ok(ShardRecoveryProgress::Deferred(PROOF_VERIFICATION_WAIT));
+                }
+                Err(error)
+                    if from == 0
+                        && target.materialized() == 0
+                        && crate::app_engine::replay_pre_state_mismatch(&error) =>
+                {
+                    tracing::info!(core_id = target.core_id(), filter = %hex::encode(filter), %error,
+                        "archive recovery installs the shard's checkpoint: this worker has materialized no frame, \
+                        and the shard's first frame does not apply to its state");
+                    break 'replay;
                 }
                 replayed => replayed?,
             };
@@ -1214,7 +1264,9 @@ fn yielded(result: Result<ShardRecoveryProgress>) -> Result<ShardRecoveryProgres
 ///
 /// A recovery for a seat this node gives up reads no archive
 /// ([`SEAT_GIVEN_UP`]): it asks `given_up` before each attempt and again
-/// once its turn is granted, which it then hands on unused.
+/// once its turn is granted, which it then hands on unused, passing whether
+/// the attempt installs the shard (the worker holds no lineage of it, or
+/// installs over the one it holds: [`ShardRecoveryTarget::installs_over_lineage`]).
 ///
 /// A recovery whose attempts keep stopping at a shard frame no archive
 /// serves waits out its back-off before it queues for a turn
@@ -1228,12 +1280,17 @@ pub(crate) async fn recover_in_turns(
     target: &dyn ShardRecoveryTarget,
     execution: &crate::worker_execution::SharedWorkerExecution,
     mut lineage: impl FnMut() -> Result<Option<AppShardFrame>>,
-    given_up: impl Fn() -> bool,
+    given_up: impl Fn(bool) -> bool,
 ) -> Result<ShardRecoveryProgress> {
     use crate::recovery_turns::{Claim, RecoveryKind};
     let mut ticket = execution.take_replay_ticket(filter);
     loop {
-        if given_up() {
+        let installs = match lineage() {
+            Ok(None) => true,
+            Ok(Some(_)) => target.installs_over_lineage().await.is_some(),
+            Err(_) => false,
+        };
+        if given_up(installs) {
             // Withholding may end (the seat renews): the place stays.
             if let Some(ticket) = ticket {
                 execution.keep_replay_ticket(filter, ticket);
@@ -1263,6 +1320,8 @@ pub(crate) async fn recover_in_turns(
             tracing::warn!(core, filter = %hex::encode(filter), %error,
             "cannot determine local shard lineage for sync")
         })?;
+        let local = replayed_lineage(filter, local, target).await;
+        let installs = local.is_none();
         let attempt = async {
             crate::worker_execution::recovery_phase("waiting_for_permit");
             let kind = if local.is_some() {
@@ -1293,7 +1352,7 @@ pub(crate) async fn recover_in_turns(
                 turn = turns.acquire(claim) => turn,
             };
             let place = *ticket.get_or_insert(turn.ticket());
-            if given_up() {
+            if given_up(installs) {
                 execution.keep_replay_ticket(filter, place);
                 return Ok(ShardRecoveryProgress::Deferred(SEAT_GIVEN_UP));
             }
@@ -2718,7 +2777,7 @@ mod tests {
                 &target,
                 &execution,
                 || Ok(Some(frame(130))),
-                || false,
+                |_| false,
             )
             .await
             .unwrap();
@@ -2766,7 +2825,7 @@ mod tests {
             &target,
             &execution,
             lineage,
-            || false,
+            |_| false,
         )
         .await
         .unwrap();
@@ -2808,7 +2867,7 @@ mod tests {
                 &target,
                 &execution,
                 lineage,
-                || false
+                |_| false
             ),
             async {
                 for _ in 0..3 {
@@ -2853,7 +2912,7 @@ mod tests {
             &target,
             &execution,
             || Ok(Some(frame(193))),
-            || false,
+            |_| false,
         )
         .await
         .unwrap();
@@ -2954,7 +3013,7 @@ mod tests {
                     &target,
                     &execution,
                     || Ok(Some(frame(130))),
-                    || false
+                    |_| false
                 )
             ),
             async {
@@ -3081,7 +3140,7 @@ mod tests {
                 &stopping,
                 &first_record,
                 lineage,
-                || false
+                |_| false
             ),
             async {
                 tokio::task::yield_now().await;
@@ -3112,7 +3171,7 @@ mod tests {
                 &restarted,
                 &second_record,
                 lineage,
-                || false
+                |_| false
             ),
             async {
                 for _ in 0..3 {
@@ -3173,7 +3232,7 @@ mod tests {
             &target,
             &execution,
             lineage,
-            || true,
+            |_| true,
         )
         .await
         .unwrap();
@@ -3203,7 +3262,7 @@ mod tests {
                 &target,
                 &execution,
                 lineage,
-                || given_up.load(Ordering::SeqCst)
+                |_| given_up.load(Ordering::SeqCst)
             ),
             async {
                 for _ in 0..3 {
@@ -5657,7 +5716,7 @@ mod tests {
                     &target,
                     &execution,
                     || Ok(None),
-                    || false,
+                    |_| false,
                 )
                 .await;
                 let installed = archive.installed.load(Ordering::SeqCst);
@@ -5760,7 +5819,7 @@ mod tests {
                     &target,
                     &execution,
                     || Ok(None),
-                    || false,
+                    |_| false,
                 )
                 .await
             });
@@ -6489,7 +6548,7 @@ mod tests {
                 &target,
                 &execution,
                 || Ok(Some(frame(target.materialized()))),
-                || false,
+                |_| false,
             )
         };
         for attempt in 0..20 {
@@ -6627,7 +6686,7 @@ mod tests {
                 target,
                 execution,
                 || Ok(Some(gap_frame(target.materialized()))),
-                || false,
+                |_| false,
             )
             .await;
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;

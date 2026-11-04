@@ -1222,10 +1222,11 @@ impl ThreadWorkerManager {
                                                                             Err(quil_types::error::QuilError::NotFound(_)) => Ok(None),
                                                                             Err(error) => Err(error),
                                                                         };
-                                                                        // Without a frame of the shard the recovery
-                                                                        // installs it, which a departing seat skips.
-                                                                        let given_up = || recovery_withheld(
-                                                                            &gate, &withheld, core_id, &filter, matches!(lineage(), Ok(None)),
+                                                                        // A recovery that installs the shard (no frame
+                                                                        // of it here, or a lineage no replay brings to
+                                                                        // its state) is skipped by a departing seat.
+                                                                        let given_up = |installs| recovery_withheld(
+                                                                            &gate, &withheld, core_id, &filter, installs,
                                                                         );
                                                                         let _ = crate::prover_tree_syncer::recover_in_turns(
                                                                             &crate::recovery_turns::SHARD_RECOVERY_TURNS, syncer.as_ref(), &filter,
