@@ -96,6 +96,8 @@ pub struct RocksDbHealth {
     pub delayed_write_rate: u64,
     pub block_cache: u64,
     pub block_cache_capacity: u64,
+    /// Open snapshots: each keeps every later deletion on disk.
+    pub snapshots: store::OpenSnapshots,
 }
 
 /// Per-instance RocksDB memory accounting (bytes). See [`RocksDb::memory_usage`].
@@ -558,6 +560,28 @@ impl RocksDb {
             delayed_write_rate: prop("rocksdb.actual-delayed-write-rate"),
             block_cache: prop("rocksdb.block-cache-usage"),
             block_cache_capacity: prop("rocksdb.block-cache-capacity"),
+            snapshots: self.snapshots(),
+        }
+    }
+
+    /// Open snapshots and the age of the oldest. A snapshot held since
+    /// startup keeps every deletion since on disk, so a store grows until
+    /// restart; this shows one held past the snapshot manager's pin window.
+    pub fn snapshots(&self) -> store::OpenSnapshots {
+        let prop = |name: &str| self.db.property_int_value(name).ok().flatten().unwrap_or(0);
+        let count = prop("rocksdb.num-snapshots");
+        // Unix seconds of the oldest snapshot's creation; 0 with none.
+        let oldest = prop("rocksdb.oldest-snapshot-time");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        store::OpenSnapshots {
+            count,
+            oldest_age_secs: if count == 0 || oldest == 0 {
+                0
+            } else {
+                now.saturating_sub(oldest)
+            },
         }
     }
 
@@ -596,6 +620,25 @@ mod read_only_tests {
             Some(b"checkpoint".to_vec())
         );
         assert_eq!(reopened.iterator(rocksdb::IteratorMode::Start).count(), 1);
+    }
+
+    /// The snapshot fields of the per-minute store lines read real RocksDB
+    /// properties: a misspelt name would read 0 and hide a held snapshot.
+    #[test]
+    fn open_snapshots_counts_held_snapshots_and_ages_the_oldest() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RocksDb::open(directory.path()).unwrap();
+        let none = store::OpenSnapshots::default();
+        assert_eq!(store::KvDb::open_snapshots(&store), Some(none));
+        let db = store.inner();
+        let first = db.snapshot();
+        let second = db.snapshot();
+        let held = store.snapshots();
+        assert_eq!(held.count, 2);
+        assert!(held.oldest_age_secs < 60, "{held:?}");
+        assert_eq!(store.health().snapshots.count, 2);
+        drop((first, second));
+        assert_eq!(store.snapshots(), none);
     }
 
     #[test]
@@ -886,6 +929,10 @@ impl store::KvDb for RocksDb {
 
     fn approximate_memory_bytes(&self) -> u64 {
         self.memory_usage().total()
+    }
+
+    fn open_snapshots(&self) -> Option<store::OpenSnapshots> {
+        Some(self.snapshots())
     }
 }
 

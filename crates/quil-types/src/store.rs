@@ -40,6 +40,15 @@ pub trait LocalVertexCommitObserver: Send + Sync {
     fn committed<'a>(&self, vertices: &mut dyn std::iter::Iterator<Item = (&'a [u8], &'a [u8])>);
 }
 
+/// A database's open point-in-time snapshots. Each keeps every key version
+/// deleted or overwritten after it on disk until released.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OpenSnapshots {
+    pub count: u64,
+    /// Age of the oldest in seconds; 0 with none.
+    pub oldest_age_secs: u64,
+}
+
 /// Low-level key-value database interface (Pebble in Go, RocksDB in Rust).
 pub trait KvDb: Send + Sync {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
@@ -86,6 +95,11 @@ pub trait KvDb: Send + Sync {
     /// Default `0` for non-RocksDB (in-memory / test) impls.
     fn approximate_memory_bytes(&self) -> u64 {
         0
+    }
+    /// Open point-in-time snapshots, for diagnostics. `None` where the store
+    /// does not track them (in-memory / test impls).
+    fn open_snapshots(&self) -> Option<OpenSnapshots> {
+        None
     }
 }
 

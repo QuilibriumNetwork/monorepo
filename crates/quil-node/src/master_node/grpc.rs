@@ -1911,6 +1911,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
     // this shows whether the store itself was behind when that happens.
     {
         let db = db_arc.clone();
+        let crdt = crdt.clone();
         sup.spawn("rocksdb-health", move |token| async move {
             let mut latency = super::store_latency::StoreLatency::default();
             let probe = super::store_latency::FsyncProbe::new(db.inner().path());
@@ -1919,6 +1920,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                     _ = token.cancelled() => return Ok(()),
                     _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
                 }
+                // Releases a published generation's store snapshot past its
+                // window if GLOBAL publication stalls; open snapshots keep
+                // every later deletion on disk, and the generation pins and
+                // wallet scans name two holders.
+                let held = crdt.release_expired_snapshots();
                 let health = db.health();
                 latency.observe(super::store_latency::Sample {
                     fsync_ms: probe.measure().await,
@@ -1937,6 +1943,10 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                     delayed_write_rate = health.delayed_write_rate,
                     block_cache_mb = health.block_cache >> 20,
                     block_cache_capacity_mb = health.block_cache_capacity >> 20,
+                    rocksdb_snapshots = health.snapshots.count,
+                    oldest_snapshot_age_secs = health.snapshots.oldest_age_secs,
+                    generation_pins = held.map(|h| h.generations),
+                    scan_snapshots = held.map(|h| h.scans),
                     "rocksdb health"
                 );
             }

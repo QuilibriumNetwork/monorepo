@@ -6578,6 +6578,13 @@ impl HypergraphCrdt {
         self.snapshot_mgr.set_pinned_limit(limit);
     }
 
+    /// Release published-generation snapshots past their pin window and
+    /// expired scans, then count those held (see
+    /// [`SnapshotManager::release_expired`]). For a periodic caller.
+    pub fn release_expired_snapshots(&self) -> Option<crate::snapshot::HeldSnapshots> {
+        self.snapshot_mgr.release_expired()
+    }
+
     pub fn close_snapshots(&self) {
         self.snapshot_mgr.close();
     }

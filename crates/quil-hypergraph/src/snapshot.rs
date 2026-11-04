@@ -13,8 +13,9 @@
 //!
 //! Behavioural parity with Go:
 //!
-//! - `publish(root, frame)` adds a new generation. Duplicate roots
-//! are no-ops (matches Go's "same root → no change").
+//! - `publish(root, frame)` adds a new generation. A duplicate root
+//! keeps the original generation and its binding (matches Go's "same
+//! root → no change"); it only advances the pin window.
 //! - `publish_with_snapshot(root, frame, snap)` is the same but
 //! binds an opaque DB-snapshot reference to the generation, which
 //! `acquire` returns to the caller for point-in-time reads.
@@ -94,6 +95,8 @@ pub struct GenerationHandle {
     /// of any held handle, so an outstanding sync session keeps using
     /// consistent data even after eviction from the manager.
     pub db_snapshot: Option<Arc<dyn SnapshotReadable>>,
+    /// When the manager registered this generation, against the pin window.
+    published: Instant,
 }
 
 impl std::fmt::Debug for GenerationHandle {
@@ -126,21 +129,25 @@ pub struct SnapshotManager {
 pub struct PreparedSnapshotPublication<'a> {
     inner: RwLockWriteGuard<'a, SnapshotManagerInner>,
     generation: Option<GenerationHandle>,
+    frame_number: u64,
 }
 
 impl PreparedSnapshotPublication<'_> {
     /// Bind the exact post-commit read view without allocation or new locking.
     /// Keep this guard until the other live execution metadata is adopted.
+    /// A duplicate root keeps its original generation and binding; it still
+    /// advances the pin window, so the original's snapshot is released in time.
     pub fn adopt(&mut self, snapshot: Arc<dyn SnapshotReadable>) {
+        self.inner.latest_frame = Some(self.frame_number);
         if let Some(mut generation) = self.generation.take() {
             generation.db_snapshot = Some(snapshot);
             self.inner.generations.push_front(generation);
             while self.inner.generations.len() > MAX_GENERATIONS {
                 self.inner.generations.pop_back();
             }
-            self.inner.release_old_pins();
-            self.inner.expire_scans();
         }
+        self.inner.release_old_pins();
+        self.inner.expire_scans();
     }
 }
 
@@ -155,13 +162,19 @@ struct SnapshotManagerInner {
     /// Orders scan generations by last use.
     scan_ticks: u64,
     closed: bool,
-    /// Generations, newest first, that keep their store snapshot; older ones
-    /// keep only their `(root, frame)` entry. Default [`MAX_GENERATIONS`].
+    /// The pin window: a generation keeps its store snapshot while it is one
+    /// of the newest `pinned_limit` generations, within `pinned_limit` frames
+    /// of the latest publication and younger than `pinned_limit` ideal frame
+    /// times. Older ones keep only their `(root, frame)` entry. Default
+    /// [`MAX_GENERATIONS`].
     pinned_limit: usize,
+    /// Frame of the latest publication, duplicate roots included.
+    latest_frame: Option<u64>,
 }
 
 impl SnapshotManagerInner {
-    /// Release the store snapshots of generations past `pinned_limit`.
+    /// Release the store snapshots of generations outside the pin window
+    /// (see `pinned_limit`).
     ///
     /// Each held RocksDB snapshot keeps every key version overwritten or
     /// deleted after it on disk, so the oldest pinned generation sets how long
@@ -170,12 +183,40 @@ impl SnapshotManagerInner {
     /// root-version index and reads versioned data, never the snapshot. A scan
     /// already holding a handle keeps its snapshot alive through its own `Arc`;
     /// continuing a scan whose generation lost its snapshot reports it expired.
+    ///
+    /// A count alone never released a root that stops changing: a worker
+    /// whose shard root stayed the same re-published it every frame as a
+    /// duplicate, and its first generation pinned deleted data until restart.
+    /// The frame distance holds in either direction, as a worker moved to
+    /// another shard numbers its frames differently; the age covers a store
+    /// that stops publishing (an idle worker), released by
+    /// [`SnapshotManager::release_expired`].
     fn release_old_pins(&mut self) {
         let limit = self.pinned_limit;
-        for generation in self.generations.iter_mut().skip(limit) {
-            generation.db_snapshot = None;
+        let latest = self.latest_frame;
+        let max_age = pin_max_age(limit);
+        for (index, generation) in self.generations.iter_mut().enumerate() {
+            let far = latest.is_some_and(|f| f.abs_diff(generation.frame_number) >= limit as u64);
+            if index >= limit || far || generation.published.elapsed() >= max_age {
+                generation.db_snapshot = None;
+            }
         }
     }
+}
+
+/// How long a generation keeps its store snapshot at `limit` frames: that
+/// many ideal frame times.
+fn pin_max_age(limit: usize) -> Duration {
+    Duration::from_millis(quil_types::consensus::IDEAL_FRAME_TIME_MS)
+        .saturating_mul(u32::try_from(limit).unwrap_or(u32::MAX))
+}
+
+/// Store snapshots a manager holds: root generations still pinned and
+/// retained wallet-scan snapshots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeldSnapshots {
+    pub generations: usize,
+    pub scans: usize,
 }
 
 /// Retained on-demand scan snapshots (continuations of recent scans). Every
@@ -286,9 +327,14 @@ impl SnapshotManager {
                 root,
                 frame_number,
                 db_snapshot: None,
+                published: Instant::now(),
             })
         };
-        Ok(PreparedSnapshotPublication { inner, generation })
+        Ok(PreparedSnapshotPublication {
+            inner,
+            generation,
+            frame_number,
+        })
     }
 
     pub fn new() -> Self {
@@ -299,6 +345,7 @@ impl SnapshotManager {
                 scan_ticks: 0,
                 closed: false,
                 pinned_limit: MAX_GENERATIONS,
+                latest_frame: None,
             }),
         }
     }
@@ -309,6 +356,27 @@ impl SnapshotManager {
         let mut inner = self.inner.write().unwrap();
         inner.pinned_limit = limit.clamp(1, MAX_GENERATIONS);
         inner.release_old_pins();
+    }
+
+    /// Release generation snapshots past the pin window and expired scans,
+    /// then count what stays held. For a periodic caller: a store that stops
+    /// publishing (an idle worker) otherwise keeps its last generation's
+    /// snapshot. `None` while a publication holds the manager; that
+    /// publication releases them itself.
+    pub fn release_expired(&self) -> Option<HeldSnapshots> {
+        let mut g = self.inner.try_write().ok()?;
+        if !g.closed {
+            g.release_old_pins();
+            g.expire_scans();
+        }
+        Some(HeldSnapshots {
+            generations: g
+                .generations
+                .iter()
+                .filter(|h| h.db_snapshot.is_some())
+                .count(),
+            scans: g.scans.len(),
+        })
     }
 
     /// Generations currently holding a store snapshot.
@@ -354,12 +422,17 @@ impl SnapshotManager {
         if g.closed {
             return;
         }
-        // Duplicate root → no-op. Matches Go's behaviour: a later
-        // publish with the same root must NOT shadow the original
+        g.latest_frame = Some(frame_number);
+        // Duplicate root → no new generation. Matches Go's behaviour: a
+        // later publish with the same root must NOT shadow the original
         // generation. (See `hypergraph/snapshot_manager.go:206-218`
         // for the rationale — a same-root re-publish during message
-        // application would otherwise rebind the wrong DB state.)
+        // application would otherwise rebind the wrong DB state.) It
+        // still advances the pin window, releasing the original's
+        // snapshot once that falls outside it.
         if g.generations.iter().any(|h| h.root == root) {
+            g.release_old_pins();
+            g.expire_scans();
             return;
         }
         let mut scan_id = [0; 32];
@@ -369,6 +442,7 @@ impl SnapshotManager {
             root,
             frame_number,
             db_snapshot: snapshot,
+            published: Instant::now(),
         });
         while g.generations.len() > MAX_GENERATIONS {
             // Pop the back; the dropped `GenerationHandle` releases its
@@ -485,6 +559,7 @@ impl SnapshotManager {
             root: Vec::new(),
             frame_number,
             db_snapshot: Some(snapshot),
+            published: Instant::now(),
         };
         g.expire_scans();
         while g.scans.len() >= MAX_SCAN_GENERATIONS {
@@ -544,6 +619,7 @@ impl SnapshotManager {
         g.closed = true;
         g.generations.clear();
         g.scans.clear();
+        g.latest_frame = None;
     }
 
     /// Reopen after close (Go's `reopen` semantic for in-process
@@ -1100,5 +1176,166 @@ mod tests {
         m.close();
         // close() clears the deque, dropping the only reference.
         assert_eq!(*counter.lock().unwrap(), 1);
+    }
+
+    // -------- Pin window for roots that stop changing --------
+
+    fn counting(counter: &Arc<Mutex<usize>>) -> Arc<dyn SnapshotReadable> {
+        Arc::new(CountingSnapshot {
+            counter: counter.clone(),
+        })
+    }
+
+    /// A worker whose shard root stops changing re-publishes it every frame.
+    /// Those duplicates keep the original generation and its binding (Go
+    /// parity) but must still release its store snapshot once the pin window
+    /// passes: the snapshot otherwise keeps every later deletion on disk until
+    /// restart (worker stores grew ~1.3 GB/day each, Nov 2026).
+    #[test]
+    fn republishing_an_unchanged_root_releases_its_first_snapshot() {
+        let limit = crate::retention::DEFAULT_PINNED_GENERATIONS;
+        let first = Arc::new(Mutex::new(0usize));
+        let m = SnapshotManager::new();
+        m.set_pinned_limit(limit);
+        m.publish_with_snapshot(vec![7; 32], 1000, counting(&first));
+        for frame in 1001..1000 + limit as u64 {
+            m.publish_with_snapshot(
+                vec![7; 32],
+                frame,
+                snap_with("vertex", "adds", shard(1), vec![9]),
+            );
+        }
+        assert_eq!(*first.lock().unwrap(), 0, "released inside the pin window");
+        assert_eq!(m.pinned_count(), 1);
+
+        m.publish_with_snapshot(
+            vec![7; 32],
+            1000 + limit as u64,
+            snap_with("vertex", "adds", shard(1), vec![9]),
+        );
+        assert_eq!(
+            *first.lock().unwrap(),
+            1,
+            "the first generation's store snapshot is still held after {limit} same-root \
+             publications: it pins every later deletion until restart"
+        );
+        assert_eq!(m.pinned_count(), 0);
+        assert_eq!(m.generation_count(), 1);
+        let kept = m.acquire(&[7; 32]).unwrap();
+        assert_eq!(
+            kept.frame_number, 1000,
+            "a duplicate never rebinds the root"
+        );
+        assert!(kept.db_snapshot.is_none());
+    }
+
+    /// The canonical publisher's duplicate path (`prepare_publication` then
+    /// `adopt` with a root already registered) advances the window too.
+    #[test]
+    fn a_duplicate_prepared_publication_releases_the_first_snapshot() {
+        let limit = crate::retention::DEFAULT_PINNED_GENERATIONS;
+        let first = Arc::new(Mutex::new(0usize));
+        let m = SnapshotManager::new();
+        m.set_pinned_limit(limit);
+        m.prepare_publication(vec![7; 32], 1000)
+            .unwrap()
+            .adopt(counting(&first));
+        for frame in 1001..=1000 + limit as u64 {
+            m.prepare_publication(vec![7; 32], frame)
+                .unwrap()
+                .adopt(snap_with("vertex", "adds", shard(1), vec![9]));
+        }
+        assert_eq!(
+            *first.lock().unwrap(),
+            1,
+            "a duplicate prepared publication never released the first generation's snapshot"
+        );
+        assert_eq!(m.acquire(&[7; 32]).unwrap().frame_number, 1000);
+    }
+
+    /// A worker moved to another shard numbers its frames differently: a
+    /// generation far from the latest publication in either direction leaves
+    /// the pin window.
+    #[test]
+    fn a_generation_from_another_frame_sequence_is_released() {
+        let first = Arc::new(Mutex::new(0usize));
+        let m = SnapshotManager::new();
+        m.set_pinned_limit(crate::retention::DEFAULT_PINNED_GENERATIONS);
+        m.publish_with_snapshot(vec![1; 32], 1_000_000, counting(&first));
+        m.publish_with_snapshot(
+            vec![2; 32],
+            50,
+            snap_with("vertex", "adds", shard(1), vec![9]),
+        );
+        assert_eq!(
+            *first.lock().unwrap(),
+            1,
+            "a generation a million frames from the latest publication kept its snapshot"
+        );
+        assert_eq!(m.pinned_count(), 1);
+    }
+
+    /// A wallet scan already paging a generation keeps its snapshot through its
+    /// own handle after the manager releases it; continuing it then reports the
+    /// scan expired, and dropping the handle releases the snapshot.
+    #[test]
+    fn a_scan_holding_a_released_generation_keeps_its_snapshot() {
+        let limit = crate::retention::DEFAULT_PINNED_GENERATIONS;
+        let first = Arc::new(Mutex::new(0usize));
+        let m = SnapshotManager::new();
+        m.set_pinned_limit(limit);
+        m.publish_with_snapshot(
+            vec![7; 32],
+            1000,
+            snap_with("vertex", "adds", shard(1), vec![1]),
+        );
+        m.publish_with_snapshot(vec![8; 32], 1001, counting(&first));
+        let held = m.acquire_scan(None).unwrap();
+        assert_eq!(held.root, vec![8; 32]);
+        let id = held.scan_id.unwrap();
+        for frame in 1002..=1001 + limit as u64 {
+            m.publish(vec![8; 32], frame);
+        }
+        assert_eq!(m.pinned_count(), 0, "both generations left the pin window");
+        assert_eq!(*first.lock().unwrap(), 0, "the paging scan still holds it");
+        assert!(
+            m.acquire_scan(Some(&id)).is_none(),
+            "continuation reports expiry"
+        );
+        drop(held);
+        assert_eq!(*first.lock().unwrap(), 1);
+    }
+
+    fn age_generations(m: &SnapshotManager, by: Duration) {
+        for generation in m.inner.write().unwrap().generations.iter_mut() {
+            generation.published -= by;
+        }
+    }
+
+    /// A store that stops publishing (an idle worker, a halted shard) has no
+    /// later publication to release its last generation: the periodic
+    /// `release_expired` does once it is older than the window's frame times.
+    #[test]
+    fn release_expired_frees_the_last_generation_of_an_idle_store() {
+        let limit = crate::retention::DEFAULT_PINNED_GENERATIONS;
+        let first = Arc::new(Mutex::new(0usize));
+        let m = SnapshotManager::new();
+        m.set_pinned_limit(limit);
+        m.publish_with_snapshot(vec![7; 32], 1000, counting(&first));
+        let held = HeldSnapshots {
+            generations: 1,
+            scans: 0,
+        };
+        assert_eq!(m.release_expired(), Some(held));
+        age_generations(&m, pin_max_age(limit) - Duration::from_secs(1));
+        assert_eq!(
+            m.release_expired(),
+            Some(held),
+            "released inside the window"
+        );
+        age_generations(&m, Duration::from_secs(1));
+        assert_eq!(m.release_expired(), Some(HeldSnapshots::default()));
+        assert_eq!(*first.lock().unwrap(), 1);
+        assert_eq!(m.acquire(&[7; 32]).unwrap().frame_number, 1000);
     }
 }

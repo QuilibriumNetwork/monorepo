@@ -862,12 +862,27 @@ impl ThreadWorkerManager {
                     loop {
                         tokio::select! {
                             _ = mem_tick.tick() => {
+                                // Also releases a published generation's store
+                                // snapshot past its window when this worker no
+                                // longer publishes (idle, or its shard halted).
+                                let held = worker_owned
+                                    .as_ref()
+                                    .and_then(|o| o.hypergraph.release_expired_snapshots());
                                 if let Some(db) = worker_db.as_ref() {
                                     let bytes = db.approximate_memory_bytes();
+                                    // Open snapshots keep every later deletion on
+                                    // disk; the generation pins and wallet scans
+                                    // name two holders, any rest is a sync or
+                                    // execution view.
+                                    let snapshots = db.open_snapshots();
                                     info!(
                                         core_id,
                                         worker_db_mb = bytes as f64 / (1024.0 * 1024.0),
                                         filter = hex::encode(&current_filter),
+                                        rocksdb_snapshots = snapshots.map(|s| s.count),
+                                        oldest_snapshot_age_secs = snapshots.map(|s| s.oldest_age_secs),
+                                        generation_pins = held.map(|h| h.generations),
+                                        scan_snapshots = held.map(|h| h.scans),
                                         "worker rocksdb memory",
                                     );
                                 }
