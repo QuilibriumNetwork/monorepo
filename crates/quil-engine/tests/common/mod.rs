@@ -33,6 +33,7 @@ use quil_types::error::Result as QResult;
 use quil_types::proto::global as gpb;
 use quil_types::store::ClockStore;
 
+use quil_engine::cw_app_seams::CW_APP_BLOCK_CHANNEL;
 use quil_engine::test_support::TestProverRegistry;
 use quil_store::testing::InMemoryClockStore;
 
@@ -602,6 +603,58 @@ pub struct HeadSeed {
     pub committee: Vec<Vec<u8>>,
 }
 
+/// Frames every worker has stored so far: the progress signal for waits on
+/// consensus output.
+pub fn frames_seen(harness: &AppShardHarness) -> u64 {
+    harness
+        .workers
+        .iter()
+        .map(|w| w.full_frames.lock().len() as u64)
+        .sum()
+}
+
+/// Poll `probe` until it yields a value. A loaded host slows consensus
+/// without stopping it, so the wait fails only when `progress` has not
+/// changed for `stall` (a hang) or `cap` has passed (a livelock).
+pub async fn until_progress<T>(
+    stall: std::time::Duration,
+    cap: std::time::Duration,
+    mut progress: impl FnMut() -> u64,
+    mut probe: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    let start = std::time::Instant::now();
+    let mut last = progress();
+    let mut moved = start;
+    loop {
+        if let Some(value) = probe() {
+            return Some(value);
+        }
+        let now = std::time::Instant::now();
+        if now.duration_since(start) >= cap || now.duration_since(moved) >= stall {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let current = progress();
+        if current != last {
+            last = current;
+            moved = std::time::Instant::now();
+        }
+    }
+}
+
+/// The frame number of a body sent on the app block channel; `None` for a
+/// terminal seal or bytes that are not a frame.
+fn block_frame_number(bytes: &[u8]) -> Option<u64> {
+    use prost::Message;
+    if quil_cw_consensus::handoff::Seal::is_encoding(bytes) {
+        return None;
+    }
+    gpb::AppShardFrame::decode(bytes)
+        .ok()?
+        .header
+        .map(|header| header.frame_number)
+}
+
 pub struct AppShardHarness {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     pub filter: Vec<u8>,
@@ -1009,6 +1062,11 @@ impl AppShardHarness {
             workers.iter().map(|w| w.events.clone()).collect();
         let full_frames_per_worker: Vec<Arc<Mutex<Vec<Vec<u8>>>>> =
             workers.iter().map(|w| w.full_frames.clone()).collect();
+        // Every frame body sent on the block channel, with its sender, so a
+        // worker that missed one can recover it (see `AncestorSyncRequested`).
+        // Each entry is (sender's committee key, body).
+        type SentBlocks = Vec<(Vec<u8>, Vec<u8>)>;
+        let blocks: Arc<Mutex<SentBlocks>> = Arc::new(Mutex::new(Vec::new()));
 
         let mut tasks = Vec::new();
         // Spawn each worker's engine + its event drain.
@@ -1036,6 +1094,7 @@ impl AppShardHarness {
             let my_handle = all_handles[idx].clone();
             let events_log = events_per_worker[idx].clone();
             let full_frames_log = full_frames_per_worker[idx].clone();
+            let blocks = blocks.clone();
             let mut rx = pending.event_rx;
             tasks.push(tokio::spawn(async move {
                 while let Some(ev) = rx.recv().await {
@@ -1084,8 +1143,28 @@ impl AppShardHarness {
                         E::Halted { .. } => {
                             events_log.lock().push("Halted".into());
                         }
-                        E::AncestorSyncRequested { .. } => {
+                        E::AncestorSyncRequested { missing_frames, .. } => {
                             events_log.lock().push("AncestorSyncRequested".into());
+                            // A worker whose consensus host starts after a
+                            // peer sent a frame body never holds it, and its
+                            // finalization holds back every later one. A node
+                            // recovers it by archive replay, which this harness
+                            // lacks: stand in for it by delivering the peers'
+                            // bodies of the missing frames again.
+                            for (from, data) in blocks.lock().iter() {
+                                if *from != my_pubkey
+                                    && block_frame_number(data)
+                                        .is_some_and(|number| missing_frames.contains(&number))
+                                {
+                                    my_handle.send(
+                                        quil_engine::app_engine::AppEngineMessage::CwIn {
+                                            channel: CW_APP_BLOCK_CHANNEL,
+                                            from: from.clone(),
+                                            data: data.clone(),
+                                        },
+                                    );
+                                }
+                            }
                         }
                         E::ParentSealed { .. } => {
                             events_log.lock().push("ParentSealed".into());
@@ -1104,6 +1183,9 @@ impl AppShardHarness {
                         }
                         E::CwOut { channel, bytes, .. } => {
                             events_log.lock().push("CwOut".into());
+                            if *channel == CW_APP_BLOCK_CHANNEL {
+                                blocks.lock().push((my_pubkey.clone(), bytes.clone()));
+                            }
                             // In-memory CW transport: deliver to every peer's
                             // `CwIn`, tagged with this worker's committee key.
                             for h in &peer_handles {
