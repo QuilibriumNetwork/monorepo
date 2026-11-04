@@ -82,6 +82,52 @@ pub fn unverified_signers(bytes: &[u8]) -> Option<(usize, usize)> {
         .then(|| (f.certificate.signers.len(), f.certificate.signers.count()))
 }
 
+/// What a certificate says of one member of its committee, read from its
+/// proposal and `Signers` bitmap ([`unverified_member`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CertificateMember {
+    /// The proposal's epoch: the generation of the committee session that
+    /// signed it.
+    pub generation: u64,
+    /// The size of the committee it was signed under.
+    pub committee: usize,
+    /// Whether the member at `index` of that committee signed it.
+    pub signed: bool,
+}
+
+/// Whether the committee member at `index` signed the certificate, with the
+/// certificate's generation and committee size. UNAUTHENTICATED: for
+/// counting a member's certificates in frames whose own authentication
+/// covers them (a GLOBAL frame including a shard header), never for
+/// accepting one.
+pub fn unverified_member(bytes: &[u8], index: usize) -> Option<CertificateMember> {
+    if bytes.len() > crate::handoff::MAX_RECORD_BYTES {
+        return None;
+    }
+    let mut cursor = bytes;
+    let f = <AppFinalization as Read>::read_cfg(&mut cursor, &crate::handoff::MAX_MEMBERS).ok()?;
+    if !cursor.is_empty() {
+        return None;
+    }
+    let signed = f
+        .certificate
+        .signers
+        .iter()
+        .any(|signer| signer.get() as usize == index);
+    Some(CertificateMember {
+        generation: f.proposal.round.epoch().get(),
+        committee: f.certificate.signers.len(),
+        signed,
+    })
+}
+
+/// The signers a certificate of a `committee`-member committee needs, and
+/// the most a batcher that stops at quorum puts in one: simplex's quorum,
+/// `committee - floor((committee - 1) / 3)`.
+pub fn certificate_quorum(committee: usize) -> usize {
+    <commonware_utils::N3f1 as commonware_utils::Faults>::quorum(committee) as usize
+}
+
 /// Which of `candidates` produced the certificate's signatures: each
 /// `(signer index in the signing committee, public key)` found. UNAUTHENTICATED,
 /// for diagnostics: it names who signed a certificate whose committee cannot be
@@ -391,6 +437,32 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "the namespace binds each signature"
+        );
+        let absent = (0..4).find(|index| !signed.contains(index)).unwrap() as usize;
+        for index in 0..4 {
+            assert_eq!(
+                unverified_member(&bytes, index),
+                Some(CertificateMember {
+                    generation: 7,
+                    committee: 4,
+                    signed: index != absent,
+                }),
+                "member {index}"
+            );
+        }
+        assert_eq!(
+            unverified_member(&bytes, 9).map(|member| member.signed),
+            Some(false),
+            "an index past the committee signed nothing"
+        );
+        assert_eq!(unverified_member(&prefix, 0), None);
+        assert_eq!(unverified_member(&bytes[..bytes.len() - 1], 0), None);
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(unverified_member(&trailing, 0), None);
+        assert_eq!(
+            [1, 2, 3, 4, 7, 10, 16, 24, 30].map(certificate_quorum),
+            [1, 2, 3, 3, 5, 7, 11, 17, 21]
         );
         assert!(
             crate::engine_host::GlobalEngineParams::new("test", 7, Sha256Digest([0; 32]))

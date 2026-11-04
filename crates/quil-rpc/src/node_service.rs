@@ -362,6 +362,10 @@ pub type AppHypergraphStores = Arc<
     dyn Fn(&[u8]) -> Result<Vec<Arc<dyn quil_types::store::HypergraphStore>>, Status> + Send + Sync,
 >;
 
+/// This node's seat's share of a shard's certificates, by shard filter.
+pub type CertificateShareProvider =
+    Arc<dyn Fn(&[u8]) -> Option<node::CertificateShare> + Send + Sync>;
+
 pub struct NodeRpcServer {
     pub peer_id: String,
     pub version: Vec<u8>,
@@ -376,6 +380,9 @@ pub struct NodeRpcServer {
     pub reachable: bool,
     pub frame_cadence_provider:
         Option<Arc<dyn Fn(&[u8]) -> Option<node::FrameCadence> + Send + Sync>>,
+    /// This node's seat's share of a shard's certificates
+    /// (`ShardRewardInfo.certificate_share`); `None` for no seat.
+    pub certificate_share_provider: Option<CertificateShareProvider>,
 
     // Stores and registries (optional — None means unavailable).
     pub prover_registry: Option<Arc<dyn ProverRegistry>>,
@@ -496,6 +503,7 @@ impl NodeRpcServer {
             prover_address: Vec::new(),
             reachable: false,
             frame_cadence_provider: None,
+            certificate_share_provider: None,
             prover_registry: None,
             shard_info_provider: None,
             token_fee_provider: None,
@@ -563,6 +571,10 @@ impl NodeRpcServer {
         provider: Arc<dyn Fn(&[u8]) -> Option<node::FrameCadence> + Send + Sync>,
     ) -> Self {
         self.frame_cadence_provider = Some(provider);
+        self
+    }
+    pub fn with_certificate_share_provider(mut self, provider: CertificateShareProvider) -> Self {
+        self.certificate_share_provider = Some(provider);
         self
     }
     pub fn with_shard_info_provider(mut self, provider: Arc<dyn ShardInfoProvider>) -> Self {
@@ -1822,6 +1834,10 @@ impl NodeService for NodeRpcServer {
                     leaving: c.leaving,
                     departing: c.departing,
                 }),
+                certificate_share: self
+                    .certificate_share_provider
+                    .as_ref()
+                    .and_then(|p| p(&d.filter)),
             });
         }
 
@@ -3318,6 +3334,61 @@ mod shard_world_size_tests {
                 BigInt::from(3000)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn seat_certificate_shares_reach_their_rows_and_older_servers_send_none() {
+        let share = node::CertificateShare {
+            hour: Some(node::CertificateWindow {
+                window_seconds: 3600,
+                observed_seconds: 3600,
+                frames: 340,
+                signed_frames: 120,
+            }),
+            day: Some(node::CertificateWindow {
+                window_seconds: 86400,
+                observed_seconds: 7200,
+                frames: 700,
+                signed_frames: 260,
+            }),
+            committee: 24,
+            quorum: 17,
+        };
+        let expected = share;
+        let request = || Request::new(node::GetShardInfoRequest { include_all: true });
+        let server = NodeRpcServer::new()
+            .with_shard_info_provider(Arc::new(Provider))
+            .with_certificate_share_provider(Arc::new(move |filter| {
+                (filter == &[1u8][..]).then_some(share)
+            }));
+        let response = server.get_shard_info(request()).await.unwrap().into_inner();
+        let response = <node::GetShardInfoResponse as prost::Message>::decode(
+            prost::Message::encode_to_vec(&response).as_slice(),
+        )
+        .unwrap();
+        assert_eq!(response.shards[0].certificate_share, Some(expected));
+        assert!(
+            response.shards[1].certificate_share.is_none(),
+            "a shard without a seat has no share"
+        );
+        let older = NodeRpcServer::new()
+            .with_shard_info_provider(Arc::new(Provider))
+            .get_shard_info(request())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(older.shards.iter().all(|s| s.certificate_share.is_none()));
+        // A row an older server encoded, without the field, still decodes.
+        let legacy = prost::Message::encode_to_vec(&node::ShardRewardInfo {
+            filter: vec![1],
+            active_provers: 8,
+            ..Default::default()
+        });
+        let decoded = <node::ShardRewardInfo as prost::Message>::decode(legacy.as_slice()).unwrap();
+        assert_eq!(
+            (decoded.active_provers, decoded.certificate_share),
+            (8, None)
+        );
     }
 }
 

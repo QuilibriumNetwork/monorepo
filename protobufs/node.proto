@@ -532,6 +532,37 @@ message ShardRewardInfo {
   // The shard's provers by lifecycle phase at frame_number; absent on older
   // servers.
   ShardProverCounts prover_counts = 16;
+  // How often this node's seat on the shard signed the certificates of the
+  // shard frames GLOBAL included; absent on older servers and for shards
+  // this node holds no seat on.
+  CertificateShare certificate_share = 17;
+}
+
+// A seat's share of its shard's certificates. A shard frame credits only
+// the members that signed its finalization certificate, and a certificate
+// carries the first `quorum` votes its assembler verified, so a member
+// whose votes arrive late signs fewer of them. Counted by this node from the
+// certificates of the shard frames in the GLOBAL frames it received, for
+// frames of committee sessions this node is a member of, by each frame's
+// own timestamp.
+message CertificateShare {
+  CertificateWindow hour = 1;
+  CertificateWindow day = 2;
+  // The committee of the latest frame counted, and the signers its
+  // certificate needs: committee - floor((committee - 1) / 3). A member that
+  // votes in time signs about quorum / committee of the frames.
+  uint32 committee = 3;
+  uint32 quorum = 4;
+}
+
+message CertificateWindow {
+  uint64 window_seconds = 1;
+  // How much of the window this node counted, since it started counting the
+  // seat; less than the window after a restart or a new seat.
+  uint64 observed_seconds = 2;
+  uint64 frames = 3;
+  // Of `frames`, those whose certificate this seat signed.
+  uint64 signed_frames = 4;
 }
 
 // Provers of a shard by effective lifecycle phase: a confirmed join counts as
