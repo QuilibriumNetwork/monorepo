@@ -496,6 +496,30 @@ impl AllocationBuckets {
     }
 }
 
+/// How long this process's longest waiter has waited for an archive recovery turn.
+fn process_recovery_wait() -> std::time::Duration {
+    crate::recovery_turns::SHARD_RECOVERY_TURNS.longest_wait()
+}
+
+/// Whether new joins wait because a worker of this process has waited
+/// `longest_wait` for an archive recovery turn: an epoch or more. A seat must
+/// host its session within an epoch or its renewal is withheld
+/// (`session_hosting`), so behind such a queue a new seat without its shard's
+/// state lapses before it first votes, is left, and its worker joins another:
+/// each cycle costs join, confirm and leave messages and a pending join in every
+/// other prover's plan, and adds an install to the queue (2026-11-02: two nodes
+/// with 53 and 18 workers waiting up to 6.4 and 4.0 h for two turns, seats hopping
+/// shards every few epochs, none or one of 55 and 20 workers serving).
+///
+/// It cannot refuse forever: a waiting seat either gets its turns or lapses within
+/// its recovery epoch and leaves the queue, which is bounded by the seats already
+/// held. Joins that landed are still decided, and an operator's manual joins and
+/// leaves are not held.
+fn joins_wait_for_recovery(longest_wait: std::time::Duration) -> bool {
+    let epoch_ms = super::session_hosting::epoch_ms(quil_types::consensus::epoch_length_frames());
+    longest_wait.as_millis() >= u128::from(epoch_ms)
+}
+
 /// Snapshot of every gate the lifecycle consults when deciding what
 /// to emit on a given frame. Populated once at the top of
 /// [`ProverLifecycle::evaluate`] (and exposed via
@@ -631,6 +655,11 @@ pub struct ProverLifecycle {
     /// How long each bound seat's worker has not hosted the committee
     /// session that counts it; a seat an epoch unhosted is not renewed.
     session_hosting: std::sync::Mutex<super::session_hosting::SessionHosting>,
+    /// How long this process's longest waiter has waited for an archive
+    /// recovery turn ([`joins_wait_for_recovery`]).
+    recovery_wait: std::sync::Mutex<fn() -> std::time::Duration>,
+    /// Set while that wait holds new joins, so a line marks each change.
+    joins_held: AtomicBool,
     leave_decisions: super::leave_decisions::LeaveDecisions,
     /// What the latest plan repeats, for its bounded log lines.
     plan_repeats: std::sync::Mutex<super::plan_repeats::PlanRepeats>,
@@ -843,6 +872,10 @@ impl ProverLifecycle {
             capacity_wait: std::sync::Mutex::new(None),
             seniority_guard: Default::default(),
             session_hosting: Default::default(),
+            recovery_wait: std::sync::Mutex::new(
+                process_recovery_wait as fn() -> std::time::Duration,
+            ),
+            joins_held: AtomicBool::new(false),
             initial_sync_complete: AtomicBool::new(false),
             prover_root_verified_frame: AtomicU64::new(0),
             current_frame,
@@ -3499,7 +3532,28 @@ impl ProverLifecycle {
                 "auto-allocation candidate snapshot"
             );
 
-            if can_propose {
+            let recovery_wait = (*self.recovery_wait.lock().unwrap_or_else(|e| e.into_inner()))();
+            let backlogged = joins_wait_for_recovery(recovery_wait);
+            if self.joins_held.swap(backlogged, Ordering::Relaxed) != backlogged {
+                if backlogged {
+                    tracing::warn!(
+                        frame = frame_number,
+                        longest_wait_secs = recovery_wait.as_secs(),
+                        scope = "this node",
+                        action = "none: joins resume as waiting seats recover or lapse; a node that \
+                                  stays here holds more seats than its archive recovery turns serve",
+                        "new joins held: a worker has waited over an epoch for an archive recovery \
+                         turn, so a new seat could not host its session within the epoch that \
+                         renews it"
+                    );
+                } else {
+                    info!(
+                        frame = frame_number,
+                        "new joins resume: archive recovery turns caught up"
+                    );
+                }
+            }
+            if can_propose && !backlogged {
                 // Per-filter Join hold: exclude any filter we've
                 // already proposed Join for while that join may still
                 // land (`join_hold_ended`). Closes the orphan-
@@ -3589,7 +3643,11 @@ impl ProverLifecycle {
             } else {
                 tracing::debug!(
                     frame = frame_number,
-                    reason = skip_reason,
+                    reason = if backlogged {
+                        "recovery backlog"
+                    } else {
+                        skip_reason
+                    },
                     "skipping join proposals"
                 );
             }
@@ -7407,6 +7465,69 @@ mod proposal_loop_tests {
                 "frame {frame}: membership unknown lifts nothing: {actions:?}"
             );
         }
+    }
+
+    /// New joins wait while a worker has waited an epoch for a recovery turn,
+    /// with one line at each change, and resume once it has not.
+    #[test]
+    fn joins_wait_for_a_recovery_backlog_and_resume_after_it() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(idle_worker(1));
+        reg.set_summaries(
+            (1..=4)
+                .map(|byte| shard_summary(filter_bytes(byte), 1))
+                .collect(),
+        );
+        reg.set_prover(prover(address.clone(), vec![]));
+        let lifecycle = |wait: fn() -> std::time::Duration| {
+            let lc = make_lifecycle(
+                address.clone(),
+                wm.clone() as Arc<dyn WorkerManager>,
+                reg.clone() as Arc<dyn ProverRegistry>,
+            );
+            *lc.recovery_wait.lock().unwrap() = wait;
+            lc.set_prover_root_verified_frame(100);
+            lc
+        };
+        let joins = |lc: &ProverLifecycle| {
+            count_proposed_joins(&lc.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap())
+        };
+        let epoch = || {
+            std::time::Duration::from_millis(crate::provers::session_hosting::epoch_ms(
+                quil_types::consensus::epoch_length_frames(),
+            ))
+        };
+        assert!(
+            joins(&lifecycle(|| std::time::Duration::ZERO)) > 0,
+            "no backlog: the node joins"
+        );
+        let just_under = || {
+            std::time::Duration::from_millis(
+                crate::provers::session_hosting::epoch_ms(
+                    quil_types::consensus::epoch_length_frames(),
+                ) - 1,
+            )
+        };
+        assert!(
+            joins(&lifecycle(just_under)) > 0,
+            "a wait under an epoch holds no join"
+        );
+        let logs = crate::outage::test_logs::CapturedLogs::default();
+        let _guard = logs.install();
+        let lc = lifecycle(epoch);
+        assert_eq!(
+            joins(&lc),
+            0,
+            "a worker waited an epoch for a recovery turn and the node still joined a shard it \
+             could not host in time"
+        );
+        assert_eq!(joins(&lc), 0, "and stays held");
+        assert_eq!(logs.lines_with("new joins held").len(), 1, "one line");
+        *lc.recovery_wait.lock().unwrap() = || std::time::Duration::ZERO;
+        assert!(joins(&lc) > 0, "the hold ended with the backlog");
+        assert_eq!(logs.lines_with("new joins resume").len(), 1, "one line");
     }
 
     /// A worker whose seat was withheld for sending no vote takes no new
