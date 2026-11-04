@@ -282,6 +282,8 @@ pub(crate) fn init(
         // certificate cannot be checked yet, and a held frame can take
         // another's place.
         let deferrals = Arc::new(quil_engine::execution_deferral::CollectorDeferrals::default());
+        // Each GLOBAL proposal line counts this gate's tasks and drops.
+        message_collector.set_verify_gate(&super::message_loop::SHARD_FRAME_VERIFY_TASKS);
         message_collector.set_shard_frame_verifier_with_provenance({
             use quil_engine::message_collector::{Provenance, ShardFrameVerdict};
             let (manager, current, global, deferrals) = (

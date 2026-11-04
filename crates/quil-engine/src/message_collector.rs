@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use sha3::{Digest, Sha3_256};
 
+use crate::proposal_pool::Intake;
+
 // NOTE: global consensus has NO per-frame request cap. The original
 // 100-message cap existed because a global proposal was gossiped and
 // BlossomSub has a ~1 MiB message-size ceiling; global consensus now
@@ -526,6 +528,13 @@ pub struct MessageCollector {
     rejects_active: std::sync::atomic::AtomicBool,
     /// The log of rejected shard-frame submits.
     rejects: std::sync::Mutex<RejectLog>,
+    /// Submits since the last GLOBAL proposal copy, for its proposal line.
+    intake: crate::proposal_pool::PoolIntake,
+    /// The node's gate on shard-frame verification tasks
+    /// ([`Self::set_verify_gate`]).
+    verify_gate: std::sync::OnceLock<&'static crate::spawn_gate::SpawnGate>,
+    /// What the last GLOBAL proposal copy found ([`Self::take_proposal_pool`]).
+    last_pool: std::sync::Mutex<Option<crate::proposal_pool::ProposalPool>>,
 }
 
 /// How often submits refused for a full rank buffer are logged while they
@@ -779,7 +788,22 @@ impl MessageCollector {
             rank_full: std::sync::Mutex::new(RankFullLog::new()),
             rejects_active: std::sync::atomic::AtomicBool::new(false),
             rejects: std::sync::Mutex::new(RejectLog::new()),
+            intake: Default::default(),
+            verify_gate: std::sync::OnceLock::new(),
+            last_pool: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The gate the node admits shard-frame verification tasks through, so a
+    /// proposal line counts its tasks and drops.
+    pub fn set_verify_gate(&self, gate: &'static crate::spawn_gate::SpawnGate) {
+        let _ = self.verify_gate.set(gate);
+    }
+
+    /// What the last GLOBAL proposal copy ([`Self::snapshot_for_proposal`]
+    /// with a frame) found, taken once.
+    pub(crate) fn take_proposal_pool(&self) -> Option<crate::proposal_pool::ProposalPool> {
+        self.last_pool.lock().ok()?.take()
     }
 
     /// Install the admission check of shard frames. Archives, whose collector
@@ -1080,6 +1104,7 @@ impl MessageCollector {
                 frame_number = c.frame_number,
                 "message collector: shard-frame submit refused — header is not in its canonical encoding"
             );
+            self.intake.note(Intake::RefusedInvalid, Instant::now());
             return SubmitOutcome::Filtered(Refusal::InvalidShardFrame);
         }
 
@@ -1123,6 +1148,8 @@ impl MessageCollector {
                             reason: String::new(),
                         },
                     );
+                    self.intake
+                        .note(Intake::RefusedUnknownShard, Instant::now());
                     return SubmitOutcome::Filtered(Refusal::UnknownShard);
                 }
             }
@@ -1165,6 +1192,8 @@ impl MessageCollector {
         // Held until the message is filed (declared before the buffers'
         // lock, so released after it): a waiting copy then finds it superseded.
         let mut _claim = None;
+        // Why a filed shard frame stays unverified, for the proposal line.
+        let mut held = None;
         if !keys.is_empty() && !verified {
             let verifier = self.shard_frame_verifier.read().unwrap().clone();
             if let Some(verify) = verifier {
@@ -1190,6 +1219,9 @@ impl MessageCollector {
                 let slot = claimed.then(|| Slot(&self.verifications)).filter(|slot| {
                     slot.0.fetch_add(1, Ordering::AcqRel) < MAX_CONCURRENT_VERIFICATIONS
                 });
+                if slot.is_none() {
+                    held = Some(Intake::HeldVerifierBusy);
+                }
                 if let Some(slot) = slot {
                     let verdict = verify(&message.data, provenance);
                     drop(slot);
@@ -1212,13 +1244,17 @@ impl MessageCollector {
                                     },
                                 );
                             }
+                            self.intake.note(Intake::RefusedInvalid, Instant::now());
                             return SubmitOutcome::Filtered(Refusal::InvalidShardFrame);
                         }
                         ShardFrameVerdict::Unavailable(reason) => {
+                            held = Some(Intake::HeldUnverifiable);
                             tracing::debug!(%reason, "message collector: shard frame not verifiable now; held unverified");
                         }
                         ShardFrameVerdict::Full(reason) => {
                             tracing::debug!(%reason, "message collector: shard frame not verifiable now and its shard's held frames are at their cap");
+                            self.intake
+                                .note(Intake::RefusedAwaitingExecution, Instant::now());
                             return SubmitOutcome::Filtered(Refusal::AwaitingExecution);
                         }
                     }
@@ -1247,7 +1283,14 @@ impl MessageCollector {
         let buffer = buffers.entry(rank).or_insert_with(RankBuffer::new);
         match buffer.add(message) {
             AddOutcome::Added => {
-                self.note_rank_accepting(Instant::now(), rank);
+                let now = Instant::now();
+                self.note_rank_accepting(now, rank);
+                if !keys.is_empty() {
+                    self.intake.note(Intake::Accepted, now);
+                    if let Some(held) = held.filter(|_| !verified) {
+                        self.intake.note(held, now);
+                    }
+                }
                 if verified && !keys.is_empty() {
                     self.supersede(&mut buffers, &keys, hash);
                 }
@@ -1255,6 +1298,7 @@ impl MessageCollector {
             }
             AddOutcome::Duplicate => SubmitOutcome::Duplicate,
             AddOutcome::Full => {
+                self.intake.note(Intake::RefusedRankFull, Instant::now());
                 self.note_rank_full(
                     Instant::now(),
                     RankFullState {
@@ -1458,6 +1502,9 @@ impl MessageCollector {
                 }
             }
         }
+        if let Some(frame) = frame {
+            self.note_proposal_pool(frame, &buffers, &finalized, &consumed_keys, &shards);
+        }
         let mut groups: Vec<((u64, [u8; 32]), Vec<Candidate>)> = {
             let included = self.included.lock().map_err(|_| unavailable())?;
             shards
@@ -1575,6 +1622,64 @@ impl MessageCollector {
             .collect())
     }
 
+    /// Record what a GLOBAL proposal of `frame` copies from: the carriable
+    /// candidates `shards` by anchor and verification, the proofs it cannot
+    /// carry, and the intake since the previous copy
+    /// ([`Self::take_proposal_pool`]).
+    fn note_proposal_pool(
+        &self,
+        frame: u64,
+        buffers: &HashMap<u64, RankBuffer>,
+        finalized: &FinalizedSet,
+        consumed: &HashSet<[u8; 32]>,
+        shards: &HashMap<&[u8], Vec<Candidate>>,
+    ) {
+        let parent = frame.saturating_sub(1);
+        let mut pool = crate::proposal_pool::ProposalPool {
+            shards: shards.len(),
+            ..Default::default()
+        };
+        for (_, _, m) in shards.values().flatten() {
+            let anchor = m.shard.as_ref().map_or(0, |s| s.anchor);
+            if anchor == parent {
+                pool.anchored_parent += 1;
+            } else {
+                pool.anchored_earlier += 1;
+            }
+            if m.verified {
+                pool.verified += 1;
+            } else {
+                pool.unverified += 1;
+            }
+        }
+        let mut seen = HashSet::new();
+        for m in buffers.values().flat_map(|b| b.iter().map(|(_, m)| m)) {
+            let carried = match &m.shard {
+                Some(shard) => anchor_in_lockstep(shard.anchor, frame),
+                None => bundle_shard_frames_in_lockstep(&m.data, frame),
+            };
+            if m.proof
+                && !carried
+                && !finalized.contains(&m.hash)
+                && !consumed.contains(&m.hash)
+                && seen.insert(m.hash)
+            {
+                pool.out_of_window += 1;
+            }
+        }
+        pool.verifying = self
+            .verifications
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let gate = self.verify_gate.get();
+        pool.gate_in_flight = gate.map_or(0, |gate| gate.in_flight());
+        pool.intake = self
+            .intake
+            .take(Instant::now(), gate.map_or(0, |gate| gate.dropped_total()));
+        if let Ok(mut last) = self.last_pool.lock() {
+            *last = Some(pool);
+        }
+    }
+
     /// Age public GLOBAL inputs only after a finalized frame has materialized.
     /// Tentative proposals use private snapshots and cannot advance this window.
     ///
@@ -1587,6 +1692,7 @@ impl MessageCollector {
     /// every message it did not carry, each one already reported to its
     /// submitter as accepted.
     pub fn prune_after_finalization(&self, rank: u64) {
+        self.intake.note_published(Instant::now());
         let cutoff = {
             let mut ranks = self.finalized_ranks.lock().unwrap();
             if ranks.back().is_some_and(|last| *last >= rank) {
@@ -3078,6 +3184,96 @@ mod tests {
             .snapshot_for_proposal(1, 4096, 100, Some(113), &[])
             .unwrap()
             .is_empty());
+    }
+
+    /// A shard bundle of shard `addr`'s `frame` anchored to GLOBAL `anchor`.
+    fn anchored_bundle(addr: u8, frame: u64, anchor: u64) -> Vec<u8> {
+        use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let header = FrameHeader {
+            address: vec![addr; 32],
+            frame_number: frame,
+            global_frame_number: anchor,
+            ..Default::default()
+        };
+        CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest {
+                inner_type_prefix: TYPE_FRAME_HEADER,
+                inner_bytes: header.to_canonical_bytes().unwrap(),
+            })],
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// A GLOBAL proposal's copy records what the mempool held, by anchor and
+    /// verification, and the submits since the previous copy, once.
+    #[test]
+    fn a_proposal_copy_records_the_pool_and_the_intake_since_the_last_copy() {
+        let mc = MessageCollector::new();
+        let (verifier, _) = counting_verifier(|frame| match frame {
+            5 => ShardFrameVerdict::Unavailable("anchor not executed".into()),
+            1_000 => ShardFrameVerdict::Invalid("certificate".into()),
+            _ => ShardFrameVerdict::Valid,
+        });
+        mc.set_shard_frame_verifier(verifier);
+        mc.prune_after_finalization(1);
+        // Proposing frame 101: its parent is 100, its window reaches 88.
+        let accepted = [
+            anchored_bundle(0x11, 5, 100),
+            anchored_bundle(0x22, 6, 95),
+            anchored_bundle(0x33, 7, 50),
+        ];
+        for bundle in accepted {
+            assert_eq!(mc.add_message_outcome(1, bundle), SubmitOutcome::Accepted);
+        }
+        assert_eq!(
+            mc.add_message_outcome(1, anchored_bundle(0x44, 1_000, 100)),
+            SubmitOutcome::Filtered(Refusal::InvalidShardFrame)
+        );
+        assert!(mc.take_proposal_pool().is_none(), "no proposal copied yet");
+        assert!(mc.snapshot_for_proposal(1, 1 << 20, 100, None, &[]).is_ok());
+        assert!(
+            mc.take_proposal_pool().is_none(),
+            "a copy for no GLOBAL frame records nothing"
+        );
+        let copied = mc
+            .snapshot_for_proposal(1, 1 << 20, 100, Some(101), &[])
+            .unwrap();
+        assert_eq!(copied.len(), 2);
+        let pool = mc.take_proposal_pool().expect("the copy's pool");
+        let intake = &pool.intake;
+        assert_eq!(
+            (pool.shards, pool.anchored_parent, pool.anchored_earlier),
+            (2, 1, 1)
+        );
+        assert_eq!(pool.out_of_window, 1, "anchored to 50, outside 88..=100");
+        assert_eq!((pool.verified, pool.unverified), (1, 1));
+        assert_eq!((pool.verifying, pool.gate_in_flight), (0, 0));
+        assert_eq!(
+            (
+                intake.accepted,
+                intake.held_unverifiable,
+                intake.refused_invalid
+            ),
+            (3, 1, 1)
+        );
+        assert_eq!(intake.held_verifier_busy + intake.refused_rank_full, 0);
+        assert!(intake.since_accepted_ms.is_some() && intake.since_published_ms.is_some());
+        assert!(mc.take_proposal_pool().is_none(), "taken once");
+        mc.snapshot_for_proposal(1, 1 << 20, 100, Some(101), &[])
+            .unwrap();
+        let next = mc.take_proposal_pool().unwrap();
+        assert_eq!(
+            (
+                next.intake.accepted,
+                next.intake.refused_invalid,
+                next.shards
+            ),
+            (0, 0, 2),
+            "the intake counts since the previous copy; the pool is what is held"
+        );
     }
 
     /// A shard's copied candidates are those its leader would examine: its

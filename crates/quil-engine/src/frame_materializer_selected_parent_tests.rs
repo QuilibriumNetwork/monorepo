@@ -760,6 +760,67 @@ fn a_proposal_that_finds_the_engines_in_use_logs_one_outage_not_a_warn_per_retry
     assert!(ended[0].contains("retries=3"), "{}", ended[0]);
 }
 
+/// Propose on `rig`'s deployed parent stamped `ahead_ms` from now, and return
+/// the proposal lines and the early-copy warnings it logged.
+fn proposal_lines(ahead_ms: i64) -> (Vec<String>, Vec<String>, std::time::Duration) {
+    use crate::outage::test_logs::CapturedLogs;
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    let rig = Rig::new();
+    let mut parent = rig.deploy();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    // The identity hashes the output only, so the stamp keeps the parent.
+    parent.header.as_mut().unwrap().timestamp = now_ms + ahead_ms;
+    rig.put(&parent);
+    let context = rig.context(&parent);
+    let seam = rig.seam(&parent);
+    let started = std::time::Instant::now();
+    assert!(seam.propose_with_context(context).is_some());
+    (
+        logs.lines_with("proving next global state"),
+        logs.lines_with("GLOBAL proposal copied its messages before waiting out"),
+        started.elapsed(),
+    )
+}
+
+/// Each own proposal logs what the mempool held when it was copied and what
+/// arrived since; a proposal built before its frame was due also says it
+/// copied early (2026-11-04: such proposals carried about 10 shard headers
+/// against about 95, and no line showed it).
+#[test]
+fn a_proposal_logs_its_pool_and_warns_when_it_copied_before_its_frame_was_due() {
+    let (lines, warned, took) = proposal_lines(1_500);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    for field in [
+        "pool_shards=",
+        "pool_anchored_parent=",
+        "pool_unverified=",
+        "held_unverifiable=",
+        "refused_rank_full=",
+        "verify_tasks_dropped=",
+        "since_published_ms=",
+        "since_accepted_ms=",
+    ] {
+        assert!(lines[0].contains(field), "{field} in {}", lines[0]);
+    }
+    let paced = |line: &str| -> u64 {
+        let value = line.split("paced_after_copy_ms=").nth(1).expect(line);
+        let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().expect(line)
+    };
+    assert!(took >= std::time::Duration::from_millis(1_000), "{took:?}");
+    assert!(paced(&lines[0]) >= 1_000, "{}", lines[0]);
+    assert_eq!(warned.len(), 1, "{warned:?}");
+
+    let (lines, warned, _) = proposal_lines(-1_000);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(paced(&lines[0]), 0, "{}", lines[0]);
+    assert!(warned.is_empty(), "a proposal copied when due: {warned:?}");
+}
+
 /// A busy proposal outage repeats at most every 10 s with its duration and
 /// retry count, and a new view ends the last view's at its last busy retry.
 #[test]

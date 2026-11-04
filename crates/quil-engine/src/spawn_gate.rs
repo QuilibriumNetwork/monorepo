@@ -35,6 +35,11 @@ impl SpawnGate {
         self.dropped.load(Ordering::Relaxed)
     }
 
+    /// Permits held now.
+    pub fn in_flight(&self) -> usize {
+        self.cap.saturating_sub(self.permits.available_permits())
+    }
+
     /// A permit, or `None` when `cap` tasks are in flight; the refusal is
     /// counted and logged (first drop at once, then once a minute).
     pub fn try_enter(&'static self) -> Option<SemaphorePermit<'static>> {
@@ -94,6 +99,7 @@ mod tests {
         let second = GATE.try_enter().expect("second slot");
         assert_eq!(GATE.dropped_total(), 0, "nothing is refused below the cap");
         assert!(GATE.try_enter().is_none(), "the cap is reached");
+        assert_eq!(GATE.in_flight(), 2);
         assert!(GATE.try_enter().is_none());
         assert_eq!(GATE.dropped_total(), 2, "each refusal is counted");
         drop(first);
