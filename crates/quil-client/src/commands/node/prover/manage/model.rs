@@ -440,6 +440,8 @@ pub struct Model {
     pub global_observed_head: u64,
     pub node_global_cadence: Option<quil_types::proto::node::FrameCadence>,
     pub node_app_cadence: HashMap<Vec<u8>, quil_types::proto::node::FrameCadence>,
+    /// Frame committee size by shard filter, scaling the observed estimates.
+    pub node_app_committee: HashMap<Vec<u8>, u32>,
     pub reward_windows: u8,
     pub interval_windows: u8,
     pub global_interval_windows: u8,
@@ -860,6 +862,7 @@ impl Model {
             self.node_app_cadence.get(filter)?,
             index == 1,
             now,
+            self.node_app_committee.get(filter).copied().unwrap_or(0),
         )
     }
     pub fn app_interval(&self, filter: &[u8]) -> Option<f64> {
@@ -882,6 +885,7 @@ impl Model {
             .iter()
             .filter_map(|s| s.frame_cadence.clone().map(|c| (s.filter.clone(), c)))
             .collect();
+        self.node_app_committee = committee_sizes(shards);
     }
 
     /// Track only fresh node responses; shard-cache refreshes cannot reset this clock.
@@ -1110,6 +1114,7 @@ impl Model {
                 .iter()
                 .filter_map(|s| s.frame_cadence.clone().map(|c| (s.filter.clone(), c)))
                 .collect();
+            self.node_app_committee = committee_sizes(shards);
         }
         self.peer_id = node_info.peer_id.clone();
         if !node_info.peer_seniority.is_empty() {
@@ -2167,6 +2172,15 @@ pub fn prover_halt_risk(counts: Option<&ShardProverCounts>, size: &BigInt) -> bo
     })
 }
 
+/// Each shard's frame committee size, by filter.
+fn committee_sizes(shards: &GetShardInfoResponse) -> HashMap<Vec<u8>, u32> {
+    shards
+        .shards
+        .iter()
+        .map(|s| (s.filter.clone(), super::super::committee_size(s)))
+        .collect()
+}
+
 /// ProverPhases sorts by the provers serving after the next boundary, then
 /// by active ones; unreported counts sort first ascending.
 fn prover_phase_order(counts: Option<&ShardProverCounts>) -> Option<(u32, u32)> {
@@ -3081,6 +3095,51 @@ mod frame_interval_tests {
         shards.shards[0].frame_cadence = None;
         m.observe_app_intervals(&shards, std::time::Instant::now());
         assert_eq!(m.app_interval(&[1]), None);
+    }
+    /// The 60m and 24h estimates pay the quorum share of frames; the theory
+    /// column still pays every frame at 10s/frame.
+    #[test]
+    fn observed_rewards_pay_the_quorum_share_and_theory_every_frame() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let window = Some(FrameWindow {
+            window_seconds: 3600,
+            observed_seconds: 600,
+            advanced_frames: 30,
+        });
+        let mut m = Model::new();
+        let shards = GetShardInfoResponse {
+            shards: vec![ShardRewardInfo {
+                filter: vec![1],
+                active_provers: 25,
+                prover_counts: Some(ShardProverCounts {
+                    joining: 2,
+                    active: 20,
+                    paused: 1,
+                    leaving: 1,
+                    departing: 1,
+                    ..Default::default()
+                }),
+                frame_cadence: Some(FrameCadence {
+                    last_observed_unix_seconds: now,
+                    hour: window,
+                    day: window,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        m.observe_app_intervals(&shards, std::time::Instant::now());
+        let per_frame = BigInt::from(22_000);
+        let quorum = Some(BigInt::from(95_040_000 / 22 * 15));
+        assert_eq!(m.daily_reward(&per_frame, &[1], 0), quorum);
+        assert_eq!(m.daily_reward(&per_frame, &[1], 1), quorum);
+        assert_eq!(
+            m.daily_reward(&per_frame, &[1], 2),
+            Some(BigInt::from(22_000 * 8640))
+        );
     }
     #[test]
     fn a_received_head_alone_cannot_create_a_node_cadence_measurement() {
