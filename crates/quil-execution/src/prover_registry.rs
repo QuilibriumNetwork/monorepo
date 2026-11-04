@@ -3735,6 +3735,22 @@ mod tests {
     use num_bigint::BigInt;
     use quil_tries::{serialize_go_tree, LeafNode, VectorCommitmentTree};
 
+    /// The split proposer treats regions at or above this bound as never
+    /// receiving an output (`quil_forest::bit_path_reaches_outputs`): it must
+    /// be the field coin and escrow addresses are Poseidon images in.
+    #[test]
+    fn the_output_address_bound_is_the_bn254_modulus() {
+        let (_, modulus) = bn254_modulus().to_bytes_be();
+        assert_eq!(
+            modulus.as_slice(),
+            quil_forest::POSEIDON_ADDRESS_BOUND.as_slice()
+        );
+        for seed in 0u32..256 {
+            let address = quil_crypto::poseidon::hash_bytes_to_32(&seed.to_be_bytes()).unwrap();
+            assert!(address < quil_forest::POSEIDON_ADDRESS_BOUND, "{seed}");
+        }
+    }
+
     fn make_vertex_key(address_byte: u8) -> Vec<u8> {
         // 32-byte domain (global intrinsic) + 32-byte address.
         let mut key = vec![0xFFu8; 32];

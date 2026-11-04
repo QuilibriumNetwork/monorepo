@@ -55,8 +55,9 @@ fn propose_split_children_descends_to_the_real_branch() {
     }
     c.commit(1).unwrap();
 
+    // No region counts as reachable here: this checks the descent alone.
     let children = c
-        .propose_split_children("vertex", "adds", &app, &[], 16)
+        .propose_split_children("vertex", "adds", &app, &[], 16, &|_| false)
         .expect("skewed app with 4 leaves splits at the real branch");
     assert_eq!(children.len(), 2, "binary bifurcation");
 
@@ -81,6 +82,20 @@ fn propose_split_children_descends_to_the_real_branch() {
         vec![false, false, false, true]
     );
 
+    // Under the Poseidon bound, 001 ([0x20, 0x40)) is empty but outputs reach
+    // it: descending past it would register it as a spine with no committee,
+    // so no split is proposed until data lands there.
+    assert!(c
+        .propose_split_children(
+            "vertex",
+            "adds",
+            &app,
+            &[],
+            16,
+            &quil_forest::bit_path_reaches_outputs
+        )
+        .is_none());
+
     // A single-leaf app is unsplittable → None (the guard).
     let single = fresh();
     single.set_unified_tree(true);
@@ -95,7 +110,7 @@ fn propose_split_children_descends_to_the_real_branch() {
         .unwrap();
     single.commit(1).unwrap();
     assert!(single
-        .propose_split_children("vertex", "adds", &app, &[], 16)
+        .propose_split_children("vertex", "adds", &app, &[], 16, &|_| false)
         .is_none());
 }
 

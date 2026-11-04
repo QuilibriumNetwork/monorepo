@@ -48,7 +48,7 @@ mod sync;
 pub use forest::tree_generation;
 pub use forest::{
     node_size_sum, rollup_phase_roots, subtree_leaf_count, subtree_size, Forest, Phase, ShardRoots,
-    PHASES,
+    SplitBifurcation, PHASES,
 };
 pub use scope::ScopeDeletion;
 pub use storage_health::{DiskThresholds, StoreRole};
@@ -522,7 +522,10 @@ pub fn shard_prefix_to_filter(l2: &[u8], prefix: &[u32]) -> Vec<u8> {
 /// alongside the two leaf children makes the shard set COMPLETE and PREFIX-FREE:
 /// every address routes to exactly one shard, no fallback. The spine shards start
 /// EMPTY (they cover the regions the split descended past, which held no data) —
-/// latent placeholders excluded from halt-risk / proposal until data lands.
+/// latent placeholders excluded from halt-risk / proposal until data lands. The
+/// node's proposer descends only past regions no output can reach
+/// ([`bit_path_reaches_outputs`]), since no committee forms on a spine to
+/// deliver one.
 ///
 /// `parent` MUST be a bit-prefix of `branch`. Example: `parent=[]`,
 /// `branch=[0,0]` (children `[0,0,0]`/`[0,0,1]`) → spine `[[1], [0,1]]`.
@@ -535,6 +538,29 @@ pub fn split_spine_siblings(parent: &[bool], branch: &[bool]) -> Vec<Vec<bool>> 
         out.push(sib);
     }
     out
+}
+
+/// Exclusive upper bound of every address an application's coins and escrows
+/// can take: the BN254 scalar modulus `p`, big-endian. Those addresses are
+/// Poseidon images (`hash_bytes_to_32`), so their top byte is at most `0x30`
+/// and a region starting at or above `p` never receives an output.
+pub const POSEIDON_ADDRESS_BOUND: [u8; 32] = [
+    0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29, 0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58, 0x5d,
+    0x28, 0x33, 0xe8, 0x48, 0x79, 0xb9, 0x70, 0x91, 0x43, 0xe1, 0xf5, 0x93, 0xf0, 0x00, 0x00, 0x01,
+];
+
+/// Whether an output address can fall under `bit_path`: its lowest address
+/// (the path followed by zero bits) is below [`POSEIDON_ADDRESS_BOUND`]. A
+/// split that left such a region as an empty shard would leave it without a
+/// committee, and an output committed there could not be delivered.
+pub fn bit_path_reaches_outputs(bit_path: &[bool]) -> bool {
+    let mut lowest = [0u8; 32];
+    for (bit, set) in bit_path.iter().take(256).enumerate() {
+        if *set {
+            lowest[bit / 8] |= 0x80 >> (bit % 8);
+        }
+    }
+    lowest < POSEIDON_ADDRESS_BOUND
 }
 
 /// Sentinel first `Vec<u32>` level marking a deep-bifurcation bit-path prefix.
@@ -1086,6 +1112,20 @@ mod tests {
             split_spine_siblings(&bits("01"), &bits("0100")),
             vec![bits("011"), bits("0101")]
         );
+    }
+
+    #[test]
+    fn only_regions_below_the_poseidon_bound_reach_outputs() {
+        // 0x30.. holds addresses below p; 0x31.. (bits 00110001) does not.
+        assert!(bit_path_reaches_outputs(&bits("")));
+        assert!(bit_path_reaches_outputs(&bits("0011")));
+        assert!(bit_path_reaches_outputs(&bits("00110000")));
+        assert!(!bit_path_reaches_outputs(&bits("00110001")));
+        assert!(!bit_path_reaches_outputs(&bits("01")));
+        assert!(!bit_path_reaches_outputs(&bits("1")));
+        // p = 0x3064…: 0x3040.. is below it, 0x3080.. above.
+        assert!(bit_path_reaches_outputs(&bits("0011000001")));
+        assert!(!bit_path_reaches_outputs(&bits("001100001")));
     }
 
     #[test]

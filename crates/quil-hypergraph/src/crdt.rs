@@ -4933,7 +4933,9 @@ impl HypergraphCrdt {
     /// [`quil_forest::encode_shard_bit_path`]. `None` when the shard is
     /// unsplittable (<2 leaves, or no branch within `max_extra_bits`) — the
     /// caller then proposes nothing (the empty-split guard: not
-    /// a one-sided cut but a real bifurcation). Only meaningful under unified (the
+    /// a one-sided cut but a real bifurcation) — or when the descent would pass
+    /// an empty side that `reachable` says outputs can still land in (it would
+    /// become a spine with no committee). Only meaningful under unified (the
     /// app tree is the data source); returns `None` otherwise.
     pub fn propose_split_children(
         &self,
@@ -4942,6 +4944,7 @@ impl HypergraphCrdt {
         app: &[u8],
         shard_bits: &[bool],
         max_extra_bits: usize,
+        reachable: &dyn Fn(&[bool]) -> bool,
     ) -> Option<Vec<Vec<u8>>> {
         if !self.unified_tree() {
             return None;
@@ -4979,15 +4982,27 @@ impl HypergraphCrdt {
             .flatten();
         let forest_ver = self.forest_version.load(Ordering::SeqCst);
         let bifurcation = forest
-            .first_split_bifurcation(app, PHASES[phase_idx], ver, shard_bits, max_extra_bits)
-            .ok()
-            .flatten();
+            .first_split_bifurcation(
+                app,
+                PHASES[phase_idx],
+                ver,
+                shard_bits,
+                max_extra_bits,
+                reachable,
+            )
+            .ok();
+        let (children_bits, withheld) = match bifurcation {
+            Some(quil_forest::SplitBifurcation::Children(children)) => (Some(children), None),
+            Some(quil_forest::SplitBifurcation::Withheld(side)) => (None, Some(side)),
+            _ => (None, None),
+        };
         // Split-proposer diagnostic: pins WHY an over-crowded shard does / doesn't
         // produce children. `resolved_version=None` ⇒ version fell back to 0 (an
         // empty read → leaf_count 0 → no split; the read_shard_phase_root path
         // instead falls back to forest_version); `parent_leaves<2` ⇒ empty-split
         // guard fired; `children=0` with parent_leaves≥2 ⇒ data too clustered to
-        // bifurcate within the bit budget.
+        // bifurcate within the bit budget, or `withheld_empty_side` names the
+        // empty side outputs can still reach (the split waits for data there).
         tracing::info!(
             app = hex::encode(app),
             shard_bits_len = shard_bits.len(),
@@ -4998,12 +5013,15 @@ impl HypergraphCrdt {
             head_ver_app = ?head_ver_app,
             parent_leaves,
             whole_tree_leaves,
-            children = bifurcation.as_ref().map(|c| c.len()).unwrap_or(0),
+            children = children_bits.as_ref().map(|c| c.len()).unwrap_or(0),
+            withheld_empty_side = %withheld
+                .as_ref()
+                .map(|side| side.iter().map(|b| if *b { '1' } else { '0' }).collect::<String>())
+                .unwrap_or_default(),
             "split-proposer: bifurcation probe"
         );
-        let children_bits = bifurcation?;
         Some(
-            children_bits
+            children_bits?
                 .iter()
                 .map(|b| quil_forest::encode_shard_bit_path(app, b))
                 .collect(),
