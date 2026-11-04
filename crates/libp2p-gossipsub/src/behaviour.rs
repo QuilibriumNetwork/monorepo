@@ -1516,7 +1516,12 @@ where
         if self.explicit_peers.contains(peer_id) {
             tracing::warn!(peer=%peer_id, "GRAFT: ignoring request from direct peer");
             // this is possibly a bug from non-reciprocal configuration; send a PRUNE for all topics
-            to_prune_topics = topics.into_iter().collect();
+            // QUILIBRIUM: only for topics the node joined. Each PRUNE stores a backoff for its
+            // topic, so the topics an explicit peer named were all kept for the prune backoff.
+            to_prune_topics = topics
+                .into_iter()
+                .filter(|topic| self.mesh.contains_key(topic))
+                .collect();
             // but don't PX
             do_px = false
         } else {
@@ -1723,6 +1728,19 @@ where
             .peer_score
             .below_threshold(peer_id, |ts| ts.accept_px_threshold);
         for (topic_hash, px, backoff) in prune_data {
+            // QUILIBRIUM: port of upstream #6707 (GHSA-vrx6-jcp8-vm7m). A PRUNE
+            // names topics of its sender's choosing, and the backoff it asks
+            // for was stored for each of them, whether or not the node joined
+            // it, for up to an hour.
+            if !self.mesh.contains_key(&topic_hash) {
+                tracing::debug!(
+                    peer=%peer_id,
+                    topic=%topic_hash,
+                    "PRUNE: Received prune for unknown topic from peer"
+                );
+                continue;
+            }
+
             if self.remove_peer_from_mesh(peer_id, &topic_hash, backoff, true) {
                 #[cfg(feature = "metrics")]
                 if let Some(m) = self.metrics.as_mut() {

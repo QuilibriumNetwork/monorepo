@@ -7223,3 +7223,77 @@ fn reproduces_graft_topics_recorded_without_subscription() {
         "a GRAFT recorded {recorded} topics the node is not subscribed to for its sender"
     );
 }
+
+/// A PRUNE names topics of its sender's choosing and asks for a backoff of
+/// up to an hour on each. Only a topic the node has joined may keep one
+/// (upstream GHSA-vrx6-jcp8-vm7m); the others were stored for the whole
+/// backoff, without limit.
+#[test]
+fn reproduces_prune_backoff_for_unjoined_topics() {
+    let (mut gs, peers, _receivers, topic_hashes) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .create_network();
+    let pruned: Vec<TopicHash> = (0..1000)
+        .map(|i| TopicHash::from_raw(format!("unjoined-{i}")))
+        .collect();
+
+    gs.handle_prune(
+        &peers[0],
+        pruned
+            .iter()
+            .map(|topic| (topic.clone(), Vec::new(), Some(3600)))
+            .collect(),
+    );
+
+    let stored = pruned
+        .iter()
+        .filter(|topic| gs.backoffs.get_backoff_time(topic, &peers[0]).is_some())
+        .count();
+    assert_eq!(
+        stored, 0,
+        "a PRUNE stored backoffs for {stored} topics the node has not joined"
+    );
+    gs.handle_prune(
+        &peers[0],
+        vec![(topic_hashes[0].clone(), Vec::new(), Some(60))],
+    );
+    assert!(
+        gs.backoffs
+            .get_backoff_time(&topic_hashes[0], &peers[0])
+            .is_some(),
+        "a PRUNE for a joined topic keeps its backoff"
+    );
+}
+
+/// An explicit peer's GRAFT is answered with a PRUNE, which stores a backoff
+/// for its topic: only for the topics the node joined.
+#[test]
+fn explicit_peer_grafts_back_off_only_joined_topics() {
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .explicit(1)
+        .create_network();
+    let mut grafted: Vec<TopicHash> = (0..1000)
+        .map(|i| TopicHash::from_raw(format!("unjoined-{i}")))
+        .collect();
+    grafted.push(topic_hashes[0].clone());
+
+    gs.handle_graft(&peers[0], grafted.clone());
+
+    let stored = grafted
+        .iter()
+        .filter(|topic| gs.backoffs.get_backoff_time(topic, &peers[0]).is_some())
+        .count();
+    assert_eq!(
+        stored, 1,
+        "an explicit peer's GRAFT left {stored} backoffs, for 1 joined topic"
+    );
+    let (prunes, _) = count_control_msgs(receivers, |peer_id, m| {
+        peer_id == &peers[0] && matches!(m, RpcOut::Prune(_))
+    });
+    assert_eq!(prunes, 1, "only the joined topic is pruned");
+}

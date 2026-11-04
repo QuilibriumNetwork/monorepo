@@ -41,3 +41,7 @@ Regression tests: `protocol::tests` (`reproduces_ed448_signed_gossip_verified`, 
 `src/behaviour.rs` (`heartbeat`): the connections of a peer whose messages failed at every heartbeat for 60 s (`SLOW_PEER_DISCONNECT_AFTER`), or whose priority queue holds more than 10,000 messages (`MAX_PRIORITY_QUEUE_LEN`), are closed; nothing else frees what is queued for it.
 
 Regression tests: `behaviour::tests` (`reproduces_graft_topics_recorded_without_subscription`, `stalled_peer_connections_are_closed`) and `rpc::tests` (`reproduces_unbounded_queued_message_bytes`, `queued_message_bytes_are_released_on_receipt`).
+
+## PRUNE backoffs for topics the node has not joined
+
+`src/behaviour.rs` (`handle_prune`): upstream stores the backoff a PRUNE asks for (up to an hour) for every topic it names, whether or not the node joined the topic, so one peer could fill the backoff storage without limit. A PRUNE for a topic outside the mesh is now ignored, as upstream fixed it in 0.50.1 (#6707, GHSA-vrx6-jcp8-vm7m). `handle_graft`: the PRUNEs that answer an explicit peer's GRAFT, each storing a backoff, now name only the joined topics. Regression tests: `behaviour::tests` (`reproduces_prune_backoff_for_unjoined_topics`, `explicit_peer_grafts_back_off_only_joined_topics`).
