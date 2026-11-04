@@ -1657,10 +1657,12 @@ pub fn set_exact_state_size_epoch_for_thread(epoch: Option<u64>) {
 
 /// The epoch from whose seals a registration may pad its leaf's data only
 /// with zero nodes: the seal's binding opens the first node past the
-/// leaf's data and shows it and every node after it zero. Before it the
-/// padding was never opened, so a member could pad with the negated last
-/// labels, making its replica zero there, and answer the frames' openings
-/// of those nodes without keeping them. Keyed by the seal's epoch, in its
+/// leaf's data and shows it and every node after it zero, and opens record
+/// 0 and shows the values start at its offset 0, adding offsets checked.
+/// Before it neither the padding nor a gap before the first value was ever
+/// opened, so a member could fill either with the negated last labels,
+/// making its replica zero there, and answer the frames' openings of those
+/// nodes without keeping them. Keyed by the seal's epoch, in its
 /// decoding too, so every build parses and checks a seal of an earlier
 /// epoch alike. Consensus-affecting: every GLOBAL prover and archive must
 /// run a build with it before its seals begin, the epoch before.

@@ -4220,6 +4220,7 @@ pub(crate) mod tests {
         };
         bound.header.iter_mut().for_each(&mut moved);
         bound.last.iter_mut().for_each(&mut moved);
+        bound.first.iter_mut().for_each(&mut moved);
         for check in &mut bound.records {
             check.records.iter_mut().for_each(&mut moved);
             check.value_node.iter_mut().for_each(&mut moved);
@@ -4441,6 +4442,311 @@ pub(crate) mod tests {
             );
             quil_types::consensus::set_storage_padding_bound_epoch_for_thread(Some(epoch));
         }
+        quil_types::consensus::set_storage_padding_bound_epoch_for_thread(None);
+    }
+
+    /// A leaf's data with every record's offset moved `gap` nodes on, and
+    /// the gap, between the index and the first value, zero.
+    fn shifted_data(captured: &Captured, prefix: &[u32], gap: u64) -> Vec<u8> {
+        use quil_crypto::storage_hash::DATA_BYTES_PER_NODE;
+        let data = captured.leaf_data(prefix).unwrap();
+        let header = binding::header_nodes(&captured.filter, prefix) as usize;
+        let entries = captured.entries(prefix).unwrap().len();
+        // An index record takes two nodes; its offset is its bytes 33..41.
+        let values = (header + 2 * entries) * DATA_BYTES_PER_NODE;
+        let mut shifted = data[..values].to_vec();
+        for r in 0..entries {
+            let at = (header + 2 * r) * DATA_BYTES_PER_NODE + 33;
+            let offset = u64::from_be_bytes(shifted[at..at + 8].try_into().unwrap());
+            if r == 0 {
+                assert_eq!(offset, 0, "harness check: record 0's offset");
+            }
+            let moved = offset + gap * DATA_BYTES_PER_NODE as u64;
+            shifted[at..at + 8].copy_from_slice(&moved.to_be_bytes());
+        }
+        shifted.resize(values + gap as usize * DATA_BYTES_PER_NODE, 0);
+        shifted.extend_from_slice(&data[values..]);
+        shifted
+    }
+
+    /// `bound`, made against the data tree `from` of `exact` nodes, moved
+    /// onto `nodes` (tree `to`): the same data with every node from
+    /// `values` on `gap` nodes further. Each opening takes its node from
+    /// `nodes`.
+    fn shift_binding(
+        bound: &mut LeafBinding,
+        from: &quil_crypto::storage_proof::MerkleTree,
+        exact: u64,
+        (values, gap): (u64, u64),
+        nodes: &[u8],
+        to: &quil_crypto::storage_proof::MerkleTree,
+    ) {
+        use quil_crypto::storage_proof::NODE_BYTES;
+        let index: std::collections::HashMap<Vec<[u8; 32]>, u64> =
+            (0..exact).map(|i| (from.path(i), i)).collect();
+        let mut moved = |opening: &mut binding::Opening| {
+            let mut i = index[&opening.path];
+            if i >= values {
+                i += gap;
+            }
+            opening.node = nodes[i as usize * NODE_BYTES..][..NODE_BYTES]
+                .try_into()
+                .unwrap();
+            opening.path = to.path(i);
+        };
+        bound.header.iter_mut().for_each(&mut moved);
+        bound.last.iter_mut().for_each(&mut moved);
+        bound.first.iter_mut().for_each(&mut moved);
+        for check in &mut bound.records {
+            check.records.iter_mut().for_each(&mut moved);
+            check.value_node.iter_mut().for_each(&mut moved);
+        }
+        for check in &mut bound.coverage {
+            if let Some((_, openings)) = &mut check.record {
+                openings.iter_mut().for_each(&mut moved);
+            }
+        }
+    }
+
+    /// A member moves every record's offset on by a gap before the first
+    /// value and fills the gap with the negated last labels, so its replica
+    /// is zero there and it keeps nothing of it: the seal holds (the
+    /// replica is the data plus the labels), the values end at the
+    /// registered count so nothing is padded, and no check opens the gap or
+    /// reads record 0's offset, so GLOBAL's binding check passed it, with a
+    /// gap past the padding cap.
+    #[test]
+    fn a_gap_before_the_first_value_is_not_bound() {
+        use quil_crypto::storage_hash as hash;
+        use quil_crypto::storage_proof::{
+            data_node_count, data_nodes, encode_leaf_at, max_padded_nodes, prove_seal, verify_seal,
+            MerkleTree, Registered, SealStatement, Tree, NODE_BYTES,
+        };
+        let epoch = 6;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        quil_types::consensus::set_storage_padding_bound_epoch_for_thread(Some(epoch));
+        let app = [0x6Cu8; 32];
+        let captured = padding_leaf(app, epoch);
+        let prefix = captured.prefixes[0].clone();
+        let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&app, &prefix);
+        let data = captured.leaf_data(&prefix).unwrap();
+        let exact = data_node_count(data.len() as u64);
+        let values = binding::header_nodes(&captured.filter, &prefix)
+            + 2 * captured.entries(&prefix).unwrap().len() as u64;
+        // One node past the padding cap: more than any padding could hold.
+        let cap = max_padded_nodes(exact) - exact;
+        let gap = cap + 1;
+        let shifted = shifted_data(&captured, &prefix, gap);
+        let n = data_node_count(shifted.len() as u64);
+        assert_eq!(n, exact + gap, "harness check: the shifted data's nodes");
+        let member = [0x4Cu8; 32];
+        let key = quil_crypto::sdr::replica_key(&member, &leaf_id, epoch);
+        let params = quil_crypto::sdr::SdrParams::default();
+        let honest = encode_leaf_at(&shifted, &key, &params, n, &mut |_, _| {});
+        let mut nodes = data_nodes(&shifted);
+        assert_eq!(
+            MerkleTree::from_nodes(&nodes)
+                .unwrap()
+                .commitment(Tree::Data),
+            honest.comm_d,
+            "harness check: the shifted data tree"
+        );
+        // On the gap the data is zero, so the replica there is the last
+        // labels: negate them into the data, and the replica is zero.
+        let mut replica = honest.replica.clone();
+        for v in values as usize..(values + gap) as usize {
+            let at = v * NODE_BYTES;
+            let label = hash::from_bytes(&honest.replica[at..][..NODE_BYTES]).unwrap();
+            let negated = hash::to_bytes(&hash::sub(&hash::ZERO, &label));
+            nodes[at..at + NODE_BYTES].copy_from_slice(&negated);
+            replica[at..at + NODE_BYTES].fill(0);
+        }
+        let cheat_data = MerkleTree::from_nodes(&nodes).unwrap();
+        let registered = Registered {
+            comm_d: cheat_data.commitment(Tree::Data),
+            comm_c: honest.comm_c,
+            comm_r: MerkleTree::from_nodes(&replica)
+                .unwrap()
+                .commitment(Tree::Replica),
+        };
+        let beacon = [0x5Cu8; 32];
+        let statement = SealStatement {
+            member: &member,
+            leaf_id: &leaf_id,
+            epoch,
+            n,
+            registered,
+            beacon: &beacon,
+        };
+        let count = quil_types::consensus::STORAGE_SEAL_CHALLENGES;
+        let seal = prove_seal(&replica, &statement, &params, count)
+            .expect("harness check: the replica zero on the gap seals");
+        assert_eq!(
+            verify_seal(&statement, &seal, &params, count),
+            Ok(()),
+            "harness check: the replica zero on the gap's seal verifies"
+        );
+        // The binding a member proves of the leaf's data, moved onto the
+        // shifted data: header and index in place, values `gap` nodes on.
+        let plain = MerkleTree::from_nodes(&data_nodes(&data)).unwrap();
+        let plain_claim = captured
+            .claim(
+                &prefix,
+                &leaf_id,
+                &member,
+                &beacon,
+                plain.commitment(Tree::Data),
+                exact,
+            )
+            .unwrap();
+        let mut bound = captured.prove_binding(&plain_claim).unwrap();
+        assert_eq!(binding::verify(&plain_claim, &bound), Ok(()));
+        shift_binding(
+            &mut bound,
+            &plain,
+            exact,
+            (values, gap),
+            &nodes,
+            &cheat_data,
+        );
+        let claim = captured
+            .claim(&prefix, &leaf_id, &member, &beacon, registered.comm_d, n)
+            .unwrap();
+        let verdict = binding::verify(&claim, &bound);
+        quil_types::consensus::set_storage_padding_bound_epoch_for_thread(None);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        match verdict {
+            Ok(()) => panic!(
+                "VULNERABLE: a binding whose values start {gap} nodes past the index was sealed \
+                 and bound, its replica zero on those {gap} of its {n} nodes, past the padding \
+                 cap of {cap}"
+            ),
+            Err(e) => assert_eq!(
+                e,
+                "storage binding: values that do not start at the first record"
+            ),
+        }
+    }
+
+    /// From the padding bound epoch the binding opens record 0 and shows the
+    /// values start at its offset 0, adding offsets checked (class guard,
+    /// with `only_a_tail_of_zero_nodes_opens_as_padding`): an honest
+    /// binding verifies and parses with record 0 in it; moving every offset
+    /// on by one node, two or past the padding cap fails, as do record 0
+    /// left out or posed by another record, and a last offset that does not
+    /// fit beside its length. Before the epoch a moved binding verifies as
+    /// every earlier build verifies it, and record 0's nodes are refused by
+    /// the check and by the parse.
+    #[test]
+    fn from_the_padding_bound_epoch_the_values_start_at_record_zero() {
+        use quil_crypto::storage_hash::DATA_BYTES_PER_NODE;
+        use quil_crypto::storage_proof::{
+            data_node_count, data_nodes, max_padded_nodes, MerkleTree, Tree,
+        };
+        let epoch = 6;
+        quil_types::consensus::set_storage_padding_bound_epoch_for_thread(Some(epoch));
+        let app = [0x6Bu8; 32];
+        let captured = padding_leaf(app, epoch);
+        let prefix = captured.prefixes[0].clone();
+        let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&app, &prefix);
+        let data = captured.leaf_data(&prefix).unwrap();
+        let exact = data_node_count(data.len() as u64);
+        let header = binding::header_nodes(&captured.filter, &prefix);
+        let entries = captured.entries(&prefix).unwrap().len() as u64;
+        let values = header + 2 * entries;
+        let (member, beacon) = ([0x4Bu8; 32], [0x5Bu8; 32]);
+        let plain = MerkleTree::from_nodes(&data_nodes(&data)).unwrap();
+        let claim = captured
+            .claim(
+                &prefix,
+                &leaf_id,
+                &member,
+                &beacon,
+                plain.commitment(Tree::Data),
+                exact,
+            )
+            .unwrap();
+        let proved = captured.prove_binding(&claim).unwrap();
+        assert_eq!(binding::verify(&claim, &proved), Ok(()));
+        assert_eq!(proved.first.len(), 2, "record 0's two nodes");
+        let bytes = proved.to_bytes();
+        assert_eq!(LeafBinding::from_bytes(&bytes, epoch), Some(proved.clone()));
+        let first_record = Err("storage binding: the first record".to_string());
+        let mut unopened = proved.clone();
+        unopened.first.clear();
+        assert_eq!(binding::verify(&claim, &unopened), first_record);
+        // Parsed, a trailer carries record 0 or a padding opening, never
+        // neither, so each binding has one encoding.
+        let encoded = unopened.to_bytes();
+        assert_eq!(
+            LeafBinding::from_bytes(&encoded, epoch),
+            Some(unopened.clone())
+        );
+        let mut empty_trailer = encoded;
+        empty_trailer.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(LeafBinding::from_bytes(&empty_trailer, epoch), None);
+        let mut posed = proved.clone();
+        posed.first = proved.last.clone();
+        assert_eq!(
+            binding::verify(&claim, &posed),
+            Err("storage binding: a record node does not open".into())
+        );
+        let cap = max_padded_nodes(exact) - exact;
+        for gap in [1, 2, cap + 1] {
+            let nodes = data_nodes(&shifted_data(&captured, &prefix, gap));
+            let tree = MerkleTree::from_nodes(&nodes).unwrap();
+            let shifted = captured
+                .claim(
+                    &prefix,
+                    &leaf_id,
+                    &member,
+                    &beacon,
+                    tree.commitment(Tree::Data),
+                    exact + gap,
+                )
+                .unwrap();
+            let mut bound = proved.clone();
+            shift_binding(&mut bound, &plain, exact, (values, gap), &nodes, &tree);
+            assert_eq!(
+                binding::verify(&shifted, &bound),
+                Err("storage binding: values that do not start at the first record".into()),
+                "a gap of {gap} nodes"
+            );
+            quil_types::consensus::set_storage_padding_bound_epoch_for_thread(Some(epoch + 1));
+            let mut earlier = bound.clone();
+            earlier.first.clear();
+            assert_eq!(
+                binding::verify(&shifted, &earlier),
+                Ok(()),
+                "before the epoch, a gap of {gap} nodes binds as it did"
+            );
+            assert_eq!(binding::verify(&shifted, &bound), first_record);
+            assert_eq!(LeafBinding::from_bytes(&bound.to_bytes(), epoch), None);
+            quil_types::consensus::set_storage_padding_bound_epoch_for_thread(Some(epoch));
+        }
+        // The last record's offset is the largest there is: its sum with
+        // the length does not fit, and refuses rather than wrapping.
+        let mut past = data;
+        let at = ((header + 2 * (entries - 1)) as usize) * DATA_BYTES_PER_NODE + 33;
+        past[at..at + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+        let nodes = data_nodes(&past);
+        let tree = MerkleTree::from_nodes(&nodes).unwrap();
+        let wrapped = captured
+            .claim(
+                &prefix,
+                &leaf_id,
+                &member,
+                &beacon,
+                tree.commitment(Tree::Data),
+                exact,
+            )
+            .unwrap();
+        let mut bound = proved.clone();
+        shift_binding(&mut bound, &plain, exact, (values, 0), &nodes, &tree);
+        assert_eq!(
+            binding::verify(&wrapped, &bound),
+            Err("storage binding: an offset past the values' end".into())
+        );
         quil_types::consensus::set_storage_padding_bound_epoch_for_thread(None);
     }
 }
