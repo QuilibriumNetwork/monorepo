@@ -1532,17 +1532,16 @@ impl P2PHandle {
     /// releases before these checks forward such messages, and penalising
     /// them for it would cut them off the mesh.
     pub async fn register_peer_info_staleness_validator(&self, bitmask: Vec<u8>) {
-        let validator: Box<dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync> =
-            Box::new(|_peer, data| {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64;
-                crate::peer_info::peer_info_gossip_result(
-                    crate::peer_info::peer_info_gossip_verdict(data, now_ms),
-                    crate::peer_info::strict_peer_info_validation(),
-                )
-            });
+        let validator: GossipValidator = Box::new(|_peer, data| {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            crate::peer_info::peer_info_gossip_result(
+                crate::peer_info::peer_info_gossip_verdict(data, now_ms),
+                crate::peer_info::strict_peer_info_validation(),
+            )
+        });
         let _ = self
             .cmd_tx
             .send(P2PCommand::RegisterValidator { bitmask, validator })
@@ -1553,10 +1552,9 @@ impl P2PHandle {
     /// verify is forwarded ([`global_alert_verdict`]; the Ed448 signature
     /// itself is verified there).
     pub async fn register_global_alert_validator(&self, bitmask: Vec<u8>) {
-        let validator: Box<dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync> =
-            Box::new(|_peer, data| {
-                global_alert_verdict(data, crate::peer_info::strict_peer_info_validation())
-            });
+        let validator: GossipValidator = Box::new(|_peer, data| {
+            global_alert_verdict(data, crate::peer_info::strict_peer_info_validation())
+        });
         let _ = self
             .cmd_tx
             .send(P2PCommand::RegisterValidator { bitmask, validator })
@@ -1598,11 +1596,7 @@ impl P2PHandle {
     /// to the app recv loop or forwarded to the mesh, so it must stay cheap.
     /// `Ignore` drops a message without penalising its forwarder; `Reject`
     /// also penalises it, so it is only for messages no release forwards.
-    pub async fn register_gossip_validator(
-        &self,
-        bitmask: Vec<u8>,
-        validator: Box<dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync>,
-    ) {
+    pub async fn register_gossip_validator(&self, bitmask: Vec<u8>, validator: GossipValidator) {
         let _ = self
             .cmd_tx
             .send(P2PCommand::RegisterValidator { bitmask, validator })
@@ -1613,10 +1607,7 @@ impl P2PHandle {
     /// of its own (the shard topics, which come and go with the shards this
     /// node serves). It gets the forwarding peer, the bitmask and the data;
     /// see [`register_gossip_validator`](Self::register_gossip_validator).
-    pub async fn register_fallback_validator(
-        &self,
-        validator: Box<dyn Fn(&PeerId, &[u8], &[u8]) -> crate::ValidationResult + Send + Sync>,
-    ) {
+    pub async fn register_fallback_validator(&self, validator: FallbackGossipValidator) {
         let _ = self
             .cmd_tx
             .send(P2PCommand::RegisterFallbackValidator { validator })
@@ -1921,7 +1912,7 @@ enum P2PCommand {
     /// PeerInfo/KeyRegistry before the composite broker re-broadcasts them).
     RegisterValidator {
         bitmask: Vec<u8>,
-        validator: Box<dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync>,
+        validator: GossipValidator,
     },
     /// Register a validator that also sees the message's signed author
     /// (`None` for an unsigned message); see `RegisterValidator`.
@@ -1933,7 +1924,7 @@ enum P2PCommand {
     /// Register the validator of every bitmask without one of its own; it
     /// gets the forwarding peer, the bitmask and the data.
     RegisterFallbackValidator {
-        validator: Box<dyn Fn(&PeerId, &[u8], &[u8]) -> crate::ValidationResult + Send + Sync>,
+        validator: FallbackGossipValidator,
     },
     Publish {
         bitmask: Vec<u8>,
@@ -1986,6 +1977,14 @@ enum P2PCommand {
     },
     Shutdown,
 }
+
+/// A mesh-level gossip validator: it gets the forwarding peer and the data.
+pub type GossipValidator = Box<dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync>;
+
+/// The validator of every bitmask without one of its own: it gets the
+/// forwarding peer, the bitmask and the data.
+pub type FallbackGossipValidator =
+    Box<dyn Fn(&PeerId, &[u8], &[u8]) -> crate::ValidationResult + Send + Sync>;
 
 type KademliaBehaviour = libp2p::kad::Behaviour<libp2p::kad::store::MemoryStore>;
 

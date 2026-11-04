@@ -1480,7 +1480,8 @@ mod propagation_tests {
     #[tokio::test]
     async fn received_messages_on_unregistered_bitmasks_get_the_fallback_verdict() {
         let bitmask = vec![0x01u8; 33];
-        let seen: Arc<std::sync::Mutex<Vec<(Vec<u8>, Vec<u8>)>>> = Default::default();
+        type Seen = Arc<std::sync::Mutex<Vec<(Vec<u8>, Vec<u8>)>>>;
+        let seen: Seen = Default::default();
 
         let mut hub = build_swarm();
         let mut leaf = build_swarm();

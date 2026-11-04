@@ -20,10 +20,12 @@ const RECEIVE_QUEUE: usize = 4096;
 #[tokio::test]
 async fn reproduces_direct_messages_filling_the_receive_queue() {
     let mut sup = quil_lifecycle::Supervisor::<anyhow::Error>::new();
-    let mut config = quil_config::P2PConfig::default();
-    config.network = 99;
-    config.bootstrap_peers = Vec::new();
-    config.direct_peers = Vec::new();
+    let config = quil_config::P2PConfig {
+        network: 99,
+        bootstrap_peers: Vec::new(),
+        direct_peers: Vec::new(),
+        ..Default::default()
+    };
 
     let receiver = P2PNode::new_with_options(&config, true, None).unwrap();
     let receiver_id = receiver.peer_id;

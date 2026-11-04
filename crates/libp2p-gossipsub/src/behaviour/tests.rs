@@ -5536,7 +5536,7 @@ fn refused_key_types_are_dropped_without_penalty() {
     });
     gs.gossip_promises.add_promise(
         peers[1],
-        &[msg_id.clone()],
+        std::slice::from_ref(&msg_id),
         Instant::now() + Duration::from_secs(60),
     );
     let deliver = |gs: &mut Behaviour, peer: PeerId, error: ValidationError| {

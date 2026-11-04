@@ -490,12 +490,14 @@ mod tests {
         sup: &mut quil_lifecycle::Supervisor<anyhow::Error>,
         relay: Option<(u16, quil_p2p::PeerId)>,
     ) -> (quil_p2p::node::P2PHandle, quil_p2p::PeerId, u16, Inbound) {
-        let mut config = quil_config::P2PConfig::default();
-        config.network = 99;
-        config.bootstrap_peers = relay
-            .map(|(port, id)| vec![format!("/ip4/127.0.0.1/tcp/{port}/p2p/{id}")])
-            .unwrap_or_default();
-        config.direct_peers = Vec::new();
+        let config = quil_config::P2PConfig {
+            network: 99,
+            bootstrap_peers: relay
+                .map(|(port, id)| vec![format!("/ip4/127.0.0.1/tcp/{port}/p2p/{id}")])
+                .unwrap_or_default(),
+            direct_peers: Vec::new(),
+            ..Default::default()
+        };
         let node = quil_p2p::node::P2PNode::new_with_options(&config, true, None).unwrap();
         let id = node.peer_id;
         let port = free_port();
