@@ -402,6 +402,65 @@ mod tests {
         }
     }
 
+    /// Class guard: every topic a node subscribes has a mesh check. Each
+    /// global topic gets its own ([`global_topics`], registered by
+    /// [`register_mesh_checks`]). Every shard topic a master, an archive or a
+    /// standalone worker subscribes is of a kind [`shard_topic`] names, for the
+    /// fallback, and junk on it is forwarded only for the kinds whose check is
+    /// left to their reader. A topic of a new kind fails here until it gets a
+    /// check.
+    #[test]
+    fn every_subscribed_topic_has_a_mesh_check() {
+        let filter = [7u8; 32];
+        let master: Vec<Vec<u8>> = super::super::worker_manager::shard_topics(&filter)
+            .into_iter()
+            .chain([quil_engine::bitmasks::shard_cw_bitmask(&filter)])
+            .collect();
+        let archive: Vec<Vec<u8>> = ARCHIVE_BULK_LENGTHS
+            .iter()
+            .map(|len| vec![0xFFu8; *len])
+            .chain([quil_engine::bitmasks::shard_frame_bitmask(&filter)])
+            .collect();
+        let worker = quil_engine::worker_node::shard_bitmasks(&filter);
+        for (role, subscribed) in [
+            (MeshRole::Master, master),
+            (MeshRole::Archive, archive),
+            (MeshRole::Worker, worker),
+        ] {
+            for (topic, _) in global_topics(role) {
+                assert_eq!(
+                    shard_topic(topic),
+                    None,
+                    "{role:?}: the global topic {} is taken for a shard topic",
+                    hex::encode(topic)
+                );
+            }
+            for topic in &subscribed {
+                let Some(kind) = shard_topic(topic) else {
+                    panic!(
+                        "{role:?} subscribes {} without a mesh check",
+                        hex::encode(topic)
+                    );
+                };
+                let forwarded = [&b""[..], &[0xEEu8; 64][..]]
+                    .into_iter()
+                    .any(|junk| shard_gossip_verdict(topic, junk) == Accept);
+                assert!(
+                    !forwarded
+                        || matches!(
+                            kind,
+                            ShardTopic::Frame
+                                | ShardTopic::Dispatch
+                                | ShardTopic::Prover
+                                | ShardTopic::ArchiveBulk
+                        ),
+                    "{role:?}: junk on {} ({kind:?}) is forwarded unchecked",
+                    hex::encode(topic)
+                );
+            }
+        }
+    }
+
     fn free_port() -> u16 {
         std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
