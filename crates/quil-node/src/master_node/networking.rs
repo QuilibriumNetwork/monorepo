@@ -296,11 +296,12 @@ pub(crate) enum ShardTopic {
     /// `0x00 ‖ appFilter`: the legacy consensus topic, ignored. Engines drop
     /// its messages unread, and no release publishes there.
     Consensus,
-    /// `0x00 0x00 ‖ appFilter`: dispatch, accepted and left to the shard's
-    /// engine.
+    /// `0x00 0x00 ‖ appFilter`: dispatch, accepted when it is a message
+    /// bundle a leader can propose ([`shard_submission_well_formed`]); its
+    /// operations are left to the shard's engine.
     Dispatch,
     /// `0x00 0x00 0x00 ‖ appFilter`: prover messages and an application's
-    /// submissions, accepted and left to the shard's engines.
+    /// submissions, checked as dispatch is.
     Prover,
     /// `0x01 ‖ appFilter`: consensus transmissions, accepted when they frame
     /// one of the CW channels.
@@ -332,8 +333,32 @@ pub(crate) fn shard_topic(bitmask: &[u8]) -> Option<ShardTopic> {
 /// receive loop drops anything else unread, so it is not forwarded either.
 /// Nothing on the legacy shard consensus topic is forwarded: no release reads
 /// it. Both are ignored, not rejected: releases before these checks forward
-/// such messages. Messages of other topics are accepted, as before.
+/// such messages. On a shard dispatch or submission topic a message must be a
+/// bundle a leader can propose ([`shard_submission_well_formed`]); anything
+/// else is ignored before the strict shard gossip epoch
+/// ([`quil_p2p::strict_shard_gossip`]) and rejected from it. Messages of
+/// other topics are accepted, as before.
 pub(crate) fn shard_gossip_verdict(bitmask: &[u8], data: &[u8]) -> quil_p2p::ValidationResult {
+    shard_gossip_verdict_when(bitmask, data, quil_p2p::strict_shard_gossip())
+}
+
+/// Whether a message on a shard's dispatch or submission topic is one a
+/// leader can propose: a message bundle that decodes as an application
+/// shard's (`decode_app_message_bundle`), the leader's own check. A leader
+/// drops anything else unread, so the mesh need not forward it. Its size is
+/// bounded by the transport (`quil_p2p::protocol::MAX_MESSAGE_SIZE`, before
+/// any check), the bound a frame carrying it must meet too; its operations
+/// are left to the shard's engine.
+pub(crate) fn shard_submission_well_formed(data: &[u8]) -> bool {
+    quil_engine::consensus_wire::decode_app_message_bundle(data).is_ok()
+}
+
+/// [`shard_gossip_verdict`] with strict shard gossip `strict`.
+pub(crate) fn shard_gossip_verdict_when(
+    bitmask: &[u8],
+    data: &[u8],
+    strict: bool,
+) -> quil_p2p::ValidationResult {
     match shard_topic(bitmask) {
         Some(ShardTopic::Cw) => match quil_engine::bitmasks::shard_cw_split_payload(data) {
             Some((channel, cw_bytes))
@@ -345,6 +370,15 @@ pub(crate) fn shard_gossip_verdict(bitmask: &[u8], data: &[u8]) -> quil_p2p::Val
             _ => quil_p2p::ValidationResult::Ignore,
         },
         Some(ShardTopic::Consensus) => quil_p2p::ValidationResult::Ignore,
+        Some(ShardTopic::Dispatch | ShardTopic::Prover) => {
+            if shard_submission_well_formed(data) {
+                quil_p2p::ValidationResult::Accept
+            } else if strict {
+                quil_p2p::ValidationResult::Reject
+            } else {
+                quil_p2p::ValidationResult::Ignore
+            }
+        }
         _ => quil_p2p::ValidationResult::Accept,
     }
 }
@@ -352,8 +386,55 @@ pub(crate) fn shard_gossip_verdict(bitmask: &[u8], data: &[u8]) -> quil_p2p::Val
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quil_p2p::ValidationResult::{Accept, Ignore};
+    use quil_p2p::ValidationResult::{Accept, Ignore, Reject};
     use std::time::Duration;
+
+    /// A message bundle of one operation, distinct for each `n`, as a wallet's
+    /// node publishes it on an application's submission topic. Its operation
+    /// is junk: the mesh checks the bundle, the engine its operations.
+    fn submission(n: u32) -> Vec<u8> {
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let mut operation = 0x0512u32.to_be_bytes().to_vec();
+        operation.extend_from_slice(&n.to_be_bytes());
+        CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest::wrap(operation).unwrap())],
+            timestamp: i64::from(n),
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// Messages on a shard dispatch or submission topic that no leader can
+    /// propose, distinct for each `n` but the empty one: none is a bundle
+    /// `decode_app_message_bundle` takes (junk, a truncated bundle, a bare
+    /// request, a bundle carrying a retired token operation).
+    fn undecodable_submissions(n: u32) -> Vec<Vec<u8>> {
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let mut junk = vec![0xEE; 64];
+        junk.extend_from_slice(&n.to_be_bytes());
+        let bundle = submission(n);
+        let mut operation = 0x0512u32.to_be_bytes().to_vec();
+        operation.extend_from_slice(&n.to_be_bytes());
+        let request = CanonicalMessageRequest::wrap(operation)
+            .unwrap()
+            .to_canonical_bytes()
+            .unwrap();
+        let retired = CanonicalMessageBundle {
+            requests: vec![Some(
+                CanonicalMessageRequest::wrap(0x0509u32.to_be_bytes().to_vec()).unwrap(),
+            )],
+            timestamp: i64::from(n),
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        vec![
+            Vec::new(),
+            junk,
+            bundle[..bundle.len() - 1].to_vec(),
+            request,
+            retired,
+        ]
+    }
 
     /// Shard CW transmissions of every framing a release sends are forwarded;
     /// malformed ones and unknown channels are dropped without penalty, and
@@ -393,13 +474,50 @@ mod tests {
         for data in [&b""[..], &b"vote"[..], &[0x80u8; 64][..]] {
             assert_eq!(shard_gossip_verdict(&consensus, data), Ignore);
         }
+        let frame_topic = quil_engine::bitmasks::shard_frame_bitmask(&filter);
+        assert_eq!(shard_gossip_verdict(&frame_topic, b"vote"), Accept);
         for topic in [
-            quil_engine::bitmasks::shard_frame_bitmask(&filter),
             quil_engine::bitmasks::shard_dispatch_bitmask(&filter),
             quil_engine::bitmasks::app_prover_bitmask(&filter),
         ] {
-            assert_eq!(shard_gossip_verdict(&topic, b"vote"), Accept);
+            assert_eq!(shard_gossip_verdict(&topic, &submission(1)), Accept);
         }
+    }
+
+    /// On a shard dispatch or submission topic the mesh forwards a message
+    /// bundle a leader can propose, and drops anything else: without penalty
+    /// before the strict shard gossip epoch, rejected from it. The other shard
+    /// topics are unaffected.
+    #[test]
+    fn shard_submissions_are_checked_at_the_mesh() {
+        let filter = [7u8; 32];
+        for topic in [
+            quil_engine::bitmasks::shard_dispatch_bitmask(&filter),
+            quil_engine::bitmasks::app_prover_bitmask(&filter),
+        ] {
+            for strict in [false, true] {
+                assert_eq!(
+                    shard_gossip_verdict_when(&topic, &submission(1), strict),
+                    Accept
+                );
+                for junk in undecodable_submissions(1) {
+                    assert_eq!(
+                        shard_gossip_verdict_when(&topic, &junk, strict),
+                        if strict { Reject } else { Ignore },
+                        "{} on {}",
+                        hex::encode(&junk),
+                        hex::encode(&topic)
+                    );
+                }
+            }
+        }
+        let frame_topic = quil_engine::bitmasks::shard_frame_bitmask(&filter);
+        assert_eq!(shard_gossip_verdict_when(&frame_topic, &[], true), Accept);
+        let consensus = quil_engine::bitmasks::shard_consensus_bitmask(&filter);
+        assert_eq!(
+            shard_gossip_verdict_when(&consensus, &submission(1), true),
+            Ignore
+        );
     }
 
     /// Class guard: every topic a node subscribes has a mesh check. Each
@@ -407,8 +525,9 @@ mod tests {
     /// [`register_mesh_checks`]). Every shard topic a master, an archive or a
     /// standalone worker subscribes is of a kind [`shard_topic`] names, for the
     /// fallback, and junk on it is forwarded only for the kinds whose check is
-    /// left to their reader. A topic of a new kind fails here until it gets a
-    /// check.
+    /// left to their reader: a shard frame (its full verification) and an
+    /// archive's bulk subscriptions. A topic of a new kind fails here until it
+    /// gets a check.
     #[test]
     fn every_subscribed_topic_has_a_mesh_check() {
         let filter = [7u8; 32];
@@ -446,14 +565,7 @@ mod tests {
                     .into_iter()
                     .any(|junk| shard_gossip_verdict(topic, junk) == Accept);
                 assert!(
-                    !forwarded
-                        || matches!(
-                            kind,
-                            ShardTopic::Frame
-                                | ShardTopic::Dispatch
-                                | ShardTopic::Prover
-                                | ShardTopic::ArchiveBulk
-                        ),
+                    !forwarded || matches!(kind, ShardTopic::Frame | ShardTopic::ArchiveBulk),
                     "{role:?}: junk on {} ({kind:?}) is forwarded unchecked",
                     hex::encode(topic)
                 );
@@ -799,6 +911,93 @@ mod tests {
             relayed, 0,
             "VULNERABLE: a master forwarded {relayed} message(s) published on the legacy \
              shard consensus topic, which no release reads"
+        );
+    }
+
+    /// A shard's dispatch topic (`0x00 0x00 ‖ appFilter`) and an application's
+    /// submission topic (`0x00 0x00 0x00 ‖ appFilter`) carry message bundles,
+    /// and a leader drops anything else unread, so a master must not forward
+    /// what no leader can propose: unchecked, junk anyone publishes there
+    /// reached every mesh peer and their engines' queues, and its sender kept
+    /// its score. A well-formed bundle published first shows the path works.
+    #[tokio::test]
+    async fn reproduces_undecodable_dispatch_gossip_relayed() {
+        let filter = [7u8; 32];
+        let dispatch = quil_engine::bitmasks::shard_dispatch_bitmask(&filter);
+        let submissions = quil_engine::bitmasks::app_prover_bitmask(&filter);
+        let alert = quil_engine::bitmasks::GLOBAL_ALERT;
+        let mut chain = chain(
+            &[dispatch.as_slice(), submissions.as_slice(), alert],
+            Some(MeshRole::Master),
+            None,
+        )
+        .await;
+        chain.wait_for_meshes().await;
+
+        let bundle = submission(1);
+        chain
+            .source
+            .publish(dispatch.clone(), bundle.clone())
+            .await
+            .expect("publish a bundle on the dispatch topic");
+        // Distinct for each topic: a copy of a message already seen is never
+        // forwarded again, whatever the mesh makes of it.
+        for (n, topic) in [(2, &dispatch), (3, &submissions)] {
+            for data in undecodable_submissions(n) {
+                if data.is_empty() {
+                    continue;
+                }
+                chain
+                    .source
+                    .publish(topic.clone(), data)
+                    .await
+                    .expect("publish junk on a shard dispatch or submission topic");
+            }
+        }
+        let last = control_alert(u32::MAX);
+        chain
+            .source
+            .publish(alert.to_vec(), last.clone())
+            .await
+            .expect("publish the last control alert");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut received: Vec<quil_p2p::node::ReceivedMessage> = Vec::new();
+        while !received.iter().any(|message| message.data == last) {
+            match tokio::time::timeout_at(deadline, chain.sink_rx.recv()).await {
+                Ok(Some(message)) => received.push(message),
+                Ok(None) => panic!("the sink stopped"),
+                Err(_) => panic!("the relay never forwarded the last control alert"),
+            }
+        }
+        // Anything the relay forwarded before the last alert has arrived.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        while let Ok(message) = chain.sink_rx.try_recv() {
+            received.push(message);
+        }
+        assert!(
+            received
+                .iter()
+                .any(|message| message.bitmask == dispatch && message.data == bundle),
+            "the relay never forwarded the well-formed bundle"
+        );
+        let relayed = received
+            .iter()
+            .filter(|message| {
+                (message.bitmask == dispatch || message.bitmask == submissions)
+                    && message.data != bundle
+            })
+            .count();
+        assert_eq!(
+            relayed, 0,
+            "VULNERABLE: a master forwarded {relayed} undecodable message(s) published on \
+             a shard dispatch or submission topic, which no leader can propose"
+        );
+        let score = chain.relay.get_peer_score(chain.source_id).await;
+        assert!(
+            score >= 0.0,
+            "a master penalised junk on a shard dispatch topic before the strict epoch \
+             (its sender scores {score})"
         );
     }
 }

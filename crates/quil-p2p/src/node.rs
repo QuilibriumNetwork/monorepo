@@ -2024,6 +2024,21 @@ pub(crate) fn global_alert_verdict(data: &[u8], strict: bool) -> crate::Validati
     }
 }
 
+static STRICT_SHARD_GOSSIP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Switch strict shard gossip (the node sets it from its GLOBAL head and
+/// `quil_types::consensus::strict_shard_gossip_active`). Returns the previous
+/// setting.
+pub fn set_strict_shard_gossip(active: bool) -> bool {
+    STRICT_SHARD_GOSSIP.swap(active, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether strict shard gossip is on.
+pub fn strict_shard_gossip() -> bool {
+    STRICT_SHARD_GOSSIP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Compute the BlossomSub message ID: `[0x01, SHA256(data)...]` —
 /// 33 bytes, leading byte 0x01. Other implementations that emit the
 /// 32-byte digest alone would compute non-matching dedup IDs for the

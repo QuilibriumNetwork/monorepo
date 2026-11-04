@@ -848,6 +848,65 @@ pub fn set_strict_peer_info_epoch_for_thread(epoch: Option<u64>) {
     STRICT_PEER_INFO_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
+/// The epoch from which nodes enforce strict shard gossip: the mesh
+/// penalises a peer that forwards, on a shard's dispatch or submission topic,
+/// a message no leader can propose (one that is not a well-formed message
+/// bundle). Before it such messages are dropped without penalty, because
+/// releases before this rule forward them. Not consensus-affecting, but it
+/// splits gossip from nodes on older releases, so it waits for an adoption
+/// census and a devnet crossing: `None` until then. `QUIL_STRICT_SHARD_GOSSIP_EPOCH`
+/// elsewhere, never by default.
+pub const MAINNET_STRICT_SHARD_GOSSIP_EPOCH: Option<u64> = None;
+
+static STRICT_SHARD_GOSSIP_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static STRICT_SHARD_GOSSIP_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn strict_shard_gossip_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_STRICT_SHARD_GOSSIP_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's strict shard gossip epoch from its network, and return
+/// it. Called at startup; the first call decides.
+pub fn init_strict_shard_gossip_epoch(network: u8) -> u64 {
+    *STRICT_SHARD_GOSSIP_EPOCH.get_or_init(|| {
+        strict_shard_gossip_epoch_for(
+            network,
+            std::env::var("QUIL_STRICT_SHARD_GOSSIP_EPOCH")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The epoch fixed by [`init_strict_shard_gossip_epoch`]; the mainnet epoch
+/// in a process that never called it. `u64::MAX` when the network has none.
+pub fn strict_shard_gossip_epoch() -> u64 {
+    if let Some(epoch) = STRICT_SHARD_GOSSIP_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *STRICT_SHARD_GOSSIP_EPOCH.get_or_init(|| strict_shard_gossip_epoch_for(0, None))
+}
+
+/// Whether GLOBAL frame `frame` falls in or after the strict shard gossip
+/// epoch.
+pub fn strict_shard_gossip_active(frame: u64) -> bool {
+    epoch_for_frame(frame) >= strict_shard_gossip_epoch()
+}
+
+/// Set the strict shard gossip epoch for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_strict_shard_gossip_epoch_for_thread(epoch: Option<u64>) {
+    STRICT_SHARD_GOSSIP_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
 /// PoRep block polynomial size (KZG evaluation-domain size per replica block).
 /// Measured most efficient at 64 in testing; a power-of-two ≤ the ceremony
 /// domain cap (`quil_crypto::sdr::BLOCK_POLY_SIZE = 256`). Consensus parameter —
@@ -3932,5 +3991,32 @@ mod strict_peer_info_epoch_tests {
         assert!(!super::strict_peer_info_active(first - 1));
         assert!(super::strict_peer_info_active(first));
         super::set_strict_peer_info_epoch_for_thread(None);
+    }
+}
+
+#[cfg(test)]
+mod strict_shard_gossip_epoch_tests {
+    #[test]
+    fn only_a_test_network_reads_the_strict_shard_gossip_setting() {
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(
+                super::strict_shard_gossip_epoch_for(0, setting),
+                super::MAINNET_STRICT_SHARD_GOSSIP_EPOCH.unwrap_or(u64::MAX)
+            );
+        }
+        assert_eq!(super::strict_shard_gossip_epoch_for(1, Some("4")), 4);
+        assert_eq!(super::strict_shard_gossip_epoch_for(1, None), u64::MAX);
+        assert_eq!(super::MAINNET_STRICT_SHARD_GOSSIP_EPOCH, None);
+    }
+
+    #[test]
+    fn strict_shard_gossip_is_active_from_the_first_frame_of_its_epoch() {
+        super::set_strict_shard_gossip_epoch_for_thread(Some(u64::MAX));
+        assert!(!super::strict_shard_gossip_active(u64::MAX - 1));
+        super::set_strict_shard_gossip_epoch_for_thread(Some(3));
+        let first = 3 * super::epoch_length_frames();
+        assert!(!super::strict_shard_gossip_active(first - 1));
+        assert!(super::strict_shard_gossip_active(first));
+        super::set_strict_shard_gossip_epoch_for_thread(None);
     }
 }

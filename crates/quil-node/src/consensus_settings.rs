@@ -126,6 +126,13 @@ pub(crate) fn initialize(network: u8) {
             "QUIL_STRICT_PEER_INFO_EPOCH override active (localnet only)"
         );
     }
+    let strict_shard_gossip_epoch = quil_types::consensus::init_strict_shard_gossip_epoch(network);
+    if network != 0 && strict_shard_gossip_epoch != u64::MAX {
+        tracing::warn!(
+            epoch = strict_shard_gossip_epoch,
+            "QUIL_STRICT_SHARD_GOSSIP_EPOCH override active (localnet only)"
+        );
+    }
     let succession_epoch = quil_types::consensus::init_seniority_succession_epoch(network);
     if network != 0 && succession_epoch != u64::MAX {
         tracing::warn!(

@@ -677,6 +677,16 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                             "GLOBAL_PEER_INFO validation changed: when strict, peers forwarding invalid PeerInfo, KeyRegistry or alerts are penalised and KeyRegistry records with an unsigned timestamp are refused"
                         );
                     }
+                    // Strict shard gossip follows it too.
+                    let strict_shard_gossip = quil_types::consensus::strict_shard_gossip_active(latest_frame);
+                    if quil_p2p::set_strict_shard_gossip(strict_shard_gossip) != strict_shard_gossip {
+                        info!(
+                            frame = latest_frame,
+                            epoch = quil_types::consensus::strict_shard_gossip_epoch(),
+                            strict = strict_shard_gossip,
+                            "shard gossip validation changed: when strict, peers forwarding a message no leader can propose on a shard's dispatch or submission topic are penalised"
+                        );
+                    }
                     {
                         let _write = probe::section(ProbeSection::StatusPeerInfoCache);
                         peer_info_bounds.expire(&mut pic_for_recv.write(), super::peer_info_file::unix_millis());

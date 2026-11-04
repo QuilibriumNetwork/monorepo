@@ -11622,6 +11622,21 @@ impl AppConsensusEngine {
             "global frame time sync"
         );
 
+        // A standalone worker's own p2p follows the GLOBAL head for strict
+        // shard gossip as its master's does (only a standalone worker
+        // receives these messages).
+        let strict_shard_gossip =
+            quil_types::consensus::strict_shard_gossip_active(global_frame_number);
+        if quil_p2p::set_strict_shard_gossip(strict_shard_gossip) != strict_shard_gossip {
+            info!(
+                core_id = self.core_id,
+                global_frame = global_frame_number,
+                epoch = quil_types::consensus::strict_shard_gossip_epoch(),
+                strict = strict_shard_gossip,
+                "shard gossip validation changed: when strict, peers forwarding a message no leader can propose on a shard's dispatch or submission topic are penalised"
+            );
+        }
+
         // Align shard frame number: shard frame N corresponds to
         // global frame N+1. If the shard is behind, advance it.
         let expected_shard_frame = global_frame_number.saturating_sub(1);

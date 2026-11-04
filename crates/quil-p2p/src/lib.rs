@@ -37,7 +37,7 @@ pub use gossip_traffic::{
 };
 pub use libp2p::identity::Keypair;
 pub use libp2p::PeerId;
-pub use node::{P2PHandle, P2PNode, ReceivedMessage};
+pub use node::{set_strict_shard_gossip, strict_shard_gossip, P2PHandle, P2PNode, ReceivedMessage};
 pub use peer_authenticator::{AllowedPeerPolicy, AuthState, PeerAuthenticator};
 pub use peer_info::{
     build_worker_reachability, classify_peer_info_message, decode_canonical_key_registry,
