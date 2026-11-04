@@ -2282,7 +2282,7 @@ pub(crate) mod tests {
         let proved = captured.prove_binding(&claim).unwrap();
         assert_eq!(binding::verify(&claim, &proved), Ok(()));
         assert_eq!(
-            LeafBinding::from_bytes(&proved.to_bytes()),
+            LeafBinding::from_bytes(&proved.to_bytes(), claim.epoch),
             Some(proved.clone())
         );
         assert!(
@@ -4183,5 +4183,264 @@ pub(crate) mod tests {
             let stored = replicas.get_hash(epoch, &leaf_id).unwrap().unwrap();
             assert!(stored.registration_root == own.registration_root());
         }
+    }
+
+    /// A leaf of 24 vertices of distinct bytes on `app`, captured at `epoch`.
+    fn padding_leaf(app: [u8; 32], epoch: u64) -> Captured {
+        let crdt = test_crdt();
+        for d in 0u8..24 {
+            let value: Vec<u8> = (0..200 + d as usize)
+                .map(|k| (k * 31 + d as usize * 7) as u8)
+                .collect();
+            crdt.add_vertex(
+                &Location {
+                    app_address: app,
+                    data_address: address(d.wrapping_mul(9), d),
+                },
+                &value,
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap()
+    }
+
+    /// `bound`'s openings, made against the data tree `from`, opened
+    /// against `to`, which holds the same nodes below `exact`.
+    fn repath(
+        bound: &mut LeafBinding,
+        from: &quil_crypto::storage_proof::MerkleTree,
+        to: &quil_crypto::storage_proof::MerkleTree,
+        exact: u64,
+    ) {
+        let index: std::collections::HashMap<Vec<[u8; 32]>, u64> =
+            (0..exact).map(|i| (from.path(i), i)).collect();
+        let mut moved = |opening: &mut binding::Opening| {
+            opening.path = to.path(index[&opening.path]);
+        };
+        bound.header.iter_mut().for_each(&mut moved);
+        bound.last.iter_mut().for_each(&mut moved);
+        for check in &mut bound.records {
+            check.records.iter_mut().for_each(&mut moved);
+            check.value_node.iter_mut().for_each(&mut moved);
+        }
+        for check in &mut bound.coverage {
+            if let Some((_, openings)) = &mut check.record {
+                openings.iter_mut().for_each(&mut moved);
+            }
+        }
+    }
+
+    /// A member pads its leaf's data with the negated last labels, so its
+    /// replica is zero on every padding node and it keeps nothing there:
+    /// the seal holds (the replica is the data plus the labels) and the
+    /// padding is never opened, so GLOBAL's binding check passed it.
+    #[test]
+    fn a_registration_padded_with_negated_labels_is_not_bound() {
+        use quil_crypto::storage_hash as hash;
+        use quil_crypto::storage_proof::{
+            data_node_count, data_nodes, encode_leaf_at, max_padded_nodes, prove_seal, verify_seal,
+            MerkleTree, Registered, SealStatement, Tree, NODE_BYTES,
+        };
+        let epoch = 6;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        quil_types::consensus::set_storage_padding_bound_epoch_for_thread(Some(epoch));
+        let app = [0x6Du8; 32];
+        let captured = padding_leaf(app, epoch);
+        let prefix = captured.prefixes[0].clone();
+        let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&app, &prefix);
+        let data = captured.leaf_data(&prefix).unwrap();
+        let exact = data_node_count(data.len() as u64);
+        let n = max_padded_nodes(exact);
+        let member = [0x4Eu8; 32];
+        let key = quil_crypto::sdr::replica_key(&member, &leaf_id, epoch);
+        let params = quil_crypto::sdr::SdrParams::default();
+        let honest = encode_leaf_at(&data, &key, &params, n, &mut |_, _| {});
+        let mut padded = data_nodes(&data);
+        padded.resize(n as usize * NODE_BYTES, 0);
+        let honest_data = MerkleTree::from_nodes(&padded).unwrap();
+        assert_eq!(
+            honest_data.commitment(Tree::Data),
+            honest.comm_d,
+            "harness check: the honest data tree"
+        );
+        // On the padding the data is zero, so the replica there is the last
+        // labels: negate them into the data, and the replica is zero.
+        let mut replica = honest.replica.clone();
+        replica[exact as usize * NODE_BYTES..].fill(0);
+        for v in exact as usize..n as usize {
+            let label = hash::from_bytes(&honest.replica[v * NODE_BYTES..][..NODE_BYTES]).unwrap();
+            let negated = hash::to_bytes(&hash::sub(&hash::ZERO, &label));
+            padded[v * NODE_BYTES..][..NODE_BYTES].copy_from_slice(&negated);
+        }
+        let cheat_data = MerkleTree::from_nodes(&padded).unwrap();
+        let registered = Registered {
+            comm_d: cheat_data.commitment(Tree::Data),
+            comm_c: honest.comm_c,
+            comm_r: MerkleTree::from_nodes(&replica)
+                .unwrap()
+                .commitment(Tree::Replica),
+        };
+        let beacon = [0x5Du8; 32];
+        let statement = SealStatement {
+            member: &member,
+            leaf_id: &leaf_id,
+            epoch,
+            n,
+            registered,
+            beacon: &beacon,
+        };
+        let count = quil_types::consensus::STORAGE_SEAL_CHALLENGES;
+        let seal = prove_seal(&replica, &statement, &params, count)
+            .expect("harness check: the zeroed replica seals");
+        assert_eq!(
+            verify_seal(&statement, &seal, &params, count),
+            Ok(()),
+            "harness check: the zeroed replica's seal verifies"
+        );
+        // The binding a member proves of its honest data, opened against the
+        // padded data instead: the nodes below `exact` are the same.
+        let honest_claim = captured
+            .claim(&prefix, &leaf_id, &member, &beacon, honest.comm_d, n)
+            .unwrap();
+        let mut bound = captured.prove_binding(&honest_claim).unwrap();
+        assert_eq!(binding::verify(&honest_claim, &bound), Ok(()));
+        repath(&mut bound, &honest_data, &cheat_data, exact);
+        let claim = captured
+            .claim(&prefix, &leaf_id, &member, &beacon, registered.comm_d, n)
+            .unwrap();
+        let verdict = binding::verify(&claim, &bound);
+        quil_types::consensus::set_storage_padding_bound_epoch_for_thread(None);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        if verdict.is_ok() {
+            panic!(
+                "VULNERABLE: a registration padded with the negated last labels was sealed \
+                 and bound, its replica zero on {} of its {n} nodes",
+                n - exact
+            );
+        }
+    }
+
+    /// From the padding bound epoch the binding shows a registration's
+    /// padding zero, at the floor (no padding), one node and the cap: an
+    /// honest member's binding verifies and parses, and padding with any
+    /// nonzero node, first, last or between, fails, however it is opened.
+    /// Before the epoch a padding opening is refused by the check and by
+    /// the parse, as a build without the bound refuses its bytes.
+    #[test]
+    fn from_the_padding_bound_epoch_only_zero_padding_is_bound() {
+        use quil_crypto::storage_proof::{
+            data_node_count, data_nodes, max_padded_nodes, MerkleTree, Tree, NODE_BYTES,
+        };
+        use quil_execution::global_intrinsic::storage_epoch_proof::{SeatProof, StorageEpochProof};
+        let epoch = 6;
+        quil_types::consensus::set_storage_padding_bound_epoch_for_thread(Some(epoch));
+        let app = [0x6Eu8; 32];
+        let captured = padding_leaf(app, epoch);
+        let prefix = captured.prefixes[0].clone();
+        let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&app, &prefix);
+        let data = captured.leaf_data(&prefix).unwrap();
+        let exact = data_node_count(data.len() as u64);
+        let (member, beacon) = ([0x4Fu8; 32], [0x5Eu8; 32]);
+        for n in [exact, exact + 1, exact + 2, max_padded_nodes(exact)] {
+            let mut padded = data_nodes(&data);
+            padded.resize(n as usize * NODE_BYTES, 0);
+            let honest = MerkleTree::from_nodes(&padded).unwrap();
+            let claim = captured
+                .claim(
+                    &prefix,
+                    &leaf_id,
+                    &member,
+                    &beacon,
+                    honest.commitment(Tree::Data),
+                    n,
+                )
+                .unwrap();
+            let proved = captured.prove_binding(&claim).unwrap();
+            assert_eq!(binding::verify(&claim, &proved), Ok(()), "{n} of {exact}");
+            assert_eq!(proved.padding.is_some(), n > exact, "{n} of {exact}");
+            let bytes = proved.to_bytes();
+            assert_eq!(LeafBinding::from_bytes(&bytes, epoch), Some(proved.clone()));
+            if n == exact {
+                let mut extra = proved.clone();
+                extra.padding = Some(extra.header[0].clone());
+                assert_eq!(
+                    binding::verify(&claim, &extra),
+                    Err("storage binding: the padding opening".into())
+                );
+                continue;
+            }
+            let mut unopened = proved.clone();
+            unopened.padding = None;
+            assert_eq!(
+                binding::verify(&claim, &unopened),
+                Err("storage binding: the padding opening".into())
+            );
+            for spot in [exact, n - 1, exact + (n - exact) / 2] {
+                let mut cheat = padded.clone();
+                cheat[spot as usize * NODE_BYTES] = 1;
+                let cheat_tree = MerkleTree::from_nodes(&cheat).unwrap();
+                let cheat_claim = captured
+                    .claim(
+                        &prefix,
+                        &leaf_id,
+                        &member,
+                        &beacon,
+                        cheat_tree.commitment(Tree::Data),
+                        n,
+                    )
+                    .unwrap();
+                let mut bound = proved.clone();
+                repath(&mut bound, &honest, &cheat_tree, exact);
+                for opened in [exact, spot] {
+                    let at = opened as usize * NODE_BYTES;
+                    for node in [[0u8; 32], cheat[at..at + NODE_BYTES].try_into().unwrap()] {
+                        bound.padding = Some(binding::Opening {
+                            node,
+                            path: cheat_tree.path(opened),
+                        });
+                        assert_eq!(
+                            binding::verify(&cheat_claim, &bound),
+                            Err("storage binding: padding that is not zero nodes".into()),
+                            "a nonzero padding node at {spot} of {n}, opened at {opened}"
+                        );
+                    }
+                }
+            }
+            // A seat's proof parses its bindings by the epoch they seal.
+            let proof = StorageEpochProof {
+                member,
+                seats: vec![SeatProof {
+                    shard_filter: app.to_vec(),
+                    epoch: epoch - 2,
+                    seals: true,
+                    bindings: vec![proved.clone()],
+                    ..Default::default()
+                }],
+                proof: vec![1],
+            };
+            let encoded = proof.to_canonical_bytes();
+            assert_eq!(
+                StorageEpochProof::from_canonical_bytes(&encoded).unwrap(),
+                proof
+            );
+            // Before the epoch: no padding opening is made, and one is refused.
+            quil_types::consensus::set_storage_padding_bound_epoch_for_thread(Some(epoch + 1));
+            assert!(StorageEpochProof::from_canonical_bytes(&encoded).is_err());
+            let earlier = captured.prove_binding(&claim).unwrap();
+            assert_eq!(earlier.padding, None);
+            assert_eq!(binding::verify(&claim, &earlier), Ok(()));
+            assert_eq!(
+                binding::verify(&claim, &proved),
+                Err("storage binding: the padding opening".into())
+            );
+            assert_eq!(LeafBinding::from_bytes(&bytes, epoch), None);
+            assert_eq!(
+                LeafBinding::from_bytes(&earlier.to_bytes(), epoch),
+                Some(earlier)
+            );
+            quil_types::consensus::set_storage_padding_bound_epoch_for_thread(Some(epoch));
+        }
+        quil_types::consensus::set_storage_padding_bound_epoch_for_thread(None);
     }
 }

@@ -202,11 +202,10 @@ impl StorageEpochProof {
                     return Err(invalid(format!("a binding of {len} bytes")));
                 }
                 bindings.push(
-                    super::storage_binding::LeafBinding::from_bytes(&read_bytes(
-                        data,
-                        &mut c,
-                        len as usize,
-                    )?)
+                    super::storage_binding::LeafBinding::from_bytes(
+                        &read_bytes(data, &mut c, len as usize)?,
+                        epoch.saturating_add(2),
+                    )
                     .ok_or_else(|| invalid("a malformed binding".into()))?,
                 );
             }

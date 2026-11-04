@@ -148,6 +148,13 @@ pub(crate) fn initialize(network: u8) {
             "QUIL_EXACT_STATE_SIZE_EPOCH override active (localnet only)"
         );
     }
+    let padding_bound_epoch = quil_types::consensus::init_storage_padding_bound_epoch(network);
+    if network != 0 && padding_bound_epoch != u64::MAX {
+        tracing::warn!(
+            epoch = padding_bound_epoch,
+            "QUIL_STORAGE_PADDING_BOUND_EPOCH override active (localnet only)"
+        );
+    }
 
     let kick_epoch = quil_types::consensus::init_kick_signed_slot_epoch(network);
     if network != 0 && kick_epoch != u64::MAX {

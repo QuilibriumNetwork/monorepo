@@ -1655,6 +1655,86 @@ pub fn set_exact_state_size_epoch_for_thread(epoch: Option<u64>) {
     EXACT_STATE_SIZE_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
+/// The epoch from whose seals a registration may pad its leaf's data only
+/// with zero nodes: the seal's binding opens the first node past the
+/// leaf's data and shows it and every node after it zero. Before it the
+/// padding was never opened, so a member could pad with the negated last
+/// labels, making its replica zero there, and answer the frames' openings
+/// of those nodes without keeping them. Keyed by the seal's epoch, in its
+/// decoding too, so every build parses and checks a seal of an earlier
+/// epoch alike. Consensus-affecting: every GLOBAL prover and archive must
+/// run a build with it before its seals begin, the epoch before.
+/// `QUIL_STORAGE_PADDING_BOUND_EPOCH` elsewhere, never by default.
+pub const MAINNET_STORAGE_PADDING_BOUND_EPOCH: Option<u64> = None;
+
+static STORAGE_PADDING_BOUND_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static STORAGE_PADDING_BOUND_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn storage_padding_bound_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_STORAGE_PADDING_BOUND_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's storage padding bound epoch from its network, and
+/// return it. Called at startup before any frame is processed; the first
+/// call decides.
+pub fn init_storage_padding_bound_epoch(network: u8) -> u64 {
+    *STORAGE_PADDING_BOUND_EPOCH.get_or_init(|| {
+        let setting = std::env::var("QUIL_STORAGE_PADDING_BOUND_EPOCH").ok();
+        storage_padding_bound_epoch_for(network, setting.as_deref())
+    })
+}
+
+/// The epoch fixed by [`init_storage_padding_bound_epoch`]; the mainnet
+/// epoch in a process that never called it, so the setting cannot reach
+/// mainnet. `u64::MAX`: never.
+pub fn storage_padding_bound_epoch() -> u64 {
+    if let Some(epoch) = STORAGE_PADDING_BOUND_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *STORAGE_PADDING_BOUND_EPOCH.get_or_init(|| storage_padding_bound_epoch_for(0, None))
+}
+
+/// Whether a seal for `epoch` must show its registration's padding zero.
+pub fn storage_padding_bound_at(epoch: u64) -> bool {
+    epoch >= storage_padding_bound_epoch()
+}
+
+/// Set the storage padding bound epoch for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_storage_padding_bound_epoch_for_thread(epoch: Option<u64>) {
+    STORAGE_PADDING_BOUND_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
+#[cfg(test)]
+mod storage_padding_bound_epoch_tests {
+    #[test]
+    fn only_a_test_network_reads_the_storage_padding_bound_setting() {
+        assert_eq!(super::MAINNET_STORAGE_PADDING_BOUND_EPOCH, None);
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(super::storage_padding_bound_epoch_for(0, setting), u64::MAX);
+        }
+        assert_eq!(super::storage_padding_bound_epoch_for(1, Some("4")), 4);
+        assert_eq!(
+            super::storage_padding_bound_epoch_for(1, Some("x")),
+            u64::MAX
+        );
+        assert_eq!(super::storage_padding_bound_epoch_for(1, None), u64::MAX);
+        super::set_storage_padding_bound_epoch_for_thread(Some(7));
+        assert!(!super::storage_padding_bound_at(6));
+        assert!(super::storage_padding_bound_at(7));
+        super::set_storage_padding_bound_epoch_for_thread(None);
+        assert!(!super::storage_padding_bound_at(u64::MAX - 1));
+    }
+}
+
 #[cfg(test)]
 mod exact_state_size_epoch_tests {
     #[test]
