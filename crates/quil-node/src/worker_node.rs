@@ -568,8 +568,8 @@ pub(crate) async fn start(
             .await
             .map_err(|e| anyhow::anyhow!("worker p2p start: {}", e))?;
         let handle = Arc::new(handle);
-        // Workers subscribe to GLOBAL_PEER_INFO only (peer discovery).
-        // GLOBAL_FRAME, GLOBAL_PROVER, and GLOBAL_CONSENSUS are
+        // Workers subscribe to GLOBAL_PEER_INFO (peer discovery) and
+        // GLOBAL_ALERT. GLOBAL_FRAME, GLOBAL_PROVER, and GLOBAL_CONSENSUS are
         // deliberately omitted:
         //   - GLOBAL_FRAME: received via master gRPC stream
         //   - GLOBAL_PROVER: submitted via direct gRPC to archives
@@ -578,12 +578,14 @@ pub(crate) async fn start(
         //     `subscribe_to_shard_bitmasks`). Subscribing to GLOBAL
         //     causes every worker to relay every shard's votes/
         //     proposals — massive amplification with zero benefit.
-        handle
-            .subscribe(quil_engine::bitmasks::GLOBAL_PEER_INFO.to_vec())
-            .await;
-        handle
-            .subscribe(quil_engine::bitmasks::GLOBAL_ALERT.to_vec())
-            .await;
+        // The topics get the master's mesh checks first, shard topics
+        // included (the fallback): without them the worker forwarded what
+        // masters refuse, and their scores of it fell.
+        crate::master_node::networking::join_global_topics(
+            &handle,
+            crate::master_node::networking::MeshRole::Worker,
+        )
+        .await;
         // Wire publish_fn → worker's own p2p.
         let p2p_for_publish = handle.clone();
         let publish_fn: quil_engine::worker_node::PublishFn = Arc::new(move |bitmask, data| {

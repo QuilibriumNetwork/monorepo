@@ -100,27 +100,13 @@ pub(crate) async fn init(
     // GLOBAL_CONSENSUS/GLOBAL_PROVER + the bulk-shard subscribes remain archive-
     // only — their bandwidth rationale (vote firehose, all-shard coverage) still
     // holds and non-archives don't need them.
-    p2p_handle
-        .subscribe(quil_engine::bitmasks::GLOBAL_FRAME.to_vec())
-        .await;
-    // Mesh-level gate on GLOBAL_FRAME: shed wrong-type garbage and rate-limit
-    // per peer BEFORE delivery/forward, so a peer flooding the topic (the CPU-DoS
-    // vector — each frame otherwise forces a downstream VDF verify) is penalised
-    // by gossip scoring and its floods stop propagating. The authoritative
-    // genesis-prover + committee-cert + VDF checks still run in the recv loop.
-    p2p_handle
-        .register_global_frame_validator(
-            quil_engine::bitmasks::GLOBAL_FRAME.to_vec(),
-            quil_engine::consensus_wire::GLOBAL_FRAME_TYPE,
-        )
-        .await;
+    let role = if archive_mode {
+        MeshRole::Archive
+    } else {
+        MeshRole::Master
+    };
+    join_global_topics(&p2p_handle, role).await;
     if archive_mode {
-        p2p_handle
-            .subscribe(quil_engine::bitmasks::GLOBAL_CONSENSUS.to_vec())
-            .await;
-        p2p_handle
-            .subscribe(quil_engine::bitmasks::GLOBAL_PROVER.to_vec())
-            .await;
         // Bulk shard subscription — an all-ones bitmask bit-COVERS every
         // specific per-shard bloom, so coverage classification meshes the
         // archive with the provers. The four per-shard channels are different
@@ -130,65 +116,10 @@ pub(crate) async fn init(
         // length, so we subscribe at EACH length — otherwise the archive relays
         // proposals (frame) but not votes (consensus) and app-shard consensus
         // stalls with no QC.
-        for len in [32usize, 33, 34, 35] {
+        for len in ARCHIVE_BULK_LENGTHS {
             p2p_handle.subscribe(vec![0xFFu8; len]).await;
         }
-        // Mesh-level checks on the archive-only global topics: a prover
-        // message must be a prover operation, bundle or request (the receive
-        // loop's own check), and GLOBAL_CONSENSUS carries nothing any release
-        // reads.
-        // Refused messages are ignored, not rejected: releases before these
-        // checks forward them, and penalising those relays would cut them off
-        // the mesh.
-        let prover_check = quil_engine::message_router::validator_global_prover();
-        p2p_handle
-            .register_gossip_validator(
-                quil_engine::bitmasks::GLOBAL_PROVER.to_vec(),
-                Box::new(move |_peer: &quil_p2p::PeerId, data: &[u8]| {
-                    if prover_check(data).is_accept() {
-                        quil_p2p::ValidationResult::Accept
-                    } else {
-                        quil_p2p::ValidationResult::Ignore
-                    }
-                }),
-            )
-            .await;
-        p2p_handle
-            .register_gossip_validator(
-                quil_engine::bitmasks::GLOBAL_CONSENSUS.to_vec(),
-                Box::new(|_peer: &quil_p2p::PeerId, _data: &[u8]| {
-                    quil_p2p::ValidationResult::Ignore
-                }),
-            )
-            .await;
     }
-    p2p_handle
-        .subscribe(quil_engine::bitmasks::GLOBAL_PEER_INFO.to_vec())
-        .await;
-    // Drop stale or invalid PeerInfo/KeyRegistry at the MESH (before forward),
-    // not just at the app router. Both ride the GLOBAL_PEER_INFO bitmask; without this the
-    // composite broker re-gossips millions of already-stale PeerInfo/KeyRegistry
-    // per hour (`*_ts_too_old`), self-amplifying the flood and bloating the
-    // gossip dedup caches. The app router still fully validates the fresh ones.
-    p2p_handle
-        .register_peer_info_staleness_validator(quil_engine::bitmasks::GLOBAL_PEER_INFO.to_vec())
-        .await;
-    p2p_handle
-        .subscribe(quil_engine::bitmasks::GLOBAL_ALERT.to_vec())
-        .await;
-    // Forward only alerts the receive loop can verify.
-    p2p_handle
-        .register_global_alert_validator(quil_engine::bitmasks::GLOBAL_ALERT.to_vec())
-        .await;
-    // Topics without a validator of their own: the shard topics, subscribed as
-    // shards come and go.
-    p2p_handle
-        .register_fallback_validator(Box::new(
-            |_peer: &quil_p2p::PeerId, bitmask: &[u8], data: &[u8]| {
-                shard_gossip_verdict(bitmask, data)
-            },
-        ))
-        .await;
     if archive_mode {
         info!("subscribed to all global + bulk shard bitmasks (archive mode)");
     } else {
@@ -212,6 +143,146 @@ pub(crate) async fn init(
         consensus_loopback_rx,
         listen_addr,
     })
+}
+
+/// Bitmask lengths of an archive's bulk shard subscriptions, `[0xFF; len]`
+/// (see `init`).
+pub(crate) const ARCHIVE_BULK_LENGTHS: [usize; 4] = [32, 33, 34, 35];
+
+/// The p2p whose global topics and mesh checks [`join_global_topics`] sets up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MeshRole {
+    /// A master that is not an archive.
+    Master,
+    /// An archive master.
+    Archive,
+    /// A standalone worker's own p2p (`engine.enableMasterProxy` off).
+    Worker,
+}
+
+/// The mesh check of a global topic (see [`register_mesh_checks`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GlobalCheck {
+    /// GLOBAL_FRAME's gate: type prefix and per-author rate.
+    Frame,
+    /// GLOBAL_CONSENSUS: nothing any release reads.
+    Consensus,
+    /// GLOBAL_PROVER: a prover operation, bundle or request.
+    Prover,
+    /// GLOBAL_PEER_INFO: freshness, size and signatures.
+    PeerInfo,
+    /// GLOBAL_ALERT: the canonical layout.
+    Alert,
+}
+
+/// The global topics a node of `role` subscribes, each with its mesh check.
+/// Every master subscribes GLOBAL_FRAME (the committee gossips each
+/// finalized global frame), GLOBAL_PEER_INFO and GLOBAL_ALERT; archives also
+/// GLOBAL_CONSENSUS and GLOBAL_PROVER. A standalone worker's own p2p
+/// subscribes GLOBAL_PEER_INFO (peer discovery) and GLOBAL_ALERT only: it gets
+/// frames over the master's stream, submits prover messages over gRPC, and
+/// serves per-shard consensus only, subscribed as its shard starts.
+pub(crate) fn global_topics(role: MeshRole) -> Vec<(&'static [u8], GlobalCheck)> {
+    use quil_engine::bitmasks::{
+        GLOBAL_ALERT, GLOBAL_CONSENSUS, GLOBAL_FRAME, GLOBAL_PEER_INFO, GLOBAL_PROVER,
+    };
+    let mut topics = Vec::new();
+    if role != MeshRole::Worker {
+        topics.push((GLOBAL_FRAME, GlobalCheck::Frame));
+    }
+    if role == MeshRole::Archive {
+        topics.push((GLOBAL_CONSENSUS, GlobalCheck::Consensus));
+        topics.push((GLOBAL_PROVER, GlobalCheck::Prover));
+    }
+    topics.push((GLOBAL_PEER_INFO, GlobalCheck::PeerInfo));
+    topics.push((GLOBAL_ALERT, GlobalCheck::Alert));
+    topics
+}
+
+/// Registers the mesh checks of a node of `role`, then subscribes its
+/// global topics ([`global_topics`]), so that nothing a topic carries is
+/// delivered or forwarded unchecked. A standalone worker's p2p gets the
+/// master's checks: without them it forwarded what masters refuse, a stale
+/// PeerInfo among it, and their scores of it fell.
+pub(crate) async fn join_global_topics(p2p: &quil_p2p::node::P2PHandle, role: MeshRole) {
+    register_mesh_checks(p2p, role).await;
+    for (topic, _) in global_topics(role) {
+        p2p.subscribe(topic.to_vec()).await;
+    }
+}
+
+/// Registers the mesh check of each global topic of `role` and the fallback
+/// of every other topic ([`shard_gossip_verdict`]). They run in the gossip
+/// poll thread before a message is delivered or forwarded, so they stay
+/// cheap; the receive loop still runs the authoritative checks.
+pub(crate) async fn register_mesh_checks(p2p: &quil_p2p::node::P2PHandle, role: MeshRole) {
+    for (topic, check) in global_topics(role) {
+        match check {
+            // Shed wrong-type garbage and rate-limit per peer BEFORE
+            // delivery/forward, so a peer flooding the topic (the CPU-DoS
+            // vector — each frame otherwise forces a downstream VDF verify) is
+            // penalised by gossip scoring and its floods stop propagating. The
+            // authoritative genesis-prover + committee-cert + VDF checks still
+            // run in the recv loop.
+            GlobalCheck::Frame => {
+                p2p.register_global_frame_validator(
+                    topic.to_vec(),
+                    quil_engine::consensus_wire::GLOBAL_FRAME_TYPE,
+                )
+                .await;
+            }
+            // The archive-only global topics: a prover message must be a
+            // prover operation, bundle or request (the receive loop's own
+            // check), and GLOBAL_CONSENSUS carries nothing any release reads.
+            // Refused messages are ignored, not rejected: releases before
+            // these checks forward them, and penalising those relays would cut
+            // them off the mesh.
+            GlobalCheck::Prover => {
+                let prover_check = quil_engine::message_router::validator_global_prover();
+                p2p.register_gossip_validator(
+                    topic.to_vec(),
+                    Box::new(move |_peer: &quil_p2p::PeerId, data: &[u8]| {
+                        if prover_check(data).is_accept() {
+                            quil_p2p::ValidationResult::Accept
+                        } else {
+                            quil_p2p::ValidationResult::Ignore
+                        }
+                    }),
+                )
+                .await;
+            }
+            GlobalCheck::Consensus => {
+                p2p.register_gossip_validator(
+                    topic.to_vec(),
+                    Box::new(|_peer: &quil_p2p::PeerId, _data: &[u8]| {
+                        quil_p2p::ValidationResult::Ignore
+                    }),
+                )
+                .await;
+            }
+            // Drop stale or invalid PeerInfo/KeyRegistry at the MESH (before
+            // forward), not just at the app router. Both ride the
+            // GLOBAL_PEER_INFO bitmask; without this the composite broker
+            // re-gossips millions of already-stale PeerInfo/KeyRegistry per
+            // hour (`*_ts_too_old`), self-amplifying the flood and bloating the
+            // gossip dedup caches. The app router still fully validates the
+            // fresh ones.
+            GlobalCheck::PeerInfo => {
+                p2p.register_peer_info_staleness_validator(topic.to_vec())
+                    .await;
+            }
+            // Forward only alerts the receive loop can verify.
+            GlobalCheck::Alert => {
+                p2p.register_global_alert_validator(topic.to_vec()).await;
+            }
+        }
+    }
+    // Topics without a validator of their own: the shard topics, subscribed as
+    // shards come and go.
+    p2p.register_fallback_validator(Box::new(
+        |_peer: &quil_p2p::PeerId, bitmask: &[u8], data: &[u8]| shard_gossip_verdict(bitmask, data),
+    ))
+    .await;
 }
 
 /// The mesh verdict on a message of a topic without a validator of its own.
@@ -241,6 +312,7 @@ pub(crate) fn shard_gossip_verdict(bitmask: &[u8], data: &[u8]) -> quil_p2p::Val
 mod tests {
     use super::*;
     use quil_p2p::ValidationResult::{Accept, Ignore};
+    use std::time::Duration;
 
     /// Shard CW transmissions of every framing a release sends are forwarded;
     /// malformed ones and unknown channels are dropped without penalty, and
@@ -268,5 +340,226 @@ mod tests {
         let frame_topic = quil_engine::bitmasks::shard_frame_bitmask(&filter);
         assert_eq!(shard_gossip_verdict(&frame_topic, &[]), Accept);
         assert_eq!(shard_gossip_verdict(&[0x01; 33], b"anything"), Ignore);
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    type Inbound = tokio::sync::mpsc::Receiver<quil_p2p::node::ReceivedMessage>;
+
+    /// Three nodes on loopback subscribed to the same topics. The source and
+    /// the sink connect only to the relay (loopback addresses are not
+    /// routable, so neither learns of the other): what the sink receives from
+    /// the source, the relay forwarded.
+    struct Chain {
+        _sup: quil_lifecycle::Supervisor<anyhow::Error>,
+        source: quil_p2p::node::P2PHandle,
+        source_id: quil_p2p::PeerId,
+        relay: quil_p2p::node::P2PHandle,
+        relay_id: quil_p2p::PeerId,
+        sink: quil_p2p::node::P2PHandle,
+        sink_rx: Inbound,
+        _inbound: Vec<Inbound>,
+    }
+
+    async fn start_node(
+        sup: &mut quil_lifecycle::Supervisor<anyhow::Error>,
+        relay: Option<(u16, quil_p2p::PeerId)>,
+    ) -> (quil_p2p::node::P2PHandle, quil_p2p::PeerId, u16, Inbound) {
+        let mut config = quil_config::P2PConfig::default();
+        config.network = 99;
+        config.bootstrap_peers = relay
+            .map(|(port, id)| vec![format!("/ip4/127.0.0.1/tcp/{port}/p2p/{id}")])
+            .unwrap_or_default();
+        config.direct_peers = Vec::new();
+        let node = quil_p2p::node::P2PNode::new_with_options(&config, true, None).unwrap();
+        let id = node.peer_id;
+        let port = free_port();
+        let (handle, inbound) = node
+            .start(sup, &format!("/ip4/127.0.0.1/tcp/{port}"))
+            .await
+            .unwrap();
+        (handle, id, port, inbound)
+    }
+
+    /// The chain, with the relay and the sink set up as nodes of their roles
+    /// ([`join`]) and every node also subscribed to `topics`.
+    async fn chain(
+        topics: &[&[u8]],
+        relay_role: Option<MeshRole>,
+        sink_role: Option<MeshRole>,
+    ) -> Chain {
+        let mut sup = quil_lifecycle::Supervisor::<anyhow::Error>::new();
+        let (relay, relay_id, relay_port, relay_rx) = start_node(&mut sup, None).await;
+        let (source, source_id, _, source_rx) =
+            start_node(&mut sup, Some((relay_port, relay_id))).await;
+        let (sink, _, _, sink_rx) = start_node(&mut sup, Some((relay_port, relay_id))).await;
+        join(&relay, relay_role).await;
+        join(&sink, sink_role).await;
+        for p2p in [&relay, &source, &sink] {
+            for topic in topics {
+                p2p.subscribe(topic.to_vec()).await;
+            }
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        for topic in topics {
+            loop {
+                let peers = relay
+                    .subscribed_peer_count(topic.to_vec())
+                    .await
+                    .unwrap_or(0);
+                if peers >= 2 {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the chain never formed: the relay sees {peers} of 2 peers on {}",
+                    hex::encode(topic)
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        Chain {
+            _sup: sup,
+            source,
+            source_id,
+            relay,
+            relay_id,
+            sink,
+            sink_rx,
+            _inbound: vec![relay_rx, source_rx],
+        }
+    }
+
+    /// A GLOBAL_ALERT of the canonical layout, distinct for each `n`. Its
+    /// signature is checked by the receive loop, not at the mesh, so every
+    /// node forwards it.
+    fn control_alert(n: u32) -> Vec<u8> {
+        let message = format!("relay check {n}");
+        let mut alert = 0x0911u32.to_be_bytes().to_vec();
+        alert.extend_from_slice(&(message.len() as u32).to_be_bytes());
+        alert.extend_from_slice(message.as_bytes());
+        alert.extend_from_slice(&114u32.to_be_bytes());
+        alert.extend_from_slice(&[7; 114]);
+        alert
+    }
+
+    impl Chain {
+        /// Publishes control alerts from the source until the sink receives
+        /// one through the relay, then lets a few heartbeats graft the meshes
+        /// of the other topics.
+        async fn wait_for_meshes(&mut self) {
+            let alert = quil_engine::bitmasks::GLOBAL_ALERT.to_vec();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let mut n = 0;
+            'publish: loop {
+                let _ = self.source.publish(alert.clone(), control_alert(n)).await;
+                n += 1;
+                let turn = tokio::time::Instant::now() + Duration::from_secs(1);
+                while let Ok(Some(message)) =
+                    tokio::time::timeout_at(turn, self.sink_rx.recv()).await
+                {
+                    if message.bitmask == alert {
+                        break 'publish;
+                    }
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the relay never forwarded a control alert to the sink"
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    /// Sets up `p2p` as a node of `role` does ([`join_global_topics`]), or
+    /// leaves it without mesh checks.
+    async fn join(p2p: &quil_p2p::node::P2PHandle, role: Option<MeshRole>) {
+        if let Some(role) = role {
+            join_global_topics(p2p, role).await;
+        }
+    }
+
+    /// A standalone worker's own p2p must check what it forwards as a master
+    /// does. Unchecked, it forwarded a stale PeerInfo anyone may send, and the
+    /// masters it relays to rejected it and lowered the worker's score as an
+    /// attacker's (repeats graylist it, its consensus messages with it).
+    #[tokio::test]
+    async fn reproduces_worker_relay_penalised_for_unchecked_gossip() {
+        let peer_info = quil_engine::bitmasks::GLOBAL_PEER_INFO;
+        let alert = quil_engine::bitmasks::GLOBAL_ALERT;
+        let mut chain = chain(
+            &[peer_info, alert],
+            Some(MeshRole::Worker),
+            Some(MeshRole::Master),
+        )
+        .await;
+        chain.wait_for_meshes().await;
+
+        // Ten minutes old, with junk keys and signatures.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let stale = quil_p2p::encode_canonical_peer_info(
+            &quil_p2p::CanonicalPeerInfo {
+                peer_id: vec![1; 38],
+                timestamp: now_ms - 600_000,
+                ..Default::default()
+            },
+            &[2; 897],
+            &[3; 666],
+        );
+        assert_eq!(
+            quil_p2p::peer_info::peer_info_gossip_verdict(&stale, now_ms),
+            quil_p2p::peer_info::PeerInfoVerdict::Stale
+        );
+        chain
+            .source
+            .publish(peer_info.to_vec(), stale)
+            .await
+            .expect("publish the stale PeerInfo");
+        let last = control_alert(u32::MAX);
+        chain
+            .source
+            .publish(alert.to_vec(), last.clone())
+            .await
+            .expect("publish the last control alert");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut arrived = false;
+        while !arrived {
+            let score = chain.sink.get_peer_score(chain.relay_id).await;
+            assert!(
+                score >= 0.0,
+                "VULNERABLE: the worker's p2p forwarded a stale PeerInfo it never checked, \
+                 and the master it relays to scored it {score}"
+            );
+            if let Ok(Some(message)) =
+                tokio::time::timeout(Duration::from_millis(100), chain.sink_rx.recv()).await
+            {
+                arrived = message.data == last;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the relay never forwarded the last control alert"
+            );
+        }
+        let score = chain.sink.get_peer_score(chain.relay_id).await;
+        assert!(
+            score >= 0.0,
+            "VULNERABLE: the worker's p2p forwarded a stale PeerInfo it never checked, \
+             and the master it relays to scored it {score}"
+        );
+        let sender = chain.relay.get_peer_score(chain.source_id).await;
+        assert!(
+            sender < 0.0,
+            "the worker's p2p did not reject the stale PeerInfo (its sender scores {sender})"
+        );
     }
 }
