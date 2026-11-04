@@ -443,6 +443,7 @@ fn cli_action(command: &super::TokenCommand) -> Option<(&'static str, serde_json
             fee: given,
             claim: None,
             status: None,
+            ..
         } => (
             "mint",
             serde_json::json!({ "recipient": recipient, "fee": fee(given) }),
@@ -451,6 +452,7 @@ fn cli_action(command: &super::TokenCommand) -> Option<(&'static str, serde_json
             recipient,
             amount,
             fee: given,
+            ..
         } => (
             "transfer",
             serde_json::json!({ "recipient": recipient, "amount": amount, "fee": fee(given) }),
@@ -460,6 +462,7 @@ fn cli_action(command: &super::TokenCommand) -> Option<(&'static str, serde_json
             amount,
             expiration,
             fee: given,
+            ..
         } => (
             "pending_transfer",
             serde_json::json!({
@@ -469,15 +472,21 @@ fn cli_action(command: &super::TokenCommand) -> Option<(&'static str, serde_json
                 "fee": fee(given),
             }),
         ),
-        TokenCommand::Accept { escrow, fee: given } => (
+        TokenCommand::Accept {
+            escrow, fee: given, ..
+        } => (
             "accept",
             serde_json::json!({ "escrow": escrow, "fee": fee(given) }),
         ),
-        TokenCommand::Reject { escrow, fee: given } => (
+        TokenCommand::Reject {
+            escrow, fee: given, ..
+        } => (
             "refund",
             serde_json::json!({ "escrow": escrow, "fee": fee(given) }),
         ),
-        TokenCommand::Merge { coins, fee: given } => (
+        TokenCommand::Merge {
+            coins, fee: given, ..
+        } => (
             "merge",
             serde_json::json!({ "coins": coins, "fee": fee(given) }),
         ),
