@@ -102,33 +102,6 @@ pub async fn send_message_bundle(
     .await
 }
 
-/// [`send_message_request`] for a submission that follows a finished proof: the
-/// bundle is built and signed once, and the identical request is resent when
-/// the node could not be reached or did not answer in time (see
-/// [`crate::retry`]). A node's refusal fails at once.
-pub async fn send_message_request_retrying(
-    client: &mut NodeServiceClient<Channel>,
-    key_manager: &FileKeyManager,
-    domain: Vec<u8>,
-    request: MessageRequest,
-) -> anyhow::Result<()> {
-    let bundle = MessageBundle {
-        requests: vec![request],
-        timestamp: now_millis(),
-    };
-    let authentication = sign_bundle(key_manager, &domain, &bundle)?;
-    deliver(
-        client,
-        SendRequest {
-            domain,
-            request: Some(bundle),
-            authentication,
-            delivery_data: Vec::new(),
-        },
-    )
-    .await
-}
-
 /// Send `request`, resending it unchanged on a transient failure.
 async fn deliver(
     client: &mut NodeServiceClient<Channel>,

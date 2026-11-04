@@ -2409,6 +2409,15 @@ fn recording_node(
     (server, received)
 }
 
+/// The one-request bundle a submission hands to `send_message_bundle`.
+#[cfg(feature = "native-proof")]
+fn submission_bundle() -> quil_types::proto::global::MessageBundle {
+    quil_types::proto::global::MessageBundle {
+        requests: vec![token_operation_request()],
+        timestamp: crate::send::now_millis(),
+    }
+}
+
 #[cfg(feature = "native-proof")]
 #[tokio::test]
 async fn a_delivery_that_fails_transiently_is_resent() {
@@ -2419,14 +2428,9 @@ async fn a_delivery_that_fails_transiently_is_resent() {
     let (multiaddr, calls, stop, serving) =
         flaky_node(server, tonic::Status::unavailable("node restarting"), 2).await;
     let mut client = client_at(&multiaddr).await;
-    crate::send::send_message_request_retrying(
-        &mut client,
-        &km,
-        vec![2; 32],
-        token_operation_request(),
-    )
-    .await
-    .expect("a node that comes back within the budget must take the submission");
+    crate::send::send_message_bundle(&mut client, &km, vec![2; 32], submission_bundle())
+        .await
+        .expect("a node that comes back within the budget must take the submission");
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
     assert_eq!(
         received.lock().unwrap().len(),
@@ -2447,14 +2451,10 @@ async fn a_rejected_delivery_is_not_resent() {
     let (multiaddr, calls, stop, serving) =
         flaky_node(server, tonic::Status::unavailable("unused"), 0).await;
     let mut client = client_at(&multiaddr).await;
-    let error = crate::send::send_message_request_retrying(
-        &mut client,
-        &km,
-        vec![2; 32],
-        token_operation_request(),
-    )
-    .await
-    .expect_err("a rejected submission must fail");
+    let error =
+        crate::send::send_message_bundle(&mut client, &km, vec![2; 32], submission_bundle())
+            .await
+            .expect_err("a rejected submission must fail");
     assert!(error.to_string().contains("send rpc"), "{error}");
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(
@@ -2479,10 +2479,7 @@ async fn a_resent_bundle_keeps_the_id_a_submit_prints() {
     let (multiaddr, calls, stop, serving) =
         flaky_node(server, tonic::Status::unavailable("node restarting"), 2).await;
     let mut client = client_at(&multiaddr).await;
-    let bundle = quil_types::proto::global::MessageBundle {
-        requests: vec![token_operation_request()],
-        timestamp: crate::send::now_millis(),
-    };
+    let bundle = submission_bundle();
     let id = bundle_id(&bundle).unwrap();
     crate::send::send_message_bundle(&mut client, &km, vec![2; 32], bundle)
         .await
