@@ -929,10 +929,27 @@ fn encode_member_until(
             return Err(stopped());
         }
         // A leaf whose seat's renewal is past its grace leaves the queue for
-        // memory, where it would hold its place before other seats' leaves.
+        // memory, where it would hold its place before other seats' leaves;
+        // so does one that, waiting while other work holds the memory, can no
+        // longer be labelled by that frame even at its fewest nodes. Its seat
+        // is given up then, warned with its estimate and the frames left,
+        // and renews without it at once, rather than wait for memory until
+        // the grace frame (2026-11-03: each shard a split creates encodes in
+        // a lane of its own, beside its siblings, and waits for memory there).
+        let late = || {
+            !may_be_kept
+                && gives_up_late_leaf(
+                    captured,
+                    member,
+                    &leaf_id,
+                    least,
+                    kept_least,
+                    LeafCount::Waiting,
+                )
+        };
         let memory = crate::storage_jobs::reserve_until(
             encoding_bytes(data_node_count(estimated_leaf_bytes(size))),
-            stop,
+            &|| stop() || late(),
         );
         let Some(mut memory) = memory.filter(|_| !stop()) else {
             return Err(stopped());
@@ -1100,6 +1117,8 @@ fn encode_member_until(
 enum LeafCount {
     /// From its values, before its data is read: the fewest it can take.
     Least,
+    /// As [`Self::Least`], while it waits for memory other work holds.
+    Waiting,
     /// From its data.
     Exact,
 }
@@ -1126,6 +1145,9 @@ fn gives_up_late_leaf(
     if give_up_snapshot(member, &captured.filter, captured.epoch) {
         let counted = match counted {
             LeafCount::Least => "at least, from its values before its data is read",
+            LeafCount::Waiting => {
+                "at least, from its values, while it waited for memory other storage work holds"
+            }
             LeafCount::Exact => "from its data",
         };
         warn!(epoch = captured.epoch, filter = %hex::encode(&captured.filter),
@@ -1307,19 +1329,21 @@ pub fn captured_for(
 
 /// Capture `filter`'s snapshot for `epoch` from `sources` and encode
 /// `member`'s replicas of it into `replicas`, in the background ([`request`]),
-/// in the lane of the seat whose shard is `seat` (its own, or the one a
-/// change creates `filter` from).
+/// in `lane`: that of `member`'s seat on `filter`, a shard a change creates
+/// included (`crate::app_shard_metadata::request_storage_snapshots`).
 pub fn request_member(
     crdt: Arc<HypergraphCrdt>,
     replicas: ReplicaStore,
     member: Vec<u8>,
-    seat: &[u8],
+    lane: &[u8],
     filter: Vec<u8>,
     epoch: u64,
     sources: Vec<Source>,
 ) {
     let key = [b"member".as_slice(), &member, &filter, &epoch.to_be_bytes()].concat();
-    request(seat, key, "member", move || {
+    let shown_lane = hex::encode(lane);
+    request(lane, key, "member", move || {
+        use quil_crypto::storage_proof::data_node_count;
         let past_grace = || {
             info!(epoch, filter = %hex::encode(&filter), scope = "local",
                 "storage snapshot not encoded: the renewal's grace frame passed, so this seat renews \
@@ -1334,20 +1358,51 @@ pub fn request_member(
             return Ok(());
         }
         let captured = capture_at(&crdt, &filter, epoch, &sources)?;
+        let started = std::time::Instant::now();
+        // Its leaves' fewest nodes, from their values: labelled side by side,
+        // the largest bounds the encode.
+        let least: Vec<u64> = captured
+            .prefixes
+            .iter()
+            .filter_map(|prefix| captured.leaf_size(prefix).ok())
+            .map(|size| data_node_count(u64::try_from(size).unwrap_or(u64::MAX)))
+            .collect();
+        let largest = least.iter().copied().max().unwrap_or(0);
+        let grace_frame = quil_types::consensus::storage_snapshot_frame(epoch)
+            .saturating_add(crate::app_shard_metadata::storage_snapshot_grace());
         info!(epoch, leaves = captured.prefixes.len(), filter = %hex::encode(&filter),
-            "storage snapshot taken for the epoch's registration");
+            lane = %shown_lane, nodes_at_least = least.iter().sum::<u64>(),
+            largest_leaf_nodes = largest,
+            estimated_seconds = label_estimate(largest).as_secs(),
+            frames_left = global_frame().map(|frame| grace_frame.saturating_sub(frame)),
+            "storage snapshot taken for the epoch's registration; its encode starts (estimated \
+             seconds: labelling its largest leaf on one core, before any labels kept ahead or on \
+             disk; frames left to the renewal's grace frame)");
         let stop = || {
             grace_passed(&member, epoch)
                 || snapshot_given_up(&member, &filter, epoch)
                 || crate::storage_jobs::stopping()
         };
-        match encode_member_until(
+        let result = encode_member_until(
             &captured,
             &member,
             &replicas,
             crate::storage_labels::installed(),
             &stop,
-        ) {
+        );
+        let outcome = match &result {
+            Ok(()) => "encoded",
+            Err(_) if grace_passed(&member, epoch) => "grace passed",
+            Err(_) if snapshot_given_up(&member, &filter, epoch) => "given up",
+            Err(_) if crate::storage_jobs::stopping() => "stopping",
+            Err(_) => "failed",
+        };
+        info!(epoch, filter = %hex::encode(&filter), lane = %shown_lane,
+            seconds = started.elapsed().as_secs_f64(), outcome,
+            "storage snapshot encode ended: only `encoded` registers the seat's leaves; `given up` \
+             and `grace passed` renew it without them (warned or logged as they happened), \
+             `failed` is tried again when next needed");
+        match result {
             Err(_) if grace_passed(&member, epoch) => return past_grace(),
             // Logged as it was given up (`encode_member_until`).
             Err(_) if snapshot_given_up(&member, &filter, epoch) => return Ok(()),
@@ -3836,8 +3891,8 @@ pub(crate) mod tests {
             "a seat certain to miss its grace waited for memory"
         );
         assert!(snapshot_given_up(&late, &app, epoch));
-        // The seat asked earlier gets its memory once the other work ends,
-        // reads its leaf, and is given up then, as before.
+        // The seat asked earlier is given up too, while it waits: its leaf
+        // can no longer end by the grace frame either.
         drop(held);
         assert!(crate::storage_jobs::wait_lane_idle(
             &early_lane,
@@ -3846,6 +3901,335 @@ pub(crate) mod tests {
         assert!(snapshot_given_up(&early, &app, epoch));
         assert_eq!(replicas.get_partition(epoch, &app).unwrap(), None);
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// Each shard a split creates encodes its snapshot in a lane of its own
+    /// (`crate::app_shard_metadata::request_storage_snapshots`), so both
+    /// children are encoded by the grace: the second while the first waits
+    /// for memory other work holds, the first once it has it, labelling on
+    /// while GLOBAL moves past the frame from which the second would no
+    /// longer fit. In its parent seat's lane the second child waited for the
+    /// first (at mainnet scale, labelling a child of 16 million nodes took
+    /// 1,798 to 1,973 s on a 4-CPU host) and was given up once it started,
+    /// though alone it fit the grace, leaving its shard no sealed member
+    /// (2026-11-03). Test builds label far slower than the estimates, so the
+    /// GLOBAL frame moves only on events, never on time.
+    #[test]
+    fn each_shard_a_split_creates_encodes_in_a_lane_of_its_own() {
+        use std::time::{Duration, Instant};
+        let epoch = 6;
+        let snapshot_frame = quil_types::consensus::storage_snapshot_frame(epoch);
+        let grace = crate::app_shard_metadata::storage_snapshot_grace();
+        // A split of a 32,349,377 node leaf at 10 s frames: each child fits
+        // the grace alone, the second not once the first has labelled.
+        assert_eq!(label_estimate(16_174_688).as_secs(), 2_410);
+        assert_eq!(misses_grace(epoch, 16_174_689, 0, snapshot_frame), None);
+        assert_eq!(
+            misses_grace(epoch, 16_174_688, 0, snapshot_frame + 184),
+            Some(grace - 184)
+        );
+        if crate::storage_jobs::job_slots() < 2 {
+            eprintln!("one storage job slot: the children encode one at a time");
+            return;
+        }
+
+        let crdt = test_crdt();
+        let app = [0x86u8; 32];
+        let filter = |bits: &[bool]| quil_forest::encode_shard_bit_path(&app, bits);
+        let (parent, first, second) = (
+            filter(&[true]),
+            filter(&[true, false]),
+            filter(&[true, true]),
+        );
+        // The first child holds twice the second's data, as little as keeps
+        // each estimate, in whole seconds, above zero: 17,477 and 8,739 nodes
+        // at least, 2 s and 1 s (one second per 6,711 nodes), as test builds
+        // label far slower than the estimates.
+        for (lead, count) in [(0x80u8, 8u8), (0xC0, 4)] {
+            for d in 0..count {
+                crdt.add_vertex(
+                    &Location {
+                        app_address: app,
+                        data_address: address(lead + d, d),
+                    },
+                    &vec![d; 64 << 10],
+                )
+                .unwrap();
+            }
+        }
+        crdt.commit(1).unwrap();
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let source = current_source(&crdt, &parent, epoch);
+        // Each child's leaf: its nodes at least and from its data, and the
+        // memory it asks for before its data is read.
+        let leaf = |child: &[u8]| {
+            use quil_crypto::storage_proof::data_node_count;
+            let captured = capture_at(&crdt, child, epoch, std::slice::from_ref(&source)).unwrap();
+            assert_eq!(captured.prefixes.len(), 1);
+            let prefix = &captured.prefixes[0];
+            let size = captured.leaf_size(prefix).unwrap();
+            let least = data_node_count(u64::try_from(size).unwrap());
+            let exact = data_node_count(captured.leaf_data(prefix).unwrap().len() as u64);
+            (
+                least,
+                exact,
+                encoding_bytes(data_node_count(estimated_leaf_bytes(size))),
+            )
+        };
+        let ((_, first_exact, first_asks), (second_least, second_exact, second_asks)) =
+            (leaf(&first), leaf(&second));
+        assert!(first_asks > second_asks);
+        // Frames short enough that the first child's estimate spans 300 of
+        // the grace's frames.
+        let first_ms = label_estimate_from(first_exact, 0).as_millis() as u64;
+        let second_ms = label_estimate_from(second_exact, 0).as_millis() as u64;
+        assert!(
+            second_ms > 0,
+            "the second child's estimate is under a second"
+        );
+        let frame_ms = first_ms / 300 + 1;
+        quil_types::consensus::set_frame_time_schedule(vec![(0, frame_ms)]);
+        assert_eq!(misses_grace(epoch, first_exact, 0, snapshot_frame), None);
+        assert_eq!(misses_grace(epoch, second_exact, 0, snapshot_frame), None);
+        // The first GLOBAL frame at which the second child no longer fits.
+        let late = (snapshot_frame..snapshot_frame + grace)
+            .find(|&frame| misses_grace(epoch, second_least, 0, frame).is_some())
+            .expect("the second child misses the grace before it ends");
+
+        // Other work holds memory: the second child fits beside it, the
+        // first does not.
+        let held_bytes = 64u64 << 20;
+        let share = held_bytes + (first_asks + second_asks) / 2;
+        let available = share * 100 / crate::storage_jobs::MEMORY_SHARE_PERCENT;
+        crate::storage_jobs::set_available_for_test(Some(available));
+        let held = crate::storage_jobs::reserve(held_bytes);
+        note_global_frame(snapshot_frame);
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let member = [0x6Du8; 32];
+        crate::app_shard_metadata::request_storage_snapshots(
+            &crdt,
+            &replicas,
+            &[parent.clone(), first.clone(), second.clone()],
+            &member,
+            epoch,
+            &[
+                (first.clone(), vec![source.clone()]),
+                (second.clone(), vec![source.clone()]),
+            ],
+        )
+        .unwrap();
+        // Each child's job runs in its own lane, none in its parent seat's.
+        let busy = |lane: &[u8]| !crate::storage_jobs::wait_lane_idle(lane, Duration::ZERO);
+        let apart = busy(&first) && busy(&second) && !busy(&parent);
+        let wait_for = |done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(120);
+            while !done() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            done()
+        };
+        let encoded = |child: &[u8]| replicas.get_partition(epoch, child).unwrap().is_some();
+        assert!(
+            wait_for(&|| encoded(&second)),
+            "the second shard the split creates was not encoded while the first waited for \
+             memory: it waits behind the first in its parent seat's lane"
+        );
+        // The other work ends: the first child has its memory and labels
+        // (the second is done, so it is the one labelling), and only then
+        // GLOBAL reaches the frame from which the second would no longer fit.
+        // Moved before the first labels, it gives the first up too
+        // (2026-11-04: moved on the second's labelling, it did).
+        drop(held);
+        assert!(
+            wait_for(&|| crate::storage_jobs::labelling_now_count() > 0 || encoded(&first)),
+            "the first shard the split creates did not start labelling once the memory was free"
+        );
+        note_global_frame(late);
+        for lane in [&parent, &first, &second] {
+            assert!(crate::storage_jobs::wait_lane_idle(
+                lane,
+                Duration::from_secs(120)
+            ));
+        }
+        crate::storage_jobs::set_available_for_test(None);
+        quil_types::consensus::set_frame_time_schedule(Vec::new());
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert!(
+            encoded(&second) && !snapshot_given_up(&member, &second, epoch),
+            "the second shard the split creates was given up at GLOBAL frame {late}, {} frames \
+             after the snapshot frame: it waited in its parent seat's lane behind the first, \
+             though alone it fit the grace (an estimate of {second_ms} ms; the grace, {grace} \
+             frames of {frame_ms} ms), so its shard starts with no sealed member",
+            late - snapshot_frame
+        );
+        assert!(
+            encoded(&first) && !snapshot_given_up(&member, &first, epoch),
+            "the first shard the split creates was not encoded, though it started at the \
+             snapshot frame and its estimate ({first_ms} ms) fit the grace"
+        );
+        assert!(
+            apart,
+            "the shards the split creates did not encode each in a lane of its own"
+        );
+    }
+
+    /// The lines logged at info or above from now on, by any thread: storage
+    /// jobs log on their own. Installs this process's subscriber (nextest
+    /// runs each test in its own process).
+    fn capture_logs() -> Arc<std::sync::Mutex<Vec<u8>>> {
+        #[derive(Clone)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Sink(lines.clone());
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .with_writer(move || sink.clone())
+                .finish(),
+        )
+        .expect("no other subscriber in this test's process");
+        lines
+    }
+
+    /// A shard a change creates encodes in a lane of its own, where its leaf
+    /// may wait for memory other storage work holds. It waits only while its
+    /// estimate still fits the frames left to the renewal's grace frame:
+    /// then it is given up, before that frame, with a warning naming the
+    /// leaf, its shard, its estimate and the frames left, and its lane ends
+    /// though the memory is still held, so the seat renews without it at
+    /// once rather than wait on memory until the grace (2026-11-03).
+    #[test]
+    fn a_created_shard_refused_memory_is_given_up_with_a_warning_not_waited_on() {
+        use std::time::Duration;
+        let logs = capture_logs();
+        let crdt = test_crdt();
+        let app = [0x87u8; 32];
+        let filter = |bits: &[bool]| quil_forest::encode_shard_bit_path(&app, bits);
+        let (parent, child) = (filter(&[true]), filter(&[true, false]));
+        for d in 0..12u8 {
+            crdt.add_vertex(
+                &Location {
+                    app_address: app,
+                    data_address: address(0x80 + d, d),
+                },
+                &vec![d; 64 << 10],
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let (member, epoch) = ([0x6Eu8; 32], 6);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let snapshot_frame = quil_types::consensus::storage_snapshot_frame(epoch);
+        let grace_frame = snapshot_frame + crate::app_shard_metadata::storage_snapshot_grace();
+        let source = current_source(&crdt, &parent, epoch);
+        let captured = capture_at(&crdt, &child, epoch, std::slice::from_ref(&source)).unwrap();
+        assert_eq!(captured.prefixes.len(), 1);
+        let least = quil_crypto::storage_proof::data_node_count(
+            u64::try_from(captured.leaf_size(&captured.prefixes[0]).unwrap()).unwrap(),
+        );
+        // Frames short enough that the leaf's estimate spans 100 of them.
+        let estimate_ms = label_estimate_from(least, 0).as_millis() as u64;
+        assert!(
+            estimate_ms > 0,
+            "the leaf's estimate is under a millisecond"
+        );
+        quil_types::consensus::set_frame_time_schedule(vec![(0, estimate_ms / 100 + 1)]);
+        let late = (snapshot_frame..grace_frame)
+            .find(|&frame| misses_grace(epoch, least, 0, frame).is_some())
+            .expect("the leaf misses the grace before it ends");
+        assert!(late > snapshot_frame && late + 50 < grace_frame);
+
+        // Other work holds all the memory.
+        let held = crate::storage_jobs::reserve(u64::MAX / 4);
+        note_global_frame(snapshot_frame);
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        crate::app_shard_metadata::request_storage_snapshots(
+            &crdt,
+            &replicas,
+            &[parent.clone(), child.clone()],
+            &member,
+            epoch,
+            &[(child.clone(), vec![source.clone()])],
+        )
+        .unwrap();
+        assert!(
+            !crate::storage_jobs::wait_lane_idle(&child, Duration::from_millis(500)),
+            "a leaf whose estimate fits the grace waits for its memory"
+        );
+        assert!(!snapshot_given_up(&member, &child, epoch));
+        // GLOBAL reaches the frame from which the leaf could no longer be
+        // labelled by the grace frame, which has not passed.
+        note_global_frame(late);
+        let ended = crate::storage_jobs::wait_lane_idle(&child, Duration::from_secs(30));
+        let given_up = snapshot_given_up(&member, &child, epoch);
+        drop(held);
+        assert!(crate::storage_jobs::wait_lane_idle(
+            &child,
+            Duration::from_secs(60)
+        ));
+        quil_types::consensus::set_frame_time_schedule(Vec::new());
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert!(
+            ended && given_up,
+            "a created shard's leaf refused memory went on waiting for it at GLOBAL frame {late}, \
+             {} frames before the grace frame, though its estimate no longer fit the frames left",
+            grace_frame - late
+        );
+        assert!(!grace_passed(&member, epoch));
+        assert_eq!(replicas.get_partition(epoch, &child).unwrap(), None);
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        let shown = hex::encode(&child);
+        let leaf_id = hex::encode(quil_execution::global_intrinsic::leaf_id_bytes(
+            &child,
+            &captured.prefixes[0],
+        ));
+        let warned = logs
+            .lines()
+            .find(|line| {
+                line.contains("WARN")
+                    && line.contains("storage snapshot given up")
+                    && line.contains(&shown)
+            })
+            .expect("the give-up was not warned");
+        for field in [
+            format!("leaf={leaf_id}"),
+            "estimated_minutes=".to_string(),
+            format!("frames_left={}", grace_frame - late),
+            "while it waited for memory".to_string(),
+        ] {
+            assert!(
+                warned.contains(&field),
+                "the give-up's warning lacks {field}: {warned}"
+            );
+        }
+        let started = logs
+            .lines()
+            .find(|line| {
+                line.contains("storage snapshot taken") && line.contains(&format!("lane={shown}"))
+            })
+            .expect("the encode's start was not logged in its own lane");
+        assert!(
+            started.contains(&format!("largest_leaf_nodes={least}")),
+            "{started}"
+        );
+        let end = logs
+            .lines()
+            .find(|line| line.contains("storage snapshot encode ended") && line.contains(&shown))
+            .expect("the encode's end was not logged");
+        assert!(
+            end.contains("outcome=\"given up\"") && end.contains("seconds="),
+            "{end}"
+        );
     }
 
     /// A leaf whose labels' filesystem has no room for them

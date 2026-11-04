@@ -889,6 +889,24 @@ impl ReplicaStore {
         self.db.get(&meta_key(SNAPSHOT_SOURCES, epoch, filter))
     }
 
+    /// The shards [`Self::put_snapshot_sources`] recorded sources of for
+    /// `epoch`: those whose registrations for it were encoded here.
+    pub fn snapshot_source_filters(&self, epoch: u64) -> Result<Vec<Vec<u8>>> {
+        let lower = meta_key(SNAPSHOT_SOURCES, epoch, &[]);
+        let upper = meta_key(SNAPSHOT_SOURCES, epoch.saturating_add(1), &[]);
+        let mut iter = self.db.new_iter(&lower, &upper)?;
+        let mut filters = Vec::new();
+        let mut ok = iter.first();
+        while ok {
+            if let Some(filter) = iter.key().get(lower.len()..) {
+                filters.push(filter.to_vec());
+            }
+            ok = iter.next();
+        }
+        iter.close()?;
+        Ok(filters)
+    }
+
     /// Record the node count of each leaf of shard `filter`'s partition for
     /// `epoch`, in the partition's order.
     pub fn put_leaf_nodes(&self, epoch: u64, filter: &[u8], nodes: &[u64]) -> Result<()> {
@@ -1269,9 +1287,21 @@ mod tests {
             "beside, not over, the replica"
         );
         assert_eq!(s.get_partition(6, b"filter").unwrap(), None);
+        s.put_snapshot_sources(5, b"child", b"sources").unwrap();
+        s.put_snapshot_sources(6, b"later", b"sources").unwrap();
+        assert_eq!(
+            s.snapshot_source_filters(5).unwrap(),
+            vec![b"child".to_vec(), b"filter".to_vec()],
+            "the epoch's shards, not another epoch's"
+        );
         s.evict_below_epoch(6).unwrap();
         assert_eq!(s.get_partition(5, b"filter").unwrap(), None);
         assert_eq!(s.get_snapshot_sources(5, b"filter").unwrap(), None);
+        assert!(s.snapshot_source_filters(5).unwrap().is_empty());
+        assert_eq!(
+            s.snapshot_source_filters(6).unwrap(),
+            vec![b"later".to_vec()]
+        );
         assert_eq!(s.get_leaf_nodes(5, b"filter").unwrap(), None);
     }
 
