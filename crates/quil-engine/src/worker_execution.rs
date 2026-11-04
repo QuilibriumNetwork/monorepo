@@ -661,7 +661,7 @@ impl SharedWorkerExecution {
                 tracing::info!(%filter, outcome = %ended.last_outcome, source,
                     attempt_secs = ended.attempt_ms / 1000, permit_wait_secs = ended.permit_wait_ms / 1000,
                     installed_leaves = ended.attempt_installed_leaves, frames = turn.frames, batches = turn.batches,
-                    fetch_ms = turn.fetch_ms, replay_ms = turn.replay_ms, failed_attempts = failed_before.0,
+                    fetch_ms = turn.fetch_ms, replay_ms = turn.replay_ms, turn_back_ms = turn.turn_back_ms, failed_attempts = failed_before.0,
                     failed_classes = %failed_before.1, "archive recovery batch complete");
                 if let Some(StreakLog::Ended { failures, duration }) = logged {
                     tracing::info!(%filter, failures, failing_secs = duration.as_secs(), source,
