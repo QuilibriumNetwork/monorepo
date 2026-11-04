@@ -3142,6 +3142,8 @@ pub(crate) mod tests {
         thread: std::thread::JoinHandle<()>,
         /// Handles of the store before the thread took one.
         held: usize,
+        /// The shard whose leaf it labels.
+        app: [u8; 32],
     }
 
     impl LabellingAhead {
@@ -3153,16 +3155,38 @@ pub(crate) mod tests {
             self.ended_within(crdt, std::time::Duration::from_secs(60))
         }
 
-        /// [`Self::ended`], waiting up to `timeout` for the labelling to end.
+        /// [`Self::ended`], waiting for the labelling to end as long as it
+        /// makes progress: it fails when the layers labelled have not changed
+        /// for `stall`. A bound on the whole labelling would be a bound on
+        /// the host's load, which labels at a fraction of its speed on a busy
+        /// runner (2026-11-03: over 60 s against 27 s idle, with the
+        /// labelling going on).
         fn ended_within(
             self,
             crdt: &Arc<HypergraphCrdt>,
-            timeout: std::time::Duration,
+            stall: std::time::Duration,
         ) -> Result<()> {
-            let result = self
-                .done
-                .recv_timeout(timeout)
-                .expect("the labelling ahead ends");
+            use std::sync::mpsc::RecvTimeoutError;
+            use std::time::{Duration, Instant};
+            let mut seen = (None, Instant::now());
+            let result = loop {
+                match self.done.recv_timeout(Duration::from_millis(250)) {
+                    Ok(result) => break result,
+                    Err(RecvTimeoutError::Timeout) => {
+                        let layers = layers_done(&self.app, LeafWork::LabellingAhead);
+                        if layers != seen.0 {
+                            seen = (layers, Instant::now());
+                        }
+                        assert!(
+                            seen.1.elapsed() < stall,
+                            "the labelling ahead made no progress for {stall:?}, at layers {layers:?}"
+                        );
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        panic!("the labelling ahead's thread ended without a result")
+                    }
+                }
+            };
             self.thread.join().expect("the labelling ahead's thread");
             assert_eq!(
                 Arc::strong_count(crdt),
@@ -3204,7 +3228,12 @@ pub(crate) mod tests {
             assert!(Instant::now() < deadline, "the leaf is labelled ahead");
             std::thread::sleep(Duration::from_millis(5));
         }
-        LabellingAhead { done, thread, held }
+        LabellingAhead {
+            done,
+            thread,
+            held,
+            app,
+        }
     }
 
     /// Whatever `dir` holds is whole layers labelled ahead and their
@@ -3558,6 +3587,10 @@ pub(crate) mod tests {
         use std::time::{Duration, Instant};
         const GIB: u64 = 1 << 30;
         crate::storage_jobs::set_available_for_test(Some(40 * GIB));
+        // Three places, for the urgent leaf, the one labelled ahead and the
+        // renewal's: with two, as on a 3-CPU runner, the renewal's leaf asks
+        // the one labelled ahead to give its memory back instead of pausing it.
+        crate::storage_jobs::set_job_slots_for_test(3);
         let (app, member, epoch) = ([0x87u8; 32], [0x6Eu8; 32], 6);
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
         let (crdt, leaf_id) = one_long_leaf(app, epoch);
@@ -3607,13 +3640,33 @@ pub(crate) mod tests {
             AtomicBool::new(false),
             AtomicBool::new(false),
         );
+        let why = std::sync::Mutex::new(String::new());
         // Looked at while the renewal's leaf is labelled now.
         let stop = || {
             if crate::storage_jobs::labelling_now_count() > 0
                 && !looked.swap(true, Ordering::SeqCst)
             {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while crate::storage_jobs::pausing_count() == 0 && Instant::now() < deadline {
+                // It looks every 1,024 nodes, so it pauses within the layer
+                // it labels: wait as long as that takes on this runner,
+                // failing once it goes on into a second layer, ends, or makes
+                // no progress for a minute.
+                let start = layers_done(&app, LeafWork::LabellingAhead);
+                let mut seen = (start, Instant::now());
+                while crate::storage_jobs::pausing_count() == 0 {
+                    let layers = layers_done(&app, LeafWork::LabellingAhead);
+                    if layers != seen.0 {
+                        seen = (layers, Instant::now());
+                    }
+                    let gone = layers
+                        .zip(start)
+                        .map_or(0, |(now, then)| now.saturating_sub(then));
+                    let stalled = seen.1.elapsed() >= Duration::from_secs(60);
+                    if gone >= 2 || (start.is_some() && layers.is_none()) || stalled {
+                        *why.lock().unwrap() = format!(
+                            "from layer {start:?} it reached {layers:?}, stalled: {stalled}"
+                        );
+                        break;
+                    }
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 paused.store(crate::storage_jobs::pausing_count() > 0, Ordering::SeqCst);
@@ -3624,7 +3677,8 @@ pub(crate) mod tests {
         encode_member_until(&captured, &[0x64; 32], &replicas, None, &stop).unwrap();
         assert!(
             paused.load(Ordering::SeqCst),
-            "labelling ahead paused while the renewal's leaf was labelled now"
+            "labelling ahead paused while the renewal's leaf was labelled now: {}",
+            why.lock().unwrap()
         );
         assert!(
             !urgent_paused.load(Ordering::SeqCst),
