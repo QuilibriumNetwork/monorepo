@@ -307,7 +307,7 @@ fn table_lines(m: &Model, inner: u16) -> Vec<Line<'static>> {
     lines
 }
 
-fn notice_lines(m: &mut Model, width: u16) -> Vec<Line<'static>> {
+pub(super) fn notice_lines(m: &mut Model, width: u16) -> Vec<Line<'static>> {
     let now = SystemTime::now();
     let notices = coins::notices(m, fmt_claimable);
     m.coins
