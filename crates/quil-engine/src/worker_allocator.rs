@@ -953,6 +953,101 @@ pub struct WorkerAllocator {
     payload_eviction: std::sync::Mutex<HashMap<u32, EvictionTrack>>,
     /// The running orphan episode, `None` while every seat has a worker.
     orphan_watch: std::sync::Mutex<Option<OrphanWatch>>,
+    /// Workers whose release is held, by core id (see [`WorkerHolds`]).
+    worker_holds: std::sync::Mutex<WorkerHolds>,
+}
+
+/// Why a worker's release is held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HoldReason {
+    /// A committee session still counts the member's vote.
+    Session,
+    /// The seat owes the epoch's storage settlement, whose window ends at
+    /// frame `until`.
+    Settlement { epoch: u64, until: u64 },
+}
+
+#[derive(Clone, Debug)]
+struct WorkerHold {
+    filter: Vec<u8>,
+    reason: HoldReason,
+    since: u64,
+    /// The latest frame a release was wanted (and so held) at.
+    wanted: u64,
+    /// The latest frame a pass checked the hold at, before its release.
+    top: u64,
+}
+
+/// The workers whose release is held, so a hold logs when it starts and when
+/// it ends, not on every pass in between.
+#[derive(Default)]
+struct WorkerHolds(HashMap<u32, WorkerHold>);
+
+impl WorkerHolds {
+    /// Record a hold; true when it is new and must be logged. A repeat on
+    /// the same shard only refreshes the reason.
+    fn begin(&mut self, core_id: u32, filter: &[u8], reason: HoldReason, frame: u64) -> bool {
+        match self.0.get_mut(&core_id) {
+            Some(hold) if hold.filter == filter => {
+                hold.reason = reason;
+                hold.wanted = frame;
+                false
+            }
+            _ => {
+                self.0.insert(
+                    core_id,
+                    WorkerHold {
+                        filter: filter.to_vec(),
+                        reason,
+                        since: frame,
+                        wanted: frame,
+                        top: frame,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// End the worker's hold, if any, returning it with its length in
+    /// frames and its outcome. `holding` says whether the worker is still
+    /// held on `filter`: a hold on another shard ends regardless.
+    fn end(
+        &mut self,
+        core_id: u32,
+        filter: &[u8],
+        holding: bool,
+        frame: u64,
+    ) -> Option<(WorkerHold, u64, &'static str)> {
+        let current = self.0.get_mut(&core_id)?;
+        let same_shard = current.filter == filter;
+        if holding && same_shard {
+            // Still retained. A pass that wanted no release since the last
+            // check means the allocation recovered and the worker serves on.
+            if current.wanted >= current.top {
+                current.top = frame;
+                return None;
+            }
+            let hold = self.0.remove(&core_id)?;
+            let held = frame.saturating_sub(hold.since);
+            return Some((hold, held, "allocation recovered; worker kept"));
+        }
+        let hold = self.0.remove(&core_id)?;
+        let held = frame.saturating_sub(hold.since);
+        let outcome = hold_outcome(&hold, same_shard, frame);
+        Some((hold, held, outcome))
+    }
+}
+
+/// How a hold ended, given the frame it ended at and whether the worker
+/// still sits on the held shard.
+fn hold_outcome(hold: &WorkerHold, same_shard: bool, frame: u64) -> &'static str {
+    match hold.reason {
+        _ if !same_shard => "worker moved off the held shard",
+        HoldReason::Session => "committee session ended",
+        HoldReason::Settlement { until, .. } if frame >= until => "settlement window closed",
+        HoldReason::Settlement { .. } => "settlement delivered",
+    }
 }
 
 impl WorkerAllocator {
@@ -1350,14 +1445,63 @@ impl WorkerAllocator {
     }
 
     /// Free a worker, unless its committee session is still closing or its
-    /// seat still owes a storage epoch proof.
-    fn release_worker(&self, worker: &WorkerInfo, retained: bool) -> Result<()> {
+    /// seat still owes a storage epoch proof. The first held release logs
+    /// why and until when ([`Self::end_worker_hold`] logs its end).
+    fn release_worker(&self, worker: &WorkerInfo, retained: bool, frame_number: u64) -> Result<()> {
         if retained {
-            debug!(core_id = worker.core_id, filter = hex::encode(&worker.filter),
-                "committee session or storage settlement still needs this member; worker stays bound");
+            self.begin_worker_hold(worker, frame_number);
             return Ok(());
         }
         self.worker_manager.deallocate_worker(worker.core_id)
+    }
+
+    fn begin_worker_hold(&self, worker: &WorkerInfo, frame_number: u64) {
+        let owed = self.owed_storage_settlements(&worker.filter, frame_number);
+        let reason = match owed.iter().min_by_key(|(_, until)| *until) {
+            Some(&(epoch, until)) => HoldReason::Settlement { epoch, until },
+            None => HoldReason::Session,
+        };
+        let new = self
+            .worker_holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .begin(worker.core_id, &worker.filter, reason, frame_number);
+        if !new {
+            return;
+        }
+        match reason {
+            HoldReason::Settlement { epoch, until } => {
+                let left = until.saturating_sub(frame_number);
+                info!(core_id = worker.core_id, filter = %hex::encode(&worker.filter),
+                    frame = frame_number, reason = "storage_settlement", epoch,
+                    window_ends_frame = until, frames_left = left,
+                    "worker release held: the seat owes its storage settlement; the worker stays \
+                     bound until the epoch proof is delivered or its window ends (~{} min); no \
+                     free worker from it before then",
+                    left.saturating_mul(quil_types::consensus::ideal_frame_time_ms()) / 60_000);
+            }
+            HoldReason::Session => {
+                info!(core_id = worker.core_id, filter = %hex::encode(&worker.filter),
+                    frame = frame_number, reason = "committee_session",
+                    "worker release held: its committee session still needs this member; the \
+                     worker stays bound until the session's seal is recorded");
+            }
+        }
+    }
+
+    /// Log the end of a worker's held release once nothing holds it any
+    /// more (`holding`) or it moved to another shard.
+    fn end_worker_hold(&self, worker: &WorkerInfo, holding: bool, frame_number: u64) {
+        let ended = self
+            .worker_holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .end(worker.core_id, &worker.filter, holding, frame_number);
+        if let Some((hold, held, outcome)) = ended {
+            info!(core_id = worker.core_id, filter = %hex::encode(&hold.filter),
+                frame = frame_number, held_frames = held, outcome,
+                "worker release hold ended: see outcome");
+        }
     }
 
     /// Whether this prover's seat on `filter` still owes GLOBAL an epoch proof
@@ -1535,6 +1679,7 @@ impl WorkerAllocator {
             pending_shard_changes: RwLock::new(None),
             payload_eviction: std::sync::Mutex::new(HashMap::new()),
             orphan_watch: std::sync::Mutex::new(None),
+            worker_holds: std::sync::Mutex::new(WorkerHolds::default()),
         }
     }
 
@@ -2342,6 +2487,8 @@ impl WorkerAllocator {
             // was still Joining at every sync and stopped it after, and each
             // restart withdrew the engine's queued recovery claim.
             let runs_consensus = retention.unwrap_or(worker.allocated) || settling;
+            // End a logged hold once nothing holds the worker (or it moved).
+            self.end_worker_hold(worker, retained, frame_number);
             if worker.filter.is_empty() {
                 // Idle worker: an expired pending-join marker is swept after
                 // the bind pass below (`expire_unlanded_join_markers`), so a
@@ -2383,7 +2530,7 @@ impl WorkerAllocator {
                          active child allocation is unbound (likely split-parent) — \
                          deallocating so the child rebinds"
                     );
-                    self.release_worker(worker, retained)?;
+                    self.release_worker(worker, retained, frame_number)?;
                     continue;
                 }
             }
@@ -2403,7 +2550,7 @@ impl WorkerAllocator {
                                 current_epoch = quil_types::consensus::epoch_for_frame(frame_number),
                                 "epoch-expired allocation released so a live shard can use the worker"
                             );
-                            self.release_worker(worker, retained)?;
+                            self.release_worker(worker, retained, frame_number)?;
                             continue;
                         }
                         Some(GivenUp::LeftLapsed) => {
@@ -2417,7 +2564,7 @@ impl WorkerAllocator {
                                 "worker released from a seat left after its storage registration lapsed, which its \
                                  committee no longer seats: it owes no notice; the seat departs at its leave boundary"
                             );
-                            self.release_worker(worker, retained)?;
+                            self.release_worker(worker, retained, frame_number)?;
                             continue;
                         }
                         // `gives_up` never reports it: only the recovery gate does.
@@ -2472,7 +2619,7 @@ impl WorkerAllocator {
                                     join_frame = alloc.join_frame_number,
                                     "join expired after 720 frames, clearing worker"
                                 );
-                                self.release_worker(worker, retained)?;
+                                self.release_worker(worker, retained, frame_number)?;
                             }
                         }
                         ProverStatus::Rejected | ProverStatus::Kicked | ProverStatus::Historic => {
@@ -2501,7 +2648,7 @@ impl WorkerAllocator {
                                 status = ?alloc.status,
                                 "allocation ended/reassigned, clearing worker"
                             );
-                            self.release_worker(worker, retained)?;
+                            self.release_worker(worker, retained, frame_number)?;
                         }
                         ProverStatus::Leaving => {
                             // Live Leave (within 720-frame grace) →
@@ -2526,7 +2673,7 @@ impl WorkerAllocator {
                                         leave_frame = alloc.leave_frame_number,
                                         "leave expired after 720 frames, clearing worker"
                                     );
-                                    self.release_worker(worker, retained)?;
+                                    self.release_worker(worker, retained, frame_number)?;
                                 }
                             }
                         }
@@ -2590,7 +2737,7 @@ impl WorkerAllocator {
                             pending_since = worker.pending_filter_frame,
                             "proposal timed out after 10 frames, clearing worker"
                         );
-                        self.release_worker(worker, retained)?;
+                        self.release_worker(worker, retained, frame_number)?;
                     } else if worker.pending_filter_frame == 0
                         && frame_number > PENDING_FILTER_GRACE_FRAMES
                     {
@@ -2601,7 +2748,7 @@ impl WorkerAllocator {
                             filter = hex::encode(&worker.filter),
                             "orphaned filter with no pending frame, clearing worker"
                         );
-                        self.release_worker(worker, retained)?;
+                        self.release_worker(worker, retained, frame_number)?;
                     }
                 }
             }
@@ -6878,5 +7025,65 @@ mod tests {
             logged.contains(&format!("activation_frame={}", 3 * e)),
             "{logged}"
         );
+    }
+
+    #[test]
+    fn worker_hold_logs_start_once_and_end_once_with_its_length() {
+        let mut holds = WorkerHolds::default();
+        let filter = vec![7u8; 4];
+        let reason = HoldReason::Settlement {
+            epoch: 9,
+            until: 500,
+        };
+        // The first held release logs; the same hold on later passes does not.
+        assert!(holds.begin(3, &filter, reason, 100), "first hold logs");
+        assert!(!holds.begin(3, &filter, reason, 110), "repeat is silent");
+        assert!(!holds.begin(3, &filter, reason, 120), "repeat is silent");
+        // Still held: nothing ends.
+        assert!(holds.end(3, &filter, true, 130).is_none());
+        // Nothing holds it any more, before the window ends: delivered, with
+        // the frames held counted from the first hold.
+        let (hold, held, outcome) = holds.end(3, &filter, false, 160).expect("end logs");
+        assert_eq!(hold.since, 100);
+        assert_eq!(held, 60);
+        assert_eq!(outcome, "settlement delivered");
+        // It ends once.
+        assert!(holds.end(3, &filter, false, 170).is_none());
+        // A new hold logs again.
+        assert!(holds.begin(3, &filter, reason, 200));
+        // Past the window the outcome is the window closing.
+        let (_, held, outcome) = holds.end(3, &filter, false, 500).unwrap();
+        assert_eq!((held, outcome), (300, "settlement window closed"));
+        // A session hold, and a hold left on another shard.
+        assert!(holds.begin(4, &filter, HoldReason::Session, 10));
+        assert_eq!(
+            holds.end(4, &filter, false, 20).unwrap().2,
+            "committee session ended"
+        );
+        assert!(holds.begin(5, &filter, HoldReason::Session, 10));
+        assert_eq!(
+            holds.end(5, &[8u8; 4], true, 30).unwrap().2,
+            "worker moved off the held shard"
+        );
+    }
+
+    #[test]
+    fn worker_hold_ends_when_the_allocation_recovers_and_the_worker_is_kept() {
+        let mut holds = WorkerHolds::default();
+        let filter = vec![7u8; 4];
+        let reason = HoldReason::Settlement {
+            epoch: 9,
+            until: 500,
+        };
+        // Retained but no release wanted since the last check: the
+        // allocation recovered and the worker is kept.
+        assert!(holds.begin(6, &filter, reason, 10));
+        assert!(holds.end(6, &filter, true, 20).is_none());
+        assert!(holds
+            .end(6, &filter, true, 30)
+            .is_some_and(|(_, held, outcome)| {
+                held == 20 && outcome == "allocation recovered; worker kept"
+            }));
+        assert!(holds.end(6, &filter, true, 40).is_none());
     }
 }
