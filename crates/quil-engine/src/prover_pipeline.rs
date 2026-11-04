@@ -864,6 +864,26 @@ fn report_over_limit(op: &'static str, frame_number: u64, seats: &[(Vec<u8>, Str
     );
 }
 
+/// Reserve those of `filters` no other attempt holds off and drop the rest,
+/// with their paired worker ids. The check and the reservation take the lock
+/// once: checked one filter at a time, an attempt ending between two checks
+/// left the filters checked before its end out of the retry (2026-11-04).
+fn reserve_free(
+    attempts: &std::sync::Arc<crate::submission_attempts::SubmissionAttempts>,
+    kind: OpKind,
+    filters: &mut Vec<Vec<u8>>,
+    worker_ids: Option<&mut Vec<u32>>,
+    frame_number: u64,
+) -> Option<crate::submission_attempts::SubmissionAttempt> {
+    let (free, attempt) = attempts.begin_free(filters, frame_number, kind);
+    let mut index = 0;
+    retain_paired(filters, worker_ids, |_| {
+        index += 1;
+        free[index - 1]
+    });
+    attempt
+}
+
 /// Keep the filters `keep` admits, with their worker ids when the ids pair
 /// one-to-one with the filters.
 fn retain_paired(
@@ -1871,11 +1891,13 @@ impl ProverPipeline {
     ) -> Option<crate::submission_attempts::SubmissionAttempt> {
         let requested = filters.len();
         let repeats = self.lifecycle.plan_repeats_filters(filters);
-        let attempts = &self.lifecycle.submission_attempts;
-        retain_paired(filters, worker_ids.as_deref_mut(), |filter| {
-            !attempts.owned(filter, frame_number, kind)
-        });
-        let Some(mut attempt) = attempts.begin(filters, frame_number, kind) else {
+        let Some(mut attempt) = reserve_free(
+            &self.lifecycle.submission_attempts,
+            kind,
+            filters,
+            worker_ids.as_deref_mut(),
+            frame_number,
+        ) else {
             // A repeated plan's retry fence defers it nearly every frame; the
             // plan's repeat lines cover that.
             if repeats {
@@ -3720,6 +3742,56 @@ mod tests {
     /// out, and fenced until the epoch ends rather than released, so it is
     /// not prepared again within the epoch; a seat its worker did not prepare
     /// is retried at once.
+    /// A reservation keeps all of a batch an ending attempt held, or none:
+    /// here the attempt ends right after the first lock the reservation
+    /// takes. Checked one seat at a time, the seats checked after its end
+    /// went out alone (a merge-queue failure of
+    /// `a_long_join_goes_on_after_a_failed_message`).
+    #[test]
+    fn a_reservation_keeps_all_or_none_of_an_ending_attempt() {
+        use std::sync::{Arc, Mutex};
+        let attempts = Arc::new(crate::submission_attempts::SubmissionAttempts::default());
+        let seats: Vec<Vec<u8>> = (0..4).map(seat).collect();
+        let held = attempts.begin(&seats, FRAME, OpKind::Join).unwrap();
+        let ending = Arc::new(Mutex::new(Some(held)));
+        let end = ending.clone();
+        attempts.on_unlock(move || drop(end.lock().unwrap().take()));
+        let (mut filters, mut workers) = (seats.clone(), vec![10, 11, 12, 13]);
+        let reserved = super::reserve_free(
+            &attempts,
+            OpKind::Join,
+            &mut filters,
+            Some(&mut workers),
+            FRAME + 1,
+        );
+        assert!(ending.lock().unwrap().is_none(), "the attempt ended");
+        assert!(
+            filters.is_empty() && workers.is_empty() && reserved.is_none(),
+            "only seats {:?} with workers {workers:?} were reserved",
+            filters.iter().map(|f| f[1]).collect::<Vec<_>>()
+        );
+        let mut filters = seats.clone();
+        let reserved = super::reserve_free(&attempts, OpKind::Join, &mut filters, None, FRAME + 2);
+        assert!(reserved.is_some(), "the next cycle reserves the batch");
+        assert_eq!(filters, seats, "the whole batch");
+        let mut filters = seats.clone();
+        filters.push(seat(4));
+        let mut workers = vec![10, 11, 12, 13, 14];
+        let more = super::reserve_free(
+            &attempts,
+            OpKind::Join,
+            &mut filters,
+            Some(&mut workers),
+            FRAME + 3,
+        );
+        assert!(more.is_some());
+        assert_eq!(
+            (filters, workers),
+            (vec![seat(4)], vec![14]),
+            "seats a running attempt holds are dropped with their workers"
+        );
+    }
+
     #[test]
     fn a_seat_over_a_decode_limit_is_left_out_and_fenced() {
         use quil_execution::global_intrinsic::leaf_root_registration::{
