@@ -5210,6 +5210,47 @@ impl GlobalIntrinsic {
                 timing.lap("early fences");
             }
         }
+        // From the silent fence's first frame, a session whose tip stood
+        // still for K frames because members went silent on every shard is
+        // fenced early without them (`handoff::silence`). The prover scan is
+        // built only when some session is due for that judgement.
+        if super::handoff::silence::evaluates(frame_number) {
+            let stalled = super::handoff::silence::stalled(state, frame_number, &filters)?;
+            timing.lap("silent stalls");
+            if !stalled.is_empty() {
+                if scanned.is_none() {
+                    scanned = Some(timed_prover_scan(hg, &timing.scan_ms)?);
+                }
+                let scan = scanned.as_ref().expect("scanned above");
+                let mut desired = |filter: &[u8]| -> Result<Vec<Vec<u8>>> {
+                    let desired =
+                        super::handoff::schedule::desired_members(scan, filter, frame_number);
+                    let desired =
+                        super::handoff::exclusion::seated(state, frame_number, filter, desired)?;
+                    super::handoff::silence::seated(state, frame_number, filter, desired, scan)
+                };
+                let checkpoint = state.changeset_len();
+                match super::handoff::silence::evaluate(
+                    state,
+                    frame_number,
+                    &stalled,
+                    scan,
+                    &mut desired,
+                ) {
+                    Ok(decisions) => {
+                        if !decisions.is_empty() {
+                            super::handoff::silence::fence(state, frame_number, &decisions)?;
+                        }
+                    }
+                    Err(error) if matches!(error, QuilError::InvalidArgument(_)) => {
+                        state.rollback_to(checkpoint);
+                        tracing::error!(frame = frame_number, %error, "committee silence: silent-prover pass failed; nothing fenced");
+                    }
+                    Err(error) => return Err(error),
+                }
+                timing.lap("silent-prover fences");
+            }
+        }
         // Closing sessions that never sealed are fenced first, so a successor
         // they authorize is visible to the reconciliation below. A fenced
         // membership successor takes the eligibility that reconciliation
@@ -5219,10 +5260,12 @@ impl GlobalIntrinsic {
             if scanned.is_none() {
                 scanned = Some(timed_prover_scan(hg, &eligible_scan_ms)?);
             }
-            let desired = scanned.as_ref().map_or_else(Vec::new, |scan| {
-                super::handoff::schedule::desired_members(scan, filter, frame_number)
-            });
-            super::handoff::exclusion::seated(state, frame_number, filter, desired)
+            let Some(scan) = scanned.as_ref() else {
+                return Ok(Vec::new());
+            };
+            let desired = super::handoff::schedule::desired_members(scan, filter, frame_number);
+            let desired = super::handoff::exclusion::seated(state, frame_number, filter, desired)?;
+            super::handoff::silence::seated(state, frame_number, filter, desired, scan)
         };
         // From the seal successor eligibility frame a sealed membership
         // source's successor waits for this pass, and takes the same

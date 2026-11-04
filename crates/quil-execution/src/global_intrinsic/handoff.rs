@@ -672,11 +672,12 @@ pub fn set_fenced_successor_eligibility_frame_for_thread(frame: Option<u64>) {
 /// another requests root for any GLOBAL frame that carries one, and every
 /// archive and GLOBAL prover must run a build with it before the frame.
 /// From the same frame GLOBAL records the frame of each session's tip
-/// advance ([`session_tip_frame`]), which an older build does not write
-/// either. Mainnet: 1,024,560, the first frame of epoch 1423, which GLOBAL
-/// cannot reach before 2026-11-07 00:00 UTC even at ten seconds a frame, with
-/// the [`presence_credit_frame`]; `QUIL_PRESENCE_REPORT_FRAME` elsewhere, never
-/// by default.
+/// advance ([`session_tip_frame`]; also from the signed-frame activation
+/// frame, if earlier: [`tip_frame_recording_frame`]), which an older build
+/// does not write either. Mainnet: 1,024,560, the first frame of epoch 1423,
+/// which GLOBAL cannot reach before 2026-11-07 00:00 UTC even at ten seconds
+/// a frame, with the [`presence_credit_frame`]; `QUIL_PRESENCE_REPORT_FRAME`
+/// elsewhere, never by default.
 pub const MAINNET_PRESENCE_REPORT_FRAME: Option<u64> = Some(1_024_560);
 
 static PRESENCE_REPORT_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1798,20 +1799,35 @@ pub fn record_session_tip(
     id: &[u8; 32],
     tip: &Checkpoint,
 ) -> Result<()> {
-    if session_tip(state, id)?.is_some_and(|current| current.frame >= tip.frame) {
+    let current = session_tip(state, id)?;
+    if current
+        .as_ref()
+        .is_some_and(|current| current.frame >= tip.frame)
+    {
         return Ok(());
     }
     let mut bytes = Vec::new();
     tip.write(&mut bytes);
     write(state, frame, b"tip", id, &bytes)?;
+    if current.is_none() {
+        silence::note_first_frame(state, frame, id, tip.frame)?;
+    }
     record_tip_frame(state, frame, id)
 }
 
-/// Record GLOBAL frame `frame` as [`session_tip_frame`] of `id`. Before the
-/// [`presence_report_frame`] this writes nothing, so GLOBAL's records and
-/// roots stay those of a build without it.
+/// The first GLOBAL frame that records [`session_tip_frame`]: the earlier
+/// of the [`presence_report_frame`] and the signed-frame activation frame
+/// ([`quil_types::consensus::signed_frame_activation_frame`]), whose
+/// silent-prover fence dates stalls by it.
+pub fn tip_frame_recording_frame() -> u64 {
+    presence_report_frame().min(quil_types::consensus::signed_frame_activation_frame())
+}
+
+/// Record GLOBAL frame `frame` as [`session_tip_frame`] of `id`. Before
+/// [`tip_frame_recording_frame`] this writes nothing, so GLOBAL's records
+/// and roots stay those of a build without it.
 fn record_tip_frame(state: &HypergraphState, frame: u64, id: &[u8; 32]) -> Result<()> {
-    if frame < presence_report_frame() {
+    if frame < tip_frame_recording_frame() {
         return Ok(());
     }
     write(state, frame, b"tip-frame", id, &frame.to_be_bytes())
@@ -1819,7 +1835,7 @@ fn record_tip_frame(state: &HypergraphState, frame: u64, id: &[u8; 32]) -> Resul
 
 /// The GLOBAL frame that last advanced [`session_tip`] of `id`, or that
 /// created the session if its tip has not advanced since. Recorded only from
-/// the [`presence_report_frame`] on: `None` for a session neither created
+/// [`tip_frame_recording_frame`] on: `None` for a session neither created
 /// nor advanced since then.
 pub fn session_tip_frame(state: &impl Records, id: &[u8; 32]) -> Result<Option<u64>> {
     read(state, b"tip-frame", id)?
@@ -1833,7 +1849,7 @@ pub fn session_tip_frame(state: &impl Records, id: &[u8; 32]) -> Result<Option<u
 
 /// How many GLOBAL frames before `frame` [`session_tip`] of `id` last
 /// advanced ([`session_tip_frame`]); zero for a `frame` not after it. Without
-/// a record, the frames since the [`presence_report_frame`]: a lower bound,
+/// a record, the frames since [`tip_frame_recording_frame`]: a lower bound,
 /// since the session has not advanced from it on. `None` before that frame.
 pub fn frames_since_tip_advance(
     state: &impl Records,
@@ -1843,7 +1859,7 @@ pub fn frames_since_tip_advance(
     if let Some(recorded) = session_tip_frame(state, id)? {
         return Ok(Some(frame.saturating_sub(recorded)));
     }
-    Ok(frame.checked_sub(presence_report_frame()))
+    Ok(frame.checked_sub(tip_frame_recording_frame()))
 }
 
 /// The reward ring of each of a session's members, in member order, fixed at
@@ -2051,6 +2067,9 @@ pub mod presence;
 
 #[path = "handoff_exclusion.rs"]
 pub mod exclusion;
+
+#[path = "handoff_silence.rs"]
+pub mod silence;
 
 #[path = "handoff_superseded.rs"]
 pub mod superseded;
