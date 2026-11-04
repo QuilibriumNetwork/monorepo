@@ -228,6 +228,80 @@ mod tests {
     use commonware_math::algebra::Random;
     use commonware_utils::{test_rng, TryCollect};
 
+    /// What an app shard's handoff does to certificates: each generation has
+    /// its own committee size and a certificate's signers are bounded by the
+    /// receiver's. One of a larger earlier committee does not decode, one of a
+    /// smaller or equal committee does; its header still names its epoch.
+    #[test]
+    fn a_certificate_of_a_larger_committee_fails_to_decode_but_names_its_round() {
+        use commonware_codec::{Decode as _, Encode as _};
+        use commonware_consensus::{
+            simplex::types::{
+                encoded_certificate_round, Certificate as Message, Finalization, Finalize,
+                Notarization, Notarize, Nullification, Nullify,
+            },
+            types::{Epoch, Round, View},
+        };
+        use commonware_cryptography::{sha256::Digest as Sha256Digest, Hasher as _, Sha256};
+        use commonware_parallel::Sequential;
+        use quil_types::crypto::Signer as _;
+
+        let keys: Vec<_> = (0..4)
+            .map(|_| {
+                let key = quil_crypto::FalconSigner::generate();
+                FalconPrivateKey::from_bytes(key.private_key(), key.public_key()).unwrap()
+            })
+            .collect();
+        let participants: Set<FalconPublicKey> = keys
+            .iter()
+            .map(commonware_cryptography::Signer::public_key)
+            .try_collect()
+            .unwrap();
+        let schemes: Vec<_> = keys
+            .into_iter()
+            .map(|key| SimplexFalconScheme::signer(b"test", participants.clone(), key).unwrap())
+            .collect();
+        let round = Round::new(Epoch::new(122), View::new(7));
+        let proposal = Proposal::new(round, View::new(6), Sha256::hash(b"frame"));
+        let voters = &schemes[..3];
+        let notarizes: Vec<_> = voters
+            .iter()
+            .map(|scheme| Notarize::sign(scheme, proposal.clone()).unwrap())
+            .collect();
+        let nullifies: Vec<_> = voters
+            .iter()
+            .map(|scheme| Nullify::sign::<Sha256Digest>(scheme, round).unwrap())
+            .collect();
+        let finalizes: Vec<_> = voters
+            .iter()
+            .map(|scheme| Finalize::sign(scheme, proposal.clone()).unwrap())
+            .collect();
+        let certificates: Vec<Message<SimplexFalconScheme, Sha256Digest>> = vec![
+            Message::Notarization(
+                Notarization::from_notarizes(&schemes[0], &notarizes, &Sequential).unwrap(),
+            ),
+            Message::Nullification(
+                Nullification::from_nullifies(&schemes[0], &nullifies, &Sequential).unwrap(),
+            ),
+            Message::Finalization(
+                Finalization::from_finalizes(&schemes[0], &finalizes, &Sequential).unwrap(),
+            ),
+        ];
+        for certificate in &certificates {
+            let bytes = certificate.encode();
+            let decode = |members: usize| {
+                Message::<SimplexFalconScheme, Sha256Digest>::decode_cfg(bytes.as_ref(), &members)
+            };
+            assert!(decode(4).is_ok(), "the same size");
+            assert!(decode(5).is_ok(), "a larger current committee");
+            assert!(decode(3).is_err(), "a smaller current committee");
+            assert_eq!(encoded_certificate_round(bytes.as_ref()), Some(round));
+        }
+        assert_eq!(encoded_certificate_round(&[]), None);
+        assert_eq!(encoded_certificate_round(&[0]), None, "a tag and no round");
+        assert_eq!(encoded_certificate_round(&[3, 1, 1]), None, "no such kind");
+    }
+
     /// Simplex clones the scheme into every view it tracks; a clone must not
     /// copy the committee or the signing key.
     #[test]
