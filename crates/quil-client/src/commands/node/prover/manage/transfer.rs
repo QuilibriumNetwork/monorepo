@@ -580,10 +580,7 @@ pub fn notices(m: &Model) -> Vec<Notice> {
                 NoticeSeverity::Info,
                 false,
                 true,
-                format!(
-                    "{what}: submitted; finalized inclusion is not yet confirmed; ‹E› reads the \
-                     shielded coins again."
-                ),
+                format!("{what}: submitted; finalized inclusion is not yet confirmed."),
             ),
             Some(Err(error)) => push(
                 "transfers-failed",
