@@ -4318,9 +4318,11 @@ mod tests {
         let bundle_bytes = bundle.to_canonical_bytes().unwrap();
 
         // Route it at the token base domain (as the global frame materializer
-        // does for a deploy).
+        // does for a deploy), at a zero price: what this test checks is
+        // routing, and at a nonzero price every node refuses a deploy that
+        // carries no settlement claim (engines' settlement parity tests).
         let token_base = crate::token_intrinsic::constants::token_base_domain();
-        m.process_message(0, &BigInt::from(1), &token_base, &bundle_bytes)
+        m.process_message(0, &BigInt::from(0), &token_base, &bundle_bytes)
             .unwrap();
         m.commit_frame(0).unwrap();
 

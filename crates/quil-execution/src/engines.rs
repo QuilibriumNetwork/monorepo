@@ -1428,8 +1428,12 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                 // price must open with a settlement claim covering that growth
                 // (paid to the executing shard's provers); the claim may also
                 // carry a paid mint's price to the token's payment address.
+                // Every engine that writes state admits it, with or without
+                // the token proof suite: one that skipped the claim applied
+                // a priced deploy or update the others refused, and left the
+                // claim's record unconsumed.
                 #[cfg(feature = "native-proof")]
-                if self.token_policy.is_some()
+                if self.state.is_some()
                     && _address.len() >= 32
                     && _address[..32] != crate::domains::QUIL_TOKEN
                 {
@@ -1483,9 +1487,10 @@ impl ShardExecutionEngine for TokenExecutionEngine {
             TYPE_MESSAGE_REQUEST => {
                 let req = CanonicalMessageRequest::from_canonical_bytes(message)?;
                 // A lone custom-token request cannot carry a claim, so it is
-                // admitted only when it grows no state or the price is zero.
+                // admitted only when it grows no state or the price is zero,
+                // with or without the token proof suite, as a bundle is.
                 #[cfg(feature = "native-proof")]
-                if self.token_policy.is_some()
+                if self.state.is_some()
                     && _address.len() >= 32
                     && _address[..32] != crate::domains::QUIL_TOKEN
                 {
@@ -4564,3 +4569,7 @@ mod tests {
     // TYPE_TRANSACTION arm for the full attack chain.
     // =================================================================
 }
+
+#[cfg(all(test, feature = "native-proof"))]
+#[path = "token_settlement_parity_tests.rs"]
+mod token_settlement_parity_tests;

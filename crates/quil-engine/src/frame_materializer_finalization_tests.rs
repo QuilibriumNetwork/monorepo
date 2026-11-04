@@ -47,8 +47,8 @@ fn busy_publication_readers_refuse_the_batch_without_advancing_public_state() {
 
 #[test]
 fn finalized_deployment_adopts_live_state_and_supports_the_next_frame_and_replay() {
-    let rig = Rig::new();
-    let expected = Fixture::new(Some(rig.signer.public_key()));
+    let rig = Rig::paying();
+    let expected = rig.expected();
     rig.clock.warm_global_frame_cache().unwrap();
     let genesis = rig.clock.get_latest_global_clock_frame().unwrap();
     rig.source
@@ -62,7 +62,7 @@ fn finalized_deployment_adopts_live_state_and_supports_the_next_frame_and_replay
         .unwrap()
         .db_snapshot
         .unwrap();
-    let mut input = rig.deploy();
+    let mut input = rig.paid_deploy();
     certify(&mut input, &rig.signer, 0);
     expected.source.materialize(&input).unwrap();
     let current = rig.source.current_frame.as_ref().unwrap().clone();
@@ -366,8 +366,8 @@ fn intervening_write_abandons_publication_and_a_fresh_attempt_can_succeed() {
 
 #[test]
 fn consensus_candidate_writes_during_execution_do_not_abandon_publication() {
-    let rig = Rig::new();
-    let mut input = rig.deploy();
+    let rig = Rig::paying();
+    let mut input = rig.paid_deploy();
     certify(&mut input, &rig.signer, 0);
     let mut next = input.clone();
     let header = next.header.as_mut().unwrap();
