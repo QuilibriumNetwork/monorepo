@@ -46,6 +46,14 @@ struct EvictionTrack {
     attempted: Option<std::time::Instant>,
 }
 
+/// First frame at which an unconfirmed join is expired: the start of epoch
+/// `join_epoch + 2` (a join proposed in epoch E must confirm in epoch E+1;
+/// mirrors `ProverAllocationInfo::effective_status`).
+pub(crate) fn join_expiry_frame(join_frame: u64) -> u64 {
+    use quil_types::consensus::{epoch_for_frame, epoch_start_frame};
+    epoch_start_frame(epoch_for_frame(join_frame) + 2)
+}
+
 /// A rejected leave restores Active without renewing storage. Keep its worker
 /// available to encode renewal until the end of the rejection epoch. This is
 /// local recovery scheduling only: the allocation remains ExpiredEpoch for
@@ -2617,7 +2625,13 @@ impl WorkerAllocator {
                                     core_id = worker.core_id,
                                     filter = hex::encode(&worker.filter),
                                     join_frame = alloc.join_frame_number,
-                                    "join expired after 720 frames, clearing worker"
+                                    frames_since_join =
+                                        frame_number.saturating_sub(alloc.join_frame_number),
+                                    expiry_frame = join_expiry_frame(alloc.join_frame_number),
+                                    current_frame = frame_number,
+                                    "join expired unconfirmed, clearing worker: its confirm was \
+                                     never included before the activation frame; check the \
+                                     join's confirm submission and inclusion"
                                 );
                                 self.release_worker(worker, retained, frame_number)?;
                             }
@@ -3373,6 +3387,20 @@ mod tests {
     use quil_types::consensus::*;
 
     use crate::test_support::{TestProverRegistry, TestWorkerManager as MockWorkerManager};
+
+    #[test]
+    fn join_expiry_frame_is_start_of_epoch_after_confirm_epoch() {
+        let len = epoch_length_frames();
+        // Joined mid-epoch 3: confirm window is epoch 4, expired from epoch 5.
+        let jf = 3 * len + 17;
+        let exp = join_expiry_frame(jf);
+        assert_eq!(exp, 5 * len);
+        let mut a = make_alloc(vec![1; 32]);
+        a.status = ProverStatus::Joining;
+        a.join_frame_number = jf;
+        assert_eq!(a.effective_status(exp - 1), EffectiveStatus::Joining);
+        assert_eq!(a.effective_status(exp), EffectiveStatus::ExpiredJoining);
+    }
 
     fn make_alloc(filter: Vec<u8>) -> ProverAllocationInfo {
         ProverAllocationInfo {
