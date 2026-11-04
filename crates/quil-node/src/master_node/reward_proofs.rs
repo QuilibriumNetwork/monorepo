@@ -36,8 +36,9 @@ impl WorkerSubmission {
     }
 
     /// Whether this node publishes it now: a presence report only while the
-    /// presence report frame is set, so a node with reports off (mainnet,
-    /// and by default) publishes none, whatever a worker sends.
+    /// presence report frame is set, so a node with reports off (a test
+    /// network without the setting, and by default) publishes none,
+    /// whatever a worker sends.
     pub(crate) fn active(self) -> bool {
         self != Self::PresenceReport || presence_report_frame() != u64::MAX
     }

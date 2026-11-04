@@ -917,7 +917,7 @@ impl InMemoryProverRegistry {
             frame_number,
             inactivity_threshold,
             shard_halt_durations,
-            quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+            quil_types::consensus::signed_frame_activation_frame(),
         )
     }
 
@@ -952,7 +952,7 @@ impl InMemoryProverRegistry {
             frame_number,
             inactivity_threshold,
             shard_halt_durations,
-            quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+            quil_types::consensus::signed_frame_activation_frame(),
         )
     }
 
@@ -1344,7 +1344,7 @@ pub fn signed_frame_census_governs(
 /// The credit is `LastActiveFrameNumber` until
 /// [`signed_frame_census_governs`], then `LastSignedFrameNumber`, which only
 /// the signers of an included app frame record. Public paths pass
-/// `SIGNED_FRAME_ACTIVATION_FRAME`; reads committed registry fields only.
+/// `signed_frame_activation_frame()`; reads committed registry fields only.
 pub fn allocation_fresh_at(
     alloc: &ProverAllocationInfo,
     frame_number: u64,
@@ -6079,7 +6079,7 @@ mod tests {
                         };
                         for frame in below.iter().chain(after.iter()).copied() {
                             let expected = last_active_rule(&alloc, frame, halt);
-                            let default = quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME;
+                            let default = quil_types::consensus::signed_frame_activation_frame();
                             assert_eq!(
                                 allocation_fresh_at(&alloc, frame, halt, threshold, default),
                                 expected,

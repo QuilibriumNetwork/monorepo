@@ -1525,7 +1525,7 @@ fn encode_rewarded_shards(
 }
 
 /// Update an allocation's `LastActiveFrameNumber`, and from
-/// `SIGNED_FRAME_ACTIVATION_FRAME` its `LastSignedFrameNumber`: the caller
+/// `signed_frame_activation_frame()` its `LastSignedFrameNumber`: the caller
 /// passes the signers of an app frame this GLOBAL frame includes.
 ///
 /// Go equivalent: `updateAllocationActivity` at
@@ -1541,7 +1541,7 @@ fn update_allocation_activity(
         frame_number,
         prover,
         filter,
-        quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+        quil_types::consensus::signed_frame_activation_frame(),
     )
 }
 
@@ -2563,7 +2563,7 @@ mod tests {
         let last_active_only = |tree: &mut quil_tries::VectorCommitmentTree| {
             materialize_frame_header_activity(tree, 77).unwrap();
         };
-        for activation in [78, quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME] {
+        for activation in [78, quil_types::consensus::signed_frame_activation_frame()] {
             let (written, expected) = activity_blobs(77, activation, last_active_only);
             assert_eq!(written, expected, "activation {activation}");
             let tree = rebuild_vertex_tree_from_blob(&written);
@@ -2574,7 +2574,7 @@ mod tests {
             );
             assert_eq!(last_signed, None);
         }
-        // The production path uses the disabled default.
+        // The production path uses the mainnet frame, far above this one.
         let state = make_state();
         let filter = vec![0xAAu8; 32];
         let p = fake_prover(1, 1, 0, &filter);

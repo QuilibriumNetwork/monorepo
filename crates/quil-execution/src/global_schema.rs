@@ -274,7 +274,7 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             // order 18 — not in the Go schema: the last GLOBAL frame that
             // included an app frame this allocation signed. Written only for
             // the signers of an included app frame, from
-            // `SIGNED_FRAME_ACTIVATION_FRAME`; confirms never write it, unlike
+            // `signed_frame_activation_frame()`; confirms never write it, unlike
             // `LastActiveFrameNumber`. Absent before then. Key 0x48: no other
             // class has an order-18 field.
             FieldTag {
