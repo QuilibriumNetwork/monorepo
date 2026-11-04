@@ -1133,9 +1133,20 @@ fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Con
         .validate_messages()
         // BlossomSub message id = `[0x01] ++ SHA256(data)`. Stock gossipsub's
         // default id differs, so we set it explicitly to keep the dedup key
-        // stable across the network.
+        // stable across the network. Under strict shard gossip a shard CW
+        // topic's id also covers the message's author
+        // (`crate::node::gossip_message_id`).
         .message_id_fn(|message: &gossipsub::Message| {
-            gossipsub::MessageId::from(crate::node::message_id(&message.data))
+            let source = message
+                .source
+                .map(|peer| peer.to_bytes())
+                .unwrap_or_default();
+            gossipsub::MessageId::from(crate::node::gossip_message_id(
+                &bitmask_from_topic(&message.topic),
+                &source,
+                &message.data,
+                crate::node::strict_shard_gossip(),
+            ))
         })
         // Inbound signature verification (StrictSign); signed outbound is
         // late-bound via `set_signing_identity`.
@@ -1155,6 +1166,61 @@ mod propagation_tests {
     use libp2p::swarm::SwarmEvent;
     use libp2p::{Multiaddr, Swarm, SwarmBuilder};
     use std::time::Duration;
+
+    /// Under strict shard gossip, two copies of a message with the same data
+    /// and different authors get different ids on a shard CW topic, so the
+    /// author's own copy is not dropped as the duplicate of a copy another
+    /// peer re-published first. Every other topic, and every topic before the
+    /// strict epoch, keeps the content id `[0x01] ++ SHA256(data)`.
+    #[test]
+    fn shard_cw_message_ids_name_their_author_when_strict() {
+        let config = build_config(0, &crate::BlossomsubParams::default());
+        let filter = [7u8; 32];
+        let mut cw = vec![0x01u8];
+        cw.extend_from_slice(&filter);
+        let (genuine, reauthored) = (PeerId::random(), PeerId::random());
+        let message = |bitmask: &[u8], source: PeerId| gossipsub::Message {
+            source: Some(source),
+            data: b"\x00vote".to_vec(),
+            sequence_number: Some(1),
+            topic: topic_for(bitmask).hash(),
+        };
+        let id = |bitmask: &[u8], source: PeerId| config.message_id(&message(bitmask, source));
+        let content = gossipsub::MessageId::from(crate::node::message_id(b"\x00vote"));
+        let mut legacy = vec![0x00u8];
+        legacy.extend_from_slice(&filter);
+        let others: [&[u8]; 6] = [
+            &[0x00, 0x00, 0x00, 0x00],
+            &[0x00, 0x00],
+            &[0u8; 16],
+            &filter,
+            &legacy,
+            &[0x01; 32],
+        ];
+        crate::node::set_strict_shard_gossip(false);
+        assert_eq!(id(&cw, genuine), content);
+        assert_eq!(id(&cw, reauthored), content);
+        crate::node::set_strict_shard_gossip(true);
+        assert_ne!(
+            id(&cw, genuine),
+            id(&cw, reauthored),
+            "a re-authored copy of a CW message shares its author's id"
+        );
+        assert_ne!(id(&cw, genuine), content);
+        assert_eq!(id(&cw, genuine).0.len(), 33);
+        assert_eq!(id(&cw, genuine).0[0], 0x01);
+        assert_eq!(id(&cw, genuine), id(&cw, genuine));
+        for bitmask in others {
+            assert_eq!(
+                id(bitmask, genuine),
+                content,
+                "{} keeps the content id",
+                hex::encode(bitmask)
+            );
+            assert_eq!(id(bitmask, reauthored), content);
+        }
+        crate::node::set_strict_shard_gossip(false);
+    }
 
     #[test]
     fn build_config_applies_the_message_cache_byte_budget() {

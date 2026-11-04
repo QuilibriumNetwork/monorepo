@@ -11633,7 +11633,7 @@ impl AppConsensusEngine {
                 global_frame = global_frame_number,
                 epoch = quil_types::consensus::strict_shard_gossip_epoch(),
                 strict = strict_shard_gossip,
-                "shard gossip validation changed: when strict, peers forwarding a message no leader can propose on a shard's dispatch or submission topic are penalised"
+                "shard gossip validation changed: when strict, peers forwarding a message no leader can propose on a shard's dispatch or submission topic are penalised and shard CW message ids name their author"
             );
         }
 

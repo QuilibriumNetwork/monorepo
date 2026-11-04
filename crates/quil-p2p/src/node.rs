@@ -2050,6 +2050,35 @@ pub fn message_id(data: &[u8]) -> Vec<u8> {
     id
 }
 
+/// Whether `bitmask` is a shard's CW topic (`0x01 ‖ appFilter`, 32 bytes).
+fn is_shard_cw_bitmask(bitmask: &[u8]) -> bool {
+    bitmask.len() == 33 && bitmask[0] == 0x01
+}
+
+/// The gossip id of `data` published by `source` (its author's peer ID bytes)
+/// on `bitmask`. Under strict shard gossip ([`strict_shard_gossip`]) a
+/// shard CW topic's id is `[0x01, SHA256(source ‖ data)...]`: a CW vote names
+/// its signer only in the channel's committee, while the receive loop
+/// attributes it to its gossip author, so with the content id alone a copy
+/// another peer re-published first was delivered and the author's own copy
+/// dropped as its duplicate. Every other topic keeps the content id
+/// ([`message_id`]): their payloads authenticate themselves. Before the
+/// strict epoch every topic keeps it, because releases before this rule
+/// compute it: a promise to deliver a message under one id and a delivery
+/// under the other counts as broken, and broken promises lower a peer's score.
+pub fn gossip_message_id(bitmask: &[u8], source: &[u8], data: &[u8], strict: bool) -> Vec<u8> {
+    if !(strict && is_shard_cw_bitmask(bitmask)) {
+        return message_id(data);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(source);
+    hasher.update(data);
+    let mut id = Vec::with_capacity(33);
+    id.push(0x01);
+    id.extend_from_slice(&hasher.finalize());
+    id
+}
+
 /// The IP the swarm binds for the configured listen address: an IPv6 address
 /// as written, `::` for a `/dns6` name; any other address `0.0.0.0`, whatever
 /// IP it names.

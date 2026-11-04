@@ -593,6 +593,7 @@ mod tests {
         source_id: quil_p2p::PeerId,
         relay: quil_p2p::node::P2PHandle,
         relay_id: quil_p2p::PeerId,
+        relay_port: u16,
         sink: quil_p2p::node::P2PHandle,
         sink_rx: Inbound,
         _inbound: Vec<Inbound>,
@@ -663,6 +664,7 @@ mod tests {
             source_id,
             relay,
             relay_id,
+            relay_port,
             sink,
             sink_rx,
             _inbound: vec![relay_rx, source_rx],
@@ -911,6 +913,114 @@ mod tests {
             relayed, 0,
             "VULNERABLE: a master forwarded {relayed} message(s) published on the legacy \
              shard consensus topic, which no release reads"
+        );
+    }
+
+    /// A CW vote names its signer only within its committee, and the receive
+    /// loop attributes a shard CW message to its gossip author. With the
+    /// content id alone, a copy of a member's vote that another peer
+    /// re-published reached a master first, and the master dropped the
+    /// member's own copy as its duplicate: the vote was lost, attributed to a
+    /// stranger. Here the attacker re-publishes the member's vote before the
+    /// member does (the member joins the topic only as it publishes, so it has
+    /// not seen the copy, as when the copy reaches the master first), and the
+    /// sink must still receive the member's copy, from the member, through the
+    /// master. Each test runs in its own process under nextest, so the strict
+    /// switch stays within this one.
+    #[tokio::test]
+    async fn reproduces_re_authored_cw_vote_dropping_the_genuine_copy() {
+        quil_p2p::set_strict_shard_gossip(true);
+        let cw = quil_engine::bitmasks::shard_cw_bitmask(&[7u8; 32]);
+        let alert = quil_engine::bitmasks::GLOBAL_ALERT;
+        let mut chain = chain(&[cw.as_slice(), alert], Some(MeshRole::Master), None).await;
+        chain.wait_for_meshes().await;
+        // The member: connected to the master only, and on the alert topic
+        // only until it publishes its vote.
+        let (member, member_id, _, member_rx) =
+            start_node(&mut chain._sup, Some((chain.relay_port, chain.relay_id))).await;
+        chain._inbound.push(member_rx);
+        member.subscribe(alert.to_vec()).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while chain
+            .relay
+            .subscribed_peer_count(alert.to_vec())
+            .await
+            .unwrap_or(0)
+            < 3
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the member never joined the master's alert topic"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let vote = quil_engine::bitmasks::shard_cw_frame_payload(0, b"the member's vote");
+        assert_eq!(shard_gossip_verdict(&cw, &vote), Accept);
+        chain
+            .source
+            .publish(cw.clone(), vote.clone())
+            .await
+            .expect("publish the re-authored copy");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match tokio::time::timeout_at(deadline, chain.sink_rx.recv()).await {
+                Ok(Some(message)) if message.data == vote => {
+                    assert_eq!(message.from, chain.source_id.to_bytes());
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("the sink stopped"),
+                Err(_) => panic!("the master never forwarded the re-authored copy"),
+            }
+        }
+
+        // The member's own copy, published to the master, which has seen the
+        // re-authored one. The member joins the topic just before (publishing
+        // needs a subscription), so the copy has not reached it.
+        member.subscribe(cw.clone()).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let published = loop {
+            match member.publish(cw.clone(), vote.clone()).await {
+                Ok(()) => break Ok(()),
+                Err(error)
+                    if error.to_string().contains("InsufficientPeers")
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(error) => break Err(error.to_string()),
+            }
+        };
+        published.expect("the member publishes its vote");
+        let last = control_alert(u32::MAX);
+        member
+            .publish(alert.to_vec(), last.clone())
+            .await
+            .expect("publish the last control alert");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut received: Vec<quil_p2p::node::ReceivedMessage> = Vec::new();
+        while !received.iter().any(|message| message.data == last) {
+            match tokio::time::timeout_at(deadline, chain.sink_rx.recv()).await {
+                Ok(Some(message)) => received.push(message),
+                Ok(None) => panic!("the sink stopped"),
+                Err(_) => panic!("the master never forwarded the member's last control alert"),
+            }
+        }
+        // Anything the master forwarded before the last alert has arrived.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        while let Ok(message) = chain.sink_rx.try_recv() {
+            received.push(message);
+        }
+        let genuine = received
+            .iter()
+            .filter(|message| message.data == vote && message.from == member_id.to_bytes())
+            .count();
+        assert_eq!(
+            genuine, 1,
+            "VULNERABLE: a master dropped a member's CW vote as the duplicate of a copy \
+             another peer re-published first, so the vote reached its committee only \
+             attributed to that peer"
         );
     }
 

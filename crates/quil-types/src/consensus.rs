@@ -851,11 +851,13 @@ pub fn set_strict_peer_info_epoch_for_thread(epoch: Option<u64>) {
 /// The epoch from which nodes enforce strict shard gossip: the mesh
 /// penalises a peer that forwards, on a shard's dispatch or submission topic,
 /// a message no leader can propose (one that is not a well-formed message
-/// bundle). Before it such messages are dropped without penalty, because
-/// releases before this rule forward them. Not consensus-affecting, but it
-/// splits gossip from nodes on older releases, so it waits for an adoption
-/// census and a devnet crossing: `None` until then. `QUIL_STRICT_SHARD_GOSSIP_EPOCH`
-/// elsewhere, never by default.
+/// bundle), and a shard CW topic's message ids cover their author. Before it
+/// such messages are dropped without penalty, because releases before this
+/// rule forward them, and every topic keeps the content id, because they
+/// compute it. Not consensus-affecting, but it splits gossip from nodes on
+/// older releases, so it waits for an adoption census and a devnet crossing:
+/// `None` until then. `QUIL_STRICT_SHARD_GOSSIP_EPOCH` elsewhere, never by
+/// default.
 pub const MAINNET_STRICT_SHARD_GOSSIP_EPOCH: Option<u64> = None;
 
 static STRICT_SHARD_GOSSIP_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
