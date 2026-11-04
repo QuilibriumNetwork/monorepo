@@ -27,6 +27,12 @@ pub const NODE_SERVICE_NAME: &str = "quilibrium-node";
 pub const DEFAULT_NODE_CONFIG_NAME: &str = "node-quickstart";
 /// Default auto-update cron interval (`client/utils/types.go`).
 pub const DEFAULT_AUTO_UPDATE_INTERVAL: &str = "*/10 * * * *";
+/// The link in the qclient install directory ([`client_data_path`]) to
+/// the release `qclient update` or install-qclient.sh installed last.
+/// Root's auto-update cron entry runs it: unlike
+/// [`default_qclient_symlink_path`], it sits in a directory only root
+/// writes.
+pub const QCLIENT_ROOT_LINK: &str = "current";
 
 /// Base release URL (`client/utils/download.go:13`).
 pub const BASE_RELEASE_URL: &str = "https://releases.quilibrium.com";

@@ -108,23 +108,54 @@ fn install_systemd() -> anyhow::Result<()> {
 }
 
 fn install_launchd() -> anyhow::Result<()> {
+    let user = system::current_user_name()?;
+    let bin = system::default_node_symlink_path();
+    let cfg = system::node_config_home_dir()?.join("default");
+    let env_path = system::node_env_path();
+    #[cfg(unix)]
+    check_daemon_paths(&user, &bin, &cfg, &env_path)?;
     // launchd opens the log files but creates no directory for them.
     let log_dir = system::service_log_dir()?;
     system::ensure_dir_owned_like_parent(&log_dir)?;
+    #[cfg(unix)]
+    check_log_dir(&user, &log_dir, 0)?;
     // launchd reads no environment file: render the node's into the plist.
-    let env_path = system::node_env_path();
     if let Some(dir) = env_path.parent() {
         system::ensure_dir_owned_like_parent(dir)?;
     }
     ensure_env_file(&env_path, write_root_file)?;
     let env = launchd_environment(&env_path)?;
-    let plist = format!(
+    let plist = launchd_plist(&user, &bin, &cfg, &log_dir, &env);
+    write_root_file(&launchd_plist_path(), &plist)?;
+    println!(
+        "Created launchd plist at {}: the node runs as {user} with config {}, logs to {} \
+         and runs with the environment of {}; after editing that file, run 'sudo qclient \
+         node service update', then reload the service ('qclient node service disable', \
+         then 'enable')",
+        launchd_plist_path(),
+        cfg.display(),
+        log_dir.display(),
+        env_path.display()
+    );
+    Ok(())
+}
+
+/// The launchd daemon of the node service. It runs as `user`, as the
+/// systemd unit does: without `UserName` launchd runs a daemon as root,
+/// which then ran the node from `/usr/local/bin` (another user may own it:
+/// Homebrew gives it to the admin user on Intel macOS) with the config in
+/// the operator's home, and either lets that user make root run their
+/// code.
+fn launchd_plist(user: &str, bin: &Path, cfg: &Path, log: &Path, env: &str) -> String {
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
 	<key>Label</key>
 	<string>{label}</string>
+	<key>UserName</key>
+	<string>{user}</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>{bin}</string>
@@ -143,21 +174,10 @@ fn install_launchd() -> anyhow::Result<()> {
 </plist>
 "#,
         label = LAUNCHD_LABEL,
-        bin = system::default_node_symlink_path().display(),
-        cfg = system::node_config_home_dir()?.join("default").display(),
-        log = log_dir.display(),
-    );
-    write_root_file(&launchd_plist_path(), &plist)?;
-    println!(
-        "Created launchd plist at {}: the node logs to {} and runs with the \
-         environment of {}; after editing that file, run 'sudo qclient node service \
-         update', then reload the service ('qclient node service disable', then \
-         'enable')",
-        launchd_plist_path(),
-        log_dir.display(),
-        env_path.display()
-    );
-    Ok(())
+        bin = bin.display(),
+        cfg = cfg.display(),
+        log = log.display(),
+    )
 }
 
 /// The plist's `EnvironmentVariables` entry for the environment file
@@ -238,6 +258,132 @@ fn launchd_env_dict(vars: &[(String, String)]) -> String {
     }
     dict.push_str("\t</dict>\n");
     dict
+}
+
+/// Refuse a node service that would let a non-root user make root run
+/// their code, or that its user cannot run. As root (`user` is root when
+/// qclient runs from a root shell, or cannot resolve the sudo user), every
+/// existing directory above the binary `bin`, the config `cfg` and the
+/// environment file `env`, which is rendered into the plist, and `cfg` and
+/// `env` themselves, must be owned by root and writable only by root. As
+/// another user, `cfg` must hold nothing a root-run node left owned by
+/// root, which that user could not open.
+#[cfg(unix)]
+fn check_daemon_paths(user: &str, bin: &Path, cfg: &Path, env: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    check_daemon_paths_with(user, bin, cfg, env, |dir| {
+        std::fs::metadata(dir).map(|meta| (meta.uid(), meta.mode()))
+    })
+}
+
+/// [`check_daemon_paths`], reading the owner uid and mode of a directory
+/// through `owner_mode`.
+#[cfg(unix)]
+fn check_daemon_paths_with(
+    user: &str,
+    bin: &Path,
+    cfg: &Path,
+    env: &Path,
+    owner_mode: impl Fn(&Path) -> std::io::Result<(u32, u32)>,
+) -> anyhow::Result<()> {
+    if user == "root" {
+        let dirs = bin
+            .ancestors()
+            .skip(1)
+            .chain(cfg.ancestors())
+            .chain(env.ancestors());
+        for dir in dirs.filter(|d| !d.as_os_str().is_empty()) {
+            let (uid, mode) = match owner_mode(dir) {
+                Ok(found) => found,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => anyhow::bail!("stat {}: {e}", dir.display()),
+            };
+            if uid != 0 || mode & 0o022 != 0 {
+                anyhow::bail!(
+                    "the node service would run as root from {} with config {} and environment \
+                     {}, but {} is \
+                     owned by uid {} with mode {:o}: whoever can write it could make root run \
+                     their code. Run 'sudo qclient node service install' from the operator's \
+                     account, so the node runs as that user",
+                    bin.display(),
+                    cfg.display(),
+                    env.display(),
+                    dir.display(),
+                    uid,
+                    mode & 0o7777
+                );
+            }
+        }
+        return Ok(());
+    }
+    let left = entries_owned_by(cfg, 0)?;
+    if let Some(first) = left.first() {
+        anyhow::bail!(
+            "{} and {} other entries in {} are owned by root, as a node run as root leaves \
+             them; the service now runs as {user}, who cannot open them. Stop the node, run \
+             'sudo chown -R {user} {}', then install the service again",
+            first.display(),
+            left.len() - 1,
+            cfg.display(),
+            cfg.display()
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a service log directory its user cannot write to: launchd opens
+/// the log files for a daemon that runs as `user`, and the `/var` layout's
+/// directory, or the logs a root-run node left in it, belong to root
+/// (`root_uid`).
+#[cfg(unix)]
+fn check_log_dir(user: &str, log: &Path, root_uid: u32) -> anyhow::Result<()> {
+    if user == "root" {
+        return Ok(());
+    }
+    let left = entries_owned_by(log, root_uid)?;
+    if let Some(first) = left.first() {
+        anyhow::bail!(
+            "{} is owned by root, but the node service runs as {user} and logs to {}. Run \
+             'sudo chown -R {user} {}', then install the service again",
+            first.display(),
+            log.display(),
+            log.display()
+        );
+    }
+    Ok(())
+}
+
+/// `dir` and its entries (not recursing, not following links) that the
+/// user id `uid` owns; none when `dir` does not exist.
+#[cfg(unix)]
+fn entries_owned_by(dir: &Path, uid: u32) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => anyhow::bail!("stat {}: {e}", dir.display()),
+    };
+    let mut owned = Vec::new();
+    if meta.uid() == uid {
+        owned.push(dir.to_path_buf());
+    }
+    if meta.is_dir() {
+        let entries =
+            std::fs::read_dir(dir).map_err(|e| anyhow::anyhow!("read {}: {e}", dir.display()))?;
+        let mut found = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| anyhow::anyhow!("read {}: {e}", dir.display()))?;
+            let meta = entry
+                .metadata()
+                .map_err(|e| anyhow::anyhow!("stat {}: {e}", entry.path().display()))?;
+            if meta.uid() == uid {
+                found.push(entry.path());
+            }
+        }
+        found.sort();
+        owned.extend(found);
+    }
+    Ok(owned)
 }
 
 /// Create the node's environment file `path`, with a comment, through
@@ -442,6 +588,168 @@ mod tests {
         assert_eq!(args("status"), format!("list {label}"));
         assert_eq!(args("start"), format!("start {label}"));
         assert_eq!(args("stop"), format!("stop {label}"));
+    }
+
+    /// The launchd daemon runs as the given user, as the systemd unit
+    /// does, never as root by default.
+    #[test]
+    fn launchd_daemon_runs_as_the_given_user() {
+        let plist = launchd_plist(
+            "op",
+            Path::new("/usr/local/bin/quilibrium-node"),
+            Path::new("/Users/op/.quilibrium/configs/default"),
+            Path::new("/var/log/quilibrium"),
+            "\t<key>EnvironmentVariables</key>\n",
+        );
+        assert!(
+            plist.contains("\t<key>UserName</key>\n\t<string>op</string>\n"),
+            "{plist}"
+        );
+        assert!(
+            plist.contains(
+                "\t\t<string>/usr/local/bin/quilibrium-node</string>\n\t\t<string>--config</string>\n\
+                 \t\t<string>/Users/op/.quilibrium/configs/default</string>\n"
+            ),
+            "{plist}"
+        );
+        assert!(
+            plist.contains("<string>/var/log/quilibrium/node.err</string>"),
+            "{plist}"
+        );
+        assert!(
+            plist.contains("</array>\n\t<key>EnvironmentVariables</key>\n\t<key>RunAtLoad</key>"),
+            "{plist}"
+        );
+    }
+
+    /// A node run as root must have a binary and config only root can
+    /// write: a directory another user owns or can write is refused. The
+    /// owners and modes are faked, so the host's directories do not decide
+    /// the outcome.
+    #[cfg(unix)]
+    #[test]
+    fn root_node_service_needs_root_only_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        /// A tree of root-owned 0755 directories, but for `odd`, a
+        /// directory with the given owner and mode; nothing else exists.
+        fn tree(
+            odd: Option<(&str, u32, u32)>,
+        ) -> impl Fn(&Path) -> std::io::Result<(u32, u32)> + '_ {
+            move |dir: &Path| match (dir.to_str().unwrap(), odd) {
+                (dir, Some((path, uid, mode))) if dir == path => Ok((uid, mode)),
+                ("/" | "/opt" | "/opt/quil" | "/opt/quil/bin" | "/opt/quil/configs", _) => {
+                    Ok((0, 0o40755))
+                }
+                _ => Err(std::io::ErrorKind::NotFound.into()),
+            }
+        }
+        let bin = Path::new("/opt/quil/bin/quilibrium-node");
+        let cfg = Path::new("/opt/quil/configs/default");
+        let env = Path::new("/opt/quil-env/quilibrium.env");
+
+        check_daemon_paths_with("root", bin, cfg, env, tree(None)).unwrap();
+        for (dir, uid, mode) in [
+            ("/opt/quil/configs", 0, 0o40777),
+            ("/opt/quil/bin", 0, 0o40775),
+            ("/opt/quil/configs/default", 0, 0o40757),
+            ("/opt", 501, 0o40755),
+            // The environment file is rendered into the root daemon's plist.
+            ("/opt/quil-env", 501, 0o40755),
+            ("/opt/quil-env/quilibrium.env", 501, 0o100644),
+        ] {
+            let err = check_daemon_paths_with("root", bin, cfg, env, tree(Some((dir, uid, mode))))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.starts_with(&format!(
+                    "the node service would run as root from {} with config {} and environment \
+                     {}, but {dir} is \
+                     owned by uid {uid} with mode {:o}: ",
+                    bin.display(),
+                    cfg.display(),
+                    env.display(),
+                    mode & 0o7777
+                )),
+                "{err}"
+            );
+        }
+
+        // The real lookup: a directory anyone can write, whatever is above it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let open = tmp.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = check_daemon_paths(
+            "root",
+            &open.join("quilibrium-node"),
+            &open.join("default"),
+            &open.join("quilibrium.env"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains(&format!(", but {} is owned by uid ", open.display()))
+                && err.contains(" with mode 777: "),
+            "{err}"
+        );
+    }
+
+    /// A log directory, or a log in it, that belongs to root is refused
+    /// with the command that fixes it, before a plist naming it is
+    /// rendered for a user who could not open it; root's own daemon and a
+    /// directory free of root's files pass, and the plist then logs there.
+    /// The directory's real owner stands in for root.
+    #[cfg(unix)]
+    #[test]
+    fn root_owned_log_dir_is_refused_for_a_user_daemon() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("quilibrium");
+        std::fs::create_dir(&log).unwrap();
+        let owner = std::fs::metadata(&log).unwrap().uid();
+
+        let err = check_log_dir("op", &log, owner).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("'sudo chown -R op {}'", log.display())),
+            "{err}"
+        );
+        check_log_dir("root", &log, owner).unwrap();
+
+        check_log_dir("op", &log, owner + 1).unwrap();
+        let plist = launchd_plist(
+            "op",
+            Path::new("/usr/local/bin/quilibrium-node"),
+            Path::new("/Users/op/.quilibrium/configs/default"),
+            &log,
+            "",
+        );
+        assert!(
+            plist.contains("\t<key>UserName</key>\n\t<string>op</string>\n")
+                && plist.contains(&format!("<string>{}/node.log</string>", log.display())),
+            "{plist}"
+        );
+    }
+
+    /// Files a root-run node left in the config are found, so the
+    /// service is not moved to a user who cannot open them.
+    #[cfg(unix)]
+    #[test]
+    fn entries_a_root_node_left_are_found() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = tmp.path().join("default");
+        std::fs::create_dir_all(cfg.join("store")).unwrap();
+        std::fs::write(cfg.join("config.yml"), b"").unwrap();
+        let uid = std::fs::metadata(&cfg).unwrap().uid();
+
+        assert_eq!(
+            entries_owned_by(&cfg, uid).unwrap(),
+            [cfg.clone(), cfg.join("config.yml"), cfg.join("store")]
+        );
+        assert!(entries_owned_by(&cfg, uid + 1).unwrap().is_empty());
+        assert!(entries_owned_by(&tmp.path().join("none"), uid)
+            .unwrap()
+            .is_empty());
     }
 
     /// The unit runs as the given user, whose config it names: systemd

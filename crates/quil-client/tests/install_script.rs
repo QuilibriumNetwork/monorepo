@@ -82,3 +82,40 @@ fn the_link_gets_the_release_files_beside_it() {
     }
     assert_eq!(std::fs::read_to_string(at(".dgst.sig.9")).unwrap(), "own");
 }
+
+/// The link root's cron entry runs points at the release, and on macOS
+/// has the signature files beside it that an older client looks for
+/// there; on Linux the client resolves the link and it needs none.
+#[test]
+fn root_cron_link_has_what_the_self_check_reads() {
+    let base = "qclient-2.1.0.23-darwin-arm64";
+    for (os_arch, signed) in [("darwin-arm64", true), ("linux-amd64", false)] {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("2.1.0.23");
+        std::fs::create_dir(&dir).unwrap();
+        let file = |suffix: &str| dir.join(format!("{base}{suffix}"));
+        for suffix in ["", ".dgst", ".dgst.sig.1"] {
+            std::fs::write(file(suffix), suffix).unwrap();
+        }
+
+        let out = run(
+            &format!("INSTALL_ROOT=\"$ROOT_DIR\"; link_root_current \"$DIR\" {base} {os_arch}"),
+            &[("DIR", dir.as_path()), ("ROOT_DIR", tmp.path())],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let at = |suffix: &str| tmp.path().join(format!("current{suffix}"));
+        assert_eq!(std::fs::read_link(at("")).ok(), Some(file("")));
+        for suffix in [".dgst", ".dgst.sig.1"] {
+            let want = signed.then(|| file(suffix));
+            assert_eq!(
+                std::fs::read_link(at(suffix)).ok(),
+                want,
+                "{os_arch} {suffix}"
+            );
+        }
+    }
+}

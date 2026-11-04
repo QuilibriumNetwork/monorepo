@@ -233,21 +233,18 @@ fn write_crontab(contents: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The cron entry. It runs `/usr/local/bin/qclient`, which `qclient update`
-/// points at a verified release, never the file this qclient was started
-/// from: the job runs as root.
+/// The cron entry. It runs `<install root>/current`
+/// ([`system::QCLIENT_ROOT_LINK`]), which `qclient update` and
+/// install-qclient.sh point at the release they verified: the job runs as
+/// root, so it never runs `/usr/local/bin/qclient`, whose directory another
+/// user may own (Homebrew gives it to the admin user on Intel macOS), nor
+/// the file this qclient was started from.
 fn cron_line() -> anyhow::Result<String> {
-    let qclient = system::default_qclient_symlink_path();
-    let target = std::fs::canonicalize(&qclient).map_err(|e| {
-        anyhow::anyhow!(
-            "resolve {}: {e}; install qclient with 'sudo qclient update' first",
-            qclient.display()
-        )
-    })?;
     let install_root = system::client_data_path();
     let install_root = std::fs::canonicalize(&install_root)
         .map_err(|e| anyhow::anyhow!("resolve {}: {e}", install_root.display()))?;
-    check_cron_target(&target, &install_root)?;
+    let qclient = install_root.join(system::QCLIENT_ROOT_LINK);
+    check_cron_target(&qclient, &install_root)?;
     Ok(cron_entry(&qclient))
 }
 
@@ -259,13 +256,20 @@ fn cron_entry(qclient: &Path) -> String {
     )
 }
 
-/// Root runs the auto-update job, so its executable (`target`, resolved)
-/// must be an installed qclient release under `install_root`, and it and
-/// every directory above it must be owned by root and writable by no one
-/// else.
+/// Root runs the auto-update job, so the path its entry names (`qclient`)
+/// must resolve to an installed qclient release under `install_root`, and
+/// the directories holding that path, the release and every directory
+/// above it must be owned by root and writable by no one else: whoever can
+/// write one of them can make root run their file.
 #[cfg(unix)]
-fn check_cron_target(target: &Path, install_root: &Path) -> anyhow::Result<()> {
+fn check_cron_target(qclient: &Path, install_root: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
+    let target = std::fs::canonicalize(qclient).map_err(|e| {
+        anyhow::anyhow!(
+            "resolve {}: {e}; install qclient with 'sudo qclient update' first",
+            qclient.display()
+        )
+    })?;
     if !target.starts_with(install_root) {
         anyhow::bail!(
             "{} is not an installed qclient release under {}; run 'sudo qclient update' to \
@@ -274,10 +278,23 @@ fn check_cron_target(target: &Path, install_root: &Path) -> anyhow::Result<()> {
             install_root.display()
         );
     }
-    for path in target.ancestors() {
+    let root_only = |path: &Path| -> anyhow::Result<bool> {
         let meta =
             std::fs::metadata(path).map_err(|e| anyhow::anyhow!("stat {}: {e}", path.display()))?;
-        if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+        Ok(meta.uid() == 0 && meta.mode() & 0o022 == 0)
+    };
+    for dir in qclient.ancestors().skip(1) {
+        if !dir.as_os_str().is_empty() && !root_only(dir)? {
+            anyhow::bail!(
+                "{} must be owned by root and writable only by root: the auto-update job \
+                 runs {} from it as root",
+                dir.display(),
+                qclient.display()
+            );
+        }
+    }
+    for path in target.ancestors() {
+        if !root_only(path)? {
             anyhow::bail!(
                 "{} must be owned by root and writable only by root: the auto-update job \
                  runs as root",
@@ -306,12 +323,9 @@ fn cron_enable() -> anyhow::Result<()> {
         .filter(|l| !l.contains(CRON_MARKER))
         .map(String::from)
         .collect();
+    println!("Auto-update enabled (every 10 minutes): {line}");
     lines.push(line);
     write_crontab(&(lines.join("\n") + "\n"))?;
-    println!(
-        "Auto-update enabled (every 10 minutes, running {})",
-        system::default_qclient_symlink_path().display()
-    );
     Ok(())
 }
 
@@ -384,8 +398,40 @@ mod tests {
     #[test]
     fn cron_entry_runs_the_installed_qclient() {
         assert_eq!(
-            cron_entry(&system::default_qclient_symlink_path()),
-            "*/10 * * * * /usr/local/bin/qclient node update --restart # quilibrium-auto-update"
+            cron_entry(&system::client_data_path().join(system::QCLIENT_ROOT_LINK)),
+            "*/10 * * * * /var/quilibrium/bin/qclient/current node update --restart \
+             # quilibrium-auto-update"
+        );
+    }
+
+    /// The path root's cron entry runs must sit in a directory only root
+    /// writes: a link elsewhere, even to an installed release, is refused.
+    #[cfg(unix)]
+    #[test]
+    fn cron_link_in_a_directory_others_can_write_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("qclient");
+        let dir = root.join("2.1.0.25");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("qclient-2.1.0.25-linux-amd64");
+        std::fs::write(&target, b"bin").unwrap();
+        let links = tmp.path().join("bin");
+        std::fs::create_dir(&links).unwrap();
+        std::fs::set_permissions(&links, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let link = links.join("qclient");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+
+        let err = check_cron_target(&link, &root).unwrap_err().to_string();
+        assert!(
+            err.starts_with(&format!(
+                "{} must be owned by root and writable only by root: the auto-update job \
+                 runs {} from it",
+                links.display(),
+                link.display()
+            )),
+            "{err}"
         );
     }
 
@@ -402,6 +448,7 @@ mod tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o777)).unwrap();
         let elsewhere = tmp.path().join("qclient-2.1.0.25-linux-amd64");
         std::fs::write(&elsewhere, b"bin").unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
 
         let err = check_cron_target(&elsewhere, &root).unwrap_err();
         assert!(
