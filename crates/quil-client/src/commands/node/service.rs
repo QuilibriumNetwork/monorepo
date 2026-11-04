@@ -101,6 +101,13 @@ fn install_launchd() -> anyhow::Result<()> {
     // launchd opens the log files but creates no directory for them.
     let log_dir = system::service_log_dir()?;
     system::ensure_dir_owned_like_parent(&log_dir)?;
+    // launchd reads no environment file: render the node's into the plist.
+    let env_path = system::node_env_path();
+    if let Some(dir) = env_path.parent() {
+        system::ensure_dir_owned_like_parent(dir)?;
+    }
+    ensure_env_file(&env_path, write_root_file)?;
+    let env = launchd_environment(&env_path)?;
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -114,7 +121,7 @@ fn install_launchd() -> anyhow::Result<()> {
 		<string>--config</string>
 		<string>{cfg}</string>
 	</array>
-	<key>RunAtLoad</key>
+{env}	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
@@ -132,11 +139,95 @@ fn install_launchd() -> anyhow::Result<()> {
     );
     write_root_file(&launchd_plist_path(), &plist)?;
     println!(
-        "Created launchd plist at {}: the node logs to {}",
+        "Created launchd plist at {}: the node logs to {} and runs with the \
+         environment of {}; after editing that file, run 'sudo qclient node service \
+         update', then reload the service ('qclient node service disable', then \
+         'enable')",
         launchd_plist_path(),
-        log_dir.display()
+        log_dir.display(),
+        env_path.display()
     );
     Ok(())
+}
+
+/// The plist's `EnvironmentVariables` entry for the environment file
+/// `path` ([`env_assignments`]), warning of each line it skips; empty when
+/// the file sets nothing.
+fn launchd_environment(path: &Path) -> anyhow::Result<String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+    let (vars, skipped) = env_assignments(&text);
+    for line in skipped {
+        eprintln!(
+            "warning: {} line {line} is not KEY=VALUE; the service does not get it",
+            path.display()
+        );
+    }
+    Ok(launchd_env_dict(&vars))
+}
+
+/// The `KEY=VALUE` assignments of an environment file, in the plain form
+/// systemd's `EnvironmentFile=` reads: blank lines and lines starting with
+/// `#` or `;` are comments, whitespace around keys and values is trimmed,
+/// a value wholly in matching single or double quotes loses them, and a
+/// later assignment of a key replaces an earlier one. Returns the
+/// assignments and the (1-based) numbers of the other lines, which are
+/// skipped.
+fn env_assignments(text: &str) -> (Vec<(String, String)>, Vec<usize>) {
+    let mut vars: Vec<(String, String)> = Vec::new();
+    let mut skipped = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            skipped.push(i + 1);
+            continue;
+        };
+        let key = key.trim();
+        let valid = key.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            skipped.push(i + 1);
+            continue;
+        }
+        let value = value.trim();
+        let value = ['"', '\'']
+            .iter()
+            .find_map(|q| value.strip_prefix(*q).and_then(|v| v.strip_suffix(*q)))
+            .unwrap_or(value);
+        match vars.iter_mut().find(|(k, _)| k == key) {
+            Some(var) => var.1 = value.to_string(),
+            None => vars.push((key.to_string(), value.to_string())),
+        }
+    }
+    (vars, skipped)
+}
+
+/// The plist `EnvironmentVariables` entry setting `vars`, XML-escaped;
+/// empty for none.
+fn launchd_env_dict(vars: &[(String, String)]) -> String {
+    if vars.is_empty() {
+        return String::new();
+    }
+    let escape = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+    };
+    let mut dict = String::from("\t<key>EnvironmentVariables</key>\n\t<dict>\n");
+    for (key, value) in vars {
+        dict.push_str(&format!(
+            "\t\t<key>{}</key>\n\t\t<string>{}</string>\n",
+            escape(key),
+            escape(value)
+        ));
+    }
+    dict.push_str("\t</dict>\n");
+    dict
 }
 
 /// Create the node's environment file `path`, with a comment, through
@@ -167,6 +258,63 @@ fn ensure_env_file(
 #[cfg(test)]
 mod env_file_tests {
     use super::*;
+
+    fn pairs(vars: &[(&str, &str)]) -> Vec<(String, String)> {
+        vars.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The service gets the assignments systemd reads from the same file:
+    /// comments and blank lines are no assignments, quotes are dropped, a
+    /// later value wins, and other lines are reported.
+    #[test]
+    fn env_file_lines_parse_as_systemd_reads_them() {
+        let text = "# Quilibrium Node Environment\n\
+                    ; old = comment\n\
+                    \n\
+                    QUIL_A=1\n  \
+                    QUIL_B = \"two words\"  \n\
+                    QUIL_C='single'\n\
+                    QUIL_D=\n\
+                    not an assignment\n\
+                    9BAD=1\n\
+                    QUIL_A=override\n\
+                    QUIL_E=\"unbalanced\n\
+                    QUIL_F=\"\n";
+        let (vars, skipped) = env_assignments(text);
+        assert_eq!(
+            vars,
+            pairs(&[
+                ("QUIL_A", "override"),
+                ("QUIL_B", "two words"),
+                ("QUIL_C", "single"),
+                ("QUIL_D", ""),
+                ("QUIL_E", "\"unbalanced"),
+                ("QUIL_F", "\""),
+            ])
+        );
+        assert_eq!(skipped, [8, 9]);
+    }
+
+    /// Keys and values are XML-escaped in the plist.
+    #[test]
+    fn env_values_are_escaped_in_the_plist() {
+        assert_eq!(
+            launchd_env_dict(&pairs(&[("QUIL_X", "a&b<c>\"d'e"), ("QUIL_Y", "2")])),
+            "\t<key>EnvironmentVariables</key>\n\t<dict>\n\
+             \t\t<key>QUIL_X</key>\n\t\t<string>a&amp;b&lt;c&gt;&quot;d&apos;e</string>\n\
+             \t\t<key>QUIL_Y</key>\n\t\t<string>2</string>\n\
+             \t</dict>\n"
+        );
+    }
+
+    /// An environment file that sets nothing adds no entry to the plist.
+    #[test]
+    fn an_env_file_without_assignments_adds_no_entry() {
+        let (vars, _) = env_assignments("# Quilibrium Node Environment\n");
+        assert_eq!(launchd_env_dict(&vars), "");
+    }
 
     fn write_file(path: &str, contents: &str) -> anyhow::Result<()> {
         Ok(std::fs::write(path, contents)?)

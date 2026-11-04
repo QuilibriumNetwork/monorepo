@@ -82,6 +82,12 @@ pub enum NodeCommand {
         config: Option<String>,
     },
     /// Manage the node system service (start/stop/status/install/…).
+    ///
+    /// The service runs with the environment of quilibrium.env in the
+    /// install root. systemd reads the file at each start; launchd (macOS)
+    /// reads none, so install and update write its KEY=VALUE lines into
+    /// the plist: after editing the file on macOS, run update, then reload
+    /// the service (disable, then enable).
     Service {
         /// One of: start, stop, restart, status, enable, disable, reload,
         /// install, update, uninstall.
