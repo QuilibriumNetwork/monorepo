@@ -1191,6 +1191,31 @@ impl ProverLifecycle {
                 .unwrap_or(true)
     }
 
+    /// Who proposed this node's leave of `filter` at `proposed`, as the
+    /// allocation record names it: `operator`, or the planner's cause, or
+    /// `unknown` with no record (a restart before the record was saved).
+    fn leave_cause(&self, filter: &[u8], proposed: u64) -> String {
+        let name = match self
+            .allocation_reasons
+            .reason(filter, false, proposed)
+            .as_deref()
+        {
+            Some("M") => return "operator".into(),
+            Some("$") => "score replacement",
+            Some("D") => "data-greedy score replacement",
+            Some("H") => "halt-risk swap",
+            Some("E") => "empty shard",
+            Some("O") => "unrecoverable orphan",
+            Some("C") => "capacity shed",
+            Some("S") => "split-away parent",
+            Some("G") => "retired split parent",
+            Some("T") => "retired shard",
+            Some("W") => "worker shortage",
+            Some(_) | None => return "unknown".into(),
+        };
+        format!("planner: {name}")
+    }
+
     /// Whether this node proposed leaving `filter` within
     /// `LEAVE_COOLDOWN_FRAMES` of `frame_number`, so its renewal waits: once
     /// the leave lands the seat is Leaving, every node refuses a confirm that
@@ -1229,8 +1254,10 @@ impl ProverLifecycle {
                     storage = storage.name(), leave_proposed_frame = proposed,
                     resume_frame = proposed + LEAVE_COOLDOWN_FRAMES, grace_frame,
                     frames_to_grace = grace_frame.saturating_sub(frame_number), scope = "local",
-                    action = "expected after an operator's leave; otherwise find this seat's cause in this \
-                              node's 'proposing leaves' line and report both lines",
+                    leave_cause = self.leave_cause(filter, proposed),
+                    action = "cause 'operator': your own leave, wait for it to land; \
+                              any other cause: the planner proposed it, and a repeat on several seats is a \
+                              defect to report with this line",
                     "seat renewal skipped while its storage for the next epoch is being encoded or is encoded: \
                      this node proposed leaving the seat, and a seat being left is not renewed, so the encoding \
                      is wasted and the seat holds no storage registration that epoch. If the leave has not \
@@ -4057,7 +4084,13 @@ impl ProverLifecycle {
                 .filter(|d| !manually_managed_filters.contains(&d.filter))
                 .cloned()
                 .collect();
-            let leave_plan = if !proposal_descriptors.is_empty() {
+            // As the capacity shed does, the replacement plan leaves a seat
+            // whose storage renewal is under way (`storage_protected`) alone
+            // until the renewal lands or its grace frame passes: its leave
+            // would skip the renewal and throw the encoding away. The next
+            // eligible seat is paired with the replacement instead, or none.
+            let plan_leaves = |holding: &std::collections::HashSet<Vec<u8>>,
+                               releasable: &dyn Fn(&[u8]) -> bool| {
                 proposer::plan_leaves_releasing_spread(
                     &auto_allocated_descriptors,
                     replacement_descriptors,
@@ -4066,12 +4099,34 @@ impl ProverLifecycle {
                     self.units,
                     self.strategy,
                     assignable_worker_ids.len(),
-                    &min_hold_filters,
-                    &releasable,
+                    holding,
+                    releasable,
                     Some(&self.prover_address),
                 )
-            } else {
+            };
+            let leave_plan = if proposal_descriptors.is_empty() {
                 proposer::LeavePlan::default()
+            } else if storage_protected.is_empty() {
+                plan_leaves(&min_hold_filters, &releasable)
+            } else {
+                let mut holding = min_hold_filters.clone();
+                holding.extend(storage_protected.keys().cloned());
+                let spares_encoding =
+                    |filter: &[u8]| releasable(filter) && !storage_protected.contains_key(filter);
+                let plan = plan_leaves(&holding, &spares_encoding);
+                let spared: Vec<Vec<u8>> = plan_leaves(&min_hold_filters, &releasable)
+                    .filters
+                    .into_iter()
+                    .filter(|f| storage_protected.contains_key(f))
+                    .collect();
+                self.report_storage_spared(
+                    frame_number,
+                    "replacement",
+                    &spared,
+                    &storage_protected,
+                    plan.filters.len(),
+                );
+                plan
             };
             let score_driven_count = leave_plan.filters.len();
 
@@ -10655,6 +10710,9 @@ mod proposal_loop_tests {
             evaluate_logged(&lc, frame, reg.as_ref(), wm.as_ref())
         };
         lc.record_leave_attempts(&[held.clone(), other.clone()], 800);
+        lc.allocation_reasons
+            .record(std::slice::from_ref(&held), false, 800, "$")
+            .unwrap();
         let (actions, logged) = evaluate(801);
         assert!(renewed(&actions).is_empty(), "{actions:?}");
         let warned: Vec<&str> = logged.lines().filter(|l| l.contains(warning)).collect();
@@ -10663,6 +10721,7 @@ mod proposal_loop_tests {
             warned[0].contains("WARN") && warned[0].contains(&hex::encode(&held)),
             "{logged}"
         );
+        assert!(warned[0].contains("planner: score replacement"), "{logged}");
         let infos: Vec<&str> = logged.lines().filter(|l| l.contains(skipped)).collect();
         assert_eq!(infos.len(), 1, "{logged}");
         assert!(infos[0].contains(&hex::encode(&other)), "{logged}");
@@ -10682,6 +10741,122 @@ mod proposal_loop_tests {
             "{logged}"
         );
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// Eight bound seats of equal score renewing for epoch 2, and four large
+    /// shards the node does not hold: the score replacement plan proposes
+    /// leaving some of the seats, worst first.
+    fn replacement_fixture() -> (
+        Arc<ProverLifecycle>,
+        Arc<ConfigurableRegistry>,
+        Arc<ConfigurableWorkerManager>,
+    ) {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut seats = Vec::new();
+        let mut summaries = Vec::new();
+        for core in 1..=8u32 {
+            let filter = filter_bytes(0xA0 + core as u8);
+            wm.add(allocated_worker(core, filter.clone()));
+            seats.push(renewing(filter.clone()));
+            summaries.push(ProverShardSummary {
+                filter,
+                status_counts: HashMap::from([(ProverStatus::Active, 64)]),
+                total_size: 1_000_000,
+            });
+        }
+        for byte in 0xC0..0xC4u8 {
+            summaries.push(ProverShardSummary {
+                filter: filter_bytes(byte),
+                status_counts: HashMap::from([(ProverStatus::Active, 8)]),
+                total_size: 100_000_000,
+            });
+        }
+        let mut members = vec![prover(address.clone(), seats.clone())];
+        for byte in 0..63u8 {
+            members.push(prover(vec![byte; 32], seats.clone()));
+        }
+        reg.set_provers(members);
+        reg.set_summaries(summaries);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        (lc, reg, wm)
+    }
+
+    /// Nov4: after two shard splits the score replacement plan proposed
+    /// leaving seats whose storage for the next epoch was encoding, on eight
+    /// nodes, because the new shards outscored them: the leave skipped each
+    /// renewal and the encoding was thrown away. The plan leaves such a seat
+    /// alone and pairs the replacement with another; bounded by the grace
+    /// frame, past which (or once the renewal landed) the seat is a source
+    /// again.
+    #[test]
+    fn the_replacement_plan_spares_seats_whose_storage_is_encoding_until_the_grace_frame() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let run = |frame: u64, storage: &[Vec<u8>]| {
+            let (lc, reg, wm) = replacement_fixture();
+            for filter in storage {
+                note_storage(&lc, 790, filter, RenewalStorage::Encoding);
+            }
+            lc.set_prover_root_verified_frame(frame);
+            evaluate_logged(&lc, frame, reg.as_ref(), wm.as_ref())
+        };
+        // Control: nothing encoding, the plan picks its sources.
+        let (actions, _) = run(800, &[]);
+        let sources = proposed_leaves(&actions);
+        assert!(
+            !sources.is_empty(),
+            "control proposes replacements: {actions:?}"
+        );
+
+        // The same seats mid-encode are not sources; others go instead.
+        let (actions, logged) = run(800, &sources);
+        let spared = proposed_leaves(&actions);
+        assert!(
+            spared.iter().all(|f| !sources.contains(f)),
+            "replacement plan picked a seat whose next-epoch storage is encoding as its source: \
+             {spared:?} of encoding {sources:?}"
+        );
+        assert_eq!(spared.len(), sources.len(), "{actions:?}");
+        assert!(
+            logged.contains("capacity shed spares seats whose storage")
+                && logged.contains("path=\"replacement\""),
+            "{logged}"
+        );
+        assert_eq!(renewed(&actions).len(), 8 - spared.len(), "{actions:?}");
+
+        // Every seat encoding: no source, no leave, until the grace frame.
+        let all: Vec<Vec<u8>> = (1..=8u8).map(|c| filter_bytes(0xA0 + c)).collect();
+        let (actions, _) = run(800, &all);
+        assert!(proposed_leaves(&actions).is_empty(), "{actions:?}");
+
+        // At the grace frame the replacement proceeds as in the control.
+        let (control, _) = run(1056, &[]);
+        let (actions, _) = run(1056, &all);
+        assert!(!proposed_leaves(&control).is_empty(), "{control:?}");
+        assert_eq!(
+            proposed_leaves(&actions),
+            proposed_leaves(&control),
+            "past the grace frame the encoding spares nothing: {actions:?}"
+        );
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// The warn names who proposed the leave, so no other line is needed.
+    #[test]
+    fn the_leave_cause_names_the_planner_or_the_operator() {
+        let (lc, ..) = replacement_fixture();
+        let seat = filter_bytes(0xA1);
+        assert_eq!(lc.leave_cause(&seat, 800), "unknown");
+        lc.allocation_reasons
+            .record(std::slice::from_ref(&seat), false, 800, "$")
+            .unwrap();
+        assert_eq!(lc.leave_cause(&seat, 801), "planner: score replacement");
+        lc.allocation_reasons
+            .record(std::slice::from_ref(&seat), false, 802, "M")
+            .unwrap();
+        assert_eq!(lc.leave_cause(&seat, 803), "operator");
     }
 
     /// Oct29 devnet: a node restarted with fewer workers shed, at its first
