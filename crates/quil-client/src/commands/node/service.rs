@@ -99,8 +99,8 @@ fn install_systemd() -> anyhow::Result<()> {
 
 fn install_launchd() -> anyhow::Result<()> {
     // launchd opens the log files but creates no directory for them.
-    let log_dir = system::log_path();
-    make_root_dir(&log_dir)?;
+    let log_dir = system::service_log_dir()?;
+    system::ensure_dir_owned_like_parent(&log_dir)?;
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -136,21 +136,6 @@ fn install_launchd() -> anyhow::Result<()> {
         launchd_plist_path(),
         log_dir.display()
     );
-    Ok(())
-}
-
-/// Create the root-owned directory `path` and its parents via `sudo mkdir
-/// -p`.
-fn make_root_dir(path: &Path) -> anyhow::Result<()> {
-    let status = Command::new("sudo")
-        .arg("mkdir")
-        .arg("-p")
-        .arg(path)
-        .status()
-        .map_err(|e| anyhow::anyhow!("sudo mkdir -p {}: {e}", path.display()))?;
-    if !status.success() {
-        anyhow::bail!("failed creating {}", path.display());
-    }
     Ok(())
 }
 

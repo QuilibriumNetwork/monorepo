@@ -33,20 +33,22 @@ pub const BASE_RELEASE_URL: &str = "https://releases.quilibrium.com";
 
 /// Where qclient installs releases and the node service keeps its files.
 ///
-/// On Linux the root is `/var/quilibrium` and the service logs go to
-/// `/var/log/quilibrium`, as the Go client had them. On macOS the root is
-/// `/opt/quilibrium` and the logs go to `/opt/quilibrium/log`, except that
-/// when `/var/quilibrium` exists and `/opt/quilibrium` does not, an install
-/// made there before keeps its whole `/var` layout: upgrades then find its
-/// releases, environment file, update lock and service logs where it left
-/// them. Releases sit in `<root>/bin/{node,qclient}/<version>`; the links
-/// stay in [`DEFAULT_SYMLINK_DIR`] and configs in `~/.quilibrium/configs`.
+/// On Linux the root is `/var/quilibrium`, as the Go client had it. On
+/// macOS the root is `/opt/quilibrium`, and the launchd service writes the
+/// node's stdout and stderr (`node.log`, `node.err`) beside the node's own
+/// log files, in the `.log` directory of its config; except that when
+/// `/var/quilibrium` exists and `/opt/quilibrium` does not, an install made
+/// there before keeps its whole `/var` layout, service logs in
+/// `/var/log/quilibrium` included: upgrades then find its releases,
+/// environment file, update lock and service logs where it left them.
+/// Releases sit in `<root>/bin/{node,qclient}/<version>`; the links stay in
+/// [`DEFAULT_SYMLINK_DIR`] and configs in `~/.quilibrium/configs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallLayout {
     /// Holds `bin/`, `quilibrium.env` and the auto-update lock.
     pub root: PathBuf,
-    /// The node service's log directory.
-    pub log: PathBuf,
+    /// The `/var` layout: Linux, or on macOS kept for an existing install.
+    pub var_layout: bool,
     /// macOS only: the `/var` layout kept for an existing install.
     pub kept_var_install: bool,
 }
@@ -57,7 +59,7 @@ impl InstallLayout {
     pub fn for_os(os: &str, exists: &dyn Fn(&Path) -> bool) -> Self {
         let var = |kept_var_install| Self {
             root: PathBuf::from(VAR_ROOT_PATH),
-            log: PathBuf::from(VAR_LOG_PATH),
+            var_layout: true,
             kept_var_install,
         };
         if os != "darwin" {
@@ -66,11 +68,22 @@ impl InstallLayout {
         if !exists(Path::new(OPT_ROOT_PATH)) && exists(Path::new(VAR_ROOT_PATH)) {
             return var(true);
         }
-        let root = PathBuf::from(OPT_ROOT_PATH);
         Self {
-            log: root.join("log"),
-            root,
+            root: PathBuf::from(OPT_ROOT_PATH),
+            var_layout: false,
             kept_var_install: false,
+        }
+    }
+
+    /// Where the node service's stdout and stderr go for the node config
+    /// directory `node_config_dir` the service runs: `/var/log/quilibrium`
+    /// in the `/var` layout, else beside the node's own log files in its
+    /// default log directory, `<node_config_dir>/.log`.
+    pub fn service_log_dir(&self, node_config_dir: &Path) -> PathBuf {
+        if self.var_layout {
+            PathBuf::from(VAR_LOG_PATH)
+        } else {
+            node_config_dir.join(quil_config::DEFAULT_LOG_DIR)
         }
     }
 
@@ -104,16 +117,16 @@ impl InstallLayout {
     pub fn notice(&self) -> String {
         if self.kept_var_install {
             format!(
-                "qclient: using the existing install under {} (service logs in {}), as \
-                 {OPT_ROOT_PATH} does not exist",
+                "qclient: using the existing install under {} (service logs in \
+                 {VAR_LOG_PATH}), as {OPT_ROOT_PATH} does not exist",
                 self.root.display(),
-                self.log.display()
             )
         } else {
             format!(
-                "qclient: install root {} (service logs in {})",
+                "qclient: install root {} (service logs beside the node's, in its \
+                 config's {})",
                 self.root.display(),
-                self.log.display()
+                quil_config::DEFAULT_LOG_DIR
             )
         }
     }
@@ -137,9 +150,10 @@ pub fn binary_path() -> PathBuf {
     install_layout().binary_path()
 }
 
-/// The node service's log directory on this host ([`InstallLayout`]).
-pub fn log_path() -> PathBuf {
-    install_layout().log.clone()
+/// [`InstallLayout::service_log_dir`] of this host for the config the node
+/// service runs, `~/.quilibrium/configs/default`.
+pub fn service_log_dir() -> anyhow::Result<PathBuf> {
+    Ok(install_layout().service_log_dir(&node_config_home_dir()?.join("default")))
 }
 
 /// [`InstallLayout::client_data_path`] of this host
@@ -357,6 +371,30 @@ pub fn ensure_symlink_dir(_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Create `dir` and any missing parents, each mode 0755 and, run as root,
+/// owned like the nearest existing parent: the operator's for a directory
+/// in their home, root's for one under `/var/log`.
+#[cfg(unix)]
+pub fn ensure_dir_owned_like_parent(dir: &Path) -> anyhow::Result<()> {
+    create_dirs(dir, if is_root() { nearest_owner(dir) } else { None })
+}
+
+/// Off unix: create `dir` and its parents.
+#[cfg(not(unix))]
+pub fn ensure_dir_owned_like_parent(dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| anyhow::anyhow!("create {}: {e}", dir.display()))
+}
+
+/// The `(uid, gid)` of the nearest existing ancestor of `dir` (itself
+/// included).
+#[cfg(unix)]
+fn nearest_owner(dir: &Path) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    dir.ancestors()
+        .find_map(|p| std::fs::metadata(p).ok())
+        .map(|meta| (meta.uid(), meta.gid()))
+}
+
 /// [`ensure_symlink_dir`], giving each created directory the owner `(uid,
 /// gid)`. A directory is created private, then given its owner, then
 /// opened to 0755, so no one else can write to it in between.
@@ -549,6 +587,29 @@ mod tests {
         assert_eq!(mode(&bin), 0o755);
     }
 
+    /// A directory created under an existing one takes that one's owner.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_dir_takes_the_owner_of_its_nearest_parent() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        if is_root() {
+            // Another owner, so the test also tells it from root's.
+            std::os::unix::fs::chown(&home, Some(1), Some(1)).unwrap();
+        }
+        let meta = std::fs::metadata(&home).unwrap();
+        let expected = (meta.uid(), meta.gid());
+        let log = home.join(".quilibrium").join("configs").join(".log");
+        assert_eq!(nearest_owner(&log), Some(expected));
+        create_dirs(&log, nearest_owner(&log)).unwrap();
+        for dir in [home.join(".quilibrium"), log.clone()] {
+            let meta = std::fs::metadata(&dir).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), expected, "{}", dir.display());
+        }
+    }
+
     /// The layout on `os` where of the two roots only those flagged exist.
     fn layout(os: &str, opt_exists: bool, var_exists: bool) -> InstallLayout {
         InstallLayout::for_os(os, &|p: &Path| {
@@ -557,7 +618,11 @@ mod tests {
         })
     }
 
-    /// Every path of a layout rooted at `root`.
+    /// The node config directory the service runs, in the tests.
+    const SERVICE_CONFIG: &str = "/Users/op/.quilibrium/configs/default";
+
+    /// Every path of a layout, the service logs for [`SERVICE_CONFIG`]
+    /// last.
     fn paths(layout: &InstallLayout) -> [PathBuf; 6] {
         [
             layout.root.clone(),
@@ -565,7 +630,7 @@ mod tests {
             layout.node_data_path(),
             layout.node_env_path(),
             layout.update_lock_path(),
-            layout.log.clone(),
+            layout.service_log_dir(Path::new(SERVICE_CONFIG)),
         ]
     }
 
@@ -594,14 +659,17 @@ mod tests {
         }
     }
 
-    /// A macOS host without an earlier install gets the whole layout under
-    /// `/opt/quilibrium`, logs included.
+    /// A macOS host without an earlier install gets the layout under
+    /// `/opt/quilibrium`, the service logs beside the node's own.
     #[test]
     fn macos_installs_under_opt() {
         let mac = layout("darwin", false, false);
         assert_eq!(
             paths(&mac),
-            expected("/opt/quilibrium", "/opt/quilibrium/log")
+            expected(
+                "/opt/quilibrium",
+                "/Users/op/.quilibrium/configs/default/.log"
+            )
         );
         assert!(!mac.kept_var_install);
     }
@@ -636,16 +704,17 @@ mod tests {
     fn the_layout_in_use_is_named() {
         let opt = InstallLayout {
             root: PathBuf::from("/opt/quilibrium"),
-            log: PathBuf::from("/opt/quilibrium/log"),
+            var_layout: false,
             kept_var_install: false,
         };
         assert_eq!(
             opt.notice(),
-            "qclient: install root /opt/quilibrium (service logs in /opt/quilibrium/log)"
+            "qclient: install root /opt/quilibrium (service logs beside the node's, in its \
+             config's .log)"
         );
         let kept = InstallLayout {
             root: PathBuf::from("/var/quilibrium"),
-            log: PathBuf::from("/var/log/quilibrium"),
+            var_layout: true,
             kept_var_install: true,
         };
         assert_eq!(
