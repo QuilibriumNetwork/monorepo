@@ -26,6 +26,9 @@ pub(crate) enum OpKind {
 pub(crate) struct SubmissionAttempts(
     Mutex<HashMap<Key, Attempt>>,
     Mutex<HashMap<(u64, Vec<u8>), u64>>,
+    /// Run each time a check releases the lock (`on_unlock`).
+    #[cfg(test)]
+    Mutex<Option<Box<dyn FnMut() + Send>>>,
 );
 
 struct Attempt {
@@ -75,13 +78,32 @@ impl SubmissionAttempts {
     /// Whether a local operation still owns `filter` at `frame` against an
     /// operation of `kind`: one in flight, a publication of this epoch inside
     /// its retry fence, or an epoch fence of the same kind.
+    #[cfg(test)]
     pub(crate) fn owned(&self, filter: &[u8], frame: u64, kind: OpKind) -> bool {
         let epoch = quil_types::consensus::epoch_for_frame(frame);
-        self.0.lock().is_ok_and(|attempts| {
+        let owned = self.0.lock().is_ok_and(|attempts| {
             attempts.iter().any(|((e, owned, k), a)| {
                 owned.as_slice() == filter && a.holds_off(*k, kind, *e, epoch, frame)
             })
-        })
+        });
+        self.unlocked();
+        owned
+    }
+
+    /// Run `hook` each time a check releases the lock, as another task
+    /// acting between two lock sections of a reservation would.
+    #[cfg(test)]
+    pub(crate) fn on_unlock(&self, hook: impl FnMut() + Send + 'static) {
+        *self.2.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn unlocked(&self) {
+        let hook = self.2.lock().unwrap().take();
+        if let Some(mut hook) = hook {
+            hook();
+            *self.2.lock().unwrap() = Some(hook);
+        }
     }
 
     /// Whether a local confirm still owns `filter` at `frame`: one in
@@ -128,26 +150,63 @@ impl SubmissionAttempts {
         released
     }
 
+    /// Begin an attempt over all of `filters`, or `None` when an attempt
+    /// holds off any of them.
+    #[cfg(test)]
     pub(crate) fn begin(
         self: &Arc<Self>,
         filters: &[Vec<u8>],
         frame: u64,
         kind: OpKind,
     ) -> Option<SubmissionAttempt> {
-        if filters.is_empty() {
-            return None;
-        }
+        let (free, attempt) = self.begin_free(filters, frame, kind);
+        attempt.filter(|_| free.iter().all(|free| *free))
+    }
+
+    /// Begin an attempt over those of `filters` no attempt holds off, and
+    /// say which those are; `None` when none is free. The check and the
+    /// reservation take the lock once, so an attempt ending meanwhile frees
+    /// all of its filters for this one or none.
+    pub(crate) fn begin_free(
+        self: &Arc<Self>,
+        filters: &[Vec<u8>],
+        frame: u64,
+        kind: OpKind,
+    ) -> (Vec<bool>, Option<SubmissionAttempt>) {
+        let reserved = self.begin_free_locked(filters, frame, kind);
+        #[cfg(test)]
+        self.unlocked();
+        reserved
+    }
+
+    fn begin_free_locked(
+        self: &Arc<Self>,
+        filters: &[Vec<u8>],
+        frame: u64,
+        kind: OpKind,
+    ) -> (Vec<bool>, Option<SubmissionAttempt>) {
         let epoch = quil_types::consensus::epoch_for_frame(frame);
-        let mut attempts = self.0.lock().ok()?;
+        let Ok(mut attempts) = self.0.lock() else {
+            return (vec![false; filters.len()], None);
+        };
         attempts.retain(|(e, _, _), a| a.owns(*e, epoch, frame));
-        if filters.iter().any(|f| {
-            attempts.iter().any(|((e, existing, k), a)| {
-                existing == f && a.holds_off(*k, kind, *e, epoch, frame)
+        let free: Vec<bool> = filters
+            .iter()
+            .map(|f| {
+                !attempts.iter().any(|((e, existing, k), a)| {
+                    existing == f && a.holds_off(*k, kind, *e, epoch, frame)
+                })
             })
-        }) {
-            return None;
+            .collect();
+        let keys: Vec<Key> = filters
+            .iter()
+            .zip(&free)
+            .filter(|(_, free)| **free)
+            .map(|(f, _)| (epoch, f.clone(), kind))
+            .collect();
+        if keys.is_empty() {
+            return (free, None);
         }
-        let keys: Vec<Key> = filters.iter().map(|f| (epoch, f.clone(), kind)).collect();
         for key in &keys {
             attempts.insert(
                 key.clone(),
@@ -158,12 +217,13 @@ impl SubmissionAttempts {
                 },
             );
         }
-        Some(SubmissionAttempt {
+        let attempt = SubmissionAttempt {
             owner: self.clone(),
             keys,
             published_frames: HashMap::new(),
             epoch_fenced: Vec::new(),
-        })
+        };
+        (free, Some(attempt))
     }
 }
 
