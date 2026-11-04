@@ -495,6 +495,9 @@ fn write_atomic(dir: &Path, name: &str, bytes: &[u8], mode: u32) -> anyhow::Resu
 /// Point `link` at `target`, replacing what `link` held by atomic rename.
 #[cfg(unix)]
 pub fn switch_symlink(target: &Path, link: &Path) -> anyhow::Result<()> {
+    if let Some(dir) = link.parent() {
+        system::ensure_symlink_dir(dir)?;
+    }
     let name = link.file_name().and_then(|n| n.to_str()).unwrap_or("link");
     let tmp = link.with_file_name(format!(".{name}.tmp-{:016x}", rand::random::<u64>()));
     std::os::unix::fs::symlink(target, &tmp)

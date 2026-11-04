@@ -342,6 +342,48 @@ pub fn is_root() -> bool {
     false
 }
 
+/// Create the link directory `dir` (such as [`DEFAULT_SYMLINK_DIR`], which
+/// a fresh macOS host may lack) and any missing parents: each new one mode
+/// 0755 and, run as root, owned by root and group 0 (`wheel` on macOS).
+/// An existing directory is left as it is.
+#[cfg(unix)]
+pub fn ensure_symlink_dir(dir: &Path) -> anyhow::Result<()> {
+    create_dirs(dir, is_root().then_some((0, 0)))
+}
+
+/// Off unix there are no release links to place.
+#[cfg(not(unix))]
+pub fn ensure_symlink_dir(_dir: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// [`ensure_symlink_dir`], giving each created directory the owner `(uid,
+/// gid)`. A directory is created private, then given its owner, then
+/// opened to 0755, so no one else can write to it in between.
+#[cfg(unix)]
+fn create_dirs(dir: &Path, owner: Option<(u32, u32)>) -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let missing: Vec<&Path> = dir
+        .ancestors()
+        .take_while(|p| !p.as_os_str().is_empty() && !p.is_dir())
+        .collect();
+    for path in missing.into_iter().rev() {
+        match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => {}
+            // Created meanwhile by another run: it is that run's to set up.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => continue,
+            Err(e) => anyhow::bail!("create {}: {e} (root required)", path.display()),
+        }
+        if let Some((uid, gid)) = owner {
+            std::os::unix::fs::chown(path, Some(uid), Some(gid))
+                .map_err(|e| anyhow::anyhow!("chown {}: {e}", path.display()))?;
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| anyhow::anyhow!("chmod {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Whether a file/dir exists (`client/utils/fileUtils.go` `FileExists`).
 pub fn file_exists<P: AsRef<Path>>(p: P) -> bool {
     p.as_ref().exists()
@@ -484,6 +526,27 @@ mod tests {
             default_node_symlink_path(),
             PathBuf::from("/usr/local/bin/quilibrium-node")
         );
+    }
+
+    /// A missing link directory and its missing parents are created 0755;
+    /// an existing parent keeps its mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_link_dir_is_created_0755_and_an_existing_one_kept() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let usr = tmp.path().join("usr");
+        std::fs::create_dir(&usr).unwrap();
+        std::fs::set_permissions(&usr, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bin = usr.join("local").join("bin");
+        let me = std::fs::metadata(tmp.path()).unwrap();
+        create_dirs(&bin, Some((me.uid(), me.gid()))).unwrap();
+        assert_eq!(mode(&usr.join("local")), 0o755);
+        assert_eq!(mode(&bin), 0o755);
+        assert_eq!(mode(&usr), 0o700);
+        create_dirs(&bin, None).unwrap();
+        assert_eq!(mode(&bin), 0o755);
     }
 
     /// The layout on `os` where of the two roots only those flagged exist.
