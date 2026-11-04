@@ -45,3 +45,7 @@ Regression tests: `behaviour::tests` (`reproduces_graft_topics_recorded_without_
 ## PRUNE backoffs for topics the node has not joined
 
 `src/behaviour.rs` (`handle_prune`): upstream stores the backoff a PRUNE asks for (up to an hour) for every topic it names, whether or not the node joined the topic, so one peer could fill the backoff storage without limit. A PRUNE for a topic outside the mesh is now ignored, as upstream fixed it in 0.50.1 (#6707, GHSA-vrx6-jcp8-vm7m). `handle_graft`: the PRUNEs that answer an explicit peer's GRAFT, each storing a backoff, now name only the joined topics. Regression tests: `behaviour::tests` (`reproduces_prune_backoff_for_unjoined_topics`, `explicit_peer_grafts_back_off_only_joined_topics`).
+
+## Peer-score state of departed peers
+
+`src/peer_score.rs` (`remove_ip`, `remove_ips_for_peer`, `remove_peer`): upstream kept an empty peer set for every IP (IPv6 /64) no peer uses any more, and retained a departed peer with no topic stats and no penalties for `retain_score`. Both are now dropped, as upstream does since #6710. Regression test: `peer_score::tests::departed_blank_peers_leave_no_score_state`.
