@@ -31,22 +31,32 @@ pub fn run(action: &str) -> anyhow::Result<()> {
     }
 }
 
+/// The `launchctl` arguments of a lifecycle action. launchctl has no
+/// `restart`: `kickstart -k` restarts a running job (or starts it), as
+/// for `reload`. enable and disable use `load -w` / `unload -w`, which
+/// also record the job as enabled or disabled; `start`, `stop` and `list`
+/// take the label.
+fn launchctl_args(action: &str) -> Vec<String> {
+    match action {
+        "enable" => vec!["load".into(), "-w".into(), launchd_plist_path()],
+        "disable" => vec!["unload".into(), "-w".into(), launchd_plist_path()],
+        "status" => vec!["list".into(), LAUNCHD_LABEL.into()],
+        "restart" | "reload" => vec![
+            "kickstart".into(),
+            "-k".into(),
+            format!("system/{LAUNCHD_LABEL}"),
+        ],
+        a => vec![a.into(), LAUNCHD_LABEL.into()],
+    }
+}
+
 /// Run a simple lifecycle action via the platform service manager.
 fn control(action: &str) -> anyhow::Result<()> {
     let status = if system::os_type() == "darwin" {
-        // launchctl uses load/unload for enable/disable.
-        let mapped = match action {
-            "enable" => vec!["load".into(), "-w".into(), launchd_plist_path()],
-            "disable" => vec!["unload".into(), "-w".into(), launchd_plist_path()],
-            "status" => vec!["list".into(), LAUNCHD_LABEL.into()],
-            "reload" => vec![
-                "kickstart".into(),
-                "-k".into(),
-                format!("system/{LAUNCHD_LABEL}"),
-            ],
-            a => vec![a.into(), LAUNCHD_LABEL.into()],
-        };
-        Command::new("sudo").arg("launchctl").args(&mapped).status()
+        Command::new("sudo")
+            .arg("launchctl")
+            .args(launchctl_args(action))
+            .status()
     } else {
         Command::new("sudo")
             .arg("systemctl")
@@ -417,6 +427,22 @@ fn systemd_unit(user: &str, env: &Path, bin: &Path, cfg: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each action maps to a verb launchctl has: restart, which `node
+    /// update --restart` and auto-update use, kickstarts the job.
+    #[test]
+    fn launchctl_gets_verbs_it_has() {
+        let args = |action| launchctl_args(action).join(" ");
+        let label = "com.quilibrium.quilibrium-node";
+        let plist = "/Library/LaunchDaemons/com.quilibrium.quilibrium-node.plist";
+        assert_eq!(args("restart"), format!("kickstart -k system/{label}"));
+        assert_eq!(args("reload"), format!("kickstart -k system/{label}"));
+        assert_eq!(args("enable"), format!("load -w {plist}"));
+        assert_eq!(args("disable"), format!("unload -w {plist}"));
+        assert_eq!(args("status"), format!("list {label}"));
+        assert_eq!(args("start"), format!("start {label}"));
+        assert_eq!(args("stop"), format!("stop {label}"));
+    }
 
     /// The unit runs as the given user, whose config it names: systemd
     /// refuses to start a unit whose user does not exist.
