@@ -4101,10 +4101,17 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                         let mut buf = Vec::with_capacity(40);
                                                         buf.extend_from_slice(&fnum.to_le_bytes());
                                                         buf.extend_from_slice(&id);
-                                                        if let Err(e) =
-                                                            std::fs::write(&marker_path, &buf)
-                                                        {
-                                                            warn!(error = %e, "cw activation: persist genesis marker failed");
+                                                        // Atomic: a torn marker reads as none,
+                                                        // which wipes the journal at every start.
+                                                        if let Err(e) = quil_config::atomic_write(
+                                                            &marker_path,
+                                                            &buf,
+                                                            0o644,
+                                                        ) {
+                                                            warn!(error = %e, path = %marker_path.display(),
+                                                                scope = "this node",
+                                                                action = "check the free space and permissions of the store directory",
+                                                                "cw activation: persist genesis marker failed; the next start wipes the consensus journal again");
                                                         }
                                                         (fnum, id)
                                                     }

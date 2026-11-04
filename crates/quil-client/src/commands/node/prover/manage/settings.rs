@@ -299,15 +299,12 @@ pub fn read(path: &Path) -> Mapping {
         .unwrap_or_default()
 }
 
-/// Write `map` to `path` through a temporary file, so a crash never
-/// leaves half a file.
+/// Write `map` to `path` atomically, so a crash never leaves half a file.
 fn write(path: &Path, map: &Mapping) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("yaml.tmp");
-    std::fs::write(&tmp, serde_yaml::to_string(map)?)?;
-    std::fs::rename(&tmp, path)?;
+    quil_config::atomic_write(path, serde_yaml::to_string(map)?.as_bytes(), 0o644)?;
     Ok(())
 }
 

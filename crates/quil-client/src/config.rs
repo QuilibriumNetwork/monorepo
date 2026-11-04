@@ -97,7 +97,7 @@ pub fn save(cfg: &ClientConfig) -> anyhow::Result<()> {
     let dir = config_dir()?;
     std::fs::create_dir_all(&dir)?;
     let data = serde_yaml::to_string(cfg)?;
-    std::fs::write(config_path()?, data)?;
+    quil_config::atomic_write(&config_path()?, data.as_bytes(), 0o644)?;
     Ok(())
 }
 

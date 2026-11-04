@@ -420,14 +420,10 @@ impl FileKeyManager {
             })?;
         }
 
-        // Atomic write: temp file + rename. The temp file is created
-        // readable by its owner only, so the keystore never is by others.
-        let tmp_path = self.keys_path.with_extension("tmp");
-        quil_config::write_private_file(&tmp_path, contents.as_bytes())
+        // Replaced atomically through a temporary file of its own, readable
+        // by its owner only, so the keystore never is by others.
+        quil_config::write_private_file(&self.keys_path, contents.as_bytes())
             .map_err(|e| QuilError::Crypto(format!("failed to write keystore: {}", e)))?;
-        std::fs::rename(&tmp_path, &self.keys_path)
-            .map_err(|e| QuilError::Crypto(format!("failed to rename keystore: {}", e)))?;
-        quil_config::sync_parent_dir(&self.keys_path);
 
         Ok(())
     }
@@ -2151,8 +2147,8 @@ q-view-key:
     }
 
     /// The keystore holds every private key of the node: it is written
-    /// readable by its owner only, also over a temporary file an
-    /// interrupted save left behind.
+    /// readable by its owner only, also over a keystore others could read,
+    /// and leaves no temporary file.
     #[cfg(unix)]
     #[test]
     fn reproduces_world_readable_keystore() {
@@ -2172,12 +2168,15 @@ q-view-key:
         m.ensure_standard_keys().unwrap();
         check(&m.keys_path);
 
-        let tmp_path = m.keys_path.with_extension("tmp");
-        std::fs::write(&tmp_path, "").unwrap();
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&m.keys_path, std::fs::Permissions::from_mode(0o644)).unwrap();
         m.create_falcon_key("another-key").unwrap();
-        assert!(!tmp_path.exists());
         check(&m.keys_path);
+        let names: Vec<_> = std::fs::read_dir(m.keys_path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(names.is_empty(), "no temporary file is left: {names:?}");
         cleanup(&dir);
     }
 }
