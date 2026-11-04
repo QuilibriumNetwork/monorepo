@@ -252,6 +252,8 @@ pub struct ForestSyncPlan {
     next: usize,
     /// A pinned GLOBAL add phase: leaves absent from the source are removed.
     removals: bool,
+    /// See [`Self::hold_view`].
+    hold: bool,
 }
 
 impl ForestSyncPlan {
@@ -267,6 +269,23 @@ impl ForestSyncPlan {
     pub fn resumable(&self) -> bool {
         !self.repair_existing
     }
+    /// Withhold the shard's committed state from the first chunk this plan
+    /// installs, in that chunk's commit, until
+    /// [`HypergraphCrdt::checkpoint_synced_view`] records the frame the
+    /// synced state belongs to. A sync's last chunk otherwise publishes the
+    /// synced records with the cursor of the state before them.
+    pub fn hold_view(&mut self) {
+        self.hold = true;
+    }
+}
+
+/// What [`HypergraphCrdt::checkpoint_synced_view`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyncedViewCheckpoint {
+    /// The cursor before; `None` when absent.
+    pub previous: Option<u64>,
+    /// Whether a held sync's records were withheld until this checkpoint.
+    pub held: bool,
 }
 
 /// The local tree moved under a sync in progress (see
@@ -387,6 +406,11 @@ fn encode_sync_scopes(scopes: &[(u8, Vec<bool>)]) -> Vec<u8> {
     bytes
 }
 
+/// The scope a held sync ([`ForestSyncPlan::hold_view`]) lists from its
+/// first chunk until [`HypergraphCrdt::checkpoint_synced_view`]: no phase
+/// has this index, and its empty bit path overlaps every scope.
+const SYNC_HOLD_SCOPE: usize = 0xff;
+
 /// List or unlist `(phase, bit_path)` among `shard_id`'s incomplete scopes
 /// in `txn`. Callers hold the commit lock, so the read is current.
 fn mark_sync_incomplete(
@@ -396,17 +420,54 @@ fn mark_sync_incomplete(
     bit_path: &[bool],
     incomplete: bool,
 ) -> Result<bool> {
+    mark_sync_scopes(txn, shard_id, &[(phase_idx, bit_path, incomplete)])
+}
+
+/// Stage [`HypergraphCrdt::checkpoint_synced_view`] in `txn`, under the
+/// commit lock.
+fn stage_synced_view(
+    txn: &dyn quil_types::store::Transaction,
+    shard_id: &[u8],
+    frame: u64,
+    cursor_key: &[u8],
+) -> Result<SyncedViewCheckpoint> {
+    let previous = txn
+        .get(cursor_key)?
+        .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_slice()).ok())
+        .map(u64::from_be_bytes);
+    if previous.is_none_or(|previous| previous < frame) {
+        txn.set(cursor_key, &frame.to_be_bytes())?;
+    }
+    let hold: [(usize, &[bool], bool); 1] = [(SYNC_HOLD_SCOPE, &[], false)];
+    let held = mark_sync_scopes(txn, shard_id, &hold)?;
+    Ok(SyncedViewCheckpoint { previous, held })
+}
+
+/// [`mark_sync_incomplete`] for several scopes in one write: a store
+/// transaction does not read its own writes.
+fn mark_sync_scopes(
+    txn: &dyn quil_types::store::Transaction,
+    shard_id: &[u8],
+    changes: &[(usize, &[bool], bool)],
+) -> Result<bool> {
     let key = sync_incomplete_key(shard_id);
     let mut scopes = txn
         .get(&key)?
         .map(|bytes| decode_sync_scopes(&bytes))
         .unwrap_or_default();
-    let scope = (phase_idx as u8, bit_path.to_vec());
-    let listed = scopes.contains(&scope);
-    match (incomplete, listed) {
-        (true, false) => scopes.push(scope),
-        (false, true) => scopes.retain(|listed| *listed != scope),
-        _ => return Ok(false),
+    let mut changed = false;
+    for &(phase_idx, bit_path, incomplete) in changes {
+        let scope = (phase_idx as u8, bit_path.to_vec());
+        let listed = scopes.contains(&scope);
+        match (incomplete, listed) {
+            (true, false) => scopes.push(scope),
+            (false, true) => scopes.retain(|listed| *listed != scope),
+            _ => continue,
+        }
+        changed = true;
+    }
+    if !changed {
+        return Ok(false);
     }
     if scopes.is_empty() {
         txn.delete(&key)?;
@@ -1873,6 +1934,35 @@ impl HypergraphCrdt {
             return Err(error);
         }
         txn.commit()
+    }
+
+    /// Record `frame` at `cursor_key` as the frame of `shard_id`'s synced
+    /// state and end the hold of its held syncs ([`ForestSyncPlan::hold_view`])
+    /// in one commit: a committed snapshot shows their records withheld or
+    /// with this cursor, never with the cursor from before them. The cursor
+    /// never moves back (a malformed one is replaced); a lower `frame` ends
+    /// the hold all the same. On failure the hold stays until a later
+    /// checkpoint succeeds.
+    pub fn checkpoint_synced_view(
+        &self,
+        shard_id: &[u8],
+        frame: u64,
+        cursor_key: &[u8],
+    ) -> Result<SyncedViewCheckpoint> {
+        let _guard = self.commit_lock.lock().map_err(|_| {
+            QuilError::ExecutionUnavailable("synced view commit lock poisoned".into())
+        })?;
+        let txn = self.store.new_transaction(false)?;
+        match stage_synced_view(txn.as_ref(), shard_id, frame, cursor_key) {
+            Ok(checkpoint) => {
+                txn.commit()?;
+                Ok(checkpoint)
+            }
+            Err(error) => {
+                let _ = txn.abort();
+                Err(error)
+            }
+        }
     }
 
     /// Read the cursor from the same store that publishes the state. Absence
@@ -3742,6 +3832,7 @@ impl HypergraphCrdt {
                 && shard_id == [0xff; 32]
                 && bit_path.is_empty()
                 && anchor.is_some(),
+            hold: false,
         })
     }
 
@@ -3930,14 +4021,14 @@ impl HypergraphCrdt {
             )?;
         }
         // Each chunk's blobs match its leaves, but the subtree holds the
-        // state it commits to only once the last chunk is in.
-        mark_sync_incomplete(
-            txn.as_ref(),
-            &plan.shard_id,
-            plan.phase_idx,
-            &plan.bit_path,
-            !final_chunk,
-        )?;
+        // state it commits to only once the last chunk is in. A held sync
+        // withholds it until its cursor is recorded as well.
+        let scope = (plan.phase_idx, plan.bit_path.as_slice(), !final_chunk);
+        let mut scopes = vec![scope];
+        if plan.hold {
+            scopes.push((SYNC_HOLD_SCOPE, &[][..], true));
+        }
+        mark_sync_scopes(txn.as_ref(), &plan.shard_id, &scopes)?;
         txn.commit()?;
         staged
             .publish_memory()

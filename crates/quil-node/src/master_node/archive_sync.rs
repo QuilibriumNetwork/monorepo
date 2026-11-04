@@ -4523,6 +4523,17 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 sync_pool.get_all().await,
                             );
                             let mut reconcile_converged = false;
+                            // A node that does not materialize global frames (a regular)
+                            // has no other writer for the GLOBAL cursor after boot.
+                            // Committee-session reads take the cursor and the
+                            // authorization records from one snapshot, so it records
+                            // each root-verified sync, and the sync withholds the
+                            // committed view until then: the header binds the state
+                            // BEFORE its frame.
+                            let record_view = !expected_root.is_empty()
+                                && sync_mat.is_none()
+                                && quil_types::consensus::committee_handoff_policy().is_some()
+                                && anchor.cursor.is_some();
                             for addr in reconcile_peers.iter() {
                                 // Snapshot the local reward balance before the
                                 // sync pulls fresh leaves. Compared against the
@@ -4535,16 +4546,63 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 // Forest sync of the global prover shard, pinned to the
                                 // finalized prover_tree_commitment. A peer whose tree
                                 // does not match it returns Ok(false) → try the next.
-                                match crate::forest_sync::sync_single_shard_verified(
-                                    addr, &seed[..], sync_crdt.clone(), &[0xffu8; 32], &expected_root,
-                                ).await {
+                                let synced = if record_view {
+                                    crate::forest_sync::sync_global_view_verified(
+                                        addr, &seed[..], sync_crdt.clone(), &expected_root,
+                                    ).await
+                                } else {
+                                    crate::forest_sync::sync_single_shard_verified(
+                                        addr, &seed[..], sync_crdt.clone(), &[0xffu8; 32], &expected_root,
+                                    ).await
+                                };
+                                match synced {
                                     Ok(conv) => {
+                                        let synced_at = std::time::Instant::now();
                                         if conv.is_none() {
                                             debug!(peer = %addr, "reconcile: peer not on finalized lineage — trying next");
                                             crate::prover_tree_syncer_prod::source_failed(addr);
                                             continue;
                                         }
                                         info!(peer = %addr, match_ok = conv.is_some(), "incremental prover tree sync complete");
+                                        // The root verified by this sync belongs to the
+                                        // captured header, even if gossip advanced during it.
+                                        // Recorded with the end of the sync's hold in one
+                                        // commit, before the registry refresh. A failure
+                                        // keeps the view withheld until a later verified
+                                        // sync records its cursor.
+                                        if let Some(frame) = anchor.cursor.filter(|_| record_view) {
+                                            let crdt = sync_crdt.clone();
+                                            let recorded = tokio::task::spawn_blocking(move || {
+                                                crdt.checkpoint_synced_view(
+                                                    &[0xffu8; 32],
+                                                    frame,
+                                                    &quil_store::encoding::global_materialized_cursor_key(),
+                                                )
+                                            })
+                                            .await;
+                                            match recorded {
+                                                Ok(Ok(checkpoint)) => info!(registry_sync,
+                                                    from = ?checkpoint.previous, to = frame,
+                                                    withheld = checkpoint.held,
+                                                    since_sync_ms = synced_at.elapsed().as_millis() as u64,
+                                                    "recorded the GLOBAL cursor of the verified prover tree \
+                                                     sync; committee-session reads see the synced state"),
+                                                Ok(Err(error)) => {
+                                                    warn!(%error, frame, registry_sync,
+                                                        "could not record the authenticated GLOBAL cursor; \
+                                                         committee-session reads wait until a later verified \
+                                                         sync records it");
+                                                    continue;
+                                                }
+                                                Err(error) => {
+                                                    warn!(%error, frame, registry_sync,
+                                                        "recording the authenticated GLOBAL cursor failed; \
+                                                         committee-session reads wait until a later verified \
+                                                         sync records it");
+                                                    continue;
+                                                }
+                                            }
+                                        }
                                         // Refresh registry with updated data.
                                         let pr = sync_pr.clone();
                                         let hs3 = sync_hg.clone();
@@ -4571,24 +4629,6 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         // (converged is meaningful) — a bootstrap
                                         // trust-sync (empty root) leaves the flag
                                         // for the normal verify path to set.
-                                        // A node that does not materialize global frames
-                                        // (a regular) has no other writer for the GLOBAL
-                                        // cursor after boot. Committee-session reads take
-                                        // the cursor and the authorization records from one
-                                        // snapshot, so record each root-verified sync: the
-                                        // header binds the state BEFORE its frame.
-                                        if conv.is_some() && !expected_root.is_empty() && sync_mat.is_none()
-                                            && quil_types::consensus::committee_handoff_policy().is_some()
-                                        {
-                                            // The root verified by this sync belongs to the
-                                            // captured header, even if gossip advanced during it.
-                                            if let Some(frame) = anchor.cursor {
-                                                if let Err(e) = sync_cs.put_global_materialized_cursor(frame) {
-                                                    warn!(error = %e, frame, "could not record the authenticated GLOBAL cursor");
-                                                    continue;
-                                                }
-                                            }
-                                        }
                                         // Use the same captured state as committee authorization,
                                         // after its cursor has been recorded. The allocator preserves
                                         // workers still needed by a closing committee.
