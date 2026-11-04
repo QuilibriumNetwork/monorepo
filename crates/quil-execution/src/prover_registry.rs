@@ -1498,9 +1498,10 @@ fn live_allocation_status(
 /// The committee is evaluated at the frame it serves, so the rule changes
 /// committee seating, leader rotation and quorum alike: consensus-affecting,
 /// and every archive and prover must run a build with it before the frame.
-/// Not scheduled on mainnet; `QUIL_LEAVER_CURRENCY_FRAME` elsewhere, never
-/// by default.
-pub const MAINNET_LEAVER_CURRENCY_FRAME: Option<u64> = None;
+/// Mainnet: 1,024,560, the first frame of epoch 1423, which GLOBAL cannot reach
+/// before 2026-11-07 00:00 UTC even at ten seconds a frame;
+/// `QUIL_LEAVER_CURRENCY_FRAME` elsewhere, never by default.
+pub const MAINNET_LEAVER_CURRENCY_FRAME: Option<u64> = Some(1_024_560);
 
 static LEAVER_CURRENCY_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -6694,12 +6695,14 @@ mod tests {
         set_leaver_currency_frame_for_thread(None);
     }
 
-    /// Leaver currency is consensus and not scheduled on mainnet.
+    /// Leaver currency is consensus: on mainnet from its own frame, the
+    /// first of an epoch, whatever the environment says.
     #[test]
-    fn leaver_currency_is_not_scheduled_by_default() {
-        assert_eq!(MAINNET_LEAVER_CURRENCY_FRAME, None);
-        assert_eq!(leaver_currency_frame_for(0, None), u64::MAX);
-        assert_eq!(leaver_currency_frame_for(0, Some("7")), u64::MAX);
+    fn leaver_currency_is_scheduled_on_mainnet_only() {
+        let mainnet = 1423 * quil_types::consensus::EPOCH_LENGTH_FRAMES;
+        assert_eq!(MAINNET_LEAVER_CURRENCY_FRAME, Some(mainnet));
+        assert_eq!(leaver_currency_frame_for(0, None), mainnet);
+        assert_eq!(leaver_currency_frame_for(0, Some("7")), mainnet);
         assert_eq!(leaver_currency_frame_for(1, Some("7")), 7);
         assert_eq!(leaver_currency_frame_for(1, Some("soon")), u64::MAX);
         assert_eq!(leaver_currency_frame_for(1, None), u64::MAX);
