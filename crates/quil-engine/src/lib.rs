@@ -54,6 +54,7 @@ pub mod outage;
 pub mod own_prover_ops;
 pub(crate) mod own_votes;
 pub mod presence_reports;
+pub(crate) mod proposal_pool;
 pub mod prover_message_transport;
 pub mod prover_op_tally;
 pub mod prover_pipeline;
