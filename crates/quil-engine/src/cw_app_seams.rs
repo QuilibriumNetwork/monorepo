@@ -112,6 +112,9 @@ pub struct SessionHost {
     /// of the committed GLOBAL view is on its way
     /// (`HandoffProposer::with_closing_probe`).
     pub closing_probe: Option<quil_cw_consensus::handoff::automaton::ClosingProbe>,
+    /// Says why this member is behind for longer than a leader's parent
+    /// waits (`HandoffProposer::with_behind_probe`).
+    pub behind: Option<quil_cw_consensus::handoff::automaton::BehindProbe>,
 }
 
 /// Build the full `AppShardFrame` from a produced consensus state + the leader's
@@ -2631,6 +2634,7 @@ pub fn activate_app_consensus_cw(
                 .with_seal_parents(store.clone(), host.read_tip)
                 .with_checkpoint_votes(host.checkpoint_votes)
                 .with_closing_probe(host.closing_probe)
+                .with_behind_probe(host.behind)
                 .with_liveness(Some(host.liveness)),
                 bodies: sealed_bodies.clone(),
             }),
