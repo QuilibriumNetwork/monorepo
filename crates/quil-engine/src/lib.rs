@@ -63,6 +63,7 @@ pub mod provers;
 mod recovery_turns;
 mod relay_reoffer;
 pub mod remote_worker;
+mod replay_split;
 pub mod resolver_traffic;
 pub mod rewards;
 mod seal_follow;

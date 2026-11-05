@@ -7,6 +7,10 @@ use std::time::{Duration, Instant};
 
 use crate::prover_tree_syncer::{ArchiveGap, ReplayTurn, ShardRecoveryProgress};
 use crate::recovery_turns::{RecoveryKind, MAX_TURN_HOLD};
+use crate::replay_split::{SlowReplayLog, SlowReplays};
+
+/// This process's workers' slow replays, warned about once between them.
+static SLOW_REPLAYS: SlowReplays = SlowReplays::new();
 
 tokio::task_local! {
     /// The record of the worker whose archive recovery runs on this task.
@@ -676,7 +680,16 @@ impl SharedWorkerExecution {
                     attempt_secs = ended.attempt_ms / 1000, permit_wait_secs = ended.permit_wait_ms / 1000,
                     installed_leaves = ended.attempt_installed_leaves, frames = turn.frames, batches = turn.batches,
                     fetch_ms = turn.fetch_ms, replay_ms = turn.replay_ms, turn_back_ms = turn.turn_back_ms, failed_attempts = failed_before.0,
-                    failed_classes = %failed_before.1, "archive recovery batch complete");
+                    failed_classes = %failed_before.1,
+                    global_sync_wait_ms = turn.split.global_sync_wait_ms, engine_queue_ms = turn.split.engine_queue_ms,
+                    prepare_ms = turn.split.prepare_ms, preverify_ms = turn.split.preverify_ms,
+                    store_write_ms = turn.split.store_write_ms, store_wait_ms = turn.split.store_wait_ms,
+                    commit_wait_ms = turn.split.commit_wait_ms, cpu_ms = turn.split.cpu_ms,
+                    run_wait_ms = turn.split.run_wait_ms, other_ms = turn.split.other_ms,
+                    replay_mostly = turn.split.mostly().map_or("none", |part| part.label()),
+                    parallel_replays = turn.load.parallel_replays, lent_turns = turn.load.lent_turns,
+                    queue_len = turn.load.queue_len, "archive recovery batch complete");
+                log_slow_replays(&filter, &turn);
                 if let Some(StreakLog::Ended { failures, duration }) = logged {
                     tracing::info!(%filter, failures, failing_secs = duration.as_secs(), source,
                         "archive recovery succeeded after a failure streak");
@@ -1283,6 +1296,33 @@ pub fn recovery_source(source: &str) {
 /// elsewhere nothing.
 pub fn recovery_installed(leaves: u64) {
     let _ = RECOVERING.try_with(|s| s.recovery(|r, _| r.attempt_installed_leaves += leaves));
+}
+
+/// Warn about replays slow while workers wait for a turn, at most once per
+/// repeat interval across this process's workers ([`SlowReplays`]). Each
+/// turn's batch line has the numbers; this says what to check.
+fn log_slow_replays(filter: &str, turn: &ReplayTurn) {
+    match SLOW_REPLAYS.observe(turn.frames, turn.replay_ms, turn.load.queue_len, now_ms()) {
+        Some(SlowReplayLog::Slow { turns, duration }) => {
+            let part = turn.split.mostly();
+            let (scope, action) = part.map_or(("this node", "report it with this line"), |part| {
+                part.guidance()
+            });
+            tracing::warn!(%filter, frames = turn.frames, replay_ms = turn.replay_ms,
+                ms_per_frame = turn.replay_ms / turn.frames.max(1),
+                replay_mostly = part.map_or("none", |part| part.label()),
+                parallel_replays = turn.load.parallel_replays, queue_len = turn.load.queue_len,
+                slow_turns = turns, slow_secs = duration.as_secs(), scope, action,
+                "archive recovery replays slowly while workers wait for a turn, so seats whose \
+                session needs their predecessor's state stay blocked; repeats every 10 minutes \
+                while it holds, and each batch line splits the time");
+        }
+        Some(SlowReplayLog::Ended { duration }) => {
+            tracing::info!(%filter, slow_secs = duration.as_secs(),
+                "archive recovery replays no longer slow while workers wait");
+        }
+        None => {}
+    }
 }
 
 /// Enter `phase` of the recovery running on this task; elsewhere nothing.

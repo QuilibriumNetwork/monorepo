@@ -585,6 +585,11 @@ pub(crate) trait ShardRecoveryTarget: Send + Sync {
     fn core_id(&self) -> Option<u32> {
         None
     }
+    /// The engine's replay costs so far ([`crate::replay_split`]); none for
+    /// a target that keeps no account.
+    fn replay_costs(&self) -> crate::replay_split::ReplayCosts {
+        crate::replay_split::ReplayCosts::default()
+    }
     /// `(source filter, sealed roots)` of the certified state a shard with no
     /// frame of its own syncs against (`app_handoff::origin_anchors`).
     async fn origin_anchors(&self) -> Result<Vec<(Vec<u8>, [[u8; 32]; 4])>> {
@@ -669,6 +674,9 @@ impl ShardRecoveryTarget for crate::app_engine::AppEngineHandle {
     }
     fn core_id(&self) -> Option<u32> {
         Some(self.core_id)
+    }
+    fn replay_costs(&self) -> crate::replay_split::ReplayCosts {
+        self.replay_costs.read()
     }
     async fn replay(&self, frame: AppShardFrame, descendants: Vec<AppShardFrame>) -> Result<u64> {
         self.replay_archive_frame(frame, descendants).await
@@ -761,6 +769,10 @@ pub(crate) struct ReplayTurn {
     pub turn_back_ms: u64,
     /// The turn ended below its replay target.
     pub behind: bool,
+    /// What `replay_ms` went to.
+    pub split: crate::replay_split::ReplaySplit,
+    /// The queue as the replay started.
+    pub load: crate::recovery_turns::ReplayLoad,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -852,6 +864,9 @@ struct GlobalSyncWait {
     /// Milliseconds of refused requests and the polls between them. An answered
     /// request's own time is its work, and spends none of the budget.
     waited_ms: AtomicU64,
+    /// Microseconds of those in refused requests and the polls between them:
+    /// an answered request's own time is the engine's work, no wait.
+    refused_us: AtomicU64,
     /// The attempt warned that its budget ran out.
     exhausted: AtomicBool,
 }
@@ -899,6 +914,10 @@ where
             tokio::time::sleep(GLOBAL_SYNC_POLL).await;
             continue;
         }
+        wait.refused_us.fetch_add(
+            if refused { waited } else { asked }.as_micros() as u64,
+            Ordering::Relaxed,
+        );
         wait.waited_ms
             .fetch_add(charged.as_millis() as u64, Ordering::Relaxed);
         if refused {
@@ -1006,6 +1025,11 @@ pub(crate) async fn recover_shard_from_latest(
         let committed_tip = target.committed_tip().await;
         let (started, from, replay_us) =
             (Instant::now(), target.materialized(), &AtomicU64::new(0));
+        let load = turn
+            .as_ref()
+            .map(crate::recovery_turns::Turn::replay_load)
+            .unwrap_or_default();
+        let costs_before = target.replay_costs();
         // Replaying reads no archive: the turn serves the queue meanwhile.
         let (lending, took_back_us) = (turn.as_ref(), &AtomicU64::new(0));
         let (mut materialized, mut batches) = (from, 0);
@@ -1034,7 +1058,7 @@ pub(crate) async fn recover_shard_from_latest(
                 committed_tip,
                 &verify,
                 |frame, child| async move {
-                    let at = Instant::now();
+                    let at = tokio::time::Instant::now();
                     let number = frame
                         .header
                         .as_ref()
@@ -1101,6 +1125,12 @@ pub(crate) async fn recover_shard_from_latest(
             replay_ms,
             turn_back_ms,
             behind: replay.materialized < replay.target,
+            split: crate::replay_split::ReplaySplit::of(
+                replay_ms,
+                sync_wait.refused_us.load(Ordering::Relaxed) / 1000,
+                target.replay_costs().since(costs_before),
+            ),
+            load,
         };
         return Ok(ShardRecoveryProgress::Replayed {
             materialized: replay.materialized,
@@ -6206,6 +6236,8 @@ mod tests {
         inner: Target,
         refusals: std::sync::atomic::AtomicUsize,
         refused: std::sync::atomic::AtomicUsize,
+        /// How long a replay it answers takes.
+        replay_takes: std::time::Duration,
     }
 
     impl SyncInstalling {
@@ -6214,6 +6246,7 @@ mod tests {
                 inner,
                 refusals: refusals.into(),
                 refused: 0.into(),
+                replay_takes: std::time::Duration::ZERO,
             }
         }
     }
@@ -6236,6 +6269,7 @@ mod tests {
                     quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS.into(),
                 ));
             }
+            tokio::time::sleep(self.replay_takes).await;
             self.inner.replay(frame, descendants).await
         }
         async fn validate(
@@ -6314,6 +6348,37 @@ mod tests {
             recovery.failures_by_class.is_empty(),
             "{:?}",
             recovery.failures_by_class
+        );
+    }
+
+    /// The turn's line tells a GLOBAL sync's wait from the replay's own time:
+    /// 5 refusals at the first frame, 2 s apart, then 32 frames of 100 ms.
+    #[tokio::test(start_paused = true)]
+    async fn a_replays_global_sync_wait_is_split_from_its_own_time() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive {
+            latest: Some(frame(500)),
+            calls: calls.clone(),
+        };
+        let target = SyncInstalling {
+            replay_takes: std::time::Duration::from_millis(100),
+            ..SyncInstalling::new(replaying_target(&calls), 5)
+        };
+        let result =
+            recover_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &target, &[], None)
+                .await
+                .unwrap();
+        let ShardRecoveryProgress::Replayed { turn, .. } = result else {
+            panic!("expected a replay: {result:?}")
+        };
+        assert_eq!(turn.frames, 32);
+        assert_eq!(turn.split.global_sync_wait_ms, 10_000, "{turn:?}");
+        // This target keeps no account: all but the wait is queueing for it.
+        assert_eq!(turn.replay_ms, 13_200, "{turn:?}");
+        assert_eq!(turn.split.engine_queue_ms, 3_200, "{turn:?}");
+        assert_eq!(
+            turn.split.mostly(),
+            Some(crate::replay_split::ReplayPart::GlobalSync)
         );
     }
 

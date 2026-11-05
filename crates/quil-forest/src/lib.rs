@@ -58,8 +58,8 @@ pub use sync::{
 // Re-export so sync callers can name the diff's key type + the reader bound
 // without depending on jmt directly.
 pub use database::{
-    take_all_stores_write_times, CoordinatedDb, DatabaseCommitError, DatabaseWriteGuard,
-    DisjointBatch, KeyPrefixSet, WeakCoordinatedDb, WriteTimesSample,
+    take_all_stores_write_times, thread_store_write_time, CoordinatedDb, DatabaseCommitError,
+    DatabaseWriteGuard, DisjointBatch, KeyPrefixSet, WeakCoordinatedDb, WriteTimesSample,
 };
 pub use jmt::storage::TreeReader;
 pub use jmt::KeyHash;
