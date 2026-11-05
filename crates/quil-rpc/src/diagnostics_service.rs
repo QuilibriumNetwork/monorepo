@@ -329,7 +329,12 @@ pub struct HealthInputs {
 
 /// The report of `inputs` at `now_ms`: allocated workers first, by core,
 /// within [`MAX_WORKERS`] and [`MAX_REPORT_BYTES`].
-pub fn build_report(inputs: &HealthInputs, build_fingerprint: &[u8], now_ms: u64) -> HealthReport {
+pub fn build_report(
+    inputs: &HealthInputs,
+    build_fingerprint: &[u8],
+    now_ms: u64,
+    requester: Requester,
+) -> HealthReport {
     let mut report = HealthReport {
         schema: SCHEMA,
         version: quil_config::VERSION.to_vec(),
@@ -341,8 +346,16 @@ pub fn build_report(inputs: &HealthInputs, build_fingerprint: &[u8], now_ms: u64
         master_store_write_failed: inputs.master_store_write_failed,
         worker_capacity: inputs.worker_capacity,
         store_io: inputs.store_io.clone(),
-        // Before the workers, within half the size bound.
-        health: inputs.health.clone().map(bound_health),
+        // Before the workers, within half the size bound; a peer gets no
+        // kind local to this node.
+        health: inputs
+            .health
+            .clone()
+            .map(|health| match requester {
+                Requester::Own => health,
+                Requester::Peer(_) => crate::health_conditions::for_peer(health),
+            })
+            .map(bound_health),
         ..Default::default()
     };
     let mut entries: Vec<&WorkerEntry> = inputs.workers.iter().collect();
@@ -741,6 +754,7 @@ impl DiagnosticsService for DiagnosticsServer {
             &inputs,
             &self.build_fingerprint,
             quil_engine::worker_execution::now_ms(),
+            requester,
         );
         match requester {
             // This node's own clients (the node manager asks each refresh)
@@ -1214,7 +1228,7 @@ mod tests {
             workers: vec![entry(2, &[2; 32], Some(latched))],
             ..Default::default()
         };
-        let report = build_report(&inputs, &[], 3_000);
+        let report = build_report(&inputs, &[], 3_000, Requester::Own);
         assert_eq!(
             (report.workers[0].phase(), report.workers[0].blocker()),
             (Phase::Blocked, Blocker::StorageWriteFailed)
@@ -1224,7 +1238,7 @@ mod tests {
             master_store_write_failed: true,
             ..inputs
         };
-        assert!(build_report(&inputs, &[], 3_000).master_store_write_failed);
+        assert!(build_report(&inputs, &[], 3_000, Requester::Own).master_store_write_failed);
     }
 
     /// The master store's latest I/O interval rides the report as given,
@@ -1247,12 +1261,12 @@ mod tests {
             store_io: Some(io.clone()),
             ..Default::default()
         };
-        let report = build_report(&inputs, &[], 3_000);
+        let report = build_report(&inputs, &[], 3_000, Requester::Own);
         assert_eq!(report.store_io.as_ref(), Some(&io));
         let decoded = HealthReport::decode(report.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded.store_io, Some(io));
         assert_eq!(
-            build_report(&HealthInputs::default(), &[], 3_000).store_io,
+            build_report(&HealthInputs::default(), &[], 3_000, Requester::Own).store_io,
             None
         );
     }
@@ -1273,7 +1287,7 @@ mod tests {
             worker_capacity: 6,
             ..Default::default()
         };
-        let report = build_report(&inputs, &[], 3_000);
+        let report = build_report(&inputs, &[], 3_000, Requester::Own);
         assert_eq!(report.worker_capacity, 6);
         let draining: Vec<(u32, bool, Phase)> = report
             .workers
@@ -1393,7 +1407,7 @@ mod tests {
             join_waits: HashMap::new(),
             ..Default::default()
         };
-        let encoded = build_report(&inputs, &[1; 32], 3_000).encode_to_vec();
+        let encoded = build_report(&inputs, &[1; 32], 3_000, Requester::Own).encode_to_vec();
         for secret in [
             "192.0.2",
             "/home",
@@ -1510,7 +1524,7 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let phases: Vec<(u32, Phase)> = build_report(&inputs, &[], 0)
+        let phases: Vec<(u32, Phase)> = build_report(&inputs, &[], 0, Requester::Own)
             .workers
             .iter()
             .map(|w| (w.core_id, w.phase()))
@@ -1546,7 +1560,7 @@ mod tests {
             join_waits: HashMap::new(),
             ..Default::default()
         };
-        let report = build_report(&inputs, &[], 0);
+        let report = build_report(&inputs, &[], 0, Requester::Own);
         let order: Vec<(u32, Option<u64>, Option<u64>)> = report
             .workers
             .iter()
@@ -1586,7 +1600,7 @@ mod tests {
             join_waits: HashMap::new(),
             ..Default::default()
         };
-        let light = build_report(&many(None), &[0xff; 32], u64::MAX);
+        let light = build_report(&many(None), &[0xff; 32], u64::MAX, Requester::Own);
         assert_eq!(
             (light.workers.len(), light.omitted_workers),
             (MAX_WORKERS, 44)
@@ -1605,7 +1619,7 @@ mod tests {
         ] {
             *at = u64::MAX;
         }
-        let heavy = build_report(&many(Some(heavy)), &[0xff; 32], u64::MAX);
+        let heavy = build_report(&many(Some(heavy)), &[0xff; 32], u64::MAX, Requester::Own);
         assert!(
             heavy.encoded_len() <= MAX_REPORT_BYTES,
             "{}",
@@ -1617,7 +1631,10 @@ mod tests {
             workers: vec![entry(1, &[1; MAX_FILTER_BYTES + 1], None)],
             ..Default::default()
         };
-        assert_eq!(build_report(&long, &[], 0).omitted_workers, 1);
+        assert_eq!(
+            build_report(&long, &[], 0, Requester::Own).omitted_workers,
+            1
+        );
     }
 
     /// The node's conditions ride the report within half its size bound:
@@ -1651,7 +1668,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let report = build_report(&inputs, &[0xff; 32], 1);
+        let report = build_report(&inputs, &[0xff; 32], 1, Requester::Own);
         let health = report.health.as_ref().expect("conditions reported");
         assert!(
             health.encoded_len() <= MAX_HEALTH_BYTES,
@@ -1666,9 +1683,61 @@ mod tests {
         assert_eq!((report.workers.len(), report.omitted_workers), (8, 0));
         assert!(report.encoded_len() <= MAX_REPORT_BYTES);
         // A node that judges nothing sends no conditions at all.
-        assert!(build_report(&HealthInputs::default(), &[], 1)
-            .health
-            .is_none());
+        assert!(
+            build_report(&HealthInputs::default(), &[], 1, Requester::Own)
+                .health
+                .is_none()
+        );
+    }
+
+    /// A kind whose evidence is local to this node reaches this node only: a
+    /// peer gets neither the condition nor its source, and gets the others.
+    #[test]
+    fn local_only_conditions_are_served_to_this_node_only() {
+        use crate::health_conditions::{local_only, KINDS};
+        use quil_types::proto::diagnostics::{ConditionKind, ConditionSource, HealthCondition};
+        let inputs = HealthInputs {
+            health: Some(HealthConditions {
+                conditions: KINDS
+                    .iter()
+                    .map(|kind| HealthCondition {
+                        kind: *kind as i32,
+                        reward_hour_units: 7,
+                        reward_day_units: 70,
+                        ..Default::default()
+                    })
+                    .collect(),
+                sources: KINDS
+                    .iter()
+                    .map(|kind| ConditionSource {
+                        kind: *kind as i32,
+                        ..Default::default()
+                    })
+                    .collect(),
+            }),
+            ..Default::default()
+        };
+        let kinds = |requester| {
+            let health = build_report(&inputs, &[], 1, requester).health.unwrap();
+            let conditions: Vec<i32> = health.conditions.iter().map(|c| c.kind).collect();
+            let sources: Vec<i32> = health.sources.iter().map(|s| s.kind).collect();
+            assert_eq!(conditions, sources);
+            conditions
+        };
+        assert_eq!(kinds(Requester::Own).len(), KINDS.len());
+        let peer = kinds(Requester::Peer(peer()));
+        for kind in [
+            ConditionKind::RewardDrop,
+            ConditionKind::PeersCannotDial,
+            ConditionKind::Ipv6NotPublished,
+        ] {
+            assert!(!peer.contains(&(kind as i32)), "{kind:?} reached a peer");
+        }
+        assert_eq!(
+            peer.len(),
+            KINDS.iter().filter(|k| !local_only(**k as i32)).count()
+        );
+        assert!(peer.contains(&(ConditionKind::StoreIoSlow as i32)));
     }
 
     /// Over the real transport: the listener's handshake identity admits a

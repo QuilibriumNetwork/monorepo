@@ -71,20 +71,9 @@ pub const AVAIL_DISPLAY_COLS: &[usize] = &[0, 1, 2, 12, 3, 4, 5, 6, 7, 8, 11, 9,
 pub const ALLOC_PROVER_PHASES_COL: usize = 17;
 pub const AVAIL_PROVER_PHASES_COL: usize = 12;
 
-/// Provers-per-shard ceiling at or under which a shard holding data is at
-/// halt risk: losing one prover risks its quorum. Mirrors quil-engine's
-/// `provers::proposer::HALT_RISK_PROVER_COUNT`, which the client cannot
-/// import.
-pub const HALT_RISK_PROVER_COUNT: u32 = 3;
-
 /// The allocations-only Cert column: the seat's share of its shard's
 /// certificates over the last 60m (`ShardRewardInfo.certificate_share`).
 pub const ALLOC_CERT_COL: usize = 18;
-
-/// Frames the last hour must hold before a low certificate share is judged.
-/// Mirrors quil-node's `seat_certificates::LOW_MIN_FRAMES`, which the client
-/// cannot import.
-pub const CERT_LOW_MIN_FRAMES: u64 = 30;
 
 pub const INTERVAL_WINDOW_NAMES: &[&str] = &["  60m window", "  24h window"];
 /// The Global KPI's fields, in printed order; picker names, and the expanded
@@ -1013,6 +1002,21 @@ impl Model {
     pub fn committed_app_flagged(&self, filter: &[u8]) -> bool {
         self.condition_affects(ConditionKind::GlobalAppFramesUnchanged, filter, None)
             || self.condition_affects(ConditionKind::GlobalAppFramesBehind, filter, None)
+    }
+
+    /// The node reports this seat's certificate share on `filter` low.
+    pub fn cert_share_flagged(&self, filter: &[u8]) -> bool {
+        self.condition_affects(ConditionKind::CertificateShareLow, filter, None)
+    }
+
+    /// The node reports the shard at halt risk.
+    pub fn halt_risk_flagged(&self, filter: &[u8]) -> bool {
+        self.condition_affects(ConditionKind::ShardHaltRisk, filter, None)
+    }
+
+    /// The node reports the shard's peer-reported materialization trailing.
+    pub fn peer_materialization_flagged(&self, filter: &[u8]) -> bool {
+        self.condition_affects(ConditionKind::PeerMaterializationLag, filter, None)
     }
 
     /// The node reports the local app frames of the allocation on `filter`
@@ -2127,15 +2131,6 @@ pub fn serving_after_boundary(counts: &ShardProverCounts) -> u32 {
     counts.active.saturating_add(counts.activating)
 }
 
-/// Halt risk by count: the shard holds data and at most
-/// [`HALT_RISK_PROVER_COUNT`] of its provers are active or activating.
-/// Unreported counts establish nothing.
-pub fn prover_halt_risk(counts: Option<&ShardProverCounts>, size: &BigInt) -> bool {
-    counts.is_some_and(|c| {
-        size.sign() == Sign::Plus && serving_after_boundary(c) <= HALT_RISK_PROVER_COUNT
-    })
-}
-
 /// Each shard's frame committee size, by filter.
 fn committee_sizes(shards: &GetShardInfoResponse) -> HashMap<Vec<u8>, u32> {
     shards
@@ -2159,22 +2154,6 @@ fn certificate_shares(shards: &GetShardInfoResponse) -> HashMap<Vec<u8>, Certifi
 pub fn cert_share_percent(share: Option<&CertificateShare>) -> Option<u64> {
     let hour = share?.hour.as_ref()?;
     (hour.frames > 0).then(|| hour.signed_frames.saturating_mul(100) / hour.frames)
-}
-
-/// The node's low-share condition (quil-node `seat_certificates::low_share`):
-/// a full hour counted with at least [`CERT_LOW_MIN_FRAMES`] frames, of which
-/// the seat signed under half the share a member voting in time signs,
-/// `quorum / committee`.
-pub fn cert_share_low(share: Option<&CertificateShare>) -> bool {
-    let Some(share) = share else { return false };
-    let Some(hour) = share.hour.as_ref() else {
-        return false;
-    };
-    hour.observed_seconds >= hour.window_seconds
-        && hour.frames >= CERT_LOW_MIN_FRAMES
-        && share.committee > 0
-        && u128::from(hour.signed_frames) * 2 * u128::from(share.committee)
-            < u128::from(hour.frames) * u128::from(share.quorum)
 }
 
 /// [`Model::seat_concentration`] of a shard-info response.

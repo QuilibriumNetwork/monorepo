@@ -74,6 +74,15 @@ fn materialization_state_color(state: &str) -> Color {
     }
 }
 
+/// PeerMat's and PeerState's color: a trailing state warns only for a shard
+/// the node lists as trailing.
+fn peer_state_color(m: &Model, s: &ShardRow) -> Color {
+    match materialization_state(s.materialized_frame, s.latest_frame) {
+        "lag" | "unmat" if !m.peer_materialization_flagged(&s.filter) => TEXT,
+        state => materialization_state_color(state),
+    }
+}
+
 /// A worker id is only worth colouring when it says the allocation is not
 /// being proved: `-1` is "no worker bound", which is the one value in the
 /// column that asks the operator to do something. Assigned ids are left plain
@@ -1523,10 +1532,14 @@ fn fmt_materialized(materialized: u64, latest: u64) -> String {
 /// The Cert cell: the seat's 60m certificate share in percent, `-` while
 /// the node reports none or counted no frame in the hour. A trailing `!`
 /// marks the node's low-share condition for `warning_slot`.
-fn cert_cell(share: Option<&quil_types::proto::node::CertificateShare>) -> String {
+fn cert_cell(
+    m: &Model,
+    filter: &[u8],
+    share: Option<&quil_types::proto::node::CertificateShare>,
+) -> String {
     match cert_share_percent(share) {
         None => "-".into(),
-        Some(percent) if cert_share_low(share) => format!("{percent}%!"),
+        Some(percent) if m.cert_share_flagged(filter) => format!("{percent}%!"),
         Some(percent) => format!("{percent}%"),
     }
 }
@@ -1534,11 +1547,11 @@ fn cert_cell(share: Option<&quil_types::proto::node::CertificateShare>) -> Strin
 /// The ProverPhases cell: the shard's provers by lifecycle phase, symbols in
 /// compact mode and names in expanded mode. Zero fields are omitted except
 /// active, so an empty shard reads `a0`; unreported counts read `-`. A
-/// trailing `!` marks halt risk for `warning_slot`.
+/// trailing `!` marks the node's halt-risk condition for `warning_slot`.
 fn prover_phases_cell(
     m: &Model,
+    filter: &[u8],
     counts: Option<&quil_types::proto::node::ShardProverCounts>,
-    size: &BigInt,
 ) -> String {
     let Some(c) = counts else {
         return "-".into();
@@ -1567,7 +1580,7 @@ fn prover_phases_cell(
             .collect::<Vec<_>>()
             .join(", ")
     };
-    if prover_halt_risk(counts, size) {
+    if m.halt_risk_flagged(filter) {
         text + "!"
     } else {
         text
@@ -1639,8 +1652,8 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
             m.interval_mask(),
             m.app_cadence_stale(),
         ),
-        ALLOC_PROVER_PHASES_COL => prover_phases_cell(m, a.prover_counts.as_ref(), &a.shard_size),
-        ALLOC_CERT_COL => cert_cell(a.certificate_share.as_ref()),
+        ALLOC_PROVER_PHASES_COL => prover_phases_cell(m, &a.filter, a.prover_counts.as_ref()),
+        ALLOC_CERT_COL => cert_cell(m, &a.filter, a.certificate_share.as_ref()),
         _ => a
             .default_action
             .render(m.threshold_unit, m.threshold_clock()),
@@ -2148,7 +2161,11 @@ fn global_snapshot_label<'a>(
 fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
     let Some(execution) = a.execution.as_ref() else {
         if matches!(a.status_name.as_str(), "joining" | "activating") {
-            return peer_materialization_detail(a.materialized_frame, a.latest_frame);
+            return peer_materialization_detail(
+                a.materialized_frame,
+                a.latest_frame,
+                m.peer_materialization_flagged(&a.filter),
+            );
         }
         return Line::default();
     };
@@ -2497,12 +2514,10 @@ fn render_alloc_panel(
                     WARNING
                 } else if ci == ALLOC_PROVER_PHASES_COL
                     && m.color_coding
-                    && prover_halt_risk(a.prover_counts.as_ref(), &a.shard_size)
+                    && m.halt_risk_flagged(&a.filter)
                 {
                     WARNING
-                } else if ci == ALLOC_CERT_COL
-                    && m.color_coding
-                    && cert_share_low(a.certificate_share.as_ref())
+                } else if ci == ALLOC_CERT_COL && m.color_coding && m.cert_share_flagged(&a.filter)
                 {
                     WARNING
                 } else if ci == ALLOC_CERT_COL
@@ -2561,15 +2576,10 @@ fn render_alloc_panel(
                         Span::styled(cell.clone(), Style::new().fg(WARNING))
                     }
                     7 | 8 if m.color_coding => Span::styled(cell.clone(), Style::new().fg(HELP)),
-                    ALLOC_PROVER_PHASES_COL
-                        if m.color_coding
-                            && prover_halt_risk(a.prover_counts.as_ref(), &a.shard_size) =>
-                    {
+                    ALLOC_PROVER_PHASES_COL if m.color_coding && m.halt_risk_flagged(&a.filter) => {
                         Span::styled(cell.clone(), Style::new().fg(WARNING))
                     }
-                    ALLOC_CERT_COL
-                        if m.color_coding && cert_share_low(a.certificate_share.as_ref()) =>
-                    {
+                    ALLOC_CERT_COL if m.color_coding && m.cert_share_flagged(&a.filter) => {
                         Span::styled(cell.clone(), Style::new().fg(WARNING))
                     }
                     ALLOC_CERT_COL
@@ -2643,7 +2653,7 @@ fn avail_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
         9 if m.reported_app_stalled(&s.filter) => "stalled!".into(),
         9 => {
             let state = materialization_state(s.materialized_frame, s.latest_frame);
-            if matches!(state, "lag" | "unmat") {
+            if matches!(state, "lag" | "unmat") && m.peer_materialization_flagged(&s.filter) {
                 format!("{state}!")
             } else {
                 state.to_string()
@@ -2655,7 +2665,7 @@ fn avail_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
             m.interval_mask(),
             m.app_cadence_stale(),
         ),
-        AVAIL_PROVER_PHASES_COL => prover_phases_cell(m, s.prover_counts.as_ref(), &s.shard_size),
+        AVAIL_PROVER_PHASES_COL => prover_phases_cell(m, &s.filter, s.prover_counts.as_ref()),
         _ => {
             if s.ring == UNKNOWN_REWARD_RING {
                 "-".into()
@@ -2882,7 +2892,11 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
 /// says `current`, `unmat` or `unknown`; a lag adds its frames.
 fn available_detail(m: &Model, s: &ShardRow) -> Line<'static> {
     let mut line = if materialization_state(s.materialized_frame, s.latest_frame) == "lag" {
-        peer_materialization_detail(s.materialized_frame, s.latest_frame)
+        peer_materialization_detail(
+            s.materialized_frame,
+            s.latest_frame,
+            m.peer_materialization_flagged(&s.filter),
+        )
     } else {
         Line::default()
     };
@@ -2910,9 +2924,12 @@ fn available_detail_lines(m: &Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
     cursor_detail(available_detail(m, row), area.width, area.height, keep)
 }
 
-fn peer_materialization_detail(materialized: u64, latest: u64) -> Line<'static> {
+/// The peer materialization's detail; it takes the warning color only for a
+/// shard the node lists as trailing.
+fn peer_materialization_detail(materialized: u64, latest: u64, flagged: bool) -> Line<'static> {
+    let trailing = if flagged { Color::Yellow } else { HELP };
     let (message, color) = match materialization_state(materialized, latest) {
-        "unmat" => ("Peer app frames: none materialized.".into(), Color::Yellow),
+        "unmat" => ("Peer app frames: none materialized.".into(), trailing),
         "lag" => (
             format!(
                 "Peer materialization trails its head by {} frame{}.",
@@ -2923,7 +2940,7 @@ fn peer_materialization_detail(materialized: u64, latest: u64) -> Line<'static> 
                     "s"
                 }
             ),
-            Color::Yellow,
+            trailing,
         ),
         "current" => ("Peer materialization is current.".into(), HELP),
         _ => ("Peer app frame heights unavailable.".into(), HELP),
@@ -3045,13 +3062,10 @@ fn render_avail_panel(
                     } else if m.color_coding && matches!(c, 10 | 11) && m.app_cadence_stale() {
                         WARNING
                     } else if m.color_coding && matches!(c, 6 | 9) {
-                        materialization_state_color(materialization_state(
-                            s.materialized_frame,
-                            s.latest_frame,
-                        ))
+                        peer_state_color(m, s)
                     } else if m.color_coding
                         && c == AVAIL_PROVER_PHASES_COL
-                        && prover_halt_risk(s.prover_counts.as_ref(), &s.shard_size)
+                        && m.halt_risk_flagged(&s.filter)
                     {
                         WARNING
                     } else {
@@ -3105,18 +3119,11 @@ fn render_avail_panel(
                     10 | 11 if m.color_coding && m.app_cadence_stale() => {
                         Span::styled(cell, Style::new().fg(WARNING))
                     }
-                    AVAIL_PROVER_PHASES_COL
-                        if m.color_coding
-                            && prover_halt_risk(s.prover_counts.as_ref(), &s.shard_size) =>
-                    {
+                    AVAIL_PROVER_PHASES_COL if m.color_coding && m.halt_risk_flagged(&s.filter) => {
                         Span::styled(cell, Style::new().fg(WARNING))
                     }
                     6 | 9 if m.color_coding => {
-                        let color = materialization_state_color(materialization_state(
-                            s.materialized_frame,
-                            s.latest_frame,
-                        ));
-                        Span::styled(cell, Style::new().fg(color))
+                        Span::styled(cell, Style::new().fg(peer_state_color(m, s)))
                     }
                     _ => Span::raw(cell),
                 });
@@ -3405,43 +3412,6 @@ fn earning_allocations(m: &Model) -> Vec<&AllocationRow> {
         .collect()
 }
 
-/// Current active + leaving forecasts in the 60m and 24h windows when the
-/// 60m one is below half the 24h one. Only rows whose shard has 30 min of
-/// 60m and 2h of 24h coverage count; both windows price frames alike.
-fn reward_drop(m: &Model) -> Option<(BigInt, BigInt)> {
-    let (mut hour, mut day, mut rows) = (BigInt::from(0), BigInt::from(0), 0);
-    for a in &m.allocations {
-        if a.ring == UNKNOWN_REWARD_RING
-            || !matches!(
-                a.reward_status(m.epoch_frame(), m.epoch_length),
-                Some(EffectiveStatus::Active | EffectiveStatus::Leaving)
-            )
-        {
-            continue;
-        }
-        let Some(cadence) = m.node_app_cadence.get(&a.filter) else {
-            continue;
-        };
-        let covered = |w: Option<&quil_types::proto::node::FrameWindow>, seconds: u64| {
-            w.is_some_and(|w| w.observed_seconds >= seconds)
-        };
-        if !covered(cadence.hour.as_ref(), 1800) || !covered(cadence.day.as_ref(), 7200) {
-            continue;
-        }
-        let (Some(h), Some(d)) = (
-            m.daily_reward(&a.estimated_reward, &a.filter, 0),
-            m.daily_reward(&a.estimated_reward, &a.filter, 1),
-        ) else {
-            continue;
-        };
-        hour += h;
-        day += d;
-        rows += 1;
-    }
-    (rows > 0 && day.sign() == num_bigint::Sign::Plus && BigInt::from(2) * &hour < day)
-        .then_some((hour, day))
-}
-
 /// Conditions that need attention besides the progress stalls: key, severity
 /// and text without its timestamp. Each needs fresh node status; missing or
 /// old data establishes none. Definitions belong in help.
@@ -3462,17 +3432,6 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
             format!("Health report unavailable: {reason}."),
         )),
         HealthAnswer::Unread | HealthAnswer::Reported(_) => {}
-    }
-    if let Some((hour, day)) = reward_drop(m) {
-        notices.push((
-            "reward-drop",
-            NoticeSeverity::Warning,
-            format!(
-                "Reward now 60m {} vs 24h {} Q/d.",
-                super::super::format_quil_daily_units(&hour),
-                super::super::format_quil_daily_units(&day)
-            ),
-        ));
     }
     if m.app_cadence_stale() && !m.node_app_cadence.is_empty() {
         notices.push((
@@ -3569,24 +3528,6 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
             ),
         ));
     }
-    let counted: Vec<_> = allocations
-        .iter()
-        .filter(|a| a.certificate_share.is_some())
-        .collect();
-    let low = counted
-        .iter()
-        .filter(|a| cert_share_low(a.certificate_share.as_ref()))
-        .count();
-    if low > 0 {
-        notices.push((
-            "cert-share-low",
-            NoticeSeverity::Warning,
-            format!(
-                "Low certificate share (60m): {low}/{} allocations.",
-                counted.len()
-            ),
-        ));
-    }
     let workers: Vec<_> = m
         .allocations
         .iter()
@@ -3606,35 +3547,6 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
                 "Last recovery attempt failed: {recovery_failed}/{} workers.",
                 workers.len()
             ),
-        ));
-    }
-    if let Some(io) = m
-        .cached_node_info
-        .as_ref()
-        .and_then(|info| info.store_io.as_ref())
-        .filter(|io| io.verdict() == quil_types::proto::diagnostics::StoreIoVerdict::Slow)
-    {
-        let figures = crate::commands::node::diagnostics::store_io_figures(io);
-        let cause = crate::commands::node::diagnostics::store_io_scope(io);
-        notices.push((
-            "store-io-slow",
-            NoticeSeverity::Warning,
-            if figures.is_empty() {
-                format!("Store reads slow ({cause}).")
-            } else {
-                format!("Store reads slow ({cause}): {figures}.")
-            },
-        ));
-    }
-    if m.cached_node_info
-        .as_ref()
-        .and_then(|info| info.node_reachability.as_ref())
-        .is_some_and(crate::commands::node::doctor::not_reachable)
-    {
-        notices.push((
-            "peers-cannot-dial",
-            NoticeSeverity::Warning,
-            "Reachability: peers cannot dial this node; run qclient node doctor.".to_string(),
         ));
     }
     if let Some((own, reported)) = m
@@ -3724,15 +3636,13 @@ fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'sta
     }
     for (severity, text) in node_condition_notices(m) {
         if severity >= m.notice_minimum {
+            let color = match severity {
+                NoticeSeverity::Info => HELP,
+                NoticeSeverity::Warning => WARNING,
+                NoticeSeverity::Error => ERROR,
+            };
             lines.extend(wrap_message(
-                Line::from(Span::styled(
-                    text,
-                    Style::new().fg(if severity == NoticeSeverity::Error {
-                        ERROR
-                    } else {
-                        WARNING
-                    }),
-                )),
+                Line::from(Span::styled(text, Style::new().fg(color))),
                 width,
             ));
         }
@@ -4615,9 +4525,9 @@ fn help_items() -> Vec<HelpItem> {
         item("`-` before a count / `departing`: leave confirmed; it keeps serving until the next epoch boundary"),
         item("`p` / `paused`: paused provers"),
         item("`-` alone: unavailable from this node (older server or no shard info)"),
-        item("`yellow` (or `!` with colors off): halt risk by count; the shard holds data and at most 3 of its provers are active or activating, so losing one risks its quorum"),
+        item("`yellow` (or `!` with colors off): the node reports the shard at halt risk; see Shard notices"),
         kv("Cert", "This node's share of its shard's certificates over the last 60m: of the shard frames GLOBAL included from committee sessions this node sits in, the percent whose certificate it signed, as the node counts them from the GLOBAL frames it receives. Only a frame's signers earn its reward, and a certificate carries the first votes to reach quorum, committee - floor((committee - 1) / 3) of them, so a member voting in time signs about 70%. Less means its votes arrive after the quorum, or its worker is blocked or behind its shard; the master log has each seat's hourly counts (`this seat's share of its shard's certificates`)"),
-        item("`yellow` (or `!` with colors off): low; an hour counted with at least 30 frames, of which this node signed under half the in-time share (quorum / committee); the node warns (`this seat signed under half the shard certificates`)"),
+        item("`yellow` (or `!` with colors off): the node reports it low: an hour counted with at least 30 frames, of which this node signed under half the in-time share (quorum / committee); the node warns (`this seat signed under half the shard certificates`)"),
         item("`-`: no frame counted in the last 60m, or a node that predates the count; the `60m` Reward estimate then uses the quorum share"),
         kv("Ring", "Committed rank; `~` marks a join forecast with one ring of competing admissions"),
         kv("Size [GB]", "Shard size in decimal gigabytes, one decimal; `<0.1` preserves small nonzero sizes"),
@@ -4645,7 +4555,7 @@ fn help_items() -> Vec<HelpItem> {
         item("`stale` / `cached`: old observation (see Freshness)"),
         item("`-`: joining without observations"),
         item("`unknown`: phase unavailable"),
-        kv("PeerState", "Peer-reported materialization relative to its head; no local worker phase or peer lifecycle inference. `!` marks a warning with colors off:"),
+        kv("PeerState", "Peer-reported materialization relative to its head; no local worker phase or peer lifecycle inference. `yellow` (or `!` with colors off) marks a shard the node reports trailing; see Shard notices:"),
         item("`current`: materialized to its head"),
         item("`lag`: behind its head"),
         item("`unmat`: nothing materialized"),
@@ -4684,7 +4594,10 @@ fn help_items() -> Vec<HelpItem> {
         item("`Global app frames unchanged >60s`: GlobalHead kept its frame for its window while the GLOBAL snapshot and the app head both advanced"),
         item("`Global app frames >100 behind app heads`: GlobalHead trails the app head by more than 100 frames"),
         item("Either way GLOBAL has not applied the newer shard frames, so their shard state and rewards are not credited yet. On most tracked shards it is network-wide: GLOBAL frames are not carrying shard frames; report it with the GLOBAL frame and shard filters. On a few shards, check those shards' committees"),
-        kv("Reward notice", "`Reward now 60m … vs 24h … Q/d`: the active + leaving forecast over the last 60m is below half its 24h value. Counts rows whose shard has 30 min of 60m and 2h of 24h coverage. Both windows apply the current per-frame reward, so the drop is in committed app frames, not in pricing; see Global app notice"),
+        kv("Reward notice", "`Reward now 60m … vs 24h … Q/d`: the node's active + leaving forecast over the last 60m is below half its 24h value, judged while a client reads shard info and served to this node only. Counts seats whose shard has 30 min of 60m and 2h of 24h coverage. Both windows apply the current per-frame reward, so the drop is in committed app frames, not in pricing; see Global app notice"),
+        kv("Shard notices", "Shards as the node judges them from the shard info it serves, of those it tracks, while a client reads shard info:"),
+        item("`Shards at halt risk (<=3 provers)`: the shard holds data and at most 3 of its provers are active or activating, so losing one risks its quorum. A join adds coverage; a leave risks it"),
+        item("`Peer materialization trails its head`: the materialized frame peers report is behind their head, or none is materialized. A gap of a frame or two is routine, so this is shown at the info level; compare a shard that stays behind on the explorer"),
         kv("Allocation notices", "Allocations or workers with a condition, out of those it applies to:"),
         item("`Allocations without a worker`: active, leaving, departing or `re-confirm!` allocations with Worker `-1`; they do no work and earn nothing until a worker is bound"),
         item("`Local execution blocked or stopped`: staffed earning allocations whose Execution is `blocked` or `stopped`, of those with fresh observations; the row footer names the blocker"),
@@ -4693,7 +4606,9 @@ fn help_items() -> Vec<HelpItem> {
         item("`Low certificate share (60m)`: allocations whose Cert is low, of those reporting one. Frames a seat does not sign earn it nothing: check its worker's Execution and LocalMat, the node's CPU load and its peer connections"),
         item("`Last recovery attempt failed`: workers whose latest archive recovery attempt failed and whose LocalMat is still below PeerHead, of workers with fresh observations (it ends once the worker catches up); the Recovery footer gives the error and the failure streak"),
         kv("Seat concentration notice", "`Seat concentration`: committee sessions where the members on this node's network (IPv4 /24 or IPv6 /48 of their announced addresses, this node included) hold at least size less quorum less one seats, of the sessions this node sits in; the node evaluates each once per session and epoch. An outage of that site, or a restart or upgrade of its nodes together, then leaves the committee at most one seat above quorum, where shards stall. Members without a public address are not counted, so it is a lower bound. To fix: spread provers across sites. The node's `seat concentration` log lines name each shard"),
-        kv("Reachability notice", "`Reachability: peers cannot dial this node`: the verdict of `qclient node doctor`, from the node's own view: AutoNAT servers on 2 or more IPs could not dial it back, AutoNAT holds it private with no confirmed address, or its address is behind carrier-grade NAT. It ends once AutoNAT confirms an address. Missing or unsettled AutoNAT results show nothing. The doctor gives a verdict per address family and what to change; it changes nothing itself."),
+        kv("Reachability notice", "`Reachability: peers cannot dial this node`: the node's verdict, served to this node only, which `qclient node doctor` also gives, from the node's own view: AutoNAT servers on 2 or more IPs could not dial it back, AutoNAT holds it private with no confirmed address, or its address is behind carrier-grade NAT. It ends once AutoNAT confirms an address. Missing or unsettled AutoNAT results show nothing. The doctor gives a verdict per address family and what to change; it changes nothing itself."),
+        kv("IPv6 notice", "`IPv6: this node binds an address but publishes none`: peers do not learn the address, so IPv6 carries no dials to this node. Served to this node only, at the info level; `qclient node doctor` names the address"),
+        kv("Master store notice", "`Master store stopped writing`: a failed write, or free space below the floor. This node cannot follow GLOBAL until the store is reopened: free disk space or fix the failed write, then restart the node"),
         kv("Store notice", "`Store reads slow (<cause>)`: the node reads one entry of its master store a second (the canary) and, on Linux, times its disk's reads and writes. Shown once a minute has 2 canary reads of 50ms or more (or one of 1s), a read stays unfinished 1s, or the disk takes 20ms a read or 100ms a write (of 20+), two minutes in a row; it clears after three minutes under all of them. Work that reads the store falls behind and allocations may lapse. The label names the cause the figures support. `this node's disk`: a disk await is over its threshold; check that TRIM runs (fstrim.timer or the discard mount option), the disk's health (SMART) and other I/O load on it. `disk normal, this node's load`: the disk's awaits (of 20+ reads) are under them; check CPU, memory pressure, store compaction and other work on this node. `disk not ruled out`: no disk figures or under 20 reads; check both. `qclient node diagnostics health --self` and the node's `store i/o` log lines give the figures"),
         kv("Command legends", "Compact mode shows applicable UI/worker commands only; expanded mode also shows disabled commands. Usable commands share one highlight; labels show colors on/off and relative/absolute thresholds. `filter*` means a column filter is active"),
         kv("Scroll hints", "Bottom border counts hidden rows `↑`/`↓` and columns `←`/`→`"),
@@ -5071,6 +4986,33 @@ fn render_join_picker(f: &mut Frame, m: &mut Model, area: Rect) {
 mod tests {
     use super::*;
     use crate::commands::node::prover::epoch::ActionHint;
+    use quil_types::proto::diagnostics::ConditionKind;
+
+    /// The node's report listing `filters` under `kind`, beside what it lists
+    /// already.
+    pub(super) fn flag(m: &mut Model, kind: ConditionKind, filters: &[&[u8]]) {
+        use quil_types::proto::diagnostics::{AffectedShard, HealthCondition, HealthConditions};
+        let mut health = match std::mem::take(&mut m.health) {
+            HealthAnswer::Reported(health) => health,
+            _ => HealthConditions::default(),
+        };
+        health.conditions.push(HealthCondition {
+            kind: kind as i32,
+            severity: ConditionSeverity::Warning as i32,
+            affected: filters.len() as u32,
+            tracked: filters.len() as u32,
+            shards: filters
+                .iter()
+                .map(|filter| AffectedShard {
+                    filter: filter.to_vec(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        });
+        m.health = HealthAnswer::Reported(health);
+        m.health_received = Some(std::time::Instant::now());
+    }
 
     #[test]
     fn hidden_shared_columns_disappear_from_both_panels_and_reclaim_width() {
@@ -5167,16 +5109,15 @@ mod tests {
         assert!(!text.contains('\u{1b}'), "no escape sequences");
     }
 
-    /// A slow store verdict in fresh node status shows one warning naming
-    /// the cause the figures support and the figures, in the drawn frame too; an ok or
-    /// absent verdict, or stale status, shows none.
+    /// The node's conditions show as one notice each, at their level, with
+    /// their evidence, in the drawn frame too; stale status shows none.
     #[test]
-    fn a_slow_store_shows_one_notice_with_its_figures() {
-        use quil_types::proto::diagnostics::{StoreIoHealth, StoreIoVerdict};
-        use quil_types::proto::node::NodeInfoResponse;
-        use std::time::{Duration, Instant};
+    fn the_nodes_seat_shard_store_and_reachability_conditions_show_as_notices() {
+        use quil_types::proto::diagnostics::{
+            HealthCondition, HealthConditions, StoreIoHealth, StoreIoVerdict,
+        };
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
         let mut io = StoreIoHealth {
-            slow_secs: 300,
             interval_secs: 60,
             canary_reads: 58,
             canary_p99_us: 412_000,
@@ -5187,133 +5128,224 @@ mod tests {
             ..Default::default()
         };
         io.set_verdict(StoreIoVerdict::Slow);
+        let since = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let condition = |kind: ConditionKind, severity: ConditionSeverity| HealthCondition {
+            kind: kind as i32,
+            severity: severity as i32,
+            since_unix_ms: since,
+            affected: 1,
+            tracked: 2,
+            threshold: 3,
+            ..Default::default()
+        };
         let mut m = Model::new();
         m.compact_actions = false;
         m.data_loaded = true;
         m.allocations = joining_table();
         m.last_fetch_success = Some(Instant::now());
-        m.cached_node_info = Some(NodeInfoResponse {
-            store_io: Some(io.clone()),
-            ..Default::default()
+        m.health = HealthAnswer::Reported(HealthConditions {
+            conditions: vec![
+                condition(
+                    ConditionKind::MasterStoreWriteFailed,
+                    ConditionSeverity::Error,
+                ),
+                HealthCondition {
+                    store_io: Some(io),
+                    ..condition(ConditionKind::StoreIoSlow, ConditionSeverity::Warning)
+                },
+                HealthCondition {
+                    reward_hour_units: 2_400_000_000,
+                    reward_day_units: 24_000_000_000,
+                    ..condition(ConditionKind::RewardDrop, ConditionSeverity::Warning)
+                },
+                condition(
+                    ConditionKind::CertificateShareLow,
+                    ConditionSeverity::Warning,
+                ),
+                condition(ConditionKind::ShardHaltRisk, ConditionSeverity::Warning),
+                condition(ConditionKind::PeersCannotDial, ConditionSeverity::Warning),
+                condition(
+                    ConditionKind::PeerMaterializationLag,
+                    ConditionSeverity::Info,
+                ),
+                condition(ConditionKind::Ipv6NotPublished, ConditionSeverity::Info),
+            ],
+            sources: Vec::new(),
         });
-        let store = |m: &Model| {
-            condition_notices(m)
-                .into_iter()
-                .filter(|(key, ..)| *key == "store-io-slow")
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            store(&m),
-            vec![(
-                "store-io-slow",
-                NoticeSeverity::Warning,
-                "Store reads slow (this node's disk): canary p99 412ms of 58 reads in 60s, \
-                 disk read 25ms/op, write 3.1ms/op."
-                    .to_string()
-            )]
-        );
-        // The label follows the cause: the disk responds normally, or the
-        // disk is unknown.
-        let notice_of = |m: &mut Model, io: &StoreIoHealth| {
-            m.cached_node_info = Some(NodeInfoResponse {
-                store_io: Some(*io),
-                ..Default::default()
-            });
-            store(m)[0].2.clone()
-        };
-        let mut normal = io;
-        normal.disk_read_await_us = Some(1_500);
-        assert_eq!(
-            notice_of(&mut m, &normal),
-            "Store reads slow (disk normal, this node's load): canary p99 412ms of 58 \
-             reads in 60s, disk read 1.5ms/op, write 3.1ms/op."
-        );
-        let mut unknown = io;
-        unknown.disk_reads = None;
-        unknown.disk_writes = None;
-        unknown.disk_read_await_us = None;
-        unknown.disk_write_await_us = None;
-        assert_eq!(
-            notice_of(&mut m, &unknown),
-            "Store reads slow (disk not ruled out): canary p99 412ms of 58 reads in 60s."
-        );
-        m.cached_node_info = Some(NodeInfoResponse {
-            store_io: Some(io),
-            ..Default::default()
-        });
+        m.health_received = Some(Instant::now());
+        m.notice_minimum = NoticeSeverity::Info;
         update_message_lifetime(&mut m);
-        let text = render_text(&mut m, 160, 30);
+        let notices = |m: &Model| {
+            message_lines(m, Line::default(), 300)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let stamp = message_timestamp(Some(UNIX_EPOCH + Duration::from_millis(since)));
+        let warnings = [
+            "Store reads slow (this node's disk): canary p99 412ms of 58 reads in 60s, \
+             disk read 25ms/op, write 3.1ms/op.",
+            "Reward now 60m ~0.3 vs 24h ~3.0 Q/d.",
+            "Low certificate share (60m): 1/2 allocations.",
+            "Shards at halt risk (<=3 provers): 1/2 tracked shards.",
+            "Reachability: peers cannot dial this node; run qclient node doctor.",
+        ];
+        let infos = [
+            "Peer materialization trails its head: 1/2 tracked shards.",
+            "IPv6: this node binds an address but publishes none; peers do not learn it.",
+        ];
+        let all = notices(&m);
+        for text in warnings.iter().chain(&infos) {
+            assert!(all.contains(&format!("{stamp}{text}")), "{text}: {all}");
+        }
+        assert!(all.contains("Master store stopped writing"), "{all}");
+        // Colored by level: info stays quiet.
+        let color_of = |needle: &str| {
+            message_lines(&m, Line::default(), 300)
+                .iter()
+                .find(|line| line.to_string().contains(needle))
+                .and_then(|line| line.spans.first())
+                .and_then(|span| span.style.fg)
+        };
+        assert_eq!(color_of("Master store stopped"), Some(ERROR));
+        assert_eq!(color_of("Store reads slow"), Some(WARNING));
+        assert_eq!(color_of("Peer materialization trails"), Some(HELP));
+        let text = render_text(&mut m, 160, 40);
         println!("{text}");
         assert!(
-            text.contains("Store reads slow (this node's disk): canary p99 412ms"),
+            text.contains("Store reads slow (this node's disk)"),
             "{text}"
         );
-        m.last_fetch_success = Some(Instant::now() - Duration::from_secs(3600));
-        assert!(store(&m).is_empty(), "stale status establishes nothing");
-        m.last_fetch_success = Some(Instant::now());
-        io.set_verdict(StoreIoVerdict::Ok);
-        m.cached_node_info = Some(NodeInfoResponse {
-            store_io: Some(io),
-            ..Default::default()
-        });
-        assert!(store(&m).is_empty());
-        m.cached_node_info = Some(NodeInfoResponse::default());
-        assert!(store(&m).is_empty());
+        // By level: errors alone show the store that stopped writing.
+        m.notice_minimum = NoticeSeverity::Warning;
+        let warned = notices(&m);
+        assert!(
+            warned.contains(warnings[0]) && !warned.contains(infos[0]),
+            "{warned}"
+        );
+        m.notice_minimum = NoticeSeverity::Error;
+        let errors = notices(&m);
+        assert!(errors.contains("Master store stopped writing"), "{errors}");
+        assert!(!errors.contains(warnings[1]), "{errors}");
+        // An old report establishes nothing.
+        m.notice_minimum = NoticeSeverity::Info;
+        m.health_received = Some(Instant::now() - Duration::from_secs(3600));
+        let stale = notices(&m);
+        assert!(!stale.contains("Store reads slow"), "{stale}");
+        // Each notice is explained in the help.
+        let help = help_text();
+        for name in [
+            "Low certificate share (60m)",
+            "Shards at halt risk",
+            "Peer materialization trails its head",
+            "Master store stopped writing",
+            "IPv6: this node binds an address",
+        ] {
+            assert!(help.contains(name), "{name}");
+        }
     }
 
+    /// Inputs that would once have raised a notice or a cell here raise
+    /// nothing without the node's condition: the node alone judges them.
     #[test]
-    fn a_node_peers_cannot_dial_shows_one_notice_pointing_to_the_doctor() {
-        use quil_types::proto::node::{AutonatProbeFailure, NodeInfoResponse, NodeReachability};
-        use std::time::{Duration, Instant};
-        let report = |unreachable: bool, confirmed: &[&str]| NodeInfoResponse {
+    fn this_client_judges_no_seat_shard_store_or_reachability_condition() {
+        use quil_types::proto::diagnostics::{StoreIoHealth, StoreIoVerdict};
+        use quil_types::proto::node::{
+            AutonatProbeFailure, FrameCadence, FrameWindow, NodeInfoResponse, NodeReachability,
+            ShardProverCounts,
+        };
+        use std::time::Instant;
+        let mut io = StoreIoHealth::default();
+        io.set_verdict(StoreIoVerdict::Slow);
+        let mut m = Model::new();
+        m.color_coding = false;
+        m.compact_actions = true;
+        m.frame_number = 2160;
+        m.epoch_length = 720;
+        m.last_fetch_success = Some(Instant::now());
+        m.hidden_columns.remove(&ALLOC_PROVER_PHASES_COL);
+        m.cached_node_info = Some(NodeInfoResponse {
+            store_io: Some(io),
             node_reachability: Some(NodeReachability {
                 listen_multiaddrs: vec!["/ip4/192.168.1.20/tcp/8336".to_string()],
-                nat_status: "unknown".to_string(),
-                confirmed_multiaddrs: confirmed.iter().map(|a| a.to_string()).collect(),
+                nat_status: "private".to_string(),
                 probe_failure: Some(AutonatProbeFailure {
                     class: "dial_error".to_string(),
                     probes: 14,
                     failing_secs: 1_920,
-                    unreachable,
+                    unreachable: true,
                 }),
                 ..Default::default()
             }),
             ..Default::default()
-        };
-        let mut m = Model::new();
-        m.compact_actions = false;
-        m.data_loaded = true;
-        m.allocations = joining_table();
-        m.last_fetch_success = Some(Instant::now());
-        m.cached_node_info = Some(report(true, &[]));
-        let shown = |m: &Model| {
-            condition_notices(m)
-                .into_iter()
-                .filter(|(key, ..)| *key == "peers-cannot-dial")
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            shown(&m),
-            vec![(
-                "peers-cannot-dial",
-                NoticeSeverity::Warning,
-                "Reachability: peers cannot dial this node; run qclient node doctor.".to_string()
-            )]
+        });
+        let counts = Some(ShardProverCounts {
+            active: 1,
+            ..Default::default()
+        });
+        let mut seat = row("aa", 24, 1, 7, "", "");
+        seat.filter = vec![0xaa];
+        seat.status = 2;
+        seat.epoch = 3;
+        seat.estimated_reward = BigInt::from(5_000_000);
+        seat.certificate_share = cert_share(3600, 340, 30);
+        seat.shard_size = BigInt::from(1);
+        seat.prover_counts = counts;
+        m.node_app_cadence.insert(
+            vec![0xaa],
+            FrameCadence {
+                last_observed_unix_seconds: 1,
+                hour: Some(FrameWindow {
+                    window_seconds: 3600,
+                    observed_seconds: 3600,
+                    advanced_frames: 20,
+                }),
+                day: Some(FrameWindow {
+                    window_seconds: 86_400,
+                    observed_seconds: 86_400,
+                    advanced_frames: 4800,
+                }),
+            },
         );
+        m.allocations = vec![seat.clone()];
+        let mut peer = shard("bb", 1, 1);
+        peer.filter = vec![0xbb];
+        peer.materialized_frame = 15;
+        peer.latest_frame = 20;
+        peer.prover_counts = counts;
+        m.health = HealthAnswer::Reported(Default::default());
+        m.health_received = Some(Instant::now());
         update_message_lifetime(&mut m);
-        let text = render_text(&mut m, 160, 30);
-        assert!(text.contains("peers cannot dial this node"), "{text}");
-        m.last_fetch_success = Some(Instant::now() - Duration::from_secs(3600));
-        assert!(shown(&m).is_empty(), "stale status establishes nothing");
-        m.last_fetch_success = Some(Instant::now());
-        // Failing probes that do not settle it yet, a confirmed address, and
-        // a node that predates the report are no claim.
-        m.cached_node_info = Some(report(false, &[]));
-        assert!(shown(&m).is_empty(), "unsettled probes");
-        m.cached_node_info = Some(report(true, &["/ip4/203.0.113.7/tcp/8336"]));
-        assert!(shown(&m).is_empty(), "confirmed by AutoNAT");
-        m.cached_node_info = Some(NodeInfoResponse::default());
-        assert!(shown(&m).is_empty(), "no report");
+        let keys: Vec<&str> = condition_notices(&m)
+            .into_iter()
+            .map(|(key, ..)| key)
+            .collect();
+        for key in [
+            "store-io-slow",
+            "peers-cannot-dial",
+            "reward-drop",
+            "cert-share-low",
+        ] {
+            assert!(!keys.contains(&key), "{key} judged here: {keys:?}");
+        }
+        assert_eq!(alloc_cell(&m, &seat, ALLOC_CERT_COL, 0), "8%");
+        assert_eq!(alloc_cell(&m, &seat, ALLOC_PROVER_PHASES_COL, 0), "a1");
+        assert_eq!(avail_cell(&m, &peer, AVAIL_PROVER_PHASES_COL, 0), "a1");
+        assert_eq!(avail_cell(&m, &peer, 9, 12), "lag");
+        assert_eq!(peer_state_color(&m, &peer), TEXT);
+        // The node's condition flags exactly the shards it lists.
+        flag(&mut m, ConditionKind::CertificateShareLow, &[&[0xaa]]);
+        flag(&mut m, ConditionKind::ShardHaltRisk, &[&[0xaa], &[0xbb]]);
+        flag(&mut m, ConditionKind::PeerMaterializationLag, &[&[0xbb]]);
+        assert_eq!(alloc_cell(&m, &seat, ALLOC_CERT_COL, 0), "8%!");
+        assert_eq!(alloc_cell(&m, &seat, ALLOC_PROVER_PHASES_COL, 0), "a1!");
+        assert_eq!(avail_cell(&m, &peer, AVAIL_PROVER_PHASES_COL, 0), "a1!");
+        assert_eq!(avail_cell(&m, &peer, 9, 12), "lag!");
+        assert_eq!(peer_state_color(&m, &peer), WARNING);
     }
 
     #[test]
@@ -5924,73 +5956,6 @@ mod tests {
     }
 
     #[test]
-    fn reward_notice_compares_the_60m_forecast_with_its_24h_window() {
-        use quil_types::proto::node::{FrameCadence, FrameWindow};
-        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-        let mut m = Model::new();
-        m.frame_number = 2160;
-        m.epoch_length = 720;
-        m.last_fetch_success = Some(Instant::now());
-        let mut allocation = row("aa", 1, 1, 7, "", "");
-        allocation.filter = vec![0xaa];
-        allocation.status = 2;
-        allocation.epoch = 3;
-        allocation.estimated_reward = BigInt::from(5_000_000);
-        m.allocations = vec![allocation];
-        let seconds = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let cadence = |hour_seconds, hour_frames| FrameCadence {
-            last_observed_unix_seconds: seconds,
-            hour: Some(FrameWindow {
-                window_seconds: 3600,
-                observed_seconds: hour_seconds,
-                advanced_frames: hour_frames,
-            }),
-            day: Some(FrameWindow {
-                window_seconds: 86_400,
-                observed_seconds: 86_400,
-                advanced_frames: 4800,
-            }),
-        };
-        let notices = |m: &Model| {
-            message_lines(m, Line::default(), 300)
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
-        m.node_app_cadence.insert(vec![0xaa], cadence(3600, 20));
-        update_message_lifetime(&mut m);
-        let since = m.notice_since["reward-drop"];
-        assert!(notices(&m).contains(&format!(
-            "{}Reward now 60m ~0.3 vs 24h ~3.0 Q/d.",
-            message_timestamp(Some(since))
-        )));
-        // The notice quotes the same forecasts as the Reward KPI.
-        assert!(reward_total(&m, &m.allocations, 0).starts_with("0.3/3.0/"));
-        m.notice_minimum = NoticeSeverity::Error;
-        assert!(!notices(&m).contains("Reward now"));
-        m.notice_minimum = NoticeSeverity::Warning;
-        m.last_fetch_success = Some(Instant::now() - Duration::from_secs(60));
-        assert!(!notices(&m).contains("Reward now"));
-        m.last_fetch_success = Some(Instant::now());
-        // Half of the 24h rate or more is not a drop.
-        m.node_app_cadence.insert(vec![0xaa], cadence(3600, 100));
-        update_message_lifetime(&mut m);
-        assert!(!m.notice_since.contains_key("reward-drop"));
-        // Short 60m coverage cannot establish a drop.
-        m.node_app_cadence.insert(vec![0xaa], cadence(600, 0));
-        update_message_lifetime(&mut m);
-        assert!(!m.notice_since.contains_key("reward-drop"));
-        // Unassigned allocations take no part.
-        m.node_app_cadence.insert(vec![0xaa], cadence(3600, 20));
-        m.allocations[0].worker_id = -1;
-        assert!(reward_drop(&m).is_none());
-    }
-
-    #[test]
     fn allocation_notices_count_workerless_failed_stale_and_recovering_rows() {
         use quil_types::proto::node::{ShardRecovery, WorkerExecution};
         use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -6462,10 +6427,17 @@ mod tests {
             .spans
             .iter()
             .all(|s| s.style.fg == Some(HELP)));
-        assert!(available_detail(&Model::new(), &peer)
+        // Yellow only for a shard the node lists as trailing.
+        let mut flagged = Model::new();
+        flag(&mut flagged, ConditionKind::PeerMaterializationLag, &[&[]]);
+        assert!(available_detail(&flagged, &peer)
             .spans
             .iter()
             .all(|s| s.style.fg == Some(Color::Yellow)));
+        assert!(available_detail(&Model::new(), &peer)
+            .spans
+            .iter()
+            .all(|s| s.style.fg == Some(HELP)));
     }
 
     #[test]
@@ -6560,6 +6532,7 @@ mod tests {
     fn inactive_cursors_bind_both_panel_details_and_keep_peer_warnings_visible() {
         let mut m = Model::new();
         m.focus = PanelFocus::Notifications;
+        flag(&mut m, ConditionKind::PeerMaterializationLag, &[&[]]);
         let mut allocation = row("aa", 1, 1, 7, "", "");
         allocation.execution = Some(quil_types::proto::node::WorkerExecution {
             state: "blocked".into(),
@@ -6881,7 +6854,8 @@ mod tests {
 
     #[test]
     fn state_cells_use_lowercase_and_keep_their_colors() {
-        let m = Model::new();
+        let mut m = Model::new();
+        flag(&mut m, ConditionKind::PeerMaterializationLag, &[&[]]);
         for (mat, head, label, color) in [
             (0, 0, "unknown", HELP),
             (0, 10, "unmat", WARNING),
@@ -7817,6 +7791,7 @@ mod tests {
         peer.materialized_frame = 44;
         peer.latest_frame = 47;
         let available = vec![peer.clone(), peer];
+        flag(&mut m, ConditionKind::PeerMaterializationLag, &[&[]]);
         let cell = |line: &Line<'_>, widths: &[usize], col: usize| -> String {
             let order = if widths.len() == ALLOC_COL_NAMES.len() {
                 ALLOC_DISPLAY_COLS
@@ -8155,7 +8130,7 @@ mod tests {
     }
 
     #[test]
-    fn prover_phases_warn_of_halt_risk_by_active_and_activating_count() {
+    fn prover_phases_warn_of_the_shards_the_node_reports_at_halt_risk() {
         use quil_types::proto::node::ShardProverCounts;
         let counts = |active, activating, joining| {
             Some(ShardProverCounts {
@@ -8166,37 +8141,24 @@ mod tests {
             })
         };
         let size = BigInt::from(1u64);
-        assert!(
-            prover_halt_risk(counts(2, 1, 9).as_ref(), &size),
-            "unconfirmed joins are no coverage"
-        );
-        assert!(prover_halt_risk(counts(0, 0, 0).as_ref(), &size));
-        assert!(
-            !prover_halt_risk(counts(3, 1, 0).as_ref(), &size),
-            "a confirmed join is coverage"
-        );
-        assert!(!prover_halt_risk(counts(4, 0, 0).as_ref(), &size));
-        assert!(
-            !prover_halt_risk(counts(0, 0, 0).as_ref(), &BigInt::from(0)),
-            "a shard without data cannot halt"
-        );
-        assert!(
-            !prover_halt_risk(None, &size),
-            "unreported counts establish nothing"
-        );
 
         let mut m = Model::new();
         m.hidden_columns.remove(&ALLOC_PROVER_PHASES_COL);
         let mut risky = row("aa", 3, 1, 1, "", "");
+        risky.filter = vec![0xaa];
         risky.shard_size = size.clone();
         risky.prover_counts = counts(2, 1, 0);
         let mut healthy = row("bb", 4, 1, 2, "", "");
+        healthy.filter = vec![0xbb];
         healthy.shard_size = size.clone();
         healthy.prover_counts = counts(4, 0, 0);
         let mut risky_shard = shard("cc", 1, 0);
+        risky_shard.filter = vec![0xcc];
         risky_shard.prover_counts = risky.prover_counts.clone();
         let mut healthy_shard = shard("dd", 1, 0);
+        healthy_shard.filter = vec![0xdd];
         healthy_shard.prover_counts = healthy.prover_counts.clone();
+        flag(&mut m, ConditionKind::ShardHaltRisk, &[&[0xaa], &[0xcc]]);
         // Colors off: `!` marks the warning; colors on keep its slot blank.
         m.color_coding = false;
         assert_eq!(
@@ -8285,29 +8247,19 @@ mod tests {
         );
         a.certificate_share = cert_share(3600, 340, 241);
         assert_eq!(alloc_cell(&m, &a, ALLOC_CERT_COL, 0), "70%");
-        // Under half of 17/24 is low once a full hour holds 30 frames.
-        a.certificate_share = cert_share(3600, 340, 120);
-        assert_eq!(alloc_cell(&m, &a, ALLOC_CERT_COL, 0), "35%!");
-        a.certificate_share = cert_share(3599, 340, 120);
-        assert_eq!(
-            alloc_cell(&m, &a, ALLOC_CERT_COL, 0),
-            "35%",
-            "under an hour"
-        );
-        a.certificate_share = cert_share(3600, 29, 0);
-        assert_eq!(
-            alloc_cell(&m, &a, ALLOC_CERT_COL, 0),
-            "0%",
-            "too few frames"
-        );
+        // Low only as the node reports it, whatever the share reads.
         a.certificate_share = cert_share(3600, 340, 121);
         assert_eq!(alloc_cell(&m, &a, ALLOC_CERT_COL, 0), "35%");
+        a.filter = vec![0xaa];
         assert!(m.alloc_column_visible(ALLOC_CERT_COL), "shown by default");
         assert_eq!(alloc_header(&m, ALLOC_CERT_COL), "Cert ");
 
         let mut low = row("bb", 24, 1, 2, "", "");
+        low.filter = vec![0xbb];
         low.certificate_share = cert_share(3600, 340, 30);
-        let older = row("cc", 24, 1, 3, "", "");
+        flag(&mut m, ConditionKind::CertificateShareLow, &[&[0xbb]]);
+        let mut older = row("cc", 24, 1, 3, "", "");
+        older.filter = vec![0xcc];
         m.color_coding = false;
         assert_eq!(alloc_display_cell(&m, &low, ALLOC_CERT_COL, 0), "8%!");
         m.color_coding = true;
@@ -8336,35 +8288,6 @@ mod tests {
             "{}",
             lines[1]
         );
-    }
-
-    #[test]
-    fn a_low_cert_share_raises_one_notice_over_the_seats_reporting_one() {
-        let mut m = Model::new();
-        m.reachable = true;
-        m.last_fetch_success = Some(std::time::Instant::now());
-        let seat = |hex: &str, share| {
-            let mut a = row(hex, 24, 1, 1, "", "");
-            a.certificate_share = share;
-            a
-        };
-        m.allocations = vec![
-            seat("aa", cert_share(3600, 340, 241)),
-            seat("bb", cert_share(3600, 340, 30)),
-            seat("cc", None),
-        ];
-        let low = |m: &Model| {
-            condition_notices(m)
-                .into_iter()
-                .find(|(key, ..)| *key == "cert-share-low")
-        };
-        let (_, severity, text) = low(&m).expect("a low seat raises the notice");
-        assert_eq!(severity, NoticeSeverity::Warning);
-        assert_eq!(text, "Low certificate share (60m): 1/2 allocations.");
-        assert!(text.chars().count() + 15 <= 80);
-        m.allocations[1].certificate_share = cert_share(1800, 340, 30);
-        assert!(low(&m).is_none(), "under an hour counted is no verdict");
-        assert!(help_text().contains("Low certificate share (60m)"));
     }
 
     fn help_text() -> String {
@@ -8519,9 +8442,12 @@ mod tests {
             "Global notice",
             "Global app notice",
             "Reward notice",
+            "Shard notices",
             "Allocation notices",
             "Seat concentration notice",
             "Reachability notice",
+            "IPv6 notice",
+            "Master store notice",
             "Store notice",
             "Command legends",
             "Scroll hints",
@@ -9917,7 +9843,7 @@ mod visibility_grid_tests {
 
 #[cfg(test)]
 mod cursor_rule_tests {
-    use super::tests::{row, shard};
+    use super::tests::{flag, row, shard};
     use super::*;
     use quil_types::proto::node::WorkerExecution;
     use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
@@ -9963,6 +9889,11 @@ mod cursor_rule_tests {
         current.materialized_frame = 20;
         current.latest_frame = 20;
         m.available = vec![lagging, current];
+        flag(
+            &mut m,
+            quil_types::proto::diagnostics::ConditionKind::PeerMaterializationLag,
+            &[&[]],
+        );
         m
     }
 

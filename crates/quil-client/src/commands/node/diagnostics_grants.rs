@@ -29,7 +29,8 @@ frame, worker count, store write state and store and disk read times; its health
 and the GLOBAL frames an expected wait ends at); and per worker its core ID, public shard \
 filter, allocation, phase, blocker, frames, committee generation, recovery state and failure \
 counts, and when these last changed.\n\
-It gets no log text, addresses or keys.\n";
+It gets no log text, addresses or keys, and no condition about this node's rewards or \
+addresses.\n";
 
 const APPLY: &str = "The node reads this at start: restart it to apply. This command restarts \
 nothing.\n";
