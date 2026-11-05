@@ -20,7 +20,7 @@
 //! `quil_cw_consensus::adapters` — they are generic over the 32-byte `Sha256`
 //! digest, so the `Global*` naming is incidental.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use quil_cw_consensus::adapters::{
@@ -1452,9 +1452,12 @@ impl FrameSink for AppSeamSink {
 // ---------------------------------------------------------------------------
 
 /// How long the head of the pending finalizations may stay undeliverable
-/// before the operator is warned, and how often the warning repeats.
-const HEAD_STALL_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
-const HEAD_STALL_REPEAT: std::time::Duration = std::time::Duration::from_secs(600);
+/// before the wait is logged.
+const HEAD_STALL_NOTE_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long before the operator is warned: a miss clears by itself well
+/// within this on a healthy node. The warning repeats at this interval too.
+const HEAD_STALL_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+const HEAD_STALL_REPEAT: std::time::Duration = HEAD_STALL_WARN_AFTER;
 
 /// Why a pending finalization was not delivered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1482,10 +1485,20 @@ impl Held {
 
     fn action(self) -> &'static str {
         match self {
-            Held::BodyMissing => "expected to clear once archive replay materializes the frame; until then this worker follows the shard by archive replay and sends no reward proofs, full frames or closing certificate; report this line if it persists",
+            Held::BodyMissing => "expected to clear once archive replay materializes the frame; until then this worker follows the shard by archive replay and its seat signs little; if it recurs, check this node's link ('app shard body delivery summary' lines); report this line if it persists",
             Held::BodyMismatch => "a peer served other bytes under this digest; report this line if it persists",
             Held::SealNotPersisted => "check free space and permissions of this node's store",
             Held::SinkRefused => "the engine is busy or stalled; check this worker's materialized height",
+        }
+    }
+
+    /// What a head held for this reason waits for, and what ends the wait.
+    fn wait(self) -> &'static str {
+        match self {
+            Held::BodyMissing => "the frame's body has not arrived by gossip; it ends when the body arrives, or once archive replay has passed the frame and a later finalization with a verified body shows it",
+            Held::BodyMismatch => "the stored bytes are not the certified frame; it ends when the certified body arrives",
+            Held::SealNotPersisted => "it ends when the closing certificate is stored",
+            Held::SinkRefused => "it ends when the engine takes the frame",
         }
     }
 }
@@ -1505,6 +1518,8 @@ struct HeadStall {
     digest: Digest,
     view: u64,
     since: std::time::Instant,
+    /// The wait was logged, so its end is too.
+    noted: bool,
     warned: Option<std::time::Instant>,
 }
 
@@ -1515,14 +1530,17 @@ struct DropReport {
     dropped: usize,
     /// The lowest and highest dropped view.
     views: Option<(u64, u64)>,
+    /// Dropped since the head was last looked at, to say how a stall ended.
+    since_head: HashSet<Digest>,
 }
 
 /// What [`AppSeamFinalizer::retry_pending_at`] told the operator.
 #[derive(Debug, PartialEq, Eq)]
 enum HeadSignal {
+    Noted,
     Stalled,
     StillStalled,
-    Cleared,
+    Cleared(&'static str),
 }
 
 /// Materializes finalized app frames + writes candidates on notarize, via
@@ -1566,6 +1584,12 @@ pub struct AppSeamFinalizer {
     scanned: Mutex<Option<(u64, usize)>>,
     /// Entries dropped as already materialized, for the operator.
     drop_report: Mutex<DropReport>,
+    /// This worker's body delivery counts, kept across its consensus hosts.
+    delivery: Arc<crate::app_body_delivery::BodyDelivery>,
+    /// `(generation, members)`, to name the leader of a view in `delivery`.
+    committee: Option<(u64, usize)>,
+    /// Pending finalizations seen without a body, counted once each.
+    missing_bodies: Mutex<HashSet<Digest>>,
 }
 
 impl AppSeamFinalizer {
@@ -1592,7 +1616,44 @@ impl AppSeamFinalizer {
             head_stall: Default::default(),
             scanned: Default::default(),
             drop_report: Default::default(),
+            delivery: Default::default(),
+            committee: None,
+            missing_bodies: Default::default(),
         }
+    }
+
+    /// Count body delivery into `delivery`, naming leaders of the host's
+    /// committee of `members` in generation `epoch`.
+    fn with_body_delivery(
+        mut self,
+        delivery: Arc<crate::app_body_delivery::BodyDelivery>,
+        epoch: u64,
+        members: usize,
+    ) -> Self {
+        self.delivery = delivery;
+        self.committee = Some((epoch, members));
+        self
+    }
+
+    /// Count a finalization's body as missing once. Only a finalization this
+    /// instance reported has a view in its own numbering, naming its leader.
+    fn note_missing_body(&self, digest: Digest, view: u64) {
+        if !self.missing_bodies.lock().unwrap().insert(digest) {
+            return;
+        }
+        let reported = self
+            .pending
+            .lock()
+            .unwrap()
+            .get(&digest)
+            .is_some_and(|(_, _, reported)| *reported);
+        let leader = self
+            .committee
+            .filter(|_| reported)
+            .and_then(|(epoch, members)| {
+                quil_cw_consensus::engine_host::round_robin_leader(epoch, view, members)
+            });
+        self.delivery.body_missing(leader);
     }
 
     /// The lowest view whose finalized body this finalizer still has to
@@ -1976,6 +2037,9 @@ impl AppSeamFinalizer {
             // Do not knowingly deliver newer finalizations ahead of a missing
             // earlier body or a backpressured notification.
             if let Err((held, frame)) = self.try_deliver(digest) {
+                if held == Held::BodyMissing {
+                    self.note_missing_body(digest, view);
+                }
                 return Some(Head {
                     view,
                     digest,
@@ -1983,6 +2047,9 @@ impl AppSeamFinalizer {
                     frame,
                     behind: count - index - 1,
                 });
+            }
+            if self.missing_bodies.lock().unwrap().remove(&digest) {
+                self.delivery.body_late();
             }
         }
         None
@@ -2040,11 +2107,14 @@ impl AppSeamFinalizer {
                 report.views = Some(report.views.map_or((*view, *view), |(low, high)| {
                     (low.min(*view), high.max(*view))
                 }));
+                report.since_head.insert(*digest);
+                self.missing_bodies.lock().unwrap().remove(digest);
             }
             !dropped
         });
         let dropped = before - pending.len();
         drop(pending);
+        self.delivery.body_never(dropped as u64);
         report.dropped += dropped;
         if dropped > 0
             && report
@@ -2068,24 +2138,32 @@ impl AppSeamFinalizer {
         report.last = Some(now);
     }
 
-    /// Warn once the same head has been undeliverable for
-    /// [`HEAD_STALL_WARN_AFTER`], again every [`HEAD_STALL_REPEAT`], and say
-    /// when it clears. A missing body with nothing behind it holds nothing
-    /// back: it is the engine's own gap, which the engine reports.
+    /// Log the wait once the same head has been undeliverable for
+    /// [`HEAD_STALL_NOTE_AFTER`], warn at [`HEAD_STALL_WARN_AFTER`] and again
+    /// every [`HEAD_STALL_REPEAT`], and say when and how it clears. A missing
+    /// body with nothing behind it holds nothing back: it is the engine's own
+    /// gap, which the engine reports.
     fn note_head(&self, head: Option<Head>, now: std::time::Instant) -> Option<HeadSignal> {
         let mut stall = self.head_stall.lock().unwrap();
         let mut signal = None;
+        let dropped = std::mem::take(&mut self.drop_report.lock().unwrap().since_head);
         let moved = stall
             .as_ref()
             .is_some_and(|stall| head.as_ref().is_none_or(|head| head.digest != stall.digest));
         if let Some(previous) = stall.take_if(|_| moved) {
-            if previous.warned.is_some() {
+            if previous.noted {
+                let how = if dropped.contains(&previous.digest) {
+                    "dropped"
+                } else {
+                    "delivered"
+                };
+                self.delivery.stall_ended(now);
                 tracing::info!(filter = %hex::encode(&self.filter), view = previous.view,
                     digest = %hex::encode(&previous.digest.0[..4]),
                     stalled_secs = now.saturating_duration_since(previous.since).as_secs(),
-                    materialized = self.materialized_floor(),
-                    "finalized app frame delivery resumed: the pending finalization that held back later ones was delivered or dropped");
-                signal = Some(HeadSignal::Cleared);
+                    materialized = self.materialized_floor(), how,
+                    "finalized app frame delivery resumed: the pending finalization that held back later ones cleared");
+                signal = Some(HeadSignal::Cleared(how));
             }
         }
         let Some(head) = head else {
@@ -2096,11 +2174,25 @@ impl AppSeamFinalizer {
             digest: head.digest,
             view: head.view,
             since: now,
+            noted: false,
             warned: None,
         });
         let stuck = now.saturating_duration_since(stall.since);
+        if stuck < HEAD_STALL_NOTE_AFTER || (head.held == Held::BodyMissing && head.behind == 0) {
+            return signal;
+        }
+        if !stall.noted {
+            stall.noted = true;
+            self.delivery.stall_noted(stall.since);
+            tracing::info!(filter = %hex::encode(&self.filter), view = head.view,
+                digest = %hex::encode(&head.digest.0[..4]),
+                frame = %head.frame.map_or_else(|| "unknown".to_string(), |frame| frame.to_string()),
+                reason = head.held.reason(), materialized = self.materialized_floor(),
+                stalled_secs = stuck.as_secs(), held_back = head.behind, wait = head.held.wait(),
+                "waiting for a pending finalization that holds back later ones: this clears by itself and takes no action");
+            signal = Some(HeadSignal::Noted);
+        }
         if stuck < HEAD_STALL_WARN_AFTER
-            || (head.held == Held::BodyMissing && head.behind == 0)
             || stall
                 .warned
                 .is_some_and(|warned| now.saturating_duration_since(warned) < HEAD_STALL_REPEAT)
@@ -2144,11 +2236,14 @@ impl FrameFinalizer for AppSeamFinalizer {
         // itself never upgrades an unverified candidate into verified data.
         self.reported
             .store(true, std::sync::atomic::Ordering::Release);
-        self.pending
-            .lock()
-            .unwrap()
+        let mut pending = self.pending.lock().unwrap();
+        if !pending.contains_key(&digest) {
+            self.delivery.finalized();
+        }
+        pending
             .entry(digest)
             .or_insert_with(|| (view, cert.unwrap_or_default(), true));
+        drop(pending);
         self.retry_pending();
     }
 }
@@ -2393,6 +2488,7 @@ pub fn activate_app_consensus_cw(
     // across sessions) and the engine's contiguous materialized cursor they
     // are kept until (see [`FinalizedRecords`]).
     finalized_records: Option<(std::path::PathBuf, Arc<std::sync::atomic::AtomicU64>)>,
+    reporting: crate::app_body_delivery::HostReporting,
 ) -> quil_types::error::Result<AppConsensusCwHandle> {
     // An instance that restarts from its certified local head: every legacy
     // instance, and generation zero, which continues one.
@@ -2499,7 +2595,8 @@ pub fn activate_app_consensus_cw(
     if let Some((records, cursor)) = finalized_records {
         finalizer = finalizer.with_finalized_records(records, cursor);
     }
-    let finalizer = Arc::new(finalizer);
+    reporting.delivery.host_started(std::time::Instant::now());
+    let finalizer = Arc::new(finalizer.with_body_delivery(reporting.delivery, epoch, peers.len()));
     // Finalized bodies wait in the store until the engine takes them, in
     // order: keep the window open below the oldest one still waiting.
     store.hold_from({
@@ -2531,6 +2628,7 @@ pub fn activate_app_consensus_cw(
     let mut params = GlobalEngineParams::new(partition, epoch, genesis_digest)
         .with_leader_timeout_secs(leader_timeout_secs);
     params.liveness = session.as_ref().map(|host| host.liveness.clone());
+    params.thread_tag = reporting.thread_tag;
     // A leader skips nullified notarized parents too deep to execute privately.
     params.parent_fallback = private_parents
         .map(|parents| parents as Arc<dyn quil_cw_consensus::engine_host::ParentFallback>);
@@ -3873,6 +3971,89 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
+    /// A head dropped as materialized says so; one under the 30 s mark never
+    /// logged a wait, so its end stays silent too.
+    #[test]
+    fn a_head_dropped_as_materialized_reports_how_it_ended() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        let directory = test_directory("head-dropped");
+        let frames = linked_frames(5, 9);
+        let digest = |index: usize| app_frame_digest(&frames[index]).unwrap();
+        let start = std::time::Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let cursor = Arc::new(std::sync::atomic::AtomicU64::new(5));
+        let (store, finalizer) =
+            gap_host(&directory.join("noted"), cursor.clone(), Default::default());
+        finalizer.on_finalized(16, digest(1), None, Some(vec![6]), true);
+        store.seal(digest(2), encode_app_frame(&frames[2]));
+        finalizer.on_finalized(17, digest(2), None, Some(vec![7]), true);
+        assert_eq!(finalizer.retry_pending_at(at(0)), None);
+        assert_eq!(finalizer.retry_pending_at(at(31)), Some(HeadSignal::Noted));
+        // Archive replay passes frame 6; frame 7's verified body shows it.
+        cursor.store(6, Ordering::SeqCst);
+        assert_eq!(
+            finalizer.retry_pending_at(at(40)),
+            Some(HeadSignal::Cleared("dropped"))
+        );
+        assert!(finalizer.pending.lock().unwrap().is_empty());
+
+        let cursor = Arc::new(std::sync::atomic::AtomicU64::new(5));
+        let (store, finalizer) = gap_host(
+            &directory.join("silent"),
+            cursor.clone(),
+            Default::default(),
+        );
+        finalizer.on_finalized(16, digest(1), None, Some(vec![6]), true);
+        store.seal(digest(2), encode_app_frame(&frames[2]));
+        finalizer.on_finalized(17, digest(2), None, Some(vec![7]), true);
+        assert_eq!(finalizer.retry_pending_at(at(0)), None);
+        cursor.store(6, Ordering::SeqCst);
+        assert_eq!(finalizer.retry_pending_at(at(10)), None);
+        assert!(finalizer.pending.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// What the summary line counts here: each finalization once, a body that
+    /// came late, one that never came and the leader of the missing ones.
+    #[test]
+    fn body_delivery_counts_late_and_never_delivered_bodies_and_their_leader() {
+        use std::sync::atomic::Ordering;
+        let directory = test_directory("delivery-counts");
+        let frames = linked_frames(5, 9);
+        let digest = |index: usize| app_frame_digest(&frames[index]).unwrap();
+        let delivery = Arc::new(crate::app_body_delivery::BodyDelivery::default());
+        let cursor = Arc::new(std::sync::atomic::AtomicU64::new(5));
+        let (store, finalizer) = gap_host(&directory, cursor.clone(), Default::default());
+        // Generation 2 of 5 members: view 16 is member 3's, view 17 member 4's.
+        let finalizer = Arc::new(finalizer.with_body_delivery(delivery.clone(), 2, 5));
+        let start = std::time::Instant::now();
+        delivery.take_summary(start);
+
+        finalizer.on_finalized(16, digest(1), None, Some(vec![6]), true);
+        finalizer.on_finalized(16, digest(1), None, Some(vec![6]), true);
+        finalizer.retry_pending();
+        store.put(digest(1), encode_app_frame(&frames[1]));
+        finalizer.retry_pending();
+        assert!(finalizer.pending.lock().unwrap().is_empty());
+
+        finalizer.on_finalized(17, digest(2), None, Some(vec![7]), true);
+        store.seal(digest(3), encode_app_frame(&frames[3]));
+        cursor.store(7, Ordering::SeqCst);
+        finalizer.on_finalized(18, digest(3), None, Some(vec![8]), true);
+        assert!(finalizer.pending.lock().unwrap().is_empty());
+        assert!(finalizer.missing_bodies.lock().unwrap().is_empty());
+
+        let summary = delivery
+            .take_summary(start + std::time::Duration::from_secs(300))
+            .unwrap();
+        assert_eq!(summary.finalized, 3, "a repeated report counts once");
+        assert_eq!(summary.body_late, 1);
+        assert_eq!(summary.body_never, 1);
+        assert_eq!(summary.top_leader, Some((3, 1)), "lowest of a tie");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
     /// A lost body above the materialized cursor still holds back later
     /// frames: delivering frame 7 first would skip frame 6. Once the body
     /// arrives, both go in order, each recorded before it is handed over.
@@ -4138,12 +4319,15 @@ mod tests {
         assert!(finalizer.pending.lock().unwrap().is_empty());
     }
 
-    /// The operator hears of a stuck head after 30 s, again every 10 min,
-    /// and when it clears; a missing body with nothing behind it is the
-    /// engine's own gap and stays silent here.
+    /// A stuck head is logged after 30 s, warned of after 10 min and every
+    /// 10 min from then on, and its end says how; a missing body with nothing
+    /// behind it is the engine's own gap and stays silent here.
     #[test]
-    fn a_stuck_head_warns_after_thirty_seconds_repeats_every_ten_minutes_and_reports_its_end() {
+    fn a_stuck_head_logs_at_thirty_seconds_warns_at_ten_minutes_and_reports_how_it_ended() {
+        use crate::outage::test_logs::CapturedLogs;
         use std::time::Duration;
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
         let directory = test_directory("head-stall");
         let frames = linked_frames(5, 7);
         let (_, alone) = implied_host(&directory.join("alone"), 5, Default::default());
@@ -4183,25 +4367,47 @@ mod tests {
         let start = std::time::Instant::now();
         let at = |secs| start + Duration::from_secs(secs);
         assert_eq!(finalizer.retry_pending_at(at(20)), None);
+        assert!(logs
+            .lines_with("waiting for a pending finalization")
+            .is_empty());
+        assert_eq!(finalizer.retry_pending_at(at(31)), Some(HeadSignal::Noted));
+        let noted = logs.lines_with("waiting for a pending finalization");
+        assert_eq!(noted.len(), 1, "{noted:?}");
+        for field in ["INFO", "has not arrived by gossip", "held_back=1"] {
+            assert!(noted[0].contains(field), "{field}: {}", noted[0]);
+        }
+        assert_eq!(finalizer.retry_pending_at(at(590)), None);
+        assert!(logs
+            .lines_with("not reaching this worker's engine")
+            .is_empty());
         assert_eq!(
-            finalizer.retry_pending_at(at(31)),
+            finalizer.retry_pending_at(at(601)),
             Some(HeadSignal::Stalled)
         );
-        assert_eq!(finalizer.retry_pending_at(at(300)), None);
+        let warned = logs.lines_with("not reaching this worker's engine");
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(warned[0].contains("WARN"), "{}", warned[0]);
+        assert!(warned[0].contains("its seat signs little"), "{}", warned[0]);
+        assert!(!warned[0].contains("reward proofs"), "{}", warned[0]);
+        assert_eq!(finalizer.retry_pending_at(at(1200)), None);
         assert_eq!(
-            finalizer.retry_pending_at(at(631)),
+            finalizer.retry_pending_at(at(1201)),
             Some(HeadSignal::StillStalled)
         );
-        assert_eq!(finalizer.retry_pending_at(at(700)), None);
         store.put(
             app_frame_digest(&frames[1]).unwrap(),
             encode_app_frame(&frames[1]),
         );
         assert_eq!(
-            finalizer.retry_pending_at(at(701)),
-            Some(HeadSignal::Cleared)
+            finalizer.retry_pending_at(at(1202)),
+            Some(HeadSignal::Cleared("delivered"))
         );
-        assert_eq!(finalizer.retry_pending_at(at(702)), None);
+        let resumed = logs.lines_with("delivery resumed");
+        assert_eq!(resumed.len(), 1, "{resumed:?}");
+        for field in ["how=\"delivered\"", "stalled_secs=120"] {
+            assert!(resumed[0].contains(field), "{field}: {}", resumed[0]);
+        }
+        assert_eq!(finalizer.retry_pending_at(at(1203)), None);
         assert_eq!(
             delivered
                 .lock()

@@ -105,6 +105,9 @@ fn short(digest: &[u8; 32]) -> String {
 /// behind costs the committee seconds, not its whole leader timeout.
 const PARENT_WAITS: u32 = 12;
 
+/// The refusal of a proposal whose body has not reached this member.
+pub const BLOCK_NOT_DELIVERED: &str = "block not delivered";
+
 impl HandoffProposer {
     pub fn new(
         inner: Arc<dyn GlobalProposer>,
@@ -657,7 +660,7 @@ impl GlobalProposer for HandoffProposer {
         let Some(bytes) = bytes else {
             tracing::debug!(view = context.view, parent_view = context.parent_view,
                 session = %digest_from_identity(self.session_id), "handoff verify: proposal bytes unavailable");
-            self.note(Step::Verify, context, "block not delivered", String::new());
+            self.note(Step::Verify, context, BLOCK_NOT_DELIVERED, String::new());
             return false;
         };
         if let Some(sealed) = self.selected_seal(context) {

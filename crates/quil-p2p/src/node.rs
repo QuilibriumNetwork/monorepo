@@ -1262,6 +1262,9 @@ impl P2PNode {
                             Some(P2PCommand::SubscribedPeerCount { bitmask, ack }) => {
                                 let _ = ack.send(swarm.behaviour().blossomsub.subscribed_peer_count(&bitmask));
                             }
+                            Some(P2PCommand::MeshPeerCount { bitmask, ack }) => {
+                                let _ = ack.send(swarm.behaviour().blossomsub.mesh_peers(&bitmask));
+                            }
                             Some(P2PCommand::SetCommitteePeers { peers, ack }) => {
                                 let count = peers.len();
                                 swarm.behaviour_mut().blossomsub.set_committee_peers(peers);
@@ -1473,6 +1476,23 @@ impl P2PHandle {
             })?;
         ack_rx.await.map_err(|_| {
             QuilError::P2p("p2p swarm dropped topic-peer-count ack (event loop exited)".into())
+        })
+    }
+
+    /// Peers in this node's mesh for a subscription.
+    pub async fn mesh_peer_count(&self, bitmask: Vec<u8>) -> quil_types::error::Result<usize> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(P2PCommand::MeshPeerCount {
+                bitmask,
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| {
+                QuilError::P2p("p2p command channel closed (swarm shutting down?)".into())
+            })?;
+        ack_rx.await.map_err(|_| {
+            QuilError::P2p("p2p swarm dropped mesh-count ack (event loop exited)".into())
         })
     }
 
@@ -1871,6 +1891,10 @@ enum P2PCommand {
         ack: oneshot::Sender<()>,
     },
     SubscribedPeerCount {
+        bitmask: Vec<u8>,
+        ack: oneshot::Sender<usize>,
+    },
+    MeshPeerCount {
         bitmask: Vec<u8>,
         ack: oneshot::Sender<usize>,
     },
