@@ -1,6 +1,7 @@
 mod actor;
 mod discards;
 mod ingress;
+mod race;
 mod repeats;
 mod round;
 mod verifier;
@@ -325,6 +326,105 @@ mod tests {
 
         // Construction is one-shot per round.
         assert!(round.try_construct_notarization(&strategy).await.is_none());
+    }
+
+    /// QUILIBRIUM (race.rs): a view this member voted finalize in reads its own
+    /// vote's place in the order the votes were held, and whose certificate
+    /// finished the view.
+    #[test]
+    fn the_own_finalize_vote_reads_its_rank_and_the_certificate_that_finished_the_view() {
+        use super::race::{Outcome, Sample};
+        let executor = tokio::Runner::default();
+        executor.start(|_context| async move {
+            let mut rng = test_rng();
+            let Fixture {
+                participants,
+                schemes,
+                ..
+            } = ed25519::fixture(&mut rng, b"batcher_race", 5);
+            let new_round = || {
+                super::Round::new(
+                    Round::new(Epoch::new(0), View::new(1)),
+                    Arc::new(schemes[0].clone()),
+                    NoopBlocker,
+                    NoopReporter(PhantomData),
+                )
+            };
+            let proposal = Proposal::new(
+                Round::new(Epoch::new(0), View::new(1)),
+                View::new(0),
+                Sha256::hash(b"payload"),
+            );
+            let finalize =
+                |i: usize| Vote::Finalize(Finalize::sign(&schemes[i], proposal.clone()).unwrap());
+            let leader = Vote::Notarize(Notarize::sign(&schemes[1], proposal.clone()).unwrap());
+
+            // Two votes of others are held when ours is added (rank 3); the
+            // other two arrive after, and this batcher assembles the view's
+            // certificate with ours among the signers.
+            let mut round = new_round();
+            round.set_leader(Participant::from_usize(1));
+            assert_eq!(round.add_network(participants[1].clone(), leader), Ok(true));
+            assert_eq!(
+                round.add_network(participants[1].clone(), finalize(1)),
+                Ok(true)
+            );
+            assert_eq!(
+                round.add_network(participants[2].clone(), finalize(2)),
+                Ok(true)
+            );
+            round.add_constructed(finalize(0));
+            assert_eq!(
+                round.add_network(participants[3].clone(), finalize(3)),
+                Ok(true)
+            );
+            assert_eq!(
+                round.add_network(participants[4].clone(), finalize(4)),
+                Ok(true)
+            );
+            assert!(round.ready_finalizes());
+            let (_, invalid) = round.verify_finalizes(&mut rng, &Sequential).await;
+            assert!(invalid.is_empty());
+            assert!(round
+                .try_construct_finalization(&Sequential)
+                .await
+                .is_some());
+            assert_eq!(
+                round.take_race(),
+                Some(Sample::new(2, 4, Outcome::Assembled { own_in: true })),
+                "rank 3 of a quorum of 4, assembled here with our vote"
+            );
+            assert_eq!(round.take_race(), None, "one reading per view");
+
+            // One vote of another is held when ours is added (rank 2); a
+            // peer's certificate then finishes the view.
+            let mut round = new_round();
+            assert_eq!(
+                round.add_network(participants[2].clone(), finalize(2)),
+                Ok(true)
+            );
+            round.add_constructed(finalize(0));
+            assert_eq!(
+                round.peer_copy_race(),
+                Some(Sample::new(1, 4, Outcome::PeerCopy)),
+                "rank 2, a certificate assembled elsewhere"
+            );
+            round.mark_finalized();
+            assert_eq!(
+                round.peer_copy_race(),
+                None,
+                "a finished view reads nothing more"
+            );
+
+            // No vote of ours, no reading.
+            let mut round = new_round();
+            assert_eq!(
+                round.add_network(participants[2].clone(), finalize(2)),
+                Ok(true)
+            );
+            assert_eq!(round.peer_copy_race(), None);
+            assert_eq!(round.take_race(), None);
+        });
     }
 
     /// Deterministic-runtime tests drive `Strategy::spawn` inline: the deterministic runtime's
