@@ -14,6 +14,10 @@ use quil_lattice_ct::confidential::{
     AmountOpening, CommitmentKey,
 };
 
+/// Past the first citable frame (669,976), so the mint meets the bound on the
+/// anchor and not the one on the first citable frame.
+const FUTURE: u64 = 669_976 + 5;
+
 fn policy() -> quil_execution::token_intrinsic::dispatch::TokenPolicy {
     quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(0)
 }
@@ -163,6 +167,7 @@ fn global_materializer_must_finish_a_frame_whose_mint_cites_an_unheld_frame() {
     check_setup(&source, &input.requests[0]);
     let first = source.materialize(&input);
     let retry = source.materialize(&input);
+    let outcomes = source.clock_store.get_global_clock_frame_outcomes(1);
     let _ = std::fs::remove_dir_all(&dir);
     match first {
         Ok(result) => {
@@ -170,6 +175,14 @@ fn global_materializer_must_finish_a_frame_whose_mint_cites_an_unheld_frame() {
                 (result.processed, source.last_materialized_frame()),
                 (0, 1),
                 "the refused mint is skipped and the frame completes"
+            );
+            let outcomes = outcomes.unwrap();
+            assert!(
+                outcomes.iter().any(|o| o
+                    .error
+                    .contains("precedes the network's first citable frame")),
+                "EARLY WRONG REFUSAL: the mint was skipped, but not by the first citable frame: \
+                 {outcomes:?}"
             );
         }
         Err(error) => panic!(
@@ -188,9 +201,10 @@ fn control_global_materializer_skips_a_refused_mint_and_finishes_the_frame() {
     let (source, root, dir) = token_source();
     let mut input = frame(1, root);
     // A future citation is refused with InvalidArgument before the clock read.
-    input.requests = vec![junk_mint_bundle(5)];
+    input.requests = vec![junk_mint_bundle(FUTURE)];
     check_setup(&source, &input.requests[0]);
     let result = source.materialize(&input);
+    let outcomes = source.clock_store.get_global_clock_frame_outcomes(1);
     let _ = std::fs::remove_dir_all(&dir);
     let result = result.unwrap_or_else(|error| {
         panic!("control: a deterministically refused mint must not fail the frame: {error}")
@@ -203,6 +217,13 @@ fn control_global_materializer_skips_a_refused_mint_and_finishes_the_frame() {
         ),
         (0, 1, 1),
         "control: the refused mint is skipped and the cursor passes frame 1"
+    );
+    let outcomes = outcomes.unwrap();
+    assert!(
+        outcomes
+            .iter()
+            .any(|o| o.error.contains("future global reward frame")),
+        "control: the mint must be refused as a future citation: {outcomes:?}"
     );
     eprintln!("EARLY CONTROL: a refused mint is skipped and the GLOBAL frame completes");
 }

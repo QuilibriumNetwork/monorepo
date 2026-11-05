@@ -412,10 +412,39 @@ impl ExecutionEngineManager {
         Ok(self)
     }
 
-    /// Set the network this node prices state growth for. Every node of a
-    /// network must use the same value (it is the network's own selector).
+    /// Set the network this node prices state growth for, which is also the
+    /// network whose first citable global frame bounds the settlement claims
+    /// the compute and hypergraph engines admit, and the token engine admits
+    /// without a token policy. Every node of a network must use the same value
+    /// (it is the network's own selector).
     pub fn with_pricing_network(mut self, network: u8) -> Self {
         self.pricing_network = network;
+        let engines = self
+            .engines
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(feature = "native-proof")]
+        if let Some(token) = engines
+            .get_mut("token")
+            .and_then(|engine| engine.as_any_mut())
+            .and_then(|engine| engine.downcast_mut::<TokenExecutionEngine>())
+        {
+            token.set_network(network);
+        }
+        if let Some(compute) = engines
+            .get_mut("compute")
+            .and_then(|engine| engine.as_any_mut())
+            .and_then(|engine| engine.downcast_mut::<ComputeExecutionEngine>())
+        {
+            compute.set_network(network);
+        }
+        if let Some(hypergraph) = engines
+            .get_mut("hypergraph")
+            .and_then(|engine| engine.as_any_mut())
+            .and_then(|engine| engine.downcast_mut::<HypergraphExecutionEngine>())
+        {
+            hypergraph.set_network(network);
+        }
         self
     }
 

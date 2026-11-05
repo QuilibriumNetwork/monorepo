@@ -5,7 +5,10 @@
 //! `clock_reward_root` turns the failed read into `ExecutionUnavailable`,
 //! which fails the whole frame on every replica. Each reproducer fails with
 //! "EARLY HALT: ..." while that holds; the controls pass and say which path
-//! drops cleanly and which class stays retryable.
+//! drops cleanly and which class stays retryable. The `zero_anchor_` and
+//! `lone_` rows are the same failure before any citation is read: an
+//! operation needing what a certified frame lacks, on every replica alike.
+use super::delivery::{CoinDelivery, Delivered};
 use super::dispatch::TokenPolicy;
 use super::settlement_claim::{
     bundle_context, marker_record, SettlementClaim, TYPE_SETTLEMENT_CLAIM,
@@ -19,6 +22,7 @@ use num_bigint::BigInt;
 use quil_lattice_ct::confidential::{
     mint::{Mint, MintStatement, RewardClaim, FALCON_PUBLIC_BYTES, FALCON_SIGNATURE_BYTES},
     mint_claim::MintClaim,
+    pending_claim::{ClaimBranch, EscrowPolicy, PendingClaim, PendingClaimStatement},
     relation::membership::IDENTITY_BYTES,
     transfer::{parameter_context, Output, MEMO_BYTES},
     AmountOpening, CommitmentKey,
@@ -208,20 +212,56 @@ fn app_context() -> FrameExecutionContext {
     }
 }
 
+/// The app-shard materializer's context for a frame whose header names no
+/// GLOBAL anchor (`app_engine.rs` ~14360): its own property, on every replica.
+fn anchorless_context() -> FrameExecutionContext {
+    FrameExecutionContext {
+        finalized_global_frame: None,
+        ..app_context()
+    }
+}
+
 /// Frame callers fail the frame on `is_execution_unavailable` and skip the
 /// op on any other error (`frame_materializer.rs` ~1109, `app_engine.rs`
-/// ~14405). Only a deterministic refusal leaves the frame able to finish.
-fn expect_refused<T>(case: &str, cited: u64, result: Result<T>) {
+/// ~14405). Only a deterministic refusal leaves the frame able to finish, and
+/// only `reason` shows the op reached the check this row is about: junk that
+/// a decode or an earlier check refuses proves nothing.
+fn expect_skipped<T>(case: &str, halt: &str, reason: &str, result: Result<T>) {
     match result {
         Err(error) if error.is_execution_unavailable() => panic!(
-            "EARLY HALT: {case}: a citation of GLOBAL frame {cited} (before the first citable \
-             frame {FIRST}, resolvable on no node) is ExecutionUnavailable, so every replica \
-             fails the frame and retries it forever: {error}"
+            "EARLY HALT: {case}: {halt}, so every replica fails the frame and retries it forever: \
+             {error}"
         ),
-        Err(QuilError::InvalidArgument(_)) => {}
+        Err(QuilError::InvalidArgument(message)) if message.contains(reason) => {}
+        Err(QuilError::InvalidArgument(message)) => {
+            panic!("EARLY WRONG REFUSAL: {case}: expected \"{reason}\", refused with: {message}")
+        }
         Err(error) => panic!("EARLY UNEXPECTED: {case}: refused with a non-skip class: {error}"),
         Ok(_) => panic!("EARLY UNEXPECTED: {case}: an unauthorized op was accepted"),
     }
+}
+
+/// [`expect_skipped`] for a citation before the first citable frame.
+fn expect_refused<T>(case: &str, cited: u64, result: Result<T>) {
+    expect_skipped(
+        case,
+        &format!(
+            "a citation of GLOBAL frame {cited} (before the first citable frame {FIRST}, \
+             resolvable on no node) is ExecutionUnavailable"
+        ),
+        "precedes the network's first citable frame",
+        result,
+    );
+}
+
+/// [`expect_skipped`] for an op in a frame whose header names no GLOBAL anchor.
+fn expect_anchorless_refused<T>(case: &str, result: Result<T>) {
+    expect_skipped(
+        case,
+        "an operation needing the anchor of a frame that names none is ExecutionUnavailable",
+        "the frame's global anchor",
+        result,
+    );
 }
 
 fn mint_in_global_venue(
@@ -240,17 +280,11 @@ fn mint_in_global_venue(
 fn reward_mint_citing_frame_one_must_not_fail_the_global_frame() {
     let engine = engine(ExecutionMode::Global, mainnet_clock());
     let message = bundle(junk_mint(BELOW_GENESIS));
-    // The materializer validates first (~1041); a deterministic refusal there
-    // would skip the op. Preflight only decodes, so it passes.
-    match engine.validate_message(ANCHOR + 1, &domains::QUIL_TOKEN, &message) {
-        Err(error) if error.is_execution_unavailable() => {
-            panic!("EARLY HALT: H1 GLOBAL validate step is ExecutionUnavailable: {error}")
-        }
-        Err(error) => {
-            eprintln!("CRR NOTE: H1 dropped cleanly at the validate step: {error}");
-            return;
-        }
-        Ok(()) => {}
+    // The materializer validates first (~1041); a deterministic refusal of the
+    // citation there would skip the op. Preflight only decodes, so it passes.
+    if let Err(error) = engine.validate_message(ANCHOR + 1, &domains::QUIL_TOKEN, &message) {
+        expect_refused::<()>("GLOBAL validate step", BELOW_GENESIS, Err(error));
+        return;
     }
     expect_refused(
         "QUIL reward mint (GLOBAL venue)",
@@ -385,8 +419,16 @@ fn admit_settlement(
     engine: &dyn ShardExecutionEngine,
     cited_global_frame: u64,
 ) -> Result<quil_types::execution::ProcessMessageResult> {
+    admit_settlement_in(engine, app_context(), cited_global_frame)
+}
+
+fn admit_settlement_in(
+    engine: &dyn ShardExecutionEngine,
+    context: FrameExecutionContext,
+    cited_global_frame: u64,
+) -> Result<quil_types::execution::ProcessMessageResult> {
     engine.process_message_with_context(
-        app_context(),
+        context,
         &BigInt::from(2),
         &PAID_APP,
         &settlement_bundle(cited_global_frame),
@@ -476,6 +518,235 @@ fn settlement_claim_through_a_mainnet_manager_must_not_fail_the_frame() {
             &format!("settlement claim ({name} engine of a mainnet manager)"),
             BELOW_GENESIS,
             admit_through_manager(&manager_on(0, mainnet_clock()), application, BELOW_GENESIS),
+        );
+    }
+}
+
+/// A delivery of a coin or an escrow with no record behind it, as a byzantine
+/// shard leader can include: only its encoding is well formed.
+fn junk_deliveries(cited_global_frame: u64) -> [(&'static str, Vec<u8>); 2] {
+    let network = policy(0).network;
+    let delivery = |delivered| {
+        CoinDelivery {
+            network,
+            application: domains::QUIL_TOKEN,
+            cited_global_frame,
+            global_root: [9; 32],
+            block: 0,
+            seq: 0,
+            source_frame: 1,
+            tx_id: [12; 32],
+            source_shard: ShardPath::WHOLE,
+            delivered,
+            forest_proof: vec![11; 40],
+        }
+        .encode()
+        .unwrap()
+    };
+    [
+        (
+            "coin",
+            delivery(Delivered::Coin(junk_outputs(&network).remove(0))),
+        ),
+        ("escrow", delivery(Delivered::Escrow(vec![13; 64]))),
+    ]
+}
+
+fn deliver(
+    clock: Arc<quil_store::testing::InMemoryClockStore>,
+    context: FrameExecutionContext,
+    delivery: Vec<u8>,
+) -> Result<quil_types::execution::ProcessMessageResult> {
+    engine(ExecutionMode::Application, clock).process_message_with_context(
+        context,
+        &BigInt::from(0),
+        &domains::QUIL_TOKEN,
+        &bundle(delivery),
+    )
+}
+
+#[test]
+fn coin_delivery_citing_frame_one_must_not_fail_the_shard_frame() {
+    for (name, delivery) in junk_deliveries(BELOW_GENESIS) {
+        expect_refused(
+            &format!("{name} delivery"),
+            BELOW_GENESIS,
+            deliver(mainnet_clock(), app_context(), delivery),
+        );
+    }
+    // An archive holds the legacy frame with its 74-byte prover root.
+    for (name, delivery) in junk_deliveries(LAST_LEGACY) {
+        let archive = mainnet_clock();
+        archive.seed_frame(global_frame(LAST_LEGACY, 74));
+        expect_refused(
+            &format!("{name} delivery citing the last legacy frame, on an archive"),
+            LAST_LEGACY,
+            deliver(archive, app_context(), delivery),
+        );
+    }
+}
+
+#[test]
+fn control_a_coin_delivery_keeps_its_other_outcomes() {
+    let expect_invalid = |case: &str, result: Result<_>, reason: &str| match result {
+        Err(QuilError::InvalidArgument(message)) if message.contains(reason) => {}
+        other => panic!(
+            "control: {case} must drop cleanly with \"{reason}\": {:?}",
+            other.err()
+        ),
+    };
+    for (name, delivery) in junk_deliveries(ANCHOR + 1) {
+        expect_invalid(
+            &format!("a future {name} delivery"),
+            deliver(mainnet_clock(), app_context(), delivery),
+            "future global reward frame",
+        );
+    }
+    for (name, delivery) in junk_deliveries(ANCHOR - 10) {
+        expect_invalid(
+            &format!("a {name} delivery with the wrong root of a held frame"),
+            deliver(mainnet_clock(), app_context(), delivery),
+            "cited global root mismatch",
+        );
+    }
+    for (name, delivery) in junk_deliveries(ANCHOR - 10) {
+        expect_invalid(
+            &format!("a {name} delivery in a frame naming no anchor"),
+            deliver(mainnet_clock(), anchorless_context(), delivery),
+            "the frame's global anchor",
+        );
+    }
+    for (name, delivery) in junk_deliveries(FIRST) {
+        let held = deliver(anchor_only_clock(), app_context(), delivery);
+        assert!(
+            held.as_ref()
+                .is_err_and(|error| error.is_execution_unavailable()),
+            "control: a local gap at the first citable frame must stay ExecutionUnavailable \
+             for a {name} delivery: {:?}",
+            held.err()
+        );
+    }
+    eprintln!("EARLY CONTROL: deliveries keep their future, root, anchor and local-gap outcomes");
+}
+
+#[test]
+fn zero_anchor_mint_claim_must_not_fail_the_quil_app_frame() {
+    let engine = engine(ExecutionMode::Application, mainnet_clock());
+    expect_anchorless_refused(
+        "mint claim in a frame naming no anchor",
+        engine.process_message_with_context(
+            anchorless_context(),
+            &BigInt::from(0),
+            &domains::QUIL_TOKEN,
+            &bundle(junk_mint_claim(ANCHOR - 10)),
+        ),
+    );
+}
+
+#[test]
+fn zero_anchor_settlement_claim_must_not_fail_the_paid_frame() {
+    for (name, engine) in settlement_engines(mainnet_clock()) {
+        expect_anchorless_refused(
+            &format!("settlement claim in a frame naming no anchor ({name} engine)"),
+            admit_settlement_in(engine.as_ref(), anchorless_context(), ANCHOR - 10),
+        );
+    }
+}
+
+/// An escrow refund any submitter can build: no escrow behind it, no valid
+/// signature or proof. Only its encoding is well formed.
+fn junk_refund() -> Vec<u8> {
+    let network = policy(0).network;
+    let context = parameter_context(&network, &domains::QUIL_TOKEN);
+    let opening = AmountOpening::from_seed(&context, &[2; 32]);
+    let mut proof = vec![0; 40];
+    proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
+    PendingClaim {
+        statement: PendingClaimStatement {
+            network,
+            application: domains::QUIL_TOKEN,
+            escrow_address: [12; 32],
+            source: CommitmentKey::derive(&context).commit(7, &opening),
+            policy: EscrowPolicy {
+                recipient: [13; FALCON_PUBLIC_BYTES],
+                refund: [14; FALCON_PUBLIC_BYTES],
+                refund_after_global_frame: 100,
+            },
+            branch: ClaimBranch::Refund,
+            fee: 0,
+            outputs: junk_outputs(&network),
+        },
+        signature: [8; FALCON_SIGNATURE_BYTES],
+        proof,
+    }
+    .encode()
+    .unwrap()
+}
+
+#[test]
+fn zero_anchor_refund_must_not_fail_the_quil_app_frame() {
+    let engine = engine(ExecutionMode::Application, mainnet_clock());
+    expect_anchorless_refused(
+        "escrow refund in a frame naming no anchor",
+        engine.process_message_with_context(
+            anchorless_context(),
+            &BigInt::from(0),
+            &domains::QUIL_TOKEN,
+            &bundle(junk_refund()),
+        ),
+    );
+}
+
+#[test]
+fn lone_settlement_claim_must_not_fail_the_paid_frame() {
+    // Bound to the empty rest of its one-request bundle and covering its marker
+    // at the multiplier below, so it passes every check before the state read of
+    // the admission it reaches alone.
+    let context = bundle_context(&CanonicalMessageBundle {
+        requests: vec![None],
+        timestamp: 0,
+    })
+    .unwrap();
+    let claim = SettlementClaim {
+        network: [1; 32],
+        application: PAID_APP,
+        cited_global_frame: ANCHOR - 10,
+        global_root: [3; 32],
+        receipt: [4; 32],
+        settlement: 2 * marker_record().unwrap().len() as u128,
+        context,
+        payment_address: [0; 32],
+        payment: 0,
+        claimant_key_type: 0,
+        claimant_public_key: Vec::new(),
+        claimant_signature: Vec::new(),
+        forest_proof: vec![6; 40],
+    };
+    let message = CanonicalMessageRequest {
+        inner_type_prefix: TYPE_SETTLEMENT_CLAIM,
+        inner_bytes: claim.encode().unwrap(),
+    }
+    .to_canonical_bytes()
+    .unwrap();
+    let engines = [
+        ("without the token suite", unsuited_engine(mainnet_clock())),
+        (
+            "with the token suite",
+            engine(ExecutionMode::Application, mainnet_clock()),
+        ),
+    ];
+    for (name, engine) in engines {
+        expect_skipped(
+            &format!("a lone settlement claim (custom-token engine {name})"),
+            "a settlement claim alone reaches an admission with no state and is \
+             ExecutionUnavailable",
+            "a settlement claim must open a bundle",
+            engine.process_message_with_context(
+                app_context(),
+                &BigInt::from(2),
+                &PAID_APP,
+                &message,
+            ),
         );
     }
 }

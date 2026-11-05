@@ -124,6 +124,8 @@ impl TokenExecutionEngine {
             // Clone the existing lane/slots/host admission limits. Constructing
             // a worker or changing concurrency here would bypass those limits.
             token_worker: self.token_worker.clone(),
+            #[cfg(feature = "native-proof")]
+            network: self.network,
             inclusion_prover: self.inclusion_prover.clone(),
             state: fork_state(&self.state, context)?,
             key_manager: self.key_manager.clone(),
@@ -157,6 +159,7 @@ impl ComputeExecutionEngine {
                 .global_clock
                 .as_ref()
                 .map(|_| context.global_clock_store.clone()),
+            network: self.network,
         })
     }
 }
@@ -188,6 +191,7 @@ impl HypergraphExecutionEngine {
                 .global_clock
                 .as_ref()
                 .map(|_| context.global_clock_store.clone()),
+            network: self.network,
         })
     }
 }
