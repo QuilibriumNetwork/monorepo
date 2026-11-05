@@ -721,6 +721,33 @@ pub(crate) fn recently_shielded(dir: &Path) -> BTreeSet<[u8; 32]> {
         .collect()
 }
 
+/// Add the coins `addresses` of a batch submitted at `now` (Unix seconds)
+/// to shield-all's journal in the config directory `dir`, replaced through
+/// [`quil_config::atomic_write`]: readable by its owner only (it lists the
+/// wallet's coins), its owner kept, and whole after a failure.
+#[cfg(feature = "native-proof")]
+pub(crate) fn record_shielded(
+    dir: &Path,
+    now: u64,
+    addresses: impl IntoIterator<Item = [u8; 32]>,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let path = dir.join(SHIELD_JOURNAL);
+    let mut journal = match std::fs::read_to_string(&path) {
+        Ok(journal) => journal,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    if !journal.is_empty() && !journal.ends_with('\n') {
+        journal.push('\n');
+    }
+    for address in addresses {
+        let _ = writeln!(journal, "{now} {}", hex::encode(address));
+    }
+    quil_config::atomic_write(&path, journal.as_bytes(), 0o600)
+        .with_context(|| format!("write {}", path.display()))
+}
+
 /// One batch of a shield plan: its shard and its coins.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlanBatch {

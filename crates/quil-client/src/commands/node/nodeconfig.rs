@@ -527,29 +527,23 @@ fn write_backup(
     )
 }
 
-/// Replace `path` atomically: write a temporary file beside it with the
-/// given permissions, then rename it over `path`.
+/// Replace the existing file `path` through [`quil_config::atomic_write`]
+/// with the given permissions: its owner is kept, and a failure leaves the
+/// previous file whole.
 pub(super) fn replace_file(
     path: &Path,
     contents: &str,
     permissions: &std::fs::Permissions,
 ) -> anyhow::Result<()> {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let temp = path.with_file_name(format!(".{name}.clean-{}.tmp", std::process::id()));
-    let written = new_private_file(&temp).and_then(|mut file| {
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-        std::fs::set_permissions(&temp, permissions.clone())?;
-        std::fs::rename(&temp, path)
-    });
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&temp);
-        return Err(e).with_context(|| format!("replace {}", path.display()));
-    }
-    Ok(())
+    #[cfg(unix)]
+    let mode = std::os::unix::fs::PermissionsExt::mode(permissions);
+    #[cfg(not(unix))]
+    let mode = {
+        let _ = permissions;
+        0o600
+    };
+    quil_config::atomic_write(path, contents.as_bytes(), mode)
+        .with_context(|| format!("replace {}", path.display()))
 }
 
 /// Create a new file readable by its owner only, failing if it exists.

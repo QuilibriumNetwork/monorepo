@@ -5724,18 +5724,14 @@ fn record_shielded(
     tc: &TokenCtx,
     sources: &[quil_lattice_ct::confidential::shield::ShieldSource],
 ) -> anyhow::Result<()> {
-    use std::io::Write;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(tc.config_dir.join(super::legacy::SHIELD_JOURNAL))?;
-    for source in sources {
-        writeln!(file, "{now} {}", hex::encode(source.address))?;
-    }
-    Ok(())
+    super::legacy::record_shielded(
+        &tc.config_dir,
+        now,
+        sources.iter().map(|source| source.address),
+    )
 }
 
 /// What `token shield-all` reports as it goes. The CLI prints
