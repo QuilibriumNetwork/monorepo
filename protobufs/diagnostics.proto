@@ -188,14 +188,18 @@ enum StoreIoVerdict {
   STORE_IO_VERDICT_UNSPECIFIED = 0;
   STORE_IO_VERDICT_OK = 1;
   // Over a slow threshold for 2 intervals in a row, until 3 intervals in a
-  // row are under every threshold: this node's disk is too slow.
+  // row are under every threshold: reads of the store are too slow.
+  // `slow_reason` and the disk fields say whether the disk (an await over
+  // its threshold), this node's load (the disk responds normally) or
+  // neither can be told (no disk figures) is the cause.
   STORE_IO_VERDICT_SLOW = 2;
 }
 
 // The slow threshold an interval crossed (`StoreIoHealth.slow_reason`).
 enum StoreIoReason {
   STORE_IO_REASON_NONE = 0;
-  // Canary reads' p99 at or over 50 ms.
+  // 2 or more canary reads at or over 50 ms in the interval (p99 is then
+  // over it too), or one of 1 s or more. Before this rule, p99 alone.
   STORE_IO_REASON_CANARY_P99 = 1;
   // A canary read unfinished for 1 s or more at the interval's end.
   STORE_IO_REASON_CANARY_PENDING = 2;

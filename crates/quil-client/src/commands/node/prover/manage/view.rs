@@ -3578,13 +3578,14 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
         .filter(|io| io.verdict() == quil_types::proto::diagnostics::StoreIoVerdict::Slow)
     {
         let figures = crate::commands::node::diagnostics::store_io_figures(io);
+        let cause = crate::commands::node::diagnostics::store_io_scope(io);
         notices.push((
             "store-io-slow",
             NoticeSeverity::Warning,
             if figures.is_empty() {
-                "Store reads slow (this node's disk).".to_string()
+                format!("Store reads slow ({cause}).")
             } else {
-                format!("Store reads slow (this node's disk): {figures}.")
+                format!("Store reads slow ({cause}): {figures}.")
             },
         ));
     }
@@ -4631,7 +4632,7 @@ fn help_items() -> Vec<HelpItem> {
         item("`Low certificate share (60m)`: allocations whose Cert is low, of those reporting one. Frames a seat does not sign earn it nothing: check its worker's Execution and LocalMat, the node's CPU load and its peer connections"),
         item("`Last recovery attempt failed`: workers whose latest archive recovery attempt failed and whose LocalMat is still below PeerHead, of workers with fresh observations (it ends once the worker catches up); the Recovery footer gives the error and the failure streak"),
         kv("Reachability notice", "`Reachability: peers cannot dial this node`: the verdict of `qclient node doctor`, from the node's own view: AutoNAT servers on 2 or more IPs could not dial it back, AutoNAT holds it private with no confirmed address, or its address is behind carrier-grade NAT. It ends once AutoNAT confirms an address. Missing or unsettled AutoNAT results show nothing. The doctor gives a verdict per address family and what to change; it changes nothing itself."),
-        kv("Store notice", "`Store reads slow (this node's disk)`: the node reads one entry of its master store a second (the canary) and, on Linux, times its disk's reads and writes. Shown once a minute's canary p99 reaches 50ms, a read stays unfinished 1s, or the disk takes 20ms a read or 100ms a write (of 20+), two minutes in a row; it clears after three minutes under all of them. Work that reads the store falls behind and allocations may lapse. The cause is this node's disk: check that TRIM runs (fstrim.timer or the discard mount option), the disk's health (SMART) and other I/O load on it. `qclient node diagnostics health --self` and the node's `store i/o` log lines give the figures"),
+        kv("Store notice", "`Store reads slow (<cause>)`: the node reads one entry of its master store a second (the canary) and, on Linux, times its disk's reads and writes. Shown once a minute has 2 canary reads of 50ms or more (or one of 1s), a read stays unfinished 1s, or the disk takes 20ms a read or 100ms a write (of 20+), two minutes in a row; it clears after three minutes under all of them. Work that reads the store falls behind and allocations may lapse. The label names the cause the figures support. `this node's disk`: a disk await is over its threshold; check that TRIM runs (fstrim.timer or the discard mount option), the disk's health (SMART) and other I/O load on it. `disk normal, this node's load`: the disk's awaits (of 20+ reads) are under them; check CPU, memory pressure, store compaction and other work on this node. `disk not ruled out`: no disk figures or under 20 reads; check both. `qclient node diagnostics health --self` and the node's `store i/o` log lines give the figures"),
         kv("Command legends", "Compact mode shows applicable UI/worker commands only; expanded mode also shows disabled commands. Usable commands share one highlight; labels show colors on/off and relative/absolute thresholds. `filter*` means a column filter is active"),
         kv("Scroll hints", "Bottom border counts hidden rows `↑`/`↓` and columns `←`/`→`"),
         kv("Colors", "What the main view's colors mean:"),
@@ -5105,7 +5106,7 @@ mod tests {
     }
 
     /// A slow store verdict in fresh node status shows one warning naming
-    /// this node's disk and the figures, in the drawn frame too; an ok or
+    /// the cause the figures support and the figures, in the drawn frame too; an ok or
     /// absent verdict, or stale status, shows none.
     #[test]
     fn a_slow_store_shows_one_notice_with_its_figures() {
@@ -5117,6 +5118,8 @@ mod tests {
             interval_secs: 60,
             canary_reads: 58,
             canary_p99_us: 412_000,
+            disk_reads: Some(40),
+            disk_writes: Some(10),
             disk_read_await_us: Some(25_400),
             disk_write_await_us: Some(3_100),
             ..Default::default()
@@ -5147,6 +5150,35 @@ mod tests {
                     .to_string()
             )]
         );
+        // The label follows the cause: the disk responds normally, or the
+        // disk is unknown.
+        let notice_of = |m: &mut Model, io: &StoreIoHealth| {
+            m.cached_node_info = Some(NodeInfoResponse {
+                store_io: Some(*io),
+                ..Default::default()
+            });
+            store(m)[0].2.clone()
+        };
+        let mut normal = io;
+        normal.disk_read_await_us = Some(1_500);
+        assert_eq!(
+            notice_of(&mut m, &normal),
+            "Store reads slow (disk normal, this node's load): canary p99 412ms of 58 \
+             reads in 60s, disk read 1.5ms/op, write 3.1ms/op."
+        );
+        let mut unknown = io;
+        unknown.disk_reads = None;
+        unknown.disk_writes = None;
+        unknown.disk_read_await_us = None;
+        unknown.disk_write_await_us = None;
+        assert_eq!(
+            notice_of(&mut m, &unknown),
+            "Store reads slow (disk not ruled out): canary p99 412ms of 58 reads in 60s."
+        );
+        m.cached_node_info = Some(NodeInfoResponse {
+            store_io: Some(io),
+            ..Default::default()
+        });
         update_message_lifetime(&mut m);
         let text = render_text(&mut m, 160, 30);
         println!("{text}");

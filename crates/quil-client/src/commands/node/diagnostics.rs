@@ -17,6 +17,7 @@ use std::str::FromStr;
 
 use clap::{Args, Subcommand};
 
+use quil_forest::store_io::{health_cause, SlowCause};
 use quil_p2p::PeerId;
 use quil_rpc::diagnostics_service as diag;
 use quil_types::proto::diagnostics::{
@@ -699,6 +700,16 @@ pub(crate) fn store_io_figures(io: &StoreIoHealth) -> String {
     parts.join(", ")
 }
 
+/// The label of the store-slow notice: the cause the figures support
+/// (the same rule as the node's warning line).
+pub(crate) fn store_io_scope(io: &StoreIoHealth) -> &'static str {
+    match health_cause(io) {
+        SlowCause::Disk => "this node's disk",
+        SlowCause::Load => "disk normal, this node's load",
+        SlowCause::Unknown => "disk not ruled out",
+    }
+}
+
 /// The health report's store I/O line; `None` from nodes that predate it.
 fn store_io_line(io: Option<&StoreIoHealth>) -> Option<String> {
     let io = io?;
@@ -710,10 +721,21 @@ fn store_io_line(io: Option<&StoreIoHealth>) -> Option<String> {
                 secs @ 120..=7199 => format!("{}m", secs / 60),
                 secs => format!("{}h", secs / 3600),
             };
-            format!(
-                "Store I/O: slow for {slow} ({figures}); this node's disk is the \
-                 cause: check TRIM, the disk's health and other I/O load."
-            )
+            let what = match health_cause(io) {
+                SlowCause::Disk => {
+                    "this node's disk is the cause: check TRIM, the disk's health \
+                     and other I/O load."
+                }
+                SlowCause::Load => {
+                    "the disk responds normally: check this node's load (CPU, \
+                     memory pressure, compaction)."
+                }
+                SlowCause::Unknown => {
+                    "the disk is not ruled out: check TRIM, the disk's health, then \
+                     this node's load (CPU, memory pressure, compaction)."
+                }
+            };
+            format!("Store I/O: slow for {slow} ({figures}); {what}")
         }
         StoreIoVerdict::Ok => format!("Store I/O: ok ({figures})."),
         _ => "Store I/O: not measured.".to_string(),
@@ -829,7 +851,7 @@ pub(crate) fn render_refusal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quil_types::proto::diagnostics::FailureCount;
+    use quil_types::proto::diagnostics::{FailureCount, StoreIoReason};
     use quil_types::proto::node::Reachability;
 
     const NOW: u64 = 1_000_000_000;
@@ -1039,6 +1061,8 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
             interval_secs: 60,
             canary_reads: 58,
             canary_p99_us: 412_000,
+            disk_reads: Some(40),
+            disk_writes: Some(10),
             disk_read_await_us: Some(25_400),
             disk_write_await_us: Some(3_100),
             ..Default::default()
@@ -1059,6 +1083,8 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
         let stalled = StoreIoHealth {
             canary_reads: 0,
             canary_pending_us: 95_000_000,
+            disk_reads: None,
+            disk_writes: None,
             disk_read_await_us: None,
             disk_write_await_us: None,
             slow_secs: 30,
@@ -1066,9 +1092,31 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
         };
         assert_eq!(
             store_io_line(Some(&stalled)).unwrap(),
-            "Store I/O: slow for 30s (a read pending 95s); this node's disk is the cause: \
-             check TRIM, the disk's health and other I/O load."
+            "Store I/O: slow for 30s (a read pending 95s); the disk is not ruled out: \
+             check TRIM, the disk's health, then this node's load (CPU, memory pressure, \
+             compaction)."
         );
+        // Canary threshold with the disk's awaits known and under theirs.
+        let load = StoreIoHealth {
+            disk_read_await_us: Some(1_500),
+            ..slow
+        };
+        assert_eq!(
+            store_io_line(Some(&load)).unwrap(),
+            "Store I/O: slow for 12m (canary p99 412ms of 58 reads in 60s, disk read \
+             1.5ms/op, write 3.1ms/op); the disk responds normally: check this node's \
+             load (CPU, memory pressure, compaction)."
+        );
+        assert_eq!(store_io_scope(&load), "disk normal, this node's load");
+        assert_eq!(store_io_scope(&slow), "this node's disk");
+        assert_eq!(store_io_scope(&stalled), "disk not ruled out");
+        // A disk threshold names the disk whatever the other figures say.
+        let mut by_disk = StoreIoHealth {
+            disk_read_await_us: Some(1_500),
+            ..slow
+        };
+        by_disk.set_slow_reason(StoreIoReason::DiskWriteAwait);
+        assert_eq!(store_io_scope(&by_disk), "this node's disk");
         let mut ok = StoreIoHealth {
             interval_secs: 60,
             canary_reads: 60,
