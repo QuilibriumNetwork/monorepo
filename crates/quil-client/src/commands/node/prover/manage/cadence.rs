@@ -7,9 +7,9 @@ mod node_forecast_tests {
     use num_bigint::BigInt;
     use quil_types::proto::node::{FrameCadence, FrameWindow, ShardProverCounts, ShardRewardInfo};
     #[test]
-    fn observed_forecasts_distinguish_zero_missing_and_stale_coverage() {
+    fn observed_forecasts_distinguish_zero_and_missing_coverage() {
         let mut c = FrameCadence {
-            last_observed_unix_seconds: 1000,
+            last_observed_unix_seconds: 1,
             hour: Some(FrameWindow {
                 window_seconds: 3600,
                 observed_seconds: 120,
@@ -17,13 +17,12 @@ mod node_forecast_tests {
             }),
             day: None,
         };
-        let rate = observed_quil_daily(&BigInt::from(100_000_000), &c, false, 1000, 1).unwrap();
+        let rate = observed_quil_daily(&BigInt::from(100_000_000), &c, false, 1).unwrap();
         assert_eq!(format_quil_daily_units(&rate), "~54.0");
-        assert!(observed_quil_daily(&BigInt::from(1), &c, true, 1000, 1).is_none());
-        assert!(observed_quil_daily(&BigInt::from(1), &c, false, 1091, 1).is_none());
+        assert!(observed_quil_daily(&BigInt::from(1), &c, true, 1).is_none());
         c.hour.as_mut().unwrap().advanced_frames = 0;
         assert_eq!(
-            observed_quil_daily(&BigInt::from(1), &c, false, 1000, 1),
+            observed_quil_daily(&BigInt::from(1), &c, false, 1),
             Some(BigInt::from(0))
         );
     }
@@ -52,9 +51,8 @@ mod node_forecast_tests {
             }),
             day: None,
         };
-        let daily = |committee| {
-            observed_quil_daily(&BigInt::from(22_000), &c, false, 1000, committee).unwrap()
-        };
+        let daily =
+            |committee| observed_quil_daily(&BigInt::from(22_000), &c, false, committee).unwrap();
         // Every frame paid: 22_000 * 30 * 86400 / 600.
         assert_eq!(daily(0), BigInt::from(95_040_000));
         assert_eq!(daily(1), BigInt::from(95_040_000));

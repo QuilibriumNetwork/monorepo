@@ -456,6 +456,9 @@ pub struct Model {
     pub node_app_cadence: HashMap<Vec<u8>, quil_types::proto::node::FrameCadence>,
     /// Frame committee size by shard filter, scaling the observed estimates.
     pub node_app_committee: HashMap<Vec<u8>, u32>,
+    /// When each cadence's RPC answer arrived; staleness counts from here.
+    pub node_global_cadence_received: Option<std::time::Instant>,
+    pub node_app_cadence_received: Option<std::time::Instant>,
     pub reward_windows: u8,
     pub interval_windows: u8,
     pub global_interval_windows: u8,
@@ -756,25 +759,39 @@ impl Model {
         }
     }
 
-    pub fn cadence_window<'a>(
+    /// How long a node answer stays valid: one polling period plus the RPC's
+    /// own deadline, so any refresh that answers at all arrives within it.
+    fn answer_budget(&self, deadline: std::time::Duration) -> std::time::Duration {
+        std::time::Duration::from_secs(self.refresh_seconds) + deadline
+    }
+    /// A refresh change restarts polling (`event_loop`) and with it this clock.
+    fn answer_overdue(
         &self,
-        cadence: &'a quil_types::proto::node::FrameCadence,
-        day: bool,
-    ) -> Option<&'a quil_types::proto::node::FrameWindow> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_secs();
-        if now < cadence.last_observed_unix_seconds || now - cadence.last_observed_unix_seconds > 90
-        {
-            return None;
-        }
-        let w = if day {
-            cadence.day.as_ref()?
-        } else {
-            cadence.hour.as_ref()?
-        };
-        (w.observed_seconds >= 60 && w.observed_seconds <= w.window_seconds).then_some(w)
+        received: Option<std::time::Instant>,
+        deadline: std::time::Duration,
+    ) -> bool {
+        received.is_some_and(|received| {
+            let since = self
+                .refresh_changed_at
+                .map_or(received, |changed| received.max(changed));
+            since.elapsed() > self.answer_budget(deadline)
+        })
+    }
+    pub fn global_cadence_stale(&self) -> bool {
+        self.answer_overdue(
+            self.node_global_cadence_received,
+            super::actions::RPC_TIMEOUT,
+        )
+    }
+    pub fn app_cadence_stale(&self) -> bool {
+        self.answer_overdue(
+            self.node_app_cadence_received,
+            super::actions::SHARD_RPC_TIMEOUT,
+        )
+    }
+    pub fn app_cadence_budget_seconds(&self) -> u64 {
+        self.answer_budget(super::actions::SHARD_RPC_TIMEOUT)
+            .as_secs()
     }
     pub fn interval_mask(&self) -> u8 {
         let mask = self.interval_windows & 3;
@@ -803,9 +820,12 @@ impl Model {
     /// Measured mean seconds per received GLOBAL frame: the 60m window when it
     /// has advances, else the 24h one; `None` without a fresh measurement.
     pub fn global_seconds_per_frame(&self) -> Option<f64> {
+        if self.global_cadence_stale() {
+            return None;
+        }
         let cadence = self.node_global_cadence.as_ref()?;
         [false, true].into_iter().find_map(|day| {
-            self.cadence_window(cadence, day)
+            super::super::observed_window(cadence, day)
                 .filter(|w| w.advanced_frames > 0)
                 .map(|w| w.observed_seconds as f64 / w.advanced_frames as f64)
         })
@@ -864,23 +884,21 @@ impl Model {
         if index == 2 {
             return Some(per_frame * BigInt::from(8640));
         }
-        if self.shard_error.is_some() {
+        if self.app_cadence_stale() {
             return None;
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_secs();
         super::super::observed_quil_daily(
             per_frame,
             self.node_app_cadence.get(filter)?,
             index == 1,
-            now,
             self.node_app_committee.get(filter).copied().unwrap_or(0),
         )
     }
     pub fn app_interval(&self, filter: &[u8]) -> Option<f64> {
-        self.cadence_window(
+        if self.app_cadence_stale() {
+            return None;
+        }
+        super::super::observed_window(
             self.node_app_cadence.get(filter)?,
             self.interval_mask() == 2,
         )
@@ -892,8 +910,9 @@ impl Model {
     pub fn observe_app_intervals(
         &mut self,
         shards: &GetShardInfoResponse,
-        _now: std::time::Instant,
+        now: std::time::Instant,
     ) {
+        self.node_app_cadence_received = Some(now);
         self.node_app_cadence = shards
             .shards
             .iter()
@@ -3143,6 +3162,112 @@ mod execution_freshness_tests {
 mod frame_interval_tests {
     use super::*;
     use quil_types::proto::node::{FrameCadence, FrameWindow, ShardRewardInfo};
+    use std::time::{Duration, Instant};
+
+    fn wall_seconds() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+    fn cadence(last_observed_unix_seconds: u64) -> FrameCadence {
+        FrameCadence {
+            last_observed_unix_seconds,
+            hour: Some(FrameWindow {
+                window_seconds: 3600,
+                observed_seconds: 600,
+                advanced_frames: 30,
+            }),
+            day: None,
+        }
+    }
+    fn answer(frame_cadence: FrameCadence) -> GetShardInfoResponse {
+        GetShardInfoResponse {
+            shards: vec![ShardRewardInfo {
+                filter: vec![1],
+                frame_cadence: Some(frame_cadence),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The live defect: on a 60s refresh a sample 55s old on arrival passed a
+    /// 90s bound 35s later, and every row read `-` until the next answer.
+    #[test]
+    fn a_late_refresh_keeps_a_sample_that_was_valid_on_arrival() {
+        let mut m = Model::new();
+        m.refresh_seconds = 60;
+        let waited = 61;
+        let observed = wall_seconds() - waited - 55;
+        let arrived = Instant::now() - Duration::from_secs(waited);
+        m.observe_app_intervals(&answer(cadence(observed)), arrived);
+        assert_eq!(m.app_interval(&[1]), Some(20.0));
+        assert!(m.daily_reward(&BigInt::from(1000), &[1], 0).is_some());
+        m.node_global_cadence = Some(cadence(observed));
+        m.node_global_cadence_received = Some(arrived);
+        assert_eq!(m.global_seconds_per_frame(), Some(20.0));
+    }
+
+    /// The client's clock takes no part: the node judged the sample.
+    #[test]
+    fn client_clock_skew_cannot_blank_a_fresh_answer() {
+        for observed in [wall_seconds() + 3600, wall_seconds() - 3600] {
+            let mut m = Model::new();
+            m.observe_app_intervals(&answer(cadence(observed)), Instant::now());
+            assert_eq!(m.app_interval(&[1]), Some(20.0), "sample at {observed}");
+            assert!(m.daily_reward(&BigInt::from(1000), &[1], 0).is_some());
+            m.node_global_cadence = Some(cadence(observed));
+            m.node_global_cadence_received = Some(Instant::now());
+            assert_eq!(m.global_seconds_per_frame(), Some(20.0));
+        }
+    }
+
+    #[test]
+    fn answers_stay_valid_for_one_refresh_plus_the_rpc_timeout() {
+        let c = cadence(wall_seconds());
+        for refresh in [5, 15, 30, 60] {
+            let mut m = Model::new();
+            m.refresh_seconds = refresh;
+            m.node_global_cadence = Some(c);
+            let ago = |seconds: u64| Instant::now() - Duration::from_secs(seconds);
+
+            m.observe_app_intervals(&answer(c), ago(refresh + 50));
+            assert!(!m.app_cadence_stale(), "refresh {refresh}");
+            assert_eq!(m.app_interval(&[1]), Some(20.0));
+            m.observe_app_intervals(&answer(c), ago(refresh + 62));
+            assert!(m.app_cadence_stale(), "refresh {refresh}");
+            assert_eq!(m.app_interval(&[1]), None);
+            assert!(m.daily_reward(&BigInt::from(1000), &[1], 0).is_none());
+            assert!(
+                m.daily_reward(&BigInt::from(1000), &[1], 2).is_some(),
+                "the 10s theory needs no observation"
+            );
+
+            m.node_global_cadence_received = Some(ago(refresh + 5));
+            assert!(!m.global_cadence_stale(), "refresh {refresh}");
+            assert_eq!(m.global_seconds_per_frame(), Some(20.0));
+            m.node_global_cadence_received = Some(ago(refresh + 17));
+            assert!(m.global_cadence_stale(), "refresh {refresh}");
+            assert_eq!(m.global_seconds_per_frame(), None);
+        }
+    }
+
+    /// Polling restarts on a refresh change, so a shorter budget cannot strand
+    /// an answer that the old period had not yet replaced.
+    #[test]
+    fn a_refresh_change_restarts_the_stale_clock() {
+        let mut m = Model::new();
+        m.refresh_seconds = 5;
+        let ago = |seconds: u64| Instant::now() - Duration::from_secs(seconds);
+        m.observe_app_intervals(&answer(cadence(1)), ago(100));
+        assert!(m.app_cadence_stale());
+        m.refresh_changed_at = Some(ago(1));
+        assert!(!m.app_cadence_stale());
+        m.refresh_changed_at = Some(ago(70));
+        assert!(m.app_cadence_stale());
+    }
+
     #[test]
     fn server_windows_ignore_peer_heads_and_client_start_time() {
         let now = std::time::SystemTime::now()

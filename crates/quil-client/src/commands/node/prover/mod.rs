@@ -397,6 +397,21 @@ pub(crate) fn committee_size(shard: &quil_types::proto::node::ShardRewardInfo) -
         .map_or(shard.active_provers, |c| c.active + c.leaving + c.departing)
 }
 
+/// A cadence window with enough coverage to read. The node withholds a cadence
+/// once its latest sample is over 90s old, so freshness on arrival is the node's
+/// call on its own clock; the client's clock takes no part.
+pub(crate) fn observed_window(
+    cadence: &quil_types::proto::node::FrameCadence,
+    day: bool,
+) -> Option<&quil_types::proto::node::FrameWindow> {
+    let w = if day {
+        cadence.day.as_ref()?
+    } else {
+        cadence.hour.as_ref()?
+    };
+    (w.observed_seconds >= 60 && w.observed_seconds <= w.window_seconds).then_some(w)
+}
+
 /// Observed QUIL/day of a seat on a shard whose frames credit
 /// [`quorum_signers`] of its `committee` members: the expected share of
 /// frames that pay this seat. A committee of 0 or 1 pays every frame.
@@ -404,20 +419,9 @@ pub(crate) fn observed_quil_daily(
     per_frame: &BigInt,
     cadence: &quil_types::proto::node::FrameCadence,
     day: bool,
-    now: u64,
     committee: u32,
 ) -> Option<BigInt> {
-    if now < cadence.last_observed_unix_seconds || now - cadence.last_observed_unix_seconds > 90 {
-        return None;
-    }
-    let w = if day {
-        cadence.day.as_ref()?
-    } else {
-        cadence.hour.as_ref()?
-    };
-    if w.observed_seconds < 60 || w.observed_seconds > w.window_seconds {
-        return None;
-    }
+    let w = observed_window(cadence, day)?;
     let n = committee.max(1);
     Some(
         per_frame

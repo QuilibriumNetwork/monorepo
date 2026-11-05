@@ -29,7 +29,9 @@ use crate::context::GlobalArgs;
 type Client = NodeServiceClient<Channel>;
 
 /// Per-call deadline for every NodeService RPC (mirrors `rpcTimeout`).
-const RPC_TIMEOUT: Duration = Duration::from_secs(15);
+pub(super) const RPC_TIMEOUT: Duration = Duration::from_secs(15);
+/// Archive fallback can exceed the fast status deadline.
+pub(super) const SHARD_RPC_TIMEOUT: Duration = Duration::from_secs(60);
 /// Longer ceiling for RequestJoin (VDF on the node side).
 const JOIN_RPC_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -1192,11 +1194,11 @@ pub async fn fetch_data(mut client: Client) -> Msg {
     }
 }
 
-/// Archive fallback can exceed the fast status deadline. Keep it bounded,
-/// report failure explicitly, and allow node status to refresh meanwhile.
+/// Keep the shard query bounded, report failure explicitly, and allow node
+/// status to refresh meanwhile.
 pub async fn fetch_shards(mut client: Client) -> Msg {
     let result = tokio::time::timeout(
-        Duration::from_secs(60),
+        SHARD_RPC_TIMEOUT,
         client.get_shard_info(tonic::Request::new(GetShardInfoRequest {
             include_all: true,
         })),
@@ -1205,7 +1207,10 @@ pub async fn fetch_shards(mut client: Client) -> Msg {
     Msg::ShardRefresh(match result {
         Ok(Ok(r)) => Ok(r.into_inner()),
         Ok(Err(e)) => Err(format!("Shard data unavailable: {e}")),
-        Err(_) => Err("Shard data timed out after 60s; retrying".into()),
+        Err(_) => Err(format!(
+            "Shard data timed out after {}s; retrying",
+            SHARD_RPC_TIMEOUT.as_secs()
+        )),
     })
 }
 
