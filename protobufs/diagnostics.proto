@@ -205,7 +205,28 @@ enum ConditionKind {
   // Shards whose head in committed GLOBAL state trails their app head by
   // more than `HealthCondition.threshold` frames.
   CONDITION_KIND_GLOBAL_APP_FRAMES_BEHIND = 4;
-  // 5-12 are taken by other conditions.
+  // This node's seats that signed under half the shard certificates a member
+  // voting in time signs over the last hour, of those reporting a share.
+  CONDITION_KIND_CERTIFICATE_SHARE_LOW = 5;
+  // Shards holding data with at most `HealthCondition.threshold` provers
+  // serving after the next epoch boundary.
+  CONDITION_KIND_SHARD_HALT_RISK = 6;
+  // Shards whose peer-reported materialized frame trails their head.
+  CONDITION_KIND_PEER_MATERIALIZATION_LAG = 7;
+  // This node's earning forecast over the last 60 minutes is below half its
+  // 24 hour value. Served to this node only.
+  CONDITION_KIND_REWARD_DROP = 8;
+  // The master store's reads or the disk under it stay slow
+  // (`StoreIoHealth.verdict`).
+  CONDITION_KIND_STORE_IO_SLOW = 9;
+  // The master store stopped writing (`master_store_write_failed`).
+  CONDITION_KIND_MASTER_STORE_WRITE_FAILED = 10;
+  // Peers cannot dial this node, by its own view of AutoNAT and its
+  // addresses. Served to this node only.
+  CONDITION_KIND_PEERS_CANNOT_DIAL = 11;
+  // This node binds an IPv6 address peers could dial and publishes none.
+  // Served to this node only.
+  CONDITION_KIND_IPV6_NOT_PUBLISHED = 12;
   // This node's GLOBAL head (the frame it follows) has not advanced for
   // `HealthCondition.threshold` seconds. On a GLOBAL prover
   // `HealthCondition.global` counts the GLOBAL provers it hears.
@@ -287,7 +308,18 @@ enum ConditionAction {
   // GLOBAL's inclusion of the shard on the explorer: advancing there means
   // this node's GLOBAL view trails.
   CONDITION_ACTION_CHECK_GLOBAL_INCLUSION = 3;
-  // 4-9 are taken by other conditions.
+  // The seat's worker: blocked or behind its shard, silent, or voting late.
+  CONDITION_ACTION_CHECK_SEAT_WORKER = 4;
+  // The shard's prover count: a join adds coverage, a leave there risks it.
+  CONDITION_ACTION_CHECK_SHARD_PROVERS = 5;
+  // The allocations' certificate share and their shards' frame intervals.
+  CONDITION_ACTION_CHECK_SEATS_AND_FRAMES = 6;
+  // TRIM, the disk's health and other I/O load, then this node's load.
+  CONDITION_ACTION_CHECK_DISK_AND_LOAD = 7;
+  // Free space or the failed write, then a node restart to reopen the store.
+  CONDITION_ACTION_REOPEN_MASTER_STORE = 8;
+  // `qclient node doctor`: the verdict per address family and what to change.
+  CONDITION_ACTION_RUN_NODE_DOCTOR = 9;
   // GLOBAL's head on the explorer: stopped there means GLOBAL halted
   // network-wide; advancing there means this node stopped following it.
   CONDITION_ACTION_CHECK_GLOBAL_HEAD = 10;
@@ -332,14 +364,16 @@ message AffectedShard {
   // The worker serving it, for conditions of this node's workers; 0
   // otherwise.
   uint32 core_id = 2;
-  // The frame that has not moved (for `..._BEHIND`, the committed head).
+  // The frame that has not moved (for `..._BEHIND`, the committed head; for
+  // `..._MATERIALIZATION_LAG`, the materialized frame).
   uint64 frame = 3;
   // Since when this node has seen that frame unchanged; 0 for `..._BEHIND`.
   uint64 unchanged_since_unix_ms = 4;
   // The window this shard was judged by: the base window, or 3 of its
   // mean frame intervals on a slower shard; 0 for `..._BEHIND`.
   uint64 window_secs = 5;
-  // For `..._BEHIND`: the frames the committed head trails the app head.
+  // For `..._BEHIND`: the frames the committed head trails the app head; for
+  // `..._MATERIALIZATION_LAG`: the frames materialization trails its head.
   uint64 lag_frames = 6;
 }
 
@@ -356,12 +390,18 @@ message HealthCondition {
   uint32 affected = 6;
   uint32 tracked = 7;
   // The base window in seconds for the `..._UNCHANGED` kinds, the lag in
-  // frames for `..._BEHIND`, the frames an hour for `..._FRAMES_SLOW`.
+  // frames for `..._BEHIND`, the frames an hour for `..._FRAMES_SLOW`, the
+  // prover count for `..._HALT_RISK`; 0 for kinds without one.
   uint64 threshold = 8;
   // The affected shards, at most 64; the rest are counted.
   repeated AffectedShard shards = 9;
   uint32 omitted_shards = 10;
-  // 11-13 are taken by other conditions.
+  // For `..._STORE_IO_SLOW`: the interval that was judged.
+  StoreIoHealth store_io = 11;
+  // For `..._REWARD_DROP`: the forecasts over the last 60 minutes and 24
+  // hours, in base units per day.
+  uint64 reward_hour_units = 12;
+  uint64 reward_day_units = 13;
   // For the GLOBAL progress kinds: what was judged.
   GlobalProgress global = 14;
   // For the expected waits: what ends it.

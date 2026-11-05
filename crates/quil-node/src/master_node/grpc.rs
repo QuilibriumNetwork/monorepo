@@ -2713,18 +2713,21 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         node_rpc_builder = node_rpc_builder
             .with_peer_info_snapshot(Arc::new(move || pic.read().values().cloned().collect()));
     }
-    {
+    let node_reachability: Arc<
+        dyn Fn() -> quil_types::proto::node::NodeReachability + Send + Sync,
+    > = {
         let p2p = p2p_handle.clone();
         let external = p2p_handle.watch_external_addresses();
-        node_rpc_builder = node_rpc_builder.with_node_reachability(Arc::new(move || {
+        Arc::new(move || {
             super::peer_info_publisher::node_reachability(
                 p2p.listen_addresses(),
                 &external.borrow(),
                 &announced_addrs.borrow(),
                 std::time::Instant::now(),
             )
-        }));
-    }
+        })
+    };
+    node_rpc_builder = node_rpc_builder.with_node_reachability(node_reachability.clone());
     {
         let p2p_handle_for_score = p2p_handle.clone();
         let self_peer_id_for_score = p2p_handle.peer_id;
@@ -3540,9 +3543,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
     node_rpc_builder = node_rpc_builder
         .with_certificate_share_provider(Arc::new(super::seat_certificates::snapshot));
     // The node's health conditions, served in its health report: fed by
-    // every shard info served (peer-reported and committed heads), the
-    // frame-observation sampler (committed heads), the worker view and this
-    // node's GLOBAL head, and judged every 15 s by each shard's cadence.
+    // every shard info served (peer-reported and committed heads, provers
+    // and forecasts), the frame-observation sampler (committed heads), the
+    // worker view, the seat tracker, the master store, this node's view of
+    // its reachability and its GLOBAL head, and judged every 15 s by each
+    // shard's cadence.
     let health = Arc::new(std::sync::Mutex::new(
         quil_rpc::health_conditions::HealthRegistry::default(),
     ));
@@ -3555,12 +3560,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         ));
     }
     {
-        let (health, cadence, view, registry, head) = (
+        let (health, cadence, view, registry, head, reachability) = (
             health.clone(),
             cadence.clone(),
             workers_view.clone(),
             prover_registry.clone(),
             current_frame.clone(),
+            node_reachability.clone(),
         );
         // The expected waits' inputs: the GLOBAL head this node serves and
         // its committed GLOBAL state.
@@ -3571,12 +3577,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
             loop {
                 tokio::select! { _ = token.cancelled() => break, _ = interval.tick() => {} }
                 let global = global.clone();
-                let (health, cadence, view, registry, head) = (
+                let (health, cadence, view, registry, head, reachability) = (
                     health.clone(),
                     cadence.clone(),
                     view.clone(),
                     registry.clone(),
                     head.clone(),
+                    reachability.clone(),
                 );
                 tokio::task::spawn_blocking(move || {
                     let now = quil_engine::worker_execution::now_ms();
@@ -3584,6 +3591,14 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                     let workers = health_workers(&view, registry.as_ref(), &prover_address, frame);
                     let allocations = prover_allocations(registry.as_ref(), &prover_address, frame);
                     let observed = health_global(&global.0, &global.1);
+                    let seats = super::seat_certificates::low_episodes()
+                        .into_iter()
+                        .map(|(filter, low)| quil_rpc::health_conditions::SeatShare { filter, low })
+                        .collect();
+                    let store_io = quil_forest::store_io::latest().map(|report| report.to_proto());
+                    let write_failed =
+                        quil_forest::storage_health::store_latched(quil_forest::StoreRole::Master);
+                    let reachability = reachability();
                     let transitions = {
                         let cadence = cadence.lock().unwrap_or_else(|e| e.into_inner());
                         let mut health = health.lock().unwrap_or_else(|e| e.into_inner());
@@ -3594,6 +3609,10 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                             let epoch = quil_types::consensus::epoch_for_frame(frame);
                             health.observe_allocations(allocations, epoch, now);
                         }
+                        health.observe_seats(seats, now);
+                        health.observe_store_io(store_io, now);
+                        health.observe_master_store(write_failed, now);
+                        health.observe_reachability(&reachability, now);
                         health.evaluate(now, &|filter: &[u8]| cadence.snapshot(filter, now / 1000))
                     };
                     for transition in &transitions {
@@ -4746,7 +4765,8 @@ fn observe_global_progress(
 }
 
 /// Feed one served shard info to the health conditions: the head peers
-/// report for each shard and its head in committed GLOBAL state.
+/// report for each shard, its head in committed GLOBAL state, its provers and
+/// a seat's forecast on it.
 fn observe_served_shards(
     health: &std::sync::Mutex<quil_rpc::health_conditions::HealthRegistry>,
     response: &quil_types::proto::node::GetShardInfoResponse,
@@ -4768,9 +4788,15 @@ fn observe_served_shards(
         .iter()
         .filter_map(|s| Some((s.filter.clone(), s.global_head?)))
         .collect();
+    let shards = response
+        .shards
+        .iter()
+        .map(quil_rpc::health_conditions::ShardObservation::of)
+        .collect();
     let mut health = health.lock().unwrap_or_else(|e| e.into_inner());
     health.observe_peers(&peers, now_ms);
     health.observe_committed(&committed, now_ms);
+    health.observe_shards(shards, now_ms);
 }
 
 /// The worker view as the health conditions judge it: each allocated
@@ -5200,7 +5226,12 @@ mod health_input_tests {
             [&filter],
             "only shards with a session"
         );
-        let report = build_report(&inputs, &[], 0);
+        let report = build_report(
+            &inputs,
+            &[],
+            0,
+            quil_rpc::diagnostics_service::Requester::Own,
+        );
         let rows: Vec<_> = report
             .workers
             .iter()
@@ -5240,13 +5271,21 @@ mod health_input_tests {
     #[test]
     fn served_shard_info_feeds_the_health_conditions() {
         use quil_types::proto::diagnostics::ConditionKind;
-        use quil_types::proto::node::{GetShardInfoResponse, GlobalAppFrameHead, ShardRewardInfo};
+        use quil_types::proto::node::{
+            GetShardInfoResponse, GlobalAppFrameHead, ShardProverCounts, ShardRewardInfo,
+        };
         let health = std::sync::Mutex::new(quil_rpc::health_conditions::HealthRegistry::default());
         let response = |global_frame| GetShardInfoResponse {
             shards: vec![ShardRewardInfo {
                 filter: vec![1],
                 active_provers: 3,
                 latest_frame: 200,
+                materialized_frame: 150,
+                shard_size: vec![1],
+                prover_counts: Some(ShardProverCounts {
+                    active: 3,
+                    ..Default::default()
+                }),
                 global_head: Some(GlobalAppFrameHead {
                     frame: 50,
                     global_frame,
@@ -5271,7 +5310,9 @@ mod health_input_tests {
             kinds,
             [
                 ConditionKind::PeerAppFramesUnchanged as i32,
-                ConditionKind::GlobalAppFramesBehind as i32
+                ConditionKind::GlobalAppFramesBehind as i32,
+                ConditionKind::ShardHaltRisk as i32,
+                ConditionKind::PeerMaterializationLag as i32,
             ]
         );
     }

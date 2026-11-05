@@ -20,9 +20,12 @@ use clap::{Args, Subcommand};
 use quil_forest::store_io::{health_cause, SlowCause};
 use quil_p2p::PeerId;
 use quil_rpc::diagnostics_service as diag;
+use quil_rpc::health_conditions::{store_io_figures, MASTER_STORE_WRITE_FAILED};
+use quil_rpc::reachability::{ip_class, IpClass};
 use quil_types::proto::diagnostics::{
-    Blocker, ConditionSeverity, GetHealthReportRequest, HealthConditions, HealthReport, Phase,
-    RecoveryFailure, RecoveryPhase, StoreIoHealth, StoreIoVerdict, WorkerHealth,
+    Blocker, ConditionKind, ConditionSeverity, GetHealthReportRequest, HealthConditions,
+    HealthReport, Phase, RecoveryFailure, RecoveryPhase, StoreIoHealth, StoreIoVerdict,
+    WorkerHealth,
 };
 use quil_types::proto::node::PeerInfo;
 
@@ -457,48 +460,6 @@ pub(crate) fn address_reach(multiaddr: &str) -> Reach {
     Reach::Unknown
 }
 
-/// What kind of network an IP address belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IpClass {
-    /// Globally routable (documentation ranges included).
-    Public,
-    /// A private network behind a NAT: RFC 1918 IPv4, unique-local IPv6.
-    Private,
-    /// Shared address space for carrier-grade NAT, 100.64.0.0/10 (RFC
-    /// 6598): the ISP's NAT, which the operator cannot forward ports on.
-    Shared,
-    /// Loopback, link-local or unspecified: this host or link only.
-    Local,
-}
-
-pub(crate) fn ip_class(ip: IpAddr) -> IpClass {
-    match ip {
-        IpAddr::V4(v4) => ipv4_class(v4),
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => ipv4_class(v4),
-            None if v6.is_loopback() || v6.is_unspecified() || v6.is_unicast_link_local() => {
-                IpClass::Local
-            }
-            None if v6.is_unique_local() => IpClass::Private,
-            None => IpClass::Public,
-        },
-    }
-}
-
-fn ipv4_class(ip: Ipv4Addr) -> IpClass {
-    // `Ipv4Addr::is_shared` is not stable.
-    let shared = ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 0x40;
-    if ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() {
-        IpClass::Local
-    } else if ip.is_private() {
-        IpClass::Private
-    } else if shared {
-        IpClass::Shared
-    } else {
-        IpClass::Public
-    }
-}
-
 fn ip_reach(ip: IpAddr) -> Reach {
     match ip_class(ip) {
         IpClass::Public => Reach::Public,
@@ -735,58 +696,6 @@ fn row(worker: &WorkerHealth, now: u64) -> [String; 11] {
     ]
 }
 
-/// The report's line for a master store that refuses writes.
-const MASTER_STORE_WRITE_FAILED: &str =
-    "Master store stopped writing (a failed write, or free space below the \
-    floor): this node cannot follow GLOBAL until the store is reopened.";
-
-/// A latency in microseconds, to two significant figures or so.
-fn io_ms(us: u64) -> String {
-    match us {
-        0..=9_999 => format!("{:.1}ms", us as f64 / 1000.0),
-        10_000..=9_999_999 => format!("{}ms", us / 1000),
-        _ => format!("{}s", us / 1_000_000),
-    }
-}
-
-/// The figures of a store I/O interval that it has: the canary reads'
-/// p99 and count, a read still pending, the disk's read and write await.
-pub(crate) fn store_io_figures(io: &StoreIoHealth) -> String {
-    let mut parts = Vec::new();
-    if io.canary_reads > 0 {
-        parts.push(format!(
-            "canary p99 {} of {} reads in {}s",
-            io_ms(io.canary_p99_us),
-            io.canary_reads,
-            io.interval_secs
-        ));
-    }
-    if io.canary_pending_us > 0 {
-        parts.push(format!("a read pending {}", io_ms(io.canary_pending_us)));
-    }
-    match (io.disk_read_await_us, io.disk_write_await_us) {
-        (Some(read), Some(write)) => parts.push(format!(
-            "disk read {}/op, write {}/op",
-            io_ms(read),
-            io_ms(write)
-        )),
-        (Some(read), None) => parts.push(format!("disk read {}/op", io_ms(read))),
-        (None, Some(write)) => parts.push(format!("disk write {}/op", io_ms(write))),
-        (None, None) => {}
-    }
-    parts.join(", ")
-}
-
-/// The label of the store-slow notice: the cause the figures support
-/// (the same rule as the node's warning line).
-pub(crate) fn store_io_scope(io: &StoreIoHealth) -> &'static str {
-    match health_cause(io) {
-        SlowCause::Disk => "this node's disk",
-        SlowCause::Load => "disk normal, this node's load",
-        SlowCause::Unknown => "disk not ruled out",
-    }
-}
-
 /// The health report's store I/O line; `None` from nodes that predate it.
 fn store_io_line(io: Option<&StoreIoHealth>) -> Option<String> {
     let io = io?;
@@ -894,11 +803,20 @@ pub(crate) fn render_report(target: &str, report: &HealthReport) -> String {
         report.global_head_frame,
         report.workers.len()
     );
-    if report.master_store_write_failed {
+    // A verdict the node also reports as a condition prints once, there.
+    let has_condition = |kind: ConditionKind| {
+        report
+            .health
+            .as_ref()
+            .is_some_and(|h| h.conditions.iter().any(|c| c.kind == kind as i32))
+    };
+    if report.master_store_write_failed && !has_condition(ConditionKind::MasterStoreWriteFailed) {
         let _ = writeln!(out, "{MASTER_STORE_WRITE_FAILED}");
     }
-    if let Some(line) = store_io_line(report.store_io.as_ref()) {
-        let _ = writeln!(out, "{line}");
+    if !has_condition(ConditionKind::StoreIoSlow) {
+        if let Some(line) = store_io_line(report.store_io.as_ref()) {
+            let _ = writeln!(out, "{line}");
+        }
     }
     out += &health_lines(report.health.as_ref());
     if report.workers.is_empty() {
@@ -976,6 +894,7 @@ pub(crate) fn render_refusal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quil_rpc::health_conditions::store_io_scope;
     use quil_types::proto::diagnostics::{FailureCount, StoreIoReason};
     use quil_types::proto::node::Reachability;
 
@@ -1231,6 +1150,64 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
             "{MASTER_STORE_WRITE_FAILED}"
         );
         assert!(!render_report("this node", &report(Vec::new(), 0)).contains("Master store"));
+    }
+
+    /// A verdict the node reports as a condition prints once, as its notice
+    /// with its scope and next check, not again as the report's own line.
+    #[test]
+    fn a_verdict_reported_as_a_condition_prints_once() {
+        use quil_types::proto::diagnostics::{ConditionAction, ConditionScope, HealthCondition};
+        let condition = |kind: ConditionKind, action: ConditionAction| HealthCondition {
+            kind: kind as i32,
+            severity: ConditionSeverity::Error as i32,
+            scope: ConditionScope::ThisNode as i32,
+            action: action as i32,
+            affected: 1,
+            tracked: 1,
+            ..Default::default()
+        };
+        let mut slow = StoreIoHealth {
+            interval_secs: 60,
+            canary_reads: 58,
+            canary_p99_us: 412_000,
+            slow_secs: 300,
+            ..Default::default()
+        };
+        slow.set_verdict(StoreIoVerdict::Slow);
+        let mut with = report(Vec::new(), 0);
+        with.master_store_write_failed = true;
+        with.store_io = Some(slow);
+        let mut store = condition(
+            ConditionKind::StoreIoSlow,
+            ConditionAction::CheckDiskAndLoad,
+        );
+        store.store_io = Some(slow);
+        with.health = Some(HealthConditions {
+            conditions: vec![
+                condition(
+                    ConditionKind::MasterStoreWriteFailed,
+                    ConditionAction::ReopenMasterStore,
+                ),
+                store,
+            ],
+            sources: Vec::new(),
+        });
+        let text = render_report("this node", &with);
+        assert_eq!(
+            text.matches("Master store stopped writing").count(),
+            1,
+            "{text}"
+        );
+        assert!(
+            text.contains("ERROR Master store stopped writing"),
+            "{text}"
+        );
+        assert!(
+            text.contains("restart the node to reopen the store"),
+            "{text}"
+        );
+        assert!(!text.contains("Store I/O: slow"), "{text}");
+        assert!(text.contains("Store reads slow"), "{text}");
     }
 
     /// The store I/O line: the verdict, its duration while slow, the

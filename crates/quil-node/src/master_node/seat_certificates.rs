@@ -642,6 +642,16 @@ impl SeatCertificates {
         Self::share(self.seats.get(filter)?, now)
     }
 
+    /// Each current seat that reports a share, and whether it is in a
+    /// low-share episode ([`Self::due`] judges them).
+    pub fn low_episodes(&self, now: u64) -> Vec<(Vec<u8>, bool)> {
+        self.seats
+            .iter()
+            .filter(|(_, seat)| seat.current && Self::share(seat, now).is_some())
+            .map(|(filter, seat)| (filter.clone(), seat.low.is_some()))
+            .collect()
+    }
+
     fn share(seat: &Seat, now: u64) -> Option<CertificateShare> {
         let committee = if seat.committee > 0 {
             seat.committee
@@ -933,6 +943,11 @@ pub(crate) fn credited(delta: &num_bigint::BigInt) {
 /// The share of this node's seat on `filter`, for the shard info RPC.
 pub(crate) fn snapshot(filter: &[u8]) -> Option<CertificateShare> {
     lock().snapshot(filter, super::frame_observations::unix_seconds())
+}
+
+/// This node's seats reporting a share, for its health conditions.
+pub(crate) fn low_episodes() -> Vec<(Vec<u8>, bool)> {
+    lock().low_episodes(super::frame_observations::unix_seconds())
 }
 
 /// Update the seats from the sampler's pass at `now` (`heads`: each seat's
@@ -1352,6 +1367,38 @@ mod tests {
             ["ended 7200 its share recovered"]
         );
         assert!(t.due(T0 + 10_800 + LOW_END_HOLD + 60).is_empty());
+    }
+
+    /// The health conditions read each current seat's low-share episode:
+    /// it starts with the tracker's own warning and ends with its end line,
+    /// after the seat stayed clear for [`LOW_END_HOLD`], and a former seat
+    /// counts no more.
+    #[test]
+    fn low_episodes_list_the_current_seats_and_follow_their_warning() {
+        let mut t = SeatCertificates::default();
+        assert!(t.low_episodes(T0).is_empty(), "no seat");
+        t.seats(&[(FILTER.to_vec(), 5)], T0);
+        assert!(t.low_episodes(T0).is_empty(), "no known membership");
+        let mut t = seated(T0);
+        assert_eq!(t.low_episodes(T0), [(FILTER.to_vec(), false)]);
+        frame_a_minute(&mut t, 0..60, false);
+        t.due(T0 + 3_600);
+        assert_eq!(t.low_episodes(T0 + 3_600), [(FILTER.to_vec(), true)]);
+        frame_a_minute(&mut t, 60..120, true);
+        t.due(T0 + 7_200);
+        // Clear, but within the hold: the episode, and its warning, go on.
+        assert_eq!(t.low_episodes(T0 + 7_200), [(FILTER.to_vec(), true)]);
+        frame_a_minute(&mut t, 120..135, true);
+        t.due(T0 + 7_200 + LOW_END_HOLD);
+        assert_eq!(
+            t.low_episodes(T0 + 7_200 + LOW_END_HOLD),
+            [(FILTER.to_vec(), false)]
+        );
+        t.seats(&[], T0 + 7_200 + LOW_END_HOLD + 60);
+        assert!(
+            t.low_episodes(T0 + 7_200 + LOW_END_HOLD + 60).is_empty(),
+            "the seat ended"
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use num_bigint::BigInt;
 
 /// Base units per QUIL: `0x1DCD65000` = 8,000,000,000
 /// (`client/cmd/token/balance.go:94`).
-pub const UNITS_PER_QUIL: u64 = 0x1_DCD6_5000;
+pub use quil_rpc::health_conditions::UNITS_PER_QUIL;
 
 /// [`UNITS_PER_QUIL`] as a [`BigInt`].
 pub fn conversion_factor() -> BigInt {
