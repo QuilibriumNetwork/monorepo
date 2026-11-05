@@ -578,8 +578,45 @@ pub fn decide_joins(
     strategy: Strategy,
     available_workers: usize,
 ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let JoinDecision {
+        below_score: mut reject,
+        above_cap,
+        confirm,
+    } = decide_joins_by_reason(
+        candidate_shards,
+        pending,
+        difficulty,
+        world_bytes,
+        units,
+        strategy,
+        available_workers,
+    );
+    reject.extend(above_cap);
+    (reject, confirm)
+}
+
+/// What [`decide_joins_by_reason`] decided for the pending joins.
+#[derive(Debug, Default)]
+pub struct JoinDecision {
+    /// Rejected: below the score threshold, or the shard is no candidate.
+    pub below_score: Vec<Vec<u8>>,
+    /// Rejected: passed the threshold, but above the worker cap.
+    pub above_cap: Vec<Vec<u8>>,
+    pub confirm: Vec<Vec<u8>>,
+}
+
+/// [`decide_joins`], with the joins it rejects apart by why.
+pub fn decide_joins_by_reason(
+    candidate_shards: &[ShardDescriptor],
+    pending: &[Vec<u8>],
+    difficulty: u64,
+    world_bytes: &BigInt,
+    units: u64,
+    strategy: Strategy,
+    available_workers: usize,
+) -> JoinDecision {
     if pending.is_empty() {
-        return (Vec::new(), Vec::new());
+        return JoinDecision::default();
     }
 
     let basis = pomw_basis(difficulty, world_bytes.try_into().unwrap_or(1), units);
@@ -611,7 +648,10 @@ pub fn decide_joins(
                 .take(100)
                 .cloned()
                 .collect();
-            return (reject, Vec::new());
+            return JoinDecision {
+                below_score: reject,
+                ..JoinDecision::default()
+            };
         }
     };
 
@@ -674,6 +714,7 @@ pub fn decide_joins(
     // and the joins above it are rejected: a join neither confirmed nor
     // rejected in its confirm epoch lapses and blocks a re-join of its
     // shard for 720 frames.
+    let mut above_cap = Vec::new();
     if !confirm.is_empty() && available_workers != usize::MAX {
         confirm.sort_by(|a, b| {
             let rank = |filter: &Vec<u8>| {
@@ -693,11 +734,15 @@ pub fn decide_joins(
                 .then_with(|| a.cmp(b))
         });
         if confirm.len() > available_workers {
-            reject.extend(confirm.split_off(available_workers));
+            above_cap = confirm.split_off(available_workers);
         }
     }
 
-    (reject, confirm)
+    JoinDecision {
+        below_score: reject,
+        above_cap,
+        confirm,
+    }
 }
 
 /// Identify shards to leave (overcrowded / poor reward / halt-risk swap).
