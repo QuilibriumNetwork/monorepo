@@ -856,6 +856,15 @@ async fn worker_active_storage_attestation() {
     // The reward proof — the canonical FrameHeader published on GLOBAL_PROVER
     // (captured via coverage_publish) — must ALSO carry the root + the openings
     // blob, since that is the payload the global frame recomputes + audits.
+    // It goes out once the frame's late-vote window closes (a later
+    // notarization, or `LATE_VOTE_WINDOW` after the certificate), so wait
+    // for it with a cap well past the window: a hold that never released
+    // would fail here.
+    let cov_cap = quil_cw_consensus::late_finalize::LATE_VOTE_WINDOW * 15;
+    assert!(
+        harness.wait_for_coverage(cov_cap).await,
+        "no coverage reward proof published within {cov_cap:?} of the full frame",
+    );
     let cov = harness
         .workers
         .iter()
