@@ -85,6 +85,11 @@ fn manual_release_reason(
             ("leave_confirmed", true)
         }
         EffectiveStatus::ExpiredLeaving => ("leave_departed", true),
+        // Released while its notice runs: a leaver its committee no longer
+        // seats (left after its registration lapsed, from the leaver
+        // currency frame), or one freed for a split child. Either way the
+        // seat is being left, as the operator asked.
+        EffectiveStatus::Leaving => ("leaving", true),
         EffectiveStatus::Kicked => ("kicked", false),
         EffectiveStatus::Rejected => ("join_rejected", false),
         EffectiveStatus::ExpiredJoining => ("join_expired", false),
@@ -6193,6 +6198,29 @@ mod tests {
         let logged = reconcile_logged(&alloc, frame);
         assert!(
             !logged.contains(LOST) && logged.contains(LEFT) && logged.contains("leave_confirmed"),
+            "{logged}"
+        );
+
+        // Left after its registration lapsed: from the leaver currency
+        // frame its committee no longer seats it, so its worker is freed
+        // during the notice. The flag-day crossing devnet warned of a lost
+        // seat for a split child here.
+        let _currency = LeaverCurrency::at(Some(0));
+        let leaving = ProverAllocationInfo {
+            status: ProverStatus::Leaving,
+            leave_frame_number: frame - 1,
+            ..stale.clone()
+        };
+        let (wm, alloc) = setup(vec![leaving]);
+        let logged = reconcile_logged(&alloc, frame);
+        assert!(
+            wm.range_workers().unwrap()[0].filter.is_empty(),
+            "the unseated leaver frees its worker"
+        );
+        assert!(
+            !logged.contains(LOST)
+                && logged.contains(LEFT)
+                && logged.contains("reason=\"leaving\""),
             "{logged}"
         );
     }

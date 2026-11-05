@@ -15968,11 +15968,27 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
                 true,
             );
         }
+        // A leave, not a missed confirm, keeps it out: nothing renews a leaving
+        // seat, and its worker waits for the leave boundary.
+        if seat.allocations.contains(&EffectiveStatus::Leaving) {
+            return refusal(
+                format!("not seated: {}", seat.describe()),
+                format!("this worker's prover is not seated in the committee (allocation status {} at GLOBAL frame {}); \
+                    start refused with: {text}", seat.describe(), seat.global_frame),
+                ExpectedWait(Awaited::Seat(None)),
+                "none: the seat is being left and its committee session does not seat it; the seat departs at its \
+                    leave boundary, which frees this worker; a rejected leave lets the seat renew",
+                true,
+            );
+        }
         let action = if seat.allocations.is_empty() {
             "the prover registry holds no allocation of this prover for the shard: check this worker's \
                 allocation (join and confirm); it starts only once a committee session seats it"
         } else if seat.allocations.contains(&EffectiveStatus::ExpiredEpoch) {
             MISSED_RECONFIRM
+        } else if seat.allocations.contains(&EffectiveStatus::Paused) {
+            "this seat is paused, and a paused seat is not seated: resume it to renew it; it starts only once a \
+                later session seats it"
         } else {
             "this worker is not a member of the shard's committee session: check the reconfirm and renewal \
                 of this worker's allocation; it starts only once a later session seats it"
@@ -16364,6 +16380,56 @@ mod start_block_tests {
             block.observe(at(9), &gap),
             Some(StartLog::Refused),
             "a later block is named afresh"
+        );
+    }
+
+    fn unseated(status: EffectiveStatus) -> StartContext {
+        StartContext {
+            not_seated: Some(NotSeated {
+                allocations: vec![status],
+                global_frame: 1234,
+                release: None,
+                join_wait: None,
+                session_wait: None,
+            }),
+            ..StartContext::default()
+        }
+    }
+
+    /// A seat being left is out by its operator's choice: no confirm failed
+    /// and nothing renews it, so its worker waits for the leave boundary. Its
+    /// record stays the seat-only blocker that renewal decisions read.
+    #[test]
+    fn a_leaving_seat_refused_a_start_waits_for_its_leave_boundary() {
+        let leaving = classify_start_refusal(
+            &committee_build_failed(),
+            &unseated(EffectiveStatus::Leaving),
+        );
+        assert!(leaving.scope.expected(), "{:?}", leaving.scope);
+        assert!(leaving.reason.contains("Leaving"), "{}", leaving.reason);
+        assert!(
+            leaving.action.contains("leave boundary") && !leaving.action.contains("reconfirm"),
+            "{}",
+            leaving.action
+        );
+        assert_eq!(
+            leaving.record(),
+            ("waiting", "committee admission unavailable", None)
+        );
+    }
+
+    /// A paused seat waits for its operator: its reconfirm did not fail.
+    #[test]
+    fn a_paused_seat_refused_a_start_is_told_to_resume() {
+        let paused = classify_start_refusal(
+            &committee_build_failed(),
+            &unseated(EffectiveStatus::Paused),
+        );
+        assert_eq!(paused.scope, StartScope::ThisNode);
+        assert!(
+            paused.action.contains("resume") && !paused.action.contains("reconfirm"),
+            "{}",
+            paused.action
         );
     }
 
