@@ -389,10 +389,23 @@ pub fn ensure_dir_owned_like_parent(dir: &Path) -> anyhow::Result<()> {
 /// included).
 #[cfg(unix)]
 fn nearest_owner(dir: &Path) -> Option<(u32, u32)> {
-    use std::os::unix::fs::MetadataExt;
-    dir.ancestors()
-        .find_map(|p| std::fs::metadata(p).ok())
-        .map(|meta| (meta.uid(), meta.gid()))
+    nearest_owner_by(dir, &|p| {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(p)
+            .ok()
+            .map(|meta| (meta.uid(), meta.gid()))
+    })
+}
+
+/// [`nearest_owner`] reading each path's `(uid, gid)` from `owner_of`
+/// (`None` for a path that does not exist), so a test sets owners without
+/// chown or host paths.
+#[cfg(unix)]
+fn nearest_owner_by(
+    dir: &Path,
+    owner_of: &dyn Fn(&Path) -> Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    dir.ancestors().find_map(owner_of)
 }
 
 /// [`ensure_symlink_dir`], giving each created directory the owner `(uid,
@@ -400,6 +413,19 @@ fn nearest_owner(dir: &Path) -> Option<(u32, u32)> {
 /// opened to 0755, so no one else can write to it in between.
 #[cfg(unix)]
 fn create_dirs(dir: &Path, owner: Option<(u32, u32)>) -> anyhow::Result<()> {
+    create_dirs_with(dir, owner, &|path, uid, gid| {
+        std::os::unix::fs::chown(path, Some(uid), Some(gid))
+    })
+}
+
+/// [`create_dirs`] giving the owner with `chown(path, uid, gid)`, so a test
+/// records the calls instead of needing root.
+#[cfg(unix)]
+fn create_dirs_with(
+    dir: &Path,
+    owner: Option<(u32, u32)>,
+    chown: &dyn Fn(&Path, u32, u32) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let missing: Vec<&Path> = dir
         .ancestors()
@@ -413,8 +439,7 @@ fn create_dirs(dir: &Path, owner: Option<(u32, u32)>) -> anyhow::Result<()> {
             Err(e) => anyhow::bail!("create {}: {e} (root required)", path.display()),
         }
         if let Some((uid, gid)) = owner {
-            std::os::unix::fs::chown(path, Some(uid), Some(gid))
-                .map_err(|e| anyhow::anyhow!("chown {}: {e}", path.display()))?;
+            chown(path, uid, gid).map_err(|e| anyhow::anyhow!("chown {}: {e}", path.display()))?;
         }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
             .map_err(|e| anyhow::anyhow!("chmod {}: {e}", path.display()))?;
@@ -587,27 +612,48 @@ mod tests {
         assert_eq!(mode(&bin), 0o755);
     }
 
-    /// A directory created under an existing one takes that one's owner.
+    /// A directory created under an existing one takes that one's owner,
+    /// every directory created, none that existed. Owners are faked (the
+    /// home belongs to uid 1000, the rest to root) and chown is recorded,
+    /// so the result does not depend on the host's users or privileges.
     #[cfg(unix)]
     #[test]
     fn a_new_dir_takes_the_owner_of_its_nearest_parent() {
-        use std::os::unix::fs::MetadataExt;
+        use std::cell::RefCell;
         let tmp = tempfile::TempDir::new().unwrap();
         let home = tmp.path().join("home");
         std::fs::create_dir(&home).unwrap();
-        if is_root() {
-            // Another owner, so the test also tells it from root's.
-            std::os::unix::fs::chown(&home, Some(1), Some(1)).unwrap();
-        }
-        let meta = std::fs::metadata(&home).unwrap();
-        let expected = (meta.uid(), meta.gid());
-        let log = home.join(".quilibrium").join("configs").join(".log");
-        assert_eq!(nearest_owner(&log), Some(expected));
-        create_dirs(&log, nearest_owner(&log)).unwrap();
-        for dir in [home.join(".quilibrium"), log.clone()] {
-            let meta = std::fs::metadata(&dir).unwrap();
-            assert_eq!((meta.uid(), meta.gid()), expected, "{}", dir.display());
-        }
+        let quil = home.join(".quilibrium");
+        let log = quil.join("configs").join(".log");
+        let owner_of = |p: &Path| {
+            if !p.exists() {
+                None
+            } else if p.starts_with(&home) {
+                Some((1000, 1001))
+            } else {
+                Some((0, 0))
+            }
+        };
+
+        assert_eq!(nearest_owner_by(&log, &owner_of), Some((1000, 1001)));
+        assert_eq!(nearest_owner_by(&home, &owner_of), Some((1000, 1001)));
+        assert_eq!(
+            nearest_owner_by(&tmp.path().join("x").join("y"), &owner_of),
+            Some((0, 0))
+        );
+
+        let chowned = RefCell::new(Vec::new());
+        create_dirs_with(&log, nearest_owner_by(&log, &owner_of), &|p, uid, gid| {
+            chowned.borrow_mut().push((p.to_path_buf(), uid, gid));
+            Ok(())
+        })
+        .unwrap();
+        let want: Vec<(PathBuf, u32, u32)> = [quil.clone(), quil.join("configs"), log.clone()]
+            .into_iter()
+            .map(|p| (p, 1000, 1001))
+            .collect();
+        assert_eq!(*chowned.borrow(), want);
+        assert!(log.is_dir());
     }
 
     /// The layout on `os` where of the two roots only those flagged exist.
