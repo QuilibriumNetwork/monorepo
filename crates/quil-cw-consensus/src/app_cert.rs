@@ -13,12 +13,22 @@
 //!   the cert, binds it to the frame identity digest, and returns the signing
 //!   members' public keys (for reward distribution).
 
-use commonware_codec::{Encode, Read};
-use commonware_consensus::simplex::types::{Finalization, Proposal};
-use commonware_cryptography::{certificate::Scheme as _, sha256::Digest as Sha256Digest};
-use commonware_utils::ordered::{Quorum as _, Set};
+use commonware_codec::{types::lazy::Lazy, Encode, Read};
+use commonware_consensus::simplex::{
+    scheme::Namespace as SimplexNamespace,
+    types::{Finalization, Proposal, Subject},
+};
+use commonware_cryptography::{
+    certificate::{Attestation, Scheme as _, Signers},
+    sha256::Digest as Sha256Digest,
+};
+use commonware_utils::{
+    ordered::{Quorum as _, Set},
+    Participant,
+};
 
-use crate::falcon_base::FalconPublicKey;
+use crate::falcon_base::{FalconPublicKey, FalconSignature};
+use crate::falcon_scheme::{Certificate, Generic};
 use crate::falcon_simplex::SimplexFalconScheme;
 
 /// The concrete finalization certificate type for Quilibrium consensus.
@@ -80,6 +90,131 @@ pub fn unverified_signers(bytes: &[u8]) -> Option<(usize, usize)> {
     cursor
         .is_empty()
         .then(|| (f.certificate.signers.len(), f.certificate.signers.count()))
+}
+
+/// The signers a copy of a held certificate adds to it, with their signatures
+/// ([`added_signers`]). Not verified until [`AddedSigners::verify`] says so.
+#[derive(Clone, Debug)]
+pub struct AddedSigners {
+    proposal: Proposal<Sha256Digest>,
+    committee: usize,
+    added: Vec<(Participant, Lazy<FalconSignature>)>,
+}
+
+/// Decode a certificate bounded by the largest committee, for a caller that
+/// holds no committee yet.
+fn decode_unbound(bytes: &[u8]) -> Option<AppFinalization> {
+    if bytes.len() > crate::handoff::MAX_RECORD_BYTES {
+        return None;
+    }
+    let mut cursor = bytes;
+    let f = <AppFinalization as Read>::read_cfg(&mut cursor, &crate::handoff::MAX_MEMBERS).ok()?;
+    cursor.is_empty().then_some(f)
+}
+
+/// What `copy` adds to `held`: its signers `held` does not name. `None` unless
+/// both are finalizations of one proposal under one committee size. Neither is
+/// verified here; a signature of a signer `held` already names is not read.
+pub fn added_signers(held: &[u8], copy: &[u8]) -> Option<AddedSigners> {
+    let (held, copy) = (decode_unbound(held)?, decode_unbound(copy)?);
+    if held.proposal != copy.proposal
+        || held.certificate.signers.len() != copy.certificate.signers.len()
+    {
+        return None;
+    }
+    let named: std::collections::BTreeSet<Participant> = held.certificate.signers.iter().collect();
+    let added = copy
+        .certificate
+        .signers
+        .iter()
+        .zip(copy.certificate.signatures.iter())
+        .filter(|(signer, _)| !named.contains(signer))
+        .map(|(signer, signature)| (signer, signature.clone()))
+        .collect();
+    Some(AddedSigners {
+        committee: copy.certificate.signers.len(),
+        proposal: copy.proposal,
+        added,
+    })
+}
+
+impl AddedSigners {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.added.len()
+    }
+
+    /// The proposal's epoch: the generation of the session that signed it.
+    pub fn generation(&self) -> u64 {
+        self.proposal.round.epoch().get()
+    }
+
+    /// Every added signature is a member's finalize vote for the proposal,
+    /// indexed as [`check_finalization`] indexes the committee. Ends at the
+    /// first that is not.
+    pub fn verify(&self, committee_pubkeys: &[Vec<u8>], namespace: &[u8]) -> bool {
+        let Some(keys) = committee_pubkeys
+            .iter()
+            .map(|key| FalconPublicKey::from_bytes(key))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        let Ok(set) = Set::<FalconPublicKey>::try_from(keys) else {
+            return false;
+        };
+        if set.len() != self.committee {
+            return false;
+        }
+        let scheme = Generic::<SimplexNamespace>::verifier(namespace, set);
+        self.added.iter().all(|(signer, signature)| {
+            scheme.verify_attestation::<SimplexFalconScheme, Sha256Digest>(
+                Subject::Finalize {
+                    proposal: &self.proposal,
+                },
+                &Attestation {
+                    signer: *signer,
+                    signature: signature.clone(),
+                },
+            )
+        })
+    }
+
+    /// `held` signed also by the added signers it does not name by now, sorted
+    /// as every certificate is. `None` when that adds nothing, or `held` is not
+    /// a finalization of the same proposal.
+    pub fn extend(&self, held: &[u8]) -> Option<Vec<u8>> {
+        let held = decode_unbound(held)?;
+        if held.proposal != self.proposal || held.certificate.signers.len() != self.committee {
+            return None;
+        }
+        let mut signatures: std::collections::BTreeMap<Participant, Lazy<FalconSignature>> = held
+            .certificate
+            .signers
+            .iter()
+            .zip(held.certificate.signatures.iter().cloned())
+            .collect();
+        let before = signatures.len();
+        for (signer, signature) in &self.added {
+            signatures
+                .entry(*signer)
+                .or_insert_with(|| signature.clone());
+        }
+        if signatures.len() == before {
+            return None;
+        }
+        let certificate = Certificate {
+            signers: Signers::from(self.committee, signatures.keys().copied()),
+            signatures: signatures.into_values().collect::<Vec<_>>().into(),
+        };
+        Some(encode_finalization(&AppFinalization {
+            proposal: self.proposal.clone(),
+            certificate,
+        }))
+    }
 }
 
 /// What a certificate says of one member of its committee, read from its

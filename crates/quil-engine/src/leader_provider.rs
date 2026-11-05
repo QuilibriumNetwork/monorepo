@@ -1416,6 +1416,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         "GLOBAL message validation budget spent; deferring the rest to a later frame",
                     );
                 }
+                crate::message_collector::order_copies_by_signers(&mut in_lockstep_shard);
                 // Each shard's tip must be verified: held verified by the
                 // collector (an archive verifies on admission) or checked here,
                 // with refusals remembered under this validation context.
