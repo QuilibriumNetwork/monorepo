@@ -2516,7 +2516,11 @@ impl DrainRig {
                 .unwrap()
                 .to_vec(),
             anchor,
-            &drain_global_output(anchor),
+            &if anchor == 0 {
+                Vec::new()
+            } else {
+                drain_global_output(anchor)
+            },
         );
         if !certified {
             frame.header.as_mut().unwrap().public_key_signature_bls48581 = None;
@@ -2835,6 +2839,33 @@ fn seal_drain_raise_changes_nothing_before_its_frame() {
             });
         handoff::set_drain_anchor_raise_for_thread(None);
     }
+}
+
+/// From the raise's frame a drain header must name an anchor, as voters have
+/// required of every frame since the required-anchor epoch; a quorum's header
+/// naming none is refused deterministically, and before the frame it is
+/// admitted as before. A build without the rule executes it.
+#[test]
+fn seal_drain_raise_refuses_a_header_naming_no_anchor() {
+    for certified in [true, false] {
+        let rig = DrainRig::new(0, certified);
+        handoff::set_drain_anchor_raise_for_thread(Some((DRAIN_FRAME + 1, DRAIN_RAISED_FLOOR)));
+        rig.check_setup();
+        handoff::set_drain_anchor_raise_for_thread(Some((6, DRAIN_RAISED_FLOOR)));
+        let sealed = rig.sealed(&rig.submission, &[&rig.header]);
+        for outcome in rig.outcomes(&sealed) {
+            match outcome {
+                Err(quil_types::error::QuilError::InvalidArgument(reason))
+                    if reason.contains("anchor 0, which names no frame") => {}
+                other => panic!(
+                    "SD ZERO: GLOBAL frame {DRAIN_FRAME}, past the raise's frame, must refuse \
+                     a drain header naming no anchor (certified {certified}), got {other:?}"
+                ),
+            }
+        }
+        handoff::set_drain_anchor_raise_for_thread(None);
+    }
+    eprintln!("SD ZERO: a drain header naming no anchor is refused from the raise's frame");
 }
 
 /// A genuine drain, certified by the session or by the seal, is admitted
