@@ -707,6 +707,7 @@ pub(crate) fn prewarm_sectors(
         let memory = crate::storage_jobs::reserve_ahead(
             crate::storage_labels::label_ahead_bytes(*n),
             *order,
+            captured.epoch,
             &gone,
         )
         .ok_or_else(|| unavailable("sector warmup stopped".into()))?;
@@ -764,6 +765,7 @@ fn resume_reserved_sector(
             let memory = crate::storage_jobs::reserve_ahead(
                 crate::storage_labels::label_ahead_bytes(n),
                 order,
+                epoch,
                 &crate::storage_jobs::stopping,
             )
             .ok_or_else(|| unavailable("sector initialization stopped".into()))?;

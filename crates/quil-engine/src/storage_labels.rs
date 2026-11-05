@@ -41,7 +41,9 @@
 //! each yield never ended (2026-11-01). The leaves wait for memory in an
 //! order (`crate::storage_jobs::AheadOrder`): those its snapshot could not
 //! label within the renewal's grace first ([`ahead_orders`]). Only two are
-//! labelled at once (`crate::storage_jobs::AHEAD_JOBS`), and while a
+//! labelled at once (`crate::storage_jobs::AHEAD_JOBS`; sectors of epochs
+//! where persistent storage holds run beside them on the other slots,
+//! `crate::storage_jobs::ahead_in_parallel`), and while a
 //! renewal's leaf is labelled now only one goes on beside it; the other
 //! pauses, keeping its memory and layers, until that labelling ends
 //! (`crate::storage_jobs::Reservation::wait_while_paused`).
@@ -2406,7 +2408,8 @@ fn label_leaf_ahead(
     loop {
         let bytes = label_ahead_bytes(n);
         let gone = || expired(epoch) || crate::storage_jobs::stopping();
-        let memory = crate::storage_jobs::reserve_ahead(bytes, order, &gone).filter(|_| !gone());
+        let memory =
+            crate::storage_jobs::reserve_ahead(bytes, order, epoch, &gone).filter(|_| !gone());
         let Some(memory) = memory else {
             if crate::storage_jobs::stopping() {
                 return Err(stopping());
