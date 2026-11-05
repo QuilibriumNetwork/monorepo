@@ -59,6 +59,10 @@ const HASH_LEAF: u8 = 0x05;
 /// length-prefixed leaf id and chunk index, so opening a node reads one chunk
 /// instead of the whole replica.
 const HASH_NODES: u8 = 0x06;
+/// What a member's snapshot encoded a hash-proof epoch's leaf from, by leaf
+/// id ([`ReplicaStore::put_hash_from`]): written once the leaf is whole, and
+/// removed before it is written again or deleted.
+const HASH_LEAF_SOURCE: u8 = 0x09;
 
 /// Nodes per stored chunk: one subtree below the cap, all a member reads of a
 /// replica to open one node of it (`MerkleCap::subtree`).
@@ -92,6 +96,23 @@ fn meta_key(kind: u8, epoch: u64, id: &[u8]) -> Vec<u8> {
 const LEGACY_HASH_REPLICA_TAG: u8 = 0xA5;
 /// Leads a [`HASH_LEAF`] record.
 const HASH_LEAF_VERSION: u8 = 1;
+
+/// A stored hash-proof epoch's leaf as [`ReplicaStore::stored_from`] found it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoredFrom {
+    /// None, or one stored without its source: cut short before it was
+    /// recorded, or stored another way.
+    Unrecorded,
+    /// One stored from another source.
+    Other,
+    /// One from this source whose nodes do not hash up to its registered
+    /// replica commitment: why.
+    Damaged(String),
+    /// One from this source, every node checked: its node count.
+    Whole(u64),
+    /// Not checked through: `stop` said so.
+    Stopped,
+}
 
 /// A hash-proof epoch's stored leaf, nodes and all.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -587,6 +608,80 @@ impl ReplicaStore {
         self.write_hash(epoch, leaf_id, replica, cap, registration_root)
     }
 
+    /// [`Self::put_hash`], then the `source` it was encoded from, for
+    /// [`Self::stored_from`].
+    pub fn put_hash_from(
+        &self,
+        epoch: u64,
+        leaf_id: &[u8],
+        replica: &[u8],
+        cap: &[u8],
+        registration_root: &[u8],
+        source: &[u8],
+    ) -> Result<()> {
+        let _writing = hash_writes().lock().unwrap_or_else(PoisonError::into_inner);
+        self.write_hash(epoch, leaf_id, replica, cap, registration_root)?;
+        self.db
+            .set(&meta_key(HASH_LEAF_SOURCE, epoch, leaf_id), source)
+    }
+
+    /// Whether `(epoch, leaf_id)` holds a leaf [`Self::put_hash_from`]
+    /// stored from `source`, each of its nodes read back and hashed up to
+    /// its cap, and the cap to the replica commitment its registration root
+    /// carries. Holds one scan window of nodes at a time, and looks at
+    /// `stop` before each.
+    pub fn stored_from(
+        &self,
+        epoch: u64,
+        leaf_id: &[u8],
+        source: &[u8],
+        stop: &dyn Fn() -> bool,
+    ) -> Result<StoredFrom> {
+        use quil_crypto::storage_proof::{parse_registration_root, Tree, CAP_HEIGHT};
+        match self.db.get(&meta_key(HASH_LEAF_SOURCE, epoch, leaf_id))? {
+            None => return Ok(StoredFrom::Unrecorded),
+            Some(stored) if stored != source => return Ok(StoredFrom::Other),
+            Some(_) => {}
+        }
+        let damaged = |why: String| Ok(StoredFrom::Damaged(why));
+        let leaf = match self.get_hash_leaf(epoch, leaf_id) {
+            Ok(Some(leaf)) => leaf,
+            Ok(None) => return Ok(StoredFrom::Unrecorded),
+            Err(error) => return damaged(error.to_string()),
+        };
+        let comm_r = parse_registration_root(&leaf.registration_root).map(|root| root.comm_r);
+        if comm_r != Some(leaf.cap.commitment(Tree::Replica))
+            || leaf.cap.n != leaf.n
+            || leaf.cap.height > CAP_HEIGHT
+        {
+            return damaged("its cap is not the registered replica's".into());
+        }
+        // The cap's subtrees: a tree shallower than the cap's height is one,
+        // under its root, whatever the chunks hold.
+        let per = 1u64 << leaf.cap.height;
+        let mut start = 0;
+        while start < leaf.n {
+            if stop() {
+                return Ok(StoredFrom::Stopped);
+            }
+            let end = (start + per * CHUNKS_PER_SCAN).min(leaf.n);
+            let nodes = match self.read_nodes(epoch, leaf_id, &leaf, start..end) {
+                Ok(nodes) => nodes,
+                Err(error) => return damaged(error.to_string()),
+            };
+            for (at, chunk) in (start..)
+                .step_by(per as usize)
+                .zip(nodes.chunks(per as usize * NODE_BYTES))
+            {
+                if leaf.cap.subtree_path(chunk, at).is_none() {
+                    return damaged(format!("nodes from {at} do not hash up to its cap"));
+                }
+            }
+            start = end;
+        }
+        Ok(StoredFrom::Whole(leaf.n))
+    }
+
     /// [`Self::put_hash`] with [`hash_writes`] held.
     fn write_hash(
         &self,
@@ -602,6 +697,8 @@ impl ReplicaStore {
             ));
         }
         forget_leaves(|e, id| e == epoch && id == leaf_id);
+        self.db
+            .delete(&meta_key(HASH_LEAF_SOURCE, epoch, leaf_id))?;
         self.db.delete(&leaf_key(epoch, leaf_id))?;
         self.db.delete_range(
             &chunk_key(epoch, leaf_id, 0),
@@ -976,6 +1073,8 @@ impl ReplicaStore {
     pub fn delete(&self, epoch: u64, leaf_id: &[u8]) -> Result<()> {
         let _writing = hash_writes().lock().unwrap_or_else(PoisonError::into_inner);
         forget_leaves(|e, id| e == epoch && id == leaf_id);
+        self.db
+            .delete(&meta_key(HASH_LEAF_SOURCE, epoch, leaf_id))?;
         self.db.delete(&leaf_key(epoch, leaf_id))?;
         self.db.delete_range(
             &chunk_key(epoch, leaf_id, 0),
@@ -1031,6 +1130,7 @@ impl ReplicaStore {
             LEAF_NODES,
             HASH_LEAF,
             HASH_NODES,
+            HASH_LEAF_SOURCE,
         ] {
             self.db
                 .delete_range(&meta_key(kind, 0, &[]), &meta_key(kind, keep_from, &[]))?;
@@ -1200,6 +1300,136 @@ mod tests {
             leaf_cache().entries.keys().all(|key| key.0 != s.identity()),
             "evicted records leave the cache"
         );
+    }
+
+    /// A leaf stored from a source is whole only for that source, at its
+    /// epoch, with every node hashing up to its cap and the cap to its
+    /// registered replica commitment: a leaf stored without its source (cut
+    /// short before it was recorded), a node changed, a chunk missing or a
+    /// registration of another replica is not, and writing the leaf again or
+    /// deleting it drops its source.
+    #[test]
+    fn a_leaf_is_stored_from_its_source_only_whole_and_intact() {
+        use quil_crypto::storage_proof::{registration_root, MerkleCap, Tree};
+        let s = store();
+        let go = || false;
+        let n = 2 * CHUNK_NODES as usize + 300;
+        let (replica, cap) = hash_leaf(n, 3);
+        let comm_r = MerkleCap::from_bytes(&cap)
+            .unwrap()
+            .commitment(Tree::Replica);
+        let root = registration_root(&[0; 32], &[0; 32], &comm_r);
+        let from = |epoch, source: &[u8]| s.stored_from(epoch, b"leaf", source, &go).unwrap();
+        assert_eq!(from(5, b"src"), StoredFrom::Unrecorded);
+        s.put_hash(5, b"leaf", &replica, &cap, &root).unwrap();
+        assert_eq!(from(5, b"src"), StoredFrom::Unrecorded, "no source");
+        s.put_hash_from(5, b"leaf", &replica, &cap, &root, b"src")
+            .unwrap();
+        assert_eq!(from(5, b"src"), StoredFrom::Whole(n as u64));
+        assert_eq!(from(5, b"other"), StoredFrom::Other);
+        assert_eq!(from(6, b"src"), StoredFrom::Unrecorded, "another epoch");
+        assert_eq!(
+            s.stored_from(5, b"leaf", b"src", &|| true).unwrap(),
+            StoredFrom::Stopped
+        );
+
+        // A node of the last, short chunk changed, then the chunk missing.
+        let last = chunk_key(5, b"leaf", 2);
+        let whole = s.db.get(&last).unwrap().unwrap();
+        let mut changed = whole.clone();
+        changed[..NODE_BYTES].copy_from_slice(&replica[..NODE_BYTES]);
+        assert_ne!(changed, whole);
+        s.db.set(&last, &changed).unwrap();
+        assert!(matches!(from(5, b"src"), StoredFrom::Damaged(_)));
+        s.db.set(&last, &whole).unwrap();
+        assert_eq!(from(5, b"src"), StoredFrom::Whole(n as u64));
+        s.db.delete(&last).unwrap();
+        assert!(matches!(from(5, b"src"), StoredFrom::Damaged(_)));
+
+        // Its cap, with the registration of another replica.
+        let other = registration_root(&[0; 32], &[0; 32], &[0; 32]);
+        s.put_hash_from(5, b"leaf", &replica, &cap, &other, b"src")
+            .unwrap();
+        assert!(matches!(from(5, b"src"), StoredFrom::Damaged(_)));
+
+        s.put_hash_from(5, b"leaf", &replica, &cap, &root, b"src")
+            .unwrap();
+        s.put_hash(5, b"leaf", &replica, &cap, &root).unwrap();
+        assert_eq!(from(5, b"src"), StoredFrom::Unrecorded, "written again");
+        s.put_hash_from(5, b"leaf", &replica, &cap, &root, b"src")
+            .unwrap();
+        s.delete(5, b"leaf").unwrap();
+        assert_eq!(from(5, b"src"), StoredFrom::Unrecorded, "deleted");
+        s.put_hash_from(5, b"leaf", &replica, &cap, &root, b"src")
+            .unwrap();
+        s.evict_below_epoch(6).unwrap();
+        assert_eq!(
+            s.db.get(&meta_key(HASH_LEAF_SOURCE, 5, b"leaf")).unwrap(),
+            None,
+            "evicted"
+        );
+    }
+
+    /// A leaf of any size is whole while intact and damaged with a node
+    /// changed, those shallower than the cap's height too, whose tree is one
+    /// subtree of it (2026-11-05: every leaf of up to 512 nodes read as
+    /// damaged, for a chunk size only deeper trees' subtrees have). A cap
+    /// higher than the store writes is refused: its subtrees would be read
+    /// whole.
+    #[test]
+    fn a_leaf_of_any_size_is_whole_intact_and_damaged_with_a_node_changed() {
+        use quil_crypto::storage_proof::{
+            registration_root, MerkleCap, MerkleTree, Tree, CAP_HEIGHT,
+        };
+        let c = CHUNK_NODES as usize;
+        let go = || false;
+        for n in [
+            2,
+            3,
+            40,
+            c / 2 - 1,
+            c / 2,
+            c / 2 + 1,
+            c - 1,
+            c,
+            c + 1,
+            2 * c + 1,
+        ] {
+            let s = store();
+            let (mut replica, cap) = hash_leaf(n, n as u32);
+            let comm_r = MerkleCap::from_bytes(&cap)
+                .unwrap()
+                .commitment(Tree::Replica);
+            let root = registration_root(&[0; 32], &[0; 32], &comm_r);
+            s.put_hash_from(5, b"leaf", &replica, &cap, &root, b"src")
+                .unwrap();
+            assert_eq!(
+                s.stored_from(5, b"leaf", b"src", &go).unwrap(),
+                StoredFrom::Whole(n as u64),
+                "{n} nodes intact"
+            );
+            replica.copy_within(0..NODE_BYTES, (n - 1) * NODE_BYTES);
+            s.put_hash_from(5, b"leaf", &replica, &cap, &root, b"src")
+                .unwrap();
+            assert!(
+                matches!(
+                    s.stored_from(5, b"leaf", b"src", &go).unwrap(),
+                    StoredFrom::Damaged(_)
+                ),
+                "{n} nodes, the last changed"
+            );
+        }
+        let s = store();
+        let (replica, _) = hash_leaf(4 * c, 7);
+        let tree = MerkleTree::from_nodes(&replica).unwrap();
+        let root = registration_root(&[0; 32], &[0; 32], &tree.commitment(Tree::Replica));
+        let high = tree.cap(CAP_HEIGHT + 1).to_bytes();
+        s.put_hash_from(5, b"leaf", &replica, &high, &root, b"src")
+            .unwrap();
+        assert!(matches!(
+            s.stored_from(5, b"leaf", b"src", &go).unwrap(),
+            StoredFrom::Damaged(_)
+        ));
     }
 
     #[test]
