@@ -40,6 +40,14 @@ const MAX_COUNTED: usize = 2_048;
 pub(crate) const LOW_MIN_FRAMES: u64 = 30;
 /// How often each seat's summary is logged, and a low share warned again.
 pub(crate) const LOG_EVERY: u64 = HOUR;
+/// How long a seat must stay out of the low share, unbroken, before its
+/// episode ends: a share at the threshold crosses it on single frames, and
+/// each crossing would otherwise start a new episode.
+pub(crate) const LOW_END_HOLD: u64 = 15 * MINUTE;
+
+/// Members a seat's per-member signer counts follow; a larger committee
+/// is judged against its size, with no voters or rank.
+const MAX_TALLY: usize = 128;
 
 /// This node's place in one committee session of a seat's shard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,10 +66,31 @@ struct Bucket {
     signed: u32,
 }
 
+/// How often each member of a committee session signed the certificates
+/// of the shard frames counted in one minute.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Tally {
+    minute: u64,
+    generation: u64,
+    frames: u32,
+    counts: Vec<u16>,
+}
+
+/// The members voting in a seat's committee over the last hour: those
+/// signing over a tenth of its frames, and this seat's place among them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Voters {
+    pub voters: u32,
+    /// 1 = most certificates signed; ties share the better rank.
+    pub rank: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Low {
     since: u64,
     warned: u64,
+    /// When the seat was first not low in its current unbroken stretch.
+    clear_since: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -74,6 +103,8 @@ struct Seat {
     memberships: VecDeque<Membership>,
     counted: BTreeSet<u64>,
     buckets: VecDeque<Bucket>,
+    /// Per-member signer counts of the last hour, by minute.
+    tallies: VecDeque<Tally>,
     /// The committee of the latest frame counted.
     committee: u32,
     last_frame: u64,
@@ -89,6 +120,7 @@ impl Seat {
             memberships: VecDeque::new(),
             counted: BTreeSet::new(),
             buckets: VecDeque::new(),
+            tallies: VecDeque::new(),
             committee: 0,
             last_frame: 0,
             summarized: now,
@@ -129,6 +161,43 @@ impl Seat {
         {
             self.buckets.pop_front();
         }
+        while self
+            .tallies
+            .front()
+            .is_some_and(|t| t.minute * MINUTE + MINUTE + HOUR <= now)
+        {
+            self.tallies.pop_front();
+        }
+    }
+
+    /// The members voting in this node's latest session over the last
+    /// hour; `None` with under [`LOW_MIN_FRAMES`] frames of it, or a
+    /// committee past [`MAX_TALLY`].
+    fn voters(&self, now: u64) -> Option<Voters> {
+        let member = self.member()?;
+        let own = member.index? as usize;
+        let size = member.committee as usize;
+        if size == 0 || size > MAX_TALLY || own >= size {
+            return None;
+        }
+        let (mut frames, mut counts) = (0u64, vec![0u64; size]);
+        for t in self.tallies.iter().filter(|t| {
+            t.generation == member.generation
+                && t.counts.len() == size
+                && t.minute * MINUTE + MINUTE + HOUR > now
+        }) {
+            frames += u64::from(t.frames);
+            for (sum, &n) in counts.iter_mut().zip(&t.counts) {
+                *sum += u64::from(n);
+            }
+        }
+        if frames < LOW_MIN_FRAMES {
+            return None;
+        }
+        Some(Voters {
+            voters: counts.iter().filter(|&&n| n * 10 > frames).count() as u32,
+            rank: 1 + counts.iter().filter(|&&n| n > counts[own]).count() as u32,
+        })
     }
 }
 
@@ -152,6 +221,7 @@ pub(crate) enum SeatLog {
     Low {
         filter: Vec<u8>,
         share: CertificateShare,
+        voters: Option<Voters>,
         low_secs: u64,
         repeat: bool,
     },
@@ -167,15 +237,25 @@ pub(crate) enum SeatLog {
 /// member voting in time signs (`quorum / committee`); `None` when it holds
 /// too little to judge: under an hour counted, or under [`LOW_MIN_FRAMES`]
 /// frames.
+#[cfg(test)]
 pub(crate) fn low_share(window: &CertificateWindow, committee: u32, quorum: u32) -> Option<bool> {
+    low_share_of(window, committee, quorum)
+}
+
+/// Whether `window` shows a seat signing under half of `quorum / voters`:
+/// every landed certificate holds exactly a quorum of signers, so with
+/// `voters` members voting a member voting in time signs about that share of
+/// them. `None` when it holds too little to judge: under an hour counted, or
+/// under [`LOW_MIN_FRAMES`] frames.
+pub(crate) fn low_share_of(window: &CertificateWindow, voters: u32, quorum: u32) -> Option<bool> {
     if window.observed_seconds < window.window_seconds
         || window.frames < LOW_MIN_FRAMES
-        || committee == 0
+        || voters == 0
     {
         return None;
     }
     Some(
-        u128::from(window.signed_frames) * 2 * u128::from(committee)
+        u128::from(window.signed_frames) * 2 * u128::from(voters)
             < u128::from(window.frames) * u128::from(quorum),
     )
 }
@@ -253,16 +333,85 @@ impl SeatCertificates {
         else {
             return false;
         };
-        let Some(member) = app_cert::unverified_member(certificate, index as usize) else {
+        let Some((member, signers)) =
+            app_cert::unverified_member_signers(certificate, index as usize)
+        else {
             return false;
         };
-        self.count(
+        let counted = self.count(
             header.filter,
             header.frame,
             header.timestamp_ms,
             member,
             now,
-        )
+        );
+        if counted {
+            self.tally(
+                header.filter,
+                header.timestamp_ms,
+                now,
+                member.generation,
+                member.committee,
+                &signers,
+            );
+        }
+        counted
+    }
+
+    /// Add the `signers` of a counted frame of `filter`, signed under
+    /// `committee` members of session `generation`, to the seat's
+    /// per-member counts.
+    pub fn tally(
+        &mut self,
+        filter: &[u8],
+        timestamp_ms: i64,
+        now: u64,
+        generation: u64,
+        committee: usize,
+        signers: &[u32],
+    ) {
+        let Some(seat) = self.seats.get_mut(filter) else {
+            return;
+        };
+        if committee == 0 || committee > MAX_TALLY {
+            return;
+        }
+        let at = u64::try_from(timestamp_ms / 1000)
+            .ok()
+            .filter(|&at| at > 0 && at <= now)
+            .unwrap_or(now);
+        let minute = at / MINUTE;
+        let slot = match seat
+            .tallies
+            .iter()
+            .position(|t| t.minute == minute && t.generation == generation)
+        {
+            Some(i) => i,
+            None => {
+                let position = seat.tallies.partition_point(|t| t.minute < minute);
+                seat.tallies.insert(
+                    position,
+                    Tally {
+                        minute,
+                        generation,
+                        frames: 0,
+                        counts: vec![0; committee],
+                    },
+                );
+                position
+            }
+        };
+        let tally = &mut seat.tallies[slot];
+        if tally.counts.len() != committee {
+            return;
+        }
+        tally.frames += 1;
+        for &signer in signers {
+            if let Some(n) = tally.counts.get_mut(signer as usize) {
+                *n = n.saturating_add(1);
+            }
+        }
+        seat.expire(now);
     }
 
     /// Count shard frame `frame` of `filter`, timestamped `timestamp_ms`,
@@ -352,7 +501,8 @@ impl SeatCertificates {
 
     /// The lines due at `now`: each current seat's summary every
     /// [`LOG_EVERY`] once it was counted that long, and a low share's
-    /// start, its repeats every [`LOG_EVERY`] and its end.
+    /// start, its repeats every [`LOG_EVERY`] and its end, which comes once the
+    /// seat has stayed out of the low share for [`LOW_END_HOLD`].
     pub fn due(&mut self, now: u64) -> Vec<SeatLog> {
         let mut logs = Vec::new();
         for (filter, seat) in self.seats.iter_mut() {
@@ -360,8 +510,15 @@ impl SeatCertificates {
                 continue;
             };
             let hour = share.hour.as_ref().cloned().unwrap_or_default();
+            let voters = if seat.current { seat.voters(now) } else { None };
+            // Every landed certificate holds exactly a quorum of signers, so
+            // the fair share is quorum / voters, not quorum / committee.
+            let fair_over = voters
+                .map(|v| v.voters)
+                .filter(|v| (share.quorum..=share.committee).contains(v))
+                .unwrap_or(share.committee);
             let judged = if seat.current {
-                low_share(&hour, share.committee, share.quorum)
+                low_share_of(&hour, fair_over, share.quorum)
             } else {
                 None
             };
@@ -370,36 +527,57 @@ impl SeatCertificates {
                     seat.low = Some(Low {
                         since: now,
                         warned: now,
+                        clear_since: None,
                     });
                     logs.push(SeatLog::Low {
                         filter: filter.clone(),
                         share,
+                        voters,
                         low_secs: 0,
                         repeat: false,
                     });
                 }
-                (Some(true), Some(low)) if now.saturating_sub(low.warned) >= LOG_EVERY => {
-                    seat.low = Some(Low { warned: now, ..low });
-                    logs.push(SeatLog::Low {
-                        filter: filter.clone(),
-                        share,
-                        low_secs: now.saturating_sub(low.since),
-                        repeat: true,
+                (Some(true), Some(low)) => {
+                    let again = now.saturating_sub(low.warned) >= LOG_EVERY;
+                    seat.low = Some(Low {
+                        warned: if again { now } else { low.warned },
+                        clear_since: None,
+                        ..low
                     });
+                    if again {
+                        logs.push(SeatLog::Low {
+                            filter: filter.clone(),
+                            share,
+                            voters,
+                            low_secs: now.saturating_sub(low.since),
+                            repeat: true,
+                        });
+                    }
                 }
-                (Some(true), Some(_)) | (_, None) => {}
+                (_, None) => {}
                 (judged, Some(low)) => {
-                    seat.low = None;
-                    logs.push(SeatLog::Ended {
-                        filter: filter.clone(),
-                        share,
-                        low_secs: now.saturating_sub(low.since),
-                        how: match (judged, seat.current) {
-                            (_, false) => "the seat ended",
-                            (Some(false), _) => "its share recovered",
-                            _ => "too few frames in the last hour to judge",
-                        },
-                    });
+                    let clear = low.clear_since.unwrap_or(now);
+                    if seat.current && now.saturating_sub(clear) < LOW_END_HOLD {
+                        seat.low = Some(Low {
+                            clear_since: Some(clear),
+                            ..low
+                        });
+                    } else {
+                        seat.low = None;
+                        // A former seat ends where it is seen; otherwise the
+                        // episode lasted until the share first cleared.
+                        let end = if seat.current { clear } else { now };
+                        logs.push(SeatLog::Ended {
+                            filter: filter.clone(),
+                            share,
+                            low_secs: end.saturating_sub(low.since),
+                            how: match (judged, seat.current) {
+                                (_, false) => "the seat ended",
+                                (Some(false), _) => "its share recovered",
+                                _ => "too few frames in the last hour to judge",
+                            },
+                        });
+                    }
                 }
             }
             if seat.current && now.saturating_sub(seat.summarized) >= LOG_EVERY {
@@ -534,20 +712,32 @@ fn log(line: &SeatLog) {
         SeatLog::Low {
             filter,
             share,
+            voters,
             low_secs,
             repeat,
         } => {
             let hour = share.hour.as_ref().cloned().unwrap_or_default();
+            let fair_over = voters
+                .map(|v| v.voters)
+                .filter(|v| (share.quorum..=share.committee).contains(v))
+                .unwrap_or(share.committee);
             tracing::warn!(filter = %hex::encode(filter), committee = share.committee,
                 quorum = share.quorum,
+                voters = voters.map(|v| u64::from(v.voters)),
+                rank = voters.map(|v| u64::from(v.rank)),
                 in_time_share_pct = percent(u64::from(share.quorum), u64::from(share.committee)),
+                fair_share_pct = percent(u64::from(share.quorum), u64::from(fair_over)),
                 hour_frames = hour.frames, hour_signed = hour.signed_frames,
                 hour_share_pct = percent(hour.signed_frames, hour.frames), low_secs, repeat,
                 scope = "this node's seat",
                 action = "check this seat's worker: blocked or behind its shard ('this worker is \
                           behind its shard', LocalMat in qclient node prover manage), silent \
                           ('this member's silence'), or voting late from CPU load or slow peer \
-                          connections; frames it does not sign earn it nothing",
+                          connections. A seat voting on time can still lose a race: every landed \
+                          certificate holds exactly quorum signers, so with more voters than \
+                          quorum the votes reaching the assembler last go unsigned, most often \
+                          at the tail of the voters (rank near voters) while peers are faster; \
+                          then no local fault shows. Frames it does not sign earn it nothing",
                 "this seat signed under half the shard certificates a member voting in time \
                  signs over the last hour");
         }
@@ -758,11 +948,15 @@ mod tests {
         assert_eq!(kinds(&t.due(T0 + 7_200)), ["low 3600 true", "summary 0/60"]);
         // The next hour this seat signs every frame.
         frame_a_minute(&mut t, 120..180, true);
+        // Not low from here, but the episode holds until the share stayed
+        // out of it for LOW_END_HOLD.
+        assert_eq!(kinds(&t.due(T0 + 10_800)), ["summary 60/60"]);
+        assert!(t.due(T0 + 10_800 + LOW_END_HOLD - 1).is_empty());
         assert_eq!(
-            kinds(&t.due(T0 + 10_800)),
-            ["ended 7200 its share recovered", "summary 60/60"]
+            kinds(&t.due(T0 + 10_800 + LOW_END_HOLD)),
+            ["ended 7200 its share recovered"]
         );
-        assert!(t.due(T0 + 10_860).is_empty());
+        assert!(t.due(T0 + 10_800 + LOW_END_HOLD + 60).is_empty());
     }
 
     #[test]
@@ -771,12 +965,10 @@ mod tests {
         frame_a_minute(&mut t, 0..60, false);
         assert_eq!(kinds(&t.due(T0 + 3_600)), ["low 0 false", "summary 0/60"]);
         // No frames for the next hour: nothing to judge, so the warning ends.
+        assert_eq!(kinds(&t.due(T0 + 7_300)), ["summary 0/0"]);
         assert_eq!(
-            kinds(&t.due(T0 + 7_300)),
-            [
-                "ended 3700 too few frames in the last hour to judge",
-                "summary 0/0"
-            ]
+            kinds(&t.due(T0 + 7_300 + LOW_END_HOLD)),
+            ["ended 3700 too few frames in the last hour to judge"]
         );
         let mut t = seated(T0);
         frame_a_minute(&mut t, 0..60, false);
@@ -784,6 +976,130 @@ mod tests {
         t.seats(&[], T0 + 3_660);
         assert_eq!(kinds(&t.due(T0 + 3_660)), ["ended 60 the seat ended"]);
         assert!(t.due(T0 + 9_000).is_empty(), "a former seat logs nothing");
+    }
+
+    #[test]
+    fn a_share_at_the_threshold_is_one_episode() {
+        let mut t = seated(T0);
+        // 4 members, quorum 3: low is 22 signed of 61 frames or fewer. A seat
+        // signing 3 frames in 8 holds 22 or 23 in the hour, so each minute's
+        // evaluation can fall on either side of the threshold.
+        let (mut low, mut clear) = (0, 0);
+        let (mut starts, mut repeats, mut ends) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut started_at, mut ended_at) = (Vec::new(), Vec::new());
+        for k in 0..240u64 {
+            let at = T0 + k * 60;
+            assert!(t.count(FILTER, k + 1, ms(at), member(5, 4, k % 8 < 3), at));
+            if k < 60 {
+                continue;
+            }
+            let share = t.snapshot(FILTER, at).unwrap();
+            let hour = share.hour.unwrap();
+            match low_share(&hour, share.committee, share.quorum) {
+                Some(true) => low += 1,
+                Some(false) => clear += 1,
+                None => {}
+            }
+            for log in t.due(at) {
+                match log {
+                    SeatLog::Low {
+                        low_secs, repeat, ..
+                    } if repeat => repeats.push(low_secs),
+                    SeatLog::Low { low_secs, .. } => {
+                        starts.push(low_secs);
+                        started_at.push(k);
+                    }
+                    SeatLog::Ended { low_secs, .. } => ends.push(low_secs),
+                    SeatLog::Summary { .. } => {}
+                }
+            }
+        }
+        assert!(
+            low > 20 && clear > 20,
+            "the share must cross: {low} {clear}"
+        );
+        assert_eq!(starts, [0], "one start");
+        // Minutes 60 and 61 hold 24 and 23 signed; minute 62 is the first at 22.
+        assert_eq!(started_at, [62], "it starts at the first low evaluation");
+        assert_eq!(repeats.len(), 2, "a repeat per hour: {repeats:?}");
+        assert!(repeats[0] >= LOG_EVERY && repeats[1] >= 2 * LOG_EVERY);
+        assert!(ends.is_empty(), "no end while it crosses: {ends:?}");
+        // The seat then signs every frame: minute 241 holds 23 signed, the
+        // first clear of the last stretch, and the end comes a hold later.
+        for k in 240..330u64 {
+            let at = T0 + k * 60;
+            assert!(t.count(FILTER, k + 1, ms(at), member(5, 4, true), at));
+            for log in t.due(at) {
+                if let SeatLog::Ended { low_secs, .. } = log {
+                    ends.push(low_secs);
+                    ended_at.push(k);
+                }
+            }
+        }
+        assert_eq!(ends, [(241 - 62) * MINUTE], "low until it first cleared");
+        assert_eq!(ended_at, [241 + LOW_END_HOLD / MINUTE], "after the hold");
+    }
+
+    /// Count a frame a minute with `signers` signing it, as the observer does.
+    fn frame_signed_by(t: &mut SeatCertificates, k: u64, signers: &[u32]) {
+        let at = T0 + k * 60;
+        let signed = signers.contains(&0);
+        assert!(t.count(FILTER, k + 1, ms(at), member(5, 4, signed), at));
+        t.tally(FILTER, ms(at), at, 5, 4, signers);
+    }
+
+    #[test]
+    fn voters_and_rank_come_from_the_signers_of_the_last_hour() {
+        let mut t = seated(T0);
+        // Member 0 (this seat) signs 28 of 60 frames; members 1 and 2 sign
+        // all; member 3 never: three voters, this seat last among them.
+        for k in 0..60 {
+            frame_signed_by(&mut t, k, if k < 28 { &[0, 1, 2] } else { &[1, 2] });
+        }
+        let seat = &t.seats[FILTER];
+        assert_eq!(seat.voters(T0 + 3_600), Some(Voters { voters: 3, rank: 3 }));
+        // Under LOW_MIN_FRAMES frames of the session: no voters.
+        let mut few = seated(T0);
+        for k in 0..LOW_MIN_FRAMES - 1 {
+            frame_signed_by(&mut few, k, &[0, 1, 2]);
+        }
+        assert_eq!(few.seats[FILTER].voters(T0 + 3_600), None);
+    }
+
+    #[test]
+    fn a_seat_is_judged_against_quorum_over_voters() {
+        let window = |frames, signed| CertificateWindow {
+            window_seconds: HOUR,
+            observed_seconds: HOUR,
+            frames,
+            signed_frames: signed,
+        };
+        // 4 members, quorum 3, 3 voting: a seat voting in time signs all
+        // of them; 19 of 40 is under half, though over half of 3/4.
+        assert_eq!(low_share_of(&window(40, 19), 3, 3), Some(true));
+        assert_eq!(low_share(&window(40, 19), 4, 3), Some(false));
+        let mut t = seated(T0);
+        for k in 0..60 {
+            frame_signed_by(&mut t, k, if k < 28 { &[0, 1, 2] } else { &[1, 2] });
+        }
+        let logs = t.due(T0 + 3_600);
+        let [SeatLog::Low {
+            voters,
+            low_secs,
+            repeat,
+            ..
+        }, SeatLog::Summary { .. }] = logs.as_slice()
+        else {
+            panic!("expected a low share and a summary: {logs:?}");
+        };
+        assert_eq!(*voters, Some(Voters { voters: 3, rank: 3 }));
+        assert_eq!((*low_secs, *repeat), (0, false));
+        // The same counts without per-member signers fall back to the
+        // committee: 28 of 60 is over half of 3/4.
+        let mut bare = seated(T0);
+        frame_a_minute(&mut bare, 0..28, true);
+        frame_a_minute(&mut bare, 28..60, false);
+        assert_eq!(kinds(&bare.due(T0 + 3_600)), ["summary 28/60"]);
     }
 
     fn header(frame: u64, signature: &[u8]) -> Header<'_> {
