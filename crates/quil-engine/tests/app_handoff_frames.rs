@@ -612,7 +612,8 @@ fn store_global_frame_at(fixture: &Fixture, number: u64, output: &[u8], difficul
 // the same seal, and any peer can gossip another copy of it: a seal is
 // identified by its request and session alone, both public in every copy. A
 // GLOBAL leader carries one copy per seal, the one whose drain reaches
-// furthest (`reduce_handoff_bundles`), and validates the copies it carries.
+// furthest that validates (`order_handoff_copies` in the leader), trying the
+// copies in that order.
 
 /// The GLOBAL frame the crowding rigs' leader proposes, on stored frame
 /// [`CROWD_FRAME`] - 1; seal drains are active from it.
@@ -1203,6 +1204,31 @@ fn seal_crowding_one_forged_bundle_keeps_every_seal_it_names_out() {
         "UNEXPECTED: the forged bundle rode"
     );
     assert_seals_ride(&[proposal], &members, "one forged bundle naming both seals");
+}
+
+/// With the fix every forged copy is validated once in the proposal that
+/// tries it and leaves the mempool, and the seal rides that proposal: an
+/// attacker pays one message per validation, and the members' copies stay
+/// until GLOBAL records the seal.
+#[test]
+fn seal_crowding_fix_refused_copies_leave_the_mempool_in_the_proposal_that_tries_them() {
+    let rig = CrowdRig::new(1);
+    let members = rig.gossip_members(0, 1);
+    let forged: Vec<_> = (0..3)
+        .map(|n| rig.forged(&[0], u64::MAX - n, 12 + n as i64))
+        .collect();
+    for copy in &forged {
+        assert!(rig.collector.add_message(1, copy.clone()));
+    }
+    assert_eq!(rig.collector.total_pending(), 5);
+    let proposal = rig.propose(1);
+    assert_eq!(carried(&proposal, &members), 1, "FIX: the seal rides");
+    assert!(forged.iter().all(|copy| !proposal.contains(copy)));
+    assert_eq!(
+        rig.collector.total_pending(),
+        members.len(),
+        "FIX: the forged copies leave the mempool, the members' stay"
+    );
 }
 
 /// An archive whose GLOBAL execution trails its stored head verifies a frame
