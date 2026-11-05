@@ -20,14 +20,17 @@
 //! `LastSignedFrameNumber`, which confirms do not advance), while at least
 //! [`Settings::evidence`] (M) of its other shards, where it sits in the
 //! head session, had a frame included in that window. A member without
-//! that evidence (one allocation, or its other shards stalled too) counts
-//! as present: no evidence never excludes anyone. GLOBAL acts only if the
-//! silent members explain the stall (the others are at most a quorum, so
-//! no margin is left) and then removes at most ⌊(n−1)/3⌋ of them, the
-//! longest silent first, keeping at least [`MIN_COMMITTEE`] members, and
-//! only if the remaining members of the session that are not silent reach
-//! the successor's quorum. The successor is a new session too, so a
-//! further step waits until it has itself stalled K frames.
+//! that evidence (one allocation, or its other shards stalled too) is
+//! never silent: no evidence never excludes anyone. GLOBAL acts only if
+//! the members not silent are at most a quorum, so that silence explains
+//! the stall (no margin is left), and then removes at most ⌊(n−1)/3⌋ of
+//! the silent ones, the longest silent first, keeping at least
+//! [`MIN_COMMITTEE`] members, and only if the session's members that
+//! signed an included frame in the window reach the successor's quorum. A
+//! member without evidence either way is not counted on: a successor that
+//! needed it could stall at once, with no evidence to exclude it. The
+//! successor is a new session too, so a further step waits until it has
+//! itself stalled K frames.
 //!
 //! An excluded member keeps its allocations; it is only not seated on that
 //! shard ([`seated`]). Its exclusion ends once any allocation of its signs
@@ -534,9 +537,10 @@ fn producing<'c>(
 type Desired<'a> = dyn FnMut(&[u8]) -> Result<Vec<Vec<u8>>> + 'a;
 
 /// Decide, for each of `stalled` ([`stalled`]), whether its silent members
-/// explain its stall and removing them lets the rest reach quorum, and
-/// return those sessions with their successors' committees. Writes nothing:
-/// [`fence`] fences each and records its exclusions together, or neither.
+/// explain its stall and, once they are removed, its members that signed in
+/// the window reach the successor's quorum, and return those sessions with
+/// their successors' committees. Writes nothing: [`fence`] fences each and
+/// records its exclusions together, or neither.
 /// `desired` gives a filter's provers to seat (eligibility less exclusions,
 /// as the membership pass seats them). Every evaluation that acts is logged
 /// with its fence; one that does not is logged with its reason.
@@ -595,6 +599,7 @@ pub fn evaluate(
         silent.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
         let present = n - silent.len();
         let skip = |reason: &'static str, committee: usize, kept: usize| {
+            let committee_quorum = if committee == 0 { 0 } else { quorum(committee) };
             tracing::warn!(
                 frame,
                 filter = hex::encode(&candidate.filter),
@@ -604,8 +609,10 @@ pub fn evaluate(
                 quorum = q,
                 silent = silent.len(),
                 unproven,
+                present,
                 committee,
-                kept_present = kept,
+                committee_quorum,
+                kept_signed = kept,
                 window,
                 evidence,
                 reason,
@@ -620,19 +627,19 @@ pub fn evaluate(
             skip(
                 "the stall is not explained by silent members: the others exceed its quorum",
                 0,
-                present,
+                0,
             );
             continue;
         }
         let cap = n.saturating_sub(1) / 3;
         let removed: Vec<(Vec<u8>, u64)> = silent.iter().take(cap).cloned().collect();
         if removed.is_empty() {
-            skip("no member may be removed", 0, present);
+            skip("no member may be removed", 0, 0);
             continue;
         }
         let eligible = desired(candidate.filter.as_slice())?;
         if eligible.is_empty() {
-            skip("no prover is eligible", 0, present);
+            skip("no prover is eligible", 0, 0);
             continue;
         }
         let gone = |member: &[u8]| removed.iter().any(|(key, _)| key.as_slice() == member);
@@ -640,14 +647,18 @@ pub fn evaluate(
             .into_iter()
             .filter(|member| !gone(member.as_slice()))
             .collect();
-        // Present in the successor: its members that were members here and
-        // are not silent. Eligible provers new to the shard are seated but
-        // not counted.
+        // Kept in the successor: its members that were members here and
+        // signed an included frame in the window. A member shown neither
+        // silent nor signing (unproven) is not counted, nor are eligible
+        // provers new to the shard: both are seated, but a successor that
+        // needed them to reach quorum could stall at once.
         let kept = committee
             .iter()
             .filter(|member| {
                 session.members.binary_search(*member).is_ok()
-                    && !silent.iter().any(|(key, _)| key == *member)
+                    && index
+                        .get(member.as_slice())
+                        .is_some_and(|signing| signing.last > since)
             })
             .count();
         if committee.len() < MIN_COMMITTEE {
@@ -660,7 +671,8 @@ pub fn evaluate(
         }
         if kept < quorum(committee.len()) {
             skip(
-                "its present members would not reach quorum of the committee without its silent members",
+                "its members that signed in the window would not reach quorum of the committee \
+                 without its silent members; unproven members are not counted",
                 committee.len(),
                 kept,
             );
@@ -679,7 +691,7 @@ pub fn evaluate(
             cap,
             committee = committee.len(),
             committee_quorum = quorum(committee.len()),
-            kept_present = kept,
+            kept_signed = kept,
             window_from = since + 1,
             window_to = frame,
             evidence,

@@ -436,8 +436,9 @@ fn a_step_never_cuts_a_committee_below_the_minimum() {
     assert_eq!(net.head().members, net.keys([0, 1, 2, joiner]));
 }
 
-/// A step after which the present members would not reach the successor's
-/// quorum is skipped; the session is fenced at its normal timeout instead.
+/// A step after which the members that signed in the window would not
+/// reach the successor's quorum is skipped; the session is fenced at its
+/// normal timeout instead.
 #[test]
 fn a_step_needs_the_present_members_to_reach_the_new_quorum() {
     let _gates = Gates::on();
@@ -514,6 +515,64 @@ fn a_single_allocation_member_is_never_excluded() {
     assert_eq!(sorted(Net::excluded_keys(&decisions[0])), net.keys(6..9));
     assert_eq!(net.excluded(9), None);
     assert!(net.head().members.contains(&net.key(9)));
+}
+
+/// Six members (quorum 5): S (4) and four others on all four other shards,
+/// U (5) on two of them only; and a newcomer allocated on the stalled shard
+/// alone, whose index is returned.
+fn unproven_and_newcomer() -> (Net, usize) {
+    let holdings = |i: usize| if i == 5 { vec![0, 1] } else { vec![0, 1, 2, 3] };
+    let mut net = Net::new(6, 4, &holdings);
+    let newcomer = net.join();
+    (net, newcomer)
+}
+
+/// S silent with evidence, U without a signature in the window but with
+/// too few other shards to show it silent (unproven), four signing. Without
+/// S the committee is six again (the newcomer joins; quorum 5) and only the
+/// four that signed count towards it: U is not counted on, so nothing is
+/// fenced early and the session waits for its timeout.
+#[test]
+fn an_unproven_member_does_not_count_towards_the_new_quorum() {
+    let _gates = Gates::on();
+    let (mut net, _) = unproven_and_newcomer();
+    let first = net.head();
+    let id = first.id().unwrap();
+    let f = pass_at(start() + K);
+    assert_eq!(
+        schedule::desired_members(&net.scan(), &net.stalled, f).len(),
+        7,
+        "setup: the six members and the newcomer are eligible"
+    );
+    net.live_before(0..4, f);
+    assert_eq!(
+        net.pass(f),
+        (vec![], 0),
+        "four signed: under quorum 5 of the six-seat successor"
+    );
+    assert_eq!(net.head(), first);
+    assert_eq!(status(&net.state, &id).unwrap(), Status::Active);
+    assert_eq!(net.excluded(4), None);
+}
+
+/// The same session with U signing at the window's first frame: five
+/// members signed, so the successor (S out, the newcomer in) is seated at
+/// once with U kept.
+#[test]
+fn a_member_that_signed_in_the_window_counts_towards_the_new_quorum() {
+    let _gates = Gates::on();
+    let (mut net, newcomer) = unproven_and_newcomer();
+    let id = net.head().id().unwrap();
+    let f = pass_at(start() + K);
+    net.live_before(0..4, f);
+    net.sign([5], f - K + 1);
+    let (decisions, fenced) = net.pass(f);
+    assert_eq!(fenced, 1);
+    assert_eq!(decisions[0].session, id);
+    assert_eq!(Net::excluded_keys(&decisions[0]), vec![net.key(4)]);
+    let committee = net.keys([0, 1, 2, 3, 5, newcomer]);
+    assert_eq!(decisions[0].committee, committee);
+    assert_eq!(net.head().members, committee);
 }
 
 /// A stall that silence does not explain (more than a quorum not silent) is
