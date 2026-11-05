@@ -3413,10 +3413,11 @@ fn mainnet_drain_anchors_start_at_the_2_1_genesis() {
     // and starts where committee sessions begin.
     assert_eq!(
         drain_anchor_raise_for(0, Some("1"), Some("2")),
-        (
-            MAINNET_DRAIN_ANCHOR_RAISE_FRAME.unwrap_or(u64::MAX),
-            861_840
-        )
+        (1_072_080, 861_840)
+    );
+    assert_eq!(
+        MAINNET_DRAIN_ANCHOR_RAISE_FRAME,
+        Some(1489 * quil_types::consensus::EPOCH_LENGTH_FRAMES)
     );
     assert_eq!(drain_anchor_raise_for(1, None, None), (u64::MAX, 0));
     assert_eq!(drain_anchor_raise_for(1, Some("6"), Some("9")), (6, 9));

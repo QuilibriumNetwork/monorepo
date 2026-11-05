@@ -548,11 +548,15 @@ pub fn drain_anchor_floor() -> u64 {
 /// the genesis is. A floor above them needs this frame, unlike the one below
 /// the genesis: an older build holding a frame under the raised floor accepts
 /// a header its committee anchored there, and a raised build refuses it.
-/// Consensus-affecting for GLOBAL: every archive and GLOBAL prover must run a
-/// build with it before the frame. Proposed after a devnet crossing, from
-/// measured adoption; `QUIL_SEAL_DRAIN_ANCHOR_RAISE_FRAME` elsewhere, never by
-/// default.
-pub const MAINNET_DRAIN_ANCHOR_RAISE_FRAME: Option<u64> = None;
+/// Consensus-affecting for GLOBAL, where only archives execute these headers:
+/// every archive must run a build with it before the frame; regular nodes
+/// follow GLOBAL state and need not. An older archive says nothing at the
+/// frame, and differs only once a header it accepts and a raised one refuses
+/// is packed, so all four must be on it first. Mainnet epoch 1489, about 4.5
+/// days after it was proposed, decided by the longest merge, release and
+/// archive restart times seen; a devnet crossed it first.
+/// `QUIL_SEAL_DRAIN_ANCHOR_RAISE_FRAME` elsewhere, never by default.
+pub const MAINNET_DRAIN_ANCHOR_RAISE_FRAME: Option<u64> = Some(1_072_080);
 
 /// The oldest anchor from [`MAINNET_DRAIN_ANCHOR_RAISE_FRAME`] on: the frame
 /// committee sessions begin. Drain headers are certified by a session, and a
