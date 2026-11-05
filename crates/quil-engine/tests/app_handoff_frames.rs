@@ -2479,6 +2479,11 @@ struct DrainRig {
 
 impl DrainRig {
     fn new(anchor: u64, certified: bool) -> Self {
+        Self::with_hole(anchor, certified, None)
+    }
+
+    /// [`Self::new`] on a store that lacks GLOBAL frame `hole`.
+    fn with_hole(anchor: u64, certified: bool, hole: Option<u64>) -> Self {
         std::env::set_var(
             "QUIL_SEAL_DRAIN_ANCHOR_FLOOR",
             DRAIN_HISTORY_START.to_string(),
@@ -2487,7 +2492,9 @@ impl DrainRig {
         let source = session(&keys, vec![0x66; 32]);
         let fixture = Fixture::new(&source);
         for number in DRAIN_HISTORY_START..DRAIN_FRAME {
-            store_global_frame(&fixture, number, &drain_global_output(number));
+            if Some(number) != hole {
+                store_global_frame(&fixture, number, &drain_global_output(number));
+            }
         }
         let intrinsic = fixture.intrinsic();
         handoff::initialize(&fixture.state, 2, &source).unwrap();
@@ -2738,6 +2745,36 @@ fn seal_drain_halt_a_seal_certified_checkpoint_header_with_its_anchor_rewritten_
         &halts,
         "a notarized checkpoint header the seal certifies, with its anchor rewritten",
     );
+}
+
+/// A frame the hole rigs' stores lack, above the network's first frame.
+const DRAIN_HOLE: u64 = 8;
+/// The oldest anchor once drain anchors are raised past [`DRAIN_HOLE`].
+const DRAIN_RAISED_FLOOR: u64 = 9;
+
+/// Every archive's history has holes above its first frame, so a floor at
+/// that first frame leaves them: a genuine header, its anchor rewritten into
+/// one, fails the frame as unavailable on every retry. Raising the floor
+/// past the hole from a frame before [`DRAIN_FRAME`] refuses it. The
+/// settings are environment variables, which a build without the raise
+/// ignores, so this runs on that build too and halts there.
+#[test]
+fn seal_drain_halt_an_anchor_in_a_hole_of_the_history_fails_every_retry() {
+    std::env::set_var("QUIL_SEAL_DRAIN_ANCHOR_RAISE_FRAME", "6");
+    std::env::set_var(
+        "QUIL_SEAL_DRAIN_ANCHOR_RAISED_FLOOR_FRAME",
+        DRAIN_RAISED_FLOOR.to_string(),
+    );
+    for certified in [true, false] {
+        let rig = DrainRig::with_hole(DRAIN_RAISED_FLOOR, certified, Some(DRAIN_HOLE));
+        rig.check_setup();
+        let halts = drain_halts(&rig, &rig.submission, &[DRAIN_HOLE]);
+        assert_no_drain_halt(
+            &halts,
+            "a genuine drain header with its anchor rewritten into a hole of the history",
+        );
+    }
+    eprintln!("SD HOLE: an anchor in a hole of the history is refused");
 }
 
 /// A genuine drain, certified by the session or by the seal, is admitted
