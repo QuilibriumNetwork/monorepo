@@ -18,6 +18,7 @@ mod committee_builds;
 mod committee_peer_policy;
 pub(crate) mod consensus_intake;
 pub(crate) mod direct_delivery;
+mod drain_raise_watch;
 pub(crate) mod engines;
 pub(crate) mod frame_pipeline;
 pub(crate) mod global_execution;

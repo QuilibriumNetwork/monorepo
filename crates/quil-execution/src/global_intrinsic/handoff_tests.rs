@@ -3426,6 +3426,31 @@ fn mainnet_drain_anchors_start_at_the_2_1_genesis() {
     assert_eq!(drain_anchor_floor_for(1, Some("7")), 7);
 }
 
+/// A mistyped setting off mainnet is refused rather than read as unset, the
+/// raise's two settings come together, and mainnet ignores all of them.
+#[test]
+fn drain_anchor_settings_off_mainnet_must_parse_and_come_together() {
+    let problem = drain_anchor_settings_problem;
+    assert_eq!(problem(0, Some("x"), Some("y"), None), None);
+    assert_eq!(problem(1, None, None, None), None);
+    assert_eq!(problem(1, Some("7"), Some("6"), Some("9")), None);
+    assert!(problem(1, Some("7x"), None, None)
+        .unwrap()
+        .contains("QUIL_SEAL_DRAIN_ANCHOR_FLOOR "));
+    assert!(problem(1, None, Some("six"), Some("9"))
+        .unwrap()
+        .contains("QUIL_SEAL_DRAIN_ANCHOR_RAISE_FRAME "));
+    assert!(problem(1, None, Some("6"), Some("nine"))
+        .unwrap()
+        .contains("QUIL_SEAL_DRAIN_ANCHOR_RAISED_FLOOR_FRAME "));
+    assert!(problem(1, None, Some("6"), None)
+        .unwrap()
+        .contains("set together"));
+    assert!(problem(1, None, None, Some("9"))
+        .unwrap()
+        .contains("set together"));
+}
+
 /// The raise applies from its frame, not before, and never lowers the floor.
 #[test]
 fn drain_anchor_raise_applies_from_its_frame_and_never_lowers_the_floor() {

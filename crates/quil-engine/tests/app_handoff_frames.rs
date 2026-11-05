@@ -2868,6 +2868,96 @@ fn seal_drain_raise_refuses_a_header_naming_no_anchor() {
     eprintln!("SD ZERO: a drain header naming no anchor is refused from the raise's frame");
 }
 
+/// The raise reads only what a drain would execute: a passed-over header
+/// naming no anchor stays unread, and the drain after it executes.
+#[test]
+fn seal_drain_raise_leaves_passed_over_headers_unread() {
+    let rig = DrainRig::new(DRAIN_RAISED_FLOOR, true);
+    handoff::set_drain_anchor_raise_for_thread(Some((6, DRAIN_RAISED_FLOOR)));
+    assert_eq!(rig.first.global_frame_number, 0);
+    let sealed = rig.sealed(&rig.submission, &[&rig.first, &rig.header]);
+    rig.intrinsic
+        .invoke_step(DRAIN_FRAME, &sealed, &rig.fixture.state)
+        .unwrap_or_else(|error| {
+            panic!("SD RAISE: a passed-over header naming no anchor stays unread: {error}")
+        });
+    handoff::set_drain_anchor_raise_for_thread(None);
+}
+
+/// A seal refused over its drain anchors costs its shard the close, not the
+/// shard. The refusal changes nothing the fence reads: the session stays
+/// closing, every retry is refused, and from its due frame, not before, GLOBAL
+/// fences it at its executed tip and authorizes the successor. The refused
+/// copy stays refused after that.
+#[test]
+fn seal_drain_refused_seal_recovers_through_the_fence() {
+    use handoff::schedule::{activated, fence_due_frame, fence_stalled_sources};
+    for certified in [true, false] {
+        let rig = DrainRig::new(DRAIN_ANCHOR, certified);
+        handoff::set_drain_anchor_raise_for_thread(Some((6, DRAIN_RAISED_FLOOR)));
+        let state = &rig.fixture.state;
+        let id = rig.source.id().unwrap();
+        let filters = [rig.source.filter.clone()];
+        let sealed = rig.sealed(&rig.submission, &[&rig.header]);
+        for outcome in rig.outcomes(&sealed) {
+            match outcome {
+                Err(quil_types::error::QuilError::InvalidArgument(reason))
+                    if reason.contains("older than any committee session") => {}
+                other => panic!("SD FENCE: every retry must be refused, got {other:?}"),
+            }
+        }
+        assert!(
+            matches!(
+                handoff::status(state, &id).unwrap(),
+                handoff::Status::Sealing(_)
+            ),
+            "SD FENCE: a refused seal leaves the session closing (certified {certified})"
+        );
+        assert_eq!(handoff::session_tip(state, &id).unwrap().unwrap().frame, 1);
+        let due = fence_due_frame(4);
+        assert_eq!(
+            fence_stalled_sources(state, due - 1, &filters, None).unwrap(),
+            0,
+            "SD FENCE: not before the due frame"
+        );
+        assert_eq!(
+            fence_stalled_sources(state, due, &filters, None).unwrap(),
+            1,
+            "SD FENCE: the due frame fences the session a refused seal left closing \
+             (certified {certified})"
+        );
+        commit(state, due);
+        assert!(handoff::is_fenced(state, &id).unwrap());
+        assert!(matches!(
+            handoff::status(state, &id).unwrap(),
+            handoff::Status::Closed(_)
+        ));
+        assert_eq!(
+            handoff::closed_checkpoint(state, &id)
+                .unwrap()
+                .unwrap()
+                .frame,
+            1,
+            "SD FENCE: fenced at the executed tip; the refused frame stays undrained"
+        );
+        let successor = handoff::head(state, &rig.source.filter).unwrap().unwrap();
+        assert_eq!(
+            (successor.generation, successor.base_frame),
+            (rig.source.generation + 1, 1),
+            "SD FENCE: the shard gets its successor"
+        );
+        assert!(activated(state, &rig.submission.seal.request).unwrap());
+        let late = rig.intrinsic.invoke_step(due + 1, &sealed, state);
+        assert!(
+            late.as_ref()
+                .is_err_and(|error| !error.is_execution_unavailable()),
+            "SD FENCE: the seal must stay refused after the fence, got {late:?}"
+        );
+        handoff::set_drain_anchor_raise_for_thread(None);
+    }
+    eprintln!("SD FENCE: a refused seal's shard recovers through the fence");
+}
+
 /// A genuine drain, certified by the session or by the seal, is admitted
 /// and executed: the session's tip moves to the checkpoint.
 #[test]

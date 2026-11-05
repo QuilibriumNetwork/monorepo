@@ -607,13 +607,68 @@ fn drain_anchor_floor_at_for(frame_number: u64, raise: (u64, u64), history: u64)
     }
 }
 
+/// From which GLOBAL frame, and to which anchor, drain anchors are raised:
+/// fixed with the seal drain frame at startup; `u64::MAX` when never.
+pub fn drain_anchor_raise() -> (u64, u64) {
+    DRAIN_ANCHOR_RAISE_OVERRIDE
+        .with(|cell| cell.get())
+        .unwrap_or_else(|| *DRAIN_ANCHOR_RAISE.get_or_init(|| drain_anchor_raise_from_env(1)))
+}
+
 /// The oldest GLOBAL frame a drain header checked at GLOBAL frame
 /// `frame_number` may name as its anchor.
 pub fn drain_anchor_floor_at(frame_number: u64) -> u64 {
-    let raise = DRAIN_ANCHOR_RAISE_OVERRIDE
-        .with(|cell| cell.get())
-        .unwrap_or_else(|| *DRAIN_ANCHOR_RAISE.get_or_init(|| drain_anchor_raise_from_env(1)));
-    drain_anchor_floor_at_for(frame_number, raise, drain_anchor_floor())
+    drain_anchor_floor_at_for(frame_number, drain_anchor_raise(), drain_anchor_floor())
+}
+
+/// Whether a drain header checked at GLOBAL frame `frame_number` must name an
+/// anchor: from the raise's frame. Voters have refused frames naming none
+/// since the required-anchor epoch, so this refuses no honest header, and an
+/// older build executes one, so it takes the raise's frame.
+pub fn drain_anchor_required_at(frame_number: u64) -> bool {
+    frame_number >= drain_anchor_raise().0
+}
+
+/// What is wrong with another network's drain anchor settings: a mistyped one
+/// would otherwise read as unset, and a run would report a false pass. Mainnet
+/// ignores them.
+fn drain_anchor_settings_problem(
+    network: u8,
+    floor: Option<&str>,
+    raise: Option<&str>,
+    raised: Option<&str>,
+) -> Option<String> {
+    if network == 0 {
+        return None;
+    }
+    for (name, setting) in [
+        ("QUIL_SEAL_DRAIN_ANCHOR_FLOOR", floor),
+        ("QUIL_SEAL_DRAIN_ANCHOR_RAISE_FRAME", raise),
+        ("QUIL_SEAL_DRAIN_ANCHOR_RAISED_FLOOR_FRAME", raised),
+    ] {
+        if setting.is_some_and(|value| value.parse::<u64>().is_err()) {
+            return Some(format!("{name} is not a frame number"));
+        }
+    }
+    (raise.is_some() != raised.is_some()).then(|| {
+        "QUIL_SEAL_DRAIN_ANCHOR_RAISE_FRAME and QUIL_SEAL_DRAIN_ANCHOR_RAISED_FLOOR_FRAME are \
+         set together"
+            .to_string()
+    })
+}
+
+/// Refuse this process's drain anchor settings when they are not usable.
+pub fn check_drain_anchor_settings(network: u8) -> Result<()> {
+    let setting = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    match drain_anchor_settings_problem(
+        network,
+        setting("QUIL_SEAL_DRAIN_ANCHOR_FLOOR").as_deref(),
+        setting("QUIL_SEAL_DRAIN_ANCHOR_RAISE_FRAME").as_deref(),
+        setting("QUIL_SEAL_DRAIN_ANCHOR_RAISED_FLOOR_FRAME").as_deref(),
+    ) {
+        Some(problem) => Err(QuilError::InvalidArgument(problem)),
+        None => Ok(()),
+    }
 }
 
 /// Set the drain anchor raise, its frame and floor, for the calling thread
