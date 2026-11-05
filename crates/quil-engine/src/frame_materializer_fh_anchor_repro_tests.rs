@@ -353,3 +353,113 @@ fn fh_fix_a_collector_holds_only_anchors_a_later_frame_can_carry() {
     }
     eprintln!("FH FIX: a collector holds only anchors a later frame can carry");
 }
+
+// FH-R13, the member route. A GLOBAL member leading a view packs shard frame
+// headers no key signed, claiming a shard's next frame numbers. Voters certify
+// the frame (they do not execute carried headers) and every node executing it
+// skips them, yet the materializer hands every bundle of the frame to the
+// collector as carried, and the collector records a carried shard frame by the
+// number its header claims. The genuine frame of that number is then taken for
+// a duplicate and dropped by every collector, so no honest leader carries it.
+// No collector admits the junk headers, so admission checks cannot stop it.
+
+/// A copy of the junk header's shard frame (shard 0x77, frame 9) other than
+/// the junk one: the frame the shard's committee made, as far as a collector
+/// can tell, which keys a carried frame by shard and number.
+fn other_copy_of_frame_nine(output: u8) -> Vec<u8> {
+    let header = quil_execution::global_intrinsic::frame_header::FrameHeader {
+        address: vec![0x77; 32],
+        frame_number: 9,
+        rank: 9,
+        output: vec![output; 32],
+        parent_selector: vec![0x11; 32],
+        requests_root: vec![0; 32],
+        state_roots: vec![vec![0; 32]; 4],
+        ..Default::default()
+    };
+    let bundle = quil_types::proto::global::MessageBundle {
+        requests: vec![quil_types::proto::global::MessageRequest {
+            request: Some(quil_types::proto::global::message_request::Request::Shard(
+                quil_execution::global_intrinsic::conversions::frame_header_to_proto(&header),
+            )),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    crate::consensus_wire::proto_message_bundle_to_canonical_bytes(&bundle).unwrap()
+}
+
+/// A collector given `consumed` as a finalized frame's bundles, the way an
+/// archive's finalization hands them over, must keep the copy of shard frame
+/// 9 it held and admit one arriving later.
+fn assert_frame_nine_not_censored(consumed: &[Vec<u8>], path: &str) {
+    use crate::message_collector::{MessageCollector, SubmitOutcome};
+    let collector = MessageCollector::new();
+    let held = other_copy_of_frame_nine(0xa5);
+    assert_eq!(
+        collector.add_message_outcome(1, held.clone()),
+        SubmitOutcome::Accepted,
+        "FH-R13 SETUP: the collector must hold shard frame 9 before the frame is finalized"
+    );
+    collector.mark_finalized(consumed);
+    let later = collector.add_message_outcome(2, other_copy_of_frame_nine(0xa6));
+    let still_held = collector.collect_for_rank(5).contains(&held);
+    assert!(
+        later == SubmitOutcome::Accepted && still_held,
+        "FH-R13 CENSORED ({path}): a junk header the GLOBAL leader packed and execution \
+         skipped was recorded as carrying shard frame 9; the collector answered the shard's \
+         own frame 9 {later:?} and kept the held copy: {still_held}, so no honest leader \
+         carries it"
+    );
+}
+
+/// The in-place path (`materialize`, then `mark_finalized` with its result):
+/// a frame a member proposed and voters certified.
+#[test]
+fn fh_r13_member_a_skipped_header_a_leader_packed_must_not_censor_the_genuine_frame() {
+    let rig = Rig::new();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let expected = Fixture::new(Some(rig.signer.public_key()));
+    expected.source.materialize(&parent).unwrap();
+    let context = rig.context(&parent);
+    let mut child = state_frame(&expected.source, 2, context.view, context.parent);
+    child.requests.push(junk_header_bundle(0));
+    body_root(&mut child);
+    let seam = rig.seam(&parent);
+    let encoded = crate::consensus_wire::encode_global_frame(&child).unwrap();
+    assert!(
+        seam.verify_with_context(context, id(&child), Some(encoded)),
+        "FH-R13 SETUP: GLOBAL voters refused the proposal carrying the junk header"
+    );
+    install_header_deps(&expected.source);
+    check_setup(&expected.source, 2);
+    let result = expected.source.materialize(&child).unwrap();
+    assert_eq!(
+        (
+            result.processed,
+            result.skipped,
+            expected.source.last_materialized_frame()
+        ),
+        (0, 1, 2),
+        "FH-R13 SETUP: execution must skip the junk header and finish the frame"
+    );
+    assert_frame_nine_not_censored(&result.finalized_bundles, "in-place execution");
+}
+
+/// The publication path: a branch's execution, whose consumed bundles the
+/// finalization pipeline hands to `mark_finalized`.
+#[test]
+fn fh_r13_member_a_branch_consuming_a_skipped_header_must_not_censor_the_genuine_frame() {
+    let (fixture, _) = materializer_with_header_deps();
+    let mut branch = fixture.source.capture_execution_branch(limits()).unwrap();
+    let mut input = frame(1, branch.prover_root().unwrap());
+    input.requests = vec![junk_header_bundle(0)];
+    let result = branch.materialize(&input).unwrap();
+    assert_eq!(
+        (result.processed, result.skipped),
+        (0, 1),
+        "FH-R13 SETUP: execution must skip the junk header"
+    );
+    assert_frame_nine_not_censored(&result.consumed_bundles, "branch execution");
+}
