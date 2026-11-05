@@ -451,6 +451,7 @@ pub(crate) async fn start(
     // info RPC.
     let (announced_tx, announced_rx) =
         tokio::sync::watch::channel(peer_info_publisher::AnnouncedAddrs::default());
+    let own_peer_info: quil_explorer::OwnPeerInfo = Arc::new(parking_lot::RwLock::new(None));
     peer_info_publisher::spawn(
         &mut sup,
         peer_info_publisher::PeerInfoPublisherArgs {
@@ -475,6 +476,7 @@ pub(crate) async fn start(
             network,
             onion_routing_enabled: !config.p2p.disable_onion_routing,
             announced: announced_tx,
+            own_peer_info: own_peer_info.clone(),
         },
     );
 
@@ -1943,7 +1945,8 @@ pub(crate) async fn start(
                 .clone()
                 .expect("recent_messages ring present when explorer enabled"),
             last_global_head_frame.clone(),
-        );
+        )
+        .with_own_peer_info(own_peer_info);
         // Outside archive mode the shards store keeps the genesis grid: the
         // production KPIs take the current one from the archive cache.
         let state = if archive_mode {
