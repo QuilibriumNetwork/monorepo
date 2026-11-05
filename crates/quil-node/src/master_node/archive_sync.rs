@@ -39,22 +39,150 @@ impl RegistrySyncAnchor {
     }
 }
 
+/// The frame a verified registry sync reconciles workers at: its captured,
+/// authenticated state height. Archives run no workers; bootstrap pulls and
+/// uncited fork targets must not change worker bindings.
+fn registry_sync_reconcile_frame(anchor: &RegistrySyncAnchor, archive_mode: bool) -> Option<u64> {
+    if archive_mode || anchor.root.is_empty() {
+        return None;
+    }
+    anchor.cursor
+}
+
 /// A registry sync can retire a worker's old filter without another GLOBAL
-/// frame arriving. Reconcile at the captured, authenticated state height;
-/// bootstrap pulls and uncited fork targets must not change worker bindings.
+/// frame arriving.
 fn reconcile_workers_after_registry_sync(
     allocator: &quil_engine::worker_allocator::WorkerAllocator,
     anchor: &RegistrySyncAnchor,
     archive_mode: bool,
 ) -> quil_types::error::Result<Option<u64>> {
-    if archive_mode || anchor.root.is_empty() {
-        return Ok(None);
-    }
-    let Some(frame) = anchor.cursor else {
+    let Some(frame) = registry_sync_reconcile_frame(anchor, archive_mode) else {
         return Ok(None);
     };
-    allocator.on_new_frame(frame)?;
+    allocator.on_new_frame_by("registry sync", frame)?;
     Ok(Some(frame))
+}
+
+/// The worker reconcile a verified registry sync owes.
+struct SyncPass {
+    anchor: RegistrySyncAnchor,
+    registry_sync: u64,
+    refresh_ms: u64,
+}
+
+#[derive(Default)]
+struct SyncReconcileState {
+    /// When the running pass began; at most one runs.
+    running_since: Option<std::time::Instant>,
+    /// The newest pass owed meanwhile, run when the one running ends.
+    next: Option<SyncPass>,
+    driver: Option<tokio::task::JoinHandle<()>>,
+}
+
+type SyncReconcilePass =
+    Arc<dyn Fn(&RegistrySyncAnchor) -> quil_types::error::Result<Option<u64>> + Send + Sync>;
+
+/// Runs the passes verified registry syncs owe, off the sync task: a pass can
+/// take minutes on a node with many seats, and awaited there it held the next
+/// pull, and with it the view every session and storage duty reads.
+///
+/// One pass at a time. A sync finishing during a pass replaces any pass still
+/// waiting, since the newest anchor covers it, so what waits is bounded by one.
+/// Nothing is lost: the waiting pass runs when the running one ends, whatever
+/// its outcome, and each frame's own reconcile still runs on its own path.
+struct SyncReconciles {
+    archive_mode: bool,
+    pass: SyncReconcilePass,
+    /// After each pass, whatever its outcome.
+    after_pass: Arc<dyn Fn() + Send + Sync>,
+    cancel: tokio_util::sync::CancellationToken,
+    state: std::sync::Mutex<SyncReconcileState>,
+}
+
+impl SyncReconciles {
+    fn new(
+        archive_mode: bool,
+        pass: SyncReconcilePass,
+        after_pass: Arc<dyn Fn() + Send + Sync>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            archive_mode,
+            pass,
+            after_pass,
+            cancel,
+            state: Default::default(),
+        })
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, SyncReconcileState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Run `pass`, now or after the one running. False when the sync owes
+    /// none: nothing runs, and nothing calls `after_pass`.
+    fn owe(self: &Arc<Self>, pass: SyncPass) -> bool {
+        if registry_sync_reconcile_frame(&pass.anchor, self.archive_mode).is_none() {
+            return false;
+        }
+        let mut state = self.state();
+        if let Some(since) = state.running_since {
+            warn!(registry_sync = pass.registry_sync, frame = ?pass.anchor.cursor,
+                running_ms = since.elapsed().as_millis() as u64, scope = "this node",
+                action = "its `worker reconcile slow` line, when it ends, names the step",
+                "worker reconcile still running when the next prover tree sync finished: the view \
+                 keeps moving, and this sync's pass runs after it");
+            state.next = Some(pass);
+            return true;
+        }
+        state.running_since = Some(std::time::Instant::now());
+        let this = self.clone();
+        state.driver = Some(tokio::spawn(this.drive(pass)));
+        true
+    }
+
+    async fn drive(self: Arc<Self>, mut pass: SyncPass) {
+        loop {
+            let started = std::time::Instant::now();
+            let (run, anchor) = (self.pass.clone(), pass.anchor.clone());
+            let outcome = tokio::task::spawn_blocking(move || run(&anchor)).await;
+            let registry_sync = pass.registry_sync;
+            match outcome {
+                Ok(Ok(Some(frame))) => info!(
+                    frame,
+                    registry_sync,
+                    refresh_ms = pass.refresh_ms,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "worker reconciliation completed after verified registry refresh"
+                ),
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => warn!(%error, registry_sync,
+                    "worker reconciliation after registry refresh failed; retrying on next sync"),
+                Err(error) => warn!(%error, registry_sync,
+                    "worker reconciliation after registry refresh task failed; retrying on next sync"),
+            }
+            (self.after_pass)();
+            let next = {
+                let mut state = self.state();
+                let next = state.next.take().filter(|_| !self.cancel.is_cancelled());
+                state.running_since = next.as_ref().map(|_| std::time::Instant::now());
+                next
+            };
+            let Some(next) = next else {
+                return;
+            };
+            pass = next;
+        }
+    }
+
+    /// Wait for the running pass: shutdown holds the stores and workers it uses
+    /// as the awaiting task did, within the supervisor's drain timeout.
+    async fn wait_idle(&self) {
+        let driver = self.state().driver.take();
+        if let Some(driver) = driver {
+            let _ = driver.await;
+        }
+    }
 }
 
 /// The next prover-tree pull: `None` for the periodic one, else the early pull
@@ -2435,7 +2563,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     if !archive_mode_poller {
                         let reconciled = {
                             let _reconcile = probe::section(ProbeSection::AllocationReconcile);
-                            wa_for_poller.on_new_frame(frame_num)
+                            wa_for_poller.on_new_frame_by("frame poller", frame_num)
                         };
                         if let Err(e) = reconciled {
                             tracing::warn!(error = %e, "worker allocation failed");
@@ -4441,6 +4569,24 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 }
                 let mut early_check = tokio::time::interval(quil_engine::global_view_refresh::CHECK_INTERVAL);
                 early_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let sync_reconciles = SyncReconciles::new(
+                    sync_archive_mode,
+                    {
+                        let allocator = sync_wa.clone();
+                        let archive_mode = sync_archive_mode;
+                        Arc::new(move |anchor: &RegistrySyncAnchor| {
+                            reconcile_workers_after_registry_sync(&allocator, anchor, archive_mode)
+                        })
+                    },
+                    {
+                        // Opens the lifecycle gate after the first verified
+                        // sync's pass, as when this task awaited it: the
+                        // planner must see those workers bound.
+                        let lifecycle = sync_pl.clone();
+                        Arc::new(move || lifecycle.set_sync_complete())
+                    },
+                    sync_token.clone(),
+                );
                 loop {
                     tokio::select! {
                         early = next_prover_tree_pull(
@@ -4628,7 +4774,10 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         // Refresh registry with updated data.
                                         let pr = sync_pr.clone();
                                         let hs3 = sync_hg.clone();
-                                        match tokio::task::spawn_blocking(move || pr.refresh_from_store(hs3.as_ref())).await {
+                                        let refresh_started = std::time::Instant::now();
+                                        let refreshed = tokio::task::spawn_blocking(move || pr.refresh_from_store(hs3.as_ref())).await;
+                                        let refresh_ms = refresh_started.elapsed().as_millis() as u64;
+                                        match refreshed {
                                             Ok(Ok(())) => sync_pl.note_registry_synced(registry_sync),
                                             Ok(Err(error)) => {
                                                 warn!(%error, "reconcile: prover registry refresh failed");
@@ -4657,19 +4806,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         // Use the same captured state as committee authorization,
                                         // after its cursor has been recorded. The allocator preserves
                                         // workers still needed by a closing committee.
-                                        let allocator = sync_wa.clone();
-                                        let worker_anchor = anchor.clone();
-                                        match tokio::task::spawn_blocking(move ||
-                                            reconcile_workers_after_registry_sync(&allocator, &worker_anchor, sync_archive_mode)
-                                        ).await {
-                                            Ok(Ok(Some(frame))) => info!(frame, registry_sync,
-                                                "worker reconciliation completed after verified registry refresh"),
-                                            Ok(Ok(None)) => {},
-                                            Ok(Err(error)) => warn!(%error, registry_sync,
-                                                "worker reconciliation after registry refresh failed; retrying on next sync"),
-                                            Err(error) => warn!(%error, registry_sync,
-                                                "worker reconciliation after registry refresh task failed; retrying on next sync"),
-                                        }
+                                        let owes_pass = sync_reconciles.owe(SyncPass {
+                                            anchor: anchor.clone(),
+                                            registry_sync,
+                                            refresh_ms,
+                                        });
                                         if conv.is_some()
                                             && (!expected_root.is_empty()
                                                 || (sync_archive_mode && mismatch_recovery))
@@ -4778,8 +4919,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         }
                                         // Recovery path: if the initial sync at
                                         // startup failed, the lifecycle gate stayed
-                                        // held. Unblock it now that we have data.
-                                        sync_pl.set_sync_complete();
+                                        // held. Unblock it now that we have data,
+                                        // after the worker pass this sync owes.
+                                        if !owes_pass {
+                                            sync_pl.set_sync_complete();
+                                        }
                                         break; // converged onto the finalized lineage — stop trying peers
                                     }
                                     Err(e) => {
@@ -4807,6 +4951,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         _ = sync_token.cancelled() => break,
                     }
                 }
+                sync_reconciles.wait_idle().await;
                 Ok(())
             });
             info!(
@@ -5589,6 +5734,410 @@ mod validation_tests {
         )
         .unwrap();
         assert_eq!(workers.range_workers().unwrap()[0].filter, vec![2; 32]);
+    }
+
+    /// A reconcile pass held until the test opens the gate, recording what ran.
+    #[derive(Default)]
+    struct PassGate {
+        state: std::sync::Mutex<PassGateState>,
+        changed: std::sync::Condvar,
+    }
+
+    #[derive(Default)]
+    struct PassGateState {
+        open: bool,
+        running: usize,
+        most_running: usize,
+        frames: Vec<Option<u64>>,
+    }
+
+    impl PassGate {
+        fn pass(&self, frame: Option<u64>) {
+            let mut state = self.state.lock().unwrap();
+            state.running += 1;
+            state.most_running = state.most_running.max(state.running);
+            state.frames.push(frame);
+            while !state.open {
+                state = self.changed.wait(state).unwrap();
+            }
+            state.running -= 1;
+        }
+
+        fn open(&self) {
+            self.state.lock().unwrap().open = true;
+            self.changed.notify_all();
+        }
+
+        fn running(&self) -> usize {
+            self.state.lock().unwrap().running
+        }
+
+        fn most_running(&self) -> usize {
+            self.state.lock().unwrap().most_running
+        }
+
+        fn frames(&self) -> Vec<Option<u64>> {
+            self.state.lock().unwrap().frames.clone()
+        }
+    }
+
+    /// Lets a held pass end when a failed assertion unwinds the test, so the
+    /// runtime's drop does not wait on it forever.
+    struct OpenOnDrop(Arc<PassGate>);
+
+    impl Drop for OpenOnDrop {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    /// Wait until `done`, at most `cap`: whether it came.
+    async fn came_within(cap: std::time::Duration, done: impl Fn() -> bool) -> bool {
+        let started = std::time::Instant::now();
+        while !done() {
+            if started.elapsed() >= cap {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        true
+    }
+
+    const PASS_STARTS_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+    fn cited_anchor(frame: u64) -> RegistrySyncAnchor {
+        RegistrySyncAnchor {
+            root: vec![9; 32],
+            cursor: Some(frame),
+        }
+    }
+
+    fn sync_pass(frame: u64) -> SyncPass {
+        SyncPass {
+            anchor: cited_anchor(frame),
+            registry_sync: frame,
+            refresh_ms: 0,
+        }
+    }
+
+    /// Reconciles held by `gate`, counting the passes that ended.
+    fn gated_reconciles(
+        gate: &Arc<PassGate>,
+    ) -> (Arc<SyncReconciles>, Arc<std::sync::atomic::AtomicU64>) {
+        let ended = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let reconciles = SyncReconciles::new(
+            false,
+            {
+                let gate = gate.clone();
+                Arc::new(move |anchor: &RegistrySyncAnchor| {
+                    gate.pass(anchor.cursor);
+                    Ok(anchor.cursor)
+                })
+            },
+            {
+                let ended = ended.clone();
+                Arc::new(move || {
+                    ended.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+            },
+            tokio_util::sync::CancellationToken::new(),
+        );
+        (reconciles, ended)
+    }
+
+    /// The sync task's turns: each pull runs while the view refresh counts it,
+    /// and its worker pass must leave the next pull free. The pass is the real
+    /// reconcile behind a gate: until it opens, the seat stays unbound, and the
+    /// pulls go on.
+    #[tokio::test]
+    async fn a_slow_worker_reconcile_does_not_hold_the_next_prover_tree_pull() {
+        use quil_engine::worker::WorkerManager;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let (workers, allocator) = reassigned_worker_fixture(vec![8; 32]);
+        let allocator = Arc::new(allocator);
+        let gate = Arc::new(PassGate::default());
+        let _open = OpenOnDrop(gate.clone());
+        let reconciles = SyncReconciles::new(
+            false,
+            {
+                let gate = gate.clone();
+                Arc::new(move |anchor: &RegistrySyncAnchor| {
+                    gate.pass(anchor.cursor);
+                    reconcile_workers_after_registry_sync(&allocator, anchor, false)
+                })
+            },
+            Arc::new(|| {}),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let refresh = Arc::new(early_refresh(false));
+        let clock = early_pull_clock(2160, 2159);
+        let pulls = Arc::new(AtomicU64::new(0));
+        let task = {
+            let (reconciles, pulls) = (reconciles.clone(), pulls.clone());
+            tokio::spawn(async move {
+                let mut periodic = tokio::time::interval(std::time::Duration::from_millis(10));
+                let mut check = tokio::time::interval(std::time::Duration::from_secs(1));
+                loop {
+                    next_prover_tree_pull(&mut periodic, &mut check, &refresh, &clock).await;
+                    let sync = pulls.fetch_add(1, Ordering::SeqCst) + 1;
+                    let _pull = refresh.pull(2159);
+                    reconciles.owe(SyncPass {
+                        anchor: cited_anchor(2159),
+                        registry_sync: sync,
+                        refresh_ms: 0,
+                    });
+                }
+            })
+        };
+        assert!(came_within(PASS_STARTS_WITHIN, || gate.running() == 1).await);
+        let moved = came_within(PASS_STARTS_WITHIN, || pulls.load(Ordering::SeqCst) >= 3).await;
+        assert!(
+            moved,
+            "a slow worker reconcile held the prover tree sync task: {} pull(s), the next waits on the pass",
+            pulls.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            workers.range_workers().unwrap()[0].filter,
+            vec![1; 32],
+            "the pass is still held"
+        );
+        task.abort();
+        let _ = task.await;
+        gate.open();
+        reconciles.wait_idle().await;
+        assert_eq!(workers.range_workers().unwrap()[0].filter, vec![2; 32]);
+    }
+
+    /// Syncs finishing during a pass run one more, at the newest anchor, and
+    /// never beside it; afterwards a sync starts a pass at once.
+    #[tokio::test]
+    async fn syncs_during_a_worker_reconcile_run_one_more_pass_at_the_newest_anchor() {
+        use std::sync::atomic::Ordering;
+        let gate = Arc::new(PassGate::default());
+        let _open = OpenOnDrop(gate.clone());
+        let (reconciles, ended) = gated_reconciles(&gate);
+        assert!(reconciles.owe(sync_pass(2101)));
+        assert!(came_within(PASS_STARTS_WITHIN, || gate.running() >= 1).await);
+        for frame in [2102, 2103, 2104] {
+            assert!(reconciles.owe(sync_pass(frame)));
+        }
+        assert_eq!(gate.frames(), vec![Some(2101)]);
+        assert_eq!(ended.load(Ordering::SeqCst), 0);
+        gate.open();
+        assert!(came_within(PASS_STARTS_WITHIN, || ended.load(Ordering::SeqCst) == 2).await);
+        reconciles.wait_idle().await;
+        assert_eq!(gate.frames(), vec![Some(2101), Some(2104)]);
+        assert_eq!(gate.most_running(), 1, "one pass at a time");
+        assert!(reconciles.owe(sync_pass(2105)));
+        assert!(came_within(PASS_STARTS_WITHIN, || ended.load(Ordering::SeqCst) == 3).await);
+        reconciles.wait_idle().await;
+        assert_eq!(gate.frames(), vec![Some(2101), Some(2104), Some(2105)]);
+    }
+
+    /// A pass that panics or fails leaves the next sync free to run its own.
+    #[tokio::test]
+    async fn a_failed_or_panicked_worker_reconcile_frees_the_next_pass() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let calls = Arc::new(AtomicU64::new(0));
+        let ended = Arc::new(AtomicU64::new(0));
+        let reconciles = SyncReconciles::new(
+            false,
+            {
+                let calls = calls.clone();
+                Arc::new(move |anchor: &RegistrySyncAnchor| {
+                    match calls.fetch_add(1, Ordering::SeqCst) {
+                        0 => panic!("a pass panics"),
+                        1 => Err(quil_types::error::QuilError::Store("a pass fails".into())),
+                        _ => Ok(anchor.cursor),
+                    }
+                })
+            },
+            {
+                let ended = ended.clone();
+                Arc::new(move || {
+                    ended.fetch_add(1, Ordering::SeqCst);
+                })
+            },
+            tokio_util::sync::CancellationToken::new(),
+        );
+        for (frame, ran) in [(2101, 1), (2102, 2), (2103, 3)] {
+            assert!(reconciles.owe(sync_pass(frame)));
+            assert!(
+                came_within(PASS_STARTS_WITHIN, || ended.load(Ordering::SeqCst) == ran).await,
+                "pass {ran} did not end"
+            );
+            reconciles.wait_idle().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// The first verified sync opens the lifecycle gate only once its pass has
+    /// bound the workers; a sync owing no pass runs nothing, so its caller opens
+    /// the gate itself.
+    #[tokio::test]
+    async fn the_lifecycle_gate_opens_after_the_pass_a_sync_owes() {
+        use std::sync::atomic::Ordering;
+        let gate = Arc::new(PassGate::default());
+        let _open = OpenOnDrop(gate.clone());
+        let (reconciles, ended) = gated_reconciles(&gate);
+        for uncited in [
+            RegistrySyncAnchor {
+                root: vec![],
+                cursor: Some(2101),
+            },
+            RegistrySyncAnchor {
+                root: vec![9; 32],
+                cursor: None,
+            },
+        ] {
+            assert!(!reconciles.owe(SyncPass {
+                anchor: uncited,
+                registry_sync: 1,
+                refresh_ms: 0,
+            }));
+        }
+        let archive = SyncReconciles::new(
+            true,
+            Arc::new(|_: &RegistrySyncAnchor| panic!("an archive runs no pass")),
+            Arc::new(|| panic!("an archive opens its gate in place")),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        assert!(!archive.owe(sync_pass(2101)));
+        assert!(gate.frames().is_empty());
+        assert!(reconciles.owe(sync_pass(2101)));
+        assert!(came_within(PASS_STARTS_WITHIN, || gate.running() == 1).await);
+        assert_eq!(
+            ended.load(Ordering::SeqCst),
+            0,
+            "the gate opened before the pass ended"
+        );
+        gate.open();
+        reconciles.wait_idle().await;
+        assert_eq!(ended.load(Ordering::SeqCst), 1);
+    }
+
+    /// Shutdown waits for the running pass and starts no waiting one.
+    #[tokio::test]
+    async fn shutdown_waits_for_the_running_pass_and_starts_no_other() {
+        let gate = Arc::new(PassGate::default());
+        let _open = OpenOnDrop(gate.clone());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let reconciles = SyncReconciles::new(
+            false,
+            {
+                let gate = gate.clone();
+                Arc::new(move |anchor: &RegistrySyncAnchor| {
+                    gate.pass(anchor.cursor);
+                    Ok(anchor.cursor)
+                })
+            },
+            Arc::new(|| {}),
+            cancel.clone(),
+        );
+        assert!(reconciles.owe(sync_pass(2101)));
+        assert!(came_within(PASS_STARTS_WITHIN, || gate.running() == 1).await);
+        assert!(reconciles.owe(sync_pass(2102)));
+        cancel.cancel();
+        let idle = {
+            let reconciles = reconciles.clone();
+            tokio::spawn(async move { reconciles.wait_idle().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !idle.is_finished(),
+            "shutdown went on past the running pass"
+        );
+        gate.open();
+        idle.await.unwrap();
+        assert_eq!(gate.frames(), vec![Some(2101)]);
+    }
+
+    /// This thread's lines. The driver logs on this thread: the test's runtime
+    /// has only it.
+    fn capture_lines() -> (
+        Arc<std::sync::Mutex<Vec<u8>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        #[derive(Clone)]
+        struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured: Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
+        let writer = Lines(captured.clone());
+        let guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        (captured, guard)
+    }
+
+    fn lines_with(captured: &std::sync::Mutex<Vec<u8>>, text: &str) -> Vec<String> {
+        String::from_utf8_lossy(&captured.lock().unwrap())
+            .lines()
+            .filter(|line| line.contains(text))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The end of a pass says what the refresh before it took and how long the
+    /// pass ran.
+    #[tokio::test]
+    async fn a_passes_end_line_carries_refresh_and_duration() {
+        let (captured, _guard) = capture_lines();
+        let gate = Arc::new(PassGate::default());
+        gate.open();
+        let (reconciles, _ended) = gated_reconciles(&gate);
+        assert!(reconciles.owe(SyncPass {
+            anchor: cited_anchor(2101),
+            registry_sync: 7,
+            refresh_ms: 1234,
+        }));
+        reconciles.wait_idle().await;
+        let completed = lines_with(&captured, "worker reconciliation completed");
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        for field in [
+            "INFO",
+            "frame=2101",
+            "registry_sync=7",
+            "refresh_ms=1234",
+            "duration_ms=",
+        ] {
+            assert!(completed[0].contains(field), "{field}: {}", completed[0]);
+        }
+    }
+
+    /// A sync meeting a running pass says so once, with how long it has run: an
+    /// overrun shows before the pass ends, however long that takes.
+    #[tokio::test]
+    async fn a_sync_meeting_a_running_pass_warns_once() {
+        let (captured, _guard) = capture_lines();
+        let gate = Arc::new(PassGate::default());
+        let _open = OpenOnDrop(gate.clone());
+        let (reconciles, _ended) = gated_reconciles(&gate);
+        assert!(reconciles.owe(sync_pass(2101)));
+        assert!(came_within(PASS_STARTS_WITHIN, || gate.running() == 1).await);
+        assert!(lines_with(&captured, "worker reconcile still running").is_empty());
+        assert!(reconciles.owe(sync_pass(2102)));
+        let overruns = lines_with(&captured, "worker reconcile still running");
+        assert_eq!(overruns.len(), 1, "{overruns:?}");
+        for field in [
+            "WARN",
+            "registry_sync=2102",
+            "running_ms=",
+            "scope=\"this node\"",
+        ] {
+            assert!(overruns[0].contains(field), "{field}: {}", overruns[0]);
+        }
+        gate.open();
+        reconciles.wait_idle().await;
     }
 
     fn early_pull_clock(head: u64, view: u64) -> quil_store::RocksClockStore {

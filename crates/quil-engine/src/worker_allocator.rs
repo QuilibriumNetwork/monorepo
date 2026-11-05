@@ -895,10 +895,104 @@ pub enum Cooldown {
 
 const COOLDOWN_KINDS: usize = 3;
 
+/// A reconcile pass longer than this logs where its time went: it holds its
+/// caller and every pass waiting behind it.
+const RECONCILE_SLOW_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Shortest time between two slow lines of one caller.
+const RECONCILE_SLOW_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Where a reconcile pass spent its time: what it waits on, and the steps that
+/// grow with its seats. The rest of the pass is the slow line's `other_ms`.
+#[derive(Debug, Default, Clone, Copy)]
+struct ReconcileTimes {
+    lock_wait: std::time::Duration,
+    retention: std::time::Duration,
+    settlement: std::time::Duration,
+    release: std::time::Duration,
+    bind: std::time::Duration,
+    eviction: std::time::Duration,
+    workers: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Time each timed step takes on top of its work, for this thread's passes.
+    static STEP_DELAY: std::cell::Cell<std::time::Duration> = const {
+        std::cell::Cell::new(std::time::Duration::ZERO)
+    };
+}
+
+/// Run `step`, adding its time to `part`.
+fn timed<T>(part: &mut std::time::Duration, step: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let done = step();
+    #[cfg(test)]
+    std::thread::sleep(STEP_DELAY.with(std::cell::Cell::get));
+    *part += started.elapsed();
+    done
+}
+
+/// Which slow passes log a line: at most one per caller per
+/// [`RECONCILE_SLOW_EVERY`], counting those it leaves out. A slow pass runs on
+/// every frame at worst, so the callers' lines stay bounded.
+#[derive(Debug)]
+struct SlowPassLog {
+    slow_after: std::time::Duration,
+    callers: HashMap<&'static str, SlowCaller>,
+}
+
+#[derive(Debug)]
+struct SlowCaller {
+    last_line: std::time::Instant,
+    left_out: u64,
+}
+
+impl Default for SlowPassLog {
+    fn default() -> Self {
+        Self {
+            slow_after: RECONCILE_SLOW_AFTER,
+            callers: HashMap::new(),
+        }
+    }
+}
+
+impl SlowPassLog {
+    /// Whether a pass of `caller` that took `took` logs a line at `now`: the
+    /// slow passes of this caller left out since its last line, or `None`.
+    fn admit(
+        &mut self,
+        caller: &'static str,
+        took: std::time::Duration,
+        now: std::time::Instant,
+    ) -> Option<u64> {
+        if took < self.slow_after {
+            return None;
+        }
+        let Some(seen) = self.callers.get_mut(caller) else {
+            self.callers.insert(
+                caller,
+                SlowCaller {
+                    last_line: now,
+                    left_out: 0,
+                },
+            );
+            return Some(0);
+        };
+        if now.saturating_duration_since(seen.last_line) < RECONCILE_SLOW_EVERY {
+            seen.left_out += 1;
+            return None;
+        }
+        seen.last_line = now;
+        Some(std::mem::take(&mut seen.left_out))
+    }
+}
+
 pub struct WorkerAllocator {
     /// Serialize frame-driven and registry-sync reconciliation so their
     /// release/bind passes cannot compete for the same idle worker.
     reconcile_lock: std::sync::Mutex<()>,
+    slow_passes: std::sync::Mutex<SlowPassLog>,
     /// Shard operations in progress, shared with the lifecycle that
     /// dispatches them.
     pub(crate) submission_attempts: Arc<crate::submission_attempts::SubmissionAttempts>,
@@ -1548,12 +1642,20 @@ impl WorkerAllocator {
     /// Free a worker, unless its committee session is still closing or its
     /// seat still owes a storage epoch proof. The first held release logs
     /// why and until when ([`Self::end_worker_hold`] logs its end).
-    fn release_worker(&self, worker: &WorkerInfo, retained: bool, frame_number: u64) -> Result<()> {
-        if retained {
-            self.begin_worker_hold(worker, frame_number);
-            return Ok(());
-        }
-        self.worker_manager.deallocate_worker(worker.core_id)
+    fn release_worker(
+        &self,
+        worker: &WorkerInfo,
+        retained: bool,
+        frame_number: u64,
+        times: &mut ReconcileTimes,
+    ) -> Result<()> {
+        timed(&mut times.release, || {
+            if retained {
+                self.begin_worker_hold(worker, frame_number);
+                return Ok(());
+            }
+            self.worker_manager.deallocate_worker(worker.core_id)
+        })
     }
 
     fn begin_worker_hold(&self, worker: &WorkerInfo, frame_number: u64) {
@@ -1751,6 +1853,7 @@ impl WorkerAllocator {
     ) -> Self {
         Self {
             reconcile_lock: std::sync::Mutex::new(()),
+            slow_passes: Default::default(),
             submission_attempts: Arc::new(crate::submission_attempts::SubmissionAttempts::default()),
             interrupted_seats: std::sync::Mutex::new(None),
             reconciled_frame: std::sync::atomic::AtomicU64::new(0),
@@ -2410,23 +2513,69 @@ impl WorkerAllocator {
         if !stored_head_current(head, head_unix_ms, now_unix_ms) {
             return Ok(false);
         }
-        self.on_new_frame(head)?;
+        self.on_new_frame_by("startup", head)?;
         Ok(true)
     }
 
     pub fn on_new_frame(&self, frame_number: u64) -> Result<()> {
-        let result = self.reconcile(frame_number);
-        if let Err(error) = self.schedule_payload_eviction(std::time::Instant::now()) {
+        self.on_new_frame_by("unnamed", frame_number)
+    }
+
+    /// [`Self::on_new_frame`] for `caller`, named in the pass's slow line.
+    pub fn on_new_frame_by(&self, caller: &'static str, frame_number: u64) -> Result<()> {
+        let started = std::time::Instant::now();
+        let mut times = ReconcileTimes::default();
+        let result = self.reconcile(frame_number, &mut times);
+        let scheduled = timed(&mut times.eviction, || {
+            self.schedule_payload_eviction(std::time::Instant::now())
+        });
+        if let Err(error) = scheduled {
             warn!(%error, "worker payload eviction not scheduled");
         }
+        self.log_slow_pass(caller, frame_number, started.elapsed(), &times);
         result
     }
 
-    fn reconcile(&self, frame_number: u64) -> Result<()> {
-        let _reconcile = self
-            .reconcile_lock
+    /// Say where a slow pass spent its time, bounded per caller.
+    fn log_slow_pass(
+        &self,
+        caller: &'static str,
+        frame_number: u64,
+        took: std::time::Duration,
+        times: &ReconcileTimes,
+    ) {
+        let left_out = self
+            .slow_passes
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(|e| e.into_inner())
+            .admit(caller, took, std::time::Instant::now());
+        let Some(left_out) = left_out else {
+            return;
+        };
+        let parts = times.lock_wait
+            + times.retention
+            + times.settlement
+            + times.release
+            + times.bind
+            + times.eviction;
+        let ms = |time: std::time::Duration| time.as_millis() as u64;
+        warn!(caller, frame = frame_number, workers = times.workers, total_ms = ms(took),
+            lock_wait_ms = ms(times.lock_wait), retention_ms = ms(times.retention),
+            settlement_ms = ms(times.settlement), release_ms = ms(times.release),
+            bind_ms = ms(times.bind), eviction_ms = ms(times.eviction),
+            other_ms = ms(took.saturating_sub(parts)), left_out, scope = "this node",
+            action = "report this line if it repeats; the largest part names the step: lock_wait_ms \
+                      behind another caller's pass, retention_ms reads of the committed GLOBAL view, \
+                      settlement_ms the registry's seat slots, release_ms and bind_ms the worker table",
+            "worker reconcile slow: this pass held its caller, and any pass behind it, past the bound");
+    }
+
+    fn reconcile(&self, frame_number: u64, times: &mut ReconcileTimes) -> Result<()> {
+        let _reconcile = timed(&mut times.lock_wait, || {
+            self.reconcile_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        });
         self.reconciled_frame
             .fetch_max(frame_number, std::sync::atomic::Ordering::Relaxed);
         // Prover-reset v3 (mainnet 747_000): clear every AUTO-managed worker's
@@ -2501,6 +2650,7 @@ impl WorkerAllocator {
 
         // Get current worker assignments
         let workers = self.worker_manager.range_workers()?;
+        times.workers = workers.len();
 
         if let Some(prover) = prover_info.as_ref() {
             self.log_renewal_sync_holds(&prover.allocations, frame_number);
@@ -2515,7 +2665,9 @@ impl WorkerAllocator {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if seats.is_none() {
-                self.log_owed_storage_settlements(&workers, frame_number);
+                timed(&mut times.settlement, || {
+                    self.log_owed_storage_settlements(&workers, frame_number)
+                });
                 let found: std::collections::HashSet<Vec<u8>> = workers
                     .iter()
                     .filter(|w| !w.filter.is_empty())
@@ -2581,14 +2733,18 @@ impl WorkerAllocator {
         for worker in &workers {
             // Whether the worker's committee session retains it: unknown while
             // a GLOBAL state sync withholds the committed view.
-            let retention = match (session_authority.as_ref(), local_public_key.as_ref()) {
-                (Some(global), Some(member)) if !worker.filter.is_empty() => {
-                    crate::app_handoff::worker_retention(global, &worker.filter, member)
+            let retention = timed(&mut times.retention, || {
+                match (session_authority.as_ref(), local_public_key.as_ref()) {
+                    (Some(global), Some(member)) if !worker.filter.is_empty() => {
+                        crate::app_handoff::worker_retention(global, &worker.filter, member)
+                    }
+                    _ => Some(false),
                 }
-                _ => Some(false),
-            };
-            let settling = !worker.filter.is_empty()
-                && self.owes_storage_settlement(&worker.filter, frame_number);
+            });
+            let settling = timed(&mut times.settlement, || {
+                !worker.filter.is_empty()
+                    && self.owes_storage_settlement(&worker.filter, frame_number)
+            });
             // Retention only withholds a RELEASE below, and so does an unknown
             // view. Everything else in this pass (notably starting the engine
             // once the allocation is Active) must still run for a retained
@@ -2644,7 +2800,7 @@ impl WorkerAllocator {
                          active child allocation is unbound (likely split-parent) — \
                          deallocating so the child rebinds"
                     );
-                    self.release_worker(worker, retained, frame_number)?;
+                    self.release_worker(worker, retained, frame_number, times)?;
                     continue;
                 }
             }
@@ -2664,7 +2820,7 @@ impl WorkerAllocator {
                                 current_epoch = quil_types::consensus::epoch_for_frame(frame_number),
                                 "epoch-expired allocation released so a live shard can use the worker"
                             );
-                            self.release_worker(worker, retained, frame_number)?;
+                            self.release_worker(worker, retained, frame_number, times)?;
                             continue;
                         }
                         Some(GivenUp::LeftLapsed) => {
@@ -2678,7 +2834,7 @@ impl WorkerAllocator {
                                 "worker released from a seat left after its storage registration lapsed, which its \
                                  committee no longer seats: it owes no notice; the seat departs at its leave boundary"
                             );
-                            self.release_worker(worker, retained, frame_number)?;
+                            self.release_worker(worker, retained, frame_number, times)?;
                             continue;
                         }
                         // `gives_up` never reports it: only the recovery gate does.
@@ -2743,7 +2899,7 @@ impl WorkerAllocator {
                                      never included before the activation frame; check the \
                                      join's confirm submission and inclusion"
                                 );
-                                self.release_worker(worker, retained, frame_number)?;
+                                self.release_worker(worker, retained, frame_number, times)?;
                             }
                         }
                         ProverStatus::Rejected | ProverStatus::Kicked | ProverStatus::Historic => {
@@ -2772,7 +2928,7 @@ impl WorkerAllocator {
                                 status = ?alloc.status,
                                 "allocation ended/reassigned, clearing worker"
                             );
-                            self.release_worker(worker, retained, frame_number)?;
+                            self.release_worker(worker, retained, frame_number, times)?;
                         }
                         ProverStatus::Leaving => {
                             // Live Leave (within 720-frame grace) →
@@ -2798,7 +2954,7 @@ impl WorkerAllocator {
                                         leave_frame = alloc.leave_frame_number,
                                         "leave expired after 720 frames, clearing worker"
                                     );
-                                    self.release_worker(worker, retained, frame_number)?;
+                                    self.release_worker(worker, retained, frame_number, times)?;
                                 }
                             }
                         }
@@ -2833,15 +2989,18 @@ impl WorkerAllocator {
                                     "alloc transitioned to Active — starting consensus engine"
                                 ),
                             }
-                            self.worker_manager.set_worker_filter(
-                                worker.core_id,
-                                &worker.filter,
-                                true,
-                            )?;
+                            timed(&mut times.bind, || {
+                                self.worker_manager.set_worker_filter(
+                                    worker.core_id,
+                                    &worker.filter,
+                                    true,
+                                )
+                            })?;
                         }
-                        let _ = self
-                            .worker_manager
-                            .set_allocated(worker.core_id, desired_allocated);
+                        let _ = timed(&mut times.bind, || {
+                            self.worker_manager
+                                .set_allocated(worker.core_id, desired_allocated)
+                        });
                     }
                 }
                 None => {
@@ -2862,7 +3021,7 @@ impl WorkerAllocator {
                             pending_since = worker.pending_filter_frame,
                             "proposal timed out after 10 frames, clearing worker"
                         );
-                        self.release_worker(worker, retained, frame_number)?;
+                        self.release_worker(worker, retained, frame_number, times)?;
                     } else if worker.pending_filter_frame == 0
                         && frame_number > PENDING_FILTER_GRACE_FRAMES
                     {
@@ -2873,7 +3032,7 @@ impl WorkerAllocator {
                             filter = hex::encode(&worker.filter),
                             "orphaned filter with no pending frame, clearing worker"
                         );
-                        self.release_worker(worker, retained, frame_number)?;
+                        self.release_worker(worker, retained, frame_number, times)?;
                     }
                 }
             }
@@ -3130,11 +3289,13 @@ impl WorkerAllocator {
                     holds_data,
                     "assigning shard to worker"
                 );
-                self.worker_manager.set_worker_filter(
-                    core_id,
-                    &alloc.confirmation_filter,
-                    start_consensus,
-                )?;
+                timed(&mut times.bind, || {
+                    self.worker_manager.set_worker_filter(
+                        core_id,
+                        &alloc.confirmation_filter,
+                        start_consensus,
+                    )
+                })?;
             } else {
                 // No idle worker available — the alloc is on-chain
                 // but has no local worker bound. This is a
@@ -5458,6 +5619,152 @@ mod tests {
                 "ranked={ranked}"
             );
         }
+    }
+
+    /// A pass under the bound logs nothing; one at it does.
+    #[test]
+    fn only_a_pass_past_the_bound_logs_a_slow_line() {
+        let now = std::time::Instant::now();
+        let mut log = SlowPassLog::default();
+        let bound = std::time::Duration::from_secs(5);
+        assert_eq!(
+            log.admit(
+                "frame poller",
+                bound - std::time::Duration::from_millis(1),
+                now
+            ),
+            None
+        );
+        assert_eq!(log.admit("frame poller", bound, now), Some(0));
+    }
+
+    /// A caller logs at most one slow line a minute, then says how many it
+    /// left out; another caller keeps its own count.
+    #[test]
+    fn a_callers_slow_line_repeats_at_most_once_a_minute() {
+        let start = std::time::Instant::now();
+        let at = |secs| start + std::time::Duration::from_secs(secs);
+        let slow = std::time::Duration::from_secs(9);
+        let mut log = SlowPassLog::default();
+        assert_eq!(log.admit("frame poller", slow, at(0)), Some(0));
+        assert_eq!(log.admit("frame poller", slow, at(10)), None);
+        assert_eq!(log.admit("frame poller", slow, at(59)), None);
+        assert_eq!(log.admit("frame receive", slow, at(59)), Some(0));
+        assert_eq!(log.admit("frame poller", slow, at(60)), Some(2));
+        assert_eq!(log.admit("frame poller", slow, at(70)), None);
+        assert_eq!(log.admit("frame poller", slow, at(120)), Some(1));
+    }
+
+    /// The slow line names the caller and splits the pass: the wait for the
+    /// lock and each step, so one line tells them apart. A pass under the bound
+    /// says nothing.
+    #[test]
+    fn a_slow_reconcile_pass_names_where_its_time_went() {
+        let wm = Arc::new(MockWorkerManager::new());
+        let kicked = vec![0x01; 32];
+        let active = vec![0x02; 32];
+        wm.add_with_filter(1, kicked.clone());
+        wm.add(idle_worker(2, 0));
+        let prover = ProverInfo {
+            public_key: vec![],
+            address: vec![0xAA; 32],
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: vec![
+                ProverAllocationInfo {
+                    status: ProverStatus::Kicked,
+                    ..make_alloc(kicked.clone())
+                },
+                make_alloc(active.clone()),
+            ],
+            available_storage: 0,
+            seniority: 0,
+            delegate_address: vec![],
+        };
+        let alloc = Arc::new(WorkerAllocator::new(
+            wm.clone(),
+            Arc::new(TestProverRegistry::with_prover(prover)),
+            vec![0xAA; 32],
+        ));
+        let logs = crate::outage::test_logs::CapturedLogs::default();
+        let _guard = logs.install();
+        alloc.on_new_frame_by("registry sync", 100).unwrap();
+        assert!(
+            logs.lines_with("worker reconcile slow").is_empty(),
+            "a pass under the bound"
+        );
+        // A second pass that releases and binds again, behind another pass.
+        wm.add_with_filter(1, kicked.clone());
+        wm.add(idle_worker(2, 0));
+        alloc.slow_passes.lock().unwrap().slow_after = std::time::Duration::ZERO;
+        let (held, wait_held) = std::sync::mpsc::channel();
+        let pass_starts = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let holder = {
+            let (alloc, pass_starts) = (alloc.clone(), pass_starts.clone());
+            std::thread::spawn(move || {
+                let _lock = alloc.reconcile_lock.lock().unwrap();
+                held.send(()).unwrap();
+                while !pass_starts.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            })
+        };
+        wait_held.recv().unwrap();
+        let step = std::time::Duration::from_millis(40);
+        STEP_DELAY.with(|delay| delay.set(step));
+        pass_starts.store(true, std::sync::atomic::Ordering::SeqCst);
+        alloc.on_new_frame_by("registry sync", 101).unwrap();
+        STEP_DELAY.with(|delay| delay.set(std::time::Duration::ZERO));
+        holder.join().unwrap();
+        let lines = logs.lines_with("worker reconcile slow");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        for field in [
+            "WARN",
+            "caller=\"registry sync\"",
+            "frame=101",
+            "workers=2",
+            "left_out=0",
+            "scope=\"this node\"",
+            "total_ms=",
+            "other_ms=",
+        ] {
+            assert!(line.contains(field), "{field}: {line}");
+        }
+        let value = |field: &str| -> u64 {
+            let at = line
+                .find(&format!("{field}="))
+                .unwrap_or_else(|| panic!("{field}: {line}"));
+            line[at + field.len() + 1..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap()
+        };
+        let parts = [
+            ("lock_wait_ms", std::time::Duration::from_millis(100)),
+            ("retention_ms", step),
+            ("settlement_ms", step),
+            ("release_ms", step),
+            ("bind_ms", step),
+            ("eviction_ms", step),
+        ];
+        let missing: Vec<&str> = parts
+            .iter()
+            .filter(|(field, least)| value(field) < least.as_millis() as u64)
+            .map(|(field, _)| *field)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "parts without their time: {missing:?}: {line}"
+        );
+        let sum: u64 = parts.iter().map(|(field, _)| value(field)).sum();
+        assert!(
+            sum <= value("total_ms"),
+            "the parts add up to the pass: {line}"
+        );
     }
 
     /// The production worker manager, counting consensus starts.

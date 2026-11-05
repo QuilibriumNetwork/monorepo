@@ -1811,7 +1811,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                             if !archive_mode_recv {
                                                                 let reconciled = {
                                                                     let _reconcile = probe::section(ProbeSection::AllocationReconcile);
-                                                                    wa_for_recv.on_new_frame(exec_num)
+                                                                    wa_for_recv.on_new_frame_by("frame receive", exec_num)
                                                                 };
                                                                 if let Err(e) = reconciled {
                                                                     warn!(error = %e, "worker allocation failed");
