@@ -637,14 +637,43 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             },
         ],
     },
+    ClassDef {
+        name: "storage:PersistentSector",
+        fields: &[
+            FieldTag {
+                name: "Member",
+                order: 39,
+                size: 32,
+                rdf_type: RdfType::ByteArray,
+            },
+            FieldTag {
+                name: "Sector",
+                order: 40,
+                size: 32,
+                rdf_type: RdfType::ByteArray,
+            },
+            FieldTag {
+                name: "Certificate",
+                order: 41,
+                size: 104,
+                rdf_type: RdfType::ByteArray,
+            },
+            FieldTag {
+                name: "Usage",
+                order: 42,
+                size: 256,
+                rdf_type: RdfType::ByteArray,
+            },
+        ],
+    },
 ];
 
-/// The schema's max `order` across all classes — now 38 (a prover's
-/// `SeniorityRestorationFrame`). Still within the single-byte band (`≤ 63`),
+/// The schema's max `order` across all classes — now 42 (persistent-sector
+/// `Usage`). Still within the single-byte band (`≤ 63`),
 /// so `order_to_key` returns `order << 2` exactly as before: every existing
 /// field key is unchanged, no allocation vertex is re-keyed. Used to decide
 /// the `order_to_key` encoding width.
-pub const GLOBAL_MAX_ORDER: u16 = 38;
+pub const GLOBAL_MAX_ORDER: u16 = 42;
 
 /// Encoding boundaries from `types/schema/order_encoding.go`.
 pub const MAX_ORDER_SINGLE_BYTE: u16 = 63;
@@ -751,7 +780,7 @@ pub fn type_hash_spent_merge() -> [u8; 32] {
 /// that is neither a prover, an allocation nor a reward (every leaf-root
 /// registration) hashed both class names again: Poseidon was at the top of a
 /// mainnet archive's 9.6 s registry reads (2026-10-25).
-static RUNTIME_TYPE_HASHES: std::sync::LazyLock<[([u8; 32], &'static str); 5]> =
+static RUNTIME_TYPE_HASHES: std::sync::LazyLock<[([u8; 32], &'static str); 6]> =
     std::sync::LazyLock::new(|| {
         [
             (compute_type_hash("merge:SpentMerge"), "merge:SpentMerge"),
@@ -770,6 +799,10 @@ static RUNTIME_TYPE_HASHES: std::sync::LazyLock<[([u8; 32], &'static str); 5]> =
             (
                 compute_type_hash("storage:StorageSnapshot"),
                 "storage:StorageSnapshot",
+            ),
+            (
+                compute_type_hash("storage:PersistentSector"),
+                "storage:PersistentSector",
             ),
         ]
     });
@@ -889,6 +922,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn persistent_sector_keys_are_unique_without_rekeying_existing_fields() {
+        let class = GLOBAL_CLASSES
+            .iter()
+            .find(|c| c.name == "storage:PersistentSector")
+            .unwrap();
+        for field in class.fields {
+            let key = order_to_key(field.order, GLOBAL_MAX_ORDER);
+            assert_eq!(key, vec![(field.order as u8) << 2]);
+            for other in GLOBAL_CLASSES.iter().filter(|c| c.name != class.name) {
+                for old in other.fields {
+                    assert_ne!(key, order_to_key(old.order, GLOBAL_MAX_ORDER));
+                }
+            }
+        }
+        assert!(GLOBAL_MAX_ORDER <= MAX_ORDER_SINGLE_BYTE);
+    }
+
+    #[test]
     fn order_to_key_single_byte() {
         // max_order ≤ 63 → single-byte encoding, `order << 2`.
         assert_eq!(order_to_key(0, 13), vec![0x00]);
@@ -963,8 +1014,8 @@ mod tests {
             Some(vec![0x98])
         );
         assert_eq!(
-            GLOBAL_MAX_ORDER, 38,
-            "SeniorityRestorationFrame (order 38) is the highest"
+            GLOBAL_MAX_ORDER, 42,
+            "persistent-sector Usage (order 42) is the highest"
         );
         assert!(GLOBAL_MAX_ORDER <= MAX_ORDER_SINGLE_BYTE);
         assert_eq!(

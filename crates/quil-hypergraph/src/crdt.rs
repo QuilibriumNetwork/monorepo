@@ -6236,6 +6236,33 @@ impl HypergraphCrdt {
             })
     }
 
+    /// Exact serialized value bytes and entry count at one retained root.
+    /// Counts and length sums come from the versioned forest, never the live
+    /// reward-size cache (which subtracts removals).
+    pub fn unified_phase_layout_at(
+        &self,
+        app: &[u8; 32],
+        phase_idx: usize,
+        version: u64,
+        bits: &[bool],
+    ) -> Result<(u64, u128)> {
+        let phase = *PHASES
+            .get(phase_idx)
+            .ok_or_else(|| QuilError::InvalidArgument("snapshot phase".into()))?;
+        let forest = self
+            .forest
+            .read()
+            .map_err(|_| QuilError::ExecutionUnavailable("forest lock poisoned".into()))?;
+        Ok((
+            forest
+                .app_subtree_leaf_count(app, phase, version, bits)
+                .map_err(|e| QuilError::ExecutionUnavailable(e.to_string()))?,
+            forest
+                .app_subtree_size(app, phase, version, bits)
+                .map_err(|e| QuilError::ExecutionUnavailable(e.to_string()))?,
+        ))
+    }
+
     /// A raw-key proof of `key` in phase `phase_idx` of `app`'s unified tree
     /// at `version`, for a key present or not (storage bindings).
     pub fn unified_phase_proof_at(
@@ -6255,6 +6282,41 @@ impl HypergraphCrdt {
                 QuilError::ExecutionUnavailable(format!("proof at version {version}: {e}"))
             })?;
         Ok(quil_forest::subtree_proof::CompactProof::of(&proof))
+    }
+
+    /// One added value at an immutable snapshot version. Membership is checked
+    /// in that version before the versioned blob is read; a current value must
+    /// never substitute for a retained snapshot's value.
+    pub fn unified_phase_value_at(
+        &self,
+        app: &[u8; 32],
+        phase_idx: usize,
+        version: u64,
+        address: &[u8; 32],
+    ) -> Result<Vec<u8>> {
+        if phase_idx != 0 && phase_idx != 2 {
+            return Err(QuilError::InvalidArgument("snapshot value phase".into()));
+        }
+        let proof = self.unified_phase_proof_at(app, phase_idx, version, address)?;
+        let Some((key, _)) = proof.leaf.filter(|(key, _)| key == address) else {
+            return Err(QuilError::ExecutionUnavailable(
+                "snapshot value is absent".into(),
+            ));
+        };
+        let shard = ShardKey {
+            l1: crate::addressing::get_bloom_filter_indices(app, 256, 3),
+            l2: *app,
+        };
+        let (set, phase) = PHASE_STR[phase_idx];
+        self.store
+            .load_vertex_underlying_at(
+                set,
+                phase,
+                &shard,
+                &[app.as_slice(), key.as_slice()].concat(),
+                version,
+            )?
+            .ok_or_else(|| QuilError::ExecutionUnavailable("snapshot value is not retained".into()))
     }
 
     /// Every `(app ‖ address, blob)` of phase `phase_idx` whose address

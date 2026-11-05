@@ -500,9 +500,6 @@ pub struct LabelStore {
     /// The release of labels for free space this process last saw
     /// ([`Self::keep_floor`]).
     seen: Mutex<Option<Shortage>>,
-    /// Leaves whose data [`precompute`] read, for tests.
-    #[cfg(test)]
-    leaves_read: AtomicU64,
 }
 
 /// Room a leaf's labels were refused: the free bytes they needed, beside
@@ -515,6 +512,31 @@ struct Shortfall {
 }
 
 impl LabelStore {
+    pub(crate) fn directory(&self) -> &Path {
+        &self.dir
+    }
+
+    /// A GLOBAL-certified final-layer commitment no longer needs the temporary
+    /// eleven-layer cache. Never remove files another proof is still reading.
+    pub(crate) fn release_certified_sector(&self, epoch: u64, member: &[u8], sector: &[u8]) {
+        let dir = self.leaf_dir(epoch, member, sector);
+        let lock = leaf_lock(&dir);
+        let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.busy().iter().any(|(path, _)| path == &dir) {
+            return;
+        }
+        let mut guards = Vec::new();
+        for n in counts_with(&dir, ".layers") {
+            let Ok(file) = File::open(paths(&dir, n)[0].clone()) else {
+                continue;
+            };
+            if file.try_lock().is_err() {
+                return;
+            }
+            guards.push(file);
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
     pub fn new(dir: PathBuf) -> Self {
         Self::with_space(dir, Box::new(quil_forest::storage_health::fs_usage))
     }
@@ -531,15 +553,7 @@ impl LabelStore {
             refused: Mutex::new(HashSet::new()),
             swept: AtomicU64::new(0),
             seen: Mutex::new(None),
-            #[cfg(test)]
-            leaves_read: AtomicU64::new(0),
         }
-    }
-
-    /// Leaves whose data [`precompute`] read with this store.
-    #[cfg(test)]
-    pub(crate) fn leaves_read(&self) -> u64 {
-        self.leaves_read.load(Ordering::SeqCst)
     }
 
     /// Whether [`Self::admit`] could admit `member`'s leaf `leaf_id` for
@@ -2261,6 +2275,9 @@ pub fn precompute(
     }
     let source = crate::storage_snapshot::current_source(crdt, filter, epoch);
     let captured = crate::storage_snapshot::capture_at(crdt, filter, epoch, &[source])?;
+    if quil_types::consensus::persistent_storage_at(epoch) {
+        return crate::storage_snapshot::prewarm_sectors(&captured, store, member);
+    }
     let params = SdrParams::default();
     let started = std::time::Instant::now();
     let sizes = captured
@@ -2286,25 +2303,7 @@ pub fn precompute(
         {
             return Ok(None);
         }
-        let exact = {
-            let memory = crate::storage_jobs::reserve_ahead_brief(
-                crate::storage_snapshot::leaf_read_bytes(size),
-                order,
-                &|| expired(epoch),
-            );
-            if memory.is_none() || expired(epoch) {
-                log_expired(
-                    epoch,
-                    filter,
-                    &leaf_id,
-                    "waiting for memory to read the leaf",
-                );
-                return Ok(Some(0));
-            }
-            #[cfg(test)]
-            store.leaves_read.fetch_add(1, Ordering::SeqCst);
-            data_node_count(captured.leaf_data(prefix)?.len() as u64)
-        };
+        let exact = captured.node_count(prefix)?;
         if store
             .find(epoch, member, &leaf_id, |n| padded_nodes_allowed(exact, n))
             .is_some()

@@ -6,6 +6,7 @@ mod falcon;
 mod frame_prover;
 mod inclusion;
 mod key_manager;
+pub mod persistent_storage;
 pub mod porep;
 pub mod poseidon;
 pub mod release_check;

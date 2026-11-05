@@ -114,6 +114,33 @@ pub fn tree_depth(n: u64) -> usize {
     }
 }
 
+/// The commitment to n zero nodes, in O(log n), for label certificates.
+pub fn zero_commitment(tree: Tree, n: u64) -> Option<Node> {
+    if n == 0 || n >= MAX_NODES {
+        return None;
+    }
+    let depth = tree_depth(n);
+    let mut zero = vec![hash::ZERO];
+    for h in 0..depth {
+        zero.push(hash::compress(&zero[h], &zero[h], Domain::Node));
+    }
+    fn root(n: u64, h: usize, zero: &[Digest]) -> Digest {
+        if n == 0 {
+            return empty_subtree(h);
+        }
+        if n == 1u64 << h {
+            return zero[h];
+        }
+        let half = 1u64 << (h - 1);
+        hash::compress(
+            &root(n.min(half), h - 1, zero),
+            &root(n.saturating_sub(half), h - 1, zero),
+            Domain::Node,
+        )
+    }
+    Some(hash::to_bytes(&bind(tree, n, &root(n, depth, &zero))))
+}
+
 /// The commitment: the root bound to which tree it is and how many leaves it
 /// has, so neither a padding position nor another tree's path can open it.
 fn bind(tree: Tree, n: u64, root: &Digest) -> Digest {
@@ -205,6 +232,13 @@ impl MerkleTree {
 
     pub fn n(&self) -> u64 {
         self.n
+    }
+
+    pub fn node(&self, index: u64) -> Option<Node> {
+        self.levels
+            .first()?
+            .get(usize::try_from(index).ok()?)
+            .map(hash::to_bytes)
     }
 
     pub fn commitment(&self, tree: Tree) -> Node {
@@ -378,6 +412,46 @@ impl MerkleCap {
                     .unwrap_or_else(|| empty_subtree(self.height + above)),
             ));
             i >>= 1;
+        }
+        Some(path)
+    }
+
+    /// Reuse a decoded subtree for several openings. The subtree is checked
+    /// against this cap, including the zero padding of its final short range.
+    pub fn path_from_subtree(&self, subtree: &MerkleTree, index: u64) -> Option<Vec<Node>> {
+        let below = self.subtree(index)?;
+        if subtree.n() != below.end - below.start {
+            return None;
+        }
+        let mut root = *subtree.levels.last()?.first()?;
+        for height in subtree.levels.len() - 1..self.height {
+            root = hash::compress(&root, &empty_subtree(height), Domain::Node);
+        }
+        let mut above = (index >> self.height) as usize;
+        if Some(&root) != self.levels[0].get(above) {
+            return None;
+        }
+        let mut at = (index - below.start) as usize;
+        let mut path = Vec::with_capacity(tree_depth(self.n));
+        for height in 0..self.height {
+            path.push(hash::to_bytes(
+                &subtree
+                    .levels
+                    .get(height)
+                    .and_then(|level| level.get(at ^ 1))
+                    .copied()
+                    .unwrap_or_else(|| empty_subtree(height)),
+            ));
+            at >>= 1;
+        }
+        for (height, level) in self.levels[..self.levels.len() - 1].iter().enumerate() {
+            path.push(hash::to_bytes(
+                &level
+                    .get(above ^ 1)
+                    .copied()
+                    .unwrap_or_else(|| empty_subtree(self.height + height)),
+            ));
+            above >>= 1;
         }
         Some(path)
     }
@@ -844,7 +918,9 @@ pub struct Registered {
 }
 
 pub fn parse_registration_root(root: &[u8]) -> Option<Registered> {
-    if root.len() != REGISTRATION_ROOT_BYTES {
+    if root.len() != REGISTRATION_ROOT_BYTES
+        && crate::persistent_storage::Registration::parse(root).is_none()
+    {
         return None;
     }
     let node = |at: usize| -> Option<Node> {

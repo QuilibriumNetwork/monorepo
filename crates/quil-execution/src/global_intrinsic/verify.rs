@@ -820,8 +820,15 @@ pub fn validate_confirm_leaf_roots(
         .iter()
         .flat_map(|group| &group.entries)
         .any(|entry| {
-            quil_crypto::storage_proof::parse_registration_root(&entry.leaf_root).is_none()
-                || entry.num_blocks == 0
+            let persistent = quil_crypto::persistent_storage::Registration::parse(&entry.leaf_root);
+            if quil_types::consensus::persistent_storage_at(epoch) {
+                !persistent.is_some_and(|root| root.certificate(entry.num_blocks).valid())
+            } else {
+                persistent.is_some()
+                    || quil_crypto::storage_proof::parse_registration_root(&entry.leaf_root)
+                        .is_none()
+                    || entry.num_blocks == 0
+            }
         });
     if malformed {
         return Err(QuilError::InvalidArgument(format!(
@@ -1044,7 +1051,7 @@ pub(crate) fn intrinsic_domain(tag: &[u8]) -> Result<[u8; 32]> {
 /// binding `poseidon(pubkey) == sig.address`, then BLS-verify under
 /// the given message + domain. Returns `Ok(false)` on any check
 /// failure (not `Err`) so the dispatcher rejects the op uniformly.
-fn verify_addressed_bls(
+pub(crate) fn verify_addressed_bls(
     sig_address: &[u8],
     signature: &[u8],
     prover_tree: &quil_tries::VectorCommitmentTree,

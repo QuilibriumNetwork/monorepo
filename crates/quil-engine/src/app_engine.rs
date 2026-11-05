@@ -3009,6 +3009,7 @@ pub struct AppConsensusEngine {
     lineage_record_absent: bool,
 
     // Identity
+    sector_signer: Box<dyn quil_types::crypto::Signer>,
     local_prover_address: Vec<u8>,
     local_bls_pubkey: Vec<u8>,
 
@@ -3273,6 +3274,7 @@ impl AppConsensusEngine {
             discarded_records_dropped: false,
             start_pace: StartPace::default(),
             lineage_record_absent: false,
+            sector_signer: deps.bls_signer,
             local_prover_address: deps.local_prover_address,
             local_bls_pubkey: deps.local_bls_pubkey,
             halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3379,7 +3381,7 @@ impl AppConsensusEngine {
     /// frame labelling ahead for it gives up
     /// (`crate::storage_snapshot::note_global_frame`).
     fn label_storage_ahead(&self, global_frame_number: u64) {
-        use quil_types::consensus::{epoch_for_frame, hash_storage_proofs_at};
+        use quil_types::consensus::epoch_for_frame;
         crate::storage_snapshot::note_global_frame(global_frame_number);
         let Some(store) = crate::storage_labels::installed() else {
             return;
@@ -3390,6 +3392,23 @@ impl AppConsensusEngine {
         // ahead again or not.
         store.sweep(current);
         let epoch = crate::storage_labels::ahead_epoch(global_frame_number);
+        self.schedule_storage_labels(global_frame_number, epoch);
+        let first = quil_types::consensus::persistent_storage_epoch();
+        if first != u64::MAX
+            && first > epoch
+            && current.saturating_add(quil_types::consensus::PERSISTENT_STORAGE_WARMUP_EPOCHS)
+                >= first
+        {
+            self.schedule_storage_labels(global_frame_number, first);
+        }
+    }
+
+    fn schedule_storage_labels(&self, global_frame_number: u64, epoch: u64) {
+        use quil_types::consensus::{epoch_for_frame, hash_storage_proofs_at};
+        let Some(store) = crate::storage_labels::installed() else {
+            return;
+        };
+        let current = epoch_for_frame(global_frame_number);
         if !hash_storage_proofs_at(epoch) {
             return;
         }
@@ -3444,7 +3463,15 @@ impl AppConsensusEngine {
         }
         let filter = self.filter.clone();
         let key = [b"labels".as_slice(), &member, &filter, &epoch.to_be_bytes()].concat();
-        let lane = [b"labels ".as_slice(), &self.filter].concat();
+        let lane = [
+            if quil_types::consensus::persistent_storage_at(epoch) {
+                b"sector warmup ".as_slice()
+            } else {
+                b"labels ".as_slice()
+            },
+            &self.filter,
+        ]
+        .concat();
         crate::storage_snapshot::request(&lane, key, "storage labels", move || {
             crate::storage_labels::precompute(store, &crdt, &member, &filter, epoch)
         });
@@ -3460,6 +3487,22 @@ impl AppConsensusEngine {
     /// not record is proven and sent again later.
     fn prove_storage_epoch_if_due(&self, global_frame_number: u64) {
         let _probe = probe::section(probe::Section::StorageEpochProofCheck);
+        if let (Some(global), Some(publish), Ok(member)) = (
+            self.global_hypergraph.as_ref(),
+            self.coverage_publish.as_ref(),
+            <[u8; 32]>::try_from(self.local_prover_address.as_slice()),
+        ) {
+            if let Err(error) = crate::storage_snapshot::poll_sector_certificates(
+                global_frame_number,
+                &member,
+                global,
+                self.global_anchor_store.clone(),
+                self.sector_signer.as_ref(),
+                publish.clone(),
+            ) {
+                debug!(%error, "persistent sector certification waits");
+            }
+        }
         self.label_storage_ahead(global_frame_number);
         self.prove_seat_epoch_if_due(global_frame_number, &self.filter, true);
         // The seats this member's confirm registered on the shards a split

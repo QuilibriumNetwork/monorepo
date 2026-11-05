@@ -57,6 +57,7 @@ mod legacy_migration;
 mod query_shards;
 mod reclaim_legacy_forest;
 mod storage_history;
+mod storage_readiness;
 mod test_prover_sync;
 mod unified_consolidation;
 mod verify_migration;
@@ -77,6 +78,8 @@ mod required_anchor_tests;
 #[derive(Parser, Debug)]
 #[command(name = "quil-node", version = quil_config::display_version(), about)]
 struct Args {
+    #[command(flatten)]
+    storage_readiness: storage_readiness::Arguments,
     /// Configuration directory path
     #[arg(short, long, default_value = ".config")]
     config: PathBuf,
@@ -438,6 +441,14 @@ static NODE_STARTED: AtomicBool = AtomicBool::new(false);
 async fn node_main() -> anyhow::Result<ExitCode> {
     initialize_tls_provider();
     let args = Args::parse();
+    if args.storage_readiness.benchmark_storage.is_some() {
+        if args.network != 0 {
+            anyhow::bail!("storage readiness authenticates mainnet checkpoints; use --network 0");
+        }
+        consensus_settings::initialize(0);
+        quil_crypto::init();
+        return storage_readiness::run(&args.storage_readiness).await;
+    }
 
     // Load configuration first so logger paths / filters come from it. A
     // missing config is generated, unless this directory shows a node ran here.

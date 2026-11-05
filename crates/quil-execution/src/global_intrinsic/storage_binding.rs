@@ -28,6 +28,9 @@ use quil_crypto::storage_proof::{padded_nodes_allowed, verify_path, Node, Tree, 
 use quil_forest::subtree_proof::{same_root, subtree_root, CompactProof};
 use sha3::{Digest as _, Sha3_256};
 
+mod sparse;
+pub use sparse::{prove_sparse, BindingSource, SparseData};
+
 /// The leaf-data encoding of hash-proof epochs.
 pub const LEAF_DATA_VERSION: u8 = 0x03;
 
@@ -154,6 +157,13 @@ pub struct LeafClaim<'a> {
 }
 
 impl LeafClaim<'_> {
+    fn allows_nodes(&self, exact: u64) -> bool {
+        if quil_types::consensus::persistent_storage_at(self.epoch) {
+            quil_crypto::persistent_storage::padded_nodes_allowed(exact, self.n)
+        } else {
+            padded_nodes_allowed(exact, self.n)
+        }
+    }
     fn challenge(&self, kind: u8, index: u64) -> [u8; 32] {
         let mut h = Sha3_256::new();
         h.update(DST_BINDING);
@@ -339,7 +349,7 @@ pub fn verify(claim: &LeafClaim, binding: &LeafBinding) -> Result<(), String> {
     if entries == 0 {
         if !binding.last.is_empty()
             || !binding.records.is_empty()
-            || !padded_nodes_allowed(node_count(header_count, 0, 0), claim.n)
+            || !claim.allows_nodes(node_count(header_count, 0, 0))
         {
             return fail("an empty leaf's size");
         }
@@ -349,7 +359,7 @@ pub fn verify(claim: &LeafClaim, binding: &LeafBinding) -> Result<(), String> {
         }
         let last = open_record(&binding.last, entries - 1)?;
         let exact = node_count(header_count, entries, last.offset + last.len as u64);
-        if !padded_nodes_allowed(exact, claim.n) {
+        if !claim.allows_nodes(exact) {
             return fail("the node count is not the index's");
         }
         if binding.records.len() != BINDING_SAMPLES {
@@ -471,7 +481,7 @@ pub fn prove_with_cap(
     let mut nodes = data_nodes(&data);
     // A registration may pad the data with zero nodes (decided 2026-10-26).
     let exact = (nodes.len() / NODE_BYTES) as u64;
-    if !padded_nodes_allowed(exact, claim.n) {
+    if !claim.allows_nodes(exact) {
         return fail("the registration is not this snapshot's data");
     }
     nodes.resize(claim.n as usize * NODE_BYTES, 0);

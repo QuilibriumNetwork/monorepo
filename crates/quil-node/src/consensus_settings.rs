@@ -220,6 +220,13 @@ pub(crate) fn initialize(network: u8) {
              storage proof epoch)"
         );
     }
+    let persistent_epoch = quil_types::consensus::init_persistent_storage_epoch(network);
+    if persistent_epoch != u64::MAX {
+        tracing::warn!(
+            epoch = persistent_epoch,
+            "persistent storage certificates activation configured"
+        );
+    }
     let (restoration_frame, restored_provers) =
         quil_types::consensus::init_kicked_seniority_restoration(network);
     if network != 0 && restoration_frame != u64::MAX {

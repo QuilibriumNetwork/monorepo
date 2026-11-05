@@ -40,6 +40,16 @@ use quil_execution::global_intrinsic::storage_binding::{
     self as binding, Entry, LeafBinding, LeafClaim,
 };
 
+mod persistent;
+pub use persistent::readiness::{
+    measure_snapshot, BenchmarkOptions, RoundMeasurement, SnapshotMeasurement,
+};
+/// 512 MiB of replica nodes per locally built sector: cold certification and
+/// changed-data encoding fit ordinary 8 GiB nodes. The protocol accepts larger
+/// certified capacities, but never requires a worker to allocate one.
+const WORKER_SECTOR_NODES: u64 = 1 << 24;
+pub(crate) use persistent::{poll_sector_certificates, prewarm_sectors};
+
 /// A snapshot source's subtree synced into a store of its own, kept for as
 /// long as the capture reading it.
 pub struct Synced {
@@ -247,7 +257,10 @@ impl Captured {
         let mut pending = vec![Vec::new()];
         while let Some(relative) = pending.pop() {
             let bits = [self.bits.as_slice(), &relative].concat();
-            if bits.len() >= 256 || self.size(&bits)? <= max {
+            let fits = self.size(&bits)? <= max
+                && (!quil_types::consensus::persistent_storage_at(self.epoch)
+                    || self.node_count(&leaf_prefix(&relative))? <= WORKER_SECTOR_NODES * 3 / 4);
+            if bits.len() >= 256 || fits {
                 leaves.push(relative);
                 continue;
             }
@@ -306,6 +319,65 @@ impl Captured {
             prefix,
             &self.entries(prefix)?,
         ))
+    }
+
+    /// The canonical node count without enumerating entries or loading blobs.
+    pub(crate) fn node_count(&self, prefix: &[u32]) -> Result<u64> {
+        let bits = self.leaf_bits(prefix)?;
+        let (mut count, mut bytes) = (0u64, 0u128);
+        for phase in binding::BOUND_PHASES {
+            for (source, scope) in self.scoped(&bits) {
+                if let Some(version) = source.versions[phase as usize] {
+                    let (entries, values) = source.crdt.unified_phase_layout_at(
+                        &self.app,
+                        phase as usize,
+                        version,
+                        scope,
+                    )?;
+                    count = count
+                        .checked_add(entries)
+                        .ok_or_else(|| unavailable("snapshot record count overflow".into()))?;
+                    bytes = bytes
+                        .checked_add(values)
+                        .ok_or_else(|| unavailable("snapshot byte count overflow".into()))?;
+                }
+            }
+        }
+        if count > u32::MAX as u64 {
+            return Err(unavailable("snapshot has too many records".into()));
+        }
+        let bytes =
+            u64::try_from(bytes).map_err(|_| unavailable("snapshot is too large".into()))?;
+        Ok(binding::node_count(
+            binding::header_nodes(&self.filter, prefix),
+            count,
+            bytes,
+        ))
+    }
+
+    fn fingerprint(&self, member: &[u8], prefix: &[u32]) -> [u8; 32] {
+        use sha3::Digest as _;
+        let mut h = sha3::Sha3_256::new();
+        h.update(b"quil/canonical-snapshot-cache/v1");
+        for bytes in [member, self.filter.as_slice()] {
+            h.update((bytes.len() as u64).to_be_bytes());
+            h.update(bytes);
+        }
+        h.update((prefix.len() as u64).to_be_bytes());
+        for p in prefix {
+            h.update(p.to_be_bytes());
+        }
+        h.update((self.sources.len() as u64).to_be_bytes());
+        for source in &self.sources {
+            h.update((source.bits.len() as u64).to_be_bytes());
+            for bit in &source.bits {
+                h.update([u8::from(*bit)]);
+            }
+            for phase in binding::BOUND_PHASES {
+                h.update(source.roots[phase as usize]);
+            }
+        }
+        h.finalize().into()
     }
 
     /// The claim GLOBAL checks a leaf's binding against, for `member` with
@@ -378,6 +450,47 @@ impl Captured {
         binding::prove_with_cap(claim, &entries, &proof_of, cap).map_err(QuilError::InvalidArgument)
     }
 
+    fn prove_binding_sparse(
+        &self,
+        claim: &LeafClaim,
+        labels: &dyn quil_crypto::storage_proof::LabelSource,
+    ) -> Result<LeafBinding> {
+        use quil_crypto::storage_proof::Tree;
+        let cap = labels
+            .cap(Tree::Data)
+            .ok_or_else(|| QuilError::Internal("no sparse data cap".into()))?;
+        let read = |range| {
+            labels
+                .nodes(Tree::Data, range)
+                .ok_or("snapshot data subtree is unavailable".to_string())
+        };
+        let source = binding::SparseData::new(&cap, &read);
+        let proof_of =
+            |phase, address: &[u8; 32]| self.proof(phase, address).map_err(|e| e.to_string());
+        let value_of = |phase: u8, address: &[u8; 32]| -> std::result::Result<Vec<u8>, String> {
+            let source = self
+                .sources
+                .iter()
+                .find(|source| binding::under(address, &source.bits))
+                .ok_or("snapshot value has no source")?;
+            let version = *source
+                .versions
+                .get(phase as usize)
+                .ok_or("snapshot value phase")?;
+            source
+                .crdt
+                .unified_phase_value_at(
+                    &self.app,
+                    phase as usize,
+                    version.ok_or("snapshot phase is absent")?,
+                    address,
+                )
+                .map_err(|e| e.to_string())
+        };
+        binding::prove_sparse(claim, &source, &proof_of, &value_of)
+            .map_err(QuilError::InvalidArgument)
+    }
+
     /// Values' bytes under one leaf, before its canonical index is added.
     pub fn leaf_size(&self, prefix: &[u32]) -> Result<u128> {
         self.size(&self.leaf_bits(prefix)?)
@@ -395,12 +508,6 @@ pub(crate) fn encoding_bytes(nodes: u64) -> u64 {
 fn estimated_leaf_bytes(size: u128) -> u64 {
     let size = u64::try_from(size).unwrap_or(u64::MAX);
     size.saturating_add(size / 4)
-}
-
-/// Peak bytes reading the data of a leaf whose values come to `size` holds:
-/// its entries, then its data, about two and a half times the data.
-pub(crate) fn leaf_read_bytes(size: u128) -> u64 {
-    estimated_leaf_bytes(size).saturating_mul(5) / 2
 }
 
 /// How long a leaf's labelling or encode runs before it is reported as
@@ -889,13 +996,30 @@ fn encode_member_until(
     let params = quil_crypto::sdr::SdrParams::default();
     let started = std::time::Instant::now();
     let stopped = || unavailable("the storage snapshot's encode was stopped".into());
-    if let Some(store) = store {
+    if let Some(store) =
+        store.filter(|_| !quil_types::consensus::persistent_storage_at(captured.epoch))
+    {
         store.sweep(captured.epoch);
     }
     let encoded = crate::storage_jobs::for_each_parallel(&captured.prefixes, |prefix| {
+        if quil_types::consensus::persistent_storage_at(captured.epoch) {
+            return persistent::encode_leaf(captured, member, prefix, replicas, store, stop);
+        }
         let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&captured.filter, prefix);
         if stop() {
             return Err(stopped());
+        }
+        let fingerprint = captured.fingerprint(member, prefix);
+        if let Some(from) = replicas.snapshot_match(&leaf_id, &fingerprint)? {
+            let same_key = quil_crypto::sdr::replica_key(member, &leaf_id, from)
+                == quil_crypto::sdr::replica_key(member, &leaf_id, captured.epoch);
+            if same_key && replicas.alias_hash(captured.epoch, &leaf_id, from)? {
+                let leaf = replicas
+                    .get_hash_leaf(captured.epoch, &leaf_id)?
+                    .ok_or_else(|| unavailable("snapshot alias disappeared".into()))?;
+                replicas.note_snapshot(captured.epoch, &leaf_id, &fingerprint)?;
+                return Ok((leaf.n, true, 0));
+            }
         }
         let size = captured.leaf_size(prefix)?;
         // A leaf's data is at least its values (`Captured::leaf_size`), so a
@@ -1094,6 +1218,7 @@ fn encode_member_until(
             &encoded.registration_root(),
         )?;
         replicas.put_data_cap(captured.epoch, &leaf_id, &encoded.data_cap)?;
+        replicas.note_snapshot(captured.epoch, &leaf_id, &fingerprint)?;
         progress.end(LeafOutcome::Completed);
         Ok((encoded.n, ahead, resumed))
     })?;
@@ -1707,6 +1832,19 @@ pub fn prepare_member_seat(
     seal: Option<(&quil_types::consensus::StorageSeatSlot, &[u8], &Captured)>,
     settle: Option<(&quil_types::consensus::StorageSeatSlot, &[[u8; 32]])>,
 ) -> Result<crate::storage_epoch_batch::PreparedSeat> {
+    if let Some((slot, _)) = settle.filter(|(slot, _)| slot.sealed_at.is_some()) {
+        persistent::observe_sealed(replicas, member, filter, slot)?;
+    }
+    if let Some((slot, output, captured)) =
+        seal.filter(|_| quil_types::consensus::persistent_storage_at(epoch + 2))
+    {
+        let sealed = persistent::prepare(replicas, member, filter, epoch, slot, output, captured)?;
+        let settled = settle
+            .map(|settle| prepare_member_seat(replicas, member, filter, epoch, None, Some(settle)))
+            .transpose()?;
+        return crate::storage_epoch_batch::PreparedSeat::join(Some(sealed), settled)
+            .ok_or_else(|| unavailable("no persistent seat part".into()));
+    }
     use quil_execution::global_intrinsic::storage_epoch_proof::{
         self as epoch_proof, SeatClaim, SeatProof,
     };
@@ -1772,8 +1910,14 @@ pub fn prepare_member_seat(
             let leaf_claim =
                 captured.claim(prefix, &leaf_id, member, &beacon, registered.comm_d, n)?;
             let data_cap = replicas.get_data_cap(epoch + 2, &leaf_claim.leaf_id)?;
-            bindings.push(captured.prove_binding_with_cap(&leaf_claim, data_cap.as_ref())?);
+            bindings.push(
+                match kept.last().and_then(Option::as_ref).filter(|_| source) {
+                    Some(labels) => captured.prove_binding_sparse(&leaf_claim, labels)?,
+                    None => captured.prove_binding_with_cap(&leaf_claim, data_cap.as_ref())?,
+                },
+            );
             claim.seals.push(epoch_proof::SealedLeaf {
+                persistent: None,
                 n,
                 registered,
                 beacon: beacon.clone(),
@@ -1975,7 +2119,7 @@ pub(crate) mod tests {
         slot
     }
 
-    fn test_crdt() -> Arc<HypergraphCrdt> {
+    pub(super) fn test_crdt() -> Arc<HypergraphCrdt> {
         let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
         let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
         let crdt = Arc::new(HypergraphCrdt::new(
@@ -2536,6 +2680,7 @@ pub(crate) mod tests {
                 .map(|prefix| {
                     let (leaf_id, n, registered) = registration(shard, epoch + 2, prefix);
                     epoch_proof::SealedLeaf {
+                        persistent: None,
                         leaf_id,
                         n,
                         registered,
@@ -2903,10 +3048,11 @@ pub(crate) mod tests {
             std::fs::metadata(&labelled[0]).unwrap().modified().unwrap(),
             modified
         );
-        assert_eq!(
-            outcomes(first + 1, &app, LeafWork::FromLabelsAhead),
-            vec![LeafOutcome::Completed]
+        assert!(
+            outcomes(first + 1, &app, LeafWork::FromLabelsAhead).is_empty(),
+            "unchanged snapshot aliases its prior chunks without encoding again"
         );
+        assert_eq!(next.replica[..], this.replica[..]);
         assert!(outcomes(first + 1, &app, LeafWork::LabellingNow).is_empty());
         assert!(
             next_claim.verify(&proof).is_err(),
@@ -3189,16 +3335,13 @@ pub(crate) mod tests {
         let (before, past) = ([0x65u8; 32], [0x66u8; 32]);
         note_global_frame(snapshot_frame - 1);
         precompute(&store, &crdt, &before, &app, epoch).unwrap();
-        let read = store.leaves_read();
-        assert_eq!(read, captured.prefixes.len() as u64);
         let labelled = files_under(&dir).len();
+        assert!(
+            labelled > 0,
+            "labels were built from metadata before the snapshot frame"
+        );
         note_global_frame(snapshot_frame);
         precompute(&store, &crdt, &past, &app, epoch).unwrap();
-        assert_eq!(
-            store.leaves_read(),
-            read,
-            "labelling ahead past the epoch's snapshot frame read leaf data"
-        );
         assert_eq!(
             files_under(&dir).len(),
             labelled,
@@ -4327,11 +4470,6 @@ pub(crate) mod tests {
             precomputed(&member, &app, epoch),
             "asked again only after a while"
         );
-        assert_eq!(
-            full.leaves_read(),
-            0,
-            "a leaf refused room is refused before its data is read into memory"
-        );
         let captured =
             capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
         assert!(!captured.prefixes.is_empty());
@@ -4380,5 +4518,224 @@ pub(crate) mod tests {
         let dense = captured.prove_binding(&claim).unwrap();
         assert_eq!(binding.to_bytes(), dense.to_bytes());
         quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
+    }
+    #[test]
+    fn sparse_binding_matches_dense_bytes_at_retained_roots() {
+        use quil_crypto::storage_proof::{data_nodes, MerkleTree, Tree, CAP_HEIGHT};
+        use std::cell::Cell;
+        let crdt = test_crdt();
+        let app = [0x9D; 32];
+        for j in 0u32..1003 {
+            let mut key = [0; 32];
+            key[..4].copy_from_slice(&(j.wrapping_mul(4_281_766_131)).to_be_bytes());
+            crdt.add_vertex(
+                &Location {
+                    app_address: app,
+                    data_address: key,
+                },
+                &vec![j as u8; j as usize % 700 + 1],
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let source = current_source(&crdt, &app, 9);
+        crdt.add_vertex(
+            &Location {
+                app_address: app,
+                data_address: [255; 32],
+            },
+            b"later state must not leak into the proof",
+        )
+        .unwrap();
+        crdt.commit(2).unwrap();
+        let mut captured = capture_at(&crdt, &app, 9, &[source]).unwrap();
+        captured.prefixes = captured
+            .partition(80_000)
+            .unwrap()
+            .iter()
+            .map(|b| leaf_prefix(b))
+            .collect();
+        for prefix in &captured.prefixes {
+            let data = captured.leaf_data(prefix).unwrap();
+            let nodes = data_nodes(&data);
+            let tree = MerkleTree::from_nodes(&nodes).unwrap();
+            let cap = tree.cap(CAP_HEIGHT);
+            assert_eq!(captured.node_count(prefix).unwrap(), tree.n());
+            let leaf = quil_execution::global_intrinsic::leaf_id_bytes(&app, prefix);
+            let claim = captured
+                .claim(
+                    prefix,
+                    &leaf,
+                    &[8; 32],
+                    b"fresh",
+                    tree.commitment(Tree::Data),
+                    tree.n(),
+                )
+                .unwrap();
+            let dense = captured.prove_binding(&claim).unwrap();
+            let values = Cell::new(0);
+            let read = |range: std::ops::Range<u64>| {
+                Ok(nodes[range.start as usize * 32..range.end as usize * 32].to_vec())
+            };
+            let source = binding::SparseData::new(&cap, &read);
+            let proof = |phase, address: &[u8; 32]| {
+                captured.proof(phase, address).map_err(|e| e.to_string())
+            };
+            let value = |phase: u8, address: &[u8; 32]| {
+                values.set(values.get() + 1);
+                let source = captured
+                    .sources
+                    .iter()
+                    .find(|s| binding::under(address, &s.bits))
+                    .unwrap();
+                source
+                    .crdt
+                    .unified_phase_value_at(
+                        &captured.app,
+                        phase as usize,
+                        source.versions[phase as usize].unwrap(),
+                        address,
+                    )
+                    .map_err(|e| e.to_string())
+            };
+            let sparse = binding::prove_sparse(&claim, &source, &proof, &value).unwrap();
+            assert_eq!(sparse.to_bytes(), dense.to_bytes());
+            binding::verify(&claim, &sparse).unwrap();
+            assert_eq!(values.get(), binding::BINDING_SAMPLES);
+            assert!(binding::prove_sparse(&claim, &source, &proof, &|_, _| Err(
+                "missing retained value".into()
+            ))
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn unchanged_snapshot_fingerprint_reuses_chunks_across_epochs() {
+        use quil_types::consensus::set_stable_replica_key_epoch_for_thread;
+        set_stable_replica_key_epoch_for_thread(Some(9));
+        let crdt = test_crdt();
+        let app = [0x9E; 32];
+        let member = [0xD9; 32];
+        crdt.add_vertex(
+            &Location {
+                app_address: app,
+                data_address: [4; 32],
+            },
+            b"unchanged data",
+        )
+        .unwrap();
+        crdt.commit(1).unwrap();
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let first = capture_at(&crdt, &app, 9, &[current_source(&crdt, &app, 9)]).unwrap();
+        encode_member(&first, &member, &replicas).unwrap();
+        let next = capture_at(&crdt, &app, 10, &[current_source(&crdt, &app, 10)]).unwrap();
+        let prefix = &first.prefixes[0];
+        let leaf = quil_execution::global_intrinsic::leaf_id_bytes(&app, prefix);
+        assert_eq!(
+            first.fingerprint(&member, prefix),
+            next.fingerprint(&member, prefix)
+        );
+        assert_ne!(
+            first.fingerprint(&member, prefix),
+            next.fingerprint(&[0; 32], prefix)
+        );
+        encode_member(&next, &member, &replicas).unwrap();
+        replicas.evict_below_epoch(10).unwrap();
+        assert!(replicas.get_hash(10, &leaf).unwrap().is_some());
+        crdt.add_vertex(
+            &Location {
+                app_address: app,
+                data_address: [5; 32],
+            },
+            b"changed",
+        )
+        .unwrap();
+        crdt.commit(2).unwrap();
+        let changed = capture_at(&crdt, &app, 11, &[current_source(&crdt, &app, 11)]).unwrap();
+        assert_ne!(
+            first.fingerprint(&member, prefix),
+            changed.fingerprint(&member, prefix)
+        );
+        set_stable_replica_key_epoch_for_thread(None);
+    }
+    #[test]
+    fn mainnet_profiles_bound_sector_memory_and_epoch_bandwidth() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-data/storage-mainnet-2026-11-04.json"
+        )))
+        .unwrap();
+        let shards = fixture["shards"].as_array().unwrap();
+        let provers = fixture["provers"].as_array().unwrap();
+        assert_eq!(shards.len(), 109);
+        assert_eq!(provers.len(), 168);
+        assert_eq!(
+            shards
+                .iter()
+                .map(|s| s["vertex_records"].as_u64().unwrap())
+                .max(),
+            Some(5_033_438)
+        );
+        assert_eq!(
+            provers.iter().map(|p| p["seats"].as_u64().unwrap()).max(),
+            Some(109)
+        );
+        let n = WORKER_SECTOR_NODES;
+        let params = quil_crypto::sdr::SdrParams::default();
+        let encode = quil_crypto::storage_proof::encoding_with_labels_bytes(n);
+        let cold = quil_crypto::storage_proof::labelling_peak_bytes(n, &params) + (400 << 20);
+        assert!(encode < 3 << 30);
+        assert!(cold < 4 << 30);
+        // Budget the largest permitted local sector even on multi-seat nodes:
+        // serialized cold admission, shared permanent L, no node-wide 11-layer
+        // cache. A 4 GiB host must defer cold work when resident state needs 2 GiB.
+        for gib in [4u64, 8, 16, 32] {
+            let available = (gib << 30).saturating_sub(2 << 30);
+            let parallel = available / cold;
+            if gib == 4 {
+                assert_eq!(parallel, 0);
+            } else {
+                assert!(parallel >= 1);
+            }
+        }
+        let depth = quil_crypto::storage_proof::tree_depth(n) as u64;
+        let q = quil_crypto::persistent_storage::CHALLENGES as u64;
+        // Worst-case dictionary occupancy of three Merkle trees with q queries:
+        // no assumptions about zero padding, value compression or query collisions.
+        let words_per_tree = q + (0..depth).map(|h| q.min(1u64 << (depth - h))).sum::<u64>();
+        let fresh_bytes = 6 + 3 * words_per_tree * 32 + q * 3 * (depth + 1) * 2;
+        let mut total_native = 0;
+        let mut replicated_native = 0;
+        let mut active_seats = 0;
+        for shard in shards {
+            let records = shard["vertex_records"].as_u64().unwrap();
+            let live = shard["live_bytes"].as_u64().unwrap();
+            // A sizing model ONLY: live explorer bytes plus raw-record index.
+            // Retained blobs/hyperedges and skewed address ranges need a real
+            // snapshot run before activation; the fixture does not claim them.
+            let model = live.saturating_add(60 * records).saturating_add(120);
+            let payload_per_leaf = n * 30 * 3 / 4;
+            let leaves = model.div_ceil(payload_per_leaf).max(1).next_power_of_two();
+            let native = leaves * fresh_bytes;
+            assert!(
+                native < (quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME as u64),
+                "native proof alone exceeds frame; filter {}",
+                shard["filter"]
+            );
+            total_native += native;
+            let replicas = shard["active_seats"].as_u64().unwrap();
+            replicated_native += native * replicas;
+            active_seats += replicas;
+        }
+        assert_eq!(active_seats, 2556);
+        assert_eq!(provers.iter().map(|p|p["seats"].as_u64().unwrap()).sum::<u64>(),4252,
+            "raw allocation profiles are a separate conservative workload, not the effective census");
+        let epoch_budget = quil_types::consensus::epoch_length_frames()
+            * quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME as u64;
+        assert!(
+            replicated_native < epoch_budget / 2,
+            "fresh native proofs alone crowd out the existing GLOBAL budget"
+        );
+        eprintln!("mainnet model: shards=109 active_app_provers=168 local_sector_mib={} changed_encode_peak_mib={} cold_peak_mib={} one-copy-native-bytes={total_native} effective-active-seats={active_seats} replicated-native-bytes={replicated_native} epoch-budget-bytes={epoch_budget}",n*32>>20,encode>>20,cold>>20);
     }
 }

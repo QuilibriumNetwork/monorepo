@@ -206,7 +206,22 @@ impl Jobs {
         job: impl FnOnce() -> Result<()> + Send + 'static,
     ) {
         let shown = hex::encode(lane);
+        let stable = quil_types::consensus::stable_replica_key_epoch_thread_override();
+        let persistent = quil_types::consensus::persistent_storage_epoch_thread_override();
         let job: Job = Box::new(move || {
+            struct Overrides(Option<u64>, Option<u64>);
+            impl Drop for Overrides {
+                fn drop(&mut self) {
+                    quil_types::consensus::set_stable_replica_key_epoch_for_thread(self.0);
+                    quil_types::consensus::set_persistent_storage_epoch_for_thread(self.1);
+                }
+            }
+            let _restore = Overrides(
+                quil_types::consensus::stable_replica_key_epoch_thread_override(),
+                quil_types::consensus::persistent_storage_epoch_thread_override(),
+            );
+            quil_types::consensus::set_stable_replica_key_epoch_for_thread(stable);
+            quil_types::consensus::set_persistent_storage_epoch_for_thread(persistent);
             let started = Instant::now();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
                 .unwrap_or_else(|_| Err(QuilError::Internal("the job panicked".into())));
@@ -505,10 +520,12 @@ pub fn for_each_parallel<T: Sync, R: Send>(
         Mutex::new((0..items.len()).map(|_| None).collect());
     // A test's stable replica key epoch, for the work's threads too.
     let stable_key = quil_types::consensus::stable_replica_key_epoch_thread_override();
+    let persistent = quil_types::consensus::persistent_storage_epoch_thread_override();
     std::thread::scope(|scope| {
         for _ in 0..job_slots().min(items.len()) {
             scope.spawn(|| {
                 quil_types::consensus::set_stable_replica_key_epoch_for_thread(stable_key);
+                quil_types::consensus::set_persistent_storage_epoch_for_thread(persistent);
                 on_process_cpus();
                 loop {
                     let index = next.fetch_add(1, Ordering::Relaxed);

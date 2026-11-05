@@ -238,6 +238,7 @@ impl StorageEpochProof {
 /// A registered leaf the proof seals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedLeaf {
+    pub persistent: Option<quil_crypto::persistent_storage::Registration>,
     pub leaf_id: Vec<u8>,
     pub n: u64,
     pub registered: quil_crypto::storage_proof::Registered,
@@ -328,6 +329,13 @@ impl EpochClaim {
     }
 
     pub fn verify(&self, proof: &[u8]) -> std::result::Result<(), String> {
+        if self
+            .seats
+            .iter()
+            .any(|seat| seat.seals.iter().any(|leaf| leaf.persistent.is_some()))
+        {
+            return super::persistent_storage::verify(self, proof, &|_| Ok(None)).map(|_| ());
+        }
         quil_storage_stark::seal::verify_epoch(
             &self.statement(),
             &quil_crypto::sdr::SdrParams::default(),
@@ -446,6 +454,8 @@ pub fn openings_root(
 /// seats' ([`prove`]).
 #[derive(Debug, Clone)]
 pub struct SeatWitness {
+    /// One optional initial label-certificate STARK per sealed leaf.
+    pub certificates: Vec<Vec<u8>>,
     pub seals: Vec<quil_crypto::storage_proof::SealProof>,
     pub opened: Vec<quil_storage_stark::seal::Opened>,
 }
@@ -520,7 +530,11 @@ pub fn prepare_with_labels(
         }
         opened.extend(values);
     }
-    Ok(SeatWitness { seals, opened })
+    Ok(SeatWitness {
+        certificates: Vec::new(),
+        seals,
+        opened,
+    })
 }
 
 /// Prove `claim` from its seats' witnesses ([`prepare`]), one per seat in
@@ -531,6 +545,13 @@ pub fn prove(
 ) -> std::result::Result<Vec<u8>, String> {
     if witnesses.len() != claim.seats.len() {
         return Err("a witness for every seat of the claim".into());
+    }
+    if claim
+        .seats
+        .iter()
+        .any(|seat| seat.seals.iter().any(|leaf| leaf.persistent.is_some()))
+    {
+        return super::persistent_storage::prove(claim, witnesses);
     }
     let params = quil_crypto::sdr::SdrParams::default();
     let seals: Vec<&quil_crypto::storage_proof::SealProof> =
@@ -557,6 +578,7 @@ pub struct Settlement {
     pub timely: u64,
     /// The slowest settled root's response time, in milliseconds.
     pub slowest_ms: i64,
+    pub persistent_records: Vec<super::persistent_storage::StateRecord>,
 }
 
 /// What GLOBAL reads a sealed registration's binding with besides its state:
@@ -636,16 +658,27 @@ pub fn check(
         claim.seats.push(seat_claim);
         checked.push(seat_checked);
     }
-    claim
-        .verify(&proof.proof)
-        .map_err(|error| invalid(format!("rejected: {error}")))?;
+    let persistent = claim
+        .seats
+        .iter()
+        .any(|seat| seat.seals.iter().any(|leaf| leaf.persistent.is_some()));
+    let records = if persistent {
+        super::persistent_storage::check(state, &claim, &proof.proof)
+            .map_err(|error| invalid(format!("rejected: {error}")))?
+    } else {
+        claim
+            .verify(&proof.proof)
+            .map_err(|error| invalid(format!("rejected: {error}")))?;
+        Vec::new()
+    };
     Ok(Some(
         proof
             .seats
             .iter()
             .zip(seats)
             .zip(checked)
-            .map(|((part, mut seat), checked)| {
+            .enumerate()
+            .map(|(i, ((part, mut seat), checked))| {
                 if part.seals {
                     seat.seal(part.seal_epoch(), frame_number);
                 }
@@ -660,6 +693,7 @@ pub fn check(
                     released,
                     timely: checked.timely,
                     slowest_ms: checked.slowest_ms,
+                    persistent_records: if i == 0 { records.clone() } else { Vec::new() },
                 }
             })
             .collect(),
@@ -854,7 +888,17 @@ fn check_seat(
                 materialize::leaf_root_address(member, &leaf_id)?,
                 leaf_sealed,
             ));
+            let persistent = registration
+                .leaf_root
+                .as_deref()
+                .and_then(quil_crypto::persistent_storage::Registration::parse);
+            if persistent.is_some() != quil_types::consensus::persistent_storage_at(seal_epoch) {
+                return Err(invalid(
+                    "registration proof version differs from activation epoch".into(),
+                ));
+            }
             claim.seals.push(SealedLeaf {
+                persistent,
                 n: registration.num_blocks,
                 registered: registered(&registration)?,
                 beacon: beacon.clone(),

@@ -2000,6 +2000,41 @@ fn perm_trace(inputs: &[[Val; W]], height: usize) -> RowMajorMatrix<Val> {
 
 // ── Proving and verifying ───────────────────────────────────────────────────
 
+/// Conservative allocation estimate for the current AIR dimensions. Includes
+/// retained traces, fourfold LDEs and prover scratch. This is a preflight guard,
+/// not a measured RSS figure or a consensus parameter.
+pub fn estimate_proving_memory_bytes(
+    statement: &EpochStatement,
+    params: &SdrParams,
+) -> Result<u64, String> {
+    let public = Public::new(statement, params)?;
+    let widths = [
+        PERM_WIDTH,
+        pubc::WIDTH,
+        lvs::WIDTH,
+        col::WIDTH,
+        lab::WIDTH,
+        mrk::WIDTH,
+        chk::WIDTH,
+        bnd::WIDTH,
+        opb::WIDTH,
+        frm::WIDTH,
+    ];
+    public
+        .heights()
+        .iter()
+        .zip(widths)
+        .try_fold(64u64 << 20, |bytes, (&rows, width)| {
+            let amount = (rows as u64)
+                .checked_mul(width as u64)
+                .and_then(|n| n.checked_mul(4 * 8))
+                .ok_or("prover memory estimate overflow")?;
+            bytes
+                .checked_add(amount)
+                .ok_or("prover memory estimate overflow".into())
+        })
+}
+
 /// A member's epoch proof: its seals (`seals[i]` proving
 /// `statement.seals[i]`) and the openings it committed (`openings` in the
 /// statement's order: frame, held registration, query).

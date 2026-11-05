@@ -36,7 +36,14 @@ const MAX_SHARD_FILTER_LEN: u32 = 64;
 /// A leaf prefix is a nibble path; a 1 GiB leaf at 6-bit branching is at most a
 /// few levels deep, but bound generously.
 const MAX_PREFIX_LEN: u32 = 256;
-const MAX_LEAF_ROOT_LEN: u32 = 128;
+const LEGACY_MAX_LEAF_ROOT_LEN: u32 = 128;
+fn max_leaf_root_len() -> u32 {
+    if quil_types::consensus::persistent_storage_epoch() == u64::MAX {
+        LEGACY_MAX_LEAF_ROOT_LEN
+    } else {
+        quil_crypto::persistent_storage::ROOT_BYTES as u32
+    }
+}
 /// The most leaf-root groups (shards) one confirm registers; a confirm with
 /// more does not decode, so a sender splits its seats across confirms.
 pub const MAX_CONFIRM_LEAF_ROOT_GROUPS: usize = MAX_PREFIX_LEN as usize;
@@ -131,7 +138,7 @@ impl LeafRootRegistration {
         let epoch = read_u64(data, &mut c)?;
 
         let lrl = read_u32(data, &mut c)?;
-        if lrl > MAX_LEAF_ROOT_LEN {
+        if lrl > max_leaf_root_len() {
             return Err(QuilError::InvalidArgument(format!(
                 "LeafRootRegistration: invalid leaf_root length {}",
                 lrl
@@ -251,11 +258,12 @@ pub fn check_confirm_leaf_roots(groups: &[ConfirmLeafRoots]) -> Result<()> {
         } else if let Some(entry) = group
             .entries
             .iter()
-            .find(|e| e.leaf_root.len() > MAX_LEAF_ROOT_LEN as usize)
+            .find(|e| e.leaf_root.len() > max_leaf_root_len() as usize)
         {
             format!(
-                "a leaf root of {} bytes (at most {MAX_LEAF_ROOT_LEN})",
-                entry.leaf_root.len()
+                "a leaf root of {} bytes (at most {})",
+                entry.leaf_root.len(),
+                max_leaf_root_len()
             )
         } else {
             continue;
@@ -309,7 +317,7 @@ pub fn read_confirm_leaf_roots(data: &[u8], cursor: &mut usize) -> Result<Vec<Co
                 prefix.push(read_u32(data, cursor)?);
             }
             let lrl = read_u32(data, cursor)?;
-            if lrl > MAX_LEAF_ROOT_LEN {
+            if lrl > max_leaf_root_len() {
                 return Err(QuilError::InvalidArgument(
                     "ConfirmLeafRoots: leaf_root too long".into(),
                 ));

@@ -4,6 +4,9 @@ use crate::store;
 use num_bigint::BigInt;
 use std::collections::HashMap;
 
+mod persistent_storage;
+pub use persistent_storage::*;
+
 // ---------------------------------------------------------------------------
 // Engine state
 // ---------------------------------------------------------------------------
@@ -1178,7 +1181,7 @@ pub fn sealed_storage_epoch() -> u64 {
 }
 pub fn sealed_storage_required(epoch: u64) -> bool {
     let first = sealed_storage_epoch();
-    first != u64::MAX && epoch >= first
+    persistent_storage_at(epoch) || (first != u64::MAX && epoch >= first)
 }
 pub fn sealed_storage_required_at(frame: u64) -> bool {
     sealed_storage_required(epoch_for_frame(frame))

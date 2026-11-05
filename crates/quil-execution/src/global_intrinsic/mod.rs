@@ -35,6 +35,7 @@ pub mod intrinsic;
 pub mod kick_verify;
 pub mod leaf_root_registration;
 pub mod materialize;
+pub mod persistent_storage;
 pub mod proof_types;
 pub mod prover_filter_ops;
 pub mod prover_join;

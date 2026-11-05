@@ -1216,3 +1216,47 @@ fn labelling_resumed_from_kept_layers_is_the_leaf_labelled_at_once() {
     );
     assert!(unreadable.is_none());
 }
+
+#[test]
+fn cached_subtree_paths_match_full_trees_including_short_tails() {
+    for n in [1, 2, 3, 5, 31, 32, 33, 1000, 1025] {
+        let nodes = nodes(n, 9);
+        let tree = MerkleTree::from_nodes(&nodes).unwrap();
+        for height in [0, 1, 3, 10] {
+            let cap = tree.cap(height);
+            for index in [0, n / 2, n - 1] {
+                let range = cap.subtree(index as u64).unwrap();
+                let subtree = MerkleTree::from_nodes(
+                    &nodes[range.start as usize * 32..range.end as usize * 32],
+                )
+                .unwrap();
+                assert_eq!(
+                    cap.path_from_subtree(&subtree, index as u64),
+                    Some(tree.path(index as u64)),
+                    "n={n},height={height},index={index}"
+                );
+                let mut corrupt =
+                    nodes[range.start as usize * 32..range.end as usize * 32].to_vec();
+                corrupt[0] ^= 1;
+                let corrupt = MerkleTree::from_nodes(&corrupt).unwrap();
+                assert!(cap.path_from_subtree(&corrupt, index as u64).is_none());
+            }
+            assert!(cap.path_from_subtree(&tree, n as u64).is_none());
+        }
+    }
+}
+
+#[test]
+fn logarithmic_zero_commitment_matches_dense_padding() {
+    assert!(zero_commitment(Tree::Data, 0).is_none());
+    for n in [1, 2, 3, 5, 8, 31, 33, 1025] {
+        let tree = MerkleTree::from_nodes(&vec![0; n * 32]).unwrap();
+        for kind in [Tree::Data, Tree::Replica, Tree::Column] {
+            assert_eq!(
+                zero_commitment(kind, n as u64),
+                Some(tree.commitment(kind)),
+                "n={n}"
+            );
+        }
+    }
+}
