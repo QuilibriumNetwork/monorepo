@@ -101,6 +101,15 @@ pub struct CertificateMember {
 /// covers them (a GLOBAL frame including a shard header), never for
 /// accepting one.
 pub fn unverified_member(bytes: &[u8], index: usize) -> Option<CertificateMember> {
+    unverified_member_signers(bytes, index).map(|(member, _)| member)
+}
+
+/// [`unverified_member`] with the indexes of every member that signed the
+/// certificate, ascending. UNAUTHENTICATED, as it is.
+pub fn unverified_member_signers(
+    bytes: &[u8],
+    index: usize,
+) -> Option<(CertificateMember, Vec<u32>)> {
     if bytes.len() > crate::handoff::MAX_RECORD_BYTES {
         return None;
     }
@@ -109,16 +118,21 @@ pub fn unverified_member(bytes: &[u8], index: usize) -> Option<CertificateMember
     if !cursor.is_empty() {
         return None;
     }
-    let signed = f
+    let signers: Vec<u32> = f
         .certificate
         .signers
         .iter()
-        .any(|signer| signer.get() as usize == index);
-    Some(CertificateMember {
-        generation: f.proposal.round.epoch().get(),
-        committee: f.certificate.signers.len(),
-        signed,
-    })
+        .map(|signer| signer.get())
+        .collect();
+    let signed = signers.iter().any(|&signer| signer as usize == index);
+    Some((
+        CertificateMember {
+            generation: f.proposal.round.epoch().get(),
+            committee: f.certificate.signers.len(),
+            signed,
+        },
+        signers,
+    ))
 }
 
 /// The signers a certificate of a `committee`-member committee needs, and
