@@ -608,6 +608,603 @@ fn store_global_frame_at(fixture: &Fixture, number: u64, output: &[u8], difficul
     txn.commit().unwrap();
 }
 
+// Committee-handoff seal copies. Every member of a closing committee gossips
+// the same seal, and any peer can gossip another copy of it: a seal is
+// identified by its request and session alone, both public in every copy. A
+// GLOBAL leader carries one copy per seal, the one whose drain reaches
+// furthest (`reduce_handoff_bundles`), and validates the copies it carries.
+
+/// The GLOBAL frame the crowding rigs' leader proposes, on stored frame
+/// [`CROWD_FRAME`] - 1; seal drains are active from it.
+const CROWD_FRAME: u64 = 6;
+
+/// A structure-only VDF: the rigs check which messages a proposal carries.
+struct CrowdFrameProver;
+impl quil_types::crypto::FrameProver for CrowdFrameProver {
+    fn prove_frame_header(
+        &self,
+        _: &[u8],
+        _: &[u8],
+        _: &[u8],
+        _: &[Vec<u8>],
+        _: &[u8],
+        _: i64,
+        _: u32,
+        _: u64,
+        _: u64,
+        _: &[u8],
+        _: u64,
+    ) -> Result<FrameHeader> {
+        unreachable!("the crowding rigs prove only GLOBAL frames")
+    }
+    fn prove_global_frame_header(
+        &self,
+        parent: &quil_types::proto::global::GlobalFrameHeader,
+        commitments: &[Vec<u8>],
+        root: &[u8],
+        auxiliary: &[Vec<u8>],
+        requests: &[u8],
+        size: u64,
+        _: &dyn quil_types::crypto::Signer,
+        timestamp: i64,
+        difficulty: u32,
+        _: u8,
+    ) -> Result<quil_types::proto::global::GlobalFrameHeader> {
+        Ok(quil_types::proto::global::GlobalFrameHeader {
+            frame_number: parent.frame_number + 1,
+            output: vec![0x5a; 516],
+            parent_selector: quil_crypto::poseidon::hash_bytes_to_32(&parent.output)
+                .unwrap()
+                .to_vec(),
+            timestamp,
+            difficulty,
+            prover_tree_commitment: root.to_vec(),
+            prover_tree_aux_roots: auxiliary.to_vec(),
+            global_commitments: commitments.to_vec(),
+            requests_root: requests.to_vec(),
+            world_state_size: size,
+            ..Default::default()
+        })
+    }
+    fn verify_global_frame_header(
+        &self,
+        header: &quil_types::proto::global::GlobalFrameHeader,
+    ) -> Result<Vec<u8>> {
+        Ok(header.output.clone())
+    }
+    fn calculate_multi_proof(&self, _: &[u8; 32], _: u32, _: &[&[u8]], _: u32) -> Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+    fn verify_multi_proof(&self, _: &[u8; 32], _: u32, _: &[&[u8]], _: &[&[u8]]) -> Result<bool> {
+        Ok(true)
+    }
+}
+
+/// One closing session's seal and the drain its members send with it.
+struct CrowdSeal {
+    filter: Vec<u8>,
+    submission: CertificateSubmission,
+    /// Its frames 1 to 3; GLOBAL executed frame 1 only.
+    drain: Vec<CanonicalHeader>,
+}
+
+/// A GLOBAL archive leader and `n` closing sessions. Each session's frame 1
+/// GLOBAL executed at frame 3; its frames 2 and 3 missed their window; a
+/// request at GLOBAL frame 4 closes each, and each seal at frame 3 brings
+/// frames 2 and 3 as its drain. The leader proposes GLOBAL frame
+/// [`CROWD_FRAME`] with the engine manager validating, as an archive does.
+struct CrowdRig {
+    _fixture: Fixture,
+    manager: Arc<quil_execution::ExecutionEngineManager>,
+    collector: Arc<quil_engine::message_collector::MessageCollector>,
+    leader: quil_engine::leader_provider::GlobalLeaderProvider,
+    /// Identity of stored GLOBAL frame [`CROWD_FRAME`] - 1.
+    parent: Vec<u8>,
+    seals: Vec<CrowdSeal>,
+}
+
+impl CrowdRig {
+    fn new(n: usize) -> Self {
+        let keys = keys();
+        let sources: Vec<Session> = (0..n)
+            .map(|i| session(&keys, vec![0x70 + i as u8; 32]))
+            .collect();
+        let fixture = Fixture::new(&sources[0]);
+        let intrinsic = fixture.intrinsic();
+        handoff::set_presence_report_frame_for_thread(Some(0));
+        for source in &sources {
+            handoff::initialize(&fixture.state, 2, source).unwrap();
+        }
+        commit(&fixture.state, 2);
+        let mut frames = Vec::new();
+        for source in &sources {
+            let mut chain = vec![first_frame(source, &keys)];
+            for (number, view, parent_view) in [(2u64, 7u64, 5u64), (3, 9, 7)] {
+                let previous = chain.last().unwrap().header.as_ref().unwrap();
+                let mut header = FrameHeader {
+                    address: source.filter.clone(),
+                    frame_number: number,
+                    rank: view,
+                    difficulty: 1,
+                    parent_selector: quil_crypto::poseidon::hash_bytes_to_32(&previous.output)
+                        .unwrap()
+                        .to_vec(),
+                    requests_root: vec![0; 32],
+                    state_roots: vec![vec![0; 32]; 4],
+                    ..Default::default()
+                };
+                certify(&mut header, source, &keys, parent_view);
+                chain.push(AppShardFrame {
+                    header: Some(header),
+                    ..Default::default()
+                });
+            }
+            intrinsic
+                .invoke_step(
+                    3,
+                    &canonical(&chain[0]).to_canonical_bytes().unwrap(),
+                    &fixture.state,
+                )
+                .unwrap();
+            frames.push(chain);
+        }
+        commit(&fixture.state, 3);
+        // One membership request per session: the sessions' shards belong to
+        // different applications, which one transition cannot span.
+        let next_keys = self::keys();
+        let requests: Vec<_> = sources
+            .iter()
+            .map(|source| {
+                handoff::schedule(
+                    &fixture.state,
+                    4,
+                    vec![source.filter.clone()],
+                    vec![DesiredCommittee {
+                        filter: source.filter.clone(),
+                        members: session(&next_keys, source.filter.clone()).members,
+                    }],
+                )
+                .unwrap()
+            })
+            .collect();
+        commit(&fixture.state, 4);
+        let seals = sources
+            .iter()
+            .zip(&frames)
+            .zip(&requests)
+            .map(|((source, chain), request)| {
+                let last = canonical(&chain[2]);
+                let seal = Seal {
+                    request: request.id().unwrap(),
+                    session: source.id().unwrap(),
+                    view: 11,
+                    checkpoint: Checkpoint {
+                        frame: 3,
+                        view: 9,
+                        digest: quil_crypto::poseidon::hash_bytes_to_32(&last.output).unwrap(),
+                        state_roots: [[0; 32]; 4],
+                        history_root: [0x66; 32],
+                    },
+                };
+                CrowdSeal {
+                    filter: source.filter.clone(),
+                    submission: CertificateSubmission {
+                        certificate: sign(source, &keys, 11, 9, seal.digest()),
+                        seal,
+                    },
+                    drain: vec![canonical(&chain[0]), canonical(&chain[1]), last],
+                }
+            })
+            .collect();
+        handoff::set_seal_drain_frame_for_thread(Some(CROWD_FRAME));
+
+        let crypto = quil_execution::testing::NoopExecutionCrypto::new();
+        let manager = Arc::new(quil_execution::ExecutionEngineManager::new(
+            fixture.inclusion.clone(),
+            crypto.key_manager,
+            fixture.state.crdt().clone(),
+            crypto.circuit_compiler,
+            fixture.clock.clone(),
+            Arc::new(quil_execution::testing::NoopHypergraphConfigResolver),
+            true,
+        ));
+        manager
+            .install_global_frame_header_deps(
+                fixture.registry.clone(),
+                Arc::new(ZeroRewards),
+                Arc::new(quil_crypto::FalconKeyConstructor),
+                fixture.inclusion.clone(),
+                fixture.prover.clone(),
+            )
+            .unwrap();
+        // The parent the leader builds on, as its materializer recorded it.
+        let parent_output = vec![0x55; 516];
+        store_global_frame(&fixture, CROWD_FRAME - 1, &parent_output);
+        fixture
+            .state
+            .crdt()
+            .record_prover_root(CROWD_FRAME - 1, vec![0x77; 32]);
+        let signer = Arc::new(quil_crypto::FalconSigner::generate());
+        let address = quil_crypto::poseidon::hash_bytes_to_32(signer.public_key())
+            .unwrap()
+            .to_vec();
+        let registry = Arc::new(TestProverRegistry::with_provers(vec![ProverInfo {
+            address: address.clone(),
+            public_key: signer.public_key().to_vec(),
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: Vec::new(),
+            available_storage: 0,
+            seniority: 1,
+            delegate_address: Vec::new(),
+        }]));
+        let collector = Arc::new(quil_engine::message_collector::MessageCollector::new());
+        let leader = quil_engine::leader_provider::GlobalLeaderProvider::new(
+            registry,
+            Arc::new(CrowdFrameProver),
+            Arc::new(quil_engine::difficulty::AsertDifficultyAdjuster::new(
+                0, 0, 100,
+            )),
+            fixture.clock.clone(),
+            collector.clone(),
+            address,
+            signer.public_key().to_vec(),
+            signer,
+            Arc::new(quil_tries::ShaInclusionProver),
+            Some(manager.clone()),
+            Some(fixture.state.crdt().clone()),
+        );
+        Self {
+            _fixture: fixture,
+            manager,
+            collector,
+            leader,
+            parent: quil_crypto::poseidon::hash_bytes_to_32(&parent_output)
+                .unwrap()
+                .to_vec(),
+            seals,
+        }
+    }
+
+    fn bundle(requests: Vec<Vec<u8>>, timestamp: i64) -> Vec<u8> {
+        quil_execution::message_envelope::CanonicalMessageBundle {
+            requests: requests
+                .into_iter()
+                .map(|inner_bytes| {
+                    Some(quil_execution::message_envelope::CanonicalMessageRequest {
+                        inner_type_prefix: handoff::TYPE_COMMITTEE_HANDOFF,
+                        inner_bytes,
+                    })
+                })
+                .collect(),
+            timestamp,
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    fn sealed(submission: &CertificateSubmission, drain: Vec<Vec<u8>>) -> Vec<u8> {
+        handoff::SealSubmission {
+            submission: submission.clone(),
+            drain,
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// A closing member's copy of seal `seal` whose drain starts at frame
+    /// `from` (headers GLOBAL executed are passed over).
+    fn member(&self, seal: usize, from: usize, timestamp: i64) -> Vec<u8> {
+        let sealed = &self.seals[seal];
+        let drain = sealed.drain[from - 1..]
+            .iter()
+            .map(|header| header.to_canonical_bytes().unwrap())
+            .collect();
+        Self::bundle(vec![Self::sealed(&sealed.submission, drain)], timestamp)
+    }
+
+    /// Two members' copies of seal `seal`, both valid, gossiped at `rank`:
+    /// one draining frames 2 and 3, a later one 1 to 3, which reaches as far
+    /// with one header more and so is the one that rides. (Copies differing
+    /// only by timestamp are one message to the mempool.)
+    fn gossip_members(&self, seal: usize, rank: u64) -> Vec<Vec<u8>> {
+        let copies = vec![self.member(seal, 2, 10), self.member(seal, 1, 11)];
+        for copy in &copies {
+            assert!(
+                self.collector.add_message(rank, copy.clone()),
+                "SETUP: the mempool must take a member's copy"
+            );
+        }
+        copies
+    }
+
+    /// A header of seal `seal`'s shard numbered `frame_number`, nothing else set.
+    fn junk_header(&self, seal: usize, frame_number: u64) -> Vec<u8> {
+        CanonicalHeader {
+            address: self.seals[seal].filter.clone(),
+            frame_number,
+            ..Default::default()
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// What any peer makes of a member's gossiped copy: the same submission
+    /// and drain with one more header, numbered one past the checkpoint.
+    fn extended(&self, seal: usize, timestamp: i64) -> Vec<u8> {
+        let sealed = &self.seals[seal];
+        let mut drain: Vec<_> = sealed
+            .drain
+            .iter()
+            .map(|header| header.to_canonical_bytes().unwrap())
+            .collect();
+        drain.push(self.junk_header(seal, 4));
+        Self::bundle(vec![Self::sealed(&sealed.submission, drain)], timestamp)
+    }
+
+    /// A copy of each of `seals` made from their request and session alone:
+    /// a certificate nobody signed and one header numbered `reach`, all in
+    /// one bundle.
+    fn forged(&self, seals: &[usize], reach: u64, timestamp: i64) -> Vec<u8> {
+        let requests = seals
+            .iter()
+            .map(|&seal| {
+                let submission = CertificateSubmission {
+                    seal: self.seals[seal].submission.seal.clone(),
+                    certificate: vec![0xee; 64],
+                };
+                Self::sealed(&submission, vec![self.junk_header(seal, reach)])
+            })
+            .collect();
+        Self::bundle(requests, timestamp)
+    }
+
+    /// A member's copy of seal `seal` with a certificate nobody signed in
+    /// place of the members' and one more header, numbered 0 (GLOBAL
+    /// executed frame 1, so it is passed over): it claims the members' reach
+    /// with more headers than any of theirs, every header it carries passes,
+    /// and validation refuses it on its certificate.
+    fn unsigned(&self, seal: usize, timestamp: i64) -> Vec<u8> {
+        let sealed = &self.seals[seal];
+        let submission = CertificateSubmission {
+            seal: sealed.submission.seal.clone(),
+            certificate: vec![0xee; 64],
+        };
+        let drain = std::iter::once(self.junk_header(seal, 0))
+            .chain(
+                sealed
+                    .drain
+                    .iter()
+                    .map(|header| header.to_canonical_bytes().unwrap()),
+            )
+            .collect();
+        Self::bundle(vec![Self::sealed(&submission, drain)], timestamp)
+    }
+
+    fn validate(&self, bundle: &[u8]) -> Result<()> {
+        self.manager
+            .validate_message(CROWD_FRAME, &quil_execution::domains::GLOBAL, bundle)
+    }
+
+    /// Members' copies pass the leader's validation and `forged` does not, so
+    /// a seal missing from a proposal is the choice's doing.
+    fn check_setup(&self, members: &[Vec<u8>], forged: &[&[u8]]) {
+        for copy in members {
+            if let Err(error) = self.validate(copy) {
+                panic!("SETUP: GLOBAL frame {CROWD_FRAME} must admit a member's copy: {error}");
+            }
+        }
+        for copy in forged {
+            assert!(
+                self.validate(copy).is_err(),
+                "UNEXPECTED: GLOBAL frame {CROWD_FRAME} admitted a forged copy"
+            );
+        }
+    }
+
+    /// The canonical bundles this leader's proposal of [`CROWD_FRAME`] at
+    /// `rank` carries.
+    fn propose(&self, rank: u64) -> Vec<Vec<u8>> {
+        use quil_consensus::leader_provider::LeaderProvider as _;
+        let state = self
+            .leader
+            .prove_next_state(rank, &[], CROWD_FRAME - 1, &self.parent)
+            .unwrap_or_else(|error| {
+                panic!("SETUP: the leader must propose GLOBAL frame {CROWD_FRAME}: {error}")
+            });
+        assert_eq!(state.state.frame_number, CROWD_FRAME);
+        state
+            .state
+            .messages
+            .iter()
+            .map(|bundle| {
+                quil_engine::consensus_wire::proto_message_bundle_to_canonical_bytes_at(
+                    bundle,
+                    Some(CROWD_FRAME),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+}
+
+impl Drop for CrowdRig {
+    fn drop(&mut self) {
+        handoff::set_seal_drain_frame_for_thread(None);
+        handoff::set_presence_report_frame_for_thread(None);
+    }
+}
+
+/// How many of `members` (one seal's copies) `proposal` carries.
+fn carried(proposal: &[Vec<u8>], members: &[Vec<u8>]) -> usize {
+    proposal
+        .iter()
+        .filter(|bundle| members.contains(bundle))
+        .count()
+}
+
+/// Every seal whose members' copies are in `members` rides `proposals`.
+fn assert_seals_ride(proposals: &[Vec<Vec<u8>>], members: &[Vec<Vec<u8>>], what: &str) {
+    let missing: Vec<String> = proposals
+        .iter()
+        .enumerate()
+        .flat_map(|(n, proposal)| {
+            members
+                .iter()
+                .enumerate()
+                .filter(|(_, copies)| carried(proposal, copies) == 0)
+                .map(move |(seal, _)| format!("proposal {} seal {seal}", n + 1))
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "CROWDED: GLOBAL frame {CROWD_FRAME}'s proposals carry no copy of a seal whose \
+         members' copies validate, after {what} reached the mempool: the leader chose the \
+         forged copy before validating any, validation refused it and the members' copies \
+         stayed back. {} of {} seal slots missed: {missing:?}",
+        missing.len(),
+        proposals.len() * members.len()
+    );
+}
+
+/// Members' copies of a seal alone in the mempool: exactly one rides, the
+/// one reaching furthest with the most headers.
+#[test]
+fn seal_crowding_control_one_members_copy_rides() {
+    let rig = CrowdRig::new(1);
+    let members = rig.gossip_members(0, 1);
+    rig.check_setup(&members, &[]);
+    let proposal = rig.propose(1);
+    assert_eq!(
+        carried(&proposal, &members),
+        1,
+        "SETUP: one member's copy must ride, got {} of {} bundles",
+        carried(&proposal, &members),
+        proposal.len()
+    );
+    assert!(
+        proposal.contains(&members[1]),
+        "SETUP: the member's copy with the most headers must ride"
+    );
+}
+
+/// A later copy reaching no further than the members' (its last header
+/// altered) does not change which copy rides: the choice is by reach.
+#[test]
+fn seal_crowding_control_a_copy_reaching_no_further_leaves_the_members_copy() {
+    let rig = CrowdRig::new(1);
+    let members = rig.gossip_members(0, 1);
+    let mut altered = rig.seals[0].drain.clone();
+    altered[2].spends = vec![1, 2, 3];
+    let equal = CrowdRig::bundle(
+        vec![CrowdRig::sealed(
+            &rig.seals[0].submission,
+            altered
+                .iter()
+                .map(|header| header.to_canonical_bytes().unwrap())
+                .collect(),
+        )],
+        12,
+    );
+    rig.check_setup(&members, &[&equal]);
+    assert!(rig.collector.add_message(1, equal.clone()));
+    let proposal = rig.propose(1);
+    assert!(!proposal.contains(&equal));
+    assert_eq!(
+        carried(&proposal, &members),
+        1,
+        "SETUP: a copy reaching no further must leave a member's copy riding"
+    );
+}
+
+/// A member's copy with one more header, numbered one past the checkpoint,
+/// reaches further than every member's own copy.
+#[test]
+fn seal_crowding_a_members_copy_with_one_more_header_keeps_the_seal_out() {
+    let rig = CrowdRig::new(1);
+    let members = rig.gossip_members(0, 1);
+    let extended = rig.extended(0, 12);
+    rig.check_setup(&members, &[&extended]);
+    assert!(rig.collector.add_message(1, extended.clone()));
+    let proposal = rig.propose(1);
+    assert!(
+        !proposal.contains(&extended),
+        "UNEXPECTED: the forged copy rode"
+    );
+    assert_seals_ride(
+        &[proposal],
+        &[members],
+        "a member's copy with one header numbered past the checkpoint",
+    );
+}
+
+/// No valid certificate is needed: a member's gossiped copy with its
+/// certificate replaced, refused only on that certificate.
+#[test]
+fn seal_crowding_a_copy_with_no_valid_certificate_keeps_the_seal_out() {
+    let rig = CrowdRig::new(1);
+    let members = rig.gossip_members(0, 1);
+    let forged = rig.unsigned(0, 12);
+    rig.check_setup(&members, &[&forged]);
+    let refusal = rig.validate(&forged).unwrap_err().to_string();
+    assert!(
+        refusal.contains("invalid source finalization certificate"),
+        "SETUP: the copy must be refused on its certificate: {refusal}"
+    );
+    assert!(rig.collector.add_message(1, forged.clone()));
+    let proposal = rig.propose(1);
+    assert!(
+        !proposal.contains(&forged),
+        "UNEXPECTED: the forged copy rode"
+    );
+    assert_seals_ride(
+        &[proposal],
+        &[members],
+        "a member's copy with an unsigned certificate and one more header",
+    );
+}
+
+/// Three forged copies sent once hold the seal out of three proposals; the
+/// leader drops one per proposal. Once they are spent a member's copy rides.
+#[test]
+fn seal_crowding_forged_copies_sent_once_keep_the_seal_out_of_as_many_proposals() {
+    let rig = CrowdRig::new(1);
+    let members = rig.gossip_members(0, 1);
+    let forged: Vec<_> = (0..3)
+        .map(|n| rig.forged(&[0], u64::MAX - n, 12 + n as i64))
+        .collect();
+    rig.check_setup(
+        &members,
+        &forged.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+    );
+    for copy in &forged {
+        assert!(rig.collector.add_message(1, copy.clone()));
+    }
+    let proposals: Vec<_> = (1..=4).map(|rank| rig.propose(rank)).collect();
+    assert_eq!(
+        carried(&proposals[3], &members),
+        1,
+        "SETUP: once the forged copies are spent a member's copy must ride"
+    );
+    assert_seals_ride(&proposals[..3], &[members], "three forged copies sent once");
+}
+
+/// One forged bundle naming two seals keeps both out.
+#[test]
+fn seal_crowding_one_forged_bundle_keeps_every_seal_it_names_out() {
+    let rig = CrowdRig::new(2);
+    let members: Vec<_> = (0..2).map(|seal| rig.gossip_members(seal, 1)).collect();
+    let forged = rig.forged(&[0, 1], u64::MAX, 12);
+    rig.check_setup(&members.concat(), &[&forged]);
+    assert!(rig.collector.add_message(1, forged.clone()));
+    let proposal = rig.propose(1);
+    assert!(
+        !proposal.contains(&forged),
+        "UNEXPECTED: the forged bundle rode"
+    );
+    assert_seals_ride(&[proposal], &members, "one forged bundle naming both seals");
+}
+
 /// An archive whose GLOBAL execution trails its stored head verifies a frame
 /// against executed state, which does not hold the session a later GLOBAL
 /// frame authorized. A frame anchored past executed state that names its
