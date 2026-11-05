@@ -240,6 +240,43 @@ message WorkerExecution {
   // workers, which run their own swarm. Absent for workers that share the
   // master's and on older builds.
   GossipTraffic gossip_traffic = 15;
+  // The running committee session as this worker's consensus saw it at
+  // `committee_observed_unix_ms`: its members, its quorum, and the distinct
+  // members that voted in the last views (this member included). All zero
+  // while no session host runs and on older builds.
+  uint32 committee_members = 16;
+  uint32 committee_quorum = 17;
+  uint32 committee_voters = 18;
+  uint64 committee_observed_unix_ms = 19;
+  // What restarting the node now costs this worker's seat. Set by the
+  // master for a worker holding a seat; absent on older nodes.
+  RestartReadiness restart = 20;
+}
+
+// What a restart now would cost one seat, from the node's own data.
+message RestartReadiness {
+  // "ok", "costs_share" (the seat's storage encode could not end by the
+  // renewal's grace frame, so it renews without its storage share that
+  // epoch), "stops_shard" (the committee has no spare voter: its quorum
+  // needs this member) or "unknown" (an encode runs and no GLOBAL frame
+  // gives the time left).
+  string verdict = 1;
+  // A storage snapshot encode of the seat's leaves runs now.
+  bool encoding = 2;
+  // Every running leaf keeps its labelled layers on disk, so a restart goes
+  // on from them; false means a restart redoes the leaf.
+  bool labels_kept = 3;
+  // Of the least advanced running leaf, its layers labelled and the total.
+  uint32 layers_done = 4;
+  uint32 layers = 5;
+  // Minutes a restart adds before the encode ends: the work lost (at most
+  // one layer when labels are kept) and the start-up to the seat's next
+  // encode request. 0 with no encode running.
+  uint32 restart_cost_minutes = 6;
+  // Minutes to the renewal's grace frame; 0 without a running encode.
+  uint32 minutes_to_grace = 7;
+  // Committee voters minus quorum; absent without a fresh committee reading.
+  optional sint32 committee_margin = 8;
 }
 
 // A finalized terminal seal and its submission to GLOBAL. GLOBAL accepts a

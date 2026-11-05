@@ -1702,6 +1702,7 @@ fn on_local_clock(
     execution.observed_unix_ms = rebase(execution.observed_unix_ms);
     execution.last_advance_unix_ms = rebase(execution.last_advance_unix_ms);
     execution.last_peer_vote_unix_ms = rebase(execution.last_peer_vote_unix_ms);
+    execution.committee_observed_unix_ms = rebase(execution.committee_observed_unix_ms);
     // `host_started_unix_ms` and `engine_started_unix_ms` name the host and
     // engine; moved, they would differ between reports by the request's
     // latency, so they stay on the worker's clock.
@@ -2306,9 +2307,11 @@ mod fee_relay_tests {
             host_started_unix_ms: 6_000,
             engine_started_unix_ms: 5_000,
             silent_ms: 4_000,
+            committee_observed_unix_ms: 3_000,
             ..Default::default()
         };
         let moved = on_local_clock(report, 10_000, 50_000);
+        assert_eq!(moved.committee_observed_unix_ms, 43_000);
         assert_eq!(
             (
                 moved.observed_unix_ms,

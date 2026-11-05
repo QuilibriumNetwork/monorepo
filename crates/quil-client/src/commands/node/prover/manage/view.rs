@@ -2,7 +2,7 @@
 //! and its panel/help/join-picker renderers, expressed with ratatui.
 
 use super::super::local_execution::{
-    advance_age, execution_label, recovery, recovery_summary, seal_summary, sealed,
+    advance_age, execution_label, recovery, recovery_summary, restart_summary, seal_summary, sealed,
 };
 
 use super::super::epoch::EffectiveStatus;
@@ -2133,6 +2133,12 @@ fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
         };
         text += &format!(" | {label}: {}", execution.blocker);
     }
+    let mut restart_warns = false;
+    if let Some(r) = execution.restart.as_ref() {
+        let (summary, warns) = restart_summary(r);
+        restart_warns = warns;
+        text += &format!(" | {summary}");
+    }
     if let Some(coverage) = cadence_coverage(m, &a.filter) {
         text += &format!(" | {coverage}");
     }
@@ -2161,6 +2167,8 @@ fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
     // A cached or stale observation is `cached` / `stale`, not `blocked`.
     let color = if matches!(state, "blocked" | "stopped") {
         ERROR
+    } else if restart_warns {
+        WARNING
     } else {
         HELP
     };
@@ -4687,7 +4695,8 @@ fn help_items() -> Vec<HelpItem> {
         kv("Interval [s]", "Node-observed mean seconds per committed app frame. ‹b› exposes `60m`/`24h` sub-items under Interval [s] in Columns and Global interval in Top header; these selections are independent. Sort/filter uses the first visible interval. Coverage needs 60s; gaps/downtime excluded; includes pauses/catch-up. `-` unavailable or no advances"),
         note("Thresholds read `in Nf` (frames from the received GLOBAL frame; `now` once reached) or `@f<frame>`; ‹e› switches. Expanded relative thresholds add a `~` time estimate from the measured GLOBAL interval; `~` marks estimates. Q/d is whole QUIL per day, GB is decimal gigabytes. Available Shards shows the same columns, minus the ones that only exist once a shard is allocated to you."),
         sec("Footers and notifications"),
-        kv("Details", "The cursor row's detail sits at the bottom of Allocations, Available Shards and Balances under a `├─ cursor ─┤` rule (a `cursor:` label when the panel leaves it one row), in dim italics, warning colors italic only, so it never reads as a row. It adds only what the row's cells lack, never its key or values: in Allocations the last advance as `<60s` / `>60s`, the reason or blocker, the coverage, recovery and seal; in Available Shards the frames PeerMat trails PeerHead by and the coverage. No ticking timers; a cursor move or a longer detail never resizes a panel. PeerHead is peer-reported metadata"),
+        kv("Details", "The cursor row's detail sits at the bottom of Allocations, Available Shards and Balances under a `├─ cursor ─┤` rule (a `cursor:` label when the panel leaves it one row), in dim italics, warning colors italic only, so it never reads as a row. It adds only what the row's cells lack, never its key or values: in Allocations the last advance as `<60s` / `>60s`, the reason or blocker, the restart cost, the coverage, recovery and seal; in Available Shards the frames PeerMat trails PeerHead by and the coverage. No ticking timers; a cursor move or a longer detail never resizes a panel. PeerHead is peer-reported metadata"),
+        kv("Restart cost", "What restarting the node now costs the seat, from data the node holds. `ok`; `costs this seat's storage share this epoch` when its running storage encode, delayed by the work a restart loses and the start-up (`adds N min`), would end past the renewal's grace frame (`N min to grace`); `stops this shard` when its committee has no spare voter (margin: voters in recent views minus quorum); `cost unknown; no GLOBAL frame seen yet`. Absent on older nodes"),
         kv("Recovery footer", "Compact shows phase and fixed age buckets; expand for archive, attempt, leaf and outcome details. `unobserved` means no timestamp; `<60s` / `>60s` are fixed age buckets. Detail wraps within the panel; enlarge it for omitted lines"),
         kv("Freshness", "Age of the worker state shown; poll delays do not age the received state, and startup restoration is not an advance:"),
         item("`stale`: node observation already >30s old at receipt"),
@@ -6419,6 +6428,58 @@ mod tests {
             footer.contains("Last recovery attempt failed"),
             "unknown head: {footer}"
         );
+    }
+
+    #[test]
+    fn the_cursor_detail_names_what_a_restart_costs_the_seat() {
+        use quil_types::proto::node::{RestartReadiness, WorkerExecution};
+        let mut m = Model::new();
+        m.compact_actions = false;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let mut worker = row("01", 2, 1, 7, "", "");
+        worker.execution = Some(WorkerExecution {
+            state: "running".into(),
+            observed_unix_ms: now,
+            materialized_frame: Some(124),
+            last_advance_unix_ms: now - 22_000,
+            ..Default::default()
+        });
+        let detail = |worker: &AllocationRow, m: &Model| allocation_detail(m, worker);
+        assert!(!detail(&worker, &m).to_string().contains("Restart"));
+        let restart = |verdict: &str| RestartReadiness {
+            verdict: verdict.into(),
+            encoding: verdict == "costs_share",
+            labels_kept: true,
+            layers_done: 4,
+            layers: 11,
+            restart_cost_minutes: 20,
+            minutes_to_grace: 15,
+            committee_margin: (verdict == "stops_shard").then_some(0),
+        };
+        worker.execution.as_mut().unwrap().restart = Some(restart("ok"));
+        let line = detail(&worker, &m);
+        assert!(line.to_string().ends_with("Restart: ok"), "{line}");
+        assert_eq!(line.spans[0].style.fg, Some(HELP));
+        worker.execution.as_mut().unwrap().restart = Some(restart("costs_share"));
+        let line = detail(&worker, &m);
+        let text = line.to_string();
+        assert!(
+            text.contains("costs this seat's storage share this epoch")
+                && text.contains("layer 4/11")
+                && text.contains("adds 20 min, 15 min to grace"),
+            "{text}"
+        );
+        assert_eq!(line.spans[0].style.fg, Some(WARNING));
+        worker.execution.as_mut().unwrap().restart = Some(restart("stops_shard"));
+        let line = detail(&worker, &m);
+        assert!(
+            line.to_string().contains("Restart: stops this shard"),
+            "{line}"
+        );
+        assert_eq!(line.spans[0].style.fg, Some(WARNING));
     }
 
     #[test]
@@ -8699,6 +8760,7 @@ mod tests {
         let topics = [
             "KPI separators",
             "Details",
+            "Restart cost",
             "Recovery footer",
             "Freshness",
             "Local app notice",

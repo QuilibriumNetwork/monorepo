@@ -4435,14 +4435,17 @@ fn worker_entries(wm: &dyn quil_engine::worker::WorkerManager) -> Vec<quil_rpc::
         .all
         .into_iter()
         .map(|w| quil_rpc::WorkerEntry {
-            execution: quil_engine::worker_execution::with_store_state(
-                w.core_id,
-                quil_engine::worker_execution::with_renewal_state(
-                    &w.filter,
-                    execution
-                        .iter()
-                        .find(|(id, filter, _)| *id == w.core_id && *filter == w.filter)
-                        .map(|(_, _, s)| s.clone()),
+            execution: quil_engine::worker_execution::with_restart_readiness(
+                &w.filter,
+                quil_engine::worker_execution::with_store_state(
+                    w.core_id,
+                    quil_engine::worker_execution::with_renewal_state(
+                        &w.filter,
+                        execution
+                            .iter()
+                            .find(|(id, filter, _)| *id == w.core_id && *filter == w.filter)
+                            .map(|(_, _, s)| s.clone()),
+                    ),
                 ),
             ),
             core_id: w.core_id,
@@ -4667,6 +4670,44 @@ mod health_input_tests {
     use quil_rpc::diagnostics_service::build_report;
     use quil_types::crypto::Signer as _;
     use quil_types::proto::diagnostics::Phase;
+
+    /// The worker view carries each seat's restart readiness: a seat whose
+    /// committee has no spare voter reads as stopping its shard, and a worker
+    /// without a seat has none.
+    #[test]
+    fn the_worker_view_carries_each_seats_restart_readiness() {
+        let workers = quil_engine::test_support::TestWorkerManager::new();
+        let filter = vec![7; 32];
+        workers.add_with_filter(1, filter.clone());
+        workers.add_with_filter(2, Vec::new());
+        let now = quil_engine::worker_execution::now_ms();
+        let tight = quil_types::proto::node::WorkerExecution {
+            state: "serving".into(),
+            observed_unix_ms: now,
+            own_votes: Some(2),
+            committee_members: 28,
+            committee_quorum: 19,
+            committee_voters: 19,
+            committee_observed_unix_ms: now,
+            ..Default::default()
+        };
+        workers.set_execution(1, &filter, tight.clone());
+        workers.set_execution(2, &[], tight);
+        let entries = worker_entries(&workers);
+        let restart = |core: u32| {
+            entries
+                .iter()
+                .find(|w| w.core_id == core)
+                .and_then(|w| w.execution.as_ref())
+                .and_then(|e| e.restart.clone())
+        };
+        let seat = restart(1).expect("a seat has a verdict");
+        assert_eq!(
+            (seat.verdict.as_str(), seat.committee_margin),
+            ("stops_shard", Some(0))
+        );
+        assert_eq!(restart(2), None);
+    }
 
     /// The report reads the master's worker view as the refresh loop builds
     /// it, and each allocated shard's committed session head.

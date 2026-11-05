@@ -8303,6 +8303,7 @@ impl AppConsensusEngine {
         let (Some(liveness), Some(session)) =
             (self.session_liveness.as_ref(), self.cw_session.as_ref())
         else {
+            self.execution.committee(0, 0, 0);
             return;
         };
         if self
@@ -8348,6 +8349,7 @@ impl AppConsensusEngine {
         let best_signers = liveness.view_signers(seen.best.view);
         let members = session.members.len();
         let quorum = members - members.saturating_sub(1) / 3;
+        self.execution.committee(members, quorum, seen.voters);
         let tally = |t: quil_cw_consensus::adapters::ViewTally| {
             format!(
                 "view {}: notarize {} ({} proposals), nullify {}, finalize {}",

@@ -66,6 +66,7 @@ mod relay_reoffer;
 pub mod remote_worker;
 mod replay_split;
 pub mod resolver_traffic;
+pub mod restart_readiness;
 pub mod rewards;
 mod seal_follow;
 pub mod shard_info;
