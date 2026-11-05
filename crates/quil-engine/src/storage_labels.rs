@@ -200,6 +200,14 @@ pub type SpaceSource = Box<dyn Fn(&Path) -> Option<FsUsage> + Send + Sync>;
 
 static STORE: OnceLock<LabelStore> = OnceLock::new();
 
+/// The directory of the host ledger ([`crate::storage_jobs::install_host_ledger`])
+/// of the node processes that keep labels in `labels_dir`: beside it, so a
+/// process that keeps none (a cluster's master) can join it from the same
+/// path.
+pub fn host_ledger_dir(labels_dir: &Path) -> PathBuf {
+    labels_dir.with_file_name("storage-admission")
+}
+
 /// Keep this process's labels under `dir`, checking their filesystem's free
 /// space every [`FLOOR_CHECK_EVERY`] ([`LabelStore::keep_floor`]), and admit
 /// its storage jobs with the node's other processes that label there
@@ -207,7 +215,7 @@ static STORE: OnceLock<LabelStore> = OnceLock::new();
 /// call decides; a process that never calls it labels nothing ahead and
 /// relabels for its seals.
 pub fn install(dir: PathBuf) {
-    let ledger = dir.with_file_name("storage-admission");
+    let ledger = host_ledger_dir(&dir);
     if STORE.set(LabelStore::new(dir)).is_err() {
         return;
     }

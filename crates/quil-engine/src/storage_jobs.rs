@@ -508,6 +508,15 @@ pub fn install_host_ledger(dir: &std::path::Path) {
     }
 }
 
+/// [`install_host_ledger`] for a master that runs storage jobs beside
+/// standalone workers (a cluster's master proves the node's epoch proofs
+/// from their parts), in the ledger directory of the workers' labels
+/// (`labels_dir`, [`crate::storage_labels::host_ledger_dir`]). The master
+/// keeps no labels itself.
+pub fn install_master_ledger(labels_dir: &std::path::Path) {
+    install_host_ledger(&crate::storage_labels::host_ledger_dir(labels_dir));
+}
+
 /// Whether a reservation's work is due now (a snapshot a renewal waits for,
 /// an epoch proof) or done ahead of when it is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2054,6 +2063,37 @@ mod tests {
         assert!(!again.yield_requested(), "no work due now waits any more");
         drop(due.release);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The master of a cluster proves the node's epoch proofs (400 MiB per
+    /// sealed leaf) beside its standalone workers, which share a ledger: a
+    /// master outside it ran its proof beside a worker's job, both over the
+    /// share (2026-11-05, the first #1225 devnet: no master record).
+    #[test]
+    fn a_master_beside_standalone_workers_waits_for_the_share_they_hold() {
+        set_available_for_test(Some(10 * GIB));
+        set_job_slots_for_test(4);
+        let labels = std::env::temp_dir()
+            .join(format!("quil-storage-master-{}", std::process::id()))
+            .join("storage-labels");
+        let ledger = crate::storage_labels::host_ledger_dir(&labels);
+        let _ = std::fs::remove_dir_all(&ledger);
+        let worker = admission_capped(4, 10 * GIB);
+        assert!(worker.use_ledger(HostLedger::open_as(&ledger, "worker").unwrap()));
+        let first = hold(worker, 6 * GIB);
+        assert!(granted(&first));
+        install_master_ledger(&labels);
+        let proof = hold(super::admission(), 6 * GIB);
+        assert!(
+            still_waiting(&proof),
+            "the master's proof and a worker's job together hold more than the jobs' share"
+        );
+        drop(first.release);
+        assert!(
+            granted(&proof),
+            "the master's proof starts once the worker's job ends"
+        );
+        let _ = std::fs::remove_dir_all(ledger.parent().unwrap());
     }
 
     #[test]
