@@ -285,6 +285,17 @@ impl SharedWorkerExecution {
         self.departing.clone()
     }
 
+    /// The archive recovery attempts this worker made, deferred ones apart
+    /// ([`Self::recovering`]).
+    pub(crate) fn recovery_attempts(&self) -> u32 {
+        self.record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recovery
+            .as_ref()
+            .map_or(0, |recovery| recovery.attempts)
+    }
+
     /// A replay of `filter` ended its turn behind its target: its next
     /// recovery of the shard queues again at `ticket`, its place, rather
     /// than behind every waiter.
