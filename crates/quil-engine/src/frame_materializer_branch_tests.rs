@@ -127,7 +127,7 @@ impl Fixture {
         .with_current_frame(current.clone())
         .with_shard_admission_refresh({
             let calls = notifications.clone();
-            Arc::new(move || {
+            Arc::new(move |_frame| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })

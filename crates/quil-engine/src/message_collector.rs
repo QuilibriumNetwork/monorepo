@@ -485,6 +485,8 @@ pub struct MessageCollector {
     /// "not yet loaded" → the address check is skipped (fail-open) so a fresh
     /// node doesn't drop everything before its first refresh.
     valid_shard_addresses: RwLock<HashSet<Vec<u8>>>,
+    /// The last successful refresh of that set, for the rejection summary.
+    admission_refresh: std::sync::Mutex<AdmissionRefresh>,
     /// The newest rank this collector has been collected, copied or carried
     /// at. [`Self::add_message_newest`] files arrivals here.
     newest_rank: std::sync::atomic::AtomicU64,
@@ -564,12 +566,22 @@ enum RejectKind {
     Verification,
 }
 
+/// What the last successful refresh of the valid-shard set read.
+#[derive(Clone, Copy, Default)]
+struct AdmissionRefresh {
+    /// GLOBAL frame the refresh ran at; 0 when it ran at start-up or never.
+    frame: u64,
+    /// Rows the shards store held then.
+    store_rows: usize,
+}
+
 /// One rejected shard-frame submit, for [`MessageCollector::note_reject`].
 struct Reject {
     kind: RejectKind,
     address: Vec<u8>,
     frame_number: u64,
     valid_shard_count: usize,
+    refresh: AdmissionRefresh,
     /// The verifier's reason, for [`RejectKind::Verification`].
     reason: String,
 }
@@ -654,10 +666,12 @@ impl MessageCollector {
             latest_address = %hex::encode(&latest.address),
             latest_frame = latest.frame_number,
             valid_shard_count = latest.valid_shard_count,
+            shards_store_rows = latest.refresh.store_rows,
+            last_refresh_frame = latest.refresh.frame,
             latest_reason = %latest.reason.chars().take(REJECT_REASON_CHARS).collect::<String>(),
             for_secs = now.duration_since(began).as_secs(),
             total,
-            "message collector: shard-frame submits REJECTED; the counts are since the previous line (the first line of a stretch counts one). unknown_shard: the frame names an address outside this node's committed shard set (valid_shard_count addresses). On an archive the set is stale while its GLOBAL execution trails (compare the gRPC refusal line's executed with its head); otherwise the sender's address is wrong. verification_failed: the frame failed verification. Senders are told and do not retry; ends when the frames stop or the shard set catches up"
+            "message collector: shard-frame submits REJECTED; the counts are since the previous line (the first line of a stretch counts one). unknown_shard: the frame names an address outside this node's committed shard set (valid_shard_count addresses, read from shards_store_rows store rows at GLOBAL frame last_refresh_frame; 0 is start-up). On an archive the set is stale while its GLOBAL execution trails (compare the gRPC refusal line's executed with its head); if last_refresh_frame is far behind the head, this node's refresh stopped: report it; otherwise the sender's address is wrong. verification_failed: the frame failed verification. Senders are told and do not retry; ends when the frames stop or the shard set catches up"
         );
     }
 
@@ -774,6 +788,7 @@ impl MessageCollector {
             shard_frame_dedup: RwLock::new(HashMap::new()),
             finalized: RwLock::new(FinalizedSet::new()),
             valid_shard_addresses: RwLock::new(HashSet::new()),
+            admission_refresh: std::sync::Mutex::new(AdmissionRefresh::default()),
             newest_rank: std::sync::atomic::AtomicU64::new(0),
             finalized_ranks: std::sync::Mutex::new(VecDeque::new()),
             shard_frame_verifier: RwLock::new(None),
@@ -945,28 +960,47 @@ impl MessageCollector {
         *self.valid_shard_addresses.write().unwrap() = addresses;
     }
 
-    /// Refresh admission from committed local topology. Archives call this
-    /// after materialization, before advertising the new global frame, so the
-    /// first child header does not wait for the periodic remote size refresh.
-    /// A failed read leaves the last successful set intact.
+    fn refresh_state(&self) -> AdmissionRefresh {
+        *self.admission_refresh.lock().unwrap()
+    }
+
+    /// Refresh admission from committed local topology at GLOBAL `frame`
+    /// (0 at start-up). Archives call this after materialization, before
+    /// advertising the new global frame, so the first child header does not
+    /// wait for the periodic remote size refresh. A failed read leaves the
+    /// last successful set intact. A row that cannot name a shard is skipped
+    /// with a warning, so one bad row cannot freeze the set for good.
     pub fn refresh_valid_shard_addresses(
         &self,
         store: &dyn quil_types::store::ShardsStore,
+        frame: u64,
     ) -> quil_types::error::Result<()> {
         let rows = store.range_app_shards()?;
-        let mut valid = HashSet::with_capacity(rows.len());
+        let store_rows = rows.len();
+        let mut valid = HashSet::with_capacity(store_rows);
+        let mut skipped = 0usize;
         for row in rows {
             if row.shard_key.len() != 35 {
-                return Err(quil_types::error::QuilError::InvalidArgument(
-                    "invalid shard key in committed topology".into(),
-                ));
+                skipped += 1;
+                continue;
             }
             valid.insert(quil_forest::shard_prefix_to_filter(
                 &row.shard_key[3..35],
                 &row.prefix,
             ));
         }
+        if skipped > 0 {
+            tracing::warn!(
+                scope = "local",
+                action = "report",
+                frame,
+                skipped,
+                store_rows,
+                "message collector: shards store rows with an invalid shard key were left out of the valid-shard set; this node's store is damaged or a defect wrote them: report it"
+            );
+        }
         self.set_valid_shard_addresses(valid);
+        *self.admission_refresh.lock().unwrap() = AdmissionRefresh { frame, store_rows };
         Ok(())
     }
 
@@ -1145,6 +1179,7 @@ impl MessageCollector {
                             address: c.address.clone(),
                             frame_number: c.frame_number,
                             valid_shard_count: valid.len(),
+                            refresh: self.refresh_state(),
                             reason: String::new(),
                         },
                     );
@@ -1240,6 +1275,7 @@ impl MessageCollector {
                                             .read()
                                             .unwrap()
                                             .len(),
+                                        refresh: self.refresh_state(),
                                         reason: reason.to_string(),
                                     },
                                 );
@@ -2968,7 +3004,7 @@ mod tests {
         let txn = clock.new_transaction(false).unwrap();
         shards.put_app_shard(txn.as_ref(), &parent).unwrap();
         txn.commit().unwrap();
-        collector.refresh_valid_shard_addresses(&shards).unwrap();
+        collector.refresh_valid_shard_addresses(&shards, 0).unwrap();
         assert_eq!(
             collector.add_message_outcome(1, bundle(&parent.prefix, 1)),
             SubmitOutcome::Accepted
@@ -2982,13 +3018,13 @@ mod tests {
             shards.put_app_shard(txn.as_ref(), child).unwrap();
         }
         // A staged topology must not leak through a committed-store refresh.
-        collector.refresh_valid_shard_addresses(&shards).unwrap();
+        collector.refresh_valid_shard_addresses(&shards, 0).unwrap();
         assert_eq!(
             collector.add_message_outcome(1, bundle(&children[0].prefix, 1)),
             SubmitOutcome::Filtered(Refusal::UnknownShard)
         );
         txn.commit().unwrap();
-        collector.refresh_valid_shard_addresses(&shards).unwrap();
+        collector.refresh_valid_shard_addresses(&shards, 0).unwrap();
         for child in &children {
             assert_eq!(
                 collector.add_message_outcome(1, bundle(&child.prefix, 1)),
@@ -3008,7 +3044,7 @@ mod tests {
         }
         shards.put_app_shard(txn.as_ref(), &parent).unwrap();
         txn.commit().unwrap();
-        collector.refresh_valid_shard_addresses(&shards).unwrap();
+        collector.refresh_valid_shard_addresses(&shards, 0).unwrap();
         assert_eq!(
             collector.add_message_outcome(1, bundle(&parent.prefix, 2)),
             SubmitOutcome::Accepted
@@ -3514,6 +3550,7 @@ mod tests {
             address: vec![0x33; 32],
             frame_number: frame,
             valid_shard_count: 1,
+            refresh: AdmissionRefresh::default(),
             reason: String::new(),
         };
         let now = Instant::now();
@@ -3536,5 +3573,179 @@ mod tests {
         for field in ["INFO", "rejected_total=1002", "rejected_since_last_line=0"] {
             assert!(ended[0].contains(field), "{field}: {}", ended[0]);
         }
+    }
+
+    /// A shards store whose `range_app_shards` can be made to fail.
+    struct FlakyShards {
+        inner: quil_store::RocksShardsStore,
+        fail: std::sync::atomic::AtomicBool,
+        /// Rows returned beside the stored ones, as a damaged store would.
+        extra: std::sync::Mutex<Vec<quil_types::store::ShardInfo>>,
+    }
+
+    impl quil_types::store::ShardsStore for FlakyShards {
+        fn range_app_shards(&self) -> quil_types::error::Result<Vec<quil_types::store::ShardInfo>> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(quil_types::error::QuilError::InvalidArgument(
+                    "injected read failure".into(),
+                ));
+            }
+            let mut rows = self.inner.range_app_shards()?;
+            rows.extend(self.extra.lock().unwrap().iter().cloned());
+            Ok(rows)
+        }
+        fn get_app_shards(
+            &self,
+            shard_key: &[u8],
+            prefix: &[u32],
+        ) -> quil_types::error::Result<Vec<quil_types::store::ShardInfo>> {
+            self.inner.get_app_shards(shard_key, prefix)
+        }
+        fn put_app_shard(
+            &self,
+            txn: &dyn quil_types::store::Transaction,
+            shard: &quil_types::store::ShardInfo,
+        ) -> quil_types::error::Result<()> {
+            self.inner.put_app_shard(txn, shard)
+        }
+        fn delete_app_shard(
+            &self,
+            txn: &dyn quil_types::store::Transaction,
+            shard_key: &[u8],
+            prefix: &[u32],
+        ) -> quil_types::error::Result<()> {
+            self.inner.delete_app_shard(txn, shard_key, prefix)
+        }
+    }
+
+    fn shard_row(app: u8, prefix: Vec<u32>) -> quil_types::store::ShardInfo {
+        let mut key = vec![1, 2, 3];
+        key.extend_from_slice(&[app; 32]);
+        quil_types::store::ShardInfo {
+            shard_key: key,
+            prefix,
+            size: vec![],
+            data_shards: 0,
+            commitment: vec![],
+        }
+    }
+
+    fn header_bundle_for(app: u8, prefix: &[u32]) -> Vec<u8> {
+        use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let header = FrameHeader {
+            address: quil_forest::shard_prefix_to_filter(&[app; 32], prefix),
+            frame_number: 1,
+            global_frame_number: 10,
+            ..Default::default()
+        };
+        CanonicalMessageBundle {
+            timestamp: 0,
+            requests: vec![Some(CanonicalMessageRequest {
+                inner_type_prefix: TYPE_FRAME_HEADER,
+                inner_bytes: header.to_canonical_bytes().unwrap(),
+            })],
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    #[test]
+    fn a_bad_store_row_does_not_freeze_the_valid_shard_set() {
+        use quil_types::store::{ClockStore, ShardsStore};
+        let rocks = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = quil_store::RocksClockStore::new(rocks.inner());
+        let shards = FlakyShards {
+            inner: quil_store::RocksShardsStore::new(rocks.inner()),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            extra: Default::default(),
+        };
+        let collector = MessageCollector::new();
+        let txn = clock.new_transaction(false).unwrap();
+        shards
+            .put_app_shard(txn.as_ref(), &shard_row(0x61, vec![]))
+            .unwrap();
+        txn.commit().unwrap();
+        collector.refresh_valid_shard_addresses(&shards, 5).unwrap();
+        assert_eq!(
+            collector.add_message_outcome(1, header_bundle_for(0x61, &[])),
+            SubmitOutcome::Accepted
+        );
+
+        // A split lands, beside a row whose key cannot name a shard.
+        // The store's own scan drops short keys, so the row is injected.
+        let mut bad = shard_row(0x62, vec![]);
+        bad.shard_key.truncate(10);
+        shards.extra.lock().unwrap().push(bad);
+        let child = shard_row(0x63, vec![]);
+        let txn = clock.new_transaction(false).unwrap();
+        shards.put_app_shard(txn.as_ref(), &child).unwrap();
+        txn.commit().unwrap();
+        // The refresh must not fail for good on the bad row.
+        collector.refresh_valid_shard_addresses(&shards, 9).unwrap();
+        assert_eq!(
+            collector.add_message_outcome(1, header_bundle_for(0x63, &[])),
+            SubmitOutcome::Accepted,
+            "a shard added after start-up is refused because one bad row froze the set"
+        );
+    }
+
+    #[test]
+    fn the_set_recovers_after_a_failed_refresh_and_the_summary_names_the_last_one() {
+        use crate::outage::test_logs::CapturedLogs;
+        use quil_types::store::{ClockStore, ShardsStore};
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        let rocks = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = quil_store::RocksClockStore::new(rocks.inner());
+        let shards = FlakyShards {
+            inner: quil_store::RocksShardsStore::new(rocks.inner()),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            extra: Default::default(),
+        };
+        let collector = MessageCollector::new();
+        let txn = clock.new_transaction(false).unwrap();
+        shards
+            .put_app_shard(txn.as_ref(), &shard_row(0x71, vec![]))
+            .unwrap();
+        txn.commit().unwrap();
+        collector
+            .refresh_valid_shard_addresses(&shards, 100)
+            .unwrap();
+
+        let txn = clock.new_transaction(false).unwrap();
+        shards
+            .put_app_shard(txn.as_ref(), &shard_row(0x72, vec![]))
+            .unwrap();
+        txn.commit().unwrap();
+        shards.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(collector
+            .refresh_valid_shard_addresses(&shards, 101)
+            .is_err());
+        assert_eq!(
+            collector.add_message_outcome(1, header_bundle_for(0x72, &[])),
+            SubmitOutcome::Filtered(Refusal::UnknownShard)
+        );
+        // The line says which refresh the set comes from.
+        let lines = logs.lines_with("shard-frame submits REJECTED");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        for field in [
+            "last_refresh_frame=100",
+            "shards_store_rows=1",
+            "valid_shard_count=1",
+        ] {
+            assert!(lines[0].contains(field), "{field}: {}", lines[0]);
+        }
+
+        shards
+            .fail
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        collector
+            .refresh_valid_shard_addresses(&shards, 102)
+            .unwrap();
+        assert_eq!(
+            collector.add_message_outcome(1, header_bundle_for(0x72, &[])),
+            SubmitOutcome::Accepted
+        );
     }
 }

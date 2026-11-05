@@ -2153,6 +2153,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         };
 
         let exec_mgr_for_poller = exec_manager.clone();
+        let mc_for_poller = message_collector.clone();
         let wa_for_poller = worker_allocator.clone();
         let pl_for_poller = prover_lifecycle.clone();
         let pr_for_poller = prover_registry.clone();
@@ -2386,6 +2387,15 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     {
                                         warn!(error = %e, frame = frame_num,
                                     "apply_due_shard_changes (inline) failed");
+                                    }
+                                    // This node executes GLOBAL itself, so its shards
+                                    // store is the topology: admit the new shards now,
+                                    // not at a remote refresh that may never succeed.
+                                    if let Err(error) = mc_for_poller.refresh_valid_shard_addresses(
+                                        shards_store_for_poller.as_ref(),
+                                        frame_num,
+                                    ) {
+                                        warn!(frame = frame_num, %error, "shard admission refresh failed; will retry next frame");
                                     }
                                     if let Err(e) = exec_mgr_for_poller.commit_frame(frame_num) {
                                         warn!(error = %e, frame = frame_num, "hypergraph commit failed");
@@ -4900,6 +4910,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                             if !archive_mode {
                                 if let Err(error) = mc_for_refresh.refresh_valid_shard_addresses(
                                     shards_store_for_refresh.as_ref(),
+                                    now_frame,
                                 ) {
                                     warn!(%error, "shard admission refresh failed");
                                 }
