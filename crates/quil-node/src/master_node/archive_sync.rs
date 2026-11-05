@@ -4985,6 +4985,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 new_balance = %post_balance,
                                                 "local prover reward balance updated by sync"
                                             );
+                                            super::seat_certificates::credited(&delta);
                                         }
                                         // Recovery path: if the initial sync at
                                         // startup failed, the lifecycle gate stayed
