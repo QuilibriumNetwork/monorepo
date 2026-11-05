@@ -28,11 +28,14 @@ use quil_cw_consensus::{
     falcon_simplex::SimplexFalconScheme,
     handoff::Session,
 };
+use quil_engine::execution_deferral::held_unverified;
 use quil_engine::message_collector::{anchor_in_lockstep, bundle_shard_frames_in_lockstep};
 use quil_engine::test_support::TestProverRegistry;
 use quil_execution::{
     global_intrinsic::{
-        frame_header::{FrameHeader as CanonicalHeader, TYPE_FRAME_HEADER},
+        frame_header::{
+            anchor_outside_window, anchor_window, FrameHeader as CanonicalHeader, TYPE_FRAME_HEADER,
+        },
         handoff,
         intrinsic::GlobalIntrinsic,
     },
@@ -503,4 +506,121 @@ fn fh_fact_honest_leader_drops_unheld_anchors() {
         );
     }
     eprintln!("FH FACT: honest leaders drop every unheld anchor");
+}
+
+/// Execution refuses a header by its window before reading anything at its
+/// anchor, as validation does: a frame replayed without validation cannot
+/// fail on an anchor no store holds either.
+#[test]
+fn fh_fix_execution_refuses_by_the_window_before_reading_the_anchor() {
+    let rig = Rig::new(2..HALT_FRAME);
+    for anchor in UNHELD_ANCHORS {
+        let wire = junk_header(anchor);
+        for (step, outcome) in [
+            (
+                "validation",
+                rig.intrinsic
+                    .validate(HALT_FRAME, &wire, None, None)
+                    .map(|_| ()),
+            ),
+            (
+                "execution",
+                rig.intrinsic.invoke_step(HALT_FRAME, &wire, &rig.state),
+            ),
+        ] {
+            match outcome {
+                Err(error) if anchor_outside_window(&error) => {}
+                other => panic!(
+                    "FH FIX: GLOBAL frame {HALT_FRAME} {step} must refuse anchor {anchor} by \
+                     the lockstep window first, got {other:?}"
+                ),
+            }
+        }
+    }
+    eprintln!("FH FIX: validation and execution refuse unheld anchors by the window");
+}
+
+/// An honest leader packs exactly the anchors validation does not refuse by
+/// the window: a header it packs is never refused for its anchor, and none
+/// validation refuses that way is ever packed.
+#[test]
+fn fh_fix_validation_refuses_exactly_the_anchors_an_honest_leader_drops() {
+    let rig = Rig::new(2..HALT_FRAME);
+    let (oldest, newest) = anchor_window(HALT_FRAME);
+    assert_eq!((oldest, newest), (HALT_FRAME - 13, HALT_FRAME - 1));
+    for anchor in (1..=HALT_FRAME + 1).chain([1_000_000, u64::MAX]) {
+        let refused = match rig
+            .intrinsic
+            .validate(HALT_FRAME, &junk_header(anchor), None, None)
+        {
+            Err(error) => anchor_outside_window(&error),
+            Ok(_) => false,
+        };
+        assert_eq!(
+            refused,
+            !anchor_in_lockstep(anchor, HALT_FRAME),
+            "FH FIX: GLOBAL frame {HALT_FRAME}, anchor {anchor}: validation refused by the \
+             window: {refused}, honest leader packs it: {}",
+            anchor_in_lockstep(anchor, HALT_FRAME)
+        );
+    }
+    eprintln!("FH FIX: validation and the honest leader share one window");
+}
+
+/// The window's bound, hit and recovered: a certified header anchored ahead
+/// of a GLOBAL frame's window is refused there, never as unavailable, and a
+/// collector holds it (`held_unverified`); the next GLOBAL frame admits and
+/// executes it, and so does each through the window's last; past that it is
+/// refused as stale. An anchor this node lacks inside the window stays
+/// unavailable (control C4).
+#[test]
+fn fh_liveness_a_header_ahead_of_its_window_rides_the_next_frame() {
+    let anchor = 2;
+    let rig = Rig::new([anchor]);
+    match rig
+        .intrinsic
+        .validate(anchor, &rig.certified(anchor), None, None)
+    {
+        Err(error) if anchor_outside_window(&error) && !error.is_execution_unavailable() => {
+            assert!(
+                held_unverified(&error),
+                "FH LIVENESS: a collector must hold a header anchored ahead of the window, \
+                 not drop it: {error}"
+            )
+        }
+        other => panic!(
+            "FH LIVENESS: GLOBAL frame {anchor} must refuse a header anchored to itself by \
+             the window, got {other:?}"
+        ),
+    }
+    let last = anchor + 1 + 12;
+    for frame in [anchor + 1, last] {
+        let rig = Rig::new([anchor]);
+        let wire = rig.certified(anchor);
+        let admitted = rig.intrinsic.validate(frame, &wire, None, None);
+        assert!(
+            matches!(admitted, Ok(true)),
+            "FH LIVENESS: GLOBAL frame {frame} must admit the header anchored to {anchor}: \
+             {admitted:?}"
+        );
+        let executed = rig.intrinsic.invoke_step(frame, &wire, &rig.state);
+        assert!(
+            executed.is_ok(),
+            "FH LIVENESS: GLOBAL frame {frame} must execute the header anchored to {anchor}: \
+             {executed:?}"
+        );
+    }
+    let rig = Rig::new([anchor]);
+    match rig
+        .intrinsic
+        .validate(last + 1, &rig.certified(anchor), None, None)
+    {
+        Err(error) if anchor_outside_window(&error) && !error.is_execution_unavailable() => {}
+        other => panic!(
+            "FH LIVENESS: GLOBAL frame {} must refuse the header as stale by the window, got \
+             {other:?}",
+            last + 1
+        ),
+    }
+    eprintln!("FH LIVENESS: a header ahead of its window is held and rides the next frame");
 }

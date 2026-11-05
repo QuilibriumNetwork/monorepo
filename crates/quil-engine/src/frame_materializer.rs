@@ -88,6 +88,60 @@ fn finish_frame_header_validation(
     Ok(validated)
 }
 
+/// When the last warning of a header anchored outside its window was logged,
+/// and the refusals quieted since.
+static ANCHOR_REFUSAL_WARNED: std::sync::Mutex<Option<(std::time::Instant, u64)>> =
+    std::sync::Mutex::new(None);
+
+/// At most one such warning per interval; the next one counts the quieted.
+const ANCHOR_REFUSAL_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Whether a refusal at `now` is due a warning, with the refusals quieted
+/// since the last one; otherwise this refusal is counted as quieted.
+fn anchor_refusal_warning_due(
+    last: &mut Option<(std::time::Instant, u64)>,
+    now: std::time::Instant,
+) -> Option<u64> {
+    match *last {
+        Some((at, quieted)) if now.duration_since(at) < ANCHOR_REFUSAL_WARN_INTERVAL => {
+            *last = Some((at, quieted + 1));
+            None
+        }
+        previous => {
+            *last = Some((now, 0));
+            Some(previous.map_or(0, |(_, quieted)| quieted))
+        }
+    }
+}
+
+/// Warn, at most once per interval, when executing GLOBAL frame
+/// `frame_number`, proposed by `prover`, refused a shard frame header for an
+/// anchor outside the frame's lockstep window. The frame skips the header
+/// and goes on; no leader running this code packs one (`anchor_in_lockstep`),
+/// so the frame's prover runs other code.
+fn note_anchor_refusal(frame_number: u64, prover: &[u8], error: &QuilError) {
+    if !quil_execution::global_intrinsic::frame_header::anchor_outside_window(error) {
+        return;
+    }
+    let due = anchor_refusal_warning_due(
+        &mut ANCHOR_REFUSAL_WARNED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        std::time::Instant::now(),
+    );
+    if let Some(quieted) = due {
+        warn!(
+            frame = frame_number,
+            prover = %hex::encode(&prover[..prover.len().min(8)]),
+            quieted,
+            error = %error,
+            "GLOBAL frame carries a shard frame header anchored outside its lockstep window; \
+             skipped it, the frame goes on. No leader running this build packs one: report \
+             this line with the frame's prover"
+        );
+    }
+}
+
 /// Frame materializer state. Tracks which frames have been materialized
 /// to ensure idempotency, and manages prover root synchronization.
 pub struct FrameMaterializer {
@@ -876,7 +930,13 @@ impl FrameMaterializer {
                             .expect("spawn a frame header validation thread");
                     }
                 });
-                finish_frame_header_validation(out.into_inner().unwrap())?
+                let results = out.into_inner().unwrap();
+                for (_, result) in &results {
+                    if let Err(error) = result {
+                        note_anchor_refusal(frame_number, &header.prover, error);
+                    }
+                }
+                finish_frame_header_validation(results)?
             } else {
                 std::collections::HashMap::new()
             }
@@ -1048,6 +1108,7 @@ impl FrameMaterializer {
                         if e.is_execution_unavailable() {
                             return Err(e);
                         }
+                        note_anchor_refusal(frame_number, &header.prover, &e);
                         info!(
                             frame = frame_number,
                             request_type = format!("0x{:08x}", request_type),

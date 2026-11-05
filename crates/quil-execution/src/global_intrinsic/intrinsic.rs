@@ -1022,6 +1022,7 @@ impl GlobalIntrinsic {
                     )
                 })?;
                 Self::require_global_anchor(frame_number, &op)?;
+                Self::refuse_anchor_outside_window(frame_number, &op)?;
                 // Header fields a certificate does not sign directly (fee
                 // total, settlement relay, ...) must reproduce the certified
                 // output, and a relay must be canonical for its window.
@@ -2787,6 +2788,35 @@ impl GlobalIntrinsic {
         Ok(())
     }
 
+    /// GLOBAL frame `frame_number` refuses a shard frame header anchored
+    /// outside its lockstep window ([`super::frame_header::anchor_in_window`])
+    /// before anything reads the anchor. No node may hold such an anchor (a
+    /// future frame, a frame below its history, any number a leader writes),
+    /// and a read that failed would fail the frame on every node, for ever;
+    /// one held is refused by the storage audit anyway. Every node so refuses
+    /// it the same way, and the frame carrying it finishes. An anchor inside
+    /// the window that this node lacks stays unavailable: a local gap.
+    fn refuse_anchor_outside_window(
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+    ) -> Result<()> {
+        use super::frame_header::{anchor_in_window, anchor_window, ANCHOR_OUTSIDE_WINDOW};
+        if op.global_frame_number == 0 || anchor_in_window(op.global_frame_number, frame_number) {
+            return Ok(());
+        }
+        let (oldest, newest) = anchor_window(frame_number);
+        Err(QuilError::InvalidArgument(format!(
+            "{ANCHOR_OUTSIDE_WINDOW}shard {} frame {} anchors to GLOBAL frame {}, but GLOBAL \
+             frame {} requires an anchor in [{}, {}]",
+            hex::encode(&op.address),
+            op.frame_number,
+            op.global_frame_number,
+            frame_number,
+            oldest,
+            newest
+        )))
+    }
+
     /// The difficulty of the GLOBAL frame a shard frame header anchors to,
     /// from this node's clock store; `None` for a header without an anchor.
     /// [`Self::verify_shard_frame_output`] already required that frame.
@@ -2847,14 +2877,18 @@ impl GlobalIntrinsic {
         // to `latest − K` (a frame every committee member already holds), which
         // then lags the packing frame by K + transit. The window absorbs that.
         // Still rejects FUTURE anchors (> frame-1) and STALE ones (older than the
-        // window). Hard-reject: an out-of-window op invalidates the whole global
-        // frame (Err → invoke_frame_header → materialize), so a correct leader
-        // includes ONLY shard proofs whose beacon anchors within the window.
+        // window). An out-of-window header is refused (its step rolls back and
+        // the frame skips it); validation and `invoke_frame_header` refuse it
+        // first, by the same predicate, before reading the anchor. A correct
+        // leader includes ONLY shard proofs whose beacon anchors within the
+        // window.
         // `W = STORAGE_ANCHOR_LOCKSTEP_WINDOW` bounds ρ_N staleness (freshness).
-        let expected_anchor = frame_number.saturating_sub(1);
-        let oldest_anchor = expected_anchor
-            .saturating_sub(crate::global_intrinsic::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW);
-        if op.global_frame_number > expected_anchor || op.global_frame_number < oldest_anchor {
+        let (oldest_anchor, expected_anchor) =
+            crate::global_intrinsic::frame_header::anchor_window(frame_number);
+        if !crate::global_intrinsic::frame_header::anchor_in_window(
+            op.global_frame_number,
+            frame_number,
+        ) {
             return Err(QuilError::InvalidArgument(format!(
                 "storage attestation out of lockstep: anchor global_frame_number={} \
                  but global frame {} requires anchor in [{}, {}]",
@@ -3506,6 +3540,7 @@ impl GlobalIntrinsic {
         // mutations but only AFTER the attestation has verified.
         let mut timing = HeaderTiming::start();
         Self::require_global_anchor(frame_number, op)?;
+        Self::refuse_anchor_outside_window(frame_number, op)?;
         let fp = self.frame_prover.as_ref().ok_or_else(|| {
             QuilError::Internal(
                 "invoke_frame_header: frame_prover not installed — cannot verify attestation"

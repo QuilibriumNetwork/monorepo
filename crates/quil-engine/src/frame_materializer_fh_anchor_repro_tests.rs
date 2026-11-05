@@ -197,3 +197,21 @@ fn fh_halt_voters_certify_a_frame_carrying_the_header_and_it_never_executes() {
          store holds",
     );
 }
+
+/// The warning of a header anchored outside its window is due once per
+/// interval and counts the refusals it quieted meanwhile.
+#[test]
+fn fh_fix_anchor_refusal_warning_is_bounded_and_counts_the_quieted() {
+    use crate::frame_materializer::{anchor_refusal_warning_due, ANCHOR_REFUSAL_WARN_INTERVAL};
+    let start = std::time::Instant::now();
+    let mut last = None;
+    assert_eq!(anchor_refusal_warning_due(&mut last, start), Some(0));
+    for _ in 0..3 {
+        assert_eq!(anchor_refusal_warning_due(&mut last, start), None);
+    }
+    assert_eq!(
+        anchor_refusal_warning_due(&mut last, start + ANCHOR_REFUSAL_WARN_INTERVAL),
+        Some(3),
+        "FH FIX: the next warning counts the three quieted refusals"
+    );
+}

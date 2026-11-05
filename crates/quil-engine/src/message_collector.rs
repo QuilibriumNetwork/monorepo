@@ -2006,10 +2006,10 @@ pub fn bundle_shard_frames_in_lockstep(data: &[u8], frame_number: u64) -> bool {
 }
 
 /// A shard frame anchored to GLOBAL frame `anchor` may ride GLOBAL frame
-/// `frame_number`. WINDOWED LOCKSTEP (must mirror the materializer's
-/// `audit_storage_attestation` exactly, or a packed frame would be rejected by
-/// followers → halt): a storage shard proof is includable iff its anchor is 0
-/// (genesis/legacy) OR within `[expected - W, expected]`. Multi-member shards
+/// `frame_number`. WINDOWED LOCKSTEP (the predicate GLOBAL validation and
+/// execution use, `anchor_in_window`, so a packed header is never refused): a
+/// storage shard proof is includable iff its anchor is 0 (genesis/legacy) OR
+/// within `[expected - W, expected]`. Multi-member shards
 /// anchor to `latest − K`, so a strict `== expected` is unsatisfiable; the
 /// window absorbs K + transit.
 ///
@@ -2017,13 +2017,10 @@ pub fn bundle_shard_frames_in_lockstep(data: &[u8], frame_number: u64) -> bool {
 /// ([`quil_types::consensus::MAINNET_REQUIRED_ANCHOR_EPOCH`]) GLOBAL refuses
 /// a shard frame without an anchor, so none rides a frame from then on.
 pub fn anchor_in_lockstep(anchor: u64, frame_number: u64) -> bool {
-    use quil_execution::global_intrinsic::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW;
-    let expected = frame_number.saturating_sub(1);
-    let oldest = expected.saturating_sub(STORAGE_ANCHOR_LOCKSTEP_WINDOW);
     if anchor == 0 {
         return !quil_types::consensus::required_anchor_active(frame_number);
     }
-    (oldest..=expected).contains(&anchor)
+    quil_execution::global_intrinsic::frame_header::anchor_in_window(anchor, frame_number)
 }
 
 /// Shard `address`'s `frame` is one a finalized frame carried.

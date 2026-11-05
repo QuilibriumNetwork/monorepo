@@ -39,6 +39,21 @@ pub fn awaits_execution(error: &QuilError, anchor: u64, executed: u64) -> bool {
         && quil_execution::global_intrinsic::handoff::frames::unauthorized_generation(error)
 }
 
+/// Whether a shard frame that verification for the GLOBAL frame after the
+/// head refused with `error` is held unverified, for the leader to verify
+/// when it packs one: the state verification needs is unavailable now, or the
+/// frame's anchor lies outside that GLOBAL frame's lockstep window
+/// ([`anchor_outside_window`]). One anchored ahead of the window rides a
+/// later GLOBAL frame once the head reaches its anchor, so it is held as it
+/// was while GLOBAL read the anchor first and found no such frame; one behind
+/// the window rides none, and the leader's lockstep filter leaves it.
+///
+/// [`anchor_outside_window`]: quil_execution::global_intrinsic::frame_header::anchor_outside_window
+pub fn held_unverified(error: &QuilError) -> bool {
+    error.is_execution_unavailable()
+        || quil_execution::global_intrinsic::frame_header::anchor_outside_window(error)
+}
+
 /// The session generation a shard frame's certificate (`signature`, the
 /// header's signature field) names, read without verifying it.
 pub fn claimed_generation(signature: &[u8]) -> Option<u64> {

@@ -296,7 +296,7 @@ pub(crate) fn init(
                 let verified_for = current.effective().saturating_add(1);
                 match manager.validate_message(verified_for, &[0xff; 32], bundle) {
                     Ok(()) => ShardFrameVerdict::Valid,
-                    Err(error) if error.is_execution_unavailable() => {
+                    Err(error) if quil_engine::execution_deferral::held_unverified(&error) => {
                         ShardFrameVerdict::Unavailable(error.to_string())
                     }
                     Err(error) => {
