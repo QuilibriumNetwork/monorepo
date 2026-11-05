@@ -2805,3 +2805,51 @@ fn seal_drain_control_a_passed_over_header_is_never_read() {
     }
     eprintln!("SD CONTROL: passed-over drain headers are never read");
 }
+
+/// Every anchor no node holds is refused before it is read, by a
+/// deterministic error naming it, whichever certificate covers the header.
+#[test]
+fn seal_drain_fix_refuses_anchors_no_node_holds_before_reading_them() {
+    for certified in [true, false] {
+        let rig = DrainRig::new(DRAIN_ANCHOR, certified);
+        rig.check_setup();
+        for anchor in DRAIN_UNHELD_ANCHORS {
+            let sealed = rig.sealed(&rig.submission, &[&rig.rewritten(anchor)]);
+            for outcome in rig.outcomes(&sealed) {
+                match outcome {
+                    Err(quil_types::error::QuilError::InvalidArgument(reason))
+                        if reason.contains("a frame no node holds")
+                            && reason.contains(&format!("anchor {anchor},")) => {}
+                    other => panic!(
+                        "SD FIX: anchor {anchor} (certified {certified}) must be refused as one \
+                         no node holds, got {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+    eprintln!("SD FIX: anchors no node holds are refused before the read");
+}
+
+/// Genuine drain headers anchored at both edges of what GLOBAL frame
+/// [`DRAIN_FRAME`] admits, the network's first frame and the frame before
+/// it, are admitted and executed.
+#[test]
+fn seal_drain_fix_admits_genuine_anchors_at_both_edges() {
+    for anchor in [DRAIN_HISTORY_START, DRAIN_FRAME - 1] {
+        for certified in [true, false] {
+            let rig = DrainRig::new(anchor, certified);
+            rig.check_setup();
+            let honest = rig.sealed(&rig.submission, &[&rig.header]);
+            rig.intrinsic
+                .invoke_step(DRAIN_FRAME, &honest, &rig.fixture.state)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "SD FIX: a genuine drain anchored to {anchor} (certified {certified}) \
+                         must execute: {error}"
+                    )
+                });
+        }
+    }
+    eprintln!("SD FIX: genuine anchors at both edges are admitted and executed");
+}

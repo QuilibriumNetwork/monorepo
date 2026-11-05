@@ -3398,3 +3398,19 @@ fn the_repair_rebuilds_a_sealed_split_and_reports_what_it_cannot_rebuild() {
         Recovery::Unresolved("the request record is absent")
     );
 }
+
+/// Mainnet's drain anchors start at the 2.1 genesis, which the environment
+/// cannot move; another network's at frame 1 unless it sets another.
+#[test]
+fn mainnet_drain_anchors_start_at_the_2_1_genesis() {
+    assert_eq!(
+        MAINNET_DRAIN_ANCHOR_FLOOR,
+        crate::token_intrinsic::constants::FRAME_2_1_CUTOVER
+    );
+    assert_eq!(drain_anchor_floor_for(0, None), 244_200);
+    assert_eq!(drain_anchor_floor_for(0, Some("7")), 244_200);
+    assert_eq!(drain_anchor_floor_for(1, None), 1);
+    assert_eq!(drain_anchor_floor_for(1, Some("0")), 1, "0 names no frame");
+    assert_eq!(drain_anchor_floor_for(1, Some("not a frame")), 1);
+    assert_eq!(drain_anchor_floor_for(1, Some("7")), 7);
+}

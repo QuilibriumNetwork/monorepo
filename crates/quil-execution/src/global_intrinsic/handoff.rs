@@ -468,6 +468,7 @@ fn seal_drain_frame_for(network: u8, setting: Option<&str>) -> u64 {
 /// Fix this process's seal drain frame from its network, and return it.
 /// Called at startup before any frame is processed; the first call decides.
 pub fn init_seal_drain_frame(network: u8) -> u64 {
+    init_drain_anchor_floor(network);
     *SEAL_DRAIN_FRAME.get_or_init(|| {
         seal_drain_frame_for(
             network,
@@ -491,6 +492,52 @@ pub fn seal_drain_frame() -> u64 {
 /// Set the seal drain frame for the calling thread only (tests).
 pub fn set_seal_drain_frame_for_thread(frame: Option<u64>) {
     SEAL_DRAIN_OVERRIDE.with(|cell| cell.set(frame));
+}
+
+/// The oldest GLOBAL frame a mainnet seal's drain header may name as its
+/// anchor (`seal_drain`): the 2.1 genesis
+/// (`token_intrinsic::constants::FRAME_2_1_CUTOVER`), below which no node
+/// holds a GLOBAL frame. A drain header missed its window, so no window
+/// bounds its anchor, and its output check reads that frame: one below
+/// every node's history is unavailable everywhere, for ever.
+pub const MAINNET_DRAIN_ANCHOR_FLOOR: u64 = 244_200;
+
+static DRAIN_ANCHOR_FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Other networks hold their GLOBAL history from frame 1, or from
+/// `QUIL_SEAL_DRAIN_ANCHOR_FLOOR`, the same on every node of the network.
+fn drain_anchor_floor_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_DRAIN_ANCHOR_FLOOR;
+    }
+    setting
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn init_drain_anchor_floor(network: u8) {
+    DRAIN_ANCHOR_FLOOR.get_or_init(|| {
+        drain_anchor_floor_for(
+            network,
+            std::env::var("QUIL_SEAL_DRAIN_ANCHOR_FLOOR")
+                .ok()
+                .as_deref(),
+        )
+    });
+}
+
+/// The oldest GLOBAL frame a seal's drain header may name as its anchor,
+/// fixed with the seal drain frame at startup ([`init_seal_drain_frame`]).
+pub fn drain_anchor_floor() -> u64 {
+    *DRAIN_ANCHOR_FLOOR.get_or_init(|| {
+        drain_anchor_floor_for(
+            1,
+            std::env::var("QUIL_SEAL_DRAIN_ANCHOR_FLOOR")
+                .ok()
+                .as_deref(),
+        )
+    })
 }
 
 /// From this GLOBAL frame GLOBAL accepts two ways out of a stalled close,
