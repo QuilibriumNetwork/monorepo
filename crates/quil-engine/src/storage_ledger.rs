@@ -12,11 +12,15 @@
 //! labels ahead and whether work due now waits for memory. A record whose
 //! lock is free belongs to a process that ended and is removed. The one
 //! process running work due now beyond the share alone holds `alone.lock`.
+//! The one process deciding what to grant holds `grant.lock`, from reading
+//! the records until its own is written. They are OS file locks: the kernel
+//! frees them when their process ends, however it ends.
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 /// What one process's storage jobs hold, as its record says, or summed over
 /// the other processes ([`HostLedger::others`]).
@@ -173,24 +177,51 @@ impl HostLedger {
         }
     }
 
-    /// The host's lock for work due now running alone beyond the jobs'
-    /// share, held until the returned file drops; `None` while another
-    /// holds it.
-    pub fn try_alone(&self) -> Option<File> {
+    /// The host's lock over one process's decision on what to grant: held
+    /// from reading the records until this process's own is written, and
+    /// freed when the returned file drops or the process ends. Waits up to
+    /// `wait`; `None` when another still holds it, an error when the
+    /// directory cannot be used.
+    pub fn grant_turn(&self, wait: Duration) -> io::Result<Option<File>> {
         let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
-            .open(self.dir.join("alone.lock"))
-            .ok()?;
-        file.try_lock().ok()?;
-        Some(file)
+            .open(self.dir.join("grant.lock"))?;
+        let deadline = Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(file)),
+                Err(TryLockError::WouldBlock) => {}
+                Err(TryLockError::Error(error)) => return Err(error),
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The host's lock for work due now running alone beyond the jobs'
+    /// share, held until the returned file drops; `None` while another
+    /// holds it, an error when the directory cannot be used.
+    pub fn try_alone(&self) -> io::Result<Option<File>> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.dir.join("alone.lock"))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(error),
+        }
     }
 
     /// Whether another process holds [`Self::try_alone`]'s lock: call it
     /// only while this process does not hold it.
     pub fn alone_elsewhere(&self) -> bool {
-        self.try_alone().is_none()
+        matches!(self.try_alone(), Ok(None))
     }
 }
 
@@ -280,11 +311,100 @@ mod tests {
         let dir = ledger_dir("alone");
         let a = HostLedger::open_as(&dir, "a").unwrap();
         let b = HostLedger::open_as(&dir, "b").unwrap();
-        let held = a.try_alone().unwrap();
-        assert!(b.try_alone().is_none());
+        let held = a.try_alone().unwrap().unwrap();
+        assert!(b.try_alone().unwrap().is_none());
         assert!(b.alone_elsewhere());
         drop(held);
         assert!(!b.alone_elsewhere());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One process at a time has the turn to decide; another's wait for it
+    /// is bounded, and it has it once the first gives it up.
+    #[test]
+    fn one_process_at_a_time_has_the_turn_to_decide() {
+        let dir = ledger_dir("turn");
+        let a = HostLedger::open_as(&dir, "a").unwrap();
+        let b = HostLedger::open_as(&dir, "b").unwrap();
+        let turn = a.grant_turn(Duration::ZERO).unwrap().unwrap();
+        let asked = Instant::now();
+        assert!(b.grant_turn(Duration::from_millis(50)).unwrap().is_none());
+        assert!(asked.elapsed() >= Duration::from_millis(50));
+        drop(turn);
+        assert!(b.grant_turn(Duration::ZERO).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Not a test of its own: the process [`a_killed_process_frees_its_turn_and_its_record`]
+    /// starts and kills, keeping a record and the turn.
+    #[test]
+    fn child_process_keeping_the_turn() {
+        let Ok(dir) = std::env::var("QUIL_TEST_LEDGER_CHILD") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let ledger = HostLedger::open(&dir).unwrap();
+        ledger
+            .publish(Held {
+                bytes: 5,
+                ahead: 0,
+                due_waiting: false,
+            })
+            .unwrap();
+        let _turn = ledger.grant_turn(Duration::from_secs(60)).unwrap().unwrap();
+        std::fs::write(dir.join(format!("child-{}.ready", std::process::id())), b"").unwrap();
+        std::thread::sleep(Duration::from_secs(600));
+    }
+
+    /// A process that dies keeping the turn wedges nothing: the kernel frees
+    /// it. Its record goes with it, and the same directory serves the process
+    /// started after it, read and written.
+    #[test]
+    fn a_killed_process_frees_its_turn_and_its_record() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = ledger_dir("killed");
+        let here = HostLedger::open_as(&dir, "here").unwrap();
+        for round in 0..2 {
+            let mut child = Child(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "storage_ledger::tests::child_process_keeping_the_turn",
+                    ])
+                    .env("QUIL_TEST_LEDGER_CHILD", &dir)
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let ready = dir.join(format!("child-{}.ready", child.0.id()));
+            let deadline = Instant::now() + Duration::from_secs(120);
+            while !ready.exists() {
+                assert!(Instant::now() < deadline, "round {round}: no child ready");
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "round {round}: the child ended"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(here.others().bytes, 5, "round {round}: its record is read");
+            assert!(here.grant_turn(Duration::ZERO).unwrap().is_none());
+            drop(child);
+            assert!(
+                here.grant_turn(Duration::ZERO).unwrap().is_some(),
+                "round {round}: the turn is freed with its process"
+            );
+            assert_eq!(
+                here.others().bytes,
+                0,
+                "round {round}: its record went with it"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
