@@ -2753,6 +2753,10 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     match tokio::task::spawn_blocking(move || pr.refresh_from_store(hs2.as_ref())).await {
                         Ok(Ok(())) => {
                             if initial_sync_data_ok {
+                                // Its state is at least at the cursor committed with it.
+                                if let Some(view) = sync_cs.get_global_materialized_cursor() {
+                                    sync_pl.note_registry_view(view);
+                                }
                                 sync_pl.note_registry_synced(registry_sync);
                             }
                         }
@@ -4624,6 +4628,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 warn!(%error, "reconcile: prover registry refresh task failed");
                                                 continue;
                                             }
+                                        }
+                                        if let Some(view) = anchor.cursor {
+                                            sync_pl.note_registry_view(view);
                                         }
                                         reconcile_converged = true;
 

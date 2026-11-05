@@ -1110,6 +1110,12 @@ impl ProverLifecycle {
         sync
     }
 
+    /// The registry now reflects the state after GLOBAL `frame`
+    /// (`WorkerAllocator::note_registry_view`).
+    pub fn note_registry_view(&self, frame: u64) {
+        self.allocator.note_registry_view(frame);
+    }
+
     /// The registry now reflects the sync [`Self::begin_registry_sync`]
     /// numbered `sync`.
     pub fn note_registry_synced(&self, sync: u64) {
@@ -1625,12 +1631,14 @@ impl ProverLifecycle {
 
     /// One line per operator join the node rejects: the seat just goes, and
     /// nothing else tells the operator, who was told it was sent. The planner's
-    /// own joins read their reason in the plan line, and carry a recorded reason
-    /// other than `M`.
+    /// own joins carry a recorded reason other than `M`: each gets one line with
+    /// why, and what it was judged on (`planner_rejects`), unless a line of its
+    /// own already said why (forced rejections, split-away shards).
     fn report_rejected_joins(
         &self,
         actions: &[LifecycleAction],
         joining: &[(Vec<u8>, u64)],
+        planner_rejects: &HashMap<Vec<u8>, PlannerJoinReject>,
         frame_number: u64,
     ) {
         let Ok(mut reported) = self.rejected_joins_reported.lock() else {
@@ -1650,9 +1658,19 @@ impl ProverLifecycle {
                 continue;
             };
             let reason = self.allocation_reasons.reason(filter, true, *join_frame);
-            if !reason.as_deref().is_none_or(|r| r == "M")
-                || !reported.insert((filter.clone(), *join_frame))
-            {
+            if reason.as_deref().is_some_and(|r| r != "M") {
+                if let Some(why) = planner_rejects.get(filter) {
+                    if reported.insert((filter.clone(), *join_frame)) {
+                        info!(frame = frame_number, filter = %hex::encode(filter), join_frame = *join_frame,
+                            reason = why.reason, worker_cap = why.worker_cap, pending_joins = why.pending,
+                            active = why.active, joining = why.joining, workers = why.workers,
+                            owed_workers = why.owed_workers, scope = "local",
+                            "lifecycle: rejecting a join this node's planner proposed");
+                    }
+                }
+                continue;
+            }
+            if !reported.insert((filter.clone(), *join_frame)) {
                 continue;
             }
             info!(frame = frame_number, filter = %hex::encode(filter), join_frame = *join_frame,
@@ -3060,10 +3078,20 @@ impl ProverLifecycle {
         });
         let mut held_back_cores: Vec<u32> = held_back.iter().copied().collect();
         held_back_cores.sort_unstable();
+        // A seat reading expired by a registry that may not show its confirm
+        // yet keeps its slot: spent on a join here, the view can then show the
+        // seat Active (`WorkerAllocator::expiry_awaits_view`).
+        let expiry_held: Vec<&Vec<u8>> = own_allocations
+            .iter()
+            .filter(|a| self.allocator.expiry_awaits_view(a, frame_number).is_some())
+            .map(|a| &a.confirmation_filter)
+            .collect();
         let unbound_held_count = all_our_filters
             .iter()
+            .chain(expiry_held.iter().copied())
             .filter(|f| !worker_bound_filters.contains(*f))
-            .count();
+            .collect::<std::collections::HashSet<_>>()
+            .len();
         // Nor may joins take the node past its capacity: every filter held or
         // bound occupies a slot, whichever worker record serves it. A join
         // published but not yet in the registry is not counted: after the
@@ -3075,6 +3103,7 @@ impl ProverLifecycle {
         let occupied = all_our_filters
             .iter()
             .chain(&worker_bound_filters)
+            .chain(expiry_held.iter().copied())
             .collect::<std::collections::HashSet<_>>()
             .len();
         let assignable_worker_ids: Vec<u32> = free_worker_ids
@@ -3744,6 +3773,7 @@ impl ProverLifecycle {
             .map(|(f, _)| f.clone())
             .collect();
 
+        let mut planner_rejects: HashMap<Vec<u8>, PlannerJoinReject> = HashMap::new();
         if !ready_join_filters.is_empty() {
             // Judge split-away joins by the proposals' shard view. A regular
             // node keeps its genesis grid, so the raw grid still names the
@@ -3834,7 +3864,11 @@ impl ProverLifecycle {
                     .get(&d.filter)
                     .map_or(0, |m| m.activating.len() as u64);
             }
-            let (auto_reject, auto_confirm) = proposer::decide_joins(
+            let proposer::JoinDecision {
+                below_score,
+                above_cap,
+                confirm: auto_confirm,
+            } = proposer::decide_joins_by_reason(
                 &decide_candidates,
                 &auto_ready,
                 difficulty,
@@ -3843,6 +3877,42 @@ impl ProverLifecycle {
                 self.strategy,
                 auto_capacity,
             );
+            let mut note_rejects = |filters: &[Vec<u8>], reason, worker_cap, pending| {
+                for filter in filters {
+                    planner_rejects.insert(
+                        filter.clone(),
+                        PlannerJoinReject {
+                            reason,
+                            worker_cap,
+                            pending,
+                            active: active_filters.len(),
+                            joining: joining_filters.len(),
+                            workers: workers.len(),
+                            owed_workers,
+                        },
+                    );
+                }
+            };
+            note_rejects(
+                &below_score,
+                "it scores below the threshold, or its shard is no candidate",
+                auto_capacity,
+                auto_ready.len(),
+            );
+            note_rejects(
+                &above_cap,
+                "more pending joins pass than workers free for them",
+                auto_capacity,
+                auto_ready.len(),
+            );
+            note_rejects(
+                &manual_reject,
+                "more pending joins on manual workers than workers free for them",
+                available_workers,
+                manual_confirm.len() + manual_reject.len(),
+            );
+            let mut auto_reject = below_score;
+            auto_reject.extend(above_cap);
 
             for filter in &split_away {
                 info!(filter = %hex::encode(filter), retired = retired.contains(filter),
@@ -4898,7 +4968,12 @@ impl ProverLifecycle {
                             .record(&[filter], joining, frame_number, reason)?;
                     }
                 }
-                self.report_rejected_joins(&actions, &joining_filters, frame_number);
+                self.report_rejected_joins(
+                    &actions,
+                    &joining_filters,
+                    &planner_rejects,
+                    frame_number,
+                );
                 self.commit_plan_attempts(&actions, frame_number, forced_rejection);
                 if !draining_cores.is_empty() {
                     self.note_drain_leaves(
@@ -5609,6 +5684,18 @@ fn buckets_line_due(
         *last = Some((contents, now));
     }
     due
+}
+
+/// Why the planner rejects a join it proposed, and what it judged that on,
+/// for the line `report_rejected_joins` gives it.
+struct PlannerJoinReject {
+    reason: &'static str,
+    worker_cap: usize,
+    pending: usize,
+    active: usize,
+    joining: usize,
+    workers: usize,
+    owed_workers: usize,
 }
 
 #[cfg(test)]
@@ -9453,6 +9540,197 @@ mod proposal_loop_tests {
             "shard 0x01 must be joinable again after the reject backoff; proposed={:?}",
             p
         );
+    }
+
+    /// The devnet's sequence (2026-11-05): a seat's confirm was included
+    /// after the last pull before the boundary. At the activation frame the
+    /// stale view still reads it Joining and expired: its worker must stay
+    /// and the planner must propose no join with it. The next pull that shows
+    /// the seat expired frees it for one.
+    #[test]
+    fn a_stale_view_at_the_activation_frame_keeps_the_worker_and_proposes_no_join() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCDu8; 32];
+        let (seat, other) = (filter_bytes(0xC1), filter_bytes(0xC2));
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(WorkerInfo {
+            allocated: false,
+            ..allocated_worker(1, seat.clone())
+        });
+        reg.set_prover(prover(
+            address.clone(),
+            vec![alloc(seat.clone(), ProverStatus::Joining, 100)],
+        ));
+        reg.set_summaries(vec![
+            shard_summary(seat.clone(), 8),
+            shard_summary(other.clone(), 1),
+        ]);
+        let lc = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lc.hold_gone_shard_leaves_for_sync();
+        let sync = lc.begin_registry_sync();
+        lc.note_registry_synced(sync);
+        let expiry = crate::worker_allocator::join_expiry_frame(100);
+        let evaluate = |frame: u64| {
+            lc.allocator.on_new_frame(frame).unwrap();
+            lc.set_prover_root_verified_frame(frame);
+            lc.evaluate(frame, 1, reg.as_ref(), wm.as_ref()).unwrap()
+        };
+        for frame in [expiry, expiry + 1] {
+            let actions = evaluate(frame);
+            assert_eq!(
+                wm.range_workers().unwrap()[0].filter,
+                seat,
+                "frame {frame}: worker core 1 released from seat {} on a stale view",
+                hex::encode(&seat)
+            );
+            assert_eq!(
+                proposed_joins(&actions),
+                Vec::<Vec<u8>>::new(),
+                "frame {frame}: spurious join proposed while the view may lack seat {}'s confirm",
+                hex::encode(&seat)
+            );
+        }
+    }
+
+    /// The hold's recovery in the planner: a view past the expiry frame that
+    /// still shows the join unconfirmed frees the worker for another shard.
+    #[test]
+    fn a_view_past_the_expiry_frame_frees_the_worker_for_a_join() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCDu8; 32];
+        let (seat, other) = (filter_bytes(0xC7), filter_bytes(0xC8));
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(WorkerInfo {
+            allocated: false,
+            ..allocated_worker(1, seat.clone())
+        });
+        reg.set_prover(prover(
+            address.clone(),
+            vec![alloc(seat.clone(), ProverStatus::Joining, 100)],
+        ));
+        reg.set_summaries(vec![
+            shard_summary(seat.clone(), 8),
+            shard_summary(other.clone(), 1),
+        ]);
+        let lc = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lc.hold_gone_shard_leaves_for_sync();
+        let expiry = crate::worker_allocator::join_expiry_frame(100);
+        lc.current_frame.observe(expiry + 1);
+        let sync = lc.begin_registry_sync();
+        lc.note_registry_view(expiry);
+        lc.note_registry_synced(sync);
+        let frame = expiry + 1;
+        lc.allocator.on_new_frame(frame).unwrap();
+        lc.set_prover_root_verified_frame(frame);
+        let actions = lc.evaluate(frame, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_ne!(wm.range_workers().unwrap()[0].filter, seat);
+        assert_eq!(proposed_joins(&actions), vec![other], "{actions:?}");
+    }
+
+    /// A held seat no worker serves still takes a slot: after a restart its
+    /// worker comes up idle, and spent on a join here the seat can then show
+    /// Active with no worker for it.
+    #[test]
+    fn a_held_expiry_counts_against_the_free_workers() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCDu8; 32];
+        let (seat, other) = (filter_bytes(0xC3), filter_bytes(0xC4));
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(idle_worker(1));
+        reg.set_prover(prover(
+            address.clone(),
+            vec![alloc(seat.clone(), ProverStatus::Joining, 100)],
+        ));
+        reg.set_summaries(vec![
+            shard_summary(seat.clone(), 8),
+            shard_summary(other, 1),
+        ]);
+        let lc = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lc.hold_gone_shard_leaves_for_sync();
+        let sync = lc.begin_registry_sync();
+        lc.note_registry_synced(sync);
+        let expiry = crate::worker_allocator::join_expiry_frame(100);
+        lc.set_prover_root_verified_frame(expiry + 1);
+        let actions = lc
+            .evaluate(expiry + 1, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        assert_eq!(
+            proposed_joins(&actions),
+            Vec::<Vec<u8>>::new(),
+            "spurious join proposed with the idle worker owed to held seat {}",
+            hex::encode(&seat)
+        );
+    }
+
+    /// A join of the planner's above the worker cap: one line says why and
+    /// what it judged that on, once per join however often the plan repeats.
+    #[test]
+    fn a_rejected_planner_join_logs_its_reason_and_cap() {
+        let address = vec![0xCDu8; 32];
+        let held = filter_bytes(0xC5);
+        let planner = filter_bytes(0xC6);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(allocated_worker(1, held.clone()));
+        reg.set_prover(prover(
+            address.clone(),
+            vec![
+                alloc(held.clone(), ProverStatus::Active, 50),
+                alloc(planner.clone(), ProverStatus::Joining, 99),
+            ],
+        ));
+        reg.set_summaries(vec![
+            shard_summary(held, 8),
+            shard_summary(planner.clone(), 1),
+        ]);
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle
+            .allocation_reasons
+            .record(std::slice::from_ref(&planner), true, 99, "$")
+            .unwrap();
+        let line = "lifecycle: rejecting a join this node's planner proposed";
+        let window = quil_types::consensus::epoch_length_frames();
+        lifecycle.set_prover_root_verified_frame(window);
+        let (actions, logged) = evaluate_logged(&lifecycle, window, reg.as_ref(), wm.as_ref());
+        assert_eq!(count_rejects(&actions), 1, "{actions:?}");
+        assert_eq!(logged.matches(line).count(), 1, "{logged}");
+        let at = logged.lines().find(|l| l.contains(line)).unwrap();
+        for text in [
+            " INFO ".to_string(),
+            format!("filter={}", hex::encode(&planner)),
+            "join_frame=99".to_string(),
+            "more pending joins pass than workers free for them".to_string(),
+            "worker_cap=0".to_string(),
+            "pending_joins=1".to_string(),
+            "active=1".to_string(),
+            "joining=1".to_string(),
+            "workers=1".to_string(),
+        ] {
+            assert!(at.contains(&text), "{text} in {at}");
+        }
+        let next = window + JOIN_COOLDOWN_FRAMES;
+        lifecycle.set_prover_root_verified_frame(next);
+        let (_, logged) = evaluate_logged(&lifecycle, next, reg.as_ref(), wm.as_ref());
+        assert_eq!(logged.matches(line).count(), 0, "{logged}");
     }
 
     /// The planner's joins and an operator's, pending and past their window on
