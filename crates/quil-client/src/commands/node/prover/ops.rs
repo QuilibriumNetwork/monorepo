@@ -514,6 +514,7 @@ mod tests {
                 ..Default::default()
             },
             key_manager,
+            epoch_waits: super::super::tests::no_epoch_wait(),
         }
     }
 

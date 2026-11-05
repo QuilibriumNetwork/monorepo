@@ -26,10 +26,10 @@ use std::collections::{BTreeMap, HashMap};
 
 use quil_types::proto::diagnostics::{
     AffectedShard, ConditionAction, ConditionKind, ConditionScope, ConditionSeverity,
-    ConditionSource, HealthCondition, HealthConditions,
+    ConditionSource, ExpectedWait, HealthCondition, HealthConditions,
 };
 use quil_types::proto::node::{FrameCadence, FrameWindow, GlobalAppFrameHead};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// The shortest window a stall is judged by.
 pub const BASE_WINDOW_MS: u64 = 60_000;
@@ -52,14 +52,65 @@ pub const REPEAT_INTERVAL_MS: u64 = 10 * 60_000;
 pub const CLEAR_HOLD_MS: u64 = 60_000;
 /// A cadence sampled longer ago than this is not fresh.
 const CADENCE_FRESH_SECS: u64 = 90;
+/// How long a GLOBAL state sync leaves committed GLOBAL state unreadable at
+/// most when all is well (its installs take about 80 s); longer is a
+/// warning.
+pub const GLOBAL_SYNC_EXPECTED_MS: u64 = 10 * 60_000;
+/// Frames a prover op takes to land at most: every node refuses one older.
+pub const PROVER_OP_MARGIN_FRAMES: u64 =
+    quil_execution::global_intrinsic::verify::PROVER_OP_FRESHNESS_WINDOW;
+/// How long prover ops wait for the next epoch at most while GLOBAL
+/// advances: the margin's frames many times over. Longer means GLOBAL is not
+/// advancing, or this node is not following it.
+pub const EPOCH_WAIT_EXPECTED_MS: u64 = 10 * 60_000;
 
 /// Every kind this build judges.
-pub const KINDS: [ConditionKind; 4] = [
+pub const KINDS: [ConditionKind; 7] = [
     ConditionKind::LocalAppFramesUnchanged,
     ConditionKind::PeerAppFramesUnchanged,
     ConditionKind::GlobalAppFramesUnchanged,
     ConditionKind::GlobalAppFramesBehind,
+    ConditionKind::GlobalStateSyncInstalling,
+    ConditionKind::ProverOpsWaitForEpoch,
+    ConditionKind::ShieldsNotAdmitted,
 ];
+
+/// The expected waits: each names the event that ends it, and only a wait
+/// past its expected time repeats in the log.
+pub const WAIT_KINDS: [ConditionKind; 3] = [
+    ConditionKind::GlobalStateSyncInstalling,
+    ConditionKind::ProverOpsWaitForEpoch,
+    ConditionKind::ShieldsNotAdmitted,
+];
+
+/// The frames left in the epoch when a prover op signed at `head` may land
+/// after it, where every node refuses it: at most
+/// [`PROVER_OP_MARGIN_FRAMES`], and at most half an epoch, so a short devnet
+/// epoch keeps a time to sign. `None` with an unknown head or epoch length.
+pub fn epoch_end_frames_left(head: u64, epoch_length: u64) -> Option<u64> {
+    if head == 0 || epoch_length == 0 {
+        return None;
+    }
+    let left = epoch_length - head % epoch_length;
+    (left <= PROVER_OP_MARGIN_FRAMES.min(epoch_length / 2)).then_some(left)
+}
+
+/// This node's GLOBAL position and settings, as the expected waits judge
+/// them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GlobalObservation {
+    /// The GLOBAL head this node serves (`last_global_head_frame`); 0
+    /// before it knows one.
+    pub head_frame: u64,
+    pub epoch_length: u64,
+    /// The GLOBAL frames from which admission takes shields of legacy coins
+    /// (`token shield`, `token shield-all`); `None` when this build admits
+    /// none, `u64::MAX` when the network sets no frame.
+    pub shields_from: Option<(u64, u64)>,
+    /// Whether a GLOBAL state sync has installed some of its chunks but not
+    /// the last; `None` when that could not be read.
+    pub sync_installing: Option<bool>,
+}
 
 /// A shard's stall window: [`BASE_WINDOW_MS`], widened to
 /// [`CADENCE_INTERVALS`] of its mean frame interval on slower shards. The
@@ -172,6 +223,8 @@ struct Current {
     /// The clear spells it recurred from, and their total length.
     clear_spells: u32,
     unserved_ms: u64,
+    /// An expected wait that lasted past its expected time.
+    overran: bool,
     condition: HealthCondition,
 }
 
@@ -188,6 +241,12 @@ pub enum Transition {
         /// length, during which it was not served.
         clear_spells: u32,
         unserved_ms: u64,
+    },
+    /// An expected wait lasted past its expected time: from now on a
+    /// warning.
+    Overran {
+        condition: HealthCondition,
+        duration_ms: u64,
     },
     Ended {
         kind: ConditionKind,
@@ -213,19 +272,29 @@ pub struct HealthRegistry {
     workers_seen_ms: u64,
     peers_seen_ms: u64,
     committed_seen_ms: u64,
+    global: GlobalObservation,
+    global_seen_ms: u64,
     /// When each judged worker without an advance was first judged.
     worker_first_seen: HashMap<(u32, Vec<u8>), u64>,
     current: BTreeMap<i32, Current>,
     sources: Vec<ConditionSource>,
 }
 
-fn severity_of(_kind: ConditionKind) -> ConditionSeverity {
-    ConditionSeverity::Warning
+/// A kind's severity; an expected wait past its expected time is a
+/// warning.
+fn severity_of(kind: ConditionKind, overran: bool) -> ConditionSeverity {
+    if WAIT_KINDS.contains(&kind) && !overran {
+        ConditionSeverity::Info
+    } else {
+        ConditionSeverity::Warning
+    }
 }
 
 fn scope_of(kind: ConditionKind) -> ConditionScope {
     match kind {
-        ConditionKind::LocalAppFramesUnchanged => ConditionScope::ThisNode,
+        ConditionKind::LocalAppFramesUnchanged | ConditionKind::GlobalStateSyncInstalling => {
+            ConditionScope::ThisNode
+        }
         ConditionKind::PeerAppFramesUnchanged => ConditionScope::Peer,
         _ => ConditionScope::Network,
     }
@@ -235,7 +304,20 @@ fn action_of(kind: ConditionKind) -> ConditionAction {
     match kind {
         ConditionKind::LocalAppFramesUnchanged => ConditionAction::CheckWorkerLogs,
         ConditionKind::PeerAppFramesUnchanged => ConditionAction::ComparePeerWithExplorer,
+        ConditionKind::GlobalStateSyncInstalling => ConditionAction::WaitForGlobalSync,
+        ConditionKind::ProverOpsWaitForEpoch => ConditionAction::WaitForNextEpoch,
+        ConditionKind::ShieldsNotAdmitted => ConditionAction::WaitForShieldAdmission,
         _ => ConditionAction::CheckGlobalInclusion,
+    }
+}
+
+/// How long an expected wait lasts at most when all is well; `None` for a
+/// wait only its frame bounds, and for the other kinds.
+fn expected_ms(kind: ConditionKind) -> Option<u64> {
+    match kind {
+        ConditionKind::GlobalStateSyncInstalling => Some(GLOBAL_SYNC_EXPECTED_MS),
+        ConditionKind::ProverOpsWaitForEpoch => Some(EPOCH_WAIT_EXPECTED_MS),
+        _ => None,
     }
 }
 
@@ -246,6 +328,8 @@ struct Judged {
     tracked: u32,
     observed_unix_ms: u64,
     threshold: u64,
+    /// For an expected wait: what ends it, when it is current.
+    wait: Option<ExpectedWait>,
 }
 
 impl HealthRegistry {
@@ -326,6 +410,100 @@ impl HealthRegistry {
             track.seen_ms = now_ms;
         }
         self.committed_seen_ms = now_ms;
+    }
+
+    /// Record this node's GLOBAL position and settings.
+    pub fn observe_global(&mut self, global: GlobalObservation, now_ms: u64) {
+        self.global = global;
+        self.global_seen_ms = now_ms;
+    }
+
+    /// The expected waits as of the latest GLOBAL observation: each current
+    /// one with what ends it. Without a fresh observation, or the inputs a
+    /// kind needs, it tracks nothing and reports nothing.
+    fn judge_waits(&self, now_ms: u64) -> [Judged; 3] {
+        let fresh = self.global_seen_ms != 0
+            && now_ms.saturating_sub(self.global_seen_ms) <= OBSERVATION_GAP_MS;
+        let g = self.global;
+        let observed = |known: bool| {
+            if fresh && known {
+                self.global_seen_ms
+            } else {
+                0
+            }
+        };
+        let wait = |until_frame, batch_from_frame, kind| ExpectedWait {
+            head_frame: g.head_frame,
+            until_frame,
+            batch_from_frame,
+            expected_secs: expected_ms(kind).unwrap_or(0) / 1000,
+        };
+        let judged =
+            |kind, observed_unix_ms: u64, tracked: bool, threshold, wait: Option<_>| Judged {
+                kind,
+                shards: Vec::new(),
+                tracked: u32::from(observed_unix_ms != 0 && tracked),
+                observed_unix_ms,
+                threshold,
+                wait: wait.filter(|_| observed_unix_ms != 0 && tracked),
+            };
+
+        let kind = ConditionKind::GlobalStateSyncInstalling;
+        let installing = g.sync_installing == Some(true);
+        let sync = judged(
+            kind,
+            observed(g.sync_installing.is_some()),
+            true,
+            0,
+            installing.then(|| wait(0, 0, kind)),
+        );
+
+        let kind = ConditionKind::ProverOpsWaitForEpoch;
+        let left = epoch_end_frames_left(g.head_frame, g.epoch_length);
+        let epoch = judged(
+            kind,
+            observed(g.head_frame != 0 && g.epoch_length != 0),
+            true,
+            PROVER_OP_MARGIN_FRAMES.min(g.epoch_length / 2),
+            left.map(|left| wait(g.head_frame + left, 0, kind)),
+        );
+
+        // A network that sets no admission frame has no wait to track.
+        let kind = ConditionKind::ShieldsNotAdmitted;
+        let frames = g
+            .shields_from
+            .filter(|(single, batch)| *single != u64::MAX && *batch != u64::MAX);
+        let shields = judged(
+            kind,
+            observed(g.head_frame != 0),
+            frames.is_some(),
+            0,
+            frames
+                .filter(|(single, batch)| g.head_frame < (*single).max(*batch))
+                .map(|(single, batch)| wait(single, single.max(batch), kind)),
+        );
+        [sync, epoch, shields]
+    }
+
+    /// Judge the expected waits at once on `global`, as a report is served:
+    /// a client deciding when to sign reads the head it signs at. The
+    /// transitions to log.
+    pub fn refresh_waits(&mut self, global: GlobalObservation, now_ms: u64) -> Vec<Transition> {
+        self.observe_global(global, now_ms);
+        self.sources
+            .retain(|s| !WAIT_KINDS.iter().any(|k| *k as i32 == s.kind));
+        let mut transitions = Vec::new();
+        for judged in self.judge_waits(now_ms) {
+            self.sources.push(ConditionSource {
+                kind: judged.kind as i32,
+                observed_unix_ms: judged.observed_unix_ms,
+                tracked: judged.tracked,
+            });
+            if let Some(t) = self.update(judged, now_ms) {
+                transitions.push(t);
+            }
+        }
+        transitions
     }
 
     /// Record the worker view.
@@ -463,6 +641,7 @@ impl HealthRegistry {
                 tracked: local_tracked,
                 observed_unix_ms: fresh(self.workers_seen_ms),
                 threshold: base_secs,
+                wait: None,
             },
             Judged {
                 kind: ConditionKind::PeerAppFramesUnchanged,
@@ -470,6 +649,7 @@ impl HealthRegistry {
                 tracked: peer_tracked,
                 observed_unix_ms: fresh(self.peers_seen_ms),
                 threshold: base_secs,
+                wait: None,
             },
             Judged {
                 kind: ConditionKind::GlobalAppFramesUnchanged,
@@ -477,6 +657,7 @@ impl HealthRegistry {
                 tracked: committed_tracked,
                 observed_unix_ms: fresh(self.committed_seen_ms),
                 threshold: base_secs,
+                wait: None,
             },
             Judged {
                 kind: ConditionKind::GlobalAppFramesBehind,
@@ -484,11 +665,12 @@ impl HealthRegistry {
                 tracked: committed_tracked,
                 observed_unix_ms: fresh(self.committed_seen_ms),
                 threshold: GLOBAL_APP_LAG_FRAMES,
+                wait: None,
             },
         ];
         self.sources.clear();
         let mut transitions = Vec::new();
-        for mut judged in judged {
+        for mut judged in judged.into_iter().chain(self.judge_waits(now_ms)) {
             self.sources.push(ConditionSource {
                 kind: judged.kind as i32,
                 observed_unix_ms: judged.observed_unix_ms,
@@ -510,10 +692,17 @@ impl HealthRegistry {
             mut shards,
             tracked,
             threshold,
+            wait,
             ..
         } = judged;
         let key = kind as i32;
-        let affected = shards.len() as u32;
+        // A current wait is one condition of this node; the others count
+        // their shards.
+        let affected = if wait.is_some() {
+            1
+        } else {
+            shards.len() as u32
+        };
         if affected == 0 {
             let current = self.current.get_mut(&key)?;
             let clear_since = *current.clear_since_ms.get_or_insert(now_ms);
@@ -534,9 +723,9 @@ impl HealthRegistry {
         }
         let omitted_shards = shards.len().saturating_sub(MAX_AFFECTED) as u32;
         shards.truncate(MAX_AFFECTED);
-        let condition = |since_unix_ms| HealthCondition {
+        let condition = |since_unix_ms, overran| HealthCondition {
             kind: key,
-            severity: severity_of(kind) as i32,
+            severity: severity_of(kind, overran) as i32,
             scope: scope_of(kind) as i32,
             action: action_of(kind) as i32,
             since_unix_ms,
@@ -545,6 +734,7 @@ impl HealthRegistry {
             threshold,
             shards,
             omitted_shards,
+            wait,
         };
         if let Some(current) = self.current.get_mut(&key) {
             // It recurred within its clear hold: count the spell.
@@ -552,8 +742,21 @@ impl HealthRegistry {
                 current.clear_spells += 1;
                 current.unserved_ms += now_ms.saturating_sub(clear_since);
             }
-            current.condition = condition(current.since_ms);
-            if now_ms.saturating_sub(current.last_logged_ms) >= REPEAT_INTERVAL_MS {
+            let duration_ms = now_ms.saturating_sub(current.since_ms);
+            let overran = expected_ms(kind).is_some_and(|expected| duration_ms >= expected);
+            current.condition = condition(current.since_ms, overran);
+            if overran && !current.overran {
+                // An anomaly now: a warning from here on.
+                current.overran = true;
+                current.last_logged_ms = now_ms;
+                return Some(Transition::Overran {
+                    condition: current.condition.clone(),
+                    duration_ms,
+                });
+            }
+            // An expected wait repeats only once it overran.
+            let repeats = !WAIT_KINDS.contains(&kind) || current.overran;
+            if repeats && now_ms.saturating_sub(current.last_logged_ms) >= REPEAT_INTERVAL_MS {
                 current.last_logged_ms = now_ms;
                 return Some(Transition::Lasting {
                     condition: current.condition.clone(),
@@ -570,7 +773,8 @@ impl HealthRegistry {
             clear_since_ms: None,
             clear_spells: 0,
             unserved_ms: 0,
-            condition: condition(now_ms),
+            overran: false,
+            condition: condition(now_ms, false),
         };
         let started = current.condition.clone();
         self.current.insert(key, current);
@@ -610,6 +814,53 @@ pub fn notice_text(c: &HealthCondition) -> String {
         ConditionKind::GlobalAppFramesBehind => format!(
             "Global app frames >{threshold} behind app heads: {affected}/{tracked} tracked shards."
         ),
+        ConditionKind::GlobalStateSyncInstalling => {
+            let expected = c.wait.as_ref().map_or(0, |w| w.expected_secs / 60);
+            if c.severity == ConditionSeverity::Warning as i32 {
+                format!(
+                    "GLOBAL state sync installing >{expected}m: committed GLOBAL state stays \
+                     unreadable until its last chunk is in."
+                )
+            } else {
+                "GLOBAL state sync installing: committed shard heads show again once its last \
+                 chunk is in."
+                    .into()
+            }
+        }
+        ConditionKind::ProverOpsWaitForEpoch => {
+            let w = c.wait.unwrap_or_default();
+            if c.severity == ConditionSeverity::Warning as i32 {
+                format!(
+                    "Prover ops waited >{}m for the next epoch at frame {}; the GLOBAL head \
+                     stays at {}.",
+                    w.expected_secs / 60,
+                    w.until_frame,
+                    w.head_frame
+                )
+            } else {
+                format!(
+                    "Prover ops wait for the next epoch: it starts at frame {} ({} frames).",
+                    w.until_frame,
+                    w.until_frame.saturating_sub(w.head_frame)
+                )
+            }
+        }
+        ConditionKind::ShieldsNotAdmitted => {
+            let w = c.wait.unwrap_or_default();
+            let to_go = w.batch_from_frame.saturating_sub(w.head_frame);
+            if w.until_frame == w.batch_from_frame {
+                format!(
+                    "Legacy coin shields admitted from GLOBAL frame {}: {to_go} frames to go.",
+                    w.until_frame
+                )
+            } else {
+                format!(
+                    "Legacy coin shields admitted from GLOBAL frame {}, batches from {}: \
+                     {to_go} frames to go.",
+                    w.until_frame, w.batch_from_frame
+                )
+            }
+        }
         ConditionKind::Unspecified => format!(
             "Health condition {} ({}, {}): {affected}/{tracked}; see this node's log.",
             c.kind,
@@ -633,6 +884,17 @@ pub fn action_text(action: i32) -> &'static str {
         ConditionAction::CheckGlobalInclusion => {
             "check GLOBAL's inclusion of the shards on the explorer: advancing there means \
              this node's GLOBAL view trails, else GLOBAL is not including them"
+        }
+        ConditionAction::WaitForGlobalSync => {
+            "nothing: committed GLOBAL state reads again once the sync's last chunk is in; past \
+             10 min, check the node's `sync phase` and prover tree sync lines"
+        }
+        ConditionAction::WaitForNextEpoch => {
+            "nothing: prover ops are signed once the next epoch starts; past 10 min, check that \
+             this node follows GLOBAL"
+        }
+        ConditionAction::WaitForShieldAdmission => {
+            "nothing: shield once GLOBAL reaches the admission frame"
         }
         ConditionAction::Unspecified => "see this node's log",
     }
@@ -663,6 +925,9 @@ pub fn kind_label(kind: i32) -> &'static str {
         ConditionKind::PeerAppFramesUnchanged => "peer_app_frames_unchanged",
         ConditionKind::GlobalAppFramesUnchanged => "global_app_frames_unchanged",
         ConditionKind::GlobalAppFramesBehind => "global_app_frames_behind",
+        ConditionKind::GlobalStateSyncInstalling => "global_state_sync_installing",
+        ConditionKind::ProverOpsWaitForEpoch => "prover_ops_wait_for_epoch",
+        ConditionKind::ShieldsNotAdmitted => "shields_not_admitted",
         ConditionKind::Unspecified => "unknown",
     }
 }
@@ -689,11 +954,33 @@ fn widest_window(c: &HealthCondition) -> u64 {
     c.shards.iter().map(|s| s.window_secs).max().unwrap_or(0)
 }
 
-/// Log one transition as one structured line.
+/// Why a condition of `kind` ended while still observed.
+fn ended_reason(kind: ConditionKind) -> &'static str {
+    match kind {
+        ConditionKind::GlobalStateSyncInstalling => "GLOBAL state installed",
+        ConditionKind::ProverOpsWaitForEpoch => "next epoch started",
+        ConditionKind::ShieldsNotAdmitted => "admission frame reached",
+        _ => "progress resumed",
+    }
+}
+
+/// Emit `$($line)*` at the level of `$severity`.
+macro_rules! at_severity {
+    ($severity:expr, $($line:tt)*) => {
+        match ConditionSeverity::try_from($severity) {
+            Ok(ConditionSeverity::Error) => error!($($line)*),
+            Ok(ConditionSeverity::Info) => info!($($line)*),
+            _ => warn!($($line)*),
+        }
+    };
+}
+
+/// Log one transition as one structured line, at the condition's severity:
+/// an expected wait starts as info, and warns once it overruns.
 pub fn log_transition(transition: &Transition) {
     match transition {
         Transition::Started { condition: c } => {
-            warn!(condition = kind_label(c.kind), scope = scope_label(c.scope),
+            at_severity!(c.severity, condition = kind_label(c.kind), scope = scope_label(c.scope),
                 affected = c.affected, tracked = c.tracked, shards = %shard_names(c),
                 widest_window_secs = widest_window(c), action = action_text(c.action),
                 text = %notice_text(c), "health condition started");
@@ -704,12 +991,22 @@ pub fn log_transition(transition: &Transition) {
             clear_spells,
             unserved_ms,
         } => {
-            warn!(condition = kind_label(c.kind), scope = scope_label(c.scope),
+            at_severity!(c.severity, condition = kind_label(c.kind), scope = scope_label(c.scope),
                 affected = c.affected, tracked = c.tracked, shards = %shard_names(c),
                 widest_window_secs = widest_window(c), duration_secs = duration_ms / 1000,
                 clear_spells, unserved_secs = unserved_ms / 1000,
                 action = action_text(c.action), text = %notice_text(c),
                 "health condition lasting");
+        }
+        Transition::Overran {
+            condition: c,
+            duration_ms,
+        } => {
+            warn!(condition = kind_label(c.kind), scope = scope_label(c.scope),
+                duration_secs = duration_ms / 1000,
+                expected_secs = c.wait.as_ref().map_or(0, |w| w.expected_secs),
+                action = action_text(c.action), text = %notice_text(c),
+                "health condition overran its expected wait");
         }
         Transition::Ended {
             kind,
@@ -728,7 +1025,7 @@ pub fn log_transition(transition: &Transition) {
                 reason = if *unobserved {
                     "no fresh observations"
                 } else {
-                    "progress resumed"
+                    ended_reason(*kind)
                 },
                 "health condition ended"
             );
@@ -1315,5 +1612,314 @@ mod tests {
             shard_names(&condition),
             "111111119001,111111119002,111111119003,+1"
         );
+    }
+
+    /// A node on a 720-frame epoch at `head`: no shields, its sync state
+    /// unread.
+    fn at_head(head: u64) -> GlobalObservation {
+        GlobalObservation {
+            head_frame: head,
+            epoch_length: 720,
+            shields_from: None,
+            sync_installing: None,
+        }
+    }
+
+    /// `kind`'s current condition.
+    fn current(reg: &HealthRegistry, kind: ConditionKind) -> Option<HealthCondition> {
+        reg.snapshot()
+            .conditions
+            .into_iter()
+            .find(|c| c.kind == kind as i32)
+    }
+
+    /// `kind`'s source: when it was observed and what it tracks.
+    fn source_of(reg: &HealthRegistry, kind: ConditionKind) -> (u64, u32) {
+        let s = reg
+            .snapshot()
+            .sources
+            .into_iter()
+            .find(|s| s.kind == kind as i32)
+            .expect("every kind reports its source");
+        (s.observed_unix_ms, s.tracked)
+    }
+
+    /// Only an epoch's last frames hold prover ops, where one may land in
+    /// the next epoch: the freshness window on a mainnet epoch, half of a
+    /// short devnet one; nothing without a head or an epoch length.
+    #[test]
+    fn only_the_end_of_an_epoch_holds_prover_ops() {
+        assert_eq!(PROVER_OP_MARGIN_FRAMES, 10);
+        assert_eq!(epoch_end_frames_left(720 - 11, 720), None);
+        assert_eq!(epoch_end_frames_left(720 - 10, 720), Some(10));
+        assert_eq!(epoch_end_frames_left(719, 720), Some(1));
+        assert_eq!(epoch_end_frames_left(720, 720), None);
+        assert_eq!(epoch_end_frames_left(89, 30), Some(1));
+        assert_eq!(epoch_end_frames_left(79, 30), None);
+        assert_eq!(epoch_end_frames_left(80, 30), Some(10));
+        assert_eq!(epoch_end_frames_left(4, 10), None);
+        assert_eq!(epoch_end_frames_left(5, 10), Some(5));
+        assert_eq!(epoch_end_frames_left(0, 720), None);
+        assert_eq!(epoch_end_frames_left(719, 0), None);
+    }
+
+    /// The epoch-end wait is an info condition naming the frame that ends
+    /// it, judged on the head as a report is served, and it ends with the
+    /// epoch; a frame-bound wait within its expected time never repeats.
+    #[test]
+    fn prover_ops_wait_for_the_next_epoch_as_an_expected_wait() {
+        let kind = ConditionKind::ProverOpsWaitForEpoch;
+        let mut reg = HealthRegistry::default();
+        assert!(reg.refresh_waits(at_head(709), T0).is_empty());
+        assert!(current(&reg, kind).is_none());
+        assert_eq!(source_of(&reg, kind), (T0, 1));
+        let started = reg.refresh_waits(at_head(712), T0 + 1_000);
+        assert!(
+            matches!(started.as_slice(), [Transition::Started { .. }]),
+            "{started:?}"
+        );
+        let c = current(&reg, kind).expect("ops wait");
+        assert_eq!(c.severity, ConditionSeverity::Info as i32);
+        assert_eq!(c.scope, ConditionScope::Network as i32);
+        assert_eq!(c.action, ConditionAction::WaitForNextEpoch as i32);
+        assert_eq!((c.affected, c.tracked, c.threshold), (1, 1, 10));
+        assert_eq!(
+            c.wait,
+            Some(ExpectedWait {
+                head_frame: 712,
+                until_frame: 720,
+                batch_from_frame: 0,
+                expected_secs: 600,
+            })
+        );
+        assert_eq!(
+            notice_text(&c),
+            "Prover ops wait for the next epoch: it starts at frame 720 (8 frames)."
+        );
+        // Judged on the tick too, with no lines while it lasts as expected.
+        for secs in [15, 30, 45, 60, 75] {
+            let now = T0 + secs * 1000;
+            reg.observe_global(at_head(712 + secs / 15), now);
+            assert!(reg.evaluate(now, &|_: &[u8]| None).is_empty());
+        }
+        // The next epoch: gone from the report at once, ended after the
+        // clear hold with its reason.
+        assert!(reg.refresh_waits(at_head(720), T0 + 90_000).is_empty());
+        assert!(current(&reg, kind).is_none());
+        let ended = reg.refresh_waits(at_head(726), T0 + 150_000);
+        assert!(
+            matches!(
+                ended.as_slice(),
+                [Transition::Ended {
+                    unobserved: false,
+                    ..
+                }]
+            ),
+            "{ended:?}"
+        );
+        assert_eq!(ended_reason(kind), "next epoch started");
+        // Without a head nothing is judged.
+        let mut unknown = HealthRegistry::default();
+        unknown.refresh_waits(at_head(0), T0);
+        assert_eq!(source_of(&unknown, kind), (0, 0));
+    }
+
+    /// Observe a GLOBAL state sync `installing` at `secs` and judge; the
+    /// transitions to log.
+    fn sync_at(reg: &mut HealthRegistry, secs: u64, installing: bool) -> Vec<Transition> {
+        let now = T0 + secs * 1000;
+        reg.observe_global(
+            GlobalObservation {
+                sync_installing: Some(installing),
+                ..at_head(700)
+            },
+            now,
+        );
+        reg.evaluate(now, &|_: &[u8]| None)
+    }
+
+    /// A GLOBAL state sync's install is an info condition of this node that
+    /// names the event ending it, and ends after the clear hold once the
+    /// last chunk is in. An unreadable sync state establishes nothing.
+    #[test]
+    fn a_global_state_sync_install_is_an_expected_wait() {
+        let kind = ConditionKind::GlobalStateSyncInstalling;
+        let mut reg = HealthRegistry::default();
+        assert!(sync_at(&mut reg, 0, false).is_empty());
+        assert_eq!(source_of(&reg, kind), (T0, 1));
+        let started = sync_at(&mut reg, 15, true);
+        assert!(
+            matches!(started.as_slice(), [Transition::Started { .. }]),
+            "{started:?}"
+        );
+        let c = current(&reg, kind).expect("installing");
+        assert_eq!(c.severity, ConditionSeverity::Info as i32);
+        assert_eq!(c.scope, ConditionScope::ThisNode as i32);
+        assert_eq!(c.action, ConditionAction::WaitForGlobalSync as i32);
+        assert_eq!(c.wait.map(|w| w.expected_secs), Some(600));
+        assert_eq!(
+            notice_text(&c),
+            "GLOBAL state sync installing: committed shard heads show again once its last \
+             chunk is in."
+        );
+        for secs in [30, 45, 60, 75, 90] {
+            assert!(sync_at(&mut reg, secs, true).is_empty());
+        }
+        // The last chunk is in: gone from the report, ended after the hold.
+        assert!(sync_at(&mut reg, 105, false).is_empty());
+        assert!(current(&reg, kind).is_none());
+        let mut ended = Vec::new();
+        for secs in [120, 135, 150, 165] {
+            ended.extend(sync_at(&mut reg, secs, false));
+        }
+        assert!(
+            matches!(
+                ended.as_slice(),
+                [Transition::Ended {
+                    unobserved: false,
+                    ..
+                }]
+            ),
+            "{ended:?}"
+        );
+        assert_eq!(ended_reason(kind), "GLOBAL state installed");
+        let mut unread = HealthRegistry::default();
+        unread.refresh_waits(at_head(700), T0);
+        assert!(current(&unread, kind).is_none());
+        assert_eq!(source_of(&unread, kind), (0, 0));
+    }
+
+    /// An expected wait lasting past its expected time warns once, then
+    /// repeats every 10 minutes; before that it logs nothing while it
+    /// lasts.
+    #[test]
+    fn an_expected_wait_warns_once_it_overruns() {
+        let mut reg = HealthRegistry::default();
+        let mut shape = Vec::new();
+        for secs in (0..=1800).step_by(15) {
+            for t in sync_at(&mut reg, secs, true) {
+                let name = match t {
+                    Transition::Started { .. } => "started",
+                    Transition::Overran { .. } => "overran",
+                    Transition::Lasting { .. } => "lasting",
+                    Transition::Ended { .. } => "ended",
+                };
+                shape.push((secs, name));
+            }
+        }
+        assert_eq!(
+            shape,
+            [
+                (0, "started"),
+                (600, "overran"),
+                (1200, "lasting"),
+                (1800, "lasting")
+            ]
+        );
+        let c = current(&reg, ConditionKind::GlobalStateSyncInstalling).unwrap();
+        assert_eq!(c.since_unix_ms, T0);
+    }
+
+    /// A wait past its expected time is a warning and says so; it started
+    /// as info.
+    #[test]
+    fn an_overrun_wait_is_a_warning() {
+        let kind = ConditionKind::GlobalStateSyncInstalling;
+        let mut reg = HealthRegistry::default();
+        sync_at(&mut reg, 0, true);
+        assert_eq!(
+            current(&reg, kind).map(|c| c.severity),
+            Some(ConditionSeverity::Info as i32)
+        );
+        for secs in (15..=1500).step_by(15) {
+            sync_at(&mut reg, secs, true);
+        }
+        let c = current(&reg, kind).expect("still installing");
+        assert_eq!(c.severity, ConditionSeverity::Warning as i32);
+        assert_eq!(
+            notice_text(&c),
+            "GLOBAL state sync installing >10m: committed GLOBAL state stays unreadable until \
+             its last chunk is in."
+        );
+    }
+
+    /// Shields wait for their admission frame, batches for the later one,
+    /// with no overrun and no repeat however long; stale inputs end it at
+    /// once.
+    #[test]
+    fn shields_wait_for_their_admission_frame() {
+        let kind = ConditionKind::ShieldsNotAdmitted;
+        let shields = |head, from| GlobalObservation {
+            shields_from: from,
+            ..at_head(head)
+        };
+        let mut reg = HealthRegistry::default();
+        let started = reg.refresh_waits(shields(950, Some((900, 1000))), T0);
+        assert!(matches!(started.as_slice(), [Transition::Started { .. }]));
+        let c = current(&reg, kind).expect("not admitted");
+        assert_eq!(c.severity, ConditionSeverity::Info as i32);
+        assert_eq!(c.scope, ConditionScope::Network as i32);
+        assert_eq!(c.action, ConditionAction::WaitForShieldAdmission as i32);
+        assert_eq!(
+            c.wait,
+            Some(ExpectedWait {
+                head_frame: 950,
+                until_frame: 900,
+                batch_from_frame: 1000,
+                expected_secs: 0,
+            })
+        );
+        assert_eq!(
+            notice_text(&c),
+            "Legacy coin shields admitted from GLOBAL frame 900, batches from 1000: 50 frames to \
+             go."
+        );
+        for hour in 1..=24 {
+            let lines = reg.refresh_waits(shields(990, Some((900, 1000))), T0 + hour * 3_600_000);
+            assert!(lines.is_empty(), "{lines:?}");
+        }
+        assert_eq!(
+            current(&reg, kind).map(|c| c.severity),
+            Some(ConditionSeverity::Info as i32)
+        );
+        let now = T0 + 25 * 3_600_000;
+        reg.refresh_waits(shields(1000, Some((900, 1000))), now);
+        assert!(current(&reg, kind).is_none(), "admitted at the batch frame");
+        let mut one = HealthRegistry::default();
+        one.refresh_waits(shields(10, Some((50, 50))), T0);
+        assert_eq!(
+            current(&one, kind).map(|c| notice_text(&c)).as_deref(),
+            Some("Legacy coin shields admitted from GLOBAL frame 50: 40 frames to go.")
+        );
+        let ended = one.evaluate(T0 + OBSERVATION_GAP_MS + 1, &|_: &[u8]| None);
+        assert!(
+            matches!(
+                ended.as_slice(),
+                [Transition::Ended {
+                    unobserved: true,
+                    ..
+                }]
+            ),
+            "{ended:?}"
+        );
+    }
+
+    /// A network that sets no admission frame for either shield, or a
+    /// build that admits none, has no wait to track.
+    #[test]
+    fn shields_track_nothing_without_admission_frames() {
+        let kind = ConditionKind::ShieldsNotAdmitted;
+        for from in [None, Some((u64::MAX, u64::MAX)), Some((50, u64::MAX))] {
+            let mut reg = HealthRegistry::default();
+            reg.refresh_waits(
+                GlobalObservation {
+                    shields_from: from,
+                    ..at_head(10)
+                },
+                T0,
+            );
+            assert!(current(&reg, kind).is_none(), "{from:?}");
+            assert_eq!(source_of(&reg, kind), (T0, 0), "{from:?}");
+        }
     }
 }

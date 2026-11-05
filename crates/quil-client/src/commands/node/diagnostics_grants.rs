@@ -25,10 +25,10 @@ const MAX_GRANT_SECS: u64 = 365 * 86_400;
 const SHARED: &str =
     "It gets, per request: this node's release and build fingerprint, GLOBAL head \
 frame, worker count, store write state and store and disk read times; its health conditions \
-(kind, severity, scope, start, counts, and the shard filters, frames and worker cores \
-affected); and per worker its core ID, public shard filter, allocation, phase, blocker, \
-frames, committee generation, recovery state and failure counts, and when these last \
-changed.\n\
+(kind, severity, scope, start, counts, the shard filters, frames and worker cores affected, \
+and the GLOBAL frames an expected wait ends at); and per worker its core ID, public shard \
+filter, allocation, phase, blocker, frames, committee generation, recovery state and failure \
+counts, and when these last changed.\n\
 It gets no log text, addresses or keys.\n";
 
 const APPLY: &str = "The node reads this at start: restart it to apply. This command restarts \

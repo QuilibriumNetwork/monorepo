@@ -5720,7 +5720,7 @@ pub(super) async fn run_shield(
     let payee = shield_recipient(&wallet, recipient)?;
     let owner = legacy_owner_signer(tc)?;
     let mut client = tc.connect().await?;
-    super::legacy::ensure_shields_active(&client, tc.node_config.p2p.network, false).await?;
+    super::legacy::ensure_shields_active(tc, false).await?;
     let bytes = super::output::slow_phase(
         "Proving the shield",
         wallet.clone().create_shield(
@@ -6062,7 +6062,7 @@ pub(crate) async fn plan_shield_all(
     if coins.is_empty() {
         return Ok(plan);
     }
-    super::legacy::ensure_shields_active(&plan.client, tc.node_config.p2p.network, true).await?;
+    super::legacy::ensure_shields_active(tc, true).await?;
     let listed_shards = super::legacy::app_shards(&plan.client, &application).await?;
     let live = super::legacy::live_of(&listed_shards);
     let paths: Vec<Vec<bool>> = live.iter().map(|(_, path)| path.clone()).collect();
