@@ -574,8 +574,17 @@ pub(crate) async fn start(
                     parent_bits_len = parent_bits.len(),
                     "split-proposer: sub-shard (byte-suffix) leaf count for the over-crowded shard"
                 );
-                // Descend up to 16 extra bits past any uniform run to the branch.
-                crdt_pr.propose_split_children("vertex", "adds", &app, &parent_bits, 16)
+                // Descend up to 16 extra bits past any uniform run to the branch,
+                // never past an empty side outputs can still reach: a split there
+                // would leave it a spine with no committee to deliver them.
+                crdt_pr.propose_split_children(
+                    "vertex",
+                    "adds",
+                    &app,
+                    &parent_bits,
+                    16,
+                    &quil_forest::bit_path_reaches_outputs,
+                )
             },
         ));
     }

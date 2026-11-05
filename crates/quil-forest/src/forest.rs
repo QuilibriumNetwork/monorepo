@@ -472,6 +472,18 @@ pub struct AppCommit {
     pub total_size: u128,
 }
 
+/// Where [`Forest::first_split_bifurcation`] would split a shard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SplitBifurcation {
+    /// The two data-bearing children.
+    Children(Vec<Vec<bool>>),
+    /// The descent reached this empty side, which outputs can still reach:
+    /// passing it would register it as a shard with no committee.
+    Withheld(Vec<bool>),
+    /// Fewer than two leaves, or no branch within the bit budget.
+    Unsplittable,
+}
+
 /// The forest over one shared RocksDB. Cheap to clone (an `Arc` handle);
 /// every method opens the relevant per-tree store on demand, so a party can
 /// touch exactly the trees its role needs. An optional `namespace` prefixes
@@ -1405,8 +1417,16 @@ impl Forest {
     /// `shard_bits ++ …1`). This is the descend-to-bifurcation + empty-split
     /// guard in one: the split cuts where the data
     /// actually branches (not the immediate bit, which may leave a child empty),
-    /// and returns `None` when the shard is unsplittable — fewer than 2 leaves, or
-    /// data so clustered no bifurcation appears within `max_extra_bits`.
+    /// and is [`SplitBifurcation::Unsplittable`] when the shard has fewer than 2
+    /// leaves, or data so clustered no bifurcation appears within
+    /// `max_extra_bits`.
+    ///
+    /// Each side the descent passes becomes an empty spine shard of the split,
+    /// with no committee. `reachable` says whether outputs can still land under
+    /// a side: the descent passes such a side never, and the split is
+    /// [`SplitBifurcation::Withheld`] until data reaches it, since an output
+    /// committed into an unstaffed spine is never delivered. The shard keeps
+    /// covering that side meanwhile, and its committee delivers there.
     ///
     /// Both returned children are guaranteed non-empty, so a split at these
     /// prefixes never produces an empty child. `max_extra_bits` bounds the descent
@@ -1418,10 +1438,11 @@ impl Forest {
         version: u64,
         shard_bits: &[bool],
         max_extra_bits: usize,
-    ) -> Result<Option<Vec<Vec<bool>>>> {
+        reachable: &dyn Fn(&[bool]) -> bool,
+    ) -> Result<SplitBifurcation> {
         // Empty-split guard: a shard with <2 leaves can't split meaningfully.
         if self.app_subtree_leaf_count(app_address, phase, version, shard_bits)? < 2 {
-            return Ok(None);
+            return Ok(SplitBifurcation::Unsplittable);
         }
         let mut prefix = shard_bits.to_vec();
         for _ in 0..max_extra_bits {
@@ -1431,14 +1452,19 @@ impl Forest {
             p1.push(true);
             let c0 = self.app_subtree_leaf_count(app_address, phase, version, &p0)?;
             let c1 = self.app_subtree_leaf_count(app_address, phase, version, &p1)?;
-            match (c0 > 0, c1 > 0) {
-                (true, true) => return Ok(Some(vec![p0, p1])), // bifurcation: both non-empty
-                (true, false) => prefix = p0,                  // all data on the 0 side — descend
-                (false, true) => prefix = p1,                  // all data on the 1 side — descend
-                (false, false) => return Ok(None),             // unreachable (count>=2 above)
+            let (kept, empty) = match (c0 > 0, c1 > 0) {
+                (true, true) => return Ok(SplitBifurcation::Children(vec![p0, p1])),
+                (true, false) => (p0, p1), // all data on the 0 side — descend
+                (false, true) => (p1, p0), // all data on the 1 side — descend
+                (false, false) => return Ok(SplitBifurcation::Unsplittable), // count>=2 above
+            };
+            if reachable(&empty) {
+                return Ok(SplitBifurcation::Withheld(empty));
             }
+            prefix = kept;
         }
-        Ok(None) // no bifurcation within the bit budget — data too clustered to split
+        // No bifurcation within the bit budget — data too clustered to split.
+        Ok(SplitBifurcation::Unsplittable)
     }
 
     /// Authenticated read of one leaf in a shard/phase tree at `version`:
@@ -1886,10 +1912,13 @@ mod tests {
             .unwrap();
 
         // Whole app (shard_bits = []): the branch is at bit 3 (top 3 bits uniform).
-        let children = forest
-            .first_split_bifurcation(&app, phase, 0, &[], 16)
+        // No region counts as reachable here: this checks the descent alone.
+        let SplitBifurcation::Children(children) = forest
+            .first_split_bifurcation(&app, phase, 0, &[], 16, &|_| false)
             .unwrap()
-            .expect("app has 4 leaves that branch → a bifurcation exists");
+        else {
+            panic!("app has 4 leaves that branch → a bifurcation exists");
+        };
         assert_eq!(children.len(), 2, "binary bifurcation");
         // Both children are non-empty (the empty-split guarantee).
         for c in &children {
@@ -1924,20 +1953,108 @@ mod tests {
             single.app_subtree_leaf_count(&app, phase, 0, &[]).unwrap(),
             1
         );
-        assert!(
+        assert_eq!(
             single
-                .first_split_bifurcation(&app, phase, 0, &[], 16)
-                .unwrap()
-                .is_none(),
+                .first_split_bifurcation(&app, phase, 0, &[], 16, &|_| false)
+                .unwrap(),
+            SplitBifurcation::Unsplittable,
             "empty-split guard: a single-leaf shard does not split"
         );
         // An empty shard is likewise unsplittable.
-        assert!(
+        assert_eq!(
             single
-                .first_split_bifurcation(&app, phase, 0, &[true], 16)
-                .unwrap()
-                .is_none(),
+                .first_split_bifurcation(&app, phase, 0, &[true], 16, &|_| false)
+                .unwrap(),
+            SplitBifurcation::Unsplittable,
             "empty-split guard: an empty shard does not split"
+        );
+    }
+
+    /// Coin addresses begin with the bits of a key's first byte here; outputs
+    /// reach only regions below the Poseidon bound (`0x3064…`).
+    fn forest_with_first_bytes(app: &[u8], first_bytes: &[u8]) -> Forest {
+        let forest = Forest::in_memory();
+        let leaves = first_bytes.iter().enumerate().map(|(i, b0)| {
+            let mut key = vec![0u8; 32];
+            key[0] = *b0;
+            key[31] = i as u8;
+            (key, vec![0xCC, i as u8])
+        });
+        forest
+            .commit_shard_phase_raw(app, Phase::VertexAdds, 0, leaves)
+            .unwrap();
+        forest
+    }
+
+    fn bit_path(s: &str) -> Vec<bool> {
+        s.chars().map(|c| c == '1').collect()
+    }
+
+    /// RC devnet M11: shard 001 held data only under 00100 and 00101, so the
+    /// split descended past 0011 and registered it as a spine with no
+    /// committee; a claim output addressed 0x3042… was committed there and
+    /// never delivered. The split must wait until 0011 holds data.
+    #[test]
+    fn a_split_never_passes_an_empty_side_outputs_reach() {
+        let app = b"quil-app-address-0123456789abcd!".to_vec();
+        let reach = &crate::bit_path_reaches_outputs;
+        let sparse = forest_with_first_bytes(&app, &[0x20, 0x22, 0x28, 0x2a]);
+        assert_eq!(
+            sparse
+                .first_split_bifurcation(&app, Phase::VertexAdds, 0, &bit_path("001"), 16, reach)
+                .unwrap(),
+            SplitBifurcation::Withheld(bit_path("0011")),
+            "0011 is empty but below the bound: the split is withheld"
+        );
+        // RC devnet M9: 001 with data only under 001000/001001 left both 00101
+        // and 0011 as spines. The first empty reachable side withholds it.
+        let m9 = forest_with_first_bytes(&app, &[0x20, 0x21, 0x24, 0x25]);
+        assert_eq!(
+            m9.first_split_bifurcation(&app, Phase::VertexAdds, 0, &bit_path("001"), 16, reach)
+                .unwrap(),
+            SplitBifurcation::Withheld(bit_path("0011")),
+        );
+        // Recovery: once a vertex lands in 0011, the same shard splits there.
+        let filled = forest_with_first_bytes(&app, &[0x20, 0x22, 0x28, 0x2a, 0x30]);
+        assert_eq!(
+            filled
+                .first_split_bifurcation(&app, Phase::VertexAdds, 0, &bit_path("001"), 16, reach)
+                .unwrap(),
+            SplitBifurcation::Children(vec![bit_path("0010"), bit_path("0011")]),
+        );
+    }
+
+    /// Sides wholly above the bound never receive an output, so the descent
+    /// still passes them: the root of Poseidon-addressed data splits at 000 /
+    /// 001 with spines 1 and 01, exactly as before.
+    #[test]
+    fn a_split_still_passes_sides_no_output_reaches() {
+        let app = b"quil-app-address-0123456789abcd!".to_vec();
+        let reach = &crate::bit_path_reaches_outputs;
+        let forest = forest_with_first_bytes(&app, &[0x00, 0x10, 0x20, 0x2f]);
+        assert_eq!(
+            forest
+                .first_split_bifurcation(&app, Phase::VertexAdds, 0, &[], 16, reach)
+                .unwrap(),
+            SplitBifurcation::Children(vec![bit_path("000"), bit_path("001")]),
+        );
+        // At the bound's edge (mainnet's 00110): 0x30 0x00.. and 0x30 0x41..
+        // differ at bit 9; every side passed on the way (001101, 0011001,
+        // 00110001, 001100001) lies above 0x3064….
+        let edge = Forest::in_memory();
+        let leaves = [(0x00u8, 1u8), (0x41, 2)].map(|(b1, tag)| {
+            let mut key = vec![0u8; 32];
+            key[0] = 0x30;
+            key[1] = b1;
+            key[31] = tag;
+            (key, vec![tag])
+        });
+        edge.commit_shard_phase_raw(&app, Phase::VertexAdds, 0, leaves)
+            .unwrap();
+        assert_eq!(
+            edge.first_split_bifurcation(&app, Phase::VertexAdds, 0, &bit_path("00110"), 16, reach)
+                .unwrap(),
+            SplitBifurcation::Children(vec![bit_path("0011000000"), bit_path("0011000001")]),
         );
     }
 
