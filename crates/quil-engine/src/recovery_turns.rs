@@ -789,7 +789,34 @@ pub(crate) async fn lent_during<R>(
     (done, asked.elapsed())
 }
 
+/// The queue as a replay starts ([`Turn::replay_load`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplayLoad {
+    /// Workers in a replay's turn, this one and those lent out included.
+    pub(crate) parallel_replays: u32,
+    /// Of all turns, those lent out to local work now.
+    pub(crate) lent_turns: u32,
+    /// Workers waiting for a turn.
+    pub(crate) queue_len: u32,
+}
+
 impl Turn<'_> {
+    /// The queue now. A lent turn's holder stays a holder, so holders count
+    /// each replay once.
+    pub(crate) fn replay_load(&self) -> ReplayLoad {
+        let state = self.turns.lock();
+        let replaying = state
+            .holders
+            .iter()
+            .filter(|holder| holder.execution.turn().kind == RecoveryKind::Replay)
+            .count();
+        ReplayLoad {
+            parallel_replays: replaying as u32,
+            lent_turns: state.queue.lent as u32,
+            queue_len: state.queue.waiters.len() as u32,
+        }
+    }
+
     /// Lend this turn out, if it may be: an install's never is, since it
     /// holds its archive reads across its local work.
     fn lend(&self) -> bool {
@@ -1231,6 +1258,39 @@ mod lending_tests {
         settles(second).await.unwrap();
         settles(third).await.unwrap();
         settles(turns.acquire(replay(9))).await;
+    }
+
+    /// Holders in a replay count once, lent out or not; an install's turn
+    /// and a waiter are no replay running.
+    #[tokio::test]
+    async fn a_replays_load_counts_replays_in_their_turns_and_the_queue() {
+        let turns = leaked(2);
+        let first = turns.acquire(replay(1)).await;
+        let installing = turns.acquire(install(2)).await;
+        let load = |parallel_replays, lent_turns, queue_len| ReplayLoad {
+            parallel_replays,
+            lent_turns,
+            queue_len,
+        };
+        assert_eq!(first.replay_load(), load(1, 0, 0));
+        let (second, got_second, end_second) = taking(turns, 3);
+        tokio::task::yield_now().await;
+        let (third, got_third, end_third) = taking(turns, 4);
+        tokio::task::yield_now().await;
+        assert_eq!(first.replay_load(), load(1, 0, 2));
+        lent_during(Some(&first), async {
+            settles(got_second).await.unwrap();
+            assert_eq!(first.replay_load(), load(2, 1, 1));
+            drop(installing);
+            settles(got_third).await.unwrap();
+            assert_eq!(first.replay_load(), load(3, 1, 0));
+            end_second.send(()).unwrap();
+            settles(second).await.unwrap();
+        })
+        .await;
+        assert_eq!(first.replay_load(), load(2, 0, 0));
+        end_third.send(()).unwrap();
+        settles(third).await.unwrap();
     }
 
     /// With nobody waiting there is nothing to lend for.

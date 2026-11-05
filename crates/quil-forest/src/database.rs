@@ -101,6 +101,18 @@ impl WriteTimes {
     }
 }
 
+thread_local! {
+    /// How long this thread's store writes took.
+    static THREAD_WRITE_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How long this thread's writes to any store took since it started: the
+/// difference across a step gives that step's writes, whichever store they
+/// went to.
+pub fn thread_store_write_time() -> std::time::Duration {
+    std::time::Duration::from_micros(THREAD_WRITE_US.with(std::cell::Cell::get))
+}
+
 /// Every store's write times in this process: a node's workers write their
 /// own stores, usually on the disk the master's is on.
 static ALL_STORES: WriteTimes = WriteTimes::new();
@@ -686,6 +698,7 @@ impl DatabaseWriteGuard<'_> {
             None => self.database.0.db.write_opt(batch, options),
         };
         let took = started.elapsed();
+        THREAD_WRITE_US.with(|us| us.set(us.get().saturating_add(took.as_micros() as u64)));
         self.database.0.times.wrote(took);
         ALL_STORES.wrote(took);
         if !matches!(watched, WatchedWrite::None) {
@@ -1218,5 +1231,28 @@ mod write_times_tests {
         assert!(held.max_barrier_hold_ms >= 150, "{held:?}");
         assert!(held.max_barrier_wait_ms >= 100, "{held:?}");
         assert!(take_all_stores_write_times().writes >= 1);
+    }
+
+    /// A thread's write time grows with its own writes, not another's.
+    #[test]
+    fn a_threads_store_write_time_counts_only_its_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = rocksdb::Options::default();
+        options.create_if_missing(true);
+        let db = CoordinatedDb::new(DB::open(&options, dir.path()).unwrap());
+        let before = thread_store_write_time();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let theirs = thread_store_write_time();
+                    db.put(b"a", b"1").unwrap();
+                    assert!(thread_store_write_time() > theirs);
+                })
+                .join()
+                .unwrap();
+        });
+        assert_eq!(thread_store_write_time(), before);
+        db.put(b"b", b"2").unwrap();
+        assert!(thread_store_write_time() > before);
     }
 }

@@ -358,6 +358,8 @@ pub struct AppEngineHandle {
     sizes: SharedAppEngineSizes,
     execution: crate::worker_execution::SharedWorkerExecution,
     fee_snapshot: Arc<std::sync::Mutex<Option<quil_execution::pricing::AppFeeSnapshot>>>,
+    /// What the engine's archive replays went to.
+    pub(crate) replay_costs: Arc<crate::replay_split::SharedReplayCosts>,
 }
 
 impl AppEngineHandle {
@@ -397,6 +399,7 @@ impl AppEngineHandle {
             sizes: SharedAppEngineSizes::new(),
             execution: Default::default(),
             fee_snapshot: Arc::new(std::sync::Mutex::new(None)),
+            replay_costs: Default::default(),
         };
         (handle, receiver)
     }
@@ -2863,6 +2866,11 @@ pub struct AppConsensusEngine {
     /// materialized twice (mirrors Go `lastMaterializedFrame`,
     /// app_consensus_engine.go:1444-1449).
     last_materialized_frame: u64,
+    /// What archive replays went to, which the handle reads, and whether one
+    /// runs now: the actor handles one message at a time, so what it times
+    /// meanwhile is that replay's.
+    replay_costs: Arc<crate::replay_split::SharedReplayCosts>,
+    replaying: bool,
     /// Spend relays GLOBAL skipped (`crate::relay_reoffer`).
     relay_watch: crate::relay_reoffer::RelayWatch,
     /// Thread-safe mirror of `last_materialized_frame` for the CW proposal
@@ -3173,8 +3181,10 @@ impl AppConsensusEngine {
         execution.engine_started();
         execution.state("starting", "waiting for transport");
         let inbound_dropped: Arc<std::sync::atomic::AtomicU64> = Default::default();
+        let replay_costs: Arc<crate::replay_split::SharedReplayCosts> = Default::default();
         let handle = AppEngineHandle {
             core_id,
+            replay_costs: replay_costs.clone(),
             execution: execution.clone(),
             cancel: cancel.clone(),
             materialized: shard_mat_frame.clone(),
@@ -3232,6 +3242,8 @@ impl AppConsensusEngine {
             retry_parent_seals: std::collections::BTreeSet::new(),
             pending_seal_rank: None,
             last_materialized_frame: 0,
+            replay_costs,
+            replaying: false,
             relay_watch: Default::default(),
             shard_mat_frame,
             execution,
@@ -4002,6 +4014,7 @@ impl AppConsensusEngine {
         let frame_outflows = self.frame_outflows.clone();
         let clock_store = self.clock_store.clone();
         let filter = self.filter.clone();
+        let replay_costs = self.replaying.then(|| self.replay_costs.clone());
         let result = tokio::task::spawn_blocking(move || {
             let materialized = materialize_app_shard_requests(
                 exec.as_ref(),
@@ -4013,6 +4026,14 @@ impl AppConsensusEngine {
                 &app_address,
                 global_frame_number,
             )?;
+            if let Some(costs) = &replay_costs {
+                let steps = &materialized.steps;
+                costs.add(&crate::replay_split::ReplayCosts::materialized(
+                    steps.preverify,
+                    &steps.execute_thread,
+                    &steps.commit_thread,
+                ));
+            }
             let digest = quil_execution::token_intrinsic::accumulator_header::report_digest(
                 &materialized.accumulator_report,
             );
@@ -5115,12 +5136,17 @@ impl AppConsensusEngine {
         frame: &quil_types::proto::global::AppShardFrame,
         frame_number: u64,
     ) -> Result<()> {
-        crate::app_handoff::commit_clock_head(
+        let started = std::time::Instant::now();
+        let committed = crate::app_handoff::commit_clock_head(
             self.clock_store.as_ref(),
             &self.filter,
             frame,
             frame_number,
-        )
+        );
+        self.note_replay_cost(&crate::replay_split::ReplayCosts::store_write(
+            started.elapsed(),
+        ));
+        committed
     }
 
     async fn reconcile_with_sync(&mut self, synced_to_frame: u64) -> Result<()> {
@@ -5266,7 +5292,9 @@ impl AppConsensusEngine {
             .and_then(|header| header.public_key_signature_bls48581.as_ref())
             .is_none_or(|signature| signature.signature.is_empty());
         if !uncertified {
-            let prepared = prepare_replayed_frame(&validator, &frame).await;
+            let prepared = self
+                .timing_replay_prepare(prepare_replayed_frame(&validator, &frame))
+                .await;
             return self
                 .replay_archive_frame_with(frame, None, |frame| {
                     prepared.judge(
@@ -5286,7 +5314,9 @@ impl AppConsensusEngine {
         let terminal = descendants.last().ok_or_else(|| {
             QuilError::InvalidSignature("archive replay frame has no certified descendant".into())
         })?;
-        let terminal_prepared = prepare_replayed_frame(&validator, terminal).await;
+        let terminal_prepared = self
+            .timing_replay_prepare(prepare_replayed_frame(&validator, terminal))
+            .await;
         let terminal_number = terminal
             .header
             .as_ref()
@@ -5308,8 +5338,12 @@ impl AppConsensusEngine {
         // The linked frames' outputs are checked against GLOBAL anchors from
         // this node's clock: fetch the missing ones first, once the
         // certificate checks out, as their storage history is fetched below.
-        crate::frame_validator::prepare_archive_replay_anchors(&validator, &frame, &descendants)
-            .await?;
+        self.timing_replay_prepare(crate::frame_validator::prepare_archive_replay_anchors(
+            &validator,
+            &frame,
+            &descendants,
+        ))
+        .await?;
         crate::frame_validator::validate_archive_replay_chain(
             &frame,
             &descendants,
@@ -5324,7 +5358,10 @@ impl AppConsensusEngine {
                 )),
             },
         )?;
-        let retained = match validator.prepare_storage_history_of_linked(&frame).await {
+        let retained = match self
+            .timing_replay_prepare(validator.prepare_storage_history_of_linked(&frame))
+            .await
+        {
             Ok(()) => true,
             Err(error) => {
                 warn!(frame = frame.header.as_ref().map_or(0, |header| header.frame_number), %error,
@@ -5348,6 +5385,24 @@ impl AppConsensusEngine {
         .await
     }
 
+    /// `prepare`, a step of an archive replay that fetches or rebuilds what a
+    /// frame's validation needs, counted in the replay's costs.
+    async fn timing_replay_prepare<T>(&self, prepare: impl std::future::Future<Output = T>) -> T {
+        let started = std::time::Instant::now();
+        let prepared = prepare.await;
+        self.note_replay_cost(&crate::replay_split::ReplayCosts::prepare(
+            started.elapsed(),
+        ));
+        prepared
+    }
+
+    /// Count `costs` in the archive replay running now, if one is.
+    fn note_replay_cost(&self, costs: &crate::replay_split::ReplayCosts) {
+        if self.replaying {
+            self.replay_costs.add(costs);
+        }
+    }
+
     /// [`Self::replay_archive_frame`] for the shard sync, noting its outcome
     /// for the successor-blocked warning ([`Self::note_replay_outcome`]).
     async fn replay_archive_frame_for_sync(
@@ -5369,7 +5424,11 @@ impl AppConsensusEngine {
                     .map(|header| (header.frame_number, header.global_frame_number))
             })
             .collect();
+        self.replaying = true;
+        let started = std::time::Instant::now();
         let result = self.replay_archive_frame(frame, descendants).await;
+        self.note_replay_cost(&crate::replay_split::ReplayCosts::engine(started.elapsed()));
+        self.replaying = false;
         // The first frame of the chain whose GLOBAL anchor this node still lacks.
         let unanchored = result
             .is_err()
@@ -5516,7 +5575,10 @@ impl AppConsensusEngine {
             )));
         }
         let validator = self.frame_validator();
-        let retained = match validator.prepare_storage_history_of_linked(&frame).await {
+        let retained = match self
+            .timing_replay_prepare(validator.prepare_storage_history_of_linked(&frame))
+            .await
+        {
             Ok(()) => true,
             Err(error) => {
                 warn!(frame = number, %error,
@@ -14196,6 +14258,10 @@ pub(crate) struct MaterializeSteps {
     pub(crate) pricing: std::time::Duration,
     pub(crate) process: std::time::Duration,
     pub(crate) commit: std::time::Duration,
+    /// Pricing and processing the bundles, on this thread.
+    pub(crate) execute_thread: crate::replay_split::ThreadStep,
+    /// The commit, on this thread.
+    pub(crate) commit_thread: crate::replay_split::ThreadStep,
 }
 
 pub(crate) fn materialize_app_shard_requests(
@@ -14255,6 +14321,7 @@ pub(crate) fn materialize_app_shard_requests(
     // Spend entries of the confidential operations this frame verified, for
     // the global commit. Capped per frame before execution, like settlements.
     let mut spends: Vec<Vec<u8>> = Vec::new();
+    let executing = crate::replay_split::ThreadStepTimer::start();
     for (index, bundle) in requests.iter().enumerate() {
         // Named while it is priced and executed: the watchdog of a frame
         // that does not finish names the bundle and its operations.
@@ -14418,7 +14485,9 @@ pub(crate) fn materialize_app_shard_requests(
         }
     }
 
+    steps.execute_thread = executing.end();
     settlements.sort();
+    let committing = crate::replay_split::ThreadStepTimer::start();
     let commit = StepTimer::start(&mut steps.commit, probe::Section::AppFrameCommit);
     let accumulator_report = execution_manager.commit_frame_with_app_history(
         frame_number,
@@ -14429,6 +14498,7 @@ pub(crate) fn materialize_app_shard_requests(
         global_frame_number,
     )?;
     drop(commit);
+    steps.commit_thread = committing.end();
     Ok(MaterializedAppFrame {
         processed,
         skipped,
@@ -17915,6 +17985,20 @@ mod fence_reanchor_tests {
             None,
             "a finished re-anchor keeps none"
         );
+    }
+
+    /// Only what runs inside a replay request counts in its costs: the
+    /// engine's live frames materialize between requests.
+    #[tokio::test]
+    async fn replay_costs_count_only_while_a_replay_runs() {
+        use crate::replay_split::ReplayCosts;
+        let (mut replaying, _events) = engine();
+        let took = std::time::Duration::from_millis(3);
+        replaying.note_replay_cost(&ReplayCosts::prepare(took));
+        assert_eq!(replaying.replay_costs.read(), ReplayCosts::default());
+        replaying.replaying = true;
+        replaying.note_replay_cost(&ReplayCosts::prepare(took));
+        assert_eq!(replaying.replay_costs.read(), ReplayCosts::prepare(took));
     }
 
     fn engine() -> (AppConsensusEngine, mpsc::UnboundedReceiver<AppEngineEvent>) {
@@ -22079,6 +22163,7 @@ mod tests {
             sizes: SharedAppEngineSizes::new(),
             materialized: materialized.clone(),
             fee_snapshot: stored.clone(),
+            replay_costs: Default::default(),
         };
         assert!(handle.fee_snapshot().is_none());
         let snapshot = quil_execution::pricing::AppFeeSnapshot {
@@ -24135,6 +24220,7 @@ mod tests {
             .unwrap()
             .is_none());
         store.fail_commit_for_test(false);
+        engine.replaying = true;
         assert_eq!(
             engine
                 .replay_archive_frame_with(frame, None, |_| Ok(true))
@@ -24142,7 +24228,16 @@ mod tests {
                 .unwrap(),
             1
         );
+        engine.replaying = false;
         assert_eq!(engine.load_materialized_cursor().unwrap(), 1);
+        let costs = engine.replay_costs.read();
+        assert!(costs.store_write_us > 0, "{costs:?}");
+        // Where the kernel offers thread times, a materialized frame shows them.
+        if std::fs::read_to_string("/proc/thread-self/schedstat")
+            .is_ok_and(|text| !text.starts_with("0 "))
+        {
+            assert_eq!(costs.sampled_frames, 1, "{costs:?}");
+        }
         // A new reader, with no in-memory records, still has the outflow history
         // needed to build the next frame's report and relay windows.
         let fresh_clock = quil_store::RocksClockStore::new(rocks.inner());
