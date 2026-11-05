@@ -1131,6 +1131,13 @@ fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Con
         .duplicate_cache_time(std::time::Duration::from_secs(300))
         // Run per-bitmask validators before forwarding (see module docs).
         .validate_messages()
+        // A node's master and standalone workers sign with one identity under
+        // different transport ids (`P2PNode::new_for_worker`), and a relay
+        // excludes only the source from forwarding. So a message from our own
+        // identity, relayed by an honest peer, is a sibling's: check it like
+        // any other, without penalising the relay. Copies of messages this
+        // process published are dropped as duplicates.
+        .allow_self_origin(true)
         // BlossomSub message id = `[0x01] ++ SHA256(data)`. Stock gossipsub's
         // default id differs, so we set it explicitly to keep the dedup key
         // stable across the network. Under strict shard gossip a shard CW
