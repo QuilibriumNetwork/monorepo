@@ -104,6 +104,10 @@ pub fn apply_msg_at(m: &mut Model, msg: Msg, now: Instant) -> Vec<Cmd> {
             coins::apply_legacy(m, answer, took);
             vec![]
         }
+        Msg::LegacyProgress { pages, coins } => {
+            coins::apply_legacy_progress(m, pages, coins);
+            vec![]
+        }
         Msg::MintPreview(preview) => {
             mint::apply_preview(m, preview);
             vec![]

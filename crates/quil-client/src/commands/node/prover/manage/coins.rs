@@ -17,8 +17,8 @@ use crate::commands::token::legacy::Snapshot;
 use super::model::{Model, NoticeSeverity, Tab};
 use super::update::Cmd;
 
-/// How often an open Coins tab reads legacy coins again (6–9 s per read on
-/// a regular node).
+/// How often an open Coins tab reads legacy coins again (5–9 s per read of
+/// 3,000 coins on a regular node, about 250 s of 180,000).
 pub const LEGACY_REFRESH: Duration = Duration::from_secs(600);
 
 /// Rows of the Balances panel, top to bottom: claimable, legacy,
@@ -357,6 +357,8 @@ pub type LegacyAnswer = Result<Option<Snapshot>, String>;
 pub struct Legacy {
     /// A read is in flight, started at this time.
     pub reading: Option<Instant>,
+    /// The read in flight's pages read and coins listed so far.
+    pub progress: Option<(usize, usize)>,
     /// When the last read started; the next one is due [`LEGACY_REFRESH`]
     /// later.
     pub last_start: Option<Instant>,
@@ -404,6 +406,7 @@ fn start_legacy(m: &mut Model, now: Instant) -> Vec<Cmd> {
         return vec![];
     }
     m.coins.legacy.reading = Some(now);
+    m.coins.legacy.progress = None;
     m.coins.legacy.last_start = Some(now);
     m.coins.legacy.refresh_at = None;
     vec![Cmd::FetchLegacy]
@@ -429,10 +432,19 @@ pub fn open(m: &mut Model) -> Vec<Cmd> {
     due(m, Instant::now())
 }
 
+/// A legacy read's progress, while it is in flight.
+pub fn apply_legacy_progress(m: &mut Model, pages: usize, coins: usize) {
+    let legacy = &mut m.coins.legacy;
+    if legacy.reading.is_some() {
+        legacy.progress = Some((pages, coins));
+    }
+}
+
 /// A finished legacy read.
 pub fn apply_legacy(m: &mut Model, answer: LegacyAnswer, took: Duration) {
     let legacy = &mut m.coins.legacy;
     legacy.reading = None;
+    legacy.progress = None;
     match answer {
         Ok(snapshot) => {
             legacy.answer = Some((snapshot, SystemTime::now(), took));
@@ -657,6 +669,36 @@ pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
         _ => {}
     }
     let legacy = &m.coins.legacy;
+    // A long listing's progress: its count is the read's own, not a row's.
+    if let (Some(since), Some((pages, coins))) = (legacy.reading, legacy.progress) {
+        out.push(Notice {
+            key: "coins-legacy-reading",
+            severity: NoticeSeverity::Info,
+            attention: false,
+            progress: true,
+            success: false,
+            text: format!(
+                "Legacy coins: reading, {} listed in {} so far {}.",
+                plural(coins, "coin", "coins"),
+                plural(pages, "page", "pages"),
+                if since.elapsed() < Duration::from_secs(60) {
+                    "<60s"
+                } else {
+                    ">60s"
+                }
+            ),
+        });
+    }
+    let mut push = |key, severity, attention, text: String| {
+        out.push(Notice {
+            key,
+            severity,
+            attention,
+            progress: false,
+            success: false,
+            text,
+        })
+    };
     // The legacy row's `As of` marks how old its figures are.
     if let (Some(error), Some(since)) = (&legacy.error, legacy.failing_since) {
         push(
@@ -664,7 +706,8 @@ pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
             NoticeSeverity::Warning,
             false,
             format!(
-                "Legacy coins: read failed {} since {} ({error}).",
+                "Legacy coins: read failed {} since {} ({error}); \
+                 qclient token legacy --summary lists them.",
                 plural(legacy.failures as usize, "time", "times"),
                 utc_hm(since)
             ),
@@ -1257,5 +1300,59 @@ mod coins_tests {
         assert_eq!(failed.severity, NoticeSeverity::Warning);
         assert!(failed.text.contains("read failed 2 times since "));
         assert!(!failed.text.contains("figures as of"), "{}", failed.text);
+    }
+
+    /// A long legacy read shows how far it got, from either tab, until it
+    /// ends; a failed one names how far it got and the command that lists
+    /// the coins instead, and ‹S› still prepares a shield, which reads the
+    /// coins itself.
+    #[test]
+    fn a_long_legacy_read_shows_its_progress_and_a_failure_its_remedy() {
+        let mut m = Model::new();
+        let fmt = |units: u128| units.to_string();
+        let reading = |m: &Model| {
+            notices(m, fmt)
+                .into_iter()
+                .find(|n| n.key == "coins-legacy-reading")
+        };
+        assert!(matches!(
+            due(&mut m, Instant::now()).as_slice(),
+            [Cmd::FetchLegacy]
+        ));
+        assert!(reading(&m).is_none(), "no page yet, nothing to count");
+        apply_legacy_progress(&mut m, 166, 84_992);
+        let shown = reading(&m).unwrap();
+        assert!(shown.progress, "{shown:?}");
+        assert_eq!(
+            shown.text,
+            "Legacy coins: reading, 84992 coins listed in 166 pages so far <60s."
+        );
+        assert!(shown.rank() >= m.notice_minimum, "shows by default");
+        // ‹S› on the legacy row prepares a shield before any answer.
+        m.tab = Tab::Coins;
+        m.coins.cursor = 1;
+        assert_eq!(key_refusal(&m, "S"), None);
+        apply_legacy(
+            &mut m,
+            Err("no answer for 120s after 166 pages (84992 coins)".into()),
+            Duration::from_secs(300),
+        );
+        assert!(reading(&m).is_none(), "the read ended");
+        let failed = notices(&m, fmt)
+            .into_iter()
+            .find(|n| n.key == "coins-legacy-failed")
+            .unwrap();
+        assert!(
+            failed.text.contains("after 166 pages (84992 coins)")
+                && failed
+                    .text
+                    .ends_with("; qclient token legacy --summary lists them."),
+            "{}",
+            failed.text
+        );
+        assert_eq!(key_refusal(&m, "S"), None, "a failed read keeps ‹S›");
+        // Progress of a read no longer in flight is stale.
+        apply_legacy_progress(&mut m, 1, 512);
+        assert!(reading(&m).is_none());
     }
 }

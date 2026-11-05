@@ -67,44 +67,117 @@ pub async fn fetch_rewards(client: Client, km: Arc<FileKeyManager>) -> Msg {
     Msg::RewardRefresh(result)
 }
 
-/// Longest a legacy read of the Coins tab may take.
-const LEGACY_TIMEOUT: Duration = Duration::from_secs(120);
+/// When a legacy read of the Coins tab gives up: once the node sends
+/// nothing for `stall` (no page, nor the shard list after the last one),
+/// or after `cap` in all. A listing's length follows the owner's coins (a
+/// regular node forwards each page of 512 to an archive in about 0.7 s:
+/// 3,000 coins take 5 s, 180,000 about 250 s), so only a stalled read
+/// fails early.
+#[derive(Clone, Copy, Debug)]
+pub struct LegacyLimits {
+    pub stall: Duration,
+    pub cap: Duration,
+}
+
+/// A page the node is still retrying arrives within the channel's 120 s
+/// call deadline, which ends a stuck call first; an hour lists over a
+/// million coins at the pace above.
+pub const LEGACY_LIMITS: LegacyLimits = LegacyLimits {
+    stall: Duration::from_secs(120),
+    cap: Duration::from_secs(3600),
+};
 
 /// Read the legacy coins of the identity with Ed448 key `public` (`None`:
-/// the config has none, so it owns no legacy coins).
+/// the config has none, so it owns no legacy coins), sending
+/// [`Msg::LegacyProgress`] to `progress` as pages arrive.
 pub async fn fetch_legacy(
     client: Client,
     public: Option<[u8; 57]>,
     network: u8,
     config_dir: Option<std::path::PathBuf>,
+    progress: tokio::sync::mpsc::UnboundedSender<Msg>,
+) -> Msg {
+    read_legacy(client, public, network, config_dir, progress, LEGACY_LIMITS).await
+}
+
+/// [`fetch_legacy`] within `limits`.
+async fn read_legacy(
+    client: Client,
+    public: Option<[u8; 57]>,
+    network: u8,
+    config_dir: Option<std::path::PathBuf>,
+    progress: tokio::sync::mpsc::UnboundedSender<Msg>,
+    limits: LegacyLimits,
 ) -> Msg {
     let started = std::time::Instant::now();
     let answer = match public {
         None => Ok(None),
-        Some(public) => tokio::time::timeout(
-            LEGACY_TIMEOUT,
-            crate::commands::token::legacy::snapshot(
+        Some(public) => {
+            let (tick, ticks) = tokio::sync::watch::channel((0, 0));
+            let mut report = move |pages: usize, coins: usize| {
+                let _ = tick.send((pages, coins));
+            };
+            let read = crate::commands::token::legacy::snapshot(
                 &client,
                 &quil_execution::domains::QUIL_TOKEN,
                 &public,
                 network,
                 config_dir.as_deref(),
-            ),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            Err(anyhow::anyhow!(
-                "no answer within {}s",
-                LEGACY_TIMEOUT.as_secs()
-            ))
-        })
-        .map(Some)
-        .map_err(|e| format!("{e:#}")),
+                &mut report,
+            );
+            until_stalled(read, ticks, limits, |(pages, coins)| {
+                let _ = progress.send(Msg::LegacyProgress { pages, coins });
+            })
+            .await
+            .and_then(|read| read.map(Some).map_err(|e| format!("{e:#}")))
+        }
     };
     Msg::LegacyRefresh {
         answer,
         took: started.elapsed(),
         mints: saved_mints(config_dir.as_deref(), network),
+    }
+}
+
+/// Run `read` to its end unless `ticks`, its `(pages, coins)` so far, stays
+/// unchanged for `limits.stall`, or `limits.cap` passes; `on_tick` gets
+/// each new value. The error says which, and how far the read got.
+async fn until_stalled<T>(
+    read: impl std::future::Future<Output = T>,
+    mut ticks: tokio::sync::watch::Receiver<(usize, usize)>,
+    limits: LegacyLimits,
+    mut on_tick: impl FnMut((usize, usize)),
+) -> Result<T, String> {
+    let started = tokio::time::Instant::now();
+    let (mut last, mut open) = (started, true);
+    tokio::pin!(read);
+    loop {
+        let wake = (last + limits.stall).min(started + limits.cap);
+        tokio::select! {
+            biased;
+            out = &mut read => return Ok(out),
+            changed = ticks.changed(), if open => match changed {
+                Ok(()) => {
+                    last = tokio::time::Instant::now();
+                    on_tick(*ticks.borrow_and_update());
+                }
+                Err(_) => open = false,
+            },
+            () = tokio::time::sleep_until(wake) => {
+                let (pages, coins) = *ticks.borrow();
+                return Err(if wake >= started + limits.cap {
+                    format!(
+                        "not done within {} min, after {pages} pages ({coins} coins)",
+                        limits.cap.as_secs() / 60
+                    )
+                } else {
+                    format!(
+                        "no answer for {}s after {pages} pages ({coins} coins)",
+                        limits.stall.as_secs_f64()
+                    )
+                });
+            }
+        }
     }
 }
 
@@ -2157,6 +2230,222 @@ mod mint_action_tests {
             assert!(!error.contains("--submit-config"), "{error}");
         }
         stop.send(()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod legacy_read_tests {
+    use super::*;
+    use quil_types::store::{CoinWitnessProvider, LegacyCoinData, LegacyCoinPageData};
+    use tokio::sync::watch;
+    use tokio::time::Instant;
+
+    const LIMITS: LegacyLimits = LEGACY_LIMITS;
+
+    /// A read sending `pages` pages of 512 coins, one every `every`, then
+    /// `after`: a snapshot's calls after its last page.
+    async fn paging<T>(
+        tick: watch::Sender<(usize, usize)>,
+        pages: usize,
+        every: Duration,
+        after: impl std::future::Future<Output = T>,
+    ) -> T {
+        for page in 1..=pages {
+            tokio::time::sleep(every).await;
+            tick.send_replace((page, page * 512));
+        }
+        after.await
+    }
+
+    /// A listing of 347 pages of 0.72 s each, 250 s, as a regular node
+    /// lists 177,000 coins. A fixed 120 s limit on the whole read, as the
+    /// Coins tab had, cuts it every time; a read that keeps paging is
+    /// never cut, and each page reaches the tab.
+    #[tokio::test(start_paused = true)]
+    async fn a_long_listing_that_keeps_paging_is_read_to_its_end() {
+        let every = Duration::from_millis(720);
+        let (tick, _) = watch::channel((0, 0));
+        let fixed = tokio::time::timeout(
+            Duration::from_secs(120),
+            paging(tick, 347, every, async { 347 }),
+        );
+        assert!(fixed.await.is_err(), "a fixed 120 s limit cuts it");
+        let started = Instant::now();
+        let (tick, ticks) = watch::channel((0, 0));
+        let mut seen = Vec::new();
+        let read = until_stalled(
+            paging(tick, 347, every, async {
+                tokio::time::sleep(every).await;
+                "listed"
+            }),
+            ticks,
+            LIMITS,
+            |tick| seen.push(tick),
+        );
+        assert_eq!(read.await, Ok("listed"));
+        assert!(started.elapsed() >= Duration::from_secs(249));
+        assert_eq!(seen.len(), 347);
+        assert_eq!(seen.last(), Some(&(347, 347 * 512)));
+    }
+
+    /// A read whose node stops answering fails once nothing came for the
+    /// stall window, naming how far it got; one that keeps answering
+    /// without end fails at the cap.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_or_endless_read_fails_and_says_how_far_it_got() {
+        let started = Instant::now();
+        let (tick, ticks) = watch::channel((0, 0));
+        let read = until_stalled(
+            paging(
+                tick,
+                10,
+                Duration::from_millis(720),
+                std::future::pending::<()>(),
+            ),
+            ticks,
+            LIMITS,
+            |_| {},
+        );
+        assert_eq!(
+            read.await,
+            Err("no answer for 120s after 10 pages (5120 coins)".into())
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(127_200) && took < Duration::from_secs(128),
+            "{took:?}"
+        );
+        let started = Instant::now();
+        let (tick, ticks) = watch::channel((0, 0));
+        let read = until_stalled(
+            paging(tick, usize::MAX, Duration::from_secs(1), async {}),
+            ticks,
+            LIMITS,
+            |_| {},
+        );
+        let error = read.await.unwrap_err();
+        assert!(
+            error.starts_with("not done within 60 min, after "),
+            "{error}"
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_secs(3600) && took < Duration::from_secs(3601),
+            "{took:?}"
+        );
+    }
+
+    /// One owner's legacy coins in full pages, each after `latency`: a
+    /// regular node forwarding each page to an archive.
+    struct SlowIndex {
+        owner: [u8; 32],
+        coins: Vec<LegacyCoinData>,
+        latency: Duration,
+    }
+
+    impl CoinWitnessProvider for SlowIndex {
+        fn legacy_coins(
+            &self,
+            _domain: &[u8; 32],
+            owner: &[u8; 32],
+            after: Option<&[u8; 32]>,
+        ) -> quil_types::error::Result<Option<LegacyCoinPageData>> {
+            std::thread::sleep(self.latency);
+            let rest: Vec<LegacyCoinData> = if *owner == self.owner {
+                self.coins
+                    .iter()
+                    .filter(|coin| after.is_none_or(|after| coin.address > *after))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let max = quil_types::store::MAX_LEGACY_COINS_PER_PAGE;
+            let coins: Vec<LegacyCoinData> = rest.iter().take(max).cloned().collect();
+            Ok(Some(LegacyCoinPageData {
+                cursor: coins.last().map(|coin| coin.address),
+                has_more: rest.len() > max,
+                coins,
+            }))
+        }
+    }
+
+    /// Over loopback gRPC, at a hundredth of the time scale: 15,360 coins
+    /// in 31 pages of 100 ms take about 3 s, twice a 1.5 s stall window,
+    /// as a 250 s listing is twice the tab's former 120 s limit. The tab gets each page's progress, then the coins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_coins_tab_reads_thousands_of_legacy_coins_paging_slowly() {
+        let public = [7u8; 57];
+        let owners = crate::commands::token::legacy::key_owners(&public).unwrap();
+        let coins: Vec<LegacyCoinData> = (1..=15_360u32)
+            .map(|i| {
+                let mut address = [0u8; 32];
+                address[28..].copy_from_slice(&i.to_be_bytes());
+                LegacyCoinData {
+                    address,
+                    amount: 1,
+                    origin: [9; 32],
+                    shielded: false,
+                }
+            })
+            .collect();
+        let provider = Arc::new(SlowIndex {
+            owner: owners[0].1,
+            coins,
+            latency: Duration::from_millis(100),
+        });
+        let server =
+            quil_rpc::node_service::NodeRpcServer::new().with_coin_witness_provider(provider);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let multiaddr = format!(
+            "/ip4/127.0.0.1/tcp/{}",
+            listener.local_addr().unwrap().port()
+        );
+        let incoming = futures::stream::unfold(listener, |listener| async {
+            let result = listener.accept().await.map(|(socket, _)| socket);
+            Some((result, listener))
+        });
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    quil_types::proto::node::node_service_server::NodeServiceServer::new(server),
+                )
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+        let client = crate::rpc::connect_node_service(&crate::rpc::ConnectOpts {
+            listen_grpc_multiaddr: multiaddr,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let limits = LegacyLimits {
+            stall: Duration::from_millis(1500),
+            cap: Duration::from_secs(60),
+        };
+        let started = std::time::Instant::now();
+        let Msg::LegacyRefresh { answer, .. } =
+            read_legacy(client, Some(public), 0, None, tx, limits).await
+        else {
+            panic!("a legacy read answers with LegacyRefresh");
+        };
+        let snapshot = answer.unwrap().unwrap();
+        assert!(
+            started.elapsed() > limits.stall,
+            "the read outlasts the window"
+        );
+        assert_eq!((snapshot.tally.unshielded, snapshot.pages), (15_360, 31));
+        let mut progress = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let Msg::LegacyProgress { pages, coins } = msg {
+                progress.push((pages, coins));
+            }
+        }
+        assert!(progress.len() >= 2, "{progress:?}");
+        assert!(progress.windows(2).all(|w| w[0] <= w[1]), "{progress:?}");
+        assert_eq!(progress.last(), Some(&(31, 15_360)));
     }
 }
 

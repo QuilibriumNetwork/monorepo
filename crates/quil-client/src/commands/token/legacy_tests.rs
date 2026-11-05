@@ -509,15 +509,21 @@ async fn the_node_manager_snapshot_tallies_both_owner_forms() {
     ]));
     let (good, stop, serving) = serve(Arc::new(index)).await;
     let client = node(&good).connect(None).await.unwrap();
+    let mut ticks = Vec::new();
     let snapshot = snapshot(
         &client,
         &quil_execution::domains::QUIL_TOKEN,
         &KEY_X,
         0,
         None,
+        &mut |pages, coins| ticks.push((pages, coins)),
     )
     .await
     .unwrap();
+    // A tick per page, counted across both owner forms; the shard list
+    // after the listing ticks again with the same counts.
+    assert_eq!(ticks[..2], [(1, 2), (2, 3)], "{ticks:?}");
+    assert!(ticks[2..].iter().all(|tick| *tick == (2, 3)), "{ticks:?}");
     assert_eq!(
         snapshot.tally,
         Tally {

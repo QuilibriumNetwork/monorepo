@@ -681,7 +681,13 @@ fn spawn_action(
                 &refresh.legacy,
                 &tx,
                 None,
-                actions::fetch_legacy(client, public, network, refresh.config_dir.clone()),
+                actions::fetch_legacy(
+                    client,
+                    public,
+                    network,
+                    refresh.config_dir.clone(),
+                    tx.clone(),
+                ),
             );
         }
         Cmd::ShieldPrepare => {
