@@ -29,3 +29,7 @@ These changes reduce unused vote-phase capacity when views advance without final
 ## Refused proposal summary
 
 `src/simplex/actors/voter/rejections.rs` replaces the voter's "proposal failed verification" warning, which named only the round, with one summary per five minutes that saw a refusal: counts by reason (the application refused it, or the ancestry is invalid), distinct views, proposals verified, distinct leaders and the leader refused most, and the view range, naming the engine's journal partition. It warns only when at least 10 refusals outnumber the proposals verified in the window; each refusal is logged at debug. `src/simplex/actors/voter/state.rs` counts them, `src/simplex/actors/voter/actor.rs` logs the summary. The same file logs the nullification floor it re-sends after its own proposal's view was nullified as one info line with the views and certificate kind, the certificate itself at debug. No protocol or timeout change. Local changes and regression tests are marked `QUILIBRIUM:`.
+
+## Echoed own vote
+
+`src/simplex/actors/batcher/round.rs` makes `Round::add_constructed` ignore a vote of ours already stored as an equal copy: the vote channel delivers our own broadcasts back to us, and that copy can reach the batcher before the voter's. It was already reported and added to the verifier, where a second copy would count twice toward the quorum. A differing vote of ours still panics. `crates/quil-cw-consensus/tests/echoed_own_vote.rs` runs the same order through a real engine, so CI covers it as well as this crate's unit tests.

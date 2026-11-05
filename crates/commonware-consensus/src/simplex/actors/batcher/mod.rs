@@ -421,6 +421,183 @@ mod tests {
         );
     }
 
+    /// QUILIBRIUM: the vote channel delivers our own broadcast back to us,
+    /// and that copy can reach the batcher before the voter's. The voter's
+    /// copy is then ignored: our vote is reported once, counts once toward
+    /// the quorum, and the certificate still assembles.
+    fn echoed_own_vote_counts_once(kind: &'static str) {
+        use crate::simplex::types::Attributable as _;
+
+        #[derive(Clone)]
+        struct Ours(Arc<Mutex<usize>>);
+
+        impl crate::Reporter for Ours {
+            type Activity = Activity<ed25519::Scheme, Sha256Digest>;
+
+            fn report(&mut self, activity: Self::Activity) -> Feedback {
+                let signer = match &activity {
+                    Activity::Notarize(vote) => Some(vote.signer()),
+                    Activity::Nullify(vote) => Some(vote.signer()),
+                    Activity::Finalize(vote) => Some(vote.signer()),
+                    _ => None,
+                };
+                if signer == Some(Participant::new(0)) {
+                    *self.0.lock() += 1;
+                }
+                Feedback::Ok
+            }
+        }
+
+        type Batch = super::Round<ed25519::Scheme, NoopBlocker, Sha256Digest, Ours>;
+
+        fn ready(round: &Batch, kind: &str) -> bool {
+            match kind {
+                "notarize" => round.ready_notarizes(),
+                "nullify" => round.ready_nullifies(),
+                _ => round.ready_finalizes(),
+            }
+        }
+
+        let executor = deterministic::Runner::default();
+        executor.start(|_| async move {
+            let mut rng = test_rng();
+            let Fixture {
+                participants,
+                schemes,
+                verifier,
+                ..
+            } = ed25519::fixture(&mut rng, b"batcher_test", 5);
+            let ours = Ours(Arc::new(Mutex::new(0)));
+            let round_id = Round::new(Epoch::new(0), View::new(1));
+            let mut round: Batch = super::Round::new(
+                round_id,
+                Arc::new(schemes[0].clone()),
+                NoopBlocker,
+                ours.clone(),
+            );
+            let proposal = Proposal::new(round_id, View::new(0), Sha256::hash(b"payload"));
+            let vote = |i: usize| -> Vote<ed25519::Scheme, Sha256Digest> {
+                match kind {
+                    "notarize" => {
+                        Vote::Notarize(Notarize::sign(&schemes[i], proposal.clone()).unwrap())
+                    }
+                    "nullify" => {
+                        Vote::Nullify(Nullify::sign::<Sha256Digest>(&schemes[i], round_id).unwrap())
+                    }
+                    _ => Vote::Finalize(Finalize::sign(&schemes[i], proposal.clone()).unwrap()),
+                }
+            };
+
+            // Member 1 leads; its notarize names the proposal finalizes count toward.
+            round.set_leader(Participant::new(1));
+            if kind == "finalize" {
+                let leader = Notarize::sign(&schemes[1], proposal.clone()).unwrap();
+                assert_eq!(
+                    round.add_network(participants[1].clone(), Vote::Notarize(leader)),
+                    Ok(true)
+                );
+            }
+
+            // Our vote arrives looped back before the voter's copy of it.
+            let own = vote(0);
+            assert_eq!(
+                round.add_network(participants[0].clone(), own.clone()),
+                Ok(true)
+            );
+            round.add_constructed(own);
+            assert_eq!(*ours.0.lock(), 1, "our {kind} is reported once");
+
+            // Three distinct votes stay short of the quorum of four.
+            for i in [1, 2] {
+                assert_eq!(
+                    round.add_network(participants[i].clone(), vote(i)),
+                    Ok(true)
+                );
+            }
+            assert!(
+                !ready(&round, kind),
+                "our {kind} counts once toward the quorum"
+            );
+
+            // A fourth member completes it.
+            assert_eq!(
+                round.add_network(participants[3].clone(), vote(3)),
+                Ok(true)
+            );
+            assert!(ready(&round, kind));
+            let (batch, invalid) = match kind {
+                "notarize" => round.verify_notarizes(&mut rng, &Sequential).await,
+                "nullify" => round.verify_nullifies(&mut rng, &Sequential).await,
+                _ => round.verify_finalizes(&mut rng, &Sequential).await,
+            };
+            assert_eq!(batch, 4);
+            assert!(invalid.is_empty());
+            let verified = match kind {
+                "notarize" => round
+                    .try_construct_notarization(&Sequential)
+                    .await
+                    .expect("notarization")
+                    .verify(&mut rng, &verifier, &Sequential),
+                "nullify" => round
+                    .try_construct_nullification(&Sequential)
+                    .await
+                    .expect("nullification")
+                    .verify::<_, Sha256Digest>(&mut rng, &verifier, &Sequential),
+                _ => round
+                    .try_construct_finalization(&Sequential)
+                    .await
+                    .expect("finalization")
+                    .verify(&mut rng, &verifier, &Sequential),
+            };
+            assert!(verified, "the {kind} certificate verifies");
+            assert_eq!(*ours.0.lock(), 1, "our {kind} is reported once");
+        });
+    }
+
+    #[test]
+    fn echoed_own_notarize_before_constructed_counts_once() {
+        echoed_own_vote_counts_once("notarize");
+    }
+
+    #[test]
+    fn echoed_own_nullify_before_constructed_counts_once() {
+        echoed_own_vote_counts_once("nullify");
+    }
+
+    #[test]
+    fn echoed_own_finalize_before_constructed_counts_once() {
+        echoed_own_vote_counts_once("finalize");
+    }
+
+    /// QUILIBRIUM: a stored vote of ours that differs from the one the voter
+    /// constructed is not an echo; it still panics, as upstream.
+    #[test]
+    #[should_panic(expected = "duplicate notarize")]
+    fn differing_own_vote_before_constructed_still_panics() {
+        let mut rng = test_rng();
+        let Fixture {
+            participants,
+            schemes,
+            ..
+        } = ed25519::fixture(&mut rng, b"batcher_test", 5);
+        let round_id = Round::new(Epoch::new(0), View::new(1));
+        let mut round = super::Round::new(
+            round_id,
+            Arc::new(schemes[0].clone()),
+            NoopBlocker,
+            NoopReporter(PhantomData),
+        );
+        let notarize = |payload: &str| {
+            let proposal = Proposal::new(round_id, View::new(0), Sha256::hash(payload.as_bytes()));
+            Notarize::sign(&schemes[0], proposal).unwrap()
+        };
+        assert_eq!(
+            round.add_network(participants[0].clone(), Vote::Notarize(notarize("a"))),
+            Ok(true)
+        );
+        round.add_constructed(Vote::Notarize(notarize("b")));
+    }
+
     /// QUILIBRIUM: a certificate of an earlier epoch whose committee was larger
     /// than this one's fails to decode, because its signers are bounded by this
     /// committee. It counts as a message of that epoch, not as undecodable
