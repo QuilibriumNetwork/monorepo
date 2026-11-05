@@ -17,6 +17,10 @@ fn selects_the_whole_requested_allocation_and_rejects_missing_or_duplicate_shard
 #[test]
 fn rejects_stale_future_or_missing_checkpoint_time() {
     assert!(freshness(1_000_000, 1_100_000, 900).is_ok());
+    // Archive clocks may be slightly ahead; accepted skew must not wrap to u64.
+    assert!(freshness(1_101_000, 1_100_000, 900).is_ok());
+    assert!(freshness(1_220_000, 1_100_000, 900).is_ok());
+    assert!(freshness(1_220_001, 1_100_000, 900).is_err());
     assert!(freshness(1_000_000, 2_000_000, 900).is_err());
     assert!(freshness(2_000_000, 1_000_000, 900).is_err());
     assert!(freshness(0, 1, 900).is_err());

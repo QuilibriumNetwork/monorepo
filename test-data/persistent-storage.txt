@@ -1,0 +1,118 @@
+Persistent storage implementation and scale validation
+
+Activation
+  MAINNET_PERSISTENT_STORAGE_EPOCH in
+  crates/quil-types/src/consensus/persistent_storage.rs is None. Mainnet has
+  NO activation epoch for this protocol. Environment variables cannot enable
+  it on mainnet. QUIL_PERSISTENT_STORAGE_EPOCH is for coordinated test networks
+  and is clamped to their hash-proof and stable-key activation epochs.
+  The existing mainnet sealed-storage requirement at epoch 1393 is retained.
+  Persistent storage also requires sealing on test networks independently of
+  that older gate.
+
+  Once an epoch is chosen, every validator and worker must carry it before
+  the 32-epoch capacity warmup window. Capacity precommit/certification messages
+  become valid during that window; new useful-data registrations switch at
+  the chosen epoch. Choose the lead time from cold hardware measurements,
+  especially for provers with many seats. No automatic mainnet rollout occurs.
+
+Protocol and lifecycle
+  A fixed-capacity sector has a stable member/sector identity and power-of-two
+  node count. The existing eleven-layer seal AIR certifies zero data: R = L.
+  A signed Falcon precommit fixes its roots before the next GLOBAL beacon.
+  Certification records on GLOBAL create no seat, eligibility, or rewards.
+  Pending precommits use bounded per-member slots; replay cannot change the
+  committed beacon frame. Orphaned cold reservations resume without shard data.
+
+  After GLOBAL accepts the certificate, the worker keeps its final label layer
+  and discards temporary eleven-layer/column files. Uncertified sectors run
+  concurrently up to the available CPU slots across local shards; shared RAM
+  and disk admission bound their temporary caches. Independent initialization,
+  certification and epoch-proof jobs have separate lanes. Later data changes reuse L,
+  encoding R = D + L. Fresh epoch/registration/member/sector/beacon-bound openings
+  prove D, R and certified L at 64 indices. GLOBAL still verifies the ordinary
+  certified-state snapshot binding and prevents allocating a sector twice in
+  one epoch, including across shards and proof batches.
+
+  Fresh proofs losslessly deduplicate repeated Merkle nodes with a canonical
+  dictionary; all 64 openings are verified unchanged. Native fresh proofs
+  trade some bandwidth for substantially less proving
+  work; initial certificates and ordinary frame settlements retain STARKs.
+  The new PS01 registration is 164 bytes; legacy roots are 96 bytes. These are
+  distinct, coordinated formats. Existing seals remain valid in their epochs.
+  Legacy registrations are refused after activation, and PS01 before it.
+
+  Canonical snapshot node counts come from immutable forest metadata. Sparse
+  bindings read authenticated index subtrees and only the sampled values.
+  Unchanged snapshots reuse immutable replica chunks across epochs; GC pins
+  base chunks while any live epoch references them, then reclaims them.
+
+Bounds and limits
+  Locally built sectors contain at most 2^24 nodes (512 MiB of replica nodes).
+  Partitioning counts canonical index/header overhead, leaves growth headroom,
+  and reserves 25% extra capacity before rounding to a power of two. Protocol
+  capacity is bounded at 2^26 nodes. Worker estimates are 2,564 MiB for changed
+  data encoding and 3,480 MiB for cold certification at the local maximum.
+  These are admission estimates, not measured RSS or a guarantee on every host.
+
+  Temporary cold layers/columns are about 6 GiB per 512 MiB sector. At most
+  one such cache per CPU slot is outstanding, further limited by disk and RAM
+  admission; certification releases each cache independently. Steady files are L
+  plus R, each n*32 bytes, plus metadata/caps and retained epoch replicas.
+  Capacity padding and retained snapshots affect the actual disk ratio. An
+  unchanged epoch alias adds metadata, not another copy of replica chunks.
+
+  Changed snapshots still use the canonical v3 flat index and require a full
+  read/encode of their affected sectors. This implementation does not claim
+  O(delta) updates or change the hypergraph's value-commitment format. Large
+  sampled blobs can exceed the existing GLOBAL message budget; generation
+  refuses such proofs before unbounded reads. A real retained mainnet snapshot
+  is needed to measure that tail, index overhead and hyperedge/retained-add
+  sizes before setting activation. Explorer live sizes are not that snapshot.
+
+Evidence and reproducibility
+  storage-mainnet-2026-11-04.json is derived from the public explorer at GLOBAL
+  frame 1,002,903, timestamp 2026-11-04T13:41:20.356Z. It covers 109 application
+  shards and 168 globally-active application prover workload profiles. Shard and membership
+  requests were collected over an interval, not at one atomic chain snapshot.
+  It contains reported live bytes and raw vertex-add counts. The median shard
+  has 1,258,607 records; the maximum has 5,033,438. The largest raw-active
+  application workload has 109 seats. These profiles include 4,252 raw-active
+  allocations and can include expired seats: REST allocation rows omit epoch
+  and eligibility. The shard summaries separately report 2,556 effective-active
+  seats. The bandwidth model weights by that effective census, and asserts
+  that native proofs alone use less than half the current epoch budget. State
+  bindings, settlements and capacity admission consume additional bandwidth. /provers defaults to GLOBAL archives;
+  the refresh script enumerates /provers/shards and each shard's allocations.
+
+  Refresh (writes a new fixture; does not silently replace the dated baseline):
+    python3 scripts/storage-mainnet-fixture.py --output /tmp/storage-current.json
+
+  Run storage regressions, one test per process to isolate existing global
+  clocks/configuration/admission state (set FLINT_DIR if the local build needs it):
+    python3 scripts/test-persistent-storage.py --jobs 2 --results /tmp/storage-results.json
+  Add --offline when dependencies are cached. QUIL_STORAGE_TEST_TOOLCHAIN
+  defaults to 1.95.0. CARGO_TARGET_DIR can reuse an existing build cache.
+
+  The suite runs real retained-forest sparse/dense equivalence, certificate AIR,
+  activation/downgrade/replay checks, GLOBAL ownership, signed precommit and
+  committed acknowledgment lifecycle, disk-cache deletion, orphan recovery,
+  aliases/GC/restart, worker wire compatibility, and admission/batch bounds.
+  It explicitly runs streaming authenticated data-index workloads with
+  1,258,607 and 5,033,438 records. Synthetic state coverage keys exercise binary
+  searches; these scale tests measure DATA index I/O, not complete end-to-end
+  mainnet state verification. Small retained-forest tests verify that separately.
+
+  Measured on the development host: index preparation took about 1.0/4.0 s;
+  challenge-time sparse preparation about 45/55 ms, reading 2,497,536/3,307,456
+  bytes respectively (77/101 subtrees). These are not cold labelling timings.
+
+  Opt into actual maximum-size cold certification plus two 75%-full changed-data
+  encodes/fresh proofs on representative hardware:
+    python3 scripts/test-persistent-storage.py --jobs 1 --full-sector --results /tmp/storage-full.json
+  The full lifecycle defaults to 512 MiB per replica and can take substantial
+  time. QUIL_STORAGE_SCALE_NODES=4096 smoke-tests that harness at 128 KiB; it is
+  not a substitute for a full run. Linux /usr/bin/time -v or macOS
+  /usr/bin/time -l can measure RSS externally. Run under representative CPU,
+  memory and disk limits, including 8 GiB/4-core hosts, before activation.
+  The existing /proc/self/io test is skipped on non-Linux hosts.

@@ -870,7 +870,12 @@ fn chunks(seats: Vec<PreparedSeat>, leaves: usize, bytes: usize) -> Vec<Vec<Prep
                 "storage proof part exceeds message budget");
             continue;
         }
-        if seat.solo {
+        if seat.solo
+            || (seat.part.settles
+                && quil_types::consensus::persistent_storage_at(seat.claim.settle_epoch))
+        {
+            // Keep persistent settlement AIRs seat-sized, matching worker
+            // preparation and allowing independent memory-admitted proofs.
             out.push(vec![seat]);
             continue;
         }
@@ -891,6 +896,41 @@ fn chunks(seats: Vec<PreparedSeat>, leaves: usize, bytes: usize) -> Vec<Vec<Prep
         out.push(open);
     }
     out
+}
+
+/// Peak admission for the actual proof dimensions. Native persistent seals
+/// do not enter the legacy AIR; settlement frames still do.
+pub(crate) fn proving_bytes(seats: &[PreparedSeat]) -> Result<u64> {
+    let member = seats
+        .first()
+        .map(|s| s.member)
+        .ok_or_else(|| QuilError::InvalidArgument("no seat to prove".into()))?;
+    let native = seats
+        .iter()
+        .map(|seat| seat.part_bytes() as u64)
+        .sum::<u64>()
+        .saturating_mul(4);
+    let mut claim = EpochClaim {
+        member,
+        seats: seats.iter().map(|s| s.claim.clone()).collect(),
+    };
+    for seat in &mut claim.seats {
+        seat.seals.retain(|leaf| leaf.persistent.is_none());
+    }
+    let old = claim
+        .seats
+        .iter()
+        .any(|s| !s.seals.is_empty() || !s.frames.is_empty());
+    let traces = if old {
+        quil_execution::global_intrinsic::persistent_storage::estimate_epoch_proving_memory_bytes(
+            &claim.statement(),
+            &quil_crypto::sdr::SdrParams::default(),
+        )
+        .map_err(QuilError::InvalidArgument)?
+    } else {
+        16 << 20
+    };
+    Ok(native.saturating_add(traces))
 }
 
 /// One proof over `seats` (one member's, distinct shards), as GLOBAL takes it.
@@ -1097,9 +1137,6 @@ fn watch(member: [u8; 32]) {
     }
 }
 
-/// Bytes proving holds per sealed leaf, and at least.
-const PROVING_BYTES_PER_SEALED_LEAF: u64 = 400 << 20;
-
 /// The lane of settlements proved alone.
 const SETTLEMENT_LANE: &[u8] = b"epoch proofs: settlements alone";
 
@@ -1114,29 +1151,26 @@ fn prove_and_publish(seats: Vec<PreparedSeat>, publish: Publish) {
     let alone = seats
         .iter()
         .all(|seat| seat.solo && seat.part.settles && !seat.part.seals);
-    let lane = if alone {
-        SETTLEMENT_LANE
+    // Independent chunks run concurrently; overlapping parts retain one lane.
+    let mut lane = if alone {
+        SETTLEMENT_LANE.to_vec()
     } else {
-        crate::storage_jobs::EPOCH_PROOF_LANE
+        crate::storage_jobs::EPOCH_PROOF_LANE.to_vec()
     };
-    crate::storage_jobs::spawn(lane, "member epoch proof", move || {
-        let old_leaves = seats
+    for seat in &seats {
+        lane.extend_from_slice(&seat.member);
+        lane.extend_from_slice(&(seat.part.shard_filter.len() as u64).to_be_bytes());
+        lane.extend_from_slice(&seat.part.shard_filter);
+        lane.extend_from_slice(&seat.part.epoch.to_be_bytes());
+        lane.extend_from_slice(&seat.claim.seal_epoch.to_be_bytes());
+        lane.extend_from_slice(&[u8::from(seat.part.seals), u8::from(seat.part.settles)]);
+    }
+    crate::storage_jobs::spawn(&lane, "member epoch proof", move || {
+        let bytes = proving_bytes(&seats)?;
+        let persistent = seats
             .iter()
-            .flat_map(|seat| &seat.claim.seals)
-            .filter(|leaf| leaf.persistent.is_none())
-            .count() as u64;
-        let old_work = old_leaves > 0 || seats.iter().any(|seat| seat.part.settles);
-        let native_bytes = seats
-            .iter()
-            .map(|seat| seat.part_bytes() as u64)
-            .sum::<u64>()
-            .saturating_mul(4);
-        let bytes = native_bytes.saturating_add(if old_work {
-            PROVING_BYTES_PER_SEALED_LEAF.saturating_mul(old_leaves.max(1))
-        } else {
-            16 << 20
-        });
-        let _memory = if alone {
+            .all(|seat| quil_types::consensus::persistent_storage_at(seat.claim.settle_epoch));
+        let _memory = if alone && !persistent {
             crate::storage_jobs::reserve_settlement(bytes)
         } else {
             crate::storage_jobs::reserve(bytes)
@@ -1249,6 +1283,26 @@ mod tests {
 
     /// A part splits into its seal and its settlement, each a part that
     /// says only its own half, and the two join back into the part.
+    #[test]
+    fn persistent_settlements_are_independent_chunks_and_reserve_actual_air_memory() {
+        let mut parts = Vec::new();
+        for shard in [11, 12] {
+            let (_, part) = sealing_and_settling(shard).halves();
+            let mut part = part.unwrap();
+            part.solo = false;
+            part.part.epoch = 1500;
+            part.claim.settle_epoch = 1500;
+            parts.push(part);
+        }
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(1500));
+        let grouped = chunks(parts.clone(), usize::MAX, usize::MAX);
+        assert_eq!(grouped.len(), 2);
+        assert!(grouped.iter().all(|part| part.len() == 1));
+        assert!(proving_bytes(&grouped[0]).unwrap() > 0);
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
+        assert_eq!(chunks(parts, usize::MAX, usize::MAX).len(), 1);
+    }
+
     #[test]
     fn native_chunks_count_proof_bytes_without_reserving_an_unused_stark() {
         let mut native = seat(197, 1, false);

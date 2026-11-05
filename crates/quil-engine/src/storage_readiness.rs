@@ -3,6 +3,25 @@
 use crate::storage_snapshot::SnapshotMeasurement;
 use serde::Serialize;
 
+/// Isolated benchmark cutoff: retain 0.1% free space (99.9% maximum used).
+/// Production node label stores retain their existing free-space policy.
+pub fn disk_floor(total_bytes: u64) -> u64 {
+    total_bytes.div_ceil(1000)
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AllocationRoundMeasurement {
+    pub registration_wall_seconds: f64,
+    pub frame_openings_wall_seconds: f64,
+    pub settlement_wall_seconds: f64,
+}
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AllocationMeasurement {
+    pub parallel_jobs: usize,
+    pub cold_wall_seconds: f64,
+    pub rounds: Vec<AllocationRoundMeasurement>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
@@ -32,6 +51,7 @@ pub struct Assessment {
 }
 pub struct Evidence<'a> {
     pub measurements: &'a [SnapshotMeasurement],
+    pub allocation: Option<&'a AllocationMeasurement>,
     pub expected_shards: usize,
     pub roots_verified: bool,
     pub release_build: bool,
@@ -148,6 +168,41 @@ pub fn assess(e: Evidence<'_>) -> Assessment {
         out.measured_allocation_seal_bytes += seal_bytes;
         out.measured_allocation_settlement_bytes += settle_bytes;
     }
+    if let Some(allocation) = e.allocation {
+        if allocation.parallel_jobs == 0
+            || allocation.rounds.len() != e.expected_rounds
+            || !allocation.cold_wall_seconds.is_finite()
+            || allocation.cold_wall_seconds < 0.
+            || allocation.rounds.iter().any(|r| {
+                [
+                    r.registration_wall_seconds,
+                    r.frame_openings_wall_seconds,
+                    r.settlement_wall_seconds,
+                ]
+                .iter()
+                .any(|s| !s.is_finite() || *s < 0.)
+            })
+        {
+            incomplete
+                .push("parallel allocation phase measurements are incomplete or invalid".into());
+        }
+        out.cold_measured_seconds = e.download_seconds + allocation.cold_wall_seconds;
+        out.worst_registration_seconds = allocation
+            .rounds
+            .iter()
+            .map(|r| r.registration_wall_seconds)
+            .fold(0., f64::max);
+        out.worst_frame_openings_seconds = allocation
+            .rounds
+            .iter()
+            .map(|r| r.frame_openings_wall_seconds)
+            .fold(0., f64::max);
+        out.worst_settlement_seconds = allocation
+            .rounds
+            .iter()
+            .map(|r| r.settlement_wall_seconds)
+            .fold(0., f64::max);
+    }
     out.frame_openings_with_headroom_seconds = out.worst_frame_openings_seconds * e.headroom;
     out.recurring_with_headroom_seconds = (out.worst_frame_openings_seconds
         + out.worst_registration_seconds
@@ -223,6 +278,7 @@ mod tests {
     fn evidence(m: &[SnapshotMeasurement]) -> Evidence<'_> {
         Evidence {
             measurements: m,
+            allocation: None,
             expected_shards: 2,
             roots_verified: true,
             release_build: true,
@@ -239,6 +295,48 @@ mod tests {
             resource_exceeded: false,
         }
     }
+    #[test]
+    fn benchmark_disk_floor_is_one_thousandth_without_the_node_minimum() {
+        assert_eq!(disk_floor(2_000_000_000_000), 2_000_000_000);
+        assert_eq!(disk_floor(2_000_000_000_001), 2_000_000_001);
+        assert_eq!(disk_floor(20 << 30), (20u64 << 30).div_ceil(1000));
+        assert_eq!(crate::storage_labels::disk_floor(20 << 30), 8 << 30);
+    }
+
+    #[test]
+    fn parallel_verdict_uses_measured_allocation_wall_time_not_summed_cpu_time() {
+        let mut m = measurements();
+        for shard in &mut m {
+            for round in &mut shard.rounds {
+                round.encode_seconds = 800.;
+            }
+        }
+        assert_eq!(assess(evidence(&m)).verdict, Verdict::NoGo);
+        let allocation = AllocationMeasurement {
+            parallel_jobs: 2,
+            cold_wall_seconds: 10.,
+            rounds: vec![
+                AllocationRoundMeasurement {
+                    registration_wall_seconds: 300.,
+                    frame_openings_wall_seconds: 5.,
+                    settlement_wall_seconds: 4.
+                };
+                2
+            ],
+        };
+        let mut e = evidence(&m);
+        e.allocation = Some(&allocation);
+        let result = assess(e);
+        assert_eq!(result.verdict, Verdict::GoForCheckpoint);
+        assert_eq!(result.worst_registration_seconds, 300.);
+        assert_eq!(result.cold_measured_seconds, 11.);
+        let mut invalid = allocation.clone();
+        invalid.rounds.pop();
+        let mut e = evidence(&m);
+        e.allocation = Some(&invalid);
+        assert_eq!(assess(e).verdict, Verdict::Incomplete);
+    }
+
     #[test]
     fn totals_the_worst_round_of_every_shard_and_reserves_consensus_time() {
         let m = measurements();

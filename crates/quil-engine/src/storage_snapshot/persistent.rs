@@ -121,6 +121,21 @@ fn reserve(
     epoch: u64,
     exact: u64,
 ) -> Result<(PathBuf, [u8; 32], u64)> {
+    try_reserve(store, member, leaf, epoch, exact)?
+        .ok_or_else(|| unavailable("sector initialization slots are occupied".into()))
+}
+
+fn sector_lane(member: &[u8], id: &[u8; 32]) -> Vec<u8> {
+    [b"persistent sector/".as_slice(), member, id].concat()
+}
+
+fn try_reserve(
+    store: &LabelStore,
+    member: &[u8],
+    leaf: &[u8],
+    epoch: u64,
+    exact: u64,
+) -> Result<Option<(PathBuf, [u8; 32], u64)>> {
     let root = home(store, member);
     fs::create_dir_all(&root).map_err(io)?;
     let lock = File::open(&root).map_err(io)?;
@@ -150,7 +165,7 @@ fn reserve(
                     let n = u64::from_be_bytes(bytes[..8].try_into().unwrap());
                     if sector::padded_nodes_allowed(exact, n) {
                         atomic(&dir.join(format!("lease-{epoch}")), &leaf_hash)?;
-                        return Ok((dir, id, n));
+                        return Ok(Some((dir, id, n)));
                     }
                 }
             }
@@ -186,7 +201,11 @@ fn reserve(
         }
         atomic(&lease, &leaf_hash)?;
         atomic(&mapping, &candidate.cert.sector)?;
-        return Ok((candidate.dir, candidate.cert.sector, candidate.cert.n));
+        return Ok(Some((
+            candidate.dir,
+            candidate.cert.sector,
+            candidate.cert.n,
+        )));
     }
     // A crash during initialization reuses its reservation and kept layers.
     let pending = root.join(format!("pending-{epoch}-{}", hex::encode(leaf_hash)));
@@ -195,24 +214,23 @@ fn reserve(
             let id: [u8; 32] = bytes[..32].try_into().unwrap();
             let n = u64::from_be_bytes(bytes[32..].try_into().unwrap());
             if sector::padded_nodes_allowed(exact, n) {
-                return Ok((root.join(hex::encode(id)), id, n));
+                return Ok(Some((root.join(hex::encode(id)), id, n)));
             }
         }
     }
-    // Keep the temporary disk cost bounded during admission: one new sector
-    // is certified and its eleven-layer cache released before the next.
+    // Bound retained uncertified caches by CPU slots, not one global sector.
+    // LabelStore admission separately reserves their disk bytes and RAM.
+    let mut pending_count = 0usize;
     for entry in fs::read_dir(&root).map_err(io)?.flatten() {
         if !sector_directory(&entry.path()) {
             continue;
         }
-        match Sector::load(entry.path())? {
-            Some(sector) if sector.certified => {}
-            _ => {
-                return Err(unavailable(
-                    "another sector awaits initial certification".into(),
-                ))
-            }
+        if !Sector::load(entry.path())?.is_some_and(|s| s.certified) {
+            pending_count += 1;
         }
+    }
+    if pending_count >= crate::storage_jobs::job_slots() {
+        return Ok(None);
     }
     let n = sector::capacity(exact.saturating_add(exact.div_ceil(4)))
         .ok_or_else(|| unavailable("snapshot exceeds maximum sector size".into()))?;
@@ -240,7 +258,7 @@ fn reserve(
     atomic(&dir.join(format!("lease-{epoch}")), &leaf_hash)?;
     atomic(&mapping, &id)?;
     atomic(&pending, &[id.as_slice(), &n.to_be_bytes()].concat())?;
-    Ok((dir, id, n))
+    Ok(Some((dir, id, n)))
 }
 
 fn initialize(
@@ -562,7 +580,7 @@ pub(super) fn prepare(
         opened: Vec::new(),
     };
     let mut bindings = Vec::new();
-    for prefix in &slot.leaves {
+    let prepared = crate::storage_jobs::for_each_parallel(&slot.leaves, |prefix| {
         let leaf = quil_execution::global_intrinsic::leaf_id_bytes(filter, prefix);
         let source = Source::new(store, replicas, member, target, leaf.clone())?;
         let n = source.stored.n;
@@ -574,13 +592,24 @@ pub(super) fn prepare(
         let _memory = crate::storage_jobs::reserve(64 << 20);
         let root = sector::Registration::parse(&source.stored.registration_root).unwrap();
         let leaf_claim = captured.claim(prefix, &leaf, member, &beacon, root.data, n)?;
-        bindings.push(captured.prove_binding_sparse(&leaf_claim, &source)?);
-        witness.seals.push(
-            sector::prove(member, &leaf, target, n, &root, &beacon, &|tree, index| {
-                source.open(tree, index)
-            })
-            .map_err(QuilError::InvalidArgument)?,
-        );
+        let binding = captured.prove_binding_sparse(&leaf_claim, &source)?;
+        let seal = sector::prove(member, &leaf, target, n, &root, &beacon, &|tree, index| {
+            source.open(tree, index)
+        })
+        .map_err(QuilError::InvalidArgument)?;
+        let leaf = SealedLeaf {
+            persistent: Some(root),
+            n,
+            registered: root.registered(),
+            beacon: beacon.clone(),
+            leaf_id: leaf,
+        };
+        Ok((binding, seal, leaf))
+    })?;
+    for (binding, seal, leaf) in prepared {
+        let n = leaf.n;
+        bindings.push(binding);
+        witness.seals.push(seal);
         witness.certificates.push(Vec::new());
         let proof_bytes = witness
             .seals
@@ -601,13 +630,7 @@ pub(super) fn prepare(
                 "persistent snapshot proof exceeds GLOBAL message budget".into(),
             ));
         }
-        claim.seals.push(SealedLeaf {
-            persistent: Some(root),
-            n,
-            registered: root.registered(),
-            beacon: beacon.clone(),
-            leaf_id: leaf,
-        });
+        claim.seals.push(leaf);
     }
     Ok(crate::storage_epoch_batch::PreparedSeat {
         member: *member,
@@ -625,8 +648,7 @@ pub(super) fn prepare(
     })
 }
 
-/// Admit one cold sector at a time. Its certificate must land before the pool
-/// creates another, bounding temporary layers independently of seat count.
+/// Warm sectors side by side, bounded globally by CPU, memory and disk admission.
 pub(crate) fn prewarm_sectors(
     captured: &Captured,
     store: &LabelStore,
@@ -642,35 +664,38 @@ pub(crate) fn prewarm_sectors(
         crate::storage_jobs::ahead_place(),
         &sizes,
     );
+    let mut tasks = Vec::new();
     for (prefix, order) in captured.prefixes.iter().zip(orders) {
         let leaf = quil_execution::global_intrinsic::leaf_id_bytes(&captured.filter, prefix);
-        let (dir, id, n) = reserve(
+        let Some((dir, id, n)) = try_reserve(
             store,
             member,
             &leaf,
             captured.epoch,
             captured.node_count(prefix)?,
-        )?;
-        if let Some(sector) = Sector::load(dir.clone())? {
-            if sector.certified {
-                continue;
-            }
-            // GLOBAL polling owns retries and cache recovery even if the
-            // originating shard no longer runs.
-            return Ok(());
+        )?
+        else {
+            break;
+        };
+        if Sector::load(dir.clone())?.is_some() {
+            continue;
         }
+        tasks.push((dir, id, n, order));
+    }
+    crate::storage_jobs::for_each_parallel(&tasks, |(dir, id, n, order)| {
         let gone = || crate::storage_jobs::stopping();
         let memory = crate::storage_jobs::reserve_ahead(
-            crate::storage_labels::label_ahead_bytes(n),
-            order,
+            crate::storage_labels::label_ahead_bytes(*n),
+            *order,
             &gone,
         )
         .ok_or_else(|| unavailable("sector warmup stopped".into()))?;
-        initialize(store, member, captured.epoch, dir, id, n, &|| {
+        initialize(store, member, captured.epoch, dir.clone(), *id, *n, &|| {
+            memory.wait_while_paused(&gone);
             gone() || memory.yield_requested()
         })?;
-        return Ok(());
-    }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -706,7 +731,7 @@ fn resume_reserved_sector(
     }
     let member = *member;
     crate::storage_jobs::spawn(
-        b"sector initialization",
+        &sector_lane(&member, &id),
         "sector initialization",
         move || {
             let _lock = lock;
@@ -723,6 +748,7 @@ fn resume_reserved_sector(
             )
             .ok_or_else(|| unavailable("sector initialization stopped".into()))?;
             initialize(store, &member, epoch, dir, id, n, &|| {
+                memory.wait_while_paused(&crate::storage_jobs::stopping);
                 crate::storage_jobs::stopping() || memory.yield_requested()
             })?;
             Ok(())
@@ -863,56 +889,59 @@ pub(crate) fn poll_sector_certificates(
         }
         let member = *member;
         let publish = publish.clone();
-        crate::storage_jobs::spawn(b"sector certificates", "sector certificate", move || {
-            let _guard = proving;
-            let bytes = match fs::read(&cache) {
-                Ok(bytes) => bytes,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    let kept = kept.ok_or_else(|| {
-                        unavailable("sector proof cache and temporary layers are absent".into())
-                    })?;
-                    let _memory = crate::storage_jobs::reserve(
-                        proof::labelling_peak_bytes(
+        crate::storage_jobs::spawn(
+            &sector_lane(&member, &sector.cert.sector),
+            "sector certificate",
+            move || {
+                let _guard = proving;
+                let bytes = match fs::read(&cache) {
+                    Ok(bytes) => bytes,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        let kept = kept.ok_or_else(|| {
+                            unavailable("sector proof cache and temporary layers are absent".into())
+                        })?;
+                        let _memory = crate::storage_jobs::reserve(
+                            proof::labelling_peak_bytes(
+                                sector.cert.n,
+                                &quil_crypto::sdr::SdrParams::default(),
+                            )
+                            .saturating_add(400 << 20),
+                        );
+                        let message = protocol::CapacityMessage {
+                            member,
+                            epoch: target,
+                            certificate: sector.cert,
+                            signed_at: 0,
+                            signature: Vec::new(),
+                            proof: Vec::new(),
+                        };
+                        let root = message.root();
+                        let last = fs::read(sector.dir.join("last")).map_err(io)?;
+                        let challenge = sector::certificate_beacon(
+                            &member,
+                            &sector.cert.sector,
+                            target,
                             sector.cert.n,
+                            &root,
+                            &beacon,
+                        );
+                        let statement = proof::SealStatement {
+                            member: &member,
+                            leaf_id: &sector.cert.sector,
+                            epoch: target,
+                            n: sector.cert.n,
+                            registered: sector.cert.registered().unwrap(),
+                            beacon: &challenge,
+                        };
+                        let plain = proof::prove_seal_with_labels(
+                            &last,
+                            &statement,
                             &quil_crypto::sdr::SdrParams::default(),
+                            sector::CHALLENGES,
+                            &kept,
                         )
-                        .saturating_add(400 << 20),
-                    );
-                    let message = protocol::CapacityMessage {
-                        member,
-                        epoch: target,
-                        certificate: sector.cert,
-                        signed_at: 0,
-                        signature: Vec::new(),
-                        proof: Vec::new(),
-                    };
-                    let root = message.root();
-                    let last = fs::read(sector.dir.join("last")).map_err(io)?;
-                    let challenge = sector::certificate_beacon(
-                        &member,
-                        &sector.cert.sector,
-                        target,
-                        sector.cert.n,
-                        &root,
-                        &beacon,
-                    );
-                    let statement = proof::SealStatement {
-                        member: &member,
-                        leaf_id: &sector.cert.sector,
-                        epoch: target,
-                        n: sector.cert.n,
-                        registered: sector.cert.registered().unwrap(),
-                        beacon: &challenge,
-                    };
-                    let plain = proof::prove_seal_with_labels(
-                        &last,
-                        &statement,
-                        &quil_crypto::sdr::SdrParams::default(),
-                        sector::CHALLENGES,
-                        &kept,
-                    )
-                    .map_err(QuilError::InvalidArgument)?;
-                    let bytes =
+                        .map_err(QuilError::InvalidArgument)?;
+                        let bytes =
                         quil_execution::global_intrinsic::persistent_storage::prove_certificate(
                             &member,
                             &sector.cert.sector,
@@ -923,25 +952,26 @@ pub(crate) fn poll_sector_certificates(
                             &plain,
                         )
                         .map_err(QuilError::InvalidArgument)?;
-                    atomic(&cache, &bytes)?;
-                    bytes
-                }
-                Err(e) => return Err(io(e)),
-            };
-            publish(
-                protocol::CapacityMessage {
-                    member,
-                    epoch: target,
-                    certificate: sector.cert,
-                    signed_at: 0,
-                    signature: Vec::new(),
-                    proof: bytes,
-                }
-                .envelope()
-                .to_canonical_bytes(),
-            );
-            Ok(())
-        });
+                        atomic(&cache, &bytes)?;
+                        bytes
+                    }
+                    Err(e) => return Err(io(e)),
+                };
+                publish(
+                    protocol::CapacityMessage {
+                        member,
+                        epoch: target,
+                        certificate: sector.cert,
+                        signed_at: 0,
+                        signature: Vec::new(),
+                        proof: bytes,
+                    }
+                    .envelope()
+                    .to_canonical_bytes(),
+                );
+                Ok(())
+            },
+        );
     }
     Ok(())
 }
@@ -955,6 +985,7 @@ mod tests {
     }
     #[test]
     fn pool_bounds_cold_work_and_reuses_certified_capacity_after_restart() {
+        crate::storage_jobs::set_job_slots_for_test(1);
         gates(true);
         let dir = tempfile::tempdir().unwrap();
         let store =
@@ -973,7 +1004,7 @@ mod tests {
         assert_eq!(reserve(&store, &member, b"first", 1500, 100).unwrap().1, id);
         assert!(
             reserve(&store, &member, b"second", 1500, 100).is_err(),
-            "one uncertified sector at a time"
+            "one uncertified sector per available CPU slot"
         );
         let mut first = Sector::load(path).unwrap().unwrap();
         first.certified = true;
@@ -999,6 +1030,89 @@ mod tests {
         assert!(Sector::load(other).unwrap().is_none());
         gates(false);
     }
+    #[test]
+    fn concurrent_pool_reservations_are_unique_and_bounded_by_cpu_slots() {
+        crate::storage_jobs::set_job_slots_for_test(3);
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let member = [91; 32];
+        let results = std::thread::scope(|scope| {
+            let jobs: Vec<_> = (0u8..9)
+                .map(|i| {
+                    let store = &store;
+                    scope.spawn(move || try_reserve(store, &member, &[i], 1500, 100).unwrap())
+                })
+                .collect();
+            jobs.into_iter()
+                .filter_map(|job| job.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results
+                .iter()
+                .map(|(_, id, _)| *id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3
+        );
+        assert!(try_reserve(&store, &member, b"extra", 1500, 100)
+            .unwrap()
+            .is_none());
+        let (path, id, n) = results[0].clone();
+        let mut sector = initialize(&store, &member, 1500, path, id, n, &|| false).unwrap();
+        sector.certified = true;
+        sector.save().unwrap();
+        store.release_certified_sector(1500, &member, &id);
+        assert!(try_reserve(&store, &member, b"extra", 1500, 100)
+            .unwrap()
+            .is_some());
+        gates(false);
+    }
+
+    #[test]
+    fn independent_sector_jobs_overlap_while_one_sectors_retries_stay_ordered() {
+        use std::sync::mpsc;
+        let member = [92; 32];
+        let first = sector_lane(&member, &[1; 32]);
+        let second = sector_lane(&member, &[2; 32]);
+        let (started, recv) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let tx = started.clone();
+        crate::storage_jobs::spawn(&first, "first sector", move || {
+            tx.send(1).unwrap();
+            wait.recv().unwrap();
+            Ok(())
+        });
+        assert_eq!(
+            recv.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            1
+        );
+        let tx = started.clone();
+        crate::storage_jobs::spawn(&first, "same sector retry", move || {
+            tx.send(3).unwrap();
+            Ok(())
+        });
+        crate::storage_jobs::spawn(&second, "second sector", move || {
+            started.send(2).unwrap();
+            Ok(())
+        });
+        assert_eq!(
+            recv.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            2
+        );
+        release.send(()).unwrap();
+        assert_eq!(
+            recv.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            3
+        );
+    }
+
     #[test]
     fn warm_data_updates_keep_labels_and_refuse_uncertified_admission() {
         gates(true);

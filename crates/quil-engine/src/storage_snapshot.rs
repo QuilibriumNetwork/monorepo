@@ -42,7 +42,8 @@ use quil_execution::global_intrinsic::storage_binding::{
 
 mod persistent;
 pub use persistent::readiness::{
-    measure_snapshot, BenchmarkOptions, RoundMeasurement, SnapshotMeasurement,
+    measure_allocation, measure_snapshot, BenchmarkInput, BenchmarkOptions, RoundMeasurement,
+    SnapshotMeasurement,
 };
 /// 512 MiB of replica nodes per locally built sector: cold certification and
 /// changed-data encoding fit ordinary 8 GiB nodes. The protocol accepts larger
@@ -1860,7 +1861,7 @@ pub fn prepare_member_seat(
     // waits behind seals relabelling: GLOBAL withholds the member's storage
     // share (before epoch 1342: kicks it) when its roots go unproven by the
     // window's end.
-    let _memory = if seal.is_none() {
+    let _memory = if seal.is_none() && !quil_types::consensus::persistent_storage_at(epoch) {
         crate::storage_jobs::reserve_settlement(bytes)
     } else {
         crate::storage_jobs::reserve(bytes)

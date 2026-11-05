@@ -484,6 +484,7 @@ pub struct Released {
 pub struct LabelStore {
     dir: PathBuf,
     space: SpaceSource,
+    disk_floor: fn(u64) -> u64,
     /// Bytes the leaves being labelled have still to write.
     pending: Mutex<u64>,
     /// Leaves' counts admitted and being labelled ([`Self::admit`]): no
@@ -546,6 +547,7 @@ impl LabelStore {
         Self {
             dir,
             space,
+            disk_floor,
             pending: Mutex::new(0),
             busy: Mutex::new(HashSet::new()),
             #[cfg(test)]
@@ -554,6 +556,18 @@ impl LabelStore {
             swept: AtomicU64::new(0),
             seen: Mutex::new(None),
         }
+    }
+
+    /// Override this store's local free-space policy, for an isolated benchmark.
+    /// Normal node stores use the production floor from [`Self::new`].
+    pub fn with_disk_floor(mut self, floor: fn(u64) -> u64) -> Self {
+        self.disk_floor = floor;
+        self
+    }
+
+    fn resume_free(&self, total_bytes: u64) -> u64 {
+        let floor = (self.disk_floor)(total_bytes);
+        floor.saturating_add(release_band(floor).saturating_mul(2))
     }
 
     /// Whether [`Self::admit`] could admit `member`'s leaf `leaf_id` for
@@ -638,9 +652,9 @@ impl LabelStore {
         let needed = pending.saturating_add(bytes);
         match usage {
             Some(usage) => {
-                let mut needed = needed.saturating_add(disk_floor(usage.total_bytes));
+                let mut needed = needed.saturating_add((self.disk_floor)(usage.total_bytes));
                 if resuming {
-                    needed = needed.max(resume_free(usage.total_bytes));
+                    needed = needed.max(self.resume_free(usage.total_bytes));
                 }
                 if usage.free_bytes >= needed {
                     Ok(())
@@ -1069,11 +1083,11 @@ impl LabelStore {
     /// above the floor or unknown, or another process is releasing.
     pub fn keep_floor(&self) -> Option<Released> {
         let usage = self.usage()?;
-        let floor = disk_floor(usage.total_bytes);
+        let floor = (self.disk_floor)(usage.total_bytes);
         let marked = self.shortage();
         self.saw(marked.as_ref());
         if usage.free_bytes >= floor {
-            if marked.is_some() && usage.free_bytes >= resume_free(usage.total_bytes) {
+            if marked.is_some() && usage.free_bytes >= self.resume_free(usage.total_bytes) {
                 self.end_shortage();
             } else if marked.is_some_and(|marked| {
                 unix_now().saturating_sub(marked.logged) >= SHORT_LOGGED_EVERY.as_secs()
@@ -1119,7 +1133,7 @@ impl LabelStore {
         let free_after = self
             .usage()
             .map_or(usage.free_bytes, |usage| usage.free_bytes);
-        let resume = resume_free(usage.total_bytes);
+        let resume = self.resume_free(usage.total_bytes);
         if first {
             warn!(free_bytes = usage.free_bytes, floor_bytes = floor, free_after_bytes = free_after,
                 released_bytes = released.bytes, released_counts = released.counts,
@@ -1132,7 +1146,7 @@ impl LabelStore {
                  labelling ahead waits until free space is back at resume_bytes; check what fills \
                  this node's disk (worker stores, logs, other files)");
         } else {
-            log_still(&usage, free_after, &released, &shortage, now);
+            log_still(&usage, free_after, &released, &shortage, now, floor);
         }
         Some(released)
     }
@@ -1163,6 +1177,7 @@ impl LabelStore {
             &Released::default(),
             &shortage,
             now,
+            (self.disk_floor)(usage.total_bytes),
         );
     }
 
@@ -1308,7 +1323,7 @@ impl LabelStore {
         }
         drop(dir);
         let usage = self.usage().unwrap_or_default();
-        info!(free_bytes = usage.free_bytes, resume_bytes = resume_free(usage.total_bytes),
+        info!(free_bytes = usage.free_bytes, resume_bytes = self.resume_free(usage.total_bytes),
             released_bytes = shortage.bytes, released_counts = shortage.counts,
             releases = shortage.releases, epochs = %shortage.epochs_text(),
             episode_seconds = unix_now().saturating_sub(shortage.since), scope = "local",
@@ -1741,14 +1756,21 @@ fn manifest_staged(dir: &Path, n: u64) -> PathBuf {
 
 /// Log a release of labels for free space that goes on ([`LabelStore::keep_floor`]):
 /// `released` by this check, from `usage` to `free_after` free bytes.
-fn log_still(usage: &FsUsage, free_after: u64, released: &Released, shortage: &Shortage, now: u64) {
-    warn!(free_bytes = usage.free_bytes, floor_bytes = disk_floor(usage.total_bytes),
+fn log_still(
+    usage: &FsUsage,
+    free_after: u64,
+    released: &Released,
+    shortage: &Shortage,
+    now: u64,
+    floor: u64,
+) {
+    warn!(free_bytes = usage.free_bytes, floor_bytes = floor,
         free_after_bytes = free_after, released_bytes = released.bytes,
         released_counts = released.counts, in_use_counts = released.in_use,
         total_released_bytes = shortage.bytes, total_released_counts = shortage.counts,
         releases = shortage.releases, epochs = %shortage.epochs_text(),
         episode_seconds = now.saturating_sub(shortage.since),
-        resume_bytes = resume_free(usage.total_bytes), scope = "local",
+        resume_bytes = floor.saturating_add(release_band(floor).saturating_mul(2)), scope = "local",
         "storage labels kept ahead still released: free disk space on this node stays below \
          resume_bytes, and labelling ahead waits; check what fills this node's disk (worker \
          stores, logs, other files)");
@@ -2814,6 +2836,34 @@ mod tests {
     /// labels free above the floor, beside what the leaves being labelled
     /// have still to write; a refused leaf leaves no files, not even those an
     /// earlier attempt left.
+    #[test]
+    fn benchmark_floor_applies_to_admission_and_retention_without_changing_node_defaults() {
+        let dir = temp_dir("benchmark-floor");
+        let free = Arc::new(AtomicU64::new(1 << 30));
+        let production = LabelStore::with_space(dir.join("production"), space(&free));
+        let benchmark = LabelStore::with_space(dir.join("benchmark"), space(&free))
+            .with_disk_floor(crate::storage_readiness::disk_floor);
+        assert!(production
+            .admit(9, &[7; 32], b"leaf", 4, Stage::Ahead)
+            .is_none());
+        keep(&benchmark, 9, &[7; 32], b"leaf", 4);
+        assert!(
+            benchmark.keep_floor().is_none(),
+            "benchmark labels survive below the production floor"
+        );
+        assert!(benchmark.find(9, &[7; 32], b"leaf", |_| true).is_some());
+        let needed = crate::storage_readiness::disk_floor(TOTAL) + DISK_MARGIN * label_bytes(4);
+        free.store(needed - 1, Ordering::SeqCst);
+        assert!(benchmark
+            .admit(9, &[7; 32], b"next", 4, Stage::Ahead)
+            .is_none());
+        free.store(needed, Ordering::SeqCst);
+        assert!(benchmark
+            .admit(9, &[7; 32], b"next", 4, Stage::Ahead)
+            .is_some());
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_leaf_is_kept_only_with_room_for_its_labels_above_the_floor() {
         assert_eq!(disk_floor(TOTAL), 10 << 30);

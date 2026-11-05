@@ -47,9 +47,8 @@
 //! waited through every seat's snapshot while the memory was there
 //! (2026-11-01).
 //!
-//! At most [`AHEAD_JOBS`] leaves are labelled ahead at once, whatever the
-//! memory lets: four of about 4.5 GB each held 17.9 GB of a 32 GB node's
-//! 20.5 GB (2026-11-01), and each takes a core. While a renewal's leaf is
+//! Leaves and persistent sectors run ahead up to the process CPU slots and
+//! memory share. While a renewal's leaf is
 //! labelled now ([`Reservation::labelling_now`]), only
 //! [`AHEAD_JOBS_BESIDE_DUE`] goes on beside it; the others pause, keeping
 //! their memory and layers, and go on once it ends
@@ -76,12 +75,10 @@ pub const EPOCH_PROOF_LANE: &[u8] = b"epoch proofs";
 /// the rest is headroom for the node and for the estimates' error.
 pub const MEMORY_SHARE_PERCENT: u64 = 75;
 
-/// Leaves labelled ahead at once ([`reserve_ahead`]), whatever the memory
-/// lets: each takes a core and about 152 bytes a node, 4.9 GB for a leaf of
-/// 32 million nodes. One asking beyond them waits in its order and starts
-/// once one of them ends: labelled, given back to more urgent work, or given
-/// up at its epoch's snapshot frame (`crate::storage_labels`).
-pub const AHEAD_JOBS: usize = 2;
+/// Explicit smaller cap used by scheduling regression tests. Production
+/// background work uses all CPU slots, subject to memory admission.
+#[cfg(test)]
+const AHEAD_JOBS: usize = 2;
 
 /// Leaves labelled ahead that go on while a renewal's leaf is labelled now
 /// ([`Reservation::labelling_now`]): the most urgent, then the most
@@ -767,7 +764,7 @@ pub struct Admission {
     pass_window: Duration,
     changed: Condvar,
     slots: usize,
-    /// [`AHEAD_JOBS`]; more in tests of the memory alone.
+    /// Maximum background labellers; defaults to the process CPU slots.
     ahead_jobs: usize,
     available: Box<dyn Fn() -> Option<u64> + Send + Sync>,
     /// [`LOOK_WINDOW`], shorter in tests.
@@ -914,7 +911,7 @@ impl Admission {
             pass_window: PASS_WINDOW,
             changed: Condvar::new(),
             slots: slots.max(1),
-            ahead_jobs: AHEAD_JOBS,
+            ahead_jobs: slots.max(1),
             available,
             window: LOOK_WINDOW,
             held_back_warn: AHEAD_HELD_BACK_WARN,
@@ -1409,7 +1406,7 @@ impl Admission {
     }
 
     /// How many leaves labelled ahead may hold memory at once
-    /// ([`AHEAD_JOBS`]): [`AHEAD_JOBS_BESIDE_DUE`] while a leaf is labelled
+    /// (the CPU slots): [`AHEAD_JOBS_BESIDE_DUE`] while a leaf is labelled
     /// now ([`Reservation::labelling_now`]).
     fn ahead_cap(&self, state: &State) -> usize {
         if state.labelling_now > 0 {
@@ -1666,12 +1663,11 @@ mod tests {
     }
 
     /// An admission of `slots` jobs sharing a constant `available`, with the
-    /// node's cap on labelling ahead ([`AHEAD_JOBS`]).
+    /// an explicit two-job cap for exercising cap and yield ordering.
     fn admission_capped(slots: usize, available: u64) -> &'static Admission {
-        Box::leak(Box::new(Admission::new(
-            slots,
-            Box::new(move || Some(available)),
-        )))
+        let mut admission = Admission::new(slots, Box::new(move || Some(available)));
+        admission.ahead_jobs = AHEAD_JOBS;
+        Box::leak(Box::new(admission))
     }
 
     /// A reservation held on a thread of its own: `granted` hears when it is,
@@ -2183,6 +2179,21 @@ mod tests {
     /// them ends; reading a leaf ahead and work due now do not wait for them
     /// (2026-11-01: four leaves labelled ahead held 17.9 GB of a 32 GB
     /// node's 20.5 GB).
+    #[test]
+    fn production_background_labelling_uses_every_cpu_slot() {
+        let admission = Box::leak(Box::new(Admission::new(9, Box::new(|| Some(128 * GIB)))));
+        let mut held = Vec::new();
+        for leaf in 0..9 {
+            held.push(reserve_now(admission, GIB, ahead(false, 1, leaf)));
+        }
+        assert_eq!(admission.state().holders, 9);
+        let tenth = hold_yielding(admission, GIB, ahead(false, 1, 9));
+        assert!(tenth.granted.recv_timeout(NOT_YET).is_err());
+        held.pop();
+        assert!(tenth.granted.recv_timeout(SOON).is_ok());
+        drop((held, tenth.release));
+    }
+
     #[test]
     fn at_most_two_leaves_are_labelled_ahead_at_once() {
         assert_eq!(AHEAD_JOBS, 2);

@@ -4,7 +4,7 @@ use anyhow::{ensure, Context};
 use clap::Args;
 use quil_engine::{
     storage_readiness::{self as verdict, Evidence},
-    storage_snapshot::{BenchmarkOptions, SnapshotMeasurement},
+    storage_snapshot::BenchmarkOptions,
 };
 use quil_types::{
     crypto::Signer,
@@ -111,7 +111,7 @@ fn freshness(timestamp: i64, now: i64, max_age: u64) -> anyhow::Result<()> {
         "checkpoint timestamp is missing or in the future"
     );
     ensure!(
-        now.saturating_sub(timestamp) as u64 <= max_age.saturating_mul(1000),
+        now.saturating_sub(timestamp).max(0) as u64 <= max_age.saturating_mul(1000),
         "archive checkpoint is stale: timestamp_ms={timestamp}, now_ms={now}, maximum_age_secs={max_age}"
     );
     Ok(())
@@ -396,6 +396,7 @@ struct Monitor {
     memory_limit: u64,
     memory_budget: u64,
     initial_free: u64,
+    disk_floor_bytes: u64,
 }
 impl Monitor {
     fn start(root: &Path, reserve: u64, timeout: Duration) -> anyhow::Result<Self> {
@@ -408,6 +409,7 @@ impl Monitor {
         let memory_budget = total - reserve;
         let usage = quil_forest::storage_health::fs_usage(root)
             .context("cannot measure benchmark filesystem space")?;
+        let disk_floor_bytes = verdict::disk_floor(usage.total_bytes);
         let done = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let exceeded = Arc::new(AtomicBool::new(false));
@@ -433,8 +435,7 @@ impl Monitor {
                 }
                 if let Some(usage) = quil_forest::storage_health::fs_usage(&path) {
                     f.fetch_min(usage.free_bytes, Ordering::Relaxed);
-                    if usage.free_bytes < quil_engine::storage_labels::disk_floor(usage.total_bytes)
-                    {
+                    if usage.free_bytes < disk_floor_bytes {
                         x.store(true, Ordering::Relaxed);
                         s.store(true, Ordering::Relaxed);
                     }
@@ -456,11 +457,12 @@ impl Monitor {
             memory_limit: total,
             memory_budget,
             initial_free: usage.free_bytes,
+            disk_floor_bytes,
         })
     }
     fn sample(&self) -> Value {
         json!({"effective_memory_limit_bytes":self.memory_limit,"storage_rss_budget_bytes":self.memory_budget,"peak_process_rss_bytes":self.peak.load(Ordering::Relaxed),
-        "filesystem_free_before_bytes":self.initial_free,"filesystem_minimum_free_bytes":self.min_free.load(Ordering::Relaxed),"filesystem_free_space_delta_peak_bytes":self.initial_free.saturating_sub(self.min_free.load(Ordering::Relaxed)),"budget_exceeded":self.exceeded.load(Ordering::Relaxed)})
+        "filesystem_free_floor_bytes":self.disk_floor_bytes,"filesystem_max_used_percent":99.9,"filesystem_free_before_bytes":self.initial_free,"filesystem_minimum_free_bytes":self.min_free.load(Ordering::Relaxed),"filesystem_free_space_delta_peak_bytes":self.initial_free.saturating_sub(self.min_free.load(Ordering::Relaxed)),"budget_exceeded":self.exceeded.load(Ordering::Relaxed)})
     }
 }
 impl Drop for Monitor {
@@ -508,7 +510,7 @@ pub async fn run(args: &Arguments) -> anyhow::Result<ExitCode> {
             .context("memory reserve overflow")?,
         timeout,
     )?;
-    let mut report = json!({"format":"quil-storage-readiness-v1","verdict":"incomplete","scope":"persistent-storage hardware rehearsal at one authenticated mainnet checkpoint; GLOBAL inclusion and concurrent node work are reserved, not submitted or measured",
+    let mut report = json!({"format":"quil-storage-readiness-v2","verdict":"incomplete","scope":"persistent-storage hardware rehearsal at one authenticated mainnet checkpoint; GLOBAL inclusion and concurrent node work are reserved, not submitted or measured",
         "started_at":chrono::Utc::now().to_rfc3339(),"build":{"version":quil_config::display_version(),"optimized":!cfg!(debug_assertions),"arch":std::env::consts::ARCH,"os":std::env::consts::OS},
         "available_cpus":std::thread::available_parallelism().map(|n|n.get()).unwrap_or(1),"rounds_requested":args.benchmark_storage_rounds,"settlement_frames_requested":args.benchmark_storage_frames,
         "headroom_multiplier":args.benchmark_storage_headroom,"input_mode":"download_actual_authenticated_mainnet_snapshots","cache_condition":"OS page cache is not globally cleared; all rounds force full input reads and fresh replica outputs",
@@ -638,7 +640,11 @@ async fn run_inner(
     let mut datasets = Vec::new();
     let mut records = Vec::new();
     let intended_shards = filters.len();
-    for filter in filters {
+    use futures::{stream, StreamExt};
+    let global_frame = header.frame_number;
+    let archive_list = &archives;
+    let downloads = stream::iter(filters.into_iter().map(|filter| async move {
+        let archives = archive_list;
         ensure!(
             !monitor.stop.load(Ordering::Relaxed),
             "benchmark resource/time limit reached"
@@ -647,7 +653,7 @@ async fn run_inner(
             quil_execution::global_intrinsic::storage_snapshot::snapshot_address(epoch, &filter)?;
         let mut snapshot = None;
         let mut errors = Vec::new();
-        for (peer, _) in &archives {
+        for (peer, _) in archives {
             let result = async {
                 let mut client = quil_rpc::ArchiveClient::connect_mtls(peer, key).await?;
                 let proof = client
@@ -655,7 +661,7 @@ async fn run_inner(
                     .await?
                     .context("archive lacks this snapshot record at the checkpoint")?;
                 let value =
-                    snapshot_record(&prover_root, &filter, epoch, header.frame_number, &proof)?;
+                    snapshot_record(&prover_root, &filter, epoch, global_frame, &proof)?;
                 Ok::<_, anyhow::Error>((value, proof))
             }
             .await;
@@ -685,7 +691,7 @@ async fn run_inner(
         );
         let mut served = None;
         let mut errors = Vec::new();
-        for (peer, _) in &archives {
+        for (peer, _) in archives {
             match pull(&dataset, peer, key).await {
                 Ok(()) => {
                     served = Some(peer.clone());
@@ -700,11 +706,18 @@ async fn run_inner(
                 errors.join("; ")
             )
         })?;
-        records.push(json!({"filter":hex::encode(&dataset.filter),"epoch":epoch,"frame":dataset.snapshot.frame,"roots":dataset.snapshot.roots.iter().map(hex::encode).collect::<Vec<_>>(),"membership_proof_hex":hex::encode(proof),"downloaded_from":served,"root_match":true}));
+        let record = json!({"filter":hex::encode(&dataset.filter),"epoch":epoch,"frame":dataset.snapshot.frame,"roots":dataset.snapshot.roots.iter().map(hex::encode).collect::<Vec<_>>(),"membership_proof_hex":hex::encode(proof),"downloaded_from":served,"root_match":true});
+        Ok::<_,anyhow::Error>((dataset,record))
+    })).buffer_unordered(quil_engine::storage_jobs::job_slots());
+    futures::pin_mut!(downloads);
+    while let Some(result) = downloads.next().await {
+        let (dataset, record) = result?;
+        records.push(record);
         report["snapshots"] = json!(&records);
         save(artifact, report)?;
         datasets.push(dataset);
     }
+    datasets.sort_by(|a, b| a.filter.cmp(&b.filter));
     let download_seconds = download.elapsed().as_secs_f64();
     report["download_seconds"] = json!(download_seconds);
     report["phase"] = json!("measuring_production_storage_paths");
@@ -721,28 +734,33 @@ async fn run_inner(
         memory_budget_bytes: monitor.memory_budget,
         stop: monitor.stop.clone(),
     };
-    let mut measured: Vec<SnapshotMeasurement> = Vec::new();
-    for dataset in datasets {
-        let options = options.clone();
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let (_db, graph) = open_dataset(&dataset.path)?;
-            Ok(quil_engine::storage_snapshot::measure_snapshot(
-                graph,
-                dataset.snapshot,
-                dataset.filter,
-                &options,
-            )?)
-        })
-        .await??;
-        measured.push(result);
-        report["measurements"] = serde_json::to_value(&measured)?;
-        report["resources"] = monitor.sample();
-        save(artifact, report)?;
-    }
+    report["parallel_storage_jobs"] = json!(quil_engine::storage_jobs::job_slots());
+    save(artifact, report)?;
+    let (measured, allocation) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let mut inputs = Vec::with_capacity(datasets.len());
+        for dataset in datasets {
+            let (db, graph) = open_dataset(&dataset.path)?;
+            inputs.push(quil_engine::storage_snapshot::BenchmarkInput {
+                crdt: graph,
+                snapshot: dataset.snapshot,
+                filter: dataset.filter,
+                keep: Box::new(db),
+            });
+        }
+        Ok(quil_engine::storage_snapshot::measure_allocation(
+            inputs, &options,
+        )?)
+    })
+    .await??;
+    report["measurements"] = serde_json::to_value(&measured)?;
+    report["allocation_measurements"] = serde_json::to_value(&allocation)?;
+    report["resources"] = monitor.sample();
+    save(artifact, report)?;
     let epoch_length = quil_types::consensus::epoch_length_frames();
     let (start, end) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
     let assessment = verdict::assess(Evidence {
         measurements: &measured,
+        allocation: Some(&allocation),
         expected_shards: intended_shards,
         roots_verified: records.iter().all(|r| r["root_match"] == true),
         release_build: !cfg!(debug_assertions),
