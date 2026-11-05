@@ -5105,6 +5105,10 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
 }
 
 #[cfg(test)]
+#[path = "archive_sync_fh_r1_tests.rs"]
+mod fh_r1_tests;
+
+#[cfg(test)]
 mod bootstrap_sync_tests {
     use super::bootstrap_prover_sync;
     use std::sync::{
