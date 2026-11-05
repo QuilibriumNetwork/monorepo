@@ -5413,10 +5413,10 @@ mod tests {
         assert_eq!(held, vec![(vec![0x11; 32], 7), (vec![0x22; 32], 9)]);
     }
 
-    /// Another member's copy of a verified frame replaces it only when its
-    /// certificate names strictly more signers, and no copy does once a
-    /// finalized frame carried the frame; each replacement costs one
-    /// verification, the rest none.
+    /// Another member's copy of a verified frame adds the signers the held one
+    /// lacks, whatever its count, and no copy does once a finalized frame
+    /// carried the frame; each addition costs one verification, a copy naming
+    /// nobody new none.
     #[test]
     fn a_copy_with_more_signers_replaces_the_held_copy_until_inclusion() {
         let mc = MessageCollector::new();
@@ -5425,25 +5425,23 @@ mod tests {
         let verified = || calls.load(std::sync::atomic::Ordering::SeqCst);
         let quorum = certified_shard_bundle(0x11, 5, 5, 0);
         assert_eq!(mc.add_message_outcome(3, quorum), SubmitOutcome::Accepted);
-        // Other members, as many of them.
+        // As many signers, one of them new.
         let same = certified_shard_bundle(0x11, 5, 5, 1);
-        assert!(!mc.requires_verification(&same));
-        assert_eq!(mc.add_message_outcome(3, same), SubmitOutcome::Duplicate);
-        assert_eq!(verified(), 1, "as many signers: not verified");
-        let more = certified_shard_bundle(0x11, 5, 6, 0);
-        assert!(mc.requires_verification(&more));
-        assert_eq!(
-            mc.add_message_outcome(3, more.clone()),
-            SubmitOutcome::Accepted
-        );
-        assert_eq!(mc.collect_for_rank(3), vec![more.clone()], "replaced");
-        assert_eq!(
-            mc.add_message_outcome(3, certified_shard_bundle(0x11, 5, 5, 2)),
-            SubmitOutcome::Duplicate
-        );
+        assert!(mc.requires_verification(&same));
+        assert_eq!(mc.add_message_outcome(3, same), SubmitOutcome::Accepted);
         assert_eq!(verified(), 2);
+        assert_eq!(
+            extract_shard_frame_copies(&mc.collect_for_rank(3)[0])[0].2,
+            6
+        );
+        // Nobody new.
+        let fewer = certified_shard_bundle(0x11, 5, 6, 0);
+        assert!(!mc.requires_verification(&fewer));
+        assert_eq!(mc.add_message_outcome(3, fewer), SubmitOutcome::Duplicate);
+        assert_eq!(verified(), 2, "nobody new: not verified");
+        let held = mc.collect_for_rank(3);
         // The frame rides a finalized GLOBAL frame: the window ends.
-        mc.mark_finalized(std::slice::from_ref(&more));
+        mc.mark_finalized(&held);
         let all = certified_shard_bundle(0x11, 5, 7, 0);
         assert!(!mc.requires_verification(&all));
         assert_eq!(mc.add_message_outcome(3, all), SubmitOutcome::Duplicate);
