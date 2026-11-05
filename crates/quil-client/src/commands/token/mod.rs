@@ -524,10 +524,15 @@ pub enum TokenCommand {
     /// naming the check if that takes longer than `--inclusion-timeout`
     /// (time GLOBAL is paused does not count; the default, an hour, outlasts
     /// the shard stalls of up to 30 minutes seen after frames carrying
-    /// batches: a batch commits with its shard's next frame). A submitted
-    /// batch's coins stay out of new runs for two hours. Submissions are at
-    /// least `--min-interval` seconds apart (default 300, at most 12 per
-    /// hour).
+    /// batches: a batch commits with its shard's next frame). A shard
+    /// without an active prover makes no frame: the run reads the batch's
+    /// shard in the node's shard list before its proof and every 2 minutes
+    /// while it waits, and leaves the batch when the shard has none (while
+    /// waiting, two reads in a row). It goes on with the next batches and
+    /// ends naming those left; a rerun plans their coins onto the live shard
+    /// covering them. A submitted batch's coins stay out of new runs for two
+    /// hours. Submissions are at least `--min-interval` seconds apart
+    /// (default 300, at most 12 per hour).
     /// The run pauses while GLOBAL is degraded (head not advancing for 60 s,
     /// or under 330 frames per hour as the head advanced across the sampled
     /// window, judged once 10 minutes are sampled) and resumes after 10

@@ -673,6 +673,16 @@ pub(crate) fn progress_of(
         ShieldReport::Paced(Paced::Resumed { paused_secs, .. }) => Progress::Resumed {
             paused_secs: *paused_secs,
         },
+        ShieldReport::Paced(Paced::ShardGone {
+            index,
+            shard,
+            submitted,
+            ..
+        }) => Progress::ShardGone {
+            index: index + 1,
+            shard: shard.clone(),
+            submitted: submitted.is_some(),
+        },
         ShieldReport::Paced(Paced::Progress { projected_end, .. }) => Progress::Projected {
             end: *projected_end,
         },
@@ -2445,6 +2455,8 @@ mod paced_shield_tests {
         now: u64,
         frames: Box<dyn Fn(u64) -> u64>,
         inclusion: u64,
+        /// A batch whose shard has no active prover from this time on.
+        gone: Option<(usize, u64)>,
         submits: Vec<(usize, u64)>,
         model: Model,
         /// The manager's stop flag, set by `Cmd::ShieldStop` as the event
@@ -2470,6 +2482,7 @@ mod paced_shield_tests {
                 now: START,
                 frames: Box::new(frames),
                 inclusion,
+                gone: None,
                 submits: Vec::new(),
                 model,
                 halt: AtomicBool::new(false),
@@ -2601,7 +2614,13 @@ mod paced_shield_tests {
         }
         async fn included(&mut self, index: usize) -> anyhow::Result<bool> {
             let sent = self.submits.iter().find(|(i, _)| *i == index).unwrap().1;
-            Ok(self.now >= sent + self.inclusion)
+            // A batch whose shard loses its provers never commits.
+            Ok(self.now >= sent + self.inclusion && self.gone.is_none_or(|(g, _)| g != index))
+        }
+        async fn shard_live(&mut self, index: usize) -> anyhow::Result<bool> {
+            Ok(!self
+                .gone
+                .is_some_and(|(gone, from)| gone == index && self.now >= from))
         }
         fn event(&mut self, event: &Paced) {
             self.report(ShieldReport::Paced(event));
@@ -2658,6 +2677,42 @@ mod paced_shield_tests {
         assert_eq!(
             io.texts(),
             ["Shield: 3 batches of 3 included: 288 coins, 2700 Q shielded."]
+        );
+    }
+
+    /// A batch whose shard loses its provers while it waits is left with a
+    /// notice naming the shard; the run goes on with the next batch and
+    /// ends with an error naming the batch left.
+    #[tokio::test]
+    async fn manager_shield_leaves_a_batch_whose_shard_lost_its_provers() {
+        let mut io = Fake::new(2, healthy(), 30);
+        // Batch 1 is submitted at START + 150; its shard empties 10 min on.
+        io.gone = Some((0, START + 750));
+        let error = io.run(2).await.unwrap_err().to_string();
+        assert!(error.starts_with("1 batch of 2 left (batch 1)"), "{error}");
+        let gone = io.after(|p| matches!(p, shield::Progress::ShardGone { index: 1, .. }));
+        assert!(
+            gone.iter().any(|t| t
+                == "Shield: 1 batch left, shard ...feedbeef00 without active provers; a rerun \
+                    plans their coins onto a live shard."),
+            "{gone:#?}"
+        );
+        assert!(
+            !gone
+                .iter()
+                .any(|t| t.starts_with("Shield batch 1/2: 96 coins submitted")),
+            "the left batch is no longer awaited: {gone:#?}"
+        );
+        assert_eq!(io.submits.len(), 2, "batch 2 goes on: {:?}", io.submits);
+        let run = io.model.coins.shield.run.as_ref().unwrap();
+        assert_eq!(run.left, [(1, "...feedbeef00".to_owned(), true)]);
+        assert!(run.submitted[1].included, "{:?}", run.submitted);
+        let texts = io.texts();
+        let stopped = "Shield: the run stopped after 2 batches of 2 submitted: 1 batch of 2 left";
+        assert!(texts.iter().any(|t| t.starts_with(stopped)), "{texts:#?}");
+        assert!(
+            !texts.iter().any(|t| t.contains("without active provers;")),
+            "the error says it once: {texts:#?}"
         );
     }
 

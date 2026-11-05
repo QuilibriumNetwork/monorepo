@@ -331,6 +331,11 @@ pub(crate) fn error_class(error: &str) -> (&'static str, &'static str) {
         ("identity", "the signing config is not the node's")
     } else if has("shields") && has("open") {
         ("not_open", "shields are not admitted yet")
+    } else if has("no active provers") {
+        (
+            "shard_no_provers",
+            "a batch's shard had no active provers; a rerun re-plans it",
+        )
     } else if has("prov") || has("budget") {
         ("proving", "a proof failed")
     } else if has("transport") || has("status:") || has("connect") || has("deadline") {
