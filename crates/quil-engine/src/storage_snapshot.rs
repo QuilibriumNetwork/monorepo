@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use quil_execution::global_intrinsic::storage_snapshot::Source;
 use quil_hypergraph::HypergraphCrdt;
-use quil_store::replica_store::ReplicaStore;
+use quil_store::replica_store::{ReplicaStore, StoredFrom};
 use quil_types::error::{QuilError, Result};
 use quil_types::store::ClockStore;
 use tracing::{info, warn};
@@ -1095,7 +1095,8 @@ fn report_long_leaves() {
 /// labelled again rather than encoded from
 /// (`crate::storage_labels::Kept::verified_last_layer`), and a leaf whose
 /// labels cannot be written is encoded as by a process that keeps none, its
-/// seal labelling it again.
+/// seal labelling it again. A leaf this snapshot stored whole before a
+/// restart is kept (`leaf_source`).
 pub fn encode_member(captured: &Captured, member: &[u8], replicas: &ReplicaStore) -> Result<()> {
     encode_member_with(
         captured,
@@ -1137,17 +1138,42 @@ fn encode_member_until(
     {
         store.sweep(captured.epoch);
     }
+    let plan = quil_execution::global_intrinsic::storage_snapshot::encode_plan(&[(
+        captured.filter.clone(),
+        captured.plan.clone(),
+    )]);
     let encoded = crate::storage_jobs::for_each_parallel(&captured.prefixes, |prefix| {
         if quil_types::consensus::persistent_storage_at(captured.epoch) {
             // A persistent sector fails rather than goes on unkept.
             return persistent::encode_leaf(captured, member, prefix, replicas, store, stop)
-                .map(|(n, ahead, resumed)| (n, ahead, resumed, None));
+                .map(|(n, ahead, resumed)| (n, ahead, resumed, None, false));
         }
         let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&captured.filter, prefix);
         if stop() {
             return Err(stopped());
         }
         let fingerprint = captured.fingerprint(member, prefix);
+        // Labelling a leaf this snapshot stored whole before a restart again
+        // would give the same replica: it is kept, unless a node of it no
+        // longer hashes up to its registration. Aliased or encoded, its
+        // source is recorded last, once all stored beside it is whole.
+        let source = leaf_source(member, &leaf_id, captured.epoch, &plan, &params);
+        let damaged = match replicas.stored_from(captured.epoch, &leaf_id, &source, stop) {
+            Ok(StoredFrom::Whole(n)) => {
+                replicas.note_snapshot(captured.epoch, &leaf_id, &fingerprint)?;
+                return Ok((n, false, 0, None, true));
+            }
+            Ok(StoredFrom::Stopped) => return Err(stopped()),
+            Ok(StoredFrom::Damaged(why)) => Some(why),
+            Err(error) => Some(error.to_string()),
+            Ok(StoredFrom::Unrecorded | StoredFrom::Other) => None,
+        };
+        if let Some(why) = damaged {
+            warn!(epoch = captured.epoch, filter = %hex::encode(&captured.filter),
+                leaf = %hex::encode(&leaf_id), reason = %why, scope = "local",
+                action = "check this node's disk and store for errors; the leaf is labelled again",
+                "storage snapshot found a leaf it stored before a restart damaged");
+        }
         if let Some(from) = replicas.snapshot_match(&leaf_id, &fingerprint)? {
             let same_key = quil_crypto::sdr::replica_key(member, &leaf_id, from)
                 == quil_crypto::sdr::replica_key(member, &leaf_id, captured.epoch);
@@ -1155,8 +1181,9 @@ fn encode_member_until(
                 let leaf = replicas
                     .get_hash_leaf(captured.epoch, &leaf_id)?
                     .ok_or_else(|| unavailable("snapshot alias disappeared".into()))?;
+                replicas.put_hash_source(captured.epoch, &leaf_id, &source)?;
                 replicas.note_snapshot(captured.epoch, &leaf_id, &fingerprint)?;
-                return Ok((leaf.n, true, 0, None));
+                return Ok((leaf.n, true, 0, None, false));
             }
         }
         let size = captured.leaf_size(prefix)?;
@@ -1407,16 +1434,20 @@ fn encode_member_until(
             &encoded.registration_root(),
         )?;
         replicas.put_data_cap(captured.epoch, &leaf_id, &encoded.data_cap)?;
+        replicas.put_hash_source(captured.epoch, &leaf_id, &source)?;
         replicas.note_snapshot(captured.epoch, &leaf_id, &fingerprint)?;
         progress.end(LeafOutcome::Completed);
-        Ok((encoded.n, ahead, resumed, unkept))
+        Ok((encoded.n, ahead, resumed, unkept, false))
     })?;
     info!(epoch = captured.epoch, filter = %hex::encode(&captured.filter), leaves = encoded.len(),
         labelled_ahead = encoded.iter().filter(|(_, ahead, ..)| *ahead).count(),
-        layers_resumed = encoded.iter().map(|(_, _, resumed, _)| resumed).sum::<usize>(),
+        layers_resumed = encoded.iter().map(|(_, _, resumed, ..)| resumed).sum::<usize>(),
+        leaves_already_stored = encoded.iter().filter(|(.., kept)| *kept).count(),
         nodes = encoded.iter().map(|(n, ..)| n).sum::<u64>(), seconds = started.elapsed().as_secs(),
         "storage snapshot leaves encoded");
-    let mut unkept = encoded.iter().filter_map(|(.., unkept)| unkept.as_ref());
+    let mut unkept = encoded
+        .iter()
+        .filter_map(|(_, _, _, unkept, _)| unkept.as_ref());
     if let Some(error) = unkept.next() {
         warn!(epoch = captured.epoch, filter = %hex::encode(&captured.filter),
             leaves = encoded.len(), unkept = 1 + unkept.count(), %error, scope = "local",
@@ -1426,13 +1457,36 @@ fn encode_member_until(
              storage-labels disk");
     }
     let nodes: Vec<u64> = encoded.iter().map(|(n, ..)| *n).collect();
-    let plan = quil_execution::global_intrinsic::storage_snapshot::encode_plan(&[(
-        captured.filter.clone(),
-        captured.plan.clone(),
-    )]);
     replicas.put_snapshot_sources(captured.epoch, &captured.filter, &plan)?;
     replicas.put_leaf_nodes(captured.epoch, &captured.filter, &nodes)?;
     replicas.put_partition(captured.epoch, &captured.filter, &captured.prefixes)
+}
+
+/// What `member`'s replica of leaf `leaf_id` for `epoch` is encoded from,
+/// as its snapshot records it beside the leaf
+/// ([`ReplicaStore::put_hash_source`]): the replica key, the labelling's
+/// parameters and the snapshot's sources (`plan`), which fix the leaf's data.
+fn leaf_source(
+    member: &[u8],
+    leaf_id: &[u8],
+    epoch: u64,
+    plan: &[u8],
+    params: &quil_crypto::sdr::SdrParams,
+) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut hash = sha2::Sha256::new();
+    hash.update(b"quil/storage-snapshot/leaf-source/v1");
+    hash.update(quil_crypto::sdr::replica_key(member, leaf_id, epoch));
+    for value in [
+        params.layers,
+        params.drg_degree,
+        params.expander_degree,
+        params.node_bytes,
+    ] {
+        hash.update((value as u64).to_be_bytes());
+    }
+    hash.update(plan);
+    hash.finalize().into()
 }
 
 /// How a leaf's nodes were counted for [`gives_up_late_leaf`].
@@ -5873,5 +5927,267 @@ pub(crate) mod tests {
             Err("storage binding: an offset past the values' end".into())
         );
         quil_types::consensus::set_storage_padding_bound_epoch_for_thread(None);
+    }
+
+    /// A shard of `app` of 32 values of 300 bytes, committed.
+    fn shard_of_leaves(app: [u8; 32]) -> Arc<HypergraphCrdt> {
+        let crdt = test_crdt();
+        for lead in 0u8..32 {
+            crdt.add_vertex(
+                &Location {
+                    app_address: app,
+                    data_address: address(lead * 8, 5),
+                },
+                &vec![lead; 300],
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        crdt
+    }
+
+    /// `captured` split into leaves of at most a fifth of its data: five or
+    /// more.
+    fn split(mut captured: Captured) -> Captured {
+        let whole = captured.size(&[]).unwrap();
+        captured.prefixes = captured
+            .partition(whole / 5)
+            .unwrap()
+            .iter()
+            .map(|relative| leaf_prefix(relative))
+            .collect();
+        assert!(captured.prefixes.len() >= 5);
+        captured
+    }
+
+    fn leaf_ids(captured: &Captured) -> Vec<Vec<u8>> {
+        captured
+            .prefixes
+            .iter()
+            .map(|prefix| quil_execution::global_intrinsic::leaf_id_bytes(&captured.filter, prefix))
+            .collect()
+    }
+
+    fn in_memory_replicas() -> ReplicaStore {
+        ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()))
+    }
+
+    /// `replicas` holds each leaf of `captured` as `expected` does.
+    fn same_replicas(captured: &Captured, replicas: &ReplicaStore, expected: &ReplicaStore) {
+        for leaf_id in leaf_ids(captured) {
+            let stored = replicas.get_hash(captured.epoch, &leaf_id).unwrap();
+            assert!(stored.is_some());
+            assert_eq!(stored, expected.get_hash(captured.epoch, &leaf_id).unwrap());
+        }
+        assert_eq!(
+            replicas
+                .get_partition(captured.epoch, &captured.filter)
+                .unwrap(),
+            Some(captured.prefixes.clone())
+        );
+    }
+
+    /// A restart midway through a snapshot's encode labels only the leaves
+    /// it had not stored whole: those it had are kept, each node read back
+    /// against its cap, and the replicas are those encoded at once
+    /// (2026-11-05: a restart labelled every leaf of a seat's snapshot again,
+    /// from its first layer where its labels had no room on disk).
+    #[test]
+    fn a_restart_labels_only_the_leaves_its_snapshot_had_not_stored() {
+        let (app, member, epoch) = ([0x86u8; 32], [0x6Eu8; 32], 6);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let crdt = shard_of_leaves(app);
+        let sources = [current_source(&crdt, &app, epoch)];
+        let captured = split(capture_at(&crdt, &app, epoch, &sources).unwrap());
+        let n = captured.prefixes.len();
+        let labelled = || outcomes(epoch, &app, LeafWork::LabellingNow).len();
+        // The first process stored k of the leaves, then stopped.
+        let k = n / 2;
+        let mut before = split(capture_at(&crdt, &app, epoch, &sources).unwrap());
+        before.prefixes.truncate(k);
+        let restarted = in_memory_replicas();
+        encode_member_with(&before, &member, &restarted, None).unwrap();
+        assert_eq!(labelled(), k);
+        // The next process.
+        encode_member_with(&captured, &member, &restarted, None).unwrap();
+        assert_eq!(labelled(), n, "only the {} leaves not stored", n - k);
+        let at_once = in_memory_replicas();
+        encode_member_with(&captured, &member, &at_once, None).unwrap();
+        assert_eq!(labelled(), 2 * n);
+        same_replicas(&captured, &restarted, &at_once);
+        // Once all are stored, none.
+        encode_member_with(&captured, &member, &restarted, None).unwrap();
+        assert_eq!(labelled(), 2 * n);
+        same_replicas(&captured, &restarted, &at_once);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// A snapshot of `app` for `epoch` with every leaf stored for `member`,
+    /// each labelled once: the snapshot, its store and its leaves' ids.
+    fn stored_snapshot(
+        app: [u8; 32],
+        member: &[u8],
+        epoch: u64,
+    ) -> (Captured, ReplicaStore, Vec<Vec<u8>>) {
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let crdt = shard_of_leaves(app);
+        let sources = [current_source(&crdt, &app, epoch)];
+        let captured = split(capture_at(&crdt, &app, epoch, &sources).unwrap());
+        let replicas = in_memory_replicas();
+        encode_member_with(&captured, member, &replicas, None).unwrap();
+        assert_eq!(
+            outcomes(epoch, &app, LeafWork::LabellingNow).len(),
+            captured.prefixes.len()
+        );
+        let ids = leaf_ids(&captured);
+        (captured, replicas, ids)
+    }
+
+    /// A leaf whose write stopped before its source was recorded is labelled
+    /// again, and only it.
+    #[test]
+    fn a_restart_labels_again_a_leaf_cut_short_before_its_source_was_recorded() {
+        let (app, member, epoch) = ([0x87u8; 32], [0x6Fu8; 32], 6);
+        let (captured, restarted, ids) = stored_snapshot(app, &member, epoch);
+        let n = captured.prefixes.len();
+        let cut = restarted.get_hash(epoch, &ids[0]).unwrap().unwrap();
+        restarted
+            .put_hash(
+                epoch,
+                &ids[0],
+                &cut.replica,
+                &cut.cap,
+                &cut.registration_root,
+            )
+            .unwrap();
+        encode_member_with(&captured, &member, &restarted, None).unwrap();
+        assert_eq!(
+            outcomes(epoch, &app, LeafWork::LabellingNow).len(),
+            n + 1,
+            "the leaf cut short"
+        );
+        let at_once = in_memory_replicas();
+        encode_member_with(&captured, &member, &at_once, None).unwrap();
+        same_replicas(&captured, &restarted, &at_once);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// A leaf with a node changed, its source recorded, is labelled again,
+    /// and only it.
+    #[test]
+    fn a_restart_labels_again_a_leaf_with_a_node_changed() {
+        let (app, member, epoch) = ([0x89u8; 32], [0x72u8; 32], 6);
+        let (captured, restarted, ids) = stored_snapshot(app, &member, epoch);
+        let n = captured.prefixes.len();
+        let damaged = restarted.get_hash(epoch, &ids[1]).unwrap().unwrap();
+        let node = quil_crypto::storage_proof::NODE_BYTES;
+        let mut changed = damaged.replica.to_vec();
+        changed[..2 * node].rotate_left(node);
+        assert_ne!(&changed[..], &damaged.replica[..]);
+        let plan = quil_execution::global_intrinsic::storage_snapshot::encode_plan(&[(
+            app.to_vec(),
+            captured.plan.clone(),
+        )]);
+        let source = leaf_source(
+            &member,
+            &ids[1],
+            epoch,
+            &plan,
+            &quil_crypto::sdr::SdrParams::default(),
+        );
+        restarted
+            .put_hash(
+                epoch,
+                &ids[1],
+                &changed,
+                &damaged.cap,
+                &damaged.registration_root,
+            )
+            .unwrap();
+        restarted.put_hash_source(epoch, &ids[1], &source).unwrap();
+        encode_member_with(&captured, &member, &restarted, None).unwrap();
+        assert_eq!(
+            outcomes(epoch, &app, LeafWork::LabellingNow).len(),
+            n + 1,
+            "the damaged leaf"
+        );
+        let at_once = in_memory_replicas();
+        encode_member_with(&captured, &member, &at_once, None).unwrap();
+        same_replicas(&captured, &restarted, &at_once);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// Another member's snapshot of the same shard into the same store labels
+    /// every leaf: its replica key differs.
+    #[test]
+    fn a_restart_labels_every_leaf_again_for_another_member() {
+        let (app, member, epoch) = ([0x8Au8; 32], [0x73u8; 32], 6);
+        let (captured, restarted, _) = stored_snapshot(app, &member, epoch);
+        let n = captured.prefixes.len();
+        let other = [0x71u8; 32];
+        encode_member_with(&captured, &other, &restarted, None).unwrap();
+        assert_eq!(outcomes(epoch, &app, LeafWork::LabellingNow).len(), 2 * n);
+        let theirs = in_memory_replicas();
+        encode_member_with(&captured, &other, &theirs, None).unwrap();
+        same_replicas(&captured, &restarted, &theirs);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// A leaf stored for an earlier epoch from the same sources and replica
+    /// key (both epochs past the stable replica key epoch) is aliased, not
+    /// labelled, and a restart keeps the alias by the source recorded for
+    /// it: a snapshot's own record never keeps another epoch's leaf.
+    #[test]
+    fn a_restart_keeps_a_leaf_aliased_from_an_earlier_epoch() {
+        let (app, member, epoch) = ([0x88u8; 32], [0x70u8; 32], 7);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 3));
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(epoch - 2));
+        let crdt = shard_of_leaves(app);
+        let sources = [current_source(&crdt, &app, epoch - 1)];
+        let earlier = split(capture_at(&crdt, &app, epoch - 1, &sources).unwrap());
+        let captured = split(capture_at(&crdt, &app, epoch, &sources).unwrap());
+        let (n, ids) = (captured.prefixes.len(), leaf_ids(&captured));
+        assert_eq!(leaf_ids(&earlier), ids);
+        let plan = quil_execution::global_intrinsic::storage_snapshot::encode_plan(&[(
+            app.to_vec(),
+            captured.plan.clone(),
+        )]);
+        let params = quil_crypto::sdr::SdrParams::default();
+        assert_eq!(
+            leaf_source(&member, &ids[0], epoch - 1, &plan, &params),
+            leaf_source(&member, &ids[0], epoch, &plan, &params),
+            "only the epoch tells them apart"
+        );
+        let replicas = in_memory_replicas();
+        encode_member_with(&earlier, &member, &replicas, None).unwrap();
+        assert_eq!(outcomes(epoch - 1, &app, LeafWork::LabellingNow).len(), n);
+        let source = leaf_source(&member, &ids[0], epoch, &plan, &params);
+        assert_eq!(
+            replicas
+                .stored_from(epoch, &ids[0], &source, &|| false)
+                .unwrap(),
+            StoredFrom::Unrecorded,
+            "not kept by the earlier epoch's record"
+        );
+        encode_member_with(&captured, &member, &replicas, None).unwrap();
+        assert!(outcomes(epoch, &app, LeafWork::LabellingNow).is_empty());
+        // The next process.
+        encode_member_with(&captured, &member, &replicas, None).unwrap();
+        assert!(
+            outcomes(epoch, &app, LeafWork::LabellingNow).is_empty(),
+            "the aliases kept"
+        );
+        assert_eq!(
+            replicas
+                .stored_from(epoch, &ids[0], &source, &|| false)
+                .unwrap(),
+            StoredFrom::Whole(replicas.get_hash_leaf(epoch, &ids[0]).unwrap().unwrap().n)
+        );
+        let at_once = in_memory_replicas();
+        encode_member_with(&captured, &member, &at_once, None).unwrap();
+        assert_eq!(outcomes(epoch, &app, LeafWork::LabellingNow).len(), n);
+        same_replicas(&captured, &replicas, &at_once);
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 }
