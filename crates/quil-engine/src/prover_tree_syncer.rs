@@ -849,7 +849,8 @@ const GLOBAL_SYNC_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_s
 /// [`GLOBAL_SYNC_WAIT_BUDGET`].
 #[derive(Default)]
 struct GlobalSyncWait {
-    /// Milliseconds the attempt's waited-out requests took.
+    /// Milliseconds of refused requests and the polls between them. An answered
+    /// request's own time is its work, and spends none of the budget.
     waited_ms: AtomicU64,
     /// The attempt warned that its budget ran out.
     exhausted: AtomicBool,
@@ -879,9 +880,11 @@ where
     let started = tokio::time::Instant::now();
     let mut waiting = false;
     loop {
+        let asked = started.elapsed();
         let result = attempt().await;
         let waited = started.elapsed();
         let refused = matches!(&result, Err(error) if global_sync_in_progress(error));
+        let charged = if refused { waited } else { asked };
         let spent =
             std::time::Duration::from_millis(wait.waited_ms.load(Ordering::Relaxed)) + waited;
         if refused && target.running() && spent + GLOBAL_SYNC_POLL <= GLOBAL_SYNC_WAIT_BUDGET {
@@ -897,7 +900,7 @@ where
             continue;
         }
         wait.waited_ms
-            .fetch_add(waited.as_millis() as u64, Ordering::Relaxed);
+            .fetch_add(charged.as_millis() as u64, Ordering::Relaxed);
         if refused {
             if target.running() && !wait.exhausted.swap(true, Ordering::Relaxed) {
                 tracing::warn!(core_id = target.core_id(), filter = %hex::encode(filter), frame,
@@ -6354,6 +6357,124 @@ mod tests {
         assert_eq!(
             recovery.failures_by_class.get("global_sync").copied(),
             Some(1)
+        );
+    }
+
+    /// Answers its replays, each taking `replay_takes`, and refuses with a
+    /// GLOBAL state sync's wait as `refusals` says, by frame number.
+    struct RefusesAtFrames {
+        inner: Target,
+        replay_takes: std::time::Duration,
+        refusals: Mutex<std::collections::HashMap<u64, usize>>,
+        refused: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ShardRecoveryTarget for RefusesAtFrames {
+        fn materialized(&self) -> u64 {
+            self.inner.materialized()
+        }
+        async fn replay(
+            &self,
+            frame: AppShardFrame,
+            descendants: Vec<AppShardFrame>,
+        ) -> Result<u64> {
+            let number = frame.header.as_ref().unwrap().frame_number;
+            let refuse = match self.refusals.lock().unwrap().get_mut(&number) {
+                Some(left) if *left > 0 => {
+                    *left -= 1;
+                    true
+                }
+                _ => false,
+            };
+            if refuse {
+                self.refused
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(quil_types::error::QuilError::ExecutionUnavailable(
+                    quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS.into(),
+                ));
+            }
+            tokio::time::sleep(self.replay_takes).await;
+            self.inner.replay(frame, descendants).await
+        }
+        async fn validate(
+            &self,
+            anchor: AppShardFrame,
+            predecessor: Option<AppShardFrame>,
+        ) -> Result<bool> {
+            self.inner.validate(anchor, predecessor).await
+        }
+        async fn install(
+            &self,
+            anchor: AppShardFrame,
+            predecessor: Option<AppShardFrame>,
+        ) -> Result<()> {
+            self.inner.install(anchor, predecessor).await
+        }
+        fn inherited(&self) {
+            panic!("a certified archive tip must never use unanchored inheritance")
+        }
+    }
+
+    /// A slow replay's own time spends none of the wait budget. A replay
+    /// answering 30 s a frame had taken 750 s by frame 155: charged for them,
+    /// its budget was gone, and a sync install starting there failed the attempt
+    /// at its first refusal, after no wait at all.
+    #[tokio::test(start_paused = true)]
+    async fn answered_replays_spend_none_of_the_global_sync_wait_budget() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive {
+            latest: Some(frame(500)),
+            calls: calls.clone(),
+        };
+        let target = RefusesAtFrames {
+            inner: replaying_target(&calls),
+            replay_takes: std::time::Duration::from_secs(30),
+            refusals: Mutex::new([(155, 3)].into()),
+            refused: 0.into(),
+        };
+        let result =
+            recover_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &target, &[], None)
+                .await;
+        let turn = match result {
+            Ok(ShardRecoveryProgress::Replayed { turn, .. }) => turn,
+            other => panic!(
+                "after 750 s of answered replays a sync install was not waited out: {other:?}"
+            ),
+        };
+        assert_eq!(turn.frames, 32, "{turn:?}");
+        assert_eq!(target.refused.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// Refused time adds up across an attempt's requests: 400 s refused at one
+    /// frame leaves 200 s for the next, and the attempt fails once they are
+    /// spent, whatever the frames' own time.
+    #[tokio::test(start_paused = true)]
+    async fn refused_requests_add_up_against_the_global_sync_wait_budget() {
+        use quil_execution::global_intrinsic::handoff::global_sync_in_progress;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive {
+            latest: Some(frame(500)),
+            calls: calls.clone(),
+        };
+        let polls_of_400_secs = (400 / GLOBAL_SYNC_POLL.as_secs()) as usize;
+        let target = RefusesAtFrames {
+            inner: replaying_target(&calls),
+            replay_takes: std::time::Duration::from_secs(1),
+            refusals: Mutex::new([(130, polls_of_400_secs), (131, usize::MAX)].into()),
+            refused: 0.into(),
+        };
+        let started = tokio::time::Instant::now();
+        let error =
+            recover_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &target, &[], None)
+                .await
+                .unwrap_err();
+        assert!(global_sync_in_progress(&error), "{error}");
+        let waited = started.elapsed();
+        assert!(
+            waited >= GLOBAL_SYNC_WAIT_BUDGET - GLOBAL_SYNC_POLL
+                && waited <= GLOBAL_SYNC_WAIT_BUDGET + 2 * GLOBAL_SYNC_POLL,
+            "{waited:?}"
         );
     }
 
