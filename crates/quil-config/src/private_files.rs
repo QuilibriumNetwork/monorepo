@@ -32,21 +32,25 @@ pub fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
 /// a crash or a power loss): the contents go to a new temporary file in
 /// the same directory, which is flushed to disk and renamed over `path`,
 /// and the directory is flushed. A new file gets `mode` less the umask; an
-/// existing one keeps its mode within `mode`. A symbolic link at `path` is
-/// followed, so its target is replaced and the link kept. On failure the
-/// temporary file is removed.
+/// existing one keeps its mode within `mode`, and its owner and group, so
+/// `sudo qclient` leaves a node directory readable by the user the node
+/// runs as. A user who may not give the replacement that owner gets a
+/// `PermissionDenied` error naming the file and its owner, and the file
+/// is left as it was. A symbolic link at `path` is followed, so its target
+/// is replaced and the link kept. On failure the temporary file is
+/// removed.
 pub fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     let target = match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path)?,
         _ => path.to_path_buf(),
     };
     let existing = match std::fs::metadata(&target) {
-        Ok(meta) => Some(meta.permissions()),
+        Ok(meta) => Some(meta),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => return Err(e),
     };
     let tmp = temporary_path(&target);
-    let written = write_new_file(&tmp, contents, mode, existing)
+    let written = write_new_file(&tmp, &target, contents, mode, existing.as_ref())
         .and_then(|()| std::fs::rename(&tmp, &target));
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
@@ -71,12 +75,14 @@ fn temporary_path(target: &Path) -> PathBuf {
 }
 
 /// Create `tmp` (it must not exist), write `contents` and flush them,
-/// with the mode [`atomic_write`] gives its target.
+/// with the owner and mode [`atomic_write`] gives `target`, which has the
+/// metadata `existing` unless it is new.
 fn write_new_file(
     tmp: &Path,
+    target: &Path,
     contents: &[u8],
     mode: u32,
-    existing: Option<std::fs::Permissions>,
+    existing: Option<&std::fs::Metadata>,
 ) -> io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -86,18 +92,65 @@ fn write_new_file(
         options.mode(mode);
     }
     let mut file = options.open(tmp)?;
-    file.write_all(contents)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if let Some(existing) = existing {
-            let kept = existing.mode() & mode & 0o7777;
+            let kept = existing.permissions().mode() & mode & 0o7777;
+            keep_owner(&file, target, existing, kept)?;
             file.set_permissions(std::fs::Permissions::from_mode(kept))?;
         }
     }
     #[cfg(not(unix))]
-    let _ = (mode, existing);
+    let _ = (target, mode, existing);
+    file.write_all(contents)?;
     file.sync_all()
+}
+
+/// Give `file`, the replacement of `target`, the owner and group of
+/// `existing` (`target`'s metadata), so that a root run leaves another
+/// user's file theirs. Without the right to, a file of another user is
+/// refused rather than taken over; only a group that `kept` (the new
+/// mode) gives no access may stay ours.
+#[cfg(unix)]
+fn keep_owner(
+    file: &File,
+    target: &Path,
+    existing: &std::fs::Metadata,
+    kept: u32,
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let ours = file.metadata()?;
+    let (uid, gid) = (existing.uid(), existing.gid());
+    if (ours.uid(), ours.gid()) == (uid, gid) {
+        return Ok(());
+    }
+    match std::os::unix::fs::fchown(file, Some(uid), Some(gid)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            if ours.uid() == uid && kept & 0o070 == 0 {
+                return Ok(());
+            }
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is owned by uid {uid} gid {gid}, which this user (uid {} \
+                     gid {}) may not give its replacement: run this as root or \
+                     as that user; the file is unchanged",
+                    target.display(),
+                    ours.uid(),
+                    ours.gid()
+                ),
+            ))
+        }
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!(
+                "keep the owner of {}: {e}; the file is unchanged",
+                target.display()
+            ),
+        )),
+    }
 }
 
 /// Flush the directory holding `path` to disk, so a rename into it
@@ -254,6 +307,116 @@ mod tests {
         assert_eq!(mode(&public) & 0o700, 0o600, "the owner can rewrite it");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The user and group `nobody`, which tests run as root give files.
+    const NOBODY: u32 = 65_534;
+
+    /// Whether this process runs as root, read from a file it creates in
+    /// `dir`.
+    fn running_as_root(dir: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let probe = dir.join("probe");
+        std::fs::write(&probe, b"").unwrap();
+        let root = std::fs::metadata(&probe).unwrap().uid() == 0;
+        std::fs::remove_file(&probe).unwrap();
+        root
+    }
+
+    fn owner(path: &Path) -> (u32, u32) {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).unwrap();
+        (meta.uid(), meta.gid())
+    }
+
+    /// Run as root (`sudo qclient ...`) on the node directory of the user
+    /// the node runs as, a replaced key or state file stays that user's,
+    /// so the node can still read it; a new file is root's as before.
+    #[test]
+    fn replaced_files_keep_their_owner() {
+        let dir = tempdir("owner");
+        if !running_as_root(&dir) {
+            println!("skipped: only root can give a file another owner");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let config = dir.join("config.yml");
+        write_private_file(&config, b"old").unwrap();
+        std::os::unix::fs::chown(&config, Some(NOBODY), Some(NOBODY)).unwrap();
+        write_private_file(&config, b"new").unwrap();
+        assert_eq!(
+            owner(&config),
+            (NOBODY, NOBODY),
+            "config.yml replaced by root keeps its owner"
+        );
+        assert_eq!(std::fs::read(&config).unwrap(), b"new");
+        assert_eq!(mode(&config), 0o600);
+
+        let aliases = dir.join("aliases.yaml");
+        atomic_write(&aliases, b"a", 0o644).unwrap();
+        std::os::unix::fs::chown(&aliases, Some(NOBODY), Some(NOBODY)).unwrap();
+        atomic_write(&aliases, b"b", 0o644).unwrap();
+        assert_eq!(
+            owner(&aliases),
+            (NOBODY, NOBODY),
+            "aliases keep their owner"
+        );
+
+        let fresh = dir.join("keys.yml");
+        write_private_file(&fresh, b"null:\n").unwrap();
+        assert_eq!(owner(&fresh).0, 0, "a new file is root's");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A user who may not give a replacement the owner of the file it
+    /// replaces is refused, with the file and its owner named, and the file
+    /// is left whole and its owner's: here `nobody` in a directory open to
+    /// all, replacing a file of root's.
+    #[test]
+    fn another_users_file_is_refused() {
+        if let Ok(path) = std::env::var(FOREIGN_OWNER) {
+            // The child, run as `nobody`.
+            let path = Path::new(&path);
+            let err = write_private_file(path, b"taken over")
+                .expect_err("nobody must not replace a file of root's");
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+            let text = err.to_string();
+            assert!(text.contains(&path.display().to_string()), "{text}");
+            assert!(text.contains("owned by uid 0"), "{text}");
+            return;
+        }
+        let dir = tempdir("foreign");
+        if !running_as_root(&dir) {
+            println!("skipped: only root can run the test as another user");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        set_mode(&dir, 0o777);
+        let path = dir.join("config.yml");
+        write_private_file(&path, b"root's").unwrap();
+        let status = {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("private_files::tests::another_users_file_is_refused")
+                .arg("--nocapture")
+                .env(FOREIGN_OWNER, &path)
+                .uid(NOBODY)
+                .gid(NOBODY)
+                .status()
+                .expect("run the test as nobody")
+        };
+        assert!(status.success(), "the write as nobody was refused");
+        assert_eq!(std::fs::read(&path).unwrap(), b"root's");
+        assert_eq!(owner(&path), (0, 0), "the file stays root's");
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("config.yml")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const FOREIGN_OWNER: &str = "QUIL_CONFIG_TEST_FOREIGN_OWNER";
 
     /// New directories, parents included, are owner-only; an existing one
     /// keeps its mode.
