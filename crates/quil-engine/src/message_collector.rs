@@ -818,7 +818,12 @@ impl MessageCollector {
     /// What the last GLOBAL proposal copy ([`Self::snapshot_for_proposal`]
     /// with a frame) found, taken once.
     pub(crate) fn take_proposal_pool(&self) -> Option<crate::proposal_pool::ProposalPool> {
-        self.last_pool.lock().ok()?.take()
+        let mut pool = self.last_pool.lock().ok()?.take()?;
+        // Read here, not under the buffers' lock the copy holds.
+        if let Ok(known) = self.valid_shard_addresses.read() {
+            pool.known = known.clone();
+        }
+        Some(pool)
     }
 
     /// Install the admission check of shard frames. Archives, whose collector
@@ -1673,6 +1678,7 @@ impl MessageCollector {
         let parent = frame.saturating_sub(1);
         let mut pool = crate::proposal_pool::ProposalPool {
             shards: shards.len(),
+            tips: shards.keys().map(|address| address.to_vec()).collect(),
             ..Default::default()
         };
         for (_, _, m) in shards.values().flatten() {
@@ -1701,6 +1707,13 @@ impl MessageCollector {
                 && seen.insert(m.hash)
             {
                 pool.out_of_window += 1;
+                if let Some(shard) = m
+                    .shard
+                    .as_ref()
+                    .filter(|shard| !shards.contains_key(shard.address.as_slice()))
+                {
+                    pool.late.insert(shard.address.clone());
+                }
             }
         }
         pool.verifying = self
@@ -3241,6 +3254,55 @@ mod tests {
         }
         .to_canonical_bytes()
         .unwrap()
+    }
+
+    /// A pool over shards 0x11-0x55, with a proof in the window of 0x11, one
+    /// outside it of 0x22, and one of each of 0x33.
+    fn held_shards_pool() -> crate::proposal_pool::ProposalPool {
+        let mc = MessageCollector::new();
+        // Held unverified, so that a higher frame leaves the lower one in place.
+        let (verifier, _) = counting_verifier(|frame| match frame {
+            7 | 8 => ShardFrameVerdict::Unavailable("anchor not executed".into()),
+            _ => ShardFrameVerdict::Valid,
+        });
+        mc.set_shard_frame_verifier(verifier);
+        mc.prune_after_finalization(1);
+        mc.set_valid_shard_addresses(shard_set(&[0x11, 0x22, 0x33, 0x44, 0x55]));
+        // Proposing frame 101: its window reaches 88.
+        for bundle in [
+            anchored_bundle(0x11, 5, 100),
+            anchored_bundle(0x22, 6, 50),
+            anchored_bundle(0x33, 7, 50),
+            anchored_bundle(0x33, 8, 95),
+        ] {
+            assert_eq!(mc.add_message_outcome(1, bundle), SubmitOutcome::Accepted);
+        }
+        mc.snapshot_for_proposal(1, 1 << 20, 100, Some(101), &[])
+            .unwrap();
+        mc.take_proposal_pool().expect("the copy's pool")
+    }
+
+    fn shard_set(bytes: &[u8]) -> HashSet<Vec<u8>> {
+        bytes.iter().map(|byte| vec![*byte; 32]).collect()
+    }
+
+    #[test]
+    fn a_proposal_copy_names_the_shards_it_can_carry() {
+        assert_eq!(held_shards_pool().tips, shard_set(&[0x11, 0x33]));
+    }
+
+    /// A shard with a proof in the window as well is not too old.
+    #[test]
+    fn a_proposal_copy_names_the_shards_with_only_old_proofs() {
+        assert_eq!(held_shards_pool().late, shard_set(&[0x22]));
+    }
+
+    #[test]
+    fn a_proposal_copy_names_the_shards_this_node_knows() {
+        assert_eq!(
+            held_shards_pool().known,
+            shard_set(&[0x11, 0x22, 0x33, 0x44, 0x55])
+        );
     }
 
     /// A GLOBAL proposal's copy records what the mempool held, by anchor and
