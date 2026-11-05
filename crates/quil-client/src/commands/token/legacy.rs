@@ -608,10 +608,11 @@ async fn list_owner(
     Ok(coins)
 }
 
-/// Every coin of `owners`. A long listing shows its progress on one line
-/// of a terminal's stderr, rewritten after each page and cleared once the
-/// listing ends; piped or redirected output gets none, nor does a `quiet`
-/// listing (the node manager, whose screen that line would overwrite).
+/// Every coin of `owners`. A listing past `output::SLOW_PHASE` (any, under
+/// `-v`) shows its progress on one line of a terminal's stderr, rewritten
+/// after each page and cleared once the listing ends; piped or redirected
+/// output gets none, nor does a `quiet` listing (the node manager, whose
+/// screen that line would overwrite).
 async fn list_owners(
     client: &Client,
     application: &[u8; 32],
@@ -622,11 +623,12 @@ async fn list_owners(
 ) -> anyhow::Result<Vec<Coin>> {
     use std::io::{IsTerminal, Write};
     let terminal = !quiet && !super::output::captured() && std::io::stderr().is_terminal();
+    let (started, verbose) = (std::time::Instant::now(), crate::verbosity::on());
     let mut coins = Vec::new();
     for (form, owner) in owners {
         let mut shown = false;
         let listed = list_owner(client, application, owner, pages, |count| {
-            if terminal {
+            if terminal && (verbose || started.elapsed() > super::output::SLOW_PHASE) {
                 eprint!(
                     "\r{label}: {count} legacy coins listed under the {} owner, more follow",
                     form.text()
