@@ -7,7 +7,8 @@
 
 use crate::leader_provider::{select_shard_tips, TipCheck};
 use crate::message_collector::{
-    MessageCollector, Provenance, ShardFrameVerdict, ShardFrameVerifier, SubmitOutcome,
+    bundle_shard_frames_in_lockstep, MessageCollector, Provenance, ShardFrameVerdict,
+    ShardFrameVerifier, SubmitOutcome,
 };
 use quil_cw_consensus::{
     _codec::Read as _,
@@ -27,7 +28,9 @@ use quil_cw_consensus::{
     falcon_scheme::{Certificate, Generic},
     falcon_simplex::SimplexFalconScheme,
 };
-use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+use quil_execution::global_intrinsic::frame_header::{
+    FrameHeader, STORAGE_ANCHOR_LOCKSTEP_WINDOW, TYPE_FRAME_HEADER,
+};
 use quil_execution::global_intrinsic::prover_shard_update::verify_frame_header_attestation;
 use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
 use quil_types::consensus::{ProverInfo, ProverStatus};
@@ -352,5 +355,120 @@ fn sca_a_stripped_copy_in_a_two_shard_bundle_decides_who_is_paid() {
          arriving first excluded signers {missed:?} from the frame's pay although a superset \
          copy signed by all 7 for the same frame verifies and reached GLOBAL before inclusion \
          (its submit: {superset:?}); riding copies pay {riding:?}"
+    );
+}
+
+/// `headers` in one bundle stamped `timestamp`: the same headers from
+/// another sender are a distinct message.
+fn bundle_at(headers: &[&FrameHeader], timestamp: i64) -> Vec<u8> {
+    let mut raw = CanonicalMessageBundle::from_canonical_bytes(&bundle(headers)).unwrap();
+    raw.timestamp = timestamp;
+    raw.to_canonical_bytes().unwrap()
+}
+
+/// Who each copy of `shard`'s frame that GLOBAL frame `global` carries from
+/// `mc` would pay. As the leader does, a bundle with a shard frame outside
+/// the anchor window is first dropped whole from the collector.
+fn riding_at(
+    mc: &MessageCollector,
+    shards: &[Shard],
+    shard: &Shard,
+    global: u64,
+) -> Vec<Vec<usize>> {
+    let (in_window, out): (Vec<_>, Vec<_>) = mc
+        .collect_for_rank(RANK)
+        .into_iter()
+        .partition(|raw| bundle_shard_frames_in_lockstep(raw, global));
+    mc.remove(&out);
+    let tips = select_shard_tips(
+        in_window,
+        |raw| mc.is_verified(raw),
+        |raw| match verdict(shards, raw) {
+            Ok(()) => TipCheck::Valid,
+            Err(reason) => TipCheck::Invalid(reason),
+        },
+    );
+    tips.kept
+        .iter()
+        .flat_map(|raw| headers_of(raw.as_slice()))
+        .filter(|header| header.address == shard.address && header.frame_number == FRAME)
+        .map(|header| shard.paid(&header).unwrap())
+        .collect()
+}
+
+/// A held frame and a second shard's frame anchored at the window's old
+/// edge (both published headers, no key needed), sent as one bundle that
+/// verifies, must not take the held frame's place: the next GLOBAL frame
+/// drops the bundle whole for its companion, and the held frame rides.
+#[test]
+fn sca_a_two_shard_bundle_dropped_whole_leaves_the_held_frame_riding() {
+    let (mc, shards) = collector(vec![Shard::new(0xA5), Shard::new(0xB6)]);
+    let (a, b) = (&shards[0], &shards[1]);
+    let all: Vec<usize> = (0..MEMBERS).collect();
+    let full_a = a.header(&all);
+    let mut edge_b = b.header(&all);
+    edge_b.global_frame_number = full_a.global_frame_number - STORAGE_ANCHOR_LOCKSTEP_WINDOW;
+    // GLOBAL frames whose window holds both anchors, then A's only.
+    let (now, next) = (
+        full_a.global_frame_number + 1,
+        full_a.global_frame_number + 2,
+    );
+    assert!(b.paid(&edge_b).is_ok(), "SCA SETUP: the companion verifies");
+    assert!(
+        bundle_shard_frames_in_lockstep(&bundle(&[&full_a, &edge_b]), now)
+            && !bundle_shard_frames_in_lockstep(&bundle(&[&edge_b]), next)
+            && bundle_shard_frames_in_lockstep(&bundle(&[&full_a]), next),
+        "SCA SETUP: the companion leaves the window one GLOBAL frame later, A does not"
+    );
+    assert_eq!(
+        mc.add_message_outcome_from(RANK, bundle(&[&full_a]), Provenance::Prover),
+        SubmitOutcome::Accepted,
+        "SCA SETUP: a member's copy of A is admitted"
+    );
+    assert!(
+        mc.is_verified(&bundle(&[&full_a])),
+        "SCA SETUP: the member's copy of A is held verified"
+    );
+    // Any sender: both headers are on public shard-frame gossip.
+    assert_eq!(
+        mc.add_message_outcome_from(RANK, bundle_at(&[&full_a, &edge_b], 7), Provenance::Other),
+        SubmitOutcome::Accepted,
+        "SCA SETUP: the two-shard bundle is admitted"
+    );
+    // Another member's copy of A arrives after the bundle.
+    let late = mc.add_message_outcome_from(RANK, bundle_at(&[&full_a], 1), Provenance::Prover);
+    let riding = riding_at(&mc, &shards, a, next);
+    assert!(
+        riding.contains(&all),
+        "SCA FRAME LOST: a verified two-shard bundle carrying a copy of A's held frame and a \
+         companion anchored at the window's old edge took the held copy's place; the next \
+         GLOBAL frame dropped the bundle whole for its companion, and no copy of A rides \
+         (a later member copy: {late:?}); riding copies pay {riding:?}"
+    );
+}
+
+/// Control: the same copy of A sent alone takes nothing, and the held copy
+/// rides.
+#[test]
+fn sca_control_a_one_shard_copy_of_a_held_frame_takes_nothing() {
+    let (mc, shards) = collector(vec![Shard::new(0xA5)]);
+    let a = &shards[0];
+    let all: Vec<usize> = (0..MEMBERS).collect();
+    let full_a = a.header(&all);
+    let next = full_a.global_frame_number + 2;
+    assert_eq!(
+        mc.add_message_outcome_from(RANK, bundle(&[&full_a]), Provenance::Prover),
+        SubmitOutcome::Accepted,
+        "SCA SETUP: a member's copy of A is admitted"
+    );
+    assert_eq!(
+        mc.add_message_outcome_from(RANK, bundle_at(&[&full_a], 7), Provenance::Other),
+        SubmitOutcome::Duplicate,
+        "SCA SETUP: a copy of a held verified frame adds nothing"
+    );
+    assert_eq!(
+        riding_at(&mc, &shards, a, next),
+        vec![all],
+        "SCA SETUP: the held copy rides"
     );
 }
