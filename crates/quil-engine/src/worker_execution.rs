@@ -22,7 +22,7 @@ pub const STATES: [&str; 9] = [
 
 /// Every reason a record gives for its phase (`WorkerExecution.blocker`),
 /// besides none.
-pub const BLOCKERS: [&str; 14] = [
+pub const BLOCKERS: [&str; 17] = [
     "waiting for transport",
     "restarting consensus host",
     "engine exited",
@@ -30,6 +30,9 @@ pub const BLOCKERS: [&str; 14] = [
     "staging shard data",
     "awaiting closing certificate",
     "awaiting allocation activation",
+    "awaiting committee session",
+    "awaiting shard re-anchor",
+    "awaiting GLOBAL state sync",
     "checkpoint mismatch",
     "state unavailable",
     "committee admission unavailable",
@@ -2158,12 +2161,12 @@ mod tests",
             )
             .unwrap()];
         let phase = region(own, "pub fn consensus_phase", "self.state(state, reason)");
-        let chain = region(engine, "let blocker = ", ";");
+        let chain = region(engine, "fn refused_check(", "\n}");
         let mut written: Vec<Vec<&str>> = [engine, thread]
             .iter()
             .flat_map(|s| literals(s, "state(", ')'))
             .collect();
-        assert!(written.len() >= 10, "{written:?}");
+        assert!(written.len() >= 8, "{written:?}");
         written.extend(literals(phase, "(", ')'));
         let chained = literals(chain, "{", '}');
         assert_eq!(chained.len(), 4, "{chain}");
@@ -2172,6 +2175,10 @@ mod tests",
                 .into_iter()
                 .map(|blocker| vec!["blocked", blocker[0]]),
         );
+        // The events a refused start awaits, which it reports as waiting.
+        let awaited = literals(engine, "Awaited::Event(", ')');
+        assert!(awaited.len() >= 5, "{awaited:?}");
+        written.extend(awaited.into_iter().map(|event| vec!["waiting", event[0]]));
         // A store's state, which no engine writes (`with_store_state`).
         written.push(vec!["blocked", STORAGE_WRITE_FAILED]);
         let states: BTreeSet<&str> = written.iter().map(|args| args[0]).collect();

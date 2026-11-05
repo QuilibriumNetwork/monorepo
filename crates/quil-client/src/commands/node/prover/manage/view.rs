@@ -4578,7 +4578,7 @@ fn help_items() -> Vec<HelpItem> {
         item("`serve`: ready host"),
         item("`close`: awaiting closing certificate"),
         item("`handoff`: sealed, awaiting successor"),
-        item("`wait`: awaiting allocation activation"),
+        item("`wait`: awaiting the event the row footer names: allocation activation, a seat or committee session, a GLOBAL state sync or a shard re-anchor"),
         item("`blocked`: preparation/admission failure"),
         item("`stopped`: engine exited"),
         item("`running`: an older node reports host startup only"),
@@ -6507,6 +6507,7 @@ mod tests {
             ("closing", "close", "awaiting closing certificate"),
             ("handoff", "handoff", "awaiting successor"),
             ("waiting", "wait", "awaiting allocation activation"),
+            ("waiting", "wait", "awaiting GLOBAL state sync"),
         ] {
             let mut allocation = row("aa", 1, 1, 7, "", "");
             allocation.status = 2;

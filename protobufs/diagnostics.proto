@@ -16,7 +16,7 @@ enum Phase {
   // The worker reported no observation.
   PHASE_UNSPECIFIED = 0;
   PHASE_STARTING = 1;
-  // Waiting for its allocation to activate.
+  // Waiting for an event that ends the wait (`blocker`, `awaited_frame`).
   PHASE_WAITING = 2;
   PHASE_SYNCING = 3;
   PHASE_SERVING = 4;
@@ -58,6 +58,12 @@ enum Blocker {
   // failed write (a full disk, an I/O error), or below the node's
   // free-space floor.
   BLOCKER_STORAGE_WRITE_FAILED = 15;
+  // Waits: GLOBAL has not authorized a committee session for the shard.
+  BLOCKER_AWAITING_COMMITTEE_SESSION = 16;
+  // Waits: the shard sync re-anchors the shard from an archive.
+  BLOCKER_AWAITING_SHARD_REANCHOR = 17;
+  // Waits: this node installs a GLOBAL state sync from an archive.
+  BLOCKER_AWAITING_GLOBAL_STATE_SYNC = 18;
 }
 
 // The phase of a worker's archive recovery (`ShardRecovery.phase`).
