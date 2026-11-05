@@ -1421,3 +1421,266 @@ mod propagation_tests {
         );
     }
 }
+
+/// A process restarted under its peer id must learn its peers' subscriptions
+/// even while they still hold the killed process's connection. A SIGKILLed
+/// QUIC peer sends no close, so the others keep its connection until their
+/// idle timeout (10 s); a restart within it reconnects beside the old one.
+/// `subscribed_peer_count` gates a starting worker's consensus (the CW
+/// transport barrier), so a count stuck at 0 keeps the worker from its seat.
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+    use futures::StreamExt;
+    use libp2p::{Multiaddr, Swarm, SwarmBuilder};
+    use std::time::Duration;
+
+    const TOPIC: [u8; 2] = [0x0c, 0xa1];
+    /// Bound for connection set-up steps.
+    const SETUP: Duration = Duration::from_secs(20);
+    /// Time the restarted process gets to learn the hub's subscription: 30
+    /// heartbeats, and past QUIC's idle timeout.
+    const RELEARN: Duration = Duration::from_secs(30);
+
+    #[derive(Clone, Copy)]
+    enum Link {
+        Tcp,
+        Quic,
+    }
+
+    fn behaviour(key: &Keypair) -> BlossomSubBehaviour {
+        let mut b = BlossomSubBehaviour::new(0);
+        b.set_signing_identity(key.public().to_peer_id(), key.clone());
+        b.subscribe(TOPIC.to_vec());
+        b
+    }
+
+    fn swarm(key: Keypair, link: Link) -> Swarm<BlossomSubBehaviour> {
+        let idle =
+            |cfg: libp2p::swarm::Config| cfg.with_idle_connection_timeout(Duration::from_secs(120));
+        match link {
+            Link::Tcp => SwarmBuilder::with_existing_identity(key)
+                .with_tokio()
+                .with_tcp(
+                    libp2p::tcp::Config::default(),
+                    libp2p::noise::Config::new,
+                    libp2p::yamux::Config::default,
+                )
+                .expect("tcp transport")
+                .with_behaviour(behaviour)
+                .expect("behaviour")
+                .with_swarm_config(idle)
+                .build(),
+            Link::Quic => SwarmBuilder::with_existing_identity(key)
+                .with_tokio()
+                .with_quic()
+                .with_behaviour(behaviour)
+                .expect("behaviour")
+                .with_swarm_config(idle)
+                .build(),
+        }
+    }
+
+    async fn listen(swarm: &mut Swarm<BlossomSubBehaviour>, link: Link) -> Multiaddr {
+        let addr = match link {
+            Link::Tcp => "/ip4/127.0.0.1/tcp/0",
+            Link::Quic => "/ip4/127.0.0.1/udp/0/quic-v1",
+        };
+        swarm.listen_on(addr.parse().unwrap()).expect("listen");
+        loop {
+            if let libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } =
+                swarm.select_next_some().await
+            {
+                return address;
+            }
+        }
+    }
+
+    /// Polls every swarm until `done` holds or `limit` passes; whether it held.
+    async fn drive(
+        swarms: &mut [&mut Swarm<BlossomSubBehaviour>],
+        limit: Duration,
+        mut done: impl FnMut(&[&mut Swarm<BlossomSubBehaviour>]) -> bool,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            if done(swarms) {
+                return true;
+            }
+            let next = futures::future::select_all(
+                swarms.iter_mut().map(|s| Box::pin(s.select_next_some())),
+            );
+            tokio::select! {
+                _ = next => {}
+                _ = tokio::time::sleep_until(deadline) => return done(swarms),
+            }
+        }
+    }
+
+    /// Connections `behaviour` holds to `peer`.
+    fn connections(behaviour: &BlossomSubBehaviour, peer: &PeerId) -> usize {
+        behaviour.connected_peers.get(peer).copied().unwrap_or(0)
+    }
+
+    /// Restarts `key`'s process beside the hub: Ok when the new process
+    /// learns the hub's subscription within `RELEARN`.
+    async fn relearned(
+        hub: &mut Swarm<BlossomSubBehaviour>,
+        hub_addr: Multiaddr,
+        key: Keypair,
+        link: Link,
+    ) -> Result<(), String> {
+        let id = key.public().to_peer_id();
+        let held = connections(hub.behaviour(), &id);
+        let mut new = swarm(key, link);
+        new.dial(hub_addr).expect("new dial");
+        let ok = drive(&mut [&mut *hub, &mut new], RELEARN, |s| {
+            s[1].behaviour().subscribed_peer_count(&TOPIC) > 0
+        })
+        .await;
+        if ok {
+            return Ok(());
+        }
+        Err(format!(
+            "RESTART SUBSCRIPTIONS LOST: the restarted process learned no subscription of the \
+             hub in {RELEARN:?} (hub connections to its peer id: {held} at the restart, {} now; \
+             hub knows it subscribed: {}; its mesh peers: {}; connected: {})",
+            connections(hub.behaviour(), &id),
+            hub.behaviour().peer_subscribed_to(&id, &TOPIC),
+            new.behaviour().mesh_peers(&TOPIC),
+            new.behaviour().is_connected(hub.local_peer_id()),
+        ))
+    }
+
+    /// TCP, the old connection still held at the restart: the hub sees the
+    /// new connection as its second to the peer id, then the old one closes.
+    #[tokio::test]
+    async fn restart_beside_a_held_connection_relearns_peer_subscriptions() {
+        let key = Keypair::generate_ed25519();
+        let id = key.public().to_peer_id();
+        let mut hub = swarm(Keypair::generate_ed25519(), Link::Tcp);
+        let hub_addr = listen(&mut hub, Link::Tcp).await;
+        let mut old = swarm(key.clone(), Link::Tcp);
+        old.dial(hub_addr.clone()).expect("old dial");
+        assert!(
+            drive(&mut [&mut hub, &mut old], SETUP, |s| {
+                s[0].behaviour().peer_subscribed_to(&id, &TOPIC)
+                    && s[1].behaviour().subscribed_peer_count(&TOPIC) == 1
+            })
+            .await,
+            "setup: the old process and the hub exchange subscriptions"
+        );
+        let mut new = swarm(key, Link::Tcp);
+        new.dial(hub_addr).expect("new dial");
+        assert!(
+            drive(&mut [&mut hub, &mut old, &mut new], SETUP, |s| {
+                connections(s[0].behaviour(), &id) == 2
+                    && s[2].behaviour().is_connected(s[0].local_peer_id())
+            })
+            .await,
+            "setup: the hub holds the old and the new connection"
+        );
+        drop(old);
+        let ok = drive(&mut [&mut hub, &mut new], RELEARN, |s| {
+            s[1].behaviour().subscribed_peer_count(&TOPIC) > 0
+        })
+        .await;
+        assert!(
+            ok,
+            "RESTART SUBSCRIPTIONS LOST: the restarted process learned no subscription of the \
+             hub in {RELEARN:?} (hub connections to its peer id: {}; its mesh peers: {})",
+            connections(hub.behaviour(), &id),
+            new.behaviour().mesh_peers(&TOPIC),
+        );
+    }
+
+    /// Control, TCP: the hub dropped the old connection before the restart.
+    #[tokio::test]
+    async fn restart_after_the_old_connection_closed_relearns_peer_subscriptions() {
+        let key = Keypair::generate_ed25519();
+        let id = key.public().to_peer_id();
+        let mut hub = swarm(Keypair::generate_ed25519(), Link::Tcp);
+        let hub_addr = listen(&mut hub, Link::Tcp).await;
+        let mut old = swarm(key.clone(), Link::Tcp);
+        old.dial(hub_addr.clone()).expect("old dial");
+        assert!(
+            drive(&mut [&mut hub, &mut old], SETUP, |s| {
+                s[0].behaviour().peer_subscribed_to(&id, &TOPIC)
+            })
+            .await,
+            "setup: the hub learns the old process's subscription"
+        );
+        drop(old);
+        assert!(
+            drive(&mut [&mut hub], SETUP, |s| {
+                connections(s[0].behaviour(), &id) == 0
+            })
+            .await,
+            "setup: the hub drops the old connection"
+        );
+        if let Err(lost) = relearned(&mut hub, hub_addr, key, Link::Tcp).await {
+            panic!("{lost}");
+        }
+    }
+
+    /// Runs `key`'s QUIC process, connected to the hub, on its own runtime.
+    /// Shutting that runtime down kills it as SIGKILL does: no packet leaves,
+    /// so the hub keeps the connection until its idle timeout.
+    fn killable(key: Keypair, hub_addr: Multiaddr) -> tokio::runtime::Runtime {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.spawn(async move {
+            let mut old = swarm(key, Link::Quic);
+            old.dial(hub_addr).expect("old dial");
+            loop {
+                old.select_next_some().await;
+            }
+        });
+        rt
+    }
+
+    /// QUIC with Ed448 identities, as a worker's: kill without a close, then
+    /// restart after `delay`, when the hub should hold `held` connections to
+    /// the peer id.
+    async fn quic_kill_and_restart(delay: Duration, held: usize) {
+        let key = Keypair::generate_ed448();
+        let id = key.public().to_peer_id();
+        let mut hub = swarm(Keypair::generate_ed448(), Link::Quic);
+        let hub_addr = listen(&mut hub, Link::Quic).await;
+        let old = killable(key.clone(), hub_addr.clone());
+        let up = drive(&mut [&mut hub], SETUP, |s| {
+            s[0].behaviour().peer_subscribed_to(&id, &TOPIC)
+        })
+        .await;
+        // Let the hub's own subscription reach the old process.
+        drive(&mut [&mut hub], Duration::from_secs(2), |_| false).await;
+        old.shutdown_background();
+        assert!(up, "setup: the hub learns the old process's subscription");
+        drive(&mut [&mut hub], delay, |_| false).await;
+        assert_eq!(
+            connections(hub.behaviour(), &id),
+            held,
+            "setup: connections the hub holds to the killed process's peer id {delay:?} after \
+             the kill"
+        );
+        if let Err(lost) = relearned(&mut hub, hub_addr, key, Link::Quic).await {
+            panic!("{lost}");
+        }
+    }
+
+    /// QUIC, restart 1 s after the kill (the devnet's took 5 s): the hub
+    /// still holds the dead connection.
+    #[tokio::test]
+    async fn quic_restart_within_the_idle_timeout_relearns_peer_subscriptions() {
+        quic_kill_and_restart(Duration::from_secs(1), 1).await;
+    }
+
+    /// Control, QUIC: restart 15 s after the kill, past the 10 s idle timeout.
+    #[tokio::test]
+    async fn quic_restart_past_the_idle_timeout_relearns_peer_subscriptions() {
+        quic_kill_and_restart(Duration::from_secs(15), 0).await;
+    }
+}

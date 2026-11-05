@@ -3206,6 +3206,18 @@ where
                     }
                 }
             }
+            // QUILIBRIUM: our subscriptions went out only when the first connection to this peer
+            // id opened. If the closed connection belonged to an earlier process of a peer since
+            // restarted under the same id (a killed QUIC peer's connection lingers until our idle
+            // timeout), the new process never received them. All connections to a peer share one
+            // send queue, so a resend while the dead connection was open could be lost on it; once
+            // it has closed, the remaining connections carry it. A peer that already knew our
+            // subscriptions only records them again.
+            if !self.blacklisted_peers.contains(&peer_id) {
+                for topic_hash in self.mesh.clone().into_keys() {
+                    self.send_message(peer_id, RpcOut::Subscribe(topic_hash));
+                }
+            }
         } else {
             // remove from mesh, topic_peers, peer_topic and the fanout
             tracing::debug!(peer=%peer_id, "Peer disconnected");
