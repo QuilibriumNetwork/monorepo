@@ -40,6 +40,10 @@ const MAX_COUNTED: usize = 2_048;
 pub(crate) const LOW_MIN_FRAMES: u64 = 30;
 /// How often each seat's summary is logged, and a low share warned again.
 pub(crate) const LOG_EVERY: u64 = HOUR;
+/// How long a seat must stay out of the low share, unbroken, before its
+/// episode ends: a share at the threshold crosses it on single frames, and
+/// each crossing would otherwise start a new episode.
+pub(crate) const LOW_END_HOLD: u64 = 15 * MINUTE;
 
 /// This node's place in one committee session of a seat's shard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +66,8 @@ struct Bucket {
 struct Low {
     since: u64,
     warned: u64,
+    /// When the seat was first not low in its current unbroken stretch.
+    clear_since: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -352,7 +358,8 @@ impl SeatCertificates {
 
     /// The lines due at `now`: each current seat's summary every
     /// [`LOG_EVERY`] once it was counted that long, and a low share's
-    /// start, its repeats every [`LOG_EVERY`] and its end.
+    /// start, its repeats every [`LOG_EVERY`] and its end, which comes once the
+    /// seat has stayed out of the low share for [`LOW_END_HOLD`].
     pub fn due(&mut self, now: u64) -> Vec<SeatLog> {
         let mut logs = Vec::new();
         for (filter, seat) in self.seats.iter_mut() {
@@ -370,6 +377,7 @@ impl SeatCertificates {
                     seat.low = Some(Low {
                         since: now,
                         warned: now,
+                        clear_since: None,
                     });
                     logs.push(SeatLog::Low {
                         filter: filter.clone(),
@@ -378,28 +386,46 @@ impl SeatCertificates {
                         repeat: false,
                     });
                 }
-                (Some(true), Some(low)) if now.saturating_sub(low.warned) >= LOG_EVERY => {
-                    seat.low = Some(Low { warned: now, ..low });
-                    logs.push(SeatLog::Low {
-                        filter: filter.clone(),
-                        share,
-                        low_secs: now.saturating_sub(low.since),
-                        repeat: true,
+                (Some(true), Some(low)) => {
+                    let again = now.saturating_sub(low.warned) >= LOG_EVERY;
+                    seat.low = Some(Low {
+                        warned: if again { now } else { low.warned },
+                        clear_since: None,
+                        ..low
                     });
+                    if again {
+                        logs.push(SeatLog::Low {
+                            filter: filter.clone(),
+                            share,
+                            low_secs: now.saturating_sub(low.since),
+                            repeat: true,
+                        });
+                    }
                 }
-                (Some(true), Some(_)) | (_, None) => {}
+                (_, None) => {}
                 (judged, Some(low)) => {
-                    seat.low = None;
-                    logs.push(SeatLog::Ended {
-                        filter: filter.clone(),
-                        share,
-                        low_secs: now.saturating_sub(low.since),
-                        how: match (judged, seat.current) {
-                            (_, false) => "the seat ended",
-                            (Some(false), _) => "its share recovered",
-                            _ => "too few frames in the last hour to judge",
-                        },
-                    });
+                    let clear = low.clear_since.unwrap_or(now);
+                    if seat.current && now.saturating_sub(clear) < LOW_END_HOLD {
+                        seat.low = Some(Low {
+                            clear_since: Some(clear),
+                            ..low
+                        });
+                    } else {
+                        seat.low = None;
+                        // A former seat ends where it is seen; otherwise the
+                        // episode lasted until the share first cleared.
+                        let end = if seat.current { clear } else { now };
+                        logs.push(SeatLog::Ended {
+                            filter: filter.clone(),
+                            share,
+                            low_secs: end.saturating_sub(low.since),
+                            how: match (judged, seat.current) {
+                                (_, false) => "the seat ended",
+                                (Some(false), _) => "its share recovered",
+                                _ => "too few frames in the last hour to judge",
+                            },
+                        });
+                    }
                 }
             }
             if seat.current && now.saturating_sub(seat.summarized) >= LOG_EVERY {
@@ -758,11 +784,15 @@ mod tests {
         assert_eq!(kinds(&t.due(T0 + 7_200)), ["low 3600 true", "summary 0/60"]);
         // The next hour this seat signs every frame.
         frame_a_minute(&mut t, 120..180, true);
+        // Not low from here, but the episode holds until the share stayed
+        // out of it for LOW_END_HOLD.
+        assert_eq!(kinds(&t.due(T0 + 10_800)), ["summary 60/60"]);
+        assert!(t.due(T0 + 10_800 + LOW_END_HOLD - 1).is_empty());
         assert_eq!(
-            kinds(&t.due(T0 + 10_800)),
-            ["ended 7200 its share recovered", "summary 60/60"]
+            kinds(&t.due(T0 + 10_800 + LOW_END_HOLD)),
+            ["ended 7200 its share recovered"]
         );
-        assert!(t.due(T0 + 10_860).is_empty());
+        assert!(t.due(T0 + 10_800 + LOW_END_HOLD + 60).is_empty());
     }
 
     #[test]
@@ -771,12 +801,10 @@ mod tests {
         frame_a_minute(&mut t, 0..60, false);
         assert_eq!(kinds(&t.due(T0 + 3_600)), ["low 0 false", "summary 0/60"]);
         // No frames for the next hour: nothing to judge, so the warning ends.
+        assert_eq!(kinds(&t.due(T0 + 7_300)), ["summary 0/0"]);
         assert_eq!(
-            kinds(&t.due(T0 + 7_300)),
-            [
-                "ended 3700 too few frames in the last hour to judge",
-                "summary 0/0"
-            ]
+            kinds(&t.due(T0 + 7_300 + LOW_END_HOLD)),
+            ["ended 3700 too few frames in the last hour to judge"]
         );
         let mut t = seated(T0);
         frame_a_minute(&mut t, 0..60, false);
@@ -784,6 +812,60 @@ mod tests {
         t.seats(&[], T0 + 3_660);
         assert_eq!(kinds(&t.due(T0 + 3_660)), ["ended 60 the seat ended"]);
         assert!(t.due(T0 + 9_000).is_empty(), "a former seat logs nothing");
+    }
+
+    #[test]
+    fn a_share_at_the_threshold_is_one_episode() {
+        let mut t = seated(T0);
+        // 4 members, quorum 3: low is 22 signed of 61 frames or fewer. A seat
+        // signing 3 frames in 8 holds 22 or 23 in the hour, so each minute's
+        // evaluation can fall on either side of the threshold.
+        let (mut low, mut clear) = (0, 0);
+        let (mut starts, mut repeats, mut ends) = (Vec::new(), Vec::new(), Vec::new());
+        for k in 0..240u64 {
+            let at = T0 + k * 60;
+            assert!(t.count(FILTER, k + 1, ms(at), member(5, 4, k % 8 < 3), at));
+            if k < 60 {
+                continue;
+            }
+            let share = t.snapshot(FILTER, at).unwrap();
+            let hour = share.hour.unwrap();
+            match low_share(&hour, share.committee, share.quorum) {
+                Some(true) => low += 1,
+                Some(false) => clear += 1,
+                None => {}
+            }
+            for log in t.due(at) {
+                match log {
+                    SeatLog::Low {
+                        low_secs, repeat, ..
+                    } if repeat => repeats.push(low_secs),
+                    SeatLog::Low { low_secs, .. } => starts.push(low_secs),
+                    SeatLog::Ended { low_secs, .. } => ends.push(low_secs),
+                    SeatLog::Summary { .. } => {}
+                }
+            }
+        }
+        assert!(
+            low > 20 && clear > 20,
+            "the share must cross: {low} {clear}"
+        );
+        assert_eq!(starts, [0], "one start");
+        assert_eq!(repeats.len(), 2, "a repeat per hour: {repeats:?}");
+        assert!(repeats[0] >= LOG_EVERY && repeats[1] >= 2 * LOG_EVERY);
+        assert!(ends.is_empty(), "no end while it crosses: {ends:?}");
+        // The seat then signs every frame: one end, after the hold.
+        for k in 240..330u64 {
+            let at = T0 + k * 60;
+            assert!(t.count(FILTER, k + 1, ms(at), member(5, 4, true), at));
+            for log in t.due(at) {
+                if let SeatLog::Ended { low_secs, .. } = log {
+                    ends.push(low_secs);
+                }
+            }
+        }
+        assert_eq!(ends.len(), 1, "one end: {ends:?}");
+        assert!(ends[0] >= 3 * HOUR && ends[0] < 3 * HOUR + 3_600);
     }
 
     fn header(frame: u64, signature: &[u8]) -> Header<'_> {
