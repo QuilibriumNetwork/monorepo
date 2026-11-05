@@ -2777,6 +2777,66 @@ fn seal_drain_halt_an_anchor_in_a_hole_of_the_history_fails_every_retry() {
     eprintln!("SD HOLE: an anchor in a hole of the history is refused");
 }
 
+/// From the raise's frame a genuine header anchored to a held frame under the
+/// raised floor is refused, deterministically; one at the floor still executes.
+#[test]
+fn seal_drain_raise_refuses_a_held_anchor_below_it_and_admits_its_edge() {
+    for certified in [true, false] {
+        let below = DrainRig::new(DRAIN_ANCHOR, certified);
+        handoff::set_drain_anchor_raise_for_thread(Some((6, DRAIN_RAISED_FLOOR)));
+        let genuine = below.sealed(&below.submission, &[&below.header]);
+        for outcome in below.outcomes(&genuine) {
+            match outcome {
+                Err(quil_types::error::QuilError::InvalidArgument(reason))
+                    if reason.contains("older than any committee session") => {}
+                other => panic!(
+                    "SD RAISE: anchor {DRAIN_ANCHOR} (certified {certified}) must be refused \
+                     as older than any session, got {other:?}"
+                ),
+            }
+        }
+        let edge = DrainRig::new(DRAIN_RAISED_FLOOR, certified);
+        edge.check_setup();
+        edge.intrinsic
+            .invoke_step(
+                DRAIN_FRAME,
+                &edge.sealed(&edge.submission, &[&edge.header]),
+                &edge.fixture.state,
+            )
+            .unwrap_or_else(|error| {
+                panic!("SD RAISE: a drain anchored at the raised floor must execute: {error}")
+            });
+        handoff::set_drain_anchor_raise_for_thread(None);
+    }
+}
+
+/// Before the raise's frame every build agrees as before: a genuine header
+/// under the raised floor executes, and an anchor in a hole stays unavailable.
+#[test]
+fn seal_drain_raise_changes_nothing_before_its_frame() {
+    for certified in [true, false] {
+        let rig = DrainRig::with_hole(DRAIN_ANCHOR, certified, Some(DRAIN_HOLE));
+        handoff::set_drain_anchor_raise_for_thread(Some((DRAIN_FRAME + 1, DRAIN_RAISED_FLOOR)));
+        rig.check_setup();
+        let halts = drain_halts(&rig, &rig.submission, &[DRAIN_HOLE]);
+        assert_eq!(
+            halts.len(),
+            1,
+            "SD RAISE: a hole stays unavailable before the raise's frame"
+        );
+        rig.intrinsic
+            .invoke_step(
+                DRAIN_FRAME,
+                &rig.sealed(&rig.submission, &[&rig.header]),
+                &rig.fixture.state,
+            )
+            .unwrap_or_else(|error| {
+                panic!("SD RAISE: a genuine drain under the floor must execute before: {error}")
+            });
+        handoff::set_drain_anchor_raise_for_thread(None);
+    }
+}
+
 /// A genuine drain, certified by the session or by the seal, is admitted
 /// and executed: the session's tip moves to the checkpoint.
 #[test]

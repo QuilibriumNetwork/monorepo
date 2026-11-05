@@ -7091,19 +7091,25 @@ fn storage_reward_withheld(global_frame_number: u64, state_size: u64, attested: 
 /// that frame's output, so nothing else binds the number. Refuse, before
 /// any read, an anchor no node can hold for GLOBAL frame `frame_number`:
 /// that frame or a later one, or one below the network's history
-/// (`handoff::drain_anchor_floor`). Anchor 0 names no frame and reads none.
-/// A frame between them that this node lacks stays unavailable: a local
-/// gap.
+/// (`handoff::drain_anchor_floor`), or, from the raise's frame, older than
+/// any committee session (`handoff::drain_anchor_floor_at`), which takes in
+/// the holes of the history. Anchor 0 names no frame and reads none. A frame
+/// between them that this node lacks stays unavailable: a local gap.
 fn refuse_drain_anchor(frame_number: u64, op: &super::frame_header::FrameHeader) -> Result<()> {
     let anchor = op.global_frame_number;
-    let floor = super::handoff::drain_anchor_floor();
+    let floor = super::handoff::drain_anchor_floor_at(frame_number);
     if anchor == 0 || (floor..frame_number).contains(&anchor) {
         return Ok(());
     }
     note_drain_anchor_refusal(frame_number, op, floor);
+    let why = if (super::handoff::drain_anchor_floor()..frame_number).contains(&anchor) {
+        "older than any committee session"
+    } else {
+        "a frame no node holds"
+    };
     Err(QuilError::InvalidArgument(format!(
-        "seal drain: shard {} frame {} names GLOBAL anchor {anchor}, a frame no node holds: \
-         GLOBAL frame {frame_number} admits anchors {floor} to {}",
+        "seal drain: shard {} frame {} names GLOBAL anchor {anchor}, {why}: GLOBAL frame \
+         {frame_number} admits anchors {floor} to {}",
         hex::encode(&op.address),
         op.frame_number,
         frame_number.saturating_sub(1),
@@ -7148,9 +7154,9 @@ fn note_drain_anchor_refusal(frame_number: u64, op: &super::frame_header::FrameH
             anchor = op.global_frame_number,
             floor,
             quieted,
-            "seal drain: refused a drain header anchored to a GLOBAL frame no node holds; an \
-             honest committee never sends one, so its submitter or the GLOBAL leader that \
-             packed it runs other code: report this line",
+            "seal drain: refused a drain header anchored outside the GLOBAL frames a drain may \
+             name; an honest committee never names one, so its submitter or the GLOBAL leader \
+             that packed it runs other code: report this line",
         );
     }
 }

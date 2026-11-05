@@ -3409,8 +3409,29 @@ fn mainnet_drain_anchors_start_at_the_2_1_genesis() {
     );
     assert_eq!(drain_anchor_floor_for(0, None), 244_200);
     assert_eq!(drain_anchor_floor_for(0, Some("7")), 244_200);
+    // The raise on mainnet comes from its constants, never the environment,
+    // and starts where committee sessions begin.
+    assert_eq!(
+        drain_anchor_raise_for(0, Some("1"), Some("2")),
+        (
+            MAINNET_DRAIN_ANCHOR_RAISE_FRAME.unwrap_or(u64::MAX),
+            861_840
+        )
+    );
+    assert_eq!(drain_anchor_raise_for(1, None, None), (u64::MAX, 0));
+    assert_eq!(drain_anchor_raise_for(1, Some("6"), Some("9")), (6, 9));
     assert_eq!(drain_anchor_floor_for(1, None), 1);
     assert_eq!(drain_anchor_floor_for(1, Some("0")), 1, "0 names no frame");
     assert_eq!(drain_anchor_floor_for(1, Some("not a frame")), 1);
     assert_eq!(drain_anchor_floor_for(1, Some("7")), 7);
+}
+
+/// The raise applies from its frame, not before, and never lowers the floor.
+#[test]
+fn drain_anchor_raise_applies_from_its_frame_and_never_lowers_the_floor() {
+    assert_eq!(drain_anchor_floor_at_for(5, (6, 9), 2), 2);
+    assert_eq!(drain_anchor_floor_at_for(6, (6, 9), 2), 9);
+    assert_eq!(drain_anchor_floor_at_for(7, (6, 9), 2), 9);
+    assert_eq!(drain_anchor_floor_at_for(6, (6, 1), 2), 2);
+    assert_eq!(drain_anchor_floor_at_for(u64::MAX - 1, (u64::MAX, 9), 2), 2);
 }
