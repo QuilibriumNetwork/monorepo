@@ -13,6 +13,11 @@
 # are built here from a validated version; no name from the release server
 # becomes a path. Needs curl and OpenSSL 1.1.1 or later.
 #
+# Installs to <root>/bin/qclient/<version> and links /usr/local/bin/qclient
+# to it. The root is /var/quilibrium on Linux and /opt/quilibrium on macOS,
+# where an earlier install under /var/quilibrium keeps its place while
+# /opt/quilibrium does not exist, as qclient itself decides.
+#
 # Options:
 #   --dry-run          download and verify the release in a temporary
 #                      directory and report what would be installed;
@@ -24,8 +29,26 @@ set -euo pipefail
 umask 022
 
 BASE_URL="https://releases.quilibrium.com"
-INSTALL_ROOT="/var/quilibrium/bin/qclient"
 SYMLINK="/usr/local/bin/qclient"
+
+# The install root for the OS named by `uname -s` ($1).
+install_root() {
+    if [ "$1" = Darwin ] && { [ -e /opt/quilibrium ] || [ ! -e /var/quilibrium ]; }; then
+        echo /opt/quilibrium
+    else
+        echo /var/quilibrium
+    fi
+}
+ROOT=$(install_root "$(uname -s)")
+INSTALL_ROOT="$ROOT/bin/qclient"
+
+# Create the link directory $1, which a fresh macOS host may lack: owner
+# root, group 0 (wheel on macOS), mode 0755; new parents get the 022 umask.
+# An existing directory is left as it is.
+ensure_link_dir() {
+    [ -d "$1" ] && return 0
+    mkdir -p -- "$1" && chown 0:0 -- "$1" && chmod 0755 -- "$1"
+}
 
 # Ed448 public keys (hex) of the release signatories: .dgst.sig.N is signed
 # by key N. Keep in sync with crates/quil-config/src/signatories.rs.
@@ -290,8 +313,9 @@ main() {
 
     # Check if the script is run with sudo privileges
     if [ "$dry_run" = false ] && [ "$EUID" -ne 0 ]; then
-        die "This script must be run as root (use sudo) to install the Quilibrium client to /var/quilibrium/ directory"
+        die "This script must be run as root (use sudo) to install the Quilibrium client under $ROOT"
     fi
+    echo "Install root: $ROOT"
 
     trap cleanup EXIT
     if [ "$dry_run" = true ]; then
@@ -326,10 +350,14 @@ main() {
     if [ "$dry_run" = true ]; then
         echo "[DRY RUN] Verified $base; would install it to $dir"
         echo "[DRY RUN] Symlink to be created: $SYMLINK -> $dir/$base"
+        if [ ! -d "$(dirname "$SYMLINK")" ]; then
+            echo "[DRY RUN] Would create $(dirname "$SYMLINK") (root, mode 0755)"
+        fi
         return
     fi
 
     install_release "$dir" "$base"
+    ensure_link_dir "$(dirname "$SYMLINK")" || die "could not create $(dirname "$SYMLINK")"
     if [ -d "$SYMLINK" ] && [ ! -L "$SYMLINK" ]; then
         die "$SYMLINK is a directory"
     fi

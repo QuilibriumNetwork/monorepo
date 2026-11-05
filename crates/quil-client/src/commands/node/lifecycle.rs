@@ -8,13 +8,11 @@ use std::path::Path;
 
 use crate::{release, system};
 
-/// The lock `node install` and `node update` hold while they change the
-/// node install, so auto-update runs (every 10 minutes) and manual runs
-/// never overlap.
-const UPDATE_LOCK: &str = "/var/quilibrium/.auto-update.lock";
-
 /// Take the exclusive lock at `path` (created 0600 if absent) until the
-/// returned file closes; fail at once if another run holds it.
+/// returned file closes; fail at once if another run holds it. `node
+/// install` and `node update` hold [`system::update_lock_path`] while they
+/// change the node install, so auto-update runs (every 10 minutes) and
+/// manual runs never overlap.
 fn lock_node_updates(path: &Path) -> anyhow::Result<std::fs::File> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
@@ -46,7 +44,7 @@ fn lock_node_updates(path: &Path) -> anyhow::Result<std::fs::File> {
 /// install the system service. An older version than the linked one needs
 /// `allow_downgrade`.
 pub async fn install(version: Option<&str>, allow_downgrade: bool) -> anyhow::Result<()> {
-    let _lock = lock_node_updates(Path::new(UPDATE_LOCK))?;
+    let _lock = lock_node_updates(&system::update_lock_path())?;
     let version = resolve_version(version).await?;
     println!("Installing Quilibrium node {version}...");
     let installed = release::download_and_install(
@@ -69,7 +67,7 @@ pub async fn update(
     restart: bool,
     allow_downgrade: bool,
 ) -> anyhow::Result<()> {
-    let _lock = lock_node_updates(Path::new(UPDATE_LOCK))?;
+    let _lock = lock_node_updates(&system::update_lock_path())?;
     let version = resolve_version(version).await?;
     println!("Updating Quilibrium node to {version}...");
     let installed = release::download_and_install(
@@ -156,7 +154,7 @@ fn require_root(action: &str, is_root: bool) -> anyhow::Result<()> {
             "auto-update {action} needs root: the job installs node releases under {} and \
              restarts the node service, so it runs from root's crontab; run 'sudo qclient \
              node auto-update {action}'",
-            system::BINARY_PATH
+            system::binary_path().display()
         );
     }
     Ok(())

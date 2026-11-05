@@ -5,14 +5,17 @@
 
 use std::path::{Path, PathBuf};
 
-/// `client/utils/fileUtils.go:18` — `/var/quilibrium/`.
-pub const ROOT_QUILIBRIUM_PATH: &str = "/var/quilibrium";
-/// `client/utils/fileUtils.go:19` — `/var/quilibrium/bin`.
-pub const BINARY_PATH: &str = "/var/quilibrium/bin";
+/// Install root on Linux (`client/utils/fileUtils.go:18`), and on macOS
+/// for an install made there before [`OPT_ROOT_PATH`]: see
+/// [`InstallLayout`].
+pub const VAR_ROOT_PATH: &str = "/var/quilibrium";
+/// Install root on macOS: see [`InstallLayout`].
+pub const OPT_ROOT_PATH: &str = "/opt/quilibrium";
 /// `client/utils/fileUtils.go:20` — `/usr/local/bin`.
 pub const DEFAULT_SYMLINK_DIR: &str = "/usr/local/bin";
-/// `client/utils/node.go:24` — `/var/log/quilibrium`.
-pub const LOG_PATH: &str = "/var/log/quilibrium";
+/// The service log directory of the [`VAR_ROOT_PATH`] layout
+/// (`client/utils/node.go:24`).
+pub const VAR_LOG_PATH: &str = "/var/log/quilibrium";
 
 /// Release-type discriminator (`client/utils/types.go`).
 pub const RELEASE_TYPE_QCLIENT: &str = "qclient";
@@ -28,14 +31,146 @@ pub const DEFAULT_AUTO_UPDATE_INTERVAL: &str = "*/10 * * * *";
 /// Base release URL (`client/utils/download.go:13`).
 pub const BASE_RELEASE_URL: &str = "https://releases.quilibrium.com";
 
-/// `client/utils/client.go` — `/var/quilibrium/bin/qclient`.
-pub fn client_data_path() -> PathBuf {
-    Path::new(BINARY_PATH).join(RELEASE_TYPE_QCLIENT)
+/// Where qclient installs releases and the node service keeps its files.
+///
+/// On Linux the root is `/var/quilibrium`, as the Go client had it. On
+/// macOS the root is `/opt/quilibrium`, and the launchd service writes the
+/// node's stdout and stderr (`node.log`, `node.err`) beside the node's own
+/// log files, in the `.log` directory of its config; except that when
+/// `/var/quilibrium` exists and `/opt/quilibrium` does not, an install made
+/// there before keeps its whole `/var` layout, service logs in
+/// `/var/log/quilibrium` included: upgrades then find its releases,
+/// environment file, update lock and service logs where it left them.
+/// Releases sit in `<root>/bin/{node,qclient}/<version>`; the links stay in
+/// [`DEFAULT_SYMLINK_DIR`] and configs in `~/.quilibrium/configs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallLayout {
+    /// Holds `bin/`, `quilibrium.env` and the auto-update lock.
+    pub root: PathBuf,
+    /// The `/var` layout: Linux, or on macOS kept for an existing install.
+    pub var_layout: bool,
+    /// macOS only: the `/var` layout kept for an existing install.
+    pub kept_var_install: bool,
 }
 
-/// `client/utils/client.go` — `/var/quilibrium/bin/node`.
+impl InstallLayout {
+    /// The layout on `os` (`darwin` or `linux`, as [`os_type`] names
+    /// them), where `exists` tells whether a path exists.
+    pub fn for_os(os: &str, exists: &dyn Fn(&Path) -> bool) -> Self {
+        let var = |kept_var_install| Self {
+            root: PathBuf::from(VAR_ROOT_PATH),
+            var_layout: true,
+            kept_var_install,
+        };
+        if os != "darwin" {
+            return var(false);
+        }
+        if !exists(Path::new(OPT_ROOT_PATH)) && exists(Path::new(VAR_ROOT_PATH)) {
+            return var(true);
+        }
+        Self {
+            root: PathBuf::from(OPT_ROOT_PATH),
+            var_layout: false,
+            kept_var_install: false,
+        }
+    }
+
+    /// Where the node service's stdout and stderr go for the node config
+    /// directory `node_config_dir` the service runs: `/var/log/quilibrium`
+    /// in the `/var` layout, else beside the node's own log files in its
+    /// default log directory, `<node_config_dir>/.log`.
+    pub fn service_log_dir(&self, node_config_dir: &Path) -> PathBuf {
+        if self.var_layout {
+            PathBuf::from(VAR_LOG_PATH)
+        } else {
+            node_config_dir.join(quil_config::DEFAULT_LOG_DIR)
+        }
+    }
+
+    /// `<root>/bin`, holding the installed releases.
+    pub fn binary_path(&self) -> PathBuf {
+        self.root.join("bin")
+    }
+
+    /// `<root>/bin/qclient`, also the client config's default `dataDir`.
+    pub fn client_data_path(&self) -> PathBuf {
+        self.binary_path().join(RELEASE_TYPE_QCLIENT)
+    }
+
+    /// `<root>/bin/node`.
+    pub fn node_data_path(&self) -> PathBuf {
+        self.binary_path().join(RELEASE_TYPE_NODE)
+    }
+
+    /// `<root>/quilibrium.env`, the node service's environment file.
+    pub fn node_env_path(&self) -> PathBuf {
+        self.root.join("quilibrium.env")
+    }
+
+    /// `<root>/.auto-update.lock`, held by `node install` and `node
+    /// update`.
+    pub fn update_lock_path(&self) -> PathBuf {
+        self.root.join(".auto-update.lock")
+    }
+
+    /// The line naming the layout in use.
+    pub fn notice(&self) -> String {
+        if self.kept_var_install {
+            format!(
+                "qclient: using the existing install under {} (service logs in \
+                 {VAR_LOG_PATH}), as {OPT_ROOT_PATH} does not exist",
+                self.root.display(),
+            )
+        } else {
+            format!(
+                "qclient: install root {} (service logs beside the node's, in its \
+                 config's {})",
+                self.root.display(),
+                quil_config::DEFAULT_LOG_DIR
+            )
+        }
+    }
+}
+
+/// This host's [`InstallLayout`], resolved once per process. On macOS the
+/// first call prints its [`InstallLayout::notice`] to stderr.
+pub fn install_layout() -> &'static InstallLayout {
+    static LAYOUT: std::sync::OnceLock<InstallLayout> = std::sync::OnceLock::new();
+    LAYOUT.get_or_init(|| {
+        let layout = InstallLayout::for_os(os_type(), &|p| p.exists());
+        if os_type() == "darwin" {
+            eprintln!("{}", layout.notice());
+        }
+        layout
+    })
+}
+
+/// [`InstallLayout::binary_path`] of this host.
+pub fn binary_path() -> PathBuf {
+    install_layout().binary_path()
+}
+
+/// [`InstallLayout::service_log_dir`] of this host for the config the node
+/// service runs, `~/.quilibrium/configs/default`.
+pub fn service_log_dir() -> anyhow::Result<PathBuf> {
+    Ok(install_layout().service_log_dir(&node_config_home_dir()?.join("default")))
+}
+
+/// [`InstallLayout::client_data_path`] of this host
+/// (`client/utils/client.go`).
+pub fn client_data_path() -> PathBuf {
+    install_layout().client_data_path()
+}
+
+/// [`InstallLayout::node_data_path`] of this host
+/// (`client/utils/client.go`).
 pub fn node_data_path() -> PathBuf {
-    Path::new(BINARY_PATH).join(RELEASE_TYPE_NODE)
+    install_layout().node_data_path()
+}
+
+/// [`InstallLayout::update_lock_path`] of this host.
+pub fn update_lock_path() -> PathBuf {
+    install_layout().update_lock_path()
 }
 
 /// `client/utils/client.go` — `/usr/local/bin/qclient`.
@@ -48,9 +183,10 @@ pub fn default_node_symlink_path() -> PathBuf {
     Path::new(DEFAULT_SYMLINK_DIR).join(NODE_SERVICE_NAME)
 }
 
-/// `client/utils/node.go:21` — `/var/quilibrium/quilibrium.env`.
+/// [`InstallLayout::node_env_path`] of this host
+/// (`client/utils/node.go:21`).
 pub fn node_env_path() -> PathBuf {
-    Path::new(ROOT_QUILIBRIUM_PATH).join("quilibrium.env")
+    install_layout().node_env_path()
 }
 
 /// Normalized OS name — `darwin` or `linux` (matches Go `runtime.GOOS`).
@@ -280,6 +416,97 @@ pub fn is_root() -> bool {
     false
 }
 
+/// Create the link directory `dir` (such as [`DEFAULT_SYMLINK_DIR`], which
+/// a fresh macOS host may lack) and any missing parents: each new one mode
+/// 0755 and, run as root, owned by root and group 0 (`wheel` on macOS).
+/// An existing directory is left as it is.
+#[cfg(unix)]
+pub fn ensure_symlink_dir(dir: &Path) -> anyhow::Result<()> {
+    create_dirs(dir, is_root().then_some((0, 0)))
+}
+
+/// Off unix there are no release links to place.
+#[cfg(not(unix))]
+pub fn ensure_symlink_dir(_dir: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// Create `dir` and any missing parents, each mode 0755 and, run as root,
+/// owned like the nearest existing parent: the operator's for a directory
+/// in their home, root's for one under `/var/log`.
+#[cfg(unix)]
+pub fn ensure_dir_owned_like_parent(dir: &Path) -> anyhow::Result<()> {
+    create_dirs(dir, if is_root() { nearest_owner(dir) } else { None })
+}
+
+/// Off unix: create `dir` and its parents.
+#[cfg(not(unix))]
+pub fn ensure_dir_owned_like_parent(dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| anyhow::anyhow!("create {}: {e}", dir.display()))
+}
+
+/// The `(uid, gid)` of the nearest existing ancestor of `dir` (itself
+/// included).
+#[cfg(unix)]
+fn nearest_owner(dir: &Path) -> Option<(u32, u32)> {
+    nearest_owner_by(dir, &|p| {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(p)
+            .ok()
+            .map(|meta| (meta.uid(), meta.gid()))
+    })
+}
+
+/// [`nearest_owner`] reading each path's `(uid, gid)` from `owner_of`
+/// (`None` for a path that does not exist), so a test sets owners without
+/// chown or host paths.
+#[cfg(unix)]
+fn nearest_owner_by(
+    dir: &Path,
+    owner_of: &dyn Fn(&Path) -> Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    dir.ancestors().find_map(owner_of)
+}
+
+/// [`ensure_symlink_dir`], giving each created directory the owner `(uid,
+/// gid)`. A directory is created private, then given its owner, then
+/// opened to 0755, so no one else can write to it in between.
+#[cfg(unix)]
+fn create_dirs(dir: &Path, owner: Option<(u32, u32)>) -> anyhow::Result<()> {
+    create_dirs_with(dir, owner, &|path, uid, gid| {
+        std::os::unix::fs::chown(path, Some(uid), Some(gid))
+    })
+}
+
+/// [`create_dirs`] giving the owner with `chown(path, uid, gid)`, so a test
+/// records the calls instead of needing root.
+#[cfg(unix)]
+fn create_dirs_with(
+    dir: &Path,
+    owner: Option<(u32, u32)>,
+    chown: &dyn Fn(&Path, u32, u32) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let missing: Vec<&Path> = dir
+        .ancestors()
+        .take_while(|p| !p.as_os_str().is_empty() && !p.is_dir())
+        .collect();
+    for path in missing.into_iter().rev() {
+        match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => {}
+            // Created meanwhile by another run: it is that run's to set up.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => continue,
+            Err(e) => anyhow::bail!("create {}: {e} (root required)", path.display()),
+        }
+        if let Some((uid, gid)) = owner {
+            chown(path, uid, gid).map_err(|e| anyhow::anyhow!("chown {}: {e}", path.display()))?;
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| anyhow::anyhow!("chmod {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Whether a file/dir exists (`client/utils/fileUtils.go` `FileExists`).
 pub fn file_exists<P: AsRef<Path>>(p: P) -> bool {
     p.as_ref().exists()
@@ -413,12 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn path_constants_match_go() {
-        assert_eq!(
-            client_data_path(),
-            PathBuf::from("/var/quilibrium/bin/qclient")
-        );
-        assert_eq!(node_data_path(), PathBuf::from("/var/quilibrium/bin/node"));
+    fn symlinks_stay_in_usr_local_bin() {
         assert_eq!(
             default_qclient_symlink_path(),
             PathBuf::from("/usr/local/bin/qclient")
@@ -427,9 +649,184 @@ mod tests {
             default_node_symlink_path(),
             PathBuf::from("/usr/local/bin/quilibrium-node")
         );
+    }
+
+    /// A missing link directory and its missing parents are created 0755;
+    /// an existing parent keeps its mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_link_dir_is_created_0755_and_an_existing_one_kept() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let usr = tmp.path().join("usr");
+        std::fs::create_dir(&usr).unwrap();
+        std::fs::set_permissions(&usr, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bin = usr.join("local").join("bin");
+        let me = std::fs::metadata(tmp.path()).unwrap();
+        create_dirs(&bin, Some((me.uid(), me.gid()))).unwrap();
+        assert_eq!(mode(&usr.join("local")), 0o755);
+        assert_eq!(mode(&bin), 0o755);
+        assert_eq!(mode(&usr), 0o700);
+        create_dirs(&bin, None).unwrap();
+        assert_eq!(mode(&bin), 0o755);
+    }
+
+    /// A directory created under an existing one takes that one's owner,
+    /// every directory created, none that existed. Owners are faked (the
+    /// home belongs to uid 1000, the rest to root) and chown is recorded,
+    /// so the result does not depend on the host's users or privileges.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_dir_takes_the_owner_of_its_nearest_parent() {
+        use std::cell::RefCell;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let quil = home.join(".quilibrium");
+        let log = quil.join("configs").join(".log");
+        let owner_of = |p: &Path| {
+            if !p.exists() {
+                None
+            } else if p.starts_with(&home) {
+                Some((1000, 1001))
+            } else {
+                Some((0, 0))
+            }
+        };
+
+        assert_eq!(nearest_owner_by(&log, &owner_of), Some((1000, 1001)));
+        assert_eq!(nearest_owner_by(&home, &owner_of), Some((1000, 1001)));
         assert_eq!(
-            node_env_path(),
-            PathBuf::from("/var/quilibrium/quilibrium.env")
+            nearest_owner_by(&tmp.path().join("x").join("y"), &owner_of),
+            Some((0, 0))
+        );
+
+        let chowned = RefCell::new(Vec::new());
+        create_dirs_with(&log, nearest_owner_by(&log, &owner_of), &|p, uid, gid| {
+            chowned.borrow_mut().push((p.to_path_buf(), uid, gid));
+            Ok(())
+        })
+        .unwrap();
+        let want: Vec<(PathBuf, u32, u32)> = [quil.clone(), quil.join("configs"), log.clone()]
+            .into_iter()
+            .map(|p| (p, 1000, 1001))
+            .collect();
+        assert_eq!(*chowned.borrow(), want);
+        assert!(log.is_dir());
+    }
+
+    /// The layout on `os` where of the two roots only those flagged exist.
+    fn layout(os: &str, opt_exists: bool, var_exists: bool) -> InstallLayout {
+        InstallLayout::for_os(os, &|p: &Path| {
+            (opt_exists && p == Path::new(OPT_ROOT_PATH))
+                || (var_exists && p == Path::new(VAR_ROOT_PATH))
+        })
+    }
+
+    /// The node config directory the service runs, in the tests.
+    const SERVICE_CONFIG: &str = "/Users/op/.quilibrium/configs/default";
+
+    /// Every path of a layout, the service logs for [`SERVICE_CONFIG`]
+    /// last.
+    fn paths(layout: &InstallLayout) -> [PathBuf; 6] {
+        [
+            layout.root.clone(),
+            layout.client_data_path(),
+            layout.node_data_path(),
+            layout.node_env_path(),
+            layout.update_lock_path(),
+            layout.service_log_dir(Path::new(SERVICE_CONFIG)),
+        ]
+    }
+
+    fn expected(root: &str, log: &str) -> [PathBuf; 6] {
+        [
+            PathBuf::from(root),
+            PathBuf::from(format!("{root}/bin/qclient")),
+            PathBuf::from(format!("{root}/bin/node")),
+            PathBuf::from(format!("{root}/quilibrium.env")),
+            PathBuf::from(format!("{root}/.auto-update.lock")),
+            PathBuf::from(log),
+        ]
+    }
+
+    /// Linux keeps the Go client's layout whichever roots exist.
+    #[test]
+    fn linux_keeps_the_var_layout() {
+        for (opt, var) in [(false, false), (true, false), (false, true), (true, true)] {
+            let linux = layout("linux", opt, var);
+            assert_eq!(
+                paths(&linux),
+                expected("/var/quilibrium", "/var/log/quilibrium"),
+                "opt={opt} var={var}"
+            );
+            assert!(!linux.kept_var_install);
+        }
+    }
+
+    /// A macOS host without an earlier install gets the layout under
+    /// `/opt/quilibrium`, the service logs beside the node's own.
+    #[test]
+    fn macos_installs_under_opt() {
+        let mac = layout("darwin", false, false);
+        assert_eq!(
+            paths(&mac),
+            expected(
+                "/opt/quilibrium",
+                "/Users/op/.quilibrium/configs/default/.log"
+            )
+        );
+        assert!(!mac.kept_var_install);
+    }
+
+    /// Once `/opt/quilibrium` exists it is the root, also beside an older
+    /// `/var/quilibrium`.
+    #[test]
+    fn macos_prefers_opt_once_it_exists() {
+        for var in [false, true] {
+            let mac = layout("darwin", true, var);
+            assert_eq!(mac.root, PathBuf::from("/opt/quilibrium"), "var={var}");
+            assert!(!mac.kept_var_install);
+        }
+    }
+
+    /// An earlier macOS install under `/var/quilibrium` keeps its whole
+    /// layout while `/opt/quilibrium` does not exist, so upgrades find its
+    /// releases, lock, environment file and logs.
+    #[test]
+    fn macos_keeps_an_existing_var_install() {
+        let mac = layout("darwin", false, true);
+        assert_eq!(
+            paths(&mac),
+            expected("/var/quilibrium", "/var/log/quilibrium")
+        );
+        assert!(mac.kept_var_install);
+    }
+
+    /// The printed line names the root and log directory, and says why an
+    /// existing `/var` install is kept.
+    #[test]
+    fn the_layout_in_use_is_named() {
+        let opt = InstallLayout {
+            root: PathBuf::from("/opt/quilibrium"),
+            var_layout: false,
+            kept_var_install: false,
+        };
+        assert_eq!(
+            opt.notice(),
+            "qclient: install root /opt/quilibrium (service logs beside the node's, in its \
+             config's .log)"
+        );
+        let kept = InstallLayout {
+            root: PathBuf::from("/var/quilibrium"),
+            var_layout: true,
+            kept_var_install: true,
+        };
+        assert_eq!(
+            kept.notice(),
+            "qclient: using the existing install under /var/quilibrium (service logs in \
+             /var/log/quilibrium), as /opt/quilibrium does not exist"
         );
     }
 

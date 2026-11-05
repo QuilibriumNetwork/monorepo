@@ -4,8 +4,11 @@
 //! `<name>.<timestamp>[.gz]`) to its log directory, `logger.path` or by
 //! default `.log` under its config directory; with `path: none` it logs only
 //! to stderr, which the system service captures (the systemd journal on
-//! Linux, `node.err` under the log directory on macOS). `export` writes a
-//! redacted bundle of a time window for bug reports.
+//! Linux, `node.err` in the service log directory on macOS: the default
+//! `.log` beside the service config's own logs, or `/var/log/quilibrium`
+//! for an install kept under `/var/quilibrium`; see
+//! [`system::InstallLayout`]). `export` writes a redacted bundle of a time
+//! window for bug reports.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -21,6 +24,11 @@ pub mod export;
 #[derive(Debug, Subcommand)]
 pub enum LogCommand {
     /// View the node log (last N lines, optionally following).
+    ///
+    /// A node that writes no log files logs to the service: the systemd
+    /// journal on Linux; on macOS node.err in
+    /// ~/.quilibrium/configs/default/.log, beside the node's own logs, or
+    /// in /var/log/quilibrium for an install kept under /var/quilibrium.
     View {
         #[arg(short = 'n', long, default_value_t = 100)]
         lines: u64,
@@ -222,7 +230,7 @@ fn view(global: &GlobalArgs, lines: u64, follow: bool, core: u32) -> anyhow::Res
             cmd
         }
         None => {
-            let file = Path::new(system::LOG_PATH).join("node.err");
+            let file = system::service_log_dir()?.join("node.err");
             if !file.exists() {
                 anyhow::bail!(
                     "the node logs to stderr only and {} is missing",

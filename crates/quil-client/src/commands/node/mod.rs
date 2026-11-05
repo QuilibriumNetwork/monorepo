@@ -82,6 +82,12 @@ pub enum NodeCommand {
         config: Option<String>,
     },
     /// Manage the node system service (start/stop/status/install/…).
+    ///
+    /// The service runs with the environment of quilibrium.env in the
+    /// install root. systemd reads the file at each start; launchd (macOS)
+    /// reads none, so install and update write its KEY=VALUE lines into
+    /// the plist: after editing the file on macOS, run update, then reload
+    /// the service (disable, then enable).
     Service {
         /// One of: start, stop, restart, status, enable, disable, reload,
         /// install, update, uninstall.
@@ -100,6 +106,14 @@ pub enum NodeCommand {
         node: bool,
     },
     /// Download, verify, and install the node binary (+ system service).
+    ///
+    /// Installs to /var/quilibrium/bin/node/<version> on Linux and
+    /// /opt/quilibrium/bin/node/<version> on macOS (/var/quilibrium while
+    /// an earlier install there exists and /opt/quilibrium does not), and
+    /// links /usr/local/bin/quilibrium-node to it. On macOS the service
+    /// writes node.log and node.err beside the node's own logs, in
+    /// ~/.quilibrium/configs/default/.log (/var/log/quilibrium with the
+    /// /var/quilibrium root). Configs stay in ~/.quilibrium/configs.
     Install {
         version: Option<String>,
         /// Install a version older than the linked one.
