@@ -263,7 +263,21 @@ fn cron_entry(qclient: &Path) -> String {
 /// write one of them can make root run their file.
 #[cfg(unix)]
 fn check_cron_target(qclient: &Path, install_root: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::MetadataExt;
+    check_cron_target_with(qclient, install_root, &|path| {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path)?;
+        Ok((meta.uid(), meta.mode()))
+    })
+}
+
+/// [`check_cron_target`] reading each path's `(owner uid, mode)` from
+/// `stat`, so a test sets owners and modes without chown or host paths.
+#[cfg(unix)]
+fn check_cron_target_with(
+    qclient: &Path,
+    install_root: &Path,
+    stat: &dyn Fn(&Path) -> std::io::Result<(u32, u32)>,
+) -> anyhow::Result<()> {
     let target = std::fs::canonicalize(qclient).map_err(|e| {
         anyhow::anyhow!(
             "resolve {}: {e}; install qclient with 'sudo qclient update' first",
@@ -279,9 +293,9 @@ fn check_cron_target(qclient: &Path, install_root: &Path) -> anyhow::Result<()> 
         );
     }
     let root_only = |path: &Path| -> anyhow::Result<bool> {
-        let meta =
-            std::fs::metadata(path).map_err(|e| anyhow::anyhow!("stat {}: {e}", path.display()))?;
-        Ok(meta.uid() == 0 && meta.mode() & 0o022 == 0)
+        let (uid, mode) =
+            stat(path).map_err(|e| anyhow::anyhow!("stat {}: {e}", path.display()))?;
+        Ok(uid == 0 && mode & 0o022 == 0)
     };
     for dir in qclient.ancestors().skip(1) {
         if !dir.as_os_str().is_empty() && !root_only(dir)? {
@@ -435,30 +449,79 @@ mod tests {
         );
     }
 
+    /// The cron target is an installed release whose every directory above
+    /// it, and itself, root owns and no one else writes. Owners and modes
+    /// are faked, so the result does not depend on the host's users or
+    /// directories; each case changes one fact and names it in its error.
     #[cfg(unix)]
     #[test]
     fn cron_target_must_be_a_root_owned_installed_release() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::collections::HashMap;
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path().join("qclient");
         let dir = root.join("2.1.0.25");
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("qclient-2.1.0.25-linux-amd64");
         std::fs::write(&target, b"bin").unwrap();
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let links = tmp.path().join("bin");
+        std::fs::create_dir(&links).unwrap();
+        let link = links.join("current");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
         let elsewhere = tmp.path().join("qclient-2.1.0.25-linux-amd64");
         std::fs::write(&elsewhere, b"bin").unwrap();
         let root = std::fs::canonicalize(&root).unwrap();
+        let target = std::fs::canonicalize(&target).unwrap();
+        let release = target.parent().unwrap().to_path_buf();
 
-        let err = check_cron_target(&elsewhere, &root).unwrap_err();
+        // Every path root-owned 0755, except the `(uid, mode)` set here.
+        let check = |qclient: &Path, set: &[(&Path, (u32, u32))]| {
+            let facts: HashMap<std::path::PathBuf, (u32, u32)> =
+                set.iter().map(|(p, f)| (p.to_path_buf(), *f)).collect();
+            check_cron_target_with(qclient, &root, &|p| {
+                Ok(facts.get(p).copied().unwrap_or((0, 0o40755)))
+            })
+        };
+
+        check(&link, &[]).expect("a root-owned installed release is accepted");
+
+        let err = check(&elsewhere, &[]).unwrap_err();
         assert!(
             err.to_string().contains("not an installed qclient release"),
             "{err}"
         );
-        // Writable by others (and, unless the tests run as root, owned by
-        // another user).
-        let err = check_cron_target(&target, &root).unwrap_err();
-        assert!(err.to_string().contains("owned by root"), "{err}");
+
+        // Owned by another user, mode 0755: only the owner check refuses.
+        let err = check(&link, &[(&target, (1000, 0o100755))]).unwrap_err();
+        assert!(
+            err.to_string().starts_with(&format!(
+                "{} must be owned by root and writable only by root",
+                target.display()
+            )),
+            "{err}"
+        );
+        let err = check(&link, &[(&release, (1000, 0o40755))]).unwrap_err();
+        assert!(
+            err.to_string().contains(&release.display().to_string()),
+            "{err}"
+        );
+        let err = check(&link, &[(&links, (1000, 0o40755))]).unwrap_err();
+        assert!(
+            err.to_string().starts_with(&format!(
+                "{} must be owned by root and writable only by root",
+                links.display()
+            )),
+            "{err}"
+        );
+
+        // Owned by root, but group- or world-writable: only the mode check
+        // refuses.
+        for mode in [0o100775, 0o100757] {
+            let err = check(&link, &[(&target, (0, mode))]).unwrap_err();
+            assert!(
+                err.to_string().contains("writable only by root"),
+                "{mode:o}: {err}"
+            );
+        }
     }
 
     #[test]
