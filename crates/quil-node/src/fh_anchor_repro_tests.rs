@@ -615,7 +615,13 @@ fn fh_liveness_a_header_ahead_of_its_window_rides_the_next_frame() {
         .intrinsic
         .validate(last + 1, &rig.certified(anchor), None, None)
     {
-        Err(error) if anchor_outside_window(&error) && !error.is_execution_unavailable() => {}
+        Err(error) if anchor_outside_window(&error) && !error.is_execution_unavailable() => {
+            assert!(
+                !held_unverified(&error),
+                "FH LIVENESS: a collector must refuse a header behind the window, which rides \
+                 no later frame, not hold it: {error}"
+            )
+        }
         other => panic!(
             "FH LIVENESS: GLOBAL frame {} must refuse the header as stale by the window, got \
              {other:?}",
@@ -623,4 +629,40 @@ fn fh_liveness_a_header_ahead_of_its_window_rides_the_next_frame() {
         ),
     }
     eprintln!("FH LIVENESS: a header ahead of its window is held and rides the next frame");
+}
+
+/// A window refusal names its direction at both edges, and only an anchor
+/// ahead of the window is one a later GLOBAL frame can carry.
+#[test]
+fn fh_fix_a_window_refusal_names_its_direction() {
+    use quil_execution::global_intrinsic::frame_header::anchor_ahead_of_window;
+    let rig = Rig::new(2..HALT_FRAME);
+    let (oldest, newest) = anchor_window(HALT_FRAME);
+    for (anchor, ahead) in [
+        (oldest - 1, false),
+        (1, false),
+        (newest + 1, true),
+        (1_000_000, true),
+        (u64::MAX, true),
+    ] {
+        match rig
+            .intrinsic
+            .validate(HALT_FRAME, &junk_header(anchor), None, None)
+        {
+            Err(error) if anchor_outside_window(&error) => {
+                assert_eq!(
+                    anchor_ahead_of_window(&error),
+                    ahead,
+                    "FH FIX: anchor {anchor}, GLOBAL frame {HALT_FRAME}: {error}"
+                );
+                assert_eq!(
+                    held_unverified(&error),
+                    ahead,
+                    "FH FIX: anchor {anchor}: only one ahead of the window is held"
+                );
+            }
+            other => panic!("FH FIX: anchor {anchor} must be refused, got {other:?}"),
+        }
+    }
+    eprintln!("FH FIX: a window refusal names its direction");
 }

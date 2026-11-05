@@ -1972,19 +1972,16 @@ pub fn bundle_has_shard_frame(data: &[u8]) -> bool {
     !extract_shard_frame_keys(data).is_empty()
 }
 
-/// True iff every shard `FrameHeader` carried by `data` is in STRICT LOCKSTEP
-/// with a global frame `frame_number`: its `global_frame_number` (storage-beacon
-/// anchor) is either 0 (genesis / legacy-VDF, no anchor) or exactly
-/// `frame_number - 1` (the immediately-preceding global frame). Returns `true`
-/// for bundles that aren't decodable / carry no shard frames (this gate only
-/// governs shard proofs).
+/// True iff every shard `FrameHeader` carried by `data` may ride global frame
+/// `frame_number` ([`anchor_in_lockstep`]). Returns `true` for bundles that
+/// aren't decodable / carry no shard frames (this gate only governs shard
+/// proofs).
 ///
 /// The global leader calls this to include ONLY in-lockstep shard proofs.
-/// Because the materializer HARD-REJECTS any frame containing an out-of-lockstep
-/// shard op (`audit_storage_attestation`), a leader that packed a stale proof
-/// would produce a frame its followers refuse — a halt. Dropping stale proofs
-/// here keeps producer and verifier symmetric: the shard must re-attest fresh
-/// (anchored to the new tip) to be included.
+/// GLOBAL validation and execution refuse an out-of-lockstep shard op by the
+/// same predicate and skip it, so a packed one earns nothing and takes a place
+/// in the frame. Dropping it here keeps producer and verifier symmetric: the
+/// shard must re-attest fresh (anchored to the new tip) to be included.
 pub fn bundle_shard_frames_in_lockstep(data: &[u8], frame_number: u64) -> bool {
     use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
     use quil_execution::message_envelope::CanonicalMessageBundle;

@@ -1021,12 +1021,11 @@ impl GlobalIntrinsic {
                         "FrameHeader: bls_constructor not installed — cannot verify".into(),
                     )
                 })?;
-                Self::require_global_anchor(frame_number, &op)?;
-                Self::refuse_anchor_outside_window(frame_number, &op)?;
-                // Header fields a certificate does not sign directly (fee
-                // total, settlement relay, ...) must reproduce the certified
-                // output, and a relay must be canonical for its window.
-                self.verify_shard_frame_output(&op)?;
+                // Header fields a certificate does not sign directly (frame
+                // number, fee total, settlement relay, ...) must reproduce
+                // the certified output, and a relay must be canonical for its
+                // window.
+                Self::check_anchor_and_output(self.clock_store.as_deref(), frame_number, &op)?;
                 super::prover_shard_update::verify_settlement_relay(&op)?;
                 // CW path: a simplex-finalized shard frame's sig field
                 // holds the magic-prefixed finalization certificate, not a BLS
@@ -2745,10 +2744,18 @@ impl GlobalIntrinsic {
     /// Recompute a shard frame header's deterministic output against the
     /// anchored global frame from this node's clock store.
     fn verify_shard_frame_output(&self, op: &super::frame_header::FrameHeader) -> Result<()> {
+        Self::verify_anchored_output(self.clock_store.as_deref(), op)
+    }
+
+    /// [`Self::verify_shard_frame_output`] against `clock_store`.
+    fn verify_anchored_output(
+        clock_store: Option<&dyn quil_types::store::ClockStore>,
+        op: &super::frame_header::FrameHeader,
+    ) -> Result<()> {
         if op.global_frame_number == 0 {
             return super::prover_shard_update::verify_app_frame_output(op, &[]);
         }
-        let clock_store = self.clock_store.as_ref().ok_or_else(|| {
+        let clock_store = clock_store.ok_or_else(|| {
             QuilError::Internal(
                 "FrameHeader: clock_store not installed — cannot recompute output".into(),
             )
@@ -2764,6 +2771,24 @@ impl GlobalIntrinsic {
                 ))
             })?;
         super::prover_shard_update::verify_app_frame_output(op, &anchor_output)
+    }
+
+    /// What GLOBAL frame `frame_number` checks of a shard frame header before
+    /// its certificate: it names an anchor, the anchor lies in the frame's
+    /// window, and the header's fields reproduce its output. The certificate
+    /// signs only the view and the output's digest, so until this passes a
+    /// header's other fields, its frame number among them, are claims.
+    /// An error of the unavailable class is a local gap: an anchor in the
+    /// window this node lacks. Any other error refuses the header on every
+    /// node, whatever its certificate.
+    pub fn check_anchor_and_output(
+        clock_store: Option<&dyn quil_types::store::ClockStore>,
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+    ) -> Result<()> {
+        Self::require_global_anchor(frame_number, op)?;
+        Self::refuse_anchor_outside_window(frame_number, op)?;
+        Self::verify_anchored_output(clock_store, op)
     }
 
     /// From the required-anchor epoch GLOBAL frame `frame_number` refuses a
@@ -2800,14 +2825,21 @@ impl GlobalIntrinsic {
         frame_number: u64,
         op: &super::frame_header::FrameHeader,
     ) -> Result<()> {
-        use super::frame_header::{anchor_in_window, anchor_window, ANCHOR_OUTSIDE_WINDOW};
+        use super::frame_header::{
+            anchor_in_window, anchor_window, ANCHOR_AHEAD_OF_WINDOW, ANCHOR_OUTSIDE_WINDOW,
+        };
         if op.global_frame_number == 0 || anchor_in_window(op.global_frame_number, frame_number) {
             return Ok(());
         }
         let (oldest, newest) = anchor_window(frame_number);
+        let refusal = if op.global_frame_number > newest {
+            ANCHOR_AHEAD_OF_WINDOW
+        } else {
+            ANCHOR_OUTSIDE_WINDOW
+        };
         Err(QuilError::InvalidArgument(format!(
-            "{ANCHOR_OUTSIDE_WINDOW}shard {} frame {} anchors to GLOBAL frame {}, but GLOBAL \
-             frame {} requires an anchor in [{}, {}]",
+            "{refusal}shard {} frame {} anchors to GLOBAL frame {}, but GLOBAL frame {} \
+             requires an anchor in [{}, {}]",
             hex::encode(&op.address),
             op.frame_number,
             op.global_frame_number,

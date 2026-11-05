@@ -202,16 +202,154 @@ fn fh_halt_voters_certify_a_frame_carrying_the_header_and_it_never_executes() {
 /// interval and counts the refusals it quieted meanwhile.
 #[test]
 fn fh_fix_anchor_refusal_warning_is_bounded_and_counts_the_quieted() {
-    use crate::frame_materializer::{anchor_refusal_warning_due, ANCHOR_REFUSAL_WARN_INTERVAL};
+    use crate::frame_materializer::{
+        unpackable_header_warning_due, UNPACKABLE_HEADER_WARN_INTERVAL,
+    };
     let start = std::time::Instant::now();
     let mut last = None;
-    assert_eq!(anchor_refusal_warning_due(&mut last, start), Some(0));
+    assert_eq!(unpackable_header_warning_due(&mut last, start), Some(0));
     for _ in 0..3 {
-        assert_eq!(anchor_refusal_warning_due(&mut last, start), None);
+        assert_eq!(unpackable_header_warning_due(&mut last, start), None);
     }
     assert_eq!(
-        anchor_refusal_warning_due(&mut last, start + ANCHOR_REFUSAL_WARN_INTERVAL),
+        unpackable_header_warning_due(&mut last, start + UNPACKABLE_HEADER_WARN_INTERVAL),
         Some(3),
         "FH FIX: the next warning counts the three quieted refusals"
     );
+}
+
+/// The warnings of a refused header captured while `input` materializes.
+fn refusal_warnings(
+    source: &FrameMaterializer,
+    input: &quil_types::proto::global::GlobalFrame,
+) -> Vec<String> {
+    use crate::outage::test_logs::CapturedLogs;
+    *crate::frame_materializer::UNPACKABLE_HEADER_WARNED
+        .lock()
+        .unwrap() = None;
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    source.materialize(input).unwrap();
+    logs.lines_with("skipped it, the frame goes on")
+}
+
+fn prover_named(
+    mut input: quil_types::proto::global::GlobalFrame,
+) -> quil_types::proto::global::GlobalFrame {
+    input.header.as_mut().unwrap().prover = vec![0xab; 32];
+    input
+}
+
+/// A header refused on the sequential path warns, naming the frame, its
+/// prover and the refusal.
+#[test]
+fn fh_fix_sequential_validation_warns_of_a_header_outside_its_window() {
+    let (fixture, root) = materializer_with_header_deps();
+    let mut input = prover_named(frame(1, root));
+    input.requests = vec![junk_header_bundle(UNHELD_ANCHOR)];
+    let lines = refusal_warnings(&fixture.source, &input);
+    assert_eq!(lines.len(), 1, "FH FIX: one warning: {lines:?}");
+    for field in [
+        "frame=1",
+        "prover=abababababababab",
+        "anchor out of lockstep",
+    ] {
+        assert!(lines[0].contains(field), "FH FIX: no {field}: {}", lines[0]);
+    }
+}
+
+/// So does one refused in the parallel pre-pass (two headers take it), and
+/// the second refusal of the frame is quieted.
+#[test]
+fn fh_fix_pre_pass_warns_of_a_header_outside_its_window() {
+    let (fixture, root) = materializer_with_header_deps();
+    let mut input = prover_named(frame(1, root));
+    input.requests = vec![
+        junk_header_bundle(UNHELD_ANCHOR),
+        junk_header_bundle(UNHELD_ANCHOR + 1),
+    ];
+    let lines = refusal_warnings(&fixture.source, &input);
+    assert_eq!(lines.len(), 1, "FH FIX: one warning: {lines:?}");
+    for field in [
+        "frame=1",
+        "prover=abababababababab",
+        "anchor out of lockstep",
+    ] {
+        assert!(lines[0].contains(field), "FH FIX: no {field}: {}", lines[0]);
+    }
+}
+
+/// A header whose fields do not reproduce its output warns too: sequenced
+/// ingest requires nothing for it, and this line is what remains of it.
+#[test]
+fn fh_fix_an_output_its_fields_do_not_reproduce_warns() {
+    let (fixture, root) = materializer_with_header_deps();
+    let mut input = prover_named(frame(1, root));
+    input.requests = vec![junk_header_bundle(0)];
+    let lines = refusal_warnings(&fixture.source, &input);
+    assert_eq!(lines.len(), 1, "FH FIX: one warning: {lines:?}");
+    assert!(
+        lines[0].contains("does not match"),
+        "FH FIX: no refusal in {}",
+        lines[0]
+    );
+}
+
+/// What an archive's collector does with each anchor, through the verifier it
+/// installs: it holds what a later GLOBAL frame can carry, ahead of the
+/// window or a local gap inside it, and refuses what none can, behind the
+/// window, so its sender hears it. The anchors are junk: anyone can send one.
+#[test]
+fn fh_fix_a_collector_holds_only_anchors_a_later_frame_can_carry() {
+    use crate::execution_deferral::{collector_verifier, CollectorDeferrals};
+    use crate::message_collector::{
+        MessageCollector, Provenance, Refusal, ShardFrameVerdict, SubmitOutcome,
+    };
+    use quil_execution::global_intrinsic::frame_header::ANCHOR_OUTSIDE_WINDOW;
+    let (fixture, _) = materializer_with_header_deps();
+    // The head: the next GLOBAL frame's window is [88, 100].
+    fixture.current.observe(100);
+    let verifier = collector_verifier(
+        fixture.source.execution_manager.clone(),
+        fixture.current.clone(),
+        fixture.source.hypergraph.clone(),
+        Arc::new(CollectorDeferrals::default()),
+    );
+    let collector = MessageCollector::new();
+    collector.set_shard_frame_verifier_with_provenance(verifier.clone());
+    for (anchor, held) in [
+        (101, true),
+        (UNHELD_ANCHOR, true),
+        (u64::MAX, true),
+        (88, true),
+        (100, true),
+        (87, false),
+        (1, false),
+    ] {
+        let bytes = crate::consensus_wire::proto_message_bundle_to_canonical_bytes(
+            &junk_header_bundle(anchor),
+        )
+        .unwrap();
+        let verdict = verifier(&bytes, Provenance::Other);
+        let outcome = collector.add_message_outcome(1, bytes);
+        if held {
+            assert!(
+                matches!(verdict, ShardFrameVerdict::Unavailable(_)),
+                "FH FIX: anchor {anchor} must be held unverified, got {verdict:?}"
+            );
+            assert_eq!(outcome, SubmitOutcome::Accepted, "FH FIX: anchor {anchor}");
+        } else {
+            assert!(
+                matches!(&verdict, ShardFrameVerdict::Invalid(reason) if reason.contains(ANCHOR_OUTSIDE_WINDOW)),
+                "FH FIX: anchor {anchor} is behind the window and rides no later frame: refused, \
+                 got {verdict:?}"
+            );
+            assert_eq!(
+                outcome,
+                SubmitOutcome::Filtered(Refusal::InvalidShardFrame),
+                "FH FIX: anchor {anchor}"
+            );
+        }
+    }
+    eprintln!("FH FIX: a collector holds only anchors a later frame can carry");
 }
