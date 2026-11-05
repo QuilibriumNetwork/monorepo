@@ -8937,10 +8937,14 @@ impl AppConsensusEngine {
                 .observe(executed, committed_frame, now);
             self.log_seal_drain_stall(stall, committed_frame);
         }
-        if recording {
-            let committed_frame = view.as_ref().ok().map(handoff::CommittedView::frame);
-            let stall = self.seal_record.observe(committed_frame, now);
-            self.log_seal_record_stall(stall, committed_frame);
+        // One read decides the record stall and the publish below. A view stuck
+        // past the wait, then moving, shows the seal recorded in the same call,
+        // which is no stall: observed before this read it warned, then cleared.
+        let view_frame = view.as_ref().ok().map(handoff::CommittedView::frame);
+        let submitted = view.and_then(|view| handoff::schedule::seal_submitted(&view, session));
+        if recording && matches!(submitted, Ok(false)) {
+            let stall = self.seal_record.observe(view_frame, now);
+            self.log_seal_record_stall(stall, view_frame);
         }
         if following {
             let rank = session
@@ -8959,8 +8963,7 @@ impl AppConsensusEngine {
         } else if !timer_due(&self.seal_follow, self.seal_published_at) {
             return;
         }
-        let view_frame = view.as_ref().ok().map(handoff::CommittedView::frame);
-        match view.and_then(|view| handoff::schedule::seal_submitted(&view, session)) {
+        match submitted {
             Ok(false) => {
                 self.publish_seal(&submission, trigger);
                 self.seal_published_at = Some(now);
@@ -26742,6 +26745,20 @@ mod tests {
         [u8; 32],
         Vec<SealMember>,
     ) {
+        let signers: Vec<_> = (0..members)
+            .map(|_| quil_crypto::FalconSigner::generate())
+            .collect();
+        sealed_drain_committee_of(&signers)
+    }
+
+    /// [`sealed_drain_committee`], of these signers.
+    fn sealed_drain_committee_of(
+        signers: &[quil_crypto::FalconSigner],
+    ) -> (
+        Arc<quil_hypergraph::HypergraphCrdt>,
+        [u8; 32],
+        Vec<SealMember>,
+    ) {
         use quil_execution::global_intrinsic::handoff;
         use quil_types::crypto::Signer as _;
         use quil_types::store::ClockStore as _;
@@ -26755,9 +26772,7 @@ mod tests {
             db.inner(),
             quil_store::FOREST_NAMESPACE,
         ));
-        let mut keys: Vec<Vec<u8>> = (0..members)
-            .map(|_| quil_crypto::FalconSigner::generate().public_key().to_vec())
-            .collect();
+        let mut keys: Vec<Vec<u8>> = signers.iter().map(|s| s.public_key().to_vec()).collect();
         keys.sort();
         let filter = vec![0x61; 32];
         let session = quil_cw_consensus::handoff::Session {
@@ -26888,6 +26903,62 @@ mod tests {
                 &quil_store::encoding::global_materialized_cursor_key(),
             )
             .unwrap();
+    }
+
+    /// GLOBAL records the committee's seal of the checkpoint its session's tip
+    /// reached ([`execute_drain_part`] to frame 40): the closing request in
+    /// GLOBAL frame `global_frame`, the certified seal in the next.
+    fn record_drained_seal(
+        global: &Arc<quil_hypergraph::HypergraphCrdt>,
+        session: &quil_cw_consensus::handoff::Session,
+        signers: &[quil_crypto::FalconSigner],
+        global_frame: u64,
+    ) {
+        use quil_execution::global_intrinsic::handoff::{
+            self, CertificateSubmission, DesiredCommittee,
+        };
+        let state = quil_execution::hypergraph_state::HypergraphState::new(global.clone());
+        let commit = |frame| {
+            state.commit().unwrap();
+            state.abort();
+            global
+                .commit_with_global_cursor(
+                    frame,
+                    &quil_store::encoding::global_materialized_cursor_key(),
+                )
+                .unwrap();
+        };
+        let request = handoff::schedule(
+            &state,
+            global_frame,
+            vec![session.filter.clone()],
+            vec![DesiredCommittee {
+                filter: session.filter.clone(),
+                members: session.members.clone(),
+            }],
+        )
+        .unwrap();
+        commit(global_frame);
+        let seal = quil_cw_consensus::handoff::Seal {
+            request: request.id().unwrap(),
+            session: session.id().unwrap(),
+            view: 50,
+            checkpoint: quil_cw_consensus::handoff::Checkpoint {
+                frame: 40,
+                view: 49,
+                digest: [0; 32],
+                state_roots: [[0; 32]; 4],
+                history_root: [0; 32],
+            },
+        };
+        let certificate = crate::test_support::certify_seal(session, signers, &seal);
+        handoff::apply_submission(
+            &state,
+            global_frame + 1,
+            &CertificateSubmission { seal, certificate },
+        )
+        .unwrap();
+        commit(global_frame + 1);
     }
 
     /// The source frames a published seal copy drains.
@@ -27190,6 +27261,51 @@ mod tests {
             assert!(ended[0].contains(field), "{field}: {}", ended[0]);
         }
         assert!(!engine.seal_record.waiting());
+        handoff::set_seal_recovery_frame_for_thread(None);
+        handoff::set_seal_drain_frame_for_thread(None);
+    }
+
+    /// A view stuck past `seal_follow::SEAL_UNRECORDED_AFTER`, then moving onto
+    /// the seal's record, shows no stall: whether the seal is recorded is read
+    /// from the view that moved, before the wait's age is judged. On a tick
+    /// that would republish, and on one that would not.
+    #[tokio::test]
+    async fn a_view_moving_onto_the_seals_record_after_the_wait_warns_nothing() {
+        use quil_execution::global_intrinsic::handoff;
+        use std::time::{Duration, Instant};
+        handoff::set_seal_drain_frame_for_thread(Some(0));
+        handoff::set_seal_recovery_frame_for_thread(Some(0));
+        for republish_due in [false, true] {
+            let signers = [quil_crypto::FalconSigner::generate()];
+            let (global, id, mut engines) = sealed_drain_committee_of(&signers);
+            execute_drain_part(&global, &id, 40, 2);
+            let logs = crate::outage::test_logs::CapturedLogs::default();
+            let _guard = logs.install();
+            let (engine, sent) = &mut engines[0];
+            engine.maintain_committee_session().await;
+            assert_eq!(sent.lock().unwrap().len(), 1);
+            assert!(engine.seal_record.waiting(), "the copy carried no drain");
+            let session = engine.cw_session.clone().unwrap();
+            // The view stays behind the record for the whole wait, and the
+            // record lands with its next move.
+            engine
+                .seal_record
+                .backdate(crate::seal_follow::SEAL_UNRECORDED_AFTER);
+            record_drained_seal(&global, &session, &signers, 3);
+            if republish_due {
+                engine.seal_published_at = Some(Instant::now() - Duration::from_secs(100));
+            }
+            engine.republish_seal_if_due(&global, &session);
+            let warned = logs.lines_with("seal not recorded");
+            assert!(
+                warned.is_empty(),
+                "republish due {republish_due}: warned though this view shows the seal \
+                 recorded: {warned:?}"
+            );
+            assert_eq!(engine.seal_record.waiting(), !republish_due);
+            assert!(logs.lines_with("seal record stall ended").is_empty());
+            assert_eq!(sent.lock().unwrap().len(), 1, "recorded: no copy to send");
+        }
         handoff::set_seal_recovery_frame_for_thread(None);
         handoff::set_seal_drain_frame_for_thread(None);
     }
