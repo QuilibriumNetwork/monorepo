@@ -605,23 +605,54 @@ mod tests {
         assert_eq!(home(4242, None, None), None);
     }
 
-    /// The C library's user database answers for root by id and by name,
-    /// with its home directory, not its comment (GECOS) field; an unknown
-    /// or malformed name has no entry.
+    /// The C library's user database answers for the current user by id
+    /// and by name, whatever the host calls it; an unknown or malformed
+    /// name has no entry.
     #[cfg(unix)]
     #[test]
-    fn the_user_database_answers_for_root() {
-        let root = user_by_uid(0).expect("user id 0 has an entry");
-        assert_eq!(root.name, "root");
-        let home = if cfg!(target_os = "macos") {
-            "/var/root"
-        } else {
-            "/root"
-        };
-        assert_eq!(root.home, PathBuf::from(home));
-        assert_eq!(user_by_name("root"), Some(root));
+    fn the_user_database_answers_for_the_current_user() {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        let me = user_by_uid(uid).expect("the effective user has an entry");
+        assert!(!me.name.is_empty(), "{me:?}");
+        assert!(me.home.is_absolute(), "{me:?}");
+        // Another name may share the id; the name found must answer for
+        // itself.
+        let named = user_by_name(&me.name).expect("the name found has an entry");
+        assert_eq!(named.name, me.name);
+        assert!(named.home.is_absolute(), "{named:?}");
         assert_eq!(user_by_name("qclient-test-no-such-user"), None);
         assert_eq!(user_by_name("ro\0ot"), None);
+    }
+
+    /// The home is the entry's home directory, not its comment (GECOS)
+    /// field or its name.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_entrys_home_is_its_home_directory() {
+        let found = user_entry(|pwd, buf, len, result| {
+            let text = b"op\0/Users/op\0Op Q. User\0";
+            assert!(len >= text.len());
+            // SAFETY: `buf` holds `len` >= text.len() bytes, `pwd` and
+            // `result` are valid for writes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(text.as_ptr().cast(), buf, text.len());
+                let mut entry: libc::passwd = std::mem::zeroed();
+                entry.pw_name = buf;
+                entry.pw_dir = buf.add(3);
+                entry.pw_gecos = buf.add(13);
+                pwd.write(entry);
+                *result = pwd;
+            }
+            0
+        });
+        assert_eq!(
+            found,
+            Some(UserEntry {
+                name: "op".to_string(),
+                home: PathBuf::from("/Users/op"),
+            })
+        );
     }
 
     /// A lookup reporting `ERANGE` gets a doubled buffer until its entry
