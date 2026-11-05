@@ -67,7 +67,7 @@ const PHASES: [(&str, Phase); 11] = [
     ("joining", Phase::Joining),
 ];
 
-const BLOCKERS: [(&str, Blocker); 14] = [
+const BLOCKERS: [(&str, Blocker); 17] = [
     ("waiting for transport", Blocker::WaitingForTransport),
     (
         "restarting consensus host",
@@ -83,6 +83,15 @@ const BLOCKERS: [(&str, Blocker); 14] = [
     (
         "awaiting allocation activation",
         Blocker::AwaitingAllocationActivation,
+    ),
+    (
+        "awaiting committee session",
+        Blocker::AwaitingCommitteeSession,
+    ),
+    ("awaiting shard re-anchor", Blocker::AwaitingShardReanchor),
+    (
+        "awaiting GLOBAL state sync",
+        Blocker::AwaitingGlobalStateSync,
     ),
     ("checkpoint mismatch", Blocker::CheckpointMismatch),
     ("state unavailable", Blocker::StateUnavailable),

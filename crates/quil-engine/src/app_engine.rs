@@ -9603,43 +9603,16 @@ impl AppConsensusEngine {
         result
     }
 
-    /// Record a refused start in this worker's execution report: its phase
-    /// and blocker, and for a wait on committed GLOBAL state the frame by
-    /// which the awaited event happens.
+    /// Record a refused start in this worker's execution report, as the
+    /// start-refusal log classifies it ([`classify_start_refusal`]): an
+    /// expected wait reads as waiting for the event that ends it, with the
+    /// frame by which committed GLOBAL state brings it when known; any other
+    /// refusal as blocked by the start check that refused it.
     fn report_start_refused(&self, error: &QuilError) {
-        let text = error.to_string();
-        if refused_while_joining(error, &self.start_context) {
-            self.execution
-                .state("waiting", "awaiting allocation activation");
-            return;
-        }
-        if text.contains("awaiting its successor") {
-            self.execution.state("handoff", "awaiting successor");
-            return;
-        }
-        let blocker = if text.contains("sealed checkpoint") {
-            "checkpoint mismatch"
-        } else if text.contains("bootstrap") || text.contains("authenticated GLOBAL") {
-            "state unavailable"
-        } else if text.contains("committee build failed") {
-            "committee admission unavailable"
-        } else {
-            "consensus startup unavailable"
-        };
-        // A worker the session does not seat, whose active, current
-        // allocation committed GLOBAL state seats at a known event, waits
-        // for that event whichever start check refused it first: the
-        // successor-state check refuses it before the committee build
-        // does. The blocker names the check that refused it: renewals read
-        // only a start refused for its seat alone as able to host.
-        let seat_wait = self
-            .start_context
-            .not_seated
-            .as_ref()
-            .and_then(NotSeated::awaits_seat);
-        match seat_wait {
-            Some(wait) => self.execution.waiting_until(blocker, wait.frame()),
-            None => self.execution.state("blocked", blocker),
+        let (state, blocker, frame) = classify_start_refusal(error, &self.start_context).record();
+        match frame {
+            Some(frame) => self.execution.waiting_until(blocker, frame),
+            None => self.execution.state(state, blocker),
         }
     }
 
@@ -15644,8 +15617,9 @@ enum StartScope {
     ThisNode,
     /// The shard's committed GLOBAL state, for every worker of the shard.
     CommittedGlobal,
-    /// A lifecycle wait that a named event ends.
-    ExpectedWait,
+    /// A lifecycle wait that a named event ends: the worker's execution
+    /// record reads it as that wait, never as blocked.
+    ExpectedWait(Awaited),
 }
 
 impl StartScope {
@@ -15653,8 +15627,39 @@ impl StartScope {
         match self {
             StartScope::ThisNode => "this node",
             StartScope::CommittedGlobal => "committed GLOBAL state",
-            StartScope::ExpectedWait => "expected wait",
+            StartScope::ExpectedWait(_) => "expected wait",
         }
+    }
+
+    fn expected(self) -> bool {
+        matches!(self, StartScope::ExpectedWait(_))
+    }
+}
+
+/// What an expected wait awaits, as the worker's execution record names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Awaited {
+    /// The event, a [`crate::worker_execution::BLOCKERS`] entry.
+    Event(&'static str),
+    /// The successor of the session this worker hosted and saw sealed.
+    Successor,
+    /// A seat in the shard's committee, which committed GLOBAL state gives
+    /// by the frame named when known. The record names the start check that
+    /// refused it: renewals read a start refused for its seat alone as able
+    /// to host ([`crate::provers::session_hosting`]).
+    Seat(Option<u64>),
+}
+
+/// The start check that refused a start, as the execution record names it.
+fn refused_check(text: &str) -> &'static str {
+    if text.contains("sealed checkpoint") {
+        "checkpoint mismatch"
+    } else if text.contains("bootstrap") || text.contains("authenticated GLOBAL") {
+        "state unavailable"
+    } else if text.contains("committee build failed") {
+        "committee admission unavailable"
+    } else {
+        "consensus startup unavailable"
     }
 }
 
@@ -15801,6 +15806,8 @@ struct StartRefusal {
     /// Whether it repeats while it lasts; a predecessor wait has its own
     /// warning ([`PredecessorBlock`]).
     repeats: bool,
+    /// The start check that refused it ([`refused_check`]).
+    check: &'static str,
 }
 
 /// The advice for a worker whose seat lapsed to `ExpiredEpoch`, unless this
@@ -15809,6 +15816,17 @@ const MISSED_RECONFIRM: &str = "this worker's allocation missed its epoch reconf
     prover confirmation (dispatch and publish in the master log); it starts only once a later session seats it";
 
 impl StartRefusal {
+    /// The worker's execution record for this refusal: its state, its
+    /// blocker and the GLOBAL frame by which the awaited event happens.
+    fn record(&self) -> (&'static str, &'static str, Option<u64>) {
+        match self.scope {
+            StartScope::ExpectedWait(Awaited::Event(blocker)) => ("waiting", blocker, None),
+            StartScope::ExpectedWait(Awaited::Successor) => ("handoff", "awaiting successor", None),
+            StartScope::ExpectedWait(Awaited::Seat(frame)) => ("waiting", self.check, frame),
+            StartScope::ThisNode | StartScope::CommittedGlobal => ("blocked", self.check, None),
+        }
+    }
+
     /// This refusal, when it advises a missed reconfirm ([`MISSED_RECONFIRM`])
     /// and this node's lifecycle withheld the seat's renewal on purpose
     /// (`withheld`): no confirmation failed, so it names that decision, what
@@ -15872,6 +15890,7 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
     use quil_types::consensus::EffectiveStatus;
     use StartScope::{CommittedGlobal, ExpectedWait, ThisNode};
     let text = error.to_string();
+    let check = refused_check(&text);
     let refusal =
         |key: String, reason: String, scope: StartScope, action: &'static str, repeats: bool| {
             StartRefusal {
@@ -15880,6 +15899,7 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
                 scope,
                 action,
                 repeats,
+                check,
             }
         };
     if refused_while_joining(error, context) {
@@ -15895,7 +15915,7 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
         return refusal(
             reason.clone(),
             reason,
-            ExpectedWait,
+            ExpectedWait(Awaited::Event("awaiting allocation activation")),
             "it starts when the allocation activates at its activation epoch",
             true,
         );
@@ -15918,7 +15938,7 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
                     shortfall.minimum,
                     shortfall.frame,
                     quil_execution::global_intrinsic::prover_release::Release::current()),
-                ExpectedWait,
+                ExpectedWait(Awaited::Seat(seat.awaits_seat().map(SessionWait::frame))),
                 "this build records its release with the allocation's next epoch reconfirm, and a session formed \
                     after that seats it; check this worker's prover confirmation (dispatch and publish in the \
                     master log) if it persists past the next epoch",
@@ -15942,7 +15962,7 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
                 format!("not seated yet: {wait:?}"),
                 format!("not seated yet: this worker's allocation is active and current (GLOBAL frame {}), but \
                     {awaited}; start refused with: {text}", seat.global_frame),
-                ExpectedWait,
+                ExpectedWait(Awaited::Seat(Some(wait.frame()))),
                 "committed GLOBAL state seats this worker at that event, for every new member of the shard; \
                     nothing to do on this node; report it with this line if it persists past that frame",
                 true,
@@ -15964,15 +15984,21 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
             ThisNode, action, true,
         );
     }
-    let (scope, action, repeats) = if text.contains("awaiting its successor")
-        || text.contains("head session is retired")
-    {
-        (ExpectedWait, "this shard's session is sealed or retired; it starts when GLOBAL authorizes its successor session", true)
+    const SUCCESSOR_WAIT: &str =
+        "this shard's session is sealed or retired; it starts when GLOBAL authorizes its successor session";
+    let (scope, action, repeats) = if text.contains("awaiting its successor") {
+        (ExpectedWait(Awaited::Successor), SUCCESSOR_WAIT, true)
+    } else if text.contains("head session is retired") {
+        (
+            ExpectedWait(Awaited::Event("awaiting successor")),
+            SUCCESSOR_WAIT,
+            true,
+        )
     } else if text.contains("first session not authorized yet")
         || text.contains("shard has no session")
     {
         (
-            ExpectedWait,
+            ExpectedWait(Awaited::Event("awaiting committee session")),
             "it starts when GLOBAL authorizes a committee session for this shard",
             true,
         )
@@ -15991,12 +16017,12 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
             false,
         )
     } else if text.contains(REANCHOR_IN_PROGRESS) {
-        (ExpectedWait, "the shard sync re-anchors this shard from an archive at the frame GLOBAL committed, after \
+        (ExpectedWait(Awaited::Event("awaiting shard re-anchor")), "the shard sync re-anchors this shard from an archive at the frame GLOBAL committed, after \
             its head lay past its session fence or its archive replays kept failing; attempted every 5 minutes, \
             backing off to hourly after a replay mismatch; it starts once the re-anchor installs; the re-anchor \
             warnings name an attempt that fails or has no outcome", true)
     } else if quil_execution::global_intrinsic::handoff::global_sync_in_progress(error) {
-        (ExpectedWait, "this node is installing a GLOBAL state sync from an archive, and committed GLOBAL state is \
+        (ExpectedWait(Awaited::Event("awaiting GLOBAL state sync")), "this node is installing a GLOBAL state sync from an archive, and committed GLOBAL state is \
             withheld until its last chunk is in (the 'sync phase: installing' lines show its progress); it retries \
             every minute", true)
     } else if text.contains("authenticated GLOBAL state") {
@@ -16043,7 +16069,7 @@ impl StartBlock {
     /// repeat an expected wait every [`START_WAIT_REPEAT`].
     fn observe(&mut self, now: std::time::Instant, refusal: &StartRefusal) -> Option<StartLog> {
         let since = *self.since.get_or_insert(now);
-        let expected = refusal.scope == StartScope::ExpectedWait;
+        let expected = refusal.scope.expected();
         if !expected {
             self.owned_since.get_or_insert(now);
         }
@@ -16206,7 +16232,7 @@ mod start_block_tests {
         let at = |minutes: u32| start + MINUTE * minutes;
         let mut block = StartBlock::default();
         let wait = joining();
-        assert_eq!(wait.scope, StartScope::ExpectedWait);
+        assert!(wait.scope.expected());
         assert_eq!(block.observe(at(0), &wait), Some(StartLog::Refused));
         assert_eq!(block.observe(at(10), &wait), None);
         assert_eq!(block.observe(at(29), &wait), None);
@@ -16386,9 +16412,10 @@ mod start_block_tests {
             }),
             ..StartContext::default()
         };
-        assert_eq!(
-            classify_start_refusal(&committee_build_failed(), &unseated_joining).scope,
-            StartScope::ExpectedWait
+        assert!(
+            classify_start_refusal(&committee_build_failed(), &unseated_joining)
+                .scope
+                .expected()
         );
         // Observed: a confirmed join awaiting its activation boundary was refused
         // by a predecessor-recovery gate; the refusal names the frame it awaits.
@@ -16411,7 +16438,7 @@ mod start_block_tests {
                 && !refused_while_joining(&predecessor, &lapsed)
         );
         let waits = classify_start_refusal(&predecessor, &activating);
-        assert_eq!(waits.scope, StartScope::ExpectedWait);
+        assert!(waits.scope.expected());
         assert!(
             waits
                 .reason
@@ -16453,12 +16480,12 @@ mod start_block_tests {
         let sealed = refusal(QuilError::Consensus(
             "app committee session is sealed; awaiting its successor".into(),
         ));
-        assert_eq!(sealed.scope, StartScope::ExpectedWait);
+        assert!(sealed.scope.expected());
         let retired = refusal(QuilError::Consensus(
             "app committee session unavailable: head session is retired".into(),
         ));
-        assert_eq!(retired.scope, StartScope::ExpectedWait);
-        assert_eq!(joining().scope, StartScope::ExpectedWait);
+        assert!(retired.scope.expected());
+        assert!(joining().scope.expected());
     }
 
     /// An active, current allocation its shard's committee does not seat waits
@@ -16483,7 +16510,7 @@ mod start_block_tests {
                 Some(SessionWait::Boundary { frame: 919_440 }),
             ),
         );
-        assert_eq!(boundary.scope, StartScope::ExpectedWait);
+        assert!(boundary.scope.expected());
         assert!(
             boundary
                 .reason
@@ -16625,7 +16652,7 @@ mod start_block_tests {
                 .into(),
         );
         let earlier = classify_start_refusal(&predecessor, &context);
-        assert_eq!(earlier.scope, StartScope::ExpectedWait);
+        assert!(earlier.scope.expected());
         assert!(
             earlier.reason.contains("successor seats it")
                 && earlier.reason.contains("fences it at frame 920000"),
@@ -16699,7 +16726,7 @@ mod start_block_tests {
                 ..StartContext::default()
             };
             let seat = classify_start_refusal(&committee_build_failed(), &context);
-            assert_eq!(seat.scope, StartScope::ExpectedWait);
+            assert!(seat.scope.expected());
             assert!(seat.repeats);
             assert!(
                 seat.reason.starts_with("not seated: release below minimum"),
@@ -21010,6 +21037,166 @@ mod tests {
                 None
             )
         );
+    }
+
+    /// A refused start reports what the start-refusal log names it: each
+    /// expected wait as waiting for its event (or, sealed, as a handoff),
+    /// never as blocked; any other refusal as blocked by its check. Seen on
+    /// mainnet (2026-11-04): a GLOBAL state sync's install, logged as an
+    /// expected wait, read as `blocked` on every worker for 60-90 s.
+    #[tokio::test]
+    async fn a_start_refused_for_an_expected_wait_reports_waiting() {
+        use quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS;
+        use quil_execution::global_intrinsic::prover_release::Release;
+        use quil_types::consensus::EffectiveStatus;
+        let (mut engine, handle, _events) =
+            test_engine(Arc::new(crate::test_support::TestProverRegistry::new()));
+        let consensus = |text: &str| QuilError::Consensus(text.into());
+        let unavailable = |text: &str| QuilError::ExecutionUnavailable(text.into());
+        let committee =
+            || consensus("app CW committee build failed (this node's key not in the active set?)");
+        let seat = |allocations: Vec<EffectiveStatus>, release, session_wait| StartContext {
+            not_seated: Some(NotSeated {
+                allocations,
+                global_frame: 918_900,
+                release,
+                join_wait: None,
+                session_wait,
+            }),
+            ..StartContext::default()
+        };
+        let minimum = Release {
+            version: [2, 1, 0],
+            patch: 25,
+            subpatch: 90,
+        };
+        let shortfall = ReleaseShortfall::of(None, minimum, 918_000, true);
+        let boundary = Some(SessionWait::Boundary { frame: 919_440 });
+        let none = StartContext::default;
+        type Row = (
+            &'static str,
+            QuilError,
+            StartContext,
+            (&'static str, &'static str, Option<u64>),
+        );
+        let rows: Vec<Row> = vec![
+            (
+                "joining",
+                unavailable("awaiting allocation activation"),
+                none(),
+                ("waiting", "awaiting allocation activation", None),
+            ),
+            (
+                "sealed",
+                consensus("app committee session is sealed; awaiting its successor"),
+                none(),
+                ("handoff", "awaiting successor", None),
+            ),
+            (
+                "retired",
+                consensus("app committee session unavailable: head session is retired"),
+                none(),
+                ("waiting", "awaiting successor", None),
+            ),
+            (
+                "first session",
+                consensus("app committee session unavailable: first session not authorized yet"),
+                none(),
+                ("waiting", "awaiting committee session", None),
+            ),
+            (
+                "no session",
+                consensus(
+                    "app committee session unavailable: application is managed; shard has no session",
+                ),
+                none(),
+                ("waiting", "awaiting committee session", None),
+            ),
+            (
+                "re-anchor",
+                unavailable(REANCHOR_IN_PROGRESS),
+                none(),
+                ("waiting", "awaiting shard re-anchor", None),
+            ),
+            (
+                "GLOBAL sync",
+                unavailable(GLOBAL_SYNC_IN_PROGRESS),
+                none(),
+                ("waiting", "awaiting GLOBAL state sync", None),
+            ),
+            (
+                "release, no seat event",
+                committee(),
+                seat(vec![EffectiveStatus::Active], shortfall, None),
+                ("waiting", "committee admission unavailable", None),
+            ),
+            (
+                "release, seat event",
+                committee(),
+                seat(vec![EffectiveStatus::Active], shortfall, boundary),
+                ("waiting", "committee admission unavailable", Some(919_440)),
+            ),
+            (
+                "seat event",
+                unavailable(GLOBAL_SYNC_IN_PROGRESS),
+                seat(vec![EffectiveStatus::Active], None, boundary),
+                ("waiting", "consensus startup unavailable", Some(919_440)),
+            ),
+            (
+                "joining seat",
+                committee(),
+                seat(vec![EffectiveStatus::Joining], None, None),
+                ("waiting", "awaiting allocation activation", None),
+            ),
+            (
+                "lapsed seat",
+                committee(),
+                seat(vec![EffectiveStatus::ExpiredEpoch], None, boundary),
+                ("blocked", "committee admission unavailable", None),
+            ),
+            (
+                "unresolvable chain",
+                consensus("app committee session: too many sessions sealed at their base to look through"),
+                none(),
+                ("blocked", "consensus startup unavailable", None),
+            ),
+            (
+                "checkpoint",
+                unavailable("sealed checkpoint mismatch"),
+                none(),
+                ("blocked", "checkpoint mismatch", None),
+            ),
+            (
+                "no GLOBAL",
+                unavailable("app committee sessions need this worker's authenticated GLOBAL state"),
+                none(),
+                ("blocked", "state unavailable", None),
+            ),
+        ];
+        for (name, error, context, expected) in rows {
+            let scope = classify_start_refusal(&error, &context).scope;
+            assert_eq!(
+                scope.expected(),
+                expected.0 != "blocked",
+                "{name}: the log names it {scope:?}"
+            );
+            engine.start_context = context;
+            engine.report_start_refused(&error);
+            let record = handle.execution_record().snapshot();
+            assert_eq!(
+                (
+                    record.state.as_str(),
+                    record.blocker.as_str(),
+                    record.awaited_frame
+                ),
+                expected,
+                "{name}"
+            );
+            assert!(
+                crate::worker_execution::BLOCKERS.contains(&expected.1),
+                "{name}"
+            );
+        }
     }
 
     #[test]
