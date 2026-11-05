@@ -2404,7 +2404,7 @@ fn recording_node(
         move |_domain, payload, _authentication| {
             captured.lock().unwrap().push(payload);
             let outcome = outcome.clone();
-            Box::pin(async move { outcome })
+            Box::pin(async move { outcome.map_err(Into::into) })
         },
     ));
     (server, received)
@@ -2463,6 +2463,94 @@ async fn a_rejected_delivery_is_not_resent() {
         1,
         "delivered once, not resent"
     );
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// A node that reached no prover of the application refuses with `retry`: over
+/// the real service a sender resends the same signed bytes until one takes them.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_send_the_node_could_not_deliver_is_resent() {
+    crate::retry::NO_WAIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let (km, _) = peer_key_manager(directory.path());
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let captured = received.clone();
+    let server = quil_rpc::node_service::NodeRpcServer::new().with_send_handler_fn(Arc::new(
+        move |_domain, payload, _authentication| {
+            let mut sends = captured.lock().unwrap();
+            sends.push(payload);
+            let attempt = sends.len();
+            Box::pin(async move {
+                if attempt < 3 {
+                    Err(quil_rpc::SubmitRefusal::retry_later("no prover reachable"))
+                } else {
+                    Ok(())
+                }
+            })
+        },
+    ));
+    let (multiaddr, _, stop, serving) =
+        flaky_node(server, tonic::Status::unavailable("unused"), 0).await;
+    let mut client = client_at(&multiaddr).await;
+    crate::send::send_message_bundle(&mut client, &km, vec![2; 32], submission_bundle())
+        .await
+        .expect("a sender resends what the node could not deliver");
+    {
+        let sends = received.lock().unwrap();
+        assert_eq!(sends.len(), 3, "resent until a prover took it");
+        assert!(
+            sends.iter().all(|bytes| bytes == &sends[0]),
+            "a resend carries the same bytes"
+        );
+    }
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// A bundle for an application whose shard topic stays out of reach is resent
+/// there for the delivery budget, and only then tried in the global venue: a
+/// covered application's bundle occupies a global frame and executes nowhere.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_venue_send_tries_global_only_after_the_shard_topic_stays_out_of_reach() {
+    crate::retry::NO_WAIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let (km, _) = peer_key_manager(directory.path());
+    let (shard, global) = (vec![2u8; 32], vec![0xffu8; 32]);
+    let domains = Arc::new(Mutex::new(Vec::new()));
+    let captured = domains.clone();
+    let shard_topic = shard.clone();
+    let server = quil_rpc::node_service::NodeRpcServer::new().with_send_handler_fn(Arc::new(
+        move |domain, _payload, _authentication| {
+            let to_shard = domain == shard_topic;
+            captured.lock().unwrap().push(domain);
+            Box::pin(async move {
+                if to_shard {
+                    Err(quil_rpc::SubmitRefusal::retry_later("no prover reachable"))
+                } else {
+                    Ok(())
+                }
+            })
+        },
+    ));
+    let (multiaddr, _, stop, serving) =
+        flaky_node(server, tonic::Status::unavailable("unused"), 0).await;
+    let mut client = client_at(&multiaddr).await;
+    crate::send::send_to_venue(&mut client, &km, shard.clone(), false, submission_bundle())
+        .await
+        .expect("the global venue takes it");
+    {
+        let domains = domains.lock().unwrap();
+        let (last, first) = domains.split_last().unwrap();
+        assert_eq!(last, &global);
+        assert!(
+            first.len() > 1,
+            "resent to the shard topic first: {domains:?}"
+        );
+        assert!(first.iter().all(|domain| domain == &shard), "{domains:?}");
+    }
     stop.send(()).unwrap();
     serving.await.unwrap();
 }

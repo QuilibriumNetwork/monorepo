@@ -448,15 +448,20 @@ pub type TraversalProofGenerator =
 /// `(domain, payload, authentication)`. Verifies the Ed448
 /// authentication over the payload under the
 /// `NODE_AUTHENTICATION || domain` prefix, then routes the
-/// MessageBundle to the correct BlossomSub bitmask.
+/// MessageBundle to the correct BlossomSub bitmask. A refusal with `retry`
+/// (no route to a node that can execute it now) answers `Unavailable`, which a
+/// sender resends; any other answers `Unauthenticated`.
 pub type SendHandler = Arc<
     dyn Fn(
             Vec<u8>,
             Vec<u8>,
             Vec<u8>,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
-        + Send
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), crate::global_service::SubmitRefusal>>
+                    + Send,
+            >,
+        > + Send
         + Sync,
 >;
 
@@ -955,7 +960,13 @@ impl NodeService for NodeRpcServer {
                 .map_err(|e| Status::internal(format!("canonicalize: {e}")))?;
         handler(req.domain, payload, req.authentication)
             .await
-            .map_err(|e| Status::unauthenticated(format!("send rejected: {e}")))?;
+            .map_err(|refusal| {
+                if refusal.retry {
+                    Status::unavailable(format!("send not delivered: {}", refusal.reason))
+                } else {
+                    Status::unauthenticated(format!("send rejected: {}", refusal.reason))
+                }
+            })?;
         Ok(Response::new(node::SendResponse {
             delivery_data: Vec::new(),
         }))

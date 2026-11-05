@@ -1590,6 +1590,160 @@ fn refuse_pruned_requests(store: &quil_store::RocksClockStore, n: u64) -> Result
     }
 }
 
+/// Tries, half a second apart, to publish a submission that finds no peer on
+/// its topic: a fresh subscription may not have learned the topic's peers yet.
+const SUBMISSION_PEER_RETRIES: u32 = 10;
+const SUBMISSION_PEER_RETRY_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The condition of submissions to an application not reaching a peer: one
+/// warn when it starts, a repeat every ten minutes while it continues, as a
+/// sender resends for minutes, and one line when publishing works again.
+fn submission_delivery_key(domain: &[u8]) -> quil_engine::bounded_warn::Key {
+    ("submission delivery", domain.to_vec(), 0, 0)
+}
+
+/// What that condition logs at this attempt: the attempts since its last line
+/// and how long it has lasted; `None` while it stays quiet.
+fn submission_undelivered_report(domain: &[u8]) -> Option<(u64, u64)> {
+    match quil_engine::bounded_warn::failed(&submission_delivery_key(domain), 0) {
+        Some(quil_engine::bounded_warn::Report::Failing { attempts, duration }) => {
+            Some((attempts, duration.as_secs()))
+        }
+        _ => None,
+    }
+}
+
+/// A submission this node could not get to any node that could execute it. A
+/// refusal to retry: nothing is wrong with the submission, and a sender that
+/// keeps its signed bytes may send them again.
+fn submission_undelivered(domain: &[u8], reason: String) -> quil_rpc::SubmitRefusal {
+    if let Some((attempts, ongoing_secs)) = submission_undelivered_report(domain) {
+        tracing::warn!(
+            domain = %hex::encode(domain),
+            error = %reason,
+            attempts,
+            ongoing_secs,
+            scope = "this node's peers or the network",
+            action = "the sender may resend it; check this node's peer count (`qclient node doctor`) and whether the application's shards have provers",
+            "submission not delivered: this node reached no prover of its application"
+        );
+    }
+    quil_rpc::SubmitRefusal::retry_later(format!(
+        "this node reached no prover of this application: {reason}"
+    ))
+}
+
+/// Shard-domain message (token / app intrinsic). App engines collect request
+/// bundles from the per-app prover topic `0x000000 || appFilter(domain)`
+/// (message_loop routes it to `AppEngineMessage::Prover` → the message
+/// collector). Every sub-shard of the app shares that topic: a wallet knows
+/// only the application, so the bloom is taken over the 32-byte app address on
+/// BOTH sides — `app_prover_bitmask` is what the shards subscribe with.
+///
+/// BlossomSub does not count the publisher among a topic's peers, so a shard's
+/// only prover finds no peer: its own engines are then the only ones that can
+/// take the submission, and they do. With no engine of the application here
+/// either, the refusal says to retry.
+async fn deliver_shard_submission<H>(
+    p2p: &quil_p2p::node::P2PHandle,
+    loopback: &tokio::sync::mpsc::Sender<quil_p2p::node::ReceivedMessage>,
+    engines: &Arc<parking_lot::RwLock<std::collections::HashMap<Vec<u8>, H>>>,
+    domain: &[u8],
+    payload: Vec<u8>,
+) -> Result<(), quil_rpc::SubmitRefusal> {
+    let bitmask = quil_engine::bitmasks::app_prover_bitmask(domain);
+    // A node submitting for a shard it does not follow (a wallet on a master
+    // whose workers cover the shard, or no coverage at all) joins the topic
+    // first; the subscription is idempotent and publishing requires it.
+    if let Err(e) = p2p.subscribe_confirmed(bitmask.clone()).await {
+        return Err(submission_undelivered(
+            domain,
+            format!("p2p subscribe failed: {e}"),
+        ));
+    }
+    let mut attempt = 0;
+    let published = loop {
+        match p2p.publish(bitmask.clone(), payload.clone()).await {
+            Err(e)
+                if attempt < SUBMISSION_PEER_RETRIES
+                    && e.to_string().contains("NoPeersSubscribedToTopic") =>
+            {
+                attempt += 1;
+                tokio::time::sleep(SUBMISSION_PEER_RETRY_WAIT).await;
+            }
+            outcome => break outcome,
+        }
+    };
+    let no_peer = match published {
+        Ok(()) => {
+            let report = quil_engine::bounded_warn::succeeded(&submission_delivery_key(domain), 0);
+            if let Some(quil_engine::bounded_warn::Report::Recovered { attempts, duration }) =
+                report
+            {
+                tracing::info!(
+                    domain = %hex::encode(domain),
+                    attempts,
+                    lasted_secs = duration.as_secs(),
+                    "submissions to this application reach peers again"
+                );
+            }
+            false
+        }
+        // No resend can make it fit.
+        Err(e) if e.to_string().contains("MessageTooLarge") => {
+            return Err(quil_rpc::SubmitRefusal::invalid(format!(
+                "p2p publish failed: {e}"
+            )));
+        }
+        Err(e) => {
+            let reason = format!("p2p publish failed: {e}");
+            let serves_application = engines
+                .read()
+                .keys()
+                .any(|filter| quil_engine::bitmasks::app_prover_bitmask(filter) == bitmask);
+            if !serves_application || !reason.contains("NoPeersSubscribedToTopic") {
+                return Err(submission_undelivered(domain, reason));
+            }
+            true
+        }
+    };
+    // BlossomSub does not deliver a node's own message to it: hand the
+    // submission to this node's own engines of the application too, as if
+    // gossiped, so they verify its proofs on arrival like every other member.
+    // A submitting member verified its own batch shield only once a frame
+    // carried it, 490 s after the others (devnet, 2026-10-29).
+    match loopback.try_send(quil_p2p::node::ReceivedMessage {
+        bitmask,
+        data: payload,
+        from: Vec::new(),
+        direct: false,
+    }) {
+        Ok(()) if no_peer => {
+            if let Some((attempts, ongoing_secs)) = submission_undelivered_report(domain) {
+                tracing::warn!(
+                    domain = %hex::encode(domain),
+                    attempts,
+                    ongoing_secs,
+                    scope = "this node's peers or the network",
+                    action = "only this node's shards can execute it until a peer of the application connects; check this node's peer count (`qclient node doctor`)",
+                    "submission handed to this node's own engines: no other node of its application is reachable"
+                );
+            }
+        }
+        Ok(()) => {}
+        Err(error) if no_peer => {
+            return Err(submission_undelivered(
+                domain,
+                format!("no peer on the topic, and this node's own queue refused it: {error}"),
+            ));
+        }
+        Err(error) => {
+            tracing::warn!(%error, scope = "this node", action = "its own engines verify the submission once a proposal or frame carries it", "own submission not looped back to this node's engines");
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> anyhow::Result<()> {
     let GrpcArgs {
         frame_observations_path,
@@ -2606,6 +2760,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         );
         let send_p2p = p2p_handle.clone();
         let send_loopback = consensus_loopback.clone();
+        let send_engines = shard_engines.clone();
         // Reuse the prover pipeline's transport for GLOBAL_PROVER-domain
         // sends. The transport already implements the correct fan-out:
         // gRPC to every known archive (so non-archive nodes have a
@@ -2625,10 +2780,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                   payload: Vec<u8>,
                   authentication: Vec<u8>|
                   -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
+                Box<dyn std::future::Future<Output = Result<(), quil_rpc::SubmitRefusal>> + Send>,
             > {
                 let p2p = send_p2p.clone();
                 let loopback = send_loopback.clone();
+                let engines = send_engines.clone();
                 let transport = send_transport.clone();
                 let lifecycle = send_lifecycle.clone();
                 let owner = send_owner.clone();
@@ -2661,7 +2817,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                             error = ?e,
                             "Send Ed448 verify failed"
                         );
-                        return Err(format!("authentication failed: {:?}", e));
+                        return Err(format!("authentication failed: {:?}", e).into());
                     }
                     if domain.iter().all(|&b| b == 0xff) {
                         if let Ok(bundle) = quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(&payload) {
@@ -2696,54 +2852,8 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                             .await
                             .map_err(|e| format!("prover transport publish failed: {}", e))?;
                     } else {
-                        // Shard-domain message (token / app intrinsic). App
-                        // engines collect request bundles from the per-app
-                        // prover topic `0x000000 || appFilter(domain)`
-                        // (message_loop routes it to `AppEngineMessage::Prover`
-                        // → the message collector). Every sub-shard of the app
-                        // shares that topic: a wallet knows only the
-                        // application, so the bloom is taken over the 32-byte
-                        // app address on BOTH sides — `app_prover_bitmask` is
-                        // what the shards subscribe with.
-                        let bitmask = quil_engine::bitmasks::app_prover_bitmask(&domain);
-                        // A node submitting for a shard it does not follow (a
-                        // wallet on a master whose workers cover the shard, or
-                        // no coverage at all) joins the topic first; the
-                        // subscription is idempotent and publishing requires it.
-                        if let Err(e) = p2p.subscribe_confirmed(bitmask.clone()).await {
-                            return Err(format!("p2p subscribe failed: {}", e));
-                        }
-                        let mut attempt = 0;
-                        loop {
-                            match p2p.publish(bitmask.clone(), payload.clone()).await {
-                                Ok(()) => break,
-                                // A fresh subscription may not have learned the
-                                // topic's peers yet; retry briefly.
-                                Err(e)
-                                    if attempt < 10
-                                        && e.to_string().contains("InsufficientPeers") =>
-                                {
-                                    attempt += 1;
-                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                }
-                                Err(e) => return Err(format!("p2p publish failed: {}", e)),
-                            }
-                        }
-                        // BlossomSub does not deliver a node's own message to
-                        // it: hand the submission to this node's own engines
-                        // of the application too, as if gossiped, so they
-                        // verify its proofs on arrival like every other
-                        // member. A submitting member verified its own batch
-                        // shield only once a frame carried it, 490 s after
-                        // the others (devnet, 2026-10-29).
-                        if let Err(error) = loopback.try_send(quil_p2p::node::ReceivedMessage {
-                            bitmask,
-                            data: payload,
-                            from: Vec::new(),
-                            direct: false,
-                        }) {
-                            tracing::warn!(%error, scope = "this node", action = "its own engines verify the submission once a proposal or frame carries it", "own submission not looped back to this node's engines");
-                        }
+                        deliver_shard_submission(&p2p, &loopback, &engines, &domain, payload)
+                            .await?;
                     }
                     Ok(())
                 })
@@ -5548,5 +5658,325 @@ mod shard_info_completeness_tests {
     fn an_archive_serves_its_local_view() {
         assert!(!local_shard_info_incomplete(&BigInt::from(1), true));
         assert!(local_shard_info_incomplete(&BigInt::from(0), true));
+    }
+}
+
+#[cfg(test)]
+mod shard_submission_tests {
+    use super::*;
+    use quil_types::proto::node::node_service_server::NodeService as _;
+    use std::collections::HashMap;
+    use tokio::sync::mpsc;
+
+    type Engines = Arc<parking_lot::RwLock<HashMap<Vec<u8>, ()>>>;
+
+    /// A real node with no peers, as a shard's only prover finds itself on the
+    /// shard's submission topic.
+    struct LoneNode {
+        p2p: quil_p2p::node::P2PHandle,
+        inbound: mpsc::Receiver<quil_p2p::node::ReceivedMessage>,
+        _sup: Supervisor<anyhow::Error>,
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn p2p_config() -> quil_config::P2PConfig {
+        quil_config::P2PConfig {
+            network: 99,
+            bootstrap_peers: Vec::new(),
+            direct_peers: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    async fn start_node(config: &quil_config::P2PConfig, port: u16) -> LoneNode {
+        let mut sup = Supervisor::<anyhow::Error>::new();
+        let node = quil_p2p::P2PNode::new_with_options(config, true, None).unwrap();
+        let (p2p, inbound) = node
+            .start(&mut sup, &format!("/ip4/127.0.0.1/tcp/{port}"))
+            .await
+            .unwrap();
+        LoneNode {
+            p2p,
+            inbound,
+            _sup: sup,
+        }
+    }
+
+    async fn lone_node() -> LoneNode {
+        start_node(&p2p_config(), free_port()).await
+    }
+
+    fn engines_of(applications: &[[u8; 32]]) -> Engines {
+        Arc::new(parking_lot::RwLock::new(
+            applications
+                .iter()
+                .map(|app| (quil_forest::encode_shard_bit_path(app, &[true]), ()))
+                .collect(),
+        ))
+    }
+
+    /// The RPC over the delivery path, as `spawn_all` wires it past the
+    /// signature check.
+    fn node_rpc(
+        p2p: quil_p2p::node::P2PHandle,
+        loopback: mpsc::Sender<quil_p2p::node::ReceivedMessage>,
+        engines: Engines,
+    ) -> quil_rpc::NodeRpcServer {
+        quil_rpc::NodeRpcServer::new().with_send_handler_fn(Arc::new(
+            move |domain, payload, _authentication| {
+                let (p2p, loopback, engines) = (p2p.clone(), loopback.clone(), engines.clone());
+                Box::pin(async move {
+                    deliver_shard_submission(&p2p, &loopback, &engines, &domain, payload).await
+                })
+            },
+        ))
+    }
+
+    async fn send(server: &quil_rpc::NodeRpcServer, domain: [u8; 32]) -> Result<(), tonic::Status> {
+        server
+            .send(tonic::Request::new(quil_types::proto::node::SendRequest {
+                domain: domain.to_vec(),
+                request: Some(quil_types::proto::global::MessageBundle {
+                    requests: Vec::new(),
+                    timestamp: 1,
+                }),
+                authentication: vec![1],
+                delivery_data: Vec::new(),
+            }))
+            .await
+            .map(|_| ())
+    }
+
+    #[derive(Clone, Default)]
+    struct Logged(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Logged {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Logged {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+        /// Lines at info and above, on this test's thread, while the guard lives.
+        fn start(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .with_writer(move || writer.clone())
+                    .finish(),
+            )
+        }
+    }
+
+    /// The shard's only prover has no peer on the submission topic, and its own
+    /// engine can execute the submission: it takes it, and the sender is told
+    /// it was taken.
+    #[tokio::test]
+    async fn a_send_from_the_only_prover_goes_to_its_own_engine() {
+        let app = [0x41u8; 32];
+        let node = lone_node().await;
+        let (loopback, mut own_engines) = mpsc::channel(4);
+        let server = node_rpc(node.p2p.clone(), loopback, engines_of(&[app]));
+        let outcome = send(&server, app).await;
+        let taken = own_engines.try_recv().ok();
+        assert!(
+            outcome.is_ok() && taken.is_some(),
+            "a send from the shard's only prover: the node answered {outcome:?}, and its own \
+             engines got {}",
+            if taken.is_some() {
+                "the submission"
+            } else {
+                "nothing"
+            }
+        );
+        let taken = taken.unwrap();
+        assert_eq!(
+            taken.bitmask,
+            quil_engine::bitmasks::app_prover_bitmask(&app),
+            "the message loop routes the submission topic to the application's engines"
+        );
+        assert!(!taken.data.is_empty());
+    }
+
+    /// No peer on the topic and no engine of the application here: nothing can
+    /// execute it now, which is not a verdict on the submission. The sender is
+    /// told to retry, the operator is told once, and the node tried for a peer
+    /// first.
+    #[tokio::test]
+    async fn a_send_nothing_here_can_take_is_unavailable_and_warned_once() {
+        let (app, other) = ([0x42u8; 32], [0x43u8; 32]);
+        let node = lone_node().await;
+        let (loopback, mut own_engines) = mpsc::channel(4);
+        let server = node_rpc(node.p2p.clone(), loopback, engines_of(&[other]));
+        let logged = Logged::default();
+        let _logging = logged.start();
+        let started = std::time::Instant::now();
+        let first = send(&server, app).await;
+        let waited = started.elapsed();
+        let code = first.as_ref().err().map(|status| status.code());
+        let warnings = logged
+            .text()
+            .lines()
+            .filter(|line| line.contains("WARN") && line.contains("submission"))
+            .count();
+        assert_eq!(
+            code,
+            Some(tonic::Code::Unavailable),
+            "a send no prover could take: the node answered {first:?} and logged {warnings} \
+             warnings about it; a sender cannot tell that from a bad signature and does not \
+             resend"
+        );
+        assert!(
+            own_engines.try_recv().is_err(),
+            "no engine of the application here"
+        );
+        assert!(
+            waited >= SUBMISSION_PEER_RETRY_WAIT * SUBMISSION_PEER_RETRIES,
+            "refused after {waited:?}, without waiting for a peer on the topic"
+        );
+        send(&server, app).await.unwrap_err();
+        let text = logged.text();
+        let warned: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("submission not delivered"))
+            .collect();
+        assert_eq!(warned.len(), 1, "one warn for two sends in a row:\n{text}");
+        for field in [
+            "WARN",
+            hex::encode(app).as_str(),
+            "NoPeersSubscribedToTopic",
+            "this node's peers or the network",
+            "qclient node doctor",
+        ] {
+            assert!(warned[0].contains(field), "no {field} in: {}", warned[0]);
+        }
+    }
+
+    /// The only prover's hand-over warns once, naming what it means.
+    #[tokio::test]
+    async fn a_hand_over_warns_once() {
+        let app = [0x47u8; 32];
+        let node = lone_node().await;
+        let (loopback, _own_engines) = mpsc::channel(4);
+        let server = node_rpc(node.p2p.clone(), loopback, engines_of(&[app]));
+        let logged = Logged::default();
+        let _logging = logged.start();
+        send(&server, app).await.expect("handed over");
+        send(&server, app).await.expect("handed over");
+        let text = logged.text();
+        let warned: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("handed to this node's own engines"))
+            .collect();
+        assert_eq!(warned.len(), 1, "one warn for two sends in a row:\n{text}");
+        assert!(warned[0].contains(&hex::encode(app)), "{}", warned[0]);
+    }
+
+    /// A message over the gossip limit fails the same on every resend, peers or
+    /// not, and no engine here is handed what no peer could carry.
+    #[tokio::test]
+    async fn a_submission_too_large_for_gossip_stays_a_refusal() {
+        let app = [0x44u8; 32];
+        let node = lone_node().await;
+        let (loopback, mut own_engines) = mpsc::channel(4);
+        let refusal = deliver_shard_submission(
+            &node.p2p,
+            &loopback,
+            &engines_of(&[app]),
+            &app,
+            vec![1u8; quil_p2p::protocol::MAX_MESSAGE_SIZE + 1],
+        )
+        .await
+        .expect_err("over the limit");
+        assert!(!refusal.retry, "{refusal:?}");
+        assert!(refusal.reason.contains("MessageTooLarge"), "{refusal:?}");
+        assert!(own_engines.try_recv().is_err());
+    }
+
+    /// The only prover's own queue is full, so nothing took the submission:
+    /// answering success would lose it unseen.
+    #[tokio::test]
+    async fn a_hand_over_refused_by_a_full_queue_is_unavailable() {
+        let app = [0x45u8; 32];
+        let node = lone_node().await;
+        let (loopback, _queue) = mpsc::channel(1);
+        loopback
+            .try_send(quil_p2p::node::ReceivedMessage {
+                bitmask: Vec::new(),
+                data: Vec::new(),
+                from: Vec::new(),
+                direct: false,
+            })
+            .unwrap();
+        let server = node_rpc(node.p2p.clone(), loopback, engines_of(&[app]));
+        let status = send(&server, app)
+            .await
+            .expect_err("a full queue took nothing");
+        assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+    }
+
+    /// With a peer on the topic the submission is gossiped and looped back as
+    /// before, and an earlier failing condition logs its end.
+    #[tokio::test]
+    async fn a_send_with_a_peer_on_the_topic_is_gossiped_and_ends_the_condition() {
+        let app = [0x46u8; 32];
+        let topic = quil_engine::bitmasks::app_prover_bitmask(&app);
+        let receiver_port = free_port();
+        let mut receiver = start_node(&p2p_config(), receiver_port).await;
+        receiver
+            .p2p
+            .subscribe_confirmed(topic.clone())
+            .await
+            .unwrap();
+        let mut sender_config = p2p_config();
+        sender_config.bootstrap_peers = vec![format!(
+            "/ip4/127.0.0.1/tcp/{receiver_port}/p2p/{}",
+            receiver.p2p.peer_id
+        )];
+        let sender = start_node(&sender_config, free_port()).await;
+        let cap = std::time::Duration::from_secs(120);
+        let deadline = tokio::time::Instant::now() + cap;
+        while sender
+            .p2p
+            .subscribed_peer_count(topic.clone())
+            .await
+            .unwrap()
+            == 0
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the receiver's subscription never reached the sender"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(submission_undelivered_report(&app).is_some());
+        let (loopback, mut own_engines) = mpsc::channel(4);
+        let server = node_rpc(sender.p2p.clone(), loopback, engines_of(&[]));
+        let logged = Logged::default();
+        let _logging = logged.start();
+        send(&server, app).await.expect("a peer is on the topic");
+        let looped = own_engines.try_recv().expect("own engines get a copy");
+        let gossiped = tokio::time::timeout(cap, receiver.inbound.recv())
+            .await
+            .expect("the peer gets the submission")
+            .expect("the peer's channel stays open");
+        assert_eq!(gossiped.data, looped.data);
+        assert_eq!(gossiped.bitmask, topic);
+        let text = logged.text();
+        assert!(text.contains("reach peers again"), "{text}");
     }
 }
