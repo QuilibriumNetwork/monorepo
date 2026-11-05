@@ -10418,6 +10418,7 @@ impl AppConsensusEngine {
                 );
                 Some(crate::cw_app_seams::SessionHost {
                     session: session.clone(),
+                    behind: Some(source.behind_probe()),
                     closing_probe: Some(source.closing_probe(
                         self.global_anchor_store.clone(),
                         crate::global_view_refresh::shared(),

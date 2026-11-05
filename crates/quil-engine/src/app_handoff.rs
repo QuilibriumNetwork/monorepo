@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use quil_cw_consensus::adapters::ProposalContext;
 use quil_cw_consensus::handoff::automaton::{
-    AuthorizedParent, ClosingAbsence, ClosingProbe, ParentReader,
+    AuthorizedParent, BehindProbe, ClosingAbsence, ClosingProbe, ParentReader,
 };
 use quil_cw_consensus::handoff::{Checkpoint, Seal, Session};
 use quil_execution::global_intrinsic::handoff::{
@@ -317,6 +317,18 @@ impl ParentSource {
 
     pub fn reader(self: &Arc<Self>) -> ParentReader {
         self.reader_of(true)
+    }
+
+    /// Behind for longer than a leader's parent waits: the committed GLOBAL
+    /// view is withheld while a state sync installs its chunks, so no parent
+    /// reads until the sync records its cursor
+    /// (`HandoffProposer::with_behind_probe`).
+    pub fn behind_probe(self: &Arc<Self>) -> BehindProbe {
+        let source = self.clone();
+        Arc::new(move || match CommittedView::capture(&source.global) {
+            Err(error) if handoff::global_sync_in_progress(&error) => Some(error.to_string()),
+            _ => None,
+        })
     }
 
     /// The authorized checkpoint at the local materialized tip, whatever the
@@ -2970,7 +2982,8 @@ mod successor_tests {
     /// committed view is withheld, and a member of the head session keeps
     /// its worker: the wait says nothing about the session, unlike a node
     /// with no GLOBAL state yet. Once the sync is in, the view shows the
-    /// archive's state (here without the session).
+    /// archive's state (here without the session). Meanwhile its leaders
+    /// are behind: they give their turns up at once.
     #[test]
     fn a_global_sync_between_chunks_withholds_the_view_but_keeps_the_worker() {
         use quil_execution::global_intrinsic::handoff::global_sync_in_progress;
@@ -2979,6 +2992,17 @@ mod successor_tests {
         let (source, _, _) = closing_session(&global, &state, &filter);
         let member = source.members[0].clone();
         assert!(retains_worker(&global, &filter, &member));
+        let behind = ParentSource::new(
+            source.clone(),
+            global.clone(),
+            crdt(),
+            Arc::new(quil_store::testing::InMemoryClockStore::new()) as Arc<dyn ClockStore>,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap()
+        .behind_probe();
+        assert_eq!(behind(), None);
 
         let address = [0xff; 32];
         let archive = Arc::new(HypergraphCrdt::new(
@@ -3024,6 +3048,7 @@ mod successor_tests {
             .err()
             .expect("no committed view between a sync's chunks");
         assert!(global_sync_in_progress(&error), "{error}");
+        assert_eq!(behind(), Some(error.to_string()));
         assert!(
             retains_worker(&global, &filter, &member),
             "the member keeps its worker while the sync installs"
@@ -3038,6 +3063,7 @@ mod successor_tests {
         global.apply_sync_chunk(&mut plan, &rest).unwrap();
         assert_eq!(global.finish_phase_sync(&plan).unwrap(), root);
         let view = CommittedView::capture(&global).unwrap();
+        assert_eq!(behind(), None);
         assert!(handoff::head(&view, &filter).unwrap().is_none());
         assert!(!retains_worker(&global, &filter, &member));
         assert_eq!(worker_retention(&global, &filter, &member), Some(false));
