@@ -3064,7 +3064,7 @@ mod tests {
         }
     }
 
-    /// Before the stable replica key epoch (mainnet: none) a leaf's labels
+    /// Before the stable replica key epoch (mainnet: 1429) a leaf's labels
     /// are kept under their epoch's directory, byte for byte as before it
     /// existed, and serve that epoch alone.
     #[test]
@@ -3325,7 +3325,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Before the stable replica key epoch (mainnet: none) the whole layers
+    /// Before the stable replica key epoch (mainnet: 1429) the whole layers
     /// kept for an epoch are kept as with no such epoch: under the epoch's
     /// directory with nothing beside them, resumed for that epoch alone,
     /// removed when discarded and with their epoch.

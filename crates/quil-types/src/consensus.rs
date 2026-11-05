@@ -1223,10 +1223,13 @@ pub fn set_storage_kick_suspension_epoch_for_thread(epoch: Option<u64>) {
 /// all hash the epoch and a beacon fixed after the registration. Labels for
 /// this epoch are made ahead two epochs before it and sealed in the epoch
 /// before it. Consensus-affecting (seal verification in every GLOBAL
-/// execution): every node must run a build carrying the epoch before the
-/// epoch two before it begins. Mainnet: not set until decided;
+/// execution): every node and archive must run a build carrying the epoch
+/// before the epoch two before it begins, and every archive before the
+/// epoch before it at the latest. Mainnet epoch 1429 (frame 1,028,880):
+/// labelling from 1427 leaves the release carrying it about a day to
+/// adopt, the slowest recent release's time to 95% of peers.
 /// `QUIL_STABLE_REPLICA_KEY_EPOCH` elsewhere, never by default.
-pub const MAINNET_STABLE_REPLICA_KEY_EPOCH: Option<u64> = None;
+pub const MAINNET_STABLE_REPLICA_KEY_EPOCH: Option<u64> = Some(1429);
 
 static STABLE_REPLICA_KEY_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -1766,14 +1769,15 @@ mod exact_state_size_epoch_tests {
         assert!(super::storage_kicks_suspended(966_240));
     }
 
-    /// Mainnet has no stable replica key epoch, whatever the setting says:
-    /// every epoch keeps the epoch-bound key. Other networks take the
-    /// setting, and none without it.
+    /// Mainnet's stable replica key epoch is 1429 (GLOBAL frame 1,028,880),
+    /// whatever the setting says. Other networks take the setting, and none
+    /// without it.
     #[test]
-    fn stable_replica_keys_are_inert_on_mainnet() {
-        assert_eq!(super::MAINNET_STABLE_REPLICA_KEY_EPOCH, None);
-        assert_eq!(super::stable_replica_key_epoch_for(0, Some("5")), u64::MAX);
-        assert_eq!(super::stable_replica_key_epoch_for(0, None), u64::MAX);
+    fn mainnet_replica_keys_are_stable_from_epoch_1429() {
+        assert_eq!(super::MAINNET_STABLE_REPLICA_KEY_EPOCH, Some(1429));
+        assert_eq!(1429 * super::EPOCH_LENGTH_FRAMES, 1_028_880);
+        assert_eq!(super::stable_replica_key_epoch_for(0, Some("5")), 1429);
+        assert_eq!(super::stable_replica_key_epoch_for(0, None), 1429);
         assert_eq!(super::stable_replica_key_epoch_for(1, Some("5")), 5);
         assert_eq!(
             super::stable_replica_key_epoch_for(1, Some("bad")),
@@ -1781,7 +1785,10 @@ mod exact_state_size_epoch_tests {
         );
         assert_eq!(super::stable_replica_key_epoch_for(1, None), u64::MAX);
         super::set_stable_replica_key_epoch_for_thread(None);
-        assert_eq!(super::stable_replica_key_epoch(), u64::MAX);
+        assert_eq!(super::stable_replica_key_epoch(), 1429);
+        assert!(!super::stable_replica_keys_at(1428));
+        assert!(super::stable_replica_keys_at(1429));
+        super::set_stable_replica_key_epoch_for_thread(Some(u64::MAX));
         assert!(!super::stable_replica_keys_at(0));
         assert!(!super::stable_replica_keys_at(u64::MAX - 1));
         assert!(!super::stable_replica_keys_at(u64::MAX));
@@ -1790,26 +1797,27 @@ mod exact_state_size_epoch_tests {
         assert!(super::stable_replica_keys_at(9));
         assert_eq!(super::stable_replica_key_epoch_thread_override(), Some(9));
         super::set_stable_replica_key_epoch_for_thread(None);
-        // Never before the hash storage proof epoch; mainnet's must not be.
+        // Never before the hash storage proof epoch; mainnet's is not.
         assert_eq!(super::stable_replica_key_epoch_from(1, Some("5"), 3), 5);
         assert_eq!(super::stable_replica_key_epoch_from(1, Some("5"), 8), 8);
         assert_eq!(super::stable_replica_key_epoch_from(1, None, 8), u64::MAX);
-        if let (Some(stable), Some(hash)) = (
-            super::MAINNET_STABLE_REPLICA_KEY_EPOCH,
-            super::MAINNET_HASH_STORAGE_PROOF_EPOCH,
-        ) {
-            assert!(stable >= hash);
-        }
+        let stable = super::MAINNET_STABLE_REPLICA_KEY_EPOCH.unwrap();
+        let hash = super::MAINNET_HASH_STORAGE_PROOF_EPOCH.unwrap();
+        assert!(stable >= hash);
+        assert_eq!(
+            super::stable_replica_key_epoch_from(0, Some("5"), hash),
+            stable
+        );
     }
 
-    /// A read before initialization does not fix the epoch: the
-    /// initialization after it still decides.
+    /// A read before initialization is the mainnet epoch and does not fix
+    /// it: the initialization after it still decides.
     #[test]
     fn a_stable_replica_key_epoch_read_before_init_does_not_fix_it() {
         if super::STABLE_REPLICA_KEY_EPOCH.get().is_some() {
             return; // another test in this process initialized it
         }
-        assert_eq!(super::stable_replica_key_epoch(), u64::MAX);
+        assert_eq!(super::stable_replica_key_epoch(), 1429);
         assert!(
             super::STABLE_REPLICA_KEY_EPOCH.get().is_none(),
             "a read fixed it"
