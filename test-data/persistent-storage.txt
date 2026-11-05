@@ -55,6 +55,13 @@ Bounds and limits
   data encoding and 3,480 MiB for cold certification at the local maximum.
   These are admission estimates, not measured RSS or a guarantee on every host.
 
+  GLOBAL certifies sectors of at least 2^20 nodes, at most 8 + 64 per seat a
+  member holds (joining, active, paused or leaving). The fixture's largest shard
+  needs 16 sectors, a shard at the 16 GiB merge limit 64, and its 109-seat
+  profile 395 of 6,984. The floor pads one fixture shard, costing 0.02% of a full
+  member's cold labelling. A member past its cap keeps its certificates and
+  reuses them; it certifies no new sector until a further seat opens room.
+
   Temporary cold layers/columns are about 6 GiB per 512 MiB sector. At most
   one such cache per CPU slot is outstanding, further limited by disk and RAM
   admission; certification releases each cache independently. Steady files are L

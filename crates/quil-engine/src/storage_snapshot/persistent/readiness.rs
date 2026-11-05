@@ -145,7 +145,7 @@ fn measure_with_store(
     let mut plans = Vec::new();
     for prefix in &captured.prefixes {
         let exact = captured.node_count(prefix)?;
-        let n = sector::capacity(exact.saturating_add(exact.div_ceil(4)))
+        let n = super::sector_nodes(exact)
             .ok_or_else(|| unavailable("sector capacity overflow".into()))?;
         measured.canonical_node_payload_bytes = measured
             .canonical_node_payload_bytes

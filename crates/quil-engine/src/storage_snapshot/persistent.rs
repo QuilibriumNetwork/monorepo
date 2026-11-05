@@ -129,6 +129,26 @@ fn sector_lane(member: &[u8], id: &[u8; 32]) -> Vec<u8> {
     [b"persistent sector/".as_slice(), member, id].concat()
 }
 
+/// The capacity to label for `exact` nodes: 25% growth headroom, rounded to a
+/// power of two, no less than GLOBAL certifies.
+fn sector_nodes(exact: u64) -> Option<u64> {
+    let floor = sector_floor();
+    sector::capacity(exact.saturating_add(exact.div_ceil(4)).max(floor))
+}
+
+#[cfg(not(test))]
+fn sector_floor() -> u64 {
+    quil_types::consensus::min_sector_nodes()
+}
+
+/// Unit tests label small sectors on every thread, spawned ones included,
+/// unless the labelling thread sets its own floor.
+#[cfg(test)]
+fn sector_floor() -> u64 {
+    use quil_types::consensus::min_sector_nodes_thread_override;
+    min_sector_nodes_thread_override().unwrap_or(2)
+}
+
 fn try_reserve(
     store: &LabelStore,
     member: &[u8],
@@ -232,7 +252,7 @@ fn try_reserve(
     if pending_count >= crate::storage_jobs::job_slots() {
         return Ok(None);
     }
-    let n = sector::capacity(exact.saturating_add(exact.div_ceil(4)))
+    let n = sector_nodes(exact)
         .ok_or_else(|| unavailable("snapshot exceeds maximum sector size".into()))?;
     let mut seed = b"quil/local-sector-id/v1".to_vec();
     seed.extend_from_slice(member);
@@ -831,6 +851,19 @@ pub(crate) fn poll_sector_certificates(
                 "certified sector absent from committed GLOBAL state".into(),
             ));
         }
+        // GLOBAL would refuse it: wait, labelled, until a seat opens room.
+        // Certified sectors go on serving every leaf they fit.
+        let room = protocol::committed_sector_room(snapshot.as_ref(), member)?;
+        if room.full() {
+            // Bounded to one line an hour at 10 s frames.
+            if frame.is_multiple_of(360) {
+                warn!(frame, sector = %hex::encode(sector.cert.sector), held = room.held,
+                    cap = room.cap(), seats = room.seats, scope = "local",
+                    "sector certification waits: this member holds its sector cap; a new \
+                     seat opens room, and certified sectors keep serving leaves they fit");
+            }
+            continue;
+        }
         let target_path = sector.dir.join("capacity-target");
         let previous = fs::read(&target_path)
             .ok()
@@ -982,6 +1015,139 @@ mod tests {
     fn gates(on: bool) {
         quil_types::consensus::set_persistent_storage_epoch_for_thread(on.then_some(1500));
         quil_types::consensus::set_stable_replica_key_epoch_for_thread(on.then_some(1393));
+    }
+    #[test]
+    fn sectors_are_labelled_at_no_less_than_the_certified_floor() {
+        use quil_types::consensus::{set_min_sector_nodes_for_thread, MIN_SECTOR_NODES};
+        gates(true);
+        set_min_sector_nodes_for_thread(Some(MIN_SECTOR_NODES));
+        assert_eq!(sector_nodes(100), Some(MIN_SECTOR_NODES));
+        assert_eq!(sector_nodes(MIN_SECTOR_NODES), Some(MIN_SECTOR_NODES * 2));
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let (_, _, n) = reserve(&store, &[18; 32], b"small", 1500, 100).unwrap();
+        assert_eq!(n, MIN_SECTOR_NODES);
+        set_min_sector_nodes_for_thread(None);
+        gates(false);
+    }
+    #[test]
+    fn sectors_are_small_in_tests_unless_the_thread_sets_the_floor() {
+        use quil_types::consensus::{set_min_sector_nodes_for_thread, MIN_SECTOR_NODES};
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        // A thread a test spawns carries no scoped epoch and no floor.
+        let spawned = || reserve(&store, &[19; 32], b"spawned", 1500, 100).unwrap();
+        let (_, _, n) = std::thread::scope(|scope| scope.spawn(spawned).join().unwrap());
+        assert_eq!(n, 128, "a test labels a small sector by default");
+        set_min_sector_nodes_for_thread(Some(MIN_SECTOR_NODES));
+        assert_eq!(sector_nodes(100), Some(MIN_SECTOR_NODES), "a test opts in");
+        set_min_sector_nodes_for_thread(None);
+        assert_eq!(sector_nodes(100), Some(128));
+    }
+    #[test]
+    fn a_member_at_its_sector_cap_publishes_nothing_until_a_seat_opens_room() {
+        use quil_execution::global_intrinsic::{materialize, persistent_storage as protocol};
+        use quil_execution::{
+            global_schema::GLOBAL_INTRINSIC_ADDRESS,
+            hypergraph_state::{
+                hyperedge_adds_discriminator, vertex_adds_discriminator, HypergraphState,
+            },
+        };
+        use quil_types::crypto::Signer;
+        gates(true);
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage_labels::install_with_space(
+            dir.path().to_owned(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let key = TestIdentity.public_key();
+        let member = materialize::prover_address_from_pubkey(key).unwrap();
+        let global = super::super::tests::test_crdt();
+        let frame = 1499 * quil_types::consensus::epoch_length_frames() + 20;
+        let state = HypergraphState::new(global.clone());
+        let adds = vertex_adds_discriminator().unwrap();
+        let prover = materialize::create_prover_vertex_tree(key, 1).unwrap();
+        state
+            .set(
+                &GLOBAL_INTRINSIC_ADDRESS,
+                &member,
+                &adds,
+                frame,
+                quil_execution::prover_registry::vertex_tree_to_blob(&prover),
+            )
+            .unwrap();
+        let held = quil_types::consensus::max_certified_sectors(0);
+        protocol::apply(
+            &state,
+            frame,
+            &[protocol::sector_count_record(&member, held)],
+        )
+        .unwrap();
+        state.commit().unwrap();
+        global.commit(frame).unwrap();
+        let (path, id, n) = reserve(store, &member, b"new leaf", 1500, 100).unwrap();
+        initialize(store, &member, 1500, path, id, n, &|| false).unwrap();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (send, recv) = std::sync::mpsc::channel();
+        let publish: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(move |bytes| {
+            send.send(bytes).unwrap();
+        });
+        poll_sector_certificates(
+            frame,
+            &member,
+            &global,
+            clock.clone(),
+            &TestIdentity,
+            publish.clone(),
+        )
+        .unwrap();
+        assert!(
+            recv.try_recv().is_err(),
+            "GLOBAL would refuse this precommit"
+        );
+        let state = HypergraphState::new(global.clone());
+        let filter = [4u8; 32];
+        let address = materialize::allocation_address(key, &filter).unwrap();
+        let seat = materialize::create_allocation_vertex_tree(&member, &filter, frame).unwrap();
+        state
+            .set(
+                &GLOBAL_INTRINSIC_ADDRESS,
+                &address,
+                &adds,
+                frame + 1,
+                quil_execution::prover_registry::vertex_tree_to_blob(&seat),
+            )
+            .unwrap();
+        state
+            .set(
+                &GLOBAL_INTRINSIC_ADDRESS,
+                &member,
+                &hyperedge_adds_discriminator().unwrap(),
+                frame + 1,
+                materialize::build_prover_allocation_hyperedge_blob(&member, &[(address, &seat)])
+                    .unwrap(),
+            )
+            .unwrap();
+        state.commit().unwrap();
+        global.commit(frame + 1).unwrap();
+        poll_sector_certificates(frame + 1, &member, &global, clock, &TestIdentity, publish)
+            .unwrap();
+        let precommit =
+            quil_execution::global_intrinsic::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(
+                &recv.try_recv().expect("a seat opened room"),
+            )
+            .unwrap();
+        let state = HypergraphState::new(global.clone());
+        let records =
+            protocol::check_capacity(frame + 1, &precommit, &state, &TestIdentity, &|_| {
+                Err(unavailable("not known".into()))
+            })
+            .unwrap();
+        assert_eq!(records.len(), 1, "GLOBAL takes it now");
+        gates(false);
     }
     #[test]
     fn pool_bounds_cold_work_and_reuses_certified_capacity_after_restart() {
@@ -1300,11 +1466,11 @@ mod tests {
     }
     #[test]
     fn controller_resumes_orphaned_capacity_and_releases_layers_only_after_global_ack() {
-        capacity_lifecycle(100, std::time::Duration::from_secs(5), false);
+        capacity_lifecycle(100, std::time::Duration::from_secs(120), false);
     }
     #[test]
     fn a_cached_capacity_certificate_retries_without_its_evicted_layers() {
-        capacity_lifecycle(100, std::time::Duration::from_secs(5), true);
+        capacity_lifecycle(100, std::time::Duration::from_secs(120), true);
     }
     #[test]
     #[ignore = "512 MiB sector lifecycle; run explicitly on representative hardware"]

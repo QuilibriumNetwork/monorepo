@@ -50,6 +50,106 @@ fn usage_address(member: &[u8; 32], id: &[u8; 32], epoch: u64) -> [u8; 32] {
     address(b"quil/sector-usage/v1", member, id, Some(epoch))
 }
 
+fn sector_count_address(member: &[u8; 32]) -> [u8; 32] {
+    address(b"quil/sector-count/v1", member, &[0; 32], None)
+}
+
+/// The record of how many sectors `member` has certified: one per member, read
+/// back from state since a member's certificates cannot be enumerated.
+pub fn sector_count_record(member: &[u8; 32], held: u64) -> StateRecord {
+    StateRecord {
+        address: sector_count_address(member),
+        member: *member,
+        sector: [0; 32],
+        certificate: Vec::new(),
+        usage: held.to_be_bytes().to_vec(),
+    }
+}
+
+/// A member's certified sectors, and the seats that decide how many it may
+/// hold. Certificates are permanent and reusable, so `held` never falls: a
+/// member over its cap keeps every sector and only certifies no new one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SectorRoom {
+    pub held: u64,
+    pub seats: u64,
+}
+impl SectorRoom {
+    pub fn cap(&self) -> u64 {
+        quil_types::consensus::max_certified_sectors(self.seats)
+    }
+    pub fn full(&self) -> bool {
+        self.held >= self.cap()
+    }
+    /// The count record once `fresh` more sectors are certified, if they fit.
+    fn admit(&self, member: &[u8; 32], fresh: u64) -> std::result::Result<StateRecord, String> {
+        let held = self.held.saturating_add(fresh);
+        if held > self.cap() {
+            return Err(format!(
+                "member holds {} certified sectors, {} more would exceed the {} of {} seats",
+                self.held,
+                fresh,
+                self.cap(),
+                self.seats
+            ));
+        }
+        Ok(sector_count_record(member, held))
+    }
+}
+/// Read through `vertex` and the member's hyperedge. A seat is an allocation
+/// its member holds or asked for: joining, active, paused or leaving.
+fn sector_room(
+    member: &[u8; 32],
+    vertex: impl Fn(&[u8; 32]) -> Result<Option<Vec<u8>>>,
+    hyperedge: Option<Vec<u8>>,
+) -> Result<SectorRoom> {
+    use super::materialize as m;
+    let held = vertex(&sector_count_address(member))?
+        .map(|blob| {
+            let tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+            read_field(&tree, CLASS, "Usage")
+                .filter(|_| {
+                    crate::global_schema::read_type(&tree) == Some(CLASS)
+                        && read_field(&tree, CLASS, "Member").as_deref() == Some(member.as_slice())
+                })
+                .and_then(|usage| <[u8; 8]>::try_from(usage.as_slice()).ok())
+                .map(u64::from_be_bytes)
+                .ok_or_else(|| QuilError::InvalidArgument("invalid sector count record".into()))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let mut seats = 0;
+    for address in m::hyperedge_allocation_addresses(&hyperedge.unwrap_or_default())? {
+        let Some(blob) = vertex(&address)?.filter(|blob| !blob.is_empty()) else {
+            continue;
+        };
+        let tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+        let status = read_field(&tree, "allocation:ProverAllocation", "Status")
+            .and_then(|status| status.first().copied());
+        if status.is_some_and(|status| {
+            [
+                m::STATUS_JOINING,
+                m::STATUS_ACTIVE,
+                m::STATUS_PAUSED,
+                m::STATUS_LEAVING,
+            ]
+            .contains(&status)
+        }) {
+            seats += 1;
+        }
+    }
+    Ok(SectorRoom { held, seats })
+}
+pub fn sector_room_in(state: &HypergraphState, member: &[u8; 32]) -> Result<SectorRoom> {
+    let adds = crate::hypergraph_state::vertex_adds_discriminator()?;
+    let links = crate::hypergraph_state::hyperedge_adds_discriminator()?;
+    sector_room(
+        member,
+        |address| state.get(&GLOBAL_INTRINSIC_ADDRESS, address, &adds),
+        state.get(&GLOBAL_INTRINSIC_ADDRESS, member, &links)?,
+    )
+}
+
 fn read(
     state: &HypergraphState,
     address: &[u8; 32],
@@ -308,6 +408,16 @@ pub fn check(
     let certs = verify(claim, bytes, &|id| {
         certificate(state, &claim.member, id).map_err(|e| e.to_string())
     })?;
+    let floor = quil_types::consensus::min_sector_nodes();
+    if certs.iter().any(|cert| cert.n < floor) {
+        return Err(format!("sector is below the {floor}-node floor"));
+    }
+    let count = if certs.is_empty() {
+        None
+    } else {
+        let room = sector_room_in(state, &claim.member).map_err(|e| e.to_string())?;
+        Some(room.admit(&claim.member, certs.len() as u64)?)
+    };
     let mut records: Vec<_> = certs
         .into_iter()
         .map(|cert| StateRecord {
@@ -318,6 +428,7 @@ pub fn check(
             usage: Vec::new(),
         })
         .collect();
+    records.extend(count);
     let mut seen = BTreeSet::new();
     for seat in &claim.seats {
         for leaf in &seat.seals {
@@ -365,6 +476,13 @@ fn committed_blob(
     snapshot: &dyn quil_types::store::SnapshotReadable,
     address: &[u8; 32],
 ) -> Result<Option<Vec<u8>>> {
+    committed_underlying(snapshot, "vertex", address)
+}
+fn committed_underlying(
+    snapshot: &dyn quil_types::store::SnapshotReadable,
+    set: &str,
+    address: &[u8; 32],
+) -> Result<Option<Vec<u8>>> {
     if !snapshot.has_snapshot_vertex_reads() {
         return Err(QuilError::ExecutionUnavailable(
             "GLOBAL snapshot vertex reads unsupported".into(),
@@ -375,7 +493,7 @@ fn committed_blob(
         data_address: *address,
     };
     snapshot.load_vertex_underlying_raw(
-        "vertex",
+        set,
         "adds",
         &quil_hypergraph::addressing::shard_key_for_location(&location),
         &location.to_id(),
@@ -400,6 +518,16 @@ pub fn committed_certificate(
             .ok_or_else(|| QuilError::InvalidArgument("invalid committed sector identity".into()))
         })
         .transpose()
+}
+pub fn committed_sector_room(
+    snapshot: &dyn quil_types::store::SnapshotReadable,
+    member: &[u8; 32],
+) -> Result<SectorRoom> {
+    sector_room(
+        member,
+        |address| committed_blob(snapshot, address),
+        committed_underlying(snapshot, "hyperedge", member)?,
+    )
 }
 pub fn committed_pending(
     snapshot: &dyn quil_types::store::SnapshotReadable,
