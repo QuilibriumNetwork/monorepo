@@ -342,10 +342,17 @@ pub struct MaterializeResult {
     pub prover_root_matched: bool,
     /// The local prover root after materialization.
     pub local_prover_root: Vec<u8>,
-    /// Canonical bytes of every bundle in the finalized frame. The caller
-    /// feeds these to `MessageCollector::mark_finalized` so the consumed
-    /// messages leave the mempool and aren't re-proposed.
+    /// Canonical bytes of every bundle in the finalized frame that execution
+    /// processed. The caller feeds these to `MessageCollector::mark_finalized`
+    /// so the consumed messages leave the mempool and aren't re-proposed, and
+    /// the shard frames they carried count as carried.
     pub finalized_bundles: Vec<Vec<u8>>,
+    /// Canonical bytes of the frame's other well-formed bundles, those
+    /// execution skipped. Consumed too (`MessageCollector::mark_skipped`), but
+    /// the shard frames they claim are not carried: a GLOBAL leader can pack a
+    /// header no key signed claiming any number, and recorded as carried it
+    /// would make every collector drop the genuine frame of that number.
+    pub skipped_bundles: Vec<Vec<u8>>,
     /// The prover lifecycle filters the frame's bundles carried.
     pub prover_ops: crate::prover_op_tally::ProverOpTally,
 }
@@ -535,6 +542,7 @@ impl FrameMaterializer {
                 prover_root_matched: true,
                 local_prover_root: Vec::new(),
                 finalized_bundles: Vec::new(),
+                skipped_bundles: Vec::new(),
                 prover_ops: Default::default(),
             });
         }
@@ -558,6 +566,7 @@ impl FrameMaterializer {
                 prover_root_matched: true,
                 local_prover_root: Vec::new(),
                 finalized_bundles: Vec::new(),
+                skipped_bundles: Vec::new(),
                 prover_ops: Default::default(),
             });
         }
@@ -714,6 +723,7 @@ impl FrameMaterializer {
                     Vec::new()
                 },
                 finalized_bundles: Vec::new(),
+                skipped_bundles: Vec::new(),
                 prover_ops: Default::default(),
             });
         }
@@ -826,10 +836,12 @@ impl FrameMaterializer {
         // the global venue (reward mints, uncovered-shard transfers); paid to
         // the frame's prover after the loop.
         let mut global_fee_total: u128 = 0;
-        // Canonical bytes of every well-formed bundle in this frame, fed
-        // to `MessageCollector::mark_finalized` by the caller so consumed
-        // messages leave the mempool.
+        // Canonical bytes of every well-formed bundle in this frame, fed to
+        // the collector by the caller so consumed messages leave the
+        // mempool: those execution processed, whose shard frames count as
+        // carried, and those it skipped, whose claims count for nothing.
         let mut finalized_bundles: Vec<Vec<u8>> = Vec::with_capacity(frame.requests.len());
+        let mut skipped_bundles: Vec<Vec<u8>> = Vec::new();
         // Per-bundle materialization outcome, ONE per `frame.requests` entry in
         // order (so the explorer can align it to each request). Every path
         // through the loop below pushes exactly one. Persisted after the loop.
@@ -1036,11 +1048,6 @@ impl FrameMaterializer {
                 });
                 continue;
             }
-            // This bundle is part of the finalized frame → it is consumed
-            // from the mempool regardless of whether execution processes
-            // or skips it below.
-            finalized_bundles.push(bundle_bytes.clone());
-
             let request_type = u32::from_be_bytes([
                 bundle_bytes[0],
                 bundle_bytes[1],
@@ -1066,6 +1073,7 @@ impl FrameMaterializer {
                             status: RequestStatus::Skipped,
                             error: format!("invalid fee cost: {e}"),
                         });
+                        skipped_bundles.push(bundle_bytes);
                         continue;
                     }
                 };
@@ -1131,6 +1139,7 @@ impl FrameMaterializer {
                     status: RequestStatus::Rejected,
                     error: reason,
                 });
+                skipped_bundles.push(bundle_bytes);
                 continue;
             }
             let process_started = std::time::Instant::now();
@@ -1168,6 +1177,7 @@ impl FrameMaterializer {
                         status: RequestStatus::Succeeded,
                         error: String::new(),
                     });
+                    finalized_bundles.push(bundle_bytes);
                 }
                 Err(e) => {
                     if e.is_execution_unavailable() {
@@ -1184,6 +1194,7 @@ impl FrameMaterializer {
                         status: RequestStatus::Failed,
                         error: format!("{e}"),
                     });
+                    skipped_bundles.push(bundle_bytes);
                 }
             }
         }
@@ -1769,6 +1780,7 @@ impl FrameMaterializer {
             prover_root_matched,
             local_prover_root: post_root,
             finalized_bundles,
+            skipped_bundles,
             prover_ops,
         })
     }
@@ -3288,6 +3300,7 @@ mod tests {
             prover_root_matched: true,
             local_prover_root: vec![0xAA; 64],
             finalized_bundles: Vec::new(),
+            skipped_bundles: Vec::new(),
             prover_ops: Default::default(),
         };
         assert_eq!(r.processed, 5);

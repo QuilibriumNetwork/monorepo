@@ -1802,6 +1802,22 @@ impl MessageCollector {
         }
     }
 
+    /// Consume `raw_msgs`, bundles a finalized frame carried that its
+    /// execution skipped: like [`mark_finalized`]'s they leave the live
+    /// buffers and are never held again, but the shard frames they claim do
+    /// not count as carried. A skipped header credited nothing, and anyone
+    /// leading GLOBAL can pack one claiming any number.
+    pub fn mark_skipped(&self, raw_msgs: &[Vec<u8>]) {
+        if raw_msgs.is_empty() {
+            return;
+        }
+        self.remove(raw_msgs);
+        let mut finalized = self.finalized.write().unwrap();
+        for raw in raw_msgs {
+            finalized.insert(message_key(raw));
+        }
+    }
+
     /// Remove `raw_msgs` from the live buffers WITHOUT recording them as
     /// finalized. Used by the leader's collect path to drop messages that
     /// fail protocol validation, mirroring Go's `collector.Remove(record)`

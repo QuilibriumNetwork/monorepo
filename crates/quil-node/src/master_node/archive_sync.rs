@@ -3853,6 +3853,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                         if !result.consumed_bundles.is_empty() {
                                                             mc.mark_finalized(&result.consumed_bundles);
                                                         }
+                                                        mc.mark_skipped(&result.skipped_bundles);
                                                         if let Some(header) = frame.header.as_ref() {
                                                             if quil_types::consensus::global_committee_epoch(header.frame_number) == cf.rank_epoch() { mc.prune_after_finalization(header.rank); }
                                                         }
@@ -3924,6 +3925,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     if !result.consumed_bundles.is_empty() {
                                                         mc.mark_finalized(&result.consumed_bundles);
                                                     }
+                                                    mc.mark_skipped(&result.skipped_bundles);
                                                     if let Some(header) = frame.header.as_ref() {
                                                         if quil_types::consensus::global_committee_epoch(header.frame_number) == cf.rank_epoch() { mc.prune_after_finalization(header.rank); }
                                                     }
@@ -3962,6 +3964,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 if !result.finalized_bundles.is_empty() {
                                                     mc.mark_finalized(&result.finalized_bundles);
                                                 }
+                                                mc.mark_skipped(&result.skipped_bundles);
                                                 if m.last_materialized_frame() >= frame_number {
                                                     catch_up.record_in_place();
                                                     if let Some(header) = frame.header.as_ref() {

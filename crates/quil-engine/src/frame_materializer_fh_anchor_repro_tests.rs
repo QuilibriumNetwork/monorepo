@@ -463,3 +463,51 @@ fn fh_r13_member_a_branch_consuming_a_skipped_header_must_not_censor_the_genuine
     );
     assert_frame_nine_not_censored(&result.consumed_bundles, "branch execution");
 }
+
+/// A skipped bundle still leaves the mempool for good while the frame it
+/// claims stays open for the genuine copy. A processed bundle's frames still
+/// count as carried: `a_shard_frame_a_finalized_frame_carried_is_not_held_again`.
+#[test]
+fn fh_r13_fix_a_skipped_bundle_is_consumed_but_carries_no_frame() {
+    use crate::consensus_wire::proto_message_bundle_to_canonical_bytes as canonical;
+    use crate::message_collector::{MessageCollector, SubmitOutcome};
+    let (fixture, root) = materializer_with_header_deps();
+    let mut input = frame(1, root);
+    input.requests = vec![junk_header_bundle(0)];
+    let junk = canonical(&input.requests[0]).unwrap();
+    let collector = MessageCollector::new();
+    let genuine = other_copy_of_frame_nine(0xa5);
+    for held in [&junk, &genuine] {
+        assert_eq!(
+            collector.add_message_outcome(1, held.clone()),
+            SubmitOutcome::Accepted
+        );
+    }
+    let result = fixture.source.materialize(&input).unwrap();
+    assert!(
+        result.finalized_bundles.is_empty(),
+        "FH-R13 FIX: execution processed nothing"
+    );
+    assert_eq!(
+        result.skipped_bundles,
+        vec![junk.clone()],
+        "FH-R13 FIX: the junk bundle is listed as skipped"
+    );
+    collector.mark_finalized(&result.finalized_bundles);
+    collector.mark_skipped(&result.skipped_bundles);
+    assert_eq!(
+        collector.collect_for_rank(5),
+        vec![genuine],
+        "FH-R13 FIX: the skipped bundle leaves, the genuine frame stays"
+    );
+    assert_eq!(
+        collector.add_message_outcome(2, junk),
+        SubmitOutcome::Duplicate,
+        "FH-R13 FIX: a consumed bundle is never held again"
+    );
+    assert_eq!(
+        collector.add_message_outcome(2, other_copy_of_frame_nine(0xa6)),
+        SubmitOutcome::Accepted,
+        "FH-R13 FIX: another copy of the frame is admitted"
+    );
+}
