@@ -80,12 +80,13 @@
 //! epochs too: labelling given up for one epoch goes on for a later one, and
 //! only the sweep removes them ([`LabelStore::discard`]).
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use quil_crypto::sdr::SdrParams;
@@ -158,8 +159,24 @@ pub fn disk_floor(total_bytes: u64) -> u64 {
     (total_bytes / 100 * DISK_FLOOR_PERCENT).max(DISK_FLOOR_MIN_BYTES)
 }
 
-/// Bytes of the buffer a leaf's layers are written through.
-const WRITE_BUFFER_BYTES: usize = 1 << 22;
+/// Bytes of a leaf's labels written to disk at a time ([`ChunkedWriter`]),
+/// the buffer they are written through: each chunk is pushed to the disk
+/// and waited for before the next is written, holding one of
+/// [`FLUSH_PERMITS`], so a store's synced commit on the same disk waits
+/// behind at most one chunk a permit (about 40 ms at 400 MB/s), not behind
+/// whole layers. Written whole, then synced, a layer put up to a gigabyte
+/// in the page cache at once, and leaves labelled together end their layers
+/// together: a regular node labelling 37 leaves at its snapshot synced about
+/// 13 GB in each round of layers, and its stores' commits waited up to 2.7 s
+/// for their fsyncs behind them, past the probe's bound of one second
+/// (2026-11-05).
+const FLUSH_CHUNK_BYTES: usize = 16 << 20;
+
+/// Chunks of labels written to disk at once in this process, however many
+/// leaves are labelled ([`FlushGate`]): two keep a fast disk's queue busy
+/// while one waits for its chunk, and bound what a slow one holds ahead of
+/// the stores' commits.
+const FLUSH_PERMITS: usize = 2;
 
 /// Bytes of a kept layer read back at once, to resume a leaf's labelling
 /// ([`Admitted::label_ahead`]).
@@ -181,11 +198,12 @@ const LABEL_AHEAD_MARGIN_PERCENT: u64 = 10;
 /// Bytes labelling a leaf of `n` nodes ahead reserves
 /// (`crate::storage_jobs::reserve_ahead`): what the labelling holds at its
 /// peak (`quil_crypto::storage_proof::label_leaf_peak_bytes`, 152 bytes a
-/// node) and [`LABEL_AHEAD_MARGIN_PERCENT`] more, and its write buffer.
-/// Measured on 2026-11-01 through this path under the node's allocator, a
-/// synthetic leaf of 32,339,852 nodes held 4,920,782,848 bytes resident
-/// above the process's baseline at its peak (152.2 a node); this reserves
-/// 5,411,417,558 for it. The snapshot's reservation
+/// node) and [`LABEL_AHEAD_MARGIN_PERCENT`] more, and its write buffer
+/// ([`FLUSH_CHUNK_BYTES`]). Measured on 2026-11-01 through this path under
+/// the node's allocator, a synthetic leaf of 32,339,852 nodes held
+/// 4,920,782,848 bytes resident above the process's baseline at its peak
+/// (152.2 a node), with a write buffer of 4 MiB; this reserves
+/// 5,424,000,470 for it, with its 16 MiB. The snapshot's reservation
 /// (`crate::storage_snapshot::encoding_bytes`, 248 bytes a node, 8.0 GB
 /// there) also holds the leaf's data, replica and trees, which labelling
 /// ahead does not: with it, a node sharing 19.8 GB labelled two leaves of 32
@@ -193,7 +211,7 @@ const LABEL_AHEAD_MARGIN_PERCENT: u64 = 10;
 pub(crate) fn label_ahead_bytes(n: u64) -> u64 {
     let peak = quil_crypto::storage_proof::label_leaf_peak_bytes(n, &SdrParams::default());
     peak.saturating_add(peak / 100 * LABEL_AHEAD_MARGIN_PERCENT)
-        .saturating_add(WRITE_BUFFER_BYTES as u64)
+        .saturating_add(FLUSH_CHUNK_BYTES as u64)
 }
 
 /// Bytes a leaf's labels at `n` nodes take on disk: every layer, and a
@@ -1584,7 +1602,9 @@ impl Admitted<'_> {
         layers: &dyn Fn(usize),
     ) -> Result<Labelling> {
         let paths = paths(&self.dir, self.n);
-        let result = self.write(params, &paths, stop, layers);
+        let tally = FlushTally::default();
+        let result = self.write(params, &paths, stop, layers, &tally);
+        tally.log(self.epoch, &self.leaf_id, self.n, self.stage);
         let keep = match &result {
             Ok(Labelling::Labelled(labelled)) => labelled.kept,
             Ok(Labelling::Stopped { layers }) => *layers > 0,
@@ -1607,6 +1627,7 @@ impl Admitted<'_> {
         paths: &[PathBuf; 3],
         stop: &dyn Fn() -> bool,
         on_layers: &dyn Fn(usize),
+        tally: &FlushTally,
     ) -> Result<Labelling> {
         let [layers_path, columns_path, ready_path] = paths;
         fs::create_dir_all(&self.dir).map_err(|e| io("create", &self.dir, e))?;
@@ -1640,11 +1661,22 @@ impl Admitted<'_> {
             File::create(layers_path)
         }
         .map_err(|e| io("open", layers_path, e))?;
+        // Past the kept layers ([`LabelStore::admit`] cut the file there).
+        let offset = file
+            .metadata()
+            .map_err(|e| io("open", layers_path, e))?
+            .len();
         let mut reader = match kept {
             0 => None,
             _ => Some(File::open(layers_path).map_err(|e| io("open", layers_path, e))?),
         };
-        let mut writer = Some(BufWriter::with_capacity(WRITE_BUFFER_BYTES, file));
+        let mut writer = Some(ChunkedWriter::new(
+            file,
+            offset,
+            chunk_bytes(),
+            flush_gate(),
+            tally,
+        ));
         let (mut failure, mut shortfall, mut unread) = (None, None, None);
         // Whole layers on disk.
         let mut whole = kept;
@@ -1685,11 +1717,12 @@ impl Admitted<'_> {
                     refused.set(self.stage == Stage::Ahead);
                     return;
                 }
-                // Synced, then listed: a listed layer is whole on disk.
+                // Synced, then listed: a listed layer is whole on disk. Its
+                // chunks went to disk as they were written; the sync takes
+                // the rest and its size.
                 let written = writer.as_mut().map(|writer| {
                     let digest = write_layer(writer, layer)?;
-                    writer.flush()?;
-                    writer.get_ref().sync_data()?;
+                    writer.sync(false)?;
                     Ok::<_, std::io::Error>(digest)
                 });
                 match written {
@@ -1697,7 +1730,11 @@ impl Admitted<'_> {
                         self.wrote((layer.len() * NODE_BYTES) as u64);
                         manifest.layers.truncate(index);
                         manifest.layers.push(digest);
-                        match write_manifest(&dir, n, &manifest) {
+                        let listed = {
+                            let _permit = flush_gate().map(|gate| gate.take(tally));
+                            write_manifest(&dir, n, &manifest)
+                        };
+                        match listed {
                             Ok(()) => whole = index + 1,
                             Err(error) => {
                                 failure = Some(error);
@@ -1744,11 +1781,7 @@ impl Admitted<'_> {
         // tree is built on is slow, which this then logs.
         let finishing = Instant::now();
         if let Some(writer) = writer {
-            writer
-                .into_inner()
-                .map_err(|e| io("write", layers_path, e.into_error()))?
-                .sync_all()
-                .map_err(|e| io("sync", layers_path, e))?;
+            writer.finish().map_err(|e| io("write", layers_path, e))?;
             shortfall = self.room().err();
         }
         if let Some(shortfall) = shortfall {
@@ -1761,16 +1794,15 @@ impl Admitted<'_> {
                 kept: false,
             }));
         }
-        let mut writer = BufWriter::with_capacity(
-            WRITE_BUFFER_BYTES,
+        let mut writer = ChunkedWriter::new(
             File::create(columns_path).map_err(|e| io("create", columns_path, e))?,
+            0,
+            chunk_bytes(),
+            flush_gate(),
+            tally,
         );
         write_digests(&mut writer, &columns).map_err(|e| io("write", columns_path, e))?;
-        writer
-            .into_inner()
-            .map_err(|e| io("write", columns_path, e.into_error()))?
-            .sync_all()
-            .map_err(|e| io("sync", columns_path, e))?;
+        writer.finish().map_err(|e| io("write", columns_path, e))?;
         self.wrote((columns.len() * NODE_BYTES) as u64);
         let written = finishing.elapsed();
         let comm_c = commitment(columns);
@@ -2071,6 +2103,264 @@ fn read_layer(file: &mut File, offset: u64, into: &mut [Digest]) -> std::io::Res
         }
     }
     Ok(true)
+}
+
+/// Counts the chunks of labels being written to disk in this process
+/// ([`FLUSH_PERMITS`]): a writer takes a permit before it writes a chunk
+/// and gives it back once the chunk is on disk ([`ChunkedWriter`]).
+struct FlushGate {
+    permits: usize,
+    held: Mutex<usize>,
+    freed: Condvar,
+}
+
+/// The gate every leaf's labels are written through, on Linux: elsewhere a
+/// layer is written through the buffer, then synced whole, as before
+/// (2026-11-05).
+static FLUSH_GATE: FlushGate = FlushGate::new(FLUSH_PERMITS);
+
+fn flush_gate() -> Option<&'static FlushGate> {
+    cfg!(target_os = "linux").then_some(&FLUSH_GATE)
+}
+
+impl FlushGate {
+    const fn new(permits: usize) -> Self {
+        Self {
+            permits,
+            held: Mutex::new(0),
+            freed: Condvar::new(),
+        }
+    }
+
+    /// A permit, once fewer than `permits` are held: a wait for it is
+    /// counted in `tally`.
+    fn take(&self, tally: &FlushTally) -> FlushPermit<'_> {
+        let started = Instant::now();
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let waits = *held >= self.permits;
+        while *held >= self.permits {
+            held = self
+                .freed
+                .wait(held)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *held += 1;
+        drop(held);
+        if waits {
+            tally.waited(started.elapsed());
+        }
+        FlushPermit(self)
+    }
+}
+
+/// A permit of a [`FlushGate`], given back when dropped.
+struct FlushPermit<'a>(&'a FlushGate);
+
+impl Drop for FlushPermit<'_> {
+    fn drop(&mut self) {
+        let mut held = self.0.held.lock().unwrap_or_else(PoisonError::into_inner);
+        *held = held.saturating_sub(1);
+        drop(held);
+        self.0.freed.notify_one();
+    }
+}
+
+/// What writing a leaf's labels waited for and took ([`ChunkedWriter`]),
+/// logged once its labelling ends ([`Self::log`]).
+#[derive(Default)]
+struct FlushTally {
+    /// Chunks written and pushed to disk, and their bytes.
+    chunks: Cell<u64>,
+    bytes: Cell<u64>,
+    /// Waits for a permit ([`FlushGate::take`]), how long they took in all,
+    /// and the longest.
+    waits: Cell<u64>,
+    waited: Cell<Duration>,
+    longest: Cell<Duration>,
+    /// Time writing, pushing and syncing, holding a permit.
+    disk: Cell<Duration>,
+}
+
+impl FlushTally {
+    fn waited(&self, took: Duration) {
+        self.waits.set(self.waits.get() + 1);
+        self.waited.set(self.waited.get() + took);
+        self.longest.set(self.longest.get().max(took));
+    }
+
+    fn pushed(&self, bytes: u64, took: Duration) {
+        self.chunks.set(self.chunks.get() + 1);
+        self.bytes.set(self.bytes.get() + bytes);
+        self.disk.set(self.disk.get() + took);
+    }
+
+    fn synced(&self, took: Duration) {
+        self.disk.set(self.disk.get() + took);
+    }
+
+    /// One line for a labelling that wrote labels, as it ends.
+    fn log(&self, epoch: u64, leaf_id: &[u8], n: u64, stage: Stage) {
+        if self.chunks.get() == 0 {
+            return;
+        }
+        info!(epoch, leaf = %hex::encode(leaf_id), nodes = n, stage = stage.name(),
+            bytes = self.bytes.get(), chunks = self.chunks.get(),
+            permit_waits = self.waits.get(),
+            permit_wait_seconds = self.waited.get().as_secs_f64(),
+            longest_permit_wait_seconds = self.longest.get().as_secs_f64(),
+            disk_seconds = self.disk.get().as_secs_f64(),
+            permits = FLUSH_PERMITS, chunk_bytes = FLUSH_CHUNK_BYTES, scope = "local",
+            "storage labels written to disk a chunk at a time, at most `permits` chunks at \
+             once in this process, so the stores' synced commits wait behind no more; \
+             permit waits well above `disk_seconds` mean labelling outpaces this node's \
+             disk, which slows labelling, not the stores: check the disk's write speed if \
+             leaves miss their renewal's grace");
+    }
+}
+
+/// Where a leaf's labels are written a chunk at a time ([`ChunkedWriter`]):
+/// a file, or a test's own.
+trait ChunkSink: Write {
+    /// Write the `len` bytes written last, from byte `start`, to the disk
+    /// and wait until they are, without their metadata ([`Self::sync`]).
+    fn push(&mut self, start: u64, len: u64) -> std::io::Result<()>;
+
+    /// `sync_all` when `all`, else `sync_data`.
+    fn sync(&mut self, all: bool) -> std::io::Result<()>;
+}
+
+impl ChunkSink for File {
+    #[cfg(target_os = "linux")]
+    fn push(&mut self, start: u64, len: u64) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let range = |bytes: u64| {
+            libc::off64_t::try_from(bytes).map_err(|_| std::io::Error::other("past a file's end"))
+        };
+        let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE
+            | libc::SYNC_FILE_RANGE_WRITE
+            | libc::SYNC_FILE_RANGE_WAIT_AFTER;
+        // SAFETY: the descriptor is this file's, open while it is borrowed;
+        // the call reads and writes no memory of the process.
+        let pushed =
+            unsafe { libc::sync_file_range(self.as_raw_fd(), range(start)?, range(len)?, flags) };
+        if pushed == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// Left to the final sync, as before (2026-11-05).
+    #[cfg(not(target_os = "linux"))]
+    fn push(&mut self, _start: u64, _len: u64) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn sync(&mut self, all: bool) -> std::io::Result<()> {
+        if all {
+            self.sync_all()
+        } else {
+            self.sync_data()
+        }
+    }
+}
+
+/// The bytes of a chunk for this thread's label writers:
+/// [`FLUSH_CHUNK_BYTES`], unless a test sets fewer.
+fn chunk_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(bytes) = tests::TEST_CHUNK_BYTES.with(Cell::get) {
+        return bytes;
+    }
+    FLUSH_CHUNK_BYTES
+}
+
+/// Writes a leaf's labels to `inner` a chunk at a time: each chunk is
+/// written and pushed to disk ([`ChunkSink::push`]) holding a permit of its
+/// gate, before the next is written, so labels written and not yet on disk
+/// are at most a chunk a permit in the process ([`FLUSH_CHUNK_BYTES`]).
+/// Syncing ([`Self::sync`]) holds one too. Without a gate (elsewhere than
+/// Linux) it is a buffered writer.
+struct ChunkedWriter<'a, W: ChunkSink> {
+    inner: W,
+    buffer: Vec<u8>,
+    chunk: usize,
+    /// Where in `inner` the next chunk goes.
+    offset: u64,
+    gate: Option<&'a FlushGate>,
+    tally: &'a FlushTally,
+}
+
+impl<'a, W: ChunkSink> ChunkedWriter<'a, W> {
+    /// Writing to `inner` from byte `offset`, its end, in chunks of `chunk`
+    /// bytes.
+    fn new(
+        inner: W,
+        offset: u64,
+        chunk: usize,
+        gate: Option<&'a FlushGate>,
+        tally: &'a FlushTally,
+    ) -> Self {
+        let chunk = chunk.max(1);
+        Self {
+            inner,
+            buffer: Vec::with_capacity(chunk),
+            chunk,
+            offset,
+            gate,
+            tally,
+        }
+    }
+
+    /// Write the buffer to `inner` and push it to disk, holding a permit.
+    fn push(&mut self) -> std::io::Result<()> {
+        #[cfg(test)]
+        tests::crash_before_push();
+        let len = self.buffer.len() as u64;
+        let _permit = self.gate.map(|gate| gate.take(self.tally));
+        let started = Instant::now();
+        self.inner.write_all(&self.buffer)?;
+        self.inner.push(self.offset, len)?;
+        self.tally.pushed(len, started.elapsed());
+        self.offset += len;
+        self.buffer.clear();
+        Ok(())
+    }
+
+    /// Push what is buffered, then sync `inner` holding a permit:
+    /// `sync_all` when `all`, else `sync_data`, cheap once its chunks are
+    /// on disk.
+    fn sync(&mut self, all: bool) -> std::io::Result<()> {
+        self.flush()?;
+        let _permit = self.gate.map(|gate| gate.take(self.tally));
+        let started = Instant::now();
+        self.inner.sync(all)?;
+        self.tally.synced(started.elapsed());
+        Ok(())
+    }
+
+    /// [`Self::sync`] all of `inner`, its metadata too.
+    fn finish(mut self) -> std::io::Result<()> {
+        self.sync(true)
+    }
+}
+
+impl<W: ChunkSink> Write for ChunkedWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.buffer.len() >= self.chunk {
+            self.push()?;
+        }
+        let len = bytes.len().min(self.chunk - self.buffer.len());
+        self.buffer.extend_from_slice(&bytes[..len]);
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if !self.buffer.is_empty() {
+            self.push()?;
+        }
+        self.inner.flush()
+    }
 }
 
 fn write_digests(writer: &mut impl Write, digests: &[Digest]) -> std::io::Result<()> {
@@ -2729,6 +3019,196 @@ mod tests {
         assert_eq!(manifest(&other_dir).stage, Stage::Snapshot);
         store.discard(9, &member, other, n);
         assert_eq!(files_under(&other_dir), Vec::<PathBuf>::new());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    thread_local! {
+        /// Bytes of a chunk for this thread's label writers, instead of
+        /// [`FLUSH_CHUNK_BYTES`] ([`chunk_bytes`]).
+        pub(super) static TEST_CHUNK_BYTES: Cell<Option<usize>> = const { Cell::new(None) };
+        /// Chunks this thread's label writers push before the next push
+        /// panics, before it writes, as a process stopped between chunks.
+        static PUSHES_BEFORE_CRASH: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn crash_before_push() {
+        PUSHES_BEFORE_CRASH.with(|left| match left.get() {
+            Some(0) => {
+                left.set(None);
+                panic!("stopped between two chunks of labels");
+            }
+            Some(pushes) => left.set(Some(pushes - 1)),
+            None => {}
+        });
+    }
+
+    /// Writes nowhere, counting the chunk writers between their write and
+    /// the end of its push, and the bytes they wrote not yet pushed, as a
+    /// page cache's dirty pages: each and the most at once.
+    #[derive(Default)]
+    struct Gauge {
+        writing: AtomicU64,
+        most_writing: AtomicU64,
+        unpushed: AtomicU64,
+        most_unpushed: AtomicU64,
+    }
+
+    struct Probe(Arc<Gauge>);
+
+    impl Write for Probe {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let gauge = &self.0;
+            let writing = gauge.writing.fetch_add(1, Ordering::SeqCst) + 1;
+            gauge.most_writing.fetch_max(writing, Ordering::SeqCst);
+            let len = bytes.len() as u64;
+            let unpushed = gauge.unpushed.fetch_add(len, Ordering::SeqCst) + len;
+            gauge.most_unpushed.fetch_max(unpushed, Ordering::SeqCst);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ChunkSink for Probe {
+        fn push(&mut self, _start: u64, len: u64) -> std::io::Result<()> {
+            // A disk taking its time.
+            std::thread::sleep(Duration::from_millis(2));
+            self.0.unpushed.fetch_sub(len, Ordering::SeqCst);
+            self.0.writing.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn sync(&mut self, _all: bool) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// However many leaves write labels at once, no more than
+    /// [`FLUSH_PERMITS`] chunks of them are being written to disk at a time,
+    /// so labels written and not yet on disk stay below a chunk a permit,
+    /// and as many as that are, keeping a disk's queue busy (2026-11-05:
+    /// leaves ending their layers together synced about 13 GB at once, and
+    /// the stores' commits waited seconds for their fsyncs behind them).
+    #[test]
+    fn label_writers_push_at_most_their_permits_of_chunks_at_once() {
+        const WRITERS: usize = 16;
+        const CHUNK: usize = 4096;
+        let gate = FlushGate::new(FLUSH_PERMITS);
+        let gauge = Arc::new(Gauge::default());
+        let start = std::sync::Barrier::new(WRITERS);
+        let waits = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for writer in 0..WRITERS {
+                let (gate, gauge, start, waits) = (&gate, gauge.clone(), &start, &waits);
+                scope.spawn(move || {
+                    let tally = FlushTally::default();
+                    let mut chunked =
+                        ChunkedWriter::new(Probe(gauge), 0, CHUNK, Some(gate), &tally);
+                    start.wait();
+                    // Eight chunks and part of one, in a layer's pieces.
+                    let bytes = vec![writer as u8; 8 * CHUNK + 1_000];
+                    for piece in bytes.chunks(1_000) {
+                        chunked.write_all(piece).unwrap();
+                    }
+                    chunked.sync(false).unwrap();
+                    waits.fetch_add(tally.waits.get(), Ordering::SeqCst);
+                });
+            }
+        });
+        let most = gauge.most_writing.load(Ordering::SeqCst);
+        let unpushed = gauge.most_unpushed.load(Ordering::SeqCst);
+        assert!(
+            most <= FLUSH_PERMITS as u64 && unpushed <= (FLUSH_PERMITS * CHUNK) as u64,
+            "{WRITERS} label writers: {most} chunks written at once, {unpushed} bytes not on \
+             disk at once, past {FLUSH_PERMITS} permits of {CHUNK} bytes"
+        );
+        assert_eq!(
+            most, FLUSH_PERMITS as u64,
+            "as many chunks written at once as permits"
+        );
+        assert!(
+            waits.load(Ordering::SeqCst) > 0,
+            "writers past the permits waited, counted for the log"
+        );
+        assert_eq!(gauge.unpushed.load(Ordering::SeqCst), 0, "all pushed");
+    }
+
+    /// A labelling stopped between two chunks of a layer, as by a crash or
+    /// a kill, leaves every layer it listed whole on disk, and the next
+    /// attempt at the leaf's count goes on from them: a layer's chunks are
+    /// pushed as they are written, its last part with its sync, and only
+    /// then is it listed (2026-11-05). Stopped right after a layer is
+    /// listed, nothing of the next is on disk; stopped after the next
+    /// layer's first chunk, the next attempt cuts that chunk off. Either way
+    /// the leaf's labels end as the leaf labelled at once.
+    #[test]
+    fn a_labelling_stopped_between_chunks_keeps_its_listed_layers_whole() {
+        let dir = temp_dir("chunks");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let params = SdrParams::default();
+        let (member, n) = ([8u8; 32], 3_000u64);
+        let layer = n * NODE_BYTES as u64;
+        // A layer of 96,000 bytes spans 23 chunks and part of one, so three
+        // layers end within a chunk too.
+        const CHUNK: u64 = 4096;
+        TEST_CHUNK_BYTES.with(|chunk| chunk.set(Some(CHUNK as usize)));
+        for (leaf, pushed) in [(b"listed".as_slice(), 0u32), (b"chunked".as_slice(), 1)] {
+            let admitted = store.admit(9, &member, leaf, n, Stage::Ahead).unwrap();
+            let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                admitted.label_kept(&params, &|| false, &|done| {
+                    // Layer 3 is labelled, layers 0 to 2 listed.
+                    if done == 4 {
+                        PUSHES_BEFORE_CRASH.with(|left| left.set(Some(pushed)));
+                    }
+                })
+            }));
+            assert!(stopped.is_err(), "{leaf:?}: stopped between chunks");
+            let leaf_dir = store.leaf_dir(9, &member, leaf);
+            let layers_path = leaf_dir.join(format!("{n}.layers"));
+            assert_eq!(
+                fs::metadata(&layers_path).unwrap().len(),
+                3 * layer + u64::from(pushed) * CHUNK,
+                "{leaf:?}: the listed layers and the chunks pushed since are on disk"
+            );
+            let admitted = store.admit(9, &member, leaf, n, Stage::Ahead).unwrap();
+            assert_eq!(
+                admitted.resumes_from(),
+                3,
+                "{leaf:?}: each listed layer is whole"
+            );
+            let Labelling::Labelled(labelled) =
+                admitted.label_kept(&params, &|| false, &|_| {}).unwrap()
+            else {
+                panic!("{leaf:?}: labelled to its end");
+            };
+            assert!(labelled.kept);
+            assert_eq!(
+                fs::metadata(&layers_path).unwrap().len(),
+                params.layers as u64 * layer,
+                "{leaf:?}: what the stop left of the next layer is cut off"
+            );
+            let mut layers = Vec::new();
+            let key = quil_crypto::sdr::replica_key(&member, leaf, 9);
+            let (last, columns) =
+                quil_crypto::storage_proof::label_leaf(n, &key, &params, &mut |_, layer| {
+                    layers.push(layer.to_vec())
+                });
+            let comm_c = quil_crypto::storage_proof::MerkleTree::from_digests(columns)
+                .commitment(quil_crypto::storage_proof::Tree::Column);
+            assert_eq!((labelled.last, labelled.comm_c), (last, comm_c), "{leaf:?}");
+            let found = store.find(9, &member, leaf, |count| count == n).unwrap();
+            for (layer, v) in [(2usize, n - 1), (3, 0), (3, 1_234), (10, n - 1)] {
+                assert_eq!(
+                    found.label(layer, v),
+                    Some(hash::to_bytes(&layers[layer][v as usize])),
+                    "{leaf:?}: layer {layer} node {v}"
+                );
+            }
+        }
+        TEST_CHUNK_BYTES.with(|chunk| chunk.set(None));
+        assert_eq!(*store.pending(), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 
