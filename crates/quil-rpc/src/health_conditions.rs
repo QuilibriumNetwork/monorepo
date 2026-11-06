@@ -5,8 +5,13 @@
 //! evidence and the operator's next check, logs it when it starts, at most
 //! every [`REPEAT_INTERVAL_MS`] while it lasts and when it ends, and serves
 //! the current ones in [`HealthConditions`]. Clients only render them, and
-//! every condition served has its start and end line: one recurring within
-//! [`CLEAR_HOLD_MS`] of clearing continues, any other starts anew.
+//! every condition served has its start and end line.
+//!
+//! A condition is served only while its last evaluation found it: one clear
+//! is not served. It ends after [`CLEAR_HOLD_MS`] clear; one recurring
+//! sooner is served again under its first start, without a line, and its
+//! lasting and end lines count those clear spells and the seconds they
+//! lasted, so the log can be matched against what a client showed.
 //!
 //! Missing or old observations establish no condition: a shard's clock
 //! restarts after a gap of [`OBSERVATION_GAP_MS`], an unchanged span counts
@@ -164,6 +169,9 @@ struct Current {
     since_ms: u64,
     last_logged_ms: u64,
     clear_since_ms: Option<u64>,
+    /// The clear spells it recurred from, and their total length.
+    clear_spells: u32,
+    unserved_ms: u64,
     condition: HealthCondition,
 }
 
@@ -176,6 +184,10 @@ pub enum Transition {
     Lasting {
         condition: HealthCondition,
         duration_ms: u64,
+        /// The clear spells it recurred from so far, and their total
+        /// length, during which it was not served.
+        clear_spells: u32,
+        unserved_ms: u64,
     },
     Ended {
         kind: ConditionKind,
@@ -183,6 +195,10 @@ pub enum Transition {
         duration_ms: u64,
         /// How long it was clear, and so not served, before it ended.
         clear_ms: u64,
+        /// Its clear spells from start to end, this last one included, and
+        /// their total length, during which it was not served.
+        clear_spells: u32,
+        unserved_ms: u64,
         /// Its inputs went stale rather than the progress resuming.
         unobserved: bool,
     },
@@ -506,10 +522,13 @@ impl HealthRegistry {
                 return None;
             }
             let current = self.current.remove(&key)?;
+            let clear_ms = now_ms.saturating_sub(clear_since);
             return Some(Transition::Ended {
                 kind,
                 duration_ms: now_ms.saturating_sub(current.since_ms),
-                clear_ms: now_ms.saturating_sub(clear_since),
+                clear_ms,
+                clear_spells: current.clear_spells + u32::from(clear_ms > 0),
+                unserved_ms: current.unserved_ms + clear_ms,
                 unobserved: tracked == 0,
             });
         }
@@ -528,13 +547,19 @@ impl HealthRegistry {
             omitted_shards,
         };
         if let Some(current) = self.current.get_mut(&key) {
-            current.clear_since_ms = None;
+            // It recurred within its clear hold: count the spell.
+            if let Some(clear_since) = current.clear_since_ms.take() {
+                current.clear_spells += 1;
+                current.unserved_ms += now_ms.saturating_sub(clear_since);
+            }
             current.condition = condition(current.since_ms);
             if now_ms.saturating_sub(current.last_logged_ms) >= REPEAT_INTERVAL_MS {
                 current.last_logged_ms = now_ms;
                 return Some(Transition::Lasting {
                     condition: current.condition.clone(),
                     duration_ms: now_ms.saturating_sub(current.since_ms),
+                    clear_spells: current.clear_spells,
+                    unserved_ms: current.unserved_ms,
                 });
             }
             return None;
@@ -543,6 +568,8 @@ impl HealthRegistry {
             since_ms: now_ms,
             last_logged_ms: now_ms,
             clear_since_ms: None,
+            clear_spells: 0,
+            unserved_ms: 0,
             condition: condition(now_ms),
         };
         let started = current.condition.clone();
@@ -550,7 +577,8 @@ impl HealthRegistry {
         Some(Transition::Started { condition: started })
     }
 
-    /// The current conditions, worst first, and every kind's source.
+    /// The conditions found at the last evaluation, worst first (a clear
+    /// one is not served), and every kind's source.
     pub fn snapshot(&self) -> HealthConditions {
         let mut conditions: Vec<HealthCondition> = self
             .current
@@ -673,10 +701,13 @@ pub fn log_transition(transition: &Transition) {
         Transition::Lasting {
             condition: c,
             duration_ms,
+            clear_spells,
+            unserved_ms,
         } => {
             warn!(condition = kind_label(c.kind), scope = scope_label(c.scope),
                 affected = c.affected, tracked = c.tracked, shards = %shard_names(c),
                 widest_window_secs = widest_window(c), duration_secs = duration_ms / 1000,
+                clear_spells, unserved_secs = unserved_ms / 1000,
                 action = action_text(c.action), text = %notice_text(c),
                 "health condition lasting");
         }
@@ -684,12 +715,16 @@ pub fn log_transition(transition: &Transition) {
             kind,
             duration_ms,
             clear_ms,
+            clear_spells,
+            unserved_ms,
             unobserved,
         } => {
             info!(
                 condition = kind_label(*kind as i32),
                 duration_secs = duration_ms / 1000,
                 clear_secs = clear_ms / 1000,
+                clear_spells,
+                unserved_secs = unserved_ms / 1000,
                 reason = if *unobserved {
                     "no fresh observations"
                 } else {
@@ -1155,6 +1190,87 @@ mod tests {
             ended,
             vec![(90_000, 60_000)],
             "the end line's duration from its start and its clear spell"
+        );
+    }
+
+    /// A condition is not served while clear. One that recurs within its
+    /// clear hold continues under its first start without a line, and its
+    /// lasting and end lines count those clear spells and their length, so
+    /// the log accounts for each time a client showed nothing.
+    #[test]
+    fn an_end_line_counts_the_clear_spells_a_condition_was_not_served() {
+        let none = |_: &[u8]| None;
+        let kind = ConditionKind::LocalAppFramesUnchanged;
+        let mut reg = HealthRegistry::default();
+        let mut step = |secs: u64, advanced: u64| {
+            let now = T0 + secs * 1000;
+            reg.observe_workers(vec![worker(1, 1, now, T0 + advanced * 1000)], now);
+            let lines = reg.evaluate(now, &none);
+            (lines, reg.snapshot())
+        };
+        let served = |s: &HealthConditions| {
+            s.conditions
+                .iter()
+                .find(|c| c.kind == kind as i32)
+                .map(|c| c.since_unix_ms)
+        };
+        let (lines, _) = step(45, 0);
+        assert!(lines.is_empty(), "{lines:?}");
+        let (lines, s) = step(60, 0);
+        assert!(matches!(lines.as_slice(), [Transition::Started { .. }]));
+        let since = served(&s).unwrap();
+        // An advance at 30 s, first reported at 75 s: clear for 15 s.
+        let (lines, s) = step(75, 30);
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(served(&s), None, "not served while clear at 75s");
+        // Unchanged 60 s at 90 s: served again under its first start.
+        let (lines, s) = step(90, 30);
+        assert!(lines.is_empty(), "a recurrence adds no line: {lines:?}");
+        assert_eq!(served(&s), Some(since), "served under its first start");
+        let mut lasting = Vec::new();
+        for secs in (105..=690).step_by(15) {
+            let (lines, s) = step(secs, 30);
+            assert_eq!(served(&s), Some(since), "served at {secs}s");
+            lasting.extend(lines.into_iter().filter_map(|t| match t {
+                Transition::Lasting {
+                    clear_spells,
+                    unserved_ms,
+                    ..
+                } => Some((clear_spells, unserved_ms)),
+                _ => None,
+            }));
+        }
+        assert_eq!(
+            lasting,
+            vec![(1, 15_000)],
+            "the lasting line counts the unserved spell so far"
+        );
+        // Progress resumes at 705 s: clear, and ended after 60 s clear.
+        for secs in (705..=750).step_by(15) {
+            let (lines, s) = step(secs, secs);
+            assert!(lines.is_empty(), "{lines:?}");
+            assert_eq!(served(&s), None, "not served while clear at {secs}s");
+        }
+        let (lines, s) = step(765, 765);
+        assert_eq!(served(&s), None);
+        let ended: Vec<_> = lines
+            .iter()
+            .filter_map(|t| match t {
+                Transition::Ended {
+                    duration_ms,
+                    clear_ms,
+                    clear_spells,
+                    unserved_ms,
+                    ..
+                } => Some((*duration_ms, *clear_ms, *clear_spells, *unserved_ms)),
+                _ => None,
+            })
+            .collect();
+        // Started at 60 s, clear 75-90 s and 705-765 s, ended at 765 s.
+        assert_eq!(
+            ended,
+            vec![(705_000, 60_000, 2, 75_000)],
+            "the end line counts each unserved clear spell and their length"
         );
     }
 
