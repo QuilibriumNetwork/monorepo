@@ -1323,6 +1323,14 @@ impl WorkerOnlyNode {
         let global = self.hypergraph.clone();
         let public_key = self.local_bls_pubkey.clone();
         let core_id = self.config.core_id;
+        let mesh_p2p = p2p.clone();
+        let mesh_topic = topic.clone();
+        let mesh_sampler = ready_handle.mesh_sampler();
+        tokio::spawn(async move {
+            mesh_sampler
+                .run(|| mesh_p2p.mesh_peer_count(mesh_topic.clone()))
+                .await;
+        });
         tokio::spawn(async move {
             let sole_member = || {
                 let frame = clock

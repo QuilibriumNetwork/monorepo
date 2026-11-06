@@ -810,7 +810,7 @@ impl ThreadWorkerManager {
                 }
 
                 // Create per-thread tokio runtime
-                let rt = crate::worker_stall::worker_runtime()
+                let rt = crate::worker_stall::worker_runtime(core_id)
                     .expect("failed to create worker tokio runtime");
 
                 // A watchdog on another thread names what blocks this one

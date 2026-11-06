@@ -489,10 +489,12 @@ impl StallWatch {
 
 /// A worker thread's current-thread runtime: it marks the thread while parked,
 /// so that a stall with no task running names a thread that was not run, a
-/// host's problem, apart from one in a task the probe does not mark.
-pub(crate) fn worker_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+/// host's problem, apart from one in a task the probe does not mark. Its
+/// blocking threads log as this worker, as the thread itself does.
+pub(crate) fn worker_runtime(core_id: u32) -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        .on_thread_start(move || route_this_thread(core_id))
         .on_thread_park(quil_types::thread_probe::parked)
         .on_thread_unpark(quil_types::thread_probe::unparked)
         .build()
@@ -519,6 +521,14 @@ static LOG_ROUTE: OnceLock<LogRoute> = OnceLock::new();
 /// the node's per-thread log tag (`None` restores the watchdog's own).
 pub fn route_logs_with(route: LogRoute) {
     let _ = LOG_ROUTE.set(route);
+}
+
+/// Tag this thread's lines as worker `core_id`'s, as that worker's own thread
+/// is, for a thread working for it. No route set: the process is that worker.
+pub(crate) fn route_this_thread(core_id: u32) {
+    if let Some(route) = LOG_ROUTE.get() {
+        route(Some(core_id));
+    }
 }
 
 fn watchdog() -> &'static Mutex<StallWatch> {
@@ -643,6 +653,27 @@ fn log(report: &StallReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    std::thread_local! {
+        static ROUTED: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    }
+
+    fn record_route(core_id: Option<u32>) {
+        ROUTED.with(|routed| routed.set(core_id));
+    }
+
+    /// What a worker offloads logs under its core, not the master's.
+    #[test]
+    fn a_workers_blocking_tasks_log_as_that_worker() {
+        route_logs_with(record_route);
+        let rt = worker_runtime(7).unwrap();
+        let routed = rt
+            .block_on(async {
+                tokio::task::spawn_blocking(|| ROUTED.with(std::cell::Cell::get)).await
+            })
+            .unwrap();
+        assert_eq!(routed, Some(7));
+    }
     use quil_types::thread_probe::{install, probed, section, step};
 
     /// A worker thread with nothing to run is marked parked, not as an
@@ -652,7 +683,7 @@ mod tests {
         let probe = ThreadProbe::new();
         let worker_probe = probe.clone();
         let worker = std::thread::spawn(move || {
-            let rt = worker_runtime().unwrap();
+            let rt = worker_runtime(5).unwrap();
             let _installed = install(worker_probe);
             rt.block_on(async { tokio::time::sleep(Duration::from_millis(1500)).await });
         });

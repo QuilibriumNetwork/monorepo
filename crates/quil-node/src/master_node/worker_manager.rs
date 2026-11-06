@@ -1395,6 +1395,7 @@ pub(crate) fn init(
                                         // readiness barrier below; the routing registry owns the
                                         // original handle.
                                         let ready_handle = handle.clone();
+                                        let mesh_sampler = handle.mesh_sampler();
                                         // Push the current halt state to the
                                         // freshly-activated engine before
                                         // registering it. Without this the
@@ -1424,6 +1425,15 @@ pub(crate) fn init(
                                         let registry_for_sub = drain_registry.clone();
                                         let pubkey_for_sub = drain_pubkey.clone();
                                         let clock_for_sub = drain_clock.clone();
+                                        // The block topic's mesh, for the worker's delivery summary.
+                                        let mesh_p2p = drain_p2p.clone();
+                                        let mesh_topic = quil_engine::bitmasks::shard_cw_bitmask(&filter);
+                                        drain_spawner.detach("shard-mesh-sample", async move {
+                                            mesh_sampler
+                                                .run(|| mesh_p2p.mesh_peer_count(mesh_topic.clone()))
+                                                .await;
+                                            Ok(())
+                                        });
                                         drain_spawner.detach("shard-subscribe", async move {
                                             for topic in shard_topics(&filter_for_sub) {
                                                 if let Err(e) = p2p.subscribe_confirmed(topic).await {

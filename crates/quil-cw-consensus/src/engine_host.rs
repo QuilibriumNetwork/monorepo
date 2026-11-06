@@ -28,6 +28,7 @@ use crate::adapters::{
 };
 use crate::falcon_base::FalconPublicKey;
 use crate::falcon_simplex::SimplexFalconScheme;
+pub use crate::journal_context::ThreadTag;
 use crate::p2p_bridge::{build_channel, build_vote_channel, Outbound};
 use commonware_p2p::Message;
 use commonware_runtime::{tokio as cw_tokio, Runner as _};
@@ -56,6 +57,8 @@ pub struct GlobalEngineParams {
     pub liveness: Option<Arc<crate::adapters::Liveness>>,
     /// Lets this node, as leader, skip notarized parents it cannot extend.
     pub parent_fallback: Option<Arc<dyn ParentFallback>>,
+    /// Tags the host's threads and every task's, for the owner's log lines.
+    pub thread_tag: Option<ThreadTag>,
 }
 
 /// Which certified parents a leader can build on, in view numbers: the
@@ -111,6 +114,7 @@ impl GlobalEngineParams {
             skip_timeout: 5,
             liveness: None,
             parent_fallback: None,
+            thread_tag: None,
         }
     }
 
@@ -142,6 +146,14 @@ impl GlobalEngineParams {
         self.finalized_floor = Some(finalization);
         Ok(self)
     }
+}
+
+/// The member [`build_global_engine`]'s elector picks to lead `view` of
+/// committee generation `epoch`, by its index in the sorted committee of
+/// `members`.
+pub fn round_robin_leader(epoch: u64, view: u64, members: usize) -> Option<u32> {
+    let members = u64::try_from(members).ok().filter(|members| *members > 0)?;
+    u32::try_from(epoch.wrapping_add(view) % members).ok()
 }
 
 /// The concrete simplex `Engine` type for Quilibrium global consensus.
@@ -448,6 +460,7 @@ where
 
     let shutdown = shutdown.unwrap_or_default();
     let registration = hosts.register(&shutdown);
+    let thread_tag = params.thread_tag.clone();
     // Named for its journal partition (`global`, `app-<filter>`), so a crash
     // on it, a stack overflow say, names the shard whose engine it ran.
     let host = std::thread::Builder::new().name(format!("cw-{}", params.partition));
@@ -456,6 +469,9 @@ where
         let Some(_registration) = registration else {
             return;
         };
+        if let Some(tag) = thread_tag.as_ref() {
+            tag();
+        }
         let cfg = match storage_directory {
             Some(dir) => {
                 let removed = remove_torn_blobs(&dir);
@@ -472,7 +488,8 @@ where
         // cleanup below and let detached I/O drop the runtime from within it.
         let runner = cw_tokio::Runner::new(cfg.with_catch_panics(true));
         runner.start(move |context| async move {
-            let context = crate::journal_context::JournalContext::new(context);
+            let context =
+                crate::journal_context::JournalContext::new(context).with_thread_tag(thread_tag);
             let engine = build_global_engine(
                 context.child("consensus"),
                 scheme,
@@ -664,6 +681,111 @@ mod host_registry_tests {
         fn drop(&mut self) {
             self.released.store(true, Ordering::SeqCst);
         }
+    }
+
+    std::thread_local! {
+        static TAGGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Sends, for each call from the engine's actors, whether its thread is
+    /// tagged, on behalf of every line a member's seams log there.
+    struct TagProbe(Mutex<mpsc::Sender<bool>>);
+    impl TagProbe {
+        fn report(&self) {
+            let _ = self
+                .0
+                .lock()
+                .unwrap()
+                .send(TAGGED.with(std::cell::Cell::get));
+        }
+    }
+    impl FrameFinalizer for TagProbe {
+        fn on_notarized(&self, _: u64, _: Digest, _: Option<Vec<u8>>) {
+            self.report();
+        }
+        fn on_finalized(&self, _: u64, _: Digest, _: Option<Vec<u8>>, _: Option<Vec<u8>>, _: bool) {
+            self.report();
+        }
+    }
+    impl GlobalProposer for TagProbe {
+        fn propose(&self, view: u64, parent: Digest) -> Option<(Digest, Vec<u8>)> {
+            self.report();
+            Proposer.propose(view, parent)
+        }
+        fn verify(
+            &self,
+            view: u64,
+            parent: Digest,
+            digest: Digest,
+            bytes: Option<Vec<u8>>,
+        ) -> bool {
+            self.report();
+            Proposer.verify(view, parent, digest, bytes)
+        }
+    }
+
+    /// The reporter and the automaton run on the runtime's own threads, not
+    /// on the host thread: their lines carry the owner's tag all the same.
+    #[test]
+    fn a_hosts_reporter_and_automaton_run_on_tagged_threads() {
+        let hosts: &'static Hosts = Box::leak(Box::new(Hosts::new()));
+        let directory = Directory::new();
+        let key = FalconPrivateKey::random(commonware_utils::test_rng());
+        let peers: Arc<[FalconPublicKey]> = vec![key.public_key()].into();
+        let set = peers.to_vec().try_into().unwrap();
+        let scheme = SimplexFalconScheme::signer(b"host-tag", set, key).unwrap();
+        let (tx, reports) = mpsc::channel();
+        let probe = Arc::new(TagProbe(Mutex::new(tx)));
+        let mut params =
+            GlobalEngineParams::new("tag", 1, crate::adapters::digest_from_identity([0; 32]));
+        params.thread_tag = Some(Arc::new(|| TAGGED.with(|tagged| tagged.set(true))));
+        let handle = spawn_host_in(
+            hosts,
+            scheme,
+            peers,
+            probe.clone(),
+            Arc::new(Sink),
+            probe.clone(),
+            BlockStore::new(),
+            params,
+            Some(directory.0.clone()),
+            None,
+        );
+        drop(probe);
+        for _ in 0..12 {
+            let tagged = reports.recv_timeout(Duration::from_secs(20)).unwrap();
+            assert!(tagged, "a consensus actor ran on an untagged thread");
+        }
+        assert_eq!(hosts.stop(), 1);
+        assert_eq!(hosts.wait(Duration::from_secs(10)), 0);
+        handle.thread.join().unwrap();
+    }
+
+    /// The elector consensus runs: an unseeded round robin.
+    #[test]
+    fn round_robin_leader_is_the_one_the_engine_elects() {
+        use commonware_consensus::simplex::elector::{Config as ElectorConfig, Elector as _};
+        use commonware_consensus::types::Round;
+        let mut rng = commonware_utils::test_rng();
+        let keys: Vec<FalconPublicKey> = (0..5)
+            .map(|_| FalconPrivateKey::random(&mut rng).public_key())
+            .collect();
+        let set: commonware_utils::ordered::Set<FalconPublicKey> = keys.try_into().unwrap();
+        let elector = <RoundRobin<Sha256> as ElectorConfig<SimplexFalconScheme>>::build(
+            RoundRobin::default(),
+            &set,
+        );
+        for epoch in [0, 3, 41] {
+            for view in [1, 2, 3, 4, 5, 6, 97, 1_000_003] {
+                let round = Round::new(Epoch::new(epoch), View::new(view));
+                assert_eq!(
+                    round_robin_leader(epoch, view, 5),
+                    Some(elector.elect(round, None).get()),
+                    "epoch {epoch} view {view}"
+                );
+            }
+        }
+        assert_eq!(round_robin_leader(1, 1, 0), None, "no committee");
     }
 
     /// A one-member host listed in `hosts`; returns its handle, the views

@@ -361,6 +361,8 @@ pub struct AppEngineHandle {
     frame_tx: Option<mpsc::Sender<Vec<u8>>>,
     /// Consensus messages dropped because the engine's queue was full.
     inbound_dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// Keeps the engine's view of its consensus topic's mesh current.
+    mesh_sampler: crate::app_body_delivery::MeshPeerSampler,
     sizes: SharedAppEngineSizes,
     execution: crate::worker_execution::SharedWorkerExecution,
     fee_snapshot: Arc<std::sync::Mutex<Option<quil_execution::pricing::AppFeeSnapshot>>>,
@@ -369,6 +371,12 @@ pub struct AppEngineHandle {
 }
 
 impl AppEngineHandle {
+    /// For whoever holds this engine's p2p handle: run it to keep the mesh
+    /// size in the engine's delivery summary current.
+    pub fn mesh_sampler(&self) -> crate::app_body_delivery::MeshPeerSampler {
+        self.mesh_sampler.clone()
+    }
+
     pub fn execution(&self) -> quil_types::proto::node::WorkerExecution {
         self.execution.snapshot()
     }
@@ -402,6 +410,7 @@ impl AppEngineHandle {
             msg_tx,
             frame_tx: None,
             inbound_dropped: Default::default(),
+            mesh_sampler: Default::default(),
             sizes: SharedAppEngineSizes::new(),
             execution: Default::default(),
             fee_snapshot: Arc::new(std::sync::Mutex::new(None)),
@@ -3091,6 +3100,12 @@ pub struct AppConsensusEngine {
     session_liveness_logged: Option<std::time::Instant>,
     /// What [`AppEngineHandle::send`] dropped ([`Self::log_inbound_drops`]).
     inbound_dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// How finalized frames' bodies reach this worker, across its hosts.
+    body_delivery: Arc<crate::app_body_delivery::BodyDelivery>,
+    /// This shard's mesh size, sampled by the holder of the p2p handle.
+    mesh_peers: crate::app_body_delivery::MeshPeers,
+    /// The host's 'block not delivered' refusals at the last summary.
+    block_not_delivered_seen: u64,
     /// The total last reported, and when.
     inbound_drops_reported: (u64, std::time::Instant),
     /// When the materialized height was last logged at info
@@ -3212,6 +3227,7 @@ impl AppConsensusEngine {
         let execution = crate::worker_execution::SharedWorkerExecution::default();
         execution.engine_started();
         execution.state("starting", "waiting for transport");
+        let mesh_peers = crate::app_body_delivery::MeshPeers::default();
         let inbound_dropped: Arc<std::sync::atomic::AtomicU64> = Default::default();
         let replay_costs: Arc<crate::replay_split::SharedReplayCosts> = Default::default();
         let handle = AppEngineHandle {
@@ -3225,6 +3241,7 @@ impl AppConsensusEngine {
             msg_tx: msg_tx.clone(),
             frame_tx: Some(frame_tx.clone()),
             inbound_dropped: inbound_dropped.clone(),
+            mesh_sampler: mesh_peers.sampler(),
             sizes: sizes.clone(),
         };
 
@@ -3335,6 +3352,9 @@ impl AppConsensusEngine {
             session_liveness: None,
             session_liveness_logged: None,
             inbound_dropped,
+            body_delivery: Default::default(),
+            mesh_peers,
+            block_not_delivered_seen: 0,
             inbound_drops_reported: (0, std::time::Instant::now()),
             materialized_log: MaterializedLog::default(),
             presence: Default::default(),
@@ -7589,9 +7609,7 @@ impl AppConsensusEngine {
                             }
                         }
                         Some(AppEngineMessage::CwIn { channel, from, data }) => {
-                            if let Some(count) = self.cw_inbound.get_mut(channel as usize) {
-                                *count += 1;
-                            }
+                            self.count_cw_inbound(channel, data.len());
                             if quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&from).is_none() {
                                 self.cw_unresolved += 1;
                             } else {
@@ -7748,6 +7766,7 @@ impl AppConsensusEngine {
                     // messages that the barrier is meant to prevent.
                     self.maintain_committee_session().await;
                     self.log_session_liveness();
+                    self.log_body_delivery(std::time::Instant::now());
                     self.report_presence();
                     self.track_own_votes();
                     self.publish_lagging_voter(std::time::Instant::now());
@@ -8220,6 +8239,49 @@ impl AppConsensusEngine {
             secs = now.saturating_duration_since(at).as_secs(), scope = "this node's worker",
             action = "this worker's engine fell behind its queue: look for 'worker thread blocked' lines of this worker; it follows the shard by archive replay until the frames it missed arrive",
             "consensus messages for this worker were dropped: its engine's queue was full");
+    }
+
+    /// Count one inbound consensus message of `bytes` on `channel`.
+    fn count_cw_inbound(&mut self, channel: u64, bytes: usize) {
+        if let Some(count) = self.cw_inbound.get_mut(channel as usize) {
+            *count += 1;
+        }
+        if channel == crate::cw_app_seams::CW_APP_BLOCK_CHANNEL {
+            self.body_delivery.block_in(bytes);
+        }
+    }
+
+    /// The delivery summary of this shard's frame bodies, and the warning when
+    /// their stalls take a real share of this worker's time
+    /// ([`crate::app_body_delivery`]).
+    fn log_body_delivery(&mut self, now: std::time::Instant) {
+        use quil_cw_consensus::handoff::automaton::BLOCK_NOT_DELIVERED;
+        let summary = self.body_delivery.take_summary(now);
+        let signal = self.body_delivery.share_signal(now);
+        if summary.is_none() && signal.is_none() {
+            return;
+        }
+        let refused = self
+            .session_liveness
+            .as_ref()
+            .map(|liveness| liveness.decisions().refused)
+            .unwrap_or_default();
+        let not_delivered = refused.get(BLOCK_NOT_DELIVERED).copied().unwrap_or(0);
+        if let Some(summary) = summary {
+            let seen = std::mem::replace(&mut self.block_not_delivered_seen, not_delivered);
+            // A new host's count starts over.
+            let since = not_delivered.checked_sub(seen).unwrap_or(not_delivered);
+            crate::app_body_delivery::log_summary(
+                &self.filter,
+                &summary,
+                &self.mesh_peers.shown(),
+                since,
+            );
+        }
+        if let Some(signal) = signal {
+            let other = refused.values().sum::<u64>() - not_delivered;
+            crate::app_body_delivery::log_share(&self.filter, &signal, not_delivered, other);
+        }
     }
 
     /// Once a minute, what the running session's consensus has seen: whether
@@ -10546,6 +10608,13 @@ impl AppConsensusEngine {
             });
         // This host numbers its views afresh; keep what is held collectable.
         self.message_collector.rebase_ranks();
+        let core_id = self.core_id;
+        let reporting = crate::app_body_delivery::HostReporting {
+            delivery: self.body_delivery.clone(),
+            thread_tag: Some(Arc::new(move || {
+                crate::worker_stall::route_this_thread(core_id)
+            })),
+        };
         let handle = crate::cw_app_seams::activate_app_consensus_cw(
             scheme,
             peers,
@@ -10568,6 +10637,7 @@ impl AppConsensusEngine {
             session_host,
             self.private_parents.clone(),
             finalized_records,
+            reporting,
         )?;
         if let Some(session) = session.as_ref() {
             info!(filter = %hex::encode(&self.filter), generation = session.generation,
@@ -22923,6 +22993,85 @@ mod tests {
     }
 
     #[test]
+    fn the_engine_logs_each_intervals_refusals_mesh_and_the_stall_share() {
+        use crate::outage::test_logs::CapturedLogs;
+        use quil_cw_consensus::adapters::{Liveness, Step};
+        use quil_cw_consensus::handoff::automaton::BLOCK_NOT_DELIVERED;
+        use std::time::Duration;
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, handle, _events) = test_engine(registry);
+        let liveness = Arc::new(Liveness::default());
+        engine.session_liveness = Some(liveness.clone());
+        let refuse = |view, reason| {
+            liveness.note(Step::Verify, view, reason, "");
+            liveness.settle(Step::Verify, view, false);
+        };
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        let start = std::time::Instant::now();
+        engine.log_body_delivery(start);
+        engine.count_cw_inbound(crate::cw_app_seams::CW_APP_BLOCK_CHANNEL, 700);
+        engine.count_cw_inbound(0, 500);
+        refuse(1, BLOCK_NOT_DELIVERED);
+        refuse(2, BLOCK_NOT_DELIVERED);
+        engine.log_body_delivery(start + Duration::from_secs(299));
+        assert!(logs.lines_with("body delivery summary").is_empty());
+        engine.log_body_delivery(start + Duration::from_secs(300));
+        refuse(3, BLOCK_NOT_DELIVERED);
+        refuse(4, "not at the parent frame");
+        refuse(5, "not at the parent frame");
+        engine.log_body_delivery(start + Duration::from_secs(600));
+        let lines = logs.lines_with("body delivery summary");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("refused_block_not_delivered=2"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains("mesh_peers=unknown"), "{}", lines[0]);
+        assert!(lines[0].contains("block_bytes_in=700"), "{}", lines[0]);
+        assert!(
+            lines[1].contains("refused_block_not_delivered=1"),
+            "{}",
+            lines[1]
+        );
+        // A new host's total starts over rather than reading as nothing new.
+        let liveness = Arc::new(Liveness::default());
+        engine.session_liveness = Some(liveness.clone());
+        liveness.note(Step::Verify, 1, BLOCK_NOT_DELIVERED, "");
+        liveness.settle(Step::Verify, 1, false);
+        engine.log_body_delivery(start + Duration::from_secs(900));
+        let lines = logs.lines_with("body delivery summary");
+        assert!(
+            lines[2].contains("refused_block_not_delivered=1"),
+            "{}",
+            lines[2]
+        );
+        // The share warning weighs the same refusals.
+        liveness.note(Step::Verify, 2, "not at the parent frame", "");
+        liveness.settle(Step::Verify, 2, false);
+        liveness.note(Step::Verify, 3, "not at the parent frame", "");
+        liveness.settle(Step::Verify, 3, false);
+        engine
+            .body_delivery
+            .stall_noted(start + Duration::from_secs(1000));
+        engine
+            .body_delivery
+            .stall_ended(start + Duration::from_secs(1040));
+        engine.log_body_delivery(start + Duration::from_secs(1050));
+        let warned = logs.lines_with("over 1% of the last hour");
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(
+            warned[0].contains("refused_block_not_delivered=1"),
+            "{}",
+            warned[0]
+        );
+        assert!(warned[0].contains("refused_other=2"), "{}", warned[0]);
+        assert!(warned[0].contains("disk"), "{}", warned[0]);
+        drop(handle);
+    }
+
+    #[test]
     fn app_fee_snapshot_requires_matching_cursor_and_live_engine() {
         let (msg_tx, receiver) = mpsc::channel(1);
         let materialized = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -22935,6 +23084,7 @@ mod tests {
             msg_tx,
             frame_tx: None,
             inbound_dropped: Default::default(),
+            mesh_sampler: Default::default(),
             sizes: SharedAppEngineSizes::new(),
             materialized: materialized.clone(),
             fee_snapshot: stored.clone(),
