@@ -905,6 +905,20 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         early_fence_frame = %if early_fence_from == u64::MAX { "never".to_string() } else { early_fence_from.to_string() },
         "committee handoff fences of unsealed closing sessions two epochs after their request"
     );
+    let signed_frame_from = quil_types::consensus::init_signed_frame_activation_frame(args.network);
+    info!(
+        signed_frame_activation_frame = %if signed_frame_from == u64::MAX { "never".to_string() } else { signed_frame_from.to_string() },
+        "included app frames recording their signers' last signed frame and sessions' tip-advance frames"
+    );
+    let silent =
+        quil_execution::global_intrinsic::handoff::silence::init_silent_fence(args.network);
+    info!(
+        silent_fence_frame = %if silent.frame == u64::MAX || signed_frame_from == u64::MAX { "never".to_string() } else { silent.frame.to_string() },
+        window_frames = silent.window,
+        evidence_shards = silent.evidence,
+        "committee sessions stalled by provers silent on every shard fenced early without them \
+         (not before one epoch after the signed-frame activation frame)"
+    );
     let leaver_currency_from =
         quil_execution::prover_registry::init_leaver_currency_frame(args.network);
     info!(

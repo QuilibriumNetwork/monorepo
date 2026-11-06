@@ -2302,11 +2302,14 @@ pub fn set_global_sync_authentication_frame_for_thread(frame: Option<u64>) {
 /// counts an allocation as fresh by that field instead of
 /// `LastActiveFrameNumber`, which confirms also advance. Recording the field
 /// changes committed allocation trees, so every archive must start at the same
-/// frame. Without one (`u64::MAX`) no frame records the field and the census
-/// keeps reading `LastActiveFrameNumber`. Mainnet: 1,024,560, the first frame
-/// of epoch 1423, which GLOBAL cannot reach before 2026-11-07 00:00 UTC even at
-/// ten seconds a frame, with the presence report frame;
-/// `QUIL_SIGNED_FRAME_ACTIVATION_FRAME` elsewhere, never by default.
+/// frame. From it GLOBAL also records the frame of each committee session's tip
+/// advance (`session_tip_frame` in the execution crate's handoff records); the
+/// silent-prover fence reads both records. Without one (`u64::MAX`) no frame
+/// records the field and the census keeps reading `LastActiveFrameNumber`.
+/// Mainnet: 1,024,560, the first frame of epoch 1423, which GLOBAL cannot reach
+/// before 2026-11-07 00:00 UTC even at ten seconds a frame, with the presence
+/// report frame; `QUIL_SIGNED_FRAME_ACTIVATION_FRAME` elsewhere, never by
+/// default.
 pub const MAINNET_SIGNED_FRAME_ACTIVATION_FRAME: Option<u64> = Some(1_024_560);
 
 static SIGNED_FRAME_ACTIVATION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
