@@ -1327,6 +1327,48 @@ fn claimable_title(m: &Model) -> String {
     }
 }
 
+/// The Credited KPI: QUIL/day credited over the last 60m and 24h of this
+/// session's claimable reads, measured, so without `~`.
+fn credited_kpi(m: &Model) -> String {
+    let now = std::time::Instant::now();
+    let values = [false, true]
+        .map(|day| {
+            m.credited_daily(day, now)
+                .map_or_else(|| "-".into(), |v| fmt_forecast(&v))
+        })
+        .join("/");
+    if m.compact_actions {
+        format!("Credited [Q/d 60m/24h] {values}")
+    } else {
+        format!("Credited [Q/d 60m/24h]: {values}")
+    }
+}
+
+/// The cursor detail's note on the Reward windows that use the quorum share
+/// because the node has counted none of this seat's certificates in them.
+fn quorum_share_detail(m: &Model, filter: &[u8]) -> Option<String> {
+    let mut share = None;
+    let windows: Vec<_> = [(false, "60m"), (true, "24h")]
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| m.reward_mask() & (1 << i) != 0)
+        .filter_map(|(_, (day, label))| {
+            let s = m.reward_share(filter, day)?;
+            (!s.measured && s.paid < s.frames).then(|| {
+                share = Some(s);
+                label
+            })
+        })
+        .collect();
+    let s = share?;
+    Some(format!(
+        "Reward {}: quorum share {}/{}, no certificate counted yet",
+        windows.join("/"),
+        s.paid,
+        s.frames
+    ))
+}
+
 fn alloc_kpis(m: &Model, sorted: &[AllocationRow]) -> Vec<String> {
     let mut joining = BigInt::from(0);
     let mut paused = BigInt::from(0);
@@ -1389,6 +1431,7 @@ fn alloc_kpis(m: &Model, sorted: &[AllocationRow]) -> Vec<String> {
             },
         ),
         ("Reward", reward),
+        ("Credited", credited_kpi(m)),
         (
             "Allocation GLOBAL snapshot",
             global_snapshot_label(m, sorted.iter().map(|a| a.global_head.as_ref())),
@@ -2136,6 +2179,9 @@ fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
     }
     if let Some(coverage) = cadence_coverage(m, &a.filter) {
         text += &format!(" | {coverage}");
+    }
+    if let Some(share) = quorum_share_detail(m, &a.filter) {
+        text += &format!(" | {share}");
     }
     if let Some(r) = execution.recovery.as_ref() {
         text += &format!(
@@ -4545,11 +4591,12 @@ fn help_items() -> Vec<HelpItem> {
         item("`bound`, `idle`: worker rows (see the Status column)"),
         item("`unknown`: a raw allocation status this client cannot classify"),
         kv("Claimable", "Authenticated claimable QUIL at the cited frame; compact label `[Q]`"),
-        kv("Reward", "Forecast QUIL/day of the displayed staffed rows in the selected `60m`/`24h`/`T` order; compact label `[~Q/d …]`, which omits zero fields. Estimates, not measured earnings; unassigned rows are excluded:"),
+        kv("Reward", "Forecast QUIL/day of the displayed staffed rows in the selected `60m`/`24h`/`T` order; compact label `[~Q/d …]`, which omits zero fields. Estimates, not measured earnings (see Credited); unassigned rows are excluded:"),
         item("`now`: active + leaving estimates; compact names it only beside other fields"),
         item("`paused`: paused estimates, available upon resume"),
         item("`delta` (compact `Δ`): joining minus leaving; activation epochs may differ"),
         item("`-`: unavailable; `+` after a value: known subtotal with unknown rows"),
+        kv("Credited", "QUIL/day credited to this node's prover, measured, so without `~`: the rises of Claimable between this session's reads over its last `60m`/`24h`, per the time the reads span. A fall (a mint) adds nothing, so credits in the read interval holding a mint are missed. `-` until the reads span 30m (`60m`) or 2h (`24h`)"),
         kv("Snapshot", "GLOBAL frame the panel's GlobalHead values cite, in expanded headers; compact mode cites it in the GlobalHead column header (see Global citation)"),
         kv("Shown", "Allocations rows that pass the active column filters / all rows; shown only while filters hide rows"),
         kv("Selected", "Rows marked for a batch action in that panel (‹space›, or ‹a› for all)"),
@@ -4571,7 +4618,7 @@ fn help_items() -> Vec<HelpItem> {
         item("`yellow` (or `!` with colors off): halt risk by count; the shard holds data and at most 3 of its provers are active or activating, so losing one risks its quorum"),
         kv("Cert", "This node's share of its shard's certificates over the last 60m: of the shard frames GLOBAL included from committee sessions this node sits in, the percent whose certificate it signed, as the node counts them from the GLOBAL frames it receives. Only a frame's signers earn its reward, and a certificate carries the first votes to reach quorum, committee - floor((committee - 1) / 3) of them, so a member voting in time signs about 70%. Less means its votes arrive after the quorum, or its worker is blocked or behind its shard; the master log has each seat's hourly counts (`this seat's share of its shard's certificates`)"),
         item("`yellow` (or `!` with colors off): low; an hour counted with at least 30 frames, of which this node signed under half the in-time share (quorum / committee); the node warns (`this seat signed under half the shard certificates`)"),
-        item("`-`: no frame counted in the last 60m, or a node that predates the count"),
+        item("`-`: no frame counted in the last 60m, or a node that predates the count; the `60m` Reward estimate then uses the quorum share"),
         kv("Ring", "Committed rank; `~` marks a join forecast with one ring of competing admissions"),
         kv("Size [GB]", "Shard size in decimal gigabytes, one decimal; `<0.1` preserves small nonzero sizes"),
         kv("Shards", "Data shards the filter covers"),
@@ -4603,7 +4650,7 @@ fn help_items() -> Vec<HelpItem> {
         item("`lag`: behind its head"),
         item("`unmat`: nothing materialized"),
         item("`unknown`: no head"),
-        kv("Reward [~Q/d]", "Forecast QUIL/day to one decimal, in selected `60m`/`24h`/`T` order (`T` = theoretical 10s/frame; expanded: `theory`). `~` before `Q/d` marks estimates; `<0.1` is a trickle; current per-frame pricing/ring applied to observed cadence, not historical credited income"),
+        kv("Reward [~Q/d]", "Forecast QUIL/day to one decimal, in selected `60m`/`24h`/`T` order (`T` = theoretical, see Reward estimates; expanded: `theory`). `~` before `Q/d` marks estimates; `<0.1` is a trickle; current per-frame pricing/ring applied to observed cadence, not historical credited income"),
         kv("Worker", "Core the allocation is bound to; `-1` means none is bound"),
         kv("Status", "Effective protocol status of the row:"),
         item("`joining`, `active`, `paused`, `leaving`, `rejected`, `kicked`: protocol status"),
@@ -4623,7 +4670,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("Interval [s]", "Node-observed mean seconds per committed app frame. ‹b› exposes `60m`/`24h` sub-items under Interval [s] in Columns and Global interval in Top header; these selections are independent. Sort/filter uses the first visible interval. Coverage needs 60s; gaps/downtime excluded; includes pauses/catch-up. `-` unavailable or no advances"),
         note("Thresholds read `in Nf` (frames from the received GLOBAL frame; `now` once reached) or `@f<frame>`; ‹e› switches. Expanded relative thresholds add a `~` time estimate from the measured GLOBAL interval; `~` marks estimates. Q/d is whole QUIL per day, GB is decimal gigabytes. Available Shards shows the same columns, minus the ones that only exist once a shard is allocated to you."),
         sec("Footers and notifications"),
-        kv("Details", "The cursor row's detail sits at the bottom of Allocations, Available Shards and Balances under a `├─ cursor ─┤` rule (a `cursor:` label when the panel leaves it one row), in dim italics, warning colors italic only, so it never reads as a row. It adds only what the row's cells lack, never its key or values: in Allocations the last advance as `<60s` / `>60s`, the reason or blocker, the restart cost, the coverage, recovery and seal; in Available Shards the frames PeerMat trails PeerHead by and the coverage. No ticking timers; a cursor move or a longer detail never resizes a panel. PeerHead is peer-reported metadata"),
+        kv("Details", "The cursor row's detail sits at the bottom of Allocations, Available Shards and Balances under a `├─ cursor ─┤` rule (a `cursor:` label when the panel leaves it one row), in dim italics, warning colors italic only, so it never reads as a row. It adds only what the row's cells lack, never its key or values: in Allocations the last advance as `<60s` / `>60s`, the reason or blocker, the restart cost, the coverage, the quorum share a Reward window uses while none of the seat's certificates is counted, recovery and seal; in Available Shards the frames PeerMat trails PeerHead by and the coverage. No ticking timers; a cursor move or a longer detail never resizes a panel. PeerHead is peer-reported metadata"),
         kv("Restart cost", "What restarting the node now costs the seat, from data the node holds. `ok`; `costs this seat's storage share this epoch` when its running storage encode, delayed by the work a restart loses and the start-up (`adds N min`), would end past the renewal's grace frame (`N min to grace`); `stops this shard` when its committee has no spare voter (margin: voters in recent views minus quorum); `cost unknown; no GLOBAL frame seen yet`. Absent on older nodes"),
         kv("Recovery footer", "Compact shows phase and fixed age buckets; expand for archive, attempt, leaf and outcome details. `unobserved` means no timestamp; `<60s` / `>60s` are fixed age buckets. Detail wraps within the panel; enlarge it for omitted lines"),
         kv("Freshness", "Age of the worker state shown; poll delays do not age the received state, and startup restoration is not an advance:"),
@@ -4657,8 +4704,8 @@ fn help_items() -> Vec<HelpItem> {
         item("`red`: blocked/error"),
         sec("Measurements and forecasts"),
         kv("Frame windows", "Node samples once/minute; `60m`/`24h` windows survive updates. Downtime/missing reads excluded; selected row shows coverage. Generation changes cannot count inherited heights as produced frames"),
-        kv("Frame intervals", "GLOBAL measures received head; app measures committed GlobalHead. Node history survives updates, retains at most 24h, samples once/minute and withholds a sample over 90s old; coverage in RPC. A value stays through a late or failed refresh; once no answer has come for one refresh plus its RPC timeout, cells read `stale` (color, or `stale!`) and the `Shard intervals and forecasts stale` notice names the wait: it says the node's RPC is not answering, not that frames stopped. `-` means the node holds no sample. Forecasts use current per-frame reward and observed frame rate; 10s is theoretical, none proves earned credits"),
-        kv("Reward estimates", "`60m`/`24h` are observation windows, scaled by the quorum share: a frame pays only its certificate's signers, n−⌊(n−1)/3⌋ of the n active and leaving provers; `T` (`theory` in expanded mode) assumes 10s/frame, every frame paid. Forecasts in heading order; ‹b› exposes shared `60m`/`24h`/`T` sub-items under the Reward column and Allocations header Reward KPI. `~` before `Q/d` marks estimates. Observed zero progress estimates zero; actual credits separate; reward sort/filter uses the first visible window"),
+        kv("Frame intervals", "GLOBAL measures received head; app measures committed GlobalHead. Node history survives updates, retains at most 24h, samples once/minute and withholds a sample over 90s old; coverage in RPC. A value stays through a late or failed refresh; once no answer has come for one refresh plus its RPC timeout, cells read `stale` (color, or `stale!`) and the `Shard intervals and forecasts stale` notice names the wait: it says the node's RPC is not answering, not that frames stopped. `-` means the node holds no sample. Forecasts use current per-frame reward and observed frame rate; `T` is theoretical, none proves earned credits"),
+        kv("Reward estimates", "`60m`/`24h` are observation windows. GLOBAL credits each signer of a frame's certificate the same per-signer reward, so each is scaled by this node's certificate share of the window (Cert shows the 60m one); while the node has counted none, and on shards where it holds no seat, by the quorum share n−⌊(n−1)/3⌋ of the n active and leaving provers, which the cursor detail names. `T` (`theory` in expanded mode) assumes one frame of the shard per GLOBAL frame at the node's measured GLOBAL interval (24h, else 60m; the 10s target until one is measured), every frame signed: the most a seat can be credited. Forecasts in heading order; ‹b› exposes shared `60m`/`24h`/`T` sub-items under the Reward column and Allocations header Reward KPI. `~` before `Q/d` marks estimates. Observed zero progress estimates zero; Credited measures actual credits; reward sort/filter uses the first visible window"),
         kv("Global citation", "Compact Global heading / expanded Snapshot cite the GLOBAL frame behind GlobalHead cells. Compact `@-Nf` / `@+Nf` offsets refer to the top Global head; equal-frame citations are omitted. Claimable uses its authenticated balance frame. Expanded shows absolute frames"),
         sec("Display"),
         kv("‹n›", "Toggle compact / expanded display (n: names; default compact): identity, KPIs, action/reason names, threshold estimates, units and recovery/seal detail; default actions remain named"),
@@ -7262,7 +7309,8 @@ mod tests {
         m.node_app_cadence.insert(a.filter.clone(), c);
         m.node_global_cadence_received = Some(Instant::now());
         m.node_app_cadence_received = Some(Instant::now());
-        let theory = fmt_forecast(&(&a.estimated_reward * BigInt::from(8640)));
+        // One frame per GLOBAL frame at its measured 20s, held while stale.
+        let theory = fmt_forecast(&(&a.estimated_reward * BigInt::from(30 * 86_400 / 600)));
         let notices = |m: &Model| {
             message_lines(m, Line::default(), 300)
                 .iter()
@@ -8451,6 +8499,7 @@ mod tests {
             "Status",
             "Claimable",
             "Reward",
+            "Credited",
             "Snapshot",
             "Shown",
             "Selected",
@@ -8605,6 +8654,7 @@ mod tests {
             "Status",
             "Claimable",
             "Reward",
+            "Credited",
             "Shown",
             "Selected",
             "Count",
@@ -10125,6 +10175,123 @@ mod cursor_rule_tests {
         assert_eq!(
             available_detail(&m, &shards[0]).to_string(),
             "Peer materialization trails its head by 5 frames."
+        );
+    }
+}
+
+#[cfg(test)]
+mod reward_share_tests {
+    use super::tests::row;
+    use super::*;
+    use quil_types::proto::node::{
+        CertificateShare, CertificateWindow, FrameCadence, FrameWindow, GetShardInfoResponse,
+        ShardRewardInfo, WorkerExecution,
+    };
+    use std::time::{Duration, Instant};
+
+    fn counted(frames: u64, signed_frames: u64) -> Option<CertificateWindow> {
+        Some(CertificateWindow {
+            window_seconds: 3600,
+            observed_seconds: 3600,
+            frames,
+            signed_frames,
+        })
+    }
+    /// A 22-member committee's shard (quorum 15) with both windows covered.
+    fn answer(share: Option<CertificateShare>) -> GetShardInfoResponse {
+        let window = Some(FrameWindow {
+            window_seconds: 3600,
+            observed_seconds: 600,
+            advanced_frames: 30,
+        });
+        GetShardInfoResponse {
+            shards: vec![ShardRewardInfo {
+                filter: vec![1],
+                active_provers: 22,
+                frame_cadence: Some(FrameCadence {
+                    last_observed_unix_seconds: 1,
+                    hour: window,
+                    day: window,
+                }),
+                certificate_share: share,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The detail names the windows still at the quorum share, and nothing
+    /// once both count the seat's own certificates.
+    #[test]
+    fn the_cursor_detail_names_the_quorum_share_a_reward_window_uses() {
+        let mut m = Model::new();
+        m.data_loaded = true;
+        m.reward_windows = 7;
+        let mut a = row("aa", 22, 1, 1, "", "");
+        a.filter = vec![1];
+        a.status = 2;
+        a.status_name = "active".into();
+        a.execution = Some(WorkerExecution {
+            state: "serving".into(),
+            ..Default::default()
+        });
+        let detail = |m: &Model| allocation_detail(m, &a).to_string();
+
+        m.observe_app_intervals(&answer(None), Instant::now());
+        assert!(
+            detail(&m).contains("Reward 60m/24h: quorum share 15/22, no certificate counted yet"),
+            "rewards: {}",
+            detail(&m)
+        );
+        let share = |hour, day| {
+            Some(CertificateShare {
+                hour,
+                day,
+                committee: 22,
+                quorum: 15,
+            })
+        };
+        m.observe_app_intervals(
+            &answer(share(counted(0, 0), counted(900, 810))),
+            Instant::now(),
+        );
+        assert!(
+            detail(&m).contains("Reward 60m: quorum share 15/22"),
+            "rewards: {}",
+            detail(&m)
+        );
+        m.observe_app_intervals(
+            &answer(share(counted(40, 38), counted(900, 810))),
+            Instant::now(),
+        );
+        assert!(
+            !detail(&m).contains("quorum share"),
+            "rewards: {}",
+            detail(&m)
+        );
+    }
+
+    /// Credited is the claimable balance's rises per day of the reads'
+    /// span: 0.5 Q, a mint's fall, 0.5 Q over 40m is 36 Q/d; the 24h value
+    /// waits for 2h of reads.
+    #[test]
+    fn credited_states_the_claimable_balance_rises_per_day() {
+        use super::super::{msg::Msg, update::apply_msg_at};
+        let mut m = Model::new();
+        m.data_loaded = true;
+        let quil = |tenths: u128| tenths * u128::from(crate::util::UNITS_PER_QUIL) / 10;
+        let start = Instant::now();
+        for (minutes, tenths) in [(0, 100), (10, 105), (20, 2), (40, 7)] {
+            apply_msg_at(
+                &mut m,
+                Msg::RewardRefresh(Ok(Some((quil(tenths), 1_000 + minutes)))),
+                start + Duration::from_secs(minutes * 60),
+            );
+        }
+        let title = alloc_title(&m, &[]).to_string();
+        assert!(
+            title.contains("Credited [Q/d 60m/24h] 36.0/-"),
+            "rewards: {title}"
         );
     }
 }
