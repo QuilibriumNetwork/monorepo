@@ -7,6 +7,7 @@
 //! cause took a log join across four archives. The proposal line
 //! ("proving next global state") now carries this summary.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -149,6 +150,12 @@ pub(crate) struct ProposalPool {
     pub verifying: usize,
     pub gate_in_flight: usize,
     pub intake: IntakeWindow,
+    /// The shards counted by [`Self::shards`].
+    pub tips: HashSet<Vec<u8>>,
+    /// Shards whose only held proofs are too old for the proposed frame.
+    pub late: HashSet<Vec<u8>>,
+    /// This node's current shard set; empty until it is first read.
+    pub known: HashSet<Vec<u8>>,
 }
 
 /// `Some(ms)` as the number, `None` as -1, for a log field.

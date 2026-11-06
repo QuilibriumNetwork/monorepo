@@ -786,6 +786,27 @@ fn proposal_lines(ahead_ms: i64) -> (Vec<String>, Vec<String>, std::time::Durati
     )
 }
 
+/// An own proposal's pool reaches the dip watch: one far under the recent
+/// median starts the line.
+#[test]
+fn a_proposal_far_under_the_recent_median_starts_the_dip_line() {
+    use crate::outage::test_logs::CapturedLogs;
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    crate::inclusion_summary::seed_pool_samples(&[97; 16]);
+    let rig = Rig::new();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let context = rig.context(&parent);
+    let seam = rig.seam(&parent);
+    assert!(seam.propose_with_context(context).is_some());
+    let lines = logs.lines_with("GLOBAL proposal pool dip");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    for field in ["phase=\"start\"", "pool_shards=0", "median_shards=97"] {
+        assert!(lines[0].contains(field), "{field}: {}", lines[0]);
+    }
+}
+
 /// Each own proposal logs what the mempool held when it was copied and what
 /// arrived since; a proposal built before its frame was due also says it
 /// copied early (2026-11-04: such proposals carried about 10 shard headers

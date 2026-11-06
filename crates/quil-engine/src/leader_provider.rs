@@ -1599,6 +1599,9 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 "proving next global state",
             ),
         }
+        if let Some(pool) = &self.pool {
+            crate::inclusion_summary::note_pool(frame_number, pool);
+        }
         if !paced_in_build.is_zero() && self.pool.is_some() {
             tracing::warn!(
                 frame = frame_number,
