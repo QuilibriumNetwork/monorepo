@@ -8286,6 +8286,9 @@ impl AppConsensusEngine {
     /// `behind_wait_median_ms` / `behind_wait_max_ms` how long they waited
     /// from the ask for a proposal to the give-up (the view's nullify); a
     /// turn that waits out its parent instead takes about 3 s.
+    /// `behind_wait_max_split` says where the longest went: pacing, the
+    /// waits between its attempts, and the proposer's calls (parent read,
+    /// probe).
     fn log_session_liveness(&mut self) {
         let _probe = probe::section(probe::Section::SessionLiveness);
         self.log_inbound_drops(std::time::Instant::now());
@@ -8374,6 +8377,7 @@ impl AppConsensusEngine {
             accepted = decided.accepted, refused = ?decided.refused, last_refused = %outcome(decided.last_refused),
             behind_gave_up = behind.turns, behind_wait_median_ms = behind.median_ms,
             behind_wait_max_ms = behind.max_ms,
+            behind_wait_max_split = %behind.longest.describe(),
             blocked = seen.blocked, blocked_peers = seen.blocked_peers,
             materialized = self.last_materialized_frame,
             data_ready = self.data_ready.load(std::sync::atomic::Ordering::Acquire),

@@ -1035,7 +1035,7 @@ fn only_a_behind_leader_gives_its_turn_up_at_once() {
         "a behind leader gave its turn up only after its parent waits"
     );
     assert_eq!(private_reads.load(Ordering::SeqCst), 0);
-    liveness.settle_turn(1, false, Duration::from_millis(7));
+    liveness.settle_turn(1, false, Duration::from_millis(7).into());
 
     *behind.lock().unwrap() = None;
     let next = ProposalContext { view: 2, ..ctx };
@@ -1044,7 +1044,7 @@ fn only_a_behind_leader_gives_its_turn_up_at_once() {
         proposer.propose_retry().is_some(),
         "a leader that is not behind waits for its parent as before"
     );
-    liveness.settle_turn(2, false, Duration::from_millis(3_000));
+    liveness.settle_turn(2, false, Duration::from_millis(3_000).into());
     let gave_up = liveness.take_behind_give_ups();
     assert_eq!(
         (gave_up.turns, gave_up.max_ms),
