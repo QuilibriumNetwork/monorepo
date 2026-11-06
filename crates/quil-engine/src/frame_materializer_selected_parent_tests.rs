@@ -9,6 +9,8 @@ use quil_cw_consensus::adapters::{
 use quil_types::crypto::{FrameProver, Signer};
 use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
 
+#[path = "frame_materializer_fh_anchor_repro_tests.rs"]
+mod fh_anchor_repro_tests;
 #[path = "frame_materializer_finalization_tests.rs"]
 mod finalization_tests;
 #[path = "frame_materializer_pipeline_tests.rs"]

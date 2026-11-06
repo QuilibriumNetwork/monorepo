@@ -1312,11 +1312,11 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 self.rejected.lock().unwrap().enter(context.clone());
                 for raw in collected {
                     if crate::message_collector::bundle_has_shard_frame(&raw) {
-                        // Strict lockstep: a shard proof rides ONLY if its ANCHOR
-                        // (`global_frame_number`) is `frame_number - 1` (or genesis
-                        // anchor 0) — NOT its local frame number. The materializer
-                        // hard-rejects any frame carrying an out-of-lockstep shard op,
-                        // so packing a stale proof would halt the chain — drop it here.
+                        // Windowed lockstep: a shard proof rides ONLY if its ANCHOR
+                        // (`global_frame_number`) lies in this frame's window (or is
+                        // genesis anchor 0) — NOT by its local frame number. GLOBAL
+                        // validation and execution refuse any other and skip it, so a
+                        // packed one earns nothing — drop it here.
                         if crate::message_collector::bundle_shard_frames_in_lockstep(
                             &raw,
                             frame_number,

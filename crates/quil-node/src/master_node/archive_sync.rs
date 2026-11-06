@@ -1744,10 +1744,10 @@ pub(crate) type AppIngestCell = Arc<
 ///
 /// GLOBAL reward execution reads shard and world sizes from that state, so the
 /// set of application frames it holds must be a function of the GLOBAL chain,
-/// not of when gossip delivered them. Only headers whose certificate verifies
-/// against the pre-state (the check execution itself applies first) require
-/// their bodies, so an invalid header, which execution skips, cannot stall the
-/// chain. Every archive decides this from the same state.
+/// not of when gossip delivered them. Only headers [`vouched_shard_headers`]
+/// vouches for require their bodies, so a header execution skips cannot stall
+/// the chain or move a shard ahead of it. Every archive decides this from the
+/// same state.
 ///
 /// A frame that keeps waiting names the shards and frames it waits for: the
 /// wait itself was silent, and an archive sat on one GLOBAL frame for two
@@ -1781,8 +1781,6 @@ fn sequenced_ingest_hook(
         )>,
     > = Default::default();
     Arc::new(move |frame: &quil_types::proto::global::GlobalFrame| {
-        use quil_execution::global_intrinsic::{conversions, prover_shard_update};
-        use quil_types::proto::global::message_request::Request;
         let Some(ingest) = cell.get() else {
             return Ok(false); // not built yet: execute nothing without it
         };
@@ -1791,46 +1789,17 @@ fn sequenced_ingest_hook(
         // activation, so no session frame it sequences is ever discarded.
         quil_engine::archive_ingest::lock_ingest(ingest).discard_legacy_history_at(frame_number)?;
         let state = quil_execution::hypergraph_state::HypergraphState::new(crdt.clone());
-        let bls = quil_crypto::FalconKeyConstructor;
-        // Per shard: the certified headers this frame carries, by frame number.
-        // The highest is the frame to materialize through; any of them whose
-        // body no endpoint serves can be rebuilt if it carried no requests.
-        let mut vouched: std::collections::BTreeMap<
-            Vec<u8>,
-            std::collections::HashMap<u64, quil_types::proto::global::FrameHeader>,
-        > = std::collections::BTreeMap::new();
-        for request in frame
-            .requests
-            .iter()
-            .flat_map(|bundle| bundle.requests.iter())
-        {
-            let Some(Request::Shard(header)) = request.request.as_ref() else {
-                continue;
-            };
-            let op = conversions::frame_header_from_proto(header);
-            let committee_frame = if op.global_frame_number > 0 {
-                op.global_frame_number
-            } else {
-                frame_number
-            };
-            if prover_shard_update::verify_frame_header_session(
-                &state,
-                &op,
-                frame_prover.as_ref(),
-                &bls,
-                prover_registry.as_ref(),
-                committee_frame,
-                frame_number,
-            )
-            .is_err()
-            {
-                continue;
-            }
-            vouched
-                .entry(op.address.clone())
-                .or_default()
-                .insert(op.frame_number, header.clone());
-        }
+        let VouchedHeaders {
+            shards: vouched,
+            unheld_anchors,
+        } = vouched_shard_headers(
+            frame,
+            frame_number,
+            clock.as_ref(),
+            &state,
+            frame_prover.as_ref(),
+            prover_registry.as_ref(),
+        );
         // Verify the frames' confidential proofs before taking the ingest:
         // a batch shield takes about two minutes, and while a backlog of
         // them verified under it, gossip ingest, its retry pass and the gap
@@ -1869,7 +1838,7 @@ fn sequenced_ingest_hook(
             }
         }
         drop(sequenced);
-        if missing.is_empty() {
+        if missing.is_empty() && unheld_anchors.is_empty() {
             return Ok(true);
         }
         drop(ingest);
@@ -1902,15 +1871,112 @@ fn sequenced_ingest_hook(
             && logged.is_none_or(|at| at.elapsed() >= WAIT_LOG_INTERVAL)
         {
             *logged = Some(now);
-            warn!(
-                frame = frame_number,
-                waited_secs = since.elapsed().as_secs(),
-                ?missing,
-                "GLOBAL frame waits for application frames this archive has not ingested"
-            );
+            if !missing.is_empty() {
+                warn!(
+                    frame = frame_number,
+                    waited_secs = since.elapsed().as_secs(),
+                    ?missing,
+                    "GLOBAL frame waits for application frames this archive has not ingested"
+                );
+            }
+            if !unheld_anchors.is_empty() {
+                warn!(
+                    frame = frame_number,
+                    waited_secs = since.elapsed().as_secs(),
+                    ?unheld_anchors,
+                    scope = "this archive",
+                    until = "its GLOBAL record backfill supplies them",
+                    "GLOBAL frame waits for GLOBAL frames its shard headers anchor to, inside \
+                     its window, which this archive's clock lacks"
+                );
+            }
         }
         Ok(false)
     })
+}
+
+/// What a GLOBAL frame's shard headers require before it executes.
+struct VouchedHeaders {
+    /// Per shard: the headers vouched for, by frame number. The highest is
+    /// the frame to materialize through; any of them whose body no endpoint
+    /// serves can be rebuilt if it carried no requests.
+    shards: std::collections::BTreeMap<
+        Vec<u8>,
+        std::collections::HashMap<u64, quil_types::proto::global::FrameHeader>,
+    >,
+    /// Anchors inside the frame's window that this archive lacks. Execution
+    /// cannot judge a header anchored to one either, and a frame number is
+    /// only a claim until it can, so the frame waits for them.
+    unheld_anchors: std::collections::BTreeSet<u64>,
+}
+
+/// The headers `frame` vouches for: each passes what GLOBAL execution checks
+/// first ([`GlobalIntrinsic::check_anchor_and_output`]) and then its
+/// certificate. The certificate signs only the view and the digest of the
+/// output, so a header's other fields, the frame number the hook waits for
+/// among them, count only once they reproduce that output: a rewritten copy
+/// of a genuine header, whose certificate still verifies, requires nothing.
+///
+/// [`GlobalIntrinsic::check_anchor_and_output`]: quil_execution::global_intrinsic::intrinsic::GlobalIntrinsic::check_anchor_and_output
+fn vouched_shard_headers(
+    frame: &quil_types::proto::global::GlobalFrame,
+    frame_number: u64,
+    clock: &dyn quil_types::store::ClockStore,
+    state: &quil_execution::hypergraph_state::HypergraphState,
+    frame_prover: &dyn quil_types::crypto::FrameProver,
+    prover_registry: &quil_execution::SharedProverRegistry,
+) -> VouchedHeaders {
+    use quil_execution::global_intrinsic::{
+        conversions, intrinsic::GlobalIntrinsic, prover_shard_update,
+    };
+    use quil_types::proto::global::message_request::Request;
+    let bls = quil_crypto::FalconKeyConstructor;
+    let mut vouched = VouchedHeaders {
+        shards: Default::default(),
+        unheld_anchors: Default::default(),
+    };
+    for request in frame
+        .requests
+        .iter()
+        .flat_map(|bundle| bundle.requests.iter())
+    {
+        let Some(Request::Shard(header)) = request.request.as_ref() else {
+            continue;
+        };
+        let op = conversions::frame_header_from_proto(header);
+        match GlobalIntrinsic::check_anchor_and_output(Some(clock), frame_number, &op) {
+            Ok(()) => {}
+            Err(error) if error.is_execution_unavailable() => {
+                vouched.unheld_anchors.insert(op.global_frame_number);
+                continue;
+            }
+            Err(_) => continue,
+        }
+        let committee_frame = if op.global_frame_number > 0 {
+            op.global_frame_number
+        } else {
+            frame_number
+        };
+        if prover_shard_update::verify_frame_header_session(
+            state,
+            &op,
+            frame_prover,
+            &bls,
+            prover_registry,
+            committee_frame,
+            frame_number,
+        )
+        .is_err()
+        {
+            continue;
+        }
+        vouched
+            .shards
+            .entry(op.address.clone())
+            .or_default()
+            .insert(op.frame_number, header.clone());
+    }
+    vouched
 }
 
 /// Which shard headers a GLOBAL proposal may carry: those whose application
@@ -3787,6 +3853,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                         if !result.consumed_bundles.is_empty() {
                                                             mc.mark_finalized(&result.consumed_bundles);
                                                         }
+                                                        mc.mark_skipped(&result.skipped_bundles);
                                                         if let Some(header) = frame.header.as_ref() {
                                                             if quil_types::consensus::global_committee_epoch(header.frame_number) == cf.rank_epoch() { mc.prune_after_finalization(header.rank); }
                                                         }
@@ -3858,6 +3925,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     if !result.consumed_bundles.is_empty() {
                                                         mc.mark_finalized(&result.consumed_bundles);
                                                     }
+                                                    mc.mark_skipped(&result.skipped_bundles);
                                                     if let Some(header) = frame.header.as_ref() {
                                                         if quil_types::consensus::global_committee_epoch(header.frame_number) == cf.rank_epoch() { mc.prune_after_finalization(header.rank); }
                                                     }
@@ -3896,6 +3964,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 if !result.finalized_bundles.is_empty() {
                                                     mc.mark_finalized(&result.finalized_bundles);
                                                 }
+                                                mc.mark_skipped(&result.skipped_bundles);
                                                 if m.last_materialized_frame() >= frame_number {
                                                     catch_up.record_in_place();
                                                     if let Some(header) = frame.header.as_ref() {
@@ -5103,6 +5172,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         );
     }
 }
+
+#[cfg(test)]
+#[path = "archive_sync_fh_r1_tests.rs"]
+mod fh_r1_tests;
+#[cfg(test)]
+#[path = "archive_sync_fh_r2_tests.rs"]
+mod fh_r2_tests;
 
 #[cfg(test)]
 mod bootstrap_sync_tests {

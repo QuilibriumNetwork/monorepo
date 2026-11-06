@@ -174,13 +174,23 @@ pub fn verify_app_frame_output(frame_header: &FrameHeader, anchor_output: &[u8])
         &frame_header.spends,
     );
     if expected != frame_header.output {
-        return Err(QuilError::Crypto(
-            "frame header attestation: app-shard frame output does not match the \
-             deterministic digest of its header fields"
-                .into(),
-        ));
+        return Err(QuilError::Crypto(format!(
+            "{OUTPUT_NOT_REPRODUCED}the deterministic digest of its header fields"
+        )));
     }
     Ok(())
+}
+
+/// The start of the refusal of a header whose fields do not reproduce its
+/// output ([`output_not_reproduced`]).
+const OUTPUT_NOT_REPRODUCED: &str =
+    "frame header attestation: app-shard frame output does not match ";
+
+/// Whether `error` refused a shard frame header because its fields do not
+/// reproduce its output: a field was rewritten after the frame was certified,
+/// or the frame was never certified at all.
+pub fn output_not_reproduced(error: &QuilError) -> bool {
+    matches!(error, QuilError::Crypto(message) if message.starts_with(OUTPUT_NOT_REPRODUCED))
 }
 
 fn verify_genesis_app_frame_output(frame_header: &FrameHeader) -> Result<()> {

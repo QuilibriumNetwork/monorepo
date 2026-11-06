@@ -1815,6 +1815,22 @@ impl MessageCollector {
         }
     }
 
+    /// Consume `raw_msgs`, bundles a finalized frame carried that its
+    /// execution skipped: like [`mark_finalized`]'s they leave the live
+    /// buffers and are never held again, but the shard frames they claim do
+    /// not count as carried. A skipped header credited nothing, and anyone
+    /// leading GLOBAL can pack one claiming any number.
+    pub fn mark_skipped(&self, raw_msgs: &[Vec<u8>]) {
+        if raw_msgs.is_empty() {
+            return;
+        }
+        self.remove(raw_msgs);
+        let mut finalized = self.finalized.write().unwrap();
+        for raw in raw_msgs {
+            finalized.insert(message_key(raw));
+        }
+    }
+
     /// Remove `raw_msgs` from the live buffers WITHOUT recording them as
     /// finalized. Used by the leader's collect path to drop messages that
     /// fail protocol validation, mirroring Go's `collector.Remove(record)`
@@ -1985,19 +2001,16 @@ pub fn bundle_has_shard_frame(data: &[u8]) -> bool {
     !extract_shard_frame_keys(data).is_empty()
 }
 
-/// True iff every shard `FrameHeader` carried by `data` is in STRICT LOCKSTEP
-/// with a global frame `frame_number`: its `global_frame_number` (storage-beacon
-/// anchor) is either 0 (genesis / legacy-VDF, no anchor) or exactly
-/// `frame_number - 1` (the immediately-preceding global frame). Returns `true`
-/// for bundles that aren't decodable / carry no shard frames (this gate only
-/// governs shard proofs).
+/// True iff every shard `FrameHeader` carried by `data` may ride global frame
+/// `frame_number` ([`anchor_in_lockstep`]). Returns `true` for bundles that
+/// aren't decodable / carry no shard frames (this gate only governs shard
+/// proofs).
 ///
 /// The global leader calls this to include ONLY in-lockstep shard proofs.
-/// Because the materializer HARD-REJECTS any frame containing an out-of-lockstep
-/// shard op (`audit_storage_attestation`), a leader that packed a stale proof
-/// would produce a frame its followers refuse — a halt. Dropping stale proofs
-/// here keeps producer and verifier symmetric: the shard must re-attest fresh
-/// (anchored to the new tip) to be included.
+/// GLOBAL validation and execution refuse an out-of-lockstep shard op by the
+/// same predicate and skip it, so a packed one earns nothing and takes a place
+/// in the frame. Dropping it here keeps producer and verifier symmetric: the
+/// shard must re-attest fresh (anchored to the new tip) to be included.
 pub fn bundle_shard_frames_in_lockstep(data: &[u8], frame_number: u64) -> bool {
     use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
     use quil_execution::message_envelope::CanonicalMessageBundle;
@@ -2019,10 +2032,10 @@ pub fn bundle_shard_frames_in_lockstep(data: &[u8], frame_number: u64) -> bool {
 }
 
 /// A shard frame anchored to GLOBAL frame `anchor` may ride GLOBAL frame
-/// `frame_number`. WINDOWED LOCKSTEP (must mirror the materializer's
-/// `audit_storage_attestation` exactly, or a packed frame would be rejected by
-/// followers → halt): a storage shard proof is includable iff its anchor is 0
-/// (genesis/legacy) OR within `[expected - W, expected]`. Multi-member shards
+/// `frame_number`. WINDOWED LOCKSTEP (the predicate GLOBAL validation and
+/// execution use, `anchor_in_window`, so a packed header is never refused): a
+/// storage shard proof is includable iff its anchor is 0 (genesis/legacy) OR
+/// within `[expected - W, expected]`. Multi-member shards
 /// anchor to `latest − K`, so a strict `== expected` is unsatisfiable; the
 /// window absorbs K + transit.
 ///
@@ -2030,13 +2043,10 @@ pub fn bundle_shard_frames_in_lockstep(data: &[u8], frame_number: u64) -> bool {
 /// ([`quil_types::consensus::MAINNET_REQUIRED_ANCHOR_EPOCH`]) GLOBAL refuses
 /// a shard frame without an anchor, so none rides a frame from then on.
 pub fn anchor_in_lockstep(anchor: u64, frame_number: u64) -> bool {
-    use quil_execution::global_intrinsic::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW;
-    let expected = frame_number.saturating_sub(1);
-    let oldest = expected.saturating_sub(STORAGE_ANCHOR_LOCKSTEP_WINDOW);
     if anchor == 0 {
         return !quil_types::consensus::required_anchor_active(frame_number);
     }
-    (oldest..=expected).contains(&anchor)
+    quil_execution::global_intrinsic::frame_header::anchor_in_window(anchor, frame_number)
 }
 
 /// Shard `address`'s `frame` is one a finalized frame carried.

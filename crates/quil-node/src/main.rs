@@ -73,6 +73,9 @@ mod rpc_metrics;
 #[cfg(test)]
 mod required_anchor_tests;
 
+#[cfg(test)]
+mod fh_anchor_repro_tests;
+
 /// Quilibrium Node — Rust implementation
 #[derive(Parser, Debug)]
 #[command(name = "quil-node", version = quil_config::display_version(), about)]
