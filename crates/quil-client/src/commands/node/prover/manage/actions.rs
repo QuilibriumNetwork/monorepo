@@ -150,16 +150,27 @@ async fn until_stalled<T>(
 ) -> Result<T, String> {
     let started = tokio::time::Instant::now();
     let (mut last, mut open) = (started, true);
+    let mut reported = None;
     tokio::pin!(read);
     loop {
         let wake = (last + limits.stall).min(started + limits.cap);
         tokio::select! {
             biased;
-            out = &mut read => return Ok(out),
+            out = &mut read => {
+                // The read's last page can land with its result in one poll;
+                // `biased` takes the result first, so report that page too.
+                let now = *ticks.borrow();
+                if now != (0, 0) && reported != Some(now) {
+                    on_tick(now);
+                }
+                return Ok(out);
+            }
             changed = ticks.changed(), if open => match changed {
                 Ok(()) => {
                     last = tokio::time::Instant::now();
-                    on_tick(*ticks.borrow_and_update());
+                    let now = *ticks.borrow_and_update();
+                    reported = Some(now);
+                    on_tick(now);
                 }
                 Err(_) => open = false,
             },
@@ -2241,6 +2252,19 @@ mod legacy_read_tests {
     use tokio::time::Instant;
 
     const LIMITS: LegacyLimits = LEGACY_LIMITS;
+
+    /// The last page and the read's result can land in one poll: the read
+    /// is ready and the watch holds a page no tick reported. The page is
+    /// still reported, so the progress shown ends at the read's total.
+    #[tokio::test(start_paused = true)]
+    async fn a_last_page_landing_with_the_result_is_reported() {
+        let (tick, ticks) = watch::channel((0, 0));
+        tick.send_replace((31, 15_872));
+        let mut seen = Vec::new();
+        let out = until_stalled(async { 7 }, ticks, LIMITS, |p| seen.push(p)).await;
+        assert_eq!(out, Ok(7));
+        assert_eq!(seen, vec![(31, 15_872)]);
+    }
 
     /// A read sending `pages` pages of 512 coins, one every `every`, then
     /// `after`: a snapshot's calls after its last page.
