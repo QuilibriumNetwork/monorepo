@@ -1137,8 +1137,75 @@ fn watch(member: [u8; 32]) {
     }
 }
 
+/// Bytes proving holds per sealed leaf, and at least, for proofs before
+/// persistent storage holds ([`proof_reservation`]).
+const PROVING_BYTES_PER_SEALED_LEAF: u64 = 400 << 20;
+
 /// The lane of settlements proved alone.
 const SETTLEMENT_LANE: &[u8] = b"epoch proofs: settlements alone";
+
+/// Whether `seats` prove on persistent storage's schedule: each settles an
+/// epoch where it holds (`quil_types::consensus::persistent_storage_at`).
+/// Before it, a node's epoch proofs run in turn in one lane and reserve
+/// [`PROVING_BYTES_PER_SEALED_LEAF`], as they were measured.
+fn persistent_schedule(seats: &[PreparedSeat]) -> bool {
+    !seats.is_empty()
+        && seats
+            .iter()
+            .all(|seat| quil_types::consensus::persistent_storage_at(seat.claim.settle_epoch))
+}
+
+/// The lane `seats` prove in ([`prove_and_publish`]): settlements alone in
+/// [`SETTLEMENT_LANE`], others in `crate::storage_jobs::EPOCH_PROOF_LANE`,
+/// one proof at a time each. On persistent storage's schedule each
+/// member, shard and epoch gets a lane of its own, so independent chunks
+/// run side by side while overlapping parts keep one lane.
+fn proof_lane(seats: &[PreparedSeat], alone: bool, persistent: bool) -> Vec<u8> {
+    let mut lane = if alone {
+        SETTLEMENT_LANE.to_vec()
+    } else {
+        crate::storage_jobs::EPOCH_PROOF_LANE.to_vec()
+    };
+    if !persistent {
+        return lane;
+    }
+    for seat in seats {
+        lane.extend_from_slice(&seat.member);
+        lane.extend_from_slice(&(seat.part.shard_filter.len() as u64).to_be_bytes());
+        lane.extend_from_slice(&seat.part.shard_filter);
+        lane.extend_from_slice(&seat.part.epoch.to_be_bytes());
+        lane.extend_from_slice(&seat.claim.seal_epoch.to_be_bytes());
+        lane.extend_from_slice(&[u8::from(seat.part.seals), u8::from(seat.part.settles)]);
+    }
+    lane
+}
+
+/// The memory proving `seats` reserves: on persistent storage's schedule
+/// its AIR estimate ([`proving_bytes`]); before it, four times the native
+/// parts' bytes plus [`PROVING_BYTES_PER_SEALED_LEAF`] per leaf sealed
+/// without a sector, at least one when the proof seals or settles any.
+fn proof_reservation(seats: &[PreparedSeat], persistent: bool) -> Result<u64> {
+    if persistent {
+        return proving_bytes(seats);
+    }
+    let old_leaves = seats
+        .iter()
+        .flat_map(|seat| &seat.claim.seals)
+        .filter(|leaf| leaf.persistent.is_none())
+        .count() as u64;
+    let old_work = old_leaves > 0 || seats.iter().any(|seat| seat.part.settles);
+    let native_bytes = seats
+        .iter()
+        .map(|seat| seat.part_bytes() as u64)
+        .sum::<u64>()
+        .saturating_mul(4);
+    let old_bytes = if old_work {
+        PROVING_BYTES_PER_SEALED_LEAF.saturating_mul(old_leaves.max(1))
+    } else {
+        16 << 20
+    };
+    Ok(native_bytes.saturating_add(old_bytes))
+}
 
 /// Prove `seats` as a storage job (`crate::storage_jobs`), once the memory
 /// proving takes is free, and publish the proof, each seat's settlement once
@@ -1151,25 +1218,10 @@ fn prove_and_publish(seats: Vec<PreparedSeat>, publish: Publish) {
     let alone = seats
         .iter()
         .all(|seat| seat.solo && seat.part.settles && !seat.part.seals);
-    // Independent chunks run concurrently; overlapping parts retain one lane.
-    let mut lane = if alone {
-        SETTLEMENT_LANE.to_vec()
-    } else {
-        crate::storage_jobs::EPOCH_PROOF_LANE.to_vec()
-    };
-    for seat in &seats {
-        lane.extend_from_slice(&seat.member);
-        lane.extend_from_slice(&(seat.part.shard_filter.len() as u64).to_be_bytes());
-        lane.extend_from_slice(&seat.part.shard_filter);
-        lane.extend_from_slice(&seat.part.epoch.to_be_bytes());
-        lane.extend_from_slice(&seat.claim.seal_epoch.to_be_bytes());
-        lane.extend_from_slice(&[u8::from(seat.part.seals), u8::from(seat.part.settles)]);
-    }
+    let persistent = persistent_schedule(&seats);
+    let lane = proof_lane(&seats, alone, persistent);
     crate::storage_jobs::spawn(&lane, "member epoch proof", move || {
-        let bytes = proving_bytes(&seats)?;
-        let persistent = seats
-            .iter()
-            .all(|seat| quil_types::consensus::persistent_storage_at(seat.claim.settle_epoch));
+        let bytes = proof_reservation(&seats, persistent)?;
         let _memory = if alone && !persistent {
             crate::storage_jobs::reserve_settlement(bytes)
         } else {
@@ -1301,6 +1353,70 @@ mod tests {
         assert!(proving_bytes(&grouped[0]).unwrap() > 0);
         quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
         assert_eq!(chunks(parts, usize::MAX, usize::MAX).len(), 1);
+    }
+
+    /// Two settling parts of different shards at epoch 1500, each its own
+    /// chunk, as `chunks` gives them once persistent storage holds.
+    fn settling_chunks() -> Vec<Vec<PreparedSeat>> {
+        [11, 12]
+            .into_iter()
+            .map(|shard| {
+                let (_, part) = sealing_and_settling(shard).halves();
+                let mut part = part.unwrap();
+                part.solo = false;
+                part.part.epoch = 1500;
+                part.claim.settle_epoch = 1500;
+                vec![part]
+            })
+            .collect()
+    }
+
+    /// Before persistent storage holds, a node's epoch proofs of different
+    /// shards share one lane and run in turn; once it holds, each member,
+    /// shard and epoch has a lane of its own.
+    #[test]
+    fn epoch_proofs_share_one_lane_until_persistent_storage_holds() {
+        let proofs = settling_chunks();
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(u64::MAX));
+        for chunk in &proofs {
+            assert_eq!(
+                proof_lane(chunk, false, persistent_schedule(chunk)),
+                crate::storage_jobs::EPOCH_PROOF_LANE,
+                "one shared lane before persistent storage"
+            );
+        }
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(1500));
+        let lanes: Vec<Vec<u8>> = proofs
+            .iter()
+            .map(|chunk| proof_lane(chunk, false, persistent_schedule(chunk)))
+            .collect();
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
+        assert_ne!(lanes[0], lanes[1], "a lane per member, shard and epoch");
+        for lane in &lanes {
+            assert!(lane.starts_with(crate::storage_jobs::EPOCH_PROOF_LANE));
+        }
+    }
+
+    /// Before persistent storage holds, an epoch proof reserves
+    /// [`PROVING_BYTES_PER_SEALED_LEAF`] per sealed leaf; once it holds, its
+    /// AIR estimate ([`proving_bytes`]).
+    #[test]
+    fn epoch_proofs_reserve_per_sealed_leaf_until_persistent_storage_holds() {
+        let sealed = [seat(13, 3, false)];
+        let proofs = settling_chunks();
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(u64::MAX));
+        let before = proof_reservation(&sealed, persistent_schedule(&sealed));
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(1500));
+        let after = proof_reservation(&proofs[0], persistent_schedule(&proofs[0]));
+        let estimate = proving_bytes(&proofs[0]);
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
+        let native = sealed[0].part_bytes() as u64 * 4;
+        assert_eq!(
+            before.unwrap(),
+            native + 3 * PROVING_BYTES_PER_SEALED_LEAF,
+            "400 MiB per sealed leaf before persistent storage"
+        );
+        assert_eq!(after.unwrap(), estimate.unwrap());
     }
 
     #[test]

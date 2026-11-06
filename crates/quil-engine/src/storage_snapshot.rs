@@ -3882,6 +3882,7 @@ pub(crate) mod tests {
                 seat: 0,
                 leaf: 0,
             },
+            epoch,
             &|| false,
         )
         .expect("it fits");
