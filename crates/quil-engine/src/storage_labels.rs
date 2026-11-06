@@ -84,7 +84,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -96,6 +96,8 @@ use quil_hypergraph::HypergraphCrdt;
 use quil_types::error::{QuilError, Result};
 use sha2::{Digest as _, Sha256};
 use tracing::{info, warn};
+
+use crate::storage_ledger::HostLedger;
 
 /// Percent of the labels' filesystem that labels leave free, unless
 /// [`DISK_FLOOR_MIN_BYTES`] is more. The stores sharing the filesystem stop
@@ -110,6 +112,12 @@ pub const DISK_FLOOR_MIN_BYTES: u64 = 8 << 30;
 /// meanwhile, the stores and the logs among them. What they take of the
 /// floor later, labels give back ([`LabelStore::keep_floor`]).
 pub const DISK_MARGIN: u64 = 2;
+
+/// How long a leaf's admission waits for the host's turn
+/// ([`HostLedger::labels_turn`]) before it admits as if alone. A turn lasts
+/// a look at the free space and a record written; one held longer is a
+/// stopped process's, which must not stop the host's labels.
+const LABELS_TURN_WAIT: Duration = Duration::from_secs(2);
 
 /// How long a shard whose leaves were refused room waits before it is
 /// labelled ahead again: the labels of the epoch before free their room once
@@ -200,13 +208,28 @@ pub type SpaceSource = Box<dyn Fn(&Path) -> Option<FsUsage> + Send + Sync>;
 
 static STORE: OnceLock<LabelStore> = OnceLock::new();
 
+/// The directory of the host ledger ([`crate::storage_jobs::install_host_ledger`])
+/// of the node processes that keep labels in `labels_dir`: beside it, so a
+/// process that keeps none (a cluster's master) can join it from the same
+/// path.
+pub fn host_ledger_dir(labels_dir: &Path) -> PathBuf {
+    labels_dir.with_file_name("storage-admission")
+}
+
 /// Keep this process's labels under `dir`, checking their filesystem's free
-/// space every [`FLOOR_CHECK_EVERY`] ([`LabelStore::keep_floor`]). The first
+/// space every [`FLOOR_CHECK_EVERY`] ([`LabelStore::keep_floor`]), and admit
+/// its storage jobs with the node's other processes that label there
+/// ([`crate::storage_jobs::install_host_ledger`], beside `dir`). The first
 /// call decides; a process that never calls it labels nothing ahead and
 /// relabels for its seals.
 pub fn install(dir: PathBuf) {
+    let ledger = host_ledger_dir(&dir);
     if STORE.set(LabelStore::new(dir)).is_err() {
         return;
+    }
+    crate::storage_jobs::install_host_ledger(&ledger);
+    if let (Some(store), Some(ledger)) = (installed(), crate::storage_jobs::host_ledger()) {
+        store.use_ledger(ledger);
     }
     let spawned = std::thread::Builder::new()
         .name("storage-labels-floor".into())
@@ -494,6 +517,11 @@ pub struct LabelStore {
     space: SpaceSource,
     /// Bytes the leaves being labelled have still to write.
     pending: Mutex<u64>,
+    /// The host's record of the node's processes ([`Self::use_ledger`]):
+    /// what the others' labels have still to write is no room for these.
+    ledger: OnceLock<&'static HostLedger>,
+    /// Whether a failure to use [`Self::ledger`] was logged.
+    ledger_warned: AtomicBool,
     /// Leaves' counts admitted and being labelled ([`Self::admit`]): no
     /// other labelling writes them, and nothing removes them meanwhile.
     busy: Mutex<HashSet<(PathBuf, u64)>>,
@@ -533,6 +561,8 @@ impl LabelStore {
             dir,
             space,
             pending: Mutex::new(0),
+            ledger: OnceLock::new(),
+            ledger_warned: AtomicBool::new(false),
             busy: Mutex::new(HashSet::new()),
             #[cfg(test)]
             resumed: Mutex::new(Vec::new()),
@@ -583,6 +613,67 @@ impl LabelStore {
         self.pending.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Count the labels still to write of the node's other processes on
+    /// this host against this store's room, and this store's in their room
+    /// (`crate::storage_ledger`): each process counting only its own, two
+    /// could each admit a leaf the disk has room for above the floor, and
+    /// write both. False when a ledger was in use already.
+    pub(crate) fn use_ledger(&self, ledger: &'static HostLedger) -> bool {
+        self.ledger.set(ledger).is_ok()
+    }
+
+    /// The bytes the node's other processes' labels have still to write
+    /// ([`Self::use_ledger`]); none without a ledger.
+    fn others_pending(&self) -> u64 {
+        self.ledger
+            .get()
+            .map_or(0, |ledger| ledger.others_labels_pending())
+    }
+
+    /// Say in the host's record that this store's labels have `pending`
+    /// bytes still to write ([`Self::use_ledger`]).
+    fn publish_pending(&self, pending: u64) {
+        let Some(ledger) = self.ledger.get() else {
+            return;
+        };
+        if let Err(error) = ledger.publish_labels_pending(pending) {
+            self.warn_ledger(ledger, &error.to_string());
+        }
+    }
+
+    /// The host's turn to admit a leaf's labels ([`HostLedger::labels_turn`]),
+    /// kept until this store's record counts it, so two processes never
+    /// admit on the same free space; `None` without a ledger, or past
+    /// [`LABELS_TURN_WAIT`] (another process stopped holding it), when this
+    /// store admits as if alone.
+    fn labels_turn(&self) -> Option<fs::File> {
+        let ledger = self.ledger.get()?;
+        match ledger.labels_turn(LABELS_TURN_WAIT) {
+            Ok(Some(turn)) => Some(turn),
+            Ok(None) => {
+                self.warn_ledger(
+                    ledger,
+                    "another process of the node kept the turn past the bound",
+                );
+                None
+            }
+            Err(error) => {
+                self.warn_ledger(ledger, &error.to_string());
+                None
+            }
+        }
+    }
+
+    fn warn_ledger(&self, ledger: &HostLedger, error: &str) {
+        if !self.ledger_warned.swap(true, Ordering::Relaxed) {
+            warn!(dir = %ledger.dir().display(), error, scope = "this node",
+                action = "check the free space and permissions of this directory, and for a stopped \
+                          process of the node",
+                "storage labels admitted without the node's other processes on this host: their \
+                 leaves and this one's may together write past the disk floor; logged once");
+        }
+    }
+
     fn busy(&self) -> MutexGuard<'_, HashSet<(PathBuf, u64)>> {
         self.busy.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -629,7 +720,9 @@ impl LabelStore {
         resuming: bool,
     ) -> std::result::Result<(), Shortfall> {
         let usage = self.usage();
-        let needed = pending.saturating_add(bytes);
+        let needed = pending
+            .saturating_add(self.others_pending())
+            .saturating_add(bytes);
         match usage {
             Some(usage) => {
                 let mut needed = needed.saturating_add(disk_floor(usage.total_bytes));
@@ -716,10 +809,15 @@ impl LabelStore {
             }
         }
         let bytes = label_bytes(n).saturating_sub(kept as u64 * layer_bytes(n));
+        // Held until this store's record counts the leaf; taken first, so
+        // this process's labels being written need not wait for it.
+        let turn = self.labels_turn();
         let mut pending = self.pending();
         match self.admission(*pending, bytes.saturating_mul(DISK_MARGIN), stage) {
             Ok(()) => {
                 *pending = pending.saturating_add(bytes);
+                self.publish_pending(*pending);
+                drop(turn);
                 note_used(&dir, n, epoch);
                 drop(held);
                 Some(Admitted {
@@ -743,7 +841,7 @@ impl LabelStore {
                 })
             }
             Err(shortfall) => {
-                drop(pending);
+                drop((turn, pending));
                 let _ = fs::remove_file(&layers);
                 let _ = fs::remove_file(kept_path(&dir, n));
                 self.busy().remove(&(dir.clone(), n));
@@ -1431,6 +1529,7 @@ impl Admitted<'_> {
         self.remaining -= bytes;
         let mut pending = self.store.pending();
         *pending = pending.saturating_sub(bytes);
+        self.store.publish_pending(*pending);
     }
 
     /// [`Self::label_until`], never given up.
@@ -1704,6 +1803,7 @@ impl Drop for Admitted<'_> {
         {
             let mut pending = self.store.pending();
             *pending = pending.saturating_sub(remaining);
+            self.store.publish_pending(*pending);
         }
         self.store.busy().remove(&(self.dir.clone(), self.n));
     }
@@ -2772,6 +2872,56 @@ mod tests {
             "free space unknown"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Two processes of a node on one host keep labels on one filesystem
+    /// ([`LabelStore::use_ledger`]): what one's leaves have still to write
+    /// is no room for the other's, and is room again as it is written or
+    /// given up. Each counting only its own, both leaves were admitted.
+    #[test]
+    fn another_processs_labels_still_to_write_are_no_room() {
+        let base = temp_dir("host-pending");
+        let (a_dir, b_dir) = (base.join("a"), base.join("b"));
+        let ledger = host_ledger_dir(&a_dir);
+        assert_eq!(ledger, host_ledger_dir(&b_dir), "one ledger beside both");
+        let free = Arc::new(AtomicU64::new(0));
+        let store = |dir: &Path, id: &str| {
+            let store = LabelStore::with_space(dir.to_path_buf(), space(&free));
+            let record: &'static HostLedger =
+                Box::leak(Box::new(HostLedger::open_as(&ledger, id).unwrap()));
+            assert!(store.use_ledger(record));
+            (store, record)
+        };
+        let ((a, _), (b, b_record)) = (store(&a_dir, "a"), store(&b_dir, "b"));
+        let (member, n) = ([7u8; 32], 3_000u64);
+        let bytes = label_bytes(n);
+        let enough = disk_floor(TOTAL) + DISK_MARGIN * bytes;
+
+        free.store(enough, Ordering::SeqCst);
+        let admitted = a.admit(9, &member, b"leaf", n, Stage::Ahead).expect("room");
+        assert_eq!(b_record.others_labels_pending(), bytes);
+        assert!(
+            b.admit(9, &member, b"other", n, Stage::Snapshot).is_none(),
+            "another process's labels still to write are no room"
+        );
+        free.store(enough + bytes, Ordering::SeqCst);
+        drop(
+            b.admit(9, &member, b"other", n, Stage::Snapshot)
+                .expect("room for both"),
+        );
+        assert_eq!(
+            a.others_pending(),
+            0,
+            "another process's dropped admission frees its room"
+        );
+
+        free.store(enough, Ordering::SeqCst);
+        assert!(admitted.label(&SdrParams::default()).unwrap().kept);
+        assert!(
+            b.admit(9, &member, b"third", n, Stage::Snapshot).is_some(),
+            "room again once another process's labels are written"
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// A leaf that runs out of room while it is labelled is labelled to the
