@@ -4,7 +4,9 @@
 //! gives it a severity, a scope (this node, a peer, the network), its
 //! evidence and the operator's next check, logs it when it starts, at most
 //! every [`REPEAT_INTERVAL_MS`] while it lasts and when it ends, and serves
-//! the current ones in [`HealthConditions`]. Clients only render them.
+//! the current ones in [`HealthConditions`]. Clients only render them, and
+//! every condition served has its start and end line: one recurring within
+//! [`CLEAR_HOLD_MS`] of clearing continues, any other starts anew.
 //!
 //! Missing or old observations establish no condition: a shard's clock
 //! restarts after a gap of [`OBSERVATION_GAP_MS`], an unchanged span counts
@@ -39,8 +41,7 @@ pub const OBSERVATION_GAP_MS: u64 = 150_000;
 pub const WORKER_STALE_MS: u64 = 30_000;
 /// Affected shards a condition lists; the rest are counted.
 pub const MAX_AFFECTED: usize = 64;
-/// How often a lasting condition is logged again, and the shortest spacing
-/// of two start lines of one kind.
+/// How often a lasting condition is logged again.
 pub const REPEAT_INTERVAL_MS: u64 = 10 * 60_000;
 /// A condition clear this long ends; one that recurs sooner continues.
 pub const CLEAR_HOLD_MS: u64 = 60_000;
@@ -163,9 +164,6 @@ struct Current {
     since_ms: u64,
     last_logged_ms: u64,
     clear_since_ms: Option<u64>,
-    /// Whether its start was logged: a start within the repeat interval of
-    /// the kind's last start line is counted instead, and so is its end.
-    logged: bool,
     condition: HealthCondition,
 }
 
@@ -174,20 +172,19 @@ struct Current {
 pub enum Transition {
     Started {
         condition: HealthCondition,
-        /// Starts and ends of this kind not logged since its last line.
-        unlogged: u32,
     },
     Lasting {
         condition: HealthCondition,
         duration_ms: u64,
-        unlogged: u32,
     },
     Ended {
         kind: ConditionKind,
+        /// From its start to this end.
         duration_ms: u64,
+        /// How long it was clear, and so not served, before it ended.
+        clear_ms: u64,
         /// Its inputs went stale rather than the progress resuming.
         unobserved: bool,
-        unlogged: u32,
     },
 }
 
@@ -203,8 +200,6 @@ pub struct HealthRegistry {
     /// When each judged worker without an advance was first judged.
     worker_first_seen: HashMap<(u32, Vec<u8>), u64>,
     current: BTreeMap<i32, Current>,
-    last_start_logged_ms: HashMap<i32, u64>,
-    unlogged: HashMap<i32, u32>,
     sources: Vec<ConditionSource>,
 }
 
@@ -511,16 +506,11 @@ impl HealthRegistry {
                 return None;
             }
             let current = self.current.remove(&key)?;
-            let duration_ms = clear_since.saturating_sub(current.since_ms);
-            if !current.logged {
-                *self.unlogged.entry(key).or_default() += 1;
-                return None;
-            }
             return Some(Transition::Ended {
                 kind,
-                duration_ms,
+                duration_ms: now_ms.saturating_sub(current.since_ms),
+                clear_ms: now_ms.saturating_sub(clear_since),
                 unobserved: tracked == 0,
-                unlogged: self.unlogged.remove(&key).unwrap_or(0),
             });
         }
         let omitted_shards = shards.len().saturating_sub(MAX_AFFECTED) as u32;
@@ -540,39 +530,24 @@ impl HealthRegistry {
         if let Some(current) = self.current.get_mut(&key) {
             current.clear_since_ms = None;
             current.condition = condition(current.since_ms);
-            if current.logged && now_ms.saturating_sub(current.last_logged_ms) >= REPEAT_INTERVAL_MS
-            {
+            if now_ms.saturating_sub(current.last_logged_ms) >= REPEAT_INTERVAL_MS {
                 current.last_logged_ms = now_ms;
                 return Some(Transition::Lasting {
                     condition: current.condition.clone(),
                     duration_ms: now_ms.saturating_sub(current.since_ms),
-                    unlogged: self.unlogged.remove(&key).unwrap_or(0),
                 });
             }
             return None;
         }
-        let logged = self
-            .last_start_logged_ms
-            .get(&key)
-            .is_none_or(|at| now_ms.saturating_sub(*at) >= REPEAT_INTERVAL_MS);
         let current = Current {
             since_ms: now_ms,
             last_logged_ms: now_ms,
             clear_since_ms: None,
-            logged,
             condition: condition(now_ms),
         };
         let started = current.condition.clone();
         self.current.insert(key, current);
-        if !logged {
-            *self.unlogged.entry(key).or_default() += 1;
-            return None;
-        }
-        self.last_start_logged_ms.insert(key, now_ms);
-        Some(Transition::Started {
-            condition: started,
-            unlogged: self.unlogged.remove(&key).unwrap_or(0),
-        })
+        Some(Transition::Started { condition: started })
     }
 
     /// The current conditions, worst first, and every kind's source.
@@ -689,42 +664,37 @@ fn widest_window(c: &HealthCondition) -> u64 {
 /// Log one transition as one structured line.
 pub fn log_transition(transition: &Transition) {
     match transition {
-        Transition::Started {
-            condition: c,
-            unlogged,
-        } => {
+        Transition::Started { condition: c } => {
             warn!(condition = kind_label(c.kind), scope = scope_label(c.scope),
                 affected = c.affected, tracked = c.tracked, shards = %shard_names(c),
-                widest_window_secs = widest_window(c), unlogged_transitions = unlogged,
-                action = action_text(c.action), text = %notice_text(c),
-                "health condition started");
+                widest_window_secs = widest_window(c), action = action_text(c.action),
+                text = %notice_text(c), "health condition started");
         }
         Transition::Lasting {
             condition: c,
             duration_ms,
-            unlogged,
         } => {
             warn!(condition = kind_label(c.kind), scope = scope_label(c.scope),
                 affected = c.affected, tracked = c.tracked, shards = %shard_names(c),
                 widest_window_secs = widest_window(c), duration_secs = duration_ms / 1000,
-                unlogged_transitions = unlogged, action = action_text(c.action),
-                text = %notice_text(c), "health condition lasting");
+                action = action_text(c.action), text = %notice_text(c),
+                "health condition lasting");
         }
         Transition::Ended {
             kind,
             duration_ms,
+            clear_ms,
             unobserved,
-            unlogged,
         } => {
             info!(
                 condition = kind_label(*kind as i32),
                 duration_secs = duration_ms / 1000,
+                clear_secs = clear_ms / 1000,
                 reason = if *unobserved {
                     "no fresh observations"
                 } else {
                     "progress resumed"
                 },
-                unlogged_transitions = unlogged,
                 "health condition ended"
             );
         }
@@ -1028,7 +998,8 @@ mod tests {
 
     /// A condition logs its start once, lasts through a short clear spell
     /// with its first start time, repeats at most every 10 minutes and ends
-    /// after a clear minute; stale inputs end it at once.
+    /// after a clear minute; a restart is logged however soon it comes;
+    /// stale inputs end it at once.
     #[test]
     fn conditions_start_last_and_end_with_bounded_lines() {
         let none = |_: &[u8]| None;
@@ -1073,24 +1044,37 @@ mod tests {
             ),
             "{ended:?}"
         );
-        // Over 10 minutes after the last start line: logged.
+        // A start: logged.
         let again = step(&mut reg, 1500, 14);
-        assert!(matches!(
-            again.as_slice(),
-            [Transition::Started { unlogged: 0, .. }]
-        ));
+        assert!(
+            matches!(again.as_slice(), [Transition::Started { .. }]),
+            "{again:?}"
+        );
         assert!(step(&mut reg, 1515, 15).is_empty());
         let ended = step(&mut reg, 1575, 16);
         assert!(
             matches!(ended.as_slice(), [Transition::Ended { .. }]),
             "{ended:?}"
         );
-        // A restart within 10 minutes of the last start line is counted,
-        // not logged, and so is its end.
-        assert!(step(&mut reg, 1650, 16).is_empty());
-        assert!(!reg.snapshot().conditions.is_empty());
-        // Inputs go stale: it ends at once, unobserved.
-        reg.evaluate(T0 + 1850 * 1000, &none);
+        // A restart within 10 minutes of the last start line: logged too.
+        let restart = step(&mut reg, 1650, 16);
+        assert!(
+            matches!(restart.as_slice(), [Transition::Started { .. }]),
+            "a restart is logged: {restart:?}"
+        );
+        // Inputs go stale: it ends at once, unobserved, never clear first.
+        let stale = reg.evaluate(T0 + 1850 * 1000, &none);
+        assert!(
+            matches!(
+                stale.as_slice(),
+                [Transition::Ended {
+                    unobserved: true,
+                    clear_ms: 0,
+                    ..
+                }]
+            ),
+            "{stale:?}"
+        );
         assert!(reg.snapshot().conditions.is_empty());
         let source = reg
             .snapshot()
@@ -1099,18 +1083,78 @@ mod tests {
             .find(|s| s.kind == ConditionKind::PeerAppFramesUnchanged as i32)
             .unwrap();
         assert_eq!((source.observed_unix_ms, source.tracked), (0, 0));
-        // The next logged line carries the two unlogged transitions.
-        let mut reg2 = reg;
-        let start = |reg: &mut HealthRegistry, secs: u64| {
+    }
+
+    /// Every condition served has its start and end line, however soon it
+    /// recurs, so a client shows only what the log records. A manager that
+    /// polls 90 s of every 5 min feeds the peer heads: each poll window
+    /// starts a condition and each gap ends it.
+    #[test]
+    fn every_served_condition_has_a_start_and_an_end_line() {
+        let none = |_: &[u8]| None;
+        let kind = ConditionKind::PeerAppFramesUnchanged;
+        let mut reg = HealthRegistry::default();
+        let (mut open, mut starts, mut ends) = (false, 0, 0);
+        for secs in (0..3600u64).step_by(15) {
             let now = T0 + secs * 1000;
-            reg.observe_peers(&[peer(1, 99)], now);
-            reg.evaluate(now, &none)
-        };
-        start(&mut reg2, 2400);
-        let again = start(&mut reg2, 2460);
-        assert!(
-            matches!(again.as_slice(), [Transition::Started { unlogged: 2, .. }]),
-            "{again:?}"
+            if secs % 300 < 90 {
+                reg.observe_peers(&[peer(1, 10)], now);
+            }
+            for t in reg.evaluate(now, &none) {
+                match t {
+                    Transition::Started { condition, .. } if condition.kind == kind as i32 => {
+                        assert!(!open, "a second start line at {secs}s");
+                        open = true;
+                        starts += 1;
+                    }
+                    Transition::Ended { kind: k, .. } if k == kind => {
+                        assert!(open, "an end line without a start at {secs}s");
+                        open = false;
+                        ends += 1;
+                    }
+                    _ => {}
+                }
+            }
+            let served = affected(&reg, kind).is_some();
+            assert!(!served || open, "served without a start line at {secs}s");
+        }
+        assert_eq!(
+            (starts, ends),
+            (12, 12),
+            "one start and end per poll window"
+        );
+    }
+
+    /// An end line's duration runs from its start line to it, and it names
+    /// how long the condition was clear, and so not served, before it ended.
+    #[test]
+    fn an_end_line_spans_from_its_start_and_names_its_clear_spell() {
+        let none = |_: &[u8]| None;
+        let mut reg = HealthRegistry::default();
+        let mut lines = Vec::new();
+        for secs in (0..=165u64).step_by(15) {
+            let now = T0 + secs * 1000;
+            // Unchanged to 75 s (a start at 60 s), then advancing from 90 s.
+            let frame = if secs < 90 { 10 } else { secs };
+            reg.observe_peers(&[peer(1, frame)], now);
+            lines.extend(reg.evaluate(now, &none));
+        }
+        let ended: Vec<_> = lines
+            .iter()
+            .filter_map(|t| match t {
+                Transition::Ended {
+                    duration_ms,
+                    clear_ms,
+                    ..
+                } => Some((*duration_ms, *clear_ms)),
+                _ => None,
+            })
+            .collect();
+        // Started at 60 s, clear from 90 s, ended at 150 s.
+        assert_eq!(
+            ended,
+            vec![(90_000, 60_000)],
+            "the end line's duration from its start and its clear spell"
         );
     }
 
