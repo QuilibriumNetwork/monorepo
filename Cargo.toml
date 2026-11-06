@@ -242,6 +242,23 @@ lto = false
 [profile.test]
 debug = "line-tables-only"
 
+# `cc` compiles vendored C and C++ with `-g` whenever a profile has any
+# debug info, so line tables above still give RocksDB full DWARF: 179 of
+# a quil-node test binary's 286 MB `.debug_info`, rewritten at each
+# relink. These crates build with `NDEBUG` either way.
+[profile.dev.package.librocksdb-sys]
+debug = false
+[profile.dev.package.zstd-sys]
+debug = false
+[profile.dev.package.lz4-sys]
+debug = false
+[profile.test.package.librocksdb-sys]
+debug = false
+[profile.test.package.zstd-sys]
+debug = false
+[profile.test.package.lz4-sys]
+debug = false
+
 # All third-party dependencies. `*` matches every package except the
 # one currently being built, so workspace members still need explicit
 # overrides below.
