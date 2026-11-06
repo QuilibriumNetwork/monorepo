@@ -967,6 +967,25 @@ impl CrowdRig {
         Self::bundle(vec![Self::sealed(&sealed.submission, drain)], timestamp)
     }
 
+    /// What any peer makes of a member's gossiped copy, its certificate
+    /// included: one more header, numbered 0 (GLOBAL executed frame 1, so it
+    /// is passed over), and the last header altered. The copy claims the
+    /// members' reach with more headers than any of theirs, and validation
+    /// checks the certificate before it refuses the altered header.
+    fn padded(&self, seal: usize, timestamp: i64) -> Vec<u8> {
+        let sealed = &self.seals[seal];
+        let mut headers = sealed.drain.clone();
+        headers.last_mut().unwrap().spends = vec![timestamp as u8];
+        let drain = std::iter::once(self.junk_header(seal, 0))
+            .chain(
+                headers
+                    .iter()
+                    .map(|header| header.to_canonical_bytes().unwrap()),
+            )
+            .collect();
+        Self::bundle(vec![Self::sealed(&sealed.submission, drain)], timestamp)
+    }
+
     /// A copy of each of `seals` made from their request and session alone:
     /// a certificate nobody signed and one header numbered `reach`, all in
     /// one bundle.
@@ -1253,6 +1272,46 @@ fn seal_crowding_fix_refused_copies_leave_the_mempool_in_the_proposal_that_tries
         rig.collector.total_pending(),
         members.len(),
         "FIX: the forged copies leave the mempool, the members' stay"
+    );
+}
+
+/// Forged copies made from a member's gossiped copy, its certificate
+/// included, each with more headers than any member's copy and so tried
+/// ahead of theirs: the leader validates one, refuses it, and then takes the
+/// seal's copies in collection order, so a member's copy rides and the other
+/// forged copies are never validated. Uncapped, each forged copy cost a
+/// certificate check before a member's copy was reached, and enough of them
+/// spent the proposal's validation budget.
+#[test]
+fn forged_copies_with_a_members_certificate_cost_one_refusal_before_a_members_copy_rides() {
+    const FORGED: usize = 8;
+    let rig = CrowdRig::new(1);
+    let members = rig.gossip_members(0, 1);
+    let forged: Vec<_> = (0..FORGED).map(|n| rig.padded(0, 20 + n as i64)).collect();
+    rig.check_setup(
+        &members,
+        &forged.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+    );
+    for copy in &forged {
+        assert!(rig.collector.add_message(1, copy.clone()));
+    }
+    let proposal = rig.propose(1);
+    assert!(
+        forged.iter().all(|copy| !proposal.contains(copy)),
+        "UNEXPECTED: a forged copy rode"
+    );
+    assert_eq!(
+        carried(&proposal, &members),
+        1,
+        "CROWDED: GLOBAL frame {CROWD_FRAME}'s proposal carries no member's copy"
+    );
+    let validated = members.len() + FORGED - rig.collector.total_pending();
+    assert_eq!(
+        validated, 1,
+        "VALIDATED AHEAD: GLOBAL frame {CROWD_FRAME}'s leader validated and refused \
+         {validated} of {FORGED} forged copies before a member's copy of the seal rode: \
+         a copy claiming more headers than the members' is tried first, so each one costs \
+         a certificate check ahead of theirs"
     );
 }
 
