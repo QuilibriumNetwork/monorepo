@@ -40,6 +40,67 @@ pub struct ProdProverMessageTransport {
     pub publish_to_blossomsub: bool,
     /// Submissions every archive refused only for now, resent later.
     pub(crate) retry_queue: Arc<SubmitRetryQueue>,
+    /// The check an archive's head header must pass to set a join's frame:
+    /// the archive-sync header check and a committee finalization
+    /// certificate (`archive_sync::join_header_check`).
+    pub(crate) join_header_check: quil_rpc::frame_sync::FrameValidator,
+}
+
+/// The header a join is stamped with, and its source: the freshest archive
+/// head header that is not below the local head and passes `check`, else
+/// the local head. No archive answer lowers the join frame below what this
+/// node already holds (a replayed old certified head, frame 0, a legacy
+/// header signed by a key it carries), and none raises it unverified.
+fn join_frame_header(
+    local: Option<GlobalFrameHeader>,
+    answers: Vec<(String, GlobalFrameHeader)>,
+    check: &quil_rpc::frame_sync::FrameValidator,
+) -> Option<(String, GlobalFrameHeader)> {
+    let floor = local.as_ref().map_or(0, |header| header.frame_number);
+    let (current, stale): (Vec<_>, Vec<_>) = answers
+        .into_iter()
+        .partition(|(_, header)| header.frame_number >= floor);
+    if let Some((addr, header)) = stale.first() {
+        warn!(
+            %addr,
+            frame_number = header.frame_number,
+            local_head = floor,
+            below = stale.len(),
+            scope = "peer",
+            "archive head header below the local head: not used for the join frame"
+        );
+    }
+    let verified = |header: &GlobalFrameHeader| {
+        check(&quil_types::proto::global::GlobalFrame {
+            header: Some(header.clone()),
+            requests: Vec::new(),
+        })
+    };
+    freshest_verified_header(current, verified)
+        .or_else(|| local.map(|header| ("local head".to_string(), header)))
+}
+
+/// The freshest of `answers` (archive, head header) that `verified` accepts:
+/// an unverified header, however fresh, never sets a join's frame. `None`
+/// when no answer verifies.
+fn freshest_verified_header(
+    mut answers: Vec<(String, GlobalFrameHeader)>,
+    verified: impl Fn(&GlobalFrameHeader) -> bool,
+) -> Option<(String, GlobalFrameHeader)> {
+    // Freshest first; among equals, the first to answer.
+    answers.sort_by_key(|(_, header)| std::cmp::Reverse(header.frame_number));
+    for (addr, header) in answers {
+        if verified(&header) {
+            return Some((addr, header));
+        }
+        warn!(
+            %addr,
+            frame_number = header.frame_number,
+            scope = "peer",
+            "archive head header failed verification: not used for the join frame"
+        );
+    }
+    None
 }
 
 /// Submissions every archive refused only for now (a full mempool, or, from
@@ -462,6 +523,7 @@ impl ProverMessageTransport for ProdProverMessageTransport {
         // header, just the freshest one available.
         const PER_ARCHIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
         const MAX_ARCHIVES_TO_TRY: usize = 5;
+        let mut answers = Vec::new();
         if let Some(seed) = self.falcon_signing_key.clone() {
             let addrs: Vec<String> = self
                 .archive_pool
@@ -500,37 +562,41 @@ impl ProverMessageTransport for ProdProverMessageTransport {
                     }
                 }));
             }
-            let mut best: Option<(String, GlobalFrameHeader)> = None;
             for h in handles {
-                if let Ok(Some((addr, header))) = h.await {
-                    match &best {
-                        None => best = Some((addr, header)),
-                        Some((_, current)) if header.frame_number > current.frame_number => {
-                            best = Some((addr, header));
-                        }
-                        _ => {}
-                    }
+                if let Ok(Some(answer)) = h.await {
+                    answers.push(answer);
                 }
             }
-            if let Some((addr, header)) = best {
-                tracing::debug!(
-                    %addr,
-                    frame_number = header.frame_number,
-                    "selected freshest archive header"
-                );
-                return Ok(header);
-            }
-            tracing::warn!("all candidate archives timed out — falling back to local clock store",);
         }
-        let f = self
-            .clock_store
-            .get_latest_global_clock_frame()
-            .map_err(|e| QuilError::Internal(format!("no local frame: {e}")))?;
-        let h = f
-            .header
-            .as_ref()
-            .ok_or_else(|| QuilError::Internal("local frame missing header".into()))?;
-        Ok(h.clone())
+        let answered = answers.len();
+        // Read after the archives answered, so the floor is the freshest
+        // head this node holds.
+        let local = self.clock_store.get_latest_global_clock_frame();
+        let local_header = local.as_ref().ok().and_then(|frame| frame.header.clone());
+        // A header any one archive (or whoever answers for it) serves
+        // stamps the join, so it must verify as GLOBAL frames do, and it
+        // never takes the join below the local head.
+        match join_frame_header(local_header, answers, &self.join_header_check) {
+            Some((source, header)) => {
+                if self.falcon_signing_key.is_some() && source == "local head" {
+                    tracing::warn!(
+                        answered,
+                        frame_number = header.frame_number,
+                        "no archive head header verified above the local head — using the local head",
+                    );
+                }
+                tracing::debug!(
+                    %source,
+                    frame_number = header.frame_number,
+                    "selected the join frame header"
+                );
+                Ok(header)
+            }
+            None => match local {
+                Err(e) => Err(QuilError::Internal(format!("no local frame: {e}"))),
+                Ok(_) => Err(QuilError::Internal("local frame missing header".into())),
+            },
+        }
     }
 
     async fn publish_prover_bundle(&self, bundle_bytes: Vec<u8>) -> Result<()> {
@@ -1705,5 +1771,99 @@ mod tests {
                 .unwrap();
         assert_eq!(queue.delivered(&sealing_too), 1, "the seal of 1335");
         assert_eq!(queue.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod join_header_tests {
+    use super::{freshest_verified_header, join_frame_header};
+    use quil_types::proto::global::GlobalFrameHeader;
+
+    fn check(accept: bool) -> quil_rpc::frame_sync::FrameValidator {
+        std::sync::Arc::new(move |_: &quil_types::proto::global::GlobalFrame| accept)
+    }
+
+    fn chosen(
+        local: Option<u64>,
+        answers: &[(&str, u64)],
+        check: &quil_rpc::frame_sync::FrameValidator,
+    ) -> Option<(String, u64)> {
+        let answers = answers
+            .iter()
+            .map(|(addr, number)| (addr.to_string(), header(*number)))
+            .collect();
+        join_frame_header(local.map(header), answers, check).map(|(src, h)| (src, h.frame_number))
+    }
+
+    /// R112-D-2: no archive answer lowers the join frame below the local
+    /// head, verified or not: a replayed old certified head, frame 0, or a
+    /// legacy header signed by a key it carries would make the chain refuse
+    /// the join as stale.
+    #[test]
+    fn r112_d2_an_archive_head_below_the_local_head_does_not_lower_the_join_frame() {
+        let accept = check(true);
+        assert_eq!(
+            chosen(Some(100), &[("replay", 90), ("zero", 0)], &accept),
+            Some(("local head".to_string(), 100)),
+            "R112-D-2: an archive head below the local head set the join frame"
+        );
+        assert_eq!(
+            chosen(Some(100), &[("replay", 90), ("b", 105)], &accept),
+            Some(("b".to_string(), 105))
+        );
+        assert_eq!(
+            chosen(None, &[("b", 7)], &accept),
+            Some(("b".to_string(), 7))
+        );
+        assert_eq!(chosen(None, &[], &accept), None);
+    }
+
+    /// R112-D-2: an archive head above the local head sets the join frame
+    /// only through the header check; a refused one leaves the local head.
+    #[test]
+    fn r112_d2_the_join_frame_takes_an_archive_head_only_through_the_check() {
+        assert_eq!(
+            chosen(Some(100), &[("x", 105)], &check(false)),
+            Some(("local head".to_string(), 100)),
+            "R112-D-2: an archive head the check refused set the join frame"
+        );
+        assert_eq!(
+            chosen(Some(100), &[("x", 105)], &check(true)),
+            Some(("x".to_string(), 105))
+        );
+    }
+
+    fn header(frame_number: u64) -> GlobalFrameHeader {
+        GlobalFrameHeader {
+            frame_number,
+            ..Default::default()
+        }
+    }
+
+    /// R112-D-2: a join's frame comes from the freshest archive head header
+    /// that verifies. One archive (or whoever answers at its address)
+    /// serving an unverifiable header with a far-future frame number would
+    /// otherwise stamp every join with it, and the chain refuses each one.
+    #[test]
+    fn r112_d2_an_unverified_archive_head_does_not_set_the_join_frame() {
+        let forged = 4_000_000_000;
+        let answers = vec![
+            ("a".to_string(), header(100)),
+            ("forger".to_string(), header(forged)),
+            ("b".to_string(), header(101)),
+            ("c".to_string(), header(101)),
+        ];
+        let chosen = freshest_verified_header(answers.clone(), |h| h.frame_number != forged)
+            .map(|(addr, h)| (addr, h.frame_number));
+        assert_eq!(
+            chosen,
+            Some(("b".to_string(), 101)),
+            "R112-D-2: the join frame came from an unverified archive head header"
+        );
+        assert_eq!(
+            freshest_verified_header(answers, |_| false).map(|(_, h)| h.frame_number),
+            None,
+            "R112-D-2: with no verified answer the join takes the local head"
+        );
     }
 }

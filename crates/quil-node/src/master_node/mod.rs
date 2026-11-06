@@ -48,6 +48,38 @@ pub(crate) fn global_consensus_participant(archive_mode: bool, network: u8) -> b
     archive_mode || network == 99
 }
 
+/// Pin each mainnet genesis archive's static endpoint (`ip:8340`) to the
+/// archive's peer id, and return the endpoints. The genesis archive at that
+/// address presents this identity on `:8340` as on the mesh; a dial reaching
+/// anyone else fails. The pins are per process: the master and each cluster
+/// worker process set their own.
+pub(crate) fn pin_genesis_archive_endpoints() -> Vec<String> {
+    let mut endpoints = Vec::new();
+    for (peer_id, ip) in quil_engine::genesis::genesis_archive_static_ips() {
+        let endpoint = format!("{}:8340", ip);
+        match peer_id.parse::<quil_p2p::PeerId>() {
+            Ok(peer) => {
+                if let Err(held) = quil_rpc::archive_client::pin_archive_peer(&endpoint, peer) {
+                    tracing::warn!(
+                        peer = %peer_id,
+                        %endpoint,
+                        pinned_to = %held,
+                        "genesis archive endpoint is already pinned to another peer; that pin stays"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                peer = %peer_id,
+                %endpoint,
+                %error,
+                "genesis archive endpoint has an unreadable peer id; dialed unpinned"
+            ),
+        }
+        endpoints.push(endpoint);
+    }
+    endpoints
+}
+
 pub(crate) async fn start(
     mut sup: Supervisor<anyhow::Error>,
     config: &quil_config::Config,
@@ -784,7 +816,16 @@ pub(crate) async fn start(
                 Some(endpoint) => {
                     // An endpoint that names its peer must answer as that peer.
                     if let Some(peer) = crate::util::multiaddr::archive_multiaddr_peer(raw) {
-                        quil_rpc::archive_client::pin_archive_peer(&endpoint, peer);
+                        if let Err(held) =
+                            quil_rpc::archive_client::pin_archive_peer(&endpoint, peer)
+                        {
+                            tracing::warn!(
+                                multiaddr = %raw,
+                                %endpoint,
+                                pinned_to = %held,
+                                "engine.archiveEndpoints names another peer for an endpoint an earlier entry pinned; the earlier pin stays"
+                            );
+                        }
                     }
                     archive_pool.add(endpoint.clone()).await;
                     tracing::debug!(
@@ -803,23 +844,9 @@ pub(crate) async fn start(
         }
     } else if network == 0 {
         let pool = archive_pool.clone();
-        let static_ips = quil_engine::genesis::genesis_archive_static_ips();
-        for (peer_id, ip) in static_ips {
-            let endpoint = format!("{}:8340", ip);
-            // The genesis archive at this address presents this identity on
-            // `:8340` as on the mesh; a dial reaching anyone else fails.
-            match peer_id.parse::<quil_p2p::PeerId>() {
-                Ok(peer) => quil_rpc::archive_client::pin_archive_peer(&endpoint, peer),
-                Err(error) => tracing::warn!(
-                    peer = %peer_id,
-                    %endpoint,
-                    %error,
-                    "genesis archive endpoint has an unreadable peer id; dialed unpinned"
-                ),
-            }
+        for endpoint in pin_genesis_archive_endpoints() {
             pool.add(endpoint.clone()).await;
             tracing::debug!(
-                peer = %peer_id,
                 endpoint = %endpoint,
                 "seeded archive pool with static genesis-archive mTLS endpoint"
             );
@@ -977,6 +1004,57 @@ pub(crate) async fn start(
         }
     };
 
+    // CW global-consensus committee roster. On mainnet (network 0) the committee
+    // IS the embedded genesis data — the same `archive_peers` (peer_id ->
+    // Falcon-512 pubkey) that already seeds `genesis_prover_addrs` and the
+    // static archive pool. It is fixed by the binary, NOT a hand-populated
+    // operator config: every archive would otherwise have to carry an identical
+    // `consensusCommittee`/`consensusCommitteePeerIds` list, and any one archive
+    // shipping it empty leaves that node unable to
+    // start simplex (`start_cw_global_consensus returned None`), stranding it at
+    // the last legacy head forever. `genesis_archive_peers()` derives each
+    // member's peer id via `peer_id_from_falcon_pubkey`, so the resolve_peer map
+    // keys match exactly what the :8340 PQNoise transport authenticates inbound
+    // peers as. Non-mainnet networks keep the config-driven lists (localnet.sh
+    // populates them from `--print-identity`).
+    let (consensus_committee, consensus_committee_peer_ids): (Vec<String>, Vec<String>) =
+        if network == 0 {
+            match quil_engine::genesis::genesis_archive_peers() {
+                Ok(peers) => {
+                    let mut hexes = Vec::with_capacity(peers.len());
+                    let mut pids = Vec::with_capacity(peers.len());
+                    for (peer_id, pubkey) in peers {
+                        pids.push(peer_id);
+                        hexes.push(hex::encode(&pubkey));
+                    }
+                    info!(
+                        committee = hexes.len(),
+                        "CW committee loaded from genesis data"
+                    );
+                    (hexes, pids)
+                }
+                Err(e) => {
+                    warn!(error = %e, "could not load genesis archive peers for CW committee");
+                    (Vec::new(), Vec::new())
+                }
+            }
+        } else {
+            (
+                config.engine.consensus_committee.clone(),
+                config.engine.consensus_committee_peer_ids.clone(),
+            )
+        };
+    // The check an archive's head header passes before it sets a join's
+    // frame: the archive-sync header check against this committee.
+    let join_header_check = archive_sync::join_header_check(
+        genesis_prover_addrs.clone(),
+        archive_sync::global_frame_verifier(
+            frame_prover.clone(),
+            network,
+            &consensus_committee,
+            &consensus_committee_peer_ids,
+        ),
+    );
     // Production transport: gRPC fan-out to archives. Archive nodes
     // also publish on BlossomSub for maximum dissemination; non-archive
     // nodes skip the gossip publish (they don't subscribe to
@@ -993,6 +1071,7 @@ pub(crate) async fn start(
             falcon_signing_key: mtls_seed.map(|_| falcon_signing_key.clone()),
             publish_to_blossomsub: archive_mode,
             retry_queue: Default::default(),
+            join_header_check,
         },
     );
 
@@ -1252,46 +1331,6 @@ pub(crate) async fn start(
     // execution materializes it at the points the chain sequences.
     let app_ingest: archive_sync::AppIngestCell = Arc::new(std::sync::OnceLock::new());
 
-    // CW global-consensus committee roster. On mainnet (network 0) the committee
-    // IS the embedded genesis data — the same `archive_peers` (peer_id ->
-    // Falcon-512 pubkey) that already seeds `genesis_prover_addrs` and the
-    // static archive pool. It is fixed by the binary, NOT a hand-populated
-    // operator config: every archive would otherwise have to carry an identical
-    // `consensusCommittee`/`consensusCommitteePeerIds` list, and any one archive
-    // shipping it empty leaves that node unable to
-    // start simplex (`start_cw_global_consensus returned None`), stranding it at
-    // the last legacy head forever. `genesis_archive_peers()` derives each
-    // member's peer id via `peer_id_from_falcon_pubkey`, so the resolve_peer map
-    // keys match exactly what the :8340 PQNoise transport authenticates inbound
-    // peers as. Non-mainnet networks keep the config-driven lists (localnet.sh
-    // populates them from `--print-identity`).
-    let (consensus_committee, consensus_committee_peer_ids): (Vec<String>, Vec<String>) =
-        if network == 0 {
-            match quil_engine::genesis::genesis_archive_peers() {
-                Ok(peers) => {
-                    let mut hexes = Vec::with_capacity(peers.len());
-                    let mut pids = Vec::with_capacity(peers.len());
-                    for (peer_id, pubkey) in peers {
-                        pids.push(peer_id);
-                        hexes.push(hex::encode(&pubkey));
-                    }
-                    info!(
-                        committee = hexes.len(),
-                        "CW committee loaded from genesis data"
-                    );
-                    (hexes, pids)
-                }
-                Err(e) => {
-                    warn!(error = %e, "could not load genesis archive peers for CW committee");
-                    (Vec::new(), Vec::new())
-                }
-            }
-        } else {
-            (
-                config.engine.consensus_committee.clone(),
-                config.engine.consensus_committee_peer_ids.clone(),
-            )
-        };
     // The committee authors GLOBAL frames: the gossip gate rate-limits the
     // frames they sign per author rather than per forwarding peer.
     p2p_handle.global_frame_gate().set_committee(

@@ -596,6 +596,47 @@ fn archive_header_is_valid(
     }
 }
 
+/// The GLOBAL frame verifier (VDF, signatures, and the finalization
+/// certificate against the fixed global committee and its successor) every
+/// archive-sourced GLOBAL frame is checked with. Without a committee the
+/// certificate check is skipped (legacy configs).
+pub(crate) fn global_frame_verifier(
+    frame_prover: Arc<dyn quil_types::crypto::FrameProver>,
+    network: u8,
+    committee: &[String],
+    peer_ids: &[String],
+) -> Arc<quil_engine::frame_validator::GlobalFrameVerifier> {
+    let decode = |keys: &[String]| -> Vec<Vec<u8>> {
+        keys.iter().filter_map(|s| hex::decode(s).ok()).collect()
+    };
+    let (successor, _) = global_committee_successor(network, committee, peer_ids);
+    Arc::new(
+        quil_engine::frame_validator::GlobalFrameVerifier::with_bls(
+            frame_prover,
+            Arc::new(quil_crypto::FalconKeyConstructor)
+                as Arc<dyn quil_types::crypto::BlsConstructor>,
+        )
+        .with_global_committee(decode(committee))
+        .with_global_committee_successor(decode(&successor)),
+    )
+}
+
+/// The check an archive's head header must pass before it sets a join's
+/// frame: the header check every archive header passes (the genesis-prover
+/// allowlist, VDF and signature, [`archive_header_is_valid`]) and a
+/// certificate of its own ([`frame_self_certified`]). The VDF alone proves
+/// nothing: its difficulty is the header's own, so anyone can build a valid
+/// one for any frame number.
+pub(crate) fn join_header_check(
+    genesis_prover_addrs: std::collections::HashSet<Vec<u8>>,
+    frame_verifier: Arc<quil_engine::frame_validator::GlobalFrameVerifier>,
+) -> quil_rpc::frame_sync::FrameValidator {
+    Arc::new(move |frame: &quil_types::proto::global::GlobalFrame| {
+        archive_header_is_valid(frame, &genesis_prover_addrs, &frame_verifier)
+            && frame_self_certified(frame, &frame_verifier)
+    })
+}
+
 /// Whether a VALIDATED global frame carries a certificate of its own: a
 /// commonware finalization certificate that verifies against the committee, or,
 /// below the GLOBAL sync authentication frame only, a legacy aggregate
@@ -2145,29 +2186,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         // prover already in scope + a fresh BLS constructor (mirrors
         // `frame_pipeline::init`). Used to gate every archive-sourced frame
         // and proposal BEFORE it is persisted / submitted into consensus.
-        let frame_verifier: Arc<quil_engine::frame_validator::GlobalFrameVerifier> = {
-            // Decode the fixed global committee (genesis archives' Falcon pubkeys)
-            // so CW-finalized global frames are verified against it via their
-            // carried finalization cert (defense-in-depth over VDF). Empty on a
-            // legacy/no-committee config → cert check is skipped.
-            let decode = |keys: &[String]| -> Vec<Vec<u8>> {
-                keys.iter().filter_map(|s| hex::decode(s).ok()).collect()
-            };
-            let (successor, _) = global_committee_successor(
-                network,
-                &consensus_committee,
-                &consensus_committee_peer_ids,
-            );
-            Arc::new(
-                quil_engine::frame_validator::GlobalFrameVerifier::with_bls(
-                    frame_prover.clone(),
-                    Arc::new(quil_crypto::FalconKeyConstructor)
-                        as Arc<dyn quil_types::crypto::BlsConstructor>,
-                )
-                .with_global_committee(decode(&consensus_committee))
-                .with_global_committee_successor(decode(&successor)),
-            )
-        };
+        let frame_verifier = global_frame_verifier(
+            frame_prover.clone(),
+            network,
+            &consensus_committee,
+            &consensus_committee_peer_ids,
+        );
         // Genesis-prover-allowlist + VDF/BLS gate packaged as a closure so the
         // (quil-rpc) poller and the record-only backfill can apply the exact
         // same drop-before-store check the gossip GLOBAL_FRAME handler applies.
@@ -5300,6 +5324,25 @@ mod validation_tests {
         assert!(
             !archive_frame_is_valid(&frame, &addrs, &any_vdf_verifier()),
             "GLOBAL frame 907920 from an archive was accepted with a request body that does not hash to its requests_root"
+        );
+    }
+
+    /// R112-D-2: an archive's head header sets a join's frame only with a
+    /// certificate of its own. One that passes the header check on an
+    /// allowlisted prover and a VDF alone (whose difficulty the header
+    /// chooses) is refused.
+    #[test]
+    fn r112_d2_a_join_header_needs_a_committee_certificate() {
+        let (frame, addrs) = allowlisted_frame(907_920, Vec::new());
+        let verifier = Arc::new(any_vdf_verifier());
+        quil_types::consensus::set_global_sync_authentication_frame_for_thread(Some(10));
+        let header_ok = archive_header_is_valid(&frame, &addrs, &verifier);
+        let joins = join_header_check(addrs, verifier)(&frame);
+        quil_types::consensus::set_global_sync_authentication_frame_for_thread(None);
+        assert!(header_ok, "the header check alone accepts it");
+        assert!(
+            !joins,
+            "R112-D-2: an uncertified head header was accepted for the join frame"
         );
     }
 
