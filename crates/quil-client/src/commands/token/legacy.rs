@@ -553,13 +553,13 @@ impl Tally {
 
 /// Every legacy coin of `owner`, ascending by address, as
 /// `(address, amount, shielded)`. `progress` gets the running count after
-/// each page that more pages follow.
+/// each page, and whether more pages follow.
 async fn list_owner(
     client: &Client,
     application: &[u8; 32],
     owner: &[u8; 32],
     pages: &mut usize,
-    mut progress: impl FnMut(usize),
+    mut progress: impl FnMut(usize, bool),
 ) -> anyhow::Result<Vec<([u8; 32], u128, bool)>> {
     let mut coins = Vec::new();
     let mut after: Vec<u8> = Vec::new();
@@ -597,13 +597,14 @@ async fn list_owner(
             after = coin.address.clone();
         }
         if !page.has_more {
+            progress(coins.len(), false);
             break;
         }
         anyhow::ensure!(
             !page.coins.is_empty(),
             "legacy coin listing did not advance"
         );
-        progress(coins.len());
+        progress(coins.len(), true);
     }
     Ok(coins)
 }
@@ -621,14 +622,40 @@ async fn list_owners(
     pages: &mut usize,
     quiet: bool,
 ) -> anyhow::Result<Vec<Coin>> {
+    list_owners_observed(
+        client,
+        application,
+        owners,
+        label,
+        pages,
+        quiet,
+        &mut |_, _| {},
+    )
+    .await
+}
+
+/// [`list_owners`], telling `on_page` the pages read and the coins listed
+/// so far, across `owners`, after each page.
+async fn list_owners_observed(
+    client: &Client,
+    application: &[u8; 32],
+    owners: &[(OwnerForm, [u8; 32])],
+    label: &str,
+    pages: &mut usize,
+    quiet: bool,
+    on_page: &mut (dyn FnMut(usize, usize) + Send),
+) -> anyhow::Result<Vec<Coin>> {
     use std::io::{IsTerminal, Write};
     let terminal = !quiet && !super::output::captured() && std::io::stderr().is_terminal();
     let (started, verbose) = (std::time::Instant::now(), crate::verbosity::on());
     let mut coins = Vec::new();
     for (form, owner) in owners {
         let mut shown = false;
-        let listed = list_owner(client, application, owner, pages, |count| {
-            if terminal && (verbose || started.elapsed() > super::output::SLOW_PHASE) {
+        let (before, mut read) = (coins.len(), *pages);
+        let listed = list_owner(client, application, owner, pages, |count, more| {
+            read += 1;
+            on_page(read, before + count);
+            if terminal && more && (verbose || started.elapsed() > super::output::SLOW_PHASE) {
                 eprint!(
                     "\r{label}: {count} legacy coins listed under the {} owner, more follow",
                     form.text()
@@ -786,23 +813,29 @@ pub(crate) struct Snapshot {
 
 /// The [`Snapshot`] of the identity with Ed448 public key `public` on
 /// `network`, read from `client`; `config_dir` holds shield-all's journal.
+/// `progress` gets the pages read and the coins listed after each page,
+/// and again after the shard list, so a caller can tell a long read from a
+/// stalled one.
 pub(crate) async fn snapshot(
     client: &Client,
     application: &[u8; 32],
     public: &[u8; 57],
     network: u8,
     config_dir: Option<&Path>,
+    progress: &mut (dyn FnMut(usize, usize) + Send),
 ) -> anyhow::Result<Snapshot> {
     let mut pages = 0;
-    let listed = list_owners(
+    let listed = list_owners_observed(
         client,
         application,
         &key_owners(public)?,
         "",
         &mut pages,
         true,
+        progress,
     )
     .await?;
+    let listed_count = listed.len();
     let tally = Tally::of(&listed)?;
     let recent = config_dir.map(recently_shielded).unwrap_or_default();
     let shielded = listed
@@ -820,7 +853,9 @@ pub(crate) async fn snapshot(
         .filter(|coin| !pending.contains(&coin.address))
         .collect();
     let shards = if tally.unshielded > pending.len() && BATCH_SHIELDS.is_some() {
-        live_shards(client, application).await.ok()
+        let shards = live_shards(client, application).await.ok();
+        progress(pages, listed_count);
+        shards
     } else {
         None
     };

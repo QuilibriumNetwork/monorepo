@@ -302,7 +302,9 @@ pub fn refusal(m: &Model) -> Option<String> {
             Some((None, _, _)) => {
                 "this node config has no Ed448 key, so it owns no legacy coins.".to_string()
             }
-            None => "legacy coins are not read yet; ‹r› reads them.".to_string(),
+            // Not read yet, or the read failed: the preparation lists the
+            // coins itself, as `token shield-all` does.
+            None => return None,
         }
     };
     Some(format!("Shield: {why}"))
