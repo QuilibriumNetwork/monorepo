@@ -1588,12 +1588,36 @@ impl ReportedCoins {
         Self::with_other(wallet, None, early, late, report)
     }
 
+    /// [`Self::new`] without late coins, plus one early coin after the
+    /// wallet's in the first early coin's block, whose owner is not a
+    /// canonical identity: GLOBAL committed it, and every tree over the
+    /// committed coins burns it (its position holds the empty leaf). Its
+    /// memo opens for another wallet.
+    fn with_burned(
+        wallet: &RecipientWallet,
+        early: usize,
+        report: bool,
+    ) -> (Self, Vec<[u8; 32]>, Vec<[u8; 32]>) {
+        Self::build(wallet, None, true, early, &[], report)
+    }
+
     /// [`Self::new`], plus four early coins of `other` after the wallet's
     /// in staging order: one in the first early coin's block, two in a block
     /// no coin of the wallet is in and one alone in a third block.
     fn with_other(
         wallet: &RecipientWallet,
         other: Option<&RecipientWallet>,
+        early: usize,
+        late: &[usize],
+        report: bool,
+    ) -> (Self, Vec<[u8; 32]>, Vec<[u8; 32]>) {
+        Self::build(wallet, other, false, early, late, report)
+    }
+
+    fn build(
+        wallet: &RecipientWallet,
+        other: Option<&RecipientWallet>,
+        burned: bool,
         early: usize,
         late: &[usize],
         report: bool,
@@ -1664,7 +1688,8 @@ impl ReportedCoins {
                     .unwrap();
                 addresses.push(address);
             }
-            roots::refresh_root(&hypergraph, &network, &application, limits).unwrap();
+            roots::refresh_root(&hypergraph, &network, &application, limits)
+                .expect("the staged coins fold");
             addresses
         };
         // Early coins in at least two blocks, so inputs come from different
@@ -1704,6 +1729,27 @@ impl ReportedCoins {
                     outputs.push(draw(other, 1, Some(block)));
                 }
             }
+        }
+        if burned {
+            let keys = sntrup761::Sntrup761KeyPair::generate();
+            let stranger = RecipientWallet::from_keys(
+                &network,
+                &application,
+                &keys.public,
+                Zeroizing::new(keys.secret),
+            )
+            .unwrap();
+            let block = block_of(&first);
+            let coin = (0..4096)
+                .map(|_| Output {
+                    owner: [0xff; IDENTITY_BYTES],
+                    ..draw(&stranger, 1, None)
+                })
+                .find(|output| {
+                    block_of(&state::coin_identity(&wallet.context, 1, output).unwrap().0) == block
+                })
+                .expect("a burned coin in the first early coin's block");
+            outputs.push(coin);
         }
         let staged = outputs.len();
         let early_addresses = stage(1, outputs);
@@ -2166,6 +2212,83 @@ async fn spend_witnesses_come_from_the_selection_scan() {
     );
     stop.send(()).unwrap();
     serving.await.unwrap();
+}
+
+/// A coin GLOBAL committed with an owner that is not a canonical identity is
+/// burned: every tree over the committed coins takes its position as the
+/// empty leaf. Anyone can place one beside a wallet's coin, so the wallet
+/// must place it as the chain does and still prove its own coin under the
+/// same subtree against the canonical root, from a full rescan and from the
+/// selection scan, with the shards' reports and without them.
+#[tokio::test]
+async fn spend_witnesses_place_a_burned_coin_as_the_chain_does() {
+    use quil_lattice_ct::confidential::relation::membership::Node;
+    use std::sync::atomic::Ordering::SeqCst;
+    for report in [true, false] {
+        let wallet = witness_wallet();
+        let (fixture, early, _) = ReportedCoins::with_burned(&wallet, 3, report);
+        let burned: Vec<[u8; 32]> = fixture
+            .coins
+            .iter()
+            .filter(|(_, output, ..)| Node::from_identity_bytes(&output.owner).is_err())
+            .map(|(address, ..)| *address)
+            .collect();
+        assert_eq!(burned.len(), 1, "one coin with a non-canonical owner");
+        assert_eq!(
+            ReportedCoins::block(&burned[0]),
+            ReportedCoins::block(&early[0]),
+            "the burned coin shares a block with the wallet's coin"
+        );
+        let provider = Arc::new(RecordingCoins::new(&wallet, &fixture));
+        let (client, stop, serving) = witness_client(&fixture, provider.clone()).await;
+        let expected = provider.tree.auth_path(&early[0]).unwrap();
+        let coin = fixture.output(&early[0]);
+        let selected = [(early[0], &coin)];
+        let (root, paths) = wallet
+            .witnesses(&client, &selected)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("a full rescan refused the spend (reported: {report}): {error:#}")
+            });
+        assert!(
+            root == fixture.root,
+            "the rescan's root is not the canonical root"
+        );
+        assert!(
+            paths[0].siblings == expected.siblings && paths[0].right == expected.right,
+            "the rescan's path is not the whole tree's (reported: {report})"
+        );
+        let owned = wallet
+            .clone()
+            .scan_spendable(&client, 64, 16)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("the selection scan refused the spend (reported: {report}): {error:#}")
+            });
+        assert_eq!(owned.len(), 3, "the burned coin is not the wallet's");
+        assert!(
+            wallet.prepared.lock().unwrap().is_some(),
+            "the selection scan kept no witnesses (reported: {report})"
+        );
+        let scanned = provider.pages.load(SeqCst);
+        let (root, paths) = wallet.witnesses(&client, &selected).await.unwrap();
+        assert_eq!(
+            provider.pages.load(SeqCst),
+            scanned,
+            "the spend scanned the coins again for its witnesses"
+        );
+        assert!(
+            root == fixture.root,
+            "the selection scan's root is not the canonical root"
+        );
+        assert!(
+            paths[0].siblings == expected.siblings && paths[0].right == expected.right,
+            "the selection scan's path is not the whole tree's (reported: {report})"
+        );
+        assert!(provider.named.lock().unwrap().is_empty());
+        stop.send(()).unwrap();
+        serving.await.unwrap();
+    }
 }
 
 // ---- Retries after proving: the call sites, against a node that fails ----
