@@ -50,6 +50,11 @@ const APP: [u8; 32] = [0x31; 32];
 
 fn install_policy() {
     quil_types::consensus::set_epoch_length_frames(EPOCH);
+    // `ACTIVATION` is past the mainnet shard op binding epoch, whose stale
+    // merge rule would consume some merges here (a parent beside a live
+    // spine). These tests drive the repair, so they keep the binding off;
+    // `shard_op_binding_tests` drives it.
+    quil_types::consensus::set_shard_op_binding_epoch_for_thread(Some(u64::MAX));
     quil_types::consensus::set_committee_handoff_policy(Some(CommitteeHandoffPolicy {
         activation_frame: ACTIVATION,
         chain_id: [0x51; 32],

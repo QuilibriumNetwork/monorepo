@@ -533,6 +533,73 @@ pub fn set_prover_op_replay_guard_epoch_for_thread(epoch: Option<u64>) {
     PROVER_OP_REPLAY_GUARD_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
+/// The epoch from which a `ShardSplit` or `ShardMerge` signs what GLOBAL
+/// executes: its signature covers the frame, the parent and every child in
+/// order, under a new domain, so a signature over only the frame and parent
+/// no longer verifies; the op must be signed at most ten frames before, and
+/// in the epoch of, the GLOBAL frame that includes it; its children must be
+/// the two bit-path children of one branch (a merge's: of its parent); and a
+/// due merge whose children are not live in the grid, or whose parent's
+/// range holds another live shard, is consumed without changing the grid.
+/// Consensus-affecting: every archive and GLOBAL prover must run a build with
+/// it before then, or they disagree on which splits and merges execute; a
+/// prover on an older build signs ops that are refused, with a warning.
+/// Mainnet epoch 1477 (frame 1,063,440), which GLOBAL cannot reach before
+/// 2026-11-11 14:00 UTC even at ten seconds a frame: only archives execute
+/// these ops and adopt a release within hours, and it is the one flag day
+/// this release's other GLOBAL gates share.
+/// `QUIL_SHARD_OP_BINDING_EPOCH` elsewhere, never by default.
+pub const MAINNET_SHARD_OP_BINDING_EPOCH: Option<u64> = Some(1477);
+
+static SHARD_OP_BINDING_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static SHARD_OP_BINDING_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn shard_op_binding_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_SHARD_OP_BINDING_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's shard op binding epoch from its network, and return
+/// it. Called at startup before any frame is processed; the first call
+/// decides.
+pub fn init_shard_op_binding_epoch(network: u8) -> u64 {
+    *SHARD_OP_BINDING_EPOCH.get_or_init(|| {
+        shard_op_binding_epoch_for(
+            network,
+            std::env::var("QUIL_SHARD_OP_BINDING_EPOCH").ok().as_deref(),
+        )
+    })
+}
+
+/// The epoch fixed by [`init_shard_op_binding_epoch`]; the mainnet epoch in
+/// a process that never called it, so the setting cannot reach mainnet.
+/// `u64::MAX` when the network has none.
+pub fn shard_op_binding_epoch() -> u64 {
+    if let Some(epoch) = SHARD_OP_BINDING_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *SHARD_OP_BINDING_EPOCH.get_or_init(|| shard_op_binding_epoch_for(0, None))
+}
+
+/// Whether GLOBAL frame `frame` applies the shard op binding
+/// ([`MAINNET_SHARD_OP_BINDING_EPOCH`]).
+pub fn shard_op_binding_active(frame: u64) -> bool {
+    epoch_for_frame(frame) >= shard_op_binding_epoch()
+}
+
+/// Set the shard op binding epoch for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_shard_op_binding_epoch_for_thread(epoch: Option<u64>) {
+    SHARD_OP_BINDING_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
 /// The epoch from which a `ProverSeniorityMerge` follows the seniority
 /// succession rules: an Ed448 node key whose spent markers name another,
 /// idle prover can move that prover's seniority to the prover submitting
