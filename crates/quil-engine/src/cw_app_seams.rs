@@ -578,6 +578,22 @@ impl<P: GlobalProposer> GlobalProposer for PersistingSeals<P> {
         self.inner.verify_with_context(context, digest, bytes)
             && copy.is_none_or(|bytes| self.keep(&digest, &bytes))
     }
+    // The inner proposer's own waits (a vote whose parent a GLOBAL state
+    // sync withholds) and its end of patience pass through.
+    fn verify_or_defer(
+        &self,
+        context: ProposalContext,
+        digest: Digest,
+        bytes: Option<Vec<u8>>,
+    ) -> std::result::Result<bool, std::time::Duration> {
+        let copy = bytes.clone();
+        self.inner
+            .verify_or_defer(context, digest, bytes)
+            .map(|verified| verified && copy.is_none_or(|bytes| self.keep(&digest, &bytes)))
+    }
+    fn verify_patience_ran_out(&self, context: ProposalContext, waited: std::time::Duration) {
+        self.inner.verify_patience_ran_out(context, waited)
+    }
 }
 
 pub struct AppSeamProposer {
@@ -4925,5 +4941,58 @@ mod tests {
             &app_a,
         )
         .is_none());
+    }
+
+    /// A vote the handoff proposer defers (its parent read withheld while a
+    /// GLOBAL state sync installs) stays deferred through the seal wrapper,
+    /// and the end of its patience reaches the proposer. The wrapper used to
+    /// check such a vote at once, refusing it.
+    #[test]
+    fn the_seal_wrapper_passes_a_deferred_vote_and_its_end_through() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Deferring(AtomicUsize);
+        impl GlobalProposer for Deferring {
+            fn propose(&self, _: u64, _: Digest) -> Option<(Digest, Vec<u8>)> {
+                None
+            }
+            fn verify(&self, _: u64, _: Digest, _: Digest, _: Option<Vec<u8>>) -> bool {
+                false
+            }
+            fn verify_or_defer(
+                &self,
+                _: ProposalContext,
+                _: Digest,
+                _: Option<Vec<u8>>,
+            ) -> std::result::Result<bool, std::time::Duration> {
+                Err(std::time::Duration::from_millis(250))
+            }
+            fn verify_patience_ran_out(&self, _: ProposalContext, _: std::time::Duration) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let wrapper = PersistingSeals {
+            inner: Deferring(AtomicUsize::new(0)),
+            bodies: None,
+        };
+        let context = ProposalContext {
+            epoch: 1,
+            view: 2,
+            parent_view: 1,
+            parent: digest_from_identity([0; 32]),
+            leader: None,
+        };
+        let digest = digest_from_identity([1; 32]);
+        assert!(
+            wrapper
+                .verify_or_defer(context, digest, Some(b"DATA".to_vec()))
+                .is_err(),
+            "a deferral of the wrapped proposer was refused at once"
+        );
+        wrapper.verify_patience_ran_out(context, quil_cw_consensus::adapters::VERIFY_PATIENCE);
+        assert_eq!(
+            wrapper.inner.0.load(Ordering::SeqCst),
+            1,
+            "the end of a vote's patience did not reach the wrapped proposer"
+        );
     }
 }
