@@ -523,6 +523,13 @@ pub fn install_host_ledger(dir: &std::path::Path) {
     }
 }
 
+/// This process's record among the host's ([`install_host_ledger`]), once
+/// in use: the label store counts its labels still to write there
+/// (`crate::storage_labels::install`).
+pub(crate) fn host_ledger() -> Option<&'static HostLedger> {
+    admission().ledger.get()
+}
+
 /// [`install_host_ledger`] for a master that runs storage jobs beside
 /// standalone workers (a cluster's master proves the node's epoch proofs
 /// from their parts), in the ledger directory of the workers' labels

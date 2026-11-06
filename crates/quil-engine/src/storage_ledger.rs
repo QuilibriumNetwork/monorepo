@@ -9,12 +9,15 @@
 //! storage labels ([`crate::storage_labels::install`]): `<id>.lock`, locked
 //! for as long as the process runs, and `<id>.res`, replaced whenever its
 //! jobs' reservations change, with the bytes they hold, the leaves it
-//! labels ahead and whether work due now waits for memory. A record whose
-//! lock is free belongs to a process that ended and is removed. The one
-//! process running work due now beyond the share alone holds `alone.lock`.
-//! The one process deciding what to grant holds `grant.lock`, from reading
-//! the records until its own is written. They are OS file locks: the kernel
-//! frees them when their process ends, however it ends.
+//! labels ahead and whether work due now waits for memory, and the bytes
+//! its storage labels have still to write
+//! ([`HostLedger::publish_labels_pending`]). A record whose lock is free
+//! belongs to a process that ended and is removed. The one process running
+//! work due now beyond the share alone holds `alone.lock`. The one process
+//! deciding what to grant holds `grant.lock`, from reading the records
+//! until its own is written; the one admitting a leaf's labels to the disk
+//! holds `labels.lock` likewise. They are OS file locks: the kernel frees
+//! them when their process ends, however it ends.
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Write as _};
@@ -34,24 +37,38 @@ pub struct Held {
     pub due_waiting: bool,
 }
 
-const RECORD_LEN: usize = 17;
+/// One process's record: what its storage jobs hold, and the bytes the
+/// leaves its storage labels are being written for have still to write
+/// (`crate::storage_labels::LabelStore`), or both summed over the other
+/// processes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Record {
+    held: Held,
+    labels_pending: u64,
+}
 
-fn encode(held: Held) -> [u8; RECORD_LEN] {
+const RECORD_LEN: usize = 25;
+
+fn encode(record: Record) -> [u8; RECORD_LEN] {
     let mut out = [0u8; RECORD_LEN];
-    out[..8].copy_from_slice(&held.bytes.to_le_bytes());
-    out[8..16].copy_from_slice(&held.ahead.to_le_bytes());
-    out[16] = u8::from(held.due_waiting);
+    out[..8].copy_from_slice(&record.held.bytes.to_le_bytes());
+    out[8..16].copy_from_slice(&record.held.ahead.to_le_bytes());
+    out[16] = u8::from(record.held.due_waiting);
+    out[17..].copy_from_slice(&record.labels_pending.to_le_bytes());
     out
 }
 
-fn decode(bytes: &[u8]) -> Option<Held> {
+fn decode(bytes: &[u8]) -> Option<Record> {
     if bytes.len() != RECORD_LEN || bytes[16] > 1 {
         return None;
     }
-    Some(Held {
-        bytes: u64::from_le_bytes(bytes[..8].try_into().ok()?),
-        ahead: u64::from_le_bytes(bytes[8..16].try_into().ok()?),
-        due_waiting: bytes[16] == 1,
+    Some(Record {
+        held: Held {
+            bytes: u64::from_le_bytes(bytes[..8].try_into().ok()?),
+            ahead: u64::from_le_bytes(bytes[8..16].try_into().ok()?),
+            due_waiting: bytes[16] == 1,
+        },
+        labels_pending: u64::from_le_bytes(bytes[17..].try_into().ok()?),
     })
 }
 
@@ -61,8 +78,9 @@ pub struct HostLedger {
     id: String,
     /// Locked while this process runs.
     _lock: File,
-    /// What the record says now.
-    last: Mutex<Option<Held>>,
+    /// What the record is to say, and what it says now (`None` until
+    /// written).
+    record: Mutex<(Record, Option<Record>)>,
 }
 
 impl HostLedger {
@@ -102,9 +120,9 @@ impl HostLedger {
             dir: dir.to_path_buf(),
             id: id.to_string(),
             _lock: lock,
-            last: Mutex::new(None),
+            record: Mutex::new((Record::default(), None)),
         };
-        ledger.publish(Held::default())?;
+        ledger.update(|_| {})?;
         Ok(ledger)
     }
 
@@ -113,19 +131,35 @@ impl HostLedger {
         &self.dir
     }
 
-    /// Replace this process's record with `held`, unless it says so already.
+    /// Say in this process's record that its jobs hold `held`.
     pub fn publish(&self, held: Held) -> io::Result<()> {
-        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
-        if *last == Some(held) {
+        self.update(|record| record.held = held)
+    }
+
+    /// Say in this process's record that its storage labels have `bytes`
+    /// still to write, for the other processes' labels on the host's disk
+    /// ([`Self::others_labels_pending`]).
+    pub fn publish_labels_pending(&self, bytes: u64) -> io::Result<()> {
+        self.update(|record| record.labels_pending = bytes)
+    }
+
+    /// Change this process's record by `change` and write it, unless it
+    /// says so already. One that could not be written is written whole at
+    /// the next change.
+    fn update(&self, change: impl FnOnce(&mut Record)) -> io::Result<()> {
+        let mut guard = self.record.lock().unwrap_or_else(PoisonError::into_inner);
+        let (wanted, written) = &mut *guard;
+        change(wanted);
+        if *written == Some(*wanted) {
             return Ok(());
         }
         // Renamed into place, so a reader sees the old record or the new.
         let tmp = self.dir.join(format!(".{}.res.tmp", self.id));
         let mut file = File::create(&tmp)?;
-        file.write_all(&encode(held))?;
+        file.write_all(&encode(*wanted))?;
         drop(file);
         std::fs::rename(&tmp, self.dir.join(format!("{}.res", self.id)))?;
-        *last = Some(held);
+        *written = Some(*wanted);
         Ok(())
     }
 
@@ -133,7 +167,17 @@ impl HostLedger {
     /// processes that ended are removed; one that cannot be read counts as
     /// holding nothing.
     pub fn others(&self) -> Held {
-        let mut sum = Held::default();
+        self.others_summed().held
+    }
+
+    /// The bytes the other processes' storage labels have still to write,
+    /// summed, as [`Self::others`] reads them.
+    pub fn others_labels_pending(&self) -> u64 {
+        self.others_summed().labels_pending
+    }
+
+    fn others_summed(&self) -> Record {
+        let mut sum = Record::default();
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return sum;
         };
@@ -148,10 +192,12 @@ impl HostLedger {
             if !self.alive(id) {
                 continue;
             }
-            if let Some(held) = std::fs::read(entry.path()).ok().and_then(|b| decode(&b)) {
-                sum.bytes = sum.bytes.saturating_add(held.bytes);
-                sum.ahead = sum.ahead.saturating_add(held.ahead);
-                sum.due_waiting |= held.due_waiting;
+            if let Some(record) = std::fs::read(entry.path()).ok().and_then(|b| decode(&b)) {
+                let held = record.held;
+                sum.held.bytes = sum.held.bytes.saturating_add(held.bytes);
+                sum.held.ahead = sum.held.ahead.saturating_add(held.ahead);
+                sum.held.due_waiting |= held.due_waiting;
+                sum.labels_pending = sum.labels_pending.saturating_add(record.labels_pending);
             }
         }
         sum
@@ -183,11 +229,23 @@ impl HostLedger {
     /// `wait`; `None` when another still holds it, an error when the
     /// directory cannot be used.
     pub fn grant_turn(&self, wait: Duration) -> io::Result<Option<File>> {
+        self.turn("grant.lock", wait)
+    }
+
+    /// [`Self::grant_turn`] for admitting a leaf's labels to the disk
+    /// (`crate::storage_labels::LabelStore::admit`): held from reading the
+    /// others' labels still to write until this process's own record counts
+    /// the leaf.
+    pub fn labels_turn(&self, wait: Duration) -> io::Result<Option<File>> {
+        self.turn("labels.lock", wait)
+    }
+
+    fn turn(&self, name: &str, wait: Duration) -> io::Result<Option<File>> {
         let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
-            .open(self.dir.join("grant.lock"))?;
+            .open(self.dir.join(name))?;
         let deadline = Instant::now() + wait;
         loop {
             match file.try_lock() {
