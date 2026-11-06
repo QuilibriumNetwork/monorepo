@@ -1277,7 +1277,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 // `globalMessageAddress`.
                 let global_addr = [0xFFu8; 32];
                 // With each message's collection index, to restore that order.
-                let mut valid: Vec<(usize, Vec<u8>)> = Vec::with_capacity(handoff.ordered.len());
+                let mut valid: Vec<(usize, Vec<u8>)> = Vec::with_capacity(handoff.remaining());
                 let mut invalid: Vec<Vec<u8>> = Vec::new();
                 // Categorized drop breakdown: `"<msg_type> :: <reason>" -> count`,
                 // logged with the summary below. The per-message reason is otherwise
@@ -1315,7 +1315,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     .ok()
                     .map(|committed| (frame_number, prior_state_id.to_vec(), committed));
                 self.rejected.lock().unwrap().enter(context.clone());
-                for (index, raw) in std::mem::take(&mut handoff.ordered) {
+                while let Some((index, raw)) = handoff.next_message() {
                     if crate::message_collector::bundle_has_shard_frame(&raw) {
                         // Windowed lockstep: a shard proof rides ONLY if its ANCHOR
                         // (`global_frame_number`) lies in this frame's window (or is
@@ -1381,6 +1381,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                             *drop_reasons
                                 .entry(format!("{} :: {}", msg_type(&raw), reason))
                                 .or_insert(0) += 1;
+                            handoff.refuse(index);
                             self.rejected
                                 .lock()
                                 .unwrap()
@@ -1865,12 +1866,29 @@ fn handoff_only_submissions(
 /// A committee-handoff seal: its request and source session.
 type SealKey = ([u8; 32], [u8; 32]);
 
+/// Copies of one committee-handoff seal a proposal may see refused in
+/// [`order_handoff_copies`]'s order, furthest claimed reach first; its other
+/// copies are then tried in collection order, as any other message is. The
+/// reach is what a copy claims: uncapped, every copy claiming more than the
+/// members' own would be validated ahead of theirs, each a certificate
+/// check, and enough of them would spend the validation budget.
+pub(crate) const SEAL_COPIES_REFUSED_BY_REACH: usize = 1;
+
 /// The bundles a proposal collected, committee-handoff seal copies in the
 /// order they are tried ([`order_handoff_copies`]).
 pub(crate) struct HandoffCopies {
-    /// Every unsettled bundle with its collection index. Other bundles keep
-    /// their places; handoff-only bundles fill theirs in trial order.
-    pub(crate) ordered: Vec<(usize, Vec<u8>)>,
+    /// Every unsettled bundle with its collection index, in collection order;
+    /// `None` is a handoff-only bundle's place, which takes the next copy to
+    /// try ([`Self::next_message`]).
+    places: std::collections::VecDeque<Option<(usize, Vec<u8>)>>,
+    /// The handoff-only bundles with their collection index, in collection
+    /// order, each taken when tried.
+    copies: Vec<Option<(usize, Vec<u8>)>>,
+    /// Positions in `copies`, furthest-reaching first.
+    by_reach: Vec<usize>,
+    /// The next position to look at in `by_reach`, and in `copies`.
+    next_by_reach: usize,
+    next_by_arrival: usize,
     /// Handoff-only bundles whose every seal the view shows settled
     /// (`handoff::submission_settled`), which leave the mempool.
     pub(crate) settled: Vec<Vec<u8>>,
@@ -1878,9 +1896,63 @@ pub(crate) struct HandoffCopies {
     seals: std::collections::HashMap<usize, Vec<SealKey>>,
     /// Seals a copy already rides for.
     riding: std::collections::HashSet<SealKey>,
+    /// How many copies of each seal validation refused.
+    refused: std::collections::HashMap<SealKey, usize>,
 }
 
 impl HandoffCopies {
+    /// Bundles not yet returned by [`Self::next_message`].
+    pub(crate) fn remaining(&self) -> usize {
+        self.places.len()
+    }
+
+    /// The next bundle, with its collection index: other bundles in their
+    /// places, and in each handoff-only bundle's place the next copy to try.
+    /// Copies go furthest-reaching first while no seal they carry has
+    /// [`SEAL_COPIES_REFUSED_BY_REACH`] copies refused ([`Self::refuse`]),
+    /// then in collection order.
+    pub(crate) fn next_message(&mut self) -> Option<(usize, Vec<u8>)> {
+        while let Some(place) = self.places.pop_front() {
+            if let Some(message) = place.or_else(|| self.next_copy()) {
+                return Some(message);
+            }
+        }
+        None
+    }
+
+    fn next_copy(&mut self) -> Option<(usize, Vec<u8>)> {
+        while let Some(&position) = self.by_reach.get(self.next_by_reach) {
+            self.next_by_reach += 1;
+            let capped = self.copies[position]
+                .as_ref()
+                .is_some_and(|(index, _)| self.capped(*index));
+            if !capped {
+                if let Some(copy) = self.copies[position].take() {
+                    return Some(copy);
+                }
+            }
+        }
+        while let Some(copy) = self.copies.get_mut(self.next_by_arrival) {
+            self.next_by_arrival += 1;
+            if let Some(copy) = copy.take() {
+                return Some(copy);
+            }
+        }
+        None
+    }
+
+    /// Whether a seal the bundle at `index` carries has had its share of
+    /// copies refused.
+    fn capped(&self, index: usize) -> bool {
+        self.seals.get(&index).is_some_and(|keys| {
+            keys.iter().any(|key| {
+                self.refused
+                    .get(key)
+                    .is_some_and(|refused| *refused >= SEAL_COPIES_REFUSED_BY_REACH)
+            })
+        })
+    }
+
     /// Whether the bundle at `index` carries only seals another copy already
     /// rides for: it stays in the mempool.
     pub(crate) fn held_back(&self, index: usize) -> bool {
@@ -1896,11 +1968,20 @@ impl HandoffCopies {
         }
     }
 
+    /// Validation refused the bundle at `index`.
+    pub(crate) fn refuse(&mut self, index: usize) {
+        if let Some(keys) = self.seals.get(&index) {
+            for key in keys {
+                *self.refused.entry(*key).or_default() += 1;
+            }
+        }
+    }
+
     /// Without validation: the first copy of each seal in trial order, with
     /// every other bundle, in collection order.
     pub(crate) fn first_copies(mut self) -> Vec<Vec<u8>> {
-        let mut kept = Vec::with_capacity(self.ordered.len());
-        for (index, raw) in std::mem::take(&mut self.ordered) {
+        let mut kept = Vec::with_capacity(self.remaining());
+        while let Some((index, raw)) = self.next_message() {
             if !self.held_back(index) {
                 self.ride(index);
                 kept.push((index, raw));
@@ -1921,10 +2002,11 @@ impl HandoffCopies {
 /// and any peer can send a copy of a seal: the leader validates the copies
 /// in this order and the first valid one rides ([`HandoffCopies::held_back`],
 /// [`HandoffCopies::ride`]), so a copy claiming more than it brings is
-/// refused and the next tried. A bundle carrying several seals is tried at
-/// its least-reaching one, never before a better copy of any seal it carries.
-/// Handoff-only bundles whose every seal `view` shows settled are returned
-/// apart, to leave the mempool.
+/// refused and the next tried; once [`SEAL_COPIES_REFUSED_BY_REACH`] copies
+/// of a seal are refused, its others are tried in collection order. A
+/// bundle carrying several seals is tried at its least-reaching one, never
+/// before a better copy of any seal it carries. Handoff-only bundles whose
+/// every seal `view` shows settled are returned apart, to leave the mempool.
 pub(crate) fn order_handoff_copies(
     collected: Vec<Vec<u8>>,
     view: Option<&quil_execution::global_intrinsic::handoff::CommittedView>,
@@ -1946,18 +2028,21 @@ pub(crate) fn order_handoff_copies(
         (last, sealed.drain.len())
     };
     let mut copies = HandoffCopies {
-        ordered: Vec::with_capacity(collected.len()),
+        places: std::collections::VecDeque::with_capacity(collected.len()),
+        copies: Vec::new(),
+        by_reach: Vec::new(),
+        next_by_reach: 0,
+        next_by_arrival: 0,
         settled: Vec::new(),
         seals: std::collections::HashMap::new(),
         riding: std::collections::HashSet::new(),
+        refused: std::collections::HashMap::new(),
     };
-    // The handoff-only bundles' places in `ordered`, and the bundles with
-    // their least reach and collection index.
-    let mut slots = Vec::new();
-    let mut handoff: Vec<(Reach, usize, Vec<u8>)> = Vec::new();
+    // Each handoff-only bundle's least reach.
+    let mut reaches: Vec<Reach> = Vec::new();
     for (index, raw) in collected.into_iter().enumerate() {
         let Some(submissions) = handoff_only_submissions(&raw) else {
-            copies.ordered.push((index, raw));
+            copies.places.push_back(Some((index, raw)));
             continue;
         };
         let done = view.is_some_and(|view| {
@@ -1986,15 +2071,15 @@ pub(crate) fn order_handoff_copies(
                 })
                 .collect(),
         );
-        slots.push(copies.ordered.len());
-        copies.ordered.push((index, Vec::new()));
-        handoff.push((least, index, raw));
+        copies.places.push_back(None);
+        copies.copies.push(Some((index, raw)));
+        reaches.push(least);
     }
     // Furthest first; the stable sort keeps arrival order among equals.
-    handoff.sort_by_key(|(reach, _, _)| std::cmp::Reverse(*reach));
-    for (slot, (_, index, raw)) in slots.into_iter().zip(handoff) {
-        copies.ordered[slot] = (index, raw);
-    }
+    copies.by_reach = (0..reaches.len()).collect();
+    copies
+        .by_reach
+        .sort_by_key(|&position| std::cmp::Reverse(reaches[position]));
     copies
 }
 
@@ -2157,8 +2242,8 @@ mod tests {
     /// Copies of a seal are tried furthest-reaching first, then by the most
     /// headers, ties by arrival; a bundle of several seals at its
     /// least-reaching one; other bundles keep their places. A copy refused
-    /// holds nothing back: the next copy of its seal is tried, and each seal
-    /// rides once.
+    /// holds nothing back: the seal's other copies are tried, in collection
+    /// order once one is refused, and each seal rides once.
     #[test]
     fn seal_copies_are_tried_furthest_first_and_a_refused_one_holds_none_back() {
         use quil_cw_consensus::handoff::{Checkpoint, Seal};
@@ -2225,30 +2310,119 @@ mod tests {
             second.clone(),
             both.clone(),
         ];
-        let mut copies = order_handoff_copies(collected, None);
-        let order: Vec<usize> = copies.ordered.iter().map(|(index, _)| *index).collect();
+        // The bundles in the order they come, those tried, and those riding,
+        // when validation refuses `refused`.
+        let trial = |refused: &[u8]| {
+            let mut copies = order_handoff_copies(collected.clone(), None);
+            let (mut order, mut tried, mut rode) = (Vec::new(), Vec::new(), Vec::new());
+            while let Some((index, raw)) = copies.next_message() {
+                order.push(index);
+                if copies.held_back(index) {
+                    continue;
+                }
+                tried.push(index);
+                if raw == refused {
+                    copies.refuse(index);
+                } else {
+                    copies.ride(index);
+                    rode.push(index);
+                }
+            }
+            (order, tried, rode)
+        };
+        let (order, tried, rode) = trial(b"");
         assert_eq!(
             order,
             vec![3, 1, 4, 2, 0, 5],
             "furthest first in the handoff places, the two-seal bundle at its least reach"
         );
-        let (mut tried, mut rode) = (Vec::new(), Vec::new());
-        for (index, raw) in std::mem::take(&mut copies.ordered) {
+        assert_eq!(
+            tried,
+            vec![3, 1, 4],
+            "nothing refused: the first copy rides"
+        );
+        assert_eq!(rode, tried);
+        let (order, tried, rode) = trial(&forged);
+        assert_eq!(
+            order,
+            vec![3, 1, 4, 0, 2, 5],
+            "once a copy of a seal is refused its others come in collection order"
+        );
+        assert_eq!(tried, vec![3, 1, 4, 0], "each copy tried at most once");
+        assert_eq!(
+            rode,
+            vec![1, 4, 0],
+            "past the refused copy the next copy of its seal rides; the rest stay back"
+        );
+    }
+
+    /// Forged copies of one seal, each claiming more reach than the last,
+    /// all collected after a member's: one is tried and refused, then the
+    /// member's copy, the oldest, rides; the others are never validated.
+    #[test]
+    fn forged_seal_copies_claiming_more_reach_cost_one_refusal_each_proposal() {
+        use quil_cw_consensus::handoff::{Checkpoint, Seal};
+        use quil_execution::global_intrinsic::handoff::{
+            CertificateSubmission, SealSubmission, TYPE_COMMITTEE_HANDOFF,
+        };
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let copy = |last: u64| {
+            let submission = CertificateSubmission {
+                seal: Seal {
+                    request: [1; 32],
+                    session: [7; 32],
+                    view: 1,
+                    checkpoint: Checkpoint {
+                        frame: 0,
+                        view: 0,
+                        digest: [0; 32],
+                        state_roots: [[0; 32]; 4],
+                        history_root: [0; 32],
+                    },
+                },
+                certificate: vec![1; 40],
+            };
+            let drain = vec![
+                quil_execution::global_intrinsic::frame_header::FrameHeader {
+                    frame_number: last,
+                    ..Default::default()
+                }
+                .to_canonical_bytes()
+                .unwrap(),
+            ];
+            CanonicalMessageBundle {
+                requests: vec![Some(CanonicalMessageRequest {
+                    inner_type_prefix: TYPE_COMMITTEE_HANDOFF,
+                    inner_bytes: SealSubmission { submission, drain }
+                        .to_canonical_bytes()
+                        .unwrap(),
+                })],
+                timestamp: last as i64,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let member = copy(3);
+        let collected: Vec<_> = std::iter::once(member.clone())
+            .chain((4..20).map(copy))
+            .collect();
+        let mut copies = order_handoff_copies(collected, None);
+        let mut tried = Vec::new();
+        while let Some((index, raw)) = copies.next_message() {
             if copies.held_back(index) {
                 continue;
             }
             tried.push(index);
-            // Validation refuses the forged copy only.
-            if raw != forged {
+            if raw == member {
                 copies.ride(index);
-                rode.push(index);
+            } else {
+                copies.refuse(index);
             }
         }
-        assert_eq!(tried, vec![3, 1, 4, 2], "each copy tried at most once");
         assert_eq!(
-            rode,
-            vec![1, 4, 2],
-            "past the refused copy the next copy of its seal rides; the rest stay back"
+            tried,
+            vec![16, 0],
+            "the furthest-reaching forged copy, then the member's"
         );
     }
 

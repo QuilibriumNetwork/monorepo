@@ -1265,10 +1265,10 @@ fn seal_crowding_one_forged_bundle_keeps_every_seal_it_names_out() {
     assert_seals_ride(&[proposal], &members, "one forged bundle naming both seals");
 }
 
-/// With the fix every forged copy is validated once in the proposal that
-/// tries it and leaves the mempool, and the seal rides that proposal: an
-/// attacker pays one message per validation, and the members' copies stay
-/// until GLOBAL records the seal.
+/// A forged copy is validated once, in the proposal that tries it, and
+/// leaves the mempool; the seal rides that proposal. The other forged copies
+/// wait unvalidated, as the seal rides: an attacker pays a message per
+/// validation, and the members' copies stay until GLOBAL records the seal.
 #[test]
 fn seal_crowding_fix_refused_copies_leave_the_mempool_in_the_proposal_that_tries_them() {
     let rig = CrowdRig::new(1);
@@ -1280,14 +1280,21 @@ fn seal_crowding_fix_refused_copies_leave_the_mempool_in_the_proposal_that_tries
         assert!(rig.collector.add_message(1, copy.clone()));
     }
     assert_eq!(rig.collector.total_pending(), 5);
-    let proposal = rig.propose(1);
-    assert_eq!(carried(&proposal, &members), 1, "FIX: the seal rides");
-    assert!(forged.iter().all(|copy| !proposal.contains(copy)));
-    assert_eq!(
-        rig.collector.total_pending(),
-        members.len(),
-        "FIX: the forged copies leave the mempool, the members' stay"
-    );
+    for rank in 1..=3 {
+        let proposal = rig.propose(rank);
+        assert_eq!(
+            carried(&proposal, &members),
+            1,
+            "REFUSED ONCE: the seal rides"
+        );
+        assert!(forged.iter().all(|copy| !proposal.contains(copy)));
+        assert_eq!(
+            rig.collector.total_pending(),
+            members.len() + forged.len() - rank as usize,
+            "REFUSED ONCE: each proposal refuses one forged copy, which leaves the mempool; \
+             the members' stay"
+        );
+    }
 }
 
 /// Forged copies made from a member's gossiped copy, its certificate
