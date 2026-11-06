@@ -238,6 +238,22 @@ impl DeployCtx {
     }
 }
 
+/// Refuse any arg that is not `key=value` with one of the `known` keys (in
+/// any case), before anything is read, signed or paid: an ignored arg would
+/// leave the field the operator meant to set as it was.
+pub(super) fn check_key_args(args: &[String], known: &[&str]) -> anyhow::Result<()> {
+    let list = known.join(", ");
+    for arg in args {
+        let Some((key, _)) = arg.split_once('=') else {
+            anyhow::bail!("{arg:?} is not key=value; known keys: {list}");
+        };
+        if !known.contains(&key.to_lowercase().as_str()) {
+            anyhow::bail!("unknown key {key:?}; known keys: {list}");
+        }
+    }
+    Ok(())
+}
+
 pub async fn run(global: GlobalArgs, cmd: &DeployCommand) -> anyhow::Result<()> {
     let dc = DeployCtx::load(global)?;
     match cmd {
@@ -259,6 +275,61 @@ pub async fn run(global: GlobalArgs, cmd: &DeployCommand) -> anyhow::Result<()> 
         }
         DeployCommand::ComputeUpdate { domain, args } => {
             compute_update::run(&dc, domain, args).await
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deploy context with an empty keystore and no node: a command fails
+    /// once it reaches for its keys or the network.
+    fn offline_ctx(name: &str) -> DeployCtx {
+        let dir =
+            std::env::temp_dir().join(format!("quil-client-deploy-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_manager = FileKeyManager::new(
+            dir.join("keys.yml"),
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            "q-prover-key".into(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )
+        .unwrap();
+        DeployCtx {
+            node_config: Config::default(),
+            config_dir: dir,
+            key_manager: Arc::new(key_manager),
+            connect_opts: ConnectOpts::default(),
+            alias_store: None,
+            global: GlobalArgs {
+                network: None,
+                yes: false,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn token_update_refuses_unknown_keys() {
+        let dc = offline_ctx("token-update-keys");
+        let domain = "00".repeat(32);
+        for (arg, refusal) in [
+            ("paymentAddress=5a", "unknown key \"paymentAddress\""),
+            ("price=1000", "unknown key \"price\""),
+            ("supply", "\"supply\" is not key=value"),
+        ] {
+            // A known key in any case is taken; the unknown one is named.
+            let args = ["mintStrategy=authority".to_string(), arg.to_string()];
+            let err = format!(
+                "{:#}",
+                token_update::run(&dc, &domain, &args).await.unwrap_err()
+            );
+            assert!(
+                err.contains(refusal)
+                    && err.contains("name, symbol, behavior, mintstrategy, units, supply"),
+                "token-update args misread: {arg} was not refused ({err})"
+            );
         }
     }
 }

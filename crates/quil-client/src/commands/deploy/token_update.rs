@@ -20,7 +20,7 @@ use quil_types::proto::token::{
     ProofBasisType, TokenConfiguration, TokenMintBehavior, TokenMintStrategy, TokenUpdate,
 };
 
-use super::DeployCtx;
+use super::{check_key_args, DeployCtx};
 
 /// Build a signed `TokenUpdate` for `domain`. The signed message is the
 /// canonical `TokenUpdate` with the signature field cleared (the node re-encodes
@@ -63,6 +63,16 @@ pub(crate) fn build_token_update(
     })
 }
 
+/// The keys an update sets.
+const UPDATE_KEYS: [&str; 6] = [
+    "name",
+    "symbol",
+    "behavior",
+    "mintstrategy",
+    "units",
+    "supply",
+];
+
 const MINTABLE: u32 = 1 << 0;
 const BURNABLE: u32 = 1 << 1;
 const DIVISIBLE: u32 = 1 << 2;
@@ -74,6 +84,7 @@ pub async fn run(dc: &DeployCtx, domain_arg: &str, args: &[String]) -> anyhow::R
     if domain_arg.is_empty() {
         anyhow::bail!("--domain <token address> is required for update");
     }
+    check_key_args(args, &UPDATE_KEYS)?;
     let domain = dc.resolve_address(domain_arg, 32)?;
 
     // Build the (new) token configuration from key=value args.
