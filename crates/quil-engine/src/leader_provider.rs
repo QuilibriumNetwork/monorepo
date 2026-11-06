@@ -96,8 +96,26 @@ type ValidationContext = (u64, Vec<u8>, u64);
 struct RejectedMessages {
     context: Option<ValidationContext>,
     reasons: std::collections::HashMap<[u8; 32], String>,
+    /// Committee-handoff seal copies refused, kept across contexts
+    /// ([`Self::copy_refused`]).
+    copies: std::collections::HashMap<[u8; 32], CopyRefusal>,
     #[cfg(test)]
     reused: usize,
+}
+
+/// GLOBAL frames a seal copy's refusal stands while the sources of the seals
+/// it carries stay executed through the same frames: about a message's stay
+/// in the mempool (`RETENTION_WINDOW` ranks). An execution branch validates
+/// a copy of the public pool, so without it a refused copy was validated
+/// again in each frame it stayed there.
+const SEAL_COPY_REFUSAL_FRAMES: u64 = 10;
+
+/// Why a seal copy was refused, in which GLOBAL frame, and the frame each
+/// seal's source was executed through then ([`seal_tips`]).
+struct CopyRefusal {
+    frame: u64,
+    tips: Vec<Option<u64>>,
+    reason: String,
 }
 
 impl RejectedMessages {
@@ -125,6 +143,57 @@ impl RejectedMessages {
             && self.reasons.len() < REJECTED_MESSAGES_KEPT
         {
             self.reasons.insert(hash, reason);
+        }
+    }
+
+    fn has_copy(&self, hash: &[u8; 32]) -> bool {
+        self.copies.contains_key(hash)
+    }
+
+    /// Why the seal copy `hash` was refused, if that was within
+    /// [`SEAL_COPY_REFUSAL_FRAMES`] before `frame` and its seals' sources
+    /// were executed through `tips` then too.
+    fn copy_refused(
+        &mut self,
+        hash: &[u8; 32],
+        frame: u64,
+        tips: &[Option<u64>],
+    ) -> Option<String> {
+        let refusal = self.copies.get(hash)?;
+        let window = refusal.frame..refusal.frame.saturating_add(SEAL_COPY_REFUSAL_FRAMES);
+        let reason =
+            (window.contains(&frame) && refusal.tips == tips).then(|| refusal.reason.clone());
+        #[cfg(test)]
+        if reason.is_some() {
+            self.reused += 1;
+        }
+        reason
+    }
+
+    /// Remember that GLOBAL frame `frame` refused the seal copy `hash`, its
+    /// seals' sources executed through `tips`; refusals past their window
+    /// make room.
+    fn remember_copy(
+        &mut self,
+        hash: [u8; 32],
+        frame: u64,
+        tips: Vec<Option<u64>>,
+        reason: String,
+    ) {
+        if self.copies.len() >= REJECTED_MESSAGES_KEPT {
+            self.copies.retain(|_, refusal| {
+                refusal.frame.saturating_add(SEAL_COPY_REFUSAL_FRAMES) > frame
+            });
+        }
+        if self.copies.len() < REJECTED_MESSAGES_KEPT {
+            self.copies.insert(
+                hash,
+                CopyRefusal {
+                    frame,
+                    tips,
+                    reason,
+                },
+            );
         }
     }
 }
@@ -1254,11 +1323,11 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // copy that fails costs one validation and holds no valid one back.
         // Copies of a seal GLOBAL already recorded leave the mempool (each
         // would re-verify a certificate to change nothing).
+        let view = self.message_validator.as_ref().and_then(|validator| {
+            quil_execution::global_intrinsic::handoff::CommittedView::capture(&validator.crdt())
+                .ok()
+        });
         let mut handoff = {
-            let view = self.message_validator.as_ref().and_then(|validator| {
-                quil_execution::global_intrinsic::handoff::CommittedView::capture(&validator.crdt())
-                    .ok()
-            });
             let copies = order_handoff_copies(collected, view.as_ref());
             if !copies.settled.is_empty() {
                 tracing::debug!(
@@ -1352,6 +1421,26 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         invalid.push(raw);
                         continue;
                     }
+                    // A seal copy refused while its seals' sources stood
+                    // where they stand now, in a recent frame on any parent.
+                    let remembered = self.rejected.lock().unwrap().has_copy(&hash);
+                    let tips = handoff
+                        .seals_of(index)
+                        .filter(|_| remembered)
+                        .and_then(|seals| seal_tips(view.as_ref(), seals));
+                    let copy_refusal = tips.and_then(|tips| {
+                        self.rejected
+                            .lock()
+                            .unwrap()
+                            .copy_refused(&hash, frame_number, &tips)
+                    });
+                    if let Some(reason) = copy_refusal {
+                        *drop_reasons
+                            .entry(format!("{} :: refused earlier: {}", msg_type(&raw), reason))
+                            .or_insert(0) += 1;
+                        invalid.push(raw);
+                        continue;
+                    }
                     if validation_started.elapsed() >= MESSAGE_VALIDATION_BUDGET {
                         deferred += 1;
                         continue;
@@ -1382,6 +1471,17 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                                 .entry(format!("{} :: {}", msg_type(&raw), reason))
                                 .or_insert(0) += 1;
                             handoff.refuse(index);
+                            let tips = handoff
+                                .seals_of(index)
+                                .and_then(|seals| seal_tips(view.as_ref(), seals));
+                            if let (QuilError::InvalidArgument(_), Some(tips)) = (&e, tips) {
+                                self.rejected.lock().unwrap().remember_copy(
+                                    hash,
+                                    frame_number,
+                                    tips,
+                                    reason.clone(),
+                                );
+                            }
                             self.rejected
                                 .lock()
                                 .unwrap()
@@ -1953,6 +2053,11 @@ impl HandoffCopies {
         })
     }
 
+    /// The seals the handoff-only bundle at `index` carries.
+    pub(crate) fn seals_of(&self, index: usize) -> Option<&[SealKey]> {
+        self.seals.get(&index).map(Vec::as_slice)
+    }
+
     /// Whether the bundle at `index` carries only seals another copy already
     /// rides for: it stays in the mempool.
     pub(crate) fn held_back(&self, index: usize) -> bool {
@@ -1990,6 +2095,23 @@ impl HandoffCopies {
         kept.sort_by_key(|(index, _)| *index);
         kept.into_iter().map(|(_, raw)| raw).collect()
     }
+}
+
+/// The source frame GLOBAL has executed each of `seals` through in `view`
+/// (`None` for a source with no recorded tip); `None` when one cannot be read.
+fn seal_tips(
+    view: Option<&quil_execution::global_intrinsic::handoff::CommittedView>,
+    seals: &[SealKey],
+) -> Option<Vec<Option<u64>>> {
+    let view = view?;
+    seals
+        .iter()
+        .map(|(_, session)| {
+            quil_execution::global_intrinsic::handoff::session_tip(view, session)
+                .ok()
+                .map(|tip| tip.map(|tip| tip.frame))
+        })
+        .collect()
 }
 
 /// `collected` with the copies of each committee-handoff seal ordered for
@@ -2423,6 +2545,58 @@ mod tests {
             tried,
             vec![16, 0],
             "the furthest-reaching forged copy, then the member's"
+        );
+    }
+
+    /// A seal copy's refusal stands across validation contexts while each
+    /// seal it carries has its source executed through the same frame, for
+    /// `SEAL_COPY_REFUSAL_FRAMES` frames from the one that refused it.
+    #[test]
+    fn a_refused_seal_copy_stands_while_its_sources_stay_executed_through_the_same_frames() {
+        let mut rejected = RejectedMessages::default();
+        let (copy, other) = ([1u8; 32], [2u8; 32]);
+        let tips = vec![Some(8), None];
+        rejected.remember_copy(copy, 100, tips.clone(), "gap after the executed tip".into());
+        // Another parent or height does not forget it.
+        rejected.enter(Some((101, vec![9; 32], 100)));
+        assert!(rejected.has_copy(&copy));
+        assert!(!rejected.has_copy(&other));
+        for frame in [100, 101, 100 + SEAL_COPY_REFUSAL_FRAMES - 1] {
+            assert_eq!(
+                rejected.copy_refused(&copy, frame, &tips).as_deref(),
+                Some("gap after the executed tip"),
+                "frame {frame}"
+            );
+        }
+        // A source executed further, or outside the window: validated again.
+        for (frame, now) in [
+            (101, vec![Some(9), None]),
+            (101, vec![Some(8), Some(1)]),
+            (100 + SEAL_COPY_REFUSAL_FRAMES, tips.clone()),
+            (99, tips.clone()),
+        ] {
+            assert_eq!(
+                rejected.copy_refused(&copy, frame, &now),
+                None,
+                "frame {frame}, tips {now:?}"
+            );
+        }
+        for n in 0..REJECTED_MESSAGES_KEPT + 10 {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            rejected.remember_copy(hash, 100, tips.clone(), "refused".into());
+        }
+        assert_eq!(rejected.copies.len(), REJECTED_MESSAGES_KEPT);
+        rejected.remember_copy(
+            other,
+            100 + SEAL_COPY_REFUSAL_FRAMES,
+            tips.clone(),
+            "refused".into(),
+        );
+        assert_eq!(
+            rejected.copies.len(),
+            1,
+            "refusals past their window make room"
         );
     }
 
