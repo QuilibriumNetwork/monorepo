@@ -1358,22 +1358,25 @@ impl WorkerOnlyNode {
                 || p2p.subscribed_peer_count(count_topic.clone()),
                 sole_member,
                 &cancel,
+                core_id,
+                &filter,
             )
             .await;
             match readiness {
-                Ok(true) => {
+                Ok(Some(waited)) => {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => {},
                         sent = ready_handle.send_cw_transport_ready() => {
                             if sent {
                                 info!(core_id, filter = hex::encode(&filter),
+                                    waited_ms = waited.as_millis() as u64,
                                     "cluster CW transport ready; releasing consensus startup barrier");
                             }
                         }
                     }
                 }
-                Ok(false) => {}
+                Ok(None) => {}
                 Err(error) => warn!(core_id, %error, "cluster CW transport readiness failed"),
             }
         });
@@ -1695,15 +1698,54 @@ fn learn_peer_key(
     true
 }
 
+/// A worker's wait for a peer subscribed to its shard's CW topic, which holds
+/// its consensus start: when the wait has overrun and should be reported.
+pub struct CwTransportWait {
+    started: std::time::Instant,
+    next_warn: Duration,
+}
+
+impl CwTransportWait {
+    /// First overrun warning: past the usual time to connect to a committee
+    /// peer and receive its subscriptions.
+    pub const WARN_AFTER: Duration = Duration::from_secs(60);
+    /// Interval between later overrun warnings.
+    pub const WARN_EVERY: Duration = Duration::from_secs(300);
+
+    pub fn start() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            next_warn: Self::WARN_AFTER,
+        }
+    }
+
+    pub fn waited(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// Whether a wait of `waited` is due an overrun warning: the first at
+    /// [`Self::WARN_AFTER`], then one per [`Self::WARN_EVERY`].
+    pub fn overrun_due(&mut self, waited: Duration) -> bool {
+        if waited < self.next_warn {
+            return false;
+        }
+        self.next_warn = waited + Self::WARN_EVERY;
+        true
+    }
+}
+
 /// Subscription installation must finish before a remote peer (or an
 /// authorized singleton) can release consensus startup. Cancellation also
 /// interrupts outstanding transport requests when the worker changes shards.
+/// Returns how long the wait took, or `None` when cancelled.
 async fn wait_for_cw_transport<S, P, F, O>(
     subscribe: S,
     mut peers: P,
     sole_member: O,
     cancel: &CancellationToken,
-) -> Result<bool>
+    core_id: u32,
+    filter: &[u8],
+) -> Result<Option<Duration>>
 where
     S: std::future::Future<Output = Result<()>>,
     P: FnMut() -> F,
@@ -1712,12 +1754,25 @@ where
 {
     tokio::select! {
         biased;
-        _ = cancel.cancelled() => Ok(false),
+        _ = cancel.cancelled() => Ok(None),
         ready = async {
             subscribe.await?;
+            let mut wait = CwTransportWait::start();
+            let mut wait_logged = false;
             loop {
                 if peers().await? > 0 || sole_member() {
-                    return Ok(true);
+                    return Ok(Some(wait.waited()));
+                }
+                let waited = wait.waited();
+                if !wait_logged {
+                    wait_logged = true;
+                    info!(core_id, filter = hex::encode(filter),
+                        "waiting for a subscribed CW peer before starting consensus");
+                } else if wait.overrun_due(waited) {
+                    warn!(core_id, filter = hex::encode(filter),
+                        waited_secs = waited.as_secs(), subscribed_peers = 0,
+                        "consensus start held: no connected peer has announced a subscription to \
+                         the shard's CW topic; check this worker's connections to its committee");
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
@@ -3052,6 +3107,8 @@ mod tests {
                 },
                 || false,
                 &CancellationToken::new(),
+                0,
+                &[],
             )
             .await
         });
@@ -3073,6 +3130,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .unwrap()
+                .is_some()
         );
     }
 
@@ -3083,15 +3141,20 @@ mod tests {
             async { Ok(()) },
             || std::future::ready(Ok(0)),
             || true,
-            &cancel
+            &cancel,
+            0,
+            &[],
         )
         .await
-        .unwrap());
+        .unwrap()
+        .is_some());
         let denied = wait_for_cw_transport(
             async { Err(QuilError::P2p("subscription failed".into())) },
             || std::future::ready(Ok(0)),
             || true,
             &cancel,
+            0,
+            &[],
         )
         .await;
         assert!(
@@ -3124,6 +3187,8 @@ mod tests {
                     },
                     || false,
                     &child_cancel,
+                    0,
+                    &[],
                 )
                 .await
             });
@@ -3134,13 +3199,27 @@ mod tests {
             }
             cancel.cancel();
             assert!(
-                !tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                tokio::time::timeout(std::time::Duration::from_secs(1), task)
                     .await
                     .unwrap()
                     .unwrap()
                     .unwrap()
+                    .is_none()
             );
         }
+    }
+
+    #[test]
+    fn a_held_cw_transport_wait_warns_after_a_minute_then_every_five() {
+        let mut wait = CwTransportWait::start();
+        let secs = Duration::from_secs;
+        assert!(!wait.overrun_due(secs(59)), "no warning within a minute");
+        assert!(wait.overrun_due(secs(60)), "first warning at a minute");
+        assert!(!wait.overrun_due(secs(61)), "one warning per interval");
+        assert!(!wait.overrun_due(secs(359)), "one warning per interval");
+        assert!(wait.overrun_due(secs(360)), "next warning five minutes on");
+        assert!(wait.overrun_due(secs(2000)), "a late check warns at once");
+        assert!(!wait.overrun_due(secs(2001)), "and then waits an interval");
     }
 
     /// A standalone worker starts the passes only for a protected, served

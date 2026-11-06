@@ -16,6 +16,10 @@ Regression tests: `protocol::tests` (`rpc_over_an_entry_limit_is_dropped_before_
 
 `src/behaviour.rs` (`get_ip_addr`): upstream counts each connected peer under its exact remote IP for the IP-colocation penalty (P6). One IPv6 host or site typically holds a whole /64, so a single operator could connect any number of peers under distinct addresses without crossing the threshold. An IPv6 address now counts by its /64; IPv4 is unchanged. Regression test: `behaviour::colocation_ip_tests::an_ipv6_peer_counts_by_its_64_and_an_ipv4_peer_by_its_address`.
 
+## Subscriptions after a peer restarts
+
+`src/behaviour.rs` (`on_connection_closed`): upstream sends our subscriptions to a peer only when its first connection opens. A peer killed without a close (a QUIC peer's connection lingers until the idle timeout) and restarted under the same peer id within that window connects as our second connection, so the new process never learned our subscriptions and counted no subscribed peer on our topics. When a connection closes and others to the same peer remain, the behaviour now sends its subscriptions again; the closed connection can no longer take them from the shared send queue. A receiver that already knew them only records them again. Regression tests: `quil-p2p` `blossomsub_behaviour::restart_tests`.
+
 ## RPCs for peers that left
 
 `src/behaviour.rs` (`send_message`): an RPC addressed to a peer that is no longer in the connected peer list was logged at `error` once per message (up to 681 lines an hour on one node). It is dropped for that peer alone, logged at `debug` and counted: `Behaviour::unsent_rpc_stats` gives the count and the latest peer, for the node's operator log.
