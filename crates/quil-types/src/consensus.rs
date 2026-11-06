@@ -855,10 +855,11 @@ pub fn set_strict_peer_info_epoch_for_thread(epoch: Option<u64>) {
 /// such messages are dropped without penalty, because releases before this
 /// rule forward them, and every topic keeps the content id, because they
 /// compute it. Not consensus-affecting, but it splits gossip from nodes on
-/// older releases, so it waits for an adoption census and a devnet crossing:
-/// `None` until then. `QUIL_STRICT_SHARD_GOSSIP_EPOCH` elsewhere, never by
-/// default.
-pub const MAINNET_STRICT_SHARD_GOSSIP_EPOCH: Option<u64> = None;
+/// older releases: from mainnet epoch 1483 (frame 1,067,760) a node that
+/// has not upgraded and the upgraded nodes in its shard CW meshes break each
+/// other's gossip promises and graylist each other.
+/// `QUIL_STRICT_SHARD_GOSSIP_EPOCH` elsewhere, never by default.
+pub const MAINNET_STRICT_SHARD_GOSSIP_EPOCH: Option<u64> = Some(1483);
 
 static STRICT_SHARD_GOSSIP_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -4008,7 +4009,7 @@ mod strict_shard_gossip_epoch_tests {
         }
         assert_eq!(super::strict_shard_gossip_epoch_for(1, Some("4")), 4);
         assert_eq!(super::strict_shard_gossip_epoch_for(1, None), u64::MAX);
-        assert_eq!(super::MAINNET_STRICT_SHARD_GOSSIP_EPOCH, None);
+        assert_eq!(super::MAINNET_STRICT_SHARD_GOSSIP_EPOCH, Some(1483));
     }
 
     #[test]
