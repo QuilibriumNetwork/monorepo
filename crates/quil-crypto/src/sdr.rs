@@ -560,12 +560,13 @@ mod tests {
         );
     }
 
-    /// Without a stable replica key epoch (mainnet's `None`) every epoch's
-    /// key is the epoch-bound one, byte for byte as before it existed.
+    /// Without a stable replica key epoch (disabled for this thread) every
+    /// epoch's key is the epoch-bound one, byte for byte as before it
+    /// existed.
     #[test]
     fn replica_keys_are_unchanged_without_a_stable_key_epoch() {
         use quil_types::consensus::set_stable_replica_key_epoch_for_thread;
-        set_stable_replica_key_epoch_for_thread(None);
+        set_stable_replica_key_epoch_for_thread(Some(u64::MAX));
         assert_eq!(
             hex::encode(replica_key(b"member0", b"shardA", 7)),
             "6bb19f89de49aae3f6a086f27c8d452efa333075960d9d8f944a7d200836f1dd"
@@ -581,6 +582,7 @@ mod tests {
                 "epoch {epoch}"
             );
         }
+        set_stable_replica_key_epoch_for_thread(None);
     }
 
     /// From the stable replica key epoch a registration's key is the
