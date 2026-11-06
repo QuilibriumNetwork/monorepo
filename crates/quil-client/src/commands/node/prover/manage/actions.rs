@@ -150,16 +150,27 @@ async fn until_stalled<T>(
 ) -> Result<T, String> {
     let started = tokio::time::Instant::now();
     let (mut last, mut open) = (started, true);
+    let mut reported = None;
     tokio::pin!(read);
     loop {
         let wake = (last + limits.stall).min(started + limits.cap);
         tokio::select! {
             biased;
-            out = &mut read => return Ok(out),
+            out = &mut read => {
+                // The read's last page can land with its result in one poll;
+                // `biased` takes the result first, so report that page too.
+                let now = *ticks.borrow();
+                if now != (0, 0) && reported != Some(now) {
+                    on_tick(now);
+                }
+                return Ok(out);
+            }
             changed = ticks.changed(), if open => match changed {
                 Ok(()) => {
                     last = tokio::time::Instant::now();
-                    on_tick(*ticks.borrow_and_update());
+                    let now = *ticks.borrow_and_update();
+                    reported = Some(now);
+                    on_tick(now);
                 }
                 Err(_) => open = false,
             },
