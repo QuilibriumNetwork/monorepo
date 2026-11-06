@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 use num_bigint::{BigInt, Sign};
 
 use quil_types::proto::node::{
-    GetShardInfoResponse, NodeInfoResponse, ShardAllocationInfo, ShardProverCounts,
-    WorkerInfoResponse,
+    CertificateShare, GetShardInfoResponse, NodeInfoResponse, ShardAllocationInfo,
+    ShardProverCounts, WorkerInfoResponse,
 };
 
 use super::super::epoch::{
@@ -19,7 +19,7 @@ use super::super::epoch::{
 
 // ── Column metadata (shared between rendering and filtering) ─────────────
 
-pub const ALLOC_COL_NAMES: [&str; 18] = [
+pub const ALLOC_COL_NAMES: [&str; 19] = [
     "Select",
     "Filter",
     "Provers",
@@ -38,6 +38,7 @@ pub const ALLOC_COL_NAMES: [&str; 18] = [
     "DefaultAction",
     "Interval [s]",
     "ProverPhases",
+    "Cert",
 ];
 pub const AVAIL_COL_NAMES: [&str; 13] = [
     "Select",
@@ -56,9 +57,10 @@ pub const AVAIL_COL_NAMES: [&str; 13] = [
 ];
 
 // Keep the new measurement beside its committed source without renumbering action columns,
-// and ProverPhases beside the Provers count it breaks down.
-pub const ALLOC_DISPLAY_COLS: &[usize] =
-    &[0, 1, 2, 17, 3, 4, 5, 6, 7, 8, 16, 9, 10, 11, 12, 13, 14, 15];
+// ProverPhases beside the Provers count it breaks down, and Cert beside the Reward it scales.
+pub const ALLOC_DISPLAY_COLS: &[usize] = &[
+    0, 1, 2, 17, 3, 4, 5, 6, 7, 8, 16, 9, 10, 18, 11, 12, 13, 14, 15,
+];
 pub const AVAIL_DISPLAY_COLS: &[usize] = &[0, 1, 2, 12, 3, 4, 5, 6, 7, 8, 11, 9, 10];
 
 /// The optional ProverPhases column in each panel; one visibility setting,
@@ -72,6 +74,15 @@ pub const AVAIL_PROVER_PHASES_COL: usize = 12;
 /// `provers::proposer::HALT_RISK_PROVER_COUNT`, which the client cannot
 /// import.
 pub const HALT_RISK_PROVER_COUNT: u32 = 3;
+
+/// The allocations-only Cert column: the seat's share of its shard's
+/// certificates over the last 60m (`ShardRewardInfo.certificate_share`).
+pub const ALLOC_CERT_COL: usize = 18;
+
+/// Frames the last hour must hold before a low certificate share is judged.
+/// Mirrors quil-node's `seat_certificates::LOW_MIN_FRAMES`, which the client
+/// cannot import.
+pub const CERT_LOW_MIN_FRAMES: u64 = 30;
 
 pub const INTERVAL_WINDOW_NAMES: &[&str] = &["  60m window", "  24h window"];
 /// The Global KPI's fields, in printed order; picker names, and the expanded
@@ -232,6 +243,9 @@ pub struct AllocationRow {
     /// The shard's provers by lifecycle phase; `None` when the node did not
     /// report them (older server, or no shard-info row).
     pub prover_counts: Option<ShardProverCounts>,
+    /// This node's seat's share of the shard's certificates; `None` when the
+    /// node did not report one (older server, no seat, or no shard-info row).
+    pub certificate_share: Option<CertificateShare>,
     pub shard_size: BigInt,
     pub data_shards: u64,
     pub materialized_frame: u64,
@@ -440,6 +454,11 @@ pub struct Model {
     pub global_observed_head: u64,
     pub node_global_cadence: Option<quil_types::proto::node::FrameCadence>,
     pub node_app_cadence: HashMap<Vec<u8>, quil_types::proto::node::FrameCadence>,
+    /// Frame committee size by shard filter, scaling the observed estimates.
+    pub node_app_committee: HashMap<Vec<u8>, u32>,
+    /// When each cadence's RPC answer arrived; staleness counts from here.
+    pub node_global_cadence_received: Option<std::time::Instant>,
+    pub node_app_cadence_received: Option<std::time::Instant>,
     pub reward_windows: u8,
     pub interval_windows: u8,
     pub global_interval_windows: u8,
@@ -452,6 +471,10 @@ pub struct Model {
     /// shard filters and the workers set to manual.
     pub join_choice: Option<(Vec<Vec<u8>>, Vec<u32>)>,
     pub difficulty: u64,
+    /// Of the committee sessions this node sits in, those whose members on
+    /// this node's network hold their quorum margin, and those the node
+    /// reported; `None` without a report (older server, or no session).
+    pub seat_concentration: Option<(usize, usize)>,
 
     // Verified GLOBAL reward witness, refreshed independently of shard queries.
     pub claimable_reward: Option<(u128, u64)>,
@@ -740,25 +763,39 @@ impl Model {
         }
     }
 
-    pub fn cadence_window<'a>(
+    /// How long a node answer stays valid: one polling period plus the RPC's
+    /// own deadline, so any refresh that answers at all arrives within it.
+    fn answer_budget(&self, deadline: std::time::Duration) -> std::time::Duration {
+        std::time::Duration::from_secs(self.refresh_seconds) + deadline
+    }
+    /// A refresh change restarts polling (`event_loop`) and with it this clock.
+    fn answer_overdue(
         &self,
-        cadence: &'a quil_types::proto::node::FrameCadence,
-        day: bool,
-    ) -> Option<&'a quil_types::proto::node::FrameWindow> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_secs();
-        if now < cadence.last_observed_unix_seconds || now - cadence.last_observed_unix_seconds > 90
-        {
-            return None;
-        }
-        let w = if day {
-            cadence.day.as_ref()?
-        } else {
-            cadence.hour.as_ref()?
-        };
-        (w.observed_seconds >= 60 && w.observed_seconds <= w.window_seconds).then_some(w)
+        received: Option<std::time::Instant>,
+        deadline: std::time::Duration,
+    ) -> bool {
+        received.is_some_and(|received| {
+            let since = self
+                .refresh_changed_at
+                .map_or(received, |changed| received.max(changed));
+            since.elapsed() > self.answer_budget(deadline)
+        })
+    }
+    pub fn global_cadence_stale(&self) -> bool {
+        self.answer_overdue(
+            self.node_global_cadence_received,
+            super::actions::RPC_TIMEOUT,
+        )
+    }
+    pub fn app_cadence_stale(&self) -> bool {
+        self.answer_overdue(
+            self.node_app_cadence_received,
+            super::actions::SHARD_RPC_TIMEOUT,
+        )
+    }
+    pub fn app_cadence_budget_seconds(&self) -> u64 {
+        self.answer_budget(super::actions::SHARD_RPC_TIMEOUT)
+            .as_secs()
     }
     pub fn interval_mask(&self) -> u8 {
         let mask = self.interval_windows & 3;
@@ -787,9 +824,12 @@ impl Model {
     /// Measured mean seconds per received GLOBAL frame: the 60m window when it
     /// has advances, else the 24h one; `None` without a fresh measurement.
     pub fn global_seconds_per_frame(&self) -> Option<f64> {
+        if self.global_cadence_stale() {
+            return None;
+        }
         let cadence = self.node_global_cadence.as_ref()?;
         [false, true].into_iter().find_map(|day| {
-            self.cadence_window(cadence, day)
+            super::super::observed_window(cadence, day)
                 .filter(|w| w.advanced_frames > 0)
                 .map(|w| w.observed_seconds as f64 / w.advanced_frames as f64)
         })
@@ -848,22 +888,21 @@ impl Model {
         if index == 2 {
             return Some(per_frame * BigInt::from(8640));
         }
-        if self.shard_error.is_some() {
+        if self.app_cadence_stale() {
             return None;
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_secs();
         super::super::observed_quil_daily(
             per_frame,
             self.node_app_cadence.get(filter)?,
             index == 1,
-            now,
+            self.node_app_committee.get(filter).copied().unwrap_or(0),
         )
     }
     pub fn app_interval(&self, filter: &[u8]) -> Option<f64> {
-        self.cadence_window(
+        if self.app_cadence_stale() {
+            return None;
+        }
+        super::super::observed_window(
             self.node_app_cadence.get(filter)?,
             self.interval_mask() == 2,
         )
@@ -875,13 +914,16 @@ impl Model {
     pub fn observe_app_intervals(
         &mut self,
         shards: &GetShardInfoResponse,
-        _now: std::time::Instant,
+        now: std::time::Instant,
     ) {
+        self.node_app_cadence_received = Some(now);
         self.node_app_cadence = shards
             .shards
             .iter()
             .filter_map(|s| s.frame_cadence.clone().map(|c| (s.filter.clone(), c)))
             .collect();
+        self.node_app_committee = committee_sizes(shards);
+        self.seat_concentration = seat_concentration(shards);
     }
 
     /// Track only fresh node responses; shard-cache refreshes cannot reset this clock.
@@ -1110,6 +1152,8 @@ impl Model {
                 .iter()
                 .filter_map(|s| s.frame_cadence.clone().map(|c| (s.filter.clone(), c)))
                 .collect();
+            self.node_app_committee = committee_sizes(shards);
+            self.seat_concentration = seat_concentration(shards);
         }
         self.peer_id = node_info.peer_id.clone();
         if !node_info.peer_seniority.is_empty() {
@@ -1209,6 +1253,7 @@ impl Model {
                 ring: UNKNOWN_REWARD_RING,
                 active_provers: 0,
                 prover_counts: None,
+                certificate_share: None,
                 shard_size: BigInt::from(0),
                 data_shards: 0,
                 materialized_frame: 0,
@@ -1233,6 +1278,7 @@ impl Model {
                 row.allocation_reason = info.allocation_reason.clone();
                 row.active_provers = info.active_provers;
                 row.prover_counts = info.prover_counts.clone();
+                row.certificate_share = info.certificate_share;
                 row.shard_size = BigInt::from_bytes_be(Sign::Plus, &info.shard_size);
                 row.data_shards = info.data_shards;
                 row.materialized_frame = info.materialized_frame;
@@ -1270,6 +1316,7 @@ impl Model {
                         ring: UNKNOWN_REWARD_RING,
                         active_provers: 0,
                         prover_counts: None,
+                        certificate_share: None,
                         shard_size: BigInt::from(0),
                         data_shards: 0,
                         materialized_frame: 0,
@@ -1454,6 +1501,9 @@ impl Model {
                 // ALLOC_PROVER_PHASES_COL; the sort column is an i32.
                 17 => prover_phase_order(a.prover_counts.as_ref())
                     .cmp(&prover_phase_order(b.prover_counts.as_ref())),
+                // ALLOC_CERT_COL.
+                18 => cert_share_percent(a.certificate_share.as_ref())
+                    .cmp(&cert_share_percent(b.certificate_share.as_ref())),
                 11 => a.worker_id.cmp(&b.worker_id),
                 12 => a.status.cmp(&b.status),
                 13 => a.manually_managed.cmp(&b.manually_managed),
@@ -2167,6 +2217,52 @@ pub fn prover_halt_risk(counts: Option<&ShardProverCounts>, size: &BigInt) -> bo
     })
 }
 
+/// Each shard's frame committee size, by filter.
+fn committee_sizes(shards: &GetShardInfoResponse) -> HashMap<Vec<u8>, u32> {
+    shards
+        .shards
+        .iter()
+        .map(|s| (s.filter.clone(), super::super::committee_size(s)))
+        .collect()
+}
+
+/// A seat's certificate share over the last 60m, in whole percent; `None`
+/// while the node reports none or counted no frame in the hour.
+pub fn cert_share_percent(share: Option<&CertificateShare>) -> Option<u64> {
+    let hour = share?.hour.as_ref()?;
+    (hour.frames > 0).then(|| hour.signed_frames.saturating_mul(100) / hour.frames)
+}
+
+/// The node's low-share condition (quil-node `seat_certificates::low_share`):
+/// a full hour counted with at least [`CERT_LOW_MIN_FRAMES`] frames, of which
+/// the seat signed under half the share a member voting in time signs,
+/// `quorum / committee`.
+pub fn cert_share_low(share: Option<&CertificateShare>) -> bool {
+    let Some(share) = share else { return false };
+    let Some(hour) = share.hour.as_ref() else {
+        return false;
+    };
+    hour.observed_seconds >= hour.window_seconds
+        && hour.frames >= CERT_LOW_MIN_FRAMES
+        && share.committee > 0
+        && u128::from(hour.signed_frames) * 2 * u128::from(share.committee)
+            < u128::from(hour.frames) * u128::from(share.quorum)
+}
+
+/// [`Model::seat_concentration`] of a shard-info response.
+fn seat_concentration(shards: &GetShardInfoResponse) -> Option<(usize, usize)> {
+    let reports: Vec<_> = shards
+        .shards
+        .iter()
+        .filter_map(|s| s.seat_concentration.as_ref())
+        .collect();
+    let own = reports
+        .iter()
+        .filter(|r| r.concentration_seats > 0 && r.own_group_seats >= r.concentration_seats)
+        .count();
+    (!reports.is_empty()).then_some((own, reports.len()))
+}
+
 /// ProverPhases sorts by the provers serving after the next boundary, then
 /// by active ones; unreported counts sort first ascending.
 fn prover_phase_order(counts: Option<&ShardProverCounts>) -> Option<(u32, u32)> {
@@ -2548,6 +2644,43 @@ mod tests {
             None,
         );
         assert_eq!(model.allocations[0].prover_counts, None);
+    }
+
+    #[test]
+    fn certificate_shares_reach_allocation_rows_and_absent_ones_stay_absent() {
+        use quil_types::proto::node::{CertificateShare, CertificateWindow};
+        let share = CertificateShare {
+            hour: Some(CertificateWindow {
+                window_seconds: 3600,
+                observed_seconds: 3600,
+                frames: 10,
+                signed_frames: 7,
+            }),
+            day: None,
+            committee: 4,
+            quorum: 3,
+        };
+        let mut shards = shard_info(vec![0xab], 1);
+        shards.shards[0].certificate_share = Some(share);
+        let mut model = Model::new();
+        model.process_refresh_data(
+            Some(node_info(allocation(vec![0xab], 3))),
+            Some(shards),
+            None,
+        );
+        assert_eq!(model.allocations[0].certificate_share, Some(share));
+        assert_eq!(
+            cert_share_percent(model.allocations[0].certificate_share.as_ref()),
+            Some(70)
+        );
+        // An older server leaves the share absent.
+        let mut model = Model::new();
+        model.process_refresh_data(
+            Some(node_info(allocation(vec![0xab], 3))),
+            Some(shard_info(vec![0xab], 1)),
+            None,
+        );
+        assert_eq!(model.allocations[0].certificate_share, None);
     }
 
     #[test]
@@ -3049,6 +3182,112 @@ mod execution_freshness_tests {
 mod frame_interval_tests {
     use super::*;
     use quil_types::proto::node::{FrameCadence, FrameWindow, ShardRewardInfo};
+    use std::time::{Duration, Instant};
+
+    fn wall_seconds() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+    fn cadence(last_observed_unix_seconds: u64) -> FrameCadence {
+        FrameCadence {
+            last_observed_unix_seconds,
+            hour: Some(FrameWindow {
+                window_seconds: 3600,
+                observed_seconds: 600,
+                advanced_frames: 30,
+            }),
+            day: None,
+        }
+    }
+    fn answer(frame_cadence: FrameCadence) -> GetShardInfoResponse {
+        GetShardInfoResponse {
+            shards: vec![ShardRewardInfo {
+                filter: vec![1],
+                frame_cadence: Some(frame_cadence),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The live defect: on a 60s refresh a sample 55s old on arrival passed a
+    /// 90s bound 35s later, and every row read `-` until the next answer.
+    #[test]
+    fn a_late_refresh_keeps_a_sample_that_was_valid_on_arrival() {
+        let mut m = Model::new();
+        m.refresh_seconds = 60;
+        let waited = 61;
+        let observed = wall_seconds() - waited - 55;
+        let arrived = Instant::now() - Duration::from_secs(waited);
+        m.observe_app_intervals(&answer(cadence(observed)), arrived);
+        assert_eq!(m.app_interval(&[1]), Some(20.0));
+        assert!(m.daily_reward(&BigInt::from(1000), &[1], 0).is_some());
+        m.node_global_cadence = Some(cadence(observed));
+        m.node_global_cadence_received = Some(arrived);
+        assert_eq!(m.global_seconds_per_frame(), Some(20.0));
+    }
+
+    /// The client's clock takes no part: the node judged the sample.
+    #[test]
+    fn client_clock_skew_cannot_blank_a_fresh_answer() {
+        for observed in [wall_seconds() + 3600, wall_seconds() - 3600] {
+            let mut m = Model::new();
+            m.observe_app_intervals(&answer(cadence(observed)), Instant::now());
+            assert_eq!(m.app_interval(&[1]), Some(20.0), "sample at {observed}");
+            assert!(m.daily_reward(&BigInt::from(1000), &[1], 0).is_some());
+            m.node_global_cadence = Some(cadence(observed));
+            m.node_global_cadence_received = Some(Instant::now());
+            assert_eq!(m.global_seconds_per_frame(), Some(20.0));
+        }
+    }
+
+    #[test]
+    fn answers_stay_valid_for_one_refresh_plus_the_rpc_timeout() {
+        let c = cadence(wall_seconds());
+        for refresh in [5, 15, 30, 60] {
+            let mut m = Model::new();
+            m.refresh_seconds = refresh;
+            m.node_global_cadence = Some(c);
+            let ago = |seconds: u64| Instant::now() - Duration::from_secs(seconds);
+
+            m.observe_app_intervals(&answer(c), ago(refresh + 50));
+            assert!(!m.app_cadence_stale(), "refresh {refresh}");
+            assert_eq!(m.app_interval(&[1]), Some(20.0));
+            m.observe_app_intervals(&answer(c), ago(refresh + 62));
+            assert!(m.app_cadence_stale(), "refresh {refresh}");
+            assert_eq!(m.app_interval(&[1]), None);
+            assert!(m.daily_reward(&BigInt::from(1000), &[1], 0).is_none());
+            assert!(
+                m.daily_reward(&BigInt::from(1000), &[1], 2).is_some(),
+                "the 10s theory needs no observation"
+            );
+
+            m.node_global_cadence_received = Some(ago(refresh + 5));
+            assert!(!m.global_cadence_stale(), "refresh {refresh}");
+            assert_eq!(m.global_seconds_per_frame(), Some(20.0));
+            m.node_global_cadence_received = Some(ago(refresh + 17));
+            assert!(m.global_cadence_stale(), "refresh {refresh}");
+            assert_eq!(m.global_seconds_per_frame(), None);
+        }
+    }
+
+    /// Polling restarts on a refresh change, so a shorter budget cannot strand
+    /// an answer that the old period had not yet replaced.
+    #[test]
+    fn a_refresh_change_restarts_the_stale_clock() {
+        let mut m = Model::new();
+        m.refresh_seconds = 5;
+        let ago = |seconds: u64| Instant::now() - Duration::from_secs(seconds);
+        m.observe_app_intervals(&answer(cadence(1)), ago(100));
+        assert!(m.app_cadence_stale());
+        m.refresh_changed_at = Some(ago(1));
+        assert!(!m.app_cadence_stale());
+        m.refresh_changed_at = Some(ago(70));
+        assert!(m.app_cadence_stale());
+    }
+
     #[test]
     fn server_windows_ignore_peer_heads_and_client_start_time() {
         let now = std::time::SystemTime::now()
@@ -3081,6 +3320,89 @@ mod frame_interval_tests {
         shards.shards[0].frame_cadence = None;
         m.observe_app_intervals(&shards, std::time::Instant::now());
         assert_eq!(m.app_interval(&[1]), None);
+    }
+
+    #[test]
+    fn seat_concentration_counts_sessions_this_nodes_site_holds_the_margin_of() {
+        use quil_types::proto::node::{SeatConcentration, ShardRewardInfo};
+        let report = |own_group_seats| {
+            Some(SeatConcentration {
+                members: 17,
+                quorum: 12,
+                largest_group_seats: 5,
+                own_group_seats,
+                unaddressed_members: 0,
+                concentration_seats: 4,
+                epoch: 1393,
+            })
+        };
+        let mut shards = GetShardInfoResponse {
+            shards: [report(4), report(3), report(0), None]
+                .into_iter()
+                .map(|seat_concentration| ShardRewardInfo {
+                    seat_concentration,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut m = Model::new();
+        m.observe_app_intervals(&shards, std::time::Instant::now());
+        assert_eq!(
+            m.seat_concentration,
+            Some((1, 3)),
+            "at the threshold, of reports"
+        );
+        for shard in &mut shards.shards {
+            shard.seat_concentration = None;
+        }
+        m.observe_app_intervals(&shards, std::time::Instant::now());
+        assert_eq!(m.seat_concentration, None, "an older server reports none");
+    }
+    /// The 60m and 24h estimates pay the quorum share of frames; the theory
+    /// column still pays every frame at 10s/frame.
+    #[test]
+    fn observed_rewards_pay_the_quorum_share_and_theory_every_frame() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let window = Some(FrameWindow {
+            window_seconds: 3600,
+            observed_seconds: 600,
+            advanced_frames: 30,
+        });
+        let mut m = Model::new();
+        let shards = GetShardInfoResponse {
+            shards: vec![ShardRewardInfo {
+                filter: vec![1],
+                active_provers: 25,
+                prover_counts: Some(ShardProverCounts {
+                    joining: 2,
+                    active: 20,
+                    paused: 1,
+                    leaving: 1,
+                    departing: 1,
+                    ..Default::default()
+                }),
+                frame_cadence: Some(FrameCadence {
+                    last_observed_unix_seconds: now,
+                    hour: window,
+                    day: window,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        m.observe_app_intervals(&shards, std::time::Instant::now());
+        let per_frame = BigInt::from(22_000);
+        let quorum = Some(BigInt::from(95_040_000 / 22 * 15));
+        assert_eq!(m.daily_reward(&per_frame, &[1], 0), quorum);
+        assert_eq!(m.daily_reward(&per_frame, &[1], 1), quorum);
+        assert_eq!(
+            m.daily_reward(&per_frame, &[1], 2),
+            Some(BigInt::from(22_000 * 8640))
+        );
     }
     #[test]
     fn a_received_head_alone_cannot_create_a_node_cadence_measurement() {

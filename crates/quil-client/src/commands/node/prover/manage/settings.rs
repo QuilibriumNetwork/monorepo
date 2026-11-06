@@ -13,9 +13,15 @@ use serde_yaml::{Mapping, Value};
 
 use super::super::epoch::ThresholdUnit;
 use super::model::{
-    Model, NoticeSeverity, ALLOC_COL_NAMES, ALLOC_DISPLAY_COLS, ALLOC_KPI_NAMES, AVAIL_COL_NAMES,
-    AVAIL_DISPLAY_COLS, AVAIL_KPI_NAMES, NOTICE_KPI_NAMES, TOP_KPI_NAMES,
+    Model, NoticeSeverity, ALLOC_CERT_COL, ALLOC_COL_NAMES, ALLOC_DISPLAY_COLS, ALLOC_KPI_NAMES,
+    AVAIL_COL_NAMES, AVAIL_DISPLAY_COLS, AVAIL_KPI_NAMES, NOTICE_KPI_NAMES, TOP_KPI_NAMES,
 };
+
+/// Allocations columns added after users began saving column orders, each
+/// with the column it follows by default: a saved order lacking one gains it
+/// after that column (or at its default place without it), and keeps the
+/// rest as saved.
+const ADDED_ALLOC_COLS: &[(usize, usize)] = &[(ALLOC_CERT_COL, 10)];
 
 /// The file's name in the qclient config directory.
 pub const FILE_NAME: &str = "qclient-node-manage.yaml";
@@ -132,13 +138,35 @@ fn index_of(name: &Value, table: &[&str]) -> Option<usize> {
 }
 
 /// A saved column order, kept only while it names exactly the columns
-/// this build shows: a renamed, added or removed column voids it.
-fn column_order(value: &Value, table: &[&str], default: &[usize]) -> Option<Vec<usize>> {
-    let order: Vec<usize> = value
+/// this build shows, but for columns of `added` (`(column, follows)`) it
+/// predates, which are inserted after the column they follow, or at their
+/// default place without it: a renamed or removed column, or a missing one
+/// not in `added`, voids it.
+fn column_order(
+    value: &Value,
+    table: &[&str],
+    default: &[usize],
+    added: &[(usize, usize)],
+) -> Option<Vec<usize>> {
+    let mut order: Vec<usize> = value
         .as_sequence()?
         .iter()
         .map(|name| index_of(name, table))
         .collect::<Option<_>>()?;
+    for &(column, follows) in added {
+        if order.contains(&column) || !default.contains(&column) {
+            continue;
+        }
+        let at = match order.iter().position(|&c| c == follows) {
+            Some(i) => i + 1,
+            None => default
+                .iter()
+                .position(|&c| c == column)
+                .unwrap_or(order.len())
+                .min(order.len()),
+        };
+        order.insert(at, column);
+    }
     let mut sorted = order.clone();
     sorted.sort_unstable();
     let mut expected = default.to_vec();
@@ -172,12 +200,12 @@ pub fn apply(m: &mut Model, map: &Mapping) {
             .collect();
     }
     if let Some(order) = get(map, "allocationColumns")
-        .and_then(|v| column_order(v, &ALLOC_COL_NAMES, ALLOC_DISPLAY_COLS))
+        .and_then(|v| column_order(v, &ALLOC_COL_NAMES, ALLOC_DISPLAY_COLS, ADDED_ALLOC_COLS))
     {
         m.alloc_column_order = order;
     }
     if let Some(order) = get(map, "availableColumns")
-        .and_then(|v| column_order(v, &AVAIL_COL_NAMES, AVAIL_DISPLAY_COLS))
+        .and_then(|v| column_order(v, &AVAIL_COL_NAMES, AVAIL_DISPLAY_COLS, &[]))
     {
         m.avail_column_order = order;
     }
@@ -299,15 +327,12 @@ pub fn read(path: &Path) -> Mapping {
         .unwrap_or_default()
 }
 
-/// Write `map` to `path` through a temporary file, so a crash never
-/// leaves half a file.
+/// Write `map` to `path` atomically, so a crash never leaves half a file.
 fn write(path: &Path, map: &Mapping) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("yaml.tmp");
-    std::fs::write(&tmp, serde_yaml::to_string(map)?)?;
-    std::fs::rename(&tmp, path)?;
+    quil_config::atomic_write(path, serde_yaml::to_string(map)?.as_bytes(), 0o644)?;
     Ok(())
 }
 
@@ -452,6 +477,83 @@ mod settings_tests {
         Store::open(Some(path.clone()), &mut m);
         assert_eq!(capture(&m), capture(&defaults));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A layout saved before the Cert column keeps its order, with Cert
+    /// after Reward, or at its default place when Reward is not in it.
+    #[test]
+    fn a_saved_order_without_cert_keeps_its_layout_and_gains_cert() {
+        let names = |order: &[usize]| -> Value {
+            Value::Sequence(
+                order
+                    .iter()
+                    .map(|&c| Value::String(ALLOC_COL_NAMES[c].into()))
+                    .collect(),
+            )
+        };
+        // A user's layout: Worker and Reward moved to the front.
+        let saved: Vec<usize> = [0, 1, 11, 10]
+            .into_iter()
+            .chain(
+                ALLOC_DISPLAY_COLS
+                    .iter()
+                    .copied()
+                    .filter(|&c| ![0, 1, 11, 10, ALLOC_CERT_COL].contains(&c)),
+            )
+            .collect();
+        let mut expected = saved.clone();
+        expected.insert(4, ALLOC_CERT_COL);
+        assert_eq!(
+            column_order(
+                &names(&saved),
+                &ALLOC_COL_NAMES,
+                ALLOC_DISPLAY_COLS,
+                ADDED_ALLOC_COLS
+            ),
+            Some(expected.clone())
+        );
+        let mut map = Mapping::new();
+        map.insert(Value::String("allocationColumns".into()), names(&saved));
+        let mut m = Model::new();
+        apply(&mut m, &map);
+        assert_eq!(m.alloc_column_order, expected);
+        // A saved order already holding Cert stays as saved.
+        assert_eq!(
+            column_order(
+                &names(&expected),
+                &ALLOC_COL_NAMES,
+                ALLOC_DISPLAY_COLS,
+                ADDED_ALLOC_COLS
+            ),
+            Some(expected)
+        );
+        // Without its column to follow, Cert takes its default place.
+        let position = ALLOC_DISPLAY_COLS
+            .iter()
+            .position(|&c| c == ALLOC_CERT_COL)
+            .unwrap();
+        let mut want = saved.clone();
+        want.insert(position, ALLOC_CERT_COL);
+        assert_eq!(
+            column_order(
+                &names(&saved),
+                &ALLOC_COL_NAMES,
+                ALLOC_DISPLAY_COLS,
+                &[(ALLOC_CERT_COL, usize::MAX)]
+            ),
+            Some(want)
+        );
+        // A missing column other than Cert still voids the saved order.
+        let without: Vec<usize> = saved.iter().copied().filter(|&c| c != 11).collect();
+        assert_eq!(
+            column_order(
+                &names(&without),
+                &ALLOC_COL_NAMES,
+                ALLOC_DISPLAY_COLS,
+                ADDED_ALLOC_COLS
+            ),
+            None
+        );
     }
 
     /// The Coins tab's edges load by position under their own key: a list

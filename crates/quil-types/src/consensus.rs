@@ -176,7 +176,7 @@ pub struct ProverAllocationInfo {
     /// The last GLOBAL frame that included an app frame this allocation
     /// signed. Unlike `last_active_frame_number`, confirms do not advance it.
     /// `0` when never recorded, including every frame before
-    /// [`SIGNED_FRAME_ACTIVATION_FRAME`].
+    /// [`signed_frame_activation_frame`].
     pub last_signed_frame_number: u64,
     /// The storage epoch this allocation was last confirmed for. A data-shard
     /// (non-empty filter) Active allocation whose `epoch` is older than the
@@ -1150,8 +1150,9 @@ pub fn set_unsealed_issuance_epoch_for_thread(epoch: Option<u64>) {
 /// rewarded participants must have a sealed registration for their epoch.
 /// No empty-committee fallback may admit an unsealed member. Archives serving
 /// GLOBAL use its separate membership protocol and have no shard storage seat.
-/// The same epoch switches replica keys to persistent member/leaf keys; epoch
-/// freshness remains bound into the registration, beacon challenges and STARK.
+/// Replica keys switch to persistent member/leaf keys at
+/// [`MAINNET_STABLE_REPLICA_KEY_EPOCH`]; epoch freshness remains bound into
+/// the registration, beacon challenges and STARK.
 /// Provers should upgrade before epoch 1385 for the full warmup. GLOBAL
 /// executors must upgrade before epoch 1392 admits the first epoch-1393 seals.
 pub const MAINNET_SEALED_STORAGE_EPOCH: Option<u64> = Some(1393);
@@ -1284,10 +1285,13 @@ pub fn set_storage_kick_suspension_epoch_for_thread(epoch: Option<u64>) {
 /// all hash the epoch and a beacon fixed after the registration. Labels for
 /// this epoch are made ahead two epochs before it and sealed in the epoch
 /// before it. Consensus-affecting (seal verification in every GLOBAL
-/// execution): every node must run a build carrying the epoch before the
-/// epoch two before it begins. Mainnet: epoch 1393, with mandatory sealing;
+/// execution): every node and archive must run a build carrying the epoch
+/// before the epoch two before it begins, and every archive before the
+/// epoch before it at the latest. Mainnet epoch 1429 (frame 1,028,880):
+/// labelling from 1427 leaves the release carrying it about a day to
+/// adopt, the slowest recent release's time to 95% of peers.
 /// `QUIL_STABLE_REPLICA_KEY_EPOCH` elsewhere, never by default.
-pub const MAINNET_STABLE_REPLICA_KEY_EPOCH: Option<u64> = Some(1393);
+pub const MAINNET_STABLE_REPLICA_KEY_EPOCH: Option<u64> = Some(1429);
 
 static STABLE_REPLICA_KEY_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -1384,9 +1388,11 @@ pub fn stable_replica_key_epoch_thread_override() -> Option<u64> {
 /// before its first kick less what its vertex held when it rejoined, so
 /// seniority earned since the rejoin is kept, once. Consensus-affecting
 /// (prover state): every node that executes GLOBAL frames must run a build
-/// carrying the frame before it. Mainnet: not set until decided;
-/// `QUIL_KICKED_SENIORITY_RESTORATION_FRAME` elsewhere, never by default.
-pub const MAINNET_KICKED_SENIORITY_RESTORATION_FRAME: Option<u64> = None;
+/// carrying the frame before it. Mainnet: 1,024,560, the first frame of epoch
+/// 1423, which GLOBAL cannot reach before 2026-11-07 00:00 UTC even at ten
+/// seconds a frame; `QUIL_KICKED_SENIORITY_RESTORATION_FRAME` elsewhere, never
+/// by default.
+pub const MAINNET_KICKED_SENIORITY_RESTORATION_FRAME: Option<u64> = Some(1_024_560);
 
 /// A prover whose seniority [`MAINNET_KICKED_SENIORITY_RESTORATION_FRAME`]
 /// restores.
@@ -1728,17 +1734,20 @@ mod exact_state_size_epoch_tests {
         assert_eq!(super::exact_state_size_epoch_for(1, None), u64::MAX);
     }
 
-    /// Mainnet restores at no frame until one is set, whatever the settings
-    /// say, and always from its own table; other networks take both
-    /// settings, and nothing without them.
+    /// Mainnet restores at its own frame, the first of an epoch, whatever
+    /// the settings say, and always from its own table; other networks
+    /// take both settings, and nothing without them.
     #[test]
     fn only_a_test_network_reads_the_kicked_seniority_restoration_settings() {
         let address = "09b404433671157db1a6f606b4d27378c970021a9d806a48b52396bb7e1a0ecf";
         let table = format!("{address}:2420:0, {}:5:7", "ab".repeat(32));
-        assert_eq!(super::MAINNET_KICKED_SENIORITY_RESTORATION_FRAME, None);
+        assert_eq!(
+            super::MAINNET_KICKED_SENIORITY_RESTORATION_FRAME,
+            Some(1423 * super::EPOCH_LENGTH_FRAMES)
+        );
         let (frame, mainnet) =
             super::kicked_seniority_restoration_for(0, Some("700"), Some(&table));
-        assert_eq!(frame, u64::MAX);
+        assert_eq!(frame, 1_024_560);
         assert_eq!(mainnet, super::MAINNET_KICKED_SENIORITY_RESTORATIONS);
         let (frame, devnet) = super::kicked_seniority_restoration_for(1, Some("700"), Some(&table));
         assert_eq!(frame, 700);
@@ -1769,7 +1778,11 @@ mod exact_state_size_epoch_tests {
         }
         super::set_kicked_seniority_restoration_frame_for_thread(None);
         super::set_kicked_seniority_restorations_for_thread(None);
-        assert_eq!(super::kicked_seniority_restoration_frame(), u64::MAX);
+        assert_eq!(
+            super::kicked_seniority_restoration_frame(),
+            1_024_560,
+            "without init, the mainnet frame"
+        );
         assert_eq!(
             super::kicked_seniority_restorations(),
             super::MAINNET_KICKED_SENIORITY_RESTORATIONS
@@ -1827,17 +1840,15 @@ mod exact_state_size_epoch_tests {
         assert!(super::storage_kicks_suspended(966_240));
     }
 
-    /// Mainnet fixes stable keys at the mandatory sealing cutover, regardless
-    /// of environment settings. Other networks require an explicit setting.
+    /// Mainnet's stable replica key epoch is 1429 (GLOBAL frame 1,028,880),
+    /// whatever the setting says. Other networks take the setting, and none
+    /// without it.
     #[test]
-    fn stable_replica_keys_start_with_mandatory_sealing_on_mainnet() {
-        assert_eq!(super::MAINNET_STABLE_REPLICA_KEY_EPOCH, Some(1393));
-        assert_eq!(
-            super::MAINNET_STABLE_REPLICA_KEY_EPOCH,
-            super::MAINNET_SEALED_STORAGE_EPOCH
-        );
-        assert_eq!(super::stable_replica_key_epoch_for(0, Some("5")), 1393);
-        assert_eq!(super::stable_replica_key_epoch_for(0, None), 1393);
+    fn mainnet_replica_keys_are_stable_from_epoch_1429() {
+        assert_eq!(super::MAINNET_STABLE_REPLICA_KEY_EPOCH, Some(1429));
+        assert_eq!(1429 * super::EPOCH_LENGTH_FRAMES, 1_028_880);
+        assert_eq!(super::stable_replica_key_epoch_for(0, Some("5")), 1429);
+        assert_eq!(super::stable_replica_key_epoch_for(0, None), 1429);
         assert_eq!(super::stable_replica_key_epoch_for(1, Some("5")), 5);
         assert_eq!(
             super::stable_replica_key_epoch_for(1, Some("bad")),
@@ -1845,38 +1856,41 @@ mod exact_state_size_epoch_tests {
         );
         assert_eq!(super::stable_replica_key_epoch_for(1, None), u64::MAX);
         super::set_stable_replica_key_epoch_for_thread(None);
-        assert_eq!(super::stable_replica_key_epoch(), 1393);
+        assert_eq!(super::stable_replica_key_epoch(), 1429);
         assert!(!super::stable_replica_keys_at(0));
-        assert!(!super::stable_replica_keys_at(1392));
-        assert!(super::stable_replica_keys_at(1393));
+        assert!(!super::stable_replica_keys_at(1428));
+        assert!(super::stable_replica_keys_at(1429));
         assert!(super::stable_replica_keys_at(u64::MAX));
         super::set_stable_replica_key_epoch_for_thread(Some(u64::MAX));
+        assert!(!super::stable_replica_keys_at(0));
+        assert!(!super::stable_replica_keys_at(u64::MAX - 1));
         assert!(!super::stable_replica_keys_at(u64::MAX));
         super::set_stable_replica_key_epoch_for_thread(Some(9));
         assert!(!super::stable_replica_keys_at(8));
         assert!(super::stable_replica_keys_at(9));
         assert_eq!(super::stable_replica_key_epoch_thread_override(), Some(9));
         super::set_stable_replica_key_epoch_for_thread(None);
-        // Never before the hash storage proof epoch; mainnet's must not be.
+        // Never before the hash storage proof epoch; mainnet's is not.
         assert_eq!(super::stable_replica_key_epoch_from(1, Some("5"), 3), 5);
         assert_eq!(super::stable_replica_key_epoch_from(1, Some("5"), 8), 8);
         assert_eq!(super::stable_replica_key_epoch_from(1, None, 8), u64::MAX);
-        if let (Some(stable), Some(hash)) = (
-            super::MAINNET_STABLE_REPLICA_KEY_EPOCH,
-            super::MAINNET_HASH_STORAGE_PROOF_EPOCH,
-        ) {
-            assert!(stable >= hash);
-        }
+        let stable = super::MAINNET_STABLE_REPLICA_KEY_EPOCH.unwrap();
+        let hash = super::MAINNET_HASH_STORAGE_PROOF_EPOCH.unwrap();
+        assert!(stable >= hash);
+        assert_eq!(
+            super::stable_replica_key_epoch_from(0, Some("5"), hash),
+            stable
+        );
     }
 
-    /// A read before initialization does not fix the epoch: the
-    /// initialization after it still decides.
+    /// A read before initialization is the mainnet epoch and does not fix
+    /// it: the initialization after it still decides.
     #[test]
     fn a_stable_replica_key_epoch_read_before_init_does_not_fix_it() {
         if super::STABLE_REPLICA_KEY_EPOCH.get().is_some() {
             return; // another test in this process initialized it
         }
-        assert_eq!(super::stable_replica_key_epoch(), 1393);
+        assert_eq!(super::stable_replica_key_epoch(), 1429);
         assert!(
             super::STABLE_REPLICA_KEY_EPOCH.get().is_none(),
             "a read fixed it"
@@ -2352,9 +2366,93 @@ pub fn set_global_sync_authentication_frame_for_thread(frame: Option<u64>) {
 /// counts an allocation as fresh by that field instead of
 /// `LastActiveFrameNumber`, which confirms also advance. Recording the field
 /// changes committed allocation trees, so every archive must start at the same
-/// frame. `u64::MAX` disables both: no frame records the field and the census
-/// keeps reading `LastActiveFrameNumber`.
-pub const SIGNED_FRAME_ACTIVATION_FRAME: u64 = u64::MAX;
+/// frame. Without one (`u64::MAX`) no frame records the field and the census
+/// keeps reading `LastActiveFrameNumber`. Mainnet: 1,024,560, the first frame
+/// of epoch 1423, which GLOBAL cannot reach before 2026-11-07 00:00 UTC even at
+/// ten seconds a frame, with the presence report frame;
+/// `QUIL_SIGNED_FRAME_ACTIVATION_FRAME` elsewhere, never by default.
+pub const MAINNET_SIGNED_FRAME_ACTIVATION_FRAME: Option<u64> = Some(1_024_560);
+
+static SIGNED_FRAME_ACTIVATION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static SIGNED_FRAME_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn signed_frame_activation_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_SIGNED_FRAME_ACTIVATION_FRAME.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's signed frame activation frame from its network, and
+/// return it. Called at startup before any frame is processed; the first
+/// call decides.
+pub fn init_signed_frame_activation_frame(network: u8) -> u64 {
+    *SIGNED_FRAME_ACTIVATION.get_or_init(|| {
+        signed_frame_activation_frame_for(
+            network,
+            std::env::var("QUIL_SIGNED_FRAME_ACTIVATION_FRAME")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The frame fixed by [`init_signed_frame_activation_frame`]; the mainnet
+/// frame in a process that never called it (the explorer, tools), so the
+/// setting cannot reach mainnet. `u64::MAX`: never.
+pub fn signed_frame_activation_frame() -> u64 {
+    if let Some(frame) = SIGNED_FRAME_ACTIVATION_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    SIGNED_FRAME_ACTIVATION
+        .get()
+        .copied()
+        .unwrap_or_else(|| signed_frame_activation_frame_for(0, None))
+}
+
+/// Set the signed frame activation frame for the calling thread only
+/// (tests). `Some(u64::MAX)` disables it; `None` restores the process
+/// setting.
+pub fn set_signed_frame_activation_frame_for_thread(frame: Option<u64>) {
+    SIGNED_FRAME_ACTIVATION_OVERRIDE.with(|cell| cell.set(frame));
+}
+
+#[cfg(test)]
+mod signed_frame_activation_tests {
+    /// Mainnet records signed frames from its own frame, the first of an
+    /// epoch, whatever the setting says; other networks only when set.
+    #[test]
+    fn only_a_test_network_reads_the_signed_frame_activation_setting() {
+        let mainnet = 1423 * super::EPOCH_LENGTH_FRAMES;
+        assert_eq!(super::MAINNET_SIGNED_FRAME_ACTIVATION_FRAME, Some(mainnet));
+        for setting in [None, Some("7"), Some("bad")] {
+            assert_eq!(
+                super::signed_frame_activation_frame_for(0, setting),
+                mainnet
+            );
+        }
+        assert_eq!(super::signed_frame_activation_frame_for(1, Some("7")), 7);
+        assert_eq!(
+            super::signed_frame_activation_frame_for(1, Some("bad")),
+            u64::MAX
+        );
+        assert_eq!(super::signed_frame_activation_frame_for(1, None), u64::MAX);
+        super::set_signed_frame_activation_frame_for_thread(None);
+        assert_eq!(
+            super::signed_frame_activation_frame(),
+            mainnet,
+            "without init, the mainnet frame"
+        );
+        super::set_signed_frame_activation_frame_for_thread(Some(9));
+        assert_eq!(super::signed_frame_activation_frame(), 9);
+        super::set_signed_frame_activation_frame_for_thread(None);
+    }
+}
 
 /// Minimum number of effectively-active provers a shard needs to run its
 /// app-shard consensus (form a committee and reach quorum). A shard with

@@ -74,6 +74,9 @@ mod rpc_metrics;
 #[cfg(test)]
 mod required_anchor_tests;
 
+#[cfg(test)]
+mod fh_anchor_repro_tests;
+
 /// Quilibrium Node — Rust implementation
 #[derive(Parser, Debug)]
 #[command(name = "quil-node", version = quil_config::display_version(), about)]
@@ -475,6 +478,12 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         args.debug,
         args.log_filter.as_deref(),
     );
+
+    // Name the shared rayon pool's threads before any parallel work starts
+    // it, so a crash on one of them (a stack overflow, say) names the pool.
+    if let Err(error) = rayon_pool().build_global() {
+        warn!(%error, "the shared rayon pool was already running: its threads stay unnamed");
+    }
 
     // Raise RLIMIT_NOFILE soft → hard. The Go runtime did this
     // automatically (Go ≥1.19), so the Go node never saw EMFILE; Rust
@@ -1497,6 +1506,12 @@ fn exit_node(result: &anyhow::Result<ExitCode>) -> ! {
     quil_engine::storage_jobs::exit_now(code)
 }
 
+/// The shared rayon pool the node's parallel work runs on, at rayon's
+/// default size, its threads named `rayon-<index>`.
+fn rayon_pool() -> rayon::ThreadPoolBuilder {
+    rayon::ThreadPoolBuilder::new().thread_name(|index| format!("rayon-{index}"))
+}
+
 /// Tonic's cluster channels can be the first TLS users in either process.
 /// Both ring and aws-lc are linked transitively, so rustls cannot select one
 /// from crate features. Match the ring provider used by the peer TLS builders
@@ -1508,6 +1523,14 @@ fn initialize_tls_provider() {
 #[cfg(test)]
 mod startup_tests {
     use quil_types::crypto::Signer;
+
+    /// The shared pool's threads carry a name, so a crash on one names it.
+    #[test]
+    fn rayon_pool_threads_are_named() {
+        let pool = super::rayon_pool().num_threads(1).build().unwrap();
+        let name = pool.install(|| std::thread::current().name().map(str::to_owned));
+        assert_eq!(name.as_deref(), Some("rayon-0"));
+    }
 
     #[test]
     fn cluster_tls_initializes_provider_in_fresh_process() {

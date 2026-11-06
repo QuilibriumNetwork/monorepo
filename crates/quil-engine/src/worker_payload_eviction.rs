@@ -28,6 +28,9 @@ pub struct Outcome {
     pub removed_bytes: u64,
     pub ranges: usize,
     pub invalidated_markers: usize,
+    /// Interrupted-sync markers whose evicted scopes were dropped in the
+    /// same write, narrowed to the kept scopes they cover or deleted.
+    pub sync_markers: usize,
     /// Payload ranges compacted to reclaim files that hold only deleted
     /// records, and those files' bytes. A snapshot older than the deletion
     /// keeps them until it is released; a later pass compacts again.
@@ -44,6 +47,148 @@ fn unavailable(message: impl Into<String>) -> QuilError {
 
 fn store_error(error: impl std::fmt::Display) -> QuilError {
     QuilError::Store(error.to_string())
+}
+
+const HISTORY_REFUSAL: &str = "application has indexed historical roots or manifests";
+
+/// Why a pass removed nothing, with what it had planned to remove and the
+/// index entry that stopped it, for its warn line.
+#[derive(Debug)]
+pub(crate) struct Refusal {
+    pub error: QuilError,
+    /// Records and bytes the pass planned to remove, once it had planned.
+    pub planned: Option<(u64, u64)>,
+    /// The tag of the historical root or manifest index entry that refused
+    /// the pass, and the frame that entry records where it is well formed.
+    pub blocking: Option<(u8, Option<u64>)>,
+    /// The phase and bit path of the interrupted-sync scope that refused
+    /// the pass.
+    pub sync_scope: Option<(u8, Vec<bool>)>,
+}
+
+impl From<QuilError> for Refusal {
+    fn from(error: QuilError) -> Self {
+        Self {
+            error,
+            planned: None,
+            blocking: None,
+            sync_scope: None,
+        }
+    }
+}
+
+const INTERRUPTED_SYNC: &str = "application has an interrupted sync";
+
+/// One `(phase, bit path)` scope of an interrupted-sync marker.
+type SyncScope = (u8, Vec<bool>);
+
+/// The scopes an interrupted-sync marker lists
+/// (`phase ‖ bits(u16) ‖ packed path`, repeated), or `None` unless the
+/// value is exactly such a list.
+fn sync_scopes(mut value: &[u8]) -> Option<Vec<SyncScope>> {
+    let mut scopes = Vec::new();
+    while !value.is_empty() {
+        let len = u16::from_be_bytes([*value.get(1)?, *value.get(2)?]) as usize;
+        if len > 256 {
+            return None;
+        }
+        let packed = value.get(3..3 + len.div_ceil(8))?;
+        let bits = (0..len).map(|i| packed[i / 8] & (0x80 >> (i % 8)) != 0);
+        scopes.push((value[0], bits.collect()));
+        value = &value[3 + packed.len()..];
+    }
+    Some(scopes)
+}
+
+fn encode_sync_scopes(scopes: &[(u8, Vec<bool>)]) -> Vec<u8> {
+    let mut value = Vec::new();
+    for (phase, bits) in scopes {
+        value.push(*phase);
+        value.extend((bits.len() as u16).to_be_bytes());
+        for chunk in bits.chunks(8) {
+            value.push(
+                chunk
+                    .iter()
+                    .enumerate()
+                    .fold(0, |byte, (i, bit)| byte | (u8::from(*bit) << (7 - i))),
+            );
+        }
+    }
+    value
+}
+
+/// An interrupted-sync marker's scopes once the gaps outside `keep` are
+/// evicted, or the scope that refuses the pass. A scope wholly in a gap
+/// loses all its records, so it is dropped. A scope wholly kept is a sync of
+/// a served shard that has not finished: the pass waits for it. A scope
+/// reaching both (the parent of a kept shard after a split, whose sync was
+/// cut short) keeps its claim only on what stays: it is narrowed to the kept
+/// paths inside it, which read as partly installed as before
+/// (`HypergraphCrdt::sync_incomplete` matches either way along a path).
+fn narrowed_sync_scopes(
+    scopes: &[(u8, Vec<bool>)],
+    keep: &[Interval],
+    paths: &[Vec<bool>],
+) -> std::result::Result<Vec<SyncScope>, SyncScope> {
+    let mut narrowed: Vec<(u8, Vec<bool>)> = Vec::new();
+    for (phase, bits) in scopes {
+        let (lo, hi) = bounds(bits);
+        if keep.iter().any(|(a, b)| lo >= *a && hi <= *b) {
+            return Err((*phase, bits.clone()));
+        }
+        if keep.iter().all(|(a, b)| hi < *a || lo > *b) {
+            continue;
+        }
+        let inside: Vec<&Vec<bool>> = paths
+            .iter()
+            .filter(|path| path.len() > bits.len() && path.starts_with(bits))
+            .collect();
+        if inside.is_empty() {
+            return Err((*phase, bits.clone()));
+        }
+        for path in inside {
+            let scope = (*phase, path.clone());
+            if !narrowed.contains(&scope) {
+                narrowed.push(scope);
+            }
+        }
+    }
+    Ok(narrowed)
+}
+
+/// The bit path of each protected filter, by application.
+fn kept_paths(filters: &[Vec<u8>]) -> BTreeMap<Address, Vec<Vec<bool>>> {
+    let mut paths = BTreeMap::<Address, Vec<Vec<bool>>>::new();
+    for filter in filters {
+        if let Some((app, bits)) = quil_forest::decode_shard_filter_or_root(filter, 32) {
+            if let Ok(app) = Address::try_from(app) {
+                paths.entry(app).or_default().push(bits);
+            }
+        }
+    }
+    paths
+}
+
+/// The frame a root-version entry (`version ‖ frame`) or a manifest
+/// (`frame ‖ entries`) records.
+fn indexed_frame(tag: u8, value: &[u8]) -> Option<u64> {
+    let frame = match tag {
+        quil_store::encoding::HG_ROOT_VERSION if value.len() == 16 => &value[8..],
+        quil_store::encoding::HG_APP_MANIFEST if value.len() >= 8 => &value[..8],
+        _ => return None,
+    };
+    Some(u64::from_be_bytes(frame.try_into().ok()?))
+}
+
+/// Whether a store may answer for its historical roots: every store but a
+/// data worker's own. A peer that resolves an application root of such a
+/// store reads that root's leaves and blobs from it, so an eviction there
+/// would hand out a tree without its payload. A worker's store is never
+/// served to peers (only the master's is), and the forest confinement that
+/// follows each pass drops the trees outside the kept scopes at every
+/// version, so its index names nothing a reader of it can still need.
+fn serves_history(db: &CoordinatedDb) -> bool {
+    !matches!(db.store_role(), Some(quil_forest::StoreRole::Worker(_)))
 }
 
 fn increment(mut address: Address) -> Option<Address> {
@@ -218,40 +363,94 @@ fn plan(db: &CoordinatedDb, apps: &BTreeMap<Address, Vec<Interval>>) -> Result<P
     Ok(plan)
 }
 
-/// Checks that need the write barrier: nothing may claim historical roots or
-/// an interrupted sync for an evicted application, and readiness markers the
-/// removal falsifies are collected for the same batch.
+/// The marker writes an eviction makes in its own batch.
+#[derive(Default)]
+struct Marked {
+    /// Readiness markers the removal falsifies.
+    invalid: Vec<Vec<u8>>,
+    /// Interrupted-sync markers left with no scope.
+    dropped: Vec<Vec<u8>>,
+    /// Interrupted-sync markers narrowed to their kept scopes.
+    narrowed: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// Checks that need the write barrier: nothing may claim an interrupted
+/// sync of a kept scope ([`narrowed_sync_scopes`]) for an evicted
+/// application, nor, on a store that may serve its history
+/// ([`serves_history`]), historical roots or manifests; readiness markers
+/// the removal falsifies and the evicted scopes of interrupted syncs are
+/// collected for the same batch.
 fn markers(
     db: &CoordinatedDb,
     apps: &BTreeMap<Address, Vec<Interval>>,
+    paths: &BTreeMap<Address, Vec<Vec<bool>>>,
     affected: &[Address],
-) -> Result<Vec<Vec<u8>>> {
-    let mut invalid = Vec::new();
+    history: bool,
+) -> std::result::Result<Marked, Refusal> {
+    let mut marked = Marked::default();
+    let invalid = &mut marked.invalid;
     for app in affected {
         let keep = &apps[app];
-        for tag in [
+        let app_paths = paths.get(app).map_or(&[][..], Vec::as_slice);
+        let tags = [
             quil_store::encoding::HG_ROOT_VERSION,
             quil_store::encoding::HG_APP_MANIFEST,
-        ] {
-            scan(db, &[tag], None, |key, _| {
+        ];
+        for tag in tags.into_iter().filter(|_| history) {
+            let mut blocking = None;
+            if let Err(error) = scan(db, &[tag], None, |key, value| {
                 if key.len() >= 35 && key[3..35] == app[..] {
-                    return Err(unavailable(
-                        "application has indexed historical roots or manifests",
-                    ));
+                    blocking = Some((tag, indexed_frame(tag, value)));
+                    return Err(unavailable(HISTORY_REFUSAL));
                 }
                 Ok(())
-            })?;
+            }) {
+                return Err(Refusal {
+                    blocking,
+                    ..Refusal::from(error)
+                });
+            }
         }
-        scan(db, INCOMPLETE, None, |key, value| {
+        let mut sync_scope = None;
+        let mut rewrites = Vec::new();
+        if let Err(error) = scan(db, INCOMPLETE, None, |key, value| {
             let tail = &key[INCOMPLETE.len()..];
             if tail.len() < 34 {
                 return Err(unavailable("malformed incomplete-sync marker"));
             }
-            if tail[2..34] == app[..] && !value.is_empty() {
-                return Err(unavailable("application has an interrupted sync"));
+            if tail[2..34] != app[..] || value.is_empty() {
+                return Ok(());
             }
-            Ok(())
-        })?;
+            // A legacy shard id or an unreadable list claims scopes this pass
+            // cannot place.
+            let scopes = match sync_scopes(value) {
+                Some(scopes) if tail.len() == 34 && tail[..2] == 32u16.to_be_bytes() => scopes,
+                _ => return Err(unavailable(INTERRUPTED_SYNC)),
+            };
+            match narrowed_sync_scopes(&scopes, keep, app_paths) {
+                Err(scope) => {
+                    sync_scope = Some(scope);
+                    Err(unavailable(INTERRUPTED_SYNC))
+                }
+                Ok(narrowed) if narrowed == scopes => Ok(()),
+                Ok(narrowed) => {
+                    rewrites.push((key.to_vec(), narrowed));
+                    Ok(())
+                }
+            }
+        }) {
+            return Err(Refusal {
+                sync_scope,
+                ..Refusal::from(error)
+            });
+        }
+        for (key, narrowed) in rewrites {
+            if narrowed.is_empty() {
+                marked.dropped.push(key);
+            } else {
+                marked.narrowed.push((key, encode_sync_scopes(&narrowed)));
+            }
+        }
         scan(db, VERIFIED, None, |key, value| {
             let tail = &key[VERIFIED.len()..];
             if tail.len() < 2 {
@@ -285,7 +484,7 @@ fn markers(
             Ok(())
         })?;
     }
-    Ok(invalid)
+    Ok(marked)
 }
 
 /// Remove payload outside `keep` from this worker's store. Unified stores
@@ -306,8 +505,18 @@ pub fn evict_outside_while(
     keep: &[Vec<u8>],
     proceed: &dyn Fn() -> bool,
 ) -> Result<Outcome> {
+    evict(crdt, keep, proceed).map_err(|refusal| refusal.error)
+}
+
+/// [`evict_outside_while`], keeping what a refused pass had planned and the
+/// index entry that refused it ([`Refusal`]).
+pub(crate) fn evict(
+    crdt: &HypergraphCrdt,
+    keep: &[Vec<u8>],
+    proceed: &dyn Fn() -> bool,
+) -> std::result::Result<Outcome, Refusal> {
     if !crdt.unified_tree() {
-        return Err(unavailable("payload eviction requires a unified store"));
+        return Err(unavailable("payload eviction requires a unified store").into());
     }
     let apps = coverage(keep)?;
     let guard = crdt.lock_forest_writes();
@@ -321,7 +530,15 @@ pub fn evict_outside_while(
     let planned = plan(&db, &apps)?;
     let mut outcome = Outcome::default();
     if !planned.ranges.is_empty() {
-        outcome = delete(crdt, &db, &apps, &planned, proceed)?;
+        let history = serves_history(&db);
+        let paths = kept_paths(keep);
+        outcome =
+            delete(crdt, &db, &apps, &paths, &planned, history, proceed).map_err(|refusal| {
+                Refusal {
+                    planned: Some((planned.records, planned.bytes)),
+                    ..refusal
+                }
+            })?;
         if outcome.stopped {
             return Ok(outcome);
         }
@@ -600,7 +817,7 @@ where
     let deleting = std::sync::Arc::new(AtomicBool::new(false));
     let deleted = deleting.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        evict_outside_while(&crdt, &keep, &|| {
+        evict(&crdt, &keep, &|| {
             let proceed = payload_bound();
             if proceed {
                 deleting.store(true, Ordering::SeqCst);
@@ -625,13 +842,46 @@ where
             removed_bytes = o.removed_bytes,
             ranges = o.ranges,
             invalidated_markers = o.invalidated_markers,
+            sync_markers = o.sync_markers,
             compacted_ranges = o.compacted_ranges,
             reclaimable_bytes = o.reclaimable_bytes,
             secs = started.elapsed().as_secs(),
             "worker payload outside served scopes evicted"
         ),
         Ok(Ok(_)) => debug!(core_id, "no worker payload outside served scopes"),
-        Ok(Err(error)) => warn!(core_id, filter, %error, "worker payload eviction refused"),
+        Ok(Err(refusal)) => {
+            let (planned_records, planned_bytes) = refusal.planned.unzip();
+            let (blocking_tag, blocking_frame) = match refusal.blocking {
+                Some((tag, frame)) => (Some(tag), frame),
+                None => (None, None),
+            };
+            let blocking_index = blocking_tag.map(|tag| match tag {
+                quil_store::encoding::HG_ROOT_VERSION => "root version",
+                _ => "app manifest",
+            });
+            // `phase 0 path 0110`; the empty path is the whole application.
+            let sync_scope = refusal.sync_scope.as_ref().map(|(phase, bits)| {
+                let path: String = bits
+                    .iter()
+                    .map(|&bit| if bit { '1' } else { '0' })
+                    .collect();
+                format!(
+                    "phase {phase} path {}",
+                    if path.is_empty() {
+                        "(whole application)"
+                    } else {
+                        path.as_str()
+                    }
+                )
+            });
+            warn!(core_id, filter, error = %refusal.error, planned_records, planned_bytes,
+                blocking_index, blocking_tag, blocking_frame, sync_scope = sync_scope.as_deref(),
+                scope = "this node",
+                action = "the next pass retries within the hour; an interrupted sync of a kept scope stops \
+                    refusing once that shard's sync completes; a refusal that repeats for another reason, or a \
+                    store error, is a defect: report it with this line",
+                "worker payload eviction refused")
+        }
         Err(error) => warn!(core_id, filter, %error, "worker payload eviction task failed"),
     }
     // The forest subtrees of the shards this worker left, recording each
@@ -744,9 +994,11 @@ fn delete(
     crdt: &HypergraphCrdt,
     db: &CoordinatedDb,
     apps: &BTreeMap<Address, Vec<Interval>>,
+    paths: &BTreeMap<Address, Vec<Vec<bool>>>,
     planned: &Plan,
+    history: bool,
     proceed: &dyn Fn() -> bool,
-) -> Result<Outcome> {
+) -> std::result::Result<Outcome, Refusal> {
     let affected: Vec<Address> = apps
         .keys()
         .filter(|app| {
@@ -758,25 +1010,34 @@ fn delete(
         .copied()
         .collect();
     let guard = crdt.lock_forest_writes();
-    let invalidated = crdt.maintain_forest(&guard, |_| {
+    let written = crdt.maintain_forest(&guard, |_| {
         if !proceed() {
-            return Ok(None);
+            return Ok(Ok(None));
         }
-        let invalid = markers(db, apps, &affected)?;
+        let marked = match markers(db, apps, paths, &affected, history) {
+            Ok(marked) => marked,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
         let mut batch = rocksdb::WriteBatch::default();
         for (lower, upper) in &planned.ranges {
             batch.delete_range(lower, upper);
         }
-        for key in &invalid {
+        for key in marked.invalid.iter().chain(&marked.dropped) {
             batch.delete(key);
+        }
+        for (key, value) in &marked.narrowed {
+            batch.put(key, value);
         }
         let mut options = rocksdb::WriteOptions::default();
         options.set_sync(true);
         db.write_opt(batch, &options).map_err(store_error)?;
-        Ok(Some(invalid.len()))
-    })?;
+        Ok(Ok(Some((
+            marked.invalid.len(),
+            marked.dropped.len() + marked.narrowed.len(),
+        ))))
+    });
     drop(guard);
-    let Some(invalidated) = invalidated else {
+    let Some((invalidated, sync_markers)) = written?? else {
         return Ok(Outcome {
             stopped: true,
             ..Outcome::default()
@@ -791,7 +1052,8 @@ fn delete(
         if residue {
             return Err(QuilError::Store(
                 "payload eviction left records in a deleted range".into(),
-            ));
+            )
+            .into());
         }
     }
     // Reclaim now where no older snapshot holds the records; boundary files
@@ -804,6 +1066,7 @@ fn delete(
         removed_bytes: planned.bytes,
         ranges: planned.ranges.len(),
         invalidated_markers: invalidated,
+        sync_markers,
         ..Outcome::default()
     })
 }
@@ -818,12 +1081,28 @@ mod tests {
 
     const APP: Address = [0x21; 32];
 
+    /// A unified store, named as a data worker's own, as every store a
+    /// worker evicts from is.
     fn open() -> (
         Arc<quil_store::RocksDb>,
         Arc<quil_store::RocksHypergraphStore>,
         HypergraphCrdt,
     ) {
+        open_as(Some(quil_forest::StoreRole::Worker(9_601)))
+    }
+
+    /// A unified store named `role`, or never named.
+    fn open_as(
+        role: Option<quil_forest::StoreRole>,
+    ) -> (
+        Arc<quil_store::RocksDb>,
+        Arc<quil_store::RocksHypergraphStore>,
+        HypergraphCrdt,
+    ) {
         let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        if let Some(role) = role {
+            assert!(db.inner().register_store(role));
+        }
         let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
         let crdt = HypergraphCrdt::new(
             store.clone(),
@@ -1435,18 +1714,288 @@ mod tests {
         refuses(&|| inner.put(&incomplete, [0, 0, 1, 0]).unwrap(), &|| {
             inner.delete(&incomplete).unwrap()
         });
-        let root_index =
-            quil_store::encoding::hypergraph_root_version_key("vertex", "adds", &APP, &[1; 32]);
-        refuses(&|| inner.put(&root_index, [0; 16]).unwrap(), &|| {
-            inner.delete(&root_index).unwrap()
-        });
         refuses(&|| crdt.set_unified_tree(false), &|| {
             crdt.set_unified_tree(true)
         });
+        // A worker's own root and manifest index names nothing a reader of
+        // its store needs ([`serves_history`]).
+        for (index, value) in history_index() {
+            inner.put(index, value).unwrap();
+        }
         assert_eq!(
             evict_outside(&crdt, &lower_half()).unwrap().removed_records,
             1,
             "each refusal was the only obstacle"
+        );
+    }
+
+    /// A root-version entry at frame 7 and a manifest at frame 9 of `APP`.
+    fn history_index() -> [(Vec<u8>, Vec<u8>); 2] {
+        let root_index =
+            quil_store::encoding::hypergraph_root_version_key("vertex", "adds", &APP, &[1; 32]);
+        let manifest =
+            quil_store::encoding::hypergraph_app_manifest_key("vertex", "adds", &APP, &[2; 32]);
+        let mut entry = 3u64.to_be_bytes().to_vec();
+        entry.extend(7u64.to_be_bytes());
+        let mut listed = 9u64.to_be_bytes().to_vec();
+        listed.extend(0u32.to_be_bytes());
+        [(root_index, entry), (manifest, listed)]
+    }
+
+    /// The vertices at 1 and 129 of `APP`, committed on the store itself at
+    /// frame 1, which indexes the application's root at that frame.
+    fn committed_store(
+        role: Option<quil_forest::StoreRole>,
+    ) -> (Arc<quil_store::RocksDb>, HypergraphCrdt) {
+        let (db, _, crdt) = open_as(role);
+        for key in [1, 129] {
+            crdt.add_vertex(&location(key), &[key; 48]).unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let inner = db.inner();
+        let mut it = inner.raw_iterator();
+        it.seek([quil_store::encoding::HG_ROOT_VERSION]);
+        assert!(
+            it.key().is_some_and(
+                |key| key[0] == quil_store::encoding::HG_ROOT_VERSION && key[3..35] == APP[..]
+            ),
+            "the commit indexed the application's root"
+        );
+        (db, crdt)
+    }
+
+    /// A worker that committed frames of the shard it keeps, as a worker
+    /// bound to a split child does, still evicts the rest of the
+    /// application, which its own root index used to refuse at every pass.
+    #[test]
+    fn a_worker_evicts_beside_the_root_index_of_its_own_commits() {
+        let (_db, crdt) = committed_store(Some(quil_forest::StoreRole::Worker(9_602)));
+        let outcome = evict_outside(&crdt, &lower_half()).unwrap();
+        assert_eq!(outcome.removed_records, 1);
+        assert!(outcome.removed_bytes > 0);
+        assert!(crdt
+            .get_vertex_data_checked(&location(129))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            crdt.get_vertex_data_checked(&location(1)).unwrap(),
+            Some(vec![1; 48])
+        );
+        // The kept shard goes on committing and evicting.
+        crdt.add_vertex(&location(2), &[2; 48]).unwrap();
+        crdt.commit(2).unwrap();
+        assert_eq!(
+            evict_outside(&crdt, &lower_half()).unwrap().removed_records,
+            0
+        );
+    }
+
+    /// A raw payload record at 129 of `APP` and a manifest of `APP` at frame
+    /// 9, with no root index, on a store named `role`.
+    fn manifest_store(role: Option<quil_forest::StoreRole>) -> HypergraphCrdt {
+        let (db, _, crdt) = open_as(role);
+        let inner = db.inner();
+        let mut id = APP.to_vec();
+        id.extend([129; 32]);
+        let key =
+            quil_store::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &shard(), &id, 0);
+        inner.put(key, b"left").unwrap();
+        let [_, (manifest, listed)] = history_index();
+        inner.put(manifest, listed).unwrap();
+        crdt
+    }
+
+    /// A store that may serve its history (the master's, an archive's, or
+    /// one never named) keeps refusing, without writing, while it indexes a
+    /// root or manifest of the application; a worker's store with the same
+    /// manifest evicts.
+    #[test]
+    fn a_store_that_may_serve_its_history_refuses_beside_its_index() {
+        for role in [None, Some(quil_forest::StoreRole::Master)] {
+            let (db, crdt) = committed_store(role);
+            let inner = db.inner();
+            let sequence = inner.latest_sequence_number();
+            let refused = evict_outside(&crdt, &lower_half()).unwrap_err();
+            assert!(
+                refused.to_string().contains(HISTORY_REFUSAL),
+                "{role:?}: {refused}"
+            );
+            assert_eq!(sequence, inner.latest_sequence_number(), "{role:?}");
+            assert_eq!(
+                crdt.get_vertex_data_checked(&location(129)).unwrap(),
+                Some(vec![129; 48]),
+                "{role:?}"
+            );
+            let refused = evict_outside(&manifest_store(role), &lower_half()).unwrap_err();
+            assert!(
+                refused.to_string().contains(HISTORY_REFUSAL),
+                "{role:?}: {refused}"
+            );
+        }
+        assert_eq!(
+            evict_outside(
+                &manifest_store(Some(quil_forest::StoreRole::Worker(9_603))),
+                &lower_half()
+            )
+            .unwrap()
+            .removed_records,
+            1
+        );
+    }
+
+    /// A refusal after planning names the records and bytes it would have
+    /// removed.
+    #[test]
+    fn a_refusal_names_what_it_planned() {
+        let (_db, crdt) = committed_store(Some(quil_forest::StoreRole::Master));
+        let refusal = evict(&crdt, &lower_half(), &|| true).unwrap_err();
+        let (records, bytes) = refusal.planned.expect("refused after planning");
+        assert_eq!(records, 1);
+        assert!(bytes > 48, "a key and its 48-byte blob: {bytes}");
+    }
+
+    /// A history refusal names the index entry that refused it: its tag
+    /// and the frame it records.
+    #[test]
+    fn a_refusal_names_the_entry_that_refused_it() {
+        let (_db, crdt) = committed_store(Some(quil_forest::StoreRole::Master));
+        assert_eq!(
+            evict(&crdt, &lower_half(), &|| true).unwrap_err().blocking,
+            Some((quil_store::encoding::HG_ROOT_VERSION, Some(1)))
+        );
+        let crdt = manifest_store(Some(quil_forest::StoreRole::Master));
+        assert_eq!(
+            evict(&crdt, &lower_half(), &|| true).unwrap_err().blocking,
+            Some((quil_store::encoding::HG_APP_MANIFEST, Some(9)))
+        );
+    }
+
+    /// An interrupted-sync marker value listing `scopes` (`phase ‖ bits ‖
+    /// packed path` each), encoded here so the tests read the store's format.
+    fn sync_marker(scopes: &[(u8, Vec<bool>)]) -> Vec<u8> {
+        let mut value = Vec::new();
+        for (phase, bits) in scopes {
+            value.push(*phase);
+            value.extend((bits.len() as u16).to_be_bytes());
+            let mut packed = vec![0u8; bits.len().div_ceil(8)];
+            for (i, bit) in bits.iter().enumerate() {
+                packed[i / 8] |= u8::from(*bit) << (7 - i % 8);
+            }
+            value.extend(packed);
+        }
+        value
+    }
+
+    /// A worker store holding raw payload at 1 (kept by [`lower_half`]) and
+    /// 129 of `APP`, and `APP`'s interrupted-sync marker listing `scopes`;
+    /// returns the store and the marker's key.
+    fn interrupted_store(
+        scopes: &[(u8, Vec<bool>)],
+    ) -> (Arc<quil_store::RocksDb>, HypergraphCrdt, Vec<u8>) {
+        let (db, _, crdt) = open();
+        let inner = db.inner();
+        for address in [1u8, 129] {
+            let mut id = APP.to_vec();
+            id.extend([address; 32]);
+            let key = quil_store::encoding::hypergraph_vertex_data_v2_key(
+                "vertex",
+                "adds",
+                &shard(),
+                &id,
+                0,
+            );
+            inner.put(key, [address]).unwrap();
+        }
+        let mut key = INCOMPLETE.to_vec();
+        key.extend(32u16.to_be_bytes());
+        key.extend(APP);
+        inner.put(&key, sync_marker(scopes)).unwrap();
+        (db, crdt, key)
+    }
+
+    /// The marker of a sync of the split parent that was cut short, left
+    /// once the worker serves one child, no longer refuses every pass: it
+    /// keeps its claim on the kept child alone.
+    #[test]
+    fn a_stale_parent_sync_marker_is_narrowed_to_the_kept_scope() {
+        let (db, crdt, key) = interrupted_store(&[(0, vec![])]);
+        assert!(crdt.sync_incomplete(&APP, &[true]).unwrap());
+        let outcome = evict_outside(&crdt, &lower_half()).unwrap();
+        assert_eq!(outcome.removed_records, 1);
+        assert_eq!(
+            db.inner().get(&key).unwrap(),
+            Some(sync_marker(&[(0, vec![false])])),
+            "narrowed to the kept half"
+        );
+        assert!(
+            crdt.sync_incomplete(&APP, &[false]).unwrap(),
+            "the kept half still reads as partly installed"
+        );
+        assert!(!crdt.sync_incomplete(&APP, &[true]).unwrap());
+    }
+
+    /// A marker whose scopes lie wholly in the evicted gap goes with their
+    /// records, in the same write.
+    #[test]
+    fn an_interrupted_sync_marker_inside_an_evicted_gap_is_dropped() {
+        let (db, crdt, key) = interrupted_store(&[(1, vec![true, false]), (2, vec![true])]);
+        assert_eq!(
+            evict_outside(&crdt, &lower_half()).unwrap().removed_records,
+            1
+        );
+        assert_eq!(db.inner().get(&key).unwrap(), None);
+        assert!(!crdt.sync_incomplete(&APP, &[]).unwrap());
+    }
+
+    /// A sync of a kept scope that has not finished, a legacy shard id's
+    /// marker and an unreadable one still refuse, writing nothing; so does a
+    /// marker of the binding when a staged child inside it is kept too.
+    #[test]
+    fn an_interrupted_sync_of_a_kept_scope_still_refuses() {
+        let staged = quil_forest::encode_shard_bit_path(&APP, &[false, true]);
+        let nested = vec![lower_half()[0].clone(), staged];
+        let cases: [(Vec<SyncScope>, Vec<Vec<u8>>); 4] = [
+            (vec![(0, vec![false])], lower_half()),
+            (vec![(3, vec![false, true])], lower_half()),
+            (vec![(0, vec![]), (0, vec![false, false])], lower_half()),
+            (vec![(0, vec![false])], nested),
+        ];
+        for (scopes, keep) in cases {
+            let (db, crdt, key) = interrupted_store(&scopes);
+            let inner = db.inner();
+            let sequence = inner.latest_sequence_number();
+            let refused = evict_outside(&crdt, &keep).unwrap_err();
+            assert!(
+                refused
+                    .to_string()
+                    .contains("application has an interrupted sync"),
+                "{scopes:?}: {refused}"
+            );
+            assert_eq!(sequence, inner.latest_sequence_number(), "{scopes:?}");
+            assert_eq!(inner.get(&key).unwrap(), Some(sync_marker(&scopes)));
+        }
+        let (db, crdt, key) = interrupted_store(&[(0, vec![true])]);
+        let inner = db.inner();
+        inner.put(&key, [0, 0, 9]).unwrap();
+        assert!(evict_outside(&crdt, &lower_half()).is_err(), "unreadable");
+        inner.delete(&key).unwrap();
+        let mut legacy = INCOMPLETE.to_vec();
+        legacy.extend(33u16.to_be_bytes());
+        legacy.extend(APP);
+        legacy.push(0);
+        inner.put(&legacy, sync_marker(&[(0, vec![true])])).unwrap();
+        assert!(evict_outside(&crdt, &lower_half()).is_err(), "legacy id");
+    }
+
+    /// An interrupted-sync refusal names the scope that refused it.
+    #[test]
+    fn an_interrupted_sync_refusal_names_its_scope() {
+        let (_db, crdt, _) = interrupted_store(&[(0, vec![true]), (3, vec![false, true])]);
+        assert_eq!(
+            evict(&crdt, &lower_half(), &|| true)
+                .unwrap_err()
+                .sync_scope,
+            Some((3, vec![false, true]))
         );
     }
 

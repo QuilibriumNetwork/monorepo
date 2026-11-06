@@ -14,6 +14,9 @@ pub fn run() -> anyhow::Result<()> {
     let exec_path = std::fs::canonicalize(&exec_path).unwrap_or(exec_path);
 
     let link = system::default_qclient_symlink_path();
+    if let Some(dir) = link.parent() {
+        system::ensure_symlink_dir(dir)?;
+    }
 
     // Replace an existing link/file at the target (CreateSymlink semantics).
     if link.exists() || std::fs::symlink_metadata(&link).is_ok() {

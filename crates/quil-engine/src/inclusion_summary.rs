@@ -5,15 +5,17 @@
 //! Those per-event lines ran to hundreds an hour on every archive
 //! (2026-10-27) and still did not say how many proposals carried shard
 //! headers. The summary counts them per interval; transitions (inclusion
-//! stalling and resuming) keep lines of their own.
+//! stalling and resuming) keep lines of their own, as does a fall in the shard
+//! headers the proposals' pool holds.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
 use crate::leader_provider::HeldShard;
+use crate::proposal_pool::ProposalPool;
 
 /// How often the summary is logged: at the first event after this long.
 const INTERVAL: Duration = Duration::from_secs(600);
@@ -28,6 +30,21 @@ const MAX_LEASE_SAMPLES: usize = 4096;
 const MAX_SHARDS: usize = 4096;
 /// The scope every line names.
 const SCOPE: &str = "this archive's GLOBAL proposals";
+/// Pool sizes kept for the median: about 20 minutes of one archive's turns.
+const POOL_SAMPLES: usize = 32;
+/// Fewer pool sizes, or a smaller median, call no dip: a node just started,
+/// or a network of a few shards.
+const POOL_MIN_SAMPLES: usize = 8;
+const POOL_MIN_MEDIAN: usize = 8;
+/// After a dip ends, a further one is logged only once this long has passed.
+const POOL_REARM: Duration = Duration::from_secs(300);
+/// A shard whose last header is older than this many GLOBAL frames before the
+/// dip began did not fall out in it: it is counted, not named.
+const POOL_RECENT_FRAMES: u64 = 64;
+/// Shards a dip line names, and the bytes of each address it shows: all of an
+/// application's shards share their first 32 bytes.
+const POOL_NAMED: usize = 5;
+const POOL_NAMED_BYTES: usize = 4;
 
 #[derive(Default)]
 struct Window {
@@ -106,6 +123,246 @@ impl Waits {
     }
 }
 
+/// A pool at its lowest in a dip, and what this archive last knows of the
+/// shards absent from it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PoolReading {
+    frame: u64,
+    shards: usize,
+    known: usize,
+    /// Absent, with no header since [`POOL_RECENT_FRAMES`] before the dip.
+    absent_long: usize,
+    /// The others absent, by what this archive knows of each: a held header
+    /// too old to carry, past the frame buffer, frames the ingest asked for, or
+    /// no header arrived.
+    late: usize,
+    behind_buffer: usize,
+    gap: usize,
+    no_header: usize,
+    /// The first of those to fall out, each as `suffix:frames since its last
+    /// header:reason`.
+    named: String,
+}
+
+struct PoolDip {
+    since: Instant,
+    since_frame: u64,
+    median: usize,
+    proposals: u64,
+    lowest: PoolReading,
+    logged: Instant,
+}
+
+/// One line of a dip in the pool.
+#[derive(Debug, PartialEq, Eq)]
+struct PoolLine {
+    phase: &'static str,
+    frame: u64,
+    pool_shards: usize,
+    median: usize,
+    proposals: u64,
+    lasted_secs: u64,
+    global_frames: u64,
+    lowest: PoolReading,
+}
+
+/// Each own proposal's pool size against the recent median: a dip is a pool
+/// under half of it, logged when it starts, every [`STALL_REPEAT`] and when it
+/// ends. Samples in a dip stay out of the median.
+#[derive(Default)]
+struct PoolWatch {
+    samples: VecDeque<usize>,
+    /// The frame of the last proposal holding a header, by shard.
+    last_seen: HashMap<Vec<u8>, u64>,
+    dip: Option<PoolDip>,
+    ended: Option<Instant>,
+}
+
+impl PoolWatch {
+    fn observe(
+        &mut self,
+        frame: u64,
+        pool: &ProposalPool,
+        behind: &HashMap<Vec<u8>, u64>,
+        gaps: &HashMap<Vec<u8>, u64>,
+        now: Instant,
+    ) -> Option<PoolLine> {
+        if !pool.known.is_empty() {
+            self.last_seen.retain(|shard, _| pool.known.contains(shard));
+        }
+        for shard in &pool.tips {
+            let tracked = self.last_seen.len();
+            match self.last_seen.get_mut(shard) {
+                Some(seen) => *seen = frame,
+                None if tracked < MAX_SHARDS => {
+                    self.last_seen.insert(shard.clone(), frame);
+                }
+                None => {}
+            }
+        }
+        let Some(mut dip) = self.dip.take() else {
+            let mut sorted: Vec<usize> = self.samples.iter().copied().collect();
+            sorted.sort_unstable();
+            let median = sorted.get(sorted.len() / 2).copied().unwrap_or(0);
+            if sorted.len() < POOL_MIN_SAMPLES
+                || median < POOL_MIN_MEDIAN
+                || pool.shards * 2 >= median
+            {
+                self.sample(pool.shards);
+                return None;
+            }
+            if self
+                .ended
+                .is_some_and(|ended| now.saturating_duration_since(ended) < POOL_REARM)
+            {
+                return None;
+            }
+            let dip = PoolDip {
+                since: now,
+                since_frame: frame,
+                median,
+                proposals: 1,
+                lowest: self.read(frame, frame, pool, behind, gaps),
+                logged: now,
+            };
+            let line = dip.line("start", frame, pool.shards, now);
+            self.dip = Some(dip);
+            return Some(line);
+        };
+        if pool.shards * 2 >= dip.median {
+            self.ended = Some(now);
+            self.sample(pool.shards);
+            return Some(dip.line("end", frame, pool.shards, now));
+        }
+        dip.proposals += 1;
+        if pool.shards < dip.lowest.shards {
+            dip.lowest = self.read(frame, dip.since_frame, pool, behind, gaps);
+        }
+        let line = (now.saturating_duration_since(dip.logged) >= STALL_REPEAT).then(|| {
+            dip.logged = now;
+            dip.line("repeat", frame, pool.shards, now)
+        });
+        self.dip = Some(dip);
+        line
+    }
+
+    fn sample(&mut self, shards: usize) {
+        if self.samples.len() == POOL_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(shards);
+    }
+
+    fn read(
+        &self,
+        frame: u64,
+        since_frame: u64,
+        pool: &ProposalPool,
+        behind: &HashMap<Vec<u8>, u64>,
+        gaps: &HashMap<Vec<u8>, u64>,
+    ) -> PoolReading {
+        let recent_from = since_frame.saturating_sub(POOL_RECENT_FRAMES);
+        let mut reading = PoolReading {
+            frame,
+            shards: pool.shards,
+            known: pool.known.len(),
+            ..Default::default()
+        };
+        let mut fell_out = Vec::new();
+        for shard in pool
+            .known
+            .iter()
+            .filter(|shard| !pool.tips.contains(*shard))
+        {
+            let Some(&seen) = self
+                .last_seen
+                .get(shard)
+                .filter(|&&seen| seen >= recent_from)
+            else {
+                reading.absent_long += 1;
+                continue;
+            };
+            let reason = if pool.late.contains(shard) {
+                reading.late += 1;
+                "late"
+            } else if behind.contains_key(shard) {
+                reading.behind_buffer += 1;
+                "behind_buffer"
+            } else if gaps.contains_key(shard) {
+                reading.gap += 1;
+                "gap"
+            } else {
+                reading.no_header += 1;
+                "no_header"
+            };
+            fell_out.push((seen, shard, reason));
+        }
+        fell_out.sort_unstable();
+        reading.named = fell_out
+            .iter()
+            .take(POOL_NAMED)
+            .map(|(seen, shard, reason)| {
+                let suffix = &shard[shard.len().saturating_sub(POOL_NAMED_BYTES)..];
+                format!(
+                    "{}:{}:{}",
+                    hex::encode(suffix),
+                    frame.saturating_sub(*seen),
+                    reason
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        reading
+    }
+}
+
+impl PoolDip {
+    fn line(&self, phase: &'static str, frame: u64, pool_shards: usize, now: Instant) -> PoolLine {
+        PoolLine {
+            phase,
+            frame,
+            pool_shards,
+            median: self.median,
+            proposals: self.proposals,
+            lasted_secs: now.saturating_duration_since(self.since).as_secs(),
+            global_frames: frame.saturating_sub(self.since_frame),
+            lowest: self.lowest.clone(),
+        }
+    }
+}
+
+impl PoolLine {
+    fn log(&self) {
+        let lowest = &self.lowest;
+        info!(
+            scope = SCOPE,
+            phase = self.phase,
+            frame = self.frame,
+            epoch_offset_frames = self.frame % quil_types::consensus::EPOCH_LENGTH_FRAMES,
+            pool_shards = self.pool_shards,
+            median_shards = self.median,
+            proposals = self.proposals,
+            lasted_secs = self.lasted_secs,
+            global_frames = self.global_frames,
+            lowest_frame = lowest.frame,
+            lowest_shards = lowest.shards,
+            shards_known = lowest.known,
+            absent_long = lowest.absent_long,
+            late = lowest.late,
+            behind_buffer = lowest.behind_buffer,
+            gap = lowest.gap,
+            no_header = lowest.no_header,
+            first_absent = %lowest.named,
+            "GLOBAL proposal pool dip: this archive's proposals hold shard headers from under half the shards \
+             of their recent median. One line at the start, every 10 minutes and at the end; the absent shards \
+             are as at the lowest pool, each named suffix:frames since its last header:reason. late: headers \
+             arrive too old to carry; behind_buffer or gap: this archive misses their frames; no_header: none \
+             arrived. Compare epoch_offset_frames across epochs and archives, and the named shards on the \
+             explorer"
+        );
+    }
+}
+
 struct State {
     since: Instant,
     window: Window,
@@ -115,6 +372,7 @@ struct State {
     stall: Option<Stall>,
     waits: Waits,
     relief: Option<Relief>,
+    pool: PoolWatch,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -130,6 +388,7 @@ fn with_state(record: impl FnOnce(&mut State)) {
         stall: None,
         waits: Waits::default(),
         relief: None,
+        pool: PoolWatch::default(),
     });
     record(state);
     if state.since.elapsed() >= INTERVAL {
@@ -284,6 +543,28 @@ pub(crate) fn note_budget(
     });
 }
 
+/// A GLOBAL proposal this archive led at `frame` copied `pool`.
+pub(crate) fn note_pool(frame: u64, pool: &ProposalPool) {
+    with_state(|state| {
+        let line = state.pool.observe(
+            frame,
+            pool,
+            &state.behind,
+            &state.window.gaps,
+            Instant::now(),
+        );
+        if let Some(line) = line {
+            line.log();
+        }
+    });
+}
+
+/// `sizes` as the recent proposals' pool sizes.
+#[cfg(test)]
+pub(crate) fn seed_pool_samples(sizes: &[usize]) {
+    with_state(|state| state.pool.samples = sizes.iter().copied().collect());
+}
+
 /// A proposal could not check which bodies this archive holds, so its
 /// `needs` shard headers stay back.
 pub fn note_gate_unavailable(needs: usize) {
@@ -426,6 +707,301 @@ mod tests {
             cursor,
             frames: 1,
             rides: false,
+        }
+    }
+
+    fn address(n: usize) -> Vec<u8> {
+        let mut address = vec![0xaa; 32];
+        address.extend([0, (n >> 8) as u8, n as u8]);
+        address
+    }
+
+    fn addresses(shards: impl IntoIterator<Item = usize>) -> HashSet<Vec<u8>> {
+        shards.into_iter().map(address).collect()
+    }
+
+    /// One archive's turns, 4 GLOBAL frames and 41 s apart.
+    struct Turns {
+        watch: PoolWatch,
+        frame: u64,
+        now: Instant,
+        known: HashSet<Vec<u8>>,
+        late: HashSet<Vec<u8>>,
+        behind: HashMap<Vec<u8>, u64>,
+        gaps: HashMap<Vec<u8>, u64>,
+    }
+
+    impl Turns {
+        fn new(known: usize) -> Self {
+            Self {
+                watch: PoolWatch::default(),
+                frame: 1000,
+                now: Instant::now(),
+                known: addresses(0..known),
+                late: HashSet::new(),
+                behind: HashMap::new(),
+                gaps: HashMap::new(),
+            }
+        }
+
+        fn turn(&mut self, tips: impl IntoIterator<Item = usize>) -> Option<PoolLine> {
+            let tips = addresses(tips);
+            let pool = ProposalPool {
+                shards: tips.len(),
+                tips,
+                late: self.late.clone(),
+                known: self.known.clone(),
+                ..Default::default()
+            };
+            let line = self
+                .watch
+                .observe(self.frame, &pool, &self.behind, &self.gaps, self.now);
+            self.frame += 4;
+            self.now += Duration::from_secs(41);
+            line
+        }
+
+        /// `turns` proposals holding `shards` shards.
+        fn turns(&mut self, turns: usize, shards: usize) -> Vec<PoolLine> {
+            (0..turns).filter_map(|_| self.turn(0..shards)).collect()
+        }
+    }
+
+    /// The fall this line is for: the first line says where the pool fell from
+    /// and who left, by what this archive knows of each.
+    #[test]
+    fn a_pool_drop_starts_a_line_naming_who_left() {
+        let mut turns = Turns::new(109);
+        assert!(turns.turns(14, 97).is_empty());
+        // Two shards leave before the rest.
+        assert_eq!(turns.turn((0..97).filter(|shard| *shard != 11)), None);
+        assert_eq!(
+            turns.turn((0..97).filter(|shard| !(11..=12).contains(shard))),
+            None
+        );
+        let at = |shards: HashSet<Vec<u8>>| shards.into_iter().map(|a| (a, 9)).collect();
+        turns.late = addresses([13, 30, 31, 32, 33, 34, 35]);
+        turns.behind = at(addresses([14, 21]));
+        turns.gaps = at(addresses([15, 21, 22, 23]));
+        let line = turns.turn(0..11).expect("the start line");
+        assert_eq!(
+            (line.phase, line.frame, line.pool_shards, line.median),
+            ("start", 1064, 11, 97)
+        );
+        assert_eq!(
+            line.lowest,
+            PoolReading {
+                frame: 1064,
+                shards: 11,
+                known: 109,
+                absent_long: 12,
+                late: 7,
+                behind_buffer: 2,
+                gap: 3,
+                no_header: 74,
+                named: "aa00000b:12:no_header,aa00000c:8:no_header,aa00000d:4:late,\
+                        aa00000e:4:behind_buffer,aa00000f:4:gap"
+                    .into(),
+            }
+        );
+    }
+
+    /// A dip lasts until the pool is back at half the median it fell from.
+    #[test]
+    fn a_dip_ends_at_half_its_median() {
+        let mut turns = Turns::new(109);
+        turns.turns(16, 97);
+        assert_eq!(turns.turn(0..10).map(|line| line.phase), Some("start"));
+        assert_eq!(turns.turn(0..48), None, "48 of 97 is under half");
+        assert_eq!(turns.turn(0..49).map(|line| line.phase), Some("end"));
+    }
+
+    /// The last line says how long the dip lasted.
+    #[test]
+    fn an_end_line_has_the_dips_duration() {
+        let mut turns = Turns::new(109);
+        turns.turns(16, 97);
+        turns.turns(4, 10);
+        let line = turns.turn(0..97).expect("the end line");
+        assert_eq!(line.phase, "end");
+        assert_eq!((line.frame, line.pool_shards, line.median), (1080, 97, 97));
+        assert_eq!(
+            (line.proposals, line.lasted_secs, line.global_frames),
+            (4, 164, 16)
+        );
+    }
+
+    /// The last line's absent shards are those at the lowest pool, not the
+    /// last or the first.
+    #[test]
+    fn an_end_line_reads_the_lowest_pool() {
+        let mut turns = Turns::new(109);
+        turns.turns(16, 97);
+        turns.turn(0..11);
+        turns.turn(0..7);
+        turns.turn(0..9);
+        let lowest = turns.turn(0..97).expect("the end line").lowest;
+        assert_eq!((lowest.frame, lowest.shards), (1068, 7));
+        assert_eq!((lowest.absent_long, lowest.no_header), (12, 90));
+    }
+
+    /// A dip of hours writes a line per [`STALL_REPEAT`].
+    #[test]
+    fn a_long_dip_is_bounded() {
+        let mut turns = Turns::new(109);
+        turns.turns(16, 97);
+        let dip = turns.turns(1000, 10);
+        let phases: Vec<&str> = dip.iter().map(|line| line.phase).collect();
+        assert_eq!(phases[0], "start");
+        // 1000 turns of 41 s, a repeat every 15 of them.
+        assert_eq!(phases.len(), 67, "{phases:?}");
+        assert!(phases[1..].iter().all(|phase| *phase == "repeat"));
+    }
+
+    /// A dip's low pools do not lower the median the next dip is judged by.
+    #[test]
+    fn a_dips_low_pools_stay_out_of_the_median() {
+        let mut turns = Turns::new(109);
+        turns.turns(16, 97);
+        turns.turns(POOL_SAMPLES, 10);
+        assert_eq!(turns.turn(0..97).map(|line| line.phase), Some("end"));
+        turns.turns(8, 97);
+        let next = turns.turn(0..10).expect("the next dip's start");
+        assert_eq!((next.phase, next.median), ("start", 97));
+    }
+
+    /// A pool swinging across the line every turn writes one start and one end
+    /// per [`POOL_REARM`] at most.
+    #[test]
+    fn a_flapping_pool_is_bounded_by_the_rearm() {
+        let mut turns = Turns::new(109);
+        turns.turns(16, 97);
+        let mut lines = Vec::new();
+        for _ in 0..500 {
+            lines.extend(turns.turn(0..10));
+            lines.extend(turns.turn(0..97));
+        }
+        // Over 41,000 s a low turn comes every 82 s. A start, its end 41 s
+        // later, and the first low turn 300 s past that end is 410 s after the
+        // start: 100 of them.
+        assert_eq!(lines.len(), 200);
+        let starts = lines.iter().filter(|line| line.phase == "start").count();
+        assert_eq!(starts, 100);
+    }
+
+    /// Exactly half the median is no dip.
+    #[test]
+    fn a_pool_at_half_its_median_is_no_dip() {
+        let mut half = Turns::new(109);
+        half.turns(16, 96);
+        assert_eq!(half.turn(0..48), None, "exactly half");
+        let line = half.turn(0..47).expect("under half");
+        assert_eq!((line.phase, line.median), ("start", 96));
+    }
+
+    /// A node with few samples yet calls no dip.
+    #[test]
+    fn a_node_just_started_calls_no_dip() {
+        let mut started = Turns::new(109);
+        assert!(started.turns(POOL_MIN_SAMPLES - 1, 97).is_empty());
+        assert_eq!(started.turn(0..10), None, "too few samples");
+    }
+
+    /// A network of a few shards calls no dip.
+    #[test]
+    fn a_small_network_calls_no_dip() {
+        let mut small = Turns::new(10);
+        assert!(small.turns(16, POOL_MIN_MEDIAN - 1).is_empty());
+        assert_eq!(small.turn(0..0), None, "median under the minimum");
+    }
+
+    /// A shard absent since well before the dip is counted and not named; one
+    /// never seen is too.
+    #[test]
+    fn a_shard_long_absent_is_counted_and_not_named() {
+        let mut turns = Turns::new(30);
+        turns.frame = 900;
+        assert_eq!(turns.turn(0..22), None);
+        assert!(turns.turns(25, 20).is_empty());
+        let line = turns.turn(0..3).expect("the dip");
+        // Shards 22-29 never had a header, and 20 and 21 last had one at frame
+        // 900, more than 64 frames before the dip's frame 1004.
+        assert_eq!(line.frame, 1004);
+        assert_eq!(line.lowest.absent_long, 10);
+        assert_eq!(line.lowest.no_header, 17);
+        assert_eq!(
+            line.lowest.named,
+            "aa000003:4:no_header,aa000004:4:no_header,aa000005:4:no_header,\
+             aa000006:4:no_header,aa000007:4:no_header"
+        );
+    }
+
+    /// Shards are tracked up to [`MAX_SHARDS`].
+    #[test]
+    fn the_shards_tracked_stay_bounded() {
+        let mut turns = Turns::new(0);
+        turns.turn(0..MAX_SHARDS + 100);
+        assert_eq!(turns.watch.last_seen.len(), MAX_SHARDS);
+    }
+
+    /// A shard no longer known is forgotten.
+    #[test]
+    fn a_shard_no_longer_known_is_forgotten() {
+        let mut turns = Turns::new(0);
+        turns.turn(0..50);
+        turns.known = addresses(0..5);
+        turns.turn(0..5);
+        assert_eq!(turns.watch.last_seen.len(), 5);
+    }
+
+    /// Every field of the line, each with its own value.
+    #[test]
+    fn a_dip_line_logs_every_field() {
+        let logs = crate::outage::test_logs::CapturedLogs::default();
+        let _logs = logs.install();
+        PoolLine {
+            phase: "end",
+            frame: 1_011_684,
+            pool_shards: 2,
+            median: 3,
+            proposals: 4,
+            lasted_secs: 5,
+            global_frames: 6,
+            lowest: PoolReading {
+                frame: 7,
+                shards: 8,
+                known: 9,
+                absent_long: 10,
+                late: 11,
+                behind_buffer: 12,
+                gap: 13,
+                no_header: 14,
+                named: "aa00000b:15:gap".into(),
+            },
+        }
+        .log();
+        let lines = logs.lines_with("GLOBAL proposal pool dip");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        for field in [
+            "phase=\"end\"",
+            "frame=1011684",
+            "epoch_offset_frames=84",
+            "pool_shards=2",
+            "median_shards=3",
+            "proposals=4",
+            "lasted_secs=5",
+            "global_frames=6",
+            "lowest_frame=7",
+            "lowest_shards=8",
+            "shards_known=9",
+            "absent_long=10",
+            "late=11",
+            "behind_buffer=12",
+            "gap=13",
+            "no_header=14",
+            "first_absent=aa00000b:15:gap",
+        ] {
+            assert!(lines[0].contains(field), "{field}: {}", lines[0]);
         }
     }
 

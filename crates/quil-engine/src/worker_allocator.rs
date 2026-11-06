@@ -46,6 +46,32 @@ struct EvictionTrack {
     attempted: Option<std::time::Instant>,
 }
 
+/// First frame at which an unconfirmed join is expired: the start of epoch
+/// `join_epoch + 2` (a join proposed in epoch E must confirm in epoch E+1;
+/// mirrors `ProverAllocationInfo::effective_status`).
+pub(crate) fn join_expiry_frame(join_frame: u64) -> u64 {
+    use quil_types::consensus::{epoch_for_frame, epoch_start_frame};
+    epoch_start_frame(epoch_for_frame(join_frame) + 2)
+}
+
+/// The frame at which `allocation` read expired at `frame`, when an operation
+/// its registry view may lack can still change that: a join whose confirm, or
+/// a leave whose reject or confirm, was due before that frame. A confirmed
+/// leave departs at its boundary whatever comes after.
+fn expiry_frame_of_unresolved_seat(
+    allocation: &quil_types::consensus::ProverAllocationInfo,
+    frame: u64,
+) -> Option<u64> {
+    use quil_types::consensus::{epoch_for_frame, epoch_start_frame, EffectiveStatus};
+    match allocation.effective_status(frame) {
+        EffectiveStatus::ExpiredJoining => Some(join_expiry_frame(allocation.join_frame_number)),
+        EffectiveStatus::ExpiredLeaving if allocation.leave_confirm_frame_number == 0 => Some(
+            epoch_start_frame(epoch_for_frame(allocation.leave_frame_number) + 2),
+        ),
+        _ => None,
+    }
+}
+
 /// A rejected leave restores Active without renewing storage. Keep its worker
 /// available to encode renewal until the end of the rejection epoch. This is
 /// local recovery scheduling only: the allocation remains ExpiredEpoch for
@@ -77,6 +103,11 @@ fn manual_release_reason(
             ("leave_confirmed", true)
         }
         EffectiveStatus::ExpiredLeaving => ("leave_departed", true),
+        // Released while its notice runs: a leaver its committee no longer
+        // seats (left after its registration lapsed, from the leaver
+        // currency frame), or one freed for a split child. Either way the
+        // seat is being left, as the operator asked.
+        EffectiveStatus::Leaving => ("leaving", true),
         EffectiveStatus::Kicked => ("kicked", false),
         EffectiveStatus::Rejected => ("join_rejected", false),
         EffectiveStatus::ExpiredJoining => ("join_expired", false),
@@ -869,10 +900,104 @@ pub enum Cooldown {
 
 const COOLDOWN_KINDS: usize = 3;
 
+/// A reconcile pass longer than this logs where its time went: it holds its
+/// caller and every pass waiting behind it.
+const RECONCILE_SLOW_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Shortest time between two slow lines of one caller.
+const RECONCILE_SLOW_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Where a reconcile pass spent its time: what it waits on, and the steps that
+/// grow with its seats. The rest of the pass is the slow line's `other_ms`.
+#[derive(Debug, Default, Clone, Copy)]
+struct ReconcileTimes {
+    lock_wait: std::time::Duration,
+    retention: std::time::Duration,
+    settlement: std::time::Duration,
+    release: std::time::Duration,
+    bind: std::time::Duration,
+    eviction: std::time::Duration,
+    workers: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Time each timed step takes on top of its work, for this thread's passes.
+    static STEP_DELAY: std::cell::Cell<std::time::Duration> = const {
+        std::cell::Cell::new(std::time::Duration::ZERO)
+    };
+}
+
+/// Run `step`, adding its time to `part`.
+fn timed<T>(part: &mut std::time::Duration, step: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let done = step();
+    #[cfg(test)]
+    std::thread::sleep(STEP_DELAY.with(std::cell::Cell::get));
+    *part += started.elapsed();
+    done
+}
+
+/// Which slow passes log a line: at most one per caller per
+/// [`RECONCILE_SLOW_EVERY`], counting those it leaves out. A slow pass runs on
+/// every frame at worst, so the callers' lines stay bounded.
+#[derive(Debug)]
+struct SlowPassLog {
+    slow_after: std::time::Duration,
+    callers: HashMap<&'static str, SlowCaller>,
+}
+
+#[derive(Debug)]
+struct SlowCaller {
+    last_line: std::time::Instant,
+    left_out: u64,
+}
+
+impl Default for SlowPassLog {
+    fn default() -> Self {
+        Self {
+            slow_after: RECONCILE_SLOW_AFTER,
+            callers: HashMap::new(),
+        }
+    }
+}
+
+impl SlowPassLog {
+    /// Whether a pass of `caller` that took `took` logs a line at `now`: the
+    /// slow passes of this caller left out since its last line, or `None`.
+    fn admit(
+        &mut self,
+        caller: &'static str,
+        took: std::time::Duration,
+        now: std::time::Instant,
+    ) -> Option<u64> {
+        if took < self.slow_after {
+            return None;
+        }
+        let Some(seen) = self.callers.get_mut(caller) else {
+            self.callers.insert(
+                caller,
+                SlowCaller {
+                    last_line: now,
+                    left_out: 0,
+                },
+            );
+            return Some(0);
+        };
+        if now.saturating_duration_since(seen.last_line) < RECONCILE_SLOW_EVERY {
+            seen.left_out += 1;
+            return None;
+        }
+        seen.last_line = now;
+        Some(std::mem::take(&mut seen.left_out))
+    }
+}
+
 pub struct WorkerAllocator {
     /// Serialize frame-driven and registry-sync reconciliation so their
     /// release/bind passes cannot compete for the same idle worker.
     reconcile_lock: std::sync::Mutex<()>,
+    slow_passes: std::sync::Mutex<SlowPassLog>,
     /// Shard operations in progress, shared with the lifecycle that
     /// dispatches them.
     pub(crate) submission_attempts: Arc<crate::submission_attempts::SubmissionAttempts>,
@@ -929,6 +1054,12 @@ pub struct WorkerAllocator {
     registry_syncs_running: std::sync::Mutex<HashMap<u64, u64>>,
     /// Latest begin frame of a sync that has refreshed the registry.
     registry_synced_from_frame: std::sync::atomic::AtomicU64,
+    /// The GLOBAL frame whose state the registry reflects after those syncs
+    /// ([`Self::note_registry_view`]); `0` until one is known.
+    registry_view_frame: std::sync::atomic::AtomicU64,
+    /// The seats [`WorkerAllocator::expiry_awaits_view`] holds, with their
+    /// expiry frame, for the lines that report a hold's start and end.
+    expiry_view_holds: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
     /// The seats [`WorkerAllocator::renewal_awaits_registry_sync`] holds, with
     /// their confirm's publication frame and the last frame that can include
     /// it, for the lines that report a hold's start and end.
@@ -953,6 +1084,101 @@ pub struct WorkerAllocator {
     payload_eviction: std::sync::Mutex<HashMap<u32, EvictionTrack>>,
     /// The running orphan episode, `None` while every seat has a worker.
     orphan_watch: std::sync::Mutex<Option<OrphanWatch>>,
+    /// Workers whose release is held, by core id (see [`WorkerHolds`]).
+    worker_holds: std::sync::Mutex<WorkerHolds>,
+}
+
+/// Why a worker's release is held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HoldReason {
+    /// A committee session still counts the member's vote.
+    Session,
+    /// The seat owes the epoch's storage settlement, whose window ends at
+    /// frame `until`.
+    Settlement { epoch: u64, until: u64 },
+}
+
+#[derive(Clone, Debug)]
+struct WorkerHold {
+    filter: Vec<u8>,
+    reason: HoldReason,
+    since: u64,
+    /// The latest frame a release was wanted (and so held) at.
+    wanted: u64,
+    /// The latest frame a pass checked the hold at, before its release.
+    top: u64,
+}
+
+/// The workers whose release is held, so a hold logs when it starts and when
+/// it ends, not on every pass in between.
+#[derive(Default)]
+struct WorkerHolds(HashMap<u32, WorkerHold>);
+
+impl WorkerHolds {
+    /// Record a hold; true when it is new and must be logged. A repeat on
+    /// the same shard only refreshes the reason.
+    fn begin(&mut self, core_id: u32, filter: &[u8], reason: HoldReason, frame: u64) -> bool {
+        match self.0.get_mut(&core_id) {
+            Some(hold) if hold.filter == filter => {
+                hold.reason = reason;
+                hold.wanted = frame;
+                false
+            }
+            _ => {
+                self.0.insert(
+                    core_id,
+                    WorkerHold {
+                        filter: filter.to_vec(),
+                        reason,
+                        since: frame,
+                        wanted: frame,
+                        top: frame,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// End the worker's hold, if any, returning it with its length in
+    /// frames and its outcome. `holding` says whether the worker is still
+    /// held on `filter`: a hold on another shard ends regardless.
+    fn end(
+        &mut self,
+        core_id: u32,
+        filter: &[u8],
+        holding: bool,
+        frame: u64,
+    ) -> Option<(WorkerHold, u64, &'static str)> {
+        let current = self.0.get_mut(&core_id)?;
+        let same_shard = current.filter == filter;
+        if holding && same_shard {
+            // Still retained. A pass that wanted no release since the last
+            // check means the allocation recovered and the worker serves on.
+            if current.wanted >= current.top {
+                current.top = frame;
+                return None;
+            }
+            let hold = self.0.remove(&core_id)?;
+            let held = frame.saturating_sub(hold.since);
+            return Some((hold, held, "allocation recovered; worker kept"));
+        }
+        let hold = self.0.remove(&core_id)?;
+        let held = frame.saturating_sub(hold.since);
+        let outcome = hold_outcome(&hold, same_shard, frame);
+        Some((hold, held, outcome))
+    }
+}
+
+/// How a hold ended, given the frame it ended at and whether the worker
+/// still sits on the held shard.
+fn hold_outcome(hold: &WorkerHold, same_shard: bool, frame: u64) -> &'static str {
+    match hold.reason {
+        _ if !same_shard => "worker moved off the held shard",
+        HoldReason::Session => "committee session ended",
+        HoldReason::Settlement { until, .. } if frame >= until => "settlement window closed",
+        HoldReason::Settlement { .. } => "settlement delivered",
+    }
 }
 
 impl WorkerAllocator {
@@ -983,15 +1209,84 @@ impl WorkerAllocator {
 
     /// Whether the registry may still lack a renewal whose last possible
     /// inclusion frame is `included_frame`: on a node whose registry follows
-    /// prover-tree syncs, none begun after that frame has refreshed it yet.
-    /// A sync anchors at the frame before its begin frame.
+    /// prover-tree syncs, none anchored at or after that frame has refreshed
+    /// it yet ([`Self::registry_may_lack_inclusion`]).
     pub(crate) fn registry_may_lack_renewal(&self, included_frame: u64) -> bool {
-        self.pending_joins_await_sync
-            .load(std::sync::atomic::Ordering::SeqCst)
-            && self
-                .registry_synced_from_frame
-                .load(std::sync::atomic::Ordering::SeqCst)
-                <= included_frame
+        self.registry_may_lack_inclusion(included_frame)
+    }
+
+    /// The seat's expiry frame while `allocation` reads expired at `frame`
+    /// only by a registry that may not show what ended the wait: on a node
+    /// whose registry follows prover-tree syncs, the view has not reached
+    /// that frame, for at most `PROPOSAL_SYNC_CEILING_FRAMES` after it, so
+    /// failing syncs cannot pin the worker. Until then the seat keeps its
+    /// worker and takes a slot from new joins. A confirm included after the
+    /// last pull before the boundary otherwise reads as never included: the
+    /// worker was freed, the planner proposed a join with it, the next pull
+    /// showed the seat Active and the planner rejected its own join
+    /// (2026-11-05, a devnet). The pull at the epoch boundary ends the hold
+    /// (`global_view_refresh`), and the reconcile after it decides at once.
+    pub(crate) fn expiry_awaits_view(
+        &self,
+        allocation: &quil_types::consensus::ProverAllocationInfo,
+        frame: u64,
+    ) -> Option<u64> {
+        let expiry = expiry_frame_of_unresolved_seat(allocation, frame)?;
+        (frame <= expiry.saturating_add(PROPOSAL_SYNC_CEILING_FRAMES)
+            && self.registry_may_lack_inclusion(expiry))
+        .then_some(expiry)
+    }
+
+    /// Report where [`Self::expiry_awaits_view`] starts and stops holding a
+    /// seat among `allocations` at `frame`. A reconcile after a registry sync
+    /// runs at that sync's older frame, where the seat may not read expired
+    /// yet: the frame-driven reconcile reports.
+    fn log_expiry_view_holds(
+        &self,
+        allocations: &[quil_types::consensus::ProverAllocationInfo],
+        frame: u64,
+    ) {
+        use std::sync::atomic::Ordering;
+        if frame < self.reconciled_frame.load(Ordering::Relaxed) {
+            return;
+        }
+        let held: HashMap<Vec<u8>, u64> = allocations
+            .iter()
+            .filter_map(|a| {
+                self.expiry_awaits_view(a, frame)
+                    .map(|expiry| (a.confirmation_filter.clone(), expiry))
+            })
+            .collect();
+        let mut logged = self
+            .expiry_view_holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let view = self.registry_view_frame.load(Ordering::SeqCst);
+        for (filter, expiry) in held.iter().filter(|(f, _)| !logged.contains_key(*f)) {
+            info!(frame, filter = hex::encode(filter), expiry_frame = expiry, registry_view_frame = view,
+                ceiling_frame = expiry + PROPOSAL_SYNC_CEILING_FRAMES, scope = "local",
+                "seat past its expiry frame keeps its worker: the registry may not show an operation \
+                 included before that frame; held until a prover-tree sync reaches it or the ceiling frame");
+        }
+        for (filter, expiry) in logged.iter().filter(|(f, _)| !held.contains_key(*f)) {
+            let resolved = allocations.iter().any(|a| {
+                &a.confirmation_filter == filter
+                    && expiry_frame_of_unresolved_seat(a, frame).is_none()
+            });
+            if resolved || !self.registry_may_lack_inclusion(*expiry) {
+                info!(frame, filter = hex::encode(filter), expiry_frame = expiry, registry_view_frame = view,
+                    ended = if resolved { "resolved" } else { "view_reached" }, scope = "local",
+                    "seat's expiry hold ended: resolved keeps the seat as the registry now shows it; \
+                     view_reached means it expired, and the allocator releases its worker");
+            } else {
+                warn!(frame, filter = hex::encode(filter), expiry_frame = expiry, registry_view_frame = view,
+                    ended = "ceiling", scope = "this node",
+                    action = "check this node's prover tree sync lines: its registry stopped following GLOBAL",
+                    "seat's expiry hold ended at its ceiling with no prover-tree sync reaching its expiry frame: \
+                     the allocator releases its worker although the seat may have been confirmed");
+            }
+        }
+        *logged = held;
     }
 
     /// The frame this node published a renewal of `allocation` at in its
@@ -1350,14 +1645,71 @@ impl WorkerAllocator {
     }
 
     /// Free a worker, unless its committee session is still closing or its
-    /// seat still owes a storage epoch proof.
-    fn release_worker(&self, worker: &WorkerInfo, retained: bool) -> Result<()> {
-        if retained {
-            debug!(core_id = worker.core_id, filter = hex::encode(&worker.filter),
-                "committee session or storage settlement still needs this member; worker stays bound");
-            return Ok(());
+    /// seat still owes a storage epoch proof. The first held release logs
+    /// why and until when ([`Self::end_worker_hold`] logs its end).
+    fn release_worker(
+        &self,
+        worker: &WorkerInfo,
+        retained: bool,
+        frame_number: u64,
+        times: &mut ReconcileTimes,
+    ) -> Result<()> {
+        timed(&mut times.release, || {
+            if retained {
+                self.begin_worker_hold(worker, frame_number);
+                return Ok(());
+            }
+            self.worker_manager.deallocate_worker(worker.core_id)
+        })
+    }
+
+    fn begin_worker_hold(&self, worker: &WorkerInfo, frame_number: u64) {
+        let owed = self.owed_storage_settlements(&worker.filter, frame_number);
+        let reason = match owed.iter().min_by_key(|(_, until)| *until) {
+            Some(&(epoch, until)) => HoldReason::Settlement { epoch, until },
+            None => HoldReason::Session,
+        };
+        let new = self
+            .worker_holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .begin(worker.core_id, &worker.filter, reason, frame_number);
+        if !new {
+            return;
         }
-        self.worker_manager.deallocate_worker(worker.core_id)
+        match reason {
+            HoldReason::Settlement { epoch, until } => {
+                let left = until.saturating_sub(frame_number);
+                info!(core_id = worker.core_id, filter = %hex::encode(&worker.filter),
+                    frame = frame_number, reason = "storage_settlement", epoch,
+                    window_ends_frame = until, frames_left = left,
+                    "worker release held: the seat owes its storage settlement; the worker stays \
+                     bound until the epoch proof is delivered or its window ends (~{} min); no \
+                     free worker from it before then",
+                    left.saturating_mul(quil_types::consensus::ideal_frame_time_ms()) / 60_000);
+            }
+            HoldReason::Session => {
+                info!(core_id = worker.core_id, filter = %hex::encode(&worker.filter),
+                    frame = frame_number, reason = "committee_session",
+                    "worker release held: its committee session still needs this member; the \
+                     worker stays bound until the session's seal is recorded");
+            }
+        }
+    }
+
+    /// Log the end of a worker's held release once nothing holds it any
+    /// more (`holding`) or it moved to another shard.
+    fn end_worker_hold(&self, worker: &WorkerInfo, holding: bool, frame_number: u64) {
+        let ended = self
+            .worker_holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .end(worker.core_id, &worker.filter, holding, frame_number);
+        if let Some((hold, held, outcome)) = ended {
+            info!(core_id = worker.core_id, filter = %hex::encode(&hold.filter),
+                frame = frame_number, held_frames = held, outcome,
+                "worker release hold ended: see outcome");
+        }
     }
 
     /// Whether this prover's seat on `filter` still owes GLOBAL an epoch proof
@@ -1506,6 +1858,7 @@ impl WorkerAllocator {
     ) -> Self {
         Self {
             reconcile_lock: std::sync::Mutex::new(()),
+            slow_passes: Default::default(),
             submission_attempts: Arc::new(crate::submission_attempts::SubmissionAttempts::default()),
             interrupted_seats: std::sync::Mutex::new(None),
             reconciled_frame: std::sync::atomic::AtomicU64::new(0),
@@ -1530,11 +1883,14 @@ impl WorkerAllocator {
             pending_joins_await_sync: std::sync::atomic::AtomicBool::new(false),
             registry_syncs_running: std::sync::Mutex::new(HashMap::new()),
             registry_synced_from_frame: std::sync::atomic::AtomicU64::new(0),
+            registry_view_frame: std::sync::atomic::AtomicU64::new(0),
+            expiry_view_holds: Default::default(),
             renewal_sync_holds: std::sync::Mutex::new(HashMap::new()),
             worker_reset_v3_done: std::sync::atomic::AtomicBool::new(false),
             pending_shard_changes: RwLock::new(None),
             payload_eviction: std::sync::Mutex::new(HashMap::new()),
             orphan_watch: std::sync::Mutex::new(None),
+            worker_holds: std::sync::Mutex::new(WorkerHolds::default()),
         }
     }
 
@@ -1861,6 +2217,15 @@ impl WorkerAllocator {
         running.retain(|later, _| *later > sync);
     }
 
+    /// The registry now reflects the state after GLOBAL `frame`. The cursor
+    /// a sync verified, not its begin frame: that is the freshest frame this
+    /// node has any evidence of, which can pass the header the sync anchors
+    /// at. Recorded after the refresh, since the cursor is committed before it.
+    pub fn note_registry_view(&self, frame: u64) {
+        self.registry_view_frame
+            .fetch_max(frame, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Whether a join proposed at `pending_frame` may still appear with the
     /// next registry sync, holding its worker for at most
     /// `PROPOSAL_SYNC_CEILING_FRAMES`.
@@ -1873,21 +2238,21 @@ impl WorkerAllocator {
     /// Whether the registry may still lack a join proposed at
     /// `proposed_frame`: on a node whose registry shows a landed join only
     /// after a prover-tree sync, no sync begun after the last frame that can
-    /// include it ([`last_join_inclusion_frame`]) has refreshed it yet. A
-    /// sync anchors at the frame before its begin frame.
+    /// include it ([`last_join_inclusion_frame`]) has refreshed it yet.
     pub(crate) fn registry_may_lack_join(&self, proposed_frame: u64) -> bool {
         self.registry_may_lack_inclusion(last_join_inclusion_frame(proposed_frame))
     }
 
     /// Whether the registry may still lack an operation included at
-    /// `included_frame`, as [`Self::registry_may_lack_join`].
+    /// `included_frame`, as [`Self::registry_may_lack_join`]. A sync anchors
+    /// at about the frame before its begin frame; the view it verified
+    /// ([`Self::note_registry_view`]) says exactly, where one is known.
     pub(crate) fn registry_may_lack_inclusion(&self, included_frame: u64) -> bool {
-        self.pending_joins_await_sync
-            .load(std::sync::atomic::Ordering::SeqCst)
-            && self
-                .registry_synced_from_frame
-                .load(std::sync::atomic::Ordering::SeqCst)
-                <= included_frame
+        use std::sync::atomic::Ordering::SeqCst;
+        let view = self.registry_view_frame.load(SeqCst);
+        self.pending_joins_await_sync.load(SeqCst)
+            && (self.registry_synced_from_frame.load(SeqCst) <= included_frame
+                || (view > 0 && view < included_frame))
     }
 
     /// Clear the pending-join marker of a worker still idle after the bind
@@ -2153,23 +2518,69 @@ impl WorkerAllocator {
         if !stored_head_current(head, head_unix_ms, now_unix_ms) {
             return Ok(false);
         }
-        self.on_new_frame(head)?;
+        self.on_new_frame_by("startup", head)?;
         Ok(true)
     }
 
     pub fn on_new_frame(&self, frame_number: u64) -> Result<()> {
-        let result = self.reconcile(frame_number);
-        if let Err(error) = self.schedule_payload_eviction(std::time::Instant::now()) {
+        self.on_new_frame_by("unnamed", frame_number)
+    }
+
+    /// [`Self::on_new_frame`] for `caller`, named in the pass's slow line.
+    pub fn on_new_frame_by(&self, caller: &'static str, frame_number: u64) -> Result<()> {
+        let started = std::time::Instant::now();
+        let mut times = ReconcileTimes::default();
+        let result = self.reconcile(frame_number, &mut times);
+        let scheduled = timed(&mut times.eviction, || {
+            self.schedule_payload_eviction(std::time::Instant::now())
+        });
+        if let Err(error) = scheduled {
             warn!(%error, "worker payload eviction not scheduled");
         }
+        self.log_slow_pass(caller, frame_number, started.elapsed(), &times);
         result
     }
 
-    fn reconcile(&self, frame_number: u64) -> Result<()> {
-        let _reconcile = self
-            .reconcile_lock
+    /// Say where a slow pass spent its time, bounded per caller.
+    fn log_slow_pass(
+        &self,
+        caller: &'static str,
+        frame_number: u64,
+        took: std::time::Duration,
+        times: &ReconcileTimes,
+    ) {
+        let left_out = self
+            .slow_passes
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(|e| e.into_inner())
+            .admit(caller, took, std::time::Instant::now());
+        let Some(left_out) = left_out else {
+            return;
+        };
+        let parts = times.lock_wait
+            + times.retention
+            + times.settlement
+            + times.release
+            + times.bind
+            + times.eviction;
+        let ms = |time: std::time::Duration| time.as_millis() as u64;
+        warn!(caller, frame = frame_number, workers = times.workers, total_ms = ms(took),
+            lock_wait_ms = ms(times.lock_wait), retention_ms = ms(times.retention),
+            settlement_ms = ms(times.settlement), release_ms = ms(times.release),
+            bind_ms = ms(times.bind), eviction_ms = ms(times.eviction),
+            other_ms = ms(took.saturating_sub(parts)), left_out, scope = "this node",
+            action = "report this line if it repeats; the largest part names the step: lock_wait_ms \
+                      behind another caller's pass, retention_ms reads of the committed GLOBAL view, \
+                      settlement_ms the registry's seat slots, release_ms and bind_ms the worker table",
+            "worker reconcile slow: this pass held its caller, and any pass behind it, past the bound");
+    }
+
+    fn reconcile(&self, frame_number: u64, times: &mut ReconcileTimes) -> Result<()> {
+        let _reconcile = timed(&mut times.lock_wait, || {
+            self.reconcile_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        });
         self.reconciled_frame
             .fetch_max(frame_number, std::sync::atomic::Ordering::Relaxed);
         // Prover-reset v3 (mainnet 747_000): clear every AUTO-managed worker's
@@ -2244,9 +2655,11 @@ impl WorkerAllocator {
 
         // Get current worker assignments
         let workers = self.worker_manager.range_workers()?;
+        times.workers = workers.len();
 
         if let Some(prover) = prover_info.as_ref() {
             self.log_renewal_sync_holds(&prover.allocations, frame_number);
+            self.log_expiry_view_holds(&prover.allocations, frame_number);
         }
 
         // The seats the first reconcile finds bound although lapsed past
@@ -2257,7 +2670,9 @@ impl WorkerAllocator {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if seats.is_none() {
-                self.log_owed_storage_settlements(&workers, frame_number);
+                timed(&mut times.settlement, || {
+                    self.log_owed_storage_settlements(&workers, frame_number)
+                });
                 let found: std::collections::HashSet<Vec<u8>> = workers
                     .iter()
                     .filter(|w| !w.filter.is_empty())
@@ -2323,14 +2738,18 @@ impl WorkerAllocator {
         for worker in &workers {
             // Whether the worker's committee session retains it: unknown while
             // a GLOBAL state sync withholds the committed view.
-            let retention = match (session_authority.as_ref(), local_public_key.as_ref()) {
-                (Some(global), Some(member)) if !worker.filter.is_empty() => {
-                    crate::app_handoff::worker_retention(global, &worker.filter, member)
+            let retention = timed(&mut times.retention, || {
+                match (session_authority.as_ref(), local_public_key.as_ref()) {
+                    (Some(global), Some(member)) if !worker.filter.is_empty() => {
+                        crate::app_handoff::worker_retention(global, &worker.filter, member)
+                    }
+                    _ => Some(false),
                 }
-                _ => Some(false),
-            };
-            let settling = !worker.filter.is_empty()
-                && self.owes_storage_settlement(&worker.filter, frame_number);
+            });
+            let settling = timed(&mut times.settlement, || {
+                !worker.filter.is_empty()
+                    && self.owes_storage_settlement(&worker.filter, frame_number)
+            });
             // Retention only withholds a RELEASE below, and so does an unknown
             // view. Everything else in this pass (notably starting the engine
             // once the allocation is Active) must still run for a retained
@@ -2342,6 +2761,8 @@ impl WorkerAllocator {
             // was still Joining at every sync and stopped it after, and each
             // restart withdrew the engine's queued recovery claim.
             let runs_consensus = retention.unwrap_or(worker.allocated) || settling;
+            // End a logged hold once nothing holds the worker (or it moved).
+            self.end_worker_hold(worker, retained, frame_number);
             if worker.filter.is_empty() {
                 // Idle worker: an expired pending-join marker is swept after
                 // the bind pass below (`expire_unlanded_join_markers`), so a
@@ -2365,6 +2786,7 @@ impl WorkerAllocator {
                                 | EffectiveStatus::Leaving
                         ) || self.renewal_recovering(a, frame_number)
                             || self.awaits_renewal_offer(a, frame_number)
+                            || self.expiry_awaits_view(a, frame_number).is_some()
                     })
                     .unwrap_or(false);
                 // Protect a still-in-flight ProposeJoin (pending window not yet
@@ -2383,7 +2805,7 @@ impl WorkerAllocator {
                          active child allocation is unbound (likely split-parent) — \
                          deallocating so the child rebinds"
                     );
-                    self.release_worker(worker, retained)?;
+                    self.release_worker(worker, retained, frame_number, times)?;
                     continue;
                 }
             }
@@ -2403,7 +2825,7 @@ impl WorkerAllocator {
                                 current_epoch = quil_types::consensus::epoch_for_frame(frame_number),
                                 "epoch-expired allocation released so a live shard can use the worker"
                             );
-                            self.release_worker(worker, retained)?;
+                            self.release_worker(worker, retained, frame_number, times)?;
                             continue;
                         }
                         Some(GivenUp::LeftLapsed) => {
@@ -2417,7 +2839,7 @@ impl WorkerAllocator {
                                 "worker released from a seat left after its storage registration lapsed, which its \
                                  committee no longer seats: it owes no notice; the seat departs at its leave boundary"
                             );
-                            self.release_worker(worker, retained)?;
+                            self.release_worker(worker, retained, frame_number, times)?;
                             continue;
                         }
                         // `gives_up` never reports it: only the recovery gate does.
@@ -2464,15 +2886,25 @@ impl WorkerAllocator {
                             // the 720-frame grace check.
                             if alloc.effective_status(frame_number)
                                 == quil_types::consensus::EffectiveStatus::ExpiredJoining
+                                && self.expiry_awaits_view(alloc, frame_number).is_none()
                             {
                                 desired_allocated = false;
                                 info!(
                                     core_id = worker.core_id,
                                     filter = hex::encode(&worker.filter),
                                     join_frame = alloc.join_frame_number,
-                                    "join expired after 720 frames, clearing worker"
+                                    frames_since_join =
+                                        frame_number.saturating_sub(alloc.join_frame_number),
+                                    expiry_frame = join_expiry_frame(alloc.join_frame_number),
+                                    current_frame = frame_number,
+                                    registry_view_frame = self
+                                        .registry_view_frame
+                                        .load(std::sync::atomic::Ordering::SeqCst),
+                                    "join expired unconfirmed, clearing worker: its confirm was \
+                                     never included before the activation frame; check the \
+                                     join's confirm submission and inclusion"
                                 );
-                                self.release_worker(worker, retained)?;
+                                self.release_worker(worker, retained, frame_number, times)?;
                             }
                         }
                         ProverStatus::Rejected | ProverStatus::Kicked | ProverStatus::Historic => {
@@ -2501,7 +2933,7 @@ impl WorkerAllocator {
                                 status = ?alloc.status,
                                 "allocation ended/reassigned, clearing worker"
                             );
-                            self.release_worker(worker, retained)?;
+                            self.release_worker(worker, retained, frame_number, times)?;
                         }
                         ProverStatus::Leaving => {
                             // Live Leave (within 720-frame grace) →
@@ -2517,6 +2949,7 @@ impl WorkerAllocator {
                             // explicitly asked to leave, forever.
                             if alloc.effective_status(frame_number)
                                 == quil_types::consensus::EffectiveStatus::ExpiredLeaving
+                                && self.expiry_awaits_view(alloc, frame_number).is_none()
                             {
                                 desired_allocated = runs_consensus;
                                 if !retained {
@@ -2526,7 +2959,7 @@ impl WorkerAllocator {
                                         leave_frame = alloc.leave_frame_number,
                                         "leave expired after 720 frames, clearing worker"
                                     );
-                                    self.release_worker(worker, retained)?;
+                                    self.release_worker(worker, retained, frame_number, times)?;
                                 }
                             }
                         }
@@ -2561,15 +2994,18 @@ impl WorkerAllocator {
                                     "alloc transitioned to Active — starting consensus engine"
                                 ),
                             }
-                            self.worker_manager.set_worker_filter(
-                                worker.core_id,
-                                &worker.filter,
-                                true,
-                            )?;
+                            timed(&mut times.bind, || {
+                                self.worker_manager.set_worker_filter(
+                                    worker.core_id,
+                                    &worker.filter,
+                                    true,
+                                )
+                            })?;
                         }
-                        let _ = self
-                            .worker_manager
-                            .set_allocated(worker.core_id, desired_allocated);
+                        let _ = timed(&mut times.bind, || {
+                            self.worker_manager
+                                .set_allocated(worker.core_id, desired_allocated)
+                        });
                     }
                 }
                 None => {
@@ -2590,7 +3026,7 @@ impl WorkerAllocator {
                             pending_since = worker.pending_filter_frame,
                             "proposal timed out after 10 frames, clearing worker"
                         );
-                        self.release_worker(worker, retained)?;
+                        self.release_worker(worker, retained, frame_number, times)?;
                     } else if worker.pending_filter_frame == 0
                         && frame_number > PENDING_FILTER_GRACE_FRAMES
                     {
@@ -2601,7 +3037,7 @@ impl WorkerAllocator {
                             filter = hex::encode(&worker.filter),
                             "orphaned filter with no pending frame, clearing worker"
                         );
-                        self.release_worker(worker, retained)?;
+                        self.release_worker(worker, retained, frame_number, times)?;
                     }
                 }
             }
@@ -2858,11 +3294,13 @@ impl WorkerAllocator {
                     holds_data,
                     "assigning shard to worker"
                 );
-                self.worker_manager.set_worker_filter(
-                    core_id,
-                    &alloc.confirmation_filter,
-                    start_consensus,
-                )?;
+                timed(&mut times.bind, || {
+                    self.worker_manager.set_worker_filter(
+                        core_id,
+                        &alloc.confirmation_filter,
+                        start_consensus,
+                    )
+                })?;
             } else {
                 // No idle worker available — the alloc is on-chain
                 // but has no local worker bound. This is a
@@ -3226,6 +3664,20 @@ mod tests {
     use quil_types::consensus::*;
 
     use crate::test_support::{TestProverRegistry, TestWorkerManager as MockWorkerManager};
+
+    #[test]
+    fn join_expiry_frame_is_start_of_epoch_after_confirm_epoch() {
+        let len = epoch_length_frames();
+        // Joined mid-epoch 3: confirm window is epoch 4, expired from epoch 5.
+        let jf = 3 * len + 17;
+        let exp = join_expiry_frame(jf);
+        assert_eq!(exp, 5 * len);
+        let mut a = make_alloc(vec![1; 32]);
+        a.status = ProverStatus::Joining;
+        a.join_frame_number = jf;
+        assert_eq!(a.effective_status(exp - 1), EffectiveStatus::Joining);
+        assert_eq!(a.effective_status(exp), EffectiveStatus::ExpiredJoining);
+    }
 
     fn make_alloc(filter: Vec<u8>) -> ProverAllocationInfo {
         ProverAllocationInfo {
@@ -3720,6 +4172,290 @@ mod tests {
             join_confirm_frame_number: 0,
             ..make_alloc(filter)
         }
+    }
+
+    /// A worker bound to `seat` on a node whose registry follows prover-tree
+    /// syncs, with one sync older than the seat's expiry having refreshed it.
+    fn expiry_fixture(
+        seat: ProverAllocationInfo,
+    ) -> (
+        Arc<MockWorkerManager>,
+        Arc<TestProverRegistry>,
+        WorkerAllocator,
+    ) {
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.allocate_worker(1, &seat.confirmation_filter).unwrap();
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![seat])));
+        let allocator = WorkerAllocator::new(wm.clone(), reg.clone(), vec![0xAA; 32]);
+        allocator.hold_pending_joins_for_registry_sync();
+        allocator.note_registry_sync_begun(1, 900);
+        allocator.note_registry_synced(1);
+        (wm, reg, allocator)
+    }
+
+    /// A pending join and its expiry frame, epoch-aligned as on the chain.
+    fn expiring_join(filter: &[u8]) -> (ProverAllocationInfo, u64) {
+        let join = joining_alloc(filter.to_vec(), 100);
+        let expiry = join_expiry_frame(100);
+        assert_eq!(
+            join.effective_status(expiry),
+            quil_types::consensus::EffectiveStatus::ExpiredJoining
+        );
+        (join, expiry)
+    }
+
+    /// An unconfirmed leave and the frame it reads expired at.
+    fn expiring_leave(filter: &[u8]) -> (ProverAllocationInfo, u64) {
+        let leave = ProverAllocationInfo {
+            status: ProverStatus::Leaving,
+            leave_frame_number: 100,
+            ..make_alloc(filter.to_vec())
+        };
+        let expiry = join_expiry_frame(100);
+        assert_eq!(
+            leave.effective_status(expiry),
+            quil_types::consensus::EffectiveStatus::ExpiredLeaving
+        );
+        (leave, expiry)
+    }
+
+    /// A confirm included after the last pull before the boundary reads as
+    /// never included at the expiry frame: the worker must stay until the
+    /// registry's view reaches that frame (2026-11-05, a devnet: released,
+    /// and the planner proposed a join with it).
+    #[test]
+    fn a_stale_view_at_the_activation_frame_keeps_a_joining_seats_worker() {
+        let filter = vec![0x41; 32];
+        let (join, expiry) = expiring_join(&filter);
+        let (wm, _reg, allocator) = expiry_fixture(join);
+        allocator.on_new_frame(expiry).unwrap();
+        assert_eq!(
+            wm.range_workers().unwrap()[0].filter,
+            filter,
+            "worker core 1 released from seat {} at its expiry frame {expiry}: the registry was last \
+             synced before that frame and may lack the seat's confirm",
+            hex::encode(&filter)
+        );
+    }
+
+    /// The hold's recovery: a prover-tree sync reaching the expiry frame
+    /// decides at once, by what it shows.
+    #[test]
+    fn an_expiry_hold_ends_when_the_view_reaches_the_expiry_frame() {
+        use quil_types::consensus::EffectiveStatus;
+        for confirmed in [false, true] {
+            let filter = vec![0x42; 32];
+            let (join, expiry) = expiring_join(&filter);
+            let (wm, reg, allocator) = expiry_fixture(join.clone());
+            let bound = || wm.range_workers().unwrap()[0].filter == filter;
+            let start = "seat past its expiry frame keeps its worker";
+            let logged = reconcile_logged(&allocator, expiry);
+            assert_eq!(logged.matches(start).count(), 1, "{logged}");
+            assert!(
+                logged.contains(&format!(
+                    "ceiling_frame={}",
+                    expiry + PROPOSAL_SYNC_CEILING_FRAMES
+                )),
+                "{logged}"
+            );
+            assert!(
+                !reconcile_logged(&allocator, expiry + 1).contains(start),
+                "reported once"
+            );
+            // A sync short of the expiry frame does not decide it.
+            allocator.note_registry_sync_begun(2, expiry);
+            allocator.note_registry_view(expiry - 1);
+            allocator.note_registry_synced(2);
+            allocator.on_new_frame(expiry + 2).unwrap();
+            assert!(
+                bound(),
+                "a view at frame {} lacks frame {expiry}",
+                expiry - 1
+            );
+            // The sync after the boundary.
+            if confirmed {
+                let active = ProverAllocationInfo {
+                    status: ProverStatus::Active,
+                    join_confirm_frame_number: expiry - 16,
+                    epoch: u64::MAX,
+                    ..join.clone()
+                };
+                assert_eq!(active.effective_status(expiry), EffectiveStatus::Active);
+                reg.set_prover(prover_with(vec![active]));
+            }
+            allocator.note_registry_sync_begun(3, expiry + 3);
+            allocator.note_registry_view(expiry + 2);
+            allocator.note_registry_synced(3);
+            let logged = reconcile_logged(&allocator, expiry + 3);
+            let end = "seat's expiry hold ended";
+            assert_eq!(logged.matches(end).count(), 1, "{logged}");
+            if confirmed {
+                assert!(bound(), "the seat the view shows Active keeps its worker");
+                assert!(logged.contains("ended=\"resolved\""), "{logged}");
+            } else {
+                assert!(!bound(), "a view past the expiry frame decides: it expired");
+                assert!(logged.contains("ended=\"view_reached\""), "{logged}");
+            }
+        }
+    }
+
+    /// The hold's bound: a view that never advances (every sync failing)
+    /// holds the worker through the ceiling frame and no further, and says so.
+    #[test]
+    fn an_expiry_hold_ends_at_its_ceiling_when_the_view_never_advances() {
+        for (filter, (seat, expiry)) in [
+            (vec![0x43; 32], expiring_join(&[0x43; 32])),
+            (vec![0x44; 32], expiring_leave(&[0x44; 32])),
+        ] {
+            let (wm, _reg, allocator) = expiry_fixture(seat);
+            let bound = || wm.range_workers().unwrap()[0].filter == filter;
+            let ceiling = expiry + PROPOSAL_SYNC_CEILING_FRAMES;
+            allocator.on_new_frame(expiry).unwrap();
+            allocator.on_new_frame(ceiling).unwrap();
+            assert!(bound(), "held through the ceiling frame {ceiling}");
+            let logged = reconcile_logged(&allocator, ceiling + 1);
+            assert!(
+                !bound(),
+                "worker pinned past the ceiling frame {ceiling} by a view that never advanced"
+            );
+            assert!(
+                logged.contains(" WARN ") && logged.contains("ended=\"ceiling\""),
+                "{logged}"
+            );
+        }
+    }
+
+    /// A node back from downtime past the ceiling judges at once: no view can
+    /// be owed that late.
+    #[test]
+    fn a_seat_past_its_ceiling_at_the_first_reconcile_is_not_held() {
+        let filter = vec![0x45; 32];
+        let (join, expiry) = expiring_join(&filter);
+        let (wm, _reg, allocator) = expiry_fixture(join);
+        allocator
+            .on_new_frame(expiry + PROPOSAL_SYNC_CEILING_FRAMES + 1)
+            .unwrap();
+        assert!(wm.range_workers().unwrap()[0].filter.is_empty());
+    }
+
+    /// Sibling: a reject of a leave included just before the boundary reads
+    /// as a lapsed leave at it (`operator_op_view_frame`), which released the
+    /// seat's worker although the seat is Active again.
+    #[test]
+    fn a_stale_view_at_the_leave_boundary_keeps_a_leaving_seats_worker() {
+        let filter = vec![0x46; 32];
+        let (leave, expiry) = expiring_leave(&filter);
+        let (wm, _reg, allocator) = expiry_fixture(leave);
+        allocator.on_new_frame(expiry).unwrap();
+        assert_eq!(
+            wm.range_workers().unwrap()[0].filter,
+            filter,
+            "worker core 1 released from seat {} at its leave's expiry frame {expiry}: the registry \
+             was last synced before that frame and may lack the leave's reject",
+            hex::encode(&filter)
+        );
+    }
+
+    /// A view reaching the boundary that shows the leave rejected keeps the
+    /// worker: the seat is Active and owes its renewal. Checked before the
+    /// view moves too: the bind pass gives a released worker back once the
+    /// seat reads Active, so the end state alone cannot show it was kept.
+    #[test]
+    fn a_rejected_leave_the_view_then_shows_keeps_its_worker() {
+        let filter = vec![0x4D; 32];
+        let (leave, expiry) = expiring_leave(&filter);
+        let (wm, reg, allocator) = expiry_fixture(leave.clone());
+        allocator.on_new_frame(expiry).unwrap();
+        assert_eq!(
+            wm.range_workers().unwrap()[0].filter,
+            filter,
+            "worker core 1 released before the view showed the leave's reject"
+        );
+        reg.set_prover(prover_with(vec![ProverAllocationInfo {
+            status: ProverStatus::Active,
+            leave_reject_frame_number: expiry - 1,
+            epoch: u64::MAX,
+            ..leave
+        }]));
+        allocator.note_registry_sync_begun(2, expiry + 2);
+        allocator.note_registry_view(expiry + 1);
+        allocator.note_registry_synced(2);
+        let logged = reconcile_logged(&allocator, expiry + 2);
+        assert_eq!(wm.range_workers().unwrap()[0].filter, filter);
+        assert!(logged.contains("ended=\"resolved\""), "{logged}");
+    }
+
+    /// A leave the view shows confirmed departs at its boundary: nothing it
+    /// may lack changes that, so a stale view holds nothing.
+    #[test]
+    fn a_confirmed_leave_is_not_held_by_a_stale_view() {
+        let filter = vec![0x47; 32];
+        let (leave, expiry) = expiring_leave(&filter);
+        let (wm, _reg, allocator) = expiry_fixture(ProverAllocationInfo {
+            leave_confirm_frame_number: expiry - 1,
+            ..leave
+        });
+        allocator.on_new_frame(expiry).unwrap();
+        assert!(wm.range_workers().unwrap()[0].filter.is_empty());
+    }
+
+    /// A node that executes GLOBAL frames has no view to wait for: it judges
+    /// at the expiry frame, also with no sync ever noted.
+    #[test]
+    fn a_node_executing_global_frames_releases_at_the_expiry_frame() {
+        for (seat, expiry) in [expiring_join(&[0x48; 32]), expiring_leave(&[0x49; 32])] {
+            let wm = Arc::new(MockWorkerManager::new());
+            wm.allocate_worker(1, &seat.confirmation_filter).unwrap();
+            let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![seat])));
+            let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+            allocator.on_new_frame(expiry).unwrap();
+            assert!(wm.range_workers().unwrap()[0].filter.is_empty());
+        }
+    }
+
+    /// A sync's begin frame is the freshest frame this node has evidence of,
+    /// which can pass the header it anchors at. The cursor it verified
+    /// decides, for every hold that reads the registry's coverage: the seat
+    /// expiring, the renewal and the join.
+    #[test]
+    fn a_sync_anchored_before_the_frame_does_not_end_a_hold_by_its_begin_frame() {
+        let filter = vec![0x4A; 32];
+        let (join, expiry) = expiring_join(&filter);
+        let (wm, _reg, allocator) = expiry_fixture(join);
+        allocator.note_registry_sync_begun(2, expiry + 1);
+        allocator.note_registry_view(expiry - 3);
+        allocator.note_registry_synced(2);
+        assert!(allocator.registry_may_lack_inclusion(expiry - 1));
+        assert!(allocator.registry_may_lack_renewal(expiry - 1));
+        allocator.on_new_frame(expiry + 1).unwrap();
+        assert_eq!(wm.range_workers().unwrap()[0].filter, filter);
+        allocator.note_registry_view(expiry);
+        assert!(!allocator.registry_may_lack_inclusion(expiry));
+        allocator.on_new_frame(expiry + 2).unwrap();
+        assert!(wm.range_workers().unwrap()[0].filter.is_empty());
+    }
+
+    /// The split-parent rebind frees a worker on a filter with no resolvable
+    /// allocation while an active one is unbound: a held seat is resolvable.
+    #[test]
+    fn a_held_expiry_is_not_freed_for_an_unbound_active_seat() {
+        let (filter, unbound) = (vec![0x4B; 32], vec![0x4C; 32]);
+        let (join, expiry) = expiring_join(&filter);
+        let (wm, reg, allocator) = expiry_fixture(join.clone());
+        reg.set_prover(prover_with(vec![
+            join,
+            ProverAllocationInfo {
+                epoch: u64::MAX,
+                ..make_alloc(unbound.clone())
+            },
+        ]));
+        allocator.on_new_frame(expiry).unwrap();
+        assert_eq!(
+            wm.range_workers().unwrap()[0].filter,
+            filter,
+            "worker core 1 freed from held seat {} for an unbound seat",
+            hex::encode(&filter)
+        );
     }
 
     const DROPPED: &str = "join submitted but no alloc landed in registry";
@@ -4890,6 +5626,152 @@ mod tests {
         }
     }
 
+    /// A pass under the bound logs nothing; one at it does.
+    #[test]
+    fn only_a_pass_past_the_bound_logs_a_slow_line() {
+        let now = std::time::Instant::now();
+        let mut log = SlowPassLog::default();
+        let bound = std::time::Duration::from_secs(5);
+        assert_eq!(
+            log.admit(
+                "frame poller",
+                bound - std::time::Duration::from_millis(1),
+                now
+            ),
+            None
+        );
+        assert_eq!(log.admit("frame poller", bound, now), Some(0));
+    }
+
+    /// A caller logs at most one slow line a minute, then says how many it
+    /// left out; another caller keeps its own count.
+    #[test]
+    fn a_callers_slow_line_repeats_at_most_once_a_minute() {
+        let start = std::time::Instant::now();
+        let at = |secs| start + std::time::Duration::from_secs(secs);
+        let slow = std::time::Duration::from_secs(9);
+        let mut log = SlowPassLog::default();
+        assert_eq!(log.admit("frame poller", slow, at(0)), Some(0));
+        assert_eq!(log.admit("frame poller", slow, at(10)), None);
+        assert_eq!(log.admit("frame poller", slow, at(59)), None);
+        assert_eq!(log.admit("frame receive", slow, at(59)), Some(0));
+        assert_eq!(log.admit("frame poller", slow, at(60)), Some(2));
+        assert_eq!(log.admit("frame poller", slow, at(70)), None);
+        assert_eq!(log.admit("frame poller", slow, at(120)), Some(1));
+    }
+
+    /// The slow line names the caller and splits the pass: the wait for the
+    /// lock and each step, so one line tells them apart. A pass under the bound
+    /// says nothing.
+    #[test]
+    fn a_slow_reconcile_pass_names_where_its_time_went() {
+        let wm = Arc::new(MockWorkerManager::new());
+        let kicked = vec![0x01; 32];
+        let active = vec![0x02; 32];
+        wm.add_with_filter(1, kicked.clone());
+        wm.add(idle_worker(2, 0));
+        let prover = ProverInfo {
+            public_key: vec![],
+            address: vec![0xAA; 32],
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: vec![
+                ProverAllocationInfo {
+                    status: ProverStatus::Kicked,
+                    ..make_alloc(kicked.clone())
+                },
+                make_alloc(active.clone()),
+            ],
+            available_storage: 0,
+            seniority: 0,
+            delegate_address: vec![],
+        };
+        let alloc = Arc::new(WorkerAllocator::new(
+            wm.clone(),
+            Arc::new(TestProverRegistry::with_prover(prover)),
+            vec![0xAA; 32],
+        ));
+        let logs = crate::outage::test_logs::CapturedLogs::default();
+        let _guard = logs.install();
+        alloc.on_new_frame_by("registry sync", 100).unwrap();
+        assert!(
+            logs.lines_with("worker reconcile slow").is_empty(),
+            "a pass under the bound"
+        );
+        // A second pass that releases and binds again, behind another pass.
+        wm.add_with_filter(1, kicked.clone());
+        wm.add(idle_worker(2, 0));
+        alloc.slow_passes.lock().unwrap().slow_after = std::time::Duration::ZERO;
+        let (held, wait_held) = std::sync::mpsc::channel();
+        let pass_starts = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let holder = {
+            let (alloc, pass_starts) = (alloc.clone(), pass_starts.clone());
+            std::thread::spawn(move || {
+                let _lock = alloc.reconcile_lock.lock().unwrap();
+                held.send(()).unwrap();
+                while !pass_starts.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            })
+        };
+        wait_held.recv().unwrap();
+        let step = std::time::Duration::from_millis(40);
+        STEP_DELAY.with(|delay| delay.set(step));
+        pass_starts.store(true, std::sync::atomic::Ordering::SeqCst);
+        alloc.on_new_frame_by("registry sync", 101).unwrap();
+        STEP_DELAY.with(|delay| delay.set(std::time::Duration::ZERO));
+        holder.join().unwrap();
+        let lines = logs.lines_with("worker reconcile slow");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        for field in [
+            "WARN",
+            "caller=\"registry sync\"",
+            "frame=101",
+            "workers=2",
+            "left_out=0",
+            "scope=\"this node\"",
+            "total_ms=",
+            "other_ms=",
+        ] {
+            assert!(line.contains(field), "{field}: {line}");
+        }
+        let value = |field: &str| -> u64 {
+            let at = line
+                .find(&format!("{field}="))
+                .unwrap_or_else(|| panic!("{field}: {line}"));
+            line[at + field.len() + 1..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap()
+        };
+        let parts = [
+            ("lock_wait_ms", std::time::Duration::from_millis(100)),
+            ("retention_ms", step),
+            ("settlement_ms", step),
+            ("release_ms", step),
+            ("bind_ms", step),
+            ("eviction_ms", step),
+        ];
+        let missing: Vec<&str> = parts
+            .iter()
+            .filter(|(field, least)| value(field) < least.as_millis() as u64)
+            .map(|(field, _)| *field)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "parts without their time: {missing:?}: {line}"
+        );
+        let sum: u64 = parts.iter().map(|(field, _)| value(field)).sum();
+        assert!(
+            sum <= value("total_ms"),
+            "the parts add up to the pass: {line}"
+        );
+    }
+
     /// The production worker manager, counting consensus starts.
     struct CountingThreadWorkers {
         inner: crate::thread_worker::ThreadWorkerManager,
@@ -6020,6 +6902,29 @@ mod tests {
             !logged.contains(LOST) && logged.contains(LEFT) && logged.contains("leave_confirmed"),
             "{logged}"
         );
+
+        // Left after its registration lapsed: from the leaver currency
+        // frame its committee no longer seats it, so its worker is freed
+        // during the notice. The flag-day crossing devnet warned of a lost
+        // seat for a split child here.
+        let _currency = LeaverCurrency::at(Some(0));
+        let leaving = ProverAllocationInfo {
+            status: ProverStatus::Leaving,
+            leave_frame_number: frame - 1,
+            ..stale.clone()
+        };
+        let (wm, alloc) = setup(vec![leaving]);
+        let logged = reconcile_logged(&alloc, frame);
+        assert!(
+            wm.range_workers().unwrap()[0].filter.is_empty(),
+            "the unseated leaver frees its worker"
+        );
+        assert!(
+            !logged.contains(LOST)
+                && logged.contains(LEFT)
+                && logged.contains("reason=\"leaving\""),
+            "{logged}"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -6878,5 +7783,65 @@ mod tests {
             logged.contains(&format!("activation_frame={}", 3 * e)),
             "{logged}"
         );
+    }
+
+    #[test]
+    fn worker_hold_logs_start_once_and_end_once_with_its_length() {
+        let mut holds = WorkerHolds::default();
+        let filter = vec![7u8; 4];
+        let reason = HoldReason::Settlement {
+            epoch: 9,
+            until: 500,
+        };
+        // The first held release logs; the same hold on later passes does not.
+        assert!(holds.begin(3, &filter, reason, 100), "first hold logs");
+        assert!(!holds.begin(3, &filter, reason, 110), "repeat is silent");
+        assert!(!holds.begin(3, &filter, reason, 120), "repeat is silent");
+        // Still held: nothing ends.
+        assert!(holds.end(3, &filter, true, 130).is_none());
+        // Nothing holds it any more, before the window ends: delivered, with
+        // the frames held counted from the first hold.
+        let (hold, held, outcome) = holds.end(3, &filter, false, 160).expect("end logs");
+        assert_eq!(hold.since, 100);
+        assert_eq!(held, 60);
+        assert_eq!(outcome, "settlement delivered");
+        // It ends once.
+        assert!(holds.end(3, &filter, false, 170).is_none());
+        // A new hold logs again.
+        assert!(holds.begin(3, &filter, reason, 200));
+        // Past the window the outcome is the window closing.
+        let (_, held, outcome) = holds.end(3, &filter, false, 500).unwrap();
+        assert_eq!((held, outcome), (300, "settlement window closed"));
+        // A session hold, and a hold left on another shard.
+        assert!(holds.begin(4, &filter, HoldReason::Session, 10));
+        assert_eq!(
+            holds.end(4, &filter, false, 20).unwrap().2,
+            "committee session ended"
+        );
+        assert!(holds.begin(5, &filter, HoldReason::Session, 10));
+        assert_eq!(
+            holds.end(5, &[8u8; 4], true, 30).unwrap().2,
+            "worker moved off the held shard"
+        );
+    }
+
+    #[test]
+    fn worker_hold_ends_when_the_allocation_recovers_and_the_worker_is_kept() {
+        let mut holds = WorkerHolds::default();
+        let filter = vec![7u8; 4];
+        let reason = HoldReason::Settlement {
+            epoch: 9,
+            until: 500,
+        };
+        // Retained but no release wanted since the last check: the
+        // allocation recovered and the worker is kept.
+        assert!(holds.begin(6, &filter, reason, 10));
+        assert!(holds.end(6, &filter, true, 20).is_none());
+        assert!(holds
+            .end(6, &filter, true, 30)
+            .is_some_and(|(_, held, outcome)| {
+                held == 20 && outcome == "allocation recovered; worker kept"
+            }));
+        assert!(holds.end(6, &filter, true, 40).is_none());
     }
 }

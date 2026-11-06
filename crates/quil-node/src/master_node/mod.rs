@@ -5,6 +5,7 @@ mod archive_verify_tests;
 mod frame_observations;
 mod peer_info_bounds;
 mod peer_info_file;
+mod seat_certificates;
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
@@ -29,6 +30,7 @@ pub(crate) mod peer_info_publisher;
 pub(crate) mod remote_reads;
 pub(crate) mod reward_proofs;
 pub(crate) mod runtime_state;
+mod seat_concentration;
 mod shard_cw_lane;
 mod shard_sender;
 pub(crate) mod stall_watch;
@@ -450,6 +452,7 @@ pub(crate) async fn start(
     // info RPC.
     let (announced_tx, announced_rx) =
         tokio::sync::watch::channel(peer_info_publisher::AnnouncedAddrs::default());
+    let own_peer_info: quil_explorer::OwnPeerInfo = Arc::new(parking_lot::RwLock::new(None));
     peer_info_publisher::spawn(
         &mut sup,
         peer_info_publisher::PeerInfoPublisherArgs {
@@ -474,6 +477,7 @@ pub(crate) async fn start(
             network,
             onion_routing_enabled: !config.p2p.disable_onion_routing,
             announced: announced_tx,
+            own_peer_info: own_peer_info.clone(),
         },
     );
 
@@ -573,8 +577,17 @@ pub(crate) async fn start(
                     parent_bits_len = parent_bits.len(),
                     "split-proposer: sub-shard (byte-suffix) leaf count for the over-crowded shard"
                 );
-                // Descend up to 16 extra bits past any uniform run to the branch.
-                crdt_pr.propose_split_children("vertex", "adds", &app, &parent_bits, 16)
+                // Descend up to 16 extra bits past any uniform run to the branch,
+                // never past an empty side outputs can still reach: a split there
+                // would leave it a spine with no committee to deliver them.
+                crdt_pr.propose_split_children(
+                    "vertex",
+                    "adds",
+                    &app,
+                    &parent_bits,
+                    16,
+                    &quil_forest::bit_path_reaches_outputs,
+                )
             },
         ));
     }
@@ -1933,7 +1946,8 @@ pub(crate) async fn start(
                 .clone()
                 .expect("recent_messages ring present when explorer enabled"),
             last_global_head_frame.clone(),
-        );
+        )
+        .with_own_peer_info(own_peer_info);
         // Outside archive mode the shards store keeps the genesis grid: the
         // production KPIs take the current one from the archive cache.
         let state = if archive_mode {

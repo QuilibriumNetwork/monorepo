@@ -1395,6 +1395,7 @@ pub(crate) fn init(
                                         // readiness barrier below; the routing registry owns the
                                         // original handle.
                                         let ready_handle = handle.clone();
+                                        let mesh_sampler = handle.mesh_sampler();
                                         // Push the current halt state to the
                                         // freshly-activated engine before
                                         // registering it. Without this the
@@ -1424,6 +1425,15 @@ pub(crate) fn init(
                                         let registry_for_sub = drain_registry.clone();
                                         let pubkey_for_sub = drain_pubkey.clone();
                                         let clock_for_sub = drain_clock.clone();
+                                        // The block topic's mesh, for the worker's delivery summary.
+                                        let mesh_p2p = drain_p2p.clone();
+                                        let mesh_topic = quil_engine::bitmasks::shard_cw_bitmask(&filter);
+                                        drain_spawner.detach("shard-mesh-sample", async move {
+                                            mesh_sampler
+                                                .run(|| mesh_p2p.mesh_peer_count(mesh_topic.clone()))
+                                                .await;
+                                            Ok(())
+                                        });
                                         drain_spawner.detach("shard-subscribe", async move {
                                             for topic in shard_topics(&filter_for_sub) {
                                                 if let Err(e) = p2p.subscribe_confirmed(topic).await {
@@ -1444,10 +1454,12 @@ pub(crate) fn init(
                                             // resolver messages directly.
                                             p2p.allow_direct(cw_topic.clone()).await;
                                             let mut wait_logged = false;
+                                            let mut wait = quil_engine::worker_node::CwTransportWait::start();
                                             loop {
                                                 match p2p.subscribed_peer_count(cw_topic.clone()).await {
                                                     Ok(peers) if peers > 0 => {
                                                         info!(core_id, filter = %hex::encode(&filter_for_sub), peers,
+                                                            waited_ms = wait.waited().as_millis() as u64,
                                                             "shard CW transport ready; starting consensus engine");
                                                         ready_handle.set_cw_transport_ready();
                                                         break;
@@ -1465,6 +1477,7 @@ pub(crate) fn init(
                                                             .is_ok_and(|members| members.len() == 1 && members[0].public_key == pubkey_for_sub)
                                                     } => {
                                                         info!(core_id, filter = %hex::encode(&filter_for_sub),
+                                                            waited_ms = wait.waited().as_millis() as u64,
                                                             "sole committee member; starting consensus without a CW peer");
                                                         ready_handle.set_cw_transport_ready();
                                                         break;
@@ -1474,7 +1487,15 @@ pub(crate) fn init(
                                                         info!(core_id, filter = %hex::encode(&filter_for_sub),
                                                             "waiting for a subscribed CW peer before starting consensus");
                                                     }
-                                                    Ok(_) => {}
+                                                    Ok(_) => {
+                                                        let waited = wait.waited();
+                                                        if wait.overrun_due(waited) {
+                                                            warn!(core_id, filter = %hex::encode(&filter_for_sub),
+                                                                waited_secs = waited.as_secs(), subscribed_peers = 0,
+                                                                "consensus start held: no connected peer has announced a subscription to \
+                                                                 the shard's CW topic; check this worker's connections to its committee");
+                                                        }
+                                                    }
                                                     Err(e) => warn!(core_id, filter = %hex::encode(&filter_for_sub), error = %e,
                                                         "CW transport readiness check failed"),
                                                 }

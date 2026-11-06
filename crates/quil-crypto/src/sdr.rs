@@ -560,8 +560,9 @@ mod tests {
         );
     }
 
-    /// With the stable replica key epoch disabled every epoch's
-    /// key is the epoch-bound one, byte for byte as before it existed.
+    /// Without a stable replica key epoch (disabled for this thread) every
+    /// epoch's key is the epoch-bound one, byte for byte as before it
+    /// existed.
     #[test]
     fn replica_keys_are_unchanged_without_a_stable_key_epoch() {
         use quil_types::consensus::set_stable_replica_key_epoch_for_thread;

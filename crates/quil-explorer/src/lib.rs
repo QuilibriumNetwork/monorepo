@@ -47,6 +47,9 @@ pub type HaltDurationsProvider =
 /// The lowest GLOBAL frame whose request bodies the store keeps (`None`:
 /// all of them). A regular node prunes older bodies and keeps only the
 /// headers, which would read as empty frames.
+/// The PeerInfo this node last published, once it has published one.
+pub type OwnPeerInfo = Arc<RwLock<Option<quil_p2p::CanonicalPeerInfo>>>;
+
 pub type RequestRetentionProvider = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 
 /// Inactivity grace before an active prover is evicted, in frames
@@ -67,6 +70,10 @@ pub struct ExplorerState {
     /// Per-shard coverage-halt durations provider (eviction-risk endpoint).
     pub halt_durations_provider: Option<HaltDurationsProvider>,
     pub peer_info_cache: Arc<RwLock<HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>>>,
+    /// The PeerInfo this node last published. A node never receives its own
+    /// gossip, so `peer_info_cache` lacks it; `/peers` and `/peers/releases`
+    /// add it.
+    pub own_peer_info: OwnPeerInfo,
     pub messages: Arc<RecentMessageRing>,
     /// Current global frame number, used for prover effective-status grace
     /// calculations (`get_prover_shard_summaries`).
@@ -141,6 +148,7 @@ impl ExplorerState {
             app_shards_provider,
             halt_durations_provider,
             peer_info_cache,
+            own_peer_info: Arc::new(RwLock::new(None)),
             messages,
             current_frame,
             cache: Arc::new(RwLock::new(HashMap::new())),
@@ -157,6 +165,13 @@ impl ExplorerState {
             archive_grid: None,
             history_file: None,
         }
+    }
+
+    /// List the PeerInfo this node publishes, held in `slot`, in `/peers` and
+    /// `/peers/releases`.
+    pub fn with_own_peer_info(mut self, slot: OwnPeerInfo) -> Self {
+        self.own_peer_info = slot;
+        self
     }
 
     /// Keep the history backfill above the frames whose request bodies the

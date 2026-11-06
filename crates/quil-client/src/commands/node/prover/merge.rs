@@ -48,7 +48,7 @@ fn peer_keys(configs: &[String]) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     let mut keys = Vec::with_capacity(configs.len());
     for (index, dir) in configs.iter().enumerate() {
         if index > 0 && !std::path::Path::new(dir).is_absolute() {
-            println!("{dir} is not an absolute path");
+            eprintln!("Warning: {dir} is not an absolute path");
         }
         keys.push(peer_key(dir)?);
     }

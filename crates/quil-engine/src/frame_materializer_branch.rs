@@ -55,7 +55,10 @@ pub struct TentativeFrameResult {
     pub processed: usize,
     pub skipped: usize,
     pub prover_root: [u8; 32],
+    /// The bundles execution processed (`MaterializeResult::finalized_bundles`).
     pub consumed_bundles: Vec<Vec<u8>>,
+    /// The bundles execution skipped (`MaterializeResult::skipped_bundles`).
+    pub skipped_bundles: Vec<Vec<u8>>,
     pub checkpoint: GlobalExecutionCheckpoint,
     pub prover_ops: crate::prover_op_tally::ProverOpTally,
 }
@@ -231,6 +234,7 @@ impl MaterializerBranch {
             skipped: result.skipped,
             prover_root: root,
             consumed_bundles: result.finalized_bundles,
+            skipped_bundles: result.skipped_bundles,
             checkpoint,
             prover_ops: result.prover_ops,
         })

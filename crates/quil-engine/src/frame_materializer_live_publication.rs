@@ -142,7 +142,7 @@ impl FrameMaterializer {
         // All execution barriers were released before these callbacks, including
         // on an authenticated replay after a previous commit or restart.
         if let Some(refresh) = &self.shard_admission_refresh {
-            if let Err(error) = refresh() {
+            if let Err(error) = refresh(number) {
                 warn!(frame = number, %error, "committed shard admission refresh failed; will retry next frame");
             }
         }

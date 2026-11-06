@@ -100,6 +100,63 @@ struct SessionPassTiming {
     steps: Vec<(&'static str, u64)>,
     filters: usize,
     allocations: Option<usize>,
+    /// Time spent in `CommittedProverScan::try_scan`, shared with the
+    /// eligibility closure that may scan lazily.
+    scan_ms: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+/// How a committee session pass is logged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionPassLevel {
+    Quiet,
+    Info,
+    Warn,
+}
+
+/// Fixed part of the scan budget (ms) and its per-1,000-allocations part.
+/// Measured on archives: the epoch-boundary scan of the committed GLOBAL
+/// prover shard takes 1.5-3.7 s for ~25,600 allocations (156 filters), flat
+/// over 12 h, so it is expected every epoch. The budget is 250 ms per 1,000
+/// allocations (6.4 s at that size, about 1.7x the worst sample), never under
+/// 5 s; past it the scan is slower than a regular shard needs.
+const SESSION_SCAN_BASE_BUDGET_MS: u64 = 5_000;
+const SESSION_SCAN_BUDGET_MS_PER_1000: u64 = 250;
+/// Any pass whose work apart from the scan takes this long warns.
+const SESSION_PASS_SLOW_MS: u64 = 500;
+
+/// Classifies a pass: the prover scan is judged against its size-derived
+/// budget, everything else against [`SESSION_PASS_SLOW_MS`].
+fn classify_session_pass(
+    total_ms: u64,
+    scan_ms: u64,
+    allocations: Option<usize>,
+) -> SessionPassLevel {
+    if scan_ms == 0 {
+        return if total_ms >= SESSION_PASS_SLOW_MS {
+            SessionPassLevel::Warn
+        } else {
+            SessionPassLevel::Quiet
+        };
+    }
+    let budget = SESSION_SCAN_BASE_BUDGET_MS.max(
+        (allocations.unwrap_or(0) as u64).saturating_mul(SESSION_SCAN_BUDGET_MS_PER_1000) / 1000,
+    );
+    if total_ms.saturating_sub(scan_ms) >= SESSION_PASS_SLOW_MS || scan_ms > budget {
+        SessionPassLevel::Warn
+    } else {
+        SessionPassLevel::Info
+    }
+}
+
+/// The prover scan, timed into `scan_ms`.
+fn timed_prover_scan(
+    hg: &Arc<quil_hypergraph::HypergraphCrdt>,
+    scan_ms: &std::cell::Cell<u64>,
+) -> Result<crate::prover_registry::CommittedProverScan> {
+    let started = std::time::Instant::now();
+    let scan = crate::prover_registry::CommittedProverScan::try_scan(hg);
+    scan_ms.set(scan_ms.get() + started.elapsed().as_millis() as u64);
+    scan
 }
 
 impl SessionPassTiming {
@@ -112,6 +169,7 @@ impl SessionPassTiming {
             steps: Vec::new(),
             filters: 0,
             allocations: None,
+            scan_ms: Default::default(),
         }
     }
 
@@ -126,9 +184,20 @@ impl SessionPassTiming {
 impl Drop for SessionPassTiming {
     fn drop(&mut self) {
         let total = self.started.elapsed().as_millis() as u64;
-        if total >= 500 {
-            tracing::warn!(frame = self.frame, total_ms = total, filters = self.filters,
-                allocations = ?self.allocations, steps = ?self.steps, "committee session pass is slow");
+        let scan_ms = self.scan_ms.get();
+        let reconcile_ms = self
+            .steps
+            .iter()
+            .find(|(step, _)| *step == "membership reconciliation")
+            .map_or(0, |(_, ms)| *ms);
+        match classify_session_pass(total, scan_ms, self.allocations) {
+            SessionPassLevel::Quiet => {}
+            SessionPassLevel::Info => tracing::info!(frame = self.frame, total_ms = total,
+                scan_ms, reconcile_ms, filters = self.filters, allocations = ?self.allocations,
+                "committee session pass scanned the prover shard"),
+            SessionPassLevel::Warn => tracing::warn!(frame = self.frame, total_ms = total,
+                scan_ms, reconcile_ms, filters = self.filters, allocations = ?self.allocations,
+                steps = ?self.steps, "committee session pass is slow"),
         }
     }
 }
@@ -952,11 +1021,11 @@ impl GlobalIntrinsic {
                         "FrameHeader: bls_constructor not installed — cannot verify".into(),
                     )
                 })?;
-                Self::require_global_anchor(frame_number, &op)?;
-                // Header fields a certificate does not sign directly (fee
-                // total, settlement relay, ...) must reproduce the certified
-                // output, and a relay must be canonical for its window.
-                self.verify_shard_frame_output(&op)?;
+                // Header fields a certificate does not sign directly (frame
+                // number, fee total, settlement relay, ...) must reproduce
+                // the certified output, and a relay must be canonical for its
+                // window.
+                Self::check_anchor_and_output(self.clock_store.as_deref(), frame_number, &op)?;
                 super::prover_shard_update::verify_settlement_relay(&op)?;
                 // CW path: a simplex-finalized shard frame's sig field
                 // holds the magic-prefixed finalization certificate, not a BLS
@@ -2684,10 +2753,18 @@ impl GlobalIntrinsic {
     /// Recompute a shard frame header's deterministic output against the
     /// anchored global frame from this node's clock store.
     fn verify_shard_frame_output(&self, op: &super::frame_header::FrameHeader) -> Result<()> {
+        Self::verify_anchored_output(self.clock_store.as_deref(), op)
+    }
+
+    /// [`Self::verify_shard_frame_output`] against `clock_store`.
+    fn verify_anchored_output(
+        clock_store: Option<&dyn quil_types::store::ClockStore>,
+        op: &super::frame_header::FrameHeader,
+    ) -> Result<()> {
         if op.global_frame_number == 0 {
             return super::prover_shard_update::verify_app_frame_output(op, &[]);
         }
-        let clock_store = self.clock_store.as_ref().ok_or_else(|| {
+        let clock_store = clock_store.ok_or_else(|| {
             QuilError::Internal(
                 "FrameHeader: clock_store not installed — cannot recompute output".into(),
             )
@@ -2703,6 +2780,24 @@ impl GlobalIntrinsic {
                 ))
             })?;
         super::prover_shard_update::verify_app_frame_output(op, &anchor_output)
+    }
+
+    /// What GLOBAL frame `frame_number` checks of a shard frame header before
+    /// its certificate: it names an anchor, the anchor lies in the frame's
+    /// window, and the header's fields reproduce its output. The certificate
+    /// signs only the view and the output's digest, so until this passes a
+    /// header's other fields, its frame number among them, are claims.
+    /// An error of the unavailable class is a local gap: an anchor in the
+    /// window this node lacks. Any other error refuses the header on every
+    /// node, whatever its certificate.
+    pub fn check_anchor_and_output(
+        clock_store: Option<&dyn quil_types::store::ClockStore>,
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+    ) -> Result<()> {
+        Self::require_global_anchor(frame_number, op)?;
+        Self::refuse_anchor_outside_window(frame_number, op)?;
+        Self::verify_anchored_output(clock_store, op)
     }
 
     /// From the required-anchor epoch GLOBAL frame `frame_number` refuses a
@@ -2725,6 +2820,42 @@ impl GlobalIntrinsic {
             )));
         }
         Ok(())
+    }
+
+    /// GLOBAL frame `frame_number` refuses a shard frame header anchored
+    /// outside its lockstep window ([`super::frame_header::anchor_in_window`])
+    /// before anything reads the anchor. No node may hold such an anchor (a
+    /// future frame, a frame below its history, any number a leader writes),
+    /// and a read that failed would fail the frame on every node, for ever;
+    /// one held is refused by the storage audit anyway. Every node so refuses
+    /// it the same way, and the frame carrying it finishes. An anchor inside
+    /// the window that this node lacks stays unavailable: a local gap.
+    fn refuse_anchor_outside_window(
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+    ) -> Result<()> {
+        use super::frame_header::{
+            anchor_in_window, anchor_window, ANCHOR_AHEAD_OF_WINDOW, ANCHOR_OUTSIDE_WINDOW,
+        };
+        if op.global_frame_number == 0 || anchor_in_window(op.global_frame_number, frame_number) {
+            return Ok(());
+        }
+        let (oldest, newest) = anchor_window(frame_number);
+        let refusal = if op.global_frame_number > newest {
+            ANCHOR_AHEAD_OF_WINDOW
+        } else {
+            ANCHOR_OUTSIDE_WINDOW
+        };
+        Err(QuilError::InvalidArgument(format!(
+            "{refusal}shard {} frame {} anchors to GLOBAL frame {}, but GLOBAL frame {} \
+             requires an anchor in [{}, {}]",
+            hex::encode(&op.address),
+            op.frame_number,
+            op.global_frame_number,
+            frame_number,
+            oldest,
+            newest
+        )))
     }
 
     /// The difficulty of the GLOBAL frame a shard frame header anchors to,
@@ -2787,14 +2918,18 @@ impl GlobalIntrinsic {
         // to `latest − K` (a frame every committee member already holds), which
         // then lags the packing frame by K + transit. The window absorbs that.
         // Still rejects FUTURE anchors (> frame-1) and STALE ones (older than the
-        // window). Hard-reject: an out-of-window op invalidates the whole global
-        // frame (Err → invoke_frame_header → materialize), so a correct leader
-        // includes ONLY shard proofs whose beacon anchors within the window.
+        // window). An out-of-window header is refused (its step rolls back and
+        // the frame skips it); validation and `invoke_frame_header` refuse it
+        // first, by the same predicate, before reading the anchor. A correct
+        // leader includes ONLY shard proofs whose beacon anchors within the
+        // window.
         // `W = STORAGE_ANCHOR_LOCKSTEP_WINDOW` bounds ρ_N staleness (freshness).
-        let expected_anchor = frame_number.saturating_sub(1);
-        let oldest_anchor = expected_anchor
-            .saturating_sub(crate::global_intrinsic::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW);
-        if op.global_frame_number > expected_anchor || op.global_frame_number < oldest_anchor {
+        let (oldest_anchor, expected_anchor) =
+            crate::global_intrinsic::frame_header::anchor_window(frame_number);
+        if !crate::global_intrinsic::frame_header::anchor_in_window(
+            op.global_frame_number,
+            frame_number,
+        ) {
             return Err(QuilError::InvalidArgument(format!(
                 "storage attestation out of lockstep: anchor global_frame_number={} \
                  but global frame {} requires anchor in [{}, {}]",
@@ -3176,13 +3311,18 @@ impl GlobalIntrinsic {
                         &op.accumulator,
                     )?;
                     #[cfg(feature = "confidential-tokens")]
-                    crate::token_intrinsic::global_commit::materialize_relay(
-                        state,
-                        frame_number,
-                        &op.address,
-                        op.frame_number,
-                        &op.spends,
-                    )?;
+                    {
+                        super::commit_destinations::header_executed(frame_number, &op.address);
+                        let commit =
+                            crate::token_intrinsic::global_commit::materialize_relay_placed(
+                                state,
+                                frame_number,
+                                &op.address,
+                                op.frame_number,
+                                &op.spends,
+                            )?;
+                        self.log_commit_destinations(frame_number, &op.address, &commit, state);
+                    }
                 }
             }
             executed = Some(tip);
@@ -3470,6 +3610,7 @@ impl GlobalIntrinsic {
         // mutations but only AFTER the attestation has verified.
         let mut timing = HeaderTiming::start();
         Self::require_global_anchor(frame_number, op)?;
+        Self::refuse_anchor_outside_window(frame_number, op)?;
         let fp = self.frame_prover.as_ref().ok_or_else(|| {
             QuilError::Internal(
                 "invoke_frame_header: frame_prover not installed — cannot verify attestation"
@@ -3627,13 +3768,18 @@ impl GlobalIntrinsic {
         // this frame's order. The report is processed first so a spend can
         // cite the root it carries.
         #[cfg(feature = "confidential-tokens")]
-        let committed_fees = crate::token_intrinsic::global_commit::materialize_relay(
-            state,
-            frame_number,
-            &op.address,
-            op.frame_number,
-            &op.spends,
-        )?;
+        let committed_fees = {
+            super::commit_destinations::header_executed(frame_number, &op.address);
+            let commit = crate::token_intrinsic::global_commit::materialize_relay_placed(
+                state,
+                frame_number,
+                &op.address,
+                op.frame_number,
+                &op.spends,
+            )?;
+            self.log_commit_destinations(frame_number, &op.address, &commit, state);
+            commit.fees
+        };
         timing.mark("relay");
         #[cfg(not(feature = "confidential-tokens"))]
         let committed_fees = 0u128;
@@ -4195,6 +4341,8 @@ impl GlobalIntrinsic {
         super::handoff::superseded::flush_due(frame_number);
         #[cfg(feature = "confidential-tokens")]
         super::relay_coverage::flush_due(frame_number);
+        #[cfg(feature = "confidential-tokens")]
+        self.check_unstaffed_destinations(frame_number, state);
         state.stage_records([quil_types::store::RecordMutation {
             key: DUE_FRAME_KEY.to_vec(),
             value: Some(frame_number.to_be_bytes().to_vec()),
@@ -4486,6 +4634,122 @@ impl GlobalIntrinsic {
             None => Err(ABSENT),
             Some(((_, first), rest)) if rest.iter().all(|(_, order)| order == first) => Ok(first.clone()),
             Some(_) => Err("the frame record holds the merge in more than one order, and which applied is unknown"),
+        }
+    }
+
+    /// Every registered shard of this frame's grid as `(application,
+    /// shard)`; `None` when this node keeps no grid or it cannot be read.
+    /// One scan of the local shard rows plus this frame's staged records,
+    /// as [`Self::reconcile_orphaned_blocks`] reads them. Logging only.
+    #[cfg(feature = "confidential-tokens")]
+    fn registered_shards(
+        &self,
+        state: &HypergraphState,
+    ) -> Option<Vec<([u8; 32], super::commit_destinations::GridShard)>> {
+        let (Some(store), true) = (
+            self.shards_store.as_ref(),
+            self.shard_metadata_writes_enabled,
+        ) else {
+            return None;
+        };
+        let rows = quil_store::ShardMetadataBatch::new(store.clone(), state.pending_records())
+            .range_app_shards()
+            .ok()?;
+        Some(
+            rows.into_iter()
+                .filter_map(|row| {
+                    let application = <[u8; 32]>::try_from(row.shard_key.get(3..35)?).ok()?;
+                    let path = quil_forest::shard_bit_path_from_prefix(&row.prefix)
+                        .unwrap_or_else(|| quil_forest::prefix_to_bits(&row.prefix, 6));
+                    let filter = quil_forest::shard_prefix_to_filter(&application, &row.prefix);
+                    Some((
+                        application,
+                        super::commit_destinations::GridShard { path, filter },
+                    ))
+                })
+                .collect(),
+        )
+    }
+
+    /// `filter`'s active provers at GLOBAL frame `frame_number` from the
+    /// in-memory registry (one read lock, as the header's own committee
+    /// check takes); `None` without a registry or on a read error.
+    #[cfg(feature = "confidential-tokens")]
+    fn active_prover_count(&self, filter: &[u8], frame_number: u64) -> Option<usize> {
+        self.prover_registry
+            .as_deref()?
+            .get_active_provers(filter, frame_number)
+            .ok()
+            .map(|provers| provers.len())
+    }
+
+    /// The line naming the shards a header's committed outputs were routed
+    /// to, and the unstaffed-owner warnings
+    /// ([`super::commit_destinations`]). Reads nothing when it committed no
+    /// output or escrow. Logging only.
+    #[cfg(feature = "confidential-tokens")]
+    fn log_commit_destinations(
+        &self,
+        frame_number: u64,
+        source: &[u8],
+        commit: &crate::token_intrinsic::global_commit::RelayCommit,
+        state: &HypergraphState,
+    ) {
+        if commit.placed.is_empty() {
+            return;
+        }
+        let Some(application) = source.get(..32).and_then(|a| <[u8; 32]>::try_from(a).ok()) else {
+            return;
+        };
+        let grid: Option<Vec<super::commit_destinations::GridShard>> =
+            self.registered_shards(state).map(|rows| {
+                rows.into_iter()
+                    .filter(|(row_application, _)| *row_application == application)
+                    .map(|(_, shard)| shard)
+                    .collect()
+            });
+        super::commit_destinations::log_commit(
+            frame_number,
+            source,
+            &application,
+            grid.as_deref(),
+            commit,
+            |filter| self.active_prover_count(filter, frame_number),
+        );
+    }
+
+    /// Warn about the staffed shards holding committed outputs that execute
+    /// no header ([`super::commit_destinations::SILENT_FRAMES`]), and re-read
+    /// the staffing of those without active provers or warned silent, at most
+    /// once per [`super::commit_destinations::CHECK_INTERVAL`]; nothing while
+    /// none waits. Logging only.
+    #[cfg(feature = "confidential-tokens")]
+    fn check_unstaffed_destinations(&self, frame_number: u64, state: &HypergraphState) {
+        use super::commit_destinations::Staffing;
+        super::commit_destinations::check_silent(frame_number, |filter| {
+            self.active_prover_count(filter, frame_number)
+        });
+        let due = super::commit_destinations::due_checks();
+        if due.is_empty() {
+            return;
+        }
+        let registered: Option<std::collections::HashSet<Vec<u8>>> = self
+            .registered_shards(state)
+            .map(|rows| rows.into_iter().map(|(_, shard)| shard.filter).collect());
+        for filter in due {
+            let staffing = if registered
+                .as_ref()
+                .is_some_and(|registered| !registered.contains(&filter))
+            {
+                Staffing::LeftGrid
+            } else {
+                match self.active_prover_count(&filter, frame_number) {
+                    Some(0) => Staffing::Unstaffed,
+                    Some(count) => Staffing::Staffed(count),
+                    None => continue,
+                }
+            };
+            super::commit_destinations::resolve(frame_number, &filter, staffing);
         }
     }
 
@@ -5026,7 +5290,7 @@ impl GlobalIntrinsic {
         let mut absent: Vec<super::handoff::exclusion::Decision> = Vec::new();
         if super::handoff::exclusion::evaluates(frame_number) {
             let scan: &crate::prover_registry::CommittedProverScan =
-                scanned.insert(crate::prover_registry::CommittedProverScan::try_scan(hg)?);
+                scanned.insert(timed_prover_scan(hg, &timing.scan_ms)?);
             let mut desired = |filter: &[u8]| -> Result<Vec<Vec<u8>>> {
                 Ok(super::handoff::schedule::desired_members(
                     scan,
@@ -5055,9 +5319,10 @@ impl GlobalIntrinsic {
         // they authorize is visible to the reconciliation below. A fenced
         // membership successor takes the eligibility that reconciliation
         // compares against: the same scan, read only once a fence needs it.
+        let eligible_scan_ms = timing.scan_ms.clone();
         let mut eligible = |filter: &[u8]| -> Result<Vec<Vec<u8>>> {
             if scanned.is_none() {
-                scanned = Some(crate::prover_registry::CommittedProverScan::try_scan(hg)?);
+                scanned = Some(timed_prover_scan(hg, &eligible_scan_ms)?);
             }
             let desired = scanned.as_ref().map_or_else(Vec::new, |scan| {
                 super::handoff::schedule::desired_members(scan, filter, frame_number)
@@ -5122,7 +5387,7 @@ impl GlobalIntrinsic {
         }
         let mut scan = match scanned {
             Some(scan) => scan,
-            None => crate::prover_registry::CommittedProverScan::try_scan(hg)?,
+            None => timed_prover_scan(hg, &timing.scan_ms)?,
         };
         timing.allocations = Some(scan.allocations.len());
         timing.lap("prover scan");
@@ -6545,6 +6810,27 @@ mod tests {
     use crate::global_intrinsic::addressed_signature::AddressedSignature;
     use crate::global_schema::{write_field, write_type};
     use quil_types::crypto::KeyType;
+
+    /// The expected epoch-boundary scan (3.7 s for 25,600 allocations) logs
+    /// at info; a slow remainder, a slow scan-free pass or a scan past its
+    /// size-derived budget warns.
+    #[test]
+    fn session_pass_classification() {
+        use SessionPassLevel::*;
+        assert_eq!(classify_session_pass(3_800, 3_700, Some(25_600)), Info);
+        assert_eq!(classify_session_pass(1_600, 1_500, Some(25_600)), Info);
+        assert_eq!(classify_session_pass(200, 0, None), Quiet);
+        assert_eq!(classify_session_pass(499, 0, None), Quiet);
+        assert_eq!(classify_session_pass(500, 0, None), Warn);
+        // Scan fine, the rest slow.
+        assert_eq!(classify_session_pass(4_300, 3_700, Some(25_600)), Warn);
+        // Scan past 250 ms per 1,000 allocations (6.4 s here) and past 5 s.
+        assert_eq!(classify_session_pass(6_500, 6_450, Some(25_600)), Warn);
+        assert_eq!(classify_session_pass(6_300, 6_250, Some(25_600)), Info);
+        // The floor holds for a small shard.
+        assert_eq!(classify_session_pass(4_900, 4_850, Some(100)), Info);
+        assert_eq!(classify_session_pass(5_100, 5_050, Some(100)), Warn);
+    }
 
     /// From the required-anchor epoch GLOBAL refuses a shard frame header
     /// without a GLOBAL anchor, before any verification; an anchored header

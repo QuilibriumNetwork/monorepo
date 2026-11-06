@@ -1599,6 +1599,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             continue;
                                         }
                                         quil_engine::own_prover_ops::tracker().observe_frame(frame_num, &frame.requests);
+                                        super::seat_certificates::observe_frame(&frame);
 
                                         // An archive with atomic finalization keeps the
                                         // authenticated frame as a durable certified
@@ -1810,7 +1811,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                             if !archive_mode_recv {
                                                                 let reconciled = {
                                                                     let _reconcile = probe::section(ProbeSection::AllocationReconcile);
-                                                                    wa_for_recv.on_new_frame(exec_num)
+                                                                    wa_for_recv.on_new_frame_by("frame receive", exec_num)
                                                                 };
                                                                 if let Err(e) = reconciled {
                                                                     warn!(error = %e, "worker allocation failed");

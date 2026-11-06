@@ -18,7 +18,8 @@
 //! legacy message and refuses it, records no releases, and forms sessions by
 //! the steps it carries. Raising the minimum is therefore a new step at a
 //! future frame that every GLOBAL-materializing build must carry before it,
-//! never a change to a build's constants. Neither is scheduled on mainnet.
+//! never a change to a build's constants. Mainnet records releases from
+//! [`MAINNET_CONFIRM_RELEASE_FRAME`] and gates no session on them yet.
 //!
 //! Below the release frame a confirm's release bytes are ignored entirely:
 //! not decoded (so a confirm re-encodes as an older build re-encodes it), not
@@ -115,9 +116,11 @@ pub struct ReleaseMinimum {
 }
 
 /// From this GLOBAL frame a confirm signs and GLOBAL records its sender's
-/// release (see the module documentation). Not scheduled on mainnet;
-/// `QUIL_CONFIRM_RELEASE_FRAME` elsewhere, never by default.
-pub const MAINNET_CONFIRM_RELEASE_FRAME: Option<u64> = None;
+/// release (see the module documentation). Mainnet: 1,024,560, the first frame
+/// of epoch 1423, which GLOBAL cannot reach before 2026-11-07 00:00 UTC even at
+/// ten seconds a frame; `QUIL_CONFIRM_RELEASE_FRAME` elsewhere, never by
+/// default.
+pub const MAINNET_CONFIRM_RELEASE_FRAME: Option<u64> = Some(1_024_560);
 
 /// The mainnet release eligibility schedule, in strictly ascending frames.
 /// Add a step only once confirms carry releases
@@ -380,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn release_frames_and_steps_are_never_set_by_default() {
+    fn only_the_mainnet_release_frame_is_set_by_default() {
         // Without `init_*` the getters ignore the environment. Nextest runs
         // each test in its own process, and nothing in this crate's tests
         // calls `init_*`.
@@ -388,20 +391,26 @@ mod tests {
         std::env::set_var(RELEASE_ELIGIBILITY_ENV, "0=2.1.0.25.0");
         set_confirm_release_frame_for_thread(None);
         set_release_eligibility_for_thread(None).unwrap();
-        assert_eq!(MAINNET_CONFIRM_RELEASE_FRAME, None);
+        let mainnet = 1423 * quil_types::consensus::EPOCH_LENGTH_FRAMES;
+        assert_eq!(MAINNET_CONFIRM_RELEASE_FRAME, Some(mainnet));
         assert!(MAINNET_RELEASE_ELIGIBILITY.is_empty());
-        assert_eq!(confirm_release_frame(), u64::MAX);
-        assert_eq!(release_for_confirm(u64::MAX - 1), None);
+        assert_eq!(
+            confirm_release_frame(),
+            mainnet,
+            "without init, the mainnet frame"
+        );
+        assert_eq!(release_for_confirm(mainnet - 1), None);
+        assert_eq!(release_for_confirm(mainnet), Some(Release::current()));
         assert_eq!(
             minimum_release_at(u64::MAX),
             None,
             "an empty schedule gates nothing"
         );
         assert!(seat_eligible(None, u64::MAX));
-        assert_eq!(frame_for(MAINNET_CONFIRM_RELEASE_FRAME, 0, None), u64::MAX);
+        assert_eq!(frame_for(MAINNET_CONFIRM_RELEASE_FRAME, 0, None), mainnet);
         assert_eq!(
             frame_for(MAINNET_CONFIRM_RELEASE_FRAME, 0, Some("7")),
-            u64::MAX
+            mainnet
         );
         assert_eq!(frame_for(MAINNET_CONFIRM_RELEASE_FRAME, 1, Some("7")), 7);
         assert_eq!(

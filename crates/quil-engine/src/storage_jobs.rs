@@ -47,18 +47,20 @@
 //! waited through every seat's snapshot while the memory was there
 //! (2026-11-01).
 //!
-//! At most [`AHEAD_JOBS`] leaves are labelled ahead at once, whatever the
-//! memory lets: four of about 4.5 GB each held 17.9 GB of a 32 GB node's
-//! 20.5 GB (2026-11-01), and each takes a core. Persistent sectors, for
-//! epochs where persistent storage holds, run ahead on every slot the
-//! memory admits, beside those leaves. While a renewal's leaf is
-//! labelled now ([`Reservation::labelling_now`]), only
-//! [`AHEAD_JOBS_BESIDE_DUE`] goes on beside it; the others pause, keeping
-//! their memory and layers, and go on once it ends
-//! ([`Reservation::wait_while_paused`]): beside three or four leaves
-//! labelled ahead, a renewal's leaf ran at under 70% of its estimated pace
-//! and missed its grace, where three leaves at a time ran at 85 to 94%
-//! (2026-11-01).
+//! At most [`ahead_jobs_for`] leaves are labelled ahead at once, whatever
+//! the memory lets at a moment: [`AHEAD_JOBS`] on a node of 32 GB, where four
+//! of about 4.5 GB each held 17.9 GB of its 20.5 GB (2026-11-01), and more
+//! with more cores and memory: at two, a node of 55 seats registers no more
+//! leaves of 30 million nodes than one of 15 (3 an epoch), where without the
+//! cap such nodes registered 11 to 49 (2026-11-03). Persistent sectors, for
+//! epochs where persistent storage holds, run ahead on every slot the memory
+//! admits, beside those leaves. While a renewal's leaf is labelled now
+//! ([`Reservation::labelling_now`]), only [`ahead_beside_due`] go on beside
+//! it; the others pause, keeping their memory and layers, and go on once it
+//! ends ([`Reservation::wait_while_paused`]): beside three or four leaves
+//! labelled ahead, a 16-thread node's renewal leaf ran at under 70% of its
+//! estimated pace and missed its grace, where three leaves at a time ran at
+//! 85 to 94% (2026-11-01).
 //!
 //! A stopping node stops its jobs ([`shut_down`]) before it exits: they use
 //! its stores, which exit tears down under a thread still using them.
@@ -78,23 +80,51 @@ pub const EPOCH_PROOF_LANE: &[u8] = b"epoch proofs";
 /// the rest is headroom for the node and for the estimates' error.
 pub const MEMORY_SHARE_PERCENT: u64 = 75;
 
-/// Leaves labelled ahead at once ([`reserve_ahead`]), whatever the memory
-/// lets: each takes a core and about 152 bytes a node, 4.9 GB for a leaf of
-/// 32 million nodes. One asking beyond them waits in its order and starts
-/// once one of them ends: labelled, given back to more urgent work, or given
-/// up at its epoch's snapshot frame (`crate::storage_labels`). Work ahead
-/// for an epoch where persistent storage holds is not counted against it
-/// and may take every slot ([`ahead_in_parallel`]).
+/// Leaves labelled ahead at once ([`reserve_ahead`]) on the smallest node,
+/// whatever the memory lets; more on a larger one ([`ahead_jobs_for`]). Each
+/// takes a core and about 152 bytes a node, 4.9 GB for a leaf of 32 million
+/// nodes. One asking beyond them waits in its order and starts once one of
+/// them ends: labelled, given back to more urgent work, or given up at its
+/// epoch's snapshot frame (`crate::storage_labels`). Work ahead for an epoch
+/// where persistent storage holds is not counted against them and may take
+/// every slot ([`ahead_in_parallel`]).
 pub const AHEAD_JOBS: usize = 2;
 
-/// Leaves labelled ahead that go on while a renewal's leaf is labelled now
-/// ([`Reservation::labelling_now`]): the most urgent, then the most
-/// advanced. The others pause until no leaf is labelled now
+/// CPUs of the node per leaf labelled ahead ([`ahead_jobs_for`]): a quarter
+/// of its threads at most, half its cores where each has two, the rest left
+/// to its workers and to leaves labelled now.
+const AHEAD_JOB_CPUS: usize = 4;
+
+/// Bytes of the node's memory per leaf labelled ahead ([`ahead_jobs_for`]):
+/// about three times what a leaf of 32 million nodes holds, the rest left to
+/// the node and to work due now. A 32 GB node holds no more than
+/// [`AHEAD_JOBS`].
+const AHEAD_JOB_MEMORY: u64 = 16 << 30;
+
+/// The leaves a node of `cpus` CPUs and `memory` bytes labels ahead at once:
+/// never fewer than [`AHEAD_JOBS`]. The memory available at a moment still
+/// bounds them (`Admission::fits`).
+pub fn ahead_jobs_for(cpus: usize, memory: u64) -> usize {
+    let by_memory = usize::try_from(memory / AHEAD_JOB_MEMORY).unwrap_or(usize::MAX);
+    (cpus / AHEAD_JOB_CPUS).min(by_memory).max(AHEAD_JOBS)
+}
+
+/// Leaves labelled ahead that go on beside a leaf labelled now on the
+/// smallest node ([`ahead_beside_due`]).
+pub const AHEAD_JOBS_BESIDE_DUE: usize = 1;
+
+/// Of `ahead_jobs` leaves labelled ahead ([`ahead_jobs_for`]), those that go
+/// on while a renewal's leaf is labelled now
+/// ([`Reservation::labelling_now`]): the most urgent, then the most advanced.
+/// The others pause until no leaf is labelled now
 /// ([`Reservation::wait_while_paused`]), at the latest at the renewal's
 /// grace frame, where its snapshot stops. With none, a leaf of 32 million
 /// nodes could not be labelled ahead in what the window has left after a
-/// grace; one keeps one such leaf going.
-pub const AHEAD_JOBS_BESIDE_DUE: usize = 1;
+/// grace; half of them, and at least [`AHEAD_JOBS_BESIDE_DUE`], keep such
+/// leaves going and leave the cores to what is due.
+pub fn ahead_beside_due(ahead_jobs: usize) -> usize {
+    (ahead_jobs / 2).max(AHEAD_JOBS_BESIDE_DUE)
+}
 
 /// How often labelling ahead that pauses ([`Reservation::wait_while_paused`])
 /// looks whether its work is still of use, besides whenever a reservation
@@ -427,8 +457,9 @@ pub fn ahead_place() -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AheadOrder {
     /// Whether the work could also be done when it is needed (a leaf its
-    /// snapshot labels within the renewal's grace): such work goes after all
-    /// that could not, and gives its memory back to it while that waits.
+    /// snapshot labels within half the renewal's grace): such work goes
+    /// after all that could not, and gives its memory back to it while that
+    /// waits.
     pub deferrable: bool,
     /// How many leaves of its seat could not: seats needing fewer go first,
     /// so the memory finishes whole seats.
@@ -454,7 +485,26 @@ pub fn reserve_settlement(bytes: u64) -> Reservation {
 
 fn admission() -> &'static Admission {
     static ADMISSION: OnceLock<Admission> = OnceLock::new();
-    ADMISSION.get_or_init(|| Admission::new(job_slots(), Box::new(available_memory)))
+    ADMISSION.get_or_init(|| {
+        let slots = job_slots();
+        let mut admission = Admission::new(slots, Box::new(available_memory));
+        // `job_slots` is one per CPU less the master's.
+        let cpus = slots.saturating_add(1);
+        // Tests size the node's admission as the smallest node's, whatever
+        // the host; those of a larger node's cap build their own.
+        let memory = if cfg!(test) { None } else { total_memory() };
+        admission.ahead_jobs = memory.map_or(AHEAD_JOBS, |memory| ahead_jobs_for(cpus, memory));
+        admission.ahead_beside_due = ahead_beside_due(admission.ahead_jobs);
+        info!(
+            ahead_jobs = admission.ahead_jobs,
+            beside_due = admission.ahead_beside_due,
+            cpus,
+            memory_bytes = memory.unwrap_or(0),
+            "storage labelling ahead sized for this node: up to this many leaves are labelled \
+             ahead at once, and this many go on beside a leaf labelled now"
+        );
+        admission
+    })
 }
 
 /// Whether a reservation's work is due now (a snapshot a renewal waits for,
@@ -539,23 +589,30 @@ pub fn for_each_parallel<T: Sync, R: Send>(
     let stable_key = quil_types::consensus::stable_replica_key_epoch_thread_override();
     let persistent = quil_types::consensus::persistent_storage_epoch_thread_override();
     std::thread::scope(|scope| {
-        for _ in 0..job_slots().min(items.len()) {
-            scope.spawn(|| {
-                quil_types::consensus::set_stable_replica_key_epoch_for_thread(stable_key);
-                quil_types::consensus::set_persistent_storage_epoch_for_thread(persistent);
-                on_process_cpus();
-                loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    if index >= items.len() || failed.load(Ordering::Relaxed) || jobs().stopping() {
-                        break;
+        for slot in 0..job_slots().min(items.len()) {
+            std::thread::Builder::new()
+                .name(format!("stor-leaf-{slot}"))
+                .spawn_scoped(scope, || {
+                    quil_types::consensus::set_stable_replica_key_epoch_for_thread(stable_key);
+                    quil_types::consensus::set_persistent_storage_epoch_for_thread(persistent);
+                    on_process_cpus();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        if index >= items.len()
+                            || failed.load(Ordering::Relaxed)
+                            || jobs().stopping()
+                        {
+                            break;
+                        }
+                        let result = work(&items[index]);
+                        if result.is_err() {
+                            failed.store(true, Ordering::Relaxed);
+                        }
+                        results.lock().unwrap_or_else(PoisonError::into_inner)[index] =
+                            Some(result);
                     }
-                    let result = work(&items[index]);
-                    if result.is_err() {
-                        failed.store(true, Ordering::Relaxed);
-                    }
-                    results.lock().unwrap_or_else(PoisonError::into_inner)[index] = Some(result);
-                }
-            });
+                })
+                .expect("spawn a storage leaf thread");
         }
     });
     let mut out = Vec::with_capacity(items.len());
@@ -651,6 +708,19 @@ fn needs_available(bytes: u64) -> u64 {
     u64::try_from(needed).unwrap_or(u64::MAX)
 }
 
+/// Bytes of memory the node has at all: the host's, or its container's limit
+/// when less. `None` when the host does not say.
+fn total_memory() -> Option<u64> {
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    let host = system.total_memory();
+    if host == 0 {
+        return None;
+    }
+    let container = system.cgroup_limits().map(|limits| limits.total_memory);
+    Some(container.map_or(host, |container| container.min(host)))
+}
+
 /// Memory a job holds while it works, granted by [`reserve`] and given back
 /// when dropped.
 #[must_use = "the memory is given back when the reservation drops"]
@@ -695,7 +765,7 @@ impl Reservation {
 
     /// Mark this reservation, for work due now, as labelling a leaf now (a
     /// renewal's snapshot without labels kept ahead for it): while it is
-    /// held, labelling ahead beyond [`AHEAD_JOBS_BESIDE_DUE`] pauses and
+    /// held, labelling ahead beyond [`ahead_beside_due`] pauses and
     /// none more starts, so the leaf has the node's cores (2026-11-01: beside
     /// three or four leaves labelled ahead, a renewal's leaf of 15 million
     /// nodes estimated at 37 minutes was still labelled after 3,137 s, at its
@@ -712,7 +782,7 @@ impl Reservation {
     }
 
     /// Whether labelling ahead holding this reservation pauses now: a leaf
-    /// is labelled now, and [`AHEAD_JOBS_BESIDE_DUE`] leaves labelled ahead
+    /// is labelled now, and [`ahead_beside_due`] leaves labelled ahead
     /// more urgent or more advanced go on beside it.
     pub fn paused(&self) -> bool {
         self.admission.pauses(&self.admission.state(), self.ticket)
@@ -784,10 +854,12 @@ pub struct Admission {
     pass_window: Duration,
     changed: Condvar,
     slots: usize,
-    /// [`AHEAD_JOBS`]; more in tests of the memory alone.
+    /// [`ahead_jobs_for`]; more in tests of the memory alone.
     ahead_jobs: usize,
     /// Work ahead in parallel ([`ahead_in_parallel`]) at once: the slots.
     parallel_ahead_jobs: usize,
+    /// [`ahead_beside_due`].
+    ahead_beside_due: usize,
     available: Box<dyn Fn() -> Option<u64> + Send + Sync>,
     /// [`LOOK_WINDOW`], shorter in tests.
     window: Duration,
@@ -940,6 +1012,7 @@ impl Admission {
             slots: slots.max(1),
             ahead_jobs: AHEAD_JOBS,
             parallel_ahead_jobs: slots.max(1),
+            ahead_beside_due: AHEAD_JOBS_BESIDE_DUE,
             available,
             window: LOOK_WINDOW,
             held_back_warn: AHEAD_HELD_BACK_WARN,
@@ -1335,8 +1408,8 @@ impl Admission {
             seconds = held_back.since.elapsed().as_secs_f64(),
             "storage jobs ahead held back for memory for a whole epoch: this host has too little \
              memory available to label leaves ahead, so each snapshot labels its leaves itself \
-             within its renewal's grace, and a seat whose leaf cannot be labelled in time misses \
-             that epoch's storage share; free memory on this host (fewer data workers, other \
+             within its renewal's grace, and a seat whose leaf cannot be labelled in time renews \
+             without a storage registration that epoch; free memory on this host (fewer data workers, other \
              processes) so that needs_available bytes are available"
         );
     }
@@ -1484,8 +1557,8 @@ impl Admission {
 
     /// How many leaves labelled ahead may hold memory at once: in parallel
     /// ([`ahead_in_parallel`]) every slot, counting all work ahead; else
-    /// [`AHEAD_JOBS`], counting only work ahead not in parallel
-    /// ([`Self::ahead_holding`]). [`AHEAD_JOBS_BESIDE_DUE`] while a leaf is
+    /// [`ahead_jobs_for`], counting only work ahead not in parallel
+    /// ([`Self::ahead_holding`]). [`ahead_beside_due`] while a leaf is
     /// labelled now ([`Reservation::labelling_now`]).
     fn ahead_cap(&self, state: &State, parallel: bool) -> usize {
         let cap = if parallel {
@@ -1494,7 +1567,7 @@ impl Admission {
             self.ahead_jobs.min(self.parallel_ahead_jobs)
         };
         if state.labelling_now > 0 {
-            cap.min(AHEAD_JOBS_BESIDE_DUE)
+            cap.min(self.ahead_beside_due)
         } else {
             cap
         }
@@ -1523,7 +1596,7 @@ impl Admission {
 
     /// Whether the labelling ahead holding `ticket` pauses
     /// ([`Reservation::wait_while_paused`]): a leaf is labelled now and
-    /// [`AHEAD_JOBS_BESIDE_DUE`] leaves labelled ahead go on before it, the
+    /// [`ahead_beside_due`] leaves labelled ahead go on before it, the
     /// more urgent first, then the more advanced
     /// ([`Reservation::progress`]). Never one asked to give its memory back:
     /// it is leaving.
@@ -1542,7 +1615,7 @@ impl Admission {
             .iter()
             .filter(|&(&other, held)| !held.asked && key(other, held) < own)
             .count()
-            >= AHEAD_JOBS_BESIDE_DUE
+            >= self.ahead_beside_due
     }
 
     /// Whether the waiting reservation `ticket`, which does not fit, holds
@@ -2418,6 +2491,96 @@ mod tests {
         drop((first, third.release, read.release, due.release));
     }
 
+    /// The cap on labelling ahead follows the node: two on a 16-thread node
+    /// of 32 GB, as measured there (2026-11-01), and on any smaller; more
+    /// only with both more cores and more memory.
+    #[test]
+    fn a_larger_node_labels_more_leaves_ahead_at_once() {
+        const GB: u64 = 1_000_000_000;
+        for (cpus, memory, jobs, beside) in [
+            (4, 8 * GB, 2, 1),
+            (8, 32 * GB, 2, 1),
+            (16, 32 * GB, 2, 1),
+            (16, 1024 * GB, 4, 2),
+            (2, 1024 * GB, 2, 1),
+            (24, 62 * GIB, 3, 1),
+            (32, 64 * GB, 3, 1),
+            (64, 256 * GB, 14, 7),
+            (256, 1024 * GB, 59, 29),
+        ] {
+            let got = ahead_jobs_for(cpus, memory);
+            assert_eq!(got, jobs, "{cpus} CPUs, {memory} bytes");
+            assert_eq!(ahead_beside_due(got), beside, "beside {got} leaves");
+        }
+    }
+
+    /// A node sized for four leaves labels four ahead and starts no fifth;
+    /// beside a leaf labelled now the two most advanced go on and the others
+    /// pause.
+    #[test]
+    fn a_larger_nodes_cap_bounds_its_labelling_ahead_and_pauses_half_beside_a_renewal() {
+        let mut sized = Admission::new(16, Box::new(|| Some(1 << 50)));
+        sized.ahead_jobs = 4;
+        sized.ahead_beside_due = ahead_beside_due(4);
+        let admission: &'static Admission = Box::leak(Box::new(sized));
+        let leaves: Vec<Reservation> = (0..4u32)
+            .map(|leaf| {
+                let held = reserve_now(admission, GIB, ahead(false, 1, u64::from(leaf)));
+                held.progress(u64::from(9 - leaf), 10);
+                held
+            })
+            .collect();
+        let fifth = hold_yielding(admission, GIB, ahead(false, 1, 4));
+        assert!(
+            fifth.granted.recv_timeout(NOT_YET).is_err(),
+            "a fifth waits though memory and slots are free"
+        );
+        let due = labelling_now(admission, GIB);
+        let paused: Vec<bool> = leaves.iter().map(|leaf| leaf.paused()).collect();
+        assert_eq!(
+            paused,
+            [false, false, true, true],
+            "the two most advanced go on beside a leaf labelled now"
+        );
+        drop(due);
+        assert!(leaves.iter().all(|leaf| !leaf.paused()));
+        drop(leaves);
+        assert!(
+            fifth.granted.recv_timeout(SOON).is_ok(),
+            "it starts once they end"
+        );
+        drop(fifth.release);
+    }
+
+    /// Beside a leaf labelled now, a node sized for four leaves ahead starts
+    /// labelling ahead while fewer than half of them hold memory
+    /// ([`ahead_beside_due`]), not while one does.
+    #[test]
+    fn beside_a_leaf_labelled_now_a_larger_node_starts_half_its_cap() {
+        let mut sized = Admission::new(16, Box::new(|| Some(1 << 50)));
+        sized.ahead_jobs = 4;
+        sized.ahead_beside_due = ahead_beside_due(4);
+        let admission: &'static Admission = Box::leak(Box::new(sized));
+        let due = labelling_now(admission, GIB);
+        let first = reserve_now(admission, GIB, ahead(false, 1, 0));
+        let second = hold_yielding(admission, GIB, ahead(false, 1, 1));
+        assert!(
+            second.granted.recv_timeout(SOON).is_ok(),
+            "a second starts beside the leaf labelled now"
+        );
+        let third = hold_yielding(admission, GIB, ahead(false, 1, 2));
+        assert!(
+            third.granted.recv_timeout(NOT_YET).is_err(),
+            "a third waits while it is labelled"
+        );
+        drop(due);
+        assert!(
+            third.granted.recv_timeout(SOON).is_ok(),
+            "it starts once the leaf labelled now ends"
+        );
+        drop((first, second.release, third.release));
+    }
+
     /// While a renewal's leaf is labelled now, labelling ahead goes on beside
     /// it for [`AHEAD_JOBS_BESIDE_DUE`] leaf only, the most urgent, then the
     /// most advanced; the others pause, holding their memory, and go on once
@@ -2514,7 +2677,7 @@ mod tests {
     }
 
     /// While a leaf is labelled now, no more labelling ahead starts than may
-    /// go on beside it ([`AHEAD_JOBS_BESIDE_DUE`]); once it ends,
+    /// go on beside it ([`ahead_beside_due`]); once it ends,
     /// [`AHEAD_JOBS`] again.
     #[test]
     fn beside_a_leaf_labelled_now_no_more_labelling_ahead_starts_than_goes_on() {
@@ -3304,5 +3467,22 @@ mod tests {
             leaves.iter().all(|&cpus| cpus == process),
             "the leaves' threads run on {leaves:?} of {process} CPUs"
         );
+    }
+
+    /// A seat's leaves run on named threads, so a crash on one (a stack
+    /// overflow, say) names the work it ran.
+    #[test]
+    fn a_seats_leaves_run_on_named_threads() {
+        let names = for_each_parallel(&[(); 4], |_| {
+            Ok(std::thread::current().name().map(str::to_owned))
+        })
+        .unwrap();
+        for name in &names {
+            assert!(
+                name.as_deref()
+                    .is_some_and(|name| name.starts_with("stor-leaf-")),
+                "the leaves ran on threads named {names:?}"
+            );
+        }
     }
 }

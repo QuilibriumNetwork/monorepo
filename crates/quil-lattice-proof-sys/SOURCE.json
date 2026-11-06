@@ -43,7 +43,7 @@
     "vendor/labrados/labrador_core.h": "fa1e3923f169ab283ed20481c985e33576bcc27c1621c2e790573e27fdd402e2",
     "vendor/labrados/labrador_tail.c": "f15da57fdc55bf4b2f7fe70ec1318ec9bbf075de0bc3e90cd888549ea8c2985c",
     "vendor/labrados/labrador_tail.h": "9da49afdb95badd53a67af388bf907de65b5bdee73a580c6820f2be1006c7ac2",
-    "vendor/labrados/labrados_python.c": "a4197d8b99388fe257c302942a55bb8293d49d8feb2892b43f7c5ec76ac9ade3",
+    "vendor/labrados/labrados_python.c": "cefba6d8bf6debd6cb1e035aa81306b45077f52466e2ff497ebc686f082ee4f2",
     "vendor/labrados/labrados_python.h": "671938cbdca16deac8f5e561bb5f46ba08de2de85b2700febd5b456483b73e26",
     "vendor/labrados/lnp.c": "c4c78eb8db74df77aac629e934363ef182ab9bfae03e478b3eeb0c428ba57767",
     "vendor/labrados/lnp.h": "f0831efb10e5f12d2955a3c46ea8aec540ac8ded91bfd30fc7cd57dd87646954",
@@ -584,5 +584,6 @@
   "diagnostic_policy": "No unconditional mask-rejection retry logging. DEBUG dumps, NDEBUG assertion removal, and disabled native randomness/masking/rejection configurations are rejected; optional coarse resource tracing remains available.",
   "private_prg": "LNP uses a fresh 32-byte private seed and AES-256 streams for Gaussian masks, uniform masks, uniform bytes and rejection draws. Shared sampler kernels preserve public AES-128 interfaces. Does not revise public transcript/challenge security parameters.",
   "x86_native": "QUIL_LATTICE_X86_NATIVE (build.rs): unset or 0 keeps SIMDE_NO_NATIVE on x86-64; 1 compiles natively for the C target (CFLAGS), the shim forwarding to the system immintrin.h and each scalar adapter applying only when the target lacks its feature (AVX512F/BW/DQ, VAES, AES), under quil_-prefixed names; avx512 also fails the build without AVX-512 F/BW/DQ/VL. docker/Dockerfile.source sets 1 (baseline x86-64, SSE2), docker/Dockerfile.sourceavx512 sets avx512. ARM64 assembly is unchanged.",
-  "witness_retry": "LNP returns status 2 instead of asserting when its input witness fails verify() (Labradoodle's amortized witness has no rejection bound); pack_prove passes the status through and the adapter retries with fresh randomness up to 8 times, logging each failed attempt, then returns 8. witness_fault.h is a test-only fault counter. Proof relations and parameters unchanged."
+  "witness_retry": "LNP returns status 2 instead of asserting when its input witness fails verify() (Labradoodle's amortized witness has no rejection bound); pack_prove passes the status through and the adapter retries with fresh randomness up to 8 times, logging each failed attempt, then returns 8. witness_fault.h is a test-only fault counter. Proof relations and parameters unchanged.",
+  "stdout_quiet": "py_gen_params prints its proof-size estimate only when its debug argument is set (the adapter passes 0), so proving and verifying write nothing to stdout; TIMING stays undefined, so timing_print is empty. Proof relations and parameters unchanged."
 }

@@ -210,10 +210,36 @@ impl Blob for JournalBlob {
     }
 }
 
+/// Tags the calling thread as belonging to a host's owner, for its log lines.
+pub type ThreadTag = Arc<dyn Fn() + Send + Sync>;
+
+/// Runs [`ThreadTag`] before each poll of a task: a host's runtime moves its
+/// tasks between threads it starts itself, and offers no hook on them.
+struct Tagged<F> {
+    tag: Option<ThreadTag>,
+    future: std::pin::Pin<Box<F>>,
+}
+
+impl<F: Future> Future for Tagged<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        let this = self.get_mut();
+        if let Some(tag) = this.tag.as_ref() {
+            tag();
+        }
+        this.future.as_mut().poll(context)
+    }
+}
+
 /// Runtime capabilities are forwarded unchanged; only journal Storage differs.
 pub(crate) struct JournalContext {
     inner: Context,
     files: Arc<Files>,
+    tag: Option<ThreadTag>,
 }
 
 impl JournalContext {
@@ -226,7 +252,17 @@ impl JournalContext {
             tasks: AtomicUsize::new(0),
             idle: Notify::new(),
         });
-        Self { inner, files }
+        Self {
+            inner,
+            files,
+            tag: None,
+        }
+    }
+
+    /// Run `tag` before each poll of every task spawned from this context.
+    pub(crate) fn with_thread_tag(mut self, tag: Option<ThreadTag>) -> Self {
+        self.tag = tag;
+        self
     }
 
     /// Hold the owning runtime until all child contexts and blobs are dropped.
@@ -408,12 +444,14 @@ impl Supervisor for JournalContext {
         Self {
             inner: self.inner.child(label),
             files: self.files.clone(),
+            tag: self.tag.clone(),
         }
     }
     fn with_attribute(self, key: &'static str, value: impl std::fmt::Display) -> Self {
         Self {
             inner: self.inner.with_attribute(key, value),
             files: self.files,
+            tag: self.tag,
         }
     }
 }
@@ -423,12 +461,14 @@ impl Spawner for JournalContext {
         Self {
             inner: self.inner.shared(blocking),
             files: self.files,
+            tag: self.tag,
         }
     }
     fn dedicated(self) -> Self {
         Self {
             inner: self.inner.dedicated(),
             files: self.files,
+            tag: self.tag,
         }
     }
     fn spawn<F, Fut, T>(self, f: F) -> Handle<T>
@@ -438,15 +478,23 @@ impl Spawner for JournalContext {
         T: Send + 'static,
     {
         let files = self.files;
+        let tag = self.tag;
         let task = Task::new(files.clone());
         self.inner.spawn(move |inner| {
             // Keep these fields together even before the task's first poll.
             // JournalContext drops inner before files, so observing the last
             // Files reference released also observes this Context released.
-            let context = Self { inner, files };
-            async move {
-                let _task = task;
-                f(context).await
+            let context = Self {
+                inner,
+                files,
+                tag: tag.clone(),
+            };
+            Tagged {
+                tag,
+                future: Box::pin(async move {
+                    let _task = task;
+                    f(context).await
+                }),
             }
         })
     }
@@ -524,6 +572,42 @@ mod tests {
     use commonware_storage::journal::segmented::variable::{Config, Journal};
     use commonware_utils::{NZUsize, NZU16};
     use futures::StreamExt;
+
+    std::thread_local! {
+        static TAGGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Every task a tagged context spawns, however deep and on whichever kind
+    /// of thread, runs each poll on a tagged thread.
+    #[test]
+    fn every_poll_of_a_spawned_task_runs_on_a_tagged_thread() {
+        let directory = Directory::new();
+        directory.runner().start(|context| async move {
+            let tag: ThreadTag = Arc::new(|| TAGGED.with(|tagged| tagged.set(true)));
+            let context = JournalContext::new(context).with_thread_tag(Some(tag));
+            let task = |context: JournalContext| async move {
+                for _ in 0..50 {
+                    assert!(TAGGED.with(std::cell::Cell::get), "untagged poll");
+                    context.sleep(Duration::from_millis(1)).await;
+                    assert!(TAGGED.with(std::cell::Cell::get), "untagged poll");
+                }
+            };
+            let nested = context.child("outer").spawn(move |context| async move {
+                assert!(TAGGED.with(std::cell::Cell::get), "untagged poll");
+                context
+                    .child("inner")
+                    .with_attribute("kind", "nested")
+                    .spawn(task)
+                    .await
+                    .unwrap();
+            });
+            nested.await.unwrap();
+            let shared = context.child("shared").shared(true).spawn(task);
+            shared.await.unwrap();
+            let dedicated = context.child("dedicated").dedicated().spawn(task);
+            dedicated.await.unwrap();
+        });
+    }
 
     struct Directory(std::path::PathBuf);
     impl Directory {

@@ -16,7 +16,7 @@ use axum::{
 };
 use base64::Engine as _;
 use num_bigint::{BigInt, Sign};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 
 use quil_execution::prover_registry::{
@@ -427,16 +427,28 @@ fn peer_json(info: &quil_p2p::CanonicalPeerInfo) -> PeerInfoJson {
     }
 }
 
+/// The peers the node knows: the received PeerInfo plus its own, which it
+/// never receives. Its own replaces any cached record of the same peer ID.
+fn known_peers(
+    cache: &RwLock<HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>>,
+    own: &RwLock<Option<quil_p2p::CanonicalPeerInfo>>,
+) -> Vec<quil_p2p::CanonicalPeerInfo> {
+    let own = own.read().as_ref().map(peer_fields);
+    let mut peers: Vec<quil_p2p::CanonicalPeerInfo> = cache
+        .read()
+        .values()
+        .filter(|info| own.as_ref().is_none_or(|o| o.peer_id != info.peer_id))
+        .map(peer_fields)
+        .collect();
+    peers.extend(own);
+    peers
+}
+
 pub async fn handle_peers(method: Method, State(state): State<ExplorerState>) -> Response {
     if !is_get(&method) {
         return method_not_allowed();
     }
-    let peers: Vec<quil_p2p::CanonicalPeerInfo> = state
-        .peer_info_cache
-        .read()
-        .values()
-        .map(peer_fields)
-        .collect();
+    let peers = known_peers(&state.peer_info_cache, &state.own_peer_info);
     let mut response: Vec<PeerInfoJson> = peers.iter().map(peer_json).collect();
     // Sort by last_seen desc, tie-break peer_id asc (Go's slices.SortFunc).
     response.sort_by(|a, b| {
@@ -582,10 +594,8 @@ pub async fn handle_peer_releases(method: Method, State(state): State<ExplorerSt
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64);
     let global_head = state.current_frame.load(Ordering::Relaxed);
-    let response = {
-        let map = state.peer_info_cache.read();
-        peer_releases(map.values(), now_ms, global_head)
-    };
+    let peers = known_peers(&state.peer_info_cache, &state.own_peer_info);
+    let response = peer_releases(&peers, now_ms, global_head);
     json_ok(&response, Some(CACHE_60))
 }
 
@@ -1286,7 +1296,7 @@ fn active_allocations_by_filter(provers: &[ProverInfo], frame: u64) -> HashMap<V
 /// fresh (`allocation_fresh_at`, with the shard's halt credit), keyed by
 /// confirmation filter: the fresh count its stall exemption
 /// (`shard_progressing`) uses. `signed_frame_activation` is
-/// `SIGNED_FRAME_ACTIVATION_FRAME` outside tests.
+/// `signed_frame_activation_frame()` outside tests.
 fn fresh_allocations_by_filter(
     provers: &[ProverInfo],
     frame: u64,
@@ -1504,7 +1514,7 @@ fn assess_eviction(
         frame,
         halts,
         threshold,
-        quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+        quil_types::consensus::signed_frame_activation_frame(),
     );
     let progressing = |filter: &[u8]| {
         shard_progressing(
@@ -2696,6 +2706,54 @@ mod tests {
         assert!(to_str(&census).contains("\"release\":\"2.1.0.25.93\""));
     }
 
+    /// `peer` with the peer ID `id`.
+    fn peer_with_id(id: u8, archive: bool, timestamp: i64) -> quil_p2p::CanonicalPeerInfo {
+        quil_p2p::CanonicalPeerInfo {
+            peer_id: vec![id; 4],
+            ..peer(Some(93), id, archive, 9_000, timestamp)
+        }
+    }
+
+    #[test]
+    fn the_node_lists_its_own_peer_info_once() {
+        let now = 10_000_000;
+        let cache = RwLock::new(
+            (1..=3u8)
+                .map(|id| (vec![id; 4], peer_with_id(id, true, now - 1_000)))
+                .collect::<HashMap<_, _>>(),
+        );
+        let own = RwLock::new(None);
+        assert_eq!(known_peers(&cache, &own).len(), 3, "nothing published yet");
+
+        *own.write() = Some(peer_with_id(4, true, now - 500));
+        let peers = known_peers(&cache, &own);
+        let ids: BTreeSet<_> = peers.iter().map(|p| p.peer_id.clone()).collect();
+        assert_eq!(
+            (peers.len(), ids.len()),
+            (4, 4),
+            "the hosting node is missing from /peers"
+        );
+        let listed: Vec<_> = peers.iter().map(peer_json).collect();
+        assert!(listed
+            .iter()
+            .any(|p| p.peer_id == bs58::encode([4u8; 4]).into_string()));
+        let census = peer_releases(&peers, now, 9_000);
+        assert_eq!(
+            (census.peers, census.releases[0].archives),
+            (4, 4),
+            "the hosting node is missing from /peers/releases"
+        );
+
+        // A cached record of the node itself gives way to the current one.
+        cache
+            .write()
+            .insert(vec![4; 4], peer_with_id(4, false, now - 9_000));
+        let peers = known_peers(&cache, &own);
+        let ours: Vec<_> = peers.iter().filter(|p| p.peer_id == vec![4; 4]).collect();
+        assert_eq!((peers.len(), ours.len()), (4, 1));
+        assert_eq!(ours[0].timestamp, now - 500);
+    }
+
     #[test]
     fn quil_str_is_exact() {
         assert_eq!(quil_str(8_000_000_000), "1");
@@ -3411,7 +3469,7 @@ mod tests {
             frame,
             &halts,
             threshold,
-            quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+            quil_types::consensus::signed_frame_activation_frame(),
         );
         let census = |filter: u8| {
             let get = |m: &HashMap<Vec<u8>, u64>| m.get(&vec![filter]).copied().unwrap_or(0);
@@ -3473,7 +3531,7 @@ mod tests {
             let get = |m: &HashMap<Vec<u8>, u64>| m.get(&vec![filter]).copied().unwrap_or(0);
             (get(&active), get(&fresh))
         };
-        let default = quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME;
+        let default = quil_types::consensus::signed_frame_activation_frame();
         assert_eq!(census(default, 0xDD), (6, 4));
         assert_eq!(census(default, 0xEE), (6, 4));
         assert_eq!(census(activation, 0xDD), (6, 0));

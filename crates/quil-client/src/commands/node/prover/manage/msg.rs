@@ -17,6 +17,11 @@ pub enum Msg {
         /// The saved mint authorizations, read with it.
         mints: Vec<super::mint::Saved>,
     },
+    /// A legacy read under way: the pages read and the coins listed so far.
+    LegacyProgress {
+        pages: usize,
+        coins: usize,
+    },
     /// The mint confirmation's reads and quote, or why there is none.
     MintPreview(Result<super::mint::Preview, String>),
     /// A running mint's or claim's report.

@@ -269,9 +269,18 @@ impl<
     }
 
     /// Adds a vote that we constructed ourselves to the verifier.
+    ///
+    /// QUILIBRIUM: the vote channel also delivers our own broadcasts to us
+    /// (quil-cw-consensus `build_vote_channel`), and that copy can reach the
+    /// batcher first. It was already reported and added, so an equal stored
+    /// vote is ignored; a differing one still panics.
     pub fn add_constructed(&mut self, message: Vote<S, D>) {
         match &message {
             Vote::Notarize(notarize) => {
+                if echoed(self.votes.notarize(notarize.signer()), notarize, "notarize") {
+                    return;
+                }
+
                 // Report activity
                 self.reporter.report(Activity::Notarize(notarize.clone()));
 
@@ -282,6 +291,10 @@ impl<
                 );
             }
             Vote::Nullify(nullify) => {
+                if echoed(self.votes.nullify(nullify.signer()), nullify, "nullify") {
+                    return;
+                }
+
                 // Report activity
                 self.reporter.report(Activity::Nullify(nullify.clone()));
 
@@ -292,6 +305,10 @@ impl<
                 );
             }
             Vote::Finalize(finalize) => {
+                if echoed(self.votes.finalize(finalize.signer()), finalize, "finalize") {
+                    return;
+                }
+
                 // Report activity
                 self.reporter.report(Activity::Finalize(finalize.clone()));
 
@@ -512,4 +529,15 @@ impl<
         self.mark_finalized();
         Some(finalization)
     }
+}
+
+/// QUILIBRIUM: returns whether `stored`, the vote already held for our own
+/// slot, is the looped-back copy of `vote`. Our own votes are unique, so a
+/// differing one panics as upstream does for any duplicate.
+fn echoed<V: PartialEq>(stored: Option<&V>, vote: &V, kind: &str) -> bool {
+    let Some(stored) = stored else {
+        return false;
+    };
+    assert!(stored == vote, "duplicate {kind}");
+    true
 }

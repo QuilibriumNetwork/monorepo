@@ -433,6 +433,43 @@ mod tests {
         }
     }
 
+    /// The signed label names the release file: a quorum-signed release
+    /// renamed to a short command name, with its release files renamed beside
+    /// it, is refused, and the same files pass under the release name. A
+    /// release image must keep that name and link it.
+    #[test]
+    fn a_release_renamed_to_a_command_name_is_refused() {
+        use ed448_rust::{PrivateKey, KEY_LENGTH};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let name = "node-2.1.0.25-linux-amd64";
+        let digest: [u8; 32] = Sha3_256::digest(b"release").into();
+        let dgst = format!("SHA3-256({name})= {}\n", hex::encode(digest));
+        let sk = PrivateKey::from([0xD4u8; KEY_LENGTH]);
+        let sig = sk.sign(dgst.as_bytes(), None).unwrap();
+        let pk_hex = hex::encode(PublicKey::from(&sk).as_byte());
+        let place = |file: &str| {
+            let exe = tmp.path().join(file);
+            std::fs::write(&exe, b"release").unwrap();
+            std::fs::write(append_suffix(&exe, ".dgst"), &dgst).unwrap();
+            std::fs::write(append_suffix(&exe, ".dgst.sig.1"), sig).unwrap();
+            exe
+        };
+
+        let released = place(name);
+        assert_eq!(
+            verify_release_signatures_with(&released, &[pk_hex.as_str()]).unwrap(),
+            1
+        );
+        let renamed = place("node");
+        match verify_release_signatures_with(&renamed, &[pk_hex.as_str()]).unwrap_err() {
+            ReleaseCheckError::NameMismatch { label, file, .. } => {
+                assert_eq!(label, format!("SHA3-256({name})="));
+                assert_eq!(file, "node");
+            }
+            other => panic!("expected NameMismatch, got {other:?}"),
+        }
+    }
+
     /// The committed published `.dgst` names its own file, and only it.
     #[test]
     fn published_label_names_its_file() {

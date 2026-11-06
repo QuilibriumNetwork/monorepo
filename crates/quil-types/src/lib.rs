@@ -3,6 +3,7 @@ pub mod crypto;
 pub mod error;
 pub mod execution;
 pub mod lifecycle;
+pub mod lock_holders;
 pub mod lock_patience;
 pub mod p2p;
 pub mod proto;

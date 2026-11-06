@@ -509,15 +509,21 @@ async fn the_node_manager_snapshot_tallies_both_owner_forms() {
     ]));
     let (good, stop, serving) = serve(Arc::new(index)).await;
     let client = node(&good).connect(None).await.unwrap();
+    let mut ticks = Vec::new();
     let snapshot = snapshot(
         &client,
         &quil_execution::domains::QUIL_TOKEN,
         &KEY_X,
         0,
         None,
+        &mut |pages, coins| ticks.push((pages, coins)),
     )
     .await
     .unwrap();
+    // A tick per page, counted across both owner forms; the shard list
+    // after the listing ticks again with the same counts.
+    assert_eq!(ticks[..2], [(1, 2), (2, 3)], "{ticks:?}");
+    assert!(ticks[2..].iter().all(|tick| *tick == (2, 3)), "{ticks:?}");
     assert_eq!(
         snapshot.tally,
         Tally {
@@ -868,4 +874,28 @@ fn shell_words_and_frames_print_as_an_operator_types_them() {
     assert_eq!(grouped(1_000), "1,000");
     assert_eq!(tail("QmAbcdefghij"), "efghij");
     assert_eq!(tail("abc"), "abc");
+}
+
+/// shield-all's journal keeps what it held, adds each batch's coins and is
+/// readable by its owner only; the coins read back as recently shielded.
+#[cfg(all(unix, feature = "native-proof"))]
+#[test]
+fn the_shield_journal_is_private_and_keeps_its_entries() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(SHIELD_JOURNAL);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // An earlier batch, its line unterminated, in a journal others can read.
+    std::fs::write(&path, format!("{} {}", now - 60, hex::encode([1u8; 32]))).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    record_shielded(dir.path(), now, [[2u8; 32], [3u8; 32]]).unwrap();
+    assert_eq!(
+        recently_shielded(dir.path()),
+        BTreeSet::from([[1u8; 32], [2u8; 32], [3u8; 32]])
+    );
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the journal lists the wallet's coins");
 }

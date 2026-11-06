@@ -35,6 +35,63 @@ pub(crate) fn err_line(text: String) {
     }
 }
 
+/// [`line`] under `-v/--verbose` only: how a result was derived. A sink
+/// in scope gets it either way: the node manager shows each line as its
+/// action's progress, not beside the result.
+pub(crate) fn detail(text: String) {
+    if crate::verbosity::on() || captured() {
+        line(text);
+    }
+}
+
+/// [`err_line`] under `-v/--verbose` only: where a phase's time went. A
+/// sink in scope gets it either way, as with [`detail`].
+pub(crate) fn err_detail(text: String) {
+    if crate::verbosity::on() || captured() {
+        err_line(text);
+    }
+}
+
+/// How long a phase runs before it says so on stderr.
+pub(crate) const SLOW_PHASE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run `work`; once it has run past [`SLOW_PHASE`] (at once under
+/// `-v/--verbose`), print `label` as one stderr line, so a long wait is
+/// explained and a quick one prints nothing.
+///
+/// `work` goes to the heap here, before the caller awaits: the phases this
+/// wraps (proofs, scans) are large futures, and holding one inline in this
+/// future and again in the caller's overflowed a 2 MiB test thread's stack
+/// in a debug build (`token mint`).
+pub(crate) fn slow_phase<F: std::future::Future>(
+    label: &'static str,
+    work: F,
+) -> impl std::future::Future<Output = F::Output> {
+    slow_phase_after(label, SLOW_PHASE, crate::verbosity::on(), Box::pin(work))
+}
+
+async fn slow_phase_after<F: std::future::Future>(
+    label: &str,
+    after: std::time::Duration,
+    verbose: bool,
+    work: F,
+) -> F::Output {
+    if verbose {
+        err_line(format!("{label}..."));
+        return work.await;
+    }
+    tokio::pin!(work);
+    tokio::select! {
+        // A phase found finished only after its time is up still ran long.
+        biased;
+        _ = tokio::time::sleep(after) => {
+            err_line(format!("{label}..."));
+            work.await
+        }
+        output = &mut work => output,
+    }
+}
+
 /// Whether a sink is in scope: then nothing may write to the terminal.
 pub(crate) fn captured() -> bool {
     SINK.try_with(|_| ()).is_ok()
@@ -108,6 +165,56 @@ mod output_tests {
         .await;
         assert_eq!(rx.recv().await.as_deref(), Some("one"));
         assert!(!captured());
+    }
+
+    /// Without `-v` a derivation stays off the terminal, but the node
+    /// manager's sink still gets it: that is its progress line.
+    #[tokio::test]
+    async fn derivations_reach_the_sink_without_verbose() {
+        assert!(!crate::verbosity::on());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        capture(tx, async {
+            detail("derived".into());
+            err_detail("timed".into());
+        })
+        .await;
+        assert_eq!(rx.recv().await.as_deref(), Some("derived"));
+        assert_eq!(rx.recv().await.as_deref(), Some("timed"));
+    }
+
+    /// A quick phase prints nothing; a slow one prints its label once, as
+    /// does any phase under `-v`.
+    #[tokio::test]
+    async fn a_phase_says_so_only_once_it_runs_long() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let after = std::time::Duration::from_millis(100);
+        let slow = tokio::time::sleep(after * 2);
+        capture(tx, async {
+            slow_phase_after("Quick", after, false, async {}).await;
+            slow_phase_after("Slow", after, false, slow).await;
+            slow_phase_after("Verbose", after, true, async {}).await;
+        })
+        .await;
+        let mut lines = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            lines.push(line);
+        }
+        assert_eq!(lines, ["Slow...", "Verbose..."]);
+    }
+
+    /// The wrapper holds a wrapped phase on the heap, not inline: its size
+    /// does not grow with the phase's.
+    #[test]
+    fn a_phase_wrapper_stays_small_whatever_it_wraps() {
+        let big = async {
+            let held = [0u8; 1 << 16];
+            tokio::task::yield_now().await;
+            std::hint::black_box(&held);
+        };
+        assert!(std::mem::size_of_val(&big) >= 1 << 16);
+        let wrapped = slow_phase("Big", big);
+        let size = std::mem::size_of_val(&wrapped);
+        assert!(size < 4096, "the wrapper is {size} bytes");
     }
 
     /// What the terminal writer received.

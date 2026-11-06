@@ -487,6 +487,7 @@ impl HistoricalCommittees {
                     &[0xff; 32],
                     expected,
                     true,
+                    false,
                 )
                 .await
             };

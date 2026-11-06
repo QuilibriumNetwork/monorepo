@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
@@ -30,8 +30,8 @@ use quil_cw_consensus::{
     falcon_simplex::SimplexFalconScheme,
     handoff::{
         automaton::{
-            AuthorizedParent, ClosingAbsence, ClosingProbe, HandoffProposer, ParentReader,
-            CLOSING_REQUEST_WAIT,
+            AuthorizedParent, BehindProbe, ClosingAbsence, ClosingProbe, HandoffProposer,
+            ParentReader, CLOSING_REQUEST_WAIT,
         },
         verify_seal, Checkpoint, Seal, Session,
     },
@@ -991,6 +991,219 @@ fn leader_waits_briefly_for_a_parent_it_has_not_materialized() {
     let next = ProposalContext { view: 2, ..ctx };
     assert!(proposer.propose_with_context(next).is_none());
     assert!(proposer.propose_retry().is_some());
+}
+
+/// A leader behind for longer than its parent waits (its committed GLOBAL
+/// view withheld while a state sync installs) gives its turn up at the
+/// first ask; one that is not behind waits for its parent as before, and
+/// one that reads its parent never asks.
+#[test]
+fn only_a_behind_leader_gives_its_turn_up_at_once() {
+    let (session, _) = session();
+    let parent = genesis(&session);
+    let ctx = context(&session, &parent, 1);
+    let state = Arc::new(Mutex::new(None));
+    let behind = Arc::new(Mutex::new(Some("GLOBAL state sync installing".to_string())));
+    let asked = Arc::new(AtomicUsize::new(0));
+    let probe: BehindProbe = {
+        let (behind, asked) = (behind.clone(), asked.clone());
+        Arc::new(move || {
+            asked.fetch_add(1, Ordering::SeqCst);
+            behind.lock().unwrap().clone()
+        })
+    };
+    let private_reads = Arc::new(AtomicUsize::new(0));
+    let private: ParentReader = {
+        let reads = private_reads.clone();
+        Arc::new(move |_| {
+            reads.fetch_add(1, Ordering::SeqCst);
+            Err(QuilError::ExecutionUnavailable(
+                "global state sync in progress".into(),
+            ))
+        })
+    };
+    let proposer = HandoffProposer::new(Arc::new(DataProposer), session, reader(state.clone()))
+        .unwrap()
+        .with_private_reader(Some(private))
+        .with_behind_probe(Some(probe));
+
+    assert!(proposer.propose_with_context(ctx).is_none());
+    assert!(
+        proposer.propose_retry().is_none(),
+        "a behind leader gave its turn up only after its parent waits"
+    );
+    assert_eq!(private_reads.load(Ordering::SeqCst), 0);
+
+    *behind.lock().unwrap() = None;
+    let next = ProposalContext { view: 2, ..ctx };
+    assert!(proposer.propose_with_context(next).is_none());
+    assert!(
+        proposer.propose_retry().is_some(),
+        "a leader that is not behind waits for its parent as before"
+    );
+    *state.lock().unwrap() = Some(parent);
+    let before = asked.load(Ordering::SeqCst);
+    assert!(proposer.propose_with_context(next).is_some());
+    assert_eq!(asked.load(Ordering::SeqCst), before);
+}
+
+/// [`DataProposer`] counting the proposals it builds.
+struct CountingProposer(Arc<AtomicUsize>);
+impl GlobalProposer for CountingProposer {
+    fn propose(&self, view: u64, parent: Digest) -> Option<(Digest, Vec<u8>)> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        DataProposer.propose(view, parent)
+    }
+    fn verify(&self, view: u64, parent: Digest, digest: Digest, bytes: Option<Vec<u8>>) -> bool {
+        DataProposer.verify(view, parent, digest, bytes)
+    }
+}
+
+struct CountingFinalizer(Arc<AtomicUsize>);
+impl FrameFinalizer for CountingFinalizer {
+    fn on_notarized(&self, _: u64, _: Digest, _: Option<Vec<u8>>) {}
+    fn on_finalized(&self, _: u64, _: Digest, _: Option<Vec<u8>>, _: Option<Vec<u8>>, _: bool) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Authorizes whatever parent consensus selects; while `behind`, fails as a
+/// node whose committed GLOBAL view is withheld does.
+fn selected_parent(session: &Session, behind: Option<Arc<AtomicBool>>) -> ParentReader {
+    let session = session.clone();
+    Arc::new(move |context: ProposalContext| {
+        if behind.as_ref().is_some_and(|b| b.load(Ordering::SeqCst)) {
+            return Err(QuilError::ExecutionUnavailable(
+                "global state sync in progress".into(),
+            ));
+        }
+        let mut parent = genesis(&session);
+        if context.parent.0 != session.genesis {
+            parent.checkpoint.frame = session.base_frame + 1;
+            parent.checkpoint.view = context.parent_view;
+            parent.checkpoint.digest = context.parent.0;
+        }
+        Ok(parent)
+    })
+}
+
+/// Four members at production timeouts, one behind (as a regular node is
+/// while a GLOBAL state sync installs, for 11-27 s every 5 min). Its turns
+/// end at once, so the other three finalize 40 frames within 10 s; holding
+/// each turn through its parent waits (about 3 s) took over 40 s. Once
+/// caught up, it proposes again and the committee keeps finalizing.
+#[test]
+fn a_committee_moves_past_a_behind_leader_and_it_proposes_again_once_caught_up() {
+    let (session, keys) = session();
+    let participants: Vec<_> = keys.iter().map(|k| k.public_key()).collect();
+    let set: Set<_> = participants.clone().try_into().unwrap();
+    let schemes: Vec<_> = keys
+        .into_iter()
+        .map(|key| {
+            SimplexFalconScheme::signer(&session.namespace().unwrap(), set.clone(), key).unwrap()
+        })
+        .collect();
+    deterministic::Runner::timed(Duration::from_secs(300)).start(|ctx| async move {
+        let (network, oracle) = Network::new_with_peers(
+            ctx.child("network"),
+            NetConfig {
+                max_size: 1024 * 1024,
+                disconnect_on_block: true,
+                tracked_peer_sets: NZUsize!(1),
+            },
+            participants.clone(),
+        )
+        .await;
+        network.start();
+        let mut regs = HashMap::new();
+        for peer in &participants {
+            let control = oracle.control(peer.clone());
+            let quota = Quota::per_second(std::num::NonZeroU32::MAX);
+            regs.insert(
+                peer.clone(),
+                (
+                    control.register(0, quota).await.unwrap(),
+                    control.register(1, quota).await.unwrap(),
+                    control.register(2, quota).await.unwrap(),
+                ),
+            );
+        }
+        for a in &participants {
+            for b in &participants {
+                if a != b {
+                    let link = Link {
+                        latency: Duration::from_millis(10),
+                        jitter: Duration::from_millis(1),
+                        success_rate: 1.0,
+                    };
+                    oracle.add_link(a.clone(), b.clone(), link).await.unwrap();
+                }
+            }
+        }
+        let store = BlockStore::new();
+        let behind = Arc::new(AtomicBool::new(true));
+        let built: Vec<_> = (0..4).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+        let finalized: Vec<_> = (0..4).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+        let mut handles = Vec::new();
+        for (node, peer) in participants.iter().enumerate() {
+            let lagging = (node == 0).then(|| behind.clone());
+            let mut proposer = HandoffProposer::new(
+                Arc::new(CountingProposer(built[node].clone())),
+                session.clone(),
+                selected_parent(&session, lagging.clone()),
+            )
+            .unwrap();
+            if let Some(flag) = lagging {
+                proposer = proposer.with_behind_probe(Some(Arc::new(move || {
+                    flag.load(Ordering::SeqCst)
+                        .then(|| "GLOBAL state sync installing".to_string())
+                })));
+            }
+            let params = GlobalEngineParams::new(
+                format!("behind-{node}"),
+                session.generation,
+                Digest(session.genesis),
+            );
+            let engine = build_global_engine(
+                ctx.child("validator").with_attribute("node", node),
+                schemes[node].clone(),
+                oracle.control(peer.clone()),
+                Arc::new(proposer),
+                Arc::new(NoopSink),
+                Arc::new(CountingFinalizer(finalized[node].clone())),
+                store.clone(),
+                params,
+            );
+            let (vote, cert, resolver) = regs.remove(peer).unwrap();
+            handles.push(engine.start(vote, cert, resolver));
+        }
+        let started = ctx.current();
+        while finalized[1].load(Ordering::SeqCst) < 40 {
+            ctx.sleep(Duration::from_millis(100)).await;
+            assert!(
+                ctx.current() < started + Duration::from_secs(10),
+                "the committee waited out a behind leader's turns: {} frames finalized in 10 s",
+                finalized[1].load(Ordering::SeqCst)
+            );
+        }
+        assert_eq!(
+            built[0].load(Ordering::SeqCst),
+            0,
+            "a behind member never builds"
+        );
+
+        behind.store(false, Ordering::SeqCst);
+        let resumed = (ctx.current(), finalized[1].load(Ordering::SeqCst));
+        while built[0].load(Ordering::SeqCst) == 0
+            || finalized[1].load(Ordering::SeqCst) < resumed.1 + 8
+        {
+            ctx.sleep(Duration::from_millis(100)).await;
+            assert!(
+                ctx.current() < resumed.0 + Duration::from_secs(60),
+                "caught up, the member proposes again and the committee finalizes"
+            );
+        }
+    });
 }
 
 #[test]

@@ -104,6 +104,14 @@ pub enum Progress {
     Resumed {
         paused_secs: u64,
     },
+    /// The batch's shard has no active prover in the node's shard list:
+    /// the run left the batch, unproved or waiting for inclusion, and goes
+    /// on with the next.
+    ShardGone {
+        index: usize,
+        shard: String,
+        submitted: bool,
+    },
     /// The projected end after a batch, in Unix seconds.
     Projected {
         end: u64,
@@ -168,6 +176,9 @@ pub struct Run {
     pub stopped: bool,
     pub submitted: Vec<Submitted>,
     pub skipped: usize,
+    /// Batches left for a shard without active provers: index, shard, and
+    /// whether it was submitted.
+    pub left: Vec<(usize, String, bool)>,
     pub note: Option<String>,
     /// The outcome, and the batch it failed at.
     pub done: Option<Result<(), String>>,
@@ -234,6 +245,7 @@ fn log_outcome(run: &Run, frame: u64) {
         batches = run.preview.batches,
         submitted = run.submitted.len(),
         skipped = run.skipped,
+        left_no_provers = run.left.len(),
         coins_submitted,
         "shield run finished"
     );
@@ -247,7 +259,10 @@ pub fn row_state(m: &Model) -> Option<String> {
     let current = match (run.proving, run.held, &run.pace) {
         (Some((index, ..)), ..) | (None, Some(index), _) => index,
         (None, None, Some(Pace::Spacing { index, .. } | Pace::Inclusion { index, .. })) => *index,
-        (None, None, None) => (run.submitted.len() + run.skipped + 1).min(count),
+        (None, None, None) => {
+            let unsubmitted = run.left.iter().filter(|(.., submitted)| !submitted).count();
+            (run.submitted.len() + run.skipped + unsubmitted + 1).min(count)
+        }
     };
     Some(format!("shielding {current}/{count}"))
 }
@@ -287,7 +302,9 @@ pub fn refusal(m: &Model) -> Option<String> {
             Some((None, _, _)) => {
                 "this node config has no Ed448 key, so it owns no legacy coins.".to_string()
             }
-            None => "legacy coins are not read yet; ‹r› reads them.".to_string(),
+            // Not read yet, or the read failed: the preparation lists the
+            // coins itself, as `token shield-all` does.
+            None => return None,
         }
     };
     Some(format!("Shield: {why}"))
@@ -341,6 +358,7 @@ pub fn dialog_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
                 stopped: false,
                 submitted: Vec::new(),
                 skipped: 0,
+                left: Vec::new(),
                 note: None,
                 done: None,
                 failed_at: None,
@@ -470,6 +488,18 @@ pub fn apply_progress(m: &mut Model, progress: Progress) {
         Progress::Resumed { paused_secs } => {
             run.paused = None;
             run.resumed = Some((wall, paused_secs));
+        }
+        Progress::ShardGone {
+            index,
+            shard,
+            submitted,
+        } => {
+            run.proving = None;
+            run.held = None;
+            if matches!(run.pace, Some(Pace::Inclusion { index: i, .. }) if i == index) {
+                run.pace = None;
+            }
+            run.left.push((index, shard, submitted));
         }
         Progress::Projected { end } => {
             run.projected_end = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(end));
@@ -765,6 +795,23 @@ pub fn notices(m: &Model, fmt_amount: &dyn Fn(u128) -> String) -> Vec<Notice> {
             format!("Action log: not written ({why}); the shield is unaffected."),
         );
     }
+    if !run.left.is_empty() && run.done.is_none() {
+        let mut shards: Vec<&str> = run.left.iter().map(|(_, s, _)| s.as_str()).collect();
+        shards.sort_unstable();
+        shards.dedup();
+        push(
+            "shield-shard-gone",
+            NoticeSeverity::Warning,
+            false,
+            false,
+            format!(
+                "Shield: {} left, shard {} without active provers; a rerun plans their coins \
+                 onto a live shard.",
+                plural(run.left.len(), "batch", "batches"),
+                shards.join(", ")
+            ),
+        );
+    }
     if run.skipped > 0 {
         push(
             "shield-skipped",
@@ -1037,6 +1084,12 @@ pub(crate) mod shield_tests {
                  it yet",
                 "not_finalized",
             ),
+            (
+                "1 batch of 3 left (batch 1): shard ...feedbeef00 had no active provers in \
+                 the node's shard list. Check `qclient token legacy`, then rerun",
+                "shard_no_provers",
+            ),
+            ("proving: budget", "proving"),
             ("something new", "other"),
         ] {
             assert_eq!(error_class(error).0, class, "{error}");

@@ -197,7 +197,6 @@ tasks:
         --build-arg GIT_REPO={{.GIT_REPO}} \
         --build-arg GIT_BRANCH={{.GIT_BRANCH}} \
         --build-arg GIT_COMMIT={{.GIT_COMMIT}} \
-        --build-arg MAX_KEY_ID={{.MAX_KEY_ID}} \
         -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}}-release \
         -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:release \
         .

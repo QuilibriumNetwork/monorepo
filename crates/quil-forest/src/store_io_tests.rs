@@ -44,7 +44,8 @@ fn summarise_takes_nearest_rank_percentiles() {
             reads: 1,
             p50: ms_n(7),
             p99: ms_n(7),
-            max: ms_n(7)
+            max: ms_n(7),
+            slow_reads: 0,
         })
     );
     let mut hundred: Vec<Duration> = (1..=100).rev().map(ms_n).collect();
@@ -54,15 +55,16 @@ fn summarise_takes_nearest_rank_percentiles() {
             reads: 100,
             p50: ms_n(50),
             p99: ms_n(99),
-            max: ms_n(100)
+            max: ms_n(100),
+            slow_reads: 51,
         })
     );
     let mut sixty: Vec<Duration> = (1..=60).map(ms_n).collect();
     sixty.swap(0, 59);
     let sixty = summarise(&mut sixty).unwrap();
     assert_eq!(
-        (sixty.reads, sixty.p50, sixty.p99),
-        (60, ms_n(30), ms_n(60))
+        (sixty.reads, sixty.p50, sixty.p99, sixty.slow_reads),
+        (60, ms_n(30), ms_n(60), 11)
     );
 }
 
@@ -326,6 +328,7 @@ fn latency(p50: u64, p99: u64) -> Option<ReadLatency> {
         p50: ms_n(p50),
         p99: ms_n(p99),
         max: ms_n(p99),
+        slow_reads: if ms_n(p99) >= SLOW_CANARY_P99 { 2 } else { 0 },
     })
 }
 
@@ -360,6 +363,7 @@ const fn ok() -> IoInterval {
             p50: Duration::from_micros(300),
             p99: Duration::from_millis(4),
             max: Duration::from_millis(4),
+            slow_reads: 0,
         }),
         pending: None,
         disk: None,
@@ -458,7 +462,8 @@ fn a_slow_episode_starts_repeats_and_ends() {
         watch.observe(&slow(), at(4)),
         IoAction::SlowStart {
             slow: INTERVAL * 2,
-            reason: SlowReason::CanaryP99
+            reason: SlowReason::CanaryP99,
+            cause: SlowCause::Unknown,
         }
     );
     assert_eq!(watch.slow_since(), Some(at(2)));
@@ -478,7 +483,8 @@ fn a_slow_episode_starts_repeats_and_ends() {
         watch.observe(&interval(None, Some(ms_n(90_000)), None), at(14)),
         IoAction::SlowRepeat {
             slow: INTERVAL * 12,
-            reason: SlowReason::CanaryPending
+            reason: SlowReason::CanaryPending,
+            cause: SlowCause::Unknown,
         }
     );
     // Two good intervals, a slow one: still slow, the good run restarts.
@@ -497,7 +503,8 @@ fn a_slow_episode_starts_repeats_and_ends() {
     assert_eq!(
         watch.observe(&ok(), at(21)),
         IoAction::SlowEnd {
-            slow: INTERVAL * 15
+            slow: INTERVAL * 15,
+            cause: SlowCause::Unknown,
         }
     );
     assert_eq!(watch.slow_since(), None);
@@ -581,6 +588,7 @@ fn lines_say_whose_problem_and_what_to_check() {
             IoAction::SlowStart {
                 slow: INTERVAL * 2,
                 reason: SlowReason::CanaryP99,
+                cause: SlowCause::Disk,
             },
             &latest,
             &mut window,
@@ -596,6 +604,7 @@ fn lines_say_whose_problem_and_what_to_check() {
         "SMART",
         "other I/O load",
         "Repeats every 10 minutes",
+        "scope=\"this node's disk\"",
         "reason=\"canary_p99\"",
         "slow_secs=120",
         "canary_p99_ms=\"400.0\"",
@@ -610,6 +619,7 @@ fn lines_say_whose_problem_and_what_to_check() {
             &subject,
             IoAction::SlowEnd {
                 slow: INTERVAL * 15,
+                cause: SlowCause::Disk,
             },
             &ok(),
             &mut window,
@@ -652,6 +662,266 @@ fn lines_say_whose_problem_and_what_to_check() {
     assert!(
         logged(|| log_action(&subject, IoAction::None, &ok(), &mut window, t0, None)).is_empty()
     );
+}
+
+/// An interval of 60 one-millisecond reads with `slow` of the given
+/// latencies in place of some.
+fn canary_of(slow: &[u64]) -> IoInterval {
+    let mut samples = vec![ms_n(1); 60];
+    for (i, n) in slow.iter().enumerate() {
+        samples[i] = ms_n(*n);
+    }
+    interval(summarise(&mut samples), None, None)
+}
+
+#[test]
+fn one_slow_canary_read_does_not_trip_but_two_do() {
+    // One read at or over 50 ms is p99 of 60 reads, and trips nothing.
+    assert_eq!(canary_of(&[]).slow_reason(), None);
+    assert_eq!(canary_of(&[80]).slow_reason(), None);
+    assert_eq!(canary_of(&[50]).slow_reason(), None);
+    assert_eq!(canary_of(&[999]).slow_reason(), None);
+    // Two reads under the threshold do not either.
+    assert_eq!(canary_of(&[49, 49]).slow_reason(), None);
+    // Two at or over it do.
+    assert_eq!(
+        canary_of(&[50, 50]).slow_reason(),
+        Some(SlowReason::CanaryP99)
+    );
+    assert_eq!(
+        canary_of(&[80, 49, 70]).slow_reason(),
+        Some(SlowReason::CanaryP99)
+    );
+}
+
+#[test]
+fn an_isolated_stall_of_a_second_still_trips() {
+    // One read of 1 s or more, finished within the interval.
+    assert_eq!(
+        canary_of(&[1000]).slow_reason(),
+        Some(SlowReason::CanaryP99)
+    );
+    assert_eq!(
+        canary_of(&[2500]).slow_reason(),
+        Some(SlowReason::CanaryP99)
+    );
+    // One still unfinished at the interval's end, with no slow read done.
+    assert_eq!(
+        interval(canary_of(&[]).canary, Some(ms_n(1000)), None).slow_reason(),
+        Some(SlowReason::CanaryPending)
+    );
+    assert_eq!(
+        interval(canary_of(&[80]).canary, Some(ms_n(999)), None).slow_reason(),
+        None
+    );
+}
+
+#[test]
+fn the_cause_follows_the_evidence() {
+    use SlowCause::{Disk, Load, Unknown};
+    let canary = latency(30, 400);
+    // A canary threshold with the disk's awaits under theirs: load.
+    let fine = disk(40, 1, 10, 2);
+    assert_eq!(
+        interval(canary, None, fine).cause(SlowReason::CanaryP99),
+        Load
+    );
+    assert_eq!(
+        interval(None, Some(ms_n(2000)), fine).cause(SlowReason::CanaryPending),
+        Load
+    );
+    // Writes too few for a verdict do not hold it back.
+    assert_eq!(
+        interval(canary, None, disk(40, 1, 5, 900)).cause(SlowReason::CanaryP99),
+        Load
+    );
+    // An await over its threshold: the disk, whichever reason came first.
+    assert_eq!(
+        interval(canary, None, disk(40, 25, 10, 2)).cause(SlowReason::CanaryP99),
+        Disk
+    );
+    assert_eq!(
+        interval(canary, None, disk(40, 1, 30, 150)).cause(SlowReason::CanaryPending),
+        Disk
+    );
+    // The disk thresholds name the disk.
+    assert_eq!(
+        interval(None, None, disk(40, 25, 0, 0)).cause(SlowReason::DiskReadAwait),
+        Disk
+    );
+    assert_eq!(
+        interval(None, None, disk(0, 0, 40, 150)).cause(SlowReason::DiskWriteAwait),
+        Disk
+    );
+    // No disk figures, or too few reads for an await: not ruled out.
+    assert_eq!(
+        interval(canary, None, None).cause(SlowReason::CanaryP99),
+        Unknown
+    );
+    assert_eq!(
+        interval(canary, None, disk(19, 1, 10, 2)).cause(SlowReason::CanaryP99),
+        Unknown
+    );
+    assert_eq!(
+        interval(canary, None, disk(0, 0, 0, 0)).cause(SlowReason::CanaryP99),
+        Unknown
+    );
+}
+
+/// The client's report and notice read the cause from the proto fields
+/// with `health_cause`; it must agree with the node's own rule.
+#[test]
+fn the_reported_cause_matches_the_nodes_rule() {
+    let cases = [
+        (SlowReason::CanaryP99, disk(40, 1, 10, 2)),
+        (SlowReason::CanaryP99, disk(40, 25, 10, 2)),
+        (SlowReason::CanaryP99, disk(40, 1, 30, 150)),
+        (SlowReason::CanaryP99, disk(19, 1, 10, 2)),
+        (SlowReason::CanaryP99, disk(0, 0, 0, 0)),
+        (SlowReason::CanaryP99, None),
+        (SlowReason::CanaryPending, disk(40, 1, 10, 2)),
+        (SlowReason::CanaryPending, None),
+        (SlowReason::DiskReadAwait, disk(40, 25, 0, 0)),
+        (SlowReason::DiskReadAwait, disk(40, 1, 10, 2)),
+        (SlowReason::DiskWriteAwait, disk(0, 0, 40, 150)),
+    ];
+    for (reason, d) in cases {
+        let latest = interval(latency(30, 400), None, d);
+        let report = StoreIoReport {
+            interval: latest,
+            slow_for: None,
+            ended_unix_ms: 0,
+        };
+        let mut health = report.to_proto();
+        health.set_slow_reason(reason.to_proto());
+        assert_eq!(
+            health_cause(&health),
+            latest.cause(reason),
+            "{reason:?} {d:?}"
+        );
+    }
+    // A node that predates the reason: the disk figures decide.
+    let mut old = StoreIoHealth {
+        disk_reads: Some(40),
+        disk_read_await_us: Some(1_000),
+        disk_writes: Some(0),
+        ..Default::default()
+    };
+    assert_eq!(health_cause(&old), SlowCause::Load);
+    old.disk_read_await_us = Some(30_000);
+    assert_eq!(health_cause(&old), SlowCause::Disk);
+    assert_eq!(health_cause(&StoreIoHealth::default()), SlowCause::Unknown);
+}
+
+#[test]
+fn the_cause_reaches_the_watch_actions() {
+    let t0 = Instant::now();
+    let at = |minute: u32| t0 + INTERVAL * minute;
+    let load = interval(latency(2, 70), None, disk(40, 1, 10, 2));
+    let mut watch = IoWatch::default();
+    assert_eq!(watch.observe(&load, at(1)), IoAction::None);
+    assert_eq!(
+        watch.observe(&load, at(2)),
+        IoAction::SlowStart {
+            slow: INTERVAL * 2,
+            reason: SlowReason::CanaryP99,
+            cause: SlowCause::Load,
+        }
+    );
+    // The end carries the cause of the last slow interval.
+    let disk_slow = interval(latency(2, 70), None, disk(40, 30, 10, 2));
+    assert_eq!(watch.observe(&disk_slow, at(3)), IoAction::None);
+    for minute in 4..6 {
+        assert_eq!(watch.observe(&ok(), at(minute)), IoAction::None);
+    }
+    assert_eq!(
+        watch.observe(&ok(), at(6)),
+        IoAction::SlowEnd {
+            slow: INTERVAL * 3,
+            cause: SlowCause::Disk,
+        }
+    );
+}
+
+#[test]
+fn lines_name_the_cause_their_evidence_supports() {
+    let subject = Subject {
+        store: "master",
+        disk: Some("nvme0n1p2".into()),
+    };
+    let t0 = Instant::now();
+    let line = |cause: SlowCause, latest: IoInterval, end: bool| {
+        let mut window = Window::new(t0, None);
+        let action = if end {
+            IoAction::SlowEnd {
+                slow: INTERVAL * 5,
+                cause,
+            }
+        } else {
+            IoAction::SlowStart {
+                slow: INTERVAL * 2,
+                reason: SlowReason::CanaryP99,
+                cause,
+            }
+        };
+        logged(|| log_action(&subject, action, &latest, &mut window, t0, None))
+    };
+    let slow_load = interval(latency(2, 70), None, disk(40, 1, 10, 2));
+    let load = line(SlowCause::Load, slow_load, false);
+    for text in [
+        "scope=\"this node's load\"",
+        "reason=\"canary_p99\"",
+        "disk_read_await_ms=\"1.0\"",
+        "The disk responds normally",
+        "CPU, memory pressure, store compaction",
+    ] {
+        assert!(load.contains(text), "{text} missing: {load}");
+    }
+    for text in ["is the cause", "TRIM", "SMART", "this node's disk\""] {
+        assert!(!load.contains(text), "{text} blames the disk: {load}");
+    }
+    let unknown = line(
+        SlowCause::Unknown,
+        interval(latency(2, 70), None, None),
+        false,
+    );
+    for text in [
+        "scope=\"this node's store reads\"",
+        "disk=\"nvme0n1p2\"",
+        "the disk is not ruled out",
+        "TRIM",
+        "SMART",
+        "this node's load",
+    ] {
+        assert!(unknown.contains(text), "{text} missing: {unknown}");
+    }
+    assert!(!unknown.contains("is the cause"), "{unknown}");
+    let disk_line = line(
+        SlowCause::Disk,
+        interval(latency(2, 70), None, disk(40, 25, 10, 2)),
+        false,
+    );
+    for text in [
+        "scope=\"this node's disk\"",
+        "This node's disk is the cause",
+        "TRIM",
+        "SMART",
+    ] {
+        assert!(disk_line.contains(text), "{text} missing: {disk_line}");
+    }
+    assert!(!disk_line.contains("responds normally"), "{disk_line}");
+    // The recovered line's scope follows the episode's cause.
+    for (cause, scope) in [
+        (SlowCause::Disk, "this node's disk"),
+        (SlowCause::Load, "this node's load"),
+        (SlowCause::Unknown, "this node's store reads"),
+    ] {
+        let end = line(cause, ok(), true);
+        assert!(
+            end.contains("store reads recovered") && end.contains(&format!("scope=\"{scope}\"")),
+            "{scope} missing: {end}"
+        );
+    }
 }
 
 #[test]

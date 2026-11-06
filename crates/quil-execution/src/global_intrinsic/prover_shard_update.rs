@@ -174,13 +174,23 @@ pub fn verify_app_frame_output(frame_header: &FrameHeader, anchor_output: &[u8])
         &frame_header.spends,
     );
     if expected != frame_header.output {
-        return Err(QuilError::Crypto(
-            "frame header attestation: app-shard frame output does not match the \
-             deterministic digest of its header fields"
-                .into(),
-        ));
+        return Err(QuilError::Crypto(format!(
+            "{OUTPUT_NOT_REPRODUCED}the deterministic digest of its header fields"
+        )));
     }
     Ok(())
+}
+
+/// The start of the refusal of a header whose fields do not reproduce its
+/// output ([`output_not_reproduced`]).
+const OUTPUT_NOT_REPRODUCED: &str =
+    "frame header attestation: app-shard frame output does not match ";
+
+/// Whether `error` refused a shard frame header because its fields do not
+/// reproduce its output: a field was rewritten after the frame was certified,
+/// or the frame was never certified at all.
+pub fn output_not_reproduced(error: &QuilError) -> bool {
+    matches!(error, QuilError::Crypto(message) if message.starts_with(OUTPUT_NOT_REPRODUCED))
 }
 
 fn verify_genesis_app_frame_output(frame_header: &FrameHeader) -> Result<()> {
@@ -1592,7 +1602,7 @@ fn encode_rewarded_shards(
 }
 
 /// Update an allocation's `LastActiveFrameNumber`, and from
-/// `SIGNED_FRAME_ACTIVATION_FRAME` its `LastSignedFrameNumber`: the caller
+/// `signed_frame_activation_frame()` its `LastSignedFrameNumber`: the caller
 /// passes the signers of an app frame this GLOBAL frame includes.
 ///
 /// Go equivalent: `updateAllocationActivity` at
@@ -1608,7 +1618,7 @@ fn update_allocation_activity(
         frame_number,
         prover,
         filter,
-        quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+        quil_types::consensus::signed_frame_activation_frame(),
     )
 }
 
@@ -2630,7 +2640,7 @@ mod tests {
         let last_active_only = |tree: &mut quil_tries::VectorCommitmentTree| {
             materialize_frame_header_activity(tree, 77).unwrap();
         };
-        for activation in [78, quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME] {
+        for activation in [78, quil_types::consensus::signed_frame_activation_frame()] {
             let (written, expected) = activity_blobs(77, activation, last_active_only);
             assert_eq!(written, expected, "activation {activation}");
             let tree = rebuild_vertex_tree_from_blob(&written);
@@ -2641,7 +2651,7 @@ mod tests {
             );
             assert_eq!(last_signed, None);
         }
-        // The production path uses the disabled default.
+        // The production path uses the mainnet frame, far above this one.
         let state = make_state();
         let filter = vec![0xAAu8; 32];
         let p = fake_prover(1, 1, 0, &filter);

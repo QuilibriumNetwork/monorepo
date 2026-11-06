@@ -532,6 +532,60 @@ message ShardRewardInfo {
   // The shard's provers by lifecycle phase at frame_number; absent on older
   // servers.
   ShardProverCounts prover_counts = 16;
+  // How often this node's seat on the shard signed the certificates of the
+  // shard frames GLOBAL included; absent on older servers and for shards
+  // this node holds no seat on.
+  CertificateShare certificate_share = 17;
+  // Members of the shard's committee session this node sits in, grouped by
+  // network; absent on older servers and for shards whose session this node
+  // does not sit in.
+  SeatConcentration seat_concentration = 18;
+}
+
+// A seat's share of its shard's certificates. A shard frame credits only
+// the members that signed its finalization certificate, and a certificate
+// carries the first `quorum` votes its assembler verified, so a member
+// whose votes arrive late signs fewer of them. Counted by this node from the
+// certificates of the shard frames in the GLOBAL frames it received, for
+// frames of committee sessions this node is a member of, by each frame's
+// own timestamp.
+message CertificateShare {
+  CertificateWindow hour = 1;
+  CertificateWindow day = 2;
+  // The committee of the latest frame counted, and the signers its
+  // certificate needs: committee - floor((committee - 1) / 3). A member that
+  // votes in time signs about quorum / committee of the frames.
+  uint32 committee = 3;
+  uint32 quorum = 4;
+}
+
+message CertificateWindow {
+  uint64 window_seconds = 1;
+  // How much of the window this node counted, since it started counting the
+  // seat; less than the window after a restart or a new seat.
+  uint64 observed_seconds = 2;
+  uint64 frames = 3;
+  // Of `frames`, those whose certificate this seat signed.
+  uint64 signed_frames = 4;
+}
+
+// A committee session's members grouped by the network of their PeerInfo
+// addresses (IPv4 /24, IPv6 /48; members sharing any network form one group),
+// evaluated once per session and epoch. Members without a known public
+// address form no group, so group seats are a lower bound.
+message SeatConcentration {
+  uint32 members = 1;
+  uint32 quorum = 2;
+  // Seats of the largest group; 0 when no member's network is known.
+  uint32 largest_group_seats = 3;
+  // Seats of this node's group, this node included; 0 when this node's own
+  // address is unknown.
+  uint32 own_group_seats = 4;
+  uint32 unaddressed_members = 5;
+  // A group with at least this many seats leaves the session at most one
+  // member above quorum when it goes offline.
+  uint32 concentration_seats = 6;
+  uint64 epoch = 7;
 }
 
 // Provers of a shard by effective lifecycle phase: a confirmed join counts as

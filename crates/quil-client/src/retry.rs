@@ -148,7 +148,9 @@ pub async fn quote(
     client: &NodeServiceClient<tonic::transport::Channel>,
     request: quil_types::proto::node::GetTokenFeeQuoteRequest,
 ) -> Result<tonic::Response<quil_types::proto::node::GetTokenFeeQuoteResponse>, tonic::Status> {
-    retry_while(
+    // Boxed here and below: these sit under every spend's future, and polled
+    // inline they overflow a 2 MiB thread stack in a debug build.
+    Box::pin(retry_while(
         QUOTE,
         busy,
         rand::random::<f64>,
@@ -164,7 +166,7 @@ pub async fn quote(
             let request = request.clone();
             async move { client.get_token_fee_quote(request).await }
         },
-    )
+    ))
     .await
 }
 
@@ -176,7 +178,7 @@ pub async fn deliver(
     client: &NodeServiceClient<tonic::transport::Channel>,
     request: SendRequest,
 ) -> Result<(), tonic::Status> {
-    retry_while(
+    Box::pin(retry_while(
         DELIVERY,
         |status: &tonic::Status| transient(status.code()),
         rand::random::<f64>,
@@ -193,7 +195,7 @@ pub async fn deliver(
             let request = request.clone();
             async move { client.send(tonic::Request::new(request)).await.map(|_| ()) }
         },
-    )
+    ))
     .await
 }
 
@@ -207,7 +209,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
 {
-    retry_while(
+    Box::pin(retry_while(
         DELIVERY,
         |_| true,
         rand::random::<f64>,
@@ -219,7 +221,7 @@ where
         },
         pause,
         &mut connect,
-    )
+    ))
     .await
 }
 

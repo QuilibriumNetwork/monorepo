@@ -585,6 +585,11 @@ pub(crate) trait ShardRecoveryTarget: Send + Sync {
     fn core_id(&self) -> Option<u32> {
         None
     }
+    /// The engine's replay costs so far ([`crate::replay_split`]); none for
+    /// a target that keeps no account.
+    fn replay_costs(&self) -> crate::replay_split::ReplayCosts {
+        crate::replay_split::ReplayCosts::default()
+    }
     /// `(source filter, sealed roots)` of the certified state a shard with no
     /// frame of its own syncs against (`app_handoff::origin_anchors`).
     async fn origin_anchors(&self) -> Result<Vec<(Vec<u8>, [[u8; 32]; 4])>> {
@@ -653,6 +658,13 @@ pub(crate) trait ShardRecoveryTarget: Send + Sync {
     async fn retry_proof_wait(&self) -> Option<u64> {
         None
     }
+    /// Why the worker's recovery installs the shard's checkpoint although it
+    /// holds a lineage of the shard, which a replay cannot bring to the
+    /// shard's state (`app_engine::AppConsensusEngine::recovery_installs`);
+    /// `None` (also when the engine does not answer): it replays.
+    async fn installs_over_lineage(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 #[async_trait]
@@ -662,6 +674,9 @@ impl ShardRecoveryTarget for crate::app_engine::AppEngineHandle {
     }
     fn core_id(&self) -> Option<u32> {
         Some(self.core_id)
+    }
+    fn replay_costs(&self) -> crate::replay_split::ReplayCosts {
+        self.replay_costs.read()
     }
     async fn replay(&self, frame: AppShardFrame, descendants: Vec<AppShardFrame>) -> Result<u64> {
         self.replay_archive_frame(frame, descendants).await
@@ -724,6 +739,9 @@ impl ShardRecoveryTarget for crate::app_engine::AppEngineHandle {
     async fn retry_proof_wait(&self) -> Option<u64> {
         crate::app_engine::AppEngineHandle::retry_proof_wait(self).await
     }
+    async fn installs_over_lineage(&self) -> Option<&'static str> {
+        self.recovery_installs().await
+    }
 }
 
 /// What a shard sync starting now does about a re-anchor at the fence.
@@ -747,8 +765,14 @@ pub(crate) struct ReplayTurn {
     pub batches: u32,
     pub fetch_ms: u64,
     pub replay_ms: u64,
+    /// Waiting to take back the turn lent during its replays.
+    pub turn_back_ms: u64,
     /// The turn ended below its replay target.
     pub behind: bool,
+    /// What `replay_ms` went to.
+    pub split: crate::replay_split::ReplaySplit,
+    /// The queue as the replay started.
+    pub load: crate::recovery_turns::ReplayLoad,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -837,8 +861,12 @@ const GLOBAL_SYNC_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_s
 /// [`GLOBAL_SYNC_WAIT_BUDGET`].
 #[derive(Default)]
 struct GlobalSyncWait {
-    /// Milliseconds the attempt's waited-out requests took.
+    /// Milliseconds of refused requests and the polls between them. An answered
+    /// request's own time is its work, and spends none of the budget.
     waited_ms: AtomicU64,
+    /// Microseconds of those in refused requests and the polls between them:
+    /// an answered request's own time is the engine's work, no wait.
+    refused_us: AtomicU64,
     /// The attempt warned that its budget ran out.
     exhausted: AtomicBool,
 }
@@ -867,9 +895,11 @@ where
     let started = tokio::time::Instant::now();
     let mut waiting = false;
     loop {
+        let asked = started.elapsed();
         let result = attempt().await;
         let waited = started.elapsed();
         let refused = matches!(&result, Err(error) if global_sync_in_progress(error));
+        let charged = if refused { waited } else { asked };
         let spent =
             std::time::Duration::from_millis(wait.waited_ms.load(Ordering::Relaxed)) + waited;
         if refused && target.running() && spent + GLOBAL_SYNC_POLL <= GLOBAL_SYNC_WAIT_BUDGET {
@@ -884,8 +914,12 @@ where
             tokio::time::sleep(GLOBAL_SYNC_POLL).await;
             continue;
         }
+        wait.refused_us.fetch_add(
+            if refused { waited } else { asked }.as_micros() as u64,
+            Ordering::Relaxed,
+        );
         wait.waited_ms
-            .fetch_add(waited.as_millis() as u64, Ordering::Relaxed);
+            .fetch_add(charged.as_millis() as u64, Ordering::Relaxed);
         if refused {
             if target.running() && !wait.exhausted.swap(true, Ordering::Relaxed) {
                 tracing::warn!(core_id = target.core_id(), filter = %hex::encode(filter), frame,
@@ -906,9 +940,32 @@ where
     }
 }
 
+/// `local`, the lineage of the shard the worker holds, as its recovery
+/// replays it: `None` when the worker installs the shard's checkpoint over
+/// it ([`ShardRecoveryTarget::installs_over_lineage`]), which is logged.
+async fn replayed_lineage(
+    filter: &[u8],
+    local: Option<AppShardFrame>,
+    target: &dyn ShardRecoveryTarget,
+) -> Option<AppShardFrame> {
+    let local = local?;
+    let Some(reason) = target.installs_over_lineage().await else {
+        return Some(local);
+    };
+    tracing::info!(core_id = target.core_id(), filter = %hex::encode(filter),
+        local_head = local.header.as_ref().map_or(0, |header| header.frame_number),
+        materialized = target.materialized(), reason,
+        "archive recovery installs the shard's checkpoint instead of replaying this worker's lineage");
+    None
+}
+
 /// Common recovery path for thread and separate-process workers. A saved
 /// lineage replays certified bodies; an empty worker fetches and authenticates
 /// the archive checkpoint before tree writes, then waits for actor installation.
+/// So does a worker whose lineage no replay brings to the shard's state: the
+/// target says so ([`ShardRecoveryTarget::installs_over_lineage`]), or the
+/// shard's first frame does not apply to the state of a worker that has
+/// materialized none.
 ///
 /// `keep_turn`: the successor-blocked and lagging-voter flags of a worker
 /// holding a recovery turn (none without one). A turn replays one batch, and
@@ -956,11 +1013,25 @@ pub(crate) async fn recover_shard_from_latest(
         return yielded(install_sealed_state(syncer, filter, mismatch, target).await);
     }
     let sync_wait = &GlobalSyncWait::default();
-    if let Some(local) = local {
+    let local = replayed_lineage(filter, local, target).await;
+    // A worker that has materialized no frame and whose state is not the
+    // pre-state of the shard's first frame has nothing a replay can reach:
+    // it installs the checkpoint below instead.
+    'replay: {
+        let Some(local) = local else {
+            break 'replay;
+        };
         recovery_phase("replaying_frames");
         let committed_tip = target.committed_tip().await;
         let (started, from, replay_us) =
             (Instant::now(), target.materialized(), &AtomicU64::new(0));
+        let load = turn
+            .as_ref()
+            .map(crate::recovery_turns::Turn::replay_load)
+            .unwrap_or_default();
+        let costs_before = target.replay_costs();
+        // Replaying reads no archive: the turn serves the queue meanwhile.
+        let (lending, took_back_us) = (turn.as_ref(), &AtomicU64::new(0));
         let (mut materialized, mut batches) = (from, 0);
         // A batch short of its target replayed all its frames: each frame
         // advances the replay or fails it.
@@ -987,21 +1058,27 @@ pub(crate) async fn recover_shard_from_latest(
                 committed_tip,
                 &verify,
                 |frame, child| async move {
-                    let at = Instant::now();
+                    let at = tokio::time::Instant::now();
                     let number = frame
                         .header
                         .as_ref()
                         .map_or(0, |header| header.frame_number);
-                    let advanced = waiting_out_global_sync(
-                        sync_wait,
-                        target,
-                        filter,
-                        number,
-                        "archive replay",
-                        move || target.replay(frame.clone(), child.clone()),
-                    )
-                    .await;
-                    replay_us.fetch_add(at.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    let (advanced, took_back) =
+                        crate::recovery_turns::lent_during(lending, async {
+                            let advanced = waiting_out_global_sync(
+                                sync_wait,
+                                target,
+                                filter,
+                                number,
+                                "archive replay",
+                                move || target.replay(frame.clone(), child.clone()),
+                            )
+                            .await;
+                            replay_us.fetch_add(at.elapsed().as_micros() as u64, Ordering::Relaxed);
+                            advanced
+                        })
+                        .await;
+                    took_back_us.fetch_add(took_back.as_micros() as u64, Ordering::Relaxed);
                     advanced
                 },
             )
@@ -1016,6 +1093,16 @@ pub(crate) async fn recover_shard_from_latest(
                 {
                     return Ok(ShardRecoveryProgress::Deferred(PROOF_VERIFICATION_WAIT));
                 }
+                Err(error)
+                    if from == 0
+                        && target.materialized() == 0
+                        && crate::app_engine::replay_pre_state_mismatch(&error) =>
+                {
+                    tracing::info!(core_id = target.core_id(), filter = %hex::encode(filter), %error,
+                        "archive recovery installs the shard's checkpoint: this worker has materialized no frame, \
+                        and the shard's first frame does not apply to its state");
+                    break 'replay;
+                }
                 replayed => replayed?,
             };
             known = last;
@@ -1028,12 +1115,22 @@ pub(crate) async fn recover_shard_from_latest(
             materialized = replay.materialized;
         };
         let replay_ms = replay_us.load(Ordering::Relaxed) / 1000;
+        let turn_back_ms = took_back_us.load(Ordering::Relaxed) / 1000;
         let turn = ReplayTurn {
             frames: replay.materialized.saturating_sub(from),
             batches,
-            fetch_ms: (started.elapsed().as_millis() as u64).saturating_sub(replay_ms),
+            fetch_ms: (started.elapsed().as_millis() as u64)
+                .saturating_sub(replay_ms)
+                .saturating_sub(turn_back_ms),
             replay_ms,
+            turn_back_ms,
             behind: replay.materialized < replay.target,
+            split: crate::replay_split::ReplaySplit::of(
+                replay_ms,
+                sync_wait.refused_us.load(Ordering::Relaxed) / 1000,
+                target.replay_costs().since(costs_before),
+            ),
+            load,
         };
         return Ok(ShardRecoveryProgress::Replayed {
             materialized: replay.materialized,
@@ -1214,7 +1311,9 @@ fn yielded(result: Result<ShardRecoveryProgress>) -> Result<ShardRecoveryProgres
 ///
 /// A recovery for a seat this node gives up reads no archive
 /// ([`SEAT_GIVEN_UP`]): it asks `given_up` before each attempt and again
-/// once its turn is granted, which it then hands on unused.
+/// once its turn is granted, which it then hands on unused, passing whether
+/// the attempt installs the shard (the worker holds no lineage of it, or
+/// installs over the one it holds: [`ShardRecoveryTarget::installs_over_lineage`]).
 ///
 /// A recovery whose attempts keep stopping at a shard frame no archive
 /// serves waits out its back-off before it queues for a turn
@@ -1228,12 +1327,17 @@ pub(crate) async fn recover_in_turns(
     target: &dyn ShardRecoveryTarget,
     execution: &crate::worker_execution::SharedWorkerExecution,
     mut lineage: impl FnMut() -> Result<Option<AppShardFrame>>,
-    given_up: impl Fn() -> bool,
+    given_up: impl Fn(bool) -> bool,
 ) -> Result<ShardRecoveryProgress> {
     use crate::recovery_turns::{Claim, RecoveryKind};
     let mut ticket = execution.take_replay_ticket(filter);
     loop {
-        if given_up() {
+        let installs = match lineage() {
+            Ok(None) => true,
+            Ok(Some(_)) => target.installs_over_lineage().await.is_some(),
+            Err(_) => false,
+        };
+        if given_up(installs) {
             // Withholding may end (the seat renews): the place stays.
             if let Some(ticket) = ticket {
                 execution.keep_replay_ticket(filter, ticket);
@@ -1263,6 +1367,8 @@ pub(crate) async fn recover_in_turns(
             tracing::warn!(core, filter = %hex::encode(filter), %error,
             "cannot determine local shard lineage for sync")
         })?;
+        let local = replayed_lineage(filter, local, target).await;
+        let installs = local.is_none();
         let attempt = async {
             crate::worker_execution::recovery_phase("waiting_for_permit");
             let kind = if local.is_some() {
@@ -1293,7 +1399,7 @@ pub(crate) async fn recover_in_turns(
                 turn = turns.acquire(claim) => turn,
             };
             let place = *ticket.get_or_insert(turn.ticket());
-            if given_up() {
+            if given_up(installs) {
                 execution.keep_replay_ticket(filter, place);
                 return Ok(ShardRecoveryProgress::Deferred(SEAT_GIVEN_UP));
             }
@@ -2460,6 +2566,64 @@ mod tests {
         }
     }
 
+    /// A replay blocked in its engine leaves its turn to the worker behind
+    /// it, and goes on once that worker's turn ends.
+    #[tokio::test]
+    async fn a_replay_in_its_engine_lends_its_turn_to_the_next_worker() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive {
+            latest: Some(frame(131)),
+            calls: calls.clone(),
+        };
+        let turns: &'static crate::recovery_turns::RecoveryTurns =
+            Box::leak(Box::new(crate::recovery_turns::RecoveryTurns::new(1)));
+        let claim = |core: u32| crate::recovery_turns::Claim {
+            core,
+            filter: vec![5; 32],
+            kind: crate::recovery_turns::RecoveryKind::Replay,
+            execution: Default::default(),
+            ticket: None,
+        };
+        let held = turns.acquire(claim(1)).await;
+        let (got_tx, got) = tokio::sync::oneshot::channel();
+        let (end_tx, end) = tokio::sync::oneshot::channel::<()>();
+        let behind = tokio::spawn(async move {
+            let _turn = turns.acquire(claim(2)).await;
+            got_tx.send(()).unwrap();
+            let _ = end.await;
+        });
+        tokio::task::yield_now().await;
+        let target = Target {
+            calls: calls.clone(),
+            cursor: 129.into(),
+            valid: false,
+            install_ok: false,
+            blocked: false.into(),
+            unblock_at: 0,
+        };
+        let recovery = recover_shard_from_latest(
+            &archive,
+            &[5; 32],
+            Some(frame(130)),
+            &target,
+            &[],
+            Some(held),
+        );
+        let mut recovery = Box::pin(recovery);
+        // The first replayed frame lends the turn on, so the worker behind
+        // has it while the recovery asks for it back.
+        tokio::select! {
+            _ = &mut recovery => panic!("it needs the turn back to go on"),
+            got = got => got.unwrap(),
+        }
+        end_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), recovery)
+            .await
+            .expect("the turn comes back")
+            .unwrap();
+        behind.await.unwrap();
+    }
+
     #[tokio::test]
     async fn existing_worker_lineage_replays_instead_of_replacing_its_tree() {
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -2718,7 +2882,7 @@ mod tests {
                 &target,
                 &execution,
                 || Ok(Some(frame(130))),
-                || false,
+                |_| false,
             )
             .await
             .unwrap();
@@ -2766,7 +2930,7 @@ mod tests {
             &target,
             &execution,
             lineage,
-            || false,
+            |_| false,
         )
         .await
         .unwrap();
@@ -2808,7 +2972,7 @@ mod tests {
                 &target,
                 &execution,
                 lineage,
-                || false
+                |_| false
             ),
             async {
                 for _ in 0..3 {
@@ -2826,14 +2990,17 @@ mod tests {
             }
         ));
         let calls = calls.lock().unwrap().clone();
+        // Its place: its first archive read comes before the other worker
+        // is granted a turn. The other is granted only once the first lends
+        // the turn, during its first frame's replay (recovery_turns::lent_during).
         assert_eq!(
             calls.first().map(String::as_str),
             Some("fetch 0"),
             "{calls:?}"
         );
         assert_eq!(
-            calls.last().map(String::as_str),
-            Some("other granted"),
+            calls.iter().filter(|call| *call == "other granted").count(),
+            1,
             "{calls:?}"
         );
         assert!(
@@ -2853,7 +3020,7 @@ mod tests {
             &target,
             &execution,
             || Ok(Some(frame(193))),
-            || false,
+            |_| false,
         )
         .await
         .unwrap();
@@ -2954,7 +3121,7 @@ mod tests {
                     &target,
                     &execution,
                     || Ok(Some(frame(130))),
-                    || false
+                    |_| false
                 )
             ),
             async {
@@ -3081,7 +3248,7 @@ mod tests {
                 &stopping,
                 &first_record,
                 lineage,
-                || false
+                |_| false
             ),
             async {
                 tokio::task::yield_now().await;
@@ -3112,7 +3279,7 @@ mod tests {
                 &restarted,
                 &second_record,
                 lineage,
-                || false
+                |_| false
             ),
             async {
                 for _ in 0..3 {
@@ -3128,14 +3295,17 @@ mod tests {
             "{again:?}"
         );
         let calls = calls.lock().unwrap().clone();
+        // Its place: its first archive read comes before the other worker
+        // is granted a turn, which it gets only once the restarted recovery
+        // lends it (recovery_turns::lent_during).
         assert_eq!(
             calls.first().map(String::as_str),
             Some("fetch 0"),
             "the restarted engine's recovery takes the next turn: {calls:?}"
         );
         assert_eq!(
-            calls.last().map(String::as_str),
-            Some("other granted"),
+            calls.iter().filter(|call| *call == "other granted").count(),
+            1,
             "{calls:?}"
         );
     }
@@ -3173,7 +3343,7 @@ mod tests {
             &target,
             &execution,
             lineage,
-            || true,
+            |_| true,
         )
         .await
         .unwrap();
@@ -3203,7 +3373,7 @@ mod tests {
                 &target,
                 &execution,
                 lineage,
-                || given_up.load(Ordering::SeqCst)
+                |_| given_up.load(Ordering::SeqCst)
             ),
             async {
                 for _ in 0..3 {
@@ -5657,7 +5827,7 @@ mod tests {
                     &target,
                     &execution,
                     || Ok(None),
-                    || false,
+                    |_| false,
                 )
                 .await;
                 let installed = archive.installed.load(Ordering::SeqCst);
@@ -5760,7 +5930,7 @@ mod tests {
                     &target,
                     &execution,
                     || Ok(None),
-                    || false,
+                    |_| false,
                 )
                 .await
             });
@@ -6066,6 +6236,8 @@ mod tests {
         inner: Target,
         refusals: std::sync::atomic::AtomicUsize,
         refused: std::sync::atomic::AtomicUsize,
+        /// How long a replay it answers takes.
+        replay_takes: std::time::Duration,
     }
 
     impl SyncInstalling {
@@ -6074,6 +6246,7 @@ mod tests {
                 inner,
                 refusals: refusals.into(),
                 refused: 0.into(),
+                replay_takes: std::time::Duration::ZERO,
             }
         }
     }
@@ -6096,6 +6269,7 @@ mod tests {
                     quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS.into(),
                 ));
             }
+            tokio::time::sleep(self.replay_takes).await;
             self.inner.replay(frame, descendants).await
         }
         async fn validate(
@@ -6177,6 +6351,37 @@ mod tests {
         );
     }
 
+    /// The turn's line tells a GLOBAL sync's wait from the replay's own time:
+    /// 5 refusals at the first frame, 2 s apart, then 32 frames of 100 ms.
+    #[tokio::test(start_paused = true)]
+    async fn a_replays_global_sync_wait_is_split_from_its_own_time() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive {
+            latest: Some(frame(500)),
+            calls: calls.clone(),
+        };
+        let target = SyncInstalling {
+            replay_takes: std::time::Duration::from_millis(100),
+            ..SyncInstalling::new(replaying_target(&calls), 5)
+        };
+        let result =
+            recover_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &target, &[], None)
+                .await
+                .unwrap();
+        let ShardRecoveryProgress::Replayed { turn, .. } = result else {
+            panic!("expected a replay: {result:?}")
+        };
+        assert_eq!(turn.frames, 32);
+        assert_eq!(turn.split.global_sync_wait_ms, 10_000, "{turn:?}");
+        // This target keeps no account: all but the wait is queueing for it.
+        assert_eq!(turn.replay_ms, 13_200, "{turn:?}");
+        assert_eq!(turn.split.engine_queue_ms, 3_200, "{turn:?}");
+        assert_eq!(
+            turn.split.mostly(),
+            Some(crate::replay_split::ReplayPart::GlobalSync)
+        );
+    }
+
     /// An install that does not finish within the attempt's budget fails the
     /// attempt with its wait, as before, once the budget is spent: the turn
     /// is held no longer than [`GLOBAL_SYNC_WAIT_BUDGET`]. The failure is
@@ -6217,6 +6422,124 @@ mod tests {
         assert_eq!(
             recovery.failures_by_class.get("global_sync").copied(),
             Some(1)
+        );
+    }
+
+    /// Answers its replays, each taking `replay_takes`, and refuses with a
+    /// GLOBAL state sync's wait as `refusals` says, by frame number.
+    struct RefusesAtFrames {
+        inner: Target,
+        replay_takes: std::time::Duration,
+        refusals: Mutex<std::collections::HashMap<u64, usize>>,
+        refused: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ShardRecoveryTarget for RefusesAtFrames {
+        fn materialized(&self) -> u64 {
+            self.inner.materialized()
+        }
+        async fn replay(
+            &self,
+            frame: AppShardFrame,
+            descendants: Vec<AppShardFrame>,
+        ) -> Result<u64> {
+            let number = frame.header.as_ref().unwrap().frame_number;
+            let refuse = match self.refusals.lock().unwrap().get_mut(&number) {
+                Some(left) if *left > 0 => {
+                    *left -= 1;
+                    true
+                }
+                _ => false,
+            };
+            if refuse {
+                self.refused
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(quil_types::error::QuilError::ExecutionUnavailable(
+                    quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS.into(),
+                ));
+            }
+            tokio::time::sleep(self.replay_takes).await;
+            self.inner.replay(frame, descendants).await
+        }
+        async fn validate(
+            &self,
+            anchor: AppShardFrame,
+            predecessor: Option<AppShardFrame>,
+        ) -> Result<bool> {
+            self.inner.validate(anchor, predecessor).await
+        }
+        async fn install(
+            &self,
+            anchor: AppShardFrame,
+            predecessor: Option<AppShardFrame>,
+        ) -> Result<()> {
+            self.inner.install(anchor, predecessor).await
+        }
+        fn inherited(&self) {
+            panic!("a certified archive tip must never use unanchored inheritance")
+        }
+    }
+
+    /// A slow replay's own time spends none of the wait budget. A replay
+    /// answering 30 s a frame had taken 750 s by frame 155: charged for them,
+    /// its budget was gone, and a sync install starting there failed the attempt
+    /// at its first refusal, after no wait at all.
+    #[tokio::test(start_paused = true)]
+    async fn answered_replays_spend_none_of_the_global_sync_wait_budget() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive {
+            latest: Some(frame(500)),
+            calls: calls.clone(),
+        };
+        let target = RefusesAtFrames {
+            inner: replaying_target(&calls),
+            replay_takes: std::time::Duration::from_secs(30),
+            refusals: Mutex::new([(155, 3)].into()),
+            refused: 0.into(),
+        };
+        let result =
+            recover_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &target, &[], None)
+                .await;
+        let turn = match result {
+            Ok(ShardRecoveryProgress::Replayed { turn, .. }) => turn,
+            other => panic!(
+                "after 750 s of answered replays a sync install was not waited out: {other:?}"
+            ),
+        };
+        assert_eq!(turn.frames, 32, "{turn:?}");
+        assert_eq!(target.refused.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// Refused time adds up across an attempt's requests: 400 s refused at one
+    /// frame leaves 200 s for the next, and the attempt fails once they are
+    /// spent, whatever the frames' own time.
+    #[tokio::test(start_paused = true)]
+    async fn refused_requests_add_up_against_the_global_sync_wait_budget() {
+        use quil_execution::global_intrinsic::handoff::global_sync_in_progress;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive {
+            latest: Some(frame(500)),
+            calls: calls.clone(),
+        };
+        let polls_of_400_secs = (400 / GLOBAL_SYNC_POLL.as_secs()) as usize;
+        let target = RefusesAtFrames {
+            inner: replaying_target(&calls),
+            replay_takes: std::time::Duration::from_secs(1),
+            refusals: Mutex::new([(130, polls_of_400_secs), (131, usize::MAX)].into()),
+            refused: 0.into(),
+        };
+        let started = tokio::time::Instant::now();
+        let error =
+            recover_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &target, &[], None)
+                .await
+                .unwrap_err();
+        assert!(global_sync_in_progress(&error), "{error}");
+        let waited = started.elapsed();
+        assert!(
+            waited >= GLOBAL_SYNC_WAIT_BUDGET - GLOBAL_SYNC_POLL
+                && waited <= GLOBAL_SYNC_WAIT_BUDGET + 2 * GLOBAL_SYNC_POLL,
+            "{waited:?}"
         );
     }
 
@@ -6489,7 +6812,7 @@ mod tests {
                 &target,
                 &execution,
                 || Ok(Some(frame(target.materialized()))),
-                || false,
+                |_| false,
             )
         };
         for attempt in 0..20 {
@@ -6627,7 +6950,7 @@ mod tests {
                 target,
                 execution,
                 || Ok(Some(gap_frame(target.materialized()))),
-                || false,
+                |_| false,
             )
             .await;
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;

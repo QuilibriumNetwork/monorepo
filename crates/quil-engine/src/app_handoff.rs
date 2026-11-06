@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use quil_cw_consensus::adapters::ProposalContext;
 use quil_cw_consensus::handoff::automaton::{
-    AuthorizedParent, ClosingAbsence, ClosingProbe, ParentReader,
+    AuthorizedParent, BehindProbe, ClosingAbsence, ClosingProbe, ParentReader,
 };
 use quil_cw_consensus::handoff::{Checkpoint, Seal, Session};
 use quil_execution::global_intrinsic::handoff::{
@@ -317,6 +317,18 @@ impl ParentSource {
 
     pub fn reader(self: &Arc<Self>) -> ParentReader {
         self.reader_of(true)
+    }
+
+    /// Behind for longer than a leader's parent waits: the committed GLOBAL
+    /// view is withheld while a state sync installs its chunks, so no parent
+    /// reads until the sync records its cursor
+    /// (`HandoffProposer::with_behind_probe`).
+    pub fn behind_probe(self: &Arc<Self>) -> BehindProbe {
+        let source = self.clone();
+        Arc::new(move || match CommittedView::capture(&source.global) {
+            Err(error) if handoff::global_sync_in_progress(&error) => Some(error.to_string()),
+            _ => None,
+        })
     }
 
     /// The authorized checkpoint at the local materialized tip, whatever the
@@ -2970,7 +2982,8 @@ mod successor_tests {
     /// committed view is withheld, and a member of the head session keeps
     /// its worker: the wait says nothing about the session, unlike a node
     /// with no GLOBAL state yet. Once the sync is in, the view shows the
-    /// archive's state (here without the session).
+    /// archive's state (here without the session). Meanwhile its leaders
+    /// are behind: they give their turns up at once.
     #[test]
     fn a_global_sync_between_chunks_withholds_the_view_but_keeps_the_worker() {
         use quil_execution::global_intrinsic::handoff::global_sync_in_progress;
@@ -2979,6 +2992,17 @@ mod successor_tests {
         let (source, _, _) = closing_session(&global, &state, &filter);
         let member = source.members[0].clone();
         assert!(retains_worker(&global, &filter, &member));
+        let behind = ParentSource::new(
+            source.clone(),
+            global.clone(),
+            crdt(),
+            Arc::new(quil_store::testing::InMemoryClockStore::new()) as Arc<dyn ClockStore>,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap()
+        .behind_probe();
+        assert_eq!(behind(), None);
 
         let address = [0xff; 32];
         let archive = Arc::new(HypergraphCrdt::new(
@@ -3024,6 +3048,7 @@ mod successor_tests {
             .err()
             .expect("no committed view between a sync's chunks");
         assert!(global_sync_in_progress(&error), "{error}");
+        assert_eq!(behind(), Some(error.to_string()));
         assert!(
             retains_worker(&global, &filter, &member),
             "the member keeps its worker while the sync installs"
@@ -3038,9 +3063,145 @@ mod successor_tests {
         global.apply_sync_chunk(&mut plan, &rest).unwrap();
         assert_eq!(global.finish_phase_sync(&plan).unwrap(), root);
         let view = CommittedView::capture(&global).unwrap();
+        assert_eq!(behind(), None);
         assert!(handoff::head(&view, &filter).unwrap().is_none());
         assert!(!retains_worker(&global, &filter, &member));
         assert_eq!(worker_retention(&global, &filter, &member), Some(false));
+    }
+
+    /// Install `archive`'s GLOBAL records into `global` as a regular node's
+    /// verified prover-tree sync does, in one chunk, before its cursor is
+    /// recorded.
+    fn sync_global_from(archive: &Arc<HypergraphCrdt>, global: &Arc<HypergraphCrdt>) {
+        let address = [0xff; 32];
+        let (version, root) = archive.serve_forest_head(&address, 0).unwrap();
+        let reader = quil_hypergraph::testing::CrdtTreeReader {
+            source: archive.clone(),
+            shard_id: address.to_vec(),
+            phase: 0,
+        };
+        let mut plan = global
+            .prepare_phase_sync(
+                &reader,
+                version,
+                &address,
+                0,
+                &[],
+                Some(quil_forest::SubtreeSyncAnchor::AppRoot(root)),
+            )
+            .unwrap();
+        plan.hold_view();
+        let blob = |key: &[u8; 32]| {
+            let location = quil_hypergraph::Location {
+                app_address: address,
+                data_address: *key,
+            };
+            archive.get_vertex_data_checked(&location).unwrap()
+        };
+        let blobs: Vec<Vec<u8>> = plan
+            .remaining()
+            .iter()
+            .map(|(key, leaf)| leaf.as_ref().and_then(|_| blob(key)).unwrap_or_default())
+            .collect();
+        if !blobs.is_empty() {
+            global.apply_sync_chunk(&mut plan, &blobs).unwrap();
+        }
+        assert_eq!(global.finish_phase_sync(&plan).unwrap(), root);
+    }
+
+    /// A regular node's verified GLOBAL sync installs the archive's records
+    /// before it records the frame they belong to. Meanwhile the committed
+    /// view must not pair the synced session with the cursor from before the
+    /// sync, a frame that never had it: reads wait instead.
+    #[test]
+    fn a_verified_global_sync_never_shows_its_records_with_the_previous_cursor() {
+        use quil_execution::global_intrinsic::handoff::global_sync_in_progress;
+        let filter = vec![0x0d; 32];
+        let (archive, archive_state) = global_state();
+        let _ = closing_session(&archive, &archive_state, &filter);
+        let (global, state) = global_state();
+        commit(&global, &state, 1);
+        let before = CommittedView::capture(&global).unwrap();
+        assert_eq!(before.frame(), 1);
+        assert!(handoff::head(&before, &filter).unwrap().is_none());
+        drop(before);
+
+        sync_global_from(&archive, &global);
+        match CommittedView::capture(&global) {
+            Err(error) => assert!(global_sync_in_progress(&error), "{error}"),
+            Ok(view) => {
+                let head = handoff::head(&view, &filter).unwrap();
+                assert!(
+                    head.is_none() || view.frame() >= 3,
+                    "the committed view shows the synced session head (generation {:?}) \
+                     with the cursor from before the sync (frame {})",
+                    head.map(|session| session.generation),
+                    view.frame(),
+                );
+            }
+        }
+    }
+
+    /// A GLOBAL store whose commits can be made to fail.
+    fn failing_global() -> (Arc<HypergraphCrdt>, Arc<quil_store::RocksHypergraphStore>) {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let crdt = Arc::new(HypergraphCrdt::new(
+            store.clone(),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
+        (crdt, store)
+    }
+
+    /// The view a verified sync withholds stays withheld while its cursor
+    /// cannot be recorded, and recovers at the next verified sync, which
+    /// records it even with nothing left to install. A checkpoint at a lower
+    /// frame never moves the cursor back.
+    #[test]
+    fn a_global_view_withheld_by_a_failed_cursor_record_recovers_at_the_next_sync() {
+        use quil_execution::global_intrinsic::handoff::global_sync_in_progress;
+        let filter = vec![0x0e; 32];
+        let (archive, archive_state) = global_state();
+        let _ = closing_session(&archive, &archive_state, &filter);
+        let (global, store) = failing_global();
+        let state = HypergraphState::new(global.clone());
+        commit(&global, &state, 1);
+        let cursor = quil_store::encoding::global_materialized_cursor_key();
+
+        sync_global_from(&archive, &global);
+        store.fail_commit_for_test(true);
+        let failed = global.checkpoint_synced_view(&[0xff; 32], 3, &cursor);
+        assert!(failed.is_err(), "{failed:?}");
+        store.fail_commit_for_test(false);
+        let error = CommittedView::capture(&global)
+            .err()
+            .expect("withheld while the cursor is not recorded");
+        assert!(global_sync_in_progress(&error), "{error}");
+        assert_eq!(
+            global.read_frame_cursor(&cursor).unwrap(),
+            1,
+            "the failed record wrote nothing"
+        );
+
+        sync_global_from(&archive, &global);
+        let checkpoint = global
+            .checkpoint_synced_view(&[0xff; 32], 3, &cursor)
+            .unwrap();
+        assert_eq!((checkpoint.previous, checkpoint.held), (Some(1), true));
+        let view = CommittedView::capture(&global).unwrap();
+        assert_eq!(view.frame(), 3);
+        assert!(handoff::head(&view, &filter).unwrap().is_some());
+        drop(view);
+
+        let checkpoint = global
+            .checkpoint_synced_view(&[0xff; 32], 2, &cursor)
+            .unwrap();
+        assert_eq!((checkpoint.previous, checkpoint.held), (Some(3), false));
+        assert_eq!(CommittedView::capture(&global).unwrap().frame(), 3);
     }
 
     /// A member whose cursor is at its predecessor's sealed checkpoint, with
