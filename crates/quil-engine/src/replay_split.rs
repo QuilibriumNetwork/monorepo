@@ -25,11 +25,10 @@
 //! iterator call sites, and a raw iterator's steps have no call to put a timer
 //! around, so `store_wait_ms` stands in for them; it also holds any lock wait
 //! on that thread. Slow-disk lines ("store reads slow") and `iostat` tell the
-//! two apart. The thread's CPU and run-queue times come from one small read of
-//! `/proc/thread-self/schedstat` around each step of a frame; where it is
-//! unavailable those parts are absent from the line and their time falls to
-//! `other_ms`. Its CPU counter advances at scheduler ticks, so frames of a few
-//! milliseconds read coarsely; slow turns, of seconds a frame, do not.
+//! two apart. Around each step of a frame the thread's CPU time comes from its
+//! CPU clock and its run-queue time from one small read of
+//! `/proc/thread-self/schedstat`; where that is unavailable those parts are
+//! absent from the line and their time falls to `other_ms`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -58,18 +57,28 @@ pub(crate) struct ThreadTimes {
 }
 
 impl ThreadTimes {
+    /// The on-CPU counter in schedstat advances only at a scheduler tick or a
+    /// switch, so it can miss up to a tick of the CPU time before a read; the
+    /// thread's CPU clock brings it up to date as it reads. The run-queue wait
+    /// grows only while the thread waits, so it is current while it runs.
     fn now() -> Option<Self> {
-        Self::parse(&std::fs::read_to_string("/proc/thread-self/schedstat").ok()?)
+        let times = Self::parse(&std::fs::read_to_string("/proc/thread-self/schedstat").ok()?)?;
+        Some(Self {
+            on_cpu: thread_cpu_time()?,
+            ..times
+        })
     }
 
     /// `<on-CPU ns> <run-queue wait ns> <timeslices>`. A kernel keeping no
-    /// scheduler statistics reports zeros, which a running thread cannot have.
+    /// scheduler statistics reports zeros. A running thread has had a
+    /// timeslice, but a new one may show no time on CPU: the counter catches
+    /// up only at a scheduler tick or a switch.
     fn parse(text: &str) -> Option<Self> {
         let mut fields = text.split_ascii_whitespace();
         let on_cpu: u64 = fields.next()?.parse().ok()?;
         let run_wait: u64 = fields.next()?.parse().ok()?;
-        fields.next()?.parse::<u64>().ok()?;
-        (fields.next().is_none() && on_cpu > 0).then(|| Self {
+        let timeslices: u64 = fields.next()?.parse().ok()?;
+        (fields.next().is_none() && timeslices > 0).then(|| Self {
             on_cpu: Duration::from_nanos(on_cpu),
             run_wait: Duration::from_nanos(run_wait),
         })
@@ -81,6 +90,29 @@ impl ThreadTimes {
             run_wait: self.run_wait.saturating_sub(earlier.run_wait),
         }
     }
+}
+
+/// This thread's CPU time, from its CPU clock.
+#[cfg(target_os = "linux")]
+fn thread_cpu_time() -> Option<Duration> {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes only the timespec it is given.
+    let read = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+    if read != 0 {
+        return None;
+    }
+    Some(Duration::new(
+        u64::try_from(now.tv_sec).ok()?,
+        u32::try_from(now.tv_nsec).ok()?,
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thread_cpu_time() -> Option<Duration> {
+    None
 }
 
 /// One step of a frame's materialization, on the thread that ran it.
@@ -112,23 +144,26 @@ pub(crate) struct ThreadStepTimer {
 }
 
 impl ThreadStepTimer {
+    /// The wall clock starts first and stops last, so that the counters'
+    /// window, their reads' cost included, nests inside the wall's.
     pub(crate) fn start() -> Self {
         Self {
-            times: ThreadTimes::now(),
-            store_write: quil_forest::thread_store_write_time(),
             started: Instant::now(),
+            store_write: quil_forest::thread_store_write_time(),
+            times: ThreadTimes::now(),
         }
     }
 
     pub(crate) fn end(self) -> ThreadStep {
-        let wall = self.started.elapsed();
+        let times = self
+            .times
+            .zip(ThreadTimes::now())
+            .map(|(before, after)| after.since(before));
+        let store_write = quil_forest::thread_store_write_time().saturating_sub(self.store_write);
         ThreadStep {
-            wall,
-            store_write: quil_forest::thread_store_write_time().saturating_sub(self.store_write),
-            times: self
-                .times
-                .zip(ThreadTimes::now())
-                .map(|(before, after)| after.since(before)),
+            wall: self.started.elapsed(),
+            store_write,
+            times,
         }
     }
 }
@@ -511,6 +546,14 @@ mod tests {
                 run_wait: Duration::from_micros(2500),
             })
         );
+        // A new thread before its first tick or switch.
+        assert_eq!(
+            ThreadTimes::parse("0 0 1\n"),
+            Some(ThreadTimes {
+                on_cpu: Duration::ZERO,
+                run_wait: Duration::ZERO,
+            })
+        );
         for malformed in [
             "",
             "\n",
@@ -528,16 +571,27 @@ mod tests {
         }
     }
 
-    /// A thread spinning shows on CPU, and one sleeping does not. Where the
-    /// kernel offers no counters there is nothing to show. The spin waits on
-    /// the counter, within a cap, so that load slows it and a hang still fails.
+    /// Replays run on blocking threads, which may be new: a thread reads its
+    /// times before its first tick or switch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_new_thread_reads_its_times() {
+        for _ in 0..20 {
+            let times = std::thread::spawn(ThreadTimes::now).join().unwrap();
+            assert!(times.is_some(), "a new thread read no times");
+        }
+    }
+
+    /// A thread spinning shows on CPU, and one sleeping does not. The spin
+    /// waits on the counter, within a cap, so that load slows it and a hang
+    /// still fails. Before its timer starts, the test's new thread runs on CPU
+    /// with no tick or switch to bring schedstat's counter up to date.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_step_tells_time_on_cpu_from_time_off_it() {
-        let Some(before) = ThreadTimes::now() else {
-            return;
-        };
-        let on_cpu = |step: &ThreadStep| step.times.unwrap().on_cpu;
+        let on_cpu = |step: &ThreadStep| step.times.expect("thread times").on_cpu;
         let spin = Duration::from_millis(150);
+        let before = ThreadTimes::now().expect("this thread's times");
         let spinning = ThreadStepTimer::start();
         while ThreadTimes::now().unwrap().since(before).on_cpu < spin {
             assert!(
@@ -546,8 +600,11 @@ mod tests {
             );
         }
         let spun = spinning.end();
-        assert!(spun.wall >= on_cpu(&spun), "{spun:?}");
-        assert!(on_cpu(&spun) > Duration::ZERO, "{spun:?}");
+        // The CPU clock runs on the scheduler's clock and the wall on the
+        // monotonic one, which time sync may slow by up to 500 ppm; a build
+        // host's scheduler clock ran 200-260 ppm slower than its monotonic one.
+        assert!(on_cpu(&spun) <= spun.wall + spun.wall / 1000, "{spun:?}");
+        assert!(on_cpu(&spun) >= spin / 2, "{spun:?}");
 
         let sleep = Duration::from_millis(200);
         let sleeping = ThreadStepTimer::start();

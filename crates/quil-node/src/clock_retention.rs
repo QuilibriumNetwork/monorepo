@@ -16,9 +16,15 @@
 //!   range only once table files of pruned bodies reach
 //!   `RocksClockStore::REQUEST_RECLAIM_BYTES`. A worker's first pass waits
 //!   an extra minute per core (repeating after an hour of cores).
+//! - `QUIL_PRUNE_UNSERVED_SHARD_FRAMES`: on a regular master, every
+//!   `QUIL_PRUNE_INTERVAL_SECS` (first after an hour), delete the stored
+//!   frames of shards no worker or engine of the node serves whose latest
+//!   frame is older than `QUIL_PRUNE_UNSERVED_SHARD_FRAMES_IDLE_SECS`
+//!   (default two days, at least one), keeping each shard's latest frame.
 //! - `QUIL_SNAPSHOT_PINNED_MAX=<n>`: keep store snapshots only on the newest
 //!   `n` (default 64, at least 16; `off` also disables it) published
 //!   generations.
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -172,6 +178,226 @@ pub(crate) fn spawn_request_pruner_for_core(
     }
 }
 
+/// Frame keys examined per step of an unserved-shard frame pass.
+const UNSERVED_STEP: usize = 10_000;
+/// Frame keys one unserved-shard pass examines at most; the next pass goes on
+/// from there.
+const UNSERVED_PASS_MAX: u64 = 1_000_000;
+/// A pass still running after this logs one overrun warning.
+const UNSERVED_PASS_OVERRUN: Duration = Duration::from_secs(600);
+/// The first unserved-shard pass waits this long, so the workers that serve
+/// shards again after a restart are listed before any shard counts as left.
+const UNSERVED_FIRST_PASS: Duration = Duration::from_secs(3600);
+/// How long a shard's frames are kept after its latest frame, by default:
+/// two days, the regular node's gap backfill window and four epochs, past a
+/// leave's confirmation and the epoch its rewards settle in.
+const UNSERVED_IDLE_DEFAULT_SECS: u64 = 2 * 86_400;
+/// Never less than two epochs, whatever is configured.
+const UNSERVED_IDLE_MIN_SECS: u64 = 86_400;
+
+/// The shard filters a node serves, or `None` when it cannot tell (then no
+/// frame is deleted).
+pub(crate) type ServedShards = Arc<dyn Fn() -> Option<HashSet<Vec<u8>>> + Send + Sync>;
+
+/// The filters of every worker bound to a shard (confirmed or pending) and
+/// of every running application engine. `None` once either has gone (the
+/// node is stopping) or the workers cannot be listed.
+pub(crate) fn served_shards(
+    workers: Weak<dyn quil_engine::worker::WorkerManager>,
+    engines: Weak<
+        parking_lot::RwLock<
+            std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
+        >,
+    >,
+) -> ServedShards {
+    Arc::new(move || {
+        let listed = workers.upgrade()?.range_workers().ok()?;
+        let engines = engines.upgrade()?;
+        let mut served: HashSet<Vec<u8>> = listed
+            .into_iter()
+            .map(|worker| worker.filter)
+            .filter(|filter| !filter.is_empty())
+            .collect();
+        served.extend(engines.read().keys().cloned());
+        Some(served)
+    })
+}
+
+/// `QUIL_PRUNE_UNSERVED_SHARD_FRAMES` (default on): on a regular master,
+/// every `QUIL_PRUNE_INTERVAL_SECS`, delete the stored frames of shards no
+/// worker or engine of this node serves and whose latest frame is older
+/// than `QUIL_PRUNE_UNSERVED_SHARD_FRAMES_IDLE_SECS` (default two days, at
+/// least one), keeping each shard's latest frame. Engines read their worker's
+/// own store, so only the master's copy, read by RPC and the explorer, goes.
+pub(crate) fn spawn_unserved_frame_pruner(
+    clock: &Arc<quil_store::RocksClockStore>,
+    served: ServedShards,
+    label: String,
+) {
+    if !enabled("QUIL_PRUNE_UNSERVED_SHARD_FRAMES") {
+        return;
+    }
+    let clock: Weak<quil_store::RocksClockStore> = Arc::downgrade(clock);
+    let idle = Duration::from_secs(unserved_idle_secs(setting(
+        "QUIL_PRUNE_UNSERVED_SHARD_FRAMES_IDLE_SECS",
+    )));
+    let interval = Duration::from_secs(setting("QUIL_PRUNE_INTERVAL_SECS").unwrap_or(600).max(10));
+    let spawned = std::thread::Builder::new()
+        .name(format!("unserved-prune-{label}"))
+        .spawn(move || {
+            info!(store = %label, idle_secs = idle.as_secs(),
+                first_pass_secs = UNSERVED_FIRST_PASS.as_secs(),
+                "pruning frames of shards this node no longer serves enabled");
+            let mut wait = UNSERVED_FIRST_PASS.max(interval);
+            let mut resume = None;
+            loop {
+                std::thread::sleep(wait);
+                wait = interval;
+                let Some(store) = clock.upgrade() else { return };
+                let pass = UnservedPass {
+                    idle,
+                    step: UNSERVED_STEP,
+                    max: UNSERVED_PASS_MAX,
+                    overrun: UNSERVED_PASS_OVERRUN,
+                    pause: Duration::from_millis(50),
+                };
+                prune_unserved(&store, served.as_ref(), &pass, &mut resume, &label);
+            }
+        });
+    if let Err(error) = spawned {
+        warn!(%error, "unserved shard frame pruning not started");
+    }
+}
+
+/// The configured idle bound in seconds, defaulted and floored.
+fn unserved_idle_secs(configured: Option<u64>) -> u64 {
+    configured
+        .unwrap_or(UNSERVED_IDLE_DEFAULT_SECS)
+        .max(UNSERVED_IDLE_MIN_SECS)
+}
+
+/// Bounds of one [`prune_unserved`] pass.
+struct UnservedPass {
+    idle: Duration,
+    step: usize,
+    max: u64,
+    overrun: Duration,
+    pause: Duration,
+}
+
+/// What one [`prune_unserved`] pass did.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UnservedTotals {
+    shards: u64,
+    frames: u64,
+    bytes: u64,
+    compacted: u64,
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as i64)
+}
+
+/// One bounded pass from `resume`, which it leaves where the next pass goes
+/// on. The served set is read again for every step; when it cannot be read
+/// the pass stops.
+fn prune_unserved(
+    store: &quil_store::RocksClockStore,
+    served: &(dyn Fn() -> Option<HashSet<Vec<u8>>> + Send + Sync),
+    pass: &UnservedPass,
+    resume: &mut Option<Vec<u8>>,
+    label: &str,
+) -> UnservedTotals {
+    let started = std::time::Instant::now();
+    let idle_before_ms = now_ms().saturating_sub(pass.idle.as_millis() as i64);
+    let mut totals = UnservedTotals::default();
+    let mut shards: HashMap<Vec<u8>, (u64, u64)> = HashMap::new();
+    let (mut examined, mut announced, mut overran) = (0u64, false, false);
+    loop {
+        let Some(set) = served() else {
+            info!(store = %label, "unserved shard frame pass skipped: the served shards cannot be listed");
+            break;
+        };
+        let is_served = |filter: &[u8]| set.contains(filter);
+        let step = pass
+            .step
+            .min(pass.max.saturating_sub(examined) as usize)
+            .max(1);
+        // A dry first step tells whether there is anything to do, so an idle
+        // store logs nothing. Nothing left past the resume point: the next
+        // pass starts over from the first shard.
+        if !announced {
+            match store.prune_unserved_shard_frames(
+                &is_served,
+                idle_before_ms,
+                resume.as_deref(),
+                step,
+                true,
+            ) {
+                Ok(dry) if dry.pruned.is_empty() && dry.next.is_none() => {
+                    *resume = None;
+                    break;
+                }
+                Ok(dry) => info!(store = %label, served = set.len(), shards = dry.shards,
+                    idle_secs = pass.idle.as_secs(), max_frames = pass.max,
+                    "pruning frames of shards this node no longer serves"),
+                Err(error) => {
+                    warn!(store = %label, %error, "unserved shard frame prune failed; retrying next pass");
+                    break;
+                }
+            }
+            announced = true;
+        }
+        let step = match store.prune_unserved_shard_frames(
+            &is_served,
+            idle_before_ms,
+            resume.as_deref(),
+            step,
+            false,
+        ) {
+            Ok(step) => step,
+            Err(error) => {
+                warn!(store = %label, %error, "unserved shard frame prune failed; retrying next pass");
+                break;
+            }
+        };
+        examined += step.examined.max(1);
+        for shard in &step.pruned {
+            let entry = shards.entry(shard.filter.clone()).or_default();
+            entry.0 = entry.0.max(shard.below);
+            entry.1 += shard.bytes;
+            totals.frames += shard.frames;
+            totals.bytes += shard.bytes;
+        }
+        *resume = step.next;
+        if !overran && started.elapsed() >= pass.overrun {
+            overran = true;
+            warn!(store = %label, secs = started.elapsed().as_secs(), frames = totals.frames,
+                mib = totals.bytes >> 20, "unserved shard frame pass is running long; it goes on");
+        }
+        if resume.is_none() || examined >= pass.max {
+            break;
+        }
+        std::thread::sleep(pass.pause);
+    }
+    totals.shards = shards.len() as u64;
+    for (filter, (below, bytes)) in &shards {
+        if *bytes >= quil_store::RocksClockStore::SHARD_FRAME_RECLAIM_BYTES {
+            store.compact_pruned_shard_frames(filter, *below);
+            totals.compacted += 1;
+        }
+    }
+    if announced {
+        info!(store = %label, shards = totals.shards, frames = totals.frames,
+            mib = totals.bytes >> 20, compacted = totals.compacted,
+            done = resume.is_none(), secs = started.elapsed().as_secs(),
+            "pruned frames of shards this node no longer serves");
+    }
+    totals
+}
+
 fn prune_staged(db: &quil_forest::WeakCoordinatedDb, label: &str) {
     let mut after: Option<Vec<u8>> = None;
     let (mut scanned, mut deleted, mut bytes, mut kept) = (0u64, 0u64, 0u64, 0u64);
@@ -261,5 +487,317 @@ mod tests {
         assert!(default_on(Some("yes")));
         assert!(!default_on(Some("0")));
         assert!(!default_on(Some(" 0 ")));
+    }
+}
+
+#[cfg(test)]
+mod unserved_tests {
+    use super::*;
+    use quil_types::proto::global;
+    use quil_types::store::ClockStore;
+
+    fn open(dir: &std::path::Path) -> (quil_store::RocksDb, quil_store::RocksClockStore) {
+        let db = quil_store::RocksDb::open(dir).unwrap();
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        (db, clock)
+    }
+
+    /// Frames `1..=head` of `filter`, all `age` old.
+    fn serve(s: &quil_store::RocksClockStore, filter: &[u8], head: u64, age: Duration) {
+        let stamp = now_ms() - age.as_millis() as i64;
+        for n in 1..=head {
+            let frame = global::AppShardFrame {
+                header: Some(global::FrameHeader {
+                    address: filter.to_vec(),
+                    frame_number: n,
+                    timestamp: stamp,
+                    output: vec![n as u8; 64],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            s.store_shard_clock_frame_for_serving(&[n as u8; 32], &frame)
+                .unwrap();
+        }
+    }
+
+    fn frames(s: &quil_store::RocksClockStore, filter: &[u8], head: u64) -> u64 {
+        (1..=head)
+            .filter(|&n| s.get_shard_clock_frame(filter, n, false).is_ok())
+            .count() as u64
+    }
+
+    fn pass(max: u64) -> UnservedPass {
+        UnservedPass {
+            idle: Duration::from_secs(UNSERVED_IDLE_DEFAULT_SECS),
+            step: 4,
+            max,
+            overrun: Duration::ZERO,
+            pause: Duration::ZERO,
+        }
+    }
+
+    const DAY: Duration = Duration::from_secs(86_400);
+
+    /// A pass deletes the old frames of shards left more than the bound ago
+    /// and keeps a served shard and one left within the bound whole.
+    #[test]
+    fn a_pass_prunes_only_shards_left_longer_than_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, s) = open(dir.path());
+        let (left, served, recent) = (vec![1u8; 35], vec![2u8; 35], vec![3u8; 35]);
+        serve(&s, &left, 12, 3 * DAY);
+        serve(&s, &served, 12, 3 * DAY);
+        serve(&s, &recent, 12, DAY);
+        let set: HashSet<Vec<u8>> = [served.clone()].into();
+        let listed = move || Some(set.clone());
+        let mut resume = None;
+
+        let totals = prune_unserved(&s, &listed, &pass(1_000), &mut resume, "test");
+
+        assert_eq!(
+            frames(&s, &left, 12),
+            1,
+            "a shard left more than the bound ago keeps only its latest frame"
+        );
+        assert_eq!(
+            frames(&s, &served, 12),
+            12,
+            "a served shard keeps every frame"
+        );
+        assert_eq!(
+            frames(&s, &recent, 12),
+            12,
+            "a recently left shard keeps every frame"
+        );
+        assert_eq!((totals.shards, totals.frames, totals.compacted), (1, 11, 0));
+        assert_eq!(resume, None);
+    }
+
+    /// Without the served shards, a pass deletes nothing.
+    #[test]
+    fn no_frame_is_deleted_when_the_served_shards_cannot_be_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, s) = open(dir.path());
+        let left = vec![1u8; 35];
+        serve(&s, &left, 12, 3 * DAY);
+        let unlisted = || None;
+        let mut resume = None;
+
+        let totals = prune_unserved(&s, &unlisted, &pass(1_000), &mut resume, "test");
+        assert_eq!(frames(&s, &left, 12), 12, "nothing is deleted unlisted");
+        assert_eq!(totals, UnservedTotals::default());
+    }
+
+    /// A pass stops at its frame budget and the next goes on from there.
+    #[test]
+    fn a_pass_stops_at_its_budget_and_the_next_goes_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, s) = open(dir.path());
+        let (a, b) = (vec![1u8; 35], vec![2u8; 35]);
+        serve(&s, &a, 12, 3 * DAY);
+        serve(&s, &b, 12, 3 * DAY);
+        let none = || Some(HashSet::new());
+        let mut resume = None;
+
+        let first = prune_unserved(&s, &none, &pass(8), &mut resume, "test");
+        assert_eq!(first.frames, 8, "a pass stops at its budget");
+        assert!(resume.is_some(), "and says where the next goes on");
+        let second = prune_unserved(&s, &none, &pass(1_000), &mut resume, "test");
+        assert_eq!(first.frames + second.frames, 22);
+        assert_eq!((frames(&s, &a, 12), frames(&s, &b, 12)), (1, 1));
+        assert_eq!(resume, None);
+    }
+
+    /// A pass that finds nothing left past where the last one stopped starts
+    /// the next from the first shard, so shards before that point are not
+    /// skipped for good.
+    #[test]
+    fn a_pass_with_nothing_past_its_resume_point_starts_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, s) = open(dir.path());
+        let (a, b) = (vec![1u8; 35], vec![2u8; 35]);
+        serve(&s, &a, 12, 3 * DAY);
+        serve(&s, &b, 12, 3 * DAY);
+        let only_a = || Some(HashSet::from([a.clone()]));
+        let only_b = || Some(HashSet::from([b.clone()]));
+        let mut resume = None;
+
+        prune_unserved(&s, &only_a, &pass(4), &mut resume, "test");
+        assert!(
+            resume.is_some(),
+            "the first pass stops inside the second shard"
+        );
+        // The second shard is taken up and the first left.
+        prune_unserved(&s, &only_b, &pass(1_000), &mut resume, "test");
+        prune_unserved(&s, &only_b, &pass(1_000), &mut resume, "test");
+        assert_eq!(
+            frames(&s, &a, 12),
+            1,
+            "a pass with nothing past its resume point starts over"
+        );
+        assert_eq!(resume, None);
+    }
+
+    /// Served: every worker bound to a shard, confirmed or still joining;
+    /// unknown once the workers are gone.
+    #[test]
+    fn served_shards_are_every_bound_workers_filter() {
+        let workers = Arc::new(quil_engine::test_support::TestWorkerManager::new());
+        workers.add_with_filter(1, vec![1; 35]);
+        workers.add(quil_engine::worker::WorkerInfo {
+            core_id: 2,
+            filter: vec![2; 35],
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: 7,
+            allocated: false,
+        });
+        workers.add_with_filter(3, Vec::new());
+        let engines = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+        let as_manager: Arc<dyn quil_engine::worker::WorkerManager> = workers.clone();
+        let served = served_shards(Arc::downgrade(&as_manager), Arc::downgrade(&engines));
+
+        let expected: HashSet<Vec<u8>> = [vec![1; 35], vec![2; 35]].into();
+        assert_eq!(
+            served(),
+            Some(expected),
+            "a joining worker's shard is served"
+        );
+        drop((as_manager, workers));
+        assert_eq!(served(), None, "unknown once the workers are gone");
+    }
+
+    /// `(read_bytes, write_bytes)` of this process from `/proc/self/io`.
+    fn process_io() -> (u64, u64) {
+        let text = std::fs::read_to_string("/proc/self/io").unwrap_or_default();
+        let field = |name: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(name))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0)
+        };
+        (field("read_bytes:"), field("write_bytes:"))
+    }
+
+    /// Full-scale cost of the pruner on a writable copy of a node's master
+    /// store (`QUIL_PRUNE_MEASURE_STORE`; never a live store): a dry run,
+    /// then the node's own passes until every shard is done, with its step,
+    /// budget and compaction threshold. `QUIL_PRUNE_MEASURE_SERVED` lists the
+    /// served filters in hex, comma-separated; with none, only the idle bound
+    /// keeps the shards the copied node still served.
+    #[test]
+    #[ignore = "measurement on a store copy"]
+    fn measure_unserved_frame_prune() {
+        let Ok(path) = std::env::var("QUIL_PRUNE_MEASURE_STORE") else {
+            return;
+        };
+        let served: HashSet<Vec<u8>> = std::env::var("QUIL_PRUNE_MEASURE_SERVED")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|hex| !hex.is_empty())
+            .map(|filter| hex::decode(filter.trim()).unwrap())
+            .collect();
+        let (db, s) = open(std::path::Path::new(&path));
+        let tables = || -> u64 {
+            db.inner()
+                .live_files()
+                .unwrap()
+                .iter()
+                .map(|f| f.size as u64)
+                .sum()
+        };
+        let idle = Duration::from_secs(unserved_idle_secs(setting(
+            "QUIL_PRUNE_UNSERVED_SHARD_FRAMES_IDLE_SECS",
+        )));
+        let idle_before_ms = now_ms() - idle.as_millis() as i64;
+        let is_served = |filter: &[u8]| served.contains(filter);
+        println!(
+            "store {path}: {} table bytes, {} served filters, idle {}s",
+            tables(),
+            served.len(),
+            idle.as_secs()
+        );
+
+        let (io, started) = (process_io(), std::time::Instant::now());
+        let (mut next, mut dry) = (None::<Vec<u8>>, (0u64, 0u64, 0u64, 0u64, 0u64));
+        loop {
+            let step = s
+                .prune_unserved_shard_frames(
+                    &is_served,
+                    idle_before_ms,
+                    next.as_deref(),
+                    UNSERVED_STEP,
+                    true,
+                )
+                .unwrap();
+            if next.is_none() {
+                dry.0 = step.shards;
+                dry.1 = step.served;
+                dry.2 = step.recent;
+            }
+            dry.3 += step.frames();
+            dry.4 += step.bytes();
+            next = step.next;
+            if next.is_none() {
+                break;
+            }
+        }
+        let after = process_io();
+        println!(
+            "dry run: shards {} (served {}, recent {}), deletable {} frames, {} bytes; {:.1}s, read {} B, written {} B",
+            dry.0, dry.1, dry.2, dry.3, dry.4,
+            started.elapsed().as_secs_f64(), after.0 - io.0, after.1 - io.1
+        );
+
+        let listed = move || Some(served.clone());
+        let mut resume = None;
+        let (mut passes, mut totals) = (0u64, UnservedTotals::default());
+        let (io, started, before) = (process_io(), std::time::Instant::now(), tables());
+        loop {
+            let pass = UnservedPass {
+                idle,
+                step: UNSERVED_STEP,
+                max: UNSERVED_PASS_MAX,
+                overrun: UNSERVED_PASS_OVERRUN,
+                pause: Duration::from_millis(50),
+            };
+            let t = std::time::Instant::now();
+            let done = prune_unserved(&s, &listed, &pass, &mut resume, "measure");
+            passes += 1;
+            println!(
+                "pass {passes}: shards {}, frames {}, bytes {}, compacted {}, {:.1}s",
+                done.shards,
+                done.frames,
+                done.bytes,
+                done.compacted,
+                t.elapsed().as_secs_f64()
+            );
+            totals.frames += done.frames;
+            totals.bytes += done.bytes;
+            totals.compacted += done.compacted;
+            if resume.is_none() {
+                break;
+            }
+        }
+        let after = process_io();
+        println!(
+            "prune: {passes} passes, {} frames, {} bytes, {} shards compacted; {:.1}s, read {} B, written {} B; table bytes {before} -> {}",
+            totals.frames, totals.bytes, totals.compacted, started.elapsed().as_secs_f64(),
+            after.0 - io.0, after.1 - io.1, tables()
+        );
+        assert_eq!(
+            totals.frames, dry.3,
+            "the passes delete what the dry run counted"
+        );
+    }
+
+    /// The idle bound defaults to two days and never goes below one.
+    #[test]
+    fn the_idle_bound_defaults_to_two_days_and_is_at_least_one() {
+        assert_eq!(unserved_idle_secs(None), 2 * 86_400);
+        assert_eq!(unserved_idle_secs(Some(600)), 86_400, "never below one day");
+        assert_eq!(unserved_idle_secs(Some(7 * 86_400)), 7 * 86_400);
     }
 }
