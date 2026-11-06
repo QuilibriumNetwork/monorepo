@@ -7340,3 +7340,67 @@ fn grafts_for_topics_the_peer_did_not_subscribe_to_are_dropped() {
         "a GRAFT after the subscription is taken"
     );
 }
+
+/// QUILIBRIUM: a peer that answers our IWANT for the id an older release computes
+/// (`Config::legacy_message_id`) is counted, also when the answer is a duplicate. A copy from a
+/// peer we asked nothing, and an answer under the current id, are not.
+#[test]
+fn iwant_answers_under_a_legacy_id_are_counted() {
+    // Data starting with 0: no legacy id; 2: the legacy id is the current one; else it differs.
+    let current = |data: &[u8]| MessageId::new(&[b"current-".as_slice(), data].concat());
+    let config = ConfigBuilder::default()
+        .message_id_fn(move |message| current(&message.data))
+        .legacy_message_id_fn(move |message| match message.data.first() {
+            Some(0) => None,
+            Some(2) => Some(current(&message.data)),
+            _ => Some(MessageId::new(&message.data)),
+        })
+        .build()
+        .unwrap();
+    let (mut gs, peers, _receivers, topic_hashes) = inject_nodes1()
+        .peer_no(5)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .create_network();
+    let message = |data: Vec<u8>| RawMessage {
+        source: Some(PeerId::random()),
+        data,
+        sequence_number: Some(0),
+        topic: topic_hashes[0].clone(),
+        signature: None,
+        key: None,
+        validated: true,
+    };
+    let topic = topic_hashes[0].clone();
+    let (legacy, mesh_first) = (vec![1u8, 1], vec![1u8, 2]);
+    let (same, none) = (vec![2u8, 3], vec![0u8, 4]);
+
+    // peers[0] answers an IWANT for its legacy id.
+    gs.handle_ihave(
+        &peers[0],
+        vec![(topic.clone(), vec![MessageId::new(&legacy)])],
+    );
+    gs.handle_received_message(message(legacy), &peers[0]);
+    // peers[1] was asked; peers[2] delivers first, then peers[1] answers with a duplicate.
+    gs.handle_ihave(
+        &peers[1],
+        vec![(topic.clone(), vec![MessageId::new(&mesh_first)])],
+    );
+    gs.handle_received_message(message(mesh_first.clone()), &peers[2]);
+    gs.handle_received_message(message(mesh_first), &peers[1]);
+    // peers[3] answers under the current id; peers[4] sends a message with no legacy id.
+    gs.handle_ihave(&peers[3], vec![(topic, vec![current(&same)])]);
+    gs.handle_received_message(message(same), &peers[3]);
+    gs.handle_received_message(message(none), &peers[4]);
+
+    assert_eq!(
+        gs.take_legacy_id_answers(),
+        HashMap::from([(peers[0], 1), (peers[1], 1)]),
+        "legacy-id answers counted for the wrong peers"
+    );
+    assert!(
+        gs.take_legacy_id_answers().is_empty(),
+        "taking resets the counts"
+    );
+}

@@ -180,6 +180,9 @@ pub struct BlossomSubBehaviour {
     /// Operator log state for gossip RPCs dropped before decoding.
     rejected_rpcs: RejectedRpcLog,
     unsent_rpcs: UnsentRpcLog,
+    /// Operator log of peers answering under the message ids of releases before strict shard
+    /// gossip.
+    legacy_ids: LegacyIdLog,
     /// Whether gossipsub metric families have been registered (guards against
     /// double-registration on a repeated `set_signing_identity`).
     metrics_registered: bool,
@@ -232,6 +235,7 @@ impl BlossomSubBehaviour {
             cache_pressure: CachePressure::default(),
             rejected_rpcs: RejectedRpcLog::default(),
             unsent_rpcs: UnsentRpcLog::default(),
+            legacy_ids: LegacyIdLog::default(),
             metrics_registered: false,
             warned_forward_filter: false,
             metrics_registry: Arc::new(std::sync::Mutex::new(
@@ -541,6 +545,11 @@ impl BlossomSubBehaviour {
         self.rejected_rpcs
             .observe(self.inner.rejected_rpc_stats(), now);
         self.unsent_rpcs.observe(self.inner.unsent_rpc_stats(), now);
+        self.legacy_ids.observe(
+            crate::node::strict_shard_gossip(),
+            self.inner.take_legacy_id_answers(),
+            now,
+        );
         if self.subscriptions.is_empty() {
             return;
         }
@@ -837,6 +846,153 @@ impl UnsentRpcLog {
              unless the count stays high for hours"
         );
         Some(unsent)
+    }
+}
+
+/// After strict shard gossip turns on, peers answering under pre-strict message ids are
+/// ignored for this long: every upgraded node switches within seconds of the epoch's first
+/// GLOBAL frame, and until then it advertises and answers under those ids too.
+const LEGACY_ID_SWITCH_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// While peers answer under pre-strict message ids, the warning repeats at this interval; this
+/// long without one ends the episode.
+const LEGACY_ID_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The most peers one line names; the line also counts them all.
+const LEGACY_ID_PEERS_NAMED: usize = 8;
+
+/// Operator log of peers on a release before strict shard gossip. Under strict shard gossip a
+/// shard CW message's id names its author; such a peer still advertises and answers under the
+/// content id, so it and this node break each other's gossip promises and lower each other's
+/// scores until they graylist each other. The peer's own node does not say why. A warning names
+/// such peers when they start answering under the content id (after
+/// [`LEGACY_ID_SWITCH_GRACE`]), one per [`LEGACY_ID_LOG_INTERVAL`] while they continue, and an
+/// info line when they stop.
+#[derive(Debug, Default)]
+struct LegacyIdLog {
+    /// When strict shard gossip was first seen on, while it stays on.
+    strict_since: Option<std::time::Instant>,
+    /// Answers per peer since the previous line.
+    pending: HashMap<PeerId, u64>,
+    episode: Option<LegacyIdEpisode>,
+}
+
+#[derive(Debug)]
+struct LegacyIdEpisode {
+    started: std::time::Instant,
+    last_answer: std::time::Instant,
+    last_log: std::time::Instant,
+    /// Answers in the episode, logged ones included.
+    answers: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LegacyIdLogLine {
+    Started,
+    Continuing,
+    Ended,
+}
+
+impl LegacyIdLog {
+    fn observe(
+        &mut self,
+        strict: bool,
+        answers: HashMap<PeerId, u64>,
+        now: std::time::Instant,
+    ) -> Option<LegacyIdLogLine> {
+        self.strict_since = if strict {
+            Some(self.strict_since.unwrap_or(now))
+        } else {
+            None
+        };
+        let switched = self
+            .strict_since
+            .is_some_and(|since| now.duration_since(since) >= LEGACY_ID_SWITCH_GRACE);
+        let answering = switched && !answers.is_empty();
+        if answering {
+            for (peer, count) in answers {
+                if self.pending.len() < 1024 || self.pending.contains_key(&peer) {
+                    *self.pending.entry(peer).or_insert(0) += count;
+                }
+            }
+        }
+        let line = match self.episode.as_mut() {
+            None if answering => LegacyIdLogLine::Started,
+            None => return None,
+            Some(episode) if answering => {
+                episode.last_answer = now;
+                if now.duration_since(episode.last_log) < LEGACY_ID_LOG_INTERVAL {
+                    return None;
+                }
+                LegacyIdLogLine::Continuing
+            }
+            Some(episode) => {
+                if now.duration_since(episode.last_answer) < LEGACY_ID_LOG_INTERVAL {
+                    return None;
+                }
+                LegacyIdLogLine::Ended
+            }
+        };
+        let episode = self.episode.get_or_insert(LegacyIdEpisode {
+            started: now,
+            last_answer: now,
+            last_log: now,
+            answers: 0,
+        });
+        let pending = std::mem::take(&mut self.pending);
+        let peers = pending.len();
+        let answers: u64 = pending.values().sum();
+        episode.answers += answers;
+        episode.last_log = now;
+        let mut ranked: Vec<_> = pending.into_iter().collect();
+        ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let named = ranked
+            .iter()
+            .take(LEGACY_ID_PEERS_NAMED)
+            .map(|(peer, count)| format!("{peer}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let epoch = quil_types::consensus::strict_shard_gossip_epoch();
+        let total = episode.answers;
+        let duration_secs = now.duration_since(episode.started).as_secs();
+        match line {
+            LegacyIdLogLine::Started => tracing::warn!(
+                peers,
+                answers,
+                %named,
+                epoch,
+                "peers answer this node's gossip requests for shard consensus messages under \
+                 the message ids of releases before strict shard gossip: they run such a \
+                 release, or have not yet reached the strict epoch's GLOBAL frames. Since that \
+                 epoch they and upgraded nodes break each other's gossip promises and graylist \
+                 each other, so their consensus messages are lost in bursts. Nothing to do on \
+                 this node; whoever runs a named peer must upgrade it, or check that it follows \
+                 the GLOBAL head"
+            ),
+            LegacyIdLogLine::Continuing => tracing::warn!(
+                peers,
+                answers,
+                total,
+                %named,
+                epoch,
+                duration_secs,
+                "peers still answer this node's gossip requests under the message ids of \
+                 releases before strict shard gossip; the counts are since the previous line"
+            ),
+            LegacyIdLogLine::Ended => {
+                tracing::info!(
+                    peers,
+                    answers,
+                    total,
+                    %named,
+                    duration_secs,
+                    "no peer answered under the message ids of releases before strict shard \
+                     gossip for ten minutes; the episode ended"
+                );
+                self.episode = None;
+            }
+        }
+        Some(line)
     }
 }
 
@@ -1155,6 +1311,16 @@ fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Con
                 crate::node::strict_shard_gossip(),
             ))
         })
+        // A peer that answers an IWANT for the content id of a shard CW message under strict
+        // shard gossip runs an older release (`LegacyIdLog`).
+        .legacy_message_id_fn(|message: &gossipsub::Message| {
+            crate::node::pre_strict_gossip_message_id(
+                &bitmask_from_topic(&message.topic),
+                &message.data,
+                crate::node::strict_shard_gossip(),
+            )
+            .map(gossipsub::MessageId::from)
+        })
         // Inbound signature verification (StrictSign); signed outbound is
         // late-bound via `set_signing_identity`.
         .validation_mode(gossipsub::ValidationMode::Strict);
@@ -1268,6 +1434,83 @@ mod propagation_tests {
             pressure.observe(stats(13), at(201)),
             Some(CachePressureLog::Started)
         );
+    }
+
+    /// Peers answering under pre-strict ids are named once strict shard gossip has been on for
+    /// the switch grace, at most once per interval, and the episode ends after an interval
+    /// without one. Before strict shard gossip, or within the grace, nothing is logged.
+    #[test]
+    fn legacy_id_answers_log_after_the_switch_with_bounded_repeats_and_end() {
+        let (old, other) = (PeerId::random(), PeerId::random());
+        let answers = |peers: &[PeerId]| -> HashMap<PeerId, u64> {
+            peers.iter().map(|peer| (*peer, 2u64)).collect()
+        };
+        let t0 = std::time::Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let mut log = LegacyIdLog::default();
+        assert_eq!(log.observe(false, answers(&[old]), at(0)), None);
+        assert_eq!(log.observe(true, answers(&[old]), at(1)), None);
+        assert_eq!(log.observe(true, answers(&[old]), at(120)), None);
+        assert!(log.pending.is_empty(), "answers within the grace were kept");
+        assert_eq!(
+            log.observe(true, answers(&[old, other]), at(121)),
+            Some(LegacyIdLogLine::Started)
+        );
+        assert_eq!(log.observe(true, answers(&[old]), at(122)), None);
+        assert_eq!(log.observe(true, answers(&[]), at(300)), None);
+        assert_eq!(
+            log.observe(true, answers(&[old]), at(721)),
+            Some(LegacyIdLogLine::Continuing)
+        );
+        assert_eq!(log.episode.as_ref().map(|episode| episode.answers), Some(8));
+        assert_eq!(log.observe(true, answers(&[]), at(1000)), None);
+        assert_eq!(
+            log.observe(true, answers(&[]), at(1321)),
+            Some(LegacyIdLogLine::Ended)
+        );
+        assert_eq!(log.observe(true, answers(&[]), at(2000)), None);
+        // Strict shard gossip off and on again: a new grace.
+        assert_eq!(log.observe(false, answers(&[]), at(2001)), None);
+        assert_eq!(log.observe(true, answers(&[old]), at(2002)), None);
+        assert_eq!(
+            log.observe(true, answers(&[old]), at(2122)),
+            Some(LegacyIdLogLine::Started)
+        );
+    }
+
+    /// Under strict shard gossip, only a shard CW topic's message has a pre-strict id, its
+    /// content id; before it, none has.
+    #[test]
+    fn only_shard_cw_messages_have_a_pre_strict_id_when_strict() {
+        let config = build_config(0, &crate::BlossomsubParams::default());
+        let mut cw = vec![0x01u8];
+        cw.extend_from_slice(&[7u8; 32]);
+        let message = |bitmask: &[u8]| gossipsub::Message {
+            source: Some(PeerId::random()),
+            data: b"\x00vote".to_vec(),
+            sequence_number: Some(1),
+            topic: topic_for(bitmask).hash(),
+        };
+        let content = gossipsub::MessageId::from(crate::node::message_id(b"\x00vote"));
+        let others: [&[u8]; 3] = [&[0x00, 0x00, 0x00, 0x00], &[7u8; 32], &[0x01; 32]];
+        crate::node::set_strict_shard_gossip(false);
+        assert_eq!(config.legacy_message_id(&message(&cw)), None);
+        crate::node::set_strict_shard_gossip(true);
+        let strict_cw = message(&cw);
+        assert_eq!(config.legacy_message_id(&strict_cw), Some(content));
+        assert_ne!(
+            config.legacy_message_id(&strict_cw),
+            Some(config.message_id(&strict_cw))
+        );
+        for bitmask in others {
+            assert_eq!(
+                config.legacy_message_id(&message(bitmask)),
+                None,
+                "{} has a pre-strict id",
+                hex::encode(bitmask)
+            );
+        }
+        crate::node::set_strict_shard_gossip(false);
     }
 
     #[test]

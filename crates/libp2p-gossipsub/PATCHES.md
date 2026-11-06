@@ -49,3 +49,7 @@ Regression tests: `behaviour::tests` (`reproduces_graft_topics_recorded_without_
 ## Peer-score state of departed peers
 
 `src/peer_score.rs` (`remove_ip`, `remove_ips_for_peer`, `remove_peer`): upstream kept an empty peer set for every IP (IPv6 /64) no peer uses any more, and retained a departed peer with no topic stats and no penalties for `retain_score`. Both are now dropped, as upstream does since #6710. Regression test: `peer_score::tests::departed_blank_peers_leave_no_score_state`.
+
+## Answers under an older release's message id
+
+`src/config.rs` (`ConfigBuilder::legacy_message_id_fn`), `src/behaviour.rs` (`handle_received_message`, `Behaviour::take_legacy_id_answers`): when a flag day changes the id of some messages, a peer on an older release advertises and answers IWANTs under the old id, so each side's promises to the other break and nothing names the cause. With the hook set, a message that answers our open IWANT to its sender for the old id, where the current id differs, is counted per sender (at most 1024 senders between two takes), for the node's operator log. Promises and scores are unchanged. Regression test: `behaviour::tests::iwant_answers_under_a_legacy_id_are_counted`.

@@ -2079,6 +2079,14 @@ pub fn gossip_message_id(bitmask: &[u8], source: &[u8], data: &[u8], strict: boo
     id
 }
 
+/// The id releases before strict shard gossip compute for `data` on `bitmask`, where it
+/// differs from [`gossip_message_id`]: under strict shard gossip, the content id of a shard CW
+/// topic's message. `None` elsewhere. A peer that answers a request for this id runs such a
+/// release.
+pub fn pre_strict_gossip_message_id(bitmask: &[u8], data: &[u8], strict: bool) -> Option<Vec<u8>> {
+    (strict && is_shard_cw_bitmask(bitmask)).then(|| message_id(data))
+}
+
 /// The IP the swarm binds for the configured listen address: an IPv6 address
 /// as written, `::` for a `/dns6` name; any other address `0.0.0.0`, whatever
 /// IP it names.

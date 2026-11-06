@@ -360,7 +360,15 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
 
     /// QUILIBRIUM: RPCs not queued because the peer was no longer connected.
     unsent_rpcs: UnsentRpcStats,
+
+    /// QUILIBRIUM: per peer, the messages it sent us in answer to an IWANT for the id an
+    /// older release computes (`Config::legacy_message_id`), since the last
+    /// [`Behaviour::take_legacy_id_answers`]; at most [`MAX_LEGACY_ID_PEERS`] peers.
+    legacy_id_answers: HashMap<PeerId, u64>,
 }
+
+/// QUILIBRIUM: the most peers [`Behaviour::take_legacy_id_answers`] holds between two calls.
+const MAX_LEGACY_ID_PEERS: usize = 1024;
 
 /// QUILIBRIUM: RPCs the behaviour did not queue because their peer was not in its connected
 /// peer list (a peer that disconnected after the RPC was addressed to it), counted since the
@@ -508,6 +516,7 @@ where
             gossip_promises: Default::default(),
             rejected_rpcs: RejectedRpcStats::default(),
             unsent_rpcs: UnsentRpcStats::default(),
+            legacy_id_answers: HashMap::new(),
         })
     }
 
@@ -581,6 +590,13 @@ where
     /// [`UnsentRpcStats`]).
     pub fn unsent_rpc_stats(&self) -> UnsentRpcStats {
         self.unsent_rpcs
+    }
+
+    /// QUILIBRIUM: the peers that answered our IWANT for a message under the id an older
+    /// release computes (`Config::legacy_message_id`), with how many such answers each, since
+    /// the previous call. Such a peer runs a release from before the change of id.
+    pub fn take_legacy_id_answers(&mut self) -> HashMap<PeerId, u64> {
+        std::mem::take(&mut self.legacy_id_answers)
     }
 
     /// Returns the gossipsub score for a given peer, if one exists.
@@ -1956,6 +1972,26 @@ where
         // and instead continually penalize peers that repeatedly send this message.
         if !self.message_is_valid(&msg_id, &mut raw_message, propagation_source) {
             return;
+        }
+
+        // QUILIBRIUM: a peer that answers our IWANT for the id an older release computes, with
+        // a message whose id is now another, computes that older id: it runs such a release.
+        // Counted for the node's operator log (`take_legacy_id_answers`); the promise itself
+        // stays, as before. Checked before the duplicate check, as the answer usually comes
+        // after a mesh peer delivered the message.
+        if let Some(legacy_id) = self.config.legacy_message_id(&message) {
+            if legacy_id != msg_id
+                && self
+                    .gossip_promises
+                    .promised_by(&legacy_id, propagation_source)
+                && (self.legacy_id_answers.len() < MAX_LEGACY_ID_PEERS
+                    || self.legacy_id_answers.contains_key(propagation_source))
+            {
+                *self
+                    .legacy_id_answers
+                    .entry(*propagation_source)
+                    .or_insert(0) += 1;
+            }
         }
 
         // Broadcast IDONTWANT messages
