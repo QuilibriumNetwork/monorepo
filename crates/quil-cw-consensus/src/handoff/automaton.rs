@@ -601,12 +601,13 @@ impl GlobalProposer for HandoffProposer {
                     return self.propose_reseal(context, &sealed);
                 }
                 if let Some(behind) = self.behind.as_ref().and_then(|probe| probe()) {
-                    self.note(
-                        Step::Propose,
-                        context,
-                        reason,
-                        format!("{detail}; behind ({behind}): turn given up at once"),
-                    );
+                    if let Some(liveness) = self.liveness.as_ref() {
+                        liveness.note_behind(
+                            context.view,
+                            reason,
+                            format!("{detail}; behind ({behind}): turn given up at once"),
+                        );
+                    }
                     *self.parent_waits.lock().unwrap() = (context.view, PARENT_WAITS + 1);
                     return None;
                 }

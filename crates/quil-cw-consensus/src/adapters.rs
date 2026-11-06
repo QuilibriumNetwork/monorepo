@@ -827,12 +827,16 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton for Falc
         let proposer = self.proposer.clone();
         let store = self.store.clone();
         let liveness = self.liveness.clone();
-        let settle = move |proposed: bool| {
-            if let Some(liveness) = liveness.as_ref() {
-                liveness.settle(Step::Propose, proposal_context.view, proposed);
-            }
-        };
         self.context.child("propose").spawn(move |ctx| async move {
+            // How long the turn took, from this ask to its end; a declined
+            // one ends in the view's nullify.
+            let asked = ctx.current();
+            let settle = |proposed: bool| {
+                if let Some(liveness) = liveness.as_ref() {
+                    let took = ctx.current().duration_since(asked).unwrap_or_default();
+                    liveness.settle_turn(proposal_context.view, proposed, took);
+                }
+            };
             // Bounded under `leader_timeout` (30s); simplex drops the receiver
             // when the view ends.
             let mut waited = std::time::Duration::ZERO;
@@ -1004,6 +1008,11 @@ const NOTE_VIEWS: u64 = 64;
 /// Distinct peers [`Liveness`] remembers having blocked.
 const BLOCKED_PEERS: usize = 256;
 
+/// Waits [`Liveness`] keeps per interval for the median of the turns given
+/// up while behind ([`Liveness::take_behind_give_ups`]); the count and the
+/// maximum include every turn.
+const BEHIND_WAIT_SAMPLES: usize = 256;
+
 /// What one consensus instance has seen, for operators: how far its views
 /// advanced, which of them ended in a certificate, how many members voted
 /// recently and for what, and why this member's own turns and votes went as
@@ -1032,6 +1041,13 @@ struct LivenessState {
     notes: std::collections::BTreeMap<(Step, u64), (&'static str, String)>,
     decisions: Decisions,
     blocked: std::collections::BTreeSet<FalconPublicKey>,
+    /// Views whose turn this member gave up because it is behind
+    /// ([`Liveness::note_behind`]), until the turn ends.
+    behind: std::collections::BTreeSet<u64>,
+    /// Turns given up while behind since the last
+    /// [`Liveness::take_behind_give_ups`]: their count, the longest wait,
+    /// and the first [`BEHIND_WAIT_SAMPLES`] waits in milliseconds.
+    behind_give_ups: (u64, u64, Vec<u64>),
 }
 
 #[derive(Default)]
@@ -1194,6 +1210,18 @@ pub struct Decisions {
     /// Proposals this member refused to vote for, by reason.
     pub refused: std::collections::BTreeMap<&'static str, u64>,
     pub last_refused: Option<Outcome>,
+}
+
+/// Turns this member gave up because it was behind its committee (a GLOBAL
+/// state sync installing), over one interval: how many, and how long each
+/// waited from the ask for a proposal to the give-up, which is when the
+/// view's nullify can start.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BehindGiveUps {
+    pub turns: u64,
+    /// The middle wait (the upper one of an even count), in milliseconds.
+    pub median_ms: u64,
+    pub max_ms: u64,
 }
 
 impl Liveness {
@@ -1486,11 +1514,62 @@ impl Liveness {
         state.notes.insert((step, view), (reason, detail.into()));
     }
 
+    /// Why this member gives its turn in `view` up at once: it is behind
+    /// its committee for longer than the turn could wait. Noted as
+    /// [`Self::note`] does; the turn's wait also counts in
+    /// [`Self::take_behind_give_ups`] once [`Self::settle_turn`] ends it.
+    pub fn note_behind(&self, view: u64, reason: &'static str, detail: impl Into<String>) {
+        self.note(Step::Propose, view, reason, detail);
+        let Ok(mut state) = self.inner.lock() else {
+            return;
+        };
+        let floor = state.snapshot.view.saturating_sub(NOTE_VIEWS);
+        state.behind.retain(|noted| *noted > floor);
+        state.behind.insert(view);
+    }
+
+    /// This member's turn in `view` ended after `waited` since it was asked
+    /// for a proposal ([`Self::settle`]).
+    pub fn settle_turn(&self, view: u64, proposed: bool, waited: std::time::Duration) {
+        let Ok(mut state) = self.inner.lock() else {
+            return;
+        };
+        if state.behind.remove(&view) && !proposed {
+            let wait = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+            let (turns, max, waits) = &mut state.behind_give_ups;
+            *turns += 1;
+            *max = (*max).max(wait);
+            if waits.len() < BEHIND_WAIT_SAMPLES {
+                waits.push(wait);
+            }
+        }
+        Self::settle_state(&mut state, Step::Propose, view, proposed);
+    }
+
+    /// The turns given up while behind since the last call, which starts a
+    /// new interval.
+    pub fn take_behind_give_ups(&self) -> BehindGiveUps {
+        let Ok(mut state) = self.inner.lock() else {
+            return BehindGiveUps::default();
+        };
+        let (turns, max_ms, mut waits) = std::mem::take(&mut state.behind_give_ups);
+        waits.sort_unstable();
+        BehindGiveUps {
+            turns,
+            median_ms: waits.get(waits.len() / 2).copied().unwrap_or_default(),
+            max_ms,
+        }
+    }
+
     /// `step` of `view` ended, successfully or under its last note.
     pub fn settle(&self, step: Step, view: u64, succeeded: bool) {
         let Ok(mut state) = self.inner.lock() else {
             return;
         };
+        Self::settle_state(&mut state, step, view, succeeded);
+    }
+
+    fn settle_state(state: &mut LivenessState, step: Step, view: u64, succeeded: bool) {
         let (reason, detail) = state
             .notes
             .remove(&(step, view))
@@ -2043,6 +2122,58 @@ mod liveness_tests {
             vec![("pre-state root differs", 1), ("unexplained", 1)],
         );
         assert_eq!(decided.last_refused.map(|o| o.view), Some(5));
+    }
+
+    /// Only turns given up while behind count, with their waits: how many
+    /// per interval, the middle and the longest; a turn noted behind that
+    /// proposed after all, and a turn declined after its parent waits, do
+    /// not. The median keeps the first waits of an interval; the count and
+    /// the maximum keep all of them.
+    #[test]
+    fn behind_give_ups_report_their_count_median_and_max_per_interval() {
+        let ms = std::time::Duration::from_millis;
+        let liveness = Liveness::default();
+        for (view, wait) in [(1, 30), (2, 10), (3, 20)] {
+            liveness.note_behind(view, "parent unavailable", "global state sync in progress");
+            liveness.settle_turn(view, false, ms(wait));
+        }
+        liveness.note_behind(4, "parent unavailable", "global state sync in progress");
+        liveness.settle_turn(4, true, ms(900));
+        liveness.note(Step::Propose, 5, "parent unavailable", "not yet");
+        liveness.settle_turn(5, false, ms(3_000));
+        liveness.settle_turn(6, false, ms(4_000));
+        assert_eq!(
+            liveness.take_behind_give_ups(),
+            BehindGiveUps {
+                turns: 3,
+                median_ms: 20,
+                max_ms: 30
+            },
+            "turns given up while behind: count, median and max"
+        );
+        let decided = liveness.decisions();
+        assert_eq!(decided.proposed, 1);
+        assert_eq!(decided.declined.get("parent unavailable"), Some(&4));
+        assert_eq!(
+            liveness.take_behind_give_ups(),
+            BehindGiveUps::default(),
+            "each interval starts over"
+        );
+
+        let turns = BEHIND_WAIT_SAMPLES as u64 + 44;
+        for view in 10..10 + turns {
+            liveness.note_behind(view, "parent unavailable", "global state sync in progress");
+            liveness.settle_turn(view, false, ms(view - 10));
+        }
+        assert_eq!(
+            liveness.take_behind_give_ups(),
+            BehindGiveUps {
+                turns,
+                median_ms: BEHIND_WAIT_SAMPLES as u64 / 2,
+                max_ms: turns - 1
+            },
+            "turns given up while behind past the kept waits"
+        );
     }
 
     /// Notarize votes are kept with their signatures for the recent views and
