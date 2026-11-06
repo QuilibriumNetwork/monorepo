@@ -1934,28 +1934,11 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                   -> Option<(u32, Vec<u8>)> {
                 // The frame of the shard that executed it: this shard's own on
                 // a whole-application shard, another's on a split one — which a
-                // node fetches ahead of time (`pending_delivery_sources`).
+                // node fetches ahead of time (`pending_delivery_census`).
                 let frame = clock_store
                     .get_shard_clock_frame(source_filter, source_frame, false)
                     .ok()?;
-                frame
-                    .requests
-                    .iter()
-                    .flat_map(|bundle| bundle.requests.iter())
-                    .find_map(|request| match request.request.as_ref()? {
-                        quil_types::proto::global::message_request::Request::TokenOperation(op)
-                            if op.canonical_bytes.len() >= 4
-                                && quil_execution::token_intrinsic::global_commit_tx_id(
-                                    &op.canonical_bytes,
-                                ) == *tx_id =>
-                        {
-                            Some((
-                                u32::from_be_bytes(op.canonical_bytes[..4].try_into().ok()?),
-                                op.canonical_bytes.clone(),
-                            ))
-                        }
-                        _ => None,
-                    })
+                crate::delivery_sources::frame_operation(&frame, tx_id)
             };
             match manager.coin_deliveries(
                 global,
@@ -7224,24 +7207,20 @@ impl AppConsensusEngine {
         };
         let (filter, clock_store) = (self.filter.clone(), self.clock_store.clone());
         let collect: crate::delivery_sources::Collect = Box::new(move || {
-            let scan = manager
-                .pending_delivery_sources(global, &filter)
+            let census = manager
+                .pending_delivery_census(global, &filter)
                 .map_err(|error| error.to_string())?;
             // Already here: this shard's own frames, and anything fetched
-            // earlier. Nothing is refetched.
-            Ok(crate::delivery_sources::Sources {
-                missing: scan
-                    .sources
-                    .into_iter()
-                    .filter(|(source, frame_number)| {
-                        clock_store
-                            .get_shard_clock_frame(source, *frame_number, false)
-                            .is_err()
-                    })
-                    .collect(),
-                pending: scan.pending,
-                blocks: scan.blocks,
-            })
+            // earlier; a held frame without the operation is asked for again.
+            Ok(crate::delivery_sources::Backlog::of(
+                &filter,
+                &census,
+                |source, frame_number| {
+                    clock_store
+                        .get_shard_clock_frame(source, frame_number, false)
+                        .ok()
+                },
+            ))
         });
         self.delivery_sources
             .sweep(&self.filter, collect, fetch, self.clock_store.clone());
