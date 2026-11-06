@@ -8143,21 +8143,20 @@ impl AppConsensusEngine {
             RecordStall::Continues(state) => (state, false),
         };
         let latest_global_frame = self.latest_global_header_frame();
-        let waits_on = crate::seal_follow::SEAL_UNRECORDED_WAITS_ON;
+        let (scope, action, waits_on) =
+            crate::seal_follow::record_stall_scope(committed_frame, latest_global_frame);
         if began {
             warn!(core_id = self.core_id, filter = %filter, session = %session, committed_frame,
                 latest_global_frame, published_global_frame = state.published_head,
                 global_executed = state.executed, checkpoint = state.checkpoint, drain = state.reason,
-                copies = state.copies, waited_secs = state.waited_secs, scope = "network",
-                action = "report", waits_on,
+                copies = state.copies, waited_secs = state.waited_secs, scope, action, waits_on,
                 "closing session's seal not recorded: this worker's GLOBAL view passed the frame \
                  its copy lands by and has not shown the seal recorded for over 5 min");
         } else {
             warn!(core_id = self.core_id, filter = %filter, session = %session, committed_frame,
                 latest_global_frame, published_global_frame = state.published_head,
                 global_executed = state.executed, checkpoint = state.checkpoint, drain = state.reason,
-                copies = state.copies, waited_secs = state.waited_secs, scope = "network",
-                action = "report", waits_on,
+                copies = state.copies, waited_secs = state.waited_secs, scope, action, waits_on,
                 "closing session's seal still not recorded");
         }
     }
@@ -27761,6 +27760,60 @@ mod tests {
             assert!(ended[0].contains(field), "{field}: {}", ended[0]);
         }
         assert!(!engine.seal_record.waiting());
+        handoff::set_seal_recovery_frame_for_thread(None);
+        handoff::set_seal_drain_frame_for_thread(None);
+    }
+
+    /// The same unrecorded seal, from a view that trails this node's latest
+    /// GLOBAL frame by 88 frames, is reported as this worker's view behind,
+    /// not as GLOBAL refusing the seal: GLOBAL may have recorded it in
+    /// frames the view has not reached.
+    #[tokio::test]
+    async fn an_unrecorded_seal_from_a_view_behind_the_node_is_reported_as_local() {
+        use quil_execution::global_intrinsic::handoff;
+        handoff::set_seal_drain_frame_for_thread(Some(0));
+        handoff::set_seal_recovery_frame_for_thread(Some(0));
+        let (global, id, mut engines) = sealed_drain_committee(1);
+        execute_drain_part(&global, &id, 40, 2);
+        let logs = crate::outage::test_logs::CapturedLogs::default();
+        let _guard = logs.install();
+        let (engine, sent) = &mut engines[0];
+        engine.maintain_committee_session().await;
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert!(engine.seal_record.waiting(), "the copy carried no drain");
+        engine
+            .global_anchor_store
+            .put_global_clock_frame(
+                &quil_types::proto::global::GlobalFrame {
+                    header: Some(quil_types::proto::global::GlobalFrameHeader {
+                        frame_number: 90,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                &AppNoopTxn,
+            )
+            .unwrap();
+        engine
+            .seal_record
+            .backdate(crate::seal_follow::SEAL_UNRECORDED_AFTER);
+        engine.maintain_committee_session().await;
+        let stalled = logs.lines_with("seal not recorded");
+        assert_eq!(stalled.len(), 1, "{stalled:?}");
+        assert!(
+            stalled[0].contains("scope=\"local\""),
+            "the scope is not local: {}",
+            stalled[0]
+        );
+        for field in [
+            "WARN",
+            "committed_frame=2",
+            "latest_global_frame=90",
+            "action=\"check\"",
+            "prover-tree sync",
+        ] {
+            assert!(stalled[0].contains(field), "{field}: {}", stalled[0]);
+        }
         handoff::set_seal_recovery_frame_for_thread(None);
         handoff::set_seal_drain_frame_for_thread(None);
     }
