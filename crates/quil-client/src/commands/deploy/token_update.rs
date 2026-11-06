@@ -73,6 +73,17 @@ const UPDATE_KEYS: [&str; 6] = [
     "supply",
 ];
 
+/// The strategy `mintstrategy=proof` sets, as `deploy token` does: a custom
+/// token mints by proof against the Merkle root of entitlements in its
+/// configuration. The node refuses its mints by proof of meaningful work.
+pub(super) fn proof_mint_strategy() -> TokenMintStrategy {
+    TokenMintStrategy {
+        mint_behavior: TokenMintBehavior::MintWithProof as i32,
+        proof_basis: ProofBasisType::MerkleEntitlementWithSignature as i32,
+        ..Default::default()
+    }
+}
+
 const MINTABLE: u32 = 1 << 0;
 const BURNABLE: u32 = 1 << 1;
 const DIVISIBLE: u32 = 1 << 2;
@@ -123,10 +134,7 @@ pub async fn run(dc: &DeployCtx, domain_arg: &str, args: &[String]) -> anyhow::R
     if let Some(v) = config.get("mintstrategy") {
         let mut strat = TokenMintStrategy::default();
         match v.to_lowercase().as_str() {
-            "proof" => {
-                strat.mint_behavior = TokenMintBehavior::MintWithProof as i32;
-                strat.proof_basis = ProofBasisType::ProofOfMeaningfulWork as i32;
-            }
+            "proof" => strat = proof_mint_strategy(),
             "authority" => strat.mint_behavior = TokenMintBehavior::MintWithAuthority as i32,
             "signature" => strat.mint_behavior = TokenMintBehavior::MintWithSignature as i32,
             "payment" => strat.mint_behavior = TokenMintBehavior::MintWithPayment as i32,

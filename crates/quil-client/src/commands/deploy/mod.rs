@@ -281,6 +281,8 @@ pub async fn run(global: GlobalArgs, cmd: &DeployCommand) -> anyhow::Result<()> 
 
 #[cfg(test)]
 mod tests {
+    use quil_execution::token_intrinsic::config_resolver::MintVariant;
+
     use super::*;
 
     /// A deploy context with an empty keystore and no node: a command fails
@@ -331,5 +333,18 @@ mod tests {
                 "token-update args misread: {arg} was not refused ({err})"
             );
         }
+    }
+
+    #[test]
+    fn token_update_proof_strategy_is_deploys() {
+        let strategy = token_update::proof_mint_strategy();
+        let variant =
+            MintVariant::from_flags(strategy.mint_behavior as u16, strategy.proof_basis as u16);
+        assert_eq!(
+            variant,
+            MintVariant::MerkleEntitlementWithSignature,
+            "token-update args misread: mintstrategy=proof sets {variant:?}, not the \
+             entitlement basis deploy token sets"
+        );
     }
 }
