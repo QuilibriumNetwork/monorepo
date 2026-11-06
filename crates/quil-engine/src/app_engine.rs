@@ -25224,10 +25224,8 @@ mod tests {
         assert_eq!(engine.load_materialized_cursor().unwrap(), 1);
         let costs = engine.replay_costs.read();
         assert!(costs.store_write_us > 0, "{costs:?}");
-        // Where the kernel offers thread times, a materialized frame shows them.
-        if std::fs::read_to_string("/proc/thread-self/schedstat")
-            .is_ok_and(|text| !text.starts_with("0 "))
-        {
+        // A materialized frame shows its thread times, even on a new thread.
+        if cfg!(target_os = "linux") {
             assert_eq!(costs.sampled_frames, 1, "{costs:?}");
         }
         // A new reader, with no in-memory records, still has the outflow history
