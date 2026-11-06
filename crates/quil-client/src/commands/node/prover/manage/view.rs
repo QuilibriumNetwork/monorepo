@@ -8865,9 +8865,11 @@ mod tests {
     }
 
     /// Every word of the help must reach a narrow terminal: lines wrap under
-    /// their own column instead of running past the right edge.
+    /// their own column instead of running past the right edge, and paging
+    /// down shows every line once, however long the help grows.
     #[test]
     fn help_wraps_to_narrow_terminals_without_losing_text() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         use ratatui::{backend::TestBackend, Terminal};
         let words = |text: &str| {
             text.split_whitespace()
@@ -8878,18 +8880,35 @@ mod tests {
         for width in [40u16, 60, 80, 120] {
             let mut m = Model::new();
             m.show_help = true;
-            // Tall enough for the whole help; ratatui caps an area at u16::MAX cells.
-            let mut terminal = Terminal::new(TestBackend::new(width, u16::MAX / width)).unwrap();
-            terminal.draw(|f| draw(f, &mut m)).unwrap();
-            let buffer = terminal.backend().buffer();
-            let screen = (1..1 + m.help_visible as u16)
-                .map(|y| {
-                    (0..width)
-                        .map(|x| buffer[(x, y)].symbol())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+            // Help lines by their index in the help, page by page.
+            let mut rows: Vec<String> = Vec::new();
+            loop {
+                terminal.draw(|f| draw(f, &mut m)).unwrap();
+                assert!(
+                    m.help_offset <= rows.len(),
+                    "paging skipped help lines at width {width}"
+                );
+                let before = rows.len();
+                let shown = m.help_visible.min(m.help_lines - m.help_offset);
+                let buffer = terminal.backend().buffer();
+                for y in before - m.help_offset..shown {
+                    rows.push(
+                        (0..width)
+                            .map(|x| buffer[(x, 1 + y as u16)].symbol())
+                            .collect(),
+                    );
+                }
+                if rows.len() >= m.help_lines {
+                    break;
+                }
+                assert!(rows.len() > before, "paging stalled at width {width}");
+                super::super::update::handle_key(
+                    &mut m,
+                    KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                );
+            }
+            let screen = rows.join("\n");
             assert_eq!(words(&screen), expected, "help text lost at width {width}");
             assert!(
                 !screen.contains('`'),
