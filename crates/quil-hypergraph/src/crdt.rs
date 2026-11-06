@@ -697,6 +697,10 @@ pub struct ForestConfinement {
 /// ([`HypergraphCrdt::confine_forest_recording`]).
 pub type LineageRecord = (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>);
 
+/// Each size bucket staging changed since the last commit, with its value
+/// before (`None`: absent).
+type SizePreImages = HashMap<Vec<u8>, Option<(u64, i128)>>;
+
 /// The forest-native hypergraph CRDT.
 pub struct HypergraphCrdt {
     /// Key-value store: per-vertex blobs, the shard-commit cache, the cursor.
@@ -801,6 +805,10 @@ pub struct HypergraphCrdt {
     /// leaf sizes, adds minus removal tombstones, which may be negative;
     /// readers count each bucket as at least zero.
     sub_meta: RwLock<HashMap<Vec<u8>, (u64, i128)>>,
+    /// Each `sub_meta` bucket staging changed since the last commit, with its
+    /// value before (`None`: absent), so discarding staged mutations restores
+    /// the sizes they counted ([`Self::discard_staged_mutations`]).
+    staged_sizes_base: RwLock<SizePreImages>,
     /// Set once `warm_sizes` has seeded the committed baseline.
     sizes_warmed: AtomicBool,
     /// Sizes count every committed leaf exactly, from the exact state-size
@@ -962,6 +970,7 @@ impl HypergraphCrdt {
             pending_records: RwLock::new(BTreeMap::new()),
             shard_metadata: RwLock::new(HashMap::new()),
             sub_meta: RwLock::new(HashMap::new()),
+            staged_sizes_base: RwLock::new(HashMap::new()),
             sizes_warmed: AtomicBool::new(false),
             exact_sizes: AtomicBool::new(false),
             size_warm_lock: std::sync::Mutex::new(()),
@@ -1726,6 +1735,7 @@ impl HypergraphCrdt {
         let mut blobs = self.pending_blobs.write().unwrap();
         let mut metadata = self.sub_meta.write().unwrap();
         let mut records = self.pending_records.write().unwrap();
+        let mut sizes_base = self.staged_sizes_base.write().unwrap();
         let mut next_metadata = HashMap::new();
         for (key, count, size) in prepared.metadata {
             let entry = next_metadata
@@ -1742,6 +1752,11 @@ impl HypergraphCrdt {
                 QuilError::ExecutionUnavailable("CRDT metadata size overflow".into())
             })?;
         }
+        for key in next_metadata.keys() {
+            sizes_base
+                .entry(key.clone())
+                .or_insert_with(|| metadata.get(key).copied());
+        }
         for (phase, entries) in prepared.deltas {
             pending.entry(phase).or_default().extend(entries);
         }
@@ -1751,6 +1766,42 @@ impl HypergraphCrdt {
         metadata.extend(next_metadata);
         records.extend(prepared.records);
         Ok(())
+    }
+
+    /// Drop every mutation staged since the last commit, and restore the
+    /// shard sizes staging counted, so the next execution starts from the
+    /// committed state. An execution that fails before its commit calls this
+    /// before the frame runs again: a retry over its own staged writes
+    /// refuses the operations that wrote them (their spent and consumption
+    /// markers are staged) and commits the writes without their outcome.
+    /// Returns whether anything was staged.
+    pub fn discard_staged_mutations(&self) -> Result<bool> {
+        let _guard = self.commit_lock.lock().map_err(|_| {
+            QuilError::ExecutionUnavailable("CRDT mutation/commit lock poisoned".into())
+        })?;
+        let mut pending = self.pending.write().unwrap();
+        let mut blobs = self.pending_blobs.write().unwrap();
+        let mut metadata = self.sub_meta.write().unwrap();
+        let mut records = self.pending_records.write().unwrap();
+        let mut sizes_base = self.staged_sizes_base.write().unwrap();
+        let staged = !pending.is_empty()
+            || !blobs.is_empty()
+            || !records.is_empty()
+            || !sizes_base.is_empty();
+        for (key, before) in sizes_base.drain() {
+            match before {
+                Some(value) => {
+                    metadata.insert(key, value);
+                }
+                None => {
+                    metadata.remove(&key);
+                }
+            }
+        }
+        pending.clear();
+        blobs.clear();
+        records.clear();
+        Ok(staged)
     }
 
     /// Whether mutations are staged in memory but not committed. A failed
@@ -2338,6 +2389,8 @@ impl HypergraphCrdt {
         )?;
         txn.commit()?;
         staged.committed = true;
+        // The committed sizes now include what staging counted.
+        self.staged_sizes_base.write().unwrap().clear();
         // Publish only heads whose nodes and blobs are now durable. A failed
         // transaction must retry from the previous head, not a missing version.
         self.phase_versions.write().unwrap().extend(phase_versions);
@@ -3203,6 +3256,9 @@ impl HypergraphCrdt {
             }
         }
         *self.sub_meta.write().unwrap() = buckets;
+        // The rebuilt sizes count staged leaves exactly; sizes from before
+        // the rebuild must never be restored over them.
+        self.staged_sizes_base.write().unwrap().clear();
         self.layout_rebuilds
             .write()
             .unwrap()

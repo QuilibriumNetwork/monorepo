@@ -15176,6 +15176,46 @@ pub(crate) struct MaterializeSteps {
     pub(crate) commit_thread: crate::replay_split::ThreadStep,
 }
 
+/// Discards what a frame's execution attempt staged unless the attempt
+/// committed: the frame then runs again from the committed state and records
+/// what a single run records. Left staged, a retry refused the bundles the
+/// failed attempt executed (their spent and consumption markers were staged),
+/// then committed their writes without their fees, settlements and spends.
+struct DiscardUnlessCommitted {
+    crdt: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    frame_number: u64,
+}
+
+impl DiscardUnlessCommitted {
+    fn committed(mut self) {
+        self.crdt = None;
+    }
+}
+
+impl Drop for DiscardUnlessCommitted {
+    fn drop(&mut self) {
+        let Some(crdt) = self.crdt.take() else {
+            return;
+        };
+        match crdt.discard_staged_mutations() {
+            Ok(true) => info!(
+                frame = self.frame_number,
+                "app-shard materialize: discarded the failed attempt's staged writes; the frame \
+                 runs again from the committed state"
+            ),
+            Ok(false) => {}
+            Err(error) => warn!(
+                frame = self.frame_number,
+                error = %error,
+                scope = "this node's worker",
+                action = "restart the node if this repeats: a retry over these writes records \
+                          another outcome than the shard's other members",
+                "app-shard materialize: could not discard the failed attempt's staged writes"
+            ),
+        }
+    }
+}
+
 pub(crate) fn materialize_app_shard_requests(
     execution_manager: &quil_execution::ExecutionEngineManager,
     requests: &[quil_types::proto::global::MessageBundle],
@@ -15197,6 +15237,10 @@ pub(crate) fn materialize_app_shard_requests(
     // application is refused identically everywhere rather than as an
     // infrastructure fault that would fail the frame and retry forever.
     let shard = shard_path_of_filter(app_address);
+    let staged = DiscardUnlessCommitted {
+        crdt: Some(execution_manager.crdt()),
+        frame_number,
+    };
 
     // Verify every confidential token proof of the frame concurrently before
     // the sequential state loop below; the loop then finds verdicts cached.
@@ -15413,6 +15457,7 @@ pub(crate) fn materialize_app_shard_requests(
     )?;
     drop(commit);
     steps.commit_thread = committing.end();
+    staged.committed();
     Ok(MaterializedAppFrame {
         processed,
         skipped,
