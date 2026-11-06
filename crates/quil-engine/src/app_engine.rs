@@ -28786,3 +28786,7 @@ mod relay_tests;
 #[cfg(test)]
 #[path = "app_engine_shield_hold_tests.rs"]
 mod shield_hold_tests;
+
+#[cfg(test)]
+#[path = "app_engine_cited_frame_fetch_tests.rs"]
+mod cited_frame_fetch_tests;
