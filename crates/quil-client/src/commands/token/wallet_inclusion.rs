@@ -343,8 +343,8 @@ impl RecipientWallet {
 
     /// Whether this wallet can open `output`: the coin is its own.
     pub(super) fn owns(&self, output: &Output) -> bool {
-        quil_lattice_ct::confidential::memo::open_output(
-            &self.context,
+        quil_lattice_ct::confidential::memo::open_output_with_keys(
+            self.opening_keys(),
             &self.kem_secret,
             &self.recipient,
             output,
