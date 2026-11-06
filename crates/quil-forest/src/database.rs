@@ -6,9 +6,11 @@
 //! cache publication still require the execution owner's higher-level locks.
 
 use std::collections::BTreeMap;
+use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, PoisonError, Weak};
+use std::time::{Duration, Instant};
 
 use crate::storage_health::{StoreRole, StoreState};
 use quil_types::store::{BackingStoreIdentity, CapturePoint, ScanPoint};
@@ -35,7 +37,8 @@ pub enum DatabaseCommitError {
 }
 
 pub(crate) struct DatabaseInner {
-    db: DB,
+    /// Closed when dropped, unless the process is exiting ([`ExitHold`]).
+    db: ManuallyDrop<DB>,
     writes: Mutex<WriteLedger>,
     /// The failed-write latch and the store's role in the operator log.
     state: Arc<StoreState>,
@@ -48,6 +51,109 @@ pub(crate) struct DatabaseInner {
 }
 
 static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+impl Drop for DatabaseInner {
+    fn drop(&mut self) {
+        // Once the process is exiting the store is left open: a close could
+        // run into RocksDB's static teardown. Its write-ahead log is
+        // replayed at the next open, as after the node's own exit.
+        if let Some(_closing) = ExitHold::unless_exiting() {
+            // SAFETY: dropped once, here; `db` is not used after.
+            unsafe { ManuallyDrop::drop(&mut self.db) };
+        }
+    }
+}
+
+/// RocksDB work a process ending through `exit` (a test binary; any normal
+/// return from `main`) waits for, up to a minute, before RocksDB's
+/// static teardown: a store closed or used under it aborts the process
+/// ("pthread lock: Invalid argument"). Every store's close holds one; hold
+/// one around RocksDB work on a thread of its own. A store dropped once the
+/// process is exiting is not closed.
+pub struct ExitHold(());
+
+/// Whether the process is exiting, and the [`ExitHold`]s held.
+struct ExitState {
+    exiting: bool,
+    held: usize,
+}
+
+static EXIT: (Mutex<ExitState>, Condvar) = (
+    Mutex::new(ExitState {
+        exiting: false,
+        held: 0,
+    }),
+    Condvar::new(),
+);
+
+/// How long an exiting process waits for the [`ExitHold`]s held.
+const EXIT_WAIT: Duration = Duration::from_secs(60);
+
+impl ExitHold {
+    /// Hold off RocksDB's teardown at exit until this is dropped.
+    pub fn start() -> Self {
+        wait_at_exit();
+        exit_state().held += 1;
+        Self(())
+    }
+
+    /// A hold, unless the process is exiting.
+    fn unless_exiting() -> Option<Self> {
+        let mut state = exit_state();
+        if state.exiting {
+            return None;
+        }
+        state.held += 1;
+        Some(Self(()))
+    }
+}
+
+impl Drop for ExitHold {
+    fn drop(&mut self) {
+        exit_state().held -= 1;
+        EXIT.1.notify_all();
+    }
+}
+
+fn exit_state() -> MutexGuard<'static, ExitState> {
+    EXIT.0.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Make the process wait for the [`ExitHold`]s held when it exits. Called
+/// once a store is open: RocksDB's static mutexes were built before (before
+/// `main`, or as the first store opened), so this runs before their
+/// teardown.
+fn wait_at_exit() {
+    static REGISTERED: Once = Once::new();
+    REGISTERED.call_once(|| {
+        extern "C" fn exiting() {
+            let deadline = Instant::now() + EXIT_WAIT;
+            let mut state = exit_state();
+            state.exiting = true;
+            while state.held > 0 {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    // Not a log line: a log writer may have stopped as
+                    // `main` returned.
+                    eprintln!(
+                        "exiting with {} store closes or RocksDB jobs still running after {} s: \
+                         RocksDB's teardown may abort the process",
+                        state.held,
+                        EXIT_WAIT.as_secs()
+                    );
+                    return;
+                }
+                state = EXIT
+                    .1
+                    .wait_timeout(state, left)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+        }
+        // SAFETY: registers a plain function with no captured state.
+        unsafe { libc::atexit(exiting) };
+    });
+}
 
 /// How long writes took, since last read. A slow disk shows in `max_write`
 /// with no `max_barrier_wait` of its own; a writer holding the barrier shows
@@ -343,10 +449,11 @@ impl CoordinatedDb {
     }
 
     fn open(db: DB, watched: Option<Vec<Vec<u8>>>) -> Self {
+        wait_at_exit();
         let general = db.latest_sequence_number();
         let state = Arc::new(StoreState::new(db.path().to_path_buf()));
         Self(Arc::new(DatabaseInner {
-            db,
+            db: ManuallyDrop::new(db),
             writes: Mutex::new(WriteLedger {
                 general,
                 disjoint: BTreeMap::new(),
