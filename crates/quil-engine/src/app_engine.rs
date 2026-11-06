@@ -1623,9 +1623,9 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             let mut next = keep.iter();
             origins.retain(|_| *next.next().unwrap_or(&true));
         };
-        // Every shard of the application collects every submission, and any
-        // one of them may execute it. Once the global commit has decided a
-        // bundle, whichever shard relayed it, it is done: drop it from the
+        // Every shard of the application collects every submission but a shield
+        // of another shard, and any one of them may execute it. Once the global
+        // commit has decided a bundle, whichever shard relayed it, it is done: drop it from the
         // mempool instead of verifying its proofs again.
         if let Some(manager) = self.execution_engine.as_ref() {
             let global = self
@@ -2879,6 +2879,10 @@ pub struct AppConsensusEngine {
     current_rank: u64,
     /// Arrival times of submissions, shared with the leader provider.
     routing_seen: RoutingClock,
+    /// Shields left to the shards holding their sources.
+    shields_elsewhere: ShieldsElsewhere,
+    /// Submissions refused because no frame could execute them.
+    malformed_arrivals: MalformedArrivals,
     shard_frame_number: u64,
 
     // Message queues
@@ -3283,6 +3287,8 @@ impl AppConsensusEngine {
             current_difficulty: Arc::new(std::sync::atomic::AtomicU32::new(50000)),
             current_rank: 0,
             routing_seen: Default::default(),
+            shields_elsewhere: ShieldsElsewhere::default(),
+            malformed_arrivals: MalformedArrivals::default(),
             shard_frame_number: 0,
             _pending_messages: VecDeque::with_capacity(MAX_APP_MESSAGES_PER_RANK),
             proposal_cache: HashMap::new(),
@@ -7724,6 +7730,7 @@ impl AppConsensusEngine {
                     }
                     self.cleanup_frame_store();
                     self.note_gossip_refusals_quiet();
+                    self.report_arrivals_left();
                 }
 
                 // Passive-mode CW retry: keep trying to start simplex until the
@@ -11760,6 +11767,13 @@ impl AppConsensusEngine {
     // Message collection
     // ---------------------------------------------------------------
 
+    /// Log what the bounded arrival lines still hold, if a line is due: nothing
+    /// else would once arrivals stop.
+    fn report_arrivals_left(&mut self) {
+        self.shields_elsewhere.report(&self.filter);
+        self.malformed_arrivals.report(&self.filter);
+    }
+
     /// Add an application message to this shard's mempool for inclusion in
     /// a later frame. Nothing else holds it: a copy the mempool already
     /// holds adds nothing, and one its full rank buffer refuses is dropped,
@@ -11768,11 +11782,44 @@ impl AppConsensusEngine {
     /// shard's mempool stays full; kept aside for a rank that never came,
     /// refused copies grew without bound (2026-10-31: 1,515 to 6,888 of
     /// about 190 KB in 8 h on one node) and no proposal read them.
+    ///
+    /// A shield another shard must propose is not held at all
+    /// ([`shield_proposed_elsewhere`]): no other shard can execute it, and
+    /// 64 MiB of such copies refused the shards' own (2026-11-02: 383 bundles
+    /// on each of one node's 15 workers, 200-266 refusals each in 37 min).
     fn add_app_message(&mut self, data: &[u8]) {
         let data = canonical_app_message(data);
+        let operations = quil_execution::ExecutionEngineManager::confidential_operation_count(
+            &self.app_address,
+            &data,
+        );
+        if shield_proposed_elsewhere(
+            &self.filter,
+            operations,
+            quil_execution::ExecutionEngineManager::shield_source(&data),
+        ) {
+            self.shields_elsewhere.note(&self.filter, data.len());
+            return;
+        }
+        // Refused here it costs no room and no later proposal's time, on the
+        // shard that would have proposed it too. No frame could execute it.
+        if self
+            .execution_engine
+            .as_ref()
+            .is_some_and(|exec| exec.refused_before_native_work(&self.app_address, &data))
+        {
+            self.malformed_arrivals.note(&self.filter, data.len());
+            return;
+        }
         let now = std::time::Instant::now();
-        stamp_arrival(&self.routing_seen, &data, now);
         let collected = self.message_collector.add_message_newest(data.clone());
+        // Only a confidential bundle the mempool holds waits for its routing
+        // fallback, and only a turn holding one prunes the stamps: any other
+        // arrival's stamp, bytes no proposal decodes or a copy a full rank
+        // refused, stayed while the mempool let it go.
+        if collected && operations > 0 {
+            stamp_arrival(&self.routing_seen, &data, now);
+        }
         self.verify_on_arrival(&data, collected, now);
     }
 
@@ -11780,7 +11827,8 @@ impl AppConsensusEngine {
     /// background, so the proposal that carries it and the frame that
     /// executes it find the verdicts cached instead of verifying for
     /// minutes. Only on the shard that proposes it (every shard of the
-    /// application collects it), and only what may still execute: one the
+    /// application collects a submission that may reach it past the routing
+    /// fallback), and only what may still execute: one the
     /// collector did not take as new (`collected`: a finalized frame
     /// consumed it, the collector holds it, or its rank is full), one that
     /// fails dispatch's checks before native work, and one the global
@@ -14097,6 +14145,114 @@ fn arrival_designated(
     match shards {
         Some(shards) if !shards.is_empty() => routing_offset(filter, shards, hash) == Some(0),
         _ => true,
+    }
+}
+
+/// Whether shard `filter` never proposes a submission of `operations`
+/// confidential operations whose first shield consumes `source`: only the
+/// shard whose range holds that coin does ([`routed_selection`], whatever
+/// the shard list or the wait), since a shield's source check reads the
+/// executing shard's own store. Its copy here could only take room from
+/// what this shard must propose. Decided from this shard's filter and the
+/// operation alone, so a shard list that dropped a stalled shard changes
+/// nothing, and the shard holding the source always collects it: its copies
+/// wait out its stall there, a split carries them to the child shards with
+/// its members' pools, and a merge to the merged shard. A filter that does
+/// not decode says nothing, so it collects as before.
+fn shield_proposed_elsewhere(filter: &[u8], operations: usize, source: Option<[u8; 32]>) -> bool {
+    operations > 0
+        && quil_forest::decode_shard_filter_or_root(filter, 32).is_some()
+        && source.is_some_and(|source| !shard_covers(filter, &source))
+}
+
+/// Submissions this shard refused on arrival since its last line.
+#[derive(Default)]
+struct MalformedArrivals {
+    submissions: u64,
+    bytes: u64,
+    logged: Option<std::time::Instant>,
+}
+
+impl MalformedArrivals {
+    /// Count one of `bytes`; one line when the first arrives and then at most
+    /// one per [`SHIELDS_ELSEWHERE_LOG_EVERY`] while they keep arriving.
+    fn note(&mut self, filter: &[u8], bytes: usize) {
+        self.submissions += 1;
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+        self.report(filter);
+    }
+
+    /// The line for what is counted, if one is due. The engine's cleanup timer
+    /// calls this too, so the last count is logged when arrivals stop.
+    fn report(&mut self, filter: &[u8]) {
+        if self.submissions == 0 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .logged
+            .is_some_and(|at| now.saturating_duration_since(at) < SHIELDS_ELSEWHERE_LOG_EVERY)
+        {
+            return;
+        }
+        self.logged = Some(now);
+        warn!(
+            filter = %hex::encode(filter),
+            submissions = self.submissions,
+            bytes = self.bytes,
+            scope = "a peer or wallet",
+            action = "none here: a wallet seeing this for its own submission has a version or encoding defect",
+            "submissions no frame could execute refused on arrival since the last line"
+        );
+        self.submissions = 0;
+        self.bytes = 0;
+    }
+}
+
+/// How often a worker reports the shields it left to their shards.
+const SHIELDS_ELSEWHERE_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Shields this shard did not collect since its last line.
+#[derive(Default)]
+struct ShieldsElsewhere {
+    shields: u64,
+    bytes: u64,
+    logged: Option<std::time::Instant>,
+}
+
+impl ShieldsElsewhere {
+    /// Count one of `bytes`; one line when the first arrives and then at most
+    /// one per [`SHIELDS_ELSEWHERE_LOG_EVERY`] while they keep arriving.
+    fn note(&mut self, filter: &[u8], bytes: usize) {
+        self.shields += 1;
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+        self.report(filter);
+    }
+
+    /// The line for what is counted, if one is due. The engine's cleanup timer
+    /// calls this too, so the last count is logged when arrivals stop.
+    fn report(&mut self, filter: &[u8]) {
+        if self.shields == 0 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .logged
+            .is_some_and(|at| now.saturating_duration_since(at) < SHIELDS_ELSEWHERE_LOG_EVERY)
+        {
+            return;
+        }
+        self.logged = Some(now);
+        info!(
+            filter = %hex::encode(filter),
+            shields = self.shields,
+            bytes = self.bytes,
+            scope = "this worker",
+            action = "none: each is proposed by the shard holding its source coin",
+            "shields for other shards left uncollected since the last line"
+        );
+        self.shields = 0;
+        self.bytes = 0;
     }
 }
 
@@ -22364,6 +22520,88 @@ mod tests {
         assert!(arrival_designated(&app, None, &[9; 32], Some([0xff; 32])));
     }
 
+    /// Exactly one shard of any partition collects a shield, the one
+    /// [`routed_selection`] has propose it whatever the shard list or the wait:
+    /// so what the gate refuses no other path could have proposed, and the shard
+    /// that must propose it never refuses it for this.
+    #[test]
+    fn every_source_has_one_collecting_shard_and_it_is_the_proposing_one() {
+        let token = |bits: &[bool]| {
+            quil_forest::encode_shard_bit_path(&quil_execution::domains::QUIL_TOKEN, bits)
+        };
+        let partitions: Vec<Vec<Vec<bool>>> = vec![
+            vec![vec![]],
+            vec![vec![false], vec![true]],
+            vec![vec![false], vec![true, false], vec![true, true]],
+            vec![
+                vec![false, false, false],
+                vec![false, false, true],
+                vec![false, true],
+                vec![true],
+            ],
+        ];
+        let waits = [
+            std::time::Duration::ZERO,
+            ROUTED_FALLBACK * 2,
+            std::time::Duration::from_secs(86_400),
+        ];
+        for partition in &partitions {
+            let shards: Vec<Vec<u8>> = partition.iter().map(|bits| token(bits)).collect();
+            for first in 0..=255u8 {
+                let mut source = [0x5a; 32];
+                source[0] = first;
+                let collecting = shards
+                    .iter()
+                    .filter(|shard| !shield_proposed_elsewhere(shard, 1, Some(source)))
+                    .count();
+                assert_eq!(collecting, 1, "{partition:?}, first byte {first:#x}");
+                for shard in &shards {
+                    for wait in waits {
+                        // With the live list, with the shard off it, and with none.
+                        let others: Vec<Vec<u8>> =
+                            shards.iter().filter(|s| *s != shard).cloned().collect();
+                        for list in [&shards, &others, &Vec::new()] {
+                            let proposes = routed_selection(
+                                shard,
+                                list,
+                                &[[9; 32]],
+                                &[1],
+                                &[Some(source)],
+                                &[wait],
+                                ROUTED_FALLBACK,
+                            )[0];
+                            assert_eq!(
+                                proposes,
+                                !shield_proposed_elsewhere(shard, 1, Some(source)),
+                                "{partition:?}, shard {shard:?}, wait {wait:?}: the gate and the \
+                                 proposal disagree"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // The 64-way genesis grid's one-byte filters.
+        for level in 0..64u8 {
+            let mut filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+            filter.push(level);
+            let mut source = [0; 32];
+            source[0] = level << 2;
+            assert!(!shield_proposed_elsewhere(&filter, 1, Some(source)));
+            source[0] = (level ^ 1) << 2;
+            assert!(shield_proposed_elsewhere(&filter, 1, Some(source)));
+        }
+        let source = Some([0xff; 32]);
+        // A submission with no confidential operation, and no shield: no gate.
+        assert!(!shield_proposed_elsewhere(&token(&[false]), 0, source));
+        assert!(!shield_proposed_elsewhere(&token(&[false]), 1, None));
+        // A filter that does not decode says nothing: it collects as before.
+        assert!(!shield_proposed_elsewhere(&[1; 31], 1, source));
+        let mut undecodable = token(&[false]);
+        undecodable.push(0);
+        assert!(!shield_proposed_elsewhere(&undecodable, 1, source));
+    }
+
     /// A frame whose proofs verify in the background is put off, and taken
     /// up once they are verified; it verifies inline when its verification
     /// cannot be queued or ends without a verdict too often. While they
@@ -28567,3 +28805,7 @@ mod arrival_tests;
 #[cfg(test)]
 #[path = "app_engine_relay_tests.rs"]
 mod relay_tests;
+
+#[cfg(test)]
+#[path = "app_engine_shield_hold_tests.rs"]
+mod shield_hold_tests;
