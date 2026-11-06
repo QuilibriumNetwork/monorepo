@@ -28,7 +28,7 @@ pub enum Msg {
     Mint(super::mint::Progress),
     /// The shielded coins and pending transfers read, or why the read
     /// failed.
-    Shielded(Result<super::transfer::Read, String>),
+    Shielded(Result<super::transfer::Read, super::transfer::ReadFailure>),
     /// A transfer action's confirmation, or why there is none.
     TransferPreview(Result<super::transfer::Preview, String>),
     /// A running transfer action's report.
