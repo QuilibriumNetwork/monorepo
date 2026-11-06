@@ -37,6 +37,11 @@ pub fn commit_and_place(
     // Every output, record and root update has to survive the commit's
     // coverage filter together, as it did when shards staged locally.
     state.require_full_domain_coverage(application)?;
+    // A coin whose owner is not a canonical identity failed this venue's fold
+    // and the operation was skipped. The fold now burns such a coin (as a
+    // split application's owning shard must), so the refusal is made here,
+    // before anything is written: the same outcome on every build.
+    spend_entries::check_coin_owners(network, application, tp, bytes)?;
     let entry = spend_entries::commit_entry(state, network, application, tp, bytes, frame)?;
     // The venue that executes it is also the one that holds it: the whole
     // application, since a globally executed one is never split.
@@ -680,5 +685,105 @@ mod tests {
             .get(&APPLICATION, &placed[0], &disc)
             .unwrap()
             .is_some());
+    }
+
+    /// Recovery: a delivery GLOBAL already committed with a non-canonical
+    /// owner is burned. The owning shard places it, the frame's fold takes
+    /// its position as the empty leaf, the block's next honest coin lands
+    /// behind it, a fresh replica replaying the frame (a restarted node or an
+    /// archive resuming the shard) publishes the same root, and a rebuild
+    /// from the stored coins reproduces it.
+    #[test]
+    fn a_committed_noncanonical_coin_is_burned_and_its_block_goes_on() {
+        use super::super::{coin_blocks, roots};
+        let parameters = parameter_context(&NETWORK, &APPLICATION);
+        let block_of = |output: &Output| {
+            let (address, _) = coin_identity(&parameters, 11, output).unwrap();
+            coin_blocks::block_for_address(coin_blocks::INITIAL_BLOCK_BITS, &address).unwrap()
+        };
+        let (_, _, bootstrap_block) = split_bootstrap();
+        let bad = (1..=200u8)
+            .map(noncanonical_output)
+            .find(|o| block_of(o) != bootstrap_block)
+            .unwrap();
+        let wedged = block_of(&bad);
+        let behind = (20..=200u8)
+            .map(|seed| output(seed, 100))
+            .find(|o| block_of(o) == wedged)
+            .expect("an honest coin shares the block among 181");
+        let (global, root, _) = split_bootstrap();
+        let bad_tx = transfer(vec![[7; IDENTITY_BYTES]], vec![bad.clone()], &root);
+        let reserved =
+            relay(&global, &bad_tx).expect("committed, as a build without the gate does");
+        let honest_tx = transfer(vec![[10; IDENTITY_BYTES]], vec![behind.clone()], &root);
+        let honest = relay(&global, &honest_tx).unwrap();
+        assert_eq!((reserved[0].block, reserved[0].seq), (wedged, 0));
+        assert_eq!((honest[0].block, honest[0].seq), (wedged, 1));
+        let replica = || {
+            let state = state();
+            for (output, placement) in [(&bad, &reserved[0]), (&behind, &honest[0])] {
+                let (address, tree) = coin_identity(&parameters, 11, output).unwrap();
+                delivery::place_committed(
+                    &state,
+                    20,
+                    &NETWORK,
+                    &APPLICATION,
+                    &address,
+                    tree,
+                    placement.block,
+                    placement.seq,
+                    &[],
+                    limits(),
+                )
+                .expect("each delivery lands in sequence");
+            }
+            let folded = roots::fold_placed(&state, 20, &NETWORK, &APPLICATION, limits())
+                .expect("the frame's fold takes the burned coin")
+                .expect("the frame placed coins");
+            (state, folded)
+        };
+        let (state, folded) = replica();
+        assert_eq!(folded.coins, 2);
+        assert_eq!(
+            roots::block_count(&state, &NETWORK, &APPLICATION, wedged, limits()).unwrap(),
+            2
+        );
+        let disc = vertex_adds_discriminator().unwrap();
+        assert!(state
+            .get(&APPLICATION, &honest[0].address, &disc)
+            .unwrap()
+            .is_some());
+        let (_, replayed) = replica();
+        assert_eq!(replayed, folded, "a replica replaying the frame agrees");
+        assert_eq!(
+            roots::full_rebuild_root(&state, &NETWORK, &APPLICATION, limits()).unwrap(),
+            folded,
+            "a rebuild from the stored coins reproduces the folded root"
+        );
+    }
+
+    /// A globally executed application, now that the fold burns such a
+    /// coin: the venue still refuses the operation, before writing anything,
+    /// as every earlier build did by failing the fold, so GLOBAL agrees across
+    /// builds; the next commit lands.
+    #[test]
+    fn the_global_venue_refuses_a_noncanonical_coin_before_writing() {
+        let state = state();
+        let savepoint = state.changeset_len();
+        let claim = mint_claim(9, vec![output(5, 100), noncanonical_output(1)]);
+        let refused = commit_and_place(&state, 10, &NETWORK, &APPLICATION, CLAIM, &claim, limits())
+            .unwrap_err();
+        assert!(
+            matches!(refused, QuilError::InvalidArgument(_)),
+            "{refused}"
+        );
+        assert!(
+            refused.to_string().contains("not a canonical identity"),
+            "{refused}"
+        );
+        assert_eq!(state.changeset_len(), savepoint, "nothing was written");
+        let next = mint_claim(8, vec![output(6, 100)]);
+        commit_and_place(&state, 11, &NETWORK, &APPLICATION, CLAIM, &next, limits())
+            .expect("the next commit lands");
     }
 }

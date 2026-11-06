@@ -504,31 +504,29 @@ impl SpendScanCollector {
 }
 
 /// Each coin's leaf, off the async runtime: the hash a witness rebuild
-/// places it by.
+/// places it by, the one the chain committed. A coin whose owner is not a
+/// canonical identity is burned (`coin_tree::committed_leaf`): it takes the
+/// empty leaf, and the coins beside it stay spendable.
 async fn hash_kept(
     key: std::sync::Arc<quil_lattice_ct::confidential::relation::membership::MembershipKey>,
     batch: Vec<(usize, ScannedCoin)>,
 ) -> anyhow::Result<Vec<KeptCoin>> {
-    use quil_lattice_ct::confidential::relation::membership::Node;
+    use quil_lattice_ct::confidential::coin_tree::committed_leaf;
     if batch.is_empty() {
         return Ok(Vec::new());
     }
-    tokio::task::spawn_blocking(move || {
+    Ok(tokio::task::spawn_blocking(move || {
         batch
             .into_iter()
-            .map(|(subtree, coin)| {
-                let owner = Node::from_identity_bytes(&coin.output.owner)
-                    .map_err(|e| anyhow::anyhow!("scanned owner: {e:?}"))?;
-                Ok(KeptCoin {
-                    subtree,
-                    position: coin.position,
-                    frame: coin.frame,
-                    leaf: key.leaf(&owner, &coin.output.commitment).to_bytes(),
-                })
+            .map(|(subtree, coin)| KeptCoin {
+                subtree,
+                position: coin.position,
+                frame: coin.frame,
+                leaf: committed_leaf(&key, &coin.output.owner, &coin.output.commitment).to_bytes(),
             })
-            .collect::<anyhow::Result<Vec<_>>>()
+            .collect()
     })
-    .await?
+    .await?)
 }
 
 /// Bounded scan state. A failed page leaves it unchanged; an expired snapshot

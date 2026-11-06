@@ -945,6 +945,12 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         committed_credit_frame = %if committed_credit_from == u64::MAX { "never".to_string() } else { committed_credit_from.to_string() },
         "settlement records and mint-claim fees credited only with committed spends"
     );
+    let canonical_owners_from =
+        quil_execution::token_intrinsic::global_commit::init_canonical_owner_frame(args.network);
+    info!(
+        canonical_owner_frame = %if canonical_owners_from == u64::MAX { "never".to_string() } else { canonical_owners_from.to_string() },
+        "confidential operations refused for an owner that is not a canonical identity"
+    );
     if let Some(frame) =
         quil_execution::global_intrinsic::leaf_root_registration::init_pre_registration_frame(
             args.network,
