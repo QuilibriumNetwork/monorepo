@@ -778,12 +778,17 @@ pub(crate) struct ReplayTurn {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ShardRecoveryProgress {
     /// `archive_tip`: the highest tip an archive reported (`None`: none had a
-    /// frame of the shard). `committed_tip`: GLOBAL's executed frame of the
-    /// session. Materialized below the committed tip is not up to date.
+    /// frame of the shard, or `discarded_tip` is set). `committed_tip`:
+    /// GLOBAL's executed frame of the session. Materialized below the
+    /// committed tip is not up to date. `discarded_tip`: the certified
+    /// archive frame, past the committed one, that validation refused as
+    /// above its session's terminal checkpoint frame, where the replay
+    /// stopped.
     Replayed {
         materialized: u64,
         archive_tip: Option<u64>,
         committed_tip: Option<u64>,
+        discarded_tip: Option<u64>,
         turn: ReplayTurn,
     },
     Anchored {
@@ -815,8 +820,20 @@ impl std::fmt::Display for ShardRecoveryProgress {
         match self {
             Self::Replayed {
                 materialized,
+                committed_tip,
+                discarded_tip: Some(discarded),
+                ..
+            } => write!(
+                f,
+                "replayed to frame {materialized} (archive frames from {discarded} lie past their \
+                 session's terminal checkpoint, committed tip {})",
+                tip(committed_tip)
+            ),
+            Self::Replayed {
+                materialized,
                 archive_tip,
                 committed_tip,
+                discarded_tip: None,
                 ..
             } => write!(
                 f,
@@ -1136,6 +1153,7 @@ pub(crate) async fn recover_shard_from_latest(
             materialized: replay.materialized,
             archive_tip: replay.archive_tip,
             committed_tip,
+            discarded_tip: replay.discarded_tip,
             turn,
         });
     }
@@ -1609,9 +1627,15 @@ pub fn carried_header_globals(predecessor: u64, successor: Option<u64>) -> Vec<u
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ShardReplay {
     pub materialized: u64,
-    /// The highest tip an archive reported; `None` when none had a frame.
+    /// The highest tip an archive reported; `None` when none had a frame,
+    /// or when `discarded_tip` is set.
     pub archive_tip: Option<u64>,
     pub target: u64,
+    /// The certified frame past the committed one that validation refused
+    /// as above its session's terminal checkpoint frame, ending the replay:
+    /// the next frame, or the certified descendant that finalizes it when
+    /// it has no certificate of its own.
+    pub discarded_tip: Option<u64>,
 }
 
 /// How the error of a replay stopped at a shard frame no archive serves
@@ -1898,6 +1922,17 @@ where
 /// never ends recovery below what GLOBAL has executed. Every frame is still
 /// authenticated by `replay`.
 ///
+/// Archives serve the frames a session fence discarded as the latest until
+/// a successor session produces past them; validation refuses each as above
+/// its session's terminal checkpoint frame. Such a refusal of a frame past
+/// `committed` ends the replay where it stands, at or past the committed
+/// frame, once the replay reached the checkpoint, rather than failing every
+/// attempt: the worker is up to date, and the refused frame is reported
+/// instead of an archive tip. Any other refusal, including one for a frame
+/// at or below the checkpoint's frame (a terminal certificate can precede
+/// GLOBAL's execution of it), or one before the replay reached the
+/// checkpoint, fails.
+///
 /// `known`: the GLOBAL frame a frame replayed earlier is anchored to (frame,
 /// anchor); the answer carries that of the frame it materialized last, when
 /// known. A batch after one that ended on a frame rebuilt from its carried
@@ -2141,6 +2176,27 @@ where
                         }
                     }
                 }
+                // A frame the session's close discarded, past the committed
+                // one, once the replay reached the checkpoint: the worker is
+                // current where it stands.
+                let checkpoint =
+                    quil_execution::global_intrinsic::handoff::frames::past_terminal_checkpoint(
+                        &error,
+                    );
+                if committed > 0
+                    && next > committed
+                    && checkpoint.is_some_and(|checkpoint| materialized >= checkpoint)
+                {
+                    return Ok((
+                        ShardReplay {
+                            materialized,
+                            archive_tip: None,
+                            target: materialized,
+                            discarded_tip: Some(last_number),
+                        },
+                        anchor.map(|anchor| (materialized, anchor)),
+                    ));
+                }
                 return Err(error);
             }
         };
@@ -2165,6 +2221,7 @@ where
             materialized,
             archive_tip,
             target,
+            discarded_tip: None,
         },
         anchor.map(|anchor| (materialized, anchor)),
     ))
@@ -2647,6 +2704,7 @@ mod tests {
             materialized,
             archive_tip,
             committed_tip,
+            discarded_tip: None,
             turn,
         } = result
         else {
@@ -3541,7 +3599,8 @@ mod tests {
             ShardReplay {
                 materialized: 161,
                 archive_tip: Some(600),
-                target: 600
+                target: 600,
+                discarded_tip: None
             }
         );
         assert_eq!(*replayed.lock().unwrap(), (130..=161).collect::<Vec<_>>());
@@ -3614,7 +3673,8 @@ mod tests {
             ShardReplay {
                 materialized: 134,
                 archive_tip: Some(134),
-                target: 134
+                target: 134,
+                discarded_tip: None
             }
         );
         assert_eq!(
@@ -4800,6 +4860,234 @@ mod tests {
         }
     }
 
+    /// The refusal a replay gives a frame above its session's terminal
+    /// checkpoint frame, one the session's close discarded (`handoff_tests`
+    /// drives the validator's own).
+    fn refusal_past_checkpoint(checkpoint: u64) -> quil_types::error::QuilError {
+        use quil_execution::global_intrinsic::handoff::frames::PAST_TERMINAL_CHECKPOINT;
+        quil_types::error::QuilError::InvalidSignature(format!(
+            "archive replay frame {}: app session certificate: {PAST_TERMINAL_CHECKPOINT} {checkpoint}",
+            checkpoint + 1
+        ))
+    }
+
+    /// [`refusal_past_checkpoint`] of a session closed at 505.
+    fn discarded_frame_refusal() -> quil_types::error::QuilError {
+        refusal_past_checkpoint(505)
+    }
+
+    /// GLOBAL fenced the shard's last session at 505; archives still serve
+    /// 506 and 507, which the fence discarded, as the latest. A worker at the
+    /// committed frame, or replaying up to it, is current there: the refusal
+    /// of 506 ends the replay instead of failing every attempt.
+    #[tokio::test]
+    async fn replay_stops_at_the_committed_frame_before_frames_a_fence_discarded() {
+        for (local, committed, expected) in [
+            (505, 505, vec![506]),
+            (503, 505, vec![504, 505, 506]),
+            (505, 503, vec![506]),
+        ] {
+            let archive = Archive {
+                latest: Some(frame(507)),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            };
+            let replayed = Arc::new(Mutex::new(Vec::new()));
+            let seen = replayed.clone();
+            let result = replay_shard_from_latest(
+                &archive,
+                &[5; 32],
+                frame(local),
+                local,
+                Some(committed),
+                &CarriedVerifierSource::default(),
+                move |frame, _| {
+                    let number = frame.header.unwrap().frame_number;
+                    seen.lock().unwrap().push(number);
+                    async move {
+                        match number > 505 {
+                            true => Err(discarded_frame_refusal()),
+                            false => Ok(number),
+                        }
+                    }
+                },
+            )
+            .await
+            .expect("a replay at the committed frame failed on frames a fence discarded");
+            assert_eq!(
+                result,
+                ShardReplay {
+                    materialized: 505,
+                    archive_tip: None,
+                    target: 505,
+                    discarded_tip: Some(506)
+                },
+                "{local} {committed}"
+            );
+            assert_eq!(
+                *replayed.lock().unwrap(),
+                expected,
+                "never past the first discarded frame"
+            );
+        }
+
+        // The worker is reported current at the committed frame.
+        struct AtFence;
+        #[async_trait]
+        impl ShardRecoveryTarget for AtFence {
+            fn materialized(&self) -> u64 {
+                505
+            }
+            async fn replay(&self, _: AppShardFrame, _: Vec<AppShardFrame>) -> Result<u64> {
+                Err(discarded_frame_refusal())
+            }
+            async fn validate(&self, _: AppShardFrame, _: Option<AppShardFrame>) -> Result<bool> {
+                panic!("no anchor")
+            }
+            async fn install(&self, _: AppShardFrame, _: Option<AppShardFrame>) -> Result<()> {
+                panic!("no install")
+            }
+            fn inherited(&self) {
+                panic!("no inheritance")
+            }
+            async fn committed_tip(&self) -> Option<u64> {
+                Some(505)
+            }
+        }
+        let archive = Archive {
+            latest: Some(frame(507)),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let result =
+            recover_shard_from_latest(&archive, &[5; 32], Some(frame(505)), &AtFence, &[], None)
+                .await
+                .expect("a replay at the committed frame failed on frames a fence discarded");
+        assert_eq!(
+            result.to_string(),
+            "replayed to frame 505 (archive frames from 506 lie past their session's terminal \
+             checkpoint, committed tip 505)"
+        );
+        let ShardRecoveryProgress::Replayed {
+            materialized,
+            archive_tip,
+            committed_tip,
+            discarded_tip,
+            turn,
+        } = result
+        else {
+            panic!("expected a replay")
+        };
+        assert_eq!(
+            (
+                materialized,
+                archive_tip,
+                committed_tip,
+                discarded_tip,
+                turn.behind
+            ),
+            (505, None, Some(505), Some(506), false)
+        );
+    }
+
+    /// A frame past the committed one with no certificate of its own is
+    /// replayed with its certified descendant, whose refusal ends the
+    /// replay: the descendant is the frame named as refused.
+    #[tokio::test]
+    async fn a_refused_descendant_ends_the_replay_at_the_committed_frame() {
+        let result = replay_shard_from_latest(
+            &BareArchive,
+            &[5; 32],
+            frame(131),
+            131,
+            Some(131),
+            &CarriedVerifierSource::default(),
+            |frame, descendants| {
+                let number = frame.header.unwrap().frame_number;
+                assert!(
+                    number != 132 || descendants.len() == 1,
+                    "132 travels with its certified child"
+                );
+                async move { Err(refusal_past_checkpoint(131)) }
+            },
+        )
+        .await
+        .expect("a replay at the committed frame failed on frames a fence discarded");
+        assert_eq!(
+            result,
+            ShardReplay {
+                materialized: 131,
+                archive_tip: None,
+                target: 131,
+                discarded_tip: Some(133)
+            }
+        );
+    }
+
+    /// Only a refusal above the terminal checkpoint's frame, of a frame past
+    /// a known committed one, ends a replay early: one at or below the
+    /// committed frame, one the checkpoint excludes at or below its frame,
+    /// any other refusal, or no committed frame at all still fails.
+    #[tokio::test]
+    async fn replay_refusals_other_than_a_discarded_frame_past_the_committed_one_still_fail() {
+        use quil_execution::global_intrinsic::handoff::frames::OUTSIDE_TERMINAL_CHECKPOINT;
+        use quil_types::error::QuilError;
+        type Refusal = fn() -> QuilError;
+        let cases: [(Option<u64>, Refusal); 5] = [
+            (None, discarded_frame_refusal),
+            (Some(0), discarded_frame_refusal),
+            (Some(506), discarded_frame_refusal),
+            (Some(505), || {
+                QuilError::InvalidSignature(format!(
+                    "app session certificate: {OUTSIDE_TERMINAL_CHECKPOINT}"
+                ))
+            }),
+            (Some(505), || {
+                QuilError::InvalidSignature("archive replay certificate rejected".into())
+            }),
+        ];
+        for (case, (committed, refusal)) in cases.into_iter().enumerate() {
+            let archive = Archive {
+                latest: Some(frame(507)),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            };
+            let result = replay_shard_from_latest(
+                &archive,
+                &[5; 32],
+                frame(505),
+                505,
+                committed,
+                &CarriedVerifierSource::default(),
+                move |_, _| async move { Err(refusal()) },
+            )
+            .await;
+            assert!(result.is_err(), "case {case}, {committed:?}: {result:?}");
+        }
+    }
+
+    /// A refusal past the terminal checkpoint before the replay reached the
+    /// checkpoint fails the attempt: GLOBAL committed 503 of a session closed
+    /// at 505, and a worker at 503 is refused 504 as past it.
+    #[tokio::test]
+    async fn a_refusal_past_the_checkpoint_before_the_replay_reached_it_fails() {
+        let archive = Archive {
+            latest: Some(frame(507)),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let result = replay_shard_from_latest(
+            &archive,
+            &[5; 32],
+            frame(503),
+            503,
+            Some(503),
+            &CarriedVerifierSource::default(),
+            |_, _| async { Err(refusal_past_checkpoint(505)) },
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "below the checkpoint the replay stopped: {result:?}"
+        );
+    }
+
     /// A session based at 0 of which GLOBAL executed nothing; the archive's
     /// latest frame (1) is refused. Certified origins pin the base state;
     /// otherwise the refused frame's attested pre-state roots do; with
@@ -5150,7 +5438,8 @@ mod tests {
                 ShardReplay {
                     materialized: 137,
                     archive_tip: tip,
-                    target: 137
+                    target: 137,
+                    discarded_tip: None
                 }
             );
             assert_eq!(
@@ -5245,7 +5534,8 @@ mod tests {
                 ShardReplay {
                     materialized: 131,
                     archive_tip: Some(tip),
-                    target: 131
+                    target: 131,
+                    discarded_tip: None
                 }
             );
             assert_eq!(*calls.lock().unwrap(), vec![(131, 0)]);
@@ -5325,7 +5615,8 @@ mod tests {
                 ShardReplay {
                     materialized: 134,
                     archive_tip: Some(134),
-                    target: 134
+                    target: 134,
+                    discarded_tip: None
                 }
             );
             assert_eq!(*replayed.lock().unwrap(), [131, 132, 133, 134]);
@@ -5360,7 +5651,8 @@ mod tests {
                 ShardReplay {
                     materialized: 130,
                     archive_tip: Some(expected_tip),
-                    target: 130
+                    target: 130,
+                    discarded_tip: None
                 }
             );
             assert_eq!(*calls.lock().unwrap(), vec![0; expected_calls]);

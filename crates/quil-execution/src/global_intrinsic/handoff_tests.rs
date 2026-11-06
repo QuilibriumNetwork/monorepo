@@ -2343,7 +2343,9 @@ fn a_re_seal_of_a_notarized_seal_closes_the_source_at_the_same_frame() {
 /// still refuses it, and nothing else at or past the checkpoint passes.
 #[test]
 fn a_re_sealed_checkpoint_keeps_its_data_frame_verifiable_as_history() {
-    use super::frames::{verify, verify_history, FrameClaim};
+    use super::frames::{
+        past_terminal_checkpoint, verify, verify_history, FrameClaim, OUTSIDE_TERMINAL_CHECKPOINT,
+    };
     let db = quil_store::RocksDb::open_in_memory().unwrap();
     let (_, state) = make_state(&db);
     let keys = keys();
@@ -2399,38 +2401,58 @@ fn a_re_sealed_checkpoint_keeps_its_data_frame_verifiable_as_history() {
         .is_some());
     let refused = verify(&committed, &tip, &tip_cert).err().unwrap();
     assert!(
-        refused
-            .to_string()
-            .contains("outside the terminal checkpoint"),
+        refused.to_string().contains(OUTSIDE_TERMINAL_CHECKPOINT),
         "{refused}"
+    );
+    assert!(
+        past_terminal_checkpoint(&refused).is_none(),
+        "the checkpoint's own frame is not past it: {refused}"
     );
     assert!(verify(&committed, &earlier, &earlier_cert)
         .unwrap()
         .is_some());
 
     // Another frame at the checkpoint, the tip's digest at another view
-    // below the seal's, and a frame past it.
+    // below the seal's, an earlier frame at a view past the seal's, and a
+    // frame past it: only the last lies above the checkpoint's frame, a
+    // frame its session's close discarded.
     let forked = FrameClaim {
         digest: [0x34; 32],
         ..tip
     };
     let other_view = FrameClaim { view: 7, ..tip };
+    let late = FrameClaim {
+        frame: 5,
+        view: 15,
+        digest: [0x36; 32],
+        ..tip
+    };
     let beyond = FrameClaim {
         frame: 7,
         view: 15,
         digest: [0x35; 32],
         ..tip
     };
-    for claim in [forked, other_view, beyond] {
+    for (claim, past) in [
+        (forked, false),
+        (other_view, false),
+        (late, false),
+        (beyond, true),
+    ] {
         let certificate = sign_certificate(source, &keys, claim.view, 4, claim.digest);
         let error = verify_history(&committed, &claim, &certificate)
             .err()
             .unwrap();
         assert!(
-            error
-                .to_string()
-                .contains("outside the terminal checkpoint"),
+            error.to_string().contains(OUTSIDE_TERMINAL_CHECKPOINT),
             "{error}"
+        );
+        assert_eq!(
+            past_terminal_checkpoint(&error),
+            past.then_some(data.frame),
+            "frame {} view {}: {error}",
+            claim.frame,
+            claim.view
         );
     }
 }

@@ -2085,6 +2085,32 @@ pub fn storage_labels_dir(db_path: &std::path::Path) -> std::path::PathBuf {
     db_path.parent().unwrap_or(db_path).join("storage-labels")
 }
 
+/// The store of the worker `core_id` (1-based; core 0 is the master):
+/// `paths[core_id - 1]`, else `prefix` with `%d` as the core id, else
+/// `<base or .config/store>/worker-<core_id>`. A standalone worker, the
+/// master's thread workers and a cluster's master (the host ledger beside
+/// the workers' labels, [`storage_labels_dir`]) resolve it the same way.
+pub fn worker_store_path(
+    paths: &[String],
+    prefix: &str,
+    base: &str,
+    core_id: u32,
+) -> std::path::PathBuf {
+    let idx = core_id.saturating_sub(1) as usize;
+    if let Some(path) = paths.get(idx).filter(|path| !path.is_empty()) {
+        std::path::PathBuf::from(path)
+    } else if !prefix.is_empty() {
+        std::path::PathBuf::from(prefix.replace("%d", &core_id.to_string()))
+    } else {
+        let base = if base.is_empty() {
+            std::path::PathBuf::from(".config/store")
+        } else {
+            std::path::PathBuf::from(base)
+        };
+        base.join(format!("worker-{core_id}"))
+    }
+}
+
 pub fn snapshot_scratch_dir(db_path: &std::path::Path) -> std::path::PathBuf {
     let name = db_path
         .file_name()
@@ -4133,5 +4159,41 @@ mod archive_routing_tests {
         assert!(read_breaks_connection(
             &quil_rpc::ArchiveClientError::InvalidEndpoint("".into())
         ));
+    }
+}
+
+#[cfg(test)]
+mod worker_store_tests {
+    use super::*;
+
+    /// A cluster's master joins the host ledger of its standalone workers
+    /// from the path they resolve themselves: the same store parent in each
+    /// of the three resolutions.
+    #[test]
+    fn the_master_resolves_the_workers_ledger_directory() {
+        let none: &[String] = &[];
+        let prefix = worker_store_path(none, "/d/worker-store/%d", "/d/store", 1);
+        assert_eq!(prefix, std::path::PathBuf::from("/d/worker-store/1"));
+        let listed = worker_store_path(
+            &["/e/ws/1".into(), "/e/ws/2".into()],
+            "/d/worker-store/%d",
+            "",
+            2,
+        );
+        assert_eq!(listed, std::path::PathBuf::from("/e/ws/2"));
+        let base = worker_store_path(none, "", "/d/store", 2);
+        assert_eq!(base, std::path::PathBuf::from("/d/store/worker-2"));
+        let ledger = |path: &std::path::Path| {
+            quil_engine::storage_labels::host_ledger_dir(&storage_labels_dir(path))
+        };
+        assert_eq!(
+            ledger(&worker_store_path(none, "/d/worker-store/%d", "", 1)),
+            ledger(&worker_store_path(none, "/d/worker-store/%d", "", 2)),
+            "every worker and the master share one ledger directory"
+        );
+        assert_eq!(
+            ledger(&prefix),
+            std::path::PathBuf::from("/d/worker-store/storage-admission")
+        );
     }
 }

@@ -363,12 +363,39 @@ pub(crate) fn successor_pull_through(head: u64, published_head: Option<u64>) -> 
 /// drain may go without a part executed ([`DRAIN_STALL_AFTER`]).
 pub(crate) const SEAL_UNRECORDED_AFTER: Duration = DRAIN_STALL_AFTER;
 
-/// What an unrecorded seal ([`SealRecord`]) waits on, for its stall lines.
-pub(crate) const SEAL_UNRECORDED_WAITS_ON: &str =
+/// What an unrecorded seal ([`SealRecord`]) waits on, for its stall lines,
+/// when this worker's view keeps up with this node's GLOBAL frames.
+const SEAL_UNRECORDED_WAITS_ON: &str =
     "GLOBAL to record the seal: this worker's view shows GLOBAL frames past the one its \
      copy lands by without it, so GLOBAL refuses or never includes the committee's copies \
      (an archive logs why it refuses a seal submission); GLOBAL fences the session at its \
      executed tip once its closing request is old enough; report this line";
+
+/// What an unrecorded seal waits on when this worker's view trails this
+/// node's latest GLOBAL frame ([`record_stall_scope`]).
+const SEAL_UNRECORDED_VIEW_BEHIND: &str =
+    "this worker's committed GLOBAL view, which trails this node's latest GLOBAL frame by \
+     more than a seal copy takes to land, so GLOBAL may have recorded the seal in frames \
+     this view has not reached; check this worker's prover-tree sync";
+
+/// Whose problem an unrecorded seal ([`SealRecord`]) is, from this member's
+/// committed view of GLOBAL at `committed_frame`: the `scope` and `action`
+/// of [`crate::outage`], and what the seal waits on, as [`stall_scope`]
+/// tells a drain's. A view trailing this node's latest GLOBAL frame by more
+/// than [`SEAL_LANDS_WITHIN`] may not reach the frame a recent copy landed
+/// in, so this worker's view lags; otherwise GLOBAL frames pass the frame a
+/// copy lands by without the seal recorded.
+pub(crate) fn record_stall_scope(
+    committed_frame: Option<u64>,
+    latest_global_frame: Option<u64>,
+) -> (&'static str, &'static str, &'static str) {
+    match (committed_frame, latest_global_frame) {
+        (Some(committed), Some(latest)) if latest > committed.saturating_add(SEAL_LANDS_WITHIN) => {
+            ("local", "check", SEAL_UNRECORDED_VIEW_BEHIND)
+        }
+        _ => ("network", "report", SEAL_UNRECORDED_WAITS_ON),
+    }
+}
 
 /// Whether this member's published seal gets recorded while its copies
 /// carry no drain (GLOBAL executed the session through its checkpoint, or
@@ -771,6 +798,24 @@ mod tests {
         assert_eq!(stall_scope(None, Some(10), Some(40)).1, "check");
         assert_eq!(stall_scope(Some(0), Some(10), Some(10)).1, "wait");
         assert_eq!(stall_scope(Some(0), Some(10), None).1, "wait");
+    }
+
+    /// An unrecorded seal's scope: this worker's view behind this node's
+    /// latest GLOBAL frame by more than a copy takes to land, or GLOBAL
+    /// passing that frame without the record.
+    #[test]
+    fn an_unrecorded_seal_names_whose_problem_it_is() {
+        let behind = record_stall_scope(Some(1_014_497), Some(1_014_585));
+        assert_eq!((behind.0, behind.1), ("local", "check"));
+        assert_eq!(behind.2, SEAL_UNRECORDED_VIEW_BEHIND);
+        let edge = Some(10 + SEAL_LANDS_WITHIN);
+        assert_eq!(record_stall_scope(Some(10), edge).0, "network");
+        assert_eq!(record_stall_scope(Some(10), edge.map(|f| f + 1)).0, "local");
+        for (committed, latest) in [(Some(10), Some(10)), (Some(10), None), (None, Some(90))] {
+            let scope = record_stall_scope(committed, latest);
+            assert_eq!((scope.0, scope.1), ("network", "report"));
+            assert_eq!(scope.2, SEAL_UNRECORDED_WAITS_ON);
+        }
     }
 
     /// A sealed member's early pull reaches no GLOBAL frame before the one

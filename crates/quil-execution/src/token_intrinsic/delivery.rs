@@ -476,7 +476,7 @@ pub struct PendingDelivery {
 }
 
 /// Committed outputs and escrows of the blocks `shard` owns that local state
-/// has not yet taken, in delivery order, at most `cap`. `global` is a view of
+/// has not yet taken: the items of [`pending_census`]. `global` is a view of
 /// GLOBAL state.
 pub fn pending_deliveries(
     global: &HypergraphState,
@@ -487,12 +487,38 @@ pub fn pending_deliveries(
     limits: SnapshotLimits,
     cap: usize,
 ) -> Result<Vec<PendingDelivery>> {
-    pending_deliveries_counted(global, local, network, application, shard, limits, cap)
-        .map(|(pending, _)| pending)
+    pending_census(global, local, network, application, shard, limits, cap)
+        .map(|census| census.items)
 }
 
-/// [`pending_deliveries`] and how many owned blocks it read.
-pub fn pending_deliveries_counted(
+/// What [`pending_census`] read of the outputs and escrows committed to a
+/// shard that it has not taken yet.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PendingCensus {
+    /// The listed items: each block's in delivery order, the blocks in turn.
+    pub items: Vec<PendingDelivery>,
+    /// Owned blocks read.
+    pub blocks: usize,
+    /// Committed outputs and escrows not taken yet, over every owned block.
+    pub pending: u64,
+    /// Blocks with something pending, coins and escrows counted apart.
+    pub blocks_pending: usize,
+    /// Whether the cap left pending items unlisted.
+    pub capped: bool,
+    /// `(escrow, block, seq)` committed to this shard whose delivery record
+    /// this GLOBAL view lacks: its block lists nothing from there on.
+    pub missing_records: Vec<(bool, u64, u64)>,
+}
+
+/// The outputs and escrows committed to the blocks `shard` owns that local
+/// state has not taken yet. A block takes only its next item, so while that
+/// item cannot land (its source frame is not here yet) nothing later in the
+/// block can either. The blocks are therefore listed in turns, one item each,
+/// and the next item of every pending block is always listed: one block's
+/// backlog never keeps another block's outputs from being listed and their
+/// source frames fetched. Beyond those first items the list stops at `cap`.
+/// `global` is a view of GLOBAL state.
+pub fn pending_census(
     global: &HypergraphState,
     local: &HypergraphState,
     network: &[u8; 32],
@@ -500,20 +526,26 @@ pub fn pending_deliveries_counted(
     shard: &[bool],
     limits: SnapshotLimits,
     cap: usize,
-) -> Result<(Vec<PendingDelivery>, usize)> {
+) -> Result<PendingCensus> {
     // Every width the application has placed at, narrowest first. Within one
     // width the shard owns exactly the blocks whose path extends its own, so
     // only those are enumerated (a whole-application holder at the widest
     // setting would otherwise walk 32,768 ids per pull); a width narrower than
     // the shard is skipped, since it owns no whole block there.
     let placed_at = global_commit::placement_width(global, application)?;
-    let mut pending = Vec::new();
-    let mut blocks = 0usize;
+    let mut census = PendingCensus::default();
+    // `(escrow, block, next seq, committed)` of each block with something
+    // pending.
+    let mut queues = Vec::new();
     for block in coin_blocks::owned_blocks(shard, placed_at) {
         debug_assert!(coin_blocks::shard_owns_block(shard, block));
-        blocks += 1;
+        census.blocks += 1;
+        // A re-placed orphan's records name deliveries of other blocks now.
+        if global_commit::orphan(global, application, block)?.is_some_and(|orphan| orphan.moved) {
+            continue;
+        }
         for escrow in [false, true] {
-            let (committed, mut seq) = if escrow {
+            let (committed, taken) = if escrow {
                 (
                     global_commit::escrow_sequence(global, application, block)?,
                     escrow_count(local, application, block)?,
@@ -524,30 +556,53 @@ pub fn pending_deliveries_counted(
                     roots::block_count(local, network, application, block, limits)?,
                 )
             };
-            while seq < committed && pending.len() < cap {
-                let record = if escrow {
-                    global_commit::escrow_delivery(global, application, block, seq)?
-                } else {
-                    global_commit::delivery(global, application, block, seq)?
-                };
-                let Some(record) = record else { break };
-                pending.push(PendingDelivery {
-                    escrow,
-                    block,
-                    seq,
-                    address: record.address,
-                    source_frame: record.source_frame,
-                    tx_id: record.tx_id,
-                    source_shard: record.source_shard,
-                });
-                seq += 1;
+            if taken < committed {
+                census.pending += committed - taken;
+                queues.push((escrow, block, taken, committed));
             }
         }
-        if pending.len() >= cap {
+    }
+    census.blocks_pending = queues.len();
+    let mut first_round = true;
+    loop {
+        let mut listed = false;
+        for queue in queues.iter_mut() {
+            let (escrow, block, seq, committed) = *queue;
+            if seq >= committed {
+                continue;
+            }
+            if !first_round && census.items.len() >= cap {
+                break;
+            }
+            let record = if escrow {
+                global_commit::escrow_delivery(global, application, block, seq)?
+            } else {
+                global_commit::delivery(global, application, block, seq)?
+            };
+            let Some(record) = record else {
+                census.missing_records.push((escrow, block, seq));
+                queue.2 = committed;
+                continue;
+            };
+            census.items.push(PendingDelivery {
+                escrow,
+                block,
+                seq,
+                address: record.address,
+                source_frame: record.source_frame,
+                tx_id: record.tx_id,
+                source_shard: record.source_shard,
+            });
+            queue.2 = seq + 1;
+            listed = true;
+        }
+        first_round = false;
+        if !listed || census.items.len() >= cap {
             break;
         }
     }
-    Ok((pending, blocks))
+    census.capped = queues.iter().any(|(_, _, seq, committed)| seq < committed);
+    Ok(census)
 }
 
 /// What a committed operation delivered at `address`, rebuilt from the
@@ -864,6 +919,180 @@ mod tests {
             limits,
         )
         .unwrap();
+    }
+
+    /// GLOBAL state where `outputs` (first address byte, count) were each
+    /// committed by their own operation, executed on an eight-bit shard of
+    /// zeros: GLOBAL places them at width eight, in the block their first byte
+    /// names. Returns the state and each group's block.
+    fn committed(outputs: &[(u8, u32)]) -> (HypergraphState, Vec<u64>) {
+        let global = mem_state(&mem_crdt());
+        let source = quil_types::execution::ShardPath::from_bits(&[false; 8]);
+        let mut blocks = Vec::new();
+        let mut n = 0u32;
+        for (first_byte, count) in outputs {
+            for _ in 0..*count {
+                n += 1;
+                let mut output = [0u8; 32];
+                output[0] = *first_byte;
+                output[28..].copy_from_slice(&n.to_be_bytes());
+                let mut tx_id = [0u8; 32];
+                tx_id[..4].copy_from_slice(&n.to_be_bytes());
+                let mut marker = tx_id;
+                marker[31] = 1;
+                let outcome = global_commit::commit_entry(
+                    &global,
+                    100,
+                    &[2u8; 32],
+                    &global_commit::SpendEntry {
+                        kind: 0x0512,
+                        tx_id,
+                        source_frame: 40 + u64::from(n),
+                        context: [8; 32],
+                        root_digest: None,
+                        consumptions: vec![marker],
+                        outputs: vec![output],
+                        escrow_create: None,
+                        escrow_claim: None,
+                        fee: 0,
+                        settlement: None,
+                    },
+                    source,
+                )
+                .unwrap();
+                assert!(
+                    matches!(outcome, global_commit::Outcome::Committed { .. }),
+                    "{outcome:?}"
+                );
+            }
+            let mut address = [0u8; 32];
+            address[0] = *first_byte;
+            blocks.push(coin_blocks::block_for_address(8, &address).unwrap());
+        }
+        global.commit().unwrap();
+        (global, blocks)
+    }
+
+    const SIX_ZEROS: [bool; 6] = [false; 6];
+    const LIMITS: SnapshotLimits = SnapshotLimits {
+        max_coins: 64,
+        max_depth: 32,
+        max_nodes: 1 << 14,
+    };
+
+    /// A shard's pending deliveries were listed block
+    /// by block up to the per-frame cap, so a block whose backlog its leaders
+    /// could not deliver (its source frame missing) filled the list. The
+    /// outputs committed to every later block of the shard were never listed,
+    /// so their source frames were never fetched: stranded, with nothing
+    /// logged. Every pending block's next output is listed now.
+    #[test]
+    fn a_backlogged_block_does_not_strand_the_outputs_of_later_blocks() {
+        let cap = MAX_DELIVERIES_PER_FRAME;
+        let (global, blocks) = committed(&[(0, cap as u32 + 6), (2, 1)]);
+        let (backlogged, later) = (blocks[0], blocks[1]);
+        assert_ne!(backlogged, later);
+        let local = mem_state(&mem_crdt());
+        let pending = pending_deliveries(
+            &global, &local, &[1u8; 32], &[2u8; 32], &SIX_ZEROS, LIMITS, cap,
+        )
+        .unwrap();
+        let listed: std::collections::BTreeSet<u64> =
+            pending.iter().map(|item| item.block).collect();
+        assert!(
+            listed.contains(&later),
+            "the output committed to block {later} is stranded: all {} items listed are block \
+             {backlogged}'s backlog",
+            pending.len()
+        );
+        assert_eq!(pending.len(), cap, "the cap still bounds the list");
+        // Each block's items are listed in sequence from its next index.
+        for block in [backlogged, later] {
+            let seqs: Vec<u64> = pending
+                .iter()
+                .filter(|item| item.block == block)
+                .map(|item| item.seq)
+                .collect();
+            assert_eq!(seqs, (0..seqs.len() as u64).collect::<Vec<_>>());
+        }
+    }
+
+    /// The census counts the whole backlog, not only what it lists.
+    #[test]
+    fn the_census_counts_the_whole_backlog() {
+        let cap = MAX_DELIVERIES_PER_FRAME;
+        let (global, _) = committed(&[(0, cap as u32 + 6), (2, 1)]);
+        let local = mem_state(&mem_crdt());
+        let census = pending_census(
+            &global, &local, &[1u8; 32], &[2u8; 32], &SIX_ZEROS, LIMITS, cap,
+        )
+        .unwrap();
+        assert_eq!(census.items.len(), cap);
+        assert_eq!(census.pending, cap as u64 + 7);
+        assert_eq!(census.blocks_pending, 2);
+        assert_eq!(census.blocks, 7, "widths six to eight under six bits");
+        assert!(census.capped);
+        assert!(census.missing_records.is_empty());
+    }
+
+    /// The next output of every pending block is listed even when there are
+    /// more such blocks than the cap allows items.
+    #[test]
+    fn every_pending_block_lists_its_next_output_beyond_the_cap() {
+        let (global, blocks) = committed(&[(0, 2), (1, 1), (3, 1)]);
+        let local = mem_state(&mem_crdt());
+        let census = pending_census(
+            &global, &local, &[1u8; 32], &[2u8; 32], &SIX_ZEROS, LIMITS, 1,
+        )
+        .unwrap();
+        let heads: Vec<(u64, u64)> = census
+            .items
+            .iter()
+            .map(|item| (item.block, item.seq))
+            .collect();
+        assert_eq!(
+            heads,
+            blocks.iter().map(|block| (*block, 0)).collect::<Vec<_>>(),
+            "a pending block's next output is unlisted"
+        );
+        assert!(census.capped, "the second output of block {}", blocks[0]);
+        assert_eq!(census.pending, 4);
+    }
+
+    /// A committed output whose delivery record this GLOBAL view lacks is
+    /// counted and named, and leaves the other blocks listed.
+    #[test]
+    fn a_missing_delivery_record_is_counted_and_spares_other_blocks() {
+        let (global, blocks) = committed(&[(0, 2), (2, 1)]);
+        super::super::global_accumulator::clear_record(
+            &global,
+            101,
+            &global_commit::delivery_address(&[2u8; 32], blocks[0], 0).unwrap(),
+        )
+        .unwrap();
+        global.commit().unwrap();
+        let local = mem_state(&mem_crdt());
+        let census = pending_census(
+            &global,
+            &local,
+            &[1u8; 32],
+            &[2u8; 32],
+            &SIX_ZEROS,
+            LIMITS,
+            MAX_DELIVERIES_PER_FRAME,
+        )
+        .unwrap();
+        assert_eq!(census.missing_records, vec![(false, blocks[0], 0)]);
+        assert_eq!(
+            census
+                .items
+                .iter()
+                .map(|item| (item.block, item.seq))
+                .collect::<Vec<_>>(),
+            vec![(blocks[1], 0)]
+        );
+        assert_eq!(census.pending, 3);
+        assert!(!census.capped);
     }
 
     fn mem_state(crdt: &std::sync::Arc<quil_hypergraph::HypergraphCrdt>) -> HypergraphState {

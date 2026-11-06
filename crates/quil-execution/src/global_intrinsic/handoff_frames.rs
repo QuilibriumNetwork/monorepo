@@ -45,6 +45,32 @@ pub fn unauthorized_generation(error: &QuilError) -> bool {
         if message.strip_prefix(CERTIFICATE_REFUSED) == Some(UNAUTHORIZED_GENERATION))
 }
 
+/// Why a data frame its session's terminal checkpoint excludes is refused.
+pub const OUTSIDE_TERMINAL_CHECKPOINT: &str = "data frame is outside the terminal checkpoint";
+
+/// [`OUTSIDE_TERMINAL_CHECKPOINT`] for a frame above the checkpoint's frame:
+/// one the session's close discarded, which no replay reaches. A terminal
+/// certificate can arrive before GLOBAL executes the session through it, so
+/// a frame at or below the checkpoint's frame, refused for its view or
+/// digest, is not one. The refusal names the checkpoint's frame after it.
+pub const PAST_TERMINAL_CHECKPOINT: &str =
+    "data frame is outside the terminal checkpoint: above its frame";
+
+/// The checkpoint frame `error` names when it refuses a data frame above its
+/// session's terminal checkpoint frame ([`PAST_TERMINAL_CHECKPOINT`]), also
+/// as a replay names the frame it refused; `None` for any other error.
+pub fn past_terminal_checkpoint(error: &QuilError) -> Option<u64> {
+    let QuilError::InvalidSignature(message) = error else {
+        return None;
+    };
+    let (_, after) = message.split_once(PAST_TERMINAL_CHECKPOINT)?;
+    let digits = after.strip_prefix(' ')?;
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    digits[..end].parse().ok()
+}
+
 /// `None` permits the explicitly legacy, generation-zero verifier only when
 /// this application has never entered the handoff protocol. A missing positive
 /// generation, corrupt index or read failure must never select that fallback.
@@ -180,7 +206,11 @@ fn verify_with(
             || (claim.frame < end.frame && claim.view >= end.view))
             && !(history && resealed_tip(state, &session, claim, &end)?)
         {
-            return Err(invalid("data frame is outside the terminal checkpoint"));
+            return Err(invalid(&if claim.frame > end.frame {
+                format!("{PAST_TERMINAL_CHECKPOINT} {}", end.frame)
+            } else {
+                OUTSIDE_TERMINAL_CHECKPOINT.to_string()
+            }));
         }
     }
     Ok(Some(VerifiedFrame {
