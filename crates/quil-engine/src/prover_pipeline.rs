@@ -4588,4 +4588,45 @@ mod tests {
             "a seat's remaining encode in frames, rounded up"
         );
     }
+
+    /// A seat whose leaf is labelled now from most of its layers kept ahead
+    /// is projected by the layers left from the leaf's start, while its kept
+    /// layers are checked, and is not warned late (2026-11-05: with 8 of a
+    /// leaf's 11 layers kept, 158 frames past the snapshot frame it was
+    /// projected 481 frames on, past its grace, and landed before it).
+    #[test]
+    fn a_seat_resuming_most_layers_kept_is_not_projected_late() {
+        use crate::storage_snapshot::{
+            label_estimate, leaf_started_from, snapshot_progress, LeafOutcome, LeafWork,
+        };
+        let epoch = 1408;
+        let snapshot = quil_types::consensus::storage_snapshot_frame(epoch);
+        let grace = snapshot + crate::app_shard_metadata::storage_snapshot_grace();
+        assert_eq!((snapshot, grace), (1_013_056, 1_013_376));
+        let (filter, nodes, frame) = ([0x5Au8; 35], 32_304_146, snapshot + 158);
+        let projected = || {
+            let seat = snapshot_progress(&[filter.to_vec()], epoch).expect("its leaf runs");
+            let at = super::projected_snapshot_frame(frame, seat.remaining);
+            (seat.remaining, at)
+        };
+        let whole = leaf_started_from(epoch, &filter, b"whole", nodes, 0, LeafWork::LabellingNow);
+        assert!(projected().1 > grace, "labelled whole, it is late");
+        whole.end(LeafOutcome::Completed);
+        let leaf = leaf_started_from(epoch, &filter, b"resumed", nodes, 8, LeafWork::LabellingNow);
+        let at = projected().1;
+        assert!(
+            at <= grace,
+            "from 8 of 11 layers kept it ends at frame {at}, by its grace frame {grace}"
+        );
+        // Its first note of its layers, once they are checked, counts the
+        // same 3 layers left, not fewer.
+        leaf.layers(8, 11);
+        let (checked, three) = (projected().0, label_estimate(nodes) * 3 / 11);
+        assert!(
+            checked > label_estimate(nodes) * 2 / 11
+                && checked <= three + std::time::Duration::from_secs(1),
+            "3 of 11 layers left: {checked:?} of {three:?}"
+        );
+        leaf.end(LeafOutcome::Completed);
+    }
 }

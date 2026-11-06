@@ -39,10 +39,11 @@
 //! window labelling ahead has, so labelling it again from its start after
 //! each yield never ended (2026-11-01). The leaves wait for memory in an
 //! order (`crate::storage_jobs::AheadOrder`): those its snapshot could not
-//! label within the renewal's grace first ([`ahead_orders`]). Only two are
-//! labelled at once (`crate::storage_jobs::AHEAD_JOBS`), and while a
-//! renewal's leaf is labelled now only one goes on beside it; the other
-//! pauses, keeping its memory and layers, until that labelling ends
+//! label within half the renewal's grace first ([`ahead_orders`]). Only so
+//! many are labelled at once (`crate::storage_jobs::ahead_jobs_for`: two on a
+//! node of 32 GB, more with more cores and memory), and while a renewal's
+//! leaf is labelled now only half of them go on beside it; the others pause,
+//! keeping their memory and layers, until that labelling ends
 //! (`crate::storage_jobs::Reservation::wait_while_paused`).
 //!
 //! Labelling ahead for an epoch gives up once GLOBAL reaches the epoch's
@@ -2091,12 +2092,12 @@ fn log_expired(epoch: u64, filter: &[u8], leaf_id: &[u8], at: &'static str) {
 /// Where each of a seat's leaves of `sizes` (`Captured::leaf_size`, bytes)
 /// waits for memory to be labelled ahead for `epoch`
 /// (`crate::storage_jobs::AheadOrder`), the seat having place `seat`: a leaf
-/// whose snapshot could not label it within the renewal's grace even at the
-/// fewest nodes its values take
+/// whose snapshot could not label it within half the renewal's grace even
+/// at the fewest nodes its values take
 /// (`crate::storage_snapshot::labels_within_grace`) goes before every leaf
 /// that it could, with the other such leaves of its seat, a seat with fewer
-/// of them first: such leaves register only from labels computed ahead,
-/// and a seat registers only once all of its leaves do.
+/// of them first: such leaves register only, or most surely, from labels
+/// computed ahead, and a seat registers only once all of its leaves do.
 pub(crate) fn ahead_orders(
     epoch: u64,
     seat: u64,
@@ -2332,7 +2333,7 @@ fn label_leaf_ahead(
         progress.layers(from, layers);
         let started = Instant::now();
         // Beside a renewal's leaf labelled now it may pause, keeping its
-        // memory and layers (`crate::storage_jobs::AHEAD_JOBS_BESIDE_DUE`).
+        // memory and layers (`crate::storage_jobs::ahead_beside_due`).
         let pause = || {
             if !memory.paused() {
                 return;
@@ -2637,8 +2638,8 @@ mod tests {
     #[test]
     fn leaves_only_labelling_ahead_registers_wait_first() {
         use quil_crypto::storage_proof::data_node_count;
-        // At 10 s frames, the grace of 320 frames labels about 21 million
-        // nodes.
+        // At 10 s frames, half the grace of 320 frames labels about 10.7
+        // million nodes.
         let epoch = 1317;
         let bytes = |nodes: u64| u128::from(nodes) * 30;
         assert_eq!(data_node_count(bytes(10_000_000) as u64), 10_000_000);
