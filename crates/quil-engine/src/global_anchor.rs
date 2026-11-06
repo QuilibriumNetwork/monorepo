@@ -75,11 +75,24 @@ pub struct CitedFetch {
     pub missing: Vec<(u64, String)>,
 }
 
+impl CitedFetch {
+    /// Each of `frames` missing for `reason`: nothing could fetch them.
+    pub fn unfetchable(frames: &[u64], reason: &str) -> Self {
+        Self {
+            held: Vec::new(),
+            missing: frames
+                .iter()
+                .map(|&number| (number, reason.to_string()))
+                .collect(),
+        }
+    }
+}
+
 /// Backfill each of `frames` the store lacks, in order, through
 /// [`ensure_global_anchor`], all within `budget`: the GLOBAL frames the
 /// reward citations of a frame about to execute name. A frame not fetched
-/// within the budget is left missing, never refused: execution then fails
-/// the frame for retry, and the frames fetched so far are kept.
+/// within the budget is left missing, never refused: the frame then waits
+/// for retry with nothing executed, and the frames fetched so far are kept.
 pub async fn fetch_cited_frames(
     store: &dyn ClockStore,
     source: &GlobalAnchorSource,

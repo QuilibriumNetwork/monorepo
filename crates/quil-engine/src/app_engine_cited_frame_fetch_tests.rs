@@ -18,16 +18,17 @@ use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader, MessageBundle};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The first mainnet frame a reward may cite (the first 2.1.0 frame).
-const FIRST_CITABLE: u64 = 669_976;
+pub(super) const FIRST_CITABLE: u64 = 669_976;
 /// The executing frame's GLOBAL anchor, past the 2,880 frames a regular
 /// node's gap fill keeps below its head.
-const ANCHOR: u64 = FIRST_CITABLE + 3_000;
+pub(super) const ANCHOR: u64 = FIRST_CITABLE + 3_000;
 /// The cited frame: 2.1.0 history this worker does not hold.
-const CITED: u64 = FIRST_CITABLE;
+pub(super) const CITED: u64 = FIRST_CITABLE;
 
-type Fetch = std::pin::Pin<Box<dyn std::future::Future<Output = Result<GlobalFrame>> + Send>>;
+pub(super) type Fetch =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<GlobalFrame>> + Send>>;
 
-fn global_frame(number: u64) -> GlobalFrame {
+pub(super) fn global_frame(number: u64) -> GlobalFrame {
     GlobalFrame {
         header: Some(GlobalFrameHeader {
             frame_number: number,
@@ -40,7 +41,7 @@ fn global_frame(number: u64) -> GlobalFrame {
 }
 
 /// A GLOBAL frame store holding `numbers`.
-fn holding(numbers: &[u64]) -> Arc<InMemoryClockStore> {
+pub(super) fn holding(numbers: &[u64]) -> Arc<InMemoryClockStore> {
     let store = Arc::new(InMemoryClockStore::new());
     for &number in numbers {
         store.seed_frame(global_frame(number));
@@ -50,7 +51,7 @@ fn holding(numbers: &[u64]) -> Arc<InMemoryClockStore> {
 
 /// The worker's own master, answering from `master` (its store and archive
 /// fallback in one), counting the requests.
-fn master_source(
+pub(super) fn master_source(
     master: &Arc<InMemoryClockStore>,
     calls: &Arc<AtomicUsize>,
 ) -> crate::global_anchor::GlobalAnchorSource {
@@ -65,34 +66,44 @@ fn master_source(
 
 /// A mint claim any submitter can build: no authorization behind it, a root
 /// matching no frame. Only its encoding is valid.
-fn mint_claim_bundle(cited_global_frame: u64) -> MessageBundle {
+pub(super) fn mint_claim_bundle(cited_global_frame: u64) -> MessageBundle {
     let network = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(0).network;
-    let application = quil_execution::domains::QUIL_TOKEN;
-    let context = parameter_context(&network, &application);
-    let key = CommitmentKey::derive(&context);
-    let opening = AmountOpening::from_seed(&context, &[2; 32]);
     let claim = MintClaim {
         network,
-        application,
+        application: quil_execution::domains::QUIL_TOKEN,
         cited_global_frame,
         global_root: [9; 32],
         receipt: [10; 32],
         fee: 1,
-        outputs: vec![Output {
-            commitment: key.commit(7, &opening),
-            owner: [3; IDENTITY_BYTES],
-            memo: [4; MEMO_BYTES],
-        }],
+        outputs: vec![junk_output(&network)],
         forest_proof: vec![11; 40],
     }
     .encode()
     .unwrap();
+    token_bundle(claim)
+}
+
+/// A QUIL output any submitter can build: a commitment to 7 with a seeded
+/// opening.
+fn junk_output(network: &[u8; 32]) -> Output {
+    let context = parameter_context(network, &quil_execution::domains::QUIL_TOKEN);
+    let key = CommitmentKey::derive(&context);
+    let opening = AmountOpening::from_seed(&context, &[2; 32]);
+    Output {
+        commitment: key.commit(7, &opening),
+        owner: [3; IDENTITY_BYTES],
+        memo: [4; MEMO_BYTES],
+    }
+}
+
+/// A bundle of one confidential token operation.
+fn token_bundle(operation: Vec<u8>) -> MessageBundle {
     MessageBundle {
         requests: vec![quil_types::proto::global::MessageRequest {
             request: Some(
                 quil_types::proto::global::message_request::Request::TokenOperation(
                     quil_types::proto::token::TokenOperation {
-                        canonical_bytes: claim,
+                        canonical_bytes: operation,
                     },
                 ),
             ),
@@ -100,6 +111,90 @@ fn mint_claim_bundle(cited_global_frame: u64) -> MessageBundle {
         }],
         ..Default::default()
     }
+}
+
+/// A settlement claim for `application` any submitter can build: no record
+/// behind it, a root matching no frame. Only a non-QUIL application decodes
+/// one (`SettlementClaim::decode`).
+fn settlement_claim(application: [u8; 32], cited_global_frame: u64) -> Vec<u8> {
+    quil_execution::token_intrinsic::settlement_claim::SettlementClaim {
+        network: [1; 32],
+        application,
+        cited_global_frame,
+        global_root: [3; 32],
+        receipt: [4; 32],
+        settlement: 1_000,
+        context: [5; 32],
+        payment_address: [0; 32],
+        payment: 0,
+        claimant_key_type: 0,
+        claimant_public_key: Vec::new(),
+        claimant_signature: Vec::new(),
+        forest_proof: vec![6; 40],
+    }
+    .encode()
+    .unwrap()
+}
+
+/// A delivery of `delivered` any byzantine shard leader can include: no
+/// record behind it, a root matching no frame.
+fn delivery(
+    cited_global_frame: u64,
+    delivered: quil_execution::token_intrinsic::delivery::Delivered,
+) -> Vec<u8> {
+    quil_execution::token_intrinsic::delivery::CoinDelivery {
+        network: quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(0).network,
+        application: quil_execution::domains::QUIL_TOKEN,
+        cited_global_frame,
+        global_root: [9; 32],
+        block: 0,
+        seq: 0,
+        source_frame: 1,
+        tx_id: [12; 32],
+        source_shard: quil_types::execution::ShardPath::WHOLE,
+        delivered,
+        forest_proof: vec![11; 40],
+    }
+    .encode()
+    .unwrap()
+}
+
+/// `manager` as a mainnet worker builds it: the token suite installed (its
+/// proof worker is absent under `dir`; junk claims never reach it), the
+/// application venue, and GLOBAL frames read from `anchors`.
+pub(super) fn with_token_suite(
+    manager: quil_execution::ExecutionEngineManager,
+    anchors: Arc<dyn ClockStore>,
+    dir: &std::path::Path,
+) -> quil_execution::ExecutionEngineManager {
+    let verifier =
+        quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier::new(
+            dir.join("absent-worker"),
+            1,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    manager
+        .with_pricing_network(0)
+        .with_application_venue()
+        .unwrap()
+        .with_global_clock_store(anchors)
+        .unwrap()
+        .with_token_worker(
+            quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(0),
+            verifier,
+        )
+        .unwrap()
+}
+
+/// A fresh directory under the system's temporary one.
+pub(super) fn scratch_dir() -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let dir = std::env::temp_dir().join(format!("quil-cited-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 /// A QUIL-shard worker of a mainnet node, built as a thread worker is: the
@@ -122,25 +217,23 @@ fn worker(
     anchors: Arc<InMemoryClockStore>,
     source: Option<crate::global_anchor::GlobalAnchorSource>,
 ) -> Worker {
+    worker_at(quil_execution::domains::QUIL_TOKEN, anchors, source)
+}
+
+/// [`worker`] of a shard of `application`.
+fn worker_at(
+    application: [u8; 32],
+    anchors: Arc<InMemoryClockStore>,
+    source: Option<crate::global_anchor::GlobalAnchorSource>,
+) -> Worker {
     let prover = Arc::new(quil_types::crypto::NoopInclusionProver);
     let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
         Arc::new(quil_hypergraph::testing::MemStore::new()),
         prover.clone(),
     ));
     let crypto = quil_execution::testing::NoopExecutionCrypto::new();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_nanos());
-    let dir = std::env::temp_dir().join(format!("quil-cited-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let verifier =
-        quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier::new(
-            dir.join("absent-worker"),
-            1,
-            Duration::from_secs(2),
-        )
-        .unwrap();
-    let manager = Arc::new(
+    let dir = scratch_dir();
+    let manager = Arc::new(with_token_suite(
         quil_execution::ExecutionEngineManager::new(
             prover.clone(),
             crypto.key_manager.clone(),
@@ -149,18 +242,10 @@ fn worker(
             crypto.clock_store.clone(),
             Arc::new(quil_execution::testing::NoopHypergraphConfigResolver),
             false,
-        )
-        .with_pricing_network(0)
-        .with_application_venue()
-        .unwrap()
-        .with_global_clock_store(anchors.clone())
-        .unwrap()
-        .with_token_worker(
-            quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(0),
-            verifier,
-        )
-        .unwrap(),
-    );
+        ),
+        anchors.clone(),
+        &dir,
+    ));
     let (events, received) = mpsc::unbounded_channel();
     let private = [7; 57];
     let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
@@ -188,7 +273,6 @@ fn worker(
         db_config: Default::default(),
         unified_cutover_hook: None,
     };
-    let application = quil_execution::domains::QUIL_TOKEN;
     let (engine, _handle) = AppConsensusEngine::new(1, application.to_vec(), deps, events);
     Worker {
         engine: engine.with_global_anchor_source(source),
@@ -303,4 +387,140 @@ async fn an_unfetchable_cited_frame_keeps_the_frame_for_retry() {
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(node.engine.load_materialized_cursor().unwrap(), 1);
+}
+
+/// A frame whose citation of a GLOBAL frame cannot be fetched executes none
+/// of its bundles, not even those before it whose cited frames are here, and
+/// stages nothing: the bundles a partial execution ran would stay staged and
+/// commit with the retry, which skips them as already applied. The frame
+/// waits for retry and, once every cited frame is held, executes whole.
+#[tokio::test]
+async fn a_frame_with_an_unfetched_citation_executes_no_bundle() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (served, unserved) = (CITED + 1, CITED + 2);
+    let master = holding(&[served]);
+    let node = worker(holding(&[ANCHOR]), Some(master_source(&master, &calls)));
+    let requests = vec![mint_claim_bundle(served), mint_claim_bundle(unserved)];
+    let canonical: Vec<Vec<u8>> = requests
+        .iter()
+        .map(|bundle| crate::consensus_wire::app_bundle_to_canonical_bytes(bundle).unwrap())
+        .collect();
+    let held = materialize(&node, requests.clone()).await;
+    assert!(
+        held.as_ref()
+            .is_err_and(|error| error.is_execution_unavailable()
+                && error.to_string().contains(CITED_FRAMES_UNFETCHED)),
+        "a frame citing a GLOBAL frame no source serves must wait before executing: {held:?}"
+    );
+    assert!(
+        !canonical.iter().any(|bundle| bundle_executed(bundle)),
+        "no bundle of a frame waiting for a cited frame may execute"
+    );
+    let exec = node.engine.execution_engine.as_ref().unwrap();
+    assert!(!exec.crdt().has_staged_mutations());
+    assert_eq!(node.engine.load_materialized_cursor().unwrap(), 0);
+    assert!(
+        node.anchors.get_global_clock_frame(served).is_ok(),
+        "the cited frame the master serves is fetched and kept"
+    );
+    master.seed_frame(global_frame(unserved));
+    let finished = materialize(&node, requests).await;
+    assert!(
+        matches!(finished, Ok((0, 2))),
+        "once every cited frame is held the frame executes whole: {finished:?}"
+    );
+    assert!(canonical.iter().all(|bundle| bundle_executed(bundle)));
+    assert_eq!(node.engine.load_materialized_cursor().unwrap(), 1);
+}
+
+/// Settlement claims and coin and escrow deliveries cite GLOBAL frames as
+/// mint claims do: a worker lacking the cited frame fetches it from its
+/// master before executing the frame, which then finishes as on a holder.
+#[tokio::test]
+async fn settlement_claim_and_delivery_citations_are_fetched_before_execution() {
+    use quil_execution::token_intrinsic::delivery::Delivered;
+    let network = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(0).network;
+    let quil = quil_execution::domains::QUIL_TOKEN;
+    // A settlement claim funds a custom token's bundle on that token's shard;
+    // the token base domain routes to the token engine like a deployed token.
+    let paid = quil_execution::token_intrinsic::constants::token_base_domain();
+    let operations = [
+        ("settlement claim", paid, settlement_claim(paid, CITED + 10)),
+        (
+            "coin delivery",
+            quil,
+            delivery(CITED + 11, Delivered::Coin(junk_output(&network))),
+        ),
+        (
+            "escrow delivery",
+            quil,
+            delivery(CITED + 12, Delivered::Escrow(vec![13; 64])),
+        ),
+    ];
+    for (offset, (name, application, operation)) in (10..).zip(operations) {
+        let cited = CITED + offset;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let master = holding(&[cited]);
+        let node = worker_at(
+            application,
+            holding(&[ANCHOR]),
+            Some(master_source(&master, &calls)),
+        );
+        let finished = materialize(&node, vec![token_bundle(operation)]).await;
+        // The frame finishes; how the junk operation counts is beside the point.
+        assert!(
+            matches!(finished, Ok((processed, skipped)) if processed + skipped == 1),
+            "a frame whose {name} cites a frame the master serves must finish: {finished:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the worker must ask its master for the frame a {name} cites"
+        );
+        assert!(
+            node.anchors.get_global_clock_frame(cited).is_ok(),
+            "the frame a {name} cites must be stored"
+        );
+        assert_eq!(node.engine.load_materialized_cursor().unwrap(), 1);
+    }
+}
+
+/// The wait for cited GLOBAL frames logs its start, then once per repeat
+/// interval with the time waited, then its end, whatever the retry rate.
+#[test]
+fn a_cited_frame_wait_logs_its_start_bounded_repeats_and_end() {
+    let mut waits = CitedFrameWaits::default();
+    let start = std::time::Instant::now();
+    let at = |secs: u64| start + Duration::from_secs(secs);
+    let filter = [7u8; 32];
+    assert_eq!(waits.missing(&filter, 5, at(0)), CitedWaitNote::Start);
+    // Canonical retries come every 10 s; they stay quiet until the interval.
+    for secs in (10..600).step_by(10) {
+        assert_eq!(
+            waits.missing(&filter, 5, at(secs)),
+            CitedWaitNote::Quiet,
+            "check at {secs} s"
+        );
+    }
+    assert_eq!(
+        waits.missing(&filter, 5, at(600)),
+        CitedWaitNote::Repeat {
+            waited: Duration::from_secs(600),
+            checks: 61
+        }
+    );
+    assert_eq!(waits.missing(&filter, 5, at(610)), CitedWaitNote::Quiet);
+    // Another frame, or another shard's, waits on its own.
+    assert_eq!(waits.missing(&filter, 6, at(610)), CitedWaitNote::Start);
+    assert_eq!(waits.missing(&[8u8; 32], 5, at(610)), CitedWaitNote::Start);
+    assert!(waits.known(&filter, 5));
+    assert_eq!(
+        waits.over(&filter, 5, at(700)),
+        Some((Duration::from_secs(700), 62))
+    );
+    assert!(!waits.known(&filter, 5));
+    assert_eq!(waits.over(&filter, 5, at(700)), None, "a wait ends once");
+    // A wait no check found for a repeat interval is forgotten: the next
+    // check starts a new one.
+    assert_eq!(waits.missing(&filter, 6, at(1_210)), CitedWaitNote::Start);
 }

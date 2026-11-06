@@ -2194,7 +2194,11 @@ impl ExecutionEngineManager {
             for request in &requests {
                 let bytes = request.inner_bytes.as_slice();
                 let frame = match request.inner_type_prefix {
-                    constants::TYPE_LATTICE_MINT_CLAIM => {
+                    // Execution refuses a mint claim of any other application
+                    // before reading its citation (`mint_claim::verify_from_clock`).
+                    constants::TYPE_LATTICE_MINT_CLAIM
+                        if application == crate::domains::QUIL_TOKEN =>
+                    {
                         quil_lattice_ct::confidential::mint_claim::MintClaim::decode(
                             bytes,
                             &network,

@@ -945,6 +945,23 @@ fn reward_citations_of_a_message_are_named_within_the_citable_range() {
         named(&PAID_APP, bundle(junk_mint_claim(FIRST + 5))).is_empty(),
         "a mint claim for another application fails decoding before any read"
     );
+    let network = policy(0).network;
+    let custom = MintClaim {
+        network,
+        application: PAID_APP,
+        cited_global_frame: FIRST + 5,
+        global_root: [9; 32],
+        receipt: [10; 32],
+        fee: 1,
+        outputs: junk_outputs(&network),
+        forest_proof: vec![11; 40],
+    }
+    .encode()
+    .unwrap();
+    assert!(
+        named(&PAID_APP, bundle(custom)).is_empty(),
+        "execution refuses a mint claim of any application but QUIL before any read"
+    );
     assert!(
         named(&quil, bundle(junk_mint(FIRST + 5))).is_empty(),
         "a reward mint executes only at GLOBAL, whose archives hold every frame"
