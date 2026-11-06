@@ -1,6 +1,8 @@
 //! Capacity certification is separate from useful-data registration. It never
 //! creates a seat, pays a reward, or makes an unsealed participant eligible.
 //! Signed precommits use a bounded ring of 16 slots per member per epoch.
+//! Certificates stay, so a member's total is capped by its seats and each
+//! certified sector is at least [`quil_types::consensus::min_sector_nodes`].
 use super::super::storage_epoch_proof::{SeatProof, StorageEpochProof};
 use super::*;
 
@@ -199,6 +201,13 @@ pub fn check_capacity(
             Err(invalid("sector certificate changed".into()))
         };
     }
+    let floor = quil_types::consensus::min_sector_nodes();
+    if message.certificate.n < floor {
+        return Err(invalid(format!(
+            "{} nodes is below the {floor}-node floor",
+            message.certificate.n
+        )));
+    }
     let pending = pending_certificate(state, &message.member, &message.certificate, message.epoch)?;
     if message.proof.is_empty() {
         let current = quil_types::consensus::epoch_for_frame(frame);
@@ -230,6 +239,9 @@ pub fn check_capacity(
         )? {
             return Err(invalid("precommit signature".into()));
         }
+        sector_room_in(state, &message.member)?
+            .admit(&message.member, 1)
+            .map_err(invalid)?;
         if let Some(pending) = pending {
             if pending.epoch == message.epoch && pending.certificate == message.certificate {
                 return Ok(Vec::new());
@@ -261,6 +273,9 @@ pub fn check_capacity(
     if quil_types::consensus::epoch_for_frame(frame) > message.epoch.saturating_add(2) {
         return Err(invalid("precommit expired".into()));
     }
+    let count = sector_room_in(state, &message.member)?
+        .admit(&message.member, 1)
+        .map_err(invalid)?;
     let beacon = quil_crypto::porep::derive_storage_beacon(beacon_frame, &output(beacon_frame)?);
     quil_storage_stark::persistent::verify(
         &message.member,
@@ -272,11 +287,14 @@ pub fn check_capacity(
         &message.proof,
     )
     .map_err(invalid)?;
-    Ok(vec![StateRecord {
-        address: certificate_address(&message.member, &message.certificate.sector),
-        member: message.member,
-        sector: message.certificate.sector,
-        certificate: message.certificate.to_bytes(),
-        usage: Vec::new(),
-    }])
+    Ok(vec![
+        StateRecord {
+            address: certificate_address(&message.member, &message.certificate.sector),
+            member: message.member,
+            sector: message.certificate.sector,
+            certificate: message.certificate.to_bytes(),
+            usage: Vec::new(),
+        },
+        count,
+    ])
 }
