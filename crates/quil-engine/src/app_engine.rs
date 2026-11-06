@@ -8734,7 +8734,8 @@ impl AppConsensusEngine {
         let _probe = probe::section(probe::Section::PresenceReport);
         use crate::presence_reports::{Hold, Look, Outcome, Pace};
         use quil_execution::global_intrinsic::handoff;
-        // Unset (mainnet, and by default): nothing is read.
+        // Unset (a test network without the setting, and by default):
+        // nothing is read.
         if handoff::presence_report_frame() == u64::MAX
             || self.halted.load(std::sync::atomic::Ordering::Relaxed)
         {

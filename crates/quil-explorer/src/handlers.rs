@@ -1296,7 +1296,7 @@ fn active_allocations_by_filter(provers: &[ProverInfo], frame: u64) -> HashMap<V
 /// fresh (`allocation_fresh_at`, with the shard's halt credit), keyed by
 /// confirmation filter: the fresh count its stall exemption
 /// (`shard_progressing`) uses. `signed_frame_activation` is
-/// `SIGNED_FRAME_ACTIVATION_FRAME` outside tests.
+/// `signed_frame_activation_frame()` outside tests.
 fn fresh_allocations_by_filter(
     provers: &[ProverInfo],
     frame: u64,
@@ -1514,7 +1514,7 @@ fn assess_eviction(
         frame,
         halts,
         threshold,
-        quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+        quil_types::consensus::signed_frame_activation_frame(),
     );
     let progressing = |filter: &[u8]| {
         shard_progressing(
@@ -3469,7 +3469,7 @@ mod tests {
             frame,
             &halts,
             threshold,
-            quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+            quil_types::consensus::signed_frame_activation_frame(),
         );
         let census = |filter: u8| {
             let get = |m: &HashMap<Vec<u8>, u64>| m.get(&vec![filter]).copied().unwrap_or(0);
@@ -3531,7 +3531,7 @@ mod tests {
             let get = |m: &HashMap<Vec<u8>, u64>| m.get(&vec![filter]).copied().unwrap_or(0);
             (get(&active), get(&fresh))
         };
-        let default = quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME;
+        let default = quil_types::consensus::signed_frame_activation_frame();
         assert_eq!(census(default, 0xDD), (6, 4));
         assert_eq!(census(default, 0xEE), (6, 4));
         assert_eq!(census(activation, 0xDD), (6, 0));

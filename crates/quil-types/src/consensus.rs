@@ -173,7 +173,7 @@ pub struct ProverAllocationInfo {
     /// The last GLOBAL frame that included an app frame this allocation
     /// signed. Unlike `last_active_frame_number`, confirms do not advance it.
     /// `0` when never recorded, including every frame before
-    /// [`SIGNED_FRAME_ACTIVATION_FRAME`].
+    /// [`signed_frame_activation_frame`].
     pub last_signed_frame_number: u64,
     /// The storage epoch this allocation was last confirmed for. A data-shard
     /// (non-empty filter) Active allocation whose `epoch` is older than the
@@ -2294,9 +2294,93 @@ pub fn set_global_sync_authentication_frame_for_thread(frame: Option<u64>) {
 /// counts an allocation as fresh by that field instead of
 /// `LastActiveFrameNumber`, which confirms also advance. Recording the field
 /// changes committed allocation trees, so every archive must start at the same
-/// frame. `u64::MAX` disables both: no frame records the field and the census
-/// keeps reading `LastActiveFrameNumber`.
-pub const SIGNED_FRAME_ACTIVATION_FRAME: u64 = u64::MAX;
+/// frame. Without one (`u64::MAX`) no frame records the field and the census
+/// keeps reading `LastActiveFrameNumber`. Mainnet: 1,024,560, the first frame
+/// of epoch 1423, which GLOBAL cannot reach before 2026-11-07 00:00 UTC even at
+/// ten seconds a frame, with the presence report frame;
+/// `QUIL_SIGNED_FRAME_ACTIVATION_FRAME` elsewhere, never by default.
+pub const MAINNET_SIGNED_FRAME_ACTIVATION_FRAME: Option<u64> = Some(1_024_560);
+
+static SIGNED_FRAME_ACTIVATION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static SIGNED_FRAME_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn signed_frame_activation_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_SIGNED_FRAME_ACTIVATION_FRAME.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's signed frame activation frame from its network, and
+/// return it. Called at startup before any frame is processed; the first
+/// call decides.
+pub fn init_signed_frame_activation_frame(network: u8) -> u64 {
+    *SIGNED_FRAME_ACTIVATION.get_or_init(|| {
+        signed_frame_activation_frame_for(
+            network,
+            std::env::var("QUIL_SIGNED_FRAME_ACTIVATION_FRAME")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The frame fixed by [`init_signed_frame_activation_frame`]; the mainnet
+/// frame in a process that never called it (the explorer, tools), so the
+/// setting cannot reach mainnet. `u64::MAX`: never.
+pub fn signed_frame_activation_frame() -> u64 {
+    if let Some(frame) = SIGNED_FRAME_ACTIVATION_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    SIGNED_FRAME_ACTIVATION
+        .get()
+        .copied()
+        .unwrap_or_else(|| signed_frame_activation_frame_for(0, None))
+}
+
+/// Set the signed frame activation frame for the calling thread only
+/// (tests). `Some(u64::MAX)` disables it; `None` restores the process
+/// setting.
+pub fn set_signed_frame_activation_frame_for_thread(frame: Option<u64>) {
+    SIGNED_FRAME_ACTIVATION_OVERRIDE.with(|cell| cell.set(frame));
+}
+
+#[cfg(test)]
+mod signed_frame_activation_tests {
+    /// Mainnet records signed frames from its own frame, the first of an
+    /// epoch, whatever the setting says; other networks only when set.
+    #[test]
+    fn only_a_test_network_reads_the_signed_frame_activation_setting() {
+        let mainnet = 1423 * super::EPOCH_LENGTH_FRAMES;
+        assert_eq!(super::MAINNET_SIGNED_FRAME_ACTIVATION_FRAME, Some(mainnet));
+        for setting in [None, Some("7"), Some("bad")] {
+            assert_eq!(
+                super::signed_frame_activation_frame_for(0, setting),
+                mainnet
+            );
+        }
+        assert_eq!(super::signed_frame_activation_frame_for(1, Some("7")), 7);
+        assert_eq!(
+            super::signed_frame_activation_frame_for(1, Some("bad")),
+            u64::MAX
+        );
+        assert_eq!(super::signed_frame_activation_frame_for(1, None), u64::MAX);
+        super::set_signed_frame_activation_frame_for_thread(None);
+        assert_eq!(
+            super::signed_frame_activation_frame(),
+            mainnet,
+            "without init, the mainnet frame"
+        );
+        super::set_signed_frame_activation_frame_for_thread(Some(9));
+        assert_eq!(super::signed_frame_activation_frame(), 9);
+        super::set_signed_frame_activation_frame_for_thread(None);
+    }
+}
 
 /// Minimum number of effectively-active provers a shard needs to run its
 /// app-shard consensus (form a committee and reach quorum). A shard with
