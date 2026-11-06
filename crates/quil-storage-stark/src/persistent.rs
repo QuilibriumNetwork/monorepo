@@ -34,7 +34,7 @@ pub fn prove(
     }
     crate::seal::prove(
         &statement,
-        &quil_crypto::sdr::SdrParams::default(),
+        &quil_crypto::sdr::SdrParams::for_profile(root.profile),
         persistent::CHALLENGES,
         plain,
     )
@@ -69,7 +69,7 @@ pub fn verify(
     }
     crate::seal::verify(
         &statement,
-        &quil_crypto::sdr::SdrParams::default(),
+        &quil_crypto::sdr::SdrParams::for_profile(root.profile),
         persistent::CHALLENGES,
         bytes,
     )

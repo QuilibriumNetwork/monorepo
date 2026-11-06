@@ -14,6 +14,9 @@ use std::{
 
 #[derive(Clone)]
 pub struct BenchmarkOptions {
+    pub profile: quil_types::consensus::StorageSealProfile,
+    pub initial_setup_complete: Arc<AtomicBool>,
+    pub regeneration_probe: Arc<AtomicBool>,
     pub directory: PathBuf,
     pub member: [u8; 32],
     pub beacon: Vec<u8>,
@@ -35,8 +38,19 @@ pub struct RoundMeasurement {
     pub settlement_verify_seconds: f64,
     pub settlement_message_bytes: u64,
 }
+#[derive(Serialize)]
+pub struct RegenerationMeasurement {
+    pub sector_nodes: u64,
+    pub layers: usize,
+    pub seconds: f64,
+    pub public_graph_prepared: bool,
+    pub roots_match: bool,
+    pub within_nominal_frame: bool,
+    pub model: &'static str,
+}
 #[derive(Default, Serialize)]
 pub struct SnapshotMeasurement {
+    pub regeneration: Option<RegenerationMeasurement>,
     pub filter: String,
     pub epoch: u64,
     pub snapshot_frame: u64,
@@ -53,17 +67,30 @@ pub struct SnapshotMeasurement {
     pub temporary_disk_peak_bytes: u64,
     pub rounds: Vec<RoundMeasurement>,
 }
-struct Gates(Option<u64>);
+struct Gates(
+    Option<u64>,
+    Option<quil_types::consensus::StorageSealProfile>,
+    Option<u64>,
+);
 impl Gates {
-    fn new(epoch: u64) -> Self {
+    fn new(epoch: u64, profile: quil_types::consensus::StorageSealProfile) -> Self {
         let old = quil_types::consensus::persistent_storage_epoch_thread_override();
         quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(epoch));
-        Self(old)
+        let old_profile = quil_types::consensus::storage_seal_profile_thread_override();
+        quil_types::consensus::set_storage_seal_profile_for_thread(Some(profile));
+        let old_floor = quil_types::consensus::min_sector_nodes_thread_override();
+        #[cfg(not(test))]
+        quil_types::consensus::set_min_sector_nodes_for_thread(Some(
+            quil_types::consensus::MIN_SECTOR_NODES,
+        ));
+        Self(old, old_profile, old_floor)
     }
 }
 impl Drop for Gates {
     fn drop(&mut self) {
         quil_types::consensus::set_persistent_storage_epoch_for_thread(self.0);
+        quil_types::consensus::set_storage_seal_profile_for_thread(self.1);
+        quil_types::consensus::set_min_sector_nodes_for_thread(self.2);
     }
 }
 fn check(options: &BenchmarkOptions) -> Result<()> {
@@ -108,6 +135,7 @@ pub fn measure_snapshot(
     options: &BenchmarkOptions,
 ) -> Result<SnapshotMeasurement> {
     let store = LabelStore::new(options.directory.join("labels"))
+        .for_profile(options.profile)
         .with_disk_floor(crate::storage_readiness::disk_floor);
     measure_with_store(crdt, snapshot, filter, options, &store, None)
 }
@@ -128,7 +156,9 @@ fn measure_with_store(
             "benchmark requires 2..5 rounds and 1..epoch_length frame openings".into(),
         ));
     }
-    let _gates = Gates::new(snapshot.epoch);
+    let _gates = Gates::new(snapshot.epoch, options.profile);
+    let view = store.for_profile(options.profile);
+    let store = &view;
     let source = quil_execution::global_intrinsic::storage_snapshot::Source {
         filter: filter.clone(),
         snapshot: snapshot.clone(),
@@ -206,14 +236,20 @@ fn measure_with_store(
                 n * 32 >> 20
             );
             fits(
-                proof::labelling_peak_bytes(*n, &quil_crypto::sdr::SdrParams::default())
-                    .saturating_add(400 << 20),
+                proof::labelling_peak_bytes(
+                    *n,
+                    &quil_crypto::sdr::SdrParams::for_profile(options.profile),
+                )
+                .saturating_add(400 << 20),
                 options,
                 "cold certification",
             )?;
             let _memory = crate::storage_jobs::reserve_until(
-                proof::labelling_peak_bytes(*n, &quil_crypto::sdr::SdrParams::default())
-                    .saturating_add(400 << 20),
+                proof::labelling_peak_bytes(
+                    *n,
+                    &quil_crypto::sdr::SdrParams::for_profile(options.profile),
+                )
+                .saturating_add(400 << 20),
                 &|| options.stop.load(Ordering::Relaxed),
             )
             .ok_or_else(|| unavailable("benchmark stopped waiting for memory".into()))?;
@@ -277,7 +313,7 @@ fn measure_with_store(
                 let plain = proof::prove_seal_with_labels(
                     &last,
                     &statement,
-                    &quil_crypto::sdr::SdrParams::default(),
+                    &quil_crypto::sdr::SdrParams::for_profile(options.profile),
                     sector::CHALLENGES,
                     &kept,
                 )
@@ -524,6 +560,16 @@ fn measure_with_store(
         }
         if let Some(coordinator) = coordinator {
             coordinator.arrive(1 + round * 3)?;
+            if round == 0 {
+                options
+                    .initial_setup_complete
+                    .store(true, Ordering::Relaxed);
+            }
+        }
+        if coordinator.is_none() && round == 0 {
+            options
+                .initial_setup_complete
+                .store(true, Ordering::Relaxed);
         }
         let mut slot = quil_types::consensus::StorageSeatSlot {
             epoch: snapshot.epoch,
@@ -602,6 +648,49 @@ fn measure_with_store(
             coordinator.arrive(3 + round * 3)?;
         }
     }
+    // Exactly one post-startup probe per allocation; it neither reuses secret
+    // labels nor inflates startup/recurring phase timers. Other shards have
+    // crossed the final settlement barrier before it starts.
+    if options.regeneration_probe.swap(false, Ordering::Relaxed) {
+        let (&id, certificate) = certificates
+            .iter()
+            .next()
+            .ok_or_else(|| unavailable("no sector to regenerate".into()))?;
+        let params = certificate.params();
+        let _memory = crate::storage_jobs::reserve_until(
+            proof::label_leaf_peak_bytes(certificate.n, &params),
+            &|| options.stop.load(Ordering::Relaxed),
+        )
+        .ok_or_else(|| unavailable("regeneration probe stopped waiting for memory".into()))?;
+        let key = quil_crypto::sdr::stable_replica_key(&options.member, &id);
+        let (timed, prepared) = proof::with_prepared_label_graph(certificate.n, &params, || {
+            let start = Instant::now();
+            let labels =
+                proof::label_leaf_until(certificate.n, &key, &params, &mut |_, _| {}, &|| {
+                    options.stop.load(Ordering::Relaxed)
+                });
+            (labels, start.elapsed().as_secs_f64())
+        });
+        let (last, columns) = timed
+            .0
+            .ok_or_else(|| unavailable("regeneration probe stopped".into()))?;
+        let cap_height = proof::seal_cap_height(certificate.n);
+        let matches = MerkleCap::from_digests(&last, cap_height).commitment(Tree::Replica)
+            == certificate.labels
+            && MerkleCap::from_digests(&columns, cap_height).commitment(Tree::Column)
+                == certificate.columns;
+        if !matches {
+            return Err(unavailable(
+                "regenerated sector roots differ from certificate".into(),
+            ));
+        }
+        measured.regeneration = Some(RegenerationMeasurement {
+            sector_nodes: certificate.n, layers: params.layers, seconds: timed.1,
+            public_graph_prepared: prepared, roots_match: matches,
+            within_nominal_frame: timed.1 * 1000. <= quil_types::consensus::IDEAL_FRAME_TIME_MS as f64,
+            model: "one CPU lane; full reconstruction from identity/key; partial-storage, GPU and ASIC attacks are not evaluated",
+        });
+    }
     Ok(measured)
 }
 
@@ -611,65 +700,76 @@ mod tests {
 
     #[test]
     fn authentic_snapshot_runs_cold_and_two_full_encode_settlement_rounds() {
-        quil_crypto::init();
-        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(1393));
-        crate::storage_jobs::set_available_for_test(Some(64 << 30));
-        let graph = super::super::super::tests::test_crdt();
-        let app = [87; 32];
-        graph
-            .add_vertex(
-                &quil_hypergraph::Location {
-                    app_address: app,
-                    data_address: [1; 32],
-                },
-                &[7; 100],
+        for profile in [
+            sector::Profile::Eleven,
+            sector::Profile::Three,
+            sector::Profile::Two,
+        ] {
+            quil_crypto::init();
+            quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(1393));
+            crate::storage_jobs::set_available_for_test(Some(64 << 30));
+            let graph = super::super::super::tests::test_crdt();
+            let app = [87; 32];
+            graph
+                .add_vertex(
+                    &quil_hypergraph::Location {
+                        app_address: app,
+                        data_address: [1; 32],
+                    },
+                    &[7; 100],
+                )
+                .unwrap();
+            graph.commit(1).unwrap();
+            let snapshot = current_source(&graph, &app, 1500).snapshot;
+            let dir = tempfile::tempdir().unwrap();
+            let options = BenchmarkOptions {
+                profile,
+                initial_setup_complete: Arc::new(AtomicBool::new(false)),
+                regeneration_probe: Arc::new(AtomicBool::new(true)),
+                directory: dir.path().to_owned(),
+                member: [99; 32],
+                beacon: vec![31; 32],
+                rounds: 2,
+                frames: 2,
+                memory_budget_bytes: 64 << 30,
+                stop: Arc::new(AtomicBool::new(false)),
+            };
+            let store = LabelStore::with_space(
+                dir.path().join("labels"),
+                crate::storage_labels::ample_space(),
+            );
+            let before = quil_types::consensus::persistent_storage_epoch_thread_override();
+            let measured = measure_with_store(
+                graph,
+                snapshot.clone(),
+                app.to_vec(),
+                &options,
+                &store,
+                None,
             )
             .unwrap();
-        graph.commit(1).unwrap();
-        let snapshot = current_source(&graph, &app, 1500).snapshot;
-        let dir = tempfile::tempdir().unwrap();
-        let options = BenchmarkOptions {
-            directory: dir.path().to_owned(),
-            member: [99; 32],
-            beacon: vec![31; 32],
-            rounds: 2,
-            frames: 2,
-            memory_budget_bytes: 64 << 30,
-            stop: Arc::new(AtomicBool::new(false)),
-        };
-        let store = LabelStore::with_space(
-            dir.path().join("labels"),
-            crate::storage_labels::ample_space(),
-        );
-        let before = quil_types::consensus::persistent_storage_epoch_thread_override();
-        let measured = measure_with_store(
-            graph,
-            snapshot.clone(),
-            app.to_vec(),
-            &options,
-            &store,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            quil_types::consensus::persistent_storage_epoch_thread_override(),
-            before
-        );
-        assert_eq!(measured.rounds.len(), 2);
-        assert_eq!(measured.sectors, 1);
-        assert_eq!(
-            measured.roots,
-            snapshot.roots.iter().map(hex::encode).collect::<Vec<_>>()
-        );
-        assert!(measured.certificate_message_bytes > 0);
-        assert!(measured.estimated_settlement_peak_bytes > measured.replica_bytes);
-        for round in measured.rounds {
-            assert!(round.encode_seconds > 0.);
-            assert!(round.seal_message_bytes > 0);
-            assert!(round.settlement_message_bytes > 0);
+            assert_eq!(
+                quil_types::consensus::persistent_storage_epoch_thread_override(),
+                before
+            );
+            assert!(options.initial_setup_complete.load(Ordering::Relaxed));
+            assert!(measured.regeneration.as_ref().unwrap().roots_match);
+            assert_eq!(measured.rounds.len(), 2);
+            assert_eq!(measured.sectors, 1);
+            assert_eq!(
+                measured.roots,
+                snapshot.roots.iter().map(hex::encode).collect::<Vec<_>>()
+            );
+            assert!(measured.certificate_message_bytes > 0);
+            assert!(measured.estimated_settlement_peak_bytes > measured.replica_bytes);
+            for round in measured.rounds {
+                assert!(round.encode_seconds > 0.);
+                assert!(round.seal_message_bytes > 0);
+                assert!(round.settlement_message_bytes > 0);
+            }
+            crate::storage_jobs::set_available_for_test(None);
+            quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
         }
-        crate::storage_jobs::set_available_for_test(None);
-        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
     }
 }
 
@@ -703,6 +803,9 @@ mod allocation_tests {
     }
     fn options(path: &Path) -> BenchmarkOptions {
         BenchmarkOptions {
+            profile: Default::default(),
+            initial_setup_complete: Arc::new(AtomicBool::new(false)),
+            regeneration_probe: Arc::new(AtomicBool::new(false)),
             directory: path.to_owned(),
             member: [109; 32],
             beacon: vec![41; 32],

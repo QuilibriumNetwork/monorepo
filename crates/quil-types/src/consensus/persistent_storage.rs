@@ -3,6 +3,83 @@
 use std::{cell::Cell, sync::OnceLock};
 
 pub const MAINNET_PERSISTENT_STORAGE_EPOCH: Option<u64> = None;
+/// Experimental suites remain disabled on mainnet until both are coordinated.
+pub const MAINNET_FAST_STORAGE_EPOCH: Option<u64> = None;
+pub const MAINNET_FAST_STORAGE_PROFILE: Option<StorageSealProfile> = None;
+/// Hard end-to-end startup target; warmup eligibility is a separate rule.
+pub const INITIAL_STORAGE_SETUP_BUDGET_SECS: u64 = 2 * 60 * 60;
+
+/// An explicit proof suite. The legacy suite and its serialization stay frozen.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[repr(u8)]
+pub enum StorageSealProfile {
+    #[default]
+    Eleven = 11,
+    Three = 3,
+    Two = 2,
+}
+impl StorageSealProfile {
+    pub const fn layers(self) -> usize {
+        self as usize
+    }
+    pub const fn tag(self) -> &'static [u8; 4] {
+        match self {
+            Self::Eleven => b"PS01",
+            Self::Three => b"PS03",
+            Self::Two => b"PS02",
+        }
+    }
+    pub fn from_tag(tag: &[u8]) -> Option<Self> {
+        match tag {
+            b"PS01" => Some(Self::Eleven),
+            b"PS03" => Some(Self::Three),
+            b"PS02" => Some(Self::Two),
+            _ => None,
+        }
+    }
+    pub fn from_layers(layers: usize) -> Option<Self> {
+        match layers {
+            11 => Some(Self::Eleven),
+            3 => Some(Self::Three),
+            2 => Some(Self::Two),
+            _ => None,
+        }
+    }
+}
+thread_local! { static PROFILE: Cell<Option<StorageSealProfile>> = const { Cell::new(None) }; }
+/// Readiness experiments are scoped to a thread; node environment variables
+/// cannot select a fast mainnet suite.
+pub fn set_storage_seal_profile_for_thread(profile: Option<StorageSealProfile>) {
+    PROFILE.with(|p| p.set(profile));
+}
+pub fn storage_seal_profile_thread_override() -> Option<StorageSealProfile> {
+    PROFILE.with(Cell::get)
+}
+pub fn storage_seal_profile(epoch: u64) -> StorageSealProfile {
+    if let Some(profile) = storage_seal_profile_thread_override() {
+        return profile;
+    }
+    profile_at(
+        epoch,
+        MAINNET_FAST_STORAGE_EPOCH,
+        MAINNET_FAST_STORAGE_PROFILE,
+        persistent_storage_at(epoch),
+    )
+}
+fn profile_at(
+    epoch: u64,
+    activation: Option<u64>,
+    selected: Option<StorageSealProfile>,
+    persistent: bool,
+) -> StorageSealProfile {
+    match (activation, selected) {
+        (Some(from), Some(profile)) if epoch >= from && persistent => profile,
+        _ => StorageSealProfile::Eleven,
+    }
+}
+
 /// Nodes must carry the coordinated epoch before capacity precommits begin.
 pub const PERSISTENT_STORAGE_WARMUP_EPOCHS: u64 = 32;
 /// The smallest sector GLOBAL certifies: 32 MiB of labels, about two CPU
@@ -134,5 +211,37 @@ mod tests {
         set_persistent_storage_epoch_for_thread(Some(u64::MAX));
         assert!(!persistent_storage_at(u64::MAX));
         set_persistent_storage_epoch_for_thread(None);
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    #[test]
+    fn fast_suites_require_both_coordinated_settings_and_persistent_activation() {
+        assert_eq!(MAINNET_FAST_STORAGE_EPOCH, None);
+        assert_eq!(MAINNET_FAST_STORAGE_PROFILE, None);
+        assert_eq!(storage_seal_profile(1500), StorageSealProfile::Eleven);
+        for suite in [StorageSealProfile::Two, StorageSealProfile::Three] {
+            assert_eq!(
+                profile_at(1499, Some(1500), Some(suite), true),
+                StorageSealProfile::Eleven
+            );
+            assert_eq!(profile_at(1500, Some(1500), Some(suite), true), suite);
+            assert_eq!(
+                profile_at(1501, Some(1500), Some(suite), false),
+                StorageSealProfile::Eleven
+            );
+            assert_eq!(
+                profile_at(1501, None, Some(suite), true),
+                StorageSealProfile::Eleven
+            );
+            assert_eq!(
+                profile_at(1501, Some(1500), None, true),
+                StorageSealProfile::Eleven
+            );
+        }
+        assert_eq!(StorageSealProfile::from_layers(1), None);
+        assert_eq!(INITIAL_STORAGE_SETUP_BUDGET_SECS, 7200);
     }
 }

@@ -3,8 +3,13 @@
 use crate::storage_snapshot::SnapshotMeasurement;
 use serde::Serialize;
 
+/// Whether unfinished local setup has reached the two-hour deadline.
+pub fn initial_setup_expired(elapsed: std::time::Duration, ready: bool) -> bool {
+    !ready && elapsed.as_secs() >= quil_types::consensus::INITIAL_STORAGE_SETUP_BUDGET_SECS
+}
+
 /// Isolated benchmark cutoff: retain 0.1% free space (99.9% maximum used).
-/// Production node label stores retain their existing free-space policy.
+/// Production stores retain their existing free-space policy.
 pub fn disk_floor(total_bytes: u64) -> u64 {
     total_bytes.div_ceil(1000)
 }
@@ -73,7 +78,8 @@ pub fn assess(e: Evidence<'_>) -> Assessment {
         reasons: Vec::new(),
         cold_measured_seconds: e.download_seconds,
         cold_with_inclusion_and_headroom_seconds: 0.,
-        cold_budget_seconds: e.warmup_frames as f64 * e.frame_seconds,
+        cold_budget_seconds: (e.warmup_frames as f64 * e.frame_seconds)
+            .min(quil_types::consensus::INITIAL_STORAGE_SETUP_BUDGET_SECS as f64),
         worst_registration_seconds: 0.,
         registration_with_headroom_seconds: 0.,
         registration_budget_seconds: e.registration_frames as f64 * e.frame_seconds,
@@ -225,7 +231,7 @@ pub fn assess(e: Evidence<'_>) -> Assessment {
     }
     if out.cold_with_inclusion_and_headroom_seconds > out.cold_budget_seconds {
         out.reasons
-            .push("cold setup exceeds the coordinated warmup budget".into());
+            .push("cold setup exceeds the initial setup budget (at most two hours)".into());
     }
     if out.registration_with_headroom_seconds > out.registration_budget_seconds {
         out.reasons
@@ -385,5 +391,29 @@ mod tests {
         let mut e = evidence(&m);
         e.headroom = f64::NAN;
         assert_eq!(assess(e).verdict, Verdict::Incomplete);
+    }
+}
+
+#[cfg(test)]
+mod startup_budget_tests {
+    use super::*;
+    #[test]
+    fn startup_deadline_is_two_hours_and_stops_only_unfinished_startup() {
+        assert!(!initial_setup_expired(
+            std::time::Duration::from_secs(7199),
+            false
+        ));
+        assert!(initial_setup_expired(
+            std::time::Duration::from_secs(7200),
+            false
+        ));
+        assert!(initial_setup_expired(
+            std::time::Duration::from_secs(7201),
+            false
+        ));
+        assert!(!initial_setup_expired(
+            std::time::Duration::from_secs(99999),
+            true
+        ));
     }
 }

@@ -11,10 +11,11 @@ import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-PACKAGES = ['quil-types', 'quil-crypto', 'quil-store', 'quil-execution', 'quil-engine']
+PACKAGES = ['quil-types', 'quil-crypto', 'quil-storage-stark', 'quil-store', 'quil-execution', 'quil-engine']
 FILTERS = {
     'quil_types': ('consensus::',),
-    'quil_crypto': ('storage_proof::', 'persistent_storage::', 'sdr::'),
+    'quil_crypto': ('storage_proof::', 'persistent_storage::', 'sdr::', 'storage_labels_compute::', 'storage_hash::'),
+    'quil_storage_stark': ('tests::',),
     'quil_store': ('replica_store::',),
     'quil_execution': ('global_intrinsic::persistent_storage::', 'global_intrinsic::storage_binding::',
                        'global_intrinsic::intrinsic::tests::join_kick_parity::',
@@ -28,12 +29,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--jobs', type=int, default=2)
     parser.add_argument('--offline', action='store_true')
+    parser.add_argument('--profile', help='Cargo profile, e.g. devnet for optimized local regressions')
     parser.add_argument('--full-sector', action='store_true', help='also run the 512 MiB cold certification and update lifecycle')
     parser.add_argument('--results', type=pathlib.Path)
     args = parser.parse_args()
     command = ['cargo', '+' + os.environ.get('QUIL_STORAGE_TEST_TOOLCHAIN', '1.95.0'),
                'test', '--locked', '--config', 'profile.test.package.quil-crypto.opt-level=3',
                '--lib', '--no-run', '--message-format=json']
+    if args.profile:
+        command += ['--profile', args.profile]
     if args.offline:
         command.append('--offline')
     for package in PACKAGES:

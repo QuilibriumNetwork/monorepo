@@ -89,6 +89,9 @@ use tracing::{info, warn};
 
 use crate::storage_ledger::HostLedger;
 
+#[cfg(any(target_os = "macos", test))]
+mod macos_memory;
+
 /// The lane of the node's epoch proofs (`storage_epoch_batch`).
 pub const EPOCH_PROOF_LANE: &[u8] = b"epoch proofs";
 
@@ -271,20 +274,33 @@ impl Jobs {
         let shown = hex::encode(lane);
         let stable = quil_types::consensus::stable_replica_key_epoch_thread_override();
         let persistent = quil_types::consensus::persistent_storage_epoch_thread_override();
+        let profile = quil_types::consensus::storage_seal_profile_thread_override();
+        let minimum = quil_types::consensus::min_sector_nodes_thread_override();
         let job: Job = Box::new(move || {
-            struct Overrides(Option<u64>, Option<u64>);
+            struct Overrides(
+                Option<u64>,
+                Option<u64>,
+                Option<quil_types::consensus::StorageSealProfile>,
+                Option<u64>,
+            );
             impl Drop for Overrides {
                 fn drop(&mut self) {
                     quil_types::consensus::set_stable_replica_key_epoch_for_thread(self.0);
                     quil_types::consensus::set_persistent_storage_epoch_for_thread(self.1);
+                    quil_types::consensus::set_storage_seal_profile_for_thread(self.2);
+                    quil_types::consensus::set_min_sector_nodes_for_thread(self.3);
                 }
             }
             let _restore = Overrides(
                 quil_types::consensus::stable_replica_key_epoch_thread_override(),
                 quil_types::consensus::persistent_storage_epoch_thread_override(),
+                quil_types::consensus::storage_seal_profile_thread_override(),
+                quil_types::consensus::min_sector_nodes_thread_override(),
             );
             quil_types::consensus::set_stable_replica_key_epoch_for_thread(stable);
             quil_types::consensus::set_persistent_storage_epoch_for_thread(persistent);
+            quil_types::consensus::set_storage_seal_profile_for_thread(profile);
+            quil_types::consensus::set_min_sector_nodes_for_thread(minimum);
             let started = Instant::now();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
                 .unwrap_or_else(|_| Err(QuilError::Internal("the job panicked".into())));
@@ -652,6 +668,8 @@ pub fn for_each_parallel<T: Sync, R: Send>(
     // A test's stable replica key epoch, for the work's threads too.
     let stable_key = quil_types::consensus::stable_replica_key_epoch_thread_override();
     let persistent = quil_types::consensus::persistent_storage_epoch_thread_override();
+    let profile = quil_types::consensus::storage_seal_profile_thread_override();
+    let minimum = quil_types::consensus::min_sector_nodes_thread_override();
     std::thread::scope(|scope| {
         for slot in 0..job_slots().min(items.len()) {
             std::thread::Builder::new()
@@ -659,6 +677,8 @@ pub fn for_each_parallel<T: Sync, R: Send>(
                 .spawn_scoped(scope, || {
                     quil_types::consensus::set_stable_replica_key_epoch_for_thread(stable_key);
                     quil_types::consensus::set_persistent_storage_epoch_for_thread(persistent);
+                    quil_types::consensus::set_storage_seal_profile_for_thread(profile);
+                    quil_types::consensus::set_min_sector_nodes_for_thread(minimum);
                     on_process_cpus();
                     loop {
                         let index = next.fetch_add(1, Ordering::Relaxed);
@@ -745,24 +765,31 @@ pub(crate) fn pausing_count() -> usize {
     admission().state().pausing
 }
 
-/// Bytes of memory available to the node now: the host's, or less within
-/// its container's limit, page cache counted available as the host counts
-/// it. `None` when the host does not say.
+/// Bytes available for additional work. macOS uses a pressure-aware process
+/// budget; other hosts use available RAM, bounded by their container's limit.
+/// `None` means the platform could not be queried, rather than zero headroom.
 fn available_memory() -> Option<u64> {
     #[cfg(test)]
     if let Some(bytes) = Some(TEST_AVAILABLE.load(Ordering::SeqCst)).filter(|&b| b > 0) {
         return Some(bytes);
     }
-    let mut system = sysinfo::System::new();
-    system.refresh_memory();
-    let host = system.available_memory();
-    if host == 0 {
-        return None;
+    #[cfg(target_os = "macos")]
+    {
+        macos_memory::available()
     }
-    let container = system
-        .cgroup_limits()
-        .map(|limits| limits.total_memory.saturating_sub(limits.rss));
-    Some(container.map_or(host, |container| container.min(host)))
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut system = sysinfo::System::new();
+        system.refresh_memory();
+        let host = system.available_memory();
+        if host == 0 {
+            return None;
+        }
+        let container = system
+            .cgroup_limits()
+            .map(|limits| limits.total_memory.saturating_sub(limits.rss));
+        Some(container.map_or(host, |container| container.min(host)))
+    }
 }
 
 /// Bytes that must be available for `bytes` of work ahead to fit with no
@@ -3721,6 +3748,75 @@ mod tests {
         drop(ahead.release);
     }
 
+    /// Regression for the 64 GiB Mac whose sysinfo estimate saturated to zero
+    /// despite normal kernel pressure, silently serializing nine cold sectors.
+    #[test]
+    fn macos_normal_pressure_admits_nine_cold_sectors() {
+        let snapshot = macos_memory::Snapshot {
+            total: 64 * GIB,
+            wired: 7 * GIB,
+            footprint: 3 * GIB,
+            pressure: 1,
+        };
+        let admission = Box::leak(Box::new(Admission::new(
+            9,
+            Box::new(move || Some(snapshot.headroom())),
+        )));
+        let held: Vec<_> = (0..9)
+            .map(|leaf| {
+                let held = hold_parallel(admission, 3_649_044_480, ahead(false, 1, leaf));
+                assert!(
+                    granted(&held),
+                    "every cold sector fits alongside the others"
+                );
+                held
+            })
+            .collect();
+        assert_eq!(admission.state().holders, 9);
+        let extra = hold_parallel(admission, 3_649_044_480, ahead(false, 1, 9));
+        assert!(still_waiting(&extra), "the CPU slot limit still applies");
+        drop(held);
+        assert!(granted(&extra));
+    }
+
+    #[test]
+    fn macos_pressure_stops_admission_and_normal_pressure_resumes_it() {
+        let pressure = Arc::new(std::sync::atomic::AtomicU32::new(1));
+        let probe = pressure.clone();
+        let mut admission = Admission::new(
+            9,
+            Box::new(move || {
+                Some(
+                    macos_memory::Snapshot {
+                        total: 64 * GIB,
+                        wired: 7 * GIB,
+                        footprint: 3 * GIB,
+                        pressure: probe.load(Ordering::SeqCst),
+                    }
+                    .headroom(),
+                )
+            }),
+        );
+        admission.window = Duration::ZERO;
+        let admission = Box::leak(Box::new(admission));
+        // Pressure with no holders must be known zero, not unknown memory:
+        // unknown memory deliberately admits one ahead job as a fallback.
+        pressure.store(2, Ordering::SeqCst);
+        let ahead = hold_with(admission, GIB, Urgency::Ahead);
+        assert!(still_waiting(&ahead));
+        let due = hold(admission, GIB);
+        assert!(
+            granted(&due),
+            "urgent work retains its one-job escape hatch"
+        );
+        assert!(still_waiting(&ahead), "no extra work starts under pressure");
+        pressure.store(1, Ordering::SeqCst);
+        admission.changed.notify_all();
+        assert!(granted(&ahead), "normal pressure resumes parallel work");
+        drop(due);
+        drop(ahead);
+    }
+
     #[test]
     fn no_more_jobs_hold_memory_than_there_are_slots() {
         let (admission, _) = admission(2, 1 << 50);
@@ -4069,5 +4165,25 @@ mod tests {
                 "the leaves ran on threads named {names:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod profile_context_tests {
+    use super::*;
+    use quil_types::consensus::*;
+    #[test]
+    fn parallel_jobs_receive_profile_and_sector_floor() {
+        let old_profile = storage_seal_profile_thread_override();
+        let old_minimum = min_sector_nodes_thread_override();
+        set_storage_seal_profile_for_thread(Some(StorageSealProfile::Three));
+        set_min_sector_nodes_for_thread(Some(64));
+        let values = for_each_parallel(&[0u8, 1], |_| {
+            Ok((storage_seal_profile(1500), min_sector_nodes()))
+        })
+        .unwrap();
+        set_storage_seal_profile_for_thread(old_profile);
+        set_min_sector_nodes_for_thread(old_minimum);
+        assert_eq!(values, vec![(StorageSealProfile::Three, 64); 2]);
     }
 }

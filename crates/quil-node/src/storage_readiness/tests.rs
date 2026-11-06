@@ -234,3 +234,40 @@ async fn live_mainnet_checkpoint_and_snapshot_record_are_authenticated() {
     }
     panic!("live inputs unavailable: {}", failures.join("; "));
 }
+
+#[test]
+fn experimental_suite_selection_is_explicit_and_rejects_unsupported_parameters() {
+    use clap::Parser;
+    assert!(crate::Args::try_parse_from(["quil-node"]).is_ok());
+    assert!(crate::Args::try_parse_from(["quil-node", "--benchmark-storage-layers", "3"]).is_err());
+    for layers in ["2", "3", "11"] {
+        let args = crate::Args::try_parse_from([
+            "quil-node",
+            "--benchmark-storage",
+            "/tmp/quil-profiles",
+            "--benchmark-storage-seats",
+            "9",
+            "--benchmark-storage-layers",
+            layers,
+            "--benchmark-storage-allow-debug",
+        ])
+        .unwrap();
+        validate(&args.storage_readiness).unwrap();
+        assert_eq!(
+            args.storage_readiness.benchmark_storage_layers.to_string(),
+            layers
+        );
+    }
+    let args = crate::Args::try_parse_from([
+        "quil-node",
+        "--benchmark-storage",
+        "/tmp/quil-profiles",
+        "--benchmark-storage-seats",
+        "9",
+        "--benchmark-storage-layers",
+        "1",
+        "--benchmark-storage-allow-debug",
+    ])
+    .unwrap();
+    assert!(validate(&args.storage_readiness).is_err());
+}

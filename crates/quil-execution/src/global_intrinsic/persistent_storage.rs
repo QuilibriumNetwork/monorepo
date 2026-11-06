@@ -357,6 +357,11 @@ pub fn verify(
                     return Err("sector certificate was changed".into());
                 }
             } else {
+                if root.profile != sector::Profile::Eleven
+                    && root.profile != quil_types::consensus::storage_seal_profile(seat.seal_epoch)
+                {
+                    return Err("sector proof profile is not activated for this epoch".into());
+                }
                 if proof.is_empty() {
                     return Err("uncertified labels".into());
                 }

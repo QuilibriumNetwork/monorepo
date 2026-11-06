@@ -1426,6 +1426,7 @@ mod tests {
     fn native_chunks_count_proof_bytes_without_reserving_an_unused_stark() {
         let mut native = seat(197, 1, false);
         let root = quil_crypto::persistent_storage::Registration {
+            profile: Default::default(),
             data: [0; 32],
             labels: [0; 32],
             replica: [0; 32],

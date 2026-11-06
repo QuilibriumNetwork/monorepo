@@ -525,31 +525,33 @@ pub struct Released {
 /// the column commitment. `kept`, beside the `layers` of a labelling not
 /// ended, is the manifest of its whole layers ([`Manifest`]), rewritten
 /// after each layer is synced.
+#[derive(Clone)]
 pub struct LabelStore {
+    params: SdrParams,
     dir: PathBuf,
-    space: SpaceSource,
+    space: Arc<dyn Fn(&Path) -> Option<FsUsage> + Send + Sync>,
     disk_floor: fn(u64) -> u64,
     /// Bytes the leaves being labelled have still to write.
-    pending: Mutex<u64>,
+    pending: Arc<Mutex<u64>>,
     /// The host's record of the node's processes ([`Self::use_ledger`]):
     /// what the others' labels have still to write is no room for these.
-    ledger: OnceLock<&'static HostLedger>,
+    ledger: Arc<OnceLock<&'static HostLedger>>,
     /// Whether a failure to use [`Self::ledger`] was logged.
-    ledger_warned: AtomicBool,
+    ledger_warned: Arc<AtomicBool>,
     /// Leaves' counts admitted and being labelled ([`Self::admit`]): no
     /// other labelling writes them, and nothing removes them meanwhile.
-    busy: Mutex<HashSet<(PathBuf, u64)>>,
+    busy: Arc<Mutex<HashSet<(PathBuf, u64)>>>,
     /// Leaves admitted with layers kept on disk, and from how many, for
     /// tests.
     #[cfg(test)]
-    resumed: Mutex<Vec<(Vec<u8>, u64, usize)>>,
+    resumed: Arc<Mutex<Vec<(Vec<u8>, u64, usize)>>>,
     /// Leaves refused room, by epoch and stage, each logged once.
-    refused: Mutex<HashSet<(u64, PathBuf, Stage)>>,
+    refused: Arc<Mutex<HashSet<(u64, PathBuf, Stage)>>>,
     /// The epoch before which labels were last removed ([`Self::sweep`]).
-    swept: AtomicU64,
+    swept: Arc<AtomicU64>,
     /// The release of labels for free space this process last saw
     /// ([`Self::keep_floor`]).
-    seen: Mutex<Option<Shortage>>,
+    seen: Arc<Mutex<Option<Shortage>>>,
 }
 
 /// Room a leaf's labels were refused: the free bytes they needed, beside
@@ -595,17 +597,18 @@ impl LabelStore {
     pub fn with_space(dir: PathBuf, space: SpaceSource) -> Self {
         Self {
             dir,
-            space,
+            params: SdrParams::default(),
+            space: Arc::from(space),
             disk_floor,
-            pending: Mutex::new(0),
-            ledger: OnceLock::new(),
-            ledger_warned: AtomicBool::new(false),
-            busy: Mutex::new(HashSet::new()),
+            pending: Arc::new(Mutex::new(0)),
+            ledger: Arc::new(OnceLock::new()),
+            ledger_warned: Arc::new(AtomicBool::new(false)),
+            busy: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
-            resumed: Mutex::new(Vec::new()),
-            refused: Mutex::new(HashSet::new()),
-            swept: AtomicU64::new(0),
-            seen: Mutex::new(None),
+            resumed: Arc::new(Mutex::new(Vec::new())),
+            refused: Arc::new(Mutex::new(HashSet::new())),
+            swept: Arc::new(AtomicU64::new(0)),
+            seen: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -614,6 +617,21 @@ impl LabelStore {
     pub fn with_disk_floor(mut self, floor: fn(u64) -> u64) -> Self {
         self.disk_floor = floor;
         self
+    }
+
+    /// Suite-specific view sharing disk reservations, busy locks and cache
+    /// eviction state with the parent. Suites have disjoint parameter-bound
+    /// label directories; switching a view cannot reinterpret stored labels.
+    pub fn for_profile(&self, profile: quil_types::consensus::StorageSealProfile) -> Self {
+        let mut view = self.clone();
+        view.params = SdrParams::for_profile(profile);
+        view
+    }
+    pub fn params(&self) -> &SdrParams {
+        &self.params
+    }
+    fn label_bytes(&self, n: u64) -> u64 {
+        n.saturating_mul(((self.params.layers + 1) * NODE_BYTES) as u64)
     }
 
     fn resume_free(&self, total_bytes: u64) -> u64 {
@@ -637,7 +655,7 @@ impl LabelStore {
         let pending = self.pending();
         match self.admission(
             *pending,
-            label_bytes(least).saturating_mul(DISK_MARGIN),
+            self.label_bytes(least).saturating_mul(DISK_MARGIN),
             stage,
         ) {
             Ok(()) => true,
@@ -789,7 +807,7 @@ impl LabelStore {
     /// The whole layers an earlier attempt at that count kept, in this
     /// process or one before it, stay for this one to resume from
     /// ([`Admitted::resumes_from`]) as far as each matches its digest
-    /// ([`verify_kept`]); whatever else an attempt left is removed first.
+    /// ([`verify_kept_with_params`]); whatever else an attempt left is removed first.
     /// `None` when refused, leaving none of its files, logged once a leaf,
     /// epoch and stage: the leaf is then labelled where it is needed, as by
     /// a process that keeps no labels. `None` too, silently, while that
@@ -815,7 +833,7 @@ impl LabelStore {
         // Not under the leaf's lock: checking a large leaf's layers takes a
         // while, and being busy keeps every removal off them. What a sweep
         // that looked before this count was busy removes is seen below.
-        let mut verified = verify_kept(&dir, n, &key);
+        let mut verified = verify_kept_with_params(&dir, n, &key, &self.params);
         if in_use.is_none() {
             verified.layers.clear();
         }
@@ -855,7 +873,9 @@ impl LabelStore {
                     .push((leaf_id.to_vec(), n, kept));
             }
         }
-        let bytes = label_bytes(n).saturating_sub(kept as u64 * layer_bytes(n));
+        let bytes = self
+            .label_bytes(n)
+            .saturating_sub(kept as u64 * layer_bytes(n));
         // Held until this store's record counts the leaf; taken first, so
         // this process's labels being written need not wait for it.
         let turn = self.labels_turn();
@@ -981,7 +1001,7 @@ impl LabelStore {
         if !first {
             return;
         }
-        let (leaf, bytes) = (hex::encode(leaf_id), label_bytes(n));
+        let (leaf, bytes) = (hex::encode(leaf_id), self.label_bytes(n));
         let free = shortfall
             .free
             .map_or_else(|| "unknown".to_string(), |free| free.to_string());
@@ -1010,7 +1030,7 @@ impl LabelStore {
         h.update(member);
         h.update(leaf_id);
         if quil_types::consensus::stable_replica_keys_at(epoch) {
-            let params = SdrParams::default();
+            let params = &self.params;
             h.update(quil_crypto::sdr::replica_key(member, leaf_id, epoch));
             for value in [
                 params.layers,
@@ -1074,7 +1094,7 @@ impl LabelStore {
         if !is_at(&layers_file, &layers) {
             return None;
         }
-        let expected = n * (SdrParams::default().layers * NODE_BYTES) as u64;
+        let expected = n * (self.params.layers * NODE_BYTES) as u64;
         if layers_file.metadata().ok()?.len() != expected {
             return None;
         }
@@ -1092,7 +1112,7 @@ impl LabelStore {
                 .ok()
                 .and_then(|bytes| quil_crypto::storage_proof::MerkleCap::from_bytes(&bytes)),
             replica: None,
-            depth: SdrParams::default().layers,
+            depth: self.params.layers,
         })
     }
 
@@ -1679,8 +1699,8 @@ impl Admitted<'_> {
             stage: self.stage,
             layers: std::mem::take(&mut self.digests),
         };
-        // The kept layers were checked against the default parameters.
-        if kept > 0 && manifest.params != params_text(&SdrParams::default()) {
+        // The kept layers were checked against this store view's suite.
+        if kept > 0 && manifest.params != params_text(params) {
             return Err(QuilError::Internal(
                 "storage labels: layers kept for other labelling parameters".into(),
             ));
@@ -2048,7 +2068,7 @@ fn write_manifest(dir: &Path, n: u64, manifest: &Manifest) -> std::io::Result<()
 }
 
 /// The whole layers kept on disk a labelling at a leaf's count may go on
-/// from ([`verify_kept`]).
+/// from ([`verify_kept_with_params`]).
 #[derive(Default)]
 struct Verified {
     /// The digests of the layers that matched, from the first.
@@ -2068,13 +2088,12 @@ struct Verified {
 /// the first one cut short or changed may be resumed from. None when there
 /// is no manifest, or it is not one for these labels (another format, node
 /// count, parameters or key). Reads each layer once, a chunk at a time.
-fn verify_kept(dir: &Path, n: u64, key: &[u8; 32]) -> Verified {
+fn verify_kept_with_params(dir: &Path, n: u64, key: &[u8; 32], params: &SdrParams) -> Verified {
     let started = Instant::now();
     let mut verified = Verified::default();
     let Ok(text) = fs::read_to_string(kept_path(dir, n)) else {
         return verified;
     };
-    let params = SdrParams::default();
     let Some(manifest) = Manifest::parse(&text) else {
         verified.unusable = Some("its manifest is of an unknown format, from another build");
         return verified;
@@ -2122,7 +2141,7 @@ fn verify_kept(dir: &Path, n: u64, key: &[u8; 32]) -> Verified {
     verified
 }
 
-/// Log a kept leaf's layers not reused ([`verify_kept`]): written for other
+/// Log a kept leaf's layers not reused ([`verify_kept_with_params`]): written for other
 /// labels (info), or a layer that did not match its digest (warn).
 fn log_verified(epoch: u64, leaf_id: &[u8], n: u64, stage: Stage, verified: &Verified) {
     let leaf = hex::encode(leaf_id);
@@ -4649,5 +4668,83 @@ mod tests {
         );
         assert!(precomputed(&member, other, 13), "no labels of it went");
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use quil_types::consensus::StorageSealProfile;
+    #[test]
+    fn profile_views_share_host_ledger_and_publish_combined_reservations() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_dir = dir.path().join("ledger");
+        let store = LabelStore::with_space(dir.path().join("labels"), ample_space());
+        let two = store.for_profile(StorageSealProfile::Two);
+        let three = store.for_profile(StorageSealProfile::Three);
+        let record = Box::leak(Box::new(
+            HostLedger::open_as(&ledger_dir, "profiles").unwrap(),
+        ));
+        let observer = HostLedger::open_as(&ledger_dir, "observer").unwrap();
+        // Installing through an existing view also installs it for every other view.
+        assert!(two.use_ledger(record));
+        assert!(!store.use_ledger(record));
+        assert!(!three.use_ledger(record));
+        let member = [8; 32];
+        let first = two
+            .admit(1500, &member, b"two", 64, Stage::Snapshot)
+            .unwrap();
+        let second = three
+            .admit(1500, &member, b"three", 64, Stage::Snapshot)
+            .unwrap();
+        assert_eq!(observer.others_labels_pending(), 64 * 32 * (3 + 4));
+        drop(first);
+        assert_eq!(observer.others_labels_pending(), 64 * 32 * 4);
+        drop(second);
+        assert_eq!(observer.others_labels_pending(), 0);
+    }
+
+    #[test]
+    fn profile_views_share_disk_reservations_and_never_reinterpret_labels() {
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(1393));
+        let dir = tempfile::tempdir().unwrap();
+        let store = LabelStore::with_space(dir.path().to_owned(), ample_space());
+        let two = store.for_profile(StorageSealProfile::Two);
+        let three = store.for_profile(StorageSealProfile::Three);
+        let member = [8; 32];
+        let admitted = three
+            .admit(1500, &member, b"same-sector", 64, Stage::Snapshot)
+            .unwrap();
+        assert_eq!(*store.pending(), 64 * 32 * 4);
+        let pending = *store.pending();
+        assert_eq!(*two.pending(), pending);
+        let done = AtomicU64::new(0);
+        let stopped = admitted
+            .label_kept(
+                three.params(),
+                &|| done.load(Ordering::Relaxed) >= 1,
+                &|n| done.store(n as u64, Ordering::Relaxed),
+            )
+            .unwrap();
+        assert!(matches!(stopped, Labelling::Stopped { layers: 1 }));
+        assert_eq!(*store.pending(), 0);
+        let resumed = three
+            .admit(1500, &member, b"same-sector", 64, Stage::Snapshot)
+            .unwrap();
+        assert_eq!(resumed.resumes_from(), 1);
+        assert!(matches!(
+            resumed
+                .label_kept(three.params(), &|| false, &|_| {})
+                .unwrap(),
+            Labelling::Labelled(_)
+        ));
+        assert!(three
+            .find(1500, &member, b"same-sector", |_| true)
+            .is_some());
+        assert!(two.find(1500, &member, b"same-sector", |_| true).is_none());
+        assert!(store
+            .find(1500, &member, b"same-sector", |_| true)
+            .is_none());
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
     }
 }

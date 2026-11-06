@@ -50,6 +50,13 @@ pub struct Arguments {
     /// Output artifact; defaults to WORKDIR/report.json.
     #[arg(long, requires = "benchmark_storage")]
     pub benchmark_storage_report: Option<PathBuf>,
+    /// Experimental persistent suite; mainnet activation remains independently gated.
+    #[arg(long, default_value_t = 11, requires = "benchmark_storage")]
+    pub benchmark_storage_layers: u8,
+    /// After measured rounds, time full sector regeneration without stored labels.
+    /// This is a one-CPU diagnostic, not a GPU/ASIC or partial-storage security assessment.
+    #[arg(long, requires = "benchmark_storage")]
+    pub benchmark_storage_regeneration_probe: bool,
     /// Fully re-encode and prove every selected shard this many times (2..5).
     #[arg(long, default_value_t = 2)]
     pub benchmark_storage_rounds: usize,
@@ -77,6 +84,10 @@ pub struct Arguments {
 }
 
 fn validate(args: &Arguments) -> anyhow::Result<()> {
+    ensure!(
+        [2, 3, 11].contains(&args.benchmark_storage_layers),
+        "storage layers must be 2, 3 or 11"
+    );
     ensure!(
         (2..=5).contains(&args.benchmark_storage_rounds),
         "rounds must be between 2 and 5"
@@ -388,6 +399,10 @@ fn rss_peak() -> Option<u64> {
 }
 struct Monitor {
     done: Arc<AtomicBool>,
+    initial_setup_complete: Arc<AtomicBool>,
+    initial_setup_seconds: Arc<AtomicU64>,
+    started: Instant,
+    initial_deadline_exceeded: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     exceeded: Arc<AtomicBool>,
@@ -411,6 +426,14 @@ impl Monitor {
             .context("cannot measure benchmark filesystem space")?;
         let disk_floor_bytes = verdict::disk_floor(usage.total_bytes);
         let done = Arc::new(AtomicBool::new(false));
+        let initial_setup_complete = Arc::new(AtomicBool::new(false));
+        let initial_deadline_exceeded = Arc::new(AtomicBool::new(false));
+        let deadline_exceeded = initial_deadline_exceeded.clone();
+        let initial_setup_seconds = Arc::new(AtomicU64::new(0));
+        let (ready, startup_seconds) = (
+            initial_setup_complete.clone(),
+            initial_setup_seconds.clone(),
+        );
         let stop = Arc::new(AtomicBool::new(false));
         let exceeded = Arc::new(AtomicBool::new(false));
         let peak = Arc::new(AtomicU64::new(0));
@@ -440,6 +463,23 @@ impl Monitor {
                         s.store(true, Ordering::Relaxed);
                     }
                 }
+                if ready.load(Ordering::Relaxed) {
+                    let elapsed_ms = (start.elapsed().as_millis() as u64).max(1);
+                    if startup_seconds
+                        .compare_exchange(0, elapsed_ms, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        let milestone = json!({"local_setup_complete":true,"local_setup_wall_seconds":elapsed_ms as f64 / 1000.,"budget_seconds":quil_types::consensus::INITIAL_STORAGE_SETUP_BUDGET_SECS,"global_inclusion":"reserved separately in assessment; not submitted"});
+                        let temporary = path.join("initial-setup.json.tmp");
+                        if std::fs::write(&temporary, milestone.to_string()).is_ok() {
+                            let _ = std::fs::rename(temporary, path.join("initial-setup.json"));
+                        }
+                    }
+                } else if verdict::initial_setup_expired(start.elapsed(), false) {
+                    deadline_exceeded.store(true, Ordering::Relaxed);
+                    x.store(true, Ordering::Relaxed);
+                    s.store(true, Ordering::Relaxed);
+                }
                 if start.elapsed() > timeout {
                     x.store(true, Ordering::Relaxed);
                     s.store(true, Ordering::Relaxed);
@@ -449,6 +489,10 @@ impl Monitor {
         });
         Ok(Self {
             done,
+            initial_setup_complete,
+            initial_setup_seconds,
+            started: start,
+            initial_deadline_exceeded,
             join: Some(join),
             stop,
             exceeded,
@@ -461,7 +505,7 @@ impl Monitor {
         })
     }
     fn sample(&self) -> Value {
-        json!({"effective_memory_limit_bytes":self.memory_limit,"storage_rss_budget_bytes":self.memory_budget,"peak_process_rss_bytes":self.peak.load(Ordering::Relaxed),
+        json!({"initial_setup_complete":self.initial_setup_complete.load(Ordering::Relaxed),"initial_setup_wall_seconds":if self.initial_setup_seconds.load(Ordering::Relaxed)>0 {self.initial_setup_seconds.load(Ordering::Relaxed) as f64 / 1000.} else {self.started.elapsed().as_secs_f64()},"initial_setup_deadline_exceeded":self.initial_deadline_exceeded.load(Ordering::Relaxed),"initial_setup_budget_seconds":quil_types::consensus::INITIAL_STORAGE_SETUP_BUDGET_SECS,"effective_memory_limit_bytes":self.memory_limit,"storage_rss_budget_bytes":self.memory_budget,"peak_process_rss_bytes":self.peak.load(Ordering::Relaxed),
         "filesystem_free_floor_bytes":self.disk_floor_bytes,"filesystem_max_used_percent":99.9,"filesystem_free_before_bytes":self.initial_free,"filesystem_minimum_free_bytes":self.min_free.load(Ordering::Relaxed),"filesystem_free_space_delta_peak_bytes":self.initial_free.saturating_sub(self.min_free.load(Ordering::Relaxed)),"budget_exceeded":self.exceeded.load(Ordering::Relaxed)})
     }
 }
@@ -514,7 +558,7 @@ pub async fn run(args: &Arguments) -> anyhow::Result<ExitCode> {
         "started_at":chrono::Utc::now().to_rfc3339(),"build":{"version":quil_config::display_version(),"optimized":!cfg!(debug_assertions),"arch":std::env::consts::ARCH,"os":std::env::consts::OS},
         "available_cpus":std::thread::available_parallelism().map(|n|n.get()).unwrap_or(1),"rounds_requested":args.benchmark_storage_rounds,"settlement_frames_requested":args.benchmark_storage_frames,
         "headroom_multiplier":args.benchmark_storage_headroom,"input_mode":"download_actual_authenticated_mainnet_snapshots","cache_condition":"OS page cache is not globally cleared; all rounds force full input reads and fresh replica outputs",
-        "measurements":[],"phase":"starting"});
+        "experimental_profile":args.benchmark_storage_layers != 11,"initial_setup_budget_seconds":quil_types::consensus::INITIAL_STORAGE_SETUP_BUDGET_SECS,"seal_profile_layers":args.benchmark_storage_layers as usize,"measurements":[],"phase":"starting"});
     save(&artifact, &report)?;
     let outcome = run_inner(
         args,
@@ -534,7 +578,13 @@ pub async fn run(args: &Arguments) -> anyhow::Result<ExitCode> {
         } else {
             "incomplete"
         });
-        report["error"] = json!(format!("{error:#}"));
+        report["error"] = json!(
+            if monitor.initial_deadline_exceeded.load(Ordering::Relaxed) {
+                format!("initial local setup exceeded 7200 seconds: {error:#}")
+            } else {
+                format!("{error:#}")
+            }
+        );
     }
     if monitor.exceeded.load(Ordering::Relaxed) && report["verdict"] == "go_for_checkpoint" {
         report["verdict"] = json!("no_go");
@@ -710,7 +760,12 @@ async fn run_inner(
         Ok::<_,anyhow::Error>((dataset,record))
     })).buffer_unordered(quil_engine::storage_jobs::job_slots());
     futures::pin_mut!(downloads);
-    while let Some(result) = downloads.next().await {
+    while let Some(result) = tokio::select! {
+        result = downloads.next() => result,
+        _ = async {
+            while !monitor.stop.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_millis(100)).await; }
+        } => anyhow::bail!("benchmark resource/time limit reached while downloading authenticated inputs"),
+    } {
         let (dataset, record) = result?;
         records.push(record);
         report["snapshots"] = json!(&records);
@@ -725,7 +780,17 @@ async fn run_inner(
     let member = quil_execution::global_intrinsic::materialize::prover_address_from_pubkey(
         signer.public_key(),
     )?;
+    let profile = quil_types::consensus::StorageSealProfile::from_layers(
+        args.benchmark_storage_layers as usize,
+    )
+    .context("unsupported seal profile")?;
+    report["seal_profile_layers"] = json!(profile.layers());
+    report["experimental_profile"] =
+        json!(profile != quil_types::consensus::StorageSealProfile::Eleven);
     let options = BenchmarkOptions {
+        profile,
+        initial_setup_complete: monitor.initial_setup_complete.clone(),
+        regeneration_probe: Arc::new(AtomicBool::new(args.benchmark_storage_regeneration_probe)),
         directory: root.join("storage"),
         member,
         beacon: quil_crypto::porep::derive_storage_beacon(header.frame_number, &header.output),

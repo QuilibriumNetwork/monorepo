@@ -54,10 +54,12 @@ impl CapacityMessage {
         .concat()
     }
     pub fn envelope(&self) -> StorageEpochProof {
-        let mut bytes = if self.proof.is_empty() {
-            b"PSC1".to_vec()
-        } else {
-            b"PSC2".to_vec()
+        let profiled = self.certificate.profile != sector::Profile::Eleven;
+        let mut bytes = match (profiled, self.proof.is_empty()) {
+            (false, true) => b"PSC1".to_vec(),
+            (false, false) => b"PSC2".to_vec(),
+            (true, true) => b"PSC3".to_vec(),
+            (true, false) => b"PSC4".to_vec(),
         };
         bytes.extend_from_slice(&self.signed_at.to_be_bytes());
         bytes.extend_from_slice(&self.certificate.to_bytes());
@@ -90,12 +92,22 @@ impl CapacityMessage {
         }
         let mut bytes = outer.proof.as_slice();
         let magic = take(&mut bytes, 4)?;
-        if magic != b"PSC1" && magic != b"PSC2" {
+        if ![b"PSC1".as_slice(), b"PSC2", b"PSC3", b"PSC4"].contains(&magic) {
             return Err("capacity proof version".into());
         }
         let signed_at = u64::from_be_bytes(take(&mut bytes, 8)?.try_into().unwrap());
-        let certificate = sector::Certificate::parse(take(&mut bytes, sector::Certificate::BYTES)?)
+        let profiled = magic == b"PSC3" || magic == b"PSC4";
+        let precommit = magic == b"PSC1" || magic == b"PSC3";
+        let length = if profiled {
+            sector::Certificate::PROFILED_BYTES
+        } else {
+            sector::Certificate::BYTES
+        };
+        let certificate = sector::Certificate::parse(take(&mut bytes, length)?)
             .ok_or("invalid capacity certificate")?;
+        if profiled == (certificate.profile == sector::Profile::Eleven) {
+            return Err("capacity suite encoding".into());
+        }
         let payload = read_lp(&mut bytes)?.to_vec();
         if payload.is_empty() {
             return Err("empty capacity payload".into());
@@ -109,21 +121,18 @@ impl CapacityMessage {
             epoch,
             certificate,
             signed_at,
-            signature: if magic == b"PSC1" {
+            signature: if precommit {
                 payload.clone()
             } else {
                 Vec::new()
             },
-            proof: if magic == b"PSC2" {
-                payload
-            } else {
-                Vec::new()
-            },
+            proof: if !precommit { payload } else { Vec::new() },
         })
     }
     /// The initial certificate proves zero data under a fixed sector identity.
     pub fn root(&self) -> sector::Registration {
         sector::Registration {
+            profile: self.certificate.profile,
             data: quil_crypto::storage_proof::zero_commitment(
                 quil_crypto::storage_proof::Tree::Data,
                 self.certificate.n,
@@ -200,6 +209,13 @@ pub fn check_capacity(
         } else {
             Err(invalid("sector certificate changed".into()))
         };
+    }
+    if message.certificate.profile != sector::Profile::Eleven
+        && message.certificate.profile != quil_types::consensus::storage_seal_profile(message.epoch)
+    {
+        return Err(invalid(
+            "sector proof profile is not activated for this epoch".into(),
+        ));
     }
     let floor = quil_types::consensus::min_sector_nodes();
     if message.certificate.n < floor {
@@ -297,4 +313,50 @@ pub fn check_capacity(
         },
         count,
     ])
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    #[test]
+    fn capacity_envelopes_bind_profiles_without_changing_legacy_formats() {
+        for profile in [
+            sector::Profile::Eleven,
+            sector::Profile::Two,
+            sector::Profile::Three,
+        ] {
+            for has_proof in [false, true] {
+                let message = CapacityMessage {
+                    member: [8; 32],
+                    epoch: 1500,
+                    certificate: sector::Certificate {
+                        profile,
+                        n: 32,
+                        sector: [5; 32],
+                        columns: [0; 32],
+                        labels: [0; 32],
+                    },
+                    signed_at: 77,
+                    signature: vec![3; 8],
+                    proof: if has_proof { vec![4; 8] } else { vec![] },
+                };
+                let envelope = message.envelope();
+                let decoded = CapacityMessage::decode(&envelope).unwrap();
+                assert_eq!(decoded.certificate, message.certificate);
+                assert_eq!(decoded.root().profile, profile);
+                let expected: &[u8] = match (profile == sector::Profile::Eleven, has_proof) {
+                    (true, false) => b"PSC1",
+                    (true, true) => b"PSC2",
+                    (false, false) => b"PSC3",
+                    (false, true) => b"PSC4",
+                };
+                assert_eq!(&envelope.proof[..4], expected);
+                let mut corrupt = envelope.clone();
+                corrupt.proof[..4].copy_from_slice(if has_proof { b"PSC2" } else { b"PSC1" });
+                if profile != sector::Profile::Eleven {
+                    assert!(CapacityMessage::decode(&corrupt).is_err());
+                }
+            }
+        }
+    }
 }

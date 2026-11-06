@@ -9,10 +9,11 @@ use sha3::{Digest as _, Sha3_256};
 pub const ROOT_BYTES: usize = 164;
 pub const MAX_SECTOR_NODES: u64 = 1 << 26;
 pub const CHALLENGES: usize = 64;
-const TAG: &[u8; 4] = b"PS01";
+pub use quil_types::consensus::StorageSealProfile as Profile;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Registration {
+    pub profile: Profile,
     pub data: Node,
     pub labels: Node,
     pub replica: Node,
@@ -25,22 +26,24 @@ impl Registration {
             self.data.as_slice(),
             &self.labels,
             &self.replica,
-            TAG,
+            self.profile.tag(),
             &self.sector,
             &self.columns,
         ]
         .concat()
     }
     pub fn parse(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != ROOT_BYTES || &bytes[96..100] != TAG {
+        if bytes.len() != ROOT_BYTES {
             return None;
         }
+        let profile = Profile::from_tag(&bytes[96..100])?;
         let node = |at| {
             let n: Node = bytes.get(at..at + 32)?.try_into().ok()?;
             let _ = hash::from_bytes(&n)?;
             Some(n)
         };
         Some(Self {
+            profile,
             data: node(0)?,
             labels: node(32)?,
             replica: node(64)?,
@@ -57,6 +60,7 @@ impl Registration {
     }
     pub fn certificate(&self, n: u64) -> Certificate {
         Certificate {
+            profile: self.profile,
             sector: self.sector,
             n,
             columns: self.columns,
@@ -67,6 +71,7 @@ impl Registration {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Certificate {
+    pub profile: Profile,
     pub sector: [u8; 32],
     pub n: u64,
     pub columns: Node,
@@ -74,6 +79,10 @@ pub struct Certificate {
 }
 impl Certificate {
     pub const BYTES: usize = 104;
+    pub const PROFILED_BYTES: usize = 108;
+    pub fn params(&self) -> crate::sdr::SdrParams {
+        crate::sdr::SdrParams::for_profile(self.profile)
+    }
     pub fn valid(&self) -> bool {
         self.n >= 2
             && self.n <= MAX_SECTOR_NODES
@@ -82,19 +91,33 @@ impl Certificate {
             && hash::from_bytes(&self.labels).is_some()
     }
     pub fn to_bytes(&self) -> Vec<u8> {
-        [
+        let base = [
             self.sector.as_slice(),
             &self.n.to_be_bytes(),
             &self.columns,
             &self.labels,
         ]
-        .concat()
+        .concat();
+        if self.profile == Profile::Eleven {
+            base
+        } else {
+            [self.profile.tag().as_slice(), &base].concat()
+        }
     }
     pub fn parse(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != Self::BYTES {
-            return None;
-        }
+        let (profile, bytes) = match bytes.len() {
+            Self::BYTES => (Profile::Eleven, bytes),
+            Self::PROFILED_BYTES => {
+                let profile = Profile::from_tag(&bytes[..4])?;
+                if profile == Profile::Eleven {
+                    return None;
+                }
+                (profile, &bytes[4..])
+            }
+            _ => return None,
+        };
         let cert = Self {
+            profile,
             sector: bytes[..32].try_into().ok()?,
             n: u64::from_be_bytes(bytes[32..40].try_into().ok()?),
             columns: bytes[40..72].try_into().ok()?,
@@ -384,6 +407,7 @@ mod tests {
             assert!(!padded_nodes_allowed(1, n));
         }
         let root = Registration {
+            profile: Profile::Eleven,
             data: [0; 32],
             labels: [0; 32],
             replica: [0; 32],
@@ -432,6 +456,7 @@ mod tests {
             let mut data_bytes = proof::data_nodes(data);
             data_bytes.resize(n as usize * 32, 0);
             let root = Registration {
+                profile: Profile::Eleven,
                 data: encoded.comm_d,
                 labels: labels.commitment(Tree::Replica),
                 replica: encoded.comm_r,
@@ -517,5 +542,46 @@ mod tests {
             }
             previous = Some(plain);
         }
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    #[test]
+    fn profile_encodings_are_canonical_and_legacy_bytes_remain_unchanged() {
+        let base = Certificate {
+            profile: Profile::Eleven,
+            sector: [7; 32],
+            n: 32,
+            columns: [0; 32],
+            labels: [0; 32],
+        };
+        let old = [&[7u8; 32][..], &32u64.to_be_bytes(), &[0u8; 64]].concat();
+        assert_eq!(base.to_bytes(), old);
+        for profile in [Profile::Eleven, Profile::Two, Profile::Three] {
+            let cert = Certificate { profile, ..base };
+            assert_eq!(Certificate::parse(&cert.to_bytes()), Some(cert));
+            let root = Registration {
+                profile,
+                data: [0; 32],
+                labels: cert.labels,
+                replica: [0; 32],
+                sector: cert.sector,
+                columns: cert.columns,
+            };
+            assert_eq!(Registration::parse(&root.to_bytes()), Some(root));
+            assert_eq!(root.certificate(32), cert);
+            assert_eq!(&root.to_bytes()[96..100], profile.tag());
+        }
+        let noncanonical = [Profile::Eleven.tag().as_slice(), &old].concat();
+        assert!(Certificate::parse(&noncanonical).is_none());
+        let unknown = [b"PS09".as_slice(), &old].concat();
+        assert!(Certificate::parse(&unknown).is_none());
+        let three = Certificate {
+            profile: Profile::Three,
+            ..base
+        };
+        assert_ne!(base, three);
     }
 }

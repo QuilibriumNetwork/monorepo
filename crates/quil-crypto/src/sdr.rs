@@ -51,6 +51,21 @@ impl Default for SdrParams {
     }
 }
 
+impl SdrParams {
+    pub fn for_profile(profile: quil_types::consensus::StorageSealProfile) -> Self {
+        Self {
+            layers: profile.layers(),
+            ..Self::default()
+        }
+    }
+    pub fn optimized(&self) -> bool {
+        self.drg_degree == 6
+            && self.expander_degree == 8
+            && self.node_bytes == 32
+            && matches!(self.layers, 2 | 3 | 11)
+    }
+}
+
 pub(crate) const DST_LABEL: &[u8] = b"quil/porep/sdr-label/v1";
 const DST_GRAPH: &[u8] = b"quil/porep/sdr-graph/v1";
 

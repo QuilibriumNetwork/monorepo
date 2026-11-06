@@ -121,6 +121,7 @@ pub fn measure_allocation(
         return Err(unavailable("empty benchmark allocation".into()));
     }
     let store = LabelStore::new(options.directory.join("labels"))
+        .for_profile(options.profile)
         .with_disk_floor(crate::storage_readiness::disk_floor);
     let coordinator = Coordinator::new(inputs.len(), options.stop.clone());
     let stable = quil_types::consensus::stable_replica_key_epoch_thread_override();

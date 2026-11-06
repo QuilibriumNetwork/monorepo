@@ -102,6 +102,21 @@ fn graph_until(key: GraphKey, stop: &dyn Fn() -> bool) -> Arc<Graph> {
     result
 }
 
+pub(crate) fn with_prepared_graph<R>(n: usize, work: impl FnOnce() -> R) -> (R, bool) {
+    let graph = graph_until(
+        GraphKey {
+            n,
+            drg: 6,
+            expander: 8,
+        },
+        &|| false,
+    );
+    let prepared = !matches!(graph.storage, GraphStorage::Derived);
+    let result = work();
+    drop(graph);
+    (result, prepared)
+}
+
 fn derive_rows(key: GraphKey, at: usize, count: usize) -> Vec<u32> {
     let width = key.drg + key.expander;
     let mut rows = vec![0; count * width];
@@ -205,6 +220,7 @@ impl Columns {
 }
 
 struct Request {
+    layers: usize,
     n: usize,
     key: Digest,
     sender: SyncSender<(usize, Arc<Vec<Digest>>)>,
@@ -222,6 +238,7 @@ impl Drop for Request {
 pub(crate) fn label(
     n: usize,
     key: Digest,
+    layers: usize,
     on_layer: &mut dyn FnMut(usize, &[Digest]),
     stop: &dyn Fn() -> bool,
 ) -> Option<(Vec<Digest>, Vec<Digest>)> {
@@ -254,6 +271,7 @@ pub(crate) fn label(
     let mut waiting = queue.lock().unwrap_or_else(|e| e.into_inner());
     let launch = waiting.is_empty();
     waiting.push(Request {
+        layers,
         n,
         key,
         sender,
@@ -264,7 +282,7 @@ pub(crate) fn label(
     if launch {
         launch_worker(queue);
     }
-    receive(n, receiver, on_layer, stop)
+    receive(n, layers, receiver, on_layer, stop)
 }
 
 /// Resume verified whole layers using the same bounded graph and columns as
@@ -272,13 +290,14 @@ pub(crate) fn label(
 pub(crate) fn label_resume(
     n: usize,
     key: Digest,
+    layers: usize,
     kept: usize,
     read_layer: &mut dyn FnMut(usize, &mut [Digest]) -> bool,
     on_layer: &mut dyn FnMut(usize, &[Digest]),
     stop: &dyn Fn() -> bool,
 ) -> Option<(Vec<Digest>, Vec<Digest>)> {
     if kept == 0 {
-        return label(n, key, on_layer, stop);
+        return label(n, key, layers, on_layer, stop);
     }
     if stop() {
         return None;
@@ -291,7 +310,7 @@ pub(crate) fn label_resume(
         }
         columns.update(&prev).ok()?;
     }
-    if kept == 11 {
+    if kept == layers {
         return Some((prev, columns.finish().ok()?));
     }
     let graph = graph_until(
@@ -303,7 +322,7 @@ pub(crate) fn label_resume(
         stop,
     );
     let mut cur = vec![hash::ZERO; n];
-    for layer in kept..11 {
+    for layer in kept..layers {
         for at in (0..n).step_by(BLOCK) {
             if stop() {
                 return None;
@@ -318,7 +337,10 @@ pub(crate) fn label_resume(
                     v as u64,
                     &mut row[..6].iter().map(|&p| cur[p as usize]),
                     &mut row[6..].iter().map(|&p| prev[p as usize]),
-                    &sdr::SdrParams::default(),
+                    &sdr::SdrParams {
+                        layers,
+                        ..sdr::SdrParams::default()
+                    },
                 );
             }
         }
@@ -342,7 +364,7 @@ fn launch_worker(queue: &'static Mutex<Vec<Request>>) {
         let mut index = 0;
         while index < waiting.len() && requests.len() < hash::packing_width() {
             let other = waiting[index].n;
-            if n.max(other) - n.min(other) <= n.min(other) / 8 {
+            if waiting[index].layers == requests[0].layers && n.max(other) - n.min(other) <= n.min(other) / 8 {
                 requests.push(waiting.remove(index));
             } else { index += 1; }
         }
@@ -362,6 +384,7 @@ fn launch_worker(queue: &'static Mutex<Vec<Request>>) {
 
 fn receive(
     n: usize,
+    layers: usize,
     receiver: Receiver<(usize, Arc<Vec<Digest>>)>,
     on_layer: &mut dyn FnMut(usize, &[Digest]),
     stop: &dyn Fn() -> bool,
@@ -372,16 +395,16 @@ fn receive(
             return None;
         }
         match receiver.recv_timeout(Duration::from_millis(10)) {
-            Ok((layer, nodes)) if layer < 11 => {
+            Ok((layer, nodes)) if layer < layers => {
                 if nodes.len() != n {
                     return None;
                 }
                 on_layer(layer, &nodes);
-                if layer == 10 {
+                if layer + 1 == layers {
                     last = Some(nodes);
                 }
             }
-            Ok((11, columns)) if columns.len() == n => {
+            Ok((layer, columns)) if layer == layers && columns.len() == n => {
                 let last = Arc::try_unwrap(last?).unwrap_or_else(|nodes| (*nodes).clone());
                 let columns = Arc::try_unwrap(columns).unwrap_or_else(|nodes| (*nodes).clone());
                 return Some((last, columns));
@@ -393,6 +416,8 @@ fn receive(
 }
 
 fn compute(requests: &[Request]) -> std::io::Result<()> {
+    let layers = requests[0].layers;
+    debug_assert!(requests.iter().all(|request| request.layers == layers));
     let n = requests.iter().map(|r| r.n).max().unwrap_or(0);
     if requests.iter().all(|r| r.cancelled.load(Ordering::Relaxed)) {
         return Ok(());
@@ -429,7 +454,7 @@ fn compute(requests: &[Request]) -> std::io::Result<()> {
         .map(|r| Arc::new(vec![hash::ZERO; r.n]))
         .collect();
     let mut cur: Vec<Vec<Digest>> = requests.iter().map(|r| vec![hash::ZERO; r.n]).collect();
-    for layer in 0..11 {
+    for layer in 0..layers {
         for at in (0..n).step_by(BLOCK) {
             release_cancelled(
                 requests,
@@ -540,7 +565,7 @@ fn compute(requests: &[Request]) -> std::io::Result<()> {
     drop(graphs);
     for (request, columns) in requests.iter().zip(columns) {
         if !request.cancelled.load(Ordering::Relaxed) {
-            let _ = request.sender.send((11, Arc::new(columns.finish()?)));
+            let _ = request.sender.send((layers, Arc::new(columns.finish()?)));
         } else {
             drop(columns);
         }
@@ -569,6 +594,7 @@ fn release_cancelled(
 }
 
 fn compute_scalar(request: &Request) -> std::io::Result<()> {
+    let layers = request.layers;
     let graph = graph_until(
         GraphKey {
             n: request.n,
@@ -580,7 +606,7 @@ fn compute_scalar(request: &Request) -> std::io::Result<()> {
     let mut columns = Columns::new(request.n);
     let mut prev = Arc::new(vec![hash::ZERO; request.n]);
     let mut cur = vec![hash::ZERO; request.n];
-    for layer in 0..11 {
+    for layer in 0..layers {
         for at in (0..request.n).step_by(BLOCK) {
             if request.cancelled.load(Ordering::Relaxed) {
                 return Ok(());
@@ -595,7 +621,10 @@ fn compute_scalar(request: &Request) -> std::io::Result<()> {
                     v as u64,
                     &mut row[..6].iter().map(|&p| cur[p as usize]),
                     &mut row[6..].iter().map(|&p| prev[p as usize]),
-                    &sdr::SdrParams::default(),
+                    &sdr::SdrParams {
+                        layers,
+                        ..sdr::SdrParams::default()
+                    },
                 );
             }
         }
@@ -609,7 +638,7 @@ fn compute_scalar(request: &Request) -> std::io::Result<()> {
     }
     drop(prev);
     drop(cur);
-    let _ = request.sender.send((11, Arc::new(columns.finish()?)));
+    let _ = request.sender.send((layers, Arc::new(columns.finish()?)));
     Ok(())
 }
 

@@ -68,18 +68,20 @@ impl Sector {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(io(e)),
         };
-        if bytes.len() != sector::Certificate::BYTES + 1 {
+        if bytes.len() != sector::Certificate::BYTES + 1
+            && bytes.len() != sector::Certificate::PROFILED_BYTES + 1
+        {
             return Err(unavailable("sector metadata length".into()));
         }
-        let cert = sector::Certificate::parse(&bytes[..sector::Certificate::BYTES])
+        let cert = sector::Certificate::parse(&bytes[..bytes.len() - 1])
             .ok_or_else(|| unavailable("sector metadata is invalid".into()))?;
-        if bytes[sector::Certificate::BYTES] > 1 {
+        if bytes[bytes.len() - 1] > 1 {
             return Err(unavailable("sector certification flag".into()));
         }
         Ok(Some(Self {
             dir,
             cert,
-            certified: bytes[sector::Certificate::BYTES] == 1,
+            certified: bytes[bytes.len() - 1] == 1,
         }))
     }
     fn save(&self) -> Result<()> {
@@ -156,6 +158,7 @@ fn try_reserve(
     epoch: u64,
     exact: u64,
 ) -> Result<Option<(PathBuf, [u8; 32], u64)>> {
+    let profile = quil_types::consensus::storage_seal_profile(epoch);
     let root = home(store, member);
     fs::create_dir_all(&root).map_err(io)?;
     let lock = File::open(&root).map_err(io)?;
@@ -181,7 +184,7 @@ fn try_reserve(
         let dir = root.join(hex::encode(id));
         if Sector::load(dir.clone())?.is_none() {
             if let Ok(bytes) = fs::read(dir.join("reservation")) {
-                if bytes.len() == 48 && bytes[16..] == leaf_hash {
+                if (bytes.len() == 48 || bytes.len() == 52) && bytes[16..48] == leaf_hash {
                     let n = u64::from_be_bytes(bytes[..8].try_into().unwrap());
                     if sector::padded_nodes_allowed(exact, n) {
                         atomic(&dir.join(format!("lease-{epoch}")), &leaf_hash)?;
@@ -259,6 +262,9 @@ fn try_reserve(
     seed.extend_from_slice(leaf);
     seed.extend_from_slice(&epoch.to_be_bytes());
     seed.extend_from_slice(&n.to_be_bytes());
+    if profile != sector::Profile::Eleven {
+        seed.extend_from_slice(profile.tag());
+    }
     let id = digest(&seed);
     let dir = root.join(hex::encode(id));
     // Publish the directory only after its recovery metadata is durable.
@@ -271,7 +277,17 @@ fn try_reserve(
     fs::create_dir_all(&staged).map_err(io)?;
     atomic(
         &staged.join("reservation"),
-        &[n.to_be_bytes().as_slice(), &epoch.to_be_bytes(), &leaf_hash].concat(),
+        &[
+            n.to_be_bytes().as_slice(),
+            &epoch.to_be_bytes(),
+            &leaf_hash,
+            if profile == sector::Profile::Eleven {
+                &[]
+            } else {
+                profile.tag().as_slice()
+            },
+        ]
+        .concat(),
     )?;
     fs::rename(&staged, &dir).map_err(io)?;
     File::open(&root).and_then(|f| f.sync_all()).map_err(io)?;
@@ -290,6 +306,16 @@ fn initialize(
     n: u64,
     stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<Sector> {
+    let reservation = fs::read(dir.join("reservation")).map_err(io)?;
+    let profile = match reservation.len() {
+        48 => sector::Profile::Eleven,
+        52 => sector::Profile::from_tag(&reservation[48..])
+            .ok_or_else(|| unavailable("sector reservation profile".into()))?,
+        _ => return Err(unavailable("sector reservation length".into())),
+    };
+    let view = store.for_profile(profile);
+    let store = &view;
+    let params = store.params();
     let guard = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -316,7 +342,7 @@ fn initialize(
             let admitted = store
                 .admit(epoch, member, &id, n, Stage::Snapshot)
                 .ok_or_else(|| unavailable("no disk space to certify a new sector".into()))?;
-            match admitted.label_kept(&quil_crypto::sdr::SdrParams::default(), stop, &|_| {})? {
+            match admitted.label_kept(params, stop, &|_| {})? {
                 Labelling::Labelled(labelled) if labelled.kept => (labelled.last, labelled.comm_c),
                 _ => {
                     return Err(unavailable(
@@ -328,6 +354,7 @@ fn initialize(
     };
     let cap = MerkleCap::from_digests(&last, proof::seal_cap_height(n));
     let cert = sector::Certificate {
+        profile,
         sector: id,
         n,
         columns,
@@ -349,6 +376,7 @@ fn initialize(
     let sector = Sector {
         dir,
         cert: sector::Certificate {
+            profile,
             sector: id,
             n,
             columns,
@@ -408,6 +436,7 @@ pub(super) fn encode_leaf(
     let encoded = proof::encode_with_labels(&data, n, &last, sector.cert.labels)
         .map_err(QuilError::InvalidArgument)?;
     let root = sector::Registration {
+        profile: sector.cert.profile,
         data: encoded.comm_d,
         labels: sector.cert.labels,
         replica: encoded.comm_r,
@@ -728,7 +757,7 @@ fn resume_reserved_sector(
     dir: PathBuf,
 ) -> Result<()> {
     let bytes = fs::read(dir.join("reservation")).map_err(io)?;
-    if bytes.len() != 48 {
+    if bytes.len() != 48 && bytes.len() != 52 {
         return Err(unavailable("sector reservation length".into()));
     }
     let n = u64::from_be_bytes(bytes[..8].try_into().unwrap());
@@ -844,7 +873,9 @@ pub(crate) fn poll_sector_certificates(
                 sector.certified = true;
                 sector.save()?;
             }
-            store.release_certified_sector(cache_epoch, member, &sector.cert.sector);
+            store
+                .for_profile(sector.cert.profile)
+                .release_certified_sector(cache_epoch, member, &sector.cert.sector);
             continue;
         }
         // A disk flag is only a hint. Authority always comes from GLOBAL.
@@ -912,7 +943,7 @@ pub(crate) fn poll_sector_certificates(
         let cache = sector.dir.join(format!("proof-{target}-{beacon_frame}"));
         // Refresh temporary layers while needed, but a durable proof can be
         // retransmitted after pressure eviction without regenerating them.
-        let kept = store.find(
+        let kept = store.for_profile(sector.cert.profile).find(
             cache_epoch.max(current.saturating_add(1)),
             member,
             &sector.cert.sector,
@@ -936,11 +967,8 @@ pub(crate) fn poll_sector_certificates(
                             unavailable("sector proof cache and temporary layers are absent".into())
                         })?;
                         let _memory = crate::storage_jobs::reserve(
-                            proof::labelling_peak_bytes(
-                                sector.cert.n,
-                                &quil_crypto::sdr::SdrParams::default(),
-                            )
-                            .saturating_add(400 << 20),
+                            proof::labelling_peak_bytes(sector.cert.n, &sector.cert.params())
+                                .saturating_add(400 << 20),
                         );
                         let message = protocol::CapacityMessage {
                             member,
@@ -971,7 +999,7 @@ pub(crate) fn poll_sector_certificates(
                         let plain = proof::prove_seal_with_labels(
                             &last,
                             &statement,
-                            &quil_crypto::sdr::SdrParams::default(),
+                            &sector.cert.params(),
                             sector::CHALLENGES,
                             &kept,
                         )
@@ -1676,6 +1704,7 @@ mod tests {
             drop(last);
             drop(data);
             let root = sector::Registration {
+                profile: quil_types::consensus::StorageSealProfile::Eleven,
                 data: encoded.comm_d,
                 labels: acknowledged.cert.labels,
                 replica: encoded.comm_r,

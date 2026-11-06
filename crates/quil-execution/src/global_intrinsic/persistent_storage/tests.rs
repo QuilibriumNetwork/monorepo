@@ -23,9 +23,20 @@ fn fixture(
     proof::SealProof,
     Vec<u8>,
 ) {
+    fixture_for_profile(member, sector::Profile::Eleven)
+}
+fn fixture_for_profile(
+    member: [u8; 32],
+    profile: sector::Profile,
+) -> (
+    sector::Registration,
+    proof::SealProof,
+    proof::SealProof,
+    Vec<u8>,
+) {
     let n = 32;
     let id = [5; 32];
-    let params = quil_crypto::sdr::SdrParams::default();
+    let params = quil_crypto::sdr::SdrParams::for_profile(profile);
     let (last, columns) = proof::label_leaf(
         n,
         &quil_crypto::sdr::stable_replica_key(&member, &id),
@@ -43,6 +54,7 @@ fn fixture(
     )
     .unwrap();
     let root = sector::Registration {
+        profile,
         data: encoded.comm_d,
         labels: labels.commitment(proof::Tree::Replica),
         replica: encoded.comm_r,
@@ -347,6 +359,7 @@ fn confirm_root_codec_and_semantics_switch_only_at_coordinated_epoch() {
     gates(true);
     quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(1314));
     let root = sector::Registration {
+        profile: quil_types::consensus::StorageSealProfile::Eleven,
         data: [0; 32],
         labels: [0; 32],
         replica: [0; 32],
@@ -459,6 +472,7 @@ fn precommit_for(member: [u8; 32], id: [u8; 32], n: u64, frame: u64) -> Capacity
         member,
         epoch: 1500,
         certificate: sector::Certificate {
+            profile: quil_types::consensus::StorageSealProfile::Eleven,
             sector: id,
             n,
             columns: [0; 32],
@@ -863,6 +877,7 @@ fn labelled_sector(member: &[u8; 32], id: [u8; 32], n: u64) -> (sector::Certific
     let columns = proof::MerkleCap::from_digests(&columns, height).commitment(proof::Tree::Column);
     (
         sector::Certificate {
+            profile: quil_types::consensus::StorageSealProfile::Eleven,
             sector: id,
             n,
             columns,
@@ -1022,4 +1037,48 @@ fn capacity_certificate_floor_is_useful() {
         outcome.is_err() && held.is_none(),
         "no capacity floor: a sector of n=2 nodes was certified, outcome {outcome:?}"
     );
+}
+
+#[test]
+fn new_profiles_are_gated_and_known_legacy_capacity_survives_profile_changes() {
+    gates(true);
+    let member = [13; 32];
+    for profile in [sector::Profile::Two, sector::Profile::Three] {
+        let (root, fresh, plain, _) = fixture_for_profile(member, profile);
+        let claim = claim(member, root);
+        let certificate =
+            prove_certificate(&member, b"leaf", 1500, 32, &root, b"beacon", &plain).unwrap();
+        let witness = SeatWitness {
+            certificates: vec![certificate],
+            seals: vec![fresh],
+            opened: vec![],
+        };
+        let bytes = prove(&claim, &[witness]).unwrap();
+        assert!(verify(&claim, &bytes, &|_| Ok(None))
+            .unwrap_err()
+            .contains("not activated"));
+        quil_types::consensus::set_storage_seal_profile_for_thread(Some(profile));
+        assert_eq!(
+            verify(&claim, &bytes, &|_| Ok(None)).unwrap(),
+            vec![root.certificate(32)]
+        );
+        quil_types::consensus::set_storage_seal_profile_for_thread(None);
+    }
+    let (root, fresh, _, _) = fixture(member);
+    let claim = claim(member, root);
+    let bytes = prove(
+        &claim,
+        &[SeatWitness {
+            certificates: vec![vec![]],
+            seals: vec![fresh],
+            opened: vec![],
+        }],
+    )
+    .unwrap();
+    quil_types::consensus::set_storage_seal_profile_for_thread(Some(sector::Profile::Three));
+    assert!(verify(&claim, &bytes, &|_| Ok(Some(root.certificate(32))))
+        .unwrap()
+        .is_empty());
+    quil_types::consensus::set_storage_seal_profile_for_thread(None);
+    gates(false);
 }

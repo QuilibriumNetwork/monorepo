@@ -676,7 +676,7 @@ pub fn data_node_count(bytes: u64) -> u64 {
 /// column accumulator. Graph tables are shared or disk-backed; callbacks
 /// borrow immutable layers without retaining an extra complete copy.
 pub fn label_working_bytes(n: u64, params: &SdrParams) -> u64 {
-    if params.drg_degree == 6 && params.expander_degree == 8 && params.layers == 11 {
+    if params.optimized() {
         n.saturating_mul((3 * NODE_BYTES) as u64)
             .saturating_add(n.saturating_mul(56).min(8 << 20))
             .saturating_add(4 << 20)
@@ -697,7 +697,7 @@ pub fn encoding_with_labels_bytes(n: u64) -> u64 {
 /// original in-memory graph implementation.
 pub fn labelling_peak_bytes(n: u64, params: &SdrParams) -> u64 {
     let parents = 4 * (params.drg_degree.max(1) + params.expander_degree);
-    if params.drg_degree == 6 && params.expander_degree == 8 && params.layers == 11 {
+    if params.optimized() {
         // Includes encoding buffers and the compatible dense proof fallback.
         // Large graph tables and column accumulators use scratch storage.
         n.saturating_mul((6 * NODE_BYTES) as u64)
@@ -710,7 +710,7 @@ pub fn labelling_peak_bytes(n: u64, params: &SdrParams) -> u64 {
 /// Bytes [`label_leaf`] holds at its peak, including its bounded graph and
 /// column scratch. Excludes the data, replica and trees used for encoding.
 pub fn label_leaf_peak_bytes(n: u64, params: &SdrParams) -> u64 {
-    if params.drg_degree == 6 && params.expander_degree == 8 && params.layers == 11 {
+    if params.optimized() {
         label_working_bytes(n, params)
     } else {
         let parents = 4 * (params.drg_degree.max(1) + params.expander_degree);
@@ -783,6 +783,20 @@ pub fn label_leaf(
     label_leaf_until(n, key, params, on_layer, &|| false).expect("labelling that never stops ends")
 }
 
+/// Run a regeneration probe with the public, key-independent graph prepared
+/// outside its timer. The boolean says whether scratch preparation succeeded.
+pub fn with_prepared_label_graph<R>(
+    n: u64,
+    params: &SdrParams,
+    work: impl FnOnce() -> R,
+) -> (R, bool) {
+    if params.optimized() {
+        crate::storage_labels_compute::with_prepared_graph(n as usize, work)
+    } else {
+        (work(), false)
+    }
+}
+
 /// [`label_leaf`], given up (`None`) once `stop` says so: for work that
 /// must give its memory back to other work. The standard worker polls while
 /// waiting and between layer callbacks; scalar labelling checks every
@@ -825,10 +839,11 @@ pub fn label_leaf_resume(
         params.layers
     );
     let n = n as usize;
-    if params.drg_degree == 6 && params.expander_degree == 8 && params.layers == 11 {
+    if params.optimized() {
         return crate::storage_labels_compute::label_resume(
             n,
             hash::key_digest(key),
+            params.layers,
             kept,
             read_layer,
             on_layer,
@@ -1674,3 +1689,73 @@ pub fn attestation_root(
 #[cfg(test)]
 #[path = "storage_proof_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    #[test]
+    fn optimized_profiles_match_scalar_labels_and_resumed_columns() {
+        for layers in [2, 3, 11] {
+            let params = SdrParams {
+                layers,
+                ..Default::default()
+            };
+            let n = 64;
+            let key = [17u8; 32];
+            let mut expected_columns = vec![hash::ZERO; n];
+            let mut saved = Vec::new();
+            let expected_last =
+                label_layers(n, &hash::key_digest(&key), &params, &mut |_, nodes| {
+                    fold_layer(&mut expected_columns, nodes);
+                    saved.push(nodes.to_vec());
+                });
+            let (last, columns) = label_leaf(n as u64, &key, &params, &mut |_, _| {});
+            assert_eq!(last, expected_last);
+            assert_eq!(columns, expected_columns);
+            let (last, columns) = label_leaf_resume(
+                n as u64,
+                &key,
+                &params,
+                1,
+                &mut |layer, out| {
+                    out.copy_from_slice(&saved[layer]);
+                    true
+                },
+                &mut |layer, _| assert!(layer >= 1),
+                &|| false,
+            )
+            .unwrap();
+            assert_eq!(last, expected_last);
+            assert_eq!(columns, expected_columns);
+        }
+    }
+    #[test]
+    fn concurrent_requests_do_not_mix_two_and_three_layer_suites() {
+        let barrier = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = [2, 3, 11]
+                .into_iter()
+                .map(|layers| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let params = SdrParams {
+                            layers,
+                            ..Default::default()
+                        };
+                        barrier.wait();
+                        let result = label_leaf(64, &[9; 32], &params, &mut |_, _| {});
+                        (layers, result)
+                    })
+                })
+                .collect();
+            for worker in workers {
+                let (layers, result) = worker.join().unwrap();
+                let params = SdrParams {
+                    layers,
+                    ..Default::default()
+                };
+                assert_eq!(result, label_leaf(64, &[9; 32], &params, &mut |_, _| {}));
+            }
+        });
+    }
+}
