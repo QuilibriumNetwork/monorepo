@@ -706,6 +706,13 @@ struct CrowdRig {
 
 impl CrowdRig {
     fn new(n: usize) -> Self {
+        Self::with_frames(n, 3, 1)
+    }
+
+    /// As [`CrowdRig::new`], with each session's frames 1 to `last`, each
+    /// seal at `last` draining all of them, and GLOBAL having executed frames
+    /// 1 to `executed` (from frame 2 as in their lockstep windows).
+    fn with_frames(n: usize, last: u64, executed: u64) -> Self {
         let keys = keys();
         let sources: Vec<Session> = (0..n)
             .map(|i| session(&keys, vec![0x70 + i as u8; 32]))
@@ -720,7 +727,8 @@ impl CrowdRig {
         let mut frames = Vec::new();
         for source in &sources {
             let mut chain = vec![first_frame(source, &keys)];
-            for (number, view, parent_view) in [(2u64, 7u64, 5u64), (3, 9, 7)] {
+            for number in 2..=last {
+                let (view, parent_view) = (2 * number + 3, 2 * number + 1);
                 let previous = chain.last().unwrap().header.as_ref().unwrap();
                 let mut header = FrameHeader {
                     address: source.filter.clone(),
@@ -747,6 +755,22 @@ impl CrowdRig {
                     &fixture.state,
                 )
                 .unwrap();
+            if executed > 1 {
+                let tip = canonical(&chain[executed as usize - 1]);
+                handoff::record_session_tip(
+                    &fixture.state,
+                    3,
+                    &source.id().unwrap(),
+                    &Checkpoint {
+                        frame: executed,
+                        view: tip.rank,
+                        digest: quil_crypto::poseidon::hash_bytes_to_32(&tip.output).unwrap(),
+                        state_roots: [[0; 32]; 4],
+                        history_root: [0; 32],
+                    },
+                )
+                .unwrap();
+            }
             frames.push(chain);
         }
         commit(&fixture.state, 3);
@@ -774,15 +798,15 @@ impl CrowdRig {
             .zip(&frames)
             .zip(&requests)
             .map(|((source, chain), request)| {
-                let last = canonical(&chain[2]);
+                let sealed = canonical(&chain[last as usize - 1]);
                 let seal = Seal {
                     request: request.id().unwrap(),
                     session: source.id().unwrap(),
-                    view: 11,
+                    view: 2 * last + 5,
                     checkpoint: Checkpoint {
-                        frame: 3,
-                        view: 9,
-                        digest: quil_crypto::poseidon::hash_bytes_to_32(&last.output).unwrap(),
+                        frame: last,
+                        view: 2 * last + 3,
+                        digest: quil_crypto::poseidon::hash_bytes_to_32(&sealed.output).unwrap(),
                         state_roots: [[0; 32]; 4],
                         history_root: [0x66; 32],
                     },
@@ -790,10 +814,10 @@ impl CrowdRig {
                 CrowdSeal {
                     filter: source.filter.clone(),
                     submission: CertificateSubmission {
-                        certificate: sign(source, &keys, 11, 9, seal.digest()),
+                        certificate: sign(source, &keys, 2 * last + 5, 2 * last + 3, seal.digest()),
                         seal,
                     },
-                    drain: vec![canonical(&chain[0]), canonical(&chain[1]), last],
+                    drain: chain.iter().map(canonical).collect(),
                 }
             })
             .collect();
@@ -1031,6 +1055,7 @@ impl CrowdRig {
 
 impl Drop for CrowdRig {
     fn drop(&mut self) {
+        handoff::set_seal_recovery_frame_for_thread(None);
         handoff::set_seal_drain_frame_for_thread(None);
         handoff::set_presence_report_frame_for_thread(None);
     }
@@ -1228,6 +1253,49 @@ fn seal_crowding_fix_refused_copies_leave_the_mempool_in_the_proposal_that_tries
         rig.collector.total_pending(),
         members.len(),
         "FIX: the forged copies leave the mempool, the members' stay"
+    );
+}
+
+/// Members whose view of GLOBAL lags send the seal with a partial drain of
+/// frames GLOBAL already executed in their lockstep windows (mainnet,
+/// 2026-11-05: eight headers ending three below the checkpoint), which GLOBAL
+/// refuses. It reaches further than a copy without a drain, so a leader that
+/// chooses by reach before validating carries only it, and the seal misses
+/// the proposal with no forged copy anywhere.
+#[test]
+fn a_stale_partial_drain_does_not_crowd_out_a_valid_seal_copy() {
+    let rig = CrowdRig::with_frames(1, 11, 11);
+    handoff::set_seal_recovery_frame_for_thread(Some(CROWD_FRAME));
+    let valid = rig.member(0, 12, 10);
+    let stale = CrowdRig::bundle(
+        vec![CrowdRig::sealed(
+            &rig.seals[0].submission,
+            rig.seals[0].drain[..handoff::MAX_DRAIN_HEADERS]
+                .iter()
+                .map(|header| header.to_canonical_bytes().unwrap())
+                .collect(),
+        )],
+        11,
+    );
+    rig.check_setup(std::slice::from_ref(&valid), &[&stale]);
+    let refusal = rig.validate(&stale).unwrap_err().to_string();
+    assert!(
+        refusal.contains(handoff::superseded::PARTIAL_DRAIN_EXECUTED),
+        "SETUP: GLOBAL must refuse the stale copy as already executed: {refusal}"
+    );
+    for copy in [&valid, &stale] {
+        assert!(rig.collector.add_message(1, copy.clone()));
+    }
+    let proposal = rig.propose(1);
+    assert!(
+        !proposal.contains(&stale),
+        "UNEXPECTED: the stale copy rode"
+    );
+    assert!(
+        proposal.contains(&valid),
+        "CROWDED: GLOBAL frame {CROWD_FRAME}'s proposal carries no copy of the seal: \
+         the leader chose a lagging member's stale partial drain over the valid copy \
+         without a drain, validation refused it and the valid copy stayed back"
     );
 }
 
