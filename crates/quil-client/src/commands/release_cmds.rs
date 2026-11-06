@@ -2,9 +2,10 @@
 //!
 //! Port of `client/cmd/update.go` + `client/cmd/download-signatures.go`.
 //! Download the qclient release + its signatory signatures, verify the
-//! quorum, install to `/var/quilibrium/bin/qclient/{version}`, and symlink
-//! `/usr/local/bin/qclient`. (Install paths require root.) Nothing reaches
-//! the install path before it verifies.
+//! quorum, install to `<root>/bin/qclient/{version}`, and symlink
+//! `/usr/local/bin/qclient`. The root is `/var/quilibrium` on Linux and
+//! `/opt/quilibrium` on macOS ([`system::InstallLayout`]). (Install paths
+//! require root.) Nothing reaches the install path before it verifies.
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +18,16 @@ fn signature_dir(exe: Option<&Path>, base: &str, install_dir: &Path) -> PathBuf 
         .filter(|exe| exe.file_name().is_some_and(|name| name == base))
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| install_dir.to_path_buf())
+}
+
+/// Point `<install_root>/current` ([`system::QCLIENT_ROOT_LINK`]) at
+/// `installed`, the release `qclient update` verified: root's auto-update
+/// cron entry runs that link, so an update reaches it as it reaches
+/// `/usr/local/bin/qclient`.
+fn link_root_qclient(installed: &Path, install_root: &Path) -> anyhow::Result<PathBuf> {
+    let link = install_root.join(system::QCLIENT_ROOT_LINK);
+    release::switch_symlink(installed, &link)?;
+    Ok(link)
 }
 
 /// The version `download-signatures` fetches: the running one unless named,
@@ -68,6 +79,7 @@ pub async fn update(version: Option<&str>, allow_downgrade: bool) -> anyhow::Res
         allow_downgrade,
     )
     .await?;
+    link_root_qclient(&installed.path, &system::client_data_path())?;
     if installed.fresh {
         println!(
             "Updated qclient to {version} at {}",
@@ -109,5 +121,23 @@ mod tests {
         assert_eq!(signature_dir(None, base, install), install);
         let older = "qclient-2.1.0.24-linux-amd64";
         assert_eq!(signature_dir(Some(&release), older, install), install);
+    }
+
+    /// Each update points the link root's cron entry runs at the release
+    /// it installed, replacing the last one.
+    #[cfg(unix)]
+    #[test]
+    fn update_links_root_cron_to_the_installed_release() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let link = root.join(system::QCLIENT_ROOT_LINK);
+        for version in ["2.1.0.24", "2.1.0.25"] {
+            let dir = root.join(version);
+            std::fs::create_dir(&dir).unwrap();
+            let bin = dir.join(format!("qclient-{version}-linux-amd64"));
+            std::fs::write(&bin, b"release").unwrap();
+            assert_eq!(link_root_qclient(&bin, root).unwrap(), link);
+            assert_eq!(std::fs::read_link(&link).unwrap(), bin);
+        }
     }
 }

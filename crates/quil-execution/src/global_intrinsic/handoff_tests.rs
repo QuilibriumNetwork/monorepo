@@ -2971,13 +2971,14 @@ fn a_sealed_membership_successor_takes_the_eligible_committee() {
 }
 
 /// Sealed membership successors from current eligibility are GLOBAL
-/// consensus: not scheduled on mainnet, whatever the environment says;
-/// other networks only when set.
+/// consensus: on mainnet from its own frame, the first of an epoch,
+/// whatever the environment says; other networks only when set.
 #[test]
-fn seal_successor_eligibility_is_not_scheduled_by_default() {
-    assert_eq!(MAINNET_SEAL_SUCCESSOR_ELIGIBILITY_FRAME, None);
-    assert_eq!(seal_successor_eligibility_frame_for(0, None), u64::MAX);
-    assert_eq!(seal_successor_eligibility_frame_for(0, Some("7")), u64::MAX);
+fn seal_successor_eligibility_is_scheduled_on_mainnet_only() {
+    let mainnet = 1423 * quil_types::consensus::EPOCH_LENGTH_FRAMES;
+    assert_eq!(MAINNET_SEAL_SUCCESSOR_ELIGIBILITY_FRAME, Some(mainnet));
+    assert_eq!(seal_successor_eligibility_frame_for(0, None), mainnet);
+    assert_eq!(seal_successor_eligibility_frame_for(0, Some("7")), mainnet);
     assert_eq!(seal_successor_eligibility_frame_for(1, Some("7")), 7);
     assert_eq!(
         seal_successor_eligibility_frame_for(1, Some("soon")),

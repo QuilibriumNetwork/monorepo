@@ -52,6 +52,13 @@ sections! {
     EngineEvents => "app engine event forwarding",
     ArchiveRecovery => "archive recovery",
     PayloadEviction => "payload eviction",
+    EngineSetup => "app engine setup",
+    ConsensusOutbound => "consensus outbound and finalized delivery",
+    GlobalAnchorRecovery => "GLOBAL anchor recovery",
+    FrameHistoryPreparation => "app frame history preparation",
+    ShardDataRead => "held shard data read",
+    DeliverySweep => "pending delivery sweep",
+    ThreadParked => "no task: a parked thread not woken in time",
     // Steps of the app engine's loop.
     EngineMessage => "inbound message",
     EngineFrameMessage => "inbound app frame",
@@ -94,6 +101,7 @@ sections! {
     EvictedLineageCheck => "evicted lineage check",
     StorageEpochProofCheck => "storage epoch proof check",
     HeldFrameCheck => "held frame re-check",
+    FinalizedRecordWrite => "finalized frame record write",
     LaggingVoterCheck => "lagging voter check",
     SessionStatusCheck => "committee session status check",
     // Master tasks.
@@ -419,6 +427,22 @@ pub fn step(step: Section) {
     if let Some(probe) = current() {
         probe.step.store(pack(step, now_ms()), Ordering::Relaxed);
     }
+}
+
+/// The runtime parks this thread, with no task to poll: a stall seen now is
+/// of a thread that was not woken in time, or not run once woken, so not of
+/// any task on it. For a runtime's `on_thread_park`.
+pub fn parked() {
+    with_current(|probe| {
+        probe
+            .task
+            .store(pack(Section::ThreadParked, now_ms()), Ordering::Relaxed);
+    });
+}
+
+/// The runtime woke this thread. For a runtime's `on_thread_unpark`.
+pub fn unparked() {
+    with_current(|probe| probe.task.store(0, Ordering::Relaxed));
 }
 
 /// A master task's loop came round: beat the probe of the task being polled

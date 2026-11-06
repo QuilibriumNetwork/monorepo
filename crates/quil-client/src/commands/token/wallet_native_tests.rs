@@ -71,6 +71,7 @@ async fn wallet_claim_command_proves_and_submits_both_authorities() {
         submit_identity: Default::default(),
         peer_id_bytes: Vec::new(),
         max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
+        read_flags: Vec::new(),
     };
     let network =
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
@@ -1080,6 +1081,7 @@ async fn wallet_transfer_flow_with_fee(command: bool, automatic_fee: bool) {
         submit_identity: Default::default(),
         peer_id_bytes: Vec::new(),
         max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
+        read_flags: Vec::new(),
     };
     let sender = if command {
         Arc::new(

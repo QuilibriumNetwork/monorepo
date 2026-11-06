@@ -1363,6 +1363,8 @@ async fn shard_dispatch_reserves_before_spawning_across_action_kinds() {
 
 /// A transport recording each published prover op: its kind and filters, or
 /// why it did not decode. The publication numbered `fail_call` (from 0) fails.
+/// A publication counts once its record is in `published`, so a test that
+/// waits for a count reads every record up to it.
 struct Recording {
     calls: std::sync::atomic::AtomicUsize,
     fail_call: usize,
@@ -1400,6 +1402,9 @@ impl quil_engine::prover_message_transport::ProverMessageTransport for Recording
             ProverConfirm, ProverReject, TYPE_PROVER_CONFIRM,
         };
         use quil_execution::message_envelope::CanonicalMessageBundle;
+        // Held until the record is in: counted before it, a waiter saw the
+        // count and read the records one short (2026-11-04).
+        let mut published = self.published.lock();
         let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if call == self.fail_call {
             return Err(quil_types::error::QuilError::Internal(
@@ -1423,9 +1428,7 @@ impl quil_engine::prover_message_transport::ProverMessageTransport for Recording
             }
             _ => ProverReject::from_canonical_bytes(inner).map(|op| ("reject", op.filters)),
         };
-        self.published
-            .lock()
-            .push(decoded.map_err(|e| e.to_string()));
+        published.push(decoded.map_err(|e| e.to_string()));
         Ok(())
     }
 }

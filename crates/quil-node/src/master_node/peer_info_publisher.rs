@@ -38,6 +38,8 @@ pub(crate) struct PeerInfoPublisherArgs {
     pub onion_routing_enabled: bool,
     /// Receives the master's addresses of each PeerInfo published.
     pub announced: watch::Sender<AnnouncedAddrs>,
+    /// Receives each PeerInfo published, for the explorer to list this node.
+    pub own_peer_info: quil_explorer::OwnPeerInfo,
 }
 
 /// The master's addresses in the last PeerInfo this node published.
@@ -500,6 +502,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
         network,
         onion_routing_enabled,
         announced,
+        own_peer_info,
     } = args;
 
     let pi_handle = p2p_handle.clone();
@@ -818,6 +821,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
                 warn!(error = %e, "failed to publish PeerInfo");
             } else {
                 announced.send_replace(master_addrs);
+                *own_peer_info.write() = Some(info);
                 debug!(
                     capabilities = pi_caps.len(),
                     signed = !pi_falcon_pubkey.is_empty(),

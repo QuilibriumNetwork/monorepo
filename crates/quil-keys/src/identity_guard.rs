@@ -260,11 +260,7 @@ pub fn record_identity(km: &FileKeyManager, config_dir: &Path) {
 
 fn write_record(path: &Path, record: &IdentityRecord) -> std::io::Result<()> {
     let contents = serde_yaml::to_string(record).map_err(std::io::Error::other)?;
-    let tmp = path.with_extension("tmp");
-    quil_config::write_private_file(&tmp, contents.as_bytes())?;
-    std::fs::rename(&tmp, path)?;
-    quil_config::sync_parent_dir(path);
-    Ok(())
+    quil_config::write_private_file(path, contents.as_bytes())
 }
 
 #[cfg(test)]
@@ -530,7 +526,8 @@ mod tests {
         let dir = config_dir("record_save");
         let km = node_that_ran(&dir);
         std::fs::remove_file(record_path(&dir)).unwrap();
-        std::fs::create_dir(record_path(&dir).with_extension("tmp")).unwrap();
+        // A directory in the record's place makes the save fail.
+        std::fs::create_dir(record_path(&dir)).unwrap();
         let warns = warns_of(|| record_identity(&km, &dir));
         assert!(
             warns

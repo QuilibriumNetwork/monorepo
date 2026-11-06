@@ -51,11 +51,12 @@
 //! and 16 frame-output recomputations for every node that materializes it,
 //! typically one report of about 20 KB with 25 verifications.
 //!
-//! Nothing is kept while the presence report frame is unset (mainnet, and
-//! by default): consensus then copies no vote signature
-//! ([`Liveness::keep_votes`]), no session is looked at, and the master
-//! relays no worker's report. Once the frame is set, votes are kept and
-//! sessions looked at even before it is reached; reports wait for it.
+//! Nothing is kept while the presence report frame is unset (a test
+//! network without the setting, and by default): consensus then copies no
+//! vote signature ([`Liveness::keep_votes`]), no session is looked at, and
+//! the master relays no worker's report. Once the frame is set (mainnet:
+//! from install), votes are kept and sessions looked at even before it is
+//! reached; reports wait for it.
 //!
 //! A report whose publication fails or is held back (a coverage halt, an
 //! unreachable master or transport) gives its budget back
@@ -2233,7 +2234,7 @@ mod tests {
     fn nothing_is_built_before_the_presence_report_frame_or_late_in_an_epoch() {
         let mainnet = Pace { length: 720 };
         assert_eq!(mainnet.margin_frames(), 30);
-        assert!(!mainnet.window_open(1_000, u64::MAX), "unset on mainnet");
+        assert!(!mainnet.window_open(1_000, u64::MAX), "unset");
         assert!(!mainnet.window_open(999, 1_000));
         assert!(mainnet.window_open(1_000, 1_000));
         // 1440 + 689 leaves 31 frames in its epoch, 1440 + 690 leaves 30.

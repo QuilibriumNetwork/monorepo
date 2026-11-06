@@ -6271,6 +6271,52 @@ mod tests {
             .unwrap());
     }
 
+    /// A round that verified some of the proofs restarts the busy window, so
+    /// a frame with more operations than slots, each longer than the window,
+    /// has them all verified before the ingest is taken (2026-11-04: an
+    /// archive verified two of four in 580 s, then held the ingest 658 s for
+    /// the other two).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_global_pre_verification_keeps_retrying_while_rounds_verify() {
+        use crate::archive_preverify::{preverify_through_within, PrepassLimits};
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let rounds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let verifier: Arc<crate::archive_preverify::ProofVerifier> = Arc::new({
+            let rounds = rounds.clone();
+            move |pairs: &[(Vec<u8>, Vec<u8>)], _: &quil_execution::manager::PreverifyPacing<'_>| {
+                // Two slots: each round verifies two, past the window, and
+                // leaves the rest busy.
+                let round = rounds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let left = pairs.len().saturating_sub(2 * round);
+                std::thread::sleep(Duration::from_millis(400));
+                quil_execution::manager::PreverifyCounts {
+                    operations: pairs.len(),
+                    cached: pairs.len() - left,
+                    verified: left.min(2),
+                    busy: left.saturating_sub(2),
+                    ..Default::default()
+                }
+            }
+        });
+        let (ingest, _) = fixture();
+        let mut ingest = ingest.with_proof_verifier(verifier);
+        ingest.sequenced = true;
+        ingest.admit_verified(frame_with_bundles(&filter, 1, 4), true);
+        let ingest = std::sync::Mutex::new(ingest);
+        let limits = PrepassLimits {
+            busy_window: Duration::from_millis(300),
+            busy_pause: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let report = preverify_through_within(&ingest, 7, &[(filter.clone(), 1)], limits);
+        assert_eq!(
+            (report.rounds, report.counts.verified, report.counts.busy),
+            (2, 4, 0),
+            "a round that verified two of four, past the busy window, left the \
+             other two to the locked pass"
+        );
+    }
+
     /// While a shard frame materializes, this thread's probe names the
     /// shard, the frame and its size after the GLOBAL frame it is sequenced
     /// by, so the watchdog of a materializer that does not return can name

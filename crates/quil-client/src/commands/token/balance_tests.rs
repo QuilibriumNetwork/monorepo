@@ -120,12 +120,17 @@ async fn claimable_rewards_are_read_without_coin_scan_and_check_membership() {
         .await
         .unwrap();
     assert_eq!(value, Some((u128::MAX, 42)));
-    let display = format_claimable_rewards(Ok(value));
+    let display = format_claimable_rewards(Ok(value), false);
+    assert_eq!(
+        display,
+        "Claimable rewards: 42535295865117307932921825928.971026 QUIL, mint to claim"
+    );
+    let display = format_claimable_rewards(Ok(value), true);
     assert!(
         display.contains("42535295865117307932921825928.971026431875 QUIL"),
         "{display}"
     );
-    assert!(display.contains("global frame 42; requires minting"));
+    assert!(display.contains("witness cites global frame 42), mint to claim"));
 
     // A server that alters the amount or root cannot claim that balance.
     provider.witness.lock().unwrap().value -= 1;
@@ -138,7 +143,7 @@ async fn claimable_rewards_are_read_without_coin_scan_and_check_membership() {
         zero.is_err(),
         "mint witnesses cannot authenticate zero-valued claims"
     );
-    assert!(format_claimable_rewards(zero).contains("unavailable"));
+    assert!(format_claimable_rewards(zero, false).contains("unavailable"));
     *provider.witness.lock().unwrap() = reward_witness(owner, 1);
     provider.witness.lock().unwrap().reward_root[0] ^= 1;
     assert!(read_claimable_rewards(client.clone(), &public)
@@ -149,68 +154,138 @@ async fn claimable_rewards_are_read_without_coin_scan_and_check_membership() {
         .await
         .unwrap();
     assert_eq!(missing, None);
-    assert!(format_claimable_rewards(Ok(missing)).contains("unavailable"));
+    assert_eq!(
+        format_claimable_rewards(Ok(missing), false),
+        "Claimable rewards: none"
+    );
     assert!(read_claimable_rewards(client, &[1; 57]).await.is_err());
     stop.send(()).unwrap();
     serving.await.unwrap();
 }
 
+/// A failed read's line says only "unavailable": the command's error gives
+/// the reason, once.
 #[test]
 fn claimable_rewards_report_rpc_failure_as_unavailable() {
-    let display = format_claimable_rewards(Err(tonic::Status::unavailable(
-        "reward history unavailable",
-    )
-    .into()));
-    assert!(display.contains("Claimable prover rewards: unavailable"));
-    assert!(display.contains("reward history unavailable"));
-    assert!(!display.contains("0.000000000000 QUIL"));
+    for verbose in [false, true] {
+        let display = format_claimable_rewards(
+            Err(tonic::Status::unavailable("reward history unavailable").into()),
+            verbose,
+        );
+        assert_eq!(display, "Claimable rewards: unavailable");
+    }
 }
 
 /// #698: `token balance` shows every section. A network with no
 /// confidential coin yet has no QUIL root, which is one plain line, not an
-/// error; a failed read names its reason.
+/// error. By default each line is the fact alone, in QUIL.
 #[test]
-fn balance_lines_show_a_missing_root_as_no_coins_and_failures_with_their_reason() {
+fn balance_lines_show_the_fact_alone_by_default() {
+    let lines = |verbose| {
+        [
+            format_confidential_coins(&Ok(None), true, verbose),
+            format_confidential_coins(&Ok(None), false, verbose),
+            format_confidential_coins(&Ok(Some((25, 2))), true, verbose),
+            format_confidential_coins(&Ok(Some((25, 1))), false, verbose),
+            format_legacy_coins(&Ok(Some((7, 2, 1))), verbose),
+            format_legacy_coins(&Ok(None), verbose),
+            // An empty listing is an answer, apart from "unavailable".
+            format_legacy_coins(&Ok(Some((0, 0, 0))), verbose),
+            format_legacy_coins(&Ok(Some((0, 0, 3))), verbose),
+            format_legacy_coins(&Err(anyhow::anyhow!("no archive answered")), verbose),
+            format_confidential_coins(&Err(anyhow::anyhow!("dial failed")), true, verbose),
+        ]
+    };
     assert_eq!(
-        format_confidential_coins(Ok(None), true),
-        "Confidential QUIL coins: none exist on the network yet (no QUIL root published)"
+        lines(false),
+        [
+            "Confidential QUIL coins: none",
+            "Confidential coins: none",
+            "Confidential QUIL coins: 0.000000003125 QUIL in 2 coins",
+            "Confidential coins: 25 base units in 1 coin",
+            "Unshielded legacy coins: 0.000000000875 QUIL in 2 coins, shield to spend",
+            "Unshielded legacy coins: none",
+            "Unshielded legacy coins: none",
+            "Unshielded legacy coins: none",
+            "Unshielded legacy coins: unavailable",
+            "Confidential coins: unavailable",
+        ]
+    );
+}
+
+/// `-v` keeps what each line derives from: base units, the shielded count,
+/// why there is none, and that the node's word is not finality.
+#[test]
+fn balance_lines_keep_their_detail_under_verbose() {
+    let unspent = "reported unspent by the configured node (not a finalized balance)";
+    assert_eq!(
+        [
+            format_confidential_coins(&Ok(None), true, true),
+            format_confidential_coins(&Ok(None), false, true),
+            format_confidential_coins(&Ok(Some((25, 2))), true, true),
+            format_confidential_coins(&Ok(Some((25, 1))), false, true),
+            format_legacy_coins(&Ok(Some((7, 2, 1))), true),
+            format_legacy_coins(&Ok(None), true),
+            format_legacy_coins(&Ok(Some((0, 0, 0))), true),
+            format_legacy_coins(&Ok(Some((0, 0, 3))), true),
+        ],
+        [
+            "Confidential QUIL coins: none (no QUIL root published on the network yet)".to_string(),
+            "Confidential coins: none (no root published in this application yet)".into(),
+            format!(
+                "Confidential QUIL coins: 0.000000003125 QUIL (25 base units) in 2 coins {unspent}"
+            ),
+            format!("Confidential coins: 25 base units in 1 coin {unspent}"),
+            "Unshielded legacy coins: 0.000000000875 QUIL (7 base units) in 2 coins (1 already \
+             shielded), shield to spend"
+                .into(),
+            "Unshielded legacy coins: none (this node has no Ed448 identity)".into(),
+            "Unshielded legacy coins: none (the listing has no coin under this identity's key or \
+             peer-id owner)"
+                .into(),
+            "Unshielded legacy coins: none left (3 already shielded)".into(),
+        ]
+    );
+}
+
+/// Reads failing for one reason name it once; different reasons each
+/// follow the reads they failed.
+#[test]
+fn an_incomplete_balance_names_each_reason_once() {
+    let key = r#"not found: no key with id "q-prover-key""#.to_string();
+    assert_eq!(
+        incomplete(&[
+            ("claimable rewards", key.clone()),
+            ("confidential coins", key.clone())
+        ]),
+        format!("balance incomplete: claimable rewards, confidential coins unavailable: {key}")
     );
     assert_eq!(
-        format_confidential_coins(Ok(None), false),
-        "Confidential coins: none exist in this application yet (no root published)"
+        incomplete(&[
+            ("claimable rewards", key.clone()),
+            ("legacy coins", "no archive answered".into()),
+            ("confidential coins", key.clone()),
+        ]),
+        format!(
+            "balance incomplete: claimable rewards, confidential coins unavailable: {key}; \
+             legacy coins unavailable: no archive answered"
+        )
     );
-    assert_eq!(format_confidential_coins(Ok(Some((25, 2))), true),
-        "Confidential QUIL coins: 0.000000003125 QUIL (25 base units) across 2 coins reported unspent by the configured node (not a finalized balance)");
-    assert_eq!(format_confidential_coins(Ok(Some((25, 2))), false),
-        "Confidential coins: 25 base units across 2 coins reported unspent by the configured node (not a finalized balance)");
-    let refusal =
-        "no node serving application 01 answered this node: 1 peer declined: 1x dial failed";
-    assert_eq!(
-        format_confidential_coins(Err(tonic::Status::unavailable(refusal).into()), true),
-        format!("Confidential coins: unavailable ({refusal})")
-    );
-    assert_eq!(
-        format_legacy_coins(Ok(Some((7, 2, 1)))),
-        "Unshielded legacy coins: 0.000000000875 QUIL (7 base units) across 2 coins (1 already shielded)"
-    );
-    assert_eq!(
-        format_legacy_coins(Ok(None)),
-        "Unshielded legacy coins: none (this node has no Ed448 identity)"
-    );
-    // An empty listing is an answer, apart from "unavailable".
-    assert_eq!(
-        format_legacy_coins(Ok(Some((0, 0, 0)))),
-        "Unshielded legacy coins: none (the listing has no coin under this identity's key or \
-         peer-id owner)"
-    );
-    assert_eq!(
-        format_legacy_coins(Ok(Some((0, 0, 3)))),
-        "Unshielded legacy coins: none left (3 already shielded)"
-    );
-    assert_eq!(
-        format_legacy_coins(Err(anyhow::anyhow!(
-            "legacy coins: no archive answered for legacy coins"
-        ))),
-        "Unshielded legacy coins: unavailable (legacy coins: no archive answered for legacy coins)"
-    );
+}
+
+/// Six decimals at most, trailing zeros dropped, half up; an amount below
+/// that shows exactly rather than as zero.
+#[test]
+fn quil_amounts_read_briefly() {
+    let quil = 8_000_000_000u128;
+    assert_eq!(quil_brief(0), "0");
+    assert_eq!(quil_brief(quil), "1");
+    assert_eq!(quil_brief(quil * 49 / 4), "12.25");
+    // 32.942335453750 QUIL
+    assert_eq!(quil_brief(263_538_683_630), "32.942335");
+    // 0.9999996 QUIL rounds up to a whole QUIL.
+    assert_eq!(quil_brief(quil - 3_200), "1");
+    assert_eq!(quil_brief(17_659), "0.000002");
+    assert_eq!(quil_brief(8), "0.000000001");
+    assert_eq!(quil_brief(1), "0.000000000125");
 }

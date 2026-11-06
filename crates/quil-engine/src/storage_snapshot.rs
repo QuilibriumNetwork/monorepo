@@ -559,6 +559,9 @@ pub enum LeafOutcome {
     Stopping,
     /// An error ended it.
     Failed,
+    /// Labelling ahead ran out of room: its labels would not be kept, and
+    /// its snapshot labels the leaf.
+    Refused,
 }
 
 impl LeafOutcome {
@@ -570,6 +573,7 @@ impl LeafOutcome {
             Self::Grace => "grace",
             Self::Stopping => "stopping",
             Self::Failed => "failed",
+            Self::Refused => "refused",
         }
     }
 }
@@ -625,17 +629,24 @@ fn misses_grace(epoch: u64, nodes: u64, kept: usize, frame: u64) -> Option<u64> 
     (estimate.as_millis() > u128::from(left) * frame_millis).then_some(left)
 }
 
+/// The share of the renewal's grace, one in this many, a leaf's labelling
+/// estimate may take for its snapshot to be left to label it
+/// ([`labels_within_grace`]): a snapshot labels beside the node's other
+/// work, and a leaf of 15 million nodes estimated at 37 minutes of the
+/// 53-minute grace was still labelled at its grace (2026-11-01).
+const GRACE_SHARE_LEFT_TO_SNAPSHOT: u128 = 2;
+
 /// Whether a leaf of `nodes` nodes labelled from `epoch`'s snapshot frame
-/// would end by the renewal's grace frame by its estimate ([`misses_grace`]):
-/// one that would not registers only from labels computed ahead.
+/// would end within half the renewal's grace by its estimate
+/// ([`GRACE_SHARE_LEFT_TO_SNAPSHOT`]): one that would not is labelled ahead
+/// with the leaves that register only from labels computed ahead
+/// (`crate::storage_labels::ahead_orders`), as its snapshot may not end it
+/// by the grace frame ([`misses_grace`]).
 pub(crate) fn labels_within_grace(epoch: u64, nodes: u64) -> bool {
-    misses_grace(
-        epoch,
-        nodes,
-        0,
-        quil_types::consensus::storage_snapshot_frame(epoch),
-    )
-    .is_none()
+    let snapshot = quil_types::consensus::storage_snapshot_frame(epoch);
+    let grace = u128::from(crate::app_shard_metadata::storage_snapshot_grace());
+    let frame_millis = u128::from(quil_types::consensus::ideal_frame_time_ms_at(snapshot));
+    label_estimate(nodes).as_millis() * GRACE_SHARE_LEFT_TO_SNAPSHOT <= grace * frame_millis
 }
 
 /// A leaf being labelled or encoded.
@@ -702,14 +713,17 @@ impl LeafProgress {
 
     /// Note that `done` of the leaf's `of` layers are labelled. The first
     /// note says where its work starts (an attempt that gave up kept the
-    /// layers before), and its estimate counts only the layers left.
+    /// layers before), and its estimate counts only the layers left, whatever
+    /// its start counted ([`leaf_started_from`]).
     pub fn layers(&self, done: usize, of: usize) {
         if let Some(leaf) = running_leaves().leaves.get_mut(&self.id) {
             let from = match leaf.layers {
                 Some((from, _, _)) => from,
                 None => {
-                    leaf.estimate = leaf.estimate.map(|estimate| {
-                        estimate.mul_f64((of.saturating_sub(done)) as f64 / of.max(1) as f64)
+                    let nodes = leaf.nodes;
+                    leaf.estimate = leaf.estimate.map(|_| {
+                        label_estimate(nodes)
+                            .mul_f64((of.saturating_sub(done)) as f64 / of.max(1) as f64)
                     });
                     done
                 }
@@ -764,12 +778,31 @@ pub fn leaf_started(
     nodes: u64,
     work: LeafWork,
 ) -> LeafProgress {
-    let estimate = (work != LeafWork::FromLabelsAhead).then(|| label_estimate(nodes));
-    let logged = estimate.is_some_and(|estimate| estimate >= LEAF_LOGGED_FROM);
+    leaf_started_from(epoch, filter, leaf_id, nodes, 0, work)
+}
+
+/// [`leaf_started`] for a leaf whose `kept` whole layers are kept on disk
+/// (`crate::storage_labels::LabelStore::resumable`): its estimate counts only
+/// the layers left from its start, before its first note of its layers
+/// ([`LeafProgress::layers`]), which waits until the kept layers are checked
+/// against their digests (2026-11-05: a seat whose leaf had 8 of 11 layers
+/// kept was warned projected 481 frames on, past its grace, in the 11 s its
+/// layers were checked, and its leaf ended 25 minutes later).
+pub fn leaf_started_from(
+    epoch: u64,
+    filter: &[u8],
+    leaf_id: &[u8],
+    nodes: u64,
+    kept: usize,
+    work: LeafWork,
+) -> LeafProgress {
+    let estimate = (work != LeafWork::FromLabelsAhead).then(|| label_estimate_from(nodes, kept));
+    // Logged by the leaf's size, as without layers kept.
+    let logged = work != LeafWork::FromLabelsAhead && label_estimate(nodes) >= LEAF_LOGGED_FROM;
     if logged {
         info!(epoch, filter = %hex::encode(filter), leaf = %hex::encode(leaf_id), nodes,
             work = work.name(), estimated_minutes = estimate.map_or(0, |e| e.as_secs() / 60),
-            scope = "local", "storage leaf work started");
+            layers_kept = kept, scope = "local", "storage leaf work started");
     }
     let mut running = running_leaves();
     let id = running.next;
@@ -945,7 +978,7 @@ fn report_long_leaves() {
                     work = work.name(), scope = "local",
                     action = "check this node's CPU and disk load: storage labelling is CPU-bound; \
                               if the leaves have not ended by the grace frame, the seat renews \
-                              without a storage registration and earns no storage share that epoch",
+                              without a storage registration that epoch",
                     "this node's storage proof data for a seat runs past its estimate; its renewal waits for it"),
             }
         }
@@ -1108,11 +1141,12 @@ fn encode_member_until(
         {
             return Err(stopped());
         }
-        let progress = leaf_started(
+        let progress = leaf_started_from(
             captured.epoch,
             &captured.filter,
             &leaf_id,
             nodes,
+            kept,
             if ahead.is_some() {
                 LeafWork::FromLabelsAhead
             } else {
@@ -1127,7 +1161,7 @@ fn encode_member_until(
         let ahead = from_kept.is_some();
         if !ahead {
             // Labelled now: labelling ahead beside it pauses but for
-            // `crate::storage_jobs::AHEAD_JOBS_BESIDE_DUE` of it.
+            // `crate::storage_jobs::ahead_beside_due` of it.
             memory.labelling_now();
         }
         // Labelled now and kept when there is room; otherwise encoded as by a
@@ -1160,6 +1194,11 @@ fn encode_member_until(
                             .label_kept(&params, stop, &|done| progress.layers(done, layers))?;
                         match labelling {
                             Labelling::Labelled(labelled) => Some((count, labelled)),
+                            Labelling::Refused => {
+                                return Err(QuilError::Internal(
+                                    "storage labels: a snapshot's labelling refused room".into(),
+                                ))
+                            }
                             Labelling::Stopped { .. } => {
                                 // Kept for the next attempt unless the seat
                                 // renews without them.
@@ -1284,7 +1323,7 @@ fn gives_up_late_leaf(
                       once; the next epoch's snapshot starts again",
             "storage snapshot given up: this node would finish a seat's storage proof data \
              after the renewal's grace frame, so the seat renews without a storage \
-             registration and earns no storage share on its shard this epoch");
+             registration this epoch");
     }
     true
 }
@@ -1473,7 +1512,7 @@ pub fn request_member(
         let past_grace = || {
             info!(epoch, filter = %hex::encode(&filter), scope = "local",
                 "storage snapshot not encoded: the renewal's grace frame passed, so this seat renews \
-                 without a storage registration and earns no storage share on its shard that epoch; \
+                 without a storage registration that epoch; \
                  its memory goes to other storage work");
             Ok(())
         };
@@ -3826,7 +3865,7 @@ pub(crate) mod tests {
 
     /// A renewal's leaf labelled now pauses labelling ahead beside it but for
     /// one leaf, the most urgent, which goes on
-    /// (`crate::storage_jobs::AHEAD_JOBS_BESIDE_DUE`); the paused leaf keeps
+    /// (`crate::storage_jobs::ahead_beside_due`); the paused leaf keeps
     /// its memory and labels on to its end once the leaf labelled now has
     /// ended (2026-11-01: beside three or four leaves labelled ahead, a
     /// renewal's leaf estimated at 37 minutes was still labelled at its
@@ -3969,6 +4008,28 @@ pub(crate) mod tests {
         assert_eq!(misses_grace(epoch, 16_182_813, 0, grace - 200), Some(200));
         assert_eq!(misses_grace(epoch, 1_000, 0, grace - 1), None);
         assert_eq!(misses_grace(epoch, 1_000_000, 0, grace), Some(0));
+    }
+
+    /// A leaf whose labelling would take more than half the renewal's grace
+    /// is labelled ahead with those that register only from labels computed
+    /// ahead, though its snapshot could end it by the grace frame on its
+    /// estimate alone (2026-11-01: one of 15 million nodes estimated at 37
+    /// minutes was still labelled at its grace, 3,137 s in).
+    #[test]
+    fn a_leaf_taking_over_half_the_grace_is_not_left_to_its_snapshot() {
+        let epoch = 1317;
+        // 37 minutes, within the 320 frames of 10 s but over half of them.
+        assert_eq!(label_estimate(15_000_000).as_secs() / 60, 37);
+        let snapshot = quil_types::consensus::storage_snapshot_frame(epoch);
+        assert_eq!(misses_grace(epoch, 15_000_000, 0, snapshot), None);
+        assert!(!labels_within_grace(epoch, 15_000_000));
+        // Half the grace is 1,600 s: the most nodes estimated within it, and
+        // one more.
+        assert_eq!(label_estimate(10_744_129).as_secs(), 1_600);
+        assert_eq!(label_estimate(10_744_130).as_secs(), 1_601);
+        assert!(labels_within_grace(epoch, 10_744_129));
+        assert!(!labels_within_grace(epoch, 10_744_130));
+        assert!(labels_within_grace(epoch, 1_000_000));
     }
 
     /// A seat's snapshot whose leaf cannot be labelled by the renewal's grace

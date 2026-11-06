@@ -113,7 +113,7 @@ mod repro_tests {
     fn reproduces_server_version_used_as_path() {
         for version in ["../../../../etc/cron.d/x", "2.1.0.25/../../x", "/etc"] {
             if let Ok(name) = release_filename(crate::system::RELEASE_TYPE_NODE, version) {
-                let path = std::path::Path::new(crate::system::BINARY_PATH)
+                let path = crate::system::binary_path()
                     .join(crate::system::RELEASE_TYPE_NODE)
                     .join(version)
                     .join(&name);
@@ -495,6 +495,9 @@ fn write_atomic(dir: &Path, name: &str, bytes: &[u8], mode: u32) -> anyhow::Resu
 /// Point `link` at `target`, replacing what `link` held by atomic rename.
 #[cfg(unix)]
 pub fn switch_symlink(target: &Path, link: &Path) -> anyhow::Result<()> {
+    if let Some(dir) = link.parent() {
+        system::ensure_symlink_dir(dir)?;
+    }
     let name = link.file_name().and_then(|n| n.to_str()).unwrap_or("link");
     let tmp = link.with_file_name(format!(".{name}.tmp-{:016x}", rand::random::<u64>()));
     std::os::unix::fs::symlink(target, &tmp)
@@ -592,9 +595,7 @@ pub async fn download_and_install(
     let installed = linked_version(symlink, release_type);
     check_downgrade(installed.as_deref(), version, allow_downgrade)?;
     check_unversioned_link(symlink, release_type, version, allow_downgrade)?;
-    let dest_dir = Path::new(system::BINARY_PATH)
-        .join(release_type)
-        .join(version);
+    let dest_dir = system::binary_path().join(release_type).join(version);
     let current = dest_dir.join(&base);
     if is_linked_and_verified_with(&current, symlink, &SIGNATORIES, signatory_quorum()) {
         println!("{base} is already installed and linked");

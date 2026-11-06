@@ -161,6 +161,7 @@ async fn wallet_scans_owned_unspent_coins_over_rpc() {
         .encode()
         .unwrap()
         .to_vec();
+    let listed = coins.clone();
     let provider = Arc::new(Pages {
         network,
         application,
@@ -248,6 +249,48 @@ async fn wallet_scans_owned_unspent_coins_over_rpc() {
             .len(),
         2
     );
+    // An operation's coins are found by content, whoever owns them; one the
+    // node does not list stays missing.
+    #[cfg(feature = "native-proof")]
+    {
+        let missing = create_output(&wallet.context, other.address(), 19)
+            .unwrap()
+            .output;
+        let wanted: Vec<Output> = listed
+            .iter()
+            .rev()
+            .map(|(_, output, _)| output.clone())
+            .chain([missing])
+            .collect();
+        let found = wallet
+            .find_coins(
+                &client,
+                &wanted,
+                4,
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            found,
+            listed
+                .iter()
+                .rev()
+                .map(|(address, _, _)| Some(*address))
+                .chain([None])
+                .collect::<Vec<_>>()
+        );
+        let owned: Vec<bool> = wanted.iter().map(|output| wallet.owns(output)).collect();
+        let expected: Vec<bool> = listed
+            .iter()
+            .rev()
+            .map(|(_, output, _)| other.owns(output))
+            .map(|theirs| !theirs)
+            .chain([false])
+            .collect();
+        assert_eq!(owned, expected);
+        assert_eq!(owned.iter().filter(|own| **own).count(), 3);
+    }
     // neon, Nov 2: one cut page ended a scan minutes in and threw its pages
     // away. The first cut read only ends the node's gathering of the first
     // page; each one after fails an asking of page 2. Three askings again are
@@ -302,6 +345,89 @@ async fn wallet_scans_owned_unspent_coins_over_rpc() {
     );
     provider.expired.store(false, SeqCst);
     assert_eq!(wallet.scan_unspent(&client, 4, 2).await.unwrap().len(), 2);
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// A submitted operation's decision is read from the node's GLOBAL state at
+/// the commit's record for it: committed or rejected with its frame, and
+/// absent while undecided.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn the_global_commit_decision_is_read_over_rpc() {
+    use quil_execution::token_intrinsic::global_commit::{
+        decision_address, encode_decision_record, Decision,
+    };
+    use quil_types::store::HypergraphStore;
+    let application = quil_execution::domains::QUIL_TOKEN;
+    let global = quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS;
+    let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+    let txn = store.new_transaction(false).unwrap();
+    let decided = [
+        ([1u8; 32], Decision::Committed { frame: 965_690 }),
+        (
+            [2u8; 32],
+            Decision::Rejected {
+                frame: 965_691,
+                reason: "already consumed".into(),
+            },
+        ),
+    ];
+    for (operation, decision) in &decided {
+        let record = decision_address(&application, operation).unwrap();
+        let mut vertex = global.to_vec();
+        vertex.extend_from_slice(&record);
+        let shard = quil_hypergraph::addressing::shard_key_for_location(
+            &quil_hypergraph::addressing::Location {
+                app_address: global,
+                data_address: record,
+            },
+        );
+        store
+            .save_vertex_underlying(
+                txn.as_ref(),
+                "vertex",
+                "adds",
+                &shard,
+                &vertex,
+                &encode_decision_record(decision).unwrap(),
+            )
+            .unwrap();
+    }
+    let server = quil_rpc::node_service::NodeRpcServer::new().with_hypergraph_store(store);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, serving) = serve_node(listener, server);
+    let client = quil_types::proto::node::node_service_client::NodeServiceClient::new(
+        tonic::transport::Endpoint::from_shared(endpoint)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap(),
+    );
+    for (operation, decision) in &decided {
+        assert_eq!(
+            inclusion::read_decision(&client, &application, operation)
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(decision)
+        );
+    }
+    assert_eq!(
+        inclusion::read_decision(&client, &application, &[3; 32])
+            .await
+            .unwrap(),
+        None,
+        "undecided"
+    );
+    assert_eq!(
+        inclusion::read_decision(&client, &[9; 32], &[1; 32])
+            .await
+            .unwrap(),
+        None,
+        "decisions are per application"
+    );
     stop.send(()).unwrap();
     serving.await.unwrap();
 }
@@ -804,6 +930,7 @@ async fn automatic_quil_fee_is_quoted_by_the_configured_node_and_bounded() {
         submit_identity: Default::default(),
         peer_id_bytes: Vec::new(),
         max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
+        read_flags: Vec::new(),
     };
     // 4096 bytes in a 1 TiB world cost one unit per byte, plus the headroom.
     assert_eq!(
@@ -1332,6 +1459,104 @@ async fn submit_config_signs_the_send_and_the_wallet_signs_the_mint() {
         &delivered.statement.context_bytes().unwrap(),
         &wallet.context
     ));
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// The paced run's submit: `token shield-all`'s batch is delivered, kept for
+/// `--wait` and routed to its source's shard; the node manager's is delivered
+/// and kept for nothing.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_paced_batch_is_kept_for_its_wait_with_its_route() {
+    use super::super::shield_pacing::ShieldIo;
+    use super::super::test_nodes;
+    use quil_lattice_ct::confidential::shield::{BatchShield, ShieldSource};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let directory = tempfile::tempdir().unwrap();
+    let (listener, listen) = bind_loopback().await;
+    let node = test_nodes::write(&directory.path().join("node"), 61, &listen);
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let sent = delivered.clone();
+    let server = quil_rpc::node_service::NodeRpcServer::new()
+        .with_peer_id(node.peer_id.clone())
+        .with_send_handler_fn(Arc::new(move |_, _, _| {
+            sent.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }));
+    let (stop, serving) = serve_node(listener, server);
+    let tc = TokenCtx::from_context(
+        &test_nodes::context(false),
+        &test_nodes::common(&node.dir, None, false),
+    )
+    .unwrap();
+    let network =
+        quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let wallet = Arc::new(
+        RecipientWallet::load(&tc, &network, &quil_execution::domains::QUIL_TOKEN).unwrap(),
+    );
+    let owner = legacy_owner_signer(&tc).unwrap();
+    let sources = vec![ShieldSource {
+        address: [0x80; 32],
+        amount: 10,
+    }];
+    let (statement, signature, _) = wallet
+        .prepare_batch_shield(
+            sources.clone(),
+            owner.as_ref(),
+            &[(wallet.address().clone(), 8)],
+            2,
+            1,
+        )
+        .unwrap();
+    let mut proof = vec![0; 40];
+    proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
+    let bytes = BatchShield {
+        statement,
+        signature,
+        proof,
+    }
+    .encode()
+    .unwrap();
+    let mut record = super::super::action_log::ShieldRecorder::new(None, "cli");
+    let mut sink = |_: ShieldReport<'_>| {};
+    let payee = Box::new(shield_recipient(&wallet, None).unwrap());
+    let mut io = ShieldAllIo {
+        tc: &tc,
+        payee,
+        wallet,
+        owner,
+        client: tc.connect().await.unwrap(),
+        batches: vec![sources],
+        shards: vec!["1".into()],
+        filters: vec![None],
+        paths: vec![vec![false], vec![true]],
+        announce: Some(true),
+        submissions: Vec::new(),
+        proved: Some((10, 2)),
+        started: std::time::Instant::now(),
+        record: &mut record,
+        stop: None,
+        sink: &mut sink,
+    };
+    io.submit(0, bytes.clone()).await.unwrap();
+    assert_eq!(delivered.load(Ordering::SeqCst), 1);
+    assert_eq!(io.submissions.len(), 1);
+    assert!(matches!(
+        &io.submissions[0].route,
+        inclusion::Route::Shard(path) if path.as_slice() == [true]
+    ));
+    assert_eq!(
+        io.submissions[0].operation,
+        quil_execution::token_intrinsic::global_commit::tx_id(&bytes)
+    );
+    // As the node manager runs it: delivered, nothing printed or kept.
+    io.announce = None;
+    io.proved = Some((10, 2));
+    io.submit(0, bytes).await.unwrap();
+    assert_eq!(delivered.load(Ordering::SeqCst), 2);
+    assert_eq!(io.submissions.len(), 1);
+    drop(io);
     stop.send(()).unwrap();
     serving.await.unwrap();
 }
@@ -2179,10 +2404,19 @@ fn recording_node(
         move |_domain, payload, _authentication| {
             captured.lock().unwrap().push(payload);
             let outcome = outcome.clone();
-            Box::pin(async move { outcome })
+            Box::pin(async move { outcome.map_err(Into::into) })
         },
     ));
     (server, received)
+}
+
+/// The one-request bundle a submission hands to `send_message_bundle`.
+#[cfg(feature = "native-proof")]
+fn submission_bundle() -> quil_types::proto::global::MessageBundle {
+    quil_types::proto::global::MessageBundle {
+        requests: vec![token_operation_request()],
+        timestamp: crate::send::now_millis(),
+    }
 }
 
 #[cfg(feature = "native-proof")]
@@ -2195,14 +2429,9 @@ async fn a_delivery_that_fails_transiently_is_resent() {
     let (multiaddr, calls, stop, serving) =
         flaky_node(server, tonic::Status::unavailable("node restarting"), 2).await;
     let mut client = client_at(&multiaddr).await;
-    crate::send::send_message_request_retrying(
-        &mut client,
-        &km,
-        vec![2; 32],
-        token_operation_request(),
-    )
-    .await
-    .expect("a node that comes back within the budget must take the submission");
+    crate::send::send_message_bundle(&mut client, &km, vec![2; 32], submission_bundle())
+        .await
+        .expect("a node that comes back within the budget must take the submission");
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
     assert_eq!(
         received.lock().unwrap().len(),
@@ -2223,14 +2452,10 @@ async fn a_rejected_delivery_is_not_resent() {
     let (multiaddr, calls, stop, serving) =
         flaky_node(server, tonic::Status::unavailable("unused"), 0).await;
     let mut client = client_at(&multiaddr).await;
-    let error = crate::send::send_message_request_retrying(
-        &mut client,
-        &km,
-        vec![2; 32],
-        token_operation_request(),
-    )
-    .await
-    .expect_err("a rejected submission must fail");
+    let error =
+        crate::send::send_message_bundle(&mut client, &km, vec![2; 32], submission_bundle())
+            .await
+            .expect_err("a rejected submission must fail");
     assert!(error.to_string().contains("send rpc"), "{error}");
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(
@@ -2238,6 +2463,121 @@ async fn a_rejected_delivery_is_not_resent() {
         1,
         "delivered once, not resent"
     );
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// A node that reached no prover of the application refuses with `retry`: over
+/// the real service a sender resends the same signed bytes until one takes them.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_send_the_node_could_not_deliver_is_resent() {
+    crate::retry::NO_WAIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let (km, _) = peer_key_manager(directory.path());
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let captured = received.clone();
+    let server = quil_rpc::node_service::NodeRpcServer::new().with_send_handler_fn(Arc::new(
+        move |_domain, payload, _authentication| {
+            let mut sends = captured.lock().unwrap();
+            sends.push(payload);
+            let attempt = sends.len();
+            Box::pin(async move {
+                if attempt < 3 {
+                    Err(quil_rpc::SubmitRefusal::retry_later("no prover reachable"))
+                } else {
+                    Ok(())
+                }
+            })
+        },
+    ));
+    let (multiaddr, _, stop, serving) =
+        flaky_node(server, tonic::Status::unavailable("unused"), 0).await;
+    let mut client = client_at(&multiaddr).await;
+    crate::send::send_message_bundle(&mut client, &km, vec![2; 32], submission_bundle())
+        .await
+        .expect("a sender resends what the node could not deliver");
+    {
+        let sends = received.lock().unwrap();
+        assert_eq!(sends.len(), 3, "resent until a prover took it");
+        assert!(
+            sends.iter().all(|bytes| bytes == &sends[0]),
+            "a resend carries the same bytes"
+        );
+    }
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// A bundle for an application whose shard topic stays out of reach is resent
+/// there for the delivery budget, and only then tried in the global venue: a
+/// covered application's bundle occupies a global frame and executes nowhere.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_venue_send_tries_global_only_after_the_shard_topic_stays_out_of_reach() {
+    crate::retry::NO_WAIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let (km, _) = peer_key_manager(directory.path());
+    let (shard, global) = (vec![2u8; 32], vec![0xffu8; 32]);
+    let domains = Arc::new(Mutex::new(Vec::new()));
+    let captured = domains.clone();
+    let shard_topic = shard.clone();
+    let server = quil_rpc::node_service::NodeRpcServer::new().with_send_handler_fn(Arc::new(
+        move |domain, _payload, _authentication| {
+            let to_shard = domain == shard_topic;
+            captured.lock().unwrap().push(domain);
+            Box::pin(async move {
+                if to_shard {
+                    Err(quil_rpc::SubmitRefusal::retry_later("no prover reachable"))
+                } else {
+                    Ok(())
+                }
+            })
+        },
+    ));
+    let (multiaddr, _, stop, serving) =
+        flaky_node(server, tonic::Status::unavailable("unused"), 0).await;
+    let mut client = client_at(&multiaddr).await;
+    crate::send::send_to_venue(&mut client, &km, shard.clone(), false, submission_bundle())
+        .await
+        .expect("the global venue takes it");
+    {
+        let domains = domains.lock().unwrap();
+        let (last, first) = domains.split_last().unwrap();
+        assert_eq!(last, &global);
+        assert!(
+            first.len() > 1,
+            "resent to the shard topic first: {domains:?}"
+        );
+        assert!(first.iter().all(|domain| domain == &shard), "{domains:?}");
+    }
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}
+
+/// `RecipientWallet::submit` prints the id of the bundle it hands to
+/// `send_message_bundle`: a resend carries those same bytes, so the id stays true.
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn a_resent_bundle_keeps_the_id_a_submit_prints() {
+    use sha3::Digest;
+    crate::retry::NO_WAIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let (km, _) = peer_key_manager(directory.path());
+    let (server, received) = recording_node(Ok(()));
+    let (multiaddr, calls, stop, serving) =
+        flaky_node(server, tonic::Status::unavailable("node restarting"), 2).await;
+    let mut client = client_at(&multiaddr).await;
+    let bundle = submission_bundle();
+    let id = bundle_id(&bundle).unwrap();
+    crate::send::send_message_bundle(&mut client, &km, vec![2; 32], bundle)
+        .await
+        .expect("a node that comes back within the budget must take the bundle");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    let received = received.lock().unwrap().clone();
+    assert_eq!(received.len(), 1, "the node was reached once");
+    let delivered: [u8; 32] = sha3::Sha3_256::digest(&received[0]).into();
+    assert_eq!(delivered, id, "the id names the bytes the node got");
     stop.send(()).unwrap();
     serving.await.unwrap();
 }
@@ -2276,6 +2616,7 @@ async fn a_transient_witness_failure_keeps_waiting_for_the_settlement() {
         submit_identity: Default::default(),
         peer_id_bytes: Vec::new(),
         max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
+        read_flags: Vec::new(),
     };
     // A zero wait ends the loop after the first answer: a slow witness read
     // is a wait for the settlement, not a failure of the operation.

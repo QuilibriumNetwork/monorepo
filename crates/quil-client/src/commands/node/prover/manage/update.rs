@@ -75,6 +75,12 @@ fn signing_wait_text(action: &str, frames_left: u64) -> String {
 }
 
 pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
+    apply_msg_at(m, msg, Instant::now())
+}
+
+/// [`apply_msg`] with the node's answers received at `now`: the clock the
+/// refresh observations (progress stalls, RPC freshness) count from.
+pub fn apply_msg_at(m: &mut Model, msg: Msg, now: Instant) -> Vec<Cmd> {
     match msg {
         Msg::SigningWait {
             action,
@@ -96,6 +102,10 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
                 .cursor
                 .min(m.coins.mint.saved.len().saturating_sub(1));
             coins::apply_legacy(m, answer, took);
+            vec![]
+        }
+        Msg::LegacyProgress { pages, coins } => {
+            coins::apply_legacy_progress(m, pages, coins);
             vec![]
         }
         Msg::MintPreview(preview) => {
@@ -130,13 +140,13 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
             m.reward_loaded = true;
             m.reward_error = result.as_ref().err().cloned();
             m.claimable_reward = result.ok().flatten();
-            m.reward_last_success = m.claimable_reward.map(|_| Instant::now());
+            m.reward_last_success = m.claimable_reward.map(|_| now);
             vec![]
         }
         Msg::ShardLoading => {
             m.shard_loading = true;
             m.shard_message_time = Some(std::time::SystemTime::now());
-            m.shard_fetch_started = Some(Instant::now());
+            m.shard_fetch_started = Some(now);
             vec![]
         }
         Msg::ShardRefresh(result) => {
@@ -148,11 +158,11 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
                 .map(|started| started.elapsed());
             match result {
                 Ok(shards) => {
-                    m.observe_app_intervals(&shards, Instant::now());
-                    m.observe_reported_app_heads(&shards, Instant::now());
-                    m.observe_committed_app_heads(&shards, Instant::now());
+                    m.observe_app_intervals(&shards, now);
+                    m.observe_reported_app_heads(&shards, now);
+                    m.observe_committed_app_heads(&shards, now);
                     m.shard_error = None;
-                    m.shard_last_success = Some(Instant::now());
+                    m.shard_last_success = Some(now);
                     m.shard_last_duration = elapsed;
                     // Node status can arrive after shard data on initial load.
                     m.cached_shard_info = Some(shards.clone());
@@ -178,14 +188,15 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
             }
             if let Some(node) = &node_info {
                 m.node_global_cadence = node.frame_cadence.clone();
-                m.observe_global_head(node.last_received_frame, Instant::now());
+                m.node_global_cadence_received = Some(now);
+                m.observe_global_head(node.last_received_frame, now);
             }
             if let Some(shards) = &shard_info {
-                m.observe_app_intervals(shards, Instant::now());
-                m.observe_reported_app_heads(shards, Instant::now());
-                m.observe_committed_app_heads(shards, Instant::now());
+                m.observe_app_intervals(shards, now);
+                m.observe_reported_app_heads(shards, now);
+                m.observe_committed_app_heads(shards, now);
             }
-            m.last_fetch_success = Some(Instant::now());
+            m.last_fetch_success = Some(now);
             if m.consecutive_failures > 0 && m.status_msg.starts_with("Refresh failed: ") {
                 m.status_msg.clear();
                 m.status_sticky = false;
@@ -1972,7 +1983,98 @@ fn handle_join_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
 mod tests {
     use super::super::model::FilterOutcome;
     use super::*;
-    use quil_types::proto::node::{NodeInfoResponse, ShardAllocationInfo};
+    use quil_types::proto::node::{
+        FrameCadence, FrameWindow, GetShardInfoResponse, NodeInfoResponse, ShardAllocationInfo,
+        ShardRewardInfo,
+    };
+
+    fn cadence_answer() -> (FrameCadence, GetShardInfoResponse) {
+        let cadence = FrameCadence {
+            last_observed_unix_seconds: 1,
+            hour: Some(FrameWindow {
+                window_seconds: 3600,
+                observed_seconds: 600,
+                advanced_frames: 30,
+            }),
+            day: None,
+        };
+        let shards = GetShardInfoResponse {
+            shards: vec![ShardRewardInfo {
+                filter: vec![1],
+                frame_cadence: Some(cadence),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        (cadence, shards)
+    }
+
+    #[test]
+    fn a_failed_shard_refresh_keeps_values_until_their_budget_ends() {
+        let (_, shards) = cadence_answer();
+        let reward = num_bigint::BigInt::from(1000);
+        let mut m = Model::new();
+        apply_msg(&mut m, Msg::ShardRefresh(Ok(shards.clone())));
+        apply_msg(&mut m, Msg::ShardRefresh(Err("timed out".into())));
+        assert!(m.shard_error.is_some());
+        assert_eq!(m.app_interval(&[1]), Some(20.0));
+        assert!(m.daily_reward(&reward, &[1], 0).is_some());
+
+        m.node_app_cadence_received = Some(Instant::now() - Duration::from_secs(76));
+        assert!(m.app_cadence_stale());
+        assert_eq!(m.app_interval(&[1]), None);
+        assert!(m.daily_reward(&reward, &[1], 0).is_none());
+
+        // A node status answer holds no shard data and revives nothing.
+        apply_msg(
+            &mut m,
+            Msg::DataRefresh {
+                node_info: Some(NodeInfoResponse::default()),
+                shard_info: None,
+                worker_info: None,
+                err: None,
+            },
+        );
+        assert!(m.app_cadence_stale());
+
+        apply_msg(&mut m, Msg::ShardRefresh(Ok(shards)));
+        assert!(!m.app_cadence_stale());
+        assert_eq!(m.app_interval(&[1]), Some(20.0));
+    }
+
+    #[test]
+    fn a_node_status_answer_restarts_the_global_budget() {
+        let (cadence, _) = cadence_answer();
+        let mut m = Model::new();
+        m.node_global_cadence = Some(cadence);
+        m.node_global_cadence_received = Some(Instant::now() - Duration::from_secs(31));
+        assert!(m.global_cadence_stale());
+        apply_msg(
+            &mut m,
+            Msg::DataRefresh {
+                node_info: Some(NodeInfoResponse {
+                    frame_cadence: Some(cadence),
+                    ..Default::default()
+                }),
+                shard_info: None,
+                worker_info: None,
+                err: None,
+            },
+        );
+        assert!(!m.global_cadence_stale());
+        assert_eq!(m.global_seconds_per_frame(), Some(20.0));
+    }
+
+    #[test]
+    fn a_node_without_a_sample_stays_missing_not_stale() {
+        let (_, mut shards) = cadence_answer();
+        shards.shards[0].frame_cadence = None;
+        let mut m = Model::new();
+        apply_msg(&mut m, Msg::ShardRefresh(Ok(shards)));
+        assert!(!m.node_app_cadence.contains_key(&[1u8][..]));
+        assert_eq!(m.app_interval(&[1]), None);
+        assert!(!m.app_cadence_stale());
+    }
 
     /// The wait to sign shows while the action is in flight, as a notice and
     /// not an error, and a refresh does not clear it.

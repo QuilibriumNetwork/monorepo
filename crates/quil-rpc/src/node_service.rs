@@ -362,6 +362,15 @@ pub type AppHypergraphStores = Arc<
     dyn Fn(&[u8]) -> Result<Vec<Arc<dyn quil_types::store::HypergraphStore>>, Status> + Send + Sync,
 >;
 
+/// This node's seat's share of a shard's certificates, by shard filter.
+pub type CertificateShareProvider =
+    Arc<dyn Fn(&[u8]) -> Option<node::CertificateShare> + Send + Sync>;
+
+/// The seat concentration of a shard's session this node sits in, by shard
+/// filter.
+pub type SeatConcentrationProvider =
+    Arc<dyn Fn(&[u8]) -> Option<node::SeatConcentration> + Send + Sync>;
+
 pub struct NodeRpcServer {
     pub peer_id: String,
     pub version: Vec<u8>,
@@ -376,6 +385,11 @@ pub struct NodeRpcServer {
     pub reachable: bool,
     pub frame_cadence_provider:
         Option<Arc<dyn Fn(&[u8]) -> Option<node::FrameCadence> + Send + Sync>>,
+    /// The seat concentration of a shard's session this node sits in.
+    pub seat_concentration_provider: Option<SeatConcentrationProvider>,
+    /// This node's seat's share of a shard's certificates
+    /// (`ShardRewardInfo.certificate_share`); `None` for no seat.
+    pub certificate_share_provider: Option<CertificateShareProvider>,
 
     // Stores and registries (optional — None means unavailable).
     pub prover_registry: Option<Arc<dyn ProverRegistry>>,
@@ -441,15 +455,20 @@ pub type TraversalProofGenerator =
 /// `(domain, payload, authentication)`. Verifies the Ed448
 /// authentication over the payload under the
 /// `NODE_AUTHENTICATION || domain` prefix, then routes the
-/// MessageBundle to the correct BlossomSub bitmask.
+/// MessageBundle to the correct BlossomSub bitmask. A refusal with `retry`
+/// (no route to a node that can execute it now) answers `Unavailable`, which a
+/// sender resends; any other answers `Unauthenticated`.
 pub type SendHandler = Arc<
     dyn Fn(
             Vec<u8>,
             Vec<u8>,
             Vec<u8>,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
-        + Send
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), crate::global_service::SubmitRefusal>>
+                    + Send,
+            >,
+        > + Send
         + Sync,
 >;
 
@@ -496,6 +515,8 @@ impl NodeRpcServer {
             prover_address: Vec::new(),
             reachable: false,
             frame_cadence_provider: None,
+            seat_concentration_provider: None,
+            certificate_share_provider: None,
             prover_registry: None,
             shard_info_provider: None,
             token_fee_provider: None,
@@ -563,6 +584,14 @@ impl NodeRpcServer {
         provider: Arc<dyn Fn(&[u8]) -> Option<node::FrameCadence> + Send + Sync>,
     ) -> Self {
         self.frame_cadence_provider = Some(provider);
+        self
+    }
+    pub fn with_seat_concentration_provider(mut self, provider: SeatConcentrationProvider) -> Self {
+        self.seat_concentration_provider = Some(provider);
+        self
+    }
+    pub fn with_certificate_share_provider(mut self, provider: CertificateShareProvider) -> Self {
+        self.certificate_share_provider = Some(provider);
         self
     }
     pub fn with_shard_info_provider(mut self, provider: Arc<dyn ShardInfoProvider>) -> Self {
@@ -943,7 +972,13 @@ impl NodeService for NodeRpcServer {
                 .map_err(|e| Status::internal(format!("canonicalize: {e}")))?;
         handler(req.domain, payload, req.authentication)
             .await
-            .map_err(|e| Status::unauthenticated(format!("send rejected: {e}")))?;
+            .map_err(|refusal| {
+                if refusal.retry {
+                    Status::unavailable(format!("send not delivered: {}", refusal.reason))
+                } else {
+                    Status::unauthenticated(format!("send rejected: {}", refusal.reason))
+                }
+            })?;
         Ok(Response::new(node::SendResponse {
             delivery_data: Vec::new(),
         }))
@@ -1822,6 +1857,14 @@ impl NodeService for NodeRpcServer {
                     leaving: c.leaving,
                     departing: c.departing,
                 }),
+                certificate_share: self
+                    .certificate_share_provider
+                    .as_ref()
+                    .and_then(|p| p(&d.filter)),
+                seat_concentration: self
+                    .seat_concentration_provider
+                    .as_ref()
+                    .and_then(|p| p(&d.filter)),
             });
         }
 
@@ -3318,6 +3361,104 @@ mod shard_world_size_tests {
                 BigInt::from(3000)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn seat_certificate_shares_reach_their_rows_and_older_servers_send_none() {
+        let share = node::CertificateShare {
+            hour: Some(node::CertificateWindow {
+                window_seconds: 3600,
+                observed_seconds: 3600,
+                frames: 340,
+                signed_frames: 120,
+            }),
+            day: Some(node::CertificateWindow {
+                window_seconds: 86400,
+                observed_seconds: 7200,
+                frames: 700,
+                signed_frames: 260,
+            }),
+            committee: 24,
+            quorum: 17,
+        };
+        let expected = share;
+        let request = || Request::new(node::GetShardInfoRequest { include_all: true });
+        let server = NodeRpcServer::new()
+            .with_shard_info_provider(Arc::new(Provider))
+            .with_certificate_share_provider(Arc::new(move |filter| {
+                (filter == &[1u8][..]).then_some(share)
+            }));
+        let response = server.get_shard_info(request()).await.unwrap().into_inner();
+        let response = <node::GetShardInfoResponse as prost::Message>::decode(
+            prost::Message::encode_to_vec(&response).as_slice(),
+        )
+        .unwrap();
+        assert_eq!(response.shards[0].certificate_share, Some(expected));
+        assert!(
+            response.shards[1].certificate_share.is_none(),
+            "a shard without a seat has no share"
+        );
+        let older = NodeRpcServer::new()
+            .with_shard_info_provider(Arc::new(Provider))
+            .get_shard_info(request())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(older.shards.iter().all(|s| s.certificate_share.is_none()));
+        // A row an older server encoded, without the field, still decodes.
+        let legacy = prost::Message::encode_to_vec(&node::ShardRewardInfo {
+            filter: vec![1],
+            active_provers: 8,
+            ..Default::default()
+        });
+        let decoded = <node::ShardRewardInfo as prost::Message>::decode(legacy.as_slice()).unwrap();
+        assert_eq!(
+            (decoded.active_provers, decoded.certificate_share),
+            (8, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn shard_rows_carry_the_seat_concentration_of_sessions_this_node_sits_in() {
+        let request = || Request::new(node::GetShardInfoRequest { include_all: true });
+        let server = NodeRpcServer::new()
+            .with_shard_info_provider(Arc::new(Provider))
+            .with_seat_concentration_provider(Arc::new(|filter| {
+                (filter == [1]).then_some(node::SeatConcentration {
+                    members: 17,
+                    quorum: 12,
+                    largest_group_seats: 5,
+                    own_group_seats: 5,
+                    unaddressed_members: 1,
+                    concentration_seats: 4,
+                    epoch: 1393,
+                })
+            }));
+        let response = server.get_shard_info(request()).await.unwrap().into_inner();
+        let response = <node::GetShardInfoResponse as prost::Message>::decode(
+            prost::Message::encode_to_vec(&response).as_slice(),
+        )
+        .unwrap();
+        let seats = response.shards[0].seat_concentration.as_ref().unwrap();
+        assert_eq!(
+            (
+                seats.members,
+                seats.own_group_seats,
+                seats.concentration_seats,
+                seats.epoch
+            ),
+            (17, 5, 4, 1393)
+        );
+        assert!(
+            response.shards[1].seat_concentration.is_none(),
+            "not a member"
+        );
+        let server = NodeRpcServer::new().with_shard_info_provider(Arc::new(Provider));
+        let response = server.get_shard_info(request()).await.unwrap().into_inner();
+        assert!(response
+            .shards
+            .iter()
+            .all(|s| s.seat_concentration.is_none()));
     }
 }
 

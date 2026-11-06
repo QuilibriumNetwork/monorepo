@@ -734,39 +734,47 @@ impl TokenExecutionEngine {
             .unwrap_or_else(|| worker.concurrency())
             .clamp(1, operations.len());
         let next = AtomicUsize::new(0);
-        let tallies: [AtomicUsize; 4] = Default::default();
+        let tallies: [AtomicUsize; 5] = Default::default();
         std::thread::scope(|scope| {
-            for _ in 0..parallelism {
-                scope.spawn(|| loop {
-                    if let Some(pause) = pacing.pause {
-                        while pause() {
-                            std::thread::sleep(std::time::Duration::from_millis(50));
+            for lane in 0..parallelism {
+                std::thread::Builder::new()
+                    .name(format!("preverify-{lane}"))
+                    .spawn_scoped(scope, || loop {
+                        if let Some(pause) = pacing.pause {
+                            while pause() {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
                         }
-                    }
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some((address, bytes, tp)) = operations.get(index) else {
-                        break;
-                    };
-                    let tally = match policy.preverify(worker, address, bytes, *tp) {
-                        Preverified::Cached => Some(0),
-                        Preverified::Verified => Some(1),
-                        Preverified::Busy => Some(2),
-                        Preverified::Unavailable => Some(3),
-                        Preverified::NotApplicable => None,
-                    };
-                    if let Some(tally) = tally {
-                        tallies[tally].fetch_add(1, Ordering::Relaxed);
-                    }
-                    if let Some(done) = pacing.done {
-                        done.fetch_add(1, Ordering::Relaxed);
-                    }
-                });
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some((address, bytes, tp)) = operations.get(index) else {
+                            break;
+                        };
+                        let tally = match policy.preverify(worker, address, bytes, *tp) {
+                            Preverified::Cached => Some(0),
+                            Preverified::Verified => Some(1),
+                            Preverified::Joined => {
+                                tallies[4].fetch_add(1, Ordering::Relaxed);
+                                Some(1)
+                            }
+                            Preverified::Busy => Some(2),
+                            Preverified::Unavailable => Some(3),
+                            Preverified::NotApplicable => None,
+                        };
+                        if let Some(tally) = tally {
+                            tallies[tally].fetch_add(1, Ordering::Relaxed);
+                        }
+                        if let Some(done) = pacing.done {
+                            done.fetch_add(1, Ordering::Relaxed);
+                        }
+                    })
+                    .expect("spawn a proof pre-verification thread");
             }
         });
         counts.cached = tallies[0].load(Ordering::Relaxed);
         counts.verified = tallies[1].load(Ordering::Relaxed);
         counts.busy = tallies[2].load(Ordering::Relaxed);
         counts.unavailable = tallies[3].load(Ordering::Relaxed);
+        counts.joined = tallies[4].load(Ordering::Relaxed);
         counts
     }
 

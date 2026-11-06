@@ -29,7 +29,9 @@ use crate::context::GlobalArgs;
 type Client = NodeServiceClient<Channel>;
 
 /// Per-call deadline for every NodeService RPC (mirrors `rpcTimeout`).
-const RPC_TIMEOUT: Duration = Duration::from_secs(15);
+pub(super) const RPC_TIMEOUT: Duration = Duration::from_secs(15);
+/// Archive fallback can exceed the fast status deadline.
+pub(super) const SHARD_RPC_TIMEOUT: Duration = Duration::from_secs(60);
 /// Longer ceiling for RequestJoin (VDF on the node side).
 const JOIN_RPC_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -65,44 +67,128 @@ pub async fn fetch_rewards(client: Client, km: Arc<FileKeyManager>) -> Msg {
     Msg::RewardRefresh(result)
 }
 
-/// Longest a legacy read of the Coins tab may take.
-const LEGACY_TIMEOUT: Duration = Duration::from_secs(120);
+/// When a legacy read of the Coins tab gives up: once the node sends
+/// nothing for `stall` (no page, nor the shard list after the last one),
+/// or after `cap` in all. A listing's length follows the owner's coins (a
+/// regular node forwards each page of 512 to an archive in about 0.7 s:
+/// 3,000 coins take 5 s, 180,000 about 250 s), so only a stalled read
+/// fails early.
+#[derive(Clone, Copy, Debug)]
+pub struct LegacyLimits {
+    pub stall: Duration,
+    pub cap: Duration,
+}
+
+/// A page the node is still retrying arrives within the channel's 120 s
+/// call deadline, which ends a stuck call first; an hour lists over a
+/// million coins at the pace above.
+pub const LEGACY_LIMITS: LegacyLimits = LegacyLimits {
+    stall: Duration::from_secs(120),
+    cap: Duration::from_secs(3600),
+};
 
 /// Read the legacy coins of the identity with Ed448 key `public` (`None`:
-/// the config has none, so it owns no legacy coins).
+/// the config has none, so it owns no legacy coins), sending
+/// [`Msg::LegacyProgress`] to `progress` as pages arrive.
 pub async fn fetch_legacy(
     client: Client,
     public: Option<[u8; 57]>,
     network: u8,
     config_dir: Option<std::path::PathBuf>,
+    progress: tokio::sync::mpsc::UnboundedSender<Msg>,
+) -> Msg {
+    read_legacy(client, public, network, config_dir, progress, LEGACY_LIMITS).await
+}
+
+/// [`fetch_legacy`] within `limits`.
+async fn read_legacy(
+    client: Client,
+    public: Option<[u8; 57]>,
+    network: u8,
+    config_dir: Option<std::path::PathBuf>,
+    progress: tokio::sync::mpsc::UnboundedSender<Msg>,
+    limits: LegacyLimits,
 ) -> Msg {
     let started = std::time::Instant::now();
     let answer = match public {
         None => Ok(None),
-        Some(public) => tokio::time::timeout(
-            LEGACY_TIMEOUT,
-            crate::commands::token::legacy::snapshot(
+        Some(public) => {
+            let (tick, ticks) = tokio::sync::watch::channel((0, 0));
+            let mut report = move |pages: usize, coins: usize| {
+                let _ = tick.send((pages, coins));
+            };
+            let read = crate::commands::token::legacy::snapshot(
                 &client,
                 &quil_execution::domains::QUIL_TOKEN,
                 &public,
                 network,
                 config_dir.as_deref(),
-            ),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            Err(anyhow::anyhow!(
-                "no answer within {}s",
-                LEGACY_TIMEOUT.as_secs()
-            ))
-        })
-        .map(Some)
-        .map_err(|e| format!("{e:#}")),
+                &mut report,
+            );
+            until_stalled(read, ticks, limits, |(pages, coins)| {
+                let _ = progress.send(Msg::LegacyProgress { pages, coins });
+            })
+            .await
+            .and_then(|read| read.map(Some).map_err(|e| format!("{e:#}")))
+        }
     };
     Msg::LegacyRefresh {
         answer,
         took: started.elapsed(),
         mints: saved_mints(config_dir.as_deref(), network),
+    }
+}
+
+/// Run `read` to its end unless `ticks`, its `(pages, coins)` so far, stays
+/// unchanged for `limits.stall`, or `limits.cap` passes; `on_tick` gets
+/// each new value. The error says which, and how far the read got.
+async fn until_stalled<T>(
+    read: impl std::future::Future<Output = T>,
+    mut ticks: tokio::sync::watch::Receiver<(usize, usize)>,
+    limits: LegacyLimits,
+    mut on_tick: impl FnMut((usize, usize)),
+) -> Result<T, String> {
+    let started = tokio::time::Instant::now();
+    let (mut last, mut open) = (started, true);
+    let mut reported = None;
+    tokio::pin!(read);
+    loop {
+        let wake = (last + limits.stall).min(started + limits.cap);
+        tokio::select! {
+            biased;
+            out = &mut read => {
+                // The read's last page can land with its result in one poll;
+                // `biased` takes the result first, so report that page too.
+                let now = *ticks.borrow();
+                if now != (0, 0) && reported != Some(now) {
+                    on_tick(now);
+                }
+                return Ok(out);
+            }
+            changed = ticks.changed(), if open => match changed {
+                Ok(()) => {
+                    last = tokio::time::Instant::now();
+                    let now = *ticks.borrow_and_update();
+                    reported = Some(now);
+                    on_tick(now);
+                }
+                Err(_) => open = false,
+            },
+            () = tokio::time::sleep_until(wake) => {
+                let (pages, coins) = *ticks.borrow();
+                return Err(if wake >= started + limits.cap {
+                    format!(
+                        "not done within {} min, after {pages} pages ({coins} coins)",
+                        limits.cap.as_secs() / 60
+                    )
+                } else {
+                    format!(
+                        "no answer for {}s after {pages} pages ({coins} coins)",
+                        limits.stall.as_secs_f64()
+                    )
+                });
+            }
+        }
     }
 }
 
@@ -673,6 +759,16 @@ pub(crate) fn progress_of(
         ShieldReport::Paced(Paced::Resumed { paused_secs, .. }) => Progress::Resumed {
             paused_secs: *paused_secs,
         },
+        ShieldReport::Paced(Paced::ShardGone {
+            index,
+            shard,
+            submitted,
+            ..
+        }) => Progress::ShardGone {
+            index: index + 1,
+            shard: shard.clone(),
+            submitted: submitted.is_some(),
+        },
         ShieldReport::Paced(Paced::Progress { projected_end, .. }) => Progress::Projected {
             end: *projected_end,
         },
@@ -991,7 +1087,15 @@ async fn transfer_action(
 ) -> anyhow::Result<()> {
     use super::transfer::Kind;
     use crate::commands::token::{
-        run_claim, run_merge, run_pending_create, run_transfer, SCAN_MAX_COINS, SCAN_MAX_PAGES,
+        run_claim, run_merge, run_pending_create, run_transfer, Follow, SCAN_MAX_COINS,
+        SCAN_MAX_PAGES,
+    };
+    // The manager prints each submission's identifiers into its notice and
+    // leaves the wait to the operator (`token inclusion`, named in the notice).
+    const NO_WAIT: std::time::Duration = std::time::Duration::ZERO;
+    let no_follow = || Follow {
+        wait: NO_WAIT,
+        max_pages: SCAN_MAX_PAGES,
     };
     own_node_only(tc)?;
     let app = quil_token();
@@ -1007,6 +1111,7 @@ async fn transfer_action(
                 None,
                 SCAN_MAX_PAGES,
                 SCAN_MAX_COINS,
+                NO_WAIT,
             )
             .await
         }
@@ -1024,14 +1129,31 @@ async fn transfer_action(
                 *refund_after,
                 SCAN_MAX_PAGES,
                 SCAN_MAX_COINS,
+                NO_WAIT,
             )
             .await
         }
         Kind::Accept { escrow, .. } => {
-            run_claim(tc, &app, &hex::encode(escrow), preview.fee, false).await
+            run_claim(
+                tc,
+                &app,
+                &hex::encode(escrow),
+                preview.fee,
+                false,
+                no_follow(),
+            )
+            .await
         }
         Kind::Refund { escrow, .. } => {
-            run_claim(tc, &app, &hex::encode(escrow), preview.fee, true).await
+            run_claim(
+                tc,
+                &app,
+                &hex::encode(escrow),
+                preview.fee,
+                true,
+                no_follow(),
+            )
+            .await
         }
         Kind::Merge => {
             run_merge(
@@ -1041,6 +1163,7 @@ async fn transfer_action(
                 preview.fee,
                 SCAN_MAX_PAGES,
                 SCAN_MAX_COINS,
+                NO_WAIT,
             )
             .await
         }
@@ -1155,11 +1278,11 @@ pub async fn fetch_data(mut client: Client) -> Msg {
     }
 }
 
-/// Archive fallback can exceed the fast status deadline. Keep it bounded,
-/// report failure explicitly, and allow node status to refresh meanwhile.
+/// Keep the shard query bounded, report failure explicitly, and allow node
+/// status to refresh meanwhile.
 pub async fn fetch_shards(mut client: Client) -> Msg {
     let result = tokio::time::timeout(
-        Duration::from_secs(60),
+        SHARD_RPC_TIMEOUT,
         client.get_shard_info(tonic::Request::new(GetShardInfoRequest {
             include_all: true,
         })),
@@ -1168,7 +1291,10 @@ pub async fn fetch_shards(mut client: Client) -> Msg {
     Msg::ShardRefresh(match result {
         Ok(Ok(r)) => Ok(r.into_inner()),
         Ok(Err(e)) => Err(format!("Shard data unavailable: {e}")),
-        Err(_) => Err("Shard data timed out after 60s; retrying".into()),
+        Err(_) => Err(format!(
+            "Shard data timed out after {}s; retrying",
+            SHARD_RPC_TIMEOUT.as_secs()
+        )),
     })
 }
 
@@ -1682,6 +1808,7 @@ mod shield_action_tests {
             submit_identity: Default::default(),
             peer_id_bytes: Vec::new(),
             max_fee: u128::MAX,
+            read_flags: Vec::new(),
         };
         let (notes, mut lines) = tokio::sync::mpsc::unbounded_channel();
         let preview = crate::commands::token::output::capture(notes, shield_preview(&tc))
@@ -1959,6 +2086,7 @@ mod mint_action_tests {
             submit_identity: Default::default(),
             peer_id_bytes: Vec::new(),
             max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
+            read_flags: Vec::new(),
         };
         let (notes, mut lines) = tokio::sync::mpsc::unbounded_channel();
         let preview = crate::commands::token::output::capture(notes, mint_preview(&tc))
@@ -2113,6 +2241,235 @@ mod mint_action_tests {
             assert!(!error.contains("--submit-config"), "{error}");
         }
         stop.send(()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod legacy_read_tests {
+    use super::*;
+    use quil_types::store::{CoinWitnessProvider, LegacyCoinData, LegacyCoinPageData};
+    use tokio::sync::watch;
+    use tokio::time::Instant;
+
+    const LIMITS: LegacyLimits = LEGACY_LIMITS;
+
+    /// The last page and the read's result can land in one poll: the read
+    /// is ready and the watch holds a page no tick reported. The page is
+    /// still reported, so the progress shown ends at the read's total.
+    #[tokio::test(start_paused = true)]
+    async fn a_last_page_landing_with_the_result_is_reported() {
+        let (tick, ticks) = watch::channel((0, 0));
+        tick.send_replace((31, 15_872));
+        let mut seen = Vec::new();
+        let out = until_stalled(async { 7 }, ticks, LIMITS, |p| seen.push(p)).await;
+        assert_eq!(out, Ok(7));
+        assert_eq!(seen, vec![(31, 15_872)]);
+    }
+
+    /// A read sending `pages` pages of 512 coins, one every `every`, then
+    /// `after`: a snapshot's calls after its last page.
+    async fn paging<T>(
+        tick: watch::Sender<(usize, usize)>,
+        pages: usize,
+        every: Duration,
+        after: impl std::future::Future<Output = T>,
+    ) -> T {
+        for page in 1..=pages {
+            tokio::time::sleep(every).await;
+            tick.send_replace((page, page * 512));
+        }
+        after.await
+    }
+
+    /// A listing of 347 pages of 0.72 s each, 250 s, as a regular node
+    /// lists 177,000 coins. A fixed 120 s limit on the whole read, as the
+    /// Coins tab had, cuts it every time; a read that keeps paging is
+    /// never cut, and each page reaches the tab.
+    #[tokio::test(start_paused = true)]
+    async fn a_long_listing_that_keeps_paging_is_read_to_its_end() {
+        let every = Duration::from_millis(720);
+        let (tick, _) = watch::channel((0, 0));
+        let fixed = tokio::time::timeout(
+            Duration::from_secs(120),
+            paging(tick, 347, every, async { 347 }),
+        );
+        assert!(fixed.await.is_err(), "a fixed 120 s limit cuts it");
+        let started = Instant::now();
+        let (tick, ticks) = watch::channel((0, 0));
+        let mut seen = Vec::new();
+        let read = until_stalled(
+            paging(tick, 347, every, async {
+                tokio::time::sleep(every).await;
+                "listed"
+            }),
+            ticks,
+            LIMITS,
+            |tick| seen.push(tick),
+        );
+        assert_eq!(read.await, Ok("listed"));
+        assert!(started.elapsed() >= Duration::from_secs(249));
+        assert_eq!(seen.len(), 347);
+        assert_eq!(seen.last(), Some(&(347, 347 * 512)));
+    }
+
+    /// A read whose node stops answering fails once nothing came for the
+    /// stall window, naming how far it got; one that keeps answering
+    /// without end fails at the cap.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_or_endless_read_fails_and_says_how_far_it_got() {
+        let started = Instant::now();
+        let (tick, ticks) = watch::channel((0, 0));
+        let read = until_stalled(
+            paging(
+                tick,
+                10,
+                Duration::from_millis(720),
+                std::future::pending::<()>(),
+            ),
+            ticks,
+            LIMITS,
+            |_| {},
+        );
+        assert_eq!(
+            read.await,
+            Err("no answer for 120s after 10 pages (5120 coins)".into())
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(127_200) && took < Duration::from_secs(128),
+            "{took:?}"
+        );
+        let started = Instant::now();
+        let (tick, ticks) = watch::channel((0, 0));
+        let read = until_stalled(
+            paging(tick, usize::MAX, Duration::from_secs(1), async {}),
+            ticks,
+            LIMITS,
+            |_| {},
+        );
+        let error = read.await.unwrap_err();
+        assert!(
+            error.starts_with("not done within 60 min, after "),
+            "{error}"
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_secs(3600) && took < Duration::from_secs(3601),
+            "{took:?}"
+        );
+    }
+
+    /// One owner's legacy coins in full pages, each after `latency`: a
+    /// regular node forwarding each page to an archive.
+    struct SlowIndex {
+        owner: [u8; 32],
+        coins: Vec<LegacyCoinData>,
+        latency: Duration,
+    }
+
+    impl CoinWitnessProvider for SlowIndex {
+        fn legacy_coins(
+            &self,
+            _domain: &[u8; 32],
+            owner: &[u8; 32],
+            after: Option<&[u8; 32]>,
+        ) -> quil_types::error::Result<Option<LegacyCoinPageData>> {
+            std::thread::sleep(self.latency);
+            let rest: Vec<LegacyCoinData> = if *owner == self.owner {
+                self.coins
+                    .iter()
+                    .filter(|coin| after.is_none_or(|after| coin.address > *after))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let max = quil_types::store::MAX_LEGACY_COINS_PER_PAGE;
+            let coins: Vec<LegacyCoinData> = rest.iter().take(max).cloned().collect();
+            Ok(Some(LegacyCoinPageData {
+                cursor: coins.last().map(|coin| coin.address),
+                has_more: rest.len() > max,
+                coins,
+            }))
+        }
+    }
+
+    /// Over loopback gRPC, at a hundredth of the time scale: 15,360 coins
+    /// in 31 pages of 100 ms take about 3 s, twice a 1.5 s stall window,
+    /// as a 250 s listing is twice the tab's former 120 s limit. The tab gets each page's progress, then the coins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_coins_tab_reads_thousands_of_legacy_coins_paging_slowly() {
+        let public = [7u8; 57];
+        let owners = crate::commands::token::legacy::key_owners(&public).unwrap();
+        let coins: Vec<LegacyCoinData> = (1..=15_360u32)
+            .map(|i| {
+                let mut address = [0u8; 32];
+                address[28..].copy_from_slice(&i.to_be_bytes());
+                LegacyCoinData {
+                    address,
+                    amount: 1,
+                    origin: [9; 32],
+                    shielded: false,
+                }
+            })
+            .collect();
+        let provider = Arc::new(SlowIndex {
+            owner: owners[0].1,
+            coins,
+            latency: Duration::from_millis(100),
+        });
+        let server =
+            quil_rpc::node_service::NodeRpcServer::new().with_coin_witness_provider(provider);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let multiaddr = format!(
+            "/ip4/127.0.0.1/tcp/{}",
+            listener.local_addr().unwrap().port()
+        );
+        let incoming = futures::stream::unfold(listener, |listener| async {
+            let result = listener.accept().await.map(|(socket, _)| socket);
+            Some((result, listener))
+        });
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    quil_types::proto::node::node_service_server::NodeServiceServer::new(server),
+                )
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+        let client = crate::rpc::connect_node_service(&crate::rpc::ConnectOpts {
+            listen_grpc_multiaddr: multiaddr,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let limits = LegacyLimits {
+            stall: Duration::from_millis(1500),
+            cap: Duration::from_secs(60),
+        };
+        let started = std::time::Instant::now();
+        let Msg::LegacyRefresh { answer, .. } =
+            read_legacy(client, Some(public), 0, None, tx, limits).await
+        else {
+            panic!("a legacy read answers with LegacyRefresh");
+        };
+        let snapshot = answer.unwrap().unwrap();
+        assert!(
+            started.elapsed() > limits.stall,
+            "the read outlasts the window"
+        );
+        assert_eq!((snapshot.tally.unshielded, snapshot.pages), (15_360, 31));
+        let mut progress = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let Msg::LegacyProgress { pages, coins } = msg {
+                progress.push((pages, coins));
+            }
+        }
+        assert!(progress.len() >= 2, "{progress:?}");
+        assert!(progress.windows(2).all(|w| w[0] <= w[1]), "{progress:?}");
+        assert_eq!(progress.last(), Some(&(31, 15_360)));
     }
 }
 
@@ -2416,6 +2773,8 @@ mod paced_shield_tests {
         now: u64,
         frames: Box<dyn Fn(u64) -> u64>,
         inclusion: u64,
+        /// A batch whose shard has no active prover from this time on.
+        gone: Option<(usize, u64)>,
         submits: Vec<(usize, u64)>,
         model: Model,
         /// The manager's stop flag, set by `Cmd::ShieldStop` as the event
@@ -2441,6 +2800,7 @@ mod paced_shield_tests {
                 now: START,
                 frames: Box::new(frames),
                 inclusion,
+                gone: None,
                 submits: Vec::new(),
                 model,
                 halt: AtomicBool::new(false),
@@ -2572,7 +2932,13 @@ mod paced_shield_tests {
         }
         async fn included(&mut self, index: usize) -> anyhow::Result<bool> {
             let sent = self.submits.iter().find(|(i, _)| *i == index).unwrap().1;
-            Ok(self.now >= sent + self.inclusion)
+            // A batch whose shard loses its provers never commits.
+            Ok(self.now >= sent + self.inclusion && self.gone.is_none_or(|(g, _)| g != index))
+        }
+        async fn shard_live(&mut self, index: usize) -> anyhow::Result<bool> {
+            Ok(!self
+                .gone
+                .is_some_and(|(gone, from)| gone == index && self.now >= from))
         }
         fn event(&mut self, event: &Paced) {
             self.report(ShieldReport::Paced(event));
@@ -2629,6 +2995,42 @@ mod paced_shield_tests {
         assert_eq!(
             io.texts(),
             ["Shield: 3 batches of 3 included: 288 coins, 2700 Q shielded."]
+        );
+    }
+
+    /// A batch whose shard loses its provers while it waits is left with a
+    /// notice naming the shard; the run goes on with the next batch and
+    /// ends with an error naming the batch left.
+    #[tokio::test]
+    async fn manager_shield_leaves_a_batch_whose_shard_lost_its_provers() {
+        let mut io = Fake::new(2, healthy(), 30);
+        // Batch 1 is submitted at START + 150; its shard empties 10 min on.
+        io.gone = Some((0, START + 750));
+        let error = io.run(2).await.unwrap_err().to_string();
+        assert!(error.starts_with("1 batch of 2 left (batch 1)"), "{error}");
+        let gone = io.after(|p| matches!(p, shield::Progress::ShardGone { index: 1, .. }));
+        assert!(
+            gone.iter().any(|t| t
+                == "Shield: 1 batch left, shard ...feedbeef00 without active provers; a rerun \
+                    plans their coins onto a live shard."),
+            "{gone:#?}"
+        );
+        assert!(
+            !gone
+                .iter()
+                .any(|t| t.starts_with("Shield batch 1/2: 96 coins submitted")),
+            "the left batch is no longer awaited: {gone:#?}"
+        );
+        assert_eq!(io.submits.len(), 2, "batch 2 goes on: {:?}", io.submits);
+        let run = io.model.coins.shield.run.as_ref().unwrap();
+        assert_eq!(run.left, [(1, "...feedbeef00".to_owned(), true)]);
+        assert!(run.submitted[1].included, "{:?}", run.submitted);
+        let texts = io.texts();
+        let stopped = "Shield: the run stopped after 2 batches of 2 submitted: 1 batch of 2 left";
+        assert!(texts.iter().any(|t| t.starts_with(stopped)), "{texts:#?}");
+        assert!(
+            !texts.iter().any(|t| t.contains("without active provers;")),
+            "the error says it once: {texts:#?}"
         );
     }
 
@@ -2825,6 +3227,7 @@ mod transfer_action_tests {
             submit_config_dir: directory.path().to_path_buf(),
             submit_identity: Default::default(),
             peer_id_bytes: Vec::new(),
+            read_flags: Vec::new(),
             max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
         };
         let capture = |kind| {
@@ -2927,6 +3330,7 @@ mod transfer_action_tests {
                 submit_config_dir: directory.path().to_path_buf(),
                 submit_identity: Default::default(),
                 peer_id_bytes: Vec::new(),
+                read_flags: Vec::new(),
                 max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
             };
             let refused = |error: String| {

@@ -60,7 +60,7 @@ runs:
           *) echo "unsupported runner arch: $RUNNER_ARCH" >&2; exit 1 ;;
         esac
         TMP="$(mktemp -d)"
-        curl -fsSL -o "$TMP/protoc.zip" \
+        curl -fsSL --retry 5 --retry-all-errors -o "$TMP/protoc.zip" \
           "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip"
         sudo unzip -o "$TMP/protoc.zip" -d /usr/local bin/protoc 'include/*'
         sudo chmod +x /usr/local/bin/protoc

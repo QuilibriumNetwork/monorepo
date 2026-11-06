@@ -380,7 +380,11 @@ int py_gen_params(dch_pack_params pp, const statement ist, int zk, int debug){
   timing_end(&time);
   timing_print(&time, 0);
 
-  printf("Estimated proof size: %.2fKB\n", ((double) pibits)/8192);
+  // Quilibrium: only with debug (the adapter passes 0). Library code must
+  // not write to stdout: it scrolls an interactive terminal (qclient's TUI).
+  if(debug){
+    printf("Estimated proof size: %.2fKB\n", ((double) pibits)/8192);
+  }
 
   return 0;
 }

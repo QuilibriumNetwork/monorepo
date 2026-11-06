@@ -573,10 +573,10 @@ fn opening_costs() {
 }
 
 #[test]
-fn stable_replica_keys_do_not_allow_epoch_stark_replay_after_1393() {
-    let legacy = Fixture::at(b"stable-key-leaf", 1392, 4096, 3);
-    let first = Fixture::at(b"stable-key-leaf", 1393, 4096, 3);
-    let next = Fixture::at(b"stable-key-leaf", 1394, 4096, 3);
+fn stable_replica_keys_do_not_allow_epoch_stark_replay_after_1429() {
+    let legacy = Fixture::at(b"stable-key-leaf", 1428, 4096, 3);
+    let first = Fixture::at(b"stable-key-leaf", 1429, 4096, 3);
+    let next = Fixture::at(b"stable-key-leaf", 1430, 4096, 3);
     assert_ne!(legacy.encoded.replica, first.encoded.replica);
     assert_eq!(first.encoded.replica, next.encoded.replica);
     let params = SdrParams::default();

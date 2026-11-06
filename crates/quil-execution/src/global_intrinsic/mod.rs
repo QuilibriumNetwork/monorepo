@@ -27,6 +27,8 @@
 
 pub mod addressed_signature;
 pub mod alt_shard_update_materialize;
+#[cfg(feature = "confidential-tokens")]
+pub mod commit_destinations;
 pub mod consensus_types;
 pub mod conversions;
 pub mod frame_header;

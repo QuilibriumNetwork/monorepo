@@ -443,6 +443,62 @@ pub fn parse_consumed_record(blob: &[u8]) -> Result<[u8; 32]> {
     )
 }
 
+/// The global commit's decision on one operation, as its GLOBAL record at
+/// [`decision_address`] holds it. Either is final.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Committed { frame: u64 },
+    Rejected { frame: u64, reason: String },
+}
+
+fn decision_fields(decision: &Decision) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let (committed, frame, reason) = match decision {
+        Decision::Committed { frame } => (1, frame, ""),
+        Decision::Rejected { frame, reason } => (0, frame, reason.as_str()),
+    };
+    Ok(vec![
+        kind_field(KIND_DECISION)?,
+        (vec![0], vec![committed]),
+        (vec![4], frame.to_be_bytes().to_vec()),
+        (vec![8], reason.as_bytes().to_vec()),
+    ])
+}
+
+/// The blob of a decision record, exactly as the commit stores it.
+pub fn encode_decision_record(decision: &Decision) -> Result<Vec<u8>> {
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    for (key, value) in decision_fields(decision)? {
+        tree.insert(&key, &value, &[], &num_bigint::BigInt::from(value.len()))?;
+    }
+    quil_tries::serialize_go_tree(tree.root.as_ref())
+        .map_err(|_| invalid("cannot encode decision record"))
+}
+
+/// Decode a decision record's stored bytes, as a node's vertex read of
+/// [`decision_address`] returns them: `None` for an empty blob (undecided).
+pub fn decode_decision(blob: &[u8]) -> Result<Option<Decision>> {
+    let Some(fields) =
+        records::decode_record_fields(blob, &records::kind(KIND_DECISION)?, &[&[0], &[4], &[8]])?
+    else {
+        return Ok(None);
+    };
+    let [Some(committed), Some(frame), reason] = fields.as_slice() else {
+        return Err(invalid("decision record missing a field"));
+    };
+    let frame = u64::from_be_bytes(fixed(frame)?);
+    match committed.as_slice() {
+        [1] => Ok(Some(Decision::Committed { frame })),
+        [0] => Ok(Some(Decision::Rejected {
+            frame,
+            reason: reason
+                .as_deref()
+                .map(|reason| String::from_utf8_lossy(reason).into_owned())
+                .unwrap_or_default(),
+        })),
+        _ => Err(invalid("malformed decision")),
+    }
+}
+
 /// Whether `marker` is consumed in `application`.
 pub fn is_consumed(
     state: &HypergraphState,
@@ -1199,12 +1255,10 @@ pub fn commit_entry(
             state,
             frame,
             &decision,
-            &[
-                kind_field(KIND_DECISION)?,
-                (vec![0], vec![0]),
-                (vec![4], frame.to_be_bytes().to_vec()),
-                (vec![8], reason.as_bytes().to_vec()),
-            ],
+            &decision_fields(&Decision::Rejected {
+                frame,
+                reason: reason.into(),
+            })?,
         )?;
         Ok(Outcome::Rejected(reason))
     };
@@ -1394,12 +1448,7 @@ pub fn commit_entry(
         state,
         frame,
         &decision,
-        &[
-            kind_field(KIND_DECISION)?,
-            (vec![0], vec![1]),
-            (vec![4], frame.to_be_bytes().to_vec()),
-            (vec![8], Vec::new()),
-        ],
+        &decision_fields(&Decision::Committed { frame })?,
     )?;
     Ok(Outcome::Committed {
         fee: entry.fee,
@@ -1437,6 +1486,28 @@ pub fn verify_relay(
 /// Operations one `spends committed` line names; it counts the rest.
 const LISTED_COMMITS: usize = 16;
 
+/// What one header's relay committed: the fees [`materialize_relay`]
+/// returns, and the blocks its committed outputs and escrows were queued
+/// into.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RelayCommit {
+    /// Fees credited to the relaying shard's provers.
+    pub fees: u128,
+    /// Per destination block: `(outputs, escrows)` committed into it.
+    pub placed: std::collections::BTreeMap<u64, (u64, u64)>,
+}
+
+impl RelayCommit {
+    fn place(&mut self, placements: &[Placement], escrow: Option<&Placement>) {
+        for placement in placements {
+            self.placed.entry(placement.block).or_default().0 += 1;
+        }
+        if let Some(escrow) = escrow {
+            self.placed.entry(escrow.block).or_default().1 += 1;
+        }
+    }
+}
+
 /// Commit every entry a certified header relays, in relay order, returning
 /// the fees of the operations that committed (credited to the relaying
 /// shard's provers). Re-carried entries are already decided and add nothing.
@@ -1450,9 +1521,21 @@ pub fn materialize_relay(
     header_frame: u64,
     relay: &[u8],
 ) -> Result<u128> {
+    materialize_relay_placed(state, frame, filter, header_frame, relay).map(|commit| commit.fees)
+}
+
+/// [`materialize_relay`], also returning the blocks its committed outputs
+/// and escrows were queued into, for the caller's destination line.
+pub fn materialize_relay_placed(
+    state: &HypergraphState,
+    frame: u64,
+    filter: &[u8],
+    header_frame: u64,
+    relay: &[u8],
+) -> Result<RelayCommit> {
     use crate::token_engine::TYPE_LATTICE_MINT_CLAIM;
     if relay.is_empty() {
-        return Ok(0);
+        return Ok(RelayCommit::default());
     }
     let application: [u8; 32] = filter
         .get(..32)
@@ -1465,17 +1548,22 @@ pub fn materialize_relay(
         None => return Err(invalid("header filter names no shard")),
     };
     let mint_fee_paid = frame >= settlement_record::committed_credit_frame();
-    let mut fees = 0u128;
+    let mut commit = RelayCommit::default();
     let (mut committed, mut rejected, mut mint_claims) = (0usize, 0usize, 0usize);
     let mut listed = Vec::new();
     for (_, entries) in verify_relay(frame, header_frame, relay)? {
         for entry in entries {
             match commit_entry(state, frame, &application, &entry, source_shard)? {
-                Outcome::Committed { fee, .. } => {
+                Outcome::Committed {
+                    fee,
+                    placements,
+                    escrow,
+                } => {
                     let mint_claim = entry.kind == TYPE_LATTICE_MINT_CLAIM;
                     if !(mint_fee_paid && mint_claim) {
-                        fees = fees.saturating_add(fee);
+                        commit.fees = commit.fees.saturating_add(fee);
                     }
+                    commit.place(&placements, escrow.as_ref());
                     mint_claims += usize::from(mint_claim);
                     if listed.len() < LISTED_COMMITS {
                         listed.push(hex::encode(&entry.tx_id[..8]));
@@ -1507,13 +1595,13 @@ pub fn materialize_relay(
             committed,
             rejected,
             mint_claims,
-            fees,
+            fees = commit.fees,
             txs = %listed.join(","),
             txs_unlisted = committed - listed.len(),
             "spends committed"
         );
     }
-    Ok(fees)
+    Ok(commit)
 }
 
 fn escrow_fields(
@@ -1942,6 +2030,56 @@ mod tests {
         ));
     }
 
+    /// A wallet reads the decision through a node's vertex read: the stored
+    /// bytes decode to the outcome and the GLOBAL frame that decided it.
+    #[test]
+    fn a_decision_record_decodes_from_its_stored_bytes() {
+        let state = mem_state();
+        let stored = |address: [u8; 32]| {
+            state
+                .get(
+                    &crate::global_schema::GLOBAL_INTRINSIC_ADDRESS,
+                    &address,
+                    &crate::hypergraph_state::vertex_adds_discriminator().unwrap(),
+                )
+                .unwrap()
+        };
+        let decision = |tx: u8| stored(decision_address(&APP, &[tx; 32]).unwrap());
+        assert_eq!(decision(1), None);
+        assert_eq!(
+            decode_decision(&[]).unwrap(),
+            None,
+            "an empty blob is undecided"
+        );
+        commit_entry(&state, 100, &APP, &entry(1, &[20, 21], &[1, 2]), SHARD).unwrap();
+        let committed = Decision::Committed { frame: 100 };
+        assert_eq!(
+            decode_decision(&decision(1).unwrap()).unwrap(),
+            Some(committed.clone())
+        );
+        assert_eq!(
+            encode_decision_record(&committed).unwrap(),
+            decision(1).unwrap()
+        );
+        commit_entry(&state, 107, &APP, &entry(2, &[21, 22], &[3]), SHARD).unwrap();
+        let rejected = Decision::Rejected {
+            frame: 107,
+            reason: "already consumed".into(),
+        };
+        assert_eq!(
+            decode_decision(&decision(2).unwrap()).unwrap(),
+            Some(rejected.clone())
+        );
+        assert_eq!(
+            encode_decision_record(&rejected).unwrap(),
+            decision(2).unwrap()
+        );
+        // Another record kind at the address is not a decision.
+        let consumed = stored(consumed_address(&APP, &[20; 32]).unwrap()).unwrap();
+        assert!(decode_decision(&consumed).is_err());
+        assert!(decode_decision(&[1, 2, 3]).is_err(), "malformed bytes");
+    }
+
     #[test]
     fn a_root_must_be_canonical_and_a_context_fixed() {
         let state = mem_state();
@@ -2251,6 +2389,45 @@ mod tests {
         assert_eq!(materialize_relay(&state, 100, &APP, 41, &relay).unwrap(), 5);
         assert!(is_consumed(&state, &APP, &[30; 32]).unwrap());
         set_committed_credit_frame_for_thread(None);
+    }
+
+    /// The relay commit reports the blocks it queued committed outputs and
+    /// escrows into; a rejected or re-carried entry places nothing.
+    #[test]
+    fn a_relay_commit_reports_where_its_outputs_were_placed() {
+        let mut escrowed = entry(2, &[21], &[4]);
+        let mut escrow = output(9);
+        escrow[0] = 0b0000_1000;
+        escrowed.escrow_create = Some(EscrowCreate {
+            address: escrow,
+            binding: [3; 32],
+            refund_after_global_frame: 500,
+        });
+        let relayed = vec![
+            entry(1, &[20], &[2, 3]).encode().unwrap(),
+            escrowed.encode().unwrap(),
+            entry(1, &[20], &[2, 3]).encode().unwrap(),
+            entry(3, &[20], &[5]).encode().unwrap(),
+        ];
+        let relay = crate::token_intrinsic::spend_relay::encode_relay(&[(40, relayed)]).unwrap();
+        let state = mem_state();
+        let commit = materialize_relay_placed(&state, 100, &APP, 41, &relay).unwrap();
+        let outputs = coin_blocks::block_for_address(6, &output(2)).unwrap();
+        let escrows = coin_blocks::block_for_address(6, &escrow).unwrap();
+        assert_ne!(outputs, escrows);
+        assert_eq!(
+            commit.fees, 10,
+            "two committed, one re-carried, one rejected"
+        );
+        assert_eq!(
+            commit.placed,
+            [(outputs, (3, 0)), (escrows, (0, 1))].into_iter().collect(),
+        );
+        assert_eq!(
+            materialize_relay_placed(&state, 101, &APP, 41, &relay).unwrap(),
+            RelayCommit::default(),
+            "a re-carried relay places nothing"
+        );
     }
 
     #[test]

@@ -427,12 +427,15 @@ impl ExecutionPublicationGuard<'_> {
         } else {
             Some(global_clock.prepare_execution_publication()?)
         };
-        let mut crdt = self.capture.prepare_adoption(
-            &branch.manager.crdt,
-            branch.overlay(),
-            self.limits.state,
-            |overlay| Ok(Arc::new(OverlayHypergraphStore::new(overlay))),
-        )?;
+        let mut crdt = self
+            .capture
+            .prepare_adoption(
+                &branch.manager.crdt,
+                branch.overlay(),
+                self.limits.state,
+                |overlay| Ok(Arc::new(OverlayHypergraphStore::new(overlay))),
+            )
+            .map_err(with_holders)?;
         let plan = branch.overlay().prepare_commit().map_err(|e| {
             QuilError::ExecutionUnavailable(format!("prepare canonical execution: {e}"))
         })?;
@@ -522,7 +525,7 @@ fn unavailable_engine(name: &str) -> QuilError {
     QuilError::ExecutionUnavailable(format!("unsupported execution capture engine {name}"))
 }
 
-/// Ends the message of a [`QuilError::ExecutionUnavailable`] whose source was
+/// Marks the message of a [`QuilError::ExecutionUnavailable`] whose source was
 /// only in use: another thread held it for a moment (a gossip validation or an
 /// RPC cost query reads the engines), and the same request succeeds once it
 /// lets go.
@@ -541,13 +544,30 @@ pub fn lock_unavailable<G>(what: &str, error: std::sync::TryLockError<G>) -> Qui
     }
 }
 
+/// Names the readers inside the locks when an adoption could not take its
+/// metadata locks in time (the CRDT crate reports the lock, not its reader).
+fn with_holders(error: QuilError) -> QuilError {
+    match error {
+        QuilError::ExecutionUnavailable(message) if message.contains("busy or poisoned") => {
+            QuilError::ExecutionUnavailable(format!(
+                "{message} (holders: {})",
+                quil_types::lock_holders::report()
+            ))
+        }
+        other => other,
+    }
+}
+
 /// `what` is in use by another holder; see [`source_busy`].
 pub fn busy_unavailable(what: &str) -> QuilError {
-    QuilError::ExecutionUnavailable(format!("{what}{SOURCE_BUSY}"))
+    QuilError::ExecutionUnavailable(format!(
+        "{what}{SOURCE_BUSY} (holders: {})",
+        quil_types::lock_holders::report()
+    ))
 }
 
 /// Whether `error` only reports a source another holder was using, so the
 /// same request may succeed if asked again shortly.
 pub fn source_busy(error: &QuilError) -> bool {
-    matches!(error, QuilError::ExecutionUnavailable(message) if message.ends_with(SOURCE_BUSY))
+    matches!(error, QuilError::ExecutionUnavailable(message) if message.contains(SOURCE_BUSY))
 }

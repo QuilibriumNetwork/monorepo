@@ -355,6 +355,111 @@ fn a_pacing_leader_is_asked_to_build_only_after_its_wait() {
     });
 }
 
+/// Cannot tell its pacing until its first attempt has declined, the way a
+/// GLOBAL leader cannot while its parent's height is not known here, then
+/// paces `pacing` once; with `declines_always` it never builds.
+struct LatePacingProposer {
+    attempts: std::sync::atomic::AtomicU32,
+    paced: std::sync::atomic::AtomicU32,
+    pacing: Duration,
+    declines_always: bool,
+}
+impl LatePacingProposer {
+    fn new(pacing: Duration, declines_always: bool) -> Arc<Self> {
+        Arc::new(Self {
+            attempts: 0.into(),
+            paced: 0.into(),
+            pacing,
+            declines_always,
+        })
+    }
+}
+impl GlobalProposer for LatePacingProposer {
+    fn propose(&self, _view: u64, _parent: Sha256Digest) -> Option<(Sha256Digest, Vec<u8>)> {
+        use std::sync::atomic::Ordering;
+        let attempt = self.attempts.fetch_add(1, Ordering::AcqRel) + 1;
+        (attempt > 1 && !self.declines_always).then(|| (Sha256Digest([9; 32]), vec![9]))
+    }
+    fn verify(&self, _: u64, _: Sha256Digest, _: Sha256Digest, _: Option<Vec<u8>>) -> bool {
+        false
+    }
+    fn propose_retry(&self) -> Option<Duration> {
+        Some(Duration::from_secs(1))
+    }
+    fn proposal_pacing(
+        &self,
+        _context: quil_cw_consensus::adapters::ProposalContext,
+    ) -> Option<Duration> {
+        use std::sync::atomic::Ordering;
+        if self.attempts.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        if self.declines_always {
+            self.paced.fetch_add(1, Ordering::AcqRel);
+            return Some(self.pacing);
+        }
+        (self.paced.fetch_add(1, Ordering::AcqRel) == 0).then_some(self.pacing)
+    }
+}
+
+/// Ask `proposer` for view 5's proposal; `Some((digest, seconds))` once it
+/// built, `None` if the turn was given up.
+fn late_paced_propose(proposer: Arc<LatePacingProposer>) -> Option<(Sha256Digest, u64)> {
+    use commonware_consensus::{simplex::types::Context, Automaton as _};
+    use commonware_runtime::Clock as _;
+    let leader = FalconPrivateKey::random(commonware_utils::test_rng()).public_key();
+    deterministic::Runner::timed(Duration::from_secs(300)).start(|context| async move {
+        let mut automaton = quil_cw_consensus::adapters::FalconAutomaton::new(
+            context.child("automaton"),
+            proposer,
+            BlockStore::new(),
+        );
+        let started = context.current();
+        let pending = automaton
+            .propose(Context {
+                round: Round::new(Epoch::new(1), View::new(5)),
+                leader,
+                parent: (View::new(4), Sha256Digest([1; 32])),
+            })
+            .await;
+        let digest = pending.await.ok()?;
+        let elapsed = context.current().duration_since(started).unwrap();
+        Some((digest, elapsed.as_secs()))
+    })
+}
+
+/// A leader that learns its pacing only while it retries waits it out before
+/// it builds again, instead of building at its next retry and pacing inside
+/// the build on inputs copied too early (2026-11-04: one archive's GLOBAL
+/// proposals carried about 10 shard headers, the others' about 95).
+#[test]
+fn a_leader_paces_when_it_learns_its_pacing_after_the_view_started() {
+    use std::sync::atomic::Ordering;
+    let proposer = LatePacingProposer::new(Duration::from_secs(5), false);
+    let built = late_paced_propose(proposer.clone());
+    // Declined at 0 s, retried after 1 s, then paced 5 s: built at 6 s.
+    assert_eq!(
+        built,
+        Some((Sha256Digest([9; 32]), 6)),
+        "the pacing learned at the retry is waited out before the second attempt"
+    );
+    assert_eq!(proposer.attempts.load(Ordering::Acquire), 2);
+}
+
+/// Pacing asked before every attempt cannot hold a turn without end: a
+/// leader that paces and declines every time gives the view up once its
+/// retries reach the propose patience.
+#[test]
+fn a_leader_that_paces_and_declines_every_attempt_gives_its_turn_up() {
+    use std::sync::atomic::Ordering;
+    let proposer = LatePacingProposer::new(Duration::from_secs(1), true);
+    assert_eq!(late_paced_propose(proposer.clone()), None);
+    let attempts = proposer.attempts.load(Ordering::Acquire);
+    // 20 s of 1 s retries after the first attempt.
+    assert_eq!(attempts, 21, "attempts until the patience ran out");
+    assert_eq!(proposer.paced.load(Ordering::Acquire), attempts - 1);
+}
+
 /// Busy the way a voter publishing the previous frame is: it defers a number
 /// of checks, then answers.
 struct BusyVerifier {

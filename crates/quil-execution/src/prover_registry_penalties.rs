@@ -114,7 +114,7 @@ impl InMemoryProverRegistry {
                         departure_frame,
                         ABSENCE_PENALTY_GRACE_FRAMES,
                         &HashMap::new(),
-                        quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+                        quil_types::consensus::signed_frame_activation_frame(),
                     )
                     .0
                 });
@@ -152,7 +152,7 @@ impl InMemoryProverRegistry {
             frame,
             ABSENCE_PENALTY_GRACE_FRAMES,
             &HashMap::new(),
-            quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+            quil_types::consensus::signed_frame_activation_frame(),
         );
         let mut scope = Vec::new();
         for info in self.prover_cache.values() {

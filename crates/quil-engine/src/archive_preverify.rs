@@ -34,6 +34,9 @@ use std::time::{Duration, Instant};
 
 use quil_execution::manager::{PreverifyCounts, PreverifyPacing};
 use quil_execution::token_intrinsic::spend_relay::RELAY_WINDOW_FRAMES;
+use quil_lattice_ct::confidential::relation::backend::worker_client::{
+    slot_busy_total, take_longest_slot_hold,
+};
 use quil_types::proto::global::MessageBundle;
 use tracing::{info, warn};
 
@@ -167,6 +170,9 @@ struct PrewarmState {
     /// Since start.
     total: PrewarmStats,
     summarized: Option<Instant>,
+    /// This process's verifier slot time at the last summary
+    /// ([`slot_busy_total`]).
+    slot_busy_mark: Duration,
     settlement: SettlementLedger,
 }
 
@@ -390,10 +396,19 @@ impl PrewarmShared {
         }
     }
 
-    /// One line per [`SUMMARY_INTERVAL`] while frames are queued or verified.
+    /// One line per [`SUMMARY_INTERVAL`] while frames are queued or verified,
+    /// or this process's verifier slots were busy: their busy time, summed
+    /// over slots, and the longest verification, by any caller, give the
+    /// time per proof and the slots' utilization (`node status` carries the
+    /// slots, `proof_slots`).
     fn summarize(state: &mut PrewarmState, max_frames: usize) {
         let now = Instant::now();
-        let since = *state.summarized.get_or_insert(now);
+        if state.summarized.is_none() {
+            state.summarized = Some(now);
+            state.slot_busy_mark = slot_busy_total();
+            take_longest_slot_hold();
+        }
+        let since = state.summarized.unwrap_or(now);
         if now.duration_since(since) < SUMMARY_INTERVAL {
             return;
         }
@@ -401,7 +416,9 @@ impl PrewarmShared {
         state.settlement.summarize(now);
         let window = std::mem::take(&mut state.window);
         state.total.add(window);
-        if window == PrewarmStats::default() && state.queue.is_empty() {
+        let slot_busy = slot_window(&mut state.slot_busy_mark, slot_busy_total());
+        let longest = take_longest_slot_hold();
+        if window == PrewarmStats::default() && state.queue.is_empty() && slot_busy.is_zero() {
             return;
         }
         info!(
@@ -410,6 +427,7 @@ impl PrewarmShared {
             frames = window.frames,
             operations = window.counts.operations,
             verified = window.counts.verified,
+            joined = window.counts.joined,
             cached = window.counts.cached,
             busy = window.counts.busy,
             failed = window.counts.unavailable,
@@ -417,11 +435,21 @@ impl PrewarmShared {
             dropped = window.dropped,
             pending = state.queue.len(),
             max_frames,
+            busy_s = slot_busy.as_secs(),
+            longest_ms = u64::try_from(longest.as_millis()).unwrap_or(u64::MAX),
+            window_secs = now.duration_since(since).as_secs(),
             interval_secs = SUMMARY_INTERVAL.as_secs(),
             "archive proof prewarm summary: confidential proofs of admitted application frames verified ahead of GLOBAL; \
              dropped frames verify when GLOBAL materializes them"
         );
     }
+}
+
+/// Slot time since `mark`, moving `mark` to `total`.
+fn slot_window(mark: &mut Duration, total: Duration) -> Duration {
+    let window = total.saturating_sub(*mark);
+    *mark = total;
+    window
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +547,9 @@ struct ShardSettlement {
     /// [`SETTLE_HOLD_LIMIT`] from it.
     since: Instant,
     frames: std::collections::BTreeMap<u64, PendingProofs>,
+    /// Since when a proposal of this archive holds the header back, until
+    /// the hold ends ([`SettlementStats`]).
+    held: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -556,6 +587,22 @@ struct SettlementStats {
     hold_limit: usize,
     /// The longest any held shard had waited.
     longest_hold: Duration,
+    /// Holds begun: a shard's header first held back by this archive's
+    /// proposals (`held` counts every such check).
+    holds: usize,
+    /// How holds ended: released by this archive's proposals as verified
+    /// here with the margin passed, at the relay bound or at the hold limit;
+    /// carried by a proposal whose check did not release it (another
+    /// leader's, or this one's once the header's anchor was about to leave
+    /// the window) and executed by GLOBAL; or forgotten.
+    ended_settled: usize,
+    ended_relay_bound: usize,
+    ended_hold_limit: usize,
+    ended_carried: usize,
+    ended_forgotten: usize,
+    /// Of the holds ended, those leaving frames this archive had not verified
+    /// yet: GLOBAL waits for their proofs here.
+    ended_unverified: usize,
 }
 
 impl ShardSettlement {
@@ -604,6 +651,7 @@ impl SettlementLedger {
             .or_insert_with(|| ShardSettlement {
                 since: now,
                 frames: Default::default(),
+                held: None,
             });
         if shard.frames.is_empty() {
             shard.since = now;
@@ -637,9 +685,16 @@ impl SettlementLedger {
         };
         // GLOBAL executed the shard through its cursor: those frames are done.
         let above = shard.frames.split_off(&cursor.saturating_add(1));
-        let executed = std::mem::replace(&mut shard.frames, above).len();
-        if executed > 0 {
-            self.frames -= executed;
+        let executed = std::mem::replace(&mut shard.frames, above);
+        if !executed.is_empty() {
+            self.frames -= executed.len();
+            // A hold no check here released: another proposal carried it.
+            if shard.held.take().is_some() {
+                self.window.ended_carried += 1;
+                if executed.values().any(|proofs| proofs.settled.is_none()) {
+                    self.window.ended_unverified += 1;
+                }
+            }
             let oldest = shard.frames.values().map(|proofs| proofs.queued).min();
             match oldest {
                 Some(oldest) => shard.since = oldest,
@@ -651,6 +706,32 @@ impl SettlementLedger {
         }
         let decision = shard.decide(cursor, through, now);
         let held = now.saturating_duration_since(shard.since);
+        match decision {
+            Settlement::Clear => {}
+            Settlement::Settling => {
+                if shard.held.is_none() {
+                    shard.held = Some(now);
+                    self.window.holds += 1;
+                }
+            }
+            Settlement::Settled | Settlement::RelayBound | Settlement::HoldLimit => {
+                if shard.held.take().is_some() {
+                    let stats = &mut self.window;
+                    match decision {
+                        Settlement::Settled => stats.ended_settled += 1,
+                        Settlement::RelayBound => stats.ended_relay_bound += 1,
+                        _ => stats.ended_hold_limit += 1,
+                    }
+                    if shard
+                        .frames
+                        .range(..=through)
+                        .any(|(_, proofs)| proofs.settled.is_none())
+                    {
+                        stats.ended_unverified += 1;
+                    }
+                }
+            }
+        }
         let stats = &mut self.window;
         match decision {
             Settlement::Clear => {}
@@ -700,19 +781,29 @@ impl SettlementLedger {
 
     /// Once per summary interval: forget frames held past twice the hold
     /// limit (they hold nothing any more), close a hold-limit run that saw
-    /// no such proposal this interval, and log what the interval did.
-    fn summarize(&mut self, now: Instant) {
+    /// no such proposal this interval, and log what the interval did, which
+    /// it returns.
+    fn summarize(&mut self, now: Instant) -> SettlementStats {
         let stale = SETTLE_HOLD_LIMIT * 2;
         let mut forgotten = 0;
+        let (mut holds_forgotten, mut forgotten_unverified) = (0, 0);
         self.shards.retain(|_, shard| {
             let before = shard.frames.len();
+            let unverified = shard.frames.values().any(|proofs| proofs.settled.is_none());
             shard
                 .frames
                 .retain(|_, proofs| now.saturating_duration_since(proofs.queued) < stale);
             forgotten += before - shard.frames.len();
-            !shard.frames.is_empty()
+            let keep = !shard.frames.is_empty();
+            if !keep && shard.held.is_some() {
+                holds_forgotten += 1;
+                forgotten_unverified += usize::from(unverified);
+            }
+            keep
         });
         self.frames -= forgotten;
+        self.window.ended_forgotten += holds_forgotten;
+        self.window.ended_unverified += forgotten_unverified;
         let window = std::mem::take(&mut self.window);
         if window.hold_limit == 0 {
             if let Some((since, _, count)) = self.limit.take() {
@@ -725,7 +816,7 @@ impl SettlementLedger {
             }
         }
         if window == SettlementStats::default() && self.frames == 0 {
-            return;
+            return window;
         }
         info!(
             scope = "this archive",
@@ -736,6 +827,13 @@ impl SettlementLedger {
             relay_bound = window.relay_bound,
             hold_limit = window.hold_limit,
             longest_hold_secs = window.longest_hold.as_secs(),
+            holds = window.holds,
+            ended_settled = window.ended_settled,
+            ended_relay_bound = window.ended_relay_bound,
+            ended_hold_limit = window.ended_hold_limit,
+            ended_carried = window.ended_carried,
+            ended_forgotten = window.ended_forgotten,
+            ended_unverified = window.ended_unverified,
             shards = self.shards.len(),
             frames = self.frames,
             forgotten,
@@ -744,6 +842,7 @@ impl SettlementLedger {
              confidential operations until this archive verified them or the spend relay window needed them to ride, \
              so GLOBAL waits less for those proofs"
         );
+        window
     }
 }
 
@@ -755,8 +854,12 @@ impl SettlementLedger {
 /// frame. Frames beyond either verify under the lock, as before.
 pub const PREPASS_MAX_FRAMES: usize = 1024;
 pub const PREPASS_MAX_BYTES: usize = 128 << 20;
-/// How long a pass retries operations that found no worker slot. Past it the
-/// locked materialization verifies them, as before.
+/// How long a pass retries operations that found no worker slot while no
+/// round verifies anything. Past it the locked materialization verifies them,
+/// as before. A round that verified some restarts it: a round outlasts the
+/// window whenever a frame carries more operations than there are slots and
+/// one takes longer than the window (2026-11-04: four of about 290 s on two
+/// slots), and the locked pass then held the ingest for the rest.
 pub const PREPASS_BUSY_WINDOW: Duration = Duration::from_secs(300);
 const PREPASS_BUSY_PAUSE: Duration = Duration::from_millis(500);
 /// A pass longer than this is logged at info.
@@ -913,37 +1016,41 @@ pub fn preverify_through_within(
     let finished = Mutex::new(false);
     let finished_signal = Condvar::new();
     std::thread::scope(|scope| {
-        let progress = scope.spawn(|| {
-            let mut warned: Option<Instant> = None;
-            let mut finished_guard = finished.lock().unwrap_or_else(|p| p.into_inner());
-            loop {
-                if *finished_guard {
-                    return;
+        let progress = std::thread::Builder::new()
+            .name("prepass-watch".into())
+            .spawn_scoped(scope, || {
+                let mut warned: Option<Instant> = None;
+                let mut finished_guard = finished.lock().unwrap_or_else(|p| p.into_inner());
+                loop {
+                    if *finished_guard {
+                        return;
+                    }
+                    let elapsed = start.elapsed();
+                    if elapsed >= PREPASS_WARN
+                        && warned.is_none_or(|at| at.elapsed() >= PREPASS_PROGRESS_INTERVAL)
+                    {
+                        warned = Some(Instant::now());
+                        warn!(
+                            scope = "this archive",
+                            frame = global_frame,
+                            shards,
+                            frames,
+                            bundles,
+                            done = done.load(Ordering::Relaxed),
+                            secs = elapsed.as_secs(),
+                            action = "GLOBAL execution of this frame waits for these proofs; the archive ingest stays free; \
+                                      it ends when they verify (raise proofWorker.maxConcurrent if CPU allows)",
+                            "archive GLOBAL frame proof pre-verification still running"
+                        );
+                    }
+                    finished_guard = match finished_signal.wait_timeout(finished_guard, Duration::from_secs(1)) {
+                        Ok((guard, _)) => guard,
+                        Err(poisoned) => poisoned.into_inner().0,
+                    };
                 }
-                let elapsed = start.elapsed();
-                if elapsed >= PREPASS_WARN
-                    && warned.is_none_or(|at| at.elapsed() >= PREPASS_PROGRESS_INTERVAL)
-                {
-                    warned = Some(Instant::now());
-                    warn!(
-                        scope = "this archive",
-                        frame = global_frame,
-                        shards,
-                        frames,
-                        bundles,
-                        done = done.load(Ordering::Relaxed),
-                        secs = elapsed.as_secs(),
-                        action = "GLOBAL execution of this frame waits for these proofs; the archive ingest stays free; \
-                                  it ends when they verify (raise proofWorker.maxConcurrent if CPU allows)",
-                        "archive GLOBAL frame proof pre-verification still running"
-                    );
-                }
-                finished_guard = match finished_signal.wait_timeout(finished_guard, Duration::from_secs(1)) {
-                    Ok((guard, _)) => guard,
-                    Err(poisoned) => poisoned.into_inner().0,
-                };
-            }
-        });
+            })
+            .expect("spawn the pre-pass progress thread");
+        let mut progressed = Instant::now();
         loop {
             report.rounds += 1;
             done.store(0, Ordering::Relaxed);
@@ -962,10 +1069,14 @@ pub fn preverify_through_within(
                 // Later rounds find earlier verdicts cached; they add what
                 // they verified and replace what is still outstanding.
                 report.counts.verified += counts.verified;
+                report.counts.joined += counts.joined;
                 report.counts.busy = counts.busy;
                 report.counts.unavailable = counts.unavailable;
             }
-            if counts.busy == 0 || start.elapsed() >= limits.busy_window {
+            if counts.verified > 0 {
+                progressed = Instant::now();
+            }
+            if counts.busy == 0 || progressed.elapsed() >= limits.busy_window {
                 break;
             }
             std::thread::sleep(limits.busy_pause);
@@ -987,6 +1098,7 @@ pub fn preverify_through_within(
                     operations = counts.operations,
                     cached = counts.cached,
                     verified = counts.verified,
+                    joined = counts.joined,
                     busy = counts.busy,
                     failed = counts.unavailable,
                     rounds = report.rounds,
@@ -1185,6 +1297,20 @@ mod tests {
         assert_eq!(most.load(Ordering::SeqCst), 3, "never more than the lanes");
     }
 
+    /// A summary's slot time is what the process added since the last one.
+    #[test]
+    fn a_summary_counts_the_slot_time_since_the_last_one() {
+        let mut mark = Duration::from_secs(10);
+        assert_eq!(
+            slot_window(&mut mark, Duration::from_secs(25)),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            slot_window(&mut mark, Duration::from_secs(25)),
+            Duration::ZERO
+        );
+    }
+
     fn admitted(ledger: &mut SettlementLedger, frame: u64, at: Instant) {
         ledger.admit(b"shard", frame, 1, at);
     }
@@ -1307,6 +1433,106 @@ mod tests {
             Settlement::Settled
         );
         assert_eq!(ledger.window.hold_limit, 0);
+    }
+
+    /// Each hold is counted once when it begins and once by how it ended,
+    /// with whether this archive had verified its frames by then: the
+    /// summary tells a hold that bought verification time from one that
+    /// rode with its proofs unverified, and from one another proposal ended.
+    #[test]
+    fn every_hold_is_counted_once_by_how_it_ended() {
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let bound = SETTLE_RELAY_ADVANCE;
+        let mut ledger = SettlementLedger::default();
+        // Held by two checks: one hold. It rides at the relay bound unverified.
+        admitted(&mut ledger, 5, at(0));
+        assert_eq!(ledger.decide(b"shard", 4, 6, at(1)), Settlement::Settling);
+        assert_eq!(ledger.decide(b"shard", 4, 7, at(2)), Settlement::Settling);
+        assert_eq!(
+            ledger.decide(b"shard", 4, 4 + bound, at(3)),
+            Settlement::RelayBound
+        );
+        assert_eq!(
+            (ledger.window.held, ledger.window.holds),
+            (2, 1),
+            "a hold was counted per proposal check instead of once"
+        );
+        assert_eq!(
+            (
+                ledger.window.ended_relay_bound,
+                ledger.window.ended_unverified
+            ),
+            (1, 1),
+            "a hold released at the relay bound with its proofs unverified was not counted"
+        );
+        // Another proposal carries the next hold: GLOBAL executes the frames
+        // before this archive's next check, which finds the cursor past them.
+        admitted(&mut ledger, 4 + bound + 1, at(10));
+        assert_eq!(
+            ledger.decide(b"shard", 4 + bound, 4 + bound + 1, at(11)),
+            Settlement::Settling
+        );
+        assert_eq!(
+            ledger.decide(b"shard", 4 + bound + 1, 4 + bound + 2, at(20)),
+            Settlement::Clear
+        );
+        assert_eq!(
+            (ledger.window.holds, ledger.window.ended_carried),
+            (2, 1),
+            "a hold another proposal ended by carrying the header was not counted"
+        );
+        assert_eq!(ledger.window.ended_unverified, 2);
+        // Verified here and past its margin: released settled, verified.
+        admitted(&mut ledger, 20, at(30));
+        assert_eq!(
+            ledger.decide(b"shard", 19, 20, at(31)),
+            Settlement::Settling
+        );
+        ledger.settle(b"shard", 20, at(40));
+        assert_eq!(ledger.decide(b"shard", 19, 20, at(50)), Settlement::Settled);
+        assert_eq!(
+            (ledger.window.ended_settled, ledger.window.ended_unverified),
+            (1, 2),
+            "a hold released as verified was not counted, or counted unverified"
+        );
+        // Released again after it ended: no second end.
+        assert_eq!(ledger.decide(b"shard", 19, 20, at(51)), Settlement::Settled);
+        assert_eq!(ledger.window.ended_settled, 1);
+        // A slow shard rides at the hold limit.
+        admitted(&mut ledger, 30, at(100));
+        assert_eq!(
+            ledger.decide(b"shard", 29, 30, at(101)),
+            Settlement::Settling
+        );
+        let limit = SETTLE_HOLD_LIMIT.as_secs();
+        assert_eq!(
+            ledger.decide(b"shard", 29, 30, at(100 + limit)),
+            Settlement::HoldLimit
+        );
+        assert_eq!(
+            (
+                ledger.window.ended_hold_limit,
+                ledger.window.ended_unverified
+            ),
+            (1, 3),
+            "a hold released at the hold limit was not counted"
+        );
+        // A hold whose frames go stale before any end is forgotten.
+        let mut ledger = SettlementLedger::default();
+        admitted(&mut ledger, 5, at(0));
+        assert_eq!(ledger.decide(b"shard", 4, 5, at(1)), Settlement::Settling);
+        let window = ledger.summarize(at(0) + SETTLE_HOLD_LIMIT * 2);
+        assert_eq!((ledger.frames, ledger.shards.len()), (0, 0));
+        assert_eq!(
+            (
+                window.holds,
+                window.ended_forgotten,
+                window.ended_unverified
+            ),
+            (1, 1, 1),
+            "a hold whose frames were forgotten was not counted"
+        );
     }
 
     /// The ledger records at most its bound; a frame it did not record never

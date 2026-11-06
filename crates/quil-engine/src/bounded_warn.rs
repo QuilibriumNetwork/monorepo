@@ -16,7 +16,7 @@ const MAX_STREAMS: usize = 256;
 
 /// What a change of a [`WarnLimiter`] logs.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Report {
+pub enum Report {
     /// The condition started, or continues: `attempts` failures since the
     /// previous line (the first line counts one), `duration` since onset.
     Failing { attempts: u64, duration: Duration },
@@ -123,12 +123,12 @@ impl<K: Ord + Clone> WarnLimiter<K> {
 
 /// Which retried duty a condition belongs to, its shard filter and two
 /// generations (zero where the duty has none).
-pub(crate) type Key = (&'static str, Vec<u8>, u64, u64);
+pub type Key = (&'static str, Vec<u8>, u64, u64);
 
 static CONDITIONS: Mutex<WarnLimiter<Key>> = Mutex::new(WarnLimiter::new());
 
 /// [`WarnLimiter::failed_at`] on the process-wide conditions, at the current time.
-pub(crate) fn failed(key: &Key, position: u64) -> Option<Report> {
+pub fn failed(key: &Key, position: u64) -> Option<Report> {
     CONDITIONS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -136,7 +136,7 @@ pub(crate) fn failed(key: &Key, position: u64) -> Option<Report> {
 }
 
 /// [`WarnLimiter::succeeded_at`] on the process-wide conditions, at the current time.
-pub(crate) fn succeeded(key: &Key, position: u64) -> Option<Report> {
+pub fn succeeded(key: &Key, position: u64) -> Option<Report> {
     CONDITIONS
         .lock()
         .unwrap_or_else(|e| e.into_inner())

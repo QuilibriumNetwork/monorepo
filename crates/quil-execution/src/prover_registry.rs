@@ -931,7 +931,7 @@ impl InMemoryProverRegistry {
             frame_number,
             inactivity_threshold,
             shard_halt_durations,
-            quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+            quil_types::consensus::signed_frame_activation_frame(),
         )
     }
 
@@ -966,7 +966,7 @@ impl InMemoryProverRegistry {
             frame_number,
             inactivity_threshold,
             shard_halt_durations,
-            quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+            quil_types::consensus::signed_frame_activation_frame(),
         )
     }
 
@@ -1358,7 +1358,7 @@ pub fn signed_frame_census_governs(
 /// The credit is `LastActiveFrameNumber` until
 /// [`signed_frame_census_governs`], then `LastSignedFrameNumber`, which only
 /// the signers of an included app frame record. Public paths pass
-/// `SIGNED_FRAME_ACTIVATION_FRAME`; reads committed registry fields only.
+/// `signed_frame_activation_frame()`; reads committed registry fields only.
 pub fn allocation_fresh_at(
     alloc: &ProverAllocationInfo,
     frame_number: u64,
@@ -1512,9 +1512,10 @@ fn live_allocation_status(
 /// The committee is evaluated at the frame it serves, so the rule changes
 /// committee seating, leader rotation and quorum alike: consensus-affecting,
 /// and every archive and prover must run a build with it before the frame.
-/// Not scheduled on mainnet; `QUIL_LEAVER_CURRENCY_FRAME` elsewhere, never
-/// by default.
-pub const MAINNET_LEAVER_CURRENCY_FRAME: Option<u64> = None;
+/// Mainnet: 1,024,560, the first frame of epoch 1423, which GLOBAL cannot reach
+/// before 2026-11-07 00:00 UTC even at ten seconds a frame;
+/// `QUIL_LEAVER_CURRENCY_FRAME` elsewhere, never by default.
+pub const MAINNET_LEAVER_CURRENCY_FRAME: Option<u64> = Some(1_024_560);
 
 static LEAVER_CURRENCY_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -3781,6 +3782,22 @@ mod tests {
     use crate::global_schema::{TYPE_HASH_PROVER, TYPE_HASH_REWARD};
     use num_bigint::BigInt;
     use quil_tries::{serialize_go_tree, LeafNode, VectorCommitmentTree};
+
+    /// The split proposer treats regions at or above this bound as never
+    /// receiving an output (`quil_forest::bit_path_reaches_outputs`): it must
+    /// be the field coin and escrow addresses are Poseidon images in.
+    #[test]
+    fn the_output_address_bound_is_the_bn254_modulus() {
+        let (_, modulus) = bn254_modulus().to_bytes_be();
+        assert_eq!(
+            modulus.as_slice(),
+            quil_forest::POSEIDON_ADDRESS_BOUND.as_slice()
+        );
+        for seed in 0u32..256 {
+            let address = quil_crypto::poseidon::hash_bytes_to_32(&seed.to_be_bytes()).unwrap();
+            assert!(address < quil_forest::POSEIDON_ADDRESS_BOUND, "{seed}");
+        }
+    }
 
     fn make_vertex_key(address_byte: u8) -> Vec<u8> {
         // 32-byte domain (global intrinsic) + 32-byte address.
@@ -6126,7 +6143,7 @@ mod tests {
                         };
                         for frame in below.iter().chain(after.iter()).copied() {
                             let expected = last_active_rule(&alloc, frame, halt);
-                            let default = quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME;
+                            let default = quil_types::consensus::signed_frame_activation_frame();
                             assert_eq!(
                                 allocation_fresh_at(&alloc, frame, halt, threshold, default),
                                 expected,
@@ -6741,12 +6758,14 @@ mod tests {
         set_leaver_currency_frame_for_thread(None);
     }
 
-    /// Leaver currency is consensus and not scheduled on mainnet.
+    /// Leaver currency is consensus: on mainnet from its own frame, the
+    /// first of an epoch, whatever the environment says.
     #[test]
-    fn leaver_currency_is_not_scheduled_by_default() {
-        assert_eq!(MAINNET_LEAVER_CURRENCY_FRAME, None);
-        assert_eq!(leaver_currency_frame_for(0, None), u64::MAX);
-        assert_eq!(leaver_currency_frame_for(0, Some("7")), u64::MAX);
+    fn leaver_currency_is_scheduled_on_mainnet_only() {
+        let mainnet = 1423 * quil_types::consensus::EPOCH_LENGTH_FRAMES;
+        assert_eq!(MAINNET_LEAVER_CURRENCY_FRAME, Some(mainnet));
+        assert_eq!(leaver_currency_frame_for(0, None), mainnet);
+        assert_eq!(leaver_currency_frame_for(0, Some("7")), mainnet);
         assert_eq!(leaver_currency_frame_for(1, Some("7")), 7);
         assert_eq!(leaver_currency_frame_for(1, Some("soon")), u64::MAX);
         assert_eq!(leaver_currency_frame_for(1, None), u64::MAX);

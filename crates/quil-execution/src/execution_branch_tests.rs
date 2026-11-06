@@ -889,3 +889,32 @@ fn seeded_capture_copies_only_a_registry_scan_of_the_captured_rows() {
     assert_eq!(copied.registry_usage(), read.registry_usage());
     assert_eq!(read.registry_usage().vertices, 3);
 }
+
+/// A busy source names the kind of reader inside the engines, so an archive
+/// that falls back to the legacy materializer says who held the lock.
+#[test]
+fn a_busy_source_names_the_reader_holding_it() {
+    quil_types::lock_holders::report();
+    let _validation = quil_types::lock_holders::hold(quil_types::lock_holders::Holder::Validation);
+    let busy = busy_unavailable("execution branch engines");
+    assert!(source_busy(&busy), "{busy}");
+    assert!(
+        busy.to_string().contains("gossip validation: 1 active"),
+        "{busy}"
+    );
+}
+
+#[test]
+fn an_adoption_lock_timeout_names_the_reader_holding_it() {
+    quil_types::lock_holders::report();
+    let _cost = quil_types::lock_holders::hold(quil_types::lock_holders::Holder::CostQuery);
+    let timeout = with_holders(QuilError::ExecutionUnavailable(
+        "execution adoption metadata is busy or poisoned".into(),
+    ));
+    assert!(
+        timeout.to_string().contains("cost query: 1 active"),
+        "{timeout}"
+    );
+    let other = with_holders(QuilError::ExecutionUnavailable("another failure".into()));
+    assert!(!other.to_string().contains("holders"), "{other}");
+}

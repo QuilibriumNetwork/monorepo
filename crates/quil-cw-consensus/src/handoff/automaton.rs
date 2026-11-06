@@ -62,7 +62,14 @@ pub struct HandoffProposer {
     /// Asked why no closing request authorizes a seal
     /// ([`Self::with_closing_probe`]).
     closing_probe: Option<ClosingProbe>,
+    /// Asked, when a leader cannot read its parent, whether it is behind
+    /// for longer than its waits last ([`Self::with_behind_probe`]).
+    behind: Option<BehindProbe>,
 }
+
+/// Why this member is behind its committee for longer than a leader's
+/// parent waits last, or `None` ([`HandoffProposer::with_behind_probe`]).
+pub type BehindProbe = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 /// Called with `true` when a verified seal's checkpoint equals this member's,
 /// and `false` when it differs only in its state roots.
@@ -105,6 +112,9 @@ fn short(digest: &[u8; 32]) -> String {
 /// behind costs the committee seconds, not its whole leader timeout.
 const PARENT_WAITS: u32 = 12;
 
+/// The refusal of a proposal whose body has not reached this member.
+pub const BLOCK_NOT_DELIVERED: &str = "block not delivered";
+
 impl HandoffProposer {
     pub fn new(
         inner: Arc<dyn GlobalProposer>,
@@ -124,7 +134,22 @@ impl HandoffProposer {
             seal_parents: None,
             checkpoint_votes: None,
             closing_probe: None,
+            behind: None,
         })
+    }
+
+    /// Give a turn up at once, not after `PARENT_WAITS`, when the parent
+    /// read fails while `probe` names why this member is behind for longer
+    /// than the waits last. A regular node's committed GLOBAL view is
+    /// withheld while a state sync installs: 11-27 s every 5 min, and about
+    /// a minute after a restart (2026-11-05), so its waits ended in a
+    /// nullify anyway, 3 s later. Its nullify now lets the next leader
+    /// propose at once; it proposes again at its first turn after the probe
+    /// clears. A member whose read succeeds, or that is not behind, is
+    /// unchanged.
+    pub fn with_behind_probe(mut self, probe: Option<BehindProbe>) -> Self {
+        self.behind = probe;
+        self
     }
 
     /// Report each verified seal's agreement with this member's own state
@@ -575,6 +600,16 @@ impl GlobalProposer for HandoffProposer {
                 if let Some(sealed) = self.recognised_seal(context) {
                     return self.propose_reseal(context, &sealed);
                 }
+                if let Some(behind) = self.behind.as_ref().and_then(|probe| probe()) {
+                    self.note(
+                        Step::Propose,
+                        context,
+                        reason,
+                        format!("{detail}; behind ({behind}): turn given up at once"),
+                    );
+                    *self.parent_waits.lock().unwrap() = (context.view, PARENT_WAITS + 1);
+                    return None;
+                }
                 self.decline(context, reason, detail);
                 return None;
             }
@@ -657,7 +692,7 @@ impl GlobalProposer for HandoffProposer {
         let Some(bytes) = bytes else {
             tracing::debug!(view = context.view, parent_view = context.parent_view,
                 session = %digest_from_identity(self.session_id), "handoff verify: proposal bytes unavailable");
-            self.note(Step::Verify, context, "block not delivered", String::new());
+            self.note(Step::Verify, context, BLOCK_NOT_DELIVERED, String::new());
             return false;
         };
         if let Some(sealed) = self.selected_seal(context) {

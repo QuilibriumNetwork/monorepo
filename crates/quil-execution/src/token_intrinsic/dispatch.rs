@@ -322,6 +322,56 @@ mod tests {
         assert_eq!(results.iter().filter(|r| **r == Ok(false)).count(), 3);
     }
 
+    /// A caller that finds an operation's verification running in another
+    /// caller and waits for it reports the verdict as joined, not as its own
+    /// verification, so an archive pass that waited for the background
+    /// pre-verification says so; a later caller finds it cached.
+    #[test]
+    fn a_caller_waiting_for_another_verification_reports_it_joined() {
+        use std::sync::mpsc;
+        let key = [0x3c; 32];
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let first = scope.spawn(move || {
+                verdict_once_from(key, || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok::<bool, &str>(true)
+                })
+            });
+            started_rx.recv().unwrap();
+            let second = scope.spawn(move || {
+                verdict_once_from(key, || -> std::result::Result<bool, &str> {
+                    panic!("a second caller verified an operation already being verified")
+                })
+            });
+            // Release the first verification only once the second caller
+            // waits for it; a hang fails at the cap.
+            let cap = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            while !IN_FLIGHT_WAITERS.lock().unwrap().contains(&key) {
+                assert!(
+                    std::time::Instant::now() < cap,
+                    "the second caller never waited for the running verification"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            release_tx.send(()).unwrap();
+            assert_eq!(first.join().unwrap(), Ok((true, VerdictSource::Verified)));
+            assert_eq!(
+                second.join().unwrap(),
+                Ok((true, VerdictSource::Joined)),
+                "a caller that waited for another's verification did not report it joined"
+            );
+        });
+        assert_eq!(
+            verdict_once_from(key, || -> std::result::Result<bool, &str> {
+                panic!("a cached verdict was verified again")
+            }),
+            Ok((true, VerdictSource::Cached))
+        );
+    }
+
     #[test]
     fn verdict_cache_keys_every_input_and_capacity_follows_budget_and_ewma() {
         let limits = CompileLimits {
@@ -1119,6 +1169,9 @@ fn record_verdict(key: [u8; 32], accepted: bool) {
 static IN_FLIGHT: std::sync::Mutex<Option<std::collections::HashSet<[u8; 32]>>> =
     std::sync::Mutex::new(None);
 static IN_FLIGHT_DONE: std::sync::Condvar = std::sync::Condvar::new();
+/// Callers waiting for another's verification of a key (tests).
+#[cfg(test)]
+static IN_FLIGHT_WAITERS: std::sync::Mutex<Vec<[u8; 32]>> = std::sync::Mutex::new(Vec::new());
 
 /// The cached verdict for `key`, or `verify`'s, run by one caller at a time.
 /// A caller that finds it running waits, and runs it itself only if that
@@ -1127,6 +1180,26 @@ fn verdict_once<E>(
     key: [u8; 32],
     verify: impl FnOnce() -> std::result::Result<bool, E>,
 ) -> std::result::Result<bool, E> {
+    verdict_once_from(key, verify).map(|(accepted, _)| accepted)
+}
+
+/// Where [`verdict_once_from`] found a verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerdictSource {
+    /// Cached when this caller looked.
+    Cached,
+    /// Computed by another caller's verification, which this one found
+    /// running and waited for.
+    Joined,
+    /// Computed by this caller.
+    Verified,
+}
+
+/// [`verdict_once`], and where the verdict came from.
+fn verdict_once_from<E>(
+    key: [u8; 32],
+    verify: impl FnOnce() -> std::result::Result<bool, E>,
+) -> std::result::Result<(bool, VerdictSource), E> {
     struct Claim([u8; 32]);
     impl Drop for Claim {
         fn drop(&mut self) {
@@ -1140,22 +1213,38 @@ fn verdict_once<E>(
     }
     let claim = {
         let mut flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut waited = false;
         loop {
             if let Some(accepted) = cached_verdict(&key) {
-                return Ok(accepted);
+                let source = if waited {
+                    VerdictSource::Joined
+                } else {
+                    VerdictSource::Cached
+                };
+                return Ok((accepted, source));
             }
             if flight.get_or_insert_with(Default::default).insert(key) {
                 break Claim(key);
             }
+            waited = true;
+            #[cfg(test)]
+            IN_FLIGHT_WAITERS.lock().unwrap().push(key);
             flight = IN_FLIGHT_DONE
                 .wait(flight)
                 .unwrap_or_else(|e| e.into_inner());
+            #[cfg(test)]
+            {
+                let mut waiters = IN_FLIGHT_WAITERS.lock().unwrap();
+                if let Some(at) = waiters.iter().position(|waiting| *waiting == key) {
+                    waiters.swap_remove(at);
+                }
+            }
         }
     };
     let accepted = verify()?;
     record_verdict(key, accepted);
     drop(claim);
-    Ok(accepted)
+    Ok((accepted, VerdictSource::Verified))
 }
 
 fn record_duration(operation_bytes: usize, elapsed: std::time::Duration) {
@@ -1218,9 +1307,12 @@ fn watched_verification_every<T: Send>(
     let estimate = estimated_verify_secs(operation_bytes);
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let result = std::thread::scope(|scope| {
-        scope.spawn(move || {
-            let _ = sender.send(verify());
-        });
+        std::thread::Builder::new()
+            .name("proof-verify".into())
+            .spawn_scoped(scope, move || {
+                let _ = sender.send(verify());
+            })
+            .expect("spawn a proof verification thread");
         let (mut reported_long, mut warned) = (false, false);
         loop {
             let next_report = match (reported_long, warned) {
@@ -1345,8 +1437,11 @@ mod estimate_tests;
 pub enum Preverified {
     /// Its verdict was cached already.
     Cached,
-    /// Verified now (or by a concurrent caller it waited for); cached.
+    /// Verified now by this caller; cached.
     Verified,
+    /// Verified by a concurrent caller in this process (a background
+    /// pre-verification, say) that it found running and waited for; cached.
+    Joined,
     /// No worker slot within the admission wait; nothing cached.
     Busy,
     /// The worker failed (timeout, crash, resource cap); nothing cached.
@@ -1442,7 +1537,7 @@ impl TokenPolicy {
         if self.preflight(address, bytes, tp).is_err() {
             return Preverified::NotApplicable;
         }
-        match verdict_once(key, || {
+        match verdict_once_from(key, || {
             worker_verdict(
                 worker,
                 &self.network,
@@ -1452,7 +1547,9 @@ impl TokenPolicy {
                 self.native_budget,
             )
         }) {
-            Ok(_) => Preverified::Verified,
+            Ok((_, VerdictSource::Cached)) => Preverified::Cached,
+            Ok((_, VerdictSource::Joined)) => Preverified::Joined,
+            Ok((_, VerdictSource::Verified)) => Preverified::Verified,
             Err(ClientError::Busy) => Preverified::Busy,
             Err(_) => Preverified::Unavailable,
         }

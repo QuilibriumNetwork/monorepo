@@ -673,9 +673,11 @@ pub fn set_fenced_successor_eligibility_frame_for_thread(frame: Option<u64>) {
 /// archive and GLOBAL prover must run a build with it before the frame.
 /// From the same frame GLOBAL records the frame of each session's tip
 /// advance ([`session_tip_frame`]), which an older build does not write
-/// either. Not scheduled on mainnet; `QUIL_PRESENCE_REPORT_FRAME`
-/// elsewhere, never by default.
-pub const MAINNET_PRESENCE_REPORT_FRAME: Option<u64> = None;
+/// either. Mainnet: 1,024,560, the first frame of epoch 1423, which GLOBAL
+/// cannot reach before 2026-11-07 00:00 UTC even at ten seconds a frame, with
+/// the [`presence_credit_frame`]; `QUIL_PRESENCE_REPORT_FRAME` elsewhere, never
+/// by default.
+pub const MAINNET_PRESENCE_REPORT_FRAME: Option<u64> = Some(1_024_560);
 
 static PRESENCE_REPORT_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -731,9 +733,10 @@ pub fn set_presence_report_frame_for_thread(frame: Option<u64>) {
 /// [`presence_report_frame`], which an older build may already have set:
 /// it accepts a report and writes nothing, so this frame is a flag day of
 /// its own. Consensus-affecting for GLOBAL: every archive and GLOBAL prover
-/// must run a build with it before the frame. Not scheduled on mainnet;
+/// must run a build with it before the frame. Mainnet: the report frame,
+/// so no report is accepted without being recorded;
 /// `QUIL_PRESENCE_CREDIT_FRAME` elsewhere, never by default.
-pub const MAINNET_PRESENCE_CREDIT_FRAME: Option<u64> = None;
+pub const MAINNET_PRESENCE_CREDIT_FRAME: Option<u64> = MAINNET_PRESENCE_REPORT_FRAME;
 
 static PRESENCE_CREDIT_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -926,9 +929,10 @@ pub fn set_early_fence_frame_for_thread(frame: Option<u64>) {
 /// one to seat. Consensus-affecting for GLOBAL: every archive and GLOBAL
 /// prover must run a build with it before the frame; an older build
 /// authorizes the successor at the seal and commits another GLOBAL state.
-/// Not scheduled on mainnet; `QUIL_SEAL_SUCCESSOR_ELIGIBILITY_FRAME`
-/// elsewhere, never by default.
-pub const MAINNET_SEAL_SUCCESSOR_ELIGIBILITY_FRAME: Option<u64> = None;
+/// Mainnet: 1,024,560, the first frame of epoch 1423, which GLOBAL cannot reach
+/// before 2026-11-07 00:00 UTC even at ten seconds a frame;
+/// `QUIL_SEAL_SUCCESSOR_ELIGIBILITY_FRAME` elsewhere, never by default.
+pub const MAINNET_SEAL_SUCCESSOR_ELIGIBILITY_FRAME: Option<u64> = Some(1_024_560);
 
 static SEAL_SUCCESSOR_ELIGIBILITY_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 

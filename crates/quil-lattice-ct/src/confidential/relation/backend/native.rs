@@ -1140,26 +1140,36 @@ mod tests {
         }
     }
 
-    /// Run `f` with file descriptor 2 sent to a file; return its result and
-    /// the native retry lines written there.
-    fn retry_lines<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    /// Run `f` with file descriptor `fd` sent to a file; return its result
+    /// and what was written there. C stdio is flushed on both sides, as C
+    /// stdout is fully buffered on a file.
+    fn captured<T>(fd: i32, f: impl FnOnce() -> T) -> (T, String) {
         use std::os::fd::AsRawFd;
         let path = std::env::temp_dir().join(format!(
-            "quil-witness-faults-{}-{:?}.log",
+            "quil-native-fd{fd}-{}-{:?}.log",
             std::process::id(),
             std::thread::current().id()
         ));
         let file = std::fs::File::create(&path).unwrap();
-        let saved = unsafe { libc::dup(2) };
+        unsafe { libc::fflush(std::ptr::null_mut()) };
+        let saved = unsafe { libc::dup(fd) };
         assert!(saved >= 0);
-        assert!(unsafe { libc::dup2(file.as_raw_fd(), 2) } >= 0);
+        assert!(unsafe { libc::dup2(file.as_raw_fd(), fd) } >= 0);
         let result = f();
         unsafe {
-            libc::dup2(saved, 2);
+            libc::fflush(std::ptr::null_mut());
+            libc::dup2(saved, fd);
             libc::close(saved);
         }
         let text = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
+        (result, text)
+    }
+
+    /// Run `f` with file descriptor 2 sent to a file; return its result and
+    /// the native retry lines written there.
+    fn retry_lines<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        let (result, text) = captured(2, f);
         let lines = text
             .lines()
             .filter(|l| l.starts_with("quil_native_prove attempt="))
@@ -1195,6 +1205,25 @@ mod tests {
         drop(context);
         proof.truncate(written);
         (status, left, proof, lines)
+    }
+
+    /// The backend writes nothing to stdout: qclient proves in-process
+    /// under its TUI, where stray text scrolls the terminal and garbles the
+    /// screen. Covers parameter generation on the prove and verify paths in
+    /// about a second; a complete proof would take minutes.
+    #[test]
+    fn native_prove_and_verify_write_nothing_to_stdout() {
+        // The magic lets verification reach parameter generation; the
+        // length then fails decoding.
+        let mut short = [0u8; 40];
+        short[..8].copy_from_slice(b"QPF6\0\0\0\0");
+        let ((status, valid), text) = captured(1, || {
+            let (status, _, _, _) = prove_with_witness_faults(0, false);
+            (status, verify_pair_proof(PAIRS, &short))
+        });
+        assert_eq!(status, 7);
+        assert!(!valid);
+        assert_eq!(text, "", "native code wrote to stdout");
     }
 
     #[test]

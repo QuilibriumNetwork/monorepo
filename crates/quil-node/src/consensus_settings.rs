@@ -227,6 +227,14 @@ pub(crate) fn initialize(network: u8) {
             "persistent storage certificates activation configured"
         );
     }
+    let signed_frame_activation =
+        quil_types::consensus::init_signed_frame_activation_frame(network);
+    if network != 0 && signed_frame_activation != u64::MAX {
+        tracing::warn!(
+            frame = signed_frame_activation,
+            "QUIL_SIGNED_FRAME_ACTIVATION_FRAME override active (localnet only)"
+        );
+    }
     let (restoration_frame, restored_provers) =
         quil_types::consensus::init_kicked_seniority_restoration(network);
     if network != 0 && restoration_frame != u64::MAX {

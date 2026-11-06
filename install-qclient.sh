@@ -13,6 +13,11 @@
 # are built here from a validated version; no name from the release server
 # becomes a path. Needs curl and OpenSSL 1.1.1 or later.
 #
+# Installs to <root>/bin/qclient/<version> and links /usr/local/bin/qclient
+# to it. The root is /var/quilibrium on Linux and /opt/quilibrium on macOS,
+# where an earlier install under /var/quilibrium keeps its place while
+# /opt/quilibrium does not exist, as qclient itself decides.
+#
 # Options:
 #   --dry-run          download and verify the release in a temporary
 #                      directory and report what would be installed;
@@ -24,8 +29,26 @@ set -euo pipefail
 umask 022
 
 BASE_URL="https://releases.quilibrium.com"
-INSTALL_ROOT="/var/quilibrium/bin/qclient"
 SYMLINK="/usr/local/bin/qclient"
+
+# The install root for the OS named by `uname -s` ($1).
+install_root() {
+    if [ "$1" = Darwin ] && { [ -e /opt/quilibrium ] || [ ! -e /var/quilibrium ]; }; then
+        echo /opt/quilibrium
+    else
+        echo /var/quilibrium
+    fi
+}
+ROOT=$(install_root "$(uname -s)")
+INSTALL_ROOT="$ROOT/bin/qclient"
+
+# Create the link directory $1, which a fresh macOS host may lack: owner
+# root, group 0 (wheel on macOS), mode 0755; new parents get the 022 umask.
+# An existing directory is left as it is.
+ensure_link_dir() {
+    [ -d "$1" ] && return 0
+    mkdir -p -- "$1" && chown 0:0 -- "$1" && chmod 0755 -- "$1"
+}
 
 # Ed448 public keys (hex) of the release signatories: .dgst.sig.N is signed
 # by key N. Keep in sync with crates/quil-config/src/signatories.rs.
@@ -75,11 +98,13 @@ fetch() {
         --connect-timeout 30 --speed-limit 1 --speed-time 60 --max-time 1800 "$@"
 }
 
-# Function to detect OS and architecture
-detect_os_arch() {
+# The release platform `<os>-<arch>` of kernel name $1 and machine $2, as
+# `uname -s` and `uname -m` print them; the release files are named
+# qclient-<version>-<os>-<arch>.
+os_arch_of() {
     local os arch
-    os=$(uname -s | tr '[:upper:]' '[:lower:]')
-    arch=$(uname -m)
+    os=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    arch=$2
     case $os in
         linux | darwin) ;;
         *) die "Unsupported OS: $os" ;;
@@ -90,6 +115,44 @@ detect_os_arch() {
         *) die "Unsupported architecture: $arch" ;;
     esac
     echo "$os-$arch"
+}
+
+# Function to detect OS and architecture
+detect_os_arch() {
+    os_arch_of "$(uname -s)" "$(uname -m)"
+}
+
+# Point $SYMLINK.dgst and $SYMLINK.dgst.sig.N at the files of the release
+# $2 installed in directory $1, dropping links to signatures it lacks.
+# qclient 2.1.0.23 and older, still the released client, look for these
+# files beside the path they were started by; on macOS that is the link,
+# not the release file, so without them every command stops at the
+# signature check. $3 names another link to give them to.
+link_release_files() {
+    local dir=$1 base=$2 link=${3:-$SYMLINK} i
+    ln -sfn -- "$dir/$base.dgst" "$link.dgst"
+    for ((i = 1; i <= ${#SIGNATORIES[@]}; i++)); do
+        if [ -f "$dir/$base.dgst.sig.$i" ]; then
+            ln -sfn -- "$dir/$base.dgst.sig.$i" "$link.dgst.sig.$i"
+        elif [ -L "$link.dgst.sig.$i" ]; then
+            rm -f -- "$link.dgst.sig.$i"
+        fi
+    done
+}
+
+# Point $INSTALL_ROOT/current at the release $2 installed in directory $1,
+# on the platform $3. Root's auto-update cron entry runs this link, which
+# sits in the root-only install root, never $SYMLINK, whose directory
+# another user may own (Homebrew gives it to the admin user on Intel macOS).
+link_root_current() {
+    local dir=$1 base=$2 os_arch=$3 link="$INSTALL_ROOT/current"
+    if [ -d "$link" ] && [ ! -L "$link" ]; then
+        die "$link is a directory"
+    fi
+    ln -sfn -- "$dir/$base" "$link"
+    case $os_arch in
+        darwin-*) link_release_files "$dir" "$base" "$link" ;;
+    esac
 }
 
 # A release version: two to five dot-separated decimal parts, such as
@@ -290,8 +353,9 @@ main() {
 
     # Check if the script is run with sudo privileges
     if [ "$dry_run" = false ] && [ "$EUID" -ne 0 ]; then
-        die "This script must be run as root (use sudo) to install the Quilibrium client to /var/quilibrium/ directory"
+        die "This script must be run as root (use sudo) to install the Quilibrium client under $ROOT"
     fi
+    echo "Install root: $ROOT"
 
     trap cleanup EXIT
     if [ "$dry_run" = true ]; then
@@ -326,18 +390,30 @@ main() {
     if [ "$dry_run" = true ]; then
         echo "[DRY RUN] Verified $base; would install it to $dir"
         echo "[DRY RUN] Symlink to be created: $SYMLINK -> $dir/$base"
+        if [ ! -d "$(dirname "$SYMLINK")" ]; then
+            echo "[DRY RUN] Would create $(dirname "$SYMLINK") (root, mode 0755)"
+        fi
         return
     fi
 
     install_release "$dir" "$base"
+    ensure_link_dir "$(dirname "$SYMLINK")" || die "could not create $(dirname "$SYMLINK")"
     if [ -d "$SYMLINK" ] && [ ! -L "$SYMLINK" ]; then
         die "$SYMLINK is a directory"
     fi
     ln -sfn -- "$dir/$base" "$SYMLINK"
     echo "Symlink created to the latest version: $SYMLINK -> $dir/$base"
+    case $os_arch in
+        darwin-*)
+            link_release_files "$dir" "$base"
+            echo "Linked $SYMLINK.dgst and its signatures to the release's files"
+            ;;
+    esac
+    link_root_current "$dir" "$base" "$os_arch"
 
     echo "Installation complete. You can now start the Quilibrium client with the following command:"
     echo "qclient --version"
 }
 
-main "$@"
+# INSTALL_QCLIENT_LIB=1 defines the functions only, for tests.
+[ -n "${INSTALL_QCLIENT_LIB:-}" ] || main "$@"

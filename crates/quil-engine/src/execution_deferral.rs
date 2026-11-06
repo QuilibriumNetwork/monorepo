@@ -39,6 +39,63 @@ pub fn awaits_execution(error: &QuilError, anchor: u64, executed: u64) -> bool {
         && quil_execution::global_intrinsic::handoff::frames::unauthorized_generation(error)
 }
 
+/// Whether a shard frame that verification for the GLOBAL frame after the
+/// head refused with `error` is held unverified, for the leader to verify
+/// when it packs one: the state verification needs is unavailable now, or the
+/// frame's anchor lies ahead of that GLOBAL frame's lockstep window
+/// ([`anchor_ahead_of_window`]). Such a frame rides a later GLOBAL frame once
+/// the head reaches its anchor, so it is held as it was while GLOBAL read the
+/// anchor first and found no such frame. One behind the window can ride no
+/// frame after the head: it is refused, and its sender hears so.
+///
+/// [`anchor_ahead_of_window`]: quil_execution::global_intrinsic::frame_header::anchor_ahead_of_window
+pub fn held_unverified(error: &QuilError) -> bool {
+    error.is_execution_unavailable()
+        || quil_execution::global_intrinsic::frame_header::anchor_ahead_of_window(error)
+}
+
+/// The verifier of the message collector that feeds an archive's GLOBAL
+/// proposals: verify a shard frame's certificate in committed state, as the
+/// GLOBAL frame after the head would execute it, before holding it. A verified
+/// frame then supersedes its shard's lower ones, and no forged header can
+/// stand in for a real one (decided 2026-10-15). One that cannot be verified
+/// now ([`held_unverified`]) is held unverified for the leader to check
+/// (decided 2026-10-16). So is one whose session executed GLOBAL state has not
+/// authorized yet while it is anchored past it, if this node or an active
+/// prover delivered it ([`CollectorDeferrals::verdict_from`]): while execution
+/// trails the head, a session a GLOBAL frame up to the anchor authorized is
+/// not in committed state, its certificate cannot be checked yet, and a held
+/// frame can take another's place. Anything else is refused.
+pub fn collector_verifier(
+    manager: Arc<quil_execution::ExecutionEngineManager>,
+    current: Arc<crate::current_frame::CurrentFrame>,
+    global: Arc<quil_hypergraph::HypergraphCrdt>,
+    deferrals: Arc<CollectorDeferrals>,
+) -> crate::message_collector::ProvenanceShardFrameVerifier {
+    Arc::new(move |bundle: &[u8], provenance: Provenance| {
+        let verified_for = current.effective().saturating_add(1);
+        match manager.validate_message(verified_for, &[0xff; 32], bundle) {
+            Ok(()) => ShardFrameVerdict::Valid,
+            Err(error) if held_unverified(&error) => {
+                ShardFrameVerdict::Unavailable(error.to_string())
+            }
+            Err(error) => {
+                let executed = global
+                    .read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+                    .ok();
+                deferrals.verdict_from(
+                    &error,
+                    bundle,
+                    executed,
+                    verified_for,
+                    provenance,
+                    |filter| next_generation(&global, filter),
+                )
+            }
+        }
+    })
+}
+
 /// The session generation a shard frame's certificate (`signature`, the
 /// header's signature field) names, read without verifying it.
 pub fn claimed_generation(signature: &[u8]) -> Option<u64> {

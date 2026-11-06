@@ -499,9 +499,10 @@ fn presence_report_is_refused_before_its_activation_frame() {
     // Without a setting, never (assumes QUIL_PRESENCE_REPORT_FRAME is unset).
     set_presence_report_frame_for_thread(None);
     refused_for(f.verify(&report), "presence report frame");
-    assert_eq!(MAINNET_PRESENCE_REPORT_FRAME, None);
-    assert_eq!(presence_report_frame_for(0, None), u64::MAX);
-    assert_eq!(presence_report_frame_for(0, Some("7")), u64::MAX);
+    let mainnet = 1423 * quil_types::consensus::EPOCH_LENGTH_FRAMES;
+    assert_eq!(MAINNET_PRESENCE_REPORT_FRAME, Some(mainnet));
+    assert_eq!(presence_report_frame_for(0, None), mainnet);
+    assert_eq!(presence_report_frame_for(0, Some("7")), mainnet);
     assert_eq!(presence_report_frame_for(1, Some("7")), 7);
     assert_eq!(presence_report_frame_for(1, Some("soon")), u64::MAX);
     assert_eq!(presence_report_frame_for(1, None), u64::MAX);
@@ -696,20 +697,23 @@ impl Fixture {
     }
 }
 
-/// Credit for presence is GLOBAL consensus and not scheduled on mainnet; a
-/// process that never fixed its network reads no setting.
+/// Credit for presence is GLOBAL consensus, on mainnet from the report
+/// frame, so a report is never accepted without being recorded; a process
+/// that never fixed its network reads no setting.
 #[test]
-fn presence_credit_is_not_scheduled_by_default() {
-    assert_eq!(MAINNET_PRESENCE_CREDIT_FRAME, None);
-    assert_eq!(presence_credit_frame_for(0, None), u64::MAX);
-    assert_eq!(presence_credit_frame_for(0, Some("7")), u64::MAX);
+fn presence_credit_starts_with_reports_on_mainnet() {
+    let mainnet = 1423 * quil_types::consensus::EPOCH_LENGTH_FRAMES;
+    assert_eq!(MAINNET_PRESENCE_CREDIT_FRAME, Some(mainnet));
+    assert_eq!(MAINNET_PRESENCE_CREDIT_FRAME, MAINNET_PRESENCE_REPORT_FRAME);
+    assert_eq!(presence_credit_frame_for(0, None), mainnet);
+    assert_eq!(presence_credit_frame_for(0, Some("7")), mainnet);
     assert_eq!(presence_credit_frame_for(1, Some("7")), 7);
     assert_eq!(presence_credit_frame_for(1, Some("soon")), u64::MAX);
     assert_eq!(presence_credit_frame_for(1, None), u64::MAX);
     set_presence_credit_frame_for_thread(None);
     assert_eq!(
         presence_credit_frame(),
-        u64::MAX,
+        mainnet,
         "without init, the mainnet value"
     );
 }

@@ -46,8 +46,13 @@ pub const END_AFTER: u32 = 3;
 // 2 severe ones (seconds a seek). A canary read is one such seek without
 // the pruning work.
 
-/// Canary reads' p99 at or over this: a slow store.
+/// Canary reads at or over this are slow reads. An interval with
+/// [`SLOW_CANARY_READS`] of them (its p99 is then over it too), or one read
+/// of [`SLOW_CANARY_PENDING`] or more, is a slow store; one slow read alone
+/// is the noise of a busy node.
 pub const SLOW_CANARY_P99: Duration = Duration::from_millis(50);
+/// Slow canary reads in one interval that make it slow.
+pub const SLOW_CANARY_READS: u32 = 2;
 /// A canary read unfinished this long at an interval's end: the disk
 /// stalls (a lower bound of that read's latency).
 pub const SLOW_CANARY_PENDING: Duration = Duration::from_secs(1);
@@ -76,6 +81,8 @@ pub struct ReadLatency {
     pub p50: Duration,
     pub p99: Duration,
     pub max: Duration,
+    /// The reads at or over [`SLOW_CANARY_P99`].
+    pub slow_reads: u32,
 }
 
 /// Nearest-rank p50, p99 and max of `samples` (sorted in place); `None`
@@ -89,6 +96,8 @@ pub fn summarise(samples: &mut [Duration]) -> Option<ReadLatency> {
         p50: rank(50),
         p99: rank(99),
         max,
+        slow_reads: u32::try_from(samples.iter().filter(|s| **s >= SLOW_CANARY_P99).count())
+            .unwrap_or(u32::MAX),
     })
 }
 
@@ -310,6 +319,30 @@ impl SlowReason {
     }
 }
 
+/// What the evidence of a slow interval says is the cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlowCause {
+    /// A disk await is over its threshold.
+    Disk,
+    /// Reads are slow while the disk's awaits are known and under their
+    /// thresholds: this node's own load.
+    Load,
+    /// Reads are slow and the disk's awaits are unknown or from too few
+    /// operations: the disk is not ruled out.
+    Unknown,
+}
+
+impl SlowCause {
+    /// The `scope` field of the slow and recovered lines.
+    pub fn scope(self) -> &'static str {
+        match self {
+            SlowCause::Disk => "this node's disk",
+            SlowCause::Load => "this node's load",
+            SlowCause::Unknown => "this node's store reads",
+        }
+    }
+}
+
 /// What one interval (or summary window) measured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IoInterval {
@@ -333,7 +366,10 @@ impl IoInterval {
         if self.pending.is_some_and(|p| p >= SLOW_CANARY_PENDING) {
             return Some(SlowReason::CanaryPending);
         }
-        if self.canary.is_some_and(|c| c.p99 >= SLOW_CANARY_P99) {
+        if self.canary.is_some_and(|c| {
+            c.p99 >= SLOW_CANARY_P99
+                && (c.slow_reads >= SLOW_CANARY_READS || c.max >= SLOW_CANARY_PENDING)
+        }) {
             return Some(SlowReason::CanaryP99);
         }
         let disk = self.disk?;
@@ -350,6 +386,62 @@ impl IoInterval {
     }
 }
 
+impl IoInterval {
+    /// The cause the evidence supports for a slow interval of `reason`.
+    pub fn cause(&self, reason: SlowReason) -> SlowCause {
+        cause_of(Some(reason), self.disk.as_ref())
+    }
+}
+
+/// The cause the evidence supports for a slow verdict. A disk threshold
+/// names the disk. Otherwise (a canary threshold, or no reason: a node
+/// that predates it) it names the disk only if its awaits are over theirs;
+/// with 20+ reads known and every await under its threshold it names this
+/// node's load; else the disk is not ruled out. The node's lines and the
+/// client's report and notice share this rule.
+pub fn cause_of(reason: Option<SlowReason>, disk: Option<&DiskAwait>) -> SlowCause {
+    if matches!(
+        reason,
+        Some(SlowReason::DiskReadAwait | SlowReason::DiskWriteAwait)
+    ) {
+        return SlowCause::Disk;
+    }
+    let Some(disk) = disk else {
+        return SlowCause::Unknown;
+    };
+    let over = |ops: u64, wait: Option<Duration>, limit: Duration| {
+        ops >= MIN_DISK_OPS && wait.is_some_and(|a| a >= limit)
+    };
+    if over(disk.reads, disk.read_await, SLOW_DISK_READ_AWAIT)
+        || over(disk.writes, disk.write_await, SLOW_DISK_WRITE_AWAIT)
+    {
+        SlowCause::Disk
+    } else if disk.reads >= MIN_DISK_OPS {
+        SlowCause::Load
+    } else {
+        SlowCause::Unknown
+    }
+}
+
+/// [`cause_of`] for a reported interval.
+pub fn health_cause(io: &StoreIoHealth) -> SlowCause {
+    let reason = match io.slow_reason() {
+        StoreIoReason::None => None,
+        StoreIoReason::CanaryP99 => Some(SlowReason::CanaryP99),
+        StoreIoReason::CanaryPending => Some(SlowReason::CanaryPending),
+        StoreIoReason::DiskReadAwait => Some(SlowReason::DiskReadAwait),
+        StoreIoReason::DiskWriteAwait => Some(SlowReason::DiskWriteAwait),
+    };
+    let disk = io.disk_reads.map(|reads| DiskAwait {
+        reads,
+        writes: io.disk_writes.unwrap_or(0),
+        read_await: io.disk_read_await_us.map(Duration::from_micros),
+        write_await: io.disk_write_await_us.map(Duration::from_micros),
+        busy_pct: io.disk_busy_pct.unwrap_or(0),
+    });
+    cause_of(reason, disk.as_ref())
+}
+
 /// What the caller logs after an interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoAction {
@@ -360,16 +452,20 @@ pub enum IoAction {
     SlowStart {
         slow: Duration,
         reason: SlowReason,
+        cause: SlowCause,
     },
     /// It still holds, [`REPEAT`] after the last warning.
     SlowRepeat {
         slow: Duration,
         reason: SlowReason,
+        cause: SlowCause,
     },
     /// It ended: `slow` from its start to its first interval under every
     /// threshold.
     SlowEnd {
         slow: Duration,
+        /// The cause of the episode's last slow interval.
+        cause: SlowCause,
     },
 }
 
@@ -383,6 +479,7 @@ pub struct IoWatch {
     slow_since: Option<Instant>,
     last_warn: Option<Instant>,
     last_line: Option<Instant>,
+    cause: Option<SlowCause>,
 }
 
 impl IoWatch {
@@ -395,6 +492,8 @@ impl IoWatch {
                 self.ok_run = 0;
                 self.first_ok = None;
                 self.slow_run = self.slow_run.saturating_add(1);
+                let cause = interval.cause(reason);
+                self.cause = Some(cause);
                 let first = *self.first_slow.get_or_insert(began);
                 match self.slow_since {
                     None if self.slow_run >= START_AFTER => {
@@ -403,6 +502,7 @@ impl IoWatch {
                         IoAction::SlowStart {
                             slow: now.saturating_duration_since(first),
                             reason,
+                            cause,
                         }
                     }
                     None => IoAction::None,
@@ -415,6 +515,7 @@ impl IoWatch {
                             IoAction::SlowRepeat {
                                 slow: now.saturating_duration_since(since),
                                 reason,
+                                cause,
                             }
                         } else {
                             IoAction::None
@@ -437,6 +538,7 @@ impl IoWatch {
                             self.first_ok = None;
                             IoAction::SlowEnd {
                                 slow: ended.saturating_duration_since(since),
+                                cause: self.cause.take().unwrap_or(SlowCause::Unknown),
                             }
                         } else {
                             IoAction::None
@@ -733,33 +835,61 @@ fn log_action(
                 "store i/o summary"
             );
         }
-        IoAction::SlowStart { slow, reason } | IoAction::SlowRepeat { slow, reason } => warn!(
-            scope = "this node's disk",
-            store = subject.store,
-            reason = reason.label(),
-            slow_secs = slow.as_secs(),
-            interval_secs = latest.length.as_secs(),
-            canary_reads = latest.canary.map_or(0, |c| c.reads),
-            canary_p50_ms = latest.canary.map(|c| ms(c.p50)),
-            canary_p99_ms = latest.canary.map(|c| ms(c.p99)),
-            canary_max_ms = latest.canary.map(|c| ms(c.max)),
-            canary_pending_ms = latest.pending.map(ms),
-            disk,
-            disk_reads = latest.disk.map(|d| d.reads),
-            disk_writes = latest.disk.map(|d| d.writes),
-            disk_read_await_ms = latest.disk.and_then(|d| d.read_await).map(ms),
-            disk_write_await_ms = latest.disk.and_then(|d| d.write_await).map(ms),
-            disk_busy_pct = latest.disk.map(|d| d.busy_pct),
-            "store reads slow: reads of this node's store, or its disk's \
-             response times, are over the slow thresholds (canary p99 50 ms, \
-             a read pending 1 s, disk await 20 ms a read or 100 ms a write); \
-             work that reads the store falls behind and seats may lapse. This \
-             node's disk is the cause: check that TRIM runs (fstrim.timer or \
-             the discard mount option), the disk's health (SMART) and other \
-             I/O load on the same disk. Repeats every 10 minutes while it holds"
-        ),
-        IoAction::SlowEnd { slow } => info!(
-            scope = "this node's disk",
+        IoAction::SlowStart {
+            slow,
+            reason,
+            cause,
+        }
+        | IoAction::SlowRepeat {
+            slow,
+            reason,
+            cause,
+        } => {
+            let what = match cause {
+                SlowCause::Disk => {
+                    "This node's disk is the cause: check that TRIM runs \
+                     (fstrim.timer or the discard mount option), the disk's \
+                     health (SMART) and other I/O load on the same disk."
+                }
+                SlowCause::Load => {
+                    "The disk responds normally (its awaits are under the \
+                     thresholds), so look at this node's load: CPU, memory \
+                     pressure, store compaction and other work on this node."
+                }
+                SlowCause::Unknown => {
+                    "The disk's awaits are unknown or from too few operations, \
+                     so the disk is not ruled out: check that TRIM runs, the \
+                     disk's health (SMART), then this node's load (CPU, memory \
+                     pressure, compaction)."
+                }
+            };
+            warn!(
+                scope = cause.scope(),
+                store = subject.store,
+                reason = reason.label(),
+                slow_secs = slow.as_secs(),
+                interval_secs = latest.length.as_secs(),
+                canary_reads = latest.canary.map_or(0, |c| c.reads),
+                canary_p50_ms = latest.canary.map(|c| ms(c.p50)),
+                canary_p99_ms = latest.canary.map(|c| ms(c.p99)),
+                canary_max_ms = latest.canary.map(|c| ms(c.max)),
+                canary_pending_ms = latest.pending.map(ms),
+                disk,
+                disk_reads = latest.disk.map(|d| d.reads),
+                disk_writes = latest.disk.map(|d| d.writes),
+                disk_read_await_ms = latest.disk.and_then(|d| d.read_await).map(ms),
+                disk_write_await_ms = latest.disk.and_then(|d| d.write_await).map(ms),
+                disk_busy_pct = latest.disk.map(|d| d.busy_pct),
+                "store reads slow: reads of this node's store, or its disk's \
+                 response times, are over the slow thresholds (2 canary reads over 50 ms or one over 1 s, \
+                 a read pending 1 s, disk await 20 ms a read or 100 ms a write); \
+                 work that reads the store falls behind and seats may lapse. {} \
+                 Repeats every 10 minutes while it holds",
+                what
+            )
+        }
+        IoAction::SlowEnd { slow, cause } => info!(
+            scope = cause.scope(),
             store = subject.store,
             slow_secs = slow.as_secs(),
             canary_p99_ms = latest.canary.map(|c| ms(c.p99)),

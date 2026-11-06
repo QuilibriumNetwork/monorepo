@@ -28,6 +28,53 @@ pub const TYPE_FRAME_HEADER: u32 = 0x030A;
 /// `bundle_shard_frames_in_lockstep` and the materializer's
 /// `audit_storage_attestation` MUST use this exact value or nodes fork.
 pub const STORAGE_ANCHOR_LOCKSTEP_WINDOW: u64 = 12;
+
+/// The GLOBAL anchors GLOBAL frame `frame_number` accepts for a shard frame
+/// header, oldest and newest: `[frame_number - 1 - W, frame_number - 1]`
+/// with `W =` [`STORAGE_ANCHOR_LOCKSTEP_WINDOW`], saturating at 0.
+pub fn anchor_window(frame_number: u64) -> (u64, u64) {
+    let newest = frame_number.saturating_sub(1);
+    (
+        newest.saturating_sub(STORAGE_ANCHOR_LOCKSTEP_WINDOW),
+        newest,
+    )
+}
+
+/// A shard frame header anchored to GLOBAL frame `anchor` lies in the
+/// lockstep window of GLOBAL frame `frame_number` ([`anchor_window`]). The one
+/// predicate the leader that packs a header, the validation that admits it
+/// and the execution that audits it all use, so they cannot drift apart.
+/// Anchor 0 names no anchor and is never in a window: the required-anchor
+/// rule decides it.
+pub fn anchor_in_window(anchor: u64, frame_number: u64) -> bool {
+    let (oldest, newest) = anchor_window(frame_number);
+    anchor != 0 && (oldest..=newest).contains(&anchor)
+}
+
+/// The start of every refusal of a header anchored outside its window
+/// ([`anchor_outside_window`]).
+pub const ANCHOR_OUTSIDE_WINDOW: &str = "FrameHeader: anchor out of lockstep: ";
+
+/// [`ANCHOR_OUTSIDE_WINDOW`] for an anchor newer than the window's newest
+/// ([`anchor_ahead_of_window`]).
+pub const ANCHOR_AHEAD_OF_WINDOW: &str = "FrameHeader: anchor out of lockstep: ahead: ";
+
+/// Whether `error` refused a shard frame header for an anchor outside the
+/// lockstep window of the GLOBAL frame it was checked for.
+pub fn anchor_outside_window(error: &quil_types::error::QuilError) -> bool {
+    matches!(error, quil_types::error::QuilError::InvalidArgument(message)
+        if message.starts_with(ANCHOR_OUTSIDE_WINDOW))
+}
+
+/// Whether [`anchor_outside_window`] refused a header for an anchor ahead of
+/// the window. Unlike a header's other refusals, a later GLOBAL frame can
+/// still carry it, so a collector holds it rather than drop it; one behind
+/// the window can ride no later frame.
+pub fn anchor_ahead_of_window(error: &quil_types::error::QuilError) -> bool {
+    matches!(error, quil_types::error::QuilError::InvalidArgument(message)
+        if message.starts_with(ANCHOR_AHEAD_OF_WINDOW))
+}
+
 fn read_opt_sig(buf: &[u8], c: &mut usize) -> Result<Vec<u8>> {
     read_lp(buf, c) // 0-length = absent, otherwise nested canonical bytes
 }

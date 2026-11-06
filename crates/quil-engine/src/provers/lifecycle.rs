@@ -100,6 +100,12 @@ pub const JOIN_FILTER_COOLDOWN_FRAMES: u64 = 30;
 /// window. Tunable.
 pub const JOIN_REJECT_BACKOFF_FRAMES: u64 = DEFAULT_CONFIRM_WINDOW_FRAMES;
 
+/// Epochs after a departure that this node's planner stays off a shard its
+/// operator left (`operator_left_holds`), so a free auto worker does not undo
+/// the leave at the next cycle. Bounded, and a shard at halt risk is joined
+/// anyway: the hold never decides a shard's coverage.
+pub const OPERATOR_LEAVE_HOLD_EPOCHS: u64 = 1;
+
 /// Why a proposed join stopped keeping its filter from new joins
 /// (`ProverLifecycle::join_hold_ended`).
 enum JoinHoldEnd {
@@ -496,6 +502,30 @@ impl AllocationBuckets {
     }
 }
 
+/// How long this process's longest waiter has waited for an archive recovery turn.
+fn process_recovery_wait() -> std::time::Duration {
+    crate::recovery_turns::SHARD_RECOVERY_TURNS.longest_wait()
+}
+
+/// Whether new joins wait because a worker of this process has waited
+/// `longest_wait` for an archive recovery turn: an epoch or more. A seat must
+/// host its session within an epoch or its renewal is withheld
+/// (`session_hosting`), so behind such a queue a new seat without its shard's
+/// state lapses before it first votes, is left, and its worker joins another:
+/// each cycle costs join, confirm and leave messages and a pending join in every
+/// other prover's plan, and adds an install to the queue (2026-11-02: two nodes
+/// with 53 and 18 workers waiting up to 6.4 and 4.0 h for two turns, seats hopping
+/// shards every few epochs, none or one of 55 and 20 workers serving).
+///
+/// It cannot refuse forever: a waiting seat either gets its turns or lapses within
+/// its recovery epoch and leaves the queue, which is bounded by the seats already
+/// held. Joins that landed are still decided, and an operator's manual joins and
+/// leaves are not held.
+fn joins_wait_for_recovery(longest_wait: std::time::Duration) -> bool {
+    let epoch_ms = super::session_hosting::epoch_ms(quil_types::consensus::epoch_length_frames());
+    longest_wait.as_millis() >= u128::from(epoch_ms)
+}
+
 /// Snapshot of every gate the lifecycle consults when deciding what
 /// to emit on a given frame. Populated once at the top of
 /// [`ProverLifecycle::evaluate`] (and exposed via
@@ -631,6 +661,11 @@ pub struct ProverLifecycle {
     /// How long each bound seat's worker has not hosted the committee
     /// session that counts it; a seat an epoch unhosted is not renewed.
     session_hosting: std::sync::Mutex<super::session_hosting::SessionHosting>,
+    /// How long this process's longest waiter has waited for an archive
+    /// recovery turn ([`joins_wait_for_recovery`]).
+    recovery_wait: std::sync::Mutex<fn() -> std::time::Duration>,
+    /// Set while that wait holds new joins, so a line marks each change.
+    joins_held: AtomicBool,
     leave_decisions: super::leave_decisions::LeaveDecisions,
     /// What the latest plan repeats, for its bounded log lines.
     plan_repeats: std::sync::Mutex<super::plan_repeats::PlanRepeats>,
@@ -768,6 +803,9 @@ pub struct ProverLifecycle {
     /// Silent seats a shield keeps renewing, with the epoch they were last
     /// reported in (`report_silence_shield`).
     silence_shield_reported: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
+    /// Holds on shards the operator left already reported, by filter and leave
+    /// frame (`report_operator_left_holds`).
+    operator_left_reported: std::sync::Mutex<std::collections::HashSet<(Vec<u8>, u64)>>,
     /// Per-filter "last frame we proposed Join on this filter."
     /// Worker-level `pending_filter_frame` already prevents re-using
     /// the same worker slot mid-flight, but it times out after 10
@@ -843,6 +881,10 @@ impl ProverLifecycle {
             capacity_wait: std::sync::Mutex::new(None),
             seniority_guard: Default::default(),
             session_hosting: Default::default(),
+            recovery_wait: std::sync::Mutex::new(
+                process_recovery_wait as fn() -> std::time::Duration,
+            ),
+            joins_held: AtomicBool::new(false),
             initial_sync_complete: AtomicBool::new(false),
             prover_root_verified_frame: AtomicU64::new(0),
             current_frame,
@@ -869,6 +911,7 @@ impl ProverLifecycle {
             rejected_joins_reported: Default::default(),
             capacity_shield_reported: std::sync::Mutex::new(HashMap::new()),
             silence_shield_reported: std::sync::Mutex::new(HashMap::new()),
+            operator_left_reported: Default::default(),
             last_join_attempt: RwLock::new(HashMap::new()),
             shard_info_loaded: AtomicBool::new(false),
             submission_attempts,
@@ -1067,6 +1110,12 @@ impl ProverLifecycle {
         sync
     }
 
+    /// The registry now reflects the state after GLOBAL `frame`
+    /// (`WorkerAllocator::note_registry_view`).
+    pub fn note_registry_view(&self, frame: u64) {
+        self.allocator.note_registry_view(frame);
+    }
+
     /// The registry now reflects the sync [`Self::begin_registry_sync`]
     /// numbered `sync`.
     pub fn note_registry_synced(&self, sync: u64) {
@@ -1191,6 +1240,31 @@ impl ProverLifecycle {
                 .unwrap_or(true)
     }
 
+    /// Who proposed this node's leave of `filter` at `proposed`, as the
+    /// allocation record names it: `operator`, or the planner's cause, or
+    /// `unknown` with no record (a restart before the record was saved).
+    fn leave_cause(&self, filter: &[u8], proposed: u64) -> String {
+        let name = match self
+            .allocation_reasons
+            .reason(filter, false, proposed)
+            .as_deref()
+        {
+            Some("M") => return "operator".into(),
+            Some("$") => "score replacement",
+            Some("D") => "data-greedy score replacement",
+            Some("H") => "halt-risk swap",
+            Some("E") => "empty shard",
+            Some("O") => "unrecoverable orphan",
+            Some("C") => "capacity shed",
+            Some("S") => "split-away parent",
+            Some("G") => "retired split parent",
+            Some("T") => "retired shard",
+            Some("W") => "worker shortage",
+            Some(_) | None => return "unknown".into(),
+        };
+        format!("planner: {name}")
+    }
+
     /// Whether this node proposed leaving `filter` within
     /// `LEAVE_COOLDOWN_FRAMES` of `frame_number`, so its renewal waits: once
     /// the leave lands the seat is Leaving, every node refuses a confirm that
@@ -1229,8 +1303,10 @@ impl ProverLifecycle {
                     storage = storage.name(), leave_proposed_frame = proposed,
                     resume_frame = proposed + LEAVE_COOLDOWN_FRAMES, grace_frame,
                     frames_to_grace = grace_frame.saturating_sub(frame_number), scope = "local",
-                    action = "expected after an operator's leave; otherwise find this seat's cause in this \
-                              node's 'proposing leaves' line and report both lines",
+                    leave_cause = self.leave_cause(filter, proposed),
+                    action = "cause 'operator': your own leave, wait for it to land; \
+                              any other cause: the planner proposed it, and a repeat on several seats is a \
+                              defect to report with this line",
                     "seat renewal skipped while its storage for the next epoch is being encoded or is encoded: \
                      this node proposed leaving the seat, and a seat being left is not renewed, so the encoding \
                      is wasted and the seat holds no storage registration that epoch. If the leave has not \
@@ -1555,12 +1631,14 @@ impl ProverLifecycle {
 
     /// One line per operator join the node rejects: the seat just goes, and
     /// nothing else tells the operator, who was told it was sent. The planner's
-    /// own joins read their reason in the plan line, and carry a recorded reason
-    /// other than `M`.
+    /// own joins carry a recorded reason other than `M`: each gets one line with
+    /// why, and what it was judged on (`planner_rejects`), unless a line of its
+    /// own already said why (forced rejections, split-away shards).
     fn report_rejected_joins(
         &self,
         actions: &[LifecycleAction],
         joining: &[(Vec<u8>, u64)],
+        planner_rejects: &HashMap<Vec<u8>, PlannerJoinReject>,
         frame_number: u64,
     ) {
         let Ok(mut reported) = self.rejected_joins_reported.lock() else {
@@ -1580,9 +1658,19 @@ impl ProverLifecycle {
                 continue;
             };
             let reason = self.allocation_reasons.reason(filter, true, *join_frame);
-            if !reason.as_deref().is_none_or(|r| r == "M")
-                || !reported.insert((filter.clone(), *join_frame))
-            {
+            if reason.as_deref().is_some_and(|r| r != "M") {
+                if let Some(why) = planner_rejects.get(filter) {
+                    if reported.insert((filter.clone(), *join_frame)) {
+                        info!(frame = frame_number, filter = %hex::encode(filter), join_frame = *join_frame,
+                            reason = why.reason, worker_cap = why.worker_cap, pending_joins = why.pending,
+                            active = why.active, joining = why.joining, workers = why.workers,
+                            owed_workers = why.owed_workers, scope = "local",
+                            "lifecycle: rejecting a join this node's planner proposed");
+                    }
+                }
+                continue;
+            }
+            if !reported.insert((filter.clone(), *join_frame)) {
                 continue;
             }
             info!(frame = frame_number, filter = %hex::encode(filter), join_frame = *join_frame,
@@ -1630,6 +1718,25 @@ impl ProverLifecycle {
                  active provers than the halt-risk count, so the seat stays and renews for the \
                  next epoch, and the surplus leave does not propose it again while the shard is \
                  that small (reported once per seat per epoch)");
+        }
+    }
+
+    /// One line per hold, when it starts: the planner's silence on a shard is
+    /// otherwise indistinguishable from the shard scoring low.
+    fn report_operator_left_holds(&self, frame_number: u64, holds: &[OperatorLeftHold]) {
+        let Ok(mut reported) = self.operator_left_reported.lock() else {
+            return;
+        };
+        reported.retain(|(f, lf)| holds.iter().any(|h| &h.filter == f && h.leave_frame == *lf));
+        for hold in holds {
+            if reported.insert((hold.filter.clone(), hold.leave_frame)) {
+                info!(frame = frame_number, filter = %hex::encode(&hold.filter),
+                    leave_frame = hold.leave_frame, until_epoch = hold.until_epoch, scope = "local",
+                    action = "none needed; to keep free workers off the shard for longer, switch \
+                              them to manual; a join you send yourself goes ahead",
+                    "lifecycle: the planner stays off a shard the operator left, unless it falls \
+                     to halt risk");
+            }
         }
     }
 
@@ -2696,6 +2803,21 @@ impl ProverLifecycle {
         if !reject_backoff.is_empty() {
             proposal_descriptors.retain(|d| !reject_backoff.contains(&d.filter));
         }
+        // A shard the operator left: a free auto worker would otherwise rejoin
+        // it at the next cycle. Local to this node's own proposals: no other
+        // planner's view changes, and a shard short of provers is joined anyway.
+        let operator_left = operator_left_holds(
+            prover_info.as_ref().map_or(&[][..], |p| &p.allocations),
+            frame_number,
+            &self.allocation_reasons,
+        );
+        if !operator_left.is_empty() {
+            proposal_descriptors.retain(|d| {
+                !operator_left.iter().any(|h| h.filter == d.filter)
+                    || proposer::halt_risk_unstaffed(d)
+            });
+        }
+        self.report_operator_left_holds(frame_number, &operator_left);
         // A shard a pending split or merge has frozen: the chain refuses the
         // whole join if it names one, taking the other shards with it.
         if let Ok(frozen) = self.frozen_shards.read() {
@@ -2956,10 +3078,20 @@ impl ProverLifecycle {
         });
         let mut held_back_cores: Vec<u32> = held_back.iter().copied().collect();
         held_back_cores.sort_unstable();
+        // A seat reading expired by a registry that may not show its confirm
+        // yet keeps its slot: spent on a join here, the view can then show the
+        // seat Active (`WorkerAllocator::expiry_awaits_view`).
+        let expiry_held: Vec<&Vec<u8>> = own_allocations
+            .iter()
+            .filter(|a| self.allocator.expiry_awaits_view(a, frame_number).is_some())
+            .map(|a| &a.confirmation_filter)
+            .collect();
         let unbound_held_count = all_our_filters
             .iter()
+            .chain(expiry_held.iter().copied())
             .filter(|f| !worker_bound_filters.contains(*f))
-            .count();
+            .collect::<std::collections::HashSet<_>>()
+            .len();
         // Nor may joins take the node past its capacity: every filter held or
         // bound occupies a slot, whichever worker record serves it. A join
         // published but not yet in the registry is not counted: after the
@@ -2971,6 +3103,7 @@ impl ProverLifecycle {
         let occupied = all_our_filters
             .iter()
             .chain(&worker_bound_filters)
+            .chain(expiry_held.iter().copied())
             .collect::<std::collections::HashSet<_>>()
             .len();
         let assignable_worker_ids: Vec<u32> = free_worker_ids
@@ -3499,7 +3632,28 @@ impl ProverLifecycle {
                 "auto-allocation candidate snapshot"
             );
 
-            if can_propose {
+            let recovery_wait = (*self.recovery_wait.lock().unwrap_or_else(|e| e.into_inner()))();
+            let backlogged = joins_wait_for_recovery(recovery_wait);
+            if self.joins_held.swap(backlogged, Ordering::Relaxed) != backlogged {
+                if backlogged {
+                    tracing::warn!(
+                        frame = frame_number,
+                        longest_wait_secs = recovery_wait.as_secs(),
+                        scope = "this node",
+                        action = "none: joins resume as waiting seats recover or lapse; a node that \
+                                  stays here holds more seats than its archive recovery turns serve",
+                        "new joins held: a worker has waited over an epoch for an archive recovery \
+                         turn, so a new seat could not host its session within the epoch that \
+                         renews it"
+                    );
+                } else {
+                    info!(
+                        frame = frame_number,
+                        "new joins resume: archive recovery turns caught up"
+                    );
+                }
+            }
+            if can_propose && !backlogged {
                 // Per-filter Join hold: exclude any filter we've
                 // already proposed Join for while that join may still
                 // land (`join_hold_ended`). Closes the orphan-
@@ -3589,7 +3743,11 @@ impl ProverLifecycle {
             } else {
                 tracing::debug!(
                     frame = frame_number,
-                    reason = skip_reason,
+                    reason = if backlogged {
+                        "recovery backlog"
+                    } else {
+                        skip_reason
+                    },
                     "skipping join proposals"
                 );
             }
@@ -3615,6 +3773,7 @@ impl ProverLifecycle {
             .map(|(f, _)| f.clone())
             .collect();
 
+        let mut planner_rejects: HashMap<Vec<u8>, PlannerJoinReject> = HashMap::new();
         if !ready_join_filters.is_empty() {
             // Judge split-away joins by the proposals' shard view. A regular
             // node keeps its genesis grid, so the raw grid still names the
@@ -3705,7 +3864,11 @@ impl ProverLifecycle {
                     .get(&d.filter)
                     .map_or(0, |m| m.activating.len() as u64);
             }
-            let (auto_reject, auto_confirm) = proposer::decide_joins(
+            let proposer::JoinDecision {
+                below_score,
+                above_cap,
+                confirm: auto_confirm,
+            } = proposer::decide_joins_by_reason(
                 &decide_candidates,
                 &auto_ready,
                 difficulty,
@@ -3714,6 +3877,42 @@ impl ProverLifecycle {
                 self.strategy,
                 auto_capacity,
             );
+            let mut note_rejects = |filters: &[Vec<u8>], reason, worker_cap, pending| {
+                for filter in filters {
+                    planner_rejects.insert(
+                        filter.clone(),
+                        PlannerJoinReject {
+                            reason,
+                            worker_cap,
+                            pending,
+                            active: active_filters.len(),
+                            joining: joining_filters.len(),
+                            workers: workers.len(),
+                            owed_workers,
+                        },
+                    );
+                }
+            };
+            note_rejects(
+                &below_score,
+                "it scores below the threshold, or its shard is no candidate",
+                auto_capacity,
+                auto_ready.len(),
+            );
+            note_rejects(
+                &above_cap,
+                "more pending joins pass than workers free for them",
+                auto_capacity,
+                auto_ready.len(),
+            );
+            note_rejects(
+                &manual_reject,
+                "more pending joins on manual workers than workers free for them",
+                available_workers,
+                manual_confirm.len() + manual_reject.len(),
+            );
+            let mut auto_reject = below_score;
+            auto_reject.extend(above_cap);
 
             for filter in &split_away {
                 info!(filter = %hex::encode(filter), retired = retired.contains(filter),
@@ -4057,7 +4256,13 @@ impl ProverLifecycle {
                 .filter(|d| !manually_managed_filters.contains(&d.filter))
                 .cloned()
                 .collect();
-            let leave_plan = if !proposal_descriptors.is_empty() {
+            // As the capacity shed does, the replacement plan leaves a seat
+            // whose storage renewal is under way (`storage_protected`) alone
+            // until the renewal lands or its grace frame passes: its leave
+            // would skip the renewal and throw the encoding away. The next
+            // eligible seat is paired with the replacement instead, or none.
+            let plan_leaves = |holding: &std::collections::HashSet<Vec<u8>>,
+                               releasable: &dyn Fn(&[u8]) -> bool| {
                 proposer::plan_leaves_releasing_spread(
                     &auto_allocated_descriptors,
                     replacement_descriptors,
@@ -4066,12 +4271,34 @@ impl ProverLifecycle {
                     self.units,
                     self.strategy,
                     assignable_worker_ids.len(),
-                    &min_hold_filters,
-                    &releasable,
+                    holding,
+                    releasable,
                     Some(&self.prover_address),
                 )
-            } else {
+            };
+            let leave_plan = if proposal_descriptors.is_empty() {
                 proposer::LeavePlan::default()
+            } else if storage_protected.is_empty() {
+                plan_leaves(&min_hold_filters, &releasable)
+            } else {
+                let mut holding = min_hold_filters.clone();
+                holding.extend(storage_protected.keys().cloned());
+                let spares_encoding =
+                    |filter: &[u8]| releasable(filter) && !storage_protected.contains_key(filter);
+                let plan = plan_leaves(&holding, &spares_encoding);
+                let spared: Vec<Vec<u8>> = plan_leaves(&min_hold_filters, &releasable)
+                    .filters
+                    .into_iter()
+                    .filter(|f| storage_protected.contains_key(f))
+                    .collect();
+                self.report_storage_spared(
+                    frame_number,
+                    "replacement",
+                    &spared,
+                    &storage_protected,
+                    plan.filters.len(),
+                );
+                plan
             };
             let score_driven_count = leave_plan.filters.len();
 
@@ -4741,7 +4968,12 @@ impl ProverLifecycle {
                             .record(&[filter], joining, frame_number, reason)?;
                     }
                 }
-                self.report_rejected_joins(&actions, &joining_filters, frame_number);
+                self.report_rejected_joins(
+                    &actions,
+                    &joining_filters,
+                    &planner_rejects,
+                    frame_number,
+                );
                 self.commit_plan_attempts(&actions, frame_number, forced_rejection);
                 if !draining_cores.is_empty() {
                     self.note_drain_leaves(
@@ -5100,6 +5332,51 @@ pub(crate) fn is_settled_split_parent(
         && is_split_parent(filter, known)
 }
 
+/// A departed seat this node's planner stays off for now.
+#[derive(Debug, PartialEq, Eq)]
+struct OperatorLeftHold {
+    filter: Vec<u8>,
+    leave_frame: u64,
+    /// The first epoch the planner may rejoin.
+    until_epoch: u64,
+}
+
+/// Seats that departed on a leave the planner did not propose: the planner
+/// records its own reason for each leave it proposes, and an operator's reads
+/// `M` (sent through this node) or has no record. A leave whose record is
+/// missing (a store reset, a proposal that landed an epoch later, a leave sent
+/// through another node) reads as an operator's; it costs only this bounded
+/// hold. Read from committed state, so it survives a restart.
+fn operator_left_holds(
+    allocations: &[quil_types::consensus::ProverAllocationInfo],
+    frame_number: u64,
+    reasons: &super::allocation_reasons::AllocationReasons,
+) -> Vec<OperatorLeftHold> {
+    use quil_types::consensus::{epoch_for_frame, EffectiveStatus};
+    let epoch = epoch_for_frame(frame_number);
+    allocations
+        .iter()
+        .filter(|a| {
+            a.status == ProverStatus::Leaving
+                && a.leave_frame_number > 0
+                && a.effective_status(frame_number) == EffectiveStatus::ExpiredLeaving
+        })
+        .filter_map(|a| {
+            // A leave proposed in epoch E departs at the E+2 boundary.
+            let until_epoch =
+                epoch_for_frame(a.leave_frame_number) + 2 + OPERATOR_LEAVE_HOLD_EPOCHS;
+            let reason = reasons.reason(&a.confirmation_filter, false, a.leave_frame_number);
+            (epoch < until_epoch && reason.as_deref().is_none_or(|r| r == "M")).then(|| {
+                OperatorLeftHold {
+                    filter: a.confirmation_filter.clone(),
+                    leave_frame: a.leave_frame_number,
+                    until_epoch,
+                }
+            })
+        })
+        .collect()
+}
+
 fn build_proposal_descriptors(
     summaries: &[ProverShardSummary],
     our_filters: &[Vec<u8>],
@@ -5407,6 +5684,18 @@ fn buckets_line_due(
         *last = Some((contents, now));
     }
     due
+}
+
+/// Why the planner rejects a join it proposed, and what it judged that on,
+/// for the line `report_rejected_joins` gives it.
+struct PlannerJoinReject {
+    reason: &'static str,
+    worker_cap: usize,
+    pending: usize,
+    active: usize,
+    joining: usize,
+    workers: usize,
+    owed_workers: usize,
 }
 
 #[cfg(test)]
@@ -7409,6 +7698,69 @@ mod proposal_loop_tests {
         }
     }
 
+    /// New joins wait while a worker has waited an epoch for a recovery turn,
+    /// with one line at each change, and resume once it has not.
+    #[test]
+    fn joins_wait_for_a_recovery_backlog_and_resume_after_it() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(idle_worker(1));
+        reg.set_summaries(
+            (1..=4)
+                .map(|byte| shard_summary(filter_bytes(byte), 1))
+                .collect(),
+        );
+        reg.set_prover(prover(address.clone(), vec![]));
+        let lifecycle = |wait: fn() -> std::time::Duration| {
+            let lc = make_lifecycle(
+                address.clone(),
+                wm.clone() as Arc<dyn WorkerManager>,
+                reg.clone() as Arc<dyn ProverRegistry>,
+            );
+            *lc.recovery_wait.lock().unwrap() = wait;
+            lc.set_prover_root_verified_frame(100);
+            lc
+        };
+        let joins = |lc: &ProverLifecycle| {
+            count_proposed_joins(&lc.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap())
+        };
+        let epoch = || {
+            std::time::Duration::from_millis(crate::provers::session_hosting::epoch_ms(
+                quil_types::consensus::epoch_length_frames(),
+            ))
+        };
+        assert!(
+            joins(&lifecycle(|| std::time::Duration::ZERO)) > 0,
+            "no backlog: the node joins"
+        );
+        let just_under = || {
+            std::time::Duration::from_millis(
+                crate::provers::session_hosting::epoch_ms(
+                    quil_types::consensus::epoch_length_frames(),
+                ) - 1,
+            )
+        };
+        assert!(
+            joins(&lifecycle(just_under)) > 0,
+            "a wait under an epoch holds no join"
+        );
+        let logs = crate::outage::test_logs::CapturedLogs::default();
+        let _guard = logs.install();
+        let lc = lifecycle(epoch);
+        assert_eq!(
+            joins(&lc),
+            0,
+            "a worker waited an epoch for a recovery turn and the node still joined a shard it \
+             could not host in time"
+        );
+        assert_eq!(joins(&lc), 0, "and stays held");
+        assert_eq!(logs.lines_with("new joins held").len(), 1, "one line");
+        *lc.recovery_wait.lock().unwrap() = || std::time::Duration::ZERO;
+        assert!(joins(&lc) > 0, "the hold ended with the backlog");
+        assert_eq!(logs.lines_with("new joins resume").len(), 1, "one line");
+    }
+
     /// A worker whose seat was withheld for sending no vote takes no new
     /// seats until it votes, restarts on that seat or four epochs pass
     /// (decided 2026-10-22): the seat lapses and is left, and joining again
@@ -8954,6 +9306,176 @@ mod proposal_loop_tests {
         );
     }
 
+    /// A departed seat, left at `leave_frame` of epoch 0, with free workers and
+    /// `active` provers on its shard.
+    fn operator_left(
+        active: u32,
+    ) -> (
+        Arc<ConfigurableWorkerManager>,
+        Arc<ConfigurableRegistry>,
+        Arc<ProverLifecycle>,
+    ) {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(idle_worker(1));
+        wm.add(idle_worker(2));
+        wm.add(idle_worker(3));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_summaries(vec![
+            shard_summary(filter_bytes(0x01), active),
+            shard_summary(filter_bytes(0x02), 8),
+        ]);
+        let mut left = alloc(filter_bytes(0x01), ProverStatus::Leaving, 50);
+        left.leave_frame_number = 100;
+        reg.set_prover(prover(address.clone(), vec![left]));
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        (wm, reg, lifecycle)
+    }
+
+    fn proposed_joins(actions: &[LifecycleAction]) -> Vec<Vec<u8>> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeJoin { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    fn evaluate_at(
+        lifecycle: &ProverLifecycle,
+        frame: u64,
+        reg: &dyn ProverRegistry,
+        wm: &dyn WorkerManager,
+    ) -> Vec<LifecycleAction> {
+        lifecycle.set_prover_root_verified_frame(frame);
+        lifecycle.evaluate(frame, 1, reg, wm).unwrap()
+    }
+
+    /// The bound and its recovery: after the operator's leave departs, free
+    /// auto workers stay off the shard through the hold and take it again at
+    /// its end, while the planner goes on joining other shards.
+    #[test]
+    fn a_shard_the_operator_left_is_held_off_then_joinable() {
+        let epoch = quil_types::consensus::epoch_length_frames();
+        let (wm, reg, lifecycle) = operator_left(8);
+        let during = epoch_end_of_hold(epoch) - 1;
+        let p = proposed_joins(&evaluate_at(&lifecycle, during, reg.as_ref(), wm.as_ref()));
+        assert!(!p.contains(&filter_bytes(0x01)), "held off: {p:?}");
+        assert!(p.contains(&filter_bytes(0x02)), "others still join: {p:?}");
+
+        let after = epoch_end_of_hold(epoch);
+        let p = proposed_joins(&evaluate_at(&lifecycle, after, reg.as_ref(), wm.as_ref()));
+        assert!(p.contains(&filter_bytes(0x01)), "joinable again: {p:?}");
+    }
+
+    /// The first frame the planner may rejoin the shard `operator_left` leaves
+    /// in epoch 0.
+    fn epoch_end_of_hold(epoch: u64) -> u64 {
+        (2 + OPERATOR_LEAVE_HOLD_EPOCHS) * epoch
+    }
+
+    /// The network effect: the hold never costs a shard coverage. One at halt
+    /// risk with nobody on the way is joined during the hold.
+    #[test]
+    fn a_held_shard_at_halt_risk_is_joined_anyway() {
+        let epoch = quil_types::consensus::epoch_length_frames();
+        let (wm, reg, lifecycle) = operator_left(1);
+        let during = epoch_end_of_hold(epoch) - 1;
+        let p = proposed_joins(&evaluate_at(&lifecycle, during, reg.as_ref(), wm.as_ref()));
+        assert!(p.contains(&filter_bytes(0x01)), "at halt risk: {p:?}");
+    }
+
+    /// The record an operator's leave leaves when sent through this node (the
+    /// send handler writes `M`) holds the shard as no record does.
+    #[test]
+    fn a_leave_recorded_as_manual_holds_the_shard() {
+        let epoch = quil_types::consensus::epoch_length_frames();
+        let (wm, reg, lifecycle) = operator_left(8);
+        lifecycle
+            .allocation_reasons
+            .record(&[filter_bytes(0x01)], false, 90, "M")
+            .unwrap();
+        let during = epoch_end_of_hold(epoch) - 1;
+        let p = proposed_joins(&evaluate_at(&lifecycle, during, reg.as_ref(), wm.as_ref()));
+        assert!(!p.contains(&filter_bytes(0x01)), "held off: {p:?}");
+    }
+
+    /// A leave the planner proposed itself holds nothing: it records why, and
+    /// it may want the shard back.
+    #[test]
+    fn a_shard_the_planner_left_is_not_held_off() {
+        let epoch = quil_types::consensus::epoch_length_frames();
+        let (wm, reg, lifecycle) = operator_left(8);
+        lifecycle
+            .allocation_reasons
+            .record(&[filter_bytes(0x01)], false, 90, "$")
+            .unwrap();
+        let during = epoch_end_of_hold(epoch) - 1;
+        let p = proposed_joins(&evaluate_at(&lifecycle, during, reg.as_ref(), wm.as_ref()));
+        assert!(p.contains(&filter_bytes(0x01)), "not held: {p:?}");
+    }
+
+    /// A hold says so once, with the shard, the leave and its end.
+    #[test]
+    fn a_hold_logs_one_line_when_it_starts() {
+        let epoch = quil_types::consensus::epoch_length_frames();
+        let (wm, reg, lifecycle) = operator_left(8);
+        let count = |logged: &str| {
+            logged
+                .matches("stays off a shard the operator left")
+                .count()
+        };
+        let during = 2 * epoch + 1;
+        lifecycle.set_prover_root_verified_frame(during);
+        let (_, logged) = evaluate_logged(&lifecycle, during, reg.as_ref(), wm.as_ref());
+        assert_eq!(count(&logged), 1, "{logged}");
+        for text in [
+            format!("filter={}", hex::encode(filter_bytes(0x01))),
+            "leave_frame=100".to_string(),
+            format!("until_epoch={}", 2 + OPERATOR_LEAVE_HOLD_EPOCHS),
+        ] {
+            assert!(logged.contains(&text), "{text} in {logged}");
+        }
+        lifecycle.set_prover_root_verified_frame(during + 1);
+        let (_, logged) = evaluate_logged(&lifecycle, during + 1, reg.as_ref(), wm.as_ref());
+        assert_eq!(count(&logged), 0, "{logged}");
+    }
+
+    /// Only a departed seat is held, and only until its bound; a seat still
+    /// serving its notice is ours and no candidate anyway, and any other
+    /// status is none of this.
+    #[test]
+    fn holds_cover_departed_operator_leaves_within_the_bound() {
+        let epoch = quil_types::consensus::epoch_length_frames();
+        let reasons = crate::provers::allocation_reasons::AllocationReasons::default();
+        let mut left = alloc(filter_bytes(0x01), ProverStatus::Leaving, 50);
+        left.leave_frame_number = 100;
+        let holds = |a: &ProverAllocationInfo, frame| {
+            operator_left_holds(std::slice::from_ref(a), frame, &reasons)
+        };
+        assert!(holds(&left, 2 * epoch - 1).is_empty(), "serving its notice");
+        let until_epoch = 2 + OPERATOR_LEAVE_HOLD_EPOCHS;
+        assert_eq!(
+            holds(&left, 2 * epoch),
+            vec![OperatorLeftHold {
+                filter: filter_bytes(0x01),
+                leave_frame: 100,
+                until_epoch,
+            }],
+            "departed"
+        );
+        assert_eq!(holds(&left, until_epoch * epoch - 1).len(), 1, "last frame");
+        assert!(holds(&left, until_epoch * epoch).is_empty(), "the bound");
+        let rejected = alloc(filter_bytes(0x01), ProverStatus::Rejected, 50);
+        assert!(holds(&rejected, 2 * epoch).is_empty());
+    }
+
     #[test]
     fn rejected_join_is_backed_off_then_retried() {
         // A shard that recently rejected our join must NOT be re-proposed
@@ -9018,6 +9540,197 @@ mod proposal_loop_tests {
             "shard 0x01 must be joinable again after the reject backoff; proposed={:?}",
             p
         );
+    }
+
+    /// The devnet's sequence (2026-11-05): a seat's confirm was included
+    /// after the last pull before the boundary. At the activation frame the
+    /// stale view still reads it Joining and expired: its worker must stay
+    /// and the planner must propose no join with it. The next pull that shows
+    /// the seat expired frees it for one.
+    #[test]
+    fn a_stale_view_at_the_activation_frame_keeps_the_worker_and_proposes_no_join() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCDu8; 32];
+        let (seat, other) = (filter_bytes(0xC1), filter_bytes(0xC2));
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(WorkerInfo {
+            allocated: false,
+            ..allocated_worker(1, seat.clone())
+        });
+        reg.set_prover(prover(
+            address.clone(),
+            vec![alloc(seat.clone(), ProverStatus::Joining, 100)],
+        ));
+        reg.set_summaries(vec![
+            shard_summary(seat.clone(), 8),
+            shard_summary(other.clone(), 1),
+        ]);
+        let lc = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lc.hold_gone_shard_leaves_for_sync();
+        let sync = lc.begin_registry_sync();
+        lc.note_registry_synced(sync);
+        let expiry = crate::worker_allocator::join_expiry_frame(100);
+        let evaluate = |frame: u64| {
+            lc.allocator.on_new_frame(frame).unwrap();
+            lc.set_prover_root_verified_frame(frame);
+            lc.evaluate(frame, 1, reg.as_ref(), wm.as_ref()).unwrap()
+        };
+        for frame in [expiry, expiry + 1] {
+            let actions = evaluate(frame);
+            assert_eq!(
+                wm.range_workers().unwrap()[0].filter,
+                seat,
+                "frame {frame}: worker core 1 released from seat {} on a stale view",
+                hex::encode(&seat)
+            );
+            assert_eq!(
+                proposed_joins(&actions),
+                Vec::<Vec<u8>>::new(),
+                "frame {frame}: spurious join proposed while the view may lack seat {}'s confirm",
+                hex::encode(&seat)
+            );
+        }
+    }
+
+    /// The hold's recovery in the planner: a view past the expiry frame that
+    /// still shows the join unconfirmed frees the worker for another shard.
+    #[test]
+    fn a_view_past_the_expiry_frame_frees_the_worker_for_a_join() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCDu8; 32];
+        let (seat, other) = (filter_bytes(0xC7), filter_bytes(0xC8));
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(WorkerInfo {
+            allocated: false,
+            ..allocated_worker(1, seat.clone())
+        });
+        reg.set_prover(prover(
+            address.clone(),
+            vec![alloc(seat.clone(), ProverStatus::Joining, 100)],
+        ));
+        reg.set_summaries(vec![
+            shard_summary(seat.clone(), 8),
+            shard_summary(other.clone(), 1),
+        ]);
+        let lc = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lc.hold_gone_shard_leaves_for_sync();
+        let expiry = crate::worker_allocator::join_expiry_frame(100);
+        lc.current_frame.observe(expiry + 1);
+        let sync = lc.begin_registry_sync();
+        lc.note_registry_view(expiry);
+        lc.note_registry_synced(sync);
+        let frame = expiry + 1;
+        lc.allocator.on_new_frame(frame).unwrap();
+        lc.set_prover_root_verified_frame(frame);
+        let actions = lc.evaluate(frame, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_ne!(wm.range_workers().unwrap()[0].filter, seat);
+        assert_eq!(proposed_joins(&actions), vec![other], "{actions:?}");
+    }
+
+    /// A held seat no worker serves still takes a slot: after a restart its
+    /// worker comes up idle, and spent on a join here the seat can then show
+    /// Active with no worker for it.
+    #[test]
+    fn a_held_expiry_counts_against_the_free_workers() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCDu8; 32];
+        let (seat, other) = (filter_bytes(0xC3), filter_bytes(0xC4));
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(idle_worker(1));
+        reg.set_prover(prover(
+            address.clone(),
+            vec![alloc(seat.clone(), ProverStatus::Joining, 100)],
+        ));
+        reg.set_summaries(vec![
+            shard_summary(seat.clone(), 8),
+            shard_summary(other, 1),
+        ]);
+        let lc = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lc.hold_gone_shard_leaves_for_sync();
+        let sync = lc.begin_registry_sync();
+        lc.note_registry_synced(sync);
+        let expiry = crate::worker_allocator::join_expiry_frame(100);
+        lc.set_prover_root_verified_frame(expiry + 1);
+        let actions = lc
+            .evaluate(expiry + 1, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        assert_eq!(
+            proposed_joins(&actions),
+            Vec::<Vec<u8>>::new(),
+            "spurious join proposed with the idle worker owed to held seat {}",
+            hex::encode(&seat)
+        );
+    }
+
+    /// A join of the planner's above the worker cap: one line says why and
+    /// what it judged that on, once per join however often the plan repeats.
+    #[test]
+    fn a_rejected_planner_join_logs_its_reason_and_cap() {
+        let address = vec![0xCDu8; 32];
+        let held = filter_bytes(0xC5);
+        let planner = filter_bytes(0xC6);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(allocated_worker(1, held.clone()));
+        reg.set_prover(prover(
+            address.clone(),
+            vec![
+                alloc(held.clone(), ProverStatus::Active, 50),
+                alloc(planner.clone(), ProverStatus::Joining, 99),
+            ],
+        ));
+        reg.set_summaries(vec![
+            shard_summary(held, 8),
+            shard_summary(planner.clone(), 1),
+        ]);
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle
+            .allocation_reasons
+            .record(std::slice::from_ref(&planner), true, 99, "$")
+            .unwrap();
+        let line = "lifecycle: rejecting a join this node's planner proposed";
+        let window = quil_types::consensus::epoch_length_frames();
+        lifecycle.set_prover_root_verified_frame(window);
+        let (actions, logged) = evaluate_logged(&lifecycle, window, reg.as_ref(), wm.as_ref());
+        assert_eq!(count_rejects(&actions), 1, "{actions:?}");
+        assert_eq!(logged.matches(line).count(), 1, "{logged}");
+        let at = logged.lines().find(|l| l.contains(line)).unwrap();
+        for text in [
+            " INFO ".to_string(),
+            format!("filter={}", hex::encode(&planner)),
+            "join_frame=99".to_string(),
+            "more pending joins pass than workers free for them".to_string(),
+            "worker_cap=0".to_string(),
+            "pending_joins=1".to_string(),
+            "active=1".to_string(),
+            "joining=1".to_string(),
+            "workers=1".to_string(),
+        ] {
+            assert!(at.contains(&text), "{text} in {at}");
+        }
+        let next = window + JOIN_COOLDOWN_FRAMES;
+        lifecycle.set_prover_root_verified_frame(next);
+        let (_, logged) = evaluate_logged(&lifecycle, next, reg.as_ref(), wm.as_ref());
+        assert_eq!(logged.matches(line).count(), 0, "{logged}");
     }
 
     /// The planner's joins and an operator's, pending and past their window on
@@ -10655,6 +11368,9 @@ mod proposal_loop_tests {
             evaluate_logged(&lc, frame, reg.as_ref(), wm.as_ref())
         };
         lc.record_leave_attempts(&[held.clone(), other.clone()], 800);
+        lc.allocation_reasons
+            .record(std::slice::from_ref(&held), false, 800, "$")
+            .unwrap();
         let (actions, logged) = evaluate(801);
         assert!(renewed(&actions).is_empty(), "{actions:?}");
         let warned: Vec<&str> = logged.lines().filter(|l| l.contains(warning)).collect();
@@ -10663,6 +11379,7 @@ mod proposal_loop_tests {
             warned[0].contains("WARN") && warned[0].contains(&hex::encode(&held)),
             "{logged}"
         );
+        assert!(warned[0].contains("planner: score replacement"), "{logged}");
         let infos: Vec<&str> = logged.lines().filter(|l| l.contains(skipped)).collect();
         assert_eq!(infos.len(), 1, "{logged}");
         assert!(infos[0].contains(&hex::encode(&other)), "{logged}");
@@ -10682,6 +11399,122 @@ mod proposal_loop_tests {
             "{logged}"
         );
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// Eight bound seats of equal score renewing for epoch 2, and four large
+    /// shards the node does not hold: the score replacement plan proposes
+    /// leaving some of the seats, worst first.
+    fn replacement_fixture() -> (
+        Arc<ProverLifecycle>,
+        Arc<ConfigurableRegistry>,
+        Arc<ConfigurableWorkerManager>,
+    ) {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut seats = Vec::new();
+        let mut summaries = Vec::new();
+        for core in 1..=8u32 {
+            let filter = filter_bytes(0xA0 + core as u8);
+            wm.add(allocated_worker(core, filter.clone()));
+            seats.push(renewing(filter.clone()));
+            summaries.push(ProverShardSummary {
+                filter,
+                status_counts: HashMap::from([(ProverStatus::Active, 64)]),
+                total_size: 1_000_000,
+            });
+        }
+        for byte in 0xC0..0xC4u8 {
+            summaries.push(ProverShardSummary {
+                filter: filter_bytes(byte),
+                status_counts: HashMap::from([(ProverStatus::Active, 8)]),
+                total_size: 100_000_000,
+            });
+        }
+        let mut members = vec![prover(address.clone(), seats.clone())];
+        for byte in 0..63u8 {
+            members.push(prover(vec![byte; 32], seats.clone()));
+        }
+        reg.set_provers(members);
+        reg.set_summaries(summaries);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        (lc, reg, wm)
+    }
+
+    /// Nov4: after two shard splits the score replacement plan proposed
+    /// leaving seats whose storage for the next epoch was encoding, on eight
+    /// nodes, because the new shards outscored them: the leave skipped each
+    /// renewal and the encoding was thrown away. The plan leaves such a seat
+    /// alone and pairs the replacement with another; bounded by the grace
+    /// frame, past which (or once the renewal landed) the seat is a source
+    /// again.
+    #[test]
+    fn the_replacement_plan_spares_seats_whose_storage_is_encoding_until_the_grace_frame() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let run = |frame: u64, storage: &[Vec<u8>]| {
+            let (lc, reg, wm) = replacement_fixture();
+            for filter in storage {
+                note_storage(&lc, 790, filter, RenewalStorage::Encoding);
+            }
+            lc.set_prover_root_verified_frame(frame);
+            evaluate_logged(&lc, frame, reg.as_ref(), wm.as_ref())
+        };
+        // Control: nothing encoding, the plan picks its sources.
+        let (actions, _) = run(800, &[]);
+        let sources = proposed_leaves(&actions);
+        assert!(
+            !sources.is_empty(),
+            "control proposes replacements: {actions:?}"
+        );
+
+        // The same seats mid-encode are not sources; others go instead.
+        let (actions, logged) = run(800, &sources);
+        let spared = proposed_leaves(&actions);
+        assert!(
+            spared.iter().all(|f| !sources.contains(f)),
+            "replacement plan picked a seat whose next-epoch storage is encoding as its source: \
+             {spared:?} of encoding {sources:?}"
+        );
+        assert_eq!(spared.len(), sources.len(), "{actions:?}");
+        assert!(
+            logged.contains("capacity shed spares seats whose storage")
+                && logged.contains("path=\"replacement\""),
+            "{logged}"
+        );
+        assert_eq!(renewed(&actions).len(), 8 - spared.len(), "{actions:?}");
+
+        // Every seat encoding: no source, no leave, until the grace frame.
+        let all: Vec<Vec<u8>> = (1..=8u8).map(|c| filter_bytes(0xA0 + c)).collect();
+        let (actions, _) = run(800, &all);
+        assert!(proposed_leaves(&actions).is_empty(), "{actions:?}");
+
+        // At the grace frame the replacement proceeds as in the control.
+        let (control, _) = run(1056, &[]);
+        let (actions, _) = run(1056, &all);
+        assert!(!proposed_leaves(&control).is_empty(), "{control:?}");
+        assert_eq!(
+            proposed_leaves(&actions),
+            proposed_leaves(&control),
+            "past the grace frame the encoding spares nothing: {actions:?}"
+        );
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// The warn names who proposed the leave, so no other line is needed.
+    #[test]
+    fn the_leave_cause_names_the_planner_or_the_operator() {
+        let (lc, ..) = replacement_fixture();
+        let seat = filter_bytes(0xA1);
+        assert_eq!(lc.leave_cause(&seat, 800), "unknown");
+        lc.allocation_reasons
+            .record(std::slice::from_ref(&seat), false, 800, "$")
+            .unwrap();
+        assert_eq!(lc.leave_cause(&seat, 801), "planner: score replacement");
+        lc.allocation_reasons
+            .record(std::slice::from_ref(&seat), false, 802, "M")
+            .unwrap();
+        assert_eq!(lc.leave_cause(&seat, 803), "operator");
     }
 
     /// Oct29 devnet: a node restarted with fewer workers shed, at its first

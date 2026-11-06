@@ -475,6 +475,10 @@ pub struct GlobalLeaderProvider {
     /// proofs it would sequence ([`ShardProofSettlement`]). `None` never
     /// waits.
     proof_settlement: Option<ShardProofSettlement>,
+    /// What the public mempool held when this execution-branch leader's
+    /// proposal copied it ([`MessageCollector::take_proposal_pool`]), for
+    /// the proposal line.
+    pool: Option<crate::proposal_pool::ProposalPool>,
 }
 
 impl GlobalLeaderProvider {
@@ -555,6 +559,7 @@ impl GlobalLeaderProvider {
         leader.rejected = self.rejected.clone();
         leader.body_availability = self.body_availability.clone();
         leader.proof_settlement = self.proof_settlement.clone();
+        leader.pool = self.message_collector.take_proposal_pool();
         Ok(leader)
     }
 
@@ -586,6 +591,7 @@ impl GlobalLeaderProvider {
             hypergraph,
             body_availability: None,
             proof_settlement: None,
+            pool: None,
         }
     }
 
@@ -964,16 +970,19 @@ pub(crate) fn select_shard_tips(
     let mut shards = shards.into_iter();
     let parts: Vec<ShardTips> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|_| {
+            .map(|lane| {
                 let part: Vec<_> = shards.by_ref().take(chunk).collect();
                 let select = &select;
-                scope.spawn(move || {
-                    let mut out = ShardTips::default();
-                    for candidates in part {
-                        select(candidates, &mut out);
-                    }
-                    out
-                })
+                std::thread::Builder::new()
+                    .name(format!("shard-tips-{lane}"))
+                    .spawn_scoped(scope, move || {
+                        let mut out = ShardTips::default();
+                        for candidates in part {
+                            select(candidates, &mut out);
+                        }
+                        out
+                    })
+                    .expect("spawn a shard tip selection thread")
             })
             .collect();
         handles
@@ -1162,7 +1171,9 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // (`GlobalProposer::proposal_pacing`), so a selected-parent leader
         // does not hold its execution lease through it; this is the backstop,
         // checked on the authenticated parent.
-        {
+        // An execution-branch leader copied its messages before this point:
+        // pacing here means it copied them early (logged with the proposal).
+        let paced_in_build = {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1176,7 +1187,8 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 );
                 std::thread::sleep(wait);
             }
-        }
+            wait
+        };
         // Timed from here: the pacing above is deliberate.
         let mut clock = crate::stage_clock::StageClock::start("GLOBAL proposal", frame_number);
 
@@ -1300,11 +1312,11 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 self.rejected.lock().unwrap().enter(context.clone());
                 for raw in collected {
                     if crate::message_collector::bundle_has_shard_frame(&raw) {
-                        // Strict lockstep: a shard proof rides ONLY if its ANCHOR
-                        // (`global_frame_number`) is `frame_number - 1` (or genesis
-                        // anchor 0) — NOT its local frame number. The materializer
-                        // hard-rejects any frame carrying an out-of-lockstep shard op,
-                        // so packing a stale proof would halt the chain — drop it here.
+                        // Windowed lockstep: a shard proof rides ONLY if its ANCHOR
+                        // (`global_frame_number`) lies in this frame's window (or is
+                        // genesis anchor 0) — NOT by its local frame number. GLOBAL
+                        // validation and execution refuse any other and skip it, so a
+                        // packed one earns nothing — drop it here.
                         if crate::message_collector::bundle_shard_frames_in_lockstep(
                             &raw,
                             frame_number,
@@ -1551,12 +1563,56 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
             None => collected,
         };
 
-        tracing::info!(
-            frame = frame_number,
-            rank,
-            message_count = messages.len(),
-            "proving next global state",
-        );
+        match &self.pool {
+            // One line per own proposal; the pool fields describe the public
+            // mempool when this proposal copied it, the intake fields the
+            // shard-frame submits since the previous proposal's copy.
+            Some(pool) => tracing::info!(
+                frame = frame_number,
+                rank,
+                message_count = messages.len(),
+                pool_shards = pool.shards,
+                pool_anchored_parent = pool.anchored_parent,
+                pool_anchored_earlier = pool.anchored_earlier,
+                pool_out_of_window = pool.out_of_window,
+                pool_verified = pool.verified,
+                pool_unverified = pool.unverified,
+                verifying = pool.verifying,
+                verify_tasks = pool.gate_in_flight,
+                submits_accepted = pool.intake.accepted,
+                held_unverifiable = pool.intake.held_unverifiable,
+                held_verifier_busy = pool.intake.held_verifier_busy,
+                refused_rank_full = pool.intake.refused_rank_full,
+                refused_awaiting_execution = pool.intake.refused_awaiting_execution,
+                refused_invalid = pool.intake.refused_invalid,
+                refused_unknown_shard = pool.intake.refused_unknown_shard,
+                verify_tasks_dropped = pool.intake.gate_dropped,
+                since_accepted_ms = crate::proposal_pool::ms_field(pool.intake.since_accepted_ms),
+                since_published_ms = crate::proposal_pool::ms_field(pool.intake.since_published_ms),
+                paced_after_copy_ms = paced_in_build.as_millis() as u64,
+                "proving next global state",
+            ),
+            None => tracing::info!(
+                frame = frame_number,
+                rank,
+                message_count = messages.len(),
+                "proving next global state",
+            ),
+        }
+        if let Some(pool) = &self.pool {
+            crate::inclusion_summary::note_pool(frame_number, pool);
+        }
+        if !paced_in_build.is_zero() && self.pool.is_some() {
+            tracing::warn!(
+                frame = frame_number,
+                rank,
+                paced_after_copy_ms = paced_in_build.as_millis() as u64,
+                scope = "local",
+                action = "report",
+                check = "this GLOBAL proposal copied the mempool before its frame was due and carries only what had arrived by then; report this line with the proposal line above it",
+                "GLOBAL proposal copied its messages before waiting out its frame interval",
+            );
+        }
         clock.mark("collect messages");
 
         // ------------------------------------------------------------------

@@ -352,6 +352,7 @@ async fn sync_phase_data(
     source_version: u64,
     bit_path: Vec<bool>,
     anchor: Option<quil_forest::SubtreeSyncAnchor>,
+    hold: bool,
 ) -> Result<[u8; 32]> {
     let remote = RemoteTreeReader::new(client.clone(), handle.clone(), shard_id.to_vec(), phase)
         .labelled(filter.to_vec());
@@ -372,6 +373,7 @@ async fn sync_phase_data(
         anchor,
         remote,
         fetch,
+        hold,
     )
     .await
 }
@@ -386,7 +388,9 @@ async fn sync_phase_data(
 /// (`HypergraphCrdt::sync_incomplete`), so the shard's partial data never
 /// counts as staged between turns, while a phase it completed leaves no
 /// marker for the phases after it. Its installed chunks stay, and its next
-/// sync diffs against them.
+/// sync diffs against them. With `hold`, its chunks also withhold the
+/// committed view until the caller records its cursor
+/// ([`quil_hypergraph::crdt::ForestSyncPlan::hold_view`]).
 #[allow(clippy::too_many_arguments)]
 async fn install_phase<R, F, Fut>(
     crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
@@ -398,6 +402,7 @@ async fn install_phase<R, F, Fut>(
     anchor: Option<quil_forest::SubtreeSyncAnchor>,
     source: R,
     mut fetch: F,
+    hold: bool,
 ) -> Result<[u8; 32]>
 where
     R: quil_forest::BatchTreeReader + Send + 'static,
@@ -424,6 +429,9 @@ where
     })
     .await
     .map_err(|e| QuilError::Internal(format!("sync preparation task: {e}")))??;
+    if hold {
+        plan.hold_view();
+    }
     let filter = hex::encode(filter);
     let mut planned = plan.remaining().len();
     // A worker's recovery reports its progress; other syncs report nothing.
@@ -584,6 +592,7 @@ pub async fn sync_one_phase(
         source_version,
         Vec::new(),
         remote_root.map(quil_forest::SubtreeSyncAnchor::AppRoot),
+        false,
     )
     .await
 }
@@ -613,6 +622,7 @@ pub async fn sync_subtree_one_phase(
         source_version,
         bit_path,
         pinned_subtree_root.map(quil_forest::SubtreeSyncAnchor::SubtreeRoot),
+        false,
     )
     .await
 }
@@ -637,6 +647,31 @@ pub async fn sync_single_shard_verified(
         crdt,
         shard_id,
         [expected_va_root, &[], &[], &[]],
+    )
+    .await
+}
+
+/// [`sync_single_shard_verified`] of the GLOBAL prover tree, pinned to
+/// `expected_va_root`, that leaves the committed GLOBAL view withheld from
+/// its first installed chunk until the caller records the frame the root
+/// belongs to with `HypergraphCrdt::checkpoint_synced_view`. Committee
+/// session reads (`CommittedView::capture`) then never see the synced
+/// records with the cursor from before them. A hold left by a failed sync
+/// or checkpoint ends at the next successful checkpoint.
+pub async fn sync_global_view_verified(
+    addr: &str,
+    falcon_signing_key: &[u8],
+    crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    expected_va_root: &[u8],
+) -> Result<Option<u64>> {
+    sync_shard_phases(
+        addr,
+        falcon_signing_key,
+        crdt,
+        &PROVER_SHARD,
+        [expected_va_root, &[], &[], &[]],
+        false,
+        true,
     )
     .await
 }
@@ -670,7 +705,16 @@ pub async fn sync_shard_phases_verified(
     shard_id: &[u8],
     expected: [&[u8]; 4],
 ) -> Result<Option<u64>> {
-    sync_shard_phases(addr, falcon_signing_key, crdt, shard_id, expected, false).await
+    sync_shard_phases(
+        addr,
+        falcon_signing_key,
+        crdt,
+        shard_id,
+        expected,
+        false,
+        false,
+    )
+    .await
 }
 
 async fn sync_shard_phases(
@@ -680,6 +724,7 @@ async fn sync_shard_phases(
     shard_id: &[u8],
     expected: [&[u8]; 4],
     pinned_only: bool,
+    hold: bool,
 ) -> Result<Option<u64>> {
     for root in expected {
         phase_anchor(root)?;
@@ -687,18 +732,20 @@ async fn sync_shard_phases(
     let mut client = ArchiveClient::connect_mtls(addr, falcon_signing_key)
         .await
         .map_err(|e| QuilError::Internal(format!("archive connect: {e}")))?;
-    sync_shard_phases_on(&mut client, crdt, shard_id, expected, pinned_only).await
+    sync_shard_phases_on(&mut client, crdt, shard_id, expected, pinned_only, hold).await
 }
 
 /// [`sync_shard_phases_verified`] over an already connected archive client;
 /// with `pinned_only`, only the phases `expected` pins are synced, and an
 /// unpinned phase is left as it is rather than taken from the peer's head.
+/// With `hold`, see [`sync_global_view_verified`].
 pub(crate) async fn sync_shard_phases_on(
     client: &mut ArchiveClient,
     crdt: Arc<quil_hypergraph::HypergraphCrdt>,
     shard_id: &[u8],
     expected: [&[u8]; 4],
     pinned_only: bool,
+    hold: bool,
 ) -> Result<Option<u64>> {
     for root in expected {
         phase_anchor(root)?;
@@ -740,14 +787,17 @@ pub(crate) async fn sync_shard_phases_on(
         if phase == 0 {
             pinned_frame = global_frame;
         }
-        let got = sync_one_phase(
+        let got = sync_phase_data(
             &mut client,
             &handle,
             &crdt,
             shard_id,
+            shard_id,
             phase,
             source_version,
-            Some(remote_root),
+            Vec::new(),
+            Some(quil_forest::SubtreeSyncAnchor::AppRoot(remote_root)),
+            hold,
         )
         .await?;
         if !exp.is_empty() {
@@ -907,8 +957,75 @@ mod tests {
             Some(quil_forest::SubtreeSyncAnchor::AppRoot(root)),
             reader,
             fetch,
+            false,
         )
         .await
+    }
+
+    /// Install phase 0 of `app` from `source` into `target`, held or not.
+    async fn install_held(
+        source: &Arc<quil_hypergraph::HypergraphCrdt>,
+        target: &Arc<quil_hypergraph::HypergraphCrdt>,
+        app: [u8; 32],
+        version: u64,
+        root: [u8; 32],
+        hold: bool,
+    ) -> Result<[u8; 32]> {
+        let reader = quil_hypergraph::testing::CrdtTreeReader {
+            source: source.clone(),
+            shard_id: app.to_vec(),
+            phase: 0,
+        };
+        let fetch = |leaves: Vec<([u8; 32], Option<Vec<u8>>)>| async move {
+            Ok::<_, QuilError>(leaves.iter().map(|(key, _)| blob_of(key)).collect())
+        };
+        install_phase(
+            target,
+            &app,
+            &app,
+            0,
+            version,
+            Vec::new(),
+            Some(quil_forest::SubtreeSyncAnchor::AppRoot(root)),
+            reader,
+            fetch,
+            hold,
+        )
+        .await
+    }
+
+    /// A held install keeps its scope's view withheld after its last chunk,
+    /// until the cursor is recorded; an unheld one leaves nothing listed,
+    /// and a sync that installs nothing places no hold.
+    #[tokio::test]
+    async fn a_held_install_withholds_the_view_until_its_cursor_is_recorded() {
+        let app = [0x75; 32];
+        let (source, version, root) = source_of(app, 10);
+        let cursor = b"test/cursor".to_vec();
+
+        let target = memory_crdt();
+        let installed = install_held(&source, &target, app, version, root, true).await;
+        assert_eq!(installed.unwrap(), root);
+        assert!(
+            target.sync_incomplete(&app, &[]).unwrap(),
+            "a held install stays listed after its last chunk"
+        );
+        // Nothing left to install: no chunk, so no further hold.
+        let again = install_held(&source, &target, app, version, root, true).await;
+        assert_eq!(again.unwrap(), root);
+        let checkpoint = target.checkpoint_synced_view(&app, 7, &cursor).unwrap();
+        assert!(checkpoint.held, "{checkpoint:?}");
+        assert_eq!(checkpoint.previous, None);
+        assert!(!target.sync_incomplete(&app, &[]).unwrap());
+        assert_eq!(target.read_frame_cursor(&cursor).unwrap(), 7);
+        let again = install_held(&source, &target, app, version, root, true).await;
+        assert_eq!(again.unwrap(), root);
+        assert!(!target.sync_incomplete(&app, &[]).unwrap());
+
+        let unheld = memory_crdt();
+        let installed = install_held(&source, &unheld, app, version, root, false).await;
+        assert_eq!(installed.unwrap(), root);
+        assert!(!unheld.sync_incomplete(&app, &[]).unwrap());
     }
 
     /// A recovery whose turn is spent hands it back only inside a phase,

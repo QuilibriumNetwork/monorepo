@@ -9,9 +9,9 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use common::{AppShardHarness, TestProver};
+use common::{frames_seen, until_progress, AppShardHarness, TestProver};
 use prost::Message as _;
 use quil_engine::test_support::TestProverRegistry;
 use quil_execution::{
@@ -98,17 +98,6 @@ fn session_of(
         .map(|v| v.session)
 }
 
-async fn until<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Some(value) = probe() {
-            return Some(value);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    None
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn legacy_history_is_discarded_and_the_first_session_certifies_from_frame_one() {
     common::init_tracing();
@@ -136,10 +125,15 @@ async fn legacy_history_is_discarded_and_the_first_session_certifies_from_frame_
     // 1. Legacy: the registry committee certifies frames.
     let harness =
         AppShardHarness::build_cw_sessions_seeded(provers.clone(), registry, global.clone(), seed);
-    let legacy = until(Duration::from_secs(90), || {
-        let frames = all_frames(&harness);
-        (frames.iter().filter(|f| number(f) >= 3).count() > 0).then_some(frames)
-    })
+    let legacy = until_progress(
+        Duration::from_secs(90),
+        Duration::from_secs(360),
+        || frames_seen(&harness),
+        || {
+            let frames = all_frames(&harness);
+            (frames.iter().filter(|f| number(f) >= 3).count() > 0).then_some(frames)
+        },
+    )
     .await
     .expect("the legacy committee certifies frames");
     let legacy_head = legacy.iter().map(number).max().unwrap();
@@ -152,17 +146,32 @@ async fn legacy_history_is_discarded_and_the_first_session_certifies_from_frame_
         membership_boundary_frame: u64::MAX,
         first_session_boundary_frame: u64::MAX,
     }));
-    let discarded = until(Duration::from_secs(60), || {
-        harness
-            .workers
-            .iter()
-            .all(|w| {
-                w.clock
-                    .as_ref()
-                    .is_some_and(|clock| clock.app_frame_history_discarded().unwrap().is_some())
-            })
-            .then_some(())
-    })
+    let discarded = until_progress(
+        Duration::from_secs(60),
+        Duration::from_secs(240),
+        || {
+            harness
+                .workers
+                .iter()
+                .filter(|w| {
+                    w.clock
+                        .as_ref()
+                        .is_some_and(|clock| clock.app_frame_history_discarded().unwrap().is_some())
+                })
+                .count() as u64
+        },
+        || {
+            harness
+                .workers
+                .iter()
+                .all(|w| {
+                    w.clock
+                        .as_ref()
+                        .is_some_and(|clock| clock.app_frame_history_discarded().unwrap().is_some())
+                })
+                .then_some(())
+        },
+    )
     .await;
     assert!(
         discarded.is_some(),
@@ -225,16 +234,21 @@ async fn legacy_history_is_discarded_and_the_first_session_certifies_from_frame_
     handoff::initialize(&state, 2, &first).unwrap();
     commit(&state, 2);
 
-    let sessions = until(Duration::from_secs(150), || {
-        let view = CommittedView::capture(&global).unwrap();
-        let mut certified: Vec<AppShardFrame> = all_frames(&harness)
-            .into_iter()
-            .filter(|f| session_of(&view, f).as_ref() == Some(&first))
-            .collect();
-        certified.sort_by_key(number);
-        certified.dedup_by_key(|f| number(f));
-        (certified.len() >= 3).then_some(certified)
-    })
+    let sessions = until_progress(
+        Duration::from_secs(150),
+        Duration::from_secs(600),
+        || frames_seen(&harness),
+        || {
+            let view = CommittedView::capture(&global).unwrap();
+            let mut certified: Vec<AppShardFrame> = all_frames(&harness)
+                .into_iter()
+                .filter(|f| session_of(&view, f).as_ref() == Some(&first))
+                .collect();
+            certified.sort_by_key(number);
+            certified.dedup_by_key(|f| number(f));
+            (certified.len() >= 3).then_some(certified)
+        },
+    )
     .await
     .expect("the first session certifies frames from 1");
     assert_eq!(
@@ -258,14 +272,24 @@ async fn legacy_history_is_discarded_and_the_first_session_certifies_from_frame_
     assert!(legacy_head >= 3);
 
     // The wait above counts frames across all members; a lagging member may
-    // not have stored one yet, so wait for each member's own head.
+    // not have stored one yet, or may first recover a body it missed (the
+    // harness answers its archive request), so wait for each member's head.
     for (index, worker) in harness.workers.iter().enumerate() {
         let clock = worker.clock.as_ref().unwrap();
-        until(Duration::from_secs(60), || {
-            let head = clock.get_latest_shard_clock_frame(&filter).ok()?;
-            let view = CommittedView::capture(&global).unwrap();
-            (session_of(&view, &head).as_ref() == Some(&first)).then_some(())
-        })
+        until_progress(
+            Duration::from_secs(60),
+            Duration::from_secs(240),
+            || {
+                clock
+                    .get_latest_shard_clock_frame(&filter)
+                    .map_or(0, |head| number(&head))
+            },
+            || {
+                let head = clock.get_latest_shard_clock_frame(&filter).ok()?;
+                let view = CommittedView::capture(&global).unwrap();
+                (session_of(&view, &head).as_ref() == Some(&first)).then_some(())
+            },
+        )
         .await
         .unwrap_or_else(|| panic!("worker {index} stores a frame of the first session"));
     }
