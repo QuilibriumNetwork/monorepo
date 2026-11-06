@@ -3535,19 +3535,23 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         let committed = crdt.clone();
         let head = current_frame.clone();
         let health = health.clone();
+        let read_failures = Arc::new(std::sync::Mutex::new(
+            super::frame_observations::ReadFailures::default(),
+        ));
         sup.spawn("frame-observation-sampler", move |token| async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut ticks = 0;
             loop {
                 tokio::select! { _ = token.cancelled() => break, _ = interval.tick() => {} }
-                let (state, registry, wm, committed, head, health) = (
+                let (state, registry, wm, committed, head, health, read_failures) = (
                     state.clone(),
                     registry.clone(),
                     wm.clone(),
                     committed.clone(),
                     head.clone(),
                     health.clone(),
+                    read_failures.clone(),
                 );
                 let path = frame_observations_path.clone();
                 let scope = cadence_scope.clone();
@@ -3574,7 +3578,20 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                         filters.extend(cache.filters());
                     }
                     let filters: Vec<_> = filters.into_iter().collect();
-                    let heads = committed_global_app_heads(&committed, &filters).ok();
+                    let started = std::time::Instant::now();
+                    let read = committed_global_app_heads(&committed, &filters);
+                    let read_ms = started.elapsed().as_millis() as u64;
+                    let line = {
+                        let mut failures = read_failures.lock().unwrap_or_else(|e| e.into_inner());
+                        match &read {
+                            Ok(_) => failures.succeeded(now),
+                            Err(e) => failures.failed(now, &e.to_string(), read_ms),
+                        }
+                    };
+                    if let Some(line) = line {
+                        line.emit(filters.len());
+                    }
+                    let heads = read.ok();
                     if let Some(heads) = heads.as_ref() {
                         let observed: Vec<_> = filters
                             .iter()
