@@ -43,7 +43,9 @@ pub enum DeployCommand {
     },
     /// Deploy a token.
     Token {
-        /// Args: `[name=… symbol=… behavior=… mintStrategy=… units=… supply=…]`.
+        /// Args: `[name=… symbol=… behavior=… mintStrategy=… units=… supply=…
+        /// additionalReference=…]`; `additionalReference` is the 64-byte address
+        /// (hex or alias) of the token's data, e.g. a file `deploy file` stored.
         args: Vec<String>,
     },
     /// Deploy a file to the hypergraph (auto-chunks files ≥ 4 MB).
@@ -79,7 +81,8 @@ pub enum DeployCommand {
         /// The token's 32-byte domain (hex or alias).
         #[arg(short = 'd', long)]
         domain: String,
-        /// Config `key=value` args (name/symbol/behavior/mintStrategy/units/supply).
+        /// Config `key=value` args
+        /// (name/symbol/behavior/mintStrategy/units/supply/additionalReference).
         args: Vec<String>,
     },
     /// Update a deployed hypergraph's config/schema (owner-signed).
@@ -363,6 +366,140 @@ mod tests {
                 err.contains(refusal) && err.contains("paymentaddress, price, entitlementroot"),
                 "token deploy args misread: {arg} was not refused ({err})"
             );
+        }
+    }
+
+    /// A 64-byte vertex address: a hypergraph domain and a data address.
+    fn reference() -> Vec<u8> {
+        let mut address = vec![0x0d; 32];
+        address.extend_from_slice(&[0x49; 32]);
+        address
+    }
+
+    /// A token configuration that already points at other data.
+    fn referencing_token() -> quil_types::proto::token::TokenConfiguration {
+        quil_types::proto::token::TokenConfiguration {
+            name: "Example".into(),
+            additional_reference: vec![vec![0x7c; 64]],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn token_additional_reference_key_is_known() {
+        let dc = offline_ctx("token-reference-keys");
+        let one = hex::encode(reference());
+        // Taken in any case by both commands: deploy builds its
+        // configuration, and the update gets past its keys to its domain.
+        let args = [format!("additionalReference={one}")];
+        let deployed = token::deploy_config(&dc, &args).map_err(|e| format!("{e:#}"));
+        assert!(
+            deployed
+                .as_ref()
+                .is_ok_and(|cfg| cfg.additional_reference == vec![reference()]),
+            "token deploy args misread: additionalReference was not taken ({deployed:?})"
+        );
+        let err = format!(
+            "{:#}",
+            token_update::run(&dc, "00", &args).await.unwrap_err()
+        );
+        assert!(
+            err.contains("expected 32 bytes, got 1"),
+            "token-update args misread: additionalReference was not taken ({err})"
+        );
+
+        // Misspelt, both refuse it before anything is read or signed.
+        let args = [format!("additionalRefrence={one}")];
+        let domain = "00".repeat(32);
+        for (command, result) in [
+            ("token deploy", token::run(&dc, &args).await),
+            ("token-update", token_update::run(&dc, &domain, &args).await),
+        ] {
+            let err = result.map_err(|e| format!("{e:#}")).err();
+            assert!(
+                err.as_ref().is_some_and(|e| {
+                    e.contains("unknown key \"additionalRefrence\"")
+                        && e.contains("additionalreference")
+                }),
+                "{command} args misread: additionalRefrence was not refused ({err:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn token_update_sets_additional_reference() {
+        let dc = offline_ctx("token-update-reference");
+        let current = referencing_token();
+        let args = [format!("additionalreference={}", hex::encode(reference()))];
+        let cfg = token_update::update_config(&dc, &current, &args).unwrap();
+        assert_eq!(
+            cfg.additional_reference,
+            vec![reference()],
+            "additional reference misread: token update did not set it"
+        );
+        let cfg =
+            token_update::update_config(&dc, &current, &["name=Renamed".to_string()]).unwrap();
+        assert_eq!(
+            cfg.additional_reference, current.additional_reference,
+            "additional reference misread: an update without it dropped the token's"
+        );
+    }
+
+    #[test]
+    fn token_additional_reference_refuses_a_wrong_length() {
+        let dc = offline_ctx("token-reference-length");
+        // 128 bytes: two references concatenated.
+        for len in [32, 63, 65, 128] {
+            let args = [format!("additionalreference={}", "ab".repeat(len))];
+            let refusal = format!("expected 64 bytes, got {len}");
+            for (command, result) in [
+                ("deploy token", token::deploy_config(&dc, &args)),
+                (
+                    "token update",
+                    token_update::update_config(&dc, &referencing_token(), &args),
+                ),
+            ] {
+                let err = result.map_err(|e| format!("{e:#}")).err();
+                assert!(
+                    err.as_ref().is_some_and(|e| e.contains(&refusal)),
+                    "additional reference misread: {command} took a {len}-byte \
+                     reference ({err:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn token_additional_reference_refuses_several_values() {
+        let dc = offline_ctx("token-reference-several");
+        let one = hex::encode(reference());
+        for (args, refusal) in [
+            (
+                vec![format!("additionalreference={one},{one}")],
+                "not a list",
+            ),
+            (
+                vec![
+                    format!("additionalreference={one}"),
+                    format!("additionalReference={one}"),
+                ],
+                "given 2 times",
+            ),
+        ] {
+            for (command, result) in [
+                ("deploy token", token::deploy_config(&dc, &args)),
+                (
+                    "token update",
+                    token_update::update_config(&dc, &referencing_token(), &args),
+                ),
+            ] {
+                let err = result.map_err(|e| format!("{e:#}")).err();
+                assert!(
+                    err.as_ref().is_some_and(|e| e.contains(refusal)),
+                    "additional reference misread: {command} took several \
+                     references {args:?} ({err:?})"
+                );
+            }
         }
     }
 }
