@@ -904,6 +904,9 @@ impl RocksClockStore {
 #[path = "clock_retention.rs"]
 mod retention;
 pub use retention::{CandidatePrune, StagedFrameCleanup};
+#[path = "shard_frame_retention.rs"]
+mod shard_retention;
+pub use shard_retention::{PrunedShard, UnservedFramePrune};
 
 #[cfg(test)]
 mod writer_hold_tests {
@@ -2850,8 +2853,8 @@ impl store::ClockStore for RocksClockStore {
     }
     fn get_latest_shard_clock_frame_number(&self, filter: &[u8]) -> Result<Option<u64>> {
         // The index only advances to a frame whose body is stored (see
-        // `commit_shard_clock_frame`), and retention never deletes canonical
-        // bodies, so it names the frame `get_latest_shard_clock_frame` reads.
+        // `commit_shard_clock_frame`), and retention keeps each shard's latest
+        // body, so it names the frame `get_latest_shard_clock_frame` reads.
         self.read_u64_index_checked(&encoding::clock_shard_latest_index(filter))
     }
     fn get_latest_shard_clock_frame(&self, filter: &[u8]) -> Result<proto::global::AppShardFrame> {

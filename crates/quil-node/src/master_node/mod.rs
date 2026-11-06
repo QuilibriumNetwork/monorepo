@@ -694,6 +694,18 @@ pub(crate) async fn start(
             proof_worker: proof_worker.clone(),
         },
     );
+    // Only a regular master's copy of shard frames may go: an archive serves
+    // their history, and engines read their own worker's store.
+    if !archive_mode {
+        crate::clock_retention::spawn_unserved_frame_pruner(
+            &storage.clock_store,
+            crate::clock_retention::served_shards(
+                Arc::downgrade(&worker_manager),
+                Arc::downgrade(&shard_engines),
+            ),
+            "master".into(),
+        );
+    }
 
     let allocator_and_lifecycle::LifecycleHandles {
         worker_allocator,
