@@ -2231,18 +2231,28 @@ impl ExecutionEngineManager {
             td
         };
 
-        if route == domains::COMPUTE {
-            Ok("compute".into())
-        } else if route == hg_base {
-            Ok("hypergraph".into())
-        } else if route == token_base || route == domains::QUIL_TOKEN {
-            Ok("token".into())
-        } else {
-            Err(QuilError::NotFound(format!(
+        engine_for_route(&route).map(String::from).ok_or_else(|| {
+            QuilError::NotFound(format!(
                 "no execution engine found for address: {}",
                 hex::encode(addr)
-            )))
-        }
+            ))
+        })
+    }
+}
+
+/// The engine executing an application whose type domain is `route` (a base
+/// domain routes as itself), or `None` for no engine.
+pub fn engine_for_route(route: &[u8; 32]) -> Option<&'static str> {
+    if *route == domains::COMPUTE {
+        Some("compute")
+    } else if *route == crate::hypergraph_intrinsic::hypergraph_base_domain() {
+        Some("hypergraph")
+    } else if *route == crate::token_intrinsic::constants::token_base_domain()
+        || *route == domains::QUIL_TOKEN
+    {
+        Some("token")
+    } else {
+        None
     }
 }
 
