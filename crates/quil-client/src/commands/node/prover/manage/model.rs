@@ -432,8 +432,6 @@ pub struct Model {
     pub compact_actions: bool,
     pub compact_units: bool,
     pub refresh_changed_at: Option<std::time::Instant>,
-    /// Monotonic observation of the received GLOBAL head, independent of RPC success.
-    pub global_observed_head: u64,
     pub node_global_cadence: Option<quil_types::proto::node::FrameCadence>,
     pub node_app_cadence: HashMap<Vec<u8>, quil_types::proto::node::FrameCadence>,
     /// Frame committee size by shard filter, scaling the observed estimates.
@@ -446,7 +444,6 @@ pub struct Model {
     pub global_interval_windows: u8,
     /// Bit mask of the shown [`GLOBAL_FIELD_NAMES`].
     pub global_fields: u8,
-    pub global_last_advance: Option<std::time::Instant>,
     /// Disruptive command and exact selected allocation identities/statuses.
     pub operation_confirmation: Option<(char, Vec<(String, u32, i64, bool)>)>,
     /// The join the worker picker chose, awaiting its confirmation: the
@@ -543,7 +540,6 @@ pub struct Model {
     pub notice_offset: usize,
     pub notice_lines: usize,
     pub notice_visible: usize,
-    pub global_alarm_time: Option<std::time::SystemTime>,
     /// The node's health conditions, as its last health report gave them.
     pub health: HealthAnswer,
     /// When the last health answer arrived.
@@ -900,15 +896,6 @@ impl Model {
             .collect();
         self.node_app_committee = committee_sizes(shards);
         self.seat_concentration = seat_concentration(shards);
-    }
-
-    /// Track only fresh node responses; shard-cache refreshes cannot reset this clock.
-    pub fn observe_global_head(&mut self, head: u64, now: std::time::Instant) {
-        if self.global_last_advance.is_none() || head > self.global_observed_head {
-            self.global_observed_head = head;
-            self.global_last_advance = Some(now);
-            self.global_alarm_time = None;
-        }
     }
 
     /// The node's current conditions, from a fresh health report; none from

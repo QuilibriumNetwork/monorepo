@@ -269,9 +269,10 @@ type HealthClient =
     >;
 
 /// How this node's own health conditions are read (the node manager each
-/// refresh, a prover op before it signs, a shield before it proves): on the
-/// node's peer listener, as the node itself, as `node diagnostics health
-/// --self` asks; the channel is kept between reads.
+/// refresh, a prover op before it signs, a shield before it proves and a
+/// paced shield before each step): on the node's peer listener, as the node
+/// itself, as `node diagnostics health --self` asks; the channel is kept
+/// between reads.
 #[derive(Clone)]
 pub(crate) struct HealthSource {
     addr: String,

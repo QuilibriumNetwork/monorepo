@@ -192,7 +192,6 @@ pub fn apply_msg_at(m: &mut Model, msg: Msg, now: Instant) -> Vec<Cmd> {
             if let Some(node) = &node_info {
                 m.node_global_cadence = node.frame_cadence.clone();
                 m.node_global_cadence_received = Some(now);
-                m.observe_global_head(node.last_received_frame, now);
             }
             if let Some(shards) = &shard_info {
                 m.observe_app_intervals(shards, now);
@@ -2704,28 +2703,6 @@ mod tests {
             .as_slice(),
             [Cmd::Quit]
         ));
-    }
-
-    #[test]
-    fn global_age_tracks_fresh_advances_not_shard_cache_or_rpc_success() {
-        let mut m = Model::new();
-        let before = Instant::now() - Duration::from_secs(65);
-        m.observe_global_head(10, before);
-        m.observe_global_head(10, Instant::now());
-        m.observe_global_head(9, Instant::now());
-        assert_eq!(m.global_last_advance, Some(before));
-        m.process_refresh_data(
-            Some(NodeInfoResponse {
-                last_received_frame: 10,
-                ..Default::default()
-            }),
-            None,
-            None,
-        );
-        assert_eq!(m.global_last_advance, Some(before));
-        let now = Instant::now();
-        m.observe_global_head(11, now);
-        assert_eq!(m.global_last_advance, Some(now));
     }
 
     #[test]

@@ -1,26 +1,12 @@
 use super::*;
 
-/// GLOBAL at one frame per 10 s that stands still on `[from, to)`.
-fn frames_with_stall(from: u64, to: u64) -> impl Fn(u64) -> u64 {
-    move |t| {
-        1_000
-            + if t < from {
-                t / 10
-            } else if t < to {
-                from / 10
-            } else {
-                from / 10 + (t - to) / 10
-            }
-    }
-}
-
 const START: u64 = 1_000_000;
 const NEVER: (u64, u64) = (u64::MAX - 1, u64::MAX);
 
 /// A fake clock and fake reads: sleeping and proving only advance time.
 struct Fake {
     now: u64,
-    frames: Box<dyn Fn(u64) -> u64>,
+    node: Box<dyn Fn(u64) -> GlobalRead>,
     /// Seconds after submission at which a batch reads included, or never.
     inclusion: Box<dyn Fn(usize) -> Option<u64>>,
     /// The time from which a batch's shard has no active prover, or never.
@@ -34,12 +20,12 @@ struct Fake {
 
 impl Fake {
     fn new(
-        frames: impl Fn(u64) -> u64 + 'static,
+        node: impl Fn(u64) -> GlobalRead + 'static,
         inclusion: impl Fn(usize) -> Option<u64> + 'static,
     ) -> Self {
         Self {
             now: START,
-            frames: Box::new(frames),
+            node: Box::new(node),
             inclusion: Box::new(inclusion),
             gone: Box::new(|_| None),
             shard_reads: Vec::new(),
@@ -50,7 +36,7 @@ impl Fake {
     }
 
     fn healthy(inclusion: impl Fn(usize) -> Option<u64> + 'static) -> Self {
-        Self::new(frames_with_stall(NEVER.0, NEVER.1), inclusion)
+        Self::new(node_with_stall(NEVER.0, NEVER.1), inclusion)
     }
 
     fn gaps(&self) -> Vec<u64> {
@@ -73,8 +59,8 @@ impl ShieldIo for Fake {
     async fn sleep(&mut self, secs: u64) {
         self.now += secs;
     }
-    async fn head(&mut self) -> anyhow::Result<u64> {
-        Ok((self.frames)(self.now))
+    async fn global(&mut self) -> anyhow::Result<GlobalRead> {
+        Ok((self.node)(self.now))
     }
     fn coins(&self, _index: usize) -> usize {
         96
@@ -387,7 +373,7 @@ async fn shield_pacing_submitted_coins_stay_out_past_the_timeout() {
     );
     // GLOBAL stands still 5,000 s from shortly after the submission.
     let (from, to) = (START + 300, START + 5_300);
-    let mut io = Fake::new(frames_with_stall(from, to), |_| None);
+    let mut io = Fake::new(node_with_stall(from, to), |_| None);
     let error = run(&mut io, 1, pacing(0)).await.unwrap_err().to_string();
     assert!(
         error.contains("a new run no longer leaves its coins out"),
@@ -420,12 +406,13 @@ async fn shield_pacing_submitted_line_names_the_shard() {
     assert_eq!(label(&[0x00, 0x06, 0xfc]), "...abababab0006fc");
 }
 
-/// GLOBAL standing still before the submission holds it until GLOBAL has
-/// been healthy for the recovery time; both changes are reported.
+/// The node's GLOBAL head condition before the submission holds it until
+/// the node has reported GLOBAL healthy for the recovery time; both changes
+/// are reported, the pause with the node's notice.
 #[tokio::test]
 async fn shield_pacing_pauses_while_global_stalls_and_resumes_after_recovery() {
     let (from, to) = (START + 20, START + 2_000);
-    let mut io = Fake::new(frames_with_stall(from, to), |_| Some(30));
+    let mut io = Fake::new(node_with_stall(from, to), |_| Some(30));
     run(&mut io, 1, pacing(0)).await.unwrap();
     let sent = io.submits[0].1;
     assert!(
@@ -443,8 +430,7 @@ async fn shield_pacing_pauses_while_global_stalls_and_resumes_after_recovery() {
     let ShieldEvent::Paused { reason, .. } = &io.events[paused] else {
         unreachable!()
     };
-    // GLOBAL stood still inside the proving gap, which shows as a small advance.
-    assert!(reason.contains("between reads"), "{reason}");
+    assert_eq!(reason, "Global head unchanged >120s");
     assert!(
         io.position(|e| matches!(e, ShieldEvent::StillPaused { .. }))
             .is_some(),
@@ -458,174 +444,76 @@ async fn shield_pacing_pauses_while_global_stalls_and_resumes_after_recovery() {
 async fn shield_pacing_inclusion_timeout_excludes_global_pauses() {
     // Submitted near START+150; GLOBAL stands still 3,600 s from START+200.
     let (from, to) = (START + 200, START + 3_800);
-    let mut io = Fake::new(frames_with_stall(from, to), |_| Some(3_900));
+    let mut io = Fake::new(node_with_stall(from, to), |_| Some(3_900));
     run(&mut io, 1, pacing(0))
         .await
         .expect("a stalled GLOBAL is not an inclusion timeout");
 }
 
-/// Below 330 frames over the sampled hour pauses; 330 does not; and nothing
-/// is judged before the samples span 10 minutes.
+/// A repeated pause notice names the node's state as the decision reads it
+/// then, not the condition that started the pause; recovery counts only
+/// time the node reports GLOBAL healthy.
 #[test]
-fn shield_pacing_health_judges_the_hourly_frame_count() {
-    let hour = |frames: u64| {
-        let mut health = Health::default();
-        for t in (0..=3_600).step_by(15) {
-            health.observe(t, 1_000 + (frames * t).div_ceil(3_600));
-        }
-        health.degraded().map(str::to_owned)
+fn shield_pacing_still_paused_names_the_nodes_current_state() {
+    let read = |degraded: Option<&str>| {
+        Ok(GlobalRead {
+            head: 700,
+            degraded: degraded.map(str::to_owned),
+        })
     };
-    assert_eq!(hour(330), None);
-    let slow = hour(329).expect("329 frames in an hour is degraded");
-    assert!(slow.contains("below 330/h"), "{slow}");
-
+    let head = "Global head unchanged >120s";
+    let slow = "Global frames slow: 300 in 60 min (~300/h, below 330/h)";
     let mut health = Health::default();
-    for t in (0..600).step_by(30) {
-        assert_eq!(health.observe(t, 5 + t / 30), None, "t={t}");
-    }
-    // One frame per 30 s is 120 an hour: judged once 10 minutes are sampled.
-    let Some(Change::Paused(reason)) = health.observe(600, 25) else {
-        panic!("120 frames an hour must pause at 10 minutes");
-    };
-    assert!(reason.contains("below 330/h"), "{reason}");
-}
-
-/// After a resume the window restarts, so the slow hour behind the pause
-/// does not pause the run again at once.
-#[test]
-fn shield_pacing_resume_restarts_the_window() {
-    let mut health = Health::default();
-    let mut t = 0;
-    let mut head = 100;
-    while t < 600 {
-        health.observe(t, head);
-        t += 10;
-        head += 1;
-    }
-    let mut paused = false;
-    while t < 1_500 {
-        paused |= matches!(health.observe(t, head), Some(Change::Paused(_)));
-        t += 15;
-    }
-    assert!(paused);
-    let mut resumed = false;
-    while t < 4_000 {
-        head += 1;
-        match health.observe(t, head) {
-            Some(Change::Resumed { .. }) => resumed = true,
-            Some(Change::Paused(reason)) => panic!("paused again: {reason}"),
-            _ => {}
-        }
-        t += 10;
-    }
-    assert!(resumed);
+    assert_eq!(health.observe(0, read(None)), None);
+    assert_eq!(
+        health.observe(15, read(Some(head))),
+        Some(Change::Paused(head.into()))
+    );
+    assert_eq!(health.observe(315, read(None)), None);
+    assert_eq!(
+        health.observe(615, read(None)),
+        Some(Change::StillPaused {
+            secs: 600,
+            reason: "the node reports GLOBAL healthy for 300 s of the 600 s needed".into(),
+        })
+    );
+    // The node reports GLOBAL slow: the recovery starts again.
+    assert_eq!(health.observe(700, read(Some(slow))), None);
+    assert_eq!(
+        health.observe(1_215, read(Some(slow))),
+        Some(Change::StillPaused {
+            secs: 1_200,
+            reason: slow.into(),
+        })
+    );
+    assert_eq!(health.degraded(), Some(head));
+    assert_eq!(health.observe(1_300, read(None)), None);
+    assert_eq!(
+        health.observe(1_900, read(None)),
+        Some(Change::Resumed { paused_secs: 1_885 })
+    );
     assert_eq!(health.degraded(), None);
 }
 
-/// A repeated pause notice names GLOBAL's state as the decision reads it
-/// then, not the stall that started the pause (2026-11-03: "head 708 has
-/// not advanced for 60 s" with GLOBAL near 813).
+/// A node whose judgement cannot be read (unreachable, or older than
+/// health conditions) says nothing of GLOBAL: the run pauses after a minute.
 #[test]
-fn shield_pacing_still_paused_names_the_current_head() {
+fn shield_pacing_pauses_when_the_nodes_judgement_cannot_be_read() {
     let mut health = Health::default();
-    let (mut t, mut head) = (0, 700);
-    // One frame per 10 s up to head 708, which then stands still.
-    while head < 708 {
-        assert_eq!(health.observe(t, head), None, "t={t}");
-        t += 10;
-        head += 1;
-    }
-    let paused = loop {
-        if let Some(change) = health.observe(t, head) {
-            break change;
-        }
-        t += 15;
+    let healthy = GlobalRead {
+        head: 10,
+        degraded: None,
     };
+    assert_eq!(health.observe(0, Ok(healthy.clone())), None);
+    assert_eq!(health.observe(10, Err("refused".into())), None);
+    assert_eq!(health.observe(69, Err("refused".into())), None);
     assert_eq!(
-        paused,
-        Change::Paused("GLOBAL head 708 has not advanced for 60 s".into())
+        health.observe(70, Err("refused".into())),
+        Some(Change::Paused(
+            "this node's GLOBAL judgement unreadable for 60 s (refused)".into()
+        ))
     );
-    assert_eq!(t, 140);
-    // GLOBAL moves again at one frame per 12 s, below 330/h.
-    let still = loop {
-        t += 12;
-        head += 1;
-        if let Some(change) = health.observe(t, head) {
-            break change;
-        }
-    };
-    assert_eq!(t, 740);
-    let Change::StillPaused { secs, reason } = still else {
-        panic!("{still:?}");
-    };
-    assert_eq!(secs, 600);
-    assert_eq!(
-        reason,
-        "GLOBAL head 758, advancing for 588 s (49 frames) of the 600 s needed"
-    );
-    assert_eq!(
-        ShieldEvent::StillPaused {
-            index: 0,
-            total: 1,
-            secs,
-            reason,
-        }
-        .line(),
-        "Batch 1/1: still paused after 10 min, GLOBAL head 758, advancing for 588 s \
-         (49 frames) of the 600 s needed."
-    );
-    // 50 frames in 600 s is too slow: the recovery starts again at 752.
-    t += 12;
-    head += 1;
-    assert_eq!(health.observe(t, head), None);
-    // Then GLOBAL stands still at head 759: the next notice says so.
-    let still = loop {
-        t += 15;
-        if let Some(change) = health.observe(t, head) {
-            break change;
-        }
-    };
-    assert_eq!(
-        still,
-        Change::StillPaused {
-            secs: 1_212,
-            reason: "GLOBAL head 759 has not advanced for 600 s".into(),
-        }
-    );
-    assert_eq!(
-        health.degraded(),
-        Some("GLOBAL head 708 has not advanced for 60 s")
-    );
-}
-
-/// An unreadable head counts as no advance.
-#[test]
-fn shield_pacing_unreadable_head_stalls_after_the_stall_time() {
-    let mut health = Health::default();
-    assert_eq!(health.observe(0, 10), None);
-    assert_eq!(health.unreadable(STALL_SECS - 1), None);
-    assert!(matches!(
-        health.unreadable(STALL_SECS),
-        Some(Change::Paused(_))
-    ));
-}
-
-/// Reads are sparse while a batch is proved: a head that moved only a few
-/// frames across a long gap was stalled inside it.
-#[test]
-fn shield_pacing_sparse_reads_catch_a_stall_inside_the_gap() {
-    let mut health = Health::default();
-    assert_eq!(health.observe(0, 100), None);
-    let Some(Change::Paused(reason)) = health.observe(150, 102) else {
-        panic!("2 frames in 150 s must pause");
-    };
-    assert!(reason.contains("between reads"), "{reason}");
-
-    let mut health = Health::default();
-    assert_eq!(health.observe(0, 100), None);
-    assert_eq!(health.observe(150, 115), None);
-    // A 60 s gap that straddled one frame boundary is not a stall.
-    assert_eq!(health.observe(210, 120), None);
+    assert_eq!(health.head(), Some(10));
 }
 
 #[test]

@@ -822,9 +822,6 @@ fn severity_color(severity: NoticeSeverity) -> Color {
 /// highest severity among them; the transient status line is not counted.
 fn provers_notice_summary(m: &Model) -> Option<(usize, NoticeSeverity)> {
     let mut found = Vec::new();
-    if global_alarm_active(m) {
-        found.push(NoticeSeverity::Error);
-    }
     found.extend(
         node_condition_notices(m)
             .into_iter()
@@ -1119,34 +1116,10 @@ fn header_line(m: &Model) -> Line<'static> {
     header_lines(m, u16::MAX).remove(0)
 }
 
-// Require three polls before establishing a new stall notice, with a 60s floor.
-// This measures lack of observed head advancement, not the frame's timestamp.
-const GLOBAL_ALARM_SECS: u64 = 60;
-
 fn rpc_status_is_fresh(m: &Model) -> bool {
     m.consecutive_failures == 0
         && m.last_fetch_success
             .is_some_and(|t| t.elapsed().as_secs() < m.refresh_seconds * 2 + 30)
-}
-
-fn global_alarm_active(m: &Model) -> bool {
-    let Some(last) = m.global_last_advance else {
-        return false;
-    };
-    if !rpc_status_is_fresh(m) {
-        return false;
-    }
-    // A cadence change cannot retract an already established stall.
-    // Head advancement clears this latch in observe_global_head.
-    if m.global_alarm_time.is_some() {
-        return true;
-    }
-    let secs = last.elapsed().as_secs();
-    // A changed cadence must first observe enough of its own polling window.
-    let window = m
-        .refresh_changed_at
-        .map_or(secs, |t| secs.min(t.elapsed().as_secs()));
-    window >= GLOBAL_ALARM_SECS.max(m.refresh_seconds * 3)
 }
 
 fn worker_counts_line(m: &Model) -> Line<'static> {
@@ -3196,12 +3169,6 @@ fn message_timestamp(time: Option<std::time::SystemTime>) -> String {
 /// Expire completed action notices, while retaining an operation in progress
 /// or a refresh failure that is still unresolved. No extra timer task needed.
 fn update_message_lifetime(m: &mut Model) {
-    if global_alarm_active(m) {
-        m.global_alarm_time
-            .get_or_insert_with(std::time::SystemTime::now);
-    } else {
-        m.global_alarm_time = None;
-    }
     let active: Vec<&'static str> = condition_notices(m)
         .into_iter()
         .map(|(key, ..)| key)
@@ -3632,11 +3599,6 @@ fn node_condition_notices(m: &Model) -> Vec<(NoticeSeverity, String)> {
         .collect()
 }
 
-/// Shared progress-notice convention; tracker definitions belong in help.
-fn progress_stall_text(signal: &str, seconds: u64) -> String {
-    format!("{signal} unchanged >{seconds}s")
-}
-
 fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'static>> {
     let primary_severity = if m.status_is_error {
         NoticeSeverity::Error
@@ -3663,19 +3625,6 @@ fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'sta
         Vec::new()
     };
     let mut lines = Vec::new();
-    if global_alarm_active(m) {
-        lines.extend(wrap_message(
-            Line::from(Span::styled(
-                format!(
-                    "{}{}.",
-                    message_timestamp(m.global_alarm_time),
-                    progress_stall_text("Global head", 60)
-                ),
-                Style::new().fg(ERROR),
-            )),
-            width,
-        ));
-    }
     for (severity, text) in node_condition_notices(m) {
         if severity >= m.notice_minimum {
             lines.extend(wrap_message(
@@ -4629,7 +4578,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("Freshness", "Age of the worker state shown; poll delays do not age the received state, and startup restoration is not an advance:"),
         item("`stale`: node observation already >30s old at receipt"),
         item("`cached`: no worker result for >2 polls +30s; not proof of ongoing execution"),
-        kv("Health conditions", "The node judges every condition below from its own observations, logs each when it starts, every 10 min while it lasts and when it ends, and serves them in its health report (`qclient node diagnostics health --self`); this manager reads that report each refresh and only shows it. A condition is shown only while the node's last evaluation found it: it ends after 60s clear, and one recurring sooner is shown again under its first start, so the log can hold a condition open while none is shown; its lasting and end lines count those clear spells (`clear_spells`, `unserved_secs`). A stall window is 60s, or 3 of the shard's node-measured mean frame intervals on a slower shard (the shorter of the fresh 60m and 24h means), so a healthy slow shard is not reported between frames; notices state the 60s base. Missing or old observations establish no condition. Expected waits are info and name the event that ends them: `GLOBAL state sync installing` (committed shard heads, and so the GlobalHead cells, show again once its last chunk is in), `Prover ops wait for the next epoch` (leave, pause and resume sign from the frame it names) and `Legacy coin shields admitted from GLOBAL frame …`; one past its expected time (10 min) is a warning. `Health conditions not reported by this node version`: the node predates them, so none are shown; update the node. `Health report unavailable`: this manager could not read the report from the node's peer listener"),
+        kv("Health conditions", "The node judges every condition below from its own observations, logs each when it starts, every 10 min while it lasts and when it ends, and serves them in its health report (`qclient node diagnostics health --self`); this manager reads that report each refresh and only shows it. A condition is shown only while the node's last evaluation found it: it ends after 60s clear, and one recurring sooner is shown again under its first start, so the log can hold a condition open while none is shown; its lasting and end lines count those clear spells (`clear_spells`, `unserved_secs`). A stall window is 60s, or 3 of the shard's node-measured mean frame intervals on a slower shard (the shorter of the fresh 60m and 24h means), so a healthy slow shard is not reported between frames; notices state the 60s base. GLOBAL progress: `Global head unchanged` (error) when this node's GLOBAL head stays for 120s, or four leader timeouts on a GLOBAL prover, which also counts the GLOBAL provers it hears against the quorum; `Global frames slow` when GLOBAL advanced under 330 frames an hour over the last 60 min, judged once 10 min are observed, so a stall shows there until the hour has made it up. Missing or old observations establish no condition. Expected waits are info and name the event that ends them: `GLOBAL state sync installing` (committed shard heads, and so the GlobalHead cells, show again once its last chunk is in), `Prover ops wait for the next epoch` (leave, pause and resume sign from the frame it names) and `Legacy coin shields admitted from GLOBAL frame …`; one past its expected time (10 min) is a warning. `Health conditions not reported by this node version`: the node predates them, so none are shown; update the node. `Health report unavailable`: this manager could not read the report from the node's peer listener"),
         kv("Local app notice", "`Local app frames unchanged >60s`: earning allocations whose worker's LocalMat has not advanced for their window, of those with fresh observations; sync, close, handoff and activation waits are excluded. Their LocalMat cells are `yellow`, or marked `!` with colors off"),
         kv("Reported app heads", "No peer-reported app frames advanced for their window on the stated subset of the shards the node tracks from served shard info; while no client reads shard info the node tracks none. Counts include allocated and unallocated shards. Affected PeerHead / PeerState cells are `yellow`, or marked `!` with colors off. Missing/unstaffed rows are excluded. Does not prove a network halt"),
         kv("Global notice", "After max(60s, 3 polls) without received-head advance; timestamp survives refresh changes. Clears on advance or stale RPC"),
@@ -4752,7 +4701,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("Coins notices", "Each names a condition and its key, not a figure on screen: the amounts, counts and frames are the rows' and panels'. `Reward claimable: ‹M› …` and `Legacy coins unshielded: ‹S› …` carry `◆` and show from the default level. `shields are not open yet` and `… on no live shard …` are expected waits (info); the Shield plan gives the frame and the counts. `Legacy coins: reading, … listed in … so far` is a legacy read's progress: a listing takes about 0.7 s a page of 512 coins on a regular node, so 180,000 coins take about 4 min. A read fails only when the node sends nothing for 120 s, or after an hour; a failing read is a warning that says since when it fails, how far it got and that `qclient token legacy --summary` lists the coins from a shell; the row's `As of` marks how old its figures are. `Shield plan: shard list unavailable` means the batch count is a lower bound"),
         kv("Claim status", "With the reward row selected, or while a mint is prepared or confirmed: `Authorization: a mint or claim is under way` while one runs (the amount, its frame and its state are the Balances row's, ‹M› the `Reward claimable` notice's), and one row per authorization `qclient token mint` or ‹M› saved as `mint-<frame>.bin` in the node config directory, newest first: the GLOBAL frame it Cited, the Amount it mints and its Fee. State is `unavailable`: this node reports no authorization status, so ‹C› asks GLOBAL for the finalized witness the claim needs before it confirms"),
         kv("Shield plan", "With the legacy row selected, or while a shield is prepared: one row per `qclient token shield-all` batch, in its order: Batch `i/N`, the Shard whose members verify it (its filter shortened from the middle), its Coins and Amount. The footer counts batches of up to 96 coins and coins on no live shard, which wait for a later run; coins submitted within the last two hours are hidden until their batch commits. `Shields open at f…` shows while shields are not yet admitted"),
-        kv("‹S›", "Shield, with the legacy row or the Shield plan selected: read the coins and quote each batch's fee, then confirm; it reads them itself, so it works before the tab's first legacy read finishes or after it failed. The confirmation names the coins and batches, the amount, the recipient (this wallet, in full), the quoted fees and the `--max-fee` cap; ‹y› starts, any other key cancels. Batches are proved here and submitted to this node, paced as `qclient token shield-all` paces them, since each batch costs every archive tens of seconds of verification on GLOBAL's critical path: one at a time, each proved after the previous one's inclusion (stopping if that takes an hour of healthy GLOBAL), submissions at least 5 min apart, held while GLOBAL is degraded (head unchanged for 60 s, or under 330 frames an hour) until it has been healthy for 10 min. One action runs at a time; quitting during it asks first"),
+        kv("‹S›", "Shield, with the legacy row or the Shield plan selected: read the coins and quote each batch's fee, then confirm; it reads them itself, so it works before the tab's first legacy read finishes or after it failed. The confirmation names the coins and batches, the amount, the recipient (this wallet, in full), the quoted fees and the `--max-fee` cap; ‹y› starts, any other key cancels. Batches are proved here and submitted to this node, paced as `qclient token shield-all` paces them, since each batch costs every archive tens of seconds of verification on GLOBAL's critical path: one at a time, each proved after the previous one's inclusion (stopping if that takes an hour of healthy GLOBAL), submissions at least 5 min apart, held while the node reports `Global head unchanged` or `Global frames slow` (see Health conditions), or its report cannot be read for 60 s, until 10 min without them. One action runs at a time; quitting during it asks first"),
         kv("‹M›", "Mint, as `qclient token mint` does, with the reward row or its Claim status selected: read the claimable reward and quote the fee, then confirm. The confirmation names the reward and the frame it cites, the amount, the fee, the `--max-fee` cap, the recipient (this wallet) and the file the authorization is saved as; ‹y› proves it here and submits it to this node, any other key cancels. The run reads the reward and quotes the fee again: at a later frame it goes on; a larger reward (rewards grow every GLOBAL frame) is minted in full to this wallet; a changed fee opens the confirmation again with it; a smaller reward stops the run"),
         kv("‹C›", "Claim, in the Claim status, the saved authorization under its cursor once GLOBAL has finalized it: the confirmation names the file, its witness frame and the amount; ‹y› builds and submits the claim, which creates the coins"),
         kv("‹esc›", "With a shield running: stop it before its next submission (‹y› confirms, any other key keeps it running); a batch being proved is not submitted, submitted batches stay submitted. While a shield, a mint or a transfer action is prepared: cancel it"),
@@ -5543,59 +5492,58 @@ mod tests {
             .any(|s| s.content == "‹b› visibility" && s.style.fg == Some(PRIMARY)));
     }
 
+    /// The node's GLOBAL head condition is an error notice at every level,
+    /// stamped with the node's start time and kept through refresh changes
+    /// and other notices; this manager judges no GLOBAL stall of its own.
     #[test]
-    fn global_alarm_requires_fresh_rpc_and_survives_notice_filters_and_monochrome() {
-        use std::time::{Duration, Instant};
+    fn the_nodes_global_head_condition_shows_at_every_level() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use quil_types::proto::diagnostics::{
+            ConditionKind, GlobalProgress, HealthCondition, HealthConditions,
+        };
+        use std::time::{Duration, Instant, UNIX_EPOCH};
         let mut m = Model::new();
-        m.data_loaded = true;
         m.last_fetch_success = Some(Instant::now());
-        for secs in [0, 29, 30, 59, 60] {
-            m.global_last_advance = Some(Instant::now() - Duration::from_secs(secs));
-            assert_eq!(global_alarm_active(&m), secs >= 60);
-        }
+        m.health_received = Some(Instant::now());
         m.notice_minimum = NoticeSeverity::Error;
         m.color_coding = false;
-        assert!(!header_line(&m).to_string().contains("ALARM"));
+        let notices = |m: &Model| {
+            message_lines(m, status_line(m), 300)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        m.health = HealthAnswer::Reported(HealthConditions::default());
+        assert!(!notices(&m).contains("Global head"));
+        let since = 1_800_000_000_000;
+        m.health = HealthAnswer::Reported(HealthConditions {
+            conditions: vec![HealthCondition {
+                kind: ConditionKind::GlobalHeadUnchanged as i32,
+                severity: ConditionSeverity::Error as i32,
+                since_unix_ms: since,
+                affected: 1,
+                tracked: 1,
+                threshold: 120,
+                global: Some(GlobalProgress {
+                    head: 935_134,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            sources: Vec::new(),
+        });
+        let stamp = message_timestamp(Some(UNIX_EPOCH + Duration::from_millis(since)));
+        let expected = format!("{stamp}Global head unchanged >120s.");
+        assert!(notices(&m).contains(&expected), "{}", notices(&m));
+        assert_eq!(
+            provers_notice_summary(&m).map(|(_, severity)| severity),
+            Some(NoticeSeverity::Error)
+        );
         assert!(!header_line(&m).to_string().contains("GLOBAL"));
-        assert!(!header_line(&m).to_string().contains("Poll"));
-        update_message_lifetime(&mut m);
-        let stamp = m.global_alarm_time.unwrap();
-        update_message_lifetime(&mut m);
-        assert_eq!(m.global_alarm_time, Some(stamp));
-        assert!(message_lines(&m, Line::default(), 300)
-            .iter()
-            .any(|l| l.to_string().starts_with(&format!(
-                "{}Global head unchanged",
-                message_timestamp(Some(stamp))
-            ))));
-        assert!(message_lines(&m, Line::default(), 40)
-            .iter()
-            .any(|l| l.to_string().contains("Global head unchanged")));
-        m.consecutive_failures = 1;
-        assert!(!global_alarm_active(&m));
-        update_message_lifetime(&mut m);
-        assert!(m.global_alarm_time.is_none());
-        m.consecutive_failures = 0;
-        m.last_fetch_success = Some(Instant::now() - Duration::from_secs(60));
-        assert!(!global_alarm_active(&m));
-        m.last_fetch_success = Some(Instant::now());
-        m.observe_global_head(1, Instant::now());
-        assert!(!global_alarm_active(&m));
-    }
-
-    #[test]
-    fn established_global_notice_survives_refresh_changes_until_recovery() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        use std::time::{Duration, Instant};
-        let mut m = Model::new();
-        m.last_fetch_success = Some(Instant::now());
-        m.global_observed_head = 100;
-        m.global_last_advance = Some(Instant::now() - Duration::from_secs(75));
         m.notice_minimum = NoticeSeverity::Info;
         m.status_msg = "Action completed".into();
         m.shard_error = Some("Shard fetch timed out".into());
-        update_message_lifetime(&mut m);
-        let stamp = m.global_alarm_time.unwrap();
         for interval in [30, 60, 5, 15] {
             super::super::update::handle_key(
                 &mut m,
@@ -5603,51 +5551,10 @@ mod tests {
             );
             assert_eq!(m.refresh_seconds, interval);
             update_message_lifetime(&mut m);
-            assert_eq!(m.global_alarm_time, Some(stamp));
-            let notices = message_lines(&m, status_line(&m), 300)
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(" ");
-            assert!(notices.contains(&format!(
-                "{}Global head unchanged",
-                message_timestamp(Some(stamp))
-            )));
-            assert!(!notices.contains("ALARM:"));
-            assert!(notices.contains("Global head unchanged >60s."));
-            assert!(
-                notices.contains("Action completed") && notices.contains("Shard fetch timed out")
-            );
+            let text = notices(&m);
+            assert!(text.contains(&expected), "{text}");
+            assert!(text.contains("Action completed") && text.contains("Shard fetch timed out"));
         }
-        m.observe_global_head(100, Instant::now());
-        assert_eq!(m.global_alarm_time, Some(stamp));
-        m.observe_global_head(101, Instant::now());
-        assert!(m.global_alarm_time.is_none() && !global_alarm_active(&m));
-        m.global_alarm_time = Some(stamp);
-        m.consecutive_failures = 1;
-        update_message_lifetime(&mut m);
-        assert!(m.global_alarm_time.is_none());
-        assert!(!message_lines(&m, Line::default(), 300)
-            .iter()
-            .any(|l| l.to_string().contains("Global head unchanged")));
-    }
-
-    #[test]
-    fn slow_polling_allows_multiple_observations_before_global_alarm() {
-        use std::time::{Duration, Instant};
-        let mut m = Model::new();
-        m.refresh_seconds = 60;
-        m.last_fetch_success = Some(Instant::now());
-        m.global_last_advance = Some(Instant::now() - Duration::from_secs(60));
-        assert!(!global_alarm_active(&m));
-
-        m.global_last_advance = Some(Instant::now() - Duration::from_secs(120));
-        assert!(!global_alarm_active(&m));
-        m.global_last_advance = Some(Instant::now() - Duration::from_secs(180));
-        assert!(global_alarm_active(&m));
-        m.refresh_seconds = 5;
-        m.refresh_changed_at = Some(Instant::now());
-        assert!(!global_alarm_active(&m));
     }
 
     #[test]
