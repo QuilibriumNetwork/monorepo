@@ -127,17 +127,32 @@ detect_os_arch() {
 # qclient 2.1.0.23 and older, still the released client, look for these
 # files beside the path they were started by; on macOS that is the link,
 # not the release file, so without them every command stops at the
-# signature check.
+# signature check. $3 names another link to give them to.
 link_release_files() {
-    local dir=$1 base=$2 i
-    ln -sfn -- "$dir/$base.dgst" "$SYMLINK.dgst"
+    local dir=$1 base=$2 link=${3:-$SYMLINK} i
+    ln -sfn -- "$dir/$base.dgst" "$link.dgst"
     for ((i = 1; i <= ${#SIGNATORIES[@]}; i++)); do
         if [ -f "$dir/$base.dgst.sig.$i" ]; then
-            ln -sfn -- "$dir/$base.dgst.sig.$i" "$SYMLINK.dgst.sig.$i"
-        elif [ -L "$SYMLINK.dgst.sig.$i" ]; then
-            rm -f -- "$SYMLINK.dgst.sig.$i"
+            ln -sfn -- "$dir/$base.dgst.sig.$i" "$link.dgst.sig.$i"
+        elif [ -L "$link.dgst.sig.$i" ]; then
+            rm -f -- "$link.dgst.sig.$i"
         fi
     done
+}
+
+# Point $INSTALL_ROOT/current at the release $2 installed in directory $1,
+# on the platform $3. Root's auto-update cron entry runs this link, which
+# sits in the root-only install root, never $SYMLINK, whose directory
+# another user may own (Homebrew gives it to the admin user on Intel macOS).
+link_root_current() {
+    local dir=$1 base=$2 os_arch=$3 link="$INSTALL_ROOT/current"
+    if [ -d "$link" ] && [ ! -L "$link" ]; then
+        die "$link is a directory"
+    fi
+    ln -sfn -- "$dir/$base" "$link"
+    case $os_arch in
+        darwin-*) link_release_files "$dir" "$base" "$link" ;;
+    esac
 }
 
 # A release version: two to five dot-separated decimal parts, such as
@@ -394,6 +409,7 @@ main() {
             echo "Linked $SYMLINK.dgst and its signatures to the release's files"
             ;;
     esac
+    link_root_current "$dir" "$base" "$os_arch"
 
     echo "Installation complete. You can now start the Quilibrium client with the following command:"
     echo "qclient --version"
