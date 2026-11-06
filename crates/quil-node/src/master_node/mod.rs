@@ -30,6 +30,7 @@ pub(crate) mod peer_info_publisher;
 pub(crate) mod remote_reads;
 pub(crate) mod reward_proofs;
 pub(crate) mod runtime_state;
+mod seat_concentration;
 mod shard_cw_lane;
 mod shard_sender;
 pub(crate) mod stall_watch;

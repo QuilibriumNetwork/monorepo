@@ -3663,6 +3663,19 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
             "Reachability: peers cannot dial this node; run qclient node doctor.".to_string(),
         ));
     }
+    if let Some((own, reported)) = m
+        .seat_concentration
+        .filter(|(own, _)| *own > 0 && m.shard_error.is_none())
+    {
+        notices.push((
+            "seat-concentration",
+            NoticeSeverity::Warning,
+            format!(
+                "Seat concentration: losing this node's site leaves {own}/{reported} committees \
+                 at most 1 seat above quorum; spread provers across sites."
+            ),
+        ));
+    }
     notices
 }
 
@@ -4694,6 +4707,7 @@ fn help_items() -> Vec<HelpItem> {
         item("`Renewal withheld, no vote sent`: local allocations whose worker hosts its committee session but has sent no vote for an epoch while the other members voted, of all allocations. The node leaves them to lapse: check the worker, and restart it if it stays silent. A seat renews once its worker votes or restarts, or at the latest four epochs on; the master log names each (`seat renewal withheld`)"),
         item("`Low certificate share (60m)`: allocations whose Cert is low, of those reporting one. Frames a seat does not sign earn it nothing: check its worker's Execution and LocalMat, the node's CPU load and its peer connections"),
         item("`Last recovery attempt failed`: workers whose latest archive recovery attempt failed and whose LocalMat is still below PeerHead, of workers with fresh observations (it ends once the worker catches up); the Recovery footer gives the error and the failure streak"),
+        kv("Seat concentration notice", "`Seat concentration`: committee sessions where the members on this node's network (IPv4 /24 or IPv6 /48 of their announced addresses, this node included) hold at least size less quorum less one seats, of the sessions this node sits in; the node evaluates each once per session and epoch. An outage of that site, or a restart or upgrade of its nodes together, then leaves the committee at most one seat above quorum, where shards stall. Members without a public address are not counted, so it is a lower bound. To fix: spread provers across sites. The node's `seat concentration` log lines name each shard"),
         kv("Reachability notice", "`Reachability: peers cannot dial this node`: the verdict of `qclient node doctor`, from the node's own view: AutoNAT servers on 2 or more IPs could not dial it back, AutoNAT holds it private with no confirmed address, or its address is behind carrier-grade NAT. It ends once AutoNAT confirms an address. Missing or unsettled AutoNAT results show nothing. The doctor gives a verdict per address family and what to change; it changes nothing itself."),
         kv("Store notice", "`Store reads slow (<cause>)`: the node reads one entry of its master store a second (the canary) and, on Linux, times its disk's reads and writes. Shown once a minute has 2 canary reads of 50ms or more (or one of 1s), a read stays unfinished 1s, or the disk takes 20ms a read or 100ms a write (of 20+), two minutes in a row; it clears after three minutes under all of them. Work that reads the store falls behind and allocations may lapse. The label names the cause the figures support. `this node's disk`: a disk await is over its threshold; check that TRIM runs (fstrim.timer or the discard mount option), the disk's health (SMART) and other I/O load on it. `disk normal, this node's load`: the disk's awaits (of 20+ reads) are under them; check CPU, memory pressure, store compaction and other work on this node. `disk not ruled out`: no disk figures or under 20 reads; check both. `qclient node diagnostics health --self` and the node's `store i/o` log lines give the figures"),
         kv("Command legends", "Compact mode shows applicable UI/worker commands only; expanded mode also shows disabled commands. Usable commands share one highlight; labels show colors on/off and relative/absolute thresholds. `filter*` means a column filter is active"),
@@ -5315,6 +5329,55 @@ mod tests {
         assert!(shown(&m).is_empty(), "confirmed by AutoNAT");
         m.cached_node_info = Some(NodeInfoResponse::default());
         assert!(shown(&m).is_empty(), "no report");
+    }
+
+    #[test]
+    fn a_site_holding_quorum_margins_shows_one_notice_with_its_share() {
+        use std::time::{Duration, Instant};
+        let mut m = Model::new();
+        m.compact_actions = false;
+        m.data_loaded = true;
+        m.allocations = joining_table();
+        m.last_fetch_success = Some(Instant::now());
+        m.seat_concentration = Some((3, 20));
+        let shown = |m: &Model| {
+            condition_notices(m)
+                .into_iter()
+                .filter(|(key, ..)| *key == "seat-concentration")
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            shown(&m),
+            vec![(
+                "seat-concentration",
+                NoticeSeverity::Warning,
+                "Seat concentration: losing this node's site leaves 3/20 committees at most 1 \
+                 seat above quorum; spread provers across sites."
+                    .to_string()
+            )]
+        );
+        update_message_lifetime(&mut m);
+        let text = render_text(&mut m, 160, 30);
+        assert!(
+            text.contains("Seat concentration: losing this node's site"),
+            "{text}"
+        );
+        m.seat_concentration = Some((0, 20));
+        assert!(
+            shown(&m).is_empty(),
+            "no committee concentrated on this site"
+        );
+        m.seat_concentration = None;
+        assert!(shown(&m).is_empty(), "no report");
+        m.seat_concentration = Some((3, 20));
+        m.shard_error = Some("unavailable".into());
+        assert!(
+            shown(&m).is_empty(),
+            "a failed shard read establishes nothing"
+        );
+        m.shard_error = None;
+        m.last_fetch_success = Some(Instant::now() - Duration::from_secs(3600));
+        assert!(shown(&m).is_empty(), "stale status establishes nothing");
     }
 
     /// The help as text keeps every section heading and has no styling.
@@ -8644,6 +8707,7 @@ mod tests {
             "Global app notice",
             "Reward notice",
             "Allocation notices",
+            "Seat concentration notice",
             "Reachability notice",
             "Store notice",
             "Command legends",

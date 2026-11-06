@@ -471,6 +471,10 @@ pub struct Model {
     /// shard filters and the workers set to manual.
     pub join_choice: Option<(Vec<Vec<u8>>, Vec<u32>)>,
     pub difficulty: u64,
+    /// Of the committee sessions this node sits in, those whose members on
+    /// this node's network hold their quorum margin, and those the node
+    /// reported; `None` without a report (older server, or no session).
+    pub seat_concentration: Option<(usize, usize)>,
 
     // Verified GLOBAL reward witness, refreshed independently of shard queries.
     pub claimable_reward: Option<(u128, u64)>,
@@ -919,6 +923,7 @@ impl Model {
             .filter_map(|s| s.frame_cadence.clone().map(|c| (s.filter.clone(), c)))
             .collect();
         self.node_app_committee = committee_sizes(shards);
+        self.seat_concentration = seat_concentration(shards);
     }
 
     /// Track only fresh node responses; shard-cache refreshes cannot reset this clock.
@@ -1148,6 +1153,7 @@ impl Model {
                 .filter_map(|s| s.frame_cadence.clone().map(|c| (s.filter.clone(), c)))
                 .collect();
             self.node_app_committee = committee_sizes(shards);
+            self.seat_concentration = seat_concentration(shards);
         }
         self.peer_id = node_info.peer_id.clone();
         if !node_info.peer_seniority.is_empty() {
@@ -2243,6 +2249,20 @@ pub fn cert_share_low(share: Option<&CertificateShare>) -> bool {
             < u128::from(hour.frames) * u128::from(share.quorum)
 }
 
+/// [`Model::seat_concentration`] of a shard-info response.
+fn seat_concentration(shards: &GetShardInfoResponse) -> Option<(usize, usize)> {
+    let reports: Vec<_> = shards
+        .shards
+        .iter()
+        .filter_map(|s| s.seat_concentration.as_ref())
+        .collect();
+    let own = reports
+        .iter()
+        .filter(|r| r.concentration_seats > 0 && r.own_group_seats >= r.concentration_seats)
+        .count();
+    (!reports.is_empty()).then_some((own, reports.len()))
+}
+
 /// ProverPhases sorts by the provers serving after the next boundary, then
 /// by active ones; unreported counts sort first ascending.
 fn prover_phase_order(counts: Option<&ShardProverCounts>) -> Option<(u32, u32)> {
@@ -3300,6 +3320,44 @@ mod frame_interval_tests {
         shards.shards[0].frame_cadence = None;
         m.observe_app_intervals(&shards, std::time::Instant::now());
         assert_eq!(m.app_interval(&[1]), None);
+    }
+
+    #[test]
+    fn seat_concentration_counts_sessions_this_nodes_site_holds_the_margin_of() {
+        use quil_types::proto::node::{SeatConcentration, ShardRewardInfo};
+        let report = |own_group_seats| {
+            Some(SeatConcentration {
+                members: 17,
+                quorum: 12,
+                largest_group_seats: 5,
+                own_group_seats,
+                unaddressed_members: 0,
+                concentration_seats: 4,
+                epoch: 1393,
+            })
+        };
+        let mut shards = GetShardInfoResponse {
+            shards: [report(4), report(3), report(0), None]
+                .into_iter()
+                .map(|seat_concentration| ShardRewardInfo {
+                    seat_concentration,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut m = Model::new();
+        m.observe_app_intervals(&shards, std::time::Instant::now());
+        assert_eq!(
+            m.seat_concentration,
+            Some((1, 3)),
+            "at the threshold, of reports"
+        );
+        for shard in &mut shards.shards {
+            shard.seat_concentration = None;
+        }
+        m.observe_app_intervals(&shards, std::time::Instant::now());
+        assert_eq!(m.seat_concentration, None, "an older server reports none");
     }
     /// The 60m and 24h estimates pay the quorum share of frames; the theory
     /// column still pays every frame at 10s/frame.

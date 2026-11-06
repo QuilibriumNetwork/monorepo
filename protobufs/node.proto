@@ -536,6 +536,10 @@ message ShardRewardInfo {
   // shard frames GLOBAL included; absent on older servers and for shards
   // this node holds no seat on.
   CertificateShare certificate_share = 17;
+  // Members of the shard's committee session this node sits in, grouped by
+  // network; absent on older servers and for shards whose session this node
+  // does not sit in.
+  SeatConcentration seat_concentration = 18;
 }
 
 // A seat's share of its shard's certificates. A shard frame credits only
@@ -563,6 +567,25 @@ message CertificateWindow {
   uint64 frames = 3;
   // Of `frames`, those whose certificate this seat signed.
   uint64 signed_frames = 4;
+}
+
+// A committee session's members grouped by the network of their PeerInfo
+// addresses (IPv4 /24, IPv6 /48; members sharing any network form one group),
+// evaluated once per session and epoch. Members without a known public
+// address form no group, so group seats are a lower bound.
+message SeatConcentration {
+  uint32 members = 1;
+  uint32 quorum = 2;
+  // Seats of the largest group; 0 when no member's network is known.
+  uint32 largest_group_seats = 3;
+  // Seats of this node's group, this node included; 0 when this node's own
+  // address is unknown.
+  uint32 own_group_seats = 4;
+  uint32 unaddressed_members = 5;
+  // A group with at least this many seats leaves the session at most one
+  // member above quorum when it goes offline.
+  uint32 concentration_seats = 6;
+  uint64 epoch = 7;
 }
 
 // Provers of a shard by effective lifecycle phase: a confirmed join counts as

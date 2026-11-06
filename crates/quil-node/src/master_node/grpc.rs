@@ -1633,6 +1633,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         consensus_intake,
         consensus_loopback,
     } = args;
+    let announced_for_seats = announced_addrs.clone();
 
     // Prover authorizer (mirrors Go `authenticateProverFromContext`, used by
     // `GetGlobalProposal`): allow ONLY (a) THIS node's own identity — its
@@ -3473,6 +3474,75 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                 }
             })
             .await?;
+            Ok(())
+        });
+    }
+    // Seat concentration of the committees this node sits in, once per
+    // session and epoch (seat_concentration.rs).
+    let seat_concentrations = Arc::new(parking_lot::RwLock::new(
+        super::seat_concentration::SeatConcentrations::default(),
+    ));
+    {
+        let state = seat_concentrations.clone();
+        node_rpc_builder = node_rpc_builder
+            .with_seat_concentration_provider(Arc::new(move |filter| state.read().report(filter)));
+    }
+    {
+        let state = seat_concentrations;
+        let engines = shard_engines.clone();
+        let remote = remote_fee_workers.clone();
+        let committed = crdt.clone();
+        let pic = peer_info_cache.clone();
+        let frames = current_frame.clone();
+        let own_peer = peer_id.to_bytes();
+        let announced = announced_for_seats;
+        sup.spawn("seat-concentration", move |token| async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! { _ = token.cancelled() => break, _ = interval.tick() => {} }
+                let own_networks = {
+                    let addrs = announced.borrow();
+                    super::seat_concentration::networks(addrs.pubsub.iter().chain(&addrs.stream))
+                };
+                let (state, engines, remote, committed, pic, frames, own_peer) = (
+                    state.clone(),
+                    engines.clone(),
+                    remote.clone(),
+                    committed.clone(),
+                    pic.clone(),
+                    frames.clone(),
+                    own_peer.clone(),
+                );
+                tokio::task::spawn_blocking(move || {
+                    use quil_execution::global_intrinsic::handoff::{self, CommittedView};
+                    let mut served: std::collections::BTreeSet<Vec<u8>> =
+                        engines.read().keys().cloned().collect();
+                    if let Some(remote) = remote.get() {
+                        served.extend(remote.served_filters());
+                    }
+                    // Unreadable committed state is reported by the committee
+                    // peer policy; the next pass retries.
+                    let Ok(view) = CommittedView::capture(&committed) else {
+                        return;
+                    };
+                    super::seat_concentration::pass(
+                        &state,
+                        &served,
+                        |filter| handoff::head(&view, filter),
+                        quil_types::consensus::epoch_for_frame(frames.effective()),
+                        &own_peer,
+                        &own_networks,
+                        |peer| {
+                            pic.read()
+                                .get(peer)
+                                .map(super::seat_concentration::peer_networks)
+                                .unwrap_or_default()
+                        },
+                    );
+                })
+                .await?;
+            }
             Ok(())
         });
     }
