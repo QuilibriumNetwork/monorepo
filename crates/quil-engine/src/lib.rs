@@ -10,7 +10,7 @@ mod app_stall;
 pub mod app_types;
 pub mod archive_ingest;
 pub mod archive_preverify;
-mod bounded_warn;
+pub mod bounded_warn;
 mod closing_certificate;
 pub mod committee;
 pub mod consensus_metrics;
