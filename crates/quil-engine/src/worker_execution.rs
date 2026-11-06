@@ -612,12 +612,24 @@ impl SharedWorkerExecution {
                 "archive recovery attempt waited for this node's proof verification; not counted as a failure");
             return result;
         }
-        let (logged, classes, failed_before, first_failure) = {
+        // A recovery holding at a frame a session fence discarded succeeds
+        // on every attempt: it logs its hold, not each attempt.
+        let (discarded, materialized, committed) = match &result {
+            Ok(ShardRecoveryProgress::Replayed {
+                discarded_tip,
+                materialized,
+                committed_tip,
+                ..
+            }) => (*discarded_tip, *materialized, *committed_tip),
+            _ => (None, 0, None),
+        };
+        let (logged, classes, failed_before, first_failure, hold) = {
             let mut streaks = self
                 .streaks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let streak = streaks.entry(filter.to_vec()).or_default();
+            let hold = streak.held(discarded, now);
             // The failures a success ends, warned about or not: one or two
             // failures between successes never reach the warning.
             let failed_before = match streak.failures {
@@ -641,7 +653,7 @@ impl SharedWorkerExecution {
             let first_failure = logged.is_none()
                 && class.is_some_and(|class| class != NO_ARCHIVE)
                 && streak.first_failure_due(now);
-            (logged, streak.classes(), failed_before, first_failure)
+            (logged, streak.classes(), failed_before, first_failure, hold)
         };
         // An attempt stopped at a shard frame no archive serves backs off the
         // next while it stops there again.
@@ -670,25 +682,52 @@ impl SharedWorkerExecution {
         };
         note_archive_known(filter, class != Some(NO_ARCHIVE), failure.as_deref(), now);
         let filter = hex::encode(filter);
+        if let Some(HoldLog::Ended { attempts, duration }) = hold {
+            let outcome = failure.as_deref().unwrap_or(ended.last_outcome.as_str());
+            tracing::info!(%filter, attempts, holding_secs = duration.as_secs(), %outcome, source,
+                "archive recovery no longer holds at frames a session fence discarded");
+        }
+        let holding = match hold {
+            Some(HoldLog::Began) => Some((1, Duration::ZERO)),
+            Some(HoldLog::Holding { attempts, duration }) => Some((attempts, duration)),
+            _ => None,
+        };
+        if let Some((attempts, duration)) = holding {
+            let committed =
+                committed.map_or_else(|| "unknown".to_string(), |frame| frame.to_string());
+            tracing::info!(%filter, discarded_frame = discarded.unwrap_or_default(), materialized,
+                committed_tip = %committed, source, attempts, holding_secs = duration.as_secs(),
+                scope = "archive",
+                action = "expected: archives serve the frames a session fence discarded as the latest until the \
+                    successor session produces past them; this worker is current where it holds; it ends when the \
+                    successor produces",
+                "archive recovery holds at frames a session fence discarded");
+        }
         match failure {
             None => {
                 let turn = match &result {
                     Ok(ShardRecoveryProgress::Replayed { turn, .. }) => *turn,
                     _ => ReplayTurn::default(),
                 };
-                tracing::info!(%filter, outcome = %ended.last_outcome, source,
-                    attempt_secs = ended.attempt_ms / 1000, permit_wait_secs = ended.permit_wait_ms / 1000,
-                    installed_leaves = ended.attempt_installed_leaves, frames = turn.frames, batches = turn.batches,
-                    fetch_ms = turn.fetch_ms, replay_ms = turn.replay_ms, turn_back_ms = turn.turn_back_ms, failed_attempts = failed_before.0,
-                    failed_classes = %failed_before.1,
-                    global_sync_wait_ms = turn.split.global_sync_wait_ms, engine_queue_ms = turn.split.engine_queue_ms,
-                    prepare_ms = turn.split.prepare_ms, preverify_ms = turn.split.preverify_ms,
-                    store_write_ms = turn.split.store_write_ms, store_wait_ms = turn.split.store_wait_ms,
-                    commit_wait_ms = turn.split.commit_wait_ms, cpu_ms = turn.split.cpu_ms,
-                    run_wait_ms = turn.split.run_wait_ms, other_ms = turn.split.other_ms,
-                    replay_mostly = turn.split.mostly().map_or("none", |part| part.label()),
-                    parallel_replays = turn.load.parallel_replays, lent_turns = turn.load.lent_turns,
-                    queue_len = turn.load.queue_len, "archive recovery batch complete");
+                // A hold logs at info above.
+                if discarded.is_some() {
+                    tracing::debug!(%filter, outcome = %ended.last_outcome, source,
+                        attempt_secs = ended.attempt_ms / 1000, "archive recovery batch complete");
+                } else {
+                    tracing::info!(%filter, outcome = %ended.last_outcome, source,
+                        attempt_secs = ended.attempt_ms / 1000, permit_wait_secs = ended.permit_wait_ms / 1000,
+                        installed_leaves = ended.attempt_installed_leaves, frames = turn.frames, batches = turn.batches,
+                        fetch_ms = turn.fetch_ms, replay_ms = turn.replay_ms, turn_back_ms = turn.turn_back_ms, failed_attempts = failed_before.0,
+                        failed_classes = %failed_before.1,
+                        global_sync_wait_ms = turn.split.global_sync_wait_ms, engine_queue_ms = turn.split.engine_queue_ms,
+                        prepare_ms = turn.split.prepare_ms, preverify_ms = turn.split.preverify_ms,
+                        store_write_ms = turn.split.store_write_ms, store_wait_ms = turn.split.store_wait_ms,
+                        commit_wait_ms = turn.split.commit_wait_ms, cpu_ms = turn.split.cpu_ms,
+                        run_wait_ms = turn.split.run_wait_ms, other_ms = turn.split.other_ms,
+                        replay_mostly = turn.split.mostly().map_or("none", |part| part.label()),
+                        parallel_replays = turn.load.parallel_replays, lent_turns = turn.load.lent_turns,
+                        queue_len = turn.load.queue_len, "archive recovery batch complete");
+                }
                 log_slow_replays(&filter, &turn);
                 if let Some(StreakLog::Ended { failures, duration }) = logged {
                     tracing::info!(%filter, failures, failing_secs = duration.as_secs(), source,
@@ -999,6 +1038,32 @@ pub(crate) struct FailureStreak {
     classes: BTreeMap<&'static str, u64>,
     /// When a streak's first failure was last noted at info.
     noted: Option<Instant>,
+    /// Successful recoveries holding at a frame a session fence discarded.
+    held: Option<DiscardedHold>,
+}
+
+/// Recoveries of one shard that held at the same frame a session fence
+/// discarded (`ShardRecoveryProgress::Replayed { discarded_tip: Some(_) }`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiscardedHold {
+    discarded: u64,
+    since: Instant,
+    /// When it was last logged at info.
+    logged: Instant,
+    attempts: u64,
+}
+
+/// What a recovery's hold at discarded frames logs ([`FailureStreak::held`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoldLog {
+    /// A hold began, or moved to another discarded frame.
+    Began,
+    /// The same hold, again after [`STREAK_REPEAT`].
+    Holding { attempts: u64, duration: Duration },
+    /// The same hold within [`STREAK_REPEAT`]: nothing at info.
+    Quiet,
+    /// The hold ended with another outcome.
+    Ended { attempts: u64, duration: Duration },
 }
 
 /// What a [`FailureStreak`] change logs.
@@ -1020,6 +1085,38 @@ impl FailureStreak {
             failures: 0,
             classes: BTreeMap::new(),
             noted: None,
+            held: None,
+        }
+    }
+
+    /// A recovery ended at `now`, holding at discarded frame `discarded`
+    /// (`Some`) or with any other outcome (`None`): what it logs.
+    pub(crate) fn held(&mut self, discarded: Option<u64>, now: Instant) -> Option<HoldLog> {
+        match (discarded, self.held.as_mut()) {
+            (Some(frame), Some(hold)) if hold.discarded == frame => {
+                hold.attempts += 1;
+                if now.saturating_duration_since(hold.logged) < STREAK_REPEAT {
+                    return Some(HoldLog::Quiet);
+                }
+                hold.logged = now;
+                Some(HoldLog::Holding {
+                    attempts: hold.attempts,
+                    duration: now.saturating_duration_since(hold.since),
+                })
+            }
+            (Some(frame), _) => {
+                self.held = Some(DiscardedHold {
+                    discarded: frame,
+                    since: now,
+                    logged: now,
+                    attempts: 1,
+                });
+                Some(HoldLog::Began)
+            }
+            (None, _) => self.held.take().map(|hold| HoldLog::Ended {
+                attempts: hold.attempts,
+                duration: now.saturating_duration_since(hold.since),
+            }),
         }
     }
 
@@ -1904,6 +2001,75 @@ mod tests {
         );
         assert!(streaks[&vec![1; 32]].reported);
         assert_eq!(streaks[&vec![2; 32]].failures, 0);
+    }
+
+    /// A recovery holding at a frame a session fence discarded is named at
+    /// its start, then only every repeat interval with its count and
+    /// duration, and once at its end; another discarded frame starts anew.
+    #[test]
+    fn a_hold_at_discarded_frames_is_named_once_then_every_repeat_and_at_its_end() {
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let mut streak = FailureStreak::default();
+        assert_eq!(streak.held(None, at(0)), None);
+        assert_eq!(streak.held(Some(506), at(0)), Some(HoldLog::Began));
+        for tick in 1..60u64 {
+            assert_eq!(
+                streak.held(Some(506), at(10 * tick)),
+                Some(HoldLog::Quiet),
+                "tick {tick}"
+            );
+        }
+        assert_eq!(
+            streak.held(Some(506), at(600)),
+            Some(HoldLog::Holding {
+                attempts: 61,
+                duration: MINUTE * 10
+            })
+        );
+        assert_eq!(streak.held(Some(506), at(610)), Some(HoldLog::Quiet));
+        assert_eq!(
+            streak.held(Some(508), at(620)),
+            Some(HoldLog::Began),
+            "another discarded frame"
+        );
+        assert_eq!(
+            streak.held(None, at(700)),
+            Some(HoldLog::Ended {
+                attempts: 1,
+                duration: Duration::from_secs(80)
+            })
+        );
+        assert_eq!(streak.held(None, at(710)), None, "ended once");
+    }
+
+    /// The recovery record holds a hold per shard, from the outcome itself.
+    #[tokio::test]
+    async fn a_recovery_outcome_at_discarded_frames_is_a_hold() {
+        let worker = SharedWorkerExecution::default();
+        let held = || async {
+            Ok(ShardRecoveryProgress::Replayed {
+                materialized: 505,
+                archive_tip: None,
+                committed_tip: Some(505),
+                discarded_tip: Some(506),
+                turn: ReplayTurn::default(),
+            })
+        };
+        let _ = worker.recovering(&[1; 32], held()).await;
+        let _ = worker.recovering(&[1; 32], held()).await;
+        let hold = |worker: &SharedWorkerExecution| {
+            worker.streaks.lock().unwrap()[&vec![1; 32]]
+                .held
+                .map(|hold| (hold.discarded, hold.attempts))
+        };
+        assert_eq!(hold(&worker), Some((506, 2)));
+        let _ = worker
+            .recovering(&[1; 32], async {
+                Ok(ShardRecoveryProgress::Anchored { frame: 507 })
+            })
+            .await;
+        assert_eq!(hold(&worker), None);
     }
 
     #[test]
