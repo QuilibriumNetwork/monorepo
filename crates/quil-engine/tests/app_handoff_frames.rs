@@ -1183,6 +1183,21 @@ fn seal_crowding_a_members_copy_with_one_more_header_keeps_the_seal_out() {
     );
 }
 
+/// A drain whose numbers cannot pass is refused on them, before any header
+/// or certificate it carries is verified: a member's copy with one more
+/// header, numbered past the checkpoint, is refused as running past it, not
+/// on that header's missing certificate after the others were verified.
+#[test]
+fn a_drain_numbered_past_the_checkpoint_is_refused_before_any_header_is_verified() {
+    let rig = CrowdRig::new(1);
+    let refusal = rig.validate(&rig.extended(0, 12)).unwrap_err().to_string();
+    assert!(
+        refusal.contains("headers run past the sealed checkpoint"),
+        "VERIFIED FIRST: GLOBAL frame {CROWD_FRAME} verified drain headers before refusing \
+         a drain numbered past the checkpoint: {refusal}"
+    );
+}
+
 /// No valid certificate is needed: a member's gossiped copy with its
 /// certificate replaced, refused only on that certificate.
 #[test]
@@ -1782,6 +1797,94 @@ fn a_seal_brings_the_drain_headers_global_never_executed() {
     handoff::set_presence_report_frame_for_thread(None);
 }
 
+/// A closing session whose frame 1 GLOBAL executed (at frame 3) and whose
+/// frames 2 to `last` are only notarized, frame n at view 2n + 3, sealed at
+/// frame `last` by its members under a request GLOBAL made at frame 4.
+struct NotarizedSeal {
+    keys: Vec<FalconPrivateKey>,
+    source: Session,
+    fixture: Fixture,
+    intrinsic: GlobalIntrinsic,
+    frames: Vec<AppShardFrame>,
+    submission: CertificateSubmission,
+}
+
+impl NotarizedSeal {
+    fn new(filter: u8, last: u64) -> Self {
+        let keys = keys();
+        let source = session(&keys, vec![filter; 32]);
+        let fixture = Fixture::new(&source);
+        let intrinsic = fixture.intrinsic();
+        handoff::initialize(&fixture.state, 2, &source).unwrap();
+        commit(&fixture.state, 2);
+        let mut frames = vec![first_frame(&source, &keys)];
+        for number in 2..=last {
+            let previous = frames.last().unwrap().header.as_ref().unwrap();
+            let mut header = FrameHeader {
+                address: source.filter.clone(),
+                frame_number: number,
+                rank: 2 * number + 3,
+                difficulty: 1,
+                parent_selector: quil_crypto::poseidon::hash_bytes_to_32(&previous.output)
+                    .unwrap()
+                    .to_vec(),
+                requests_root: vec![0; 32],
+                state_roots: vec![vec![0; 32]; 4],
+                ..Default::default()
+            };
+            stamp(&mut header);
+            frames.push(AppShardFrame {
+                header: Some(header),
+                ..Default::default()
+            });
+        }
+        intrinsic
+            .invoke_step(
+                3,
+                &canonical(&frames[0]).to_canonical_bytes().unwrap(),
+                &fixture.state,
+            )
+            .unwrap();
+        commit(&fixture.state, 3);
+        let request = handoff::schedule(
+            &fixture.state,
+            4,
+            vec![source.filter.clone()],
+            vec![DesiredCommittee {
+                filter: source.filter.clone(),
+                members: session(&self::keys(), source.filter.clone()).members,
+            }],
+        )
+        .unwrap();
+        commit(&fixture.state, 4);
+        let checkpoint = canonical(&frames[last as usize - 1]);
+        let seal = Seal {
+            request: request.id().unwrap(),
+            session: source.id().unwrap(),
+            view: 2 * last + 5,
+            checkpoint: Checkpoint {
+                frame: last,
+                view: 2 * last + 3,
+                digest: quil_crypto::poseidon::hash_bytes_to_32(&checkpoint.output).unwrap(),
+                state_roots: [[0; 32]; 4],
+                history_root: [0x66; 32],
+            },
+        };
+        let submission = CertificateSubmission {
+            certificate: sign(&source, &keys, 2 * last + 5, 2 * last + 3, seal.digest()),
+            seal,
+        };
+        Self {
+            keys,
+            source,
+            fixture,
+            intrinsic,
+            frames,
+            submission,
+        }
+    }
+}
+
 /// A seal built on a notarized checkpoint finalizes that frame, and a
 /// notarized frame under it, with no certificate of their own: no proof
 /// carries them to GLOBAL, and a session-certified drain cannot either (eight
@@ -1792,67 +1895,18 @@ fn a_seal_brings_the_drain_headers_global_never_executed() {
 /// the checkpoint stays refused.
 #[test]
 fn a_seal_drains_the_notarized_frames_its_certificate_finalized() {
-    let keys = keys();
-    let source = session(&keys, vec![0x65; 32]);
-    let fixture = Fixture::new(&source);
-    let intrinsic = fixture.intrinsic();
-    handoff::initialize(&fixture.state, 2, &source).unwrap();
-    commit(&fixture.state, 2);
-
     // Frame 1 certified; frames 2 and 3 (views 7 and 9) only notarized.
-    let mut frames = vec![first_frame(&source, &keys)];
-    for (number, view) in [(2u64, 7u64), (3, 9)] {
-        let previous = frames.last().unwrap().header.as_ref().unwrap();
-        let mut header = FrameHeader {
-            address: source.filter.clone(),
-            frame_number: number,
-            rank: view,
-            difficulty: 1,
-            parent_selector: quil_crypto::poseidon::hash_bytes_to_32(&previous.output)
-                .unwrap()
-                .to_vec(),
-            requests_root: vec![0; 32],
-            state_roots: vec![vec![0; 32]; 4],
-            ..Default::default()
-        };
-        stamp(&mut header);
-        frames.push(AppShardFrame {
-            header: Some(header),
-            ..Default::default()
-        });
-    }
+    let NotarizedSeal {
+        keys,
+        source,
+        fixture,
+        intrinsic,
+        frames,
+        submission,
+    } = NotarizedSeal::new(0x65, 3);
+    // Frames 1 to 10 of another, for a drain stopping short of its checkpoint.
+    let longer = NotarizedSeal::new(0x66, 10);
     let wire = |frame: &AppShardFrame| canonical(frame).to_canonical_bytes().unwrap();
-    intrinsic
-        .invoke_step(3, &wire(&frames[0]), &fixture.state)
-        .unwrap();
-    commit(&fixture.state, 3);
-    let request = handoff::schedule(
-        &fixture.state,
-        4,
-        vec![source.filter.clone()],
-        vec![DesiredCommittee {
-            filter: source.filter.clone(),
-            members: session(&self::keys(), source.filter.clone()).members,
-        }],
-    )
-    .unwrap();
-    commit(&fixture.state, 4);
-    let seal = Seal {
-        request: request.id().unwrap(),
-        session: source.id().unwrap(),
-        view: 11,
-        checkpoint: Checkpoint {
-            frame: 3,
-            view: 9,
-            digest: quil_crypto::poseidon::hash_bytes_to_32(&canonical(&frames[2]).output).unwrap(),
-            state_roots: [[0; 32]; 4],
-            history_root: [0x66; 32],
-        },
-    };
-    let submission = CertificateSubmission {
-        certificate: sign(&source, &keys, 11, 9, seal.digest()),
-        seal,
-    };
     let sealed = |submission: &CertificateSubmission, drain: Vec<Vec<u8>>| {
         handoff::SealSubmission {
             submission: submission.clone(),
@@ -1911,8 +1965,33 @@ fn a_seal_drains_the_notarized_frames_its_certificate_finalized() {
         7,
         uncertified,
     );
-    // A drain stopping short of the checkpoint has nothing to chain to.
-    refused(&sealed(&submission, vec![wire(&frames[1])]), 7, uncertified);
+    // A drain stopping short of the checkpoint has nothing to chain to. Its
+    // numbering must pass, so it is a partial drain (eight headers, from the
+    // seal recovery frame) of a session sealed further on: frames 2 to 9 of
+    // one sealed at frame 10.
+    handoff::set_seal_recovery_frame_for_thread(Some(7));
+    let partial = sealed(
+        &longer.submission,
+        longer.frames[1..=8].iter().map(wire).collect(),
+    );
+    let error = longer
+        .intrinsic
+        .invoke_step(7, &partial, &longer.fixture.state)
+        .expect_err("UNANCHORED: a drain stopping short of the sealed checkpoint executed");
+    assert!(
+        error.to_string().contains(uncertified),
+        "expected {uncertified:?}, got {error}"
+    );
+    assert!(longer.intrinsic.validate(7, &partial, None, None).is_err());
+    handoff::set_seal_recovery_frame_for_thread(None);
+    assert_eq!(
+        handoff::session_tip(&longer.fixture.state, &longer.source.id().unwrap())
+            .unwrap()
+            .unwrap()
+            .frame,
+        1,
+        "a refused partial drain executes nothing"
+    );
     assert_eq!(tip(), 1, "a refused drain executes nothing");
 
     assert!(intrinsic.validate(7, &drain, None, None).unwrap());
