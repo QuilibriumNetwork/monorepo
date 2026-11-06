@@ -49,6 +49,10 @@ const MAX_APP_MESSAGES_PER_RANK: usize = 100;
 /// Consecutive `commit_frame` failures on a received frame before it's
 /// dropped and repaired via a shard sync instead of retried-from-zero.
 const MAX_MATERIALIZE_RETRIES: u32 = 3;
+/// Longest one materialization waits for the GLOBAL frames its reward
+/// citations name ([`AppConsensusEngine::fetch_cited_global_frames`]); one
+/// fetch from the master is bounded at 12 s.
+const CITED_FRAME_FETCH_BUDGET: Duration = Duration::from_secs(30);
 
 // =====================================================================
 // Inbound messages to the app engine
@@ -4311,6 +4315,8 @@ impl AppConsensusEngine {
         if let Some(pending) = self.defer_for_proof_verification(&exec, &requests, frame_number) {
             return Err(pending);
         }
+        self.fetch_cited_global_frames(&exec, &requests, frame_number, global_frame_number)
+            .await;
         let collector = self.message_collector.clone();
         // Price from the network size certified by global consensus on the
         // anchored global frame — identical on every member — never from this
@@ -4403,6 +4409,102 @@ impl AppConsensusEngine {
             collector.mark_finalized(&taken);
             (processed, skipped)
         })
+    }
+
+    /// Fetch from this node's own master the GLOBAL frames this frame's
+    /// reward citations name (mint claims, settlement claims, deliveries)
+    /// that this worker does not hold, before execution reads them. A worker
+    /// holds GLOBAL frames only from its start, so a citation of older
+    /// history found nothing here and failed the frame on every retry. The
+    /// fetched frame is the canonical one (the master authenticates it), so
+    /// the result equals a holder's. Frames not fetched within
+    /// [`CITED_FRAME_FETCH_BUDGET`] are left: execution then fails the frame
+    /// for retry, never refuses the operation, since another replica may
+    /// hold the frame and accept it.
+    async fn fetch_cited_global_frames(
+        &self,
+        exec: &quil_execution::ExecutionEngineManager,
+        requests: &[quil_types::proto::global::MessageBundle],
+        frame_number: u64,
+        global_frame_number: u64,
+    ) {
+        let Some(source) = self.global_anchor_source.as_ref() else {
+            return;
+        };
+        if global_frame_number == 0 {
+            return;
+        }
+        let address = &self.app_address[..self.app_address.len().min(32)];
+        let store = self.global_anchor_store.as_ref();
+        let mut cited = std::collections::BTreeSet::new();
+        for bundle in requests {
+            if let Ok(bytes) = crate::consensus_wire::app_bundle_to_canonical_bytes(bundle) {
+                cited.extend(exec.message_cited_global_frames(
+                    address,
+                    &bytes,
+                    global_frame_number,
+                ));
+            }
+        }
+        let frames: Vec<u64> = cited
+            .into_iter()
+            .filter(|&number| {
+                matches!(
+                    store.get_global_clock_frame(number),
+                    Err(QuilError::NotFound(_))
+                )
+            })
+            .collect();
+        let (Some(&first), Some(&last)) = (frames.first(), frames.last()) else {
+            return;
+        };
+        info!(
+            core_id = self.core_id,
+            filter = %hex::encode(&self.filter),
+            frame = frame_number,
+            anchor = global_frame_number,
+            cited = frames.len(),
+            first,
+            last,
+            "fetching the GLOBAL frames this frame's reward citations name from this node's \
+             master before executing it"
+        );
+        let started = std::time::Instant::now();
+        let outcome = crate::global_anchor::fetch_cited_frames(
+            store,
+            source,
+            &frames,
+            CITED_FRAME_FETCH_BUDGET,
+        )
+        .await;
+        let millis = started.elapsed().as_millis() as u64;
+        match outcome.missing.first() {
+            None => info!(
+                core_id = self.core_id,
+                filter = %hex::encode(&self.filter),
+                frame = frame_number,
+                fetched = outcome.held.len(),
+                millis,
+                "fetched the GLOBAL frames this frame's reward citations name"
+            ),
+            Some((missing, reason)) => warn!(
+                core_id = self.core_id,
+                filter = %hex::encode(&self.filter),
+                frame = frame_number,
+                anchor = global_frame_number,
+                fetched = outcome.held.len(),
+                missing_frames = outcome.missing.len(),
+                first_missing = *missing,
+                reason = %reason,
+                millis,
+                scope = "this node: it lacks GLOBAL frames other replicas may hold",
+                action = "none if it clears: the frame is retried and the frames fetched so far \
+                          are kept; if it repeats, check that this node's master reaches an \
+                          archive",
+                "GLOBAL frames this frame's reward citations name are not fetched yet; the \
+                 frame waits for them"
+            ),
+        }
     }
 
     /// Recompute a received frame's `requests_root` on the blocking

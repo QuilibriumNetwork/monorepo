@@ -272,3 +272,35 @@ async fn control_a_worker_holding_the_cited_frame_finishes_the_frame() {
     );
     eprintln!("UNHELD CONTROL: a worker holding the cited frame finishes the frame");
 }
+
+/// The master cannot serve the cited frame (no archive answers): the frame is
+/// held for retry, never finished by refusing the claim, since a replica
+/// holding the frame decides it. Once the master has the frame, the same
+/// frame finishes as on a holder.
+#[tokio::test]
+async fn an_unfetchable_cited_frame_keeps_the_frame_for_retry() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let master = holding(&[]);
+    let node = worker(holding(&[ANCHOR]), Some(master_source(&master, &calls)));
+    let requests = vec![mint_claim_bundle(CITED)];
+    let held = materialize(&node, requests.clone()).await;
+    assert!(
+        held.as_ref()
+            .is_err_and(|error| error.is_execution_unavailable() && !setup_error(error)),
+        "a cited frame no source serves must hold the frame for retry: {held:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the worker must ask its master for the cited frame"
+    );
+    assert_eq!(node.engine.load_materialized_cursor().unwrap(), 0);
+    master.seed_frame(global_frame(CITED));
+    let finished = materialize(&node, requests).await;
+    assert!(
+        matches!(finished, Ok((0, 1))),
+        "once the master serves the cited frame, the frame must finish: {finished:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(node.engine.load_materialized_cursor().unwrap(), 1);
+}

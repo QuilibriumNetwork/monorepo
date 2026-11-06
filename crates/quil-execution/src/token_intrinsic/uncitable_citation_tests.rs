@@ -880,3 +880,73 @@ fn control_a_test_network_cites_from_frame_zero() {
     }
     eprintln!("EARLY CONTROL: a test network cites from frame 0");
 }
+
+/// The reward citations a shard worker fetches before it executes a
+/// frame are the ones execution reads: every mint claim, settlement claim and
+/// coin delivery that decodes, from the first citable frame to the anchor.
+#[test]
+fn reward_citations_of_a_message_are_named_within_the_citable_range() {
+    let manager = manager_on(0, mainnet_clock());
+    let quil = domains::QUIL_TOKEN;
+    let named = |address: &[u8; 32], message: Vec<u8>| {
+        manager.message_cited_global_frames(address, &message, ANCHOR)
+    };
+    let wrapped = |cited: u64| CanonicalMessageRequest::wrap(junk_mint_claim(cited)).unwrap();
+    assert_eq!(
+        named(&quil, bundle(junk_mint_claim(FIRST + 5))),
+        vec![FIRST + 5],
+        "a mint claim"
+    );
+    assert_eq!(
+        named(&quil, wrapped(FIRST + 6).to_canonical_bytes().unwrap()),
+        vec![FIRST + 6],
+        "a lone mint claim request"
+    );
+    assert_eq!(
+        named(&PAID_APP, settlement_bundle(FIRST + 7)),
+        vec![FIRST + 7],
+        "a settlement claim"
+    );
+    for (name, delivery) in junk_deliveries(FIRST + 8) {
+        assert_eq!(
+            named(&quil, bundle(delivery)),
+            vec![FIRST + 8],
+            "a {name} delivery"
+        );
+    }
+    let several = CanonicalMessageBundle {
+        requests: [FIRST + 9, FIRST + 5, FIRST + 9]
+            .into_iter()
+            .map(|cited| Some(wrapped(cited)))
+            .collect(),
+        timestamp: 1,
+    }
+    .to_canonical_bytes()
+    .unwrap();
+    assert_eq!(
+        named(&quil, several),
+        vec![FIRST + 5, FIRST + 9],
+        "ascending, each once"
+    );
+    for edge in [FIRST, ANCHOR] {
+        assert_eq!(
+            named(&quil, bundle(junk_mint_claim(edge))),
+            vec![edge],
+            "edge {edge}"
+        );
+    }
+    for unread in [BELOW_GENESIS, FIRST - 1, ANCHOR + 1] {
+        assert!(
+            named(&quil, bundle(junk_mint_claim(unread))).is_empty(),
+            "execution refuses a citation of frame {unread} before any read: nothing to fetch"
+        );
+    }
+    assert!(
+        named(&PAID_APP, bundle(junk_mint_claim(FIRST + 5))).is_empty(),
+        "a mint claim for another application fails decoding before any read"
+    );
+    assert!(
+        named(&quil, bundle(junk_mint(FIRST + 5))).is_empty(),
+        "a reward mint executes only at GLOBAL, whose archives hold every frame"
+    );
+}

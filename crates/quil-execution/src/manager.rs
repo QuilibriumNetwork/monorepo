@@ -2144,6 +2144,88 @@ impl ExecutionEngineManager {
         }
     }
 
+    /// GLOBAL frames whose prover roots the reward citations of a request or
+    /// bundle to `address` name (mint claims, settlement claims and coin
+    /// deliveries that decode), limited to the ones execution reads: from the
+    /// network's first citable frame to `anchor`, the executing frame's GLOBAL
+    /// anchor. Ascending, each once. A shard worker fetches those it lacks
+    /// before executing the frame; execution still decides every operation,
+    /// so a citation missed here only goes unfetched.
+    pub fn message_cited_global_frames(
+        &self,
+        address: &[u8],
+        message: &[u8],
+        anchor: u64,
+    ) -> Vec<u64> {
+        #[cfg(not(feature = "confidential-tokens"))]
+        {
+            let _ = (address, message, anchor);
+            Vec::new()
+        }
+        #[cfg(feature = "confidential-tokens")]
+        {
+            use crate::message_envelope::{
+                CanonicalMessageBundle, CanonicalMessageRequest, TYPE_MESSAGE_BUNDLE,
+                TYPE_MESSAGE_REQUEST,
+            };
+            use crate::token_intrinsic::{constants, settlement_claim};
+            let Some(application) = address.get(..32).and_then(|a| <[u8; 32]>::try_from(a).ok())
+            else {
+                return Vec::new();
+            };
+            let requests: Vec<CanonicalMessageRequest> = match message
+                .get(..4)
+                .map(|prefix| u32::from_be_bytes(prefix.try_into().unwrap()))
+            {
+                Some(TYPE_MESSAGE_REQUEST) => {
+                    CanonicalMessageRequest::from_canonical_bytes(message)
+                        .map(|request| vec![request])
+                        .unwrap_or_default()
+                }
+                Some(TYPE_MESSAGE_BUNDLE) => CanonicalMessageBundle::from_canonical_bytes(message)
+                    .map(|bundle| bundle.requests.into_iter().flatten().collect())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            let network = crate::token_intrinsic::state::network_identifier(self.pricing_network());
+            let first =
+                crate::token_intrinsic::mint_authorization::first_citable_global_frame(&network);
+            let mut cited = std::collections::BTreeSet::new();
+            for request in &requests {
+                let bytes = request.inner_bytes.as_slice();
+                let frame = match request.inner_type_prefix {
+                    constants::TYPE_LATTICE_MINT_CLAIM => {
+                        quil_lattice_ct::confidential::mint_claim::MintClaim::decode(
+                            bytes,
+                            &network,
+                            &application,
+                        )
+                        .ok()
+                        .map(|claim| claim.cited_global_frame)
+                    }
+                    settlement_claim::TYPE_SETTLEMENT_CLAIM => {
+                        settlement_claim::SettlementClaim::decode(bytes)
+                            .ok()
+                            .map(|claim| claim.cited_global_frame)
+                    }
+                    #[cfg(feature = "native-proof")]
+                    constants::TYPE_COIN_DELIVERY => {
+                        crate::token_intrinsic::delivery::CoinDelivery::decode(
+                            bytes,
+                            &network,
+                            &application,
+                        )
+                        .ok()
+                        .map(|delivery| delivery.cited_global_frame)
+                    }
+                    _ => None,
+                };
+                cited.extend(frame.filter(|frame| (first..=anchor).contains(frame)));
+            }
+            cited.into_iter().collect()
+        }
+    }
+
     /// Relay entries of the cross-domain settlements (`0x0518`) carried by a
     /// request or bundle, in request order (empty for anything else). The app
     /// materializer records them for an admitted bundle; the next shard frame
