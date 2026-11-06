@@ -57,6 +57,7 @@ members = [
     "crates/quil-node",
     "crates/quil-compiler",
     "crates/quil-client",
+    "crates/quil-agent",
     "crates/quil-explorer",
     "crates/libp2p-identity",
     "crates/libp2p-autonat",

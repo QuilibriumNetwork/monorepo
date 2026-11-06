@@ -166,6 +166,26 @@ tasks:
     cmds:
       - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output crates/quil-client/build/amd64_avx512_linux --target=qclient .
 
+  build_qagent_arm64_macos:
+    desc: Build the qagent MCP server (Rust crates/quil-agent) for MacOS ARM. Outputs to crates/quil-agent/build.
+    cmds:
+      - CRATE_NAME=quil-agent BIN_NAME=qagent OUT_BIN_NAME=qagent OUT_BASE_DIR=crates/quil-agent/build node/build.sh
+
+  build_qagent_arm64_linux:
+    desc: Build the qagent MCP server (Rust crates/quil-agent) for ARM64 Linux. Outputs to crates/quil-agent/build.
+    cmds:
+      - docker build --ulimit stack=-1:-1 --platform linux/arm64 -f docker/Dockerfile.source --output crates/quil-agent/build/arm64_linux --target=qagent .
+
+  build_qagent_amd64_linux:
+    desc: Build the qagent MCP server (Rust crates/quil-agent) for AMD64 Linux. Outputs to crates/quil-agent/build.
+    cmds:
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.source --output crates/quil-agent/build/amd64_linux --target=qagent .
+
+  build_qagent_amd64_avx512_linux:
+    desc: Build the qagent MCP server (Rust crates/quil-agent) for AMD64 Linux with AVX-512 extensions. Outputs to crates/quil-agent/build.
+    cmds:
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output crates/quil-agent/build/amd64_avx512_linux --target=qagent .
+
   build:source:
     desc: Build the Quilibrium docker image from source.
     cmds:
@@ -223,6 +243,11 @@ tasks:
     desc: Test the Rust qclient (crates/quil-client).
     cmds:
       - cargo test -p quil-client
+
+  test:qagent:
+    desc: Test the Rust qagent MCP server (crates/quil-agent).
+    cmds:
+      - cargo test -p quil-agent
 
   config:gen:
     desc: >-

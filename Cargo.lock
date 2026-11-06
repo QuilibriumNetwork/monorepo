@@ -6221,6 +6221,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "quil-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.7.9",
+ "clap 4.5.4",
+ "hex 0.4.3",
+ "quil-client",
+ "quil-config",
+ "quil-types",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "quil-client"
 version = "0.1.0"
 dependencies = [

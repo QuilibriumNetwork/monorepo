@@ -184,6 +184,19 @@ RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=lo
     OUT_BASE_DIR=crates/quil-client/build bash node/build.sh && \
     cp crates/quil-client/build/*/qclient /usr/bin/qclient
 
+FROM build-avx512 AS build-qagent-avx512
+ARG TARGETOS
+ARG TARGETARCH
+WORKDIR /opt/ceremonyclient
+COPY ./node/build.sh /opt/ceremonyclient/node/build.sh
+COPY ./node/execution/intrinsics/global/compat /opt/ceremonyclient/node/execution/intrinsics/global/compat
+RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,id=cargo-target-${TARGETOS}-${TARGETARCH}-avx512,target=/opt/ceremonyclient/target,sharing=locked \
+    CARGO_TIMINGS=1 CRATE_NAME=quil-agent BIN_NAME=qagent OUT_BIN_NAME=qagent \
+    OUT_BASE_DIR=crates/quil-agent/build bash node/build.sh && \
+    cp crates/quil-agent/build/*/qagent /usr/bin/qagent
+
 # Allows exporting single binary
 FROM scratch AS node
 COPY --from=build-node-avx512 /usr/bin/node /node
@@ -197,6 +210,14 @@ ENTRYPOINT [ "/qclient" ]
 FROM qclient-unix AS qclient-linux
 FROM qclient-unix AS qclient-darwin
 FROM qclient-${TARGETOS} AS qclient
+
+FROM scratch AS qagent-unix
+COPY --from=build-qagent-avx512 /usr/bin/qagent /qagent
+ENTRYPOINT [ "/qagent" ]
+
+FROM qagent-unix AS qagent-linux
+FROM qagent-unix AS qagent-darwin
+FROM qagent-${TARGETOS} AS qagent
 
 FROM ubuntu:24.04 AS final
 
@@ -226,6 +247,7 @@ LABEL org.opencontainers.image.revision=$GIT_COMMIT
 
 COPY --from=build-node-avx512 /usr/bin/node /usr/local/bin
 COPY --from=build-qclient-avx512 /usr/bin/qclient /usr/local/bin
+COPY --from=build-qagent-avx512 /usr/bin/qagent /usr/local/bin
 
 WORKDIR /root
 

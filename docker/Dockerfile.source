@@ -227,6 +227,25 @@ RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=lo
     cp crates/quil-client/build/*/qclient /usr/bin/qclient
 
 # -----------------------------------------------------------------------------
+# Stage: build-qagent
+# Builds the Rust `qagent` MCP server (crates/quil-agent) with the same
+# toolchain and target cache as qclient. qagent links quil-client, so it
+# needs the same genesis seniority data.
+# -----------------------------------------------------------------------------
+FROM build-context AS build-qagent
+ARG TARGETOS
+ARG TARGETARCH
+WORKDIR /opt/ceremonyclient
+COPY ./node/build.sh /opt/ceremonyclient/node/build.sh
+COPY ./node/execution/intrinsics/global/compat /opt/ceremonyclient/node/execution/intrinsics/global/compat
+RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,id=cargo-target-${TARGETOS}-${TARGETARCH}-standard,target=/opt/ceremonyclient/target,sharing=locked \
+    CARGO_TIMINGS=1 CRATE_NAME=quil-agent BIN_NAME=qagent OUT_BIN_NAME=qagent \
+    OUT_BASE_DIR=crates/quil-agent/build bash node/build.sh && \
+    cp crates/quil-agent/build/*/qagent /usr/bin/qagent
+
+# -----------------------------------------------------------------------------
 # Stage: node-only
 # -----------------------------------------------------------------------------
 FROM ubuntu:24.04 AS node-only
@@ -273,6 +292,14 @@ FROM qclient-unix AS qclient-linux
 FROM qclient-unix AS qclient-darwin
 FROM qclient-${TARGETOS} AS qclient
 
+FROM scratch AS qagent-unix
+COPY --from=build-qagent /usr/bin/qagent /qagent
+ENTRYPOINT [ "/qagent" ]
+
+FROM qagent-unix AS qagent-linux
+FROM qagent-unix AS qagent-darwin
+FROM qagent-${TARGETOS} AS qagent
+
 # -----------------------------------------------------------------------------
 # Stage: final (Default combined image)
 # -----------------------------------------------------------------------------
@@ -304,6 +331,7 @@ LABEL org.opencontainers.image.revision=$GIT_COMMIT
 
 COPY --from=build-node /usr/bin/node /usr/local/bin
 COPY --from=build-qclient /usr/bin/qclient /usr/local/bin
+COPY --from=build-qagent /usr/bin/qagent /usr/local/bin
 
 WORKDIR /root
 ENTRYPOINT ["node"]

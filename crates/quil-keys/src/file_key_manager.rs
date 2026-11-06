@@ -202,11 +202,7 @@ impl FileKeyManager {
             ))
         })?;
 
-        tracing::info!(
-            count = keys.len(),
-            path = %self.keys_path.display(),
-            "loaded keystore"
-        );
+        tracing::info!(count = keys.len(), "loaded keystore");
 
         // Decrypt and populate signers
         for (id, stored) in &keys {
