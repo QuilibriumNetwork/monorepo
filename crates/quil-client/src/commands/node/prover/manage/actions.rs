@@ -2242,6 +2242,19 @@ mod legacy_read_tests {
 
     const LIMITS: LegacyLimits = LEGACY_LIMITS;
 
+    /// The last page and the read's result can land in one poll: the read
+    /// is ready and the watch holds a page no tick reported. The page is
+    /// still reported, so the progress shown ends at the read's total.
+    #[tokio::test(start_paused = true)]
+    async fn a_last_page_landing_with_the_result_is_reported() {
+        let (tick, ticks) = watch::channel((0, 0));
+        tick.send_replace((31, 15_872));
+        let mut seen = Vec::new();
+        let out = until_stalled(async { 7 }, ticks, LIMITS, |p| seen.push(p)).await;
+        assert_eq!(out, Ok(7));
+        assert_eq!(seen, vec![(31, 15_872)]);
+    }
+
     /// A read sending `pages` pages of 512 coins, one every `every`, then
     /// `after`: a snapshot's calls after its last page.
     async fn paging<T>(
