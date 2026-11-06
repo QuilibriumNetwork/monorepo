@@ -1323,9 +1323,11 @@ pub fn stable_replica_key_epoch_thread_override() -> Option<u64> {
 /// before its first kick less what its vertex held when it rejoined, so
 /// seniority earned since the rejoin is kept, once. Consensus-affecting
 /// (prover state): every node that executes GLOBAL frames must run a build
-/// carrying the frame before it. Mainnet: not set until decided;
-/// `QUIL_KICKED_SENIORITY_RESTORATION_FRAME` elsewhere, never by default.
-pub const MAINNET_KICKED_SENIORITY_RESTORATION_FRAME: Option<u64> = None;
+/// carrying the frame before it. Mainnet: 1,024,560, the first frame of epoch
+/// 1423, which GLOBAL cannot reach before 2026-11-07 00:00 UTC even at ten
+/// seconds a frame; `QUIL_KICKED_SENIORITY_RESTORATION_FRAME` elsewhere, never
+/// by default.
+pub const MAINNET_KICKED_SENIORITY_RESTORATION_FRAME: Option<u64> = Some(1_024_560);
 
 /// A prover whose seniority [`MAINNET_KICKED_SENIORITY_RESTORATION_FRAME`]
 /// restores.
@@ -1667,17 +1669,20 @@ mod exact_state_size_epoch_tests {
         assert_eq!(super::exact_state_size_epoch_for(1, None), u64::MAX);
     }
 
-    /// Mainnet restores at no frame until one is set, whatever the settings
-    /// say, and always from its own table; other networks take both
-    /// settings, and nothing without them.
+    /// Mainnet restores at its own frame, the first of an epoch, whatever
+    /// the settings say, and always from its own table; other networks
+    /// take both settings, and nothing without them.
     #[test]
     fn only_a_test_network_reads_the_kicked_seniority_restoration_settings() {
         let address = "09b404433671157db1a6f606b4d27378c970021a9d806a48b52396bb7e1a0ecf";
         let table = format!("{address}:2420:0, {}:5:7", "ab".repeat(32));
-        assert_eq!(super::MAINNET_KICKED_SENIORITY_RESTORATION_FRAME, None);
+        assert_eq!(
+            super::MAINNET_KICKED_SENIORITY_RESTORATION_FRAME,
+            Some(1423 * super::EPOCH_LENGTH_FRAMES)
+        );
         let (frame, mainnet) =
             super::kicked_seniority_restoration_for(0, Some("700"), Some(&table));
-        assert_eq!(frame, u64::MAX);
+        assert_eq!(frame, 1_024_560);
         assert_eq!(mainnet, super::MAINNET_KICKED_SENIORITY_RESTORATIONS);
         let (frame, devnet) = super::kicked_seniority_restoration_for(1, Some("700"), Some(&table));
         assert_eq!(frame, 700);
@@ -1708,7 +1713,11 @@ mod exact_state_size_epoch_tests {
         }
         super::set_kicked_seniority_restoration_frame_for_thread(None);
         super::set_kicked_seniority_restorations_for_thread(None);
-        assert_eq!(super::kicked_seniority_restoration_frame(), u64::MAX);
+        assert_eq!(
+            super::kicked_seniority_restoration_frame(),
+            1_024_560,
+            "without init, the mainnet frame"
+        );
         assert_eq!(
             super::kicked_seniority_restorations(),
             super::MAINNET_KICKED_SENIORITY_RESTORATIONS
