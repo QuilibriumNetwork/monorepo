@@ -855,7 +855,7 @@ fn report_long_leaves() {
                     work = work.name(), scope = "local",
                     action = "check this node's CPU and disk load: storage labelling is CPU-bound; \
                               if the leaves have not ended by the grace frame, the seat renews \
-                              without a storage registration and earns no storage share that epoch",
+                              without a storage registration that epoch",
                     "this node's storage proof data for a seat runs past its estimate; its renewal waits for it"),
             }
         }
@@ -1151,7 +1151,7 @@ fn gives_up_late_leaf(
                       once; the next epoch's snapshot starts again",
             "storage snapshot given up: this node would finish a seat's storage proof data \
              after the renewal's grace frame, so the seat renews without a storage \
-             registration and earns no storage share on its shard this epoch");
+             registration this epoch");
     }
     true
 }
@@ -1338,7 +1338,7 @@ pub fn request_member(
         let past_grace = || {
             info!(epoch, filter = %hex::encode(&filter), scope = "local",
                 "storage snapshot not encoded: the renewal's grace frame passed, so this seat renews \
-                 without a storage registration and earns no storage share on its shard that epoch; \
+                 without a storage registration that epoch; \
                  its memory goes to other storage work");
             Ok(())
         };

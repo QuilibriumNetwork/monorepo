@@ -709,7 +709,7 @@ fn snapshot_storage_confirm(
                         action = "check this node's CPU and disk load and how many seats it labels \
                                   at once; the next epoch's snapshot starts again",
                         "renewing a seat without a storage registration: this seat's frames carry no \
-                         storage attestation and earn no storage share this epoch");
+                         storage attestation this epoch");
                 }
             }
             all.push(ConfirmLeafRoots {

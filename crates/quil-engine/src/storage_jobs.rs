@@ -1333,8 +1333,8 @@ impl Admission {
             seconds = held_back.since.elapsed().as_secs_f64(),
             "storage jobs ahead held back for memory for a whole epoch: this host has too little \
              memory available to label leaves ahead, so each snapshot labels its leaves itself \
-             within its renewal's grace, and a seat whose leaf cannot be labelled in time misses \
-             that epoch's storage share; free memory on this host (fewer data workers, other \
+             within its renewal's grace, and a seat whose leaf cannot be labelled in time renews \
+             without a storage registration that epoch; free memory on this host (fewer data workers, other \
              processes) so that needs_available bytes are available"
         );
     }

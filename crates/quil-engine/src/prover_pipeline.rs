@@ -486,7 +486,7 @@ fn report_pending_snapshots(frame_number: u64, prepared: &PreparedConfirm) {
                 more_pending = filters.len().saturating_sub(LISTED), scope = "local",
                 "confirmation submits the seats whose storage snapshot is encoded and retries the pending \
                  ones each cycle: an expected wait while their snapshots encode; a seat still pending at the \
-                 grace frame renews without a storage registration and earns no storage share on its shard \
+                 grace frame renews without a storage registration, so its frames carry no storage attestation \
                  that epoch");
         }
     }
@@ -515,7 +515,7 @@ fn report_pending_snapshots(frame_number: u64, prepared: &PreparedConfirm) {
         warn!(frame = frame_number, epoch, filter = %hex::encode(&filter), projected_frame = projected,
             grace_frame, scope = "local", action,
             "storage snapshot of a seat is projected to finish after its renewal's grace frame: past it the \
-             seat renews without a storage registration and earns no storage share on its shard that epoch \
+             seat renews without a storage registration and carries no storage attestation that epoch \
              (reported once a seat per epoch)");
     }
 }
