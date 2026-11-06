@@ -347,4 +347,22 @@ mod tests {
              entitlement basis deploy token sets"
         );
     }
+
+    #[tokio::test]
+    async fn token_deploy_refuses_unknown_keys() {
+        let dc = offline_ctx("token-deploy-keys");
+        for (arg, refusal) in [
+            ("paymentAdress=5a", "unknown key \"paymentAdress\""),
+            ("decimals=8", "unknown key \"decimals\""),
+            ("supply", "\"supply\" is not key=value"),
+        ] {
+            // A known key in any case is taken; the unknown one is named.
+            let args = ["mintStrategy=authority".to_string(), arg.to_string()];
+            let err = format!("{:#}", token::run(&dc, &args).await.unwrap_err());
+            assert!(
+                err.contains(refusal) && err.contains("paymentaddress, price, entitlementroot"),
+                "token deploy args misread: {arg} was not refused ({err})"
+            );
+        }
+    }
 }
