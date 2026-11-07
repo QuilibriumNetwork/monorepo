@@ -1280,94 +1280,20 @@ pub async fn fetch_data(mut client: Client) -> Msg {
 
 // ── Health report ────────────────────────────────────────────────────────
 
-/// How the node manager asks this node for its health conditions: on the
-/// node's own peer listener, as the node itself, as `qclient node
-/// diagnostics health --self` asks; the channel is kept between refreshes.
-#[derive(Clone)]
-pub struct HealthSource {
-    addr: String,
-    key: Arc<Vec<u8>>,
-    peer: quil_p2p::PeerId,
-    client: Arc<
-        tokio::sync::Mutex<
-            Option<
-                quil_types::proto::diagnostics::diagnostics_service_client::DiagnosticsServiceClient<
-                    Channel,
-                >,
-            >,
-        >,
-    >,
-}
-
-impl HealthSource {
-    /// This node's source, or why there is none.
-    pub fn for_node(config: &quil_config::Config, km: &FileKeyManager) -> Result<Self, String> {
-        let key = km
-            .get_secret_key_bytes_by_id("q-prover-key")
-            .map_err(|e| format!("no network key to ask this node with: {e}"))?;
-        let peer = crate::commands::node::diagnostics_logs::falcon_peer(&key)
-            .map_err(|e| format!("{e:#}"))?;
-        let addr = crate::rpc::local_stream_addr(config).map_err(|e| format!("{e:#}"))?;
-        Ok(Self {
-            addr,
-            key: Arc::new(key),
-            peer,
-            client: Arc::default(),
-        })
-    }
-}
-
 /// The node's health conditions, or why there are none. A node without the
 /// diagnostics service, or whose report has no conditions, predates them:
 /// the node manager judges none in its place.
-pub async fn fetch_health(source: Result<HealthSource, String>) -> Msg {
+pub async fn fetch_health(
+    source: Result<crate::commands::node::diagnostics::HealthSource, String>,
+) -> Msg {
     use super::model::HealthAnswer;
-    use quil_types::proto::diagnostics::GetHealthReportRequest;
-    let source = match source {
-        Ok(source) => source,
-        Err(reason) => return Msg::HealthRefresh(HealthAnswer::Failed(reason)),
-    };
-    let mut slot = source.client.lock().await;
-    if slot.is_none() {
-        let connect =
-            quil_rpc::diagnostics_service::connect_peer(&source.addr, &source.key, source.peer);
-        match tokio::time::timeout(RPC_TIMEOUT, connect).await {
-            Ok(Ok(client)) => *slot = Some(client),
-            Ok(Err(e)) => {
-                return Msg::HealthRefresh(HealthAnswer::Failed(format!(
-                    "connect to this node's peer listener: {}",
-                    crate::commands::node::diagnostics::error_chain(&*e)
-                )))
-            }
-            Err(_) => {
-                return Msg::HealthRefresh(HealthAnswer::Failed(
-                    "connect to this node's peer listener: timed out".into(),
-                ))
-            }
-        }
-    }
-    let Some(client) = slot.as_mut() else {
-        return Msg::HealthRefresh(HealthAnswer::Failed("not connected".into()));
-    };
-    let answer = match tokio::time::timeout(
-        RPC_TIMEOUT,
-        client.get_health_report(GetHealthReportRequest {}),
-    )
-    .await
-    {
-        Ok(Ok(report)) => match report.into_inner().health {
-            Some(health) => HealthAnswer::Reported(health),
-            None => HealthAnswer::NotReported,
+    let answer = match source {
+        Err(reason) => HealthAnswer::Failed(reason),
+        Ok(source) => match source.read().await {
+            Ok(Some(health)) => HealthAnswer::Reported(health),
+            Ok(None) => HealthAnswer::NotReported,
+            Err(reason) => HealthAnswer::Failed(reason),
         },
-        Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => HealthAnswer::NotReported,
-        Ok(Err(status)) => {
-            *slot = None;
-            HealthAnswer::Failed(format!("health report: {}", status.message()))
-        }
-        Err(_) => {
-            *slot = None;
-            HealthAnswer::Failed("health report: timed out".into())
-        }
     };
     Msg::HealthRefresh(answer)
 }
@@ -1494,6 +1420,7 @@ fn build_request(
 pub async fn do_lifecycle(
     mut client: Client,
     km: Arc<FileKeyManager>,
+    waits: super::super::EpochWaits,
     action: String,
     filters: Vec<Vec<u8>>,
     original_status: u32,
@@ -1508,11 +1435,13 @@ pub async fn do_lifecycle(
     let _ = label; // label mirrors Go's status string; unused in the Rust flow.
 
     // Every node refuses one of these landing in a later epoch than it was
-    // signed in, so it signs clear of the epoch's end. A confirm or reject is
-    // valid only in this epoch and goes at once.
+    // signed in, so it signs once this node no longer holds prover ops for
+    // the next epoch. A confirm or reject is valid only in this epoch and
+    // goes at once.
     if matches!(action.as_str(), "Leave" | "Pause" | "Resume") {
         if let Err(e) = super::super::frame_clear_of_epoch_end(
             &mut client,
+            &waits,
             super::super::EPOCH_END_WAIT_CAP,
             super::super::EPOCH_END_POLL,
             |frames_left| {
@@ -2591,6 +2520,7 @@ mod epoch_end_tests {
         let length = quil_types::consensus::epoch_length_frames();
         let mut server = quil_rpc::NodeRpcServer::default();
         server.last_global_head_frame = Arc::new(AtomicU64::new(length - 1));
+        let head = server.last_global_head_frame.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let multiaddr = format!(
             "/ip4/127.0.0.1/tcp/{}",
@@ -2616,12 +2546,14 @@ mod epoch_end_tests {
         .await
         .unwrap();
         let (progress, mut notices) = tokio::sync::mpsc::unbounded_channel();
+        let waits = super::super::super::tests::node_waits(head.clone());
         let run = |action: &str| {
             tokio::time::timeout(
                 Duration::from_secs(1),
                 do_lifecycle(
                     client.clone(),
                     km.clone(),
+                    waits.clone(),
                     action.to_string(),
                     vec![vec![0xAA; 32]],
                     2,

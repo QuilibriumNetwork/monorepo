@@ -114,7 +114,7 @@ fn legacy_row(m: &Model) -> [Cell; 5] {
     let state = if let Some(state) = super::super::shield::row_state(m) {
         (state, Some(PRIMARY))
     } else if tally.unshielded > 0 {
-        if coins::shields_open_at(snapshot).is_some() {
+        if coins::shields_open_at(m).is_some() {
             plain("unshielded")
         } else {
             attention("unshielded")
@@ -1084,7 +1084,7 @@ fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'stat
         return ("Shield plan".into(), Vec::new(), None);
     };
     let mut footer = Vec::new();
-    if let Some((frame, left)) = coins::shields_open_at(snapshot) {
+    if let Some((frame, left)) = coins::shields_open_at(m) {
         footer.push(Line::from(Span::styled(
             format!("Shields open at f{frame} (in {left} frames)."),
             Style::new().fg(PRIMARY),

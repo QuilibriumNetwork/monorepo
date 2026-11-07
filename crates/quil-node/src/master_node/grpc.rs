@@ -3497,11 +3497,15 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
             prover_registry.clone(),
             current_frame.clone(),
         );
+        // The expected waits' inputs: the GLOBAL head this node serves and
+        // its committed GLOBAL state.
+        let global = (last_global_head_frame.clone(), crdt.clone());
         sup.spawn("health-conditions", move |token| async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! { _ = token.cancelled() => break, _ = interval.tick() => {} }
+                let global = global.clone();
                 let (health, cadence, view, registry, head) = (
                     health.clone(),
                     cadence.clone(),
@@ -3513,9 +3517,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                     let now = quil_engine::worker_execution::now_ms();
                     let workers =
                         health_workers(&view, registry.as_ref(), &prover_address, head.effective());
+                    let observed = health_global(&global.0, &global.1);
                     let transitions = {
                         let cadence = cadence.lock().unwrap_or_else(|e| e.into_inner());
                         let mut health = health.lock().unwrap_or_else(|e| e.into_inner());
+                        health.observe_global(observed, now);
                         health.observe_workers(workers, now);
                         health.evaluate(now, &|filter: &[u8]| cadence.snapshot(filter, now / 1000))
                     };
@@ -4154,7 +4160,19 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                 let mut inputs =
                     health_inputs(&view, &head, &crdt, registry.as_ref(), &prover_address);
                 inputs.worker_capacity = capacity.load(std::sync::atomic::Ordering::Relaxed);
-                inputs.health = Some(health.lock().unwrap_or_else(|e| e.into_inner()).snapshot());
+                // The expected waits are judged on the head served now: a
+                // client deciding when to sign reads them.
+                let observed = health_global(&head, &crdt);
+                let now = quil_engine::worker_execution::now_ms();
+                let (snapshot, transitions) = {
+                    let mut health = health.lock().unwrap_or_else(|e| e.into_inner());
+                    let transitions = health.refresh_waits(observed, now);
+                    (health.snapshot(), transitions)
+                };
+                for transition in &transitions {
+                    quil_rpc::health_conditions::log_transition(transition);
+                }
+                inputs.health = Some(snapshot);
                 inputs
             });
             let fingerprint = hex::decode(env!("QUIL_BUILD_FINGERPRINT"))
@@ -4589,6 +4607,39 @@ fn health_inputs(
         store_io: quil_forest::store_io::latest().map(|report| report.to_proto()),
         // The node's registry; the source sets it.
         health: None,
+    }
+}
+
+/// This node's GLOBAL position and settings as the health conditions'
+/// expected waits judge them: the head it serves, the epoch length, the
+/// frames admission takes legacy coin shields from, and whether a GLOBAL
+/// state sync has installed some of its chunks but not the last (committed
+/// GLOBAL state is unreadable until it does).
+fn health_global(
+    head: &std::sync::atomic::AtomicU64,
+    crdt: &quil_hypergraph::HypergraphCrdt,
+) -> quil_rpc::health_conditions::GlobalObservation {
+    #[cfg(feature = "confidential-tokens")]
+    let shields_from = Some((
+        quil_execution::token_intrinsic::legacy_migration::migrated_owner_frame(),
+        quil_execution::token_intrinsic::global_commit::batch_shield_frame(),
+    ));
+    #[cfg(not(feature = "confidential-tokens"))]
+    let shields_from = None;
+    let sync_installing = crdt.capture_committed_snapshot().and_then(|snapshot| {
+        quil_hypergraph::crdt::snapshot_sync_incomplete(
+            snapshot.as_ref(),
+            &quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS,
+        )
+    });
+    if let Err(error) = &sync_installing {
+        debug!(%error, "health conditions: GLOBAL sync state unreadable");
+    }
+    quil_rpc::health_conditions::GlobalObservation {
+        head_frame: head.load(std::sync::atomic::Ordering::Relaxed),
+        epoch_length: quil_types::consensus::epoch_length_frames(),
+        shields_from,
+        sync_installing: sync_installing.ok(),
     }
 }
 
@@ -5035,6 +5086,82 @@ mod health_input_tests {
                 ConditionKind::PeerAppFramesUnchanged as i32,
                 ConditionKind::GlobalAppFramesBehind as i32
             ]
+        );
+    }
+
+    /// The expected waits read the head this node serves and its committed
+    /// GLOBAL state: a GLOBAL state sync that installed some of its chunks
+    /// but not the last reads as installing until the last one is in.
+    #[test]
+    fn the_expected_waits_read_the_served_head_and_a_global_sync() {
+        use quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS;
+        use quil_hypergraph::testing::{CrdtTreeReader, MemStore, StubProver};
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(StubProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::new(db.inner()));
+        let head = std::sync::atomic::AtomicU64::new(712);
+        let observed = health_global(&head, &crdt);
+        assert_eq!(
+            (
+                observed.head_frame,
+                observed.epoch_length,
+                observed.sync_installing
+            ),
+            (
+                712,
+                quil_types::consensus::epoch_length_frames(),
+                Some(false)
+            )
+        );
+
+        let archive = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(MemStore::new()),
+            Arc::new(StubProver),
+        ));
+        for byte in 1..=2u8 {
+            let location = quil_hypergraph::Location {
+                app_address: GLOBAL_INTRINSIC_ADDRESS,
+                data_address: [byte; 32],
+            };
+            archive.add_vertex(&location, &[byte; 48]).unwrap();
+        }
+        archive.commit(1).unwrap();
+        let (version, root) = archive
+            .serve_forest_head(&GLOBAL_INTRINSIC_ADDRESS, 0)
+            .unwrap();
+        let reader = CrdtTreeReader {
+            source: archive,
+            shard_id: GLOBAL_INTRINSIC_ADDRESS.to_vec(),
+            phase: 0,
+        };
+        let mut plan = crdt
+            .prepare_phase_sync(
+                &reader,
+                version,
+                &GLOBAL_INTRINSIC_ADDRESS,
+                0,
+                &[],
+                Some(quil_forest::SubtreeSyncAnchor::AppRoot(root)),
+            )
+            .unwrap();
+        assert_eq!(plan.remaining().len(), 2);
+        let byte = plan.remaining()[0].0[0];
+        crdt.apply_sync_chunk(&mut plan, &[vec![byte; 48]]).unwrap();
+        assert_eq!(
+            health_global(&head, &crdt).sync_installing,
+            Some(true),
+            "between a sync's chunks"
+        );
+        let byte = plan.remaining()[0].0[0];
+        crdt.apply_sync_chunk(&mut plan, &[vec![byte; 48]]).unwrap();
+        assert_eq!(crdt.finish_phase_sync(&plan).unwrap(), root);
+        assert_eq!(
+            health_global(&head, &crdt).sync_installing,
+            Some(false),
+            "the last chunk is in"
         );
     }
 }

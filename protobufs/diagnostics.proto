@@ -205,6 +205,21 @@ enum ConditionKind {
   // Shards whose head in committed GLOBAL state trails their app head by
   // more than `HealthCondition.threshold` frames.
   CONDITION_KIND_GLOBAL_APP_FRAMES_BEHIND = 4;
+  // 5-24 are taken by other conditions.
+  // An expected wait: an archive state sync of GLOBAL has installed some of
+  // its chunks but not the last, so committed GLOBAL state (each shard's
+  // committed head among it) is unreadable until it does. A warning once it
+  // lasts past `HealthCondition.wait.expected_secs`.
+  CONDITION_KIND_GLOBAL_STATE_SYNC_INSTALLING = 25;
+  // An expected wait: the epoch ends within the frames a prover op takes to
+  // land, and every node refuses an op landing in a later epoch than it was
+  // signed in, so pauses, resumes, leaves and updates are signed from
+  // `HealthCondition.wait.until_frame`, the next epoch's first frame.
+  CONDITION_KIND_PROVER_OPS_WAIT_FOR_EPOCH = 26;
+  // An expected wait: admission refuses shields of legacy coins before
+  // `HealthCondition.wait.until_frame` (`token shield`) and
+  // `HealthCondition.wait.batch_from_frame` (`token shield-all`).
+  CONDITION_KIND_SHIELDS_NOT_ADMITTED = 27;
 }
 
 enum ConditionSeverity {
@@ -237,6 +252,15 @@ enum ConditionAction {
   // GLOBAL's inclusion of the shard on the explorer: advancing there means
   // this node's GLOBAL view trails.
   CONDITION_ACTION_CHECK_GLOBAL_INCLUSION = 3;
+  // 4-20 are taken by other conditions.
+  // None while the GLOBAL state sync installs; past its expected time, the
+  // node's `sync phase` and prover tree sync log lines.
+  CONDITION_ACTION_WAIT_FOR_GLOBAL_SYNC = 21;
+  // None: ops wait for the next epoch; past the expected time, whether this
+  // node follows GLOBAL.
+  CONDITION_ACTION_WAIT_FOR_NEXT_EPOCH = 22;
+  // None: shield once GLOBAL reaches the admission frame.
+  CONDITION_ACTION_WAIT_FOR_SHIELD_ADMISSION = 23;
 }
 
 // One shard or allocation a condition affects.
@@ -275,6 +299,23 @@ message HealthCondition {
   // The affected shards, at most 64; the rest are counted.
   repeated AffectedShard shards = 9;
   uint32 omitted_shards = 10;
+  // 11-14 are taken by other conditions.
+  // For the expected waits: what ends it.
+  ExpectedWait wait = 15;
+}
+
+// An expected wait as this node judged it (`HealthCondition.wait`).
+message ExpectedWait {
+  // The GLOBAL head it was judged at (`last_global_head_frame`).
+  uint64 head_frame = 1;
+  // The GLOBAL frame that ends it; 0 when an event other than a frame does.
+  uint64 until_frame = 2;
+  // For `..._SHIELDS_NOT_ADMITTED`: the frame batch shields are admitted
+  // from; 0 otherwise.
+  uint64 batch_from_frame = 3;
+  // How long it lasts at most when all is well; 0 when only its frame bounds
+  // it. A wait lasting longer is a warning.
+  uint64 expected_secs = 4;
 }
 
 // What this node observed to judge one kind, so a reader can tell "nothing

@@ -260,6 +260,82 @@ async fn health(global: GlobalArgs, args: &HealthArgs) -> anyhow::Result<()> {
     }
 }
 
+/// How long one connect or read of this node's health report may take.
+const HEALTH_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+type HealthClient =
+    quil_types::proto::diagnostics::diagnostics_service_client::DiagnosticsServiceClient<
+        tonic::transport::Channel,
+    >;
+
+/// How this node's own health conditions are read (the node manager each
+/// refresh, a prover op before it signs, a shield before it proves): on the
+/// node's peer listener, as the node itself, as `node diagnostics health
+/// --self` asks; the channel is kept between reads.
+#[derive(Clone)]
+pub(crate) struct HealthSource {
+    addr: String,
+    key: std::sync::Arc<Vec<u8>>,
+    peer: PeerId,
+    client: std::sync::Arc<tokio::sync::Mutex<Option<HealthClient>>>,
+}
+
+impl HealthSource {
+    /// This node's source, or why there is none.
+    pub(crate) fn for_node(
+        config: &quil_config::Config,
+        km: &quil_keys::FileKeyManager,
+    ) -> Result<Self, String> {
+        let key = km
+            .get_secret_key_bytes_by_id("q-prover-key")
+            .map_err(|e| format!("no network key to ask this node with: {e}"))?;
+        let peer = super::diagnostics_logs::falcon_peer(&key).map_err(|e| format!("{e:#}"))?;
+        let addr = rpc::local_stream_addr(config).map_err(|e| format!("{e:#}"))?;
+        Ok(Self {
+            addr,
+            key: std::sync::Arc::new(key),
+            peer,
+            client: std::sync::Arc::default(),
+        })
+    }
+
+    /// The node's health conditions; `None` from a node that predates them
+    /// (no conditions in its report, or no diagnostics service); an error
+    /// naming why none could be read.
+    pub(crate) async fn read(&self) -> Result<Option<HealthConditions>, String> {
+        let mut slot = self.client.lock().await;
+        if slot.is_none() {
+            let connect = diag::connect_peer(&self.addr, &self.key, self.peer);
+            match tokio::time::timeout(HEALTH_READ_TIMEOUT, connect).await {
+                Ok(Ok(client)) => *slot = Some(client),
+                Ok(Err(e)) => {
+                    return Err(format!(
+                        "connect to this node's peer listener: {}",
+                        error_chain(&*e)
+                    ))
+                }
+                Err(_) => return Err("connect to this node's peer listener: timed out".into()),
+            }
+        }
+        let Some(client) = slot.as_mut() else {
+            return Err("not connected".into());
+        };
+        let read = client.get_health_report(GetHealthReportRequest {});
+        match tokio::time::timeout(HEALTH_READ_TIMEOUT, read).await {
+            Ok(Ok(report)) => Ok(report.into_inner().health),
+            Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => Ok(None),
+            Ok(Err(status)) => {
+                *slot = None;
+                Err(format!("health report: {}", status.message()))
+            }
+            Err(_) => {
+                *slot = None;
+                Err("health report: timed out".into())
+            }
+        }
+    }
+}
+
 async fn resolve(global: GlobalArgs, args: &ResolveArgs) -> anyhow::Result<()> {
     let target = parse_peer(&args.peer)?;
     let node = super::diagnostics_logs::NodeSide::load(global).map_err(|e| {

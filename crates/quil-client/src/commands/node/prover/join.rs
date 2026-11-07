@@ -219,6 +219,7 @@ mod tests {
                 ..Default::default()
             },
             key_manager,
+            epoch_waits: None,
         };
         let args = [hex::encode([0xAA; 32])];
 

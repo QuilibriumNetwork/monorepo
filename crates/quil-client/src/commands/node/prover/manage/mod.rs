@@ -570,7 +570,7 @@ struct RefreshState {
     node: Arc<Semaphore>,
     health: Arc<Semaphore>,
     /// Where the node's health conditions are read, or why they are not.
-    health_source: Result<actions::HealthSource, String>,
+    health_source: Result<crate::commands::node::diagnostics::HealthSource, String>,
     shards: Arc<Semaphore>,
     rewards: Arc<Semaphore>,
     legacy: Arc<Semaphore>,
@@ -617,7 +617,10 @@ impl RefreshState {
                 p2p.network,
             ),
             config_dir: Some(pc.config_dir.clone()),
-            health_source: actions::HealthSource::for_node(&pc.node_config, &pc.key_manager),
+            health_source: crate::commands::node::diagnostics::HealthSource::for_node(
+                &pc.node_config,
+                &pc.key_manager,
+            ),
             token: Some((global, max_fee)),
             action_log: crate::commands::token::action_log::ActionLog::enabled(
                 &pc.config_dir,
@@ -773,10 +776,19 @@ fn spawn_action(
             original_status,
         } => {
             let progress = tx.clone();
+            let waits = super::EpochWaits::Node(refresh.health_source.clone());
             tokio::spawn(async move {
                 let _ = tx.send(
-                    actions::do_lifecycle(client, km, action, filters, original_status, progress)
-                        .await,
+                    actions::do_lifecycle(
+                        client,
+                        km,
+                        waits,
+                        action,
+                        filters,
+                        original_status,
+                        progress,
+                    )
+                    .await,
                 );
             });
         }

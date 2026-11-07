@@ -344,6 +344,7 @@ mod tests {
                 ..Default::default()
             },
             key_manager,
+            epoch_waits: super::super::tests::no_epoch_wait(),
         };
 
         let refusal = super::super::ops::leave(&pc, &[hex::encode(&active), hex::encode(&leaving)])
