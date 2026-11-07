@@ -19,6 +19,7 @@ pub mod peer_info;
 pub mod pqnoise;
 pub mod pqnoise_transport;
 pub mod protocol;
+mod quic_close;
 pub mod signer_registry;
 pub mod tls_debug;
 

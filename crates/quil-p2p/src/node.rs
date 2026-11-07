@@ -674,6 +674,8 @@ impl P2PNode {
             // from a real partition.
             let need_peers_throttle = Duration::from_secs(30);
             let mut last_need_peers_query: Option<std::time::Instant> = None;
+            // Operator lines on QUIC connections that end on a transport error.
+            let mut quic_closes = crate::quic_close::QuicCloses::default();
             loop {
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
@@ -686,6 +688,9 @@ impl P2PNode {
                         traffic_logged = now;
                     }
                     _ = discovery_timer.tick() => {
+                        if let Some(line) = quic_closes.on_tick(std::time::Instant::now()) {
+                            line.log();
+                        }
                         // Other nodes' AutoNAT dial-back requests: one line
                         // per hour, only when there were any.
                         let summary_secs = autonat_server_summary_at.elapsed();
@@ -889,6 +894,7 @@ impl P2PNode {
                                 listen_tx.send_if_modified(|addrs| remove_listen_addrs(addrs, &addresses));
                             }
                             libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
+                                quic_closes.on_established(connection_id, std::time::Instant::now());
                                 crate::autonat_servers::apply(
                                     &mut swarm.behaviour_mut().autonat,
                                     probe_servers.on_connection(connection_id, peer_id, endpoint.get_remote_address()),
@@ -915,6 +921,15 @@ impl P2PNode {
                                     .inc();
                                 swarm_metrics.connected_peers.set(count as i64);
                                 debug!(%peer_id, cause = ?cause, peers = count, "peer disconnected");
+                                for line in quic_closes.on_closed(
+                                    connection_id,
+                                    peer_id,
+                                    &endpoint,
+                                    cause.as_ref(),
+                                    std::time::Instant::now(),
+                                ) {
+                                    line.log();
+                                }
                             }
                             libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                                 swarm_metrics.dial_failures.inc();
