@@ -247,6 +247,7 @@ fn suite_selection_uses_scheduled_mainnet_default_and_rejects_unsupported_parame
         "/tmp/quil-default-profile",
         "--benchmark-storage-seats",
         "9",
+        "--benchmark-storage-allow-debug",
     ])
     .unwrap();
     assert_eq!(benchmark.storage_readiness.benchmark_storage_layers, 3);
