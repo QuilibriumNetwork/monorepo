@@ -236,9 +236,20 @@ async fn live_mainnet_checkpoint_and_snapshot_record_are_authenticated() {
 }
 
 #[test]
-fn experimental_suite_selection_is_explicit_and_rejects_unsupported_parameters() {
+fn suite_selection_uses_scheduled_mainnet_default_and_rejects_unsupported_parameters() {
     use clap::Parser;
-    assert!(crate::Args::try_parse_from(["quil-node"]).is_ok());
+    let defaults = crate::Args::try_parse_from(["quil-node"]).unwrap();
+    assert_eq!(defaults.storage_readiness.benchmark_storage_layers, 3);
+    let benchmark = crate::Args::try_parse_from([
+        "quil-node",
+        "--benchmark-storage",
+        "/tmp/quil-default-profile",
+        "--benchmark-storage-seats",
+        "9",
+    ])
+    .unwrap();
+    assert_eq!(benchmark.storage_readiness.benchmark_storage_layers, 3);
+    validate(&benchmark.storage_readiness).unwrap();
     assert!(crate::Args::try_parse_from(["quil-node", "--benchmark-storage-layers", "3"]).is_err());
     for layers in ["2", "3", "11"] {
         let args = crate::Args::try_parse_from([

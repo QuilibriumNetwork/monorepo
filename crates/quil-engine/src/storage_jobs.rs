@@ -3043,7 +3043,7 @@ mod tests {
     }
 
     /// Work ahead runs in parallel only for an epoch where persistent
-    /// storage holds; never while it is unset, as on mainnet today.
+    /// storage holds; a disabled or future activation keeps the legacy cap.
     #[test]
     fn work_ahead_runs_in_parallel_only_once_persistent_storage_holds() {
         quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(u64::MAX));

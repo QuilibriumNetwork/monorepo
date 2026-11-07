@@ -558,38 +558,52 @@ mod tests {
             append_confirm_leaf_roots(&mut bytes, groups);
             read_confirm_leaf_roots(&bytes, &mut 0).is_ok()
         };
-        let max = MAX_PREFIX_LEN as usize;
-        let at_limits = vec![group(64, vec![entry(max, 128); max])];
-        let cases = [
-            (at_limits, true),
-            (
-                vec![group(32, Vec::new()); MAX_CONFIRM_LEAF_ROOT_GROUPS],
-                true,
-            ),
-            (
-                vec![group(32, Vec::new()); MAX_CONFIRM_LEAF_ROOT_GROUPS + 1],
-                false,
-            ),
-            (vec![group(65, Vec::new())], false),
-            (vec![group(32, vec![entry(1, 1); max + 1])], false),
-            (vec![group(32, vec![entry(max + 1, 1)])], false),
-            (vec![group(32, vec![entry(1, 129)])], false),
-        ];
-        for (index, (groups, fits)) in cases.iter().enumerate() {
-            assert_eq!(
-                check_confirm_leaf_roots(groups).is_ok(),
-                *fits,
-                "case {index}"
+        // Exercise both the historical limit and the configured persistent
+        // format, whose future-epoch registrations must decode during warmup.
+        for (activation, root_limit) in [
+            (Some(u64::MAX), 128),
+            (None, quil_crypto::persistent_storage::ROOT_BYTES),
+        ] {
+            quil_types::consensus::set_persistent_storage_epoch_for_thread(activation);
+            assert_eq!(max_leaf_root_len() as usize, root_limit);
+            let max = MAX_PREFIX_LEN as usize;
+            let at_limits = vec![group(64, vec![entry(max, root_limit); max])];
+            let cases = [
+                (at_limits, true),
+                (
+                    vec![group(32, Vec::new()); MAX_CONFIRM_LEAF_ROOT_GROUPS],
+                    true,
+                ),
+                (
+                    vec![group(32, Vec::new()); MAX_CONFIRM_LEAF_ROOT_GROUPS + 1],
+                    false,
+                ),
+                (vec![group(65, Vec::new())], false),
+                (vec![group(32, vec![entry(1, 1); max + 1])], false),
+                (vec![group(32, vec![entry(max + 1, 1)])], false),
+                (vec![group(32, vec![entry(1, root_limit + 1)])], false),
+            ];
+            for (index, (groups, fits)) in cases.iter().enumerate() {
+                assert_eq!(
+                    check_confirm_leaf_roots(groups).is_ok(),
+                    *fits,
+                    "case {index}"
+                );
+                assert_eq!(decodes(groups), *fits, "case {index}");
+            }
+            let error = check_confirm_leaf_roots(&[group(1, vec![entry(1, root_limit + 1)])])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!(
+                    "leaf-root group 04: a leaf root of {} bytes (at most {})",
+                    root_limit + 1,
+                    root_limit
+                )),
+                "{error}"
             );
-            assert_eq!(decodes(groups), *fits, "case {index}");
         }
-        let error = check_confirm_leaf_roots(&[group(1, vec![entry(1, 129)])])
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("leaf-root group 04: a leaf root of 129 bytes (at most 128)"),
-            "{error}"
-        );
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
     }
 
     fn sample(sig: bool) -> LeafRootRegistration {

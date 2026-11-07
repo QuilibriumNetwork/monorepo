@@ -21,6 +21,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn scheduled_benchmark_layers() -> u8 {
+    quil_types::consensus::MAINNET_FAST_STORAGE_PROFILE
+        .unwrap_or(quil_types::consensus::StorageSealProfile::Eleven)
+        .layers() as u8
+}
+
 #[derive(Args, Debug)]
 pub struct Arguments {
     /// Measure storage readiness on this disk, starting with an empty scratch directory; exit without joining mainnet.
@@ -50,8 +56,8 @@ pub struct Arguments {
     /// Output artifact; defaults to WORKDIR/report.json.
     #[arg(long, requires = "benchmark_storage")]
     pub benchmark_storage_report: Option<PathBuf>,
-    /// Experimental persistent suite; mainnet activation remains independently gated.
-    #[arg(long, default_value_t = 11, requires = "benchmark_storage")]
+    /// Persistent suite to rehearse; defaults to the scheduled mainnet profile.
+    #[arg(long, default_value_t = scheduled_benchmark_layers(), requires = "benchmark_storage")]
     pub benchmark_storage_layers: u8,
     /// After measured rounds, time full sector regeneration without stored labels.
     /// This is a one-CPU diagnostic, not a GPU/ASIC or partial-storage security assessment.

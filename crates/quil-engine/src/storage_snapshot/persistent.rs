@@ -1058,7 +1058,63 @@ mod tests {
     fn gates(on: bool) {
         quil_types::consensus::set_persistent_storage_epoch_for_thread(on.then_some(1500));
         quil_types::consensus::set_stable_replica_key_epoch_for_thread(on.then_some(1393));
+        // These fixtures intentionally cover existing eleven-layer sectors.
+        quil_types::consensus::set_storage_seal_profile_for_thread(
+            on.then_some(quil_types::consensus::StorageSealProfile::Eleven),
+        );
     }
+    #[test]
+    fn scheduled_mainnet_warmup_builds_three_layer_sectors_for_1444() {
+        gates(false);
+        quil_types::consensus::set_min_sector_nodes_for_thread(Some(64));
+        crate::storage_jobs::set_available_for_test(Some(64 << 30));
+        let graph = super::super::tests::test_crdt();
+        let filter = [0xB4; 32];
+        graph
+            .add_vertex(
+                &quil_hypergraph::Location {
+                    app_address: filter,
+                    data_address: [1; 32],
+                },
+                &[7; 100],
+            )
+            .unwrap();
+        graph.commit(1).unwrap();
+        let captured = capture_at(
+            &graph,
+            &filter,
+            1444,
+            &[current_source(&graph, &filter, 1444)],
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LabelStore::with_space(dir.path().to_owned(), crate::storage_labels::ample_space());
+        let member = [0xC4; 32];
+        prewarm_sectors(&captured, &store, &member).unwrap();
+        let sector = fs::read_dir(home(&store, &member))
+            .unwrap()
+            .flatten()
+            .filter(|entry| sector_directory(&entry.path()))
+            .find_map(|entry| Sector::load(entry.path()).unwrap())
+            .unwrap();
+        assert_eq!(sector.cert.profile, sector::Profile::Three);
+        assert!(
+            !sector.certified,
+            "only committed GLOBAL acknowledgment certifies capacity"
+        );
+        assert_eq!(fs::read(sector.dir.join("reservation")).unwrap().len(), 52);
+        assert!(store
+            .for_profile(sector::Profile::Three)
+            .find(1444, &member, &sector.cert.sector, |n| n == sector.cert.n)
+            .is_some());
+        assert!(store
+            .find(1444, &member, &sector.cert.sector, |_| true)
+            .is_none());
+        quil_types::consensus::set_min_sector_nodes_for_thread(None);
+        crate::storage_jobs::set_available_for_test(None);
+    }
+
     #[test]
     fn sectors_are_labelled_at_no_less_than_the_certified_floor() {
         use quil_types::consensus::{set_min_sector_nodes_for_thread, MIN_SECTOR_NODES};

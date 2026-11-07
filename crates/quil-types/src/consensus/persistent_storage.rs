@@ -1,11 +1,12 @@
 //! Coordinated activation of persistent label certificates and sector roots.
-//! Mainnet deliberately has no activation epoch until the rollout is agreed.
+//! Mainnet persistent certificates and three-layer seals activate at epoch 1444.
 use std::{cell::Cell, sync::OnceLock};
 
-pub const MAINNET_PERSISTENT_STORAGE_EPOCH: Option<u64> = None;
-/// Experimental suites remain disabled on mainnet until both are coordinated.
-pub const MAINNET_FAST_STORAGE_EPOCH: Option<u64> = None;
-pub const MAINNET_FAST_STORAGE_PROFILE: Option<StorageSealProfile> = None;
+pub const MAINNET_PERSISTENT_STORAGE_EPOCH: Option<u64> = Some(1444);
+/// The faster suite switches with the coordinated persistent-storage activation.
+pub const MAINNET_FAST_STORAGE_EPOCH: Option<u64> = MAINNET_PERSISTENT_STORAGE_EPOCH;
+pub const MAINNET_FAST_STORAGE_PROFILE: Option<StorageSealProfile> =
+    Some(StorageSealProfile::Three);
 /// Hard end-to-end startup target; warmup eligibility is a separate rule.
 pub const INITIAL_STORAGE_SETUP_BUDGET_SECS: u64 = 2 * 60 * 60;
 
@@ -175,16 +176,36 @@ pub fn persistent_storage_epoch_thread_override() -> Option<u64> {
 mod tests {
     use super::*;
     #[test]
-    fn mainnet_is_disabled_and_ignores_environment_settings() {
-        assert_eq!(MAINNET_PERSISTENT_STORAGE_EPOCH, None);
+    fn mainnet_activation_is_coordinated_and_ignores_environment_settings() {
+        assert_eq!(MAINNET_PERSISTENT_STORAGE_EPOCH, Some(1444));
         for setting in [None, Some("0"), Some("1393"), Some("bad")] {
-            assert_eq!(configured(0, setting, 1314, 1393), u64::MAX);
+            assert_eq!(configured(0, setting, 1314, 1429), 1444);
         }
         assert_eq!(configured(1, Some("1400"), 1314, 1393), 1400);
         assert_eq!(configured(1, Some("12"), 1314, 1393), 1393);
         assert_eq!(configured(1, None, 1314, 1393), u64::MAX);
         assert_eq!(configured(1, Some("1400"), 1314, u64::MAX), u64::MAX);
     }
+    #[test]
+    fn mainnet_switches_to_three_layers_exactly_at_epoch_1444() {
+        set_persistent_storage_epoch_for_thread(None);
+        set_storage_seal_profile_for_thread(None);
+        assert_eq!(persistent_storage_epoch(), 1444);
+        assert_eq!(1444 * super::super::EPOCH_LENGTH_FRAMES, 1_039_680);
+        assert!(super::super::stable_replica_keys_at(1444));
+        for epoch in [1442, 1443] {
+            assert!(!persistent_storage_at(epoch));
+            assert_eq!(storage_seal_profile(epoch), StorageSealProfile::Eleven);
+        }
+        for epoch in [1444, 1445] {
+            assert!(persistent_storage_at(epoch));
+            assert_eq!(storage_seal_profile(epoch), StorageSealProfile::Three);
+        }
+        set_persistent_storage_epoch_for_thread(Some(u64::MAX));
+        assert_eq!(storage_seal_profile(1444), StorageSealProfile::Eleven);
+        set_persistent_storage_epoch_for_thread(None);
+    }
+
     #[test]
     fn sector_cap_and_floor_are_the_proposed_values() {
         assert_eq!(max_certified_sectors(0), 8);
@@ -219,9 +240,12 @@ mod profile_tests {
     use super::*;
     #[test]
     fn fast_suites_require_both_coordinated_settings_and_persistent_activation() {
-        assert_eq!(MAINNET_FAST_STORAGE_EPOCH, None);
-        assert_eq!(MAINNET_FAST_STORAGE_PROFILE, None);
-        assert_eq!(storage_seal_profile(1500), StorageSealProfile::Eleven);
+        assert_eq!(MAINNET_FAST_STORAGE_EPOCH, Some(1444));
+        assert_eq!(
+            MAINNET_FAST_STORAGE_PROFILE,
+            Some(StorageSealProfile::Three)
+        );
+        assert_eq!(storage_seal_profile(1500), StorageSealProfile::Three);
         for suite in [StorageSealProfile::Two, StorageSealProfile::Three] {
             assert_eq!(
                 profile_at(1499, Some(1500), Some(suite), true),

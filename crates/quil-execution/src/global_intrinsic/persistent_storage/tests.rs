@@ -14,6 +14,9 @@ fn gates(on: bool) {
     quil_types::consensus::set_persistent_storage_epoch_for_thread(on.then_some(1500));
     quil_types::consensus::set_stable_replica_key_epoch_for_thread(on.then_some(1393));
     quil_types::consensus::set_min_sector_nodes_for_thread(on.then_some(32));
+    quil_types::consensus::set_storage_seal_profile_for_thread(
+        on.then_some(sector::Profile::Eleven),
+    );
 }
 fn fixture(
     member: [u8; 32],
@@ -1044,6 +1047,7 @@ fn new_profiles_are_gated_and_known_legacy_capacity_survives_profile_changes() {
     gates(true);
     let member = [13; 32];
     for profile in [sector::Profile::Two, sector::Profile::Three] {
+        quil_types::consensus::set_storage_seal_profile_for_thread(Some(sector::Profile::Eleven));
         let (root, fresh, plain, _) = fixture_for_profile(member, profile);
         let claim = claim(member, root);
         let certificate =
@@ -1081,4 +1085,76 @@ fn new_profiles_are_gated_and_known_legacy_capacity_survives_profile_changes() {
         .is_empty());
     quil_types::consensus::set_storage_seal_profile_for_thread(None);
     gates(false);
+}
+
+#[test]
+fn mainnet_1444_precommits_use_three_layers_within_the_coordinated_warmup() {
+    use quil_types::consensus::{
+        set_min_sector_nodes_for_thread, set_persistent_storage_epoch_for_thread,
+        set_storage_seal_profile_for_thread, EPOCH_LENGTH_FRAMES,
+    };
+    set_persistent_storage_epoch_for_thread(None);
+    set_storage_seal_profile_for_thread(None);
+    set_min_sector_nodes_for_thread(Some(32));
+    let state = state();
+    let member = registered_member(&state);
+    let (root, _, _, _) = fixture_for_profile(member, sector::Profile::Three);
+    let mut message = CapacityMessage {
+        member,
+        epoch: 1444,
+        certificate: root.certificate(32),
+        signed_at: 0,
+        signature: vec![1; 666],
+        proof: Vec::new(),
+    };
+    let before = 1411 * EPOCH_LENGTH_FRAMES + 20;
+    message.signed_at = before;
+    assert!(check_capacity(
+        before,
+        &message.envelope(),
+        &state,
+        &Signature(true),
+        &|_| unreachable!()
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("warmup"));
+    let warmup = 1412 * EPOCH_LENGTH_FRAMES + 20;
+    message.signed_at = warmup;
+    assert_eq!(
+        check_capacity(
+            warmup,
+            &message.envelope(),
+            &state,
+            &Signature(true),
+            &|_| unreachable!()
+        )
+        .unwrap()
+        .len(),
+        1
+    );
+    message.epoch = 1443;
+    assert!(check_capacity(
+        warmup,
+        &message.envelope(),
+        &state,
+        &Signature(true),
+        &|_| unreachable!()
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("inactive"));
+    message.epoch = 1444;
+    message.certificate.profile = sector::Profile::Two;
+    assert!(check_capacity(
+        warmup,
+        &message.envelope(),
+        &state,
+        &Signature(true),
+        &|_| unreachable!()
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("not activated"));
+    set_min_sector_nodes_for_thread(None);
 }

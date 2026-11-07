@@ -1354,8 +1354,9 @@ mod tests {
         assert_eq!(grouped.len(), 2);
         assert!(grouped.iter().all(|part| part.len() == 1));
         assert!(proving_bytes(&grouped[0]).unwrap() > 0);
-        quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(u64::MAX));
         assert_eq!(chunks(parts, usize::MAX, usize::MAX).len(), 1);
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
     }
 
     /// Two settling parts of different shards at epoch 1500, each its own
