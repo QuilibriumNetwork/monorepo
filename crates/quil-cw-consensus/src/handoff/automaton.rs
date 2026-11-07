@@ -65,6 +65,23 @@ pub struct HandoffProposer {
     /// Asked, when a leader cannot read its parent, whether it is behind
     /// for longer than its waits last ([`Self::with_behind_probe`]).
     behind: Option<BehindProbe>,
+    /// Votes waiting for the GLOBAL state sync the probe names
+    /// ([`Self::with_behind_probe`]).
+    sync_waits: std::sync::Mutex<SyncWaits>,
+}
+
+/// Votes whose parent read waited for a GLOBAL state sync to install, and
+/// how those waits ended since the last summary line.
+#[derive(Default)]
+struct SyncWaits {
+    /// The views waiting now, each with when it began.
+    waiting: Vec<(u64, std::time::Instant)>,
+    /// Waits that ended in a complete check.
+    checked: u64,
+    /// Waits the vote's patience ended (the proposal was refused).
+    gave_up: u64,
+    longest: std::time::Duration,
+    summarized: Option<std::time::Instant>,
 }
 
 /// Why this member is behind its committee for longer than a leader's
@@ -115,6 +132,21 @@ const PARENT_WAITS: u32 = 12;
 /// The refusal of a proposal whose body has not reached this member.
 pub const BLOCK_NOT_DELIVERED: &str = "block not delivered";
 
+/// The refusal of a proposal whose selected parent this member cannot read.
+pub const PARENT_UNAVAILABLE: &str = "parent unavailable";
+
+/// How often a vote whose parent read a GLOBAL state sync withholds is
+/// checked again; the adapter's `VERIFY_PATIENCE` bounds the wait.
+pub const GLOBAL_SYNC_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Views whose votes are tracked waiting at once; past it the oldest is
+/// forgotten (its end goes uncounted).
+const SYNC_WAIT_VIEWS: usize = 8;
+
+/// Shortest interval between two summary lines of the votes that waited for
+/// a GLOBAL state sync.
+const SYNC_WAIT_SUMMARY: std::time::Duration = std::time::Duration::from_secs(600);
+
 impl HandoffProposer {
     pub fn new(
         inner: Arc<dyn GlobalProposer>,
@@ -135,6 +167,7 @@ impl HandoffProposer {
             checkpoint_votes: None,
             closing_probe: None,
             behind: None,
+            sync_waits: Default::default(),
         })
     }
 
@@ -147,6 +180,13 @@ impl HandoffProposer {
     /// propose at once; it proposes again at its first turn after the probe
     /// clears. A member whose read succeeds, or that is not behind, is
     /// unchanged.
+    ///
+    /// A vote, unlike a turn, holds up no one: one whose parent read fails
+    /// while the probe names a GLOBAL state sync waits for it to install
+    /// ([`GLOBAL_SYNC_WAIT`], within the adapter's patience), then is checked
+    /// in full. Refused at once, it cost this member the view's certificate
+    /// signatures: a few views per sync on every worker of a regular node
+    /// (mainnet, 2026-11-06).
     pub fn with_behind_probe(mut self, probe: Option<BehindProbe>) -> Self {
         self.behind = probe;
         self
@@ -312,8 +352,7 @@ impl HandoffProposer {
                 format!("view {}, parent view {}", context.view, context.parent_view),
             ));
         }
-        let parent =
-            (reader)(context).map_err(|error| ("parent unavailable", error.to_string()))?;
+        let parent = (reader)(context).map_err(|error| (PARENT_UNAVAILABLE, error.to_string()))?;
         let checkpoint = &parent.checkpoint;
         let differs = |what: &str| {
             (
@@ -481,8 +520,7 @@ impl HandoffProposer {
         let Some((_, read_tip)) = self.seal_parents.as_ref() else {
             return Err(("selected parent is a terminal seal", String::new()));
         };
-        let mut tip =
-            read_tip(context).map_err(|error| ("parent unavailable", error.to_string()))?;
+        let mut tip = read_tip(context).map_err(|error| (PARENT_UNAVAILABLE, error.to_string()))?;
         // A seal can be built above privately executed data that is notarized
         // but not finalized. Requiring that data to materialize before its
         // seal can finalize leaves every later view unable to extend it.
@@ -553,6 +591,89 @@ impl HandoffProposer {
         } else {
             (context.view, 1)
         };
+    }
+
+    /// The wait for a vote whose parent read failed, while the probe names
+    /// a GLOBAL state sync installing ([`Self::with_behind_probe`]); `None`
+    /// refuses the vote at once, as before.
+    fn sync_wait(&self, context: ProposalContext) -> Option<std::time::Duration> {
+        let why = self.behind.as_ref().and_then(|probe| probe())?;
+        let now = std::time::Instant::now();
+        let began = {
+            let mut waits = self.sync_waits.lock().unwrap_or_else(|e| e.into_inner());
+            match waits.waiting.iter().find(|(view, _)| *view == context.view) {
+                Some((_, began)) => *began,
+                None => {
+                    if waits.waiting.len() >= SYNC_WAIT_VIEWS {
+                        waits.waiting.remove(0);
+                    }
+                    waits.waiting.push((context.view, now));
+                    now
+                }
+            }
+        };
+        // Counted under this reason if the vote's patience runs out first.
+        self.note(
+            Step::Verify,
+            context,
+            PARENT_UNAVAILABLE,
+            format!(
+                "{why}; the vote waited {} ms for it",
+                now.duration_since(began).as_millis()
+            ),
+        );
+        Some(GLOBAL_SYNC_WAIT)
+    }
+
+    /// The vote for `context` stopped waiting for a GLOBAL state sync:
+    /// checked in full, or refused when its patience ran out (`gave_up`).
+    /// Summarized in one line at most every [`SYNC_WAIT_SUMMARY`].
+    fn sync_wait_ended(&self, context: ProposalContext, gave_up: bool) {
+        let mut waits = self.sync_waits.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(index) = waits
+            .waiting
+            .iter()
+            .position(|(view, _)| *view == context.view)
+        else {
+            return;
+        };
+        let (_, began) = waits.waiting.remove(index);
+        let now = std::time::Instant::now();
+        waits.longest = waits.longest.max(now.duration_since(began));
+        if gave_up {
+            waits.gave_up += 1;
+        } else {
+            waits.checked += 1;
+        }
+        if waits
+            .summarized
+            .is_some_and(|at| now.duration_since(at) < SYNC_WAIT_SUMMARY)
+        {
+            return;
+        }
+        let since = waits.summarized.replace(now);
+        let filter: String = self
+            .session
+            .filter
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        tracing::info!(
+            %filter,
+            generation = self.session.generation,
+            checked = waits.checked,
+            gave_up = waits.gave_up,
+            longest_ms = waits.longest.as_millis() as u64,
+            since_secs = since.map(|at| now.duration_since(at).as_secs()),
+            scope = "this worker",
+            action = "an expected wait: a vote whose parent is withheld while this node's GLOBAL \
+                      state sync installs is checked once it lands; gave_up counts votes the sync \
+                      outlasted, refused as 'parent unavailable'",
+            "votes waited for a GLOBAL state sync to install before checking their parent"
+        );
+        waits.checked = 0;
+        waits.gave_up = 0;
+        waits.longest = std::time::Duration::ZERO;
     }
 }
 
@@ -681,7 +802,32 @@ impl GlobalProposer for HandoffProposer {
     }
 
     fn verify_patience_ran_out(&self, context: ProposalContext, waited: std::time::Duration) {
+        self.sync_wait_ended(context, true);
         self.inner.verify_patience_ran_out(context, waited)
+    }
+
+    /// [`Self::verify_with_context`], waiting while a GLOBAL state sync
+    /// withholds the parent read ([`Self::with_behind_probe`]).
+    fn verify_or_defer(
+        &self,
+        context: ProposalContext,
+        digest: Digest,
+        bytes: Option<Vec<u8>>,
+    ) -> std::result::Result<bool, std::time::Duration> {
+        if let Some(delay) = bytes
+            .as_deref()
+            .and_then(|bytes| self.verify_delay(context, bytes))
+        {
+            return Err(delay);
+        }
+        let verdict = self.check(context, digest, bytes);
+        if verdict.is_none() {
+            if let Some(delay) = self.sync_wait(context) {
+                return Err(delay);
+            }
+        }
+        self.sync_wait_ended(context, false);
+        Ok(verdict.unwrap_or(false))
     }
 
     fn verify_with_context(
@@ -690,23 +836,36 @@ impl GlobalProposer for HandoffProposer {
         digest: Digest,
         bytes: Option<Vec<u8>>,
     ) -> bool {
+        self.check(context, digest, bytes).unwrap_or(false)
+    }
+}
+
+impl HandoffProposer {
+    /// The vote's complete check; `None` when the selected parent could not
+    /// be read ([`PARENT_UNAVAILABLE`], noted), which a wait may clear.
+    fn check(
+        &self,
+        context: ProposalContext,
+        digest: Digest,
+        bytes: Option<Vec<u8>>,
+    ) -> Option<bool> {
         let Some(bytes) = bytes else {
             tracing::debug!(view = context.view, parent_view = context.parent_view,
                 session = %digest_from_identity(self.session_id), "handoff verify: proposal bytes unavailable");
             self.note(Step::Verify, context, BLOCK_NOT_DELIVERED, String::new());
-            return false;
+            return Some(false);
         };
         if let Some(sealed) = self.selected_seal(context) {
-            return self.verify_reseal(context, &sealed, digest, &bytes);
+            return Some(self.verify_reseal(context, &sealed, digest, &bytes));
         }
         let (parent, committed) = match self.parent_or_private(context, true) {
             Ok(parent) => parent,
             Err((reason, detail)) => {
                 if let Some(sealed) = self.recognised_seal(context) {
-                    return self.verify_reseal(context, &sealed, digest, &bytes);
+                    return Some(self.verify_reseal(context, &sealed, digest, &bytes));
                 }
                 self.note(Step::Verify, context, reason, detail);
-                return false;
+                return (reason != PARENT_UNAVAILABLE).then_some(false);
             }
         };
         if Seal::is_encoding(&bytes) {
@@ -726,11 +885,11 @@ impl GlobalProposer for HandoffProposer {
                     "seal while no closing request",
                     detail,
                 );
-                return false;
+                return Some(false);
             };
             let Ok(seal) = Seal::decode(&bytes) else {
                 self.note(Step::Verify, context, "undecodable seal", String::new());
-                return false;
+                return Some(false);
             };
             if seal.request == request && seal.session == self.session_id {
                 self.vote_roots(&seal.checkpoint, &parent.checkpoint);
@@ -780,10 +939,10 @@ impl GlobalProposer for HandoffProposer {
                         parent.checkpoint.frame, parent.checkpoint.view,
                     ),
                 );
-                return false;
+                return Some(false);
             }
-            return valid;
+            return Some(valid);
         }
-        self.inner.verify_with_context(context, digest, Some(bytes))
+        Some(self.inner.verify_with_context(context, digest, Some(bytes)))
     }
 }

@@ -24,6 +24,7 @@ use commonware_utils::{
 use quil_cw_consensus::{
     adapters::{
         BlockStore, FrameFinalizer, FrameSink, GlobalProposer, Liveness, ProposalContext, Step,
+        VERIFY_PATIENCE,
     },
     engine_host::{build_global_engine, GlobalEngineParams},
     falcon_base::{FalconPrivateKey, FalconPublicKey},
@@ -1055,6 +1056,100 @@ fn only_a_behind_leader_gives_its_turn_up_at_once() {
     let before = asked.load(Ordering::SeqCst);
     assert!(proposer.propose_with_context(next).is_some());
     assert_eq!(asked.load(Ordering::SeqCst), before);
+}
+
+/// A vote whose parent read a GLOBAL state sync withholds (11-27 s every
+/// 5 min on a regular node) waits for the sync to install, then is checked
+/// in full: refused at once, it cost the member the view's certificate
+/// signatures. A parent unreadable without a sync, and any other refusal
+/// during one, are answered at once; a sync that outlasts the vote's
+/// patience is refused as before, naming the sync.
+#[test]
+fn a_vote_waits_for_a_global_state_sync_then_is_checked() {
+    let (session, _) = session();
+    let parent = genesis(&session);
+    let syncing = Arc::new(AtomicBool::new(true));
+    let probe: BehindProbe = {
+        let syncing = syncing.clone();
+        Arc::new(move || {
+            syncing
+                .load(Ordering::SeqCst)
+                .then(|| "execution unavailable: global state sync in progress".to_string())
+        })
+    };
+    let liveness = Arc::new(Liveness::default());
+    let proposer = HandoffProposer::new(
+        Arc::new(DataProposer),
+        session.clone(),
+        selected_parent(&session, Some(syncing.clone())),
+    )
+    .unwrap()
+    .with_behind_probe(Some(probe))
+    .with_liveness(Some(liveness.clone()));
+
+    // While the sync installs, the vote waits; once it landed, it is checked.
+    let first = context(&session, &parent, 1);
+    let (digest, bytes) = DataProposer.propose(1, first.parent).unwrap();
+    for _ in 0..3 {
+        assert!(
+            proposer
+                .verify_or_defer(first, digest, Some(bytes.clone()))
+                .is_err(),
+            "a vote whose parent a GLOBAL state sync withholds was refused at once"
+        );
+    }
+    syncing.store(false, Ordering::SeqCst);
+    assert_eq!(
+        proposer.verify_or_defer(first, digest, Some(bytes.clone())),
+        Ok(true)
+    );
+    liveness.settle(Step::Verify, 1, true);
+
+    // Another refusal during a sync is answered at once.
+    syncing.store(true, Ordering::SeqCst);
+    let other_epoch = ProposalContext {
+        epoch: session.generation + 1,
+        ..context(&session, &parent, 2)
+    };
+    assert_eq!(
+        proposer.verify_or_defer(other_epoch, digest, Some(bytes.clone())),
+        Ok(false),
+        "another refusal waited for the sync"
+    );
+    liveness.settle(Step::Verify, 2, false);
+
+    // A sync that outlasts the vote's patience: refused, naming the sync.
+    let third = context(&session, &parent, 3);
+    let (digest, bytes) = DataProposer.propose(3, third.parent).unwrap();
+    assert!(proposer
+        .verify_or_defer(third, digest, Some(bytes.clone()))
+        .is_err());
+    proposer.verify_patience_ran_out(third, VERIFY_PATIENCE);
+    liveness.settle(Step::Verify, 3, false);
+    let decided = liveness.decisions();
+    assert_eq!(decided.accepted, 1);
+    assert_eq!(decided.refused.get("parent unavailable"), Some(&1));
+    let last = decided.last_refused.unwrap();
+    assert_eq!(last.view, 3);
+    assert!(
+        last.detail.contains("global state sync in progress") && last.detail.contains("waited"),
+        "the refusal names the sync and its wait: {}",
+        last.detail
+    );
+
+    // Without a sync, an unreadable parent is refused at once, as before.
+    let quiet = HandoffProposer::new(
+        Arc::new(DataProposer),
+        session.clone(),
+        reader(Arc::new(Mutex::new(None))),
+    )
+    .unwrap()
+    .with_behind_probe(Some(Arc::new(|| None)));
+    assert_eq!(
+        quiet.verify_or_defer(first, digest, Some(bytes)),
+        Ok(false),
+        "a vote waited without a sync"
+    );
 }
 
 /// [`DataProposer`] counting the proposals it builds.
