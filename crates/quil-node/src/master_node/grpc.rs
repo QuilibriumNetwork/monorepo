@@ -3580,8 +3580,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                 );
                 tokio::task::spawn_blocking(move || {
                     let now = quil_engine::worker_execution::now_ms();
-                    let workers =
-                        health_workers(&view, registry.as_ref(), &prover_address, head.effective());
+                    let frame = head.effective();
+                    let workers = health_workers(&view, registry.as_ref(), &prover_address, frame);
+                    let allocations = prover_allocations(registry.as_ref(), &prover_address, frame);
                     let observed = health_global(&global.0, &global.1);
                     let transitions = {
                         let cadence = cadence.lock().unwrap_or_else(|e| e.into_inner());
@@ -3589,6 +3590,10 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                         health.observe_global(observed, now);
                         health.observe_workers(workers, now);
                         observe_global_progress(&mut health, &head, now);
+                        if let Some(allocations) = allocations {
+                            let epoch = quil_types::consensus::epoch_for_frame(frame);
+                            health.observe_allocations(allocations, epoch, now);
+                        }
                         health.evaluate(now, &|filter: &[u8]| cadence.snapshot(filter, now / 1000))
                     };
                     for transition in &transitions {
@@ -4803,6 +4808,7 @@ fn health_workers(
         .filter(|w| w.allocated && !w.filter.is_empty())
         .map(|w| {
             let e = w.execution.as_ref();
+            let recovery = e.and_then(|e| e.recovery.as_ref());
             quil_rpc::health_conditions::WorkerObservation {
                 core_id: w.core_id,
                 filter: w.filter.clone(),
@@ -4812,6 +4818,67 @@ fn health_workers(
                 observed_unix_ms: e.map_or(0, |e| e.observed_unix_ms),
                 materialized_frame: e.and_then(|e| e.materialized_frame),
                 last_advance_unix_ms: e.map_or(0, |e| e.last_advance_unix_ms),
+                recovery_error_unix_ms: recovery.map_or(0, |r| r.last_error_unix_ms),
+                recovery_outcome_unix_ms: recovery.map_or(0, |r| r.last_outcome_unix_ms),
+            }
+        })
+        .collect()
+}
+
+/// This prover's allocations at `frame` as the health conditions judge
+/// them; `None` without a frame or a readable prover registry, which
+/// establishes nothing.
+fn prover_allocations(
+    registry: &dyn quil_types::consensus::ProverRegistry,
+    prover_address: &[u8],
+    frame: u64,
+) -> Option<Vec<quil_rpc::health_conditions::AllocationObservation>> {
+    if frame == 0 {
+        return None;
+    }
+    match registry.get_prover_info(prover_address) {
+        Ok(prover) => Some(prover.map_or_else(Vec::new, |p| health_allocations(&p, frame))),
+        Err(error) => {
+            debug!(%error, "health conditions without allocations: prover registry unavailable");
+            None
+        }
+    }
+}
+
+/// `prover`'s shard allocations at `frame`: each one's effective status and,
+/// for one lost (rejected, kicked, or a join that missed its confirm
+/// window), the epoch it was lost in. The global allocation serves no shard
+/// and is left out.
+fn health_allocations(
+    prover: &quil_types::consensus::ProverInfo,
+    frame: u64,
+) -> Vec<quil_rpc::health_conditions::AllocationObservation> {
+    use quil_types::consensus::{epoch_for_frame, EffectiveStatus};
+    let epoch_of = |frame: u64| (frame > 0).then(|| epoch_for_frame(frame));
+    prover
+        .allocations
+        .iter()
+        .filter(|a| !a.confirmation_filter.is_empty())
+        .map(|a| {
+            let status = a.effective_status(frame);
+            let lost_epoch = match status {
+                EffectiveStatus::Rejected => {
+                    epoch_of(a.kick_frame_number.max(a.join_reject_frame_number))
+                }
+                EffectiveStatus::Kicked => {
+                    epoch_of(a.kick_frame_number.max(prover.kick_frame_number))
+                }
+                // A join must be confirmed in the epoch after its proposal;
+                // from the next one it reads as implicitly rejected.
+                EffectiveStatus::ExpiredJoining => {
+                    epoch_of(a.join_frame_number).map(|epoch| epoch + 2)
+                }
+                _ => None,
+            };
+            quil_rpc::health_conditions::AllocationObservation {
+                filter: a.confirmation_filter.clone(),
+                status,
+                lost_epoch,
             }
         })
         .collect()
@@ -5732,7 +5799,7 @@ mod composite_scan_tests {
 
 #[cfg(test)]
 mod owned_filter_tests {
-    use super::owned_filters;
+    use super::{health_allocations, owned_filters};
     use quil_types::consensus::{
         EffectiveStatus, ProverAllocationInfo, ProverInfo, ProverRegistry, ProverShardSummary,
         ProverStatus,
@@ -5886,6 +5953,45 @@ mod owned_filter_tests {
         // Frame 5000 is epoch 6; a join proposed in epoch 0 had to be
         // confirmed in epoch 1, so it reads as implicitly rejected.
         assert!(owned_filters(&reg, &ADDRESS, 5_000).is_empty());
+    }
+
+    /// A lost seat carries the epoch it was lost in: a kick or rejection by
+    /// its frame, a join that missed its confirm window from the second
+    /// epoch after its proposal; without a frame the epoch is unknown. The
+    /// global allocation serves no shard and is left out.
+    #[test]
+    fn health_allocations_date_each_lost_seat() {
+        let mut kicked = allocation(&[1; 4], ProverStatus::Rejected, 100);
+        kicked.kick_frame_number = 1_500;
+        let mut rejected = allocation(&[2; 4], ProverStatus::Rejected, 100);
+        rejected.join_reject_frame_number = 800;
+        let undated = allocation(&[3; 4], ProverStatus::Kicked, 100);
+        let mut expired = allocation(&[4; 4], ProverStatus::Joining, 100);
+        expired.join_frame_number = 100;
+        let global = allocation(&[], ProverStatus::Active, 100);
+        let reg = registry(vec![
+            kicked,
+            rejected,
+            undated,
+            expired,
+            allocation(&FILTER, ProverStatus::Paused, 100),
+            global,
+        ]);
+        let seats = health_allocations(&reg.provers[0], 5_000);
+        let seen: Vec<(Vec<u8>, EffectiveStatus, Option<u64>)> = seats
+            .into_iter()
+            .map(|a| (a.filter, a.status, a.lost_epoch))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (vec![1; 4], EffectiveStatus::Rejected, Some(2)),
+                (vec![2; 4], EffectiveStatus::Rejected, Some(1)),
+                (vec![3; 4], EffectiveStatus::Kicked, None),
+                (vec![4; 4], EffectiveStatus::ExpiredJoining, Some(2)),
+                (FILTER.to_vec(), EffectiveStatus::Paused, None),
+            ]
+        );
     }
 
     #[test]

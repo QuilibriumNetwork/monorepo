@@ -11,6 +11,10 @@ pub fn state_at(s: Option<&WorkerExecution>, now: u64) -> &str {
     if s.observed_unix_ms == 0 || now.saturating_sub(s.observed_unix_ms) > 30_000 {
         return "stale";
     }
+    reported_state(s)
+}
+/// The phase the worker reports, without judging its age: the node does.
+pub fn reported_state(s: &WorkerExecution) -> &str {
     // Older nodes classified this expected lifecycle wait as a blocker.
     if s.state == "blocked" && s.blocker == "awaiting successor" {
         return "handoff";
@@ -52,16 +56,17 @@ pub fn age_bucket(timestamp: u64) -> &'static str {
     }
 }
 /// Keep the ordinary row footer focused on the current recovery phase. A
-/// failure notes only while the worker is behind: once it has caught up by
-/// another path the failed attempt is history, which the expanded footer keeps.
-pub fn recovery_summary(r: &ShardRecovery, caught_up: bool) -> String {
+/// failure notes only while the node reports the recovery failing: once the
+/// worker has caught up by another path the failed attempt is history, which
+/// the expanded footer keeps.
+pub fn recovery_summary(r: &ShardRecovery, failing: bool) -> String {
     let phase = if r.phase.is_empty() {
         "unknown"
     } else {
         &r.phase
     };
     let mut text = format!("Recovery: {phase} ({})", age_bucket(r.phase_since_unix_ms));
-    if r.last_error_unix_ms > r.last_outcome_unix_ms && !caught_up {
+    if failing {
         text += " | Last recovery attempt failed; expand for details";
     }
     text
@@ -267,14 +272,12 @@ mod tests {
         r.phase_since_unix_ms = now_ms().saturating_sub(61_000);
         r.last_error_unix_ms = 20;
         r.last_outcome_unix_ms = 10;
-        assert!(recovery_summary(&r, false).contains("idle (>60s) | Last recovery attempt failed"));
+        assert!(recovery_summary(&r, true).contains("idle (>60s) | Last recovery attempt failed"));
         assert_eq!(
-            recovery_summary(&r, true),
+            recovery_summary(&r, false),
             "Recovery: idle (>60s)",
-            "a caught-up worker no longer shows the old failure"
+            "a failure the node no longer reports is history"
         );
-        r.last_outcome_unix_ms = 30;
-        assert_eq!(recovery_summary(&r, false), "Recovery: idle (>60s)");
         let mut seal = SessionSeal {
             generation: 4,
             checkpoint: 9,

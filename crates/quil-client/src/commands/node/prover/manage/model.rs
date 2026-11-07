@@ -2,7 +2,7 @@
 //! `manageModel` (`client/cmd/node/prover/manage_model.go`) — the state
 //! struct, data-refresh processing, and the filter/sort derivations.
 
-use super::super::local_execution::{execution_label, local_execution_state, state_at};
+use super::super::local_execution::{execution_label, reported_state};
 use std::collections::{HashMap, HashSet};
 
 use quil_types::proto::diagnostics::{ConditionKind, HealthCondition, HealthConditions};
@@ -604,8 +604,8 @@ pub struct Model {
     pub shard_last_duration: Option<std::time::Duration>,
     pub shard_error: Option<String>,
     pub cached_shard_info: Option<GetShardInfoResponse>,
-    /// Receipt clock of the last successful worker snapshot; cache reuse cannot reset it.
-    pub worker_snapshot_received: Option<(std::time::Instant, u64)>,
+    /// Receipt time of the last successful worker snapshot; cache reuse cannot reset it.
+    pub worker_snapshot_received: Option<std::time::Instant>,
     pub cached_worker_info: Option<WorkerInfoResponse>,
 
     // Broadcast accumulator for the await loop.
@@ -708,33 +708,31 @@ impl Model {
         if row.execution.is_none() && matches!(row.status_name.as_str(), "joining" | "activating") {
             "-"
         } else {
-            execution_label(self.execution_state(row.execution.as_ref()))
+            execution_label(self.execution_state(row))
         }
     }
 
     /// Classify node observation age at receipt, separately from client cache age.
-    pub fn execution_state<'a>(
-        &self,
-        execution: Option<&'a quil_types::proto::node::WorkerExecution>,
-    ) -> &'a str {
-        self.execution_state_at(execution, std::time::Instant::now())
+    pub fn execution_state<'a>(&self, row: &'a AllocationRow) -> &'a str {
+        self.execution_state_at(row, std::time::Instant::now())
     }
 
-    fn execution_state_at<'a>(
-        &self,
-        execution: Option<&'a quil_types::proto::node::WorkerExecution>,
-        now: std::time::Instant,
-    ) -> &'a str {
-        if execution.is_none() {
+    /// `cached` once this manager's worker answer outlived its budget, `stale`
+    /// while the node reports the worker's observation stale on its own
+    /// clock, else the phase the worker reports.
+    fn execution_state_at<'a>(&self, row: &'a AllocationRow, now: std::time::Instant) -> &'a str {
+        let Some(execution) = row.execution.as_ref() else {
             return "unknown";
-        }
-        let Some((received, wall_ms)) = self.worker_snapshot_received else {
-            return local_execution_state(execution);
         };
-        if now.saturating_duration_since(received).as_secs() > self.refresh_seconds * 2 + 30 {
+        if self.worker_snapshot_received.is_some_and(|received| {
+            now.saturating_duration_since(received).as_secs() > self.refresh_seconds * 2 + 30
+        }) {
             return "cached";
         }
-        state_at(execution, wall_ms)
+        if self.worker_flagged(ConditionKind::WorkerObservationsStale, row) {
+            return "stale";
+        }
+        reported_state(execution)
     }
 
     /// `epochFrame` — frame the client uses for epoch-aligned lifecycle math.
@@ -971,13 +969,44 @@ impl Model {
     /// The node's current conditions, from a fresh health report; none from
     /// an old or missing one.
     pub fn health_conditions(&self) -> &[HealthCondition] {
+        self.fresh_health()
+            .map_or(&[], |health| health.conditions.as_slice())
+    }
+
+    /// The node's health report while it is fresh.
+    fn fresh_health(&self) -> Option<&HealthConditions> {
         let fresh = self
             .health_received
             .is_some_and(|t| t.elapsed().as_secs() <= self.refresh_seconds * 2 + 30);
         match &self.health {
-            HealthAnswer::Reported(health) if fresh => health.conditions.as_slice(),
-            _ => &[],
+            HealthAnswer::Reported(health) if fresh => Some(health),
+            _ => None,
         }
+    }
+
+    /// Whether a fresh report says the node judged `kind` on fresh
+    /// observations, so the kind's absence means nothing is wrong rather
+    /// than nothing observed.
+    pub fn condition_judged(&self, kind: ConditionKind) -> bool {
+        self.fresh_health().is_some_and(|health| {
+            health
+                .sources
+                .iter()
+                .any(|s| s.kind == kind as i32 && s.observed_unix_ms != 0)
+        })
+    }
+
+    /// Whether the node's current `kind` condition lists the allocation's
+    /// shard.
+    pub fn allocation_flagged(&self, kind: ConditionKind, row: &AllocationRow) -> bool {
+        self.condition_affects(kind, &row.filter, None)
+    }
+
+    /// Whether the node's current `kind` condition lists the row's worker on
+    /// its shard.
+    pub fn worker_flagged(&self, kind: ConditionKind, row: &AllocationRow) -> bool {
+        u32::try_from(row.worker_id)
+            .is_ok_and(|core| self.condition_affects(kind, &row.filter, Some(core)))
     }
 
     /// Whether the node's current `kind` condition lists `filter` (and,
@@ -1036,13 +1065,7 @@ impl Model {
         };
         let worker_info = match worker_info {
             Some(w) => {
-                self.worker_snapshot_received = Some((
-                    std::time::Instant::now(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                ));
+                self.worker_snapshot_received = Some(std::time::Instant::now());
                 self.cached_worker_info = Some(w.clone());
                 Some(w)
             }
@@ -2389,6 +2412,26 @@ mod tests {
         assert!(m.local_app_stalled(&[3], 7));
         assert!(!m.local_app_stalled(&[3], 8), "another worker on it");
         assert!(!m.local_app_stalled(&[3], -1), "no worker");
+        m.process_refresh_data(
+            Some(NodeInfoResponse::default()),
+            None,
+            Some(WorkerInfoResponse {
+                worker_info: vec![quil_types::proto::node::WorkerInfo {
+                    core_id: 7,
+                    filter: vec![3],
+                    ..Default::default()
+                }],
+            }),
+        );
+        let mut row = m.allocations[0].clone();
+        assert!(m.worker_flagged(ConditionKind::LocalAppFramesUnchanged, &row));
+        assert!(m.allocation_flagged(ConditionKind::LocalAppFramesUnchanged, &row));
+        row.worker_id = 8;
+        assert!(!m.worker_flagged(ConditionKind::LocalAppFramesUnchanged, &row));
+        row.worker_id = -1;
+        assert!(!m.worker_flagged(ConditionKind::LocalAppFramesUnchanged, &row));
+        assert!(m.allocation_flagged(ConditionKind::LocalAppFramesUnchanged, &row));
+        assert!(!m.allocation_flagged(ConditionKind::PeerAppFramesUnchanged, &row));
         m.health_received = Some(std::time::Instant::now() - std::time::Duration::from_secs(61));
         assert!(!m.reported_app_stalled(&[1]), "an old report");
         m.health_received = Some(std::time::Instant::now());
@@ -2954,51 +2997,90 @@ mod execution_freshness_tests {
     use quil_types::proto::node::WorkerExecution;
     use std::time::{Duration, Instant};
 
+    /// The Execution state: `cached` once this manager's worker answer
+    /// outlived its budget at any poll interval, `stale` only while the node
+    /// reports the worker's observation stale, else the phase the worker
+    /// reports, however old it looks on this client's clock.
     #[test]
-    fn all_poll_options_preserve_fresh_received_state_and_bound_cached_data() {
-        let received = Instant::now();
-        let fresh = WorkerExecution {
+    fn execution_is_stale_by_the_node_and_cached_by_the_answer_age() {
+        use quil_types::proto::diagnostics::AffectedShard;
+        use quil_types::proto::node::WorkerInfo;
+        let blocked = WorkerExecution {
             state: "blocked".into(),
-            observed_unix_ms: 99_000,
-            ..Default::default()
-        };
-        let old = WorkerExecution {
-            state: "running".into(),
-            observed_unix_ms: 69_999,
+            observed_unix_ms: 1,
             ..Default::default()
         };
         for seconds in [5, 15, 30, 60] {
             let mut m = Model::new();
             m.refresh_seconds = seconds;
-            m.worker_snapshot_received = Some((received, 100_000));
-            assert_eq!(
-                m.execution_state_at(Some(&fresh), received + Duration::from_secs(seconds + 15)),
-                "blocked"
+            m.process_refresh_data(
+                Some(NodeInfoResponse::default()),
+                None,
+                Some(WorkerInfoResponse {
+                    worker_info: vec![WorkerInfo {
+                        core_id: 7,
+                        filter: vec![1],
+                        execution: Some(blocked.clone()),
+                        ..Default::default()
+                    }],
+                }),
             );
-            assert_eq!(
-                m.execution_state_at(
-                    Some(&fresh),
-                    received + Duration::from_secs(seconds * 2 + 30)
-                ),
-                "blocked"
-            );
-            assert_eq!(
-                m.execution_state_at(
-                    Some(&fresh),
-                    received + Duration::from_secs(seconds * 2 + 31)
-                ),
-                "cached"
-            );
-            assert_eq!(m.execution_state_at(Some(&old), received), "stale");
-            assert_eq!(
-                m.execution_state_at(Some(&WorkerExecution::default()), received),
-                "stale"
-            );
-            assert_eq!(
-                m.execution_state_at(None, received + Duration::from_secs(500)),
-                "unknown"
-            );
+            let received = m.worker_snapshot_received.unwrap();
+            let row = m.allocations[0].clone();
+            let at =
+                |m: &Model, secs| m.execution_state_at(&row, received + Duration::from_secs(secs));
+            assert_eq!(at(&m, seconds * 2 + 30), "blocked", "an old observation");
+            assert_eq!(at(&m, seconds * 2 + 31), "cached");
+            m.health = HealthAnswer::Reported(HealthConditions {
+                conditions: vec![HealthCondition {
+                    kind: ConditionKind::WorkerObservationsStale as i32,
+                    shards: vec![AffectedShard {
+                        filter: vec![1],
+                        core_id: 7,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                sources: Vec::new(),
+            });
+            m.health_received = Some(Instant::now());
+            assert_eq!(at(&m, 0), "stale");
+            let mut other = row.clone();
+            other.worker_id = 8;
+            assert_eq!(m.execution_state_at(&other, received), "blocked");
+            other.execution = None;
+            assert_eq!(m.execution_state_at(&other, received), "unknown");
         }
+    }
+
+    /// A kind the node judged on fresh observations, in a fresh report, is
+    /// known; one it did not observe, or an old report, is not.
+    #[test]
+    fn a_kind_is_judged_only_from_a_fresh_source() {
+        use quil_types::proto::diagnostics::ConditionSource;
+        let mut m = Model::new();
+        let kind = ConditionKind::RecoveryFailing;
+        assert!(!m.condition_judged(kind));
+        m.health = HealthAnswer::Reported(HealthConditions {
+            conditions: Vec::new(),
+            sources: vec![
+                ConditionSource {
+                    kind: kind as i32,
+                    observed_unix_ms: 5,
+                    tracked: 1,
+                },
+                ConditionSource {
+                    kind: ConditionKind::AllocationsPaused as i32,
+                    observed_unix_ms: 0,
+                    tracked: 0,
+                },
+            ],
+        });
+        m.health_received = Some(Instant::now());
+        assert!(m.condition_judged(kind));
+        assert!(!m.condition_judged(ConditionKind::AllocationsPaused));
+        m.health_received = Some(Instant::now() - Duration::from_secs(61));
+        assert!(!m.condition_judged(kind));
     }
 
     #[test]
