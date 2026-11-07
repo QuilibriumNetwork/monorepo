@@ -44,7 +44,8 @@ const SUGGESTED_WAIT_SECS: u64 = 600;
 pub(crate) struct Follow {
     /// `--wait`: zero prints the identifiers and returns.
     pub(crate) wait: std::time::Duration,
-    /// Page budget of a coin scan for the operation's coins.
+    /// Page cap of a coin scan for the operation's coins: `--max-pages`, else
+    /// none.
     pub(crate) max_pages: usize,
 }
 
@@ -324,6 +325,9 @@ impl RecipientWallet {
                     }
                 }
                 pages += 1;
+                if let Some(line) = scan.progress("coins") {
+                    say_err!("{line}");
+                }
             }
             say_err!(
                 "coin scan: {pages} pages in {:.1} s{}",

@@ -1132,6 +1132,8 @@ mod coins_tests {
             &mut m,
             Ok(Read {
                 coins: Some((2, 90)),
+                skipped: Default::default(),
+                escrows_failed: None,
                 escrows: vec![escrow(false, 0), escrow(true, 400), escrow(true, 900)],
             }),
         );

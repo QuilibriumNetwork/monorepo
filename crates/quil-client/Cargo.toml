@@ -69,6 +69,8 @@ quil-execution = { path = "../quil-execution", features = ["testing-stubs"] }
 quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }
 quil-store = { path = "../quil-store" }
 tempfile = "3"
+# Builds memo fixtures the wallet must survive (already in the build).
+aes-gcm = "0.10"
 # Paused time drives `--observe` through its polls in tests.
 tokio = { version = "1", features = ["test-util"] }
 
