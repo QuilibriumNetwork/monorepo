@@ -1715,3 +1715,241 @@ fn a_retry_episode_ends_when_its_frame_is_passed() {
     assert_eq!(ended.len(), 1, "{ended:?}");
     assert!(ended[0].contains("outcome=\"passed\""), "{}", ended[0]);
 }
+
+// Alt shard updates reach execution unverified: GLOBAL validation skips their
+// type. These use only APIs of the base they were first run on.
+
+fn alt_update(key: u8, root_len: usize) -> quil_types::proto::global::AltShardUpdate {
+    quil_types::proto::global::AltShardUpdate {
+        public_key: vec![key; 3],
+        frame_number: 1,
+        vertex_adds_root: vec![1; root_len],
+        vertex_removes_root: vec![2; root_len],
+        hyperedge_adds_root: vec![3; root_len],
+        hyperedge_removes_root: vec![4; root_len],
+        signature: vec![9; 1],
+    }
+}
+
+fn alt_bundle(
+    updates: &[quil_types::proto::global::AltShardUpdate],
+) -> quil_types::proto::global::MessageBundle {
+    quil_types::proto::global::MessageBundle {
+        requests: updates
+            .iter()
+            .map(|update| quil_types::proto::global::MessageRequest {
+                request: Some(
+                    quil_types::proto::global::message_request::Request::AltShardUpdate(
+                        update.clone(),
+                    ),
+                ),
+                ..Default::default()
+            })
+            .collect(),
+        timestamp: 1,
+    }
+}
+
+fn alt_raw(updates: &[quil_types::proto::global::AltShardUpdate]) -> Vec<u8> {
+    crate::consensus_wire::proto_message_bundle_to_canonical_bytes_at(&alt_bundle(updates), None)
+        .unwrap()
+}
+
+/// The certified frame after genesis carrying `updates`, on `rig`'s chain.
+fn alt_frame(rig: &Rig, updates: &[quil_types::proto::global::AltShardUpdate]) -> GlobalFrame {
+    let mut frame = state_frame(&rig.source, 1, 41, rig.genesis);
+    frame.header.as_mut().unwrap().prover = vec![0x42; 32];
+    frame.requests.push(alt_bundle(updates));
+    body_root(&mut frame);
+    certify(&mut frame, &rig.signer, 0);
+    frame
+}
+
+fn alt_commit(store: &dyn quil_types::store::HypergraphStore, key: u8) -> Vec<u8> {
+    let address = quil_crypto::poseidon::hash_bytes_to_32(&[key; 3]).unwrap();
+    store.get_latest_alt_shard_commit(&address).unwrap().0
+}
+
+/// A bad root in a certified frame publishes atomically like any other frame,
+/// and the chain goes on from it.
+#[test]
+fn a_certified_frame_with_a_bad_alt_shard_root_publishes_atomically() {
+    let rig = Rig::new();
+    let input = alt_frame(&rig, &[alt_update(7, 1)]);
+    let (pipeline, _) = pipeline(&rig, prover(&input), 8);
+    assert!(pipeline.offer(input.clone()));
+    match pipeline.step(1) {
+        FinalizationStep::Published { .. } => {}
+        other => panic!(
+            "one unauthenticated alt shard update with a bad root failed the atomic publication \
+             of a certified GLOBAL frame: {other:?}"
+        ),
+    }
+    assert_eq!(rig.source.last_materialized_frame(), 1);
+    let mut next = state_frame(&rig.source, 2, 73, id(&input));
+    certify_parent(&mut next, &rig.signer, 0, 41);
+    assert!(pipeline.offer(next));
+    assert!(
+        matches!(pipeline.step(2), FinalizationStep::Published { .. }),
+        "the frame after it did not publish"
+    );
+}
+
+/// Votes and proposals over a frame not yet published execute it first.
+#[test]
+fn a_vote_and_a_proposal_prepare_over_a_bad_alt_shard_root() {
+    let rig = Rig::new();
+    let parent = alt_frame(&rig, &[alt_update(7, 1)]);
+    rig.put(&parent);
+    let context = rig.context(&parent);
+    for for_proposal in [false, true] {
+        if let Err(error) =
+            rig.executor
+                .prepare(context, 1, &rig.blocks, &rig.verifier, for_proposal)
+        {
+            panic!(
+                "one unauthenticated alt shard update with a bad root stops every \
+                 {} over its frame: {error}",
+                if for_proposal { "proposal" } else { "vote" }
+            );
+        }
+    }
+}
+
+/// Atomic and in-place execution of such a frame agree, with the same state as
+/// a frame without it, and none of its updates stored: the outcome of a build
+/// without the check, which reaches it in place. Mixed builds cannot split on it.
+#[test]
+fn a_bad_alt_shard_root_changes_no_root_and_stores_none_of_its_frames_updates() {
+    let updates = [alt_update(7, 64), alt_update(8, 1)];
+    let body = |number: u64, root: [u8; 32], with: bool| {
+        let mut input = frame(number, root);
+        if with {
+            input.requests = vec![alt_bundle(&updates)];
+        }
+        input
+    };
+    let key = quil_crypto::FalconSigner::generate().public_key().to_vec();
+    let plain = Fixture::new(Some(&key));
+    let in_place = Fixture::new(Some(&key));
+    let atomic = Fixture::new(Some(&key));
+    let root = plain
+        .source
+        .capture_execution_branch(limits())
+        .unwrap()
+        .prover_root()
+        .unwrap();
+    plain.source.materialize(&body(1, root, false)).unwrap();
+    in_place.source.materialize(&body(1, root, true)).unwrap();
+    let forest_root = |fixture: &Fixture| {
+        fixture
+            .source
+            .hypergraph
+            .current_forest_phase_root(&[0xff; 32], 0)
+            .unwrap()
+    };
+    let (plain_root, in_place_root) = (forest_root(&plain), forest_root(&in_place));
+    let mut branch = atomic.source.capture_execution_branch(limits()).unwrap();
+    let atomic_root = match branch.materialize(&body(1, root, true)) {
+        Ok(result) => result.prover_root,
+        Err(error) => panic!(
+            "one unauthenticated alt shard update with a bad root failed atomic execution: {error}"
+        ),
+    };
+    assert_eq!(
+        in_place_root, plain_root,
+        "alt shard records entered a root"
+    );
+    assert_eq!(
+        atomic_root, plain_root,
+        "atomic and in-place execution split"
+    );
+    let store = branch.execution.hypergraph_store();
+    for key in [7, 8] {
+        for (how, commit) in [
+            ("in place", alt_commit(in_place.store.as_ref(), key)),
+            ("atomically", alt_commit(store.as_ref(), key)),
+        ] {
+            assert!(
+                commit.is_empty(),
+                "a frame with a bad root stored update {key} {how}, unlike a build without the \
+                 check"
+            );
+        }
+    }
+}
+
+/// Only a root no commit can hold changes anything: storable updates persist as
+/// before, atomically and in place, beside one skipped for an empty key.
+#[test]
+fn storable_alt_shard_updates_persist_as_before() {
+    let mut empty_key = alt_update(0, 1);
+    empty_key.public_key.clear();
+    let updates = [empty_key, alt_update(7, 64), alt_update(8, 74)];
+    let key = quil_crypto::FalconSigner::generate().public_key().to_vec();
+    let in_place = Fixture::new(Some(&key));
+    let atomic = Fixture::new(Some(&key));
+    let mut branch = atomic.source.capture_execution_branch(limits()).unwrap();
+    let mut input = frame(1, branch.prover_root().unwrap());
+    input.requests = vec![alt_bundle(&updates)];
+    in_place.source.materialize(&input).unwrap();
+    branch.materialize(&input).unwrap();
+    let store = branch.execution.hypergraph_store();
+    for (key, len) in [(7, 64), (8, 74)] {
+        assert_eq!(alt_commit(store.as_ref(), key).len(), len);
+        assert_eq!(alt_commit(in_place.store.as_ref(), key).len(), len);
+    }
+}
+
+/// The collector, a leader's only input, refuses them, and goes on admitting
+/// other messages.
+#[test]
+fn a_leader_proposes_no_alt_shard_update_its_verifier_refuses() {
+    let rig = Rig::new();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let forged = [
+        ("a bad root", alt_raw(&[alt_update(7, 1)])),
+        ("a forged key and signature", alt_raw(&[alt_update(8, 64)])),
+        (
+            "a bad one in a bundle",
+            alt_raw(&[alt_update(9, 64), alt_update(10, 1)]),
+        ),
+    ];
+    for (what, raw) in &forged {
+        assert!(
+            !matches!(
+                rig.collector.add_message_outcome(1, raw.clone()),
+                crate::message_collector::SubmitOutcome::Accepted
+            ),
+            "the mempool held an unauthenticated alt shard update with {what}"
+        );
+    }
+    let kept = crate::consensus_wire::proto_message_bundle_to_canonical_bytes_at(
+        &parent.requests[0],
+        None,
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            rig.collector.add_message_outcome(1, kept.clone()),
+            crate::message_collector::SubmitOutcome::Accepted
+        ),
+        "a refusal must not stop the messages after it"
+    );
+    let lease = rig
+        .executor
+        .prepare(rig.context(&parent), 1, &rig.blocks, &rig.verifier, true)
+        .unwrap();
+    let messages = lease.prove(&[]).unwrap().state.messages;
+    assert!(
+        !messages
+            .iter()
+            .flat_map(|bundle| &bundle.requests)
+            .any(|request| matches!(
+                request.request,
+                Some(quil_types::proto::global::message_request::Request::AltShardUpdate(_))
+            )),
+        "a leader proposed an unauthenticated alt shard update"
+    );
+}
