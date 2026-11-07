@@ -4,6 +4,9 @@ use crate::store;
 use num_bigint::BigInt;
 use std::collections::HashMap;
 
+mod persistent_storage;
+pub use persistent_storage::*;
+
 // ---------------------------------------------------------------------------
 // Engine state
 // ---------------------------------------------------------------------------
@@ -1196,13 +1199,72 @@ pub fn unsealed_issuance_epoch() -> u64 {
 /// without a sealed registration at once
 /// ([`MAINNET_UNSEALED_ISSUANCE_EPOCH`]).
 pub fn unsealed_issuance_active(frame: u64) -> bool {
-    epoch_for_frame(frame) >= unsealed_issuance_epoch()
+    epoch_for_frame(frame) >= unsealed_issuance_epoch() && !sealed_storage_required_at(frame)
 }
 
 /// Set the unsealed issuance epoch for the calling thread only (tests).
 /// `Some(u64::MAX)` disables it; `None` restores the process setting.
 pub fn set_unsealed_issuance_epoch_for_thread(epoch: Option<u64>) {
     UNSEALED_ISSUANCE_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
+/// Mainnet epoch 1393 (GLOBAL frame 1,002,960): application committees and
+/// rewarded participants must have a sealed registration for their epoch.
+/// No empty-committee fallback may admit an unsealed member. Archives serving
+/// GLOBAL use its separate membership protocol and have no shard storage seat.
+/// Replica keys switch to persistent member/leaf keys at
+/// [`MAINNET_STABLE_REPLICA_KEY_EPOCH`]; epoch freshness remains bound into
+/// the registration, beacon challenges and STARK.
+/// Provers should upgrade before epoch 1385 for the full warmup. GLOBAL
+/// executors must upgrade before epoch 1392 admits the first epoch-1393 seals.
+pub const MAINNET_SEALED_STORAGE_EPOCH: Option<u64> = Some(1393);
+static SEALED_STORAGE_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+thread_local! {
+    static SEALED_STORAGE_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+fn sealed_storage_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_SEALED_STORAGE_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting.and_then(|s| s.parse().ok()).unwrap_or(u64::MAX)
+}
+pub fn init_sealed_storage_epoch(network: u8) -> u64 {
+    *SEALED_STORAGE_EPOCH.get_or_init(|| {
+        sealed_storage_epoch_for(
+            network,
+            std::env::var("QUIL_SEALED_STORAGE_EPOCH").ok().as_deref(),
+        )
+    })
+}
+pub fn sealed_storage_epoch() -> u64 {
+    if let Some(epoch) = SEALED_STORAGE_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *SEALED_STORAGE_EPOCH.get_or_init(|| sealed_storage_epoch_for(0, None))
+}
+pub fn sealed_storage_required(epoch: u64) -> bool {
+    let first = sealed_storage_epoch();
+    persistent_storage_at(epoch) || (first != u64::MAX && epoch >= first)
+}
+pub fn sealed_storage_required_at(frame: u64) -> bool {
+    sealed_storage_required(epoch_for_frame(frame))
+}
+/// Shared by committed scheduling, cached runtime membership and header admission.
+pub fn storage_seat_eligible(filter: &[u8], frame: u64, slot: Option<&StorageSeatSlot>) -> bool {
+    if filter.is_empty() || !sealed_storage_required_at(frame) {
+        return true;
+    }
+    let epoch = epoch_for_frame(frame);
+    slot.is_some_and(|slot| {
+        slot.epoch == epoch
+            && !slot.leaves.is_empty()
+            && slot
+                .sealed_at
+                .is_some_and(|at| at < epoch_start_frame(epoch))
+    })
+}
+pub fn set_sealed_storage_epoch_for_thread(epoch: Option<u64>) {
+    SEALED_STORAGE_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
 /// The epoch from which a storage seat that closes an epoch with committed
@@ -1939,8 +2001,10 @@ mod exact_state_size_epoch_tests {
         assert_eq!(super::stable_replica_key_epoch_for(1, None), u64::MAX);
         super::set_stable_replica_key_epoch_for_thread(None);
         assert_eq!(super::stable_replica_key_epoch(), 1429);
+        assert!(!super::stable_replica_keys_at(0));
         assert!(!super::stable_replica_keys_at(1428));
         assert!(super::stable_replica_keys_at(1429));
+        assert!(super::stable_replica_keys_at(u64::MAX));
         super::set_stable_replica_key_epoch_for_thread(Some(u64::MAX));
         assert!(!super::stable_replica_keys_at(0));
         assert!(!super::stable_replica_keys_at(u64::MAX - 1));
@@ -4180,6 +4244,52 @@ mod strict_peer_info_epoch_tests {
         assert!(!super::strict_peer_info_active(first - 1));
         assert!(super::strict_peer_info_active(first));
         super::set_strict_peer_info_epoch_for_thread(None);
+    }
+}
+
+#[cfg(test)]
+mod sealed_storage_activation_tests {
+    use super::*;
+    #[test]
+    fn sealed_storage_cutover_is_1393_and_mainnet_ignores_overrides() {
+        assert_eq!(MAINNET_SEALED_STORAGE_EPOCH, Some(1393));
+        for setting in [None, Some("0"), Some("9999"), Some("bad")] {
+            assert_eq!(sealed_storage_epoch_for(0, setting), 1393);
+        }
+        assert_eq!(sealed_storage_epoch_for(1, None), u64::MAX);
+        assert_eq!(sealed_storage_epoch_for(1, Some("7")), 7);
+        set_sealed_storage_epoch_for_thread(Some(1393));
+        set_unsealed_issuance_epoch_for_thread(Some(1321));
+        let boundary = epoch_start_frame(1393);
+        assert!(unsealed_issuance_active(boundary - 1));
+        assert!(!unsealed_issuance_active(boundary));
+        assert!(storage_seat_eligible(&[1], boundary - 1, None));
+        assert!(!storage_seat_eligible(&[1], boundary, None));
+        assert!(
+            storage_seat_eligible(&[], boundary, None),
+            "GLOBAL archives have separate membership"
+        );
+        let mut slot = StorageSeatSlot {
+            epoch: 1393,
+            leaves: vec![vec![]],
+            registered_at: boundary - 10,
+            sealed_at: Some(boundary - 1),
+            frames: 0,
+            accumulator: [0; 32],
+            chained: vec![],
+            open: true,
+        };
+        assert!(storage_seat_eligible(&[1], boundary, Some(&slot)));
+        slot.sealed_at = Some(boundary);
+        assert!(!storage_seat_eligible(&[1], boundary, Some(&slot)));
+        slot.sealed_at = Some(boundary - 1);
+        slot.epoch = 1392;
+        assert!(!storage_seat_eligible(&[1], boundary, Some(&slot)));
+        slot.epoch = 1393;
+        slot.leaves.clear();
+        assert!(!storage_seat_eligible(&[1], boundary, Some(&slot)));
+        set_unsealed_issuance_epoch_for_thread(None);
+        set_sealed_storage_epoch_for_thread(None);
     }
 }
 

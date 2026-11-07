@@ -50,6 +50,39 @@ use crate::hypergraph_state::HypergraphState;
 pub const CLASS: &str = "storage:StorageSeat";
 pub const EXPIRY_CLASS: &str = "storage:StorageExpiry";
 
+/// Canonical application participation gate. Missing storage is never an
+/// affirmative result; this reads the committed seat, not an async registry.
+pub fn require_sealed_participant(
+    state: &HypergraphState,
+    member: &[u8],
+    filter: &[u8],
+    frame: u64,
+    epoch: u64,
+) -> Result<()> {
+    if filter.is_empty() || !quil_types::consensus::sealed_storage_required_at(frame) {
+        return Ok(());
+    }
+    let member = <&[u8; 32]>::try_from(member)
+        .map_err(|_| QuilError::InvalidArgument("invalid storage member address".into()))?;
+    let seat = read(state, member, filter)?;
+    let slot = seat
+        .as_ref()
+        .and_then(|seat| seat.slot(epoch))
+        .map(SeatSlot::view);
+    // Gate by the executing GLOBAL frame, but check the header's anchor epoch.
+    if slot.as_ref().is_none_or(|slot| {
+        slot.leaves.is_empty()
+            || slot
+                .sealed_at
+                .is_none_or(|at| at >= quil_types::consensus::epoch_start_frame(epoch))
+    }) {
+        return Err(QuilError::InvalidArgument(format!(
+            "unsealed storage participant for epoch {epoch}"
+        )));
+    }
+    Ok(())
+}
+
 /// Buckets an epoch's expiry queue is split into, one swept per GLOBAL frame
 /// from the frame its settlement window closes (fewer frames when an epoch
 /// is shorter than this).
@@ -766,6 +799,31 @@ pub fn encode_slots(slots: &[SeatSlot]) -> Vec<u8> {
 }
 
 pub fn decode_slots(data: &[u8]) -> Result<Vec<SeatSlot>> {
+    decode_slots_inner(data, true)
+}
+
+/// Committee scheduling only needs sealed epochs, not copies of every
+/// committed frame's chain. Keep validation identical to full decoding.
+pub(crate) fn decode_sealed_epochs(data: &[u8]) -> Result<Vec<u64>> {
+    let mut seen = Vec::new();
+    let mut sealed = Vec::new();
+    for slot in decode_slots_inner(data, false)? {
+        if seen.contains(&slot.epoch) {
+            continue;
+        }
+        seen.push(slot.epoch);
+        if slot.is_sealed()
+            && slot
+                .sealed_at
+                .is_some_and(|at| at < quil_types::consensus::epoch_start_frame(slot.epoch))
+        {
+            sealed.push(slot.epoch);
+        }
+    }
+    Ok(sealed)
+}
+
+fn decode_slots_inner(data: &[u8], details: bool) -> Result<Vec<SeatSlot>> {
     let invalid = |what: &str| QuilError::InvalidArgument(format!("storage seat slots: {what}"));
     let mut c = 0usize;
     let byte = |c: &mut usize| -> Result<u8> {
@@ -787,18 +845,33 @@ pub fn decode_slots(data: &[u8]) -> Result<Vec<SeatSlot>> {
         if leaf_count > MAX_LEAVES {
             return Err(invalid("too many leaves"));
         }
-        let mut leaves = Vec::with_capacity(leaf_count);
+        let mut leaves = Vec::with_capacity(if details {
+            leaf_count
+        } else {
+            usize::from(leaf_count > 0)
+        });
         for _ in 0..leaf_count {
             let len = read_u32(data, &mut c)? as usize;
             if len > MAX_PREFIX {
                 return Err(invalid("prefix too long"));
             }
-            leaves.push(
-                (0..len)
-                    .map(|_| read_u32(data, &mut c))
-                    .collect::<Result<Vec<u32>>>()?,
-            );
+            if details {
+                leaves.push(
+                    (0..len)
+                        .map(|_| read_u32(data, &mut c))
+                        .collect::<Result<Vec<u32>>>()?,
+                );
+            } else {
+                c = c
+                    .checked_add(len * 4)
+                    .filter(|&end| end <= data.len())
+                    .ok_or_else(|| invalid("truncated prefix"))?;
+            }
         }
+        if !details && leaf_count > 0 {
+            leaves.push(Vec::new());
+        }
+
         let registered_at = read_u64(data, &mut c)?;
         let sealed_at = match byte(&mut c)? {
             0 => None,
@@ -811,7 +884,7 @@ pub fn decode_slots(data: &[u8]) -> Result<Vec<SeatSlot>> {
         if chained_count > MAX_CHAINED {
             return Err(invalid("too many chained frames"));
         }
-        let mut chained = Vec::with_capacity(chained_count);
+        let mut chained = Vec::with_capacity(if details { chained_count } else { 0 });
         let (mut frame, mut beacon) = (0u64, 0u64);
         for _ in 0..chained_count {
             let gap = read_varint(data, &mut c).ok_or_else(|| invalid("bad frame gap"))?;
@@ -822,11 +895,13 @@ pub fn decode_slots(data: &[u8]) -> Result<Vec<SeatSlot>> {
                 .filter(|_| gap > 0)
                 .ok_or_else(|| invalid("frames not ascending"))?;
             beacon = beacon.wrapping_add(unzigzag(step) as u64);
-            chained.push(Chained {
-                frame,
-                beacon,
-                executed: beacon.wrapping_add(lag),
-            });
+            if details {
+                chained.push(Chained {
+                    frame,
+                    beacon,
+                    executed: beacon.wrapping_add(lag),
+                });
+            }
         }
         let expected = read_u64(data, &mut c)?;
         let counted_through = read_u64(data, &mut c)?;
@@ -1401,5 +1476,39 @@ mod tests {
         }
         suspend_storage_kicks(None);
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+    #[test]
+    fn compact_seal_decoding_matches_full_validation_and_first_slot_semantics() {
+        let mut seat = Seat::new([7; 32], vec![9; 32]);
+        seat.register(1393, &[vec![1, 0, 1]], 100);
+        seat.seal(1393, 101);
+        let mut duplicate = seat.slots[0].clone();
+        duplicate.sealed_at = None;
+        seat.slots.insert(0, duplicate);
+        let bytes = encode_slots(&seat.slots);
+        assert!(
+            decode_sealed_epochs(&bytes).unwrap().is_empty(),
+            "the first duplicate slot governs"
+        );
+        for end in 0..=bytes.len() {
+            assert_eq!(
+                decode_slots(&bytes[..end]).is_ok(),
+                decode_sealed_epochs(&bytes[..end]).is_ok()
+            );
+        }
+        seat.slots.remove(0);
+        assert_eq!(
+            decode_sealed_epochs(&encode_slots(&seat.slots)).unwrap(),
+            vec![1393]
+        );
+        for index in 0..bytes.len() {
+            let mut corrupt = bytes.clone();
+            corrupt[index] ^= 0xFF;
+            assert_eq!(
+                decode_slots(&corrupt).is_ok(),
+                decode_sealed_epochs(&corrupt).is_ok(),
+                "byte {index}"
+            );
+        }
     }
 }

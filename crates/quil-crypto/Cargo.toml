@@ -24,6 +24,8 @@ sha2 = "0.10"
 rand = "0.8"
 # Storage audits check independent openings in parallel.
 rayon = "1"
+# Anonymous scratch files bound the memory of large storage graphs and columns.
+tempfile = "3"
 # Falcon / FN-DSA-512 post-quantum consensus signatures (pure Rust, Pornin).
 fn-dsa = "0.3"
 # sntrup761 (Streamlined NTRU Prime) KEM — post-quantum config read/encryption
