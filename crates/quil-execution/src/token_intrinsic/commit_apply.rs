@@ -735,6 +735,42 @@ mod tests {
         assert!(refused_before_proof(&state, 10, &NETWORK, &APPLICATION, CLAIM, &honest).is_none());
     }
 
+    /// A node whose store does not cover the whole application refuses a
+    /// coin whose owner is not canonical before the proof, at any frame,
+    /// with the error every covering node's commit refuses it with: it
+    /// records the operation as failed and goes on, as they do, where it
+    /// used to verify the proof and then stop the frame at the coverage
+    /// check. What needs the coverage still stops it.
+    #[test]
+    fn a_node_without_full_coverage_refuses_a_noncanonical_owner_as_a_covering_one() {
+        let state = state();
+        let claim = mint_claim(9, vec![noncanonical_output(1)]);
+        let commit = commit_and_place(&state, 10, &NETWORK, &APPLICATION, CLAIM, &claim, limits())
+            .expect_err("a covering node's commit refuses it");
+        state
+            .crdt()
+            .set_covered_prefix(&quil_tries::get_full_path(&APPLICATION))
+            .unwrap();
+        let ahead = refused_before_proof(&state, 10, &NETWORK, &APPLICATION, CLAIM, &claim);
+        let plain = mint_claim(8, vec![output(6, 100)]);
+        let stops = commit_and_place(&state, 10, &NETWORK, &APPLICATION, CLAIM, &plain, limits());
+        state.crdt().set_covered_prefix(&[]).unwrap();
+        let ahead = ahead.expect(
+            "READ-AHEAD GAP: a node without full coverage verifies the proof of a coin every \
+             commit refuses, then stops the frame",
+        );
+        assert_eq!(
+            ahead.to_string(),
+            commit.to_string(),
+            "a node without full coverage records another outcome"
+        );
+        assert!(!ahead.is_execution_unavailable());
+        assert!(
+            matches!(stops, Err(QuilError::ExecutionUnavailable(_))),
+            "{stops:?}"
+        );
+    }
+
     /// Recovery: a delivery GLOBAL already committed with a non-canonical
     /// owner is burned. The owning shard places it, the frame's fold takes
     /// its position as the empty leaf, the block's next honest coin lands

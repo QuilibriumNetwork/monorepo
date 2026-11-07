@@ -308,6 +308,60 @@ pub struct PreverifyPacing<'a> {
     pub background: bool,
 }
 
+/// The frame that executes an operation judged ahead of it, as far as the
+/// judging caller knows it.
+// Read only by the native prover's read-ahead.
+#[cfg_attr(not(feature = "native-proof"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecutingFrame {
+    /// One not known yet: a frame a later proposal carries.
+    Later,
+    /// An app-shard frame anchored at this GLOBAL frame (`None`: without an
+    /// anchor).
+    App(Option<u64>),
+    /// GLOBAL frame N in the global venue, anchored at N - 1.
+    Global(u64),
+}
+
+/// How far behind the latest GLOBAL frame this process saw a frame not known
+/// yet may be anchored: an app-shard frame anchors
+/// `GLOBAL_ANCHOR_SAFETY_MARGIN` behind its proposer's latest GLOBAL frame,
+/// and its proposer may be as far again behind this node (the slack a mint
+/// claim's citation keeps). A later GLOBAL frame is anchored past every
+/// frame seen.
+#[cfg(feature = "native-proof")]
+const LATER_ANCHOR_LAG: u64 = crate::token_intrinsic::constants::MINT_CLAIM_CITATION_LAG;
+
+#[cfg(feature = "native-proof")]
+impl ExecutingFrame {
+    /// The lowest GLOBAL anchor a frame executing the operation can have,
+    /// `head` being the latest GLOBAL frame this process saw: its own where
+    /// it is known (the global venue's N - 1), and for a frame not known yet
+    /// `LATER_ANCHOR_LAG` behind `head` (none before `head` reaches it). A
+    /// gate that opens once and is active there is active at every frame
+    /// that can still carry the operation.
+    fn anchor_floor(self, head: u64) -> Option<u64> {
+        match self {
+            Self::Later => head.checked_sub(LATER_ANCHOR_LAG),
+            Self::App(anchor) => anchor,
+            Self::Global(frame) => frame.checked_sub(1),
+        }
+    }
+
+    /// [`Self::anchor_floor`] at the latest GLOBAL frame this process saw.
+    fn anchor_floor_now(self) -> Option<u64> {
+        self.anchor_floor(quil_types::consensus::frame_time_head())
+    }
+
+    /// The GLOBAL frame whose commit the global venue makes inline.
+    fn commit_frame(self) -> Option<u64> {
+        match self {
+            Self::Global(frame) => Some(frame),
+            Self::Later | Self::App(_) => None,
+        }
+    }
+}
+
 impl ExecutionEngineManager {
     /// Reconstruct all engines against the supplied state, preserving configured
     /// modes, cryptographic providers, worker admission and pricing policy.
@@ -561,7 +615,7 @@ impl ExecutionEngineManager {
         bundles: &[(Vec<u8>, Vec<u8>)],
         pacing: &PreverifyPacing<'_>,
     ) -> PreverifyCounts {
-        self.preverify_routed(bundles, pacing, None)
+        self.preverify_routed(bundles, pacing, ExecutingFrame::Later)
     }
 
     /// [`Self::preverify_bundles`] ahead of the global venue's execution of
@@ -575,14 +629,35 @@ impl ExecutionEngineManager {
         frame: u64,
         bundles: &[(Vec<u8>, Vec<u8>)],
     ) -> PreverifyCounts {
-        self.preverify_routed(bundles, &PreverifyPacing::default(), Some(frame))
+        self.preverify_routed(
+            bundles,
+            &PreverifyPacing::default(),
+            ExecutingFrame::Global(frame),
+        )
+    }
+
+    /// [`Self::preverify_bundles`] ahead of executing an app-shard frame
+    /// anchored at GLOBAL frame `anchor` (`None`: without an anchor): what
+    /// execution refuses before the proof from that anchor on (an owner
+    /// that is not a canonical identity) is not verified, and what it
+    /// admits there is, whatever GLOBAL frame this node saw since.
+    pub fn preverify_app_frame_bundles(
+        &self,
+        anchor: Option<u64>,
+        bundles: &[(Vec<u8>, Vec<u8>)],
+    ) -> PreverifyCounts {
+        self.preverify_routed(
+            bundles,
+            &PreverifyPacing::default(),
+            ExecutingFrame::App(anchor),
+        )
     }
 
     fn preverify_routed(
         &self,
         bundles: &[(Vec<u8>, Vec<u8>)],
         pacing: &PreverifyPacing<'_>,
-        commit_frame: Option<u64>,
+        frame: ExecutingFrame,
     ) -> PreverifyCounts {
         #[cfg(feature = "native-proof")]
         {
@@ -610,7 +685,7 @@ impl ExecutionEngineManager {
                 Some((policy, worker)) => {
                     let network = policy.network;
                     let refused = |address: &[u8], bytes: &[u8], tp: u32| {
-                        self.proof_refused(&network, address, bytes, tp, commit_frame)
+                        self.proof_refused(&network, address, bytes, tp, frame)
                     };
                     TokenExecutionEngine::preverify_with(policy, &worker, &routed, pacing, &refused)
                 }
@@ -619,7 +694,7 @@ impl ExecutionEngineManager {
         }
         #[cfg(not(feature = "native-proof"))]
         {
-            let _ = (bundles, pacing, commit_frame);
+            let _ = (bundles, pacing, frame);
             PreverifyCounts::default()
         }
     }
@@ -659,7 +734,13 @@ impl ExecutionEngineManager {
             match policy {
                 Some(policy) => {
                     let refused = |address: &[u8], bytes: &[u8], tp: u32| {
-                        self.proof_refused(&policy.network, address, bytes, tp, None)
+                        self.proof_refused(
+                            &policy.network,
+                            address,
+                            bytes,
+                            tp,
+                            ExecutingFrame::Later,
+                        )
                     };
                     TokenExecutionEngine::unverified_operation_estimates(&policy, &routed, &refused)
                 }
@@ -1053,7 +1134,8 @@ impl ExecutionEngineManager {
         let mut needs = spend_entries::commit_needs(application, tp, bytes)?;
         let mut held = None;
         if let Some((shard, network)) = shard {
-            match Self::execution_standing(shard, network, application, tp, bytes) {
+            let anchor = ExecutingFrame::Later.anchor_floor_now();
+            match Self::execution_standing(shard, network, application, tp, bytes, anchor) {
                 Some(lasting @ Standing::Lasting(_)) => return Some(lasting),
                 pending => held = pending,
             }
@@ -1080,10 +1162,13 @@ impl ExecutionEngineManager {
     /// pending claim its branch's authority did not sign and a settlement
     /// whose terms execution refuses (lasting: both are read from the bytes
     /// alone, by execution's own checks), a custom mint the policy held here
-    /// does not authorize (pending). `None` for every other operation and
-    /// when it cannot say. When a refund falls due, a batch shield's
-    /// activation and a source outside the executing shard are judged by
-    /// the executing frame only: no frame is known ahead of it.
+    /// does not authorize (pending), and an owner that is not a canonical
+    /// identity once that check is active at GLOBAL frame `anchor`, the
+    /// lowest anchor of a frame that can still execute it
+    /// ([`ExecutingFrame::anchor_floor`]; lasting). `None` for every other
+    /// operation and when it cannot say. When a refund falls due, a batch
+    /// shield's activation and a source outside the executing shard are
+    /// judged by the executing frame only: no frame is known ahead of it.
     #[cfg(feature = "native-proof")]
     fn execution_standing(
         shard: &crate::hypergraph_state::HypergraphState,
@@ -1091,6 +1176,7 @@ impl ExecutionEngineManager {
         application: &[u8; 32],
         tp: u32,
         bytes: &[u8],
+        anchor: Option<u64>,
     ) -> Option<crate::token_intrinsic::global_commit::Standing> {
         use crate::token_engine::{
             TYPE_LATTICE_MINT, TYPE_LATTICE_PENDING_CLAIM, TYPE_LATTICE_SETTLEMENT,
@@ -1103,13 +1189,12 @@ impl ExecutionEngineManager {
             spend_entries,
         };
         // Execution refuses an operation naming an owner that is not a
-        // canonical identity before its proof once that check is active
-        // (`dispatch_for_commit`). The check reads the bytes alone and its
-        // gate opens once, so it is judged at the latest GLOBAL frame this
-        // process saw; near the gate frame that can refuse a few frames
-        // early, which drops only operations no honest wallet makes.
-        let view = quil_types::consensus::frame_time_head();
-        if global_commit::canonical_owners_active(Some(view))
+        // canonical identity before its proof once that check is active at
+        // the executing frame's anchor (`dispatch_for_commit`,
+        // `dispatch_global_mint`). The check reads the bytes alone and its
+        // gate opens once, so active at `anchor` it is active at every frame
+        // that can still carry the operation.
+        if global_commit::canonical_owners_active(anchor)
             && spend_entries::names_noncanonical_owner(network, application, tp, bytes)
         {
             return Some(Standing::Lasting("an owner is not a canonical identity"));
@@ -1166,12 +1251,12 @@ impl ExecutionEngineManager {
     /// `address` needs no verification here: execution against this node's
     /// store refuses it before its proof ([`Self::execution_standing`]), so
     /// no frame that carries it verifies it, here or on any node holding
-    /// that state; and, with `commit_frame`, in the global venue that
-    /// commits it at that frame, the commit refuses it from GLOBAL state
-    /// alone (`commit_apply::refused_before_proof`), as the venue does
-    /// before the proof. A frame reading a store that gains what refused it
-    /// (a source still syncing, a root an earlier operation of the frame
-    /// publishes) verifies it when it executes, as before.
+    /// that state, as `frame` executes it; and, when `frame` is GLOBAL frame
+    /// N, in the global venue that commits it at N, the commit refuses it
+    /// from GLOBAL state alone (`commit_apply::refused_before_proof`), as
+    /// the venue does before the proof. A frame reading a store that gains
+    /// what refused it (a source still syncing, a root an earlier operation
+    /// of the frame publishes) verifies it when it executes, as before.
     #[cfg(feature = "native-proof")]
     fn proof_refused(
         &self,
@@ -1179,16 +1264,18 @@ impl ExecutionEngineManager {
         address: &[u8],
         bytes: &[u8],
         tp: u32,
-        commit_frame: Option<u64>,
+        frame: ExecutingFrame,
     ) -> bool {
         let Some(Ok(application)) = address.get(..32).map(<[u8; 32]>::try_from) else {
             return false;
         };
         let store = crate::hypergraph_state::HypergraphState::new(self.crdt());
-        if Self::execution_standing(&store, network, &application, tp, bytes).is_some() {
+        let anchor = frame.anchor_floor_now();
+        let standing = Self::execution_standing(&store, network, &application, tp, bytes, anchor);
+        if standing.is_some() {
             return true;
         }
-        commit_frame.is_some_and(|frame| {
+        frame.commit_frame().is_some_and(|frame| {
             crate::token_intrinsic::spend_entries::commits_globally(&application, tp)
                 && crate::token_intrinsic::commit_apply::refused_before_proof(
                     &store,

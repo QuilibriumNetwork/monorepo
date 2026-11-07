@@ -15743,8 +15743,12 @@ pub(crate) fn materialize_app_shard_requests(
         frame_number,
     };
 
+    // The GLOBAL frame this frame is anchored at; none without an anchor.
+    let anchor = (global_frame_number != 0).then_some(global_frame_number);
     // Verify every confidential token proof of the frame concurrently before
     // the sequential state loop below; the loop then finds verdicts cached.
+    // What execution refuses before the proof at the frame's anchor is not
+    // verified.
     let canonical: Vec<(Vec<u8>, Vec<u8>)> = requests
         .iter()
         .filter_map(|bundle| crate::consensus_wire::app_bundle_to_canonical_bytes(bundle).ok())
@@ -15754,7 +15758,7 @@ pub(crate) fn materialize_app_shard_requests(
     let preverify_start = std::time::Instant::now();
     {
         let _step = StepTimer::start(&mut steps.preverify, probe::Section::AppFramePreverify);
-        execution_manager.preverify_bundles(&canonical);
+        execution_manager.preverify_app_frame_bundles(anchor, &canonical);
     }
     if preverify_start.elapsed() > std::time::Duration::from_secs(1) {
         info!(
@@ -15883,7 +15887,7 @@ pub(crate) fn materialize_app_shard_requests(
         let outcome = execution_manager.process_message_with_context(
             quil_types::execution::FrameExecutionContext {
                 frame_number,
-                finalized_global_frame: (global_frame_number != 0).then_some(global_frame_number),
+                finalized_global_frame: anchor,
                 shard,
                 // Workers and archives replay app-shard frames alike: always
                 // in the application venue, never committing inline.
