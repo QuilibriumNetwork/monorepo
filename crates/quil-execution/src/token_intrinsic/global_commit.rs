@@ -874,6 +874,77 @@ pub fn batch_shields_active(anchor: Option<u64>) -> bool {
     anchor.is_some_and(|frame| frame >= batch_shield_frame())
 }
 
+// ---- canonical owners -------------------------------------------------------
+
+/// From this GLOBAL frame an executing shard, and GLOBAL executing an
+/// application itself, refuse a confidential operation naming an owner that
+/// is not a canonical identity (`spend_entries::operation_owners`). Before
+/// it only a globally executed application refuses one
+/// (`spend_entries::check_coin_owners`), as its fold always did; a split
+/// application's executing shard relays it, GLOBAL commits it, and the
+/// shard owning its block burns the coin when it places it
+/// (`coin_tree::committed_leaf`). Honest wallets never make one.
+///
+/// Consensus-affecting for application shards and GLOBAL, which switch
+/// together: a build without it relays and commits what one with it
+/// refuses, so every archive and prover must run a build with it before the
+/// frame; honest operations are the same on every build. Mainnet 1,063,440,
+/// the first frame of epoch 1477, which GLOBAL cannot reach before
+/// 2026-11-11 14:00 UTC even at ten seconds a frame: the release carrying it
+/// reaches nearly every worker within a day and every archive within hours,
+/// and it is the one flag day this release's other GLOBAL gates share.
+/// `QUIL_CANONICAL_OWNER_FRAME` elsewhere, never by default.
+pub const MAINNET_CANONICAL_OWNER_FRAME: Option<u64> = Some(1_063_440);
+
+static CANONICAL_OWNER_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static CANONICAL_OWNER_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn canonical_owner_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_CANONICAL_OWNER_FRAME.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's canonical owner frame from its network, and return
+/// it. Called at startup before any frame is processed; the first call
+/// decides.
+pub fn init_canonical_owner_frame(network: u8) -> u64 {
+    *CANONICAL_OWNER_FRAME.get_or_init(|| {
+        canonical_owner_frame_for(
+            network,
+            std::env::var("QUIL_CANONICAL_OWNER_FRAME").ok().as_deref(),
+        )
+    })
+}
+
+/// The frame fixed by [`init_canonical_owner_frame`]; the mainnet frame in a
+/// process that never called it, so the setting cannot reach mainnet.
+/// `u64::MAX`: never.
+pub fn canonical_owner_frame() -> u64 {
+    if let Some(frame) = CANONICAL_OWNER_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    *CANONICAL_OWNER_FRAME.get_or_init(|| canonical_owner_frame_for(0, None))
+}
+
+/// Set the canonical owner frame for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_canonical_owner_frame_for_thread(frame: Option<u64>) {
+    CANONICAL_OWNER_OVERRIDE.with(|cell| cell.set(frame));
+}
+
+/// Whether owners must be canonical for an operation whose frame is
+/// anchored at GLOBAL frame `anchor` (none known: not yet).
+pub fn canonical_owners_active(anchor: Option<u64>) -> bool {
+    anchor.is_some_and(|frame| frame >= canonical_owner_frame())
+}
+
 // ---- relay records across the upgrade from the mainnet build ---------------
 
 /// The GLOBAL frame from which application shards relay this release's
@@ -2628,6 +2699,25 @@ mod tests {
         );
         assert_eq!(batch_shield_frame_for(1, Some("5")), 5);
         assert_eq!(batch_shield_frame_for(1, None), u64::MAX);
+    }
+
+    /// The canonical owner gate: fixed on mainnet whatever the setting, set
+    /// elsewhere only by `QUIL_CANONICAL_OWNER_FRAME`, and active from its
+    /// frame for an operation anchored at or past it.
+    #[test]
+    fn the_canonical_owner_frame_is_fixed_on_mainnet_and_active_from_its_frame() {
+        assert_eq!(
+            canonical_owner_frame_for(0, Some("5")),
+            MAINNET_CANONICAL_OWNER_FRAME.unwrap_or(u64::MAX),
+            "fixed on mainnet"
+        );
+        assert_eq!(canonical_owner_frame_for(1, Some("5")), 5);
+        assert_eq!(canonical_owner_frame_for(1, None), u64::MAX);
+        set_canonical_owner_frame_for_thread(Some(1_000));
+        assert!(canonical_owners_active(Some(1_000)));
+        assert!(!canonical_owners_active(Some(999)));
+        assert!(!canonical_owners_active(None));
+        set_canonical_owner_frame_for_thread(None);
     }
 
     /// A batch shield commits every source or none: one already-shielded

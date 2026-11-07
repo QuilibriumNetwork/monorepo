@@ -1779,6 +1779,9 @@ impl TokenPolicy {
                 "operation does not commit through the global frame",
             ));
         }
+        if super::global_commit::canonical_owners_active(context.finalized_global_frame) {
+            super::spend_entries::check_owners(&self.network, &application, tp, bytes)?;
+        }
         if tp == TYPE_LATTICE_MINT {
             custom_mint::verify_custom_mint_with_worker(
                 state,
@@ -1881,6 +1884,14 @@ impl TokenPolicy {
         let finalized = frame
             .checked_sub(1)
             .ok_or_else(|| invalid("mint requires a prior global frame"))?;
+        if super::global_commit::canonical_owners_active(Some(finalized)) {
+            super::spend_entries::check_owners(
+                &self.network,
+                &domains::QUIL_TOKEN,
+                TYPE_LATTICE_MINT,
+                bytes,
+            )?;
+        }
         super::mint::verify_mint_from_clock_with_worker(
             state,
             clock,

@@ -37,6 +37,11 @@ pub fn commit_and_place(
     // Every output, record and root update has to survive the commit's
     // coverage filter together, as it did when shards staged locally.
     state.require_full_domain_coverage(application)?;
+    // A coin whose owner is not a canonical identity failed this venue's fold
+    // and the operation was skipped. The fold now burns such a coin (as a
+    // split application's owning shard must), so the refusal is made here,
+    // before anything is written: the same outcome on every build.
+    spend_entries::check_coin_owners(network, application, tp, bytes)?;
     let entry = spend_entries::commit_entry(state, network, application, tp, bytes, frame)?;
     // The venue that executes it is also the one that holds it: the whole
     // application, since a globally executed one is never split.
@@ -458,5 +463,327 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// An output no fold can take: one owner coefficient is 2^38 - 1 >= P.
+    fn noncanonical_output(memo: u8) -> Output {
+        Output {
+            owner: [0xff; IDENTITY_BYTES],
+            ..output(memo, 100)
+        }
+    }
+
+    /// A split application's GLOBAL view, bootstrapped by a reward claim
+    /// committed in the global venue, which publishes the canonical root a
+    /// transfer cites. Returns the state, the root and its coin's block.
+    fn split_bootstrap() -> (
+        HypergraphState,
+        quil_lattice_ct::confidential::coin_tree::RootRecord,
+        u64,
+    ) {
+        let global = state();
+        let claim = mint_claim(9, vec![output(5, 100)]);
+        let placed =
+            commit_and_place(&global, 10, &NETWORK, &APPLICATION, CLAIM, &claim, limits()).unwrap();
+        let root = super::super::roots::read_current(&global, &NETWORK, &APPLICATION)
+            .unwrap()
+            .unwrap();
+        let width = super::super::coin_blocks::INITIAL_BLOCK_BITS;
+        let block = super::super::coin_blocks::block_for_address(width, &placed[0]).unwrap();
+        (global, root, block)
+    }
+
+    /// Commit a transfer relayed from a split shard, as the global
+    /// materializer does. The source shard's checks never read an output
+    /// owner, so its verdict is the decode's.
+    fn relay(
+        global: &HypergraphState,
+        bytes: &[u8],
+    ) -> std::result::Result<Vec<global_commit::Placement>, String> {
+        let entry =
+            spend_entries::commit_entry(global, &NETWORK, &APPLICATION, TRANSFER, bytes, 11)
+                .map_err(|e| format!("refused at decode: {e}"))?;
+        let source = quil_types::execution::ShardPath::from_bits(&[false]);
+        let outcome = global_commit::commit_entry(global, 11, &APPLICATION, &entry, source)
+            .map_err(|e| format!("GLOBAL commit error: {e}"))?;
+        match outcome {
+            global_commit::Outcome::Committed { placements, .. } => Ok(placements),
+            other => Err(format!("GLOBAL commit outcome: {other:?}")),
+        }
+    }
+
+    /// Reproducer. A transfer's output owners are never checked canonical
+    /// at decode: the source shard verifies and relays it, GLOBAL reserves
+    /// its outputs' delivery sequences, and the owner is first parsed when
+    /// the owning shard folds the frame's coins. That fold fails, so
+    /// `commit_frame_with_app_history` fails for the certified frame on every
+    /// replica, the cursor is held and the frame is retried forever: the
+    /// shard halts. A fixed node refuses the transfer before GLOBAL reserves
+    /// a sequence, or lands and folds every honest coin of the frame.
+    #[test]
+    fn reproduces_a_noncanonical_owner_wedging_the_owning_shard() {
+        use super::super::{coin_blocks, roots};
+        use quil_lattice_ct::confidential::relation::membership::Node;
+        let parameters = parameter_context(&NETWORK, &APPLICATION);
+        let block_of = |output: &Output| {
+            let (address, _) = coin_identity(&parameters, 11, output).unwrap();
+            coin_blocks::block_for_address(coin_blocks::INITIAL_BLOCK_BITS, &address).unwrap()
+        };
+        let canonical = |seed: u8| {
+            let o = output(seed, 100);
+            Node::from_identity_bytes(&o.owner).is_ok().then_some(o)
+        };
+        let (_, _, bootstrap_block) = split_bootstrap();
+        assert!(
+            Node::from_identity_bytes(&noncanonical_output(1).owner).is_err(),
+            "precondition: the owner is non-canonical"
+        );
+        let bad = (1..=200u8)
+            .map(noncanonical_output)
+            .find(|o| block_of(o) != bootstrap_block)
+            .unwrap();
+        let wedged = block_of(&bad);
+        let behind = (20..=200u8)
+            .filter_map(canonical)
+            .find(|o| block_of(o) == wedged)
+            .expect("an honest coin shares the block among 181");
+        let elsewhere = (20..=200u8)
+            .filter_map(canonical)
+            .find(|o| ![wedged, bootstrap_block].contains(&block_of(o)))
+            .unwrap();
+
+        // Control: the same transfer with a canonical owner commits, so a
+        // refusal below is the owner's.
+        let (control, root, _) = split_bootstrap();
+        let twin = Output {
+            owner: [3; IDENTITY_BYTES],
+            ..bad.clone()
+        };
+        let twin_tx = transfer(vec![[7; IDENTITY_BYTES]], vec![twin], &root);
+        relay(&control, &twin_tx).expect("control: a canonical twin commits");
+
+        let (global, root, _) = split_bootstrap();
+        let bad_tx = transfer(vec![[7; IDENTITY_BYTES]], vec![bad.clone()], &root);
+        let reserved = match relay(&global, &bad_tx) {
+            Ok(placements) => placements,
+            Err(refused) => {
+                eprintln!("refused before GLOBAL reserved a sequence: {refused}");
+                return;
+            }
+        };
+        let outputs = vec![behind.clone(), elsewhere.clone()];
+        let honest_tx = transfer(vec![[10; IDENTITY_BYTES]], outputs, &root);
+        let honest = relay(&global, &honest_tx).expect("an honest transfer commits");
+        assert_eq!((reserved[0].block, reserved[0].seq), (wedged, 0));
+        assert_eq!((honest[0].block, honest[0].seq), (wedged, 1));
+        let deliveries = [
+            (&bad, &reserved[0]),
+            (&behind, &honest[0]),
+            (&elsewhere, &honest[1]),
+        ];
+
+        // The owning shard takes the frame's deliveries, one message each,
+        // and folds them at the frame's end, as the app materializer does.
+        let deliver = |skip_bad: bool| {
+            let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                Arc::new(quil_hypergraph::testing::MemStore::new()),
+                Arc::new(quil_types::crypto::NoopInclusionProver),
+            ));
+            let message = HypergraphState::new(crdt.clone());
+            let mut placed = Vec::new();
+            for (output, placement) in deliveries.iter().skip(usize::from(skip_bad)) {
+                let (address, tree) = coin_identity(&parameters, 11, output).unwrap();
+                assert_eq!(address, placement.address);
+                let result = delivery::place_committed(
+                    &message,
+                    20,
+                    &NETWORK,
+                    &APPLICATION,
+                    &address,
+                    tree,
+                    placement.block,
+                    placement.seq,
+                    &[],
+                    limits(),
+                );
+                placed.push(result.map_err(|e| e.to_string()));
+                message.commit().unwrap();
+                message.abort();
+            }
+            let end = HypergraphState::new(crdt);
+            let folded = roots::fold_placed(&end, 20, &NETWORK, &APPLICATION, limits())
+                .map_err(|e| e.to_string());
+            (end, placed, folded)
+        };
+        let (end, placed, folded) = deliver(false);
+        if let Err(error) = &folded {
+            let (_, _, replayed) = deliver(false);
+            let (_, without, _) = deliver(true);
+            panic!(
+                "WEDGED SHARD: GLOBAL reserved block {wedged} seq 0 for a coin whose owner is \
+                 non-canonical; the owning shard placed it ({:?}) and the frame's fold fails \
+                 ({error}). A fresh replica replaying the frame fails the same way \
+                 ({replayed:?}), and without it the block's next honest coin is refused \
+                 ({:?}). commit_frame_with_app_history returns this error on every replica, \
+                 so the certified frame retries forever and the shard halts",
+                placed[0], without[0]
+            );
+        }
+        let disc = vertex_adds_discriminator().unwrap();
+        let landed = |output: &Output| {
+            let (address, _) = coin_identity(&parameters, 11, output).unwrap();
+            end.get(&APPLICATION, &address, &disc).unwrap().is_some()
+        };
+        assert!(
+            landed(&behind) && landed(&elsewhere),
+            "PERMANENT REFUSAL: the frame folds but an honest coin of it never lands \
+             ({placed:?}); the block's later coins wait behind the refused one"
+        );
+    }
+
+    /// A globally executed application: the same output, committed and
+    /// placed in the global venue, is refused (by its failing fold on the
+    /// release base, before anything is written once fixed), and the
+    /// engine's per-operation rollback leaves nothing behind. The operation
+    /// is skipped (a deterministic error, not an unavailable store) on every
+    /// build, so GLOBAL agrees across builds, and the next commit lands.
+    #[test]
+    fn a_noncanonical_owner_in_the_global_venue_rolls_back_cleanly() {
+        use super::super::coin_blocks;
+        let parameters = parameter_context(&NETWORK, &APPLICATION);
+        let state = state();
+        let bad = noncanonical_output(1);
+        let (address, _) = coin_identity(&parameters, 10, &bad).unwrap();
+        let width = coin_blocks::INITIAL_BLOCK_BITS;
+        let block = coin_blocks::block_for_address(width, &address).unwrap();
+        let savepoint = state.changeset_len();
+        let claim = mint_claim(9, vec![bad]);
+        let Err(error) =
+            commit_and_place(&state, 10, &NETWORK, &APPLICATION, CLAIM, &claim, limits())
+        else {
+            panic!(
+                "GLOBAL DIVERGENCE: the global venue committed a coin whose owner is \
+                 non-canonical; every earlier build fails that operation, so GLOBAL \
+                 would disagree across builds"
+            );
+        };
+        assert!(
+            !error.is_execution_unavailable(),
+            "GLOBAL HALT: the global materializer fails its frame on this error: {error}"
+        );
+        // What `finish_token_step` does for a failed operation.
+        state.rollback_to(savepoint);
+        let sequence = global_commit::block_sequence(&state, &APPLICATION, block).unwrap();
+        assert_eq!(sequence, 0, "the rollback releases the reserved sequence");
+        let record = global_commit::delivery(&state, &APPLICATION, block, 0).unwrap();
+        assert!(record.is_none());
+        let next = mint_claim(8, vec![output(6, 100)]);
+        let placed = commit_and_place(&state, 11, &NETWORK, &APPLICATION, CLAIM, &next, limits())
+            .expect("the next commit lands");
+        let disc = vertex_adds_discriminator().unwrap();
+        assert!(state
+            .get(&APPLICATION, &placed[0], &disc)
+            .unwrap()
+            .is_some());
+    }
+
+    /// Recovery: a delivery GLOBAL already committed with a non-canonical
+    /// owner is burned. The owning shard places it, the frame's fold takes
+    /// its position as the empty leaf, the block's next honest coin lands
+    /// behind it, a fresh replica replaying the frame (a restarted node or an
+    /// archive resuming the shard) publishes the same root, and a rebuild
+    /// from the stored coins reproduces it.
+    #[test]
+    fn a_committed_noncanonical_coin_is_burned_and_its_block_goes_on() {
+        use super::super::{coin_blocks, roots};
+        let parameters = parameter_context(&NETWORK, &APPLICATION);
+        let block_of = |output: &Output| {
+            let (address, _) = coin_identity(&parameters, 11, output).unwrap();
+            coin_blocks::block_for_address(coin_blocks::INITIAL_BLOCK_BITS, &address).unwrap()
+        };
+        let (_, _, bootstrap_block) = split_bootstrap();
+        let bad = (1..=200u8)
+            .map(noncanonical_output)
+            .find(|o| block_of(o) != bootstrap_block)
+            .unwrap();
+        let wedged = block_of(&bad);
+        let behind = (20..=200u8)
+            .map(|seed| output(seed, 100))
+            .find(|o| block_of(o) == wedged)
+            .expect("an honest coin shares the block among 181");
+        let (global, root, _) = split_bootstrap();
+        let bad_tx = transfer(vec![[7; IDENTITY_BYTES]], vec![bad.clone()], &root);
+        let reserved =
+            relay(&global, &bad_tx).expect("committed, as a build without the gate does");
+        let honest_tx = transfer(vec![[10; IDENTITY_BYTES]], vec![behind.clone()], &root);
+        let honest = relay(&global, &honest_tx).unwrap();
+        assert_eq!((reserved[0].block, reserved[0].seq), (wedged, 0));
+        assert_eq!((honest[0].block, honest[0].seq), (wedged, 1));
+        let replica = || {
+            let state = state();
+            for (output, placement) in [(&bad, &reserved[0]), (&behind, &honest[0])] {
+                let (address, tree) = coin_identity(&parameters, 11, output).unwrap();
+                delivery::place_committed(
+                    &state,
+                    20,
+                    &NETWORK,
+                    &APPLICATION,
+                    &address,
+                    tree,
+                    placement.block,
+                    placement.seq,
+                    &[],
+                    limits(),
+                )
+                .expect("each delivery lands in sequence");
+            }
+            let folded = roots::fold_placed(&state, 20, &NETWORK, &APPLICATION, limits())
+                .expect("the frame's fold takes the burned coin")
+                .expect("the frame placed coins");
+            (state, folded)
+        };
+        let (state, folded) = replica();
+        assert_eq!(folded.coins, 2);
+        assert_eq!(
+            roots::block_count(&state, &NETWORK, &APPLICATION, wedged, limits()).unwrap(),
+            2
+        );
+        let disc = vertex_adds_discriminator().unwrap();
+        assert!(state
+            .get(&APPLICATION, &honest[0].address, &disc)
+            .unwrap()
+            .is_some());
+        let (_, replayed) = replica();
+        assert_eq!(replayed, folded, "a replica replaying the frame agrees");
+        assert_eq!(
+            roots::full_rebuild_root(&state, &NETWORK, &APPLICATION, limits()).unwrap(),
+            folded,
+            "a rebuild from the stored coins reproduces the folded root"
+        );
+    }
+
+    /// A globally executed application, now that the fold burns such a
+    /// coin: the venue still refuses the operation, before writing anything,
+    /// as every earlier build did by failing the fold, so GLOBAL agrees across
+    /// builds; the next commit lands.
+    #[test]
+    fn the_global_venue_refuses_a_noncanonical_coin_before_writing() {
+        let state = state();
+        let savepoint = state.changeset_len();
+        let claim = mint_claim(9, vec![output(5, 100), noncanonical_output(1)]);
+        let refused = commit_and_place(&state, 10, &NETWORK, &APPLICATION, CLAIM, &claim, limits())
+            .unwrap_err();
+        assert!(
+            matches!(refused, QuilError::InvalidArgument(_)),
+            "{refused}"
+        );
+        assert!(
+            refused.to_string().contains("not a canonical identity"),
+            "{refused}"
+        );
+        assert_eq!(state.changeset_len(), savepoint, "nothing was written");
+        let next = mint_claim(8, vec![output(6, 100)]);
+        commit_and_place(&state, 11, &NETWORK, &APPLICATION, CLAIM, &next, limits())
+            .expect("the next commit lands");
     }
 }
