@@ -5,8 +5,11 @@
 //! frame, and its seat signs little meanwhile. One such wait is ordinary: this
 //! module counts them, per shard, into one bounded summary line that separates
 //! a thin mesh, loss on the link and one silent sender, and warns only when
-//! they take a real share of the worker's time.
+//! they take a real share of the worker's time, naming the reason this worker
+//! refused proposals most in the same hour.
 
+use quil_cw_consensus::adapters::Liveness;
+use quil_cw_consensus::handoff::automaton::BLOCK_NOT_DELIVERED;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -31,9 +34,58 @@ const LINK_ACTION: &str = "frame bodies are not reaching this worker: check that
     'app shard body delivery summary' lines tell a thin mesh (mesh_peers under 3) from loss on \
     the link (mesh_peers 6 or more with body_never high) and from one sender (top_leader_missing \
     dominant)";
-const DISK_ACTION: &str = "this worker refuses proposals mostly for other reasons than a missing \
-    body, so it applies frames late: check this node's disk (fsync latency, free space) and CPU; \
-    'refused' in 'this worker refused some proposals' lines names the reasons";
+const GLOBAL_ACTION: &str = "this worker refuses proposals mostly because this node's GLOBAL \
+    view lacks what they build on (their parent's state or GLOBAL anchor), usually while a GLOBAL \
+    state sync from an archive installs its chunks: check that no 'archive connection still \
+    failing' warning repeats and that prover tree sync lines end in 'converged'; 'committee \
+    session parent unavailable; abstaining' lines name each error";
+const DISK_ACTION: &str = "this worker refuses proposals mostly because it has not applied their \
+    parent frame yet, so it applies frames late: check this node's disk (fsync latency, free \
+    space) and CPU; 'refused' in 'this worker refused some proposals' lines names the reasons";
+const OTHER_ACTION: &str = "refused_mostly names a reason other than a missing body, this node's \
+    GLOBAL view or a frame not applied yet: if it repeats, report this line with its shard to the \
+    maintainer";
+const NO_REFUSAL_ACTION: &str = "this worker refused no proposals in the window, so no refusal \
+    names the cause: 'reason' in 'waiting for a pending finalization' lines names what held the \
+    frames; 'frame body not held by this worker' points at this node's link ('app shard body \
+    delivery summary' lines)";
+
+/// What a refusal reason points this node's operator at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cause {
+    /// A body that did not arrive: the link.
+    Link,
+    /// A parent or GLOBAL anchor this node's GLOBAL view lacks.
+    GlobalView,
+    /// A parent frame this worker has not applied yet: disk and CPU.
+    Apply,
+    /// The proposal's contents or the session.
+    Other,
+}
+
+fn cause(reason: &str) -> Cause {
+    match reason {
+        BLOCK_NOT_DELIVERED => Cause::Link,
+        crate::app_stall::PARENT_UNAVAILABLE
+        | "anchored GLOBAL frame missing"
+        | "anchored GLOBAL frame not here yet" => Cause::GlobalView,
+        "not at the parent frame"
+        | "covered shard data not staged"
+        | "no state to check proposals against" => Cause::Apply,
+        _ => Cause::Other,
+    }
+}
+
+/// This worker's refusals of one window, by reason.
+pub(crate) type Refusals = BTreeMap<&'static str, u64>;
+
+/// The reason refused most, with its count; a tie goes to the first by name.
+fn commonest(refused: &Refusals) -> Option<(&'static str, u64)> {
+    refused
+        .iter()
+        .max_by_key(|(reason, n)| (**n, std::cmp::Reverse(**reason)))
+        .map(|(reason, n)| (*reason, *n))
+}
 
 #[derive(Default)]
 struct Inner {
@@ -49,9 +101,27 @@ struct Inner {
     /// Noted stalls ended within [`SHARE_WINDOW`], oldest first.
     closed: VecDeque<(Instant, Instant)>,
     warned: Option<Instant>,
+    /// The consensus host whose refusal counts were read last; held weakly,
+    /// so its address names it until another host is read.
+    refusal_host: Weak<Liveness>,
+    /// That host's refusal counts as last read.
+    refusals_seen: Refusals,
+    /// Refusals read within [`SHARE_WINDOW`], by when they were read, oldest
+    /// first.
+    refusals: VecDeque<(Instant, &'static str, u64)>,
 }
 
 impl Inner {
+    /// Forget the refusals read before the window ending `now`.
+    fn forget_refusals(&mut self, now: Instant) {
+        let Some(start) = now.checked_sub(SHARE_WINDOW) else {
+            return;
+        };
+        while self.refusals.front().is_some_and(|(at, ..)| *at <= start) {
+            self.refusals.pop_front();
+        }
+    }
+
     /// Stalled time within the window ending `now`, and how many stalls.
     fn stalled(&mut self, now: Instant) -> (Duration, usize) {
         let start = now.checked_sub(SHARE_WINDOW);
@@ -206,6 +276,41 @@ impl BodyDelivery {
         inner.warned = Some(now);
         Some(ShareSignal::High { stalled, stalls })
     }
+
+    /// Read the running consensus host's refusal counts, `host`, at `now`:
+    /// what it refused since the last read joins the window. A new host
+    /// counts from zero; the refusals of the hosts before it stay.
+    pub(crate) fn read_refusals(&self, now: Instant, host: Option<&Arc<Liveness>>) {
+        let Some(host) = host else { return };
+        let refused = host.decisions().refused;
+        let mut inner = self.inner();
+        let inner = &mut *inner;
+        if !std::ptr::eq(inner.refusal_host.as_ptr(), Arc::as_ptr(host)) {
+            inner.refusal_host = Arc::downgrade(host);
+            inner.refusals_seen.clear();
+        }
+        for (reason, count) in &refused {
+            let seen = inner.refusals_seen.get(reason).copied().unwrap_or(0);
+            let new = count.saturating_sub(seen);
+            if new > 0 {
+                inner.refusals.push_back((now, *reason, new));
+            }
+        }
+        inner.refusals_seen = refused;
+        inner.forget_refusals(now);
+    }
+
+    /// This worker's refusals read within the window ending `now`, by
+    /// reason: those [`ShareSignal::High`] at `now` is weighed against.
+    pub(crate) fn refused_within(&self, now: Instant) -> Refusals {
+        let mut inner = self.inner();
+        inner.forget_refusals(now);
+        let mut refused = Refusals::new();
+        for (_, reason, n) in &inner.refusals {
+            *refused.entry(*reason).or_default() += n;
+        }
+        refused
+    }
 }
 
 /// What a consensus host reports through, kept by its owner across hosts.
@@ -279,32 +384,42 @@ pub(crate) fn log_summary(
         "app shard body delivery summary");
 }
 
-/// Which of this node's parts to check, by what this worker refused:
-/// `block_not_delivered` refusals against every other reason.
-pub(crate) fn share_action(block_not_delivered: u64, other_refusals: u64) -> &'static str {
-    if other_refusals > block_not_delivered {
-        DISK_ACTION
-    } else {
-        LINK_ACTION
+/// Which of this node's parts to check, by the reason this worker refused
+/// most in the window, `refused`.
+fn share_action(refused: &Refusals) -> &'static str {
+    match commonest(refused).map(|(reason, _)| cause(reason)) {
+        None => NO_REFUSAL_ACTION,
+        Some(Cause::Link) => LINK_ACTION,
+        Some(Cause::GlobalView) => GLOBAL_ACTION,
+        Some(Cause::Apply) => DISK_ACTION,
+        Some(Cause::Other) => OTHER_ACTION,
     }
 }
 
-pub(crate) fn log_share(
-    filter: &[u8],
-    signal: &ShareSignal,
-    block_not_delivered: u64,
-    other_refusals: u64,
-) {
+/// `<reason> <count> of <all refusals>`, or `none`.
+fn refused_mostly(refused: &Refusals) -> String {
+    commonest(refused).map_or_else(
+        || "none".to_string(),
+        |(reason, n)| format!("{reason} {n} of {}", refused.values().sum::<u64>()),
+    )
+}
+
+/// `refused` counts this worker's refusals in the same window as `signal`.
+pub(crate) fn log_share(filter: &[u8], signal: &ShareSignal, refused: &Refusals) {
     match signal {
-        ShareSignal::High { stalled, stalls } => tracing::warn!(
-            filter = %hex::encode(filter), stalled_secs = stalled.as_secs(),
-            window_secs = SHARE_WINDOW.as_secs(), stalls,
-            refused_block_not_delivered = block_not_delivered, refused_other = other_refusals,
-            scope = "this node",
-            action = share_action(block_not_delivered, other_refusals),
-            "finalized app frames stalled on this worker for over 1% of the last hour; \
-             its seat signs little during a stall"
-        ),
+        ShareSignal::High { stalled, stalls } => {
+            let block_not_delivered = refused.get(BLOCK_NOT_DELIVERED).copied().unwrap_or(0);
+            tracing::warn!(
+                filter = %hex::encode(filter), stalled_secs = stalled.as_secs(),
+                window_secs = SHARE_WINDOW.as_secs(), stalls,
+                refused_mostly = %refused_mostly(refused),
+                refused_block_not_delivered = block_not_delivered,
+                refused_other = refused.values().sum::<u64>() - block_not_delivered,
+                scope = "this node", action = share_action(refused),
+                "finalized app frames stalled on this worker for over 1% of the last hour; \
+                 its seat signs little during a stall"
+            )
+        }
         ShareSignal::Ended { stalled } => tracing::info!(
             filter = %hex::encode(filter), stalled_secs = stalled.as_secs(),
             window_secs = SHARE_WINDOW.as_secs(),
@@ -476,32 +591,123 @@ mod tests {
         );
     }
 
+    /// The advice follows the reason refused most in the window: a missing
+    /// body the link, an unreadable parent or GLOBAL anchor this node's
+    /// GLOBAL view, a parent frame not applied yet the disk, any other reason
+    /// by its name.
     #[test]
-    fn the_share_warning_names_the_link_or_the_disk_by_the_refusal_mix() {
+    fn the_share_warning_routes_its_advice_by_the_hours_commonest_refusal() {
+        use crate::app_stall::PARENT_UNAVAILABLE;
+        let mix = |counts: &[(&'static str, u64)]| counts.iter().copied().collect::<Refusals>();
+        assert_eq!(share_action(&mix(&[])), NO_REFUSAL_ACTION);
         assert_eq!(
-            share_action(0, 0),
-            LINK_ACTION,
-            "bodies are what is missing"
+            share_action(&mix(&[
+                (BLOCK_NOT_DELIVERED, 3),
+                ("not at the parent frame", 2)
+            ])),
+            LINK_ACTION
         );
-        assert_eq!(share_action(9, 3), LINK_ACTION);
-        assert_eq!(share_action(3, 3), LINK_ACTION);
-        assert_eq!(share_action(3, 9), DISK_ACTION);
+        for reason in [
+            PARENT_UNAVAILABLE,
+            "anchored GLOBAL frame missing",
+            "anchored GLOBAL frame not here yet",
+        ] {
+            assert_eq!(
+                share_action(&mix(&[(reason, 3), (BLOCK_NOT_DELIVERED, 2)])),
+                GLOBAL_ACTION,
+                "{reason}"
+            );
+        }
+        for reason in [
+            "not at the parent frame",
+            "covered shard data not staged",
+            "no state to check proposals against",
+        ] {
+            assert!(
+                share_action(&mix(&[(reason, 3), (BLOCK_NOT_DELIVERED, 2)])) == DISK_ACTION,
+                "an unapplied parent frame points at the disk: {reason}"
+            );
+        }
+        assert_eq!(
+            share_action(&mix(&[("digest mismatch", 3), (BLOCK_NOT_DELIVERED, 2)])),
+            OTHER_ACTION
+        );
+        assert_eq!(
+            commonest(&mix(&[(PARENT_UNAVAILABLE, 2), (BLOCK_NOT_DELIVERED, 2)])),
+            Some((BLOCK_NOT_DELIVERED, 2)),
+            "a tie goes to the first by name"
+        );
         let logs = CapturedLogs::default();
         let _guard = logs.install();
         let high = ShareSignal::High {
             stalled: secs(40),
             stalls: 2,
         };
-        log_share(&[1], &high, 3, 9);
+        log_share(
+            &[1],
+            &high,
+            &mix(&[(PARENT_UNAVAILABLE, 10), (BLOCK_NOT_DELIVERED, 2)]),
+        );
         let warned = logs.lines_with("over 1% of the last hour");
         assert_eq!(warned.len(), 1);
-        assert!(warned[0].contains("WARN"), "{}", warned[0]);
-        assert!(warned[0].contains("disk"), "{}", warned[0]);
-        assert!(warned[0].contains("stalled_secs=40"), "{}", warned[0]);
-        log_share(&[1], &high, 9, 3);
-        assert!(logs.lines_with("over 1% of the last hour")[1].contains("p2p port"));
-        log_share(&[1], &ShareSignal::Ended { stalled: secs(1) }, 0, 0);
+        for field in [
+            "WARN",
+            "stalled_secs=40",
+            "refused_mostly=parent unavailable 10 of 12",
+            "refused_block_not_delivered=2",
+            "refused_other=10",
+            "archive connection still failing",
+        ] {
+            assert!(warned[0].contains(field), "{field}: {}", warned[0]);
+        }
+        log_share(&[1], &high, &mix(&[]));
+        let warned = logs.lines_with("over 1% of the last hour");
+        assert!(warned[1].contains("refused_mostly=none"), "{}", warned[1]);
+        assert!(warned[1].contains("refused_other=0"), "{}", warned[1]);
+        log_share(&[1], &ShareSignal::Ended { stalled: secs(1) }, &mix(&[]));
         assert!(logs.lines_with("under 1% of the last hour")[0].contains("INFO"));
+    }
+
+    /// Each host's refusals join the window once, a new host counting from
+    /// zero, and leave it with the hour.
+    #[test]
+    fn refusals_join_the_window_once_per_host_and_leave_it_with_the_hour() {
+        use quil_cw_consensus::adapters::Step;
+        let delivery = BodyDelivery::default();
+        let start = Instant::now();
+        let at = |s| start + secs(s);
+        let refuse = |host: &Liveness, view, reason| {
+            host.note(Step::Verify, view, reason, "");
+            host.settle(Step::Verify, view, false);
+        };
+        delivery.read_refusals(at(0), None);
+        assert!(delivery.refused_within(at(0)).is_empty());
+        let first = Arc::new(Liveness::default());
+        refuse(&first, 1, "not at the parent frame");
+        refuse(&first, 2, "not at the parent frame");
+        delivery.read_refusals(at(10), Some(&first));
+        delivery.read_refusals(at(20), Some(&first));
+        assert_eq!(
+            delivery.refused_within(at(20)),
+            Refusals::from([("not at the parent frame", 2)]),
+            "read once"
+        );
+        let second = Arc::new(Liveness::default());
+        refuse(&second, 1, "not at the parent frame");
+        refuse(&second, 2, BLOCK_NOT_DELIVERED);
+        drop(first);
+        delivery.read_refusals(at(1000), Some(&second));
+        assert_eq!(
+            delivery.refused_within(at(1000)),
+            Refusals::from([("not at the parent frame", 3), (BLOCK_NOT_DELIVERED, 1)]),
+            "a new host counts from zero"
+        );
+        assert_eq!(
+            delivery.refused_within(at(3610)),
+            Refusals::from([("not at the parent frame", 1), (BLOCK_NOT_DELIVERED, 1)]),
+            "the first host's refusals left the hour"
+        );
+        assert!(delivery.refused_within(at(4600)).is_empty());
     }
 
     #[tokio::test(start_paused = true)]
