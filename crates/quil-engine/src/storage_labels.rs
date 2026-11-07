@@ -182,7 +182,7 @@ pub fn disk_floor(total_bytes: u64) -> u64 {
 /// in the page cache at once, and leaves labelled together end their layers
 /// together: a regular node labelling 37 leaves at its snapshot synced about
 /// 13 GB in each round of layers, and its stores' commits waited up to 2.7 s
-/// for their fsyncs behind them, past the probe's bound of one second
+/// for their fsyncs behind them, past the store latency probe's fsync bound
 /// (2026-11-05).
 const FLUSH_CHUNK_BYTES: usize = 16 << 20;
 
