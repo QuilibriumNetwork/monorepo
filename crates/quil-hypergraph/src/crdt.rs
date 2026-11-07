@@ -4149,6 +4149,16 @@ impl HypergraphCrdt {
                 version,
             )?;
         }
+        // Synced leaves never pass through the mutation methods, so count
+        // their size changes here, in the same transaction as the leaves.
+        let sizes = self.synced_size_changes(&forest, &app, plan.phase_idx, leaves)?;
+        if !sizes.is_empty() {
+            if let Some(blob) = txn.get(SIZE_BUCKETS_KEY)? {
+                let mut persisted = deserialize_buckets(&blob);
+                apply_size_changes(&mut persisted, &sizes);
+                txn.set(SIZE_BUCKETS_KEY, &serialize_buckets(&persisted))?;
+            }
+        }
         // A scope that began empty is complete after every chunk. Repair of
         // legacy state becomes complete only after checking every source leaf.
         if !plan.repair_existing || final_chunk {
@@ -4174,9 +4184,52 @@ impl HypergraphCrdt {
             .write()
             .unwrap()
             .insert((plan.shard_id.clone(), plan.phase_idx), version);
+        if !sizes.is_empty() && self.sizes_warmed.load(Ordering::Acquire) {
+            apply_size_changes(&mut self.sub_meta.write().unwrap(), &sizes);
+        }
         plan.base_version = Some(version);
         plan.next += blobs.len();
         Ok(())
+    }
+
+    /// The size bucket changes installing `leaves` into phase `phase_idx` of
+    /// `app` makes under exact sizes: per leaf the change in its size (a
+    /// removes phase subtracts it), and in the vertex adds phase one more or
+    /// one fewer leaf. Read against the committed tree before the install.
+    /// Nothing before the exact state-size epoch, whose rebuild counts the
+    /// synced state, nor for the global prover tree, which has no buckets.
+    fn synced_size_changes(
+        &self,
+        forest: &Forest,
+        app: &[u8; 32],
+        phase_idx: usize,
+        leaves: &[([u8; 32], Option<Vec<u8>>)],
+    ) -> Result<Vec<(Vec<u8>, i64, i128)>> {
+        if *app == [0xff; 32] || !self.exact_sizes() {
+            return Ok(Vec::new());
+        }
+        let mut changes = Vec::new();
+        for (key, leaf) in leaves {
+            let old = self.committed_leaf_size(forest, app, phase_idx, key)?;
+            let new = leaf
+                .as_ref()
+                .map(|leaf| quil_forest::vertex_leaf_size(leaf) as u64);
+            let size = i128::from(new.unwrap_or(0)) - i128::from(old.unwrap_or(0));
+            let size = if phase_idx.is_multiple_of(2) {
+                size
+            } else {
+                -size
+            };
+            let count = if phase_idx == 0 {
+                i64::from(new.is_some()) - i64::from(old.is_some())
+            } else {
+                0
+            };
+            if size != 0 || count != 0 {
+                changes.push((self.sub_shard_id_for(app, key), count, size));
+            }
+        }
+        Ok(changes)
     }
 
     /// Completion is a current local root check, including a no-op diff.
@@ -6942,7 +6995,18 @@ const SIZE_INDEX_SEEDED_KEY: &[u8] = b"hgsz:seeded";
 /// ([`HypergraphCrdt::activate_exact_sizes`]), and the persisted buckets do.
 /// Its value is the rule's version; another value or none rebuilds.
 const SIZE_EXACT_KEY: &[u8] = b"hgsz:exact";
-const SIZE_EXACT_VERSION: &[u8] = b"1";
+/// Version 2 rebuilds buckets persisted before synced state was counted
+/// (a node that received an application by sync counted none of it).
+const SIZE_EXACT_VERSION: &[u8] = b"2";
+
+/// Add `(bucket, count, size)` changes to a size bucket map.
+fn apply_size_changes(m: &mut HashMap<Vec<u8>, (u64, i128)>, changes: &[(Vec<u8>, i64, i128)]) {
+    for (key, count, size) in changes {
+        let entry = m.entry(key.clone()).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add_signed(*count);
+        entry.1 = entry.1.saturating_add(*size);
+    }
+}
 
 /// `[count u32][ (klen u32)(shard_id)(count u64)(size i128) ]*` — the persisted
 /// per-sub-shard `(raw_count, live_size)` map. Small (one entry per sub-shard).
@@ -7848,5 +7912,161 @@ mod commit_lock_label_tests {
         assert_eq!(marked_wait(&hg), Section::CommitLockWait);
         hg.name_commit_lock_global();
         assert_eq!(marked_wait(&hg), Section::GlobalCommitLockWait);
+    }
+}
+
+#[cfg(test)]
+mod synced_size_tests {
+    use super::*;
+    use crate::testing::{CrdtTreeReader, MemStore, StubProver};
+
+    fn node(store: Arc<MemStore>, app: [u8; 32]) -> Arc<HypergraphCrdt> {
+        let crdt = Arc::new(HypergraphCrdt::new(store, Arc::new(StubProver)));
+        crdt.set_unified_tree(true);
+        crdt.warm_sizes(&[app]).unwrap();
+        assert!(crdt.activate_exact_sizes(&[app]).unwrap().is_some());
+        crdt
+    }
+
+    fn location(app: [u8; 32], byte: u8) -> Location {
+        Location {
+            app_address: app,
+            data_address: [byte; 32],
+        }
+    }
+
+    /// The reward basis and world size GLOBAL issuance reads.
+    fn sizes(crdt: &HypergraphCrdt, app: &[u8; 32]) -> (Option<(u64, BigInt)>, BigInt) {
+        (
+            crdt.sub_shard_metadata_for_filter(app)
+                .map(|md| (md.leaf_count, md.size)),
+            crdt.total_size(),
+        )
+    }
+
+    /// Install `source`'s committed vertex adds of `app` on `target` by a
+    /// forest sync, as a catch-up or state jump does.
+    fn sync_adds(source: &Arc<HypergraphCrdt>, target: &HypergraphCrdt, app: [u8; 32]) {
+        let (version, root) = source.serve_forest_head(&app, 0).unwrap();
+        let reader = CrdtTreeReader {
+            source: source.clone(),
+            shard_id: app.to_vec(),
+            phase: 0,
+        };
+        let mut plan = target
+            .prepare_phase_sync(
+                &reader,
+                version,
+                &app,
+                0,
+                &[],
+                Some(quil_forest::SubtreeSyncAnchor::AppRoot(root)),
+            )
+            .unwrap();
+        while let Some((key, _)) = plan.remaining().first() {
+            let blob = source
+                .get_vertex_data_checked(&location(app, key[0]))
+                .unwrap()
+                .unwrap();
+            target.apply_sync_chunk(&mut plan, &[blob]).unwrap();
+        }
+        assert_eq!(target.finish_phase_sync(&plan).unwrap(), root);
+    }
+
+    /// A node that received an application's state by forest sync prices
+    /// issuance from the same reward basis and world size as a node that
+    /// executed it, then and after both execute the next frame and restart.
+    #[test]
+    fn a_synced_node_counts_the_sizes_of_an_executing_node() {
+        let app = [0x74; 32];
+        let executed = node(Arc::new(MemStore::new()), app);
+        for byte in [0x10, 0x50, 0x90] {
+            executed
+                .add_vertex(&location(app, byte), &[byte; 48])
+                .unwrap();
+        }
+        executed.commit(1).unwrap();
+        let store = Arc::new(MemStore::new());
+        let synced = node(store.clone(), app);
+        sync_adds(&executed, &synced, app);
+        assert_eq!(
+            synced
+                .get_vertex_data_checked(&location(app, 0x50))
+                .unwrap(),
+            Some(vec![0x50; 48]),
+            "the synced state is readable"
+        );
+        assert_eq!(
+            sizes(&synced, &app),
+            sizes(&executed, &app),
+            "the synced node's buckets match the executing node's"
+        );
+        let early = Arc::new(HypergraphCrdt::new(store.clone(), Arc::new(StubProver)));
+        early.set_unified_tree(true);
+        early.warm_sizes(&[app]).unwrap();
+        assert_eq!(
+            sizes(&early, &app),
+            sizes(&executed, &app),
+            "a restart before the next commit keeps the synced buckets"
+        );
+        for crdt in [&executed, &synced] {
+            crdt.add_vertex(&location(app, 0xd0), &[0xd0; 20]).unwrap();
+            crdt.commit(2).unwrap();
+        }
+        assert_eq!(
+            sizes(&synced, &app),
+            sizes(&executed, &app),
+            "the buckets agree after both execute the next frame"
+        );
+        let reopened = Arc::new(HypergraphCrdt::new(store, Arc::new(StubProver)));
+        reopened.set_unified_tree(true);
+        reopened.warm_sizes(&[app]).unwrap();
+        assert_eq!(
+            sizes(&reopened, &app),
+            sizes(&executed, &app),
+            "a restart restores the counted buckets"
+        );
+    }
+
+    /// Buckets persisted under the first exact rule may lack synced state,
+    /// so a store carrying them rebuilds once from the committed leaves.
+    #[test]
+    fn buckets_persisted_before_synced_state_counted_rebuild_once() {
+        let app = [0x75; 32];
+        let store = Arc::new(MemStore::new());
+        let crdt = node(store.clone(), app);
+        crdt.add_vertex(&location(app, 0x10), &[0x10; 48]).unwrap();
+        crdt.commit(1).unwrap();
+        let counted = sizes(&crdt, &app);
+        let txn = store.new_transaction(false).unwrap();
+        txn.set(SIZE_BUCKETS_KEY, &serialize_buckets(&HashMap::new()))
+            .unwrap();
+        txn.set(SIZE_EXACT_KEY, b"1").unwrap();
+        txn.commit().unwrap();
+        // A restarted node reopens its forest with the store; the test forest
+        // lives in memory and keeps no head versions, so share it and carry
+        // the heads a RocksDB forest persists.
+        let reopened = Arc::new(HypergraphCrdt::new(store, Arc::new(StubProver)));
+        reopened.set_forest(crdt.forest.read().unwrap().clone());
+        reopened
+            .phase_versions
+            .write()
+            .unwrap()
+            .extend(crdt.phase_versions.read().unwrap().clone());
+        reopened.set_unified_tree(true);
+        reopened.warm_sizes(&[app]).unwrap();
+        assert!(
+            reopened.activate_exact_sizes(&[app]).unwrap().is_some(),
+            "the first rule's buckets are rebuilt"
+        );
+        assert_eq!(
+            sizes(&reopened, &app),
+            counted,
+            "the rebuild counts the committed leaves"
+        );
+        assert!(
+            reopened.activate_exact_sizes(&[app]).unwrap().is_none(),
+            "once"
+        );
     }
 }
