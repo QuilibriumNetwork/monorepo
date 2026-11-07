@@ -4430,7 +4430,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("Reachability notice", "`Reachability: peers cannot dial this node`: the node's verdict, served to this node only, which `qclient node doctor` also gives, from the node's own view: AutoNAT servers on 2 or more IPs could not dial it back, AutoNAT holds it private with no confirmed address, or its address is behind carrier-grade NAT. It ends once AutoNAT confirms an address. Missing or unsettled AutoNAT results show nothing. The doctor gives a verdict per address family and what to change; it changes nothing itself."),
         kv("IPv6 notice", "`IPv6: this node binds an address but publishes none`: peers do not learn the address, so IPv6 carries no dials to this node. Served to this node only, at the info level; `qclient node doctor` names the address"),
         kv("Master store notice", "`Master store stopped writing`: a failed write, or free space below the floor. This node cannot follow GLOBAL until the store is reopened: free disk space or fix the failed write, then restart the node"),
-        kv("Store notice", "`Store reads slow (<cause>)`: the node reads one entry of its master store a second (the canary) and, on Linux, times its disk's reads and writes. Shown once a minute has 2 canary reads of 50ms or more (or one of 1s), a read stays unfinished 1s, or the disk takes 20ms a read or 100ms a write (of 20+), two minutes in a row; it clears after three minutes under all of them. Work that reads the store falls behind and allocations may lapse. The label names the cause the figures support. `this node's disk`: a disk await is over its threshold; check that TRIM runs (fstrim.timer or the discard mount option), the disk's health (SMART) and other I/O load on it. `disk normal, this node's load`: the disk's awaits (of 20+ reads) are under them; check CPU, memory pressure, store compaction and other work on this node. `disk not ruled out`: no disk figures or under 20 reads; check both. `qclient node diagnostics health --self` and the node's `store i/o` log lines give the figures"),
+        kv("Store notice", "`Store reads slow (<cause>)`: the node reads one entry of its master store a second (the canary) and, on Linux, times its disk's reads and writes. Shown once a minute has 2 canary reads of 50ms or more (or one of 1s), a read stays unfinished 1s, or the disk takes 20ms a read or 100ms a write (of 20+), two minutes in a row; it clears after three minutes under all of them. Work that reads the store falls behind and allocations may lapse. The label names the cause the figures support. `this node's disk`: a disk await is over its threshold; check that TRIM runs (fstrim.timer or the discard mount option), the disk's health (SMART) and other I/O load on it. `disk normal, this node's load`: the disk's awaits (of 20+ reads) are under them; check CPU, memory pressure, store compaction and other work on this node. `disk not ruled out`: no disk figures or under 20 reads; check both. `qclient node diagnostics health --self` and the node's `store i/o` log lines give the figures. `Store fsync slow (this node's disk)`: once a minute the node writes 4 KiB beside its master store and syncs it to the disk; shown while the latest took its bound or longer (the notice gives both), gone once one is under it. This node's votes wait on such syncs, so a disk this slow signs fewer certificates and earns less. `Store reads and fsync slow`: the reads are slow too. Check the drive with `iostat -x` and what else writes to it, storage label writes included; a DRAM-less drive under load is a common cause: move the store to a drive with a DRAM cache, or run fewer seats. The node's `store latency` log lines give each sync's time"),
         kv("Command legends", "Compact mode shows applicable UI/worker commands only; expanded mode also shows disabled commands. Usable commands share one highlight; labels show colors on/off and relative/absolute thresholds. `filter*` means a column filter is active"),
         kv("Scroll hints", "Bottom border counts hidden rows `↑`/`↓` and columns `←`/`→`"),
         kv("Colors", "What the main view's colors mean:"),
@@ -5068,6 +5068,55 @@ mod tests {
         ] {
             assert!(help.contains(name), "{name}");
         }
+    }
+
+    /// A slow store fsync shows as the node's notice, with its figure and
+    /// bound, in the drawn frame; the help explains it.
+    #[test]
+    fn a_slow_store_fsync_shows_as_a_notice_with_its_bound() {
+        use quil_types::proto::diagnostics::{HealthCondition, HealthConditions};
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+        let since = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let mut m = Model::new();
+        m.compact_actions = false;
+        m.data_loaded = true;
+        m.allocations = joining_table();
+        m.last_fetch_success = Some(Instant::now());
+        m.health = HealthAnswer::Reported(HealthConditions {
+            conditions: vec![HealthCondition {
+                kind: ConditionKind::StoreIoSlow as i32,
+                severity: ConditionSeverity::Warning as i32,
+                since_unix_ms: since,
+                affected: 1,
+                tracked: 1,
+                threshold: 100,
+                store_fsync_ms: Some(1_002),
+                ..Default::default()
+            }],
+            sources: Vec::new(),
+        });
+        m.health_received = Some(Instant::now());
+        m.notice_minimum = NoticeSeverity::Warning;
+        update_message_lifetime(&mut m);
+        let stamp = message_timestamp(Some(UNIX_EPOCH + Duration::from_millis(since)));
+        let notice = format!(
+            "{stamp}Store fsync slow (this node's disk): 4 KiB write and fsync 1002ms \
+             (bound 100ms)."
+        );
+        let text = render_text(&mut m, 160, 40);
+        println!("{text}");
+        let line = text.lines().find(|l| l.contains("Store fsync slow"));
+        assert!(
+            line.is_some_and(|l| l.contains(&notice)),
+            "FSYNC-HEALTH fsync_notice_missing: {text}"
+        );
+        assert!(
+            help_text().contains("Store fsync slow (this node's disk)"),
+            "FSYNC-HEALTH fsync_help_missing"
+        );
     }
 
     /// Inputs that would once have raised a notice or a cell here raise

@@ -19,10 +19,10 @@
 //! observations reports nothing and ends what it reported.
 //!
 //! Evidence is safe to serve to an allowlisted peer: public shard filters,
-//! worker core numbers, frames, counts, times and store read times, never
-//! addresses, keys, paths or peer IDs. A kind whose evidence reveals more than
-//! that (amounts, this node's addresses) is [`local_only`]: the report drops
-//! it for peers.
+//! worker core numbers, frames, counts, times and store read and fsync times,
+//! never addresses, keys, paths or peer IDs. A kind whose evidence reveals more
+//! than that (amounts, this node's addresses) is [`local_only`]: the report
+//! drops it for peers.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -289,6 +289,15 @@ pub fn store_io_figures(io: &StoreIoHealth) -> String {
         (None, None) => {}
     }
     parts.join(", ")
+}
+
+/// The store's 4 KiB write and fsync against its bound, both in ms.
+fn store_fsync_figure(ms: u64, bound_ms: u64) -> String {
+    format!(
+        "4 KiB write and fsync {} (bound {})",
+        io_ms(ms.saturating_mul(1000)),
+        io_ms(bound_ms.saturating_mul(1000))
+    )
 }
 
 /// The label of the store-slow notice: the cause the figures support
@@ -600,6 +609,9 @@ pub struct HealthRegistry {
     seats_seen_ms: u64,
     store_io: Option<StoreIoHealth>,
     store_io_seen_ms: u64,
+    /// The store's latest write and fsync and its bound, in ms.
+    store_fsync: Option<(u64, u64)>,
+    store_fsync_seen_ms: u64,
     master_store_write_failed: bool,
     master_store_seen_ms: u64,
     reachability: ReachabilityVerdict,
@@ -749,6 +761,7 @@ struct Judged {
     global: Option<GlobalProgress>,
     log_evidence: Option<String>,
     store_io: Option<StoreIoHealth>,
+    store_fsync_ms: Option<u64>,
     reward_hour_units: u64,
     reward_day_units: u64,
 }
@@ -1300,6 +1313,14 @@ impl HealthRegistry {
         }
     }
 
+    /// Record the store's latest 4 KiB write and fsync, which returned at
+    /// `sampled_ms`, and the bound from which it delays this node's votes.
+    /// A probe that stops returning goes stale like any observation.
+    pub fn observe_store_fsync(&mut self, fsync_ms: u64, bound_ms: u64, sampled_ms: u64) {
+        self.store_fsync = Some((fsync_ms, bound_ms));
+        self.store_fsync_seen_ms = sampled_ms;
+    }
+
     /// Record whether the master store stopped writing.
     pub fn observe_master_store(&mut self, write_failed: bool, now_ms: u64) {
         self.master_store_write_failed = write_failed;
@@ -1593,9 +1614,20 @@ impl HealthRegistry {
                 ..Default::default()
             }
         };
+        // Reads and fsync are judged apart, each while fresh; either holds
+        // the one condition of the store.
+        let (reads_seen, fsync_seen) = (
+            fresh(self.store_io_seen_ms),
+            fresh(self.store_fsync_seen_ms),
+        );
         let store_io = self
             .store_io
-            .filter(|io| io.verdict() == StoreIoVerdict::Slow);
+            .filter(|io| reads_seen != 0 && io.verdict() == StoreIoVerdict::Slow);
+        let fsync_bound_ms = self.store_fsync.map_or(0, |(_, bound)| bound);
+        let store_fsync_ms = self
+            .store_fsync
+            .filter(|&(ms, bound)| fsync_seen != 0 && ms >= bound)
+            .map(|(ms, _)| ms);
         let judged = [
             Judged {
                 kind: ConditionKind::LocalAppFramesUnchanged,
@@ -1685,10 +1717,12 @@ impl HealthRegistry {
             },
             Judged {
                 store_io,
+                store_fsync_ms,
+                threshold: fsync_bound_ms,
                 ..verdict(
                     ConditionKind::StoreIoSlow,
-                    self.store_io_seen_ms,
-                    store_io.is_some(),
+                    reads_seen.max(fsync_seen),
+                    store_io.is_some() || store_fsync_ms.is_some(),
                 )
             },
             verdict(
@@ -1737,6 +1771,7 @@ impl HealthRegistry {
             global,
             log_evidence,
             store_io,
+            store_fsync_ms,
             reward_hour_units,
             reward_day_units,
             ..
@@ -1773,7 +1808,12 @@ impl HealthRegistry {
             kind: key,
             severity: severity_of(kind, overran) as i32,
             scope: scope_of(kind) as i32,
-            action: action_of(kind) as i32,
+            // A drive slow to sync is checked as such, whatever its reads.
+            action: if store_fsync_ms.is_some() {
+                ConditionAction::CheckStoreFsync
+            } else {
+                action_of(kind)
+            } as i32,
             since_unix_ms,
             affected,
             tracked,
@@ -1783,6 +1823,7 @@ impl HealthRegistry {
             wait,
             global,
             store_io,
+            store_fsync_ms,
             reward_hour_units,
             reward_day_units,
         };
@@ -2002,16 +2043,29 @@ pub fn notice_text(c: &HealthCondition) -> String {
             format_quil_daily_units(&BigInt::from(c.reward_hour_units)),
             format_quil_daily_units(&BigInt::from(c.reward_day_units))
         ),
-        ConditionKind::StoreIoSlow => {
-            let io = c.store_io.unwrap_or_default();
-            let figures = store_io_figures(&io);
-            let cause = store_io_scope(&io);
-            if figures.is_empty() {
-                format!("Store reads slow ({cause}).")
-            } else {
-                format!("Store reads slow ({cause}): {figures}.")
+        // The fsync probe times the disk itself: past its bound, the disk is
+        // the cause.
+        ConditionKind::StoreIoSlow => match (c.store_fsync_ms, c.store_io) {
+            (Some(ms), Some(io)) => format!(
+                "Store reads and fsync slow (this node's disk): {}, {}.",
+                store_io_figures(&io),
+                store_fsync_figure(ms, threshold)
+            ),
+            (Some(ms), None) => format!(
+                "Store fsync slow (this node's disk): {}.",
+                store_fsync_figure(ms, threshold)
+            ),
+            (None, io) => {
+                let io = io.unwrap_or_default();
+                let figures = store_io_figures(&io);
+                let cause = store_io_scope(&io);
+                if figures.is_empty() {
+                    format!("Store reads slow ({cause}).")
+                } else {
+                    format!("Store reads slow ({cause}): {figures}.")
+                }
             }
-        }
+        },
         ConditionKind::MasterStoreWriteFailed => MASTER_STORE_WRITE_FAILED.to_string(),
         ConditionKind::PeersCannotDial => {
             "Reachability: peers cannot dial this node; run qclient node doctor.".to_string()
@@ -2134,6 +2188,12 @@ pub fn action_text(action: i32) -> &'static str {
         ConditionAction::CheckDiskAndLoad => {
             "check TRIM, the disk's health and other I/O load, then this node's load (CPU, \
              memory pressure, compaction)"
+        }
+        ConditionAction::CheckStoreFsync => {
+            "the store's drive syncs writes too slowly, which delays this node's votes: check \
+             it with iostat -x and what else writes to it, storage label writes included; a \
+             DRAM-less drive under load is a common cause: move the store to a drive with a \
+             DRAM cache, or run fewer seats"
         }
         ConditionAction::ReopenMasterStore => {
             "free disk space or fix the failed write, then restart the node to reopen the store"
@@ -4323,6 +4383,138 @@ mod tests {
         reg.observe_store_io(Some(ok), T0 + 15_000);
         reg.evaluate(T0 + 15_000, &no_cadence);
         assert!(current(&reg, ConditionKind::StoreIoSlow).is_none());
+    }
+
+    /// The store's fsync at or past its bound is the store condition, with
+    /// its figure and the drive's check; one under the bound clears it, and
+    /// it ends after the clear hold. A probe that stops returning ends it as
+    /// unobserved once stale.
+    #[test]
+    fn a_store_fsync_at_its_bound_is_a_store_condition_until_one_under_it() {
+        const BOUND: u64 = 100;
+        let at = |secs: u64| T0 + secs * 1000;
+        let step = |reg: &mut HealthRegistry, secs: u64, fsync: Option<u64>| {
+            if let Some(ms) = fsync {
+                reg.observe_store_fsync(ms, BOUND, at(secs));
+            }
+            reg.evaluate(at(secs), &no_cadence)
+        };
+        let fsync_of = |reg: &HealthRegistry| {
+            current(reg, ConditionKind::StoreIoSlow).and_then(|c| c.store_fsync_ms)
+        };
+        let mut reg = HealthRegistry::default();
+        assert!(
+            step(&mut reg, 0, Some(BOUND - 1)).is_empty(),
+            "FSYNC-HEALTH fsync_below_bound_raised"
+        );
+        assert!(
+            current(&reg, ConditionKind::StoreIoSlow).is_none(),
+            "FSYNC-HEALTH fsync_below_bound_raised"
+        );
+        let source = reg
+            .snapshot()
+            .sources
+            .into_iter()
+            .find(|s| s.kind == ConditionKind::StoreIoSlow as i32)
+            .unwrap();
+        assert_eq!(
+            (source.observed_unix_ms, source.tracked),
+            (at(0), 1),
+            "FSYNC-HEALTH fsync_not_observed"
+        );
+
+        let started = step(&mut reg, 60, Some(BOUND));
+        assert!(
+            matches!(started.as_slice(), [Transition::Started { .. }]),
+            "FSYNC-HEALTH fsync_at_bound_not_raised: {started:?}"
+        );
+        let c = current(&reg, ConditionKind::StoreIoSlow).unwrap();
+        assert_eq!(
+            (c.affected, c.tracked, c.threshold, c.store_fsync_ms),
+            (1, 1, BOUND, Some(BOUND))
+        );
+        assert_eq!(c.severity, ConditionSeverity::Warning as i32);
+        assert_eq!(
+            c.action,
+            ConditionAction::CheckStoreFsync as i32,
+            "FSYNC-HEALTH fsync_action_not_named"
+        );
+        assert_eq!(
+            notice_text(&c),
+            "Store fsync slow (this node's disk): 4 KiB write and fsync 100ms (bound 100ms).",
+            "FSYNC-HEALTH fsync_notice_missing"
+        );
+        assert!(action_text(c.action).contains("DRAM cache"));
+        // Between probes it holds on the last; a slower one updates the
+        // figure without a line.
+        assert!(step(&mut reg, 105, None).is_empty());
+        assert_eq!(fsync_of(&reg), Some(BOUND));
+        assert!(step(&mut reg, 120, Some(1_002)).is_empty());
+        assert_eq!(fsync_of(&reg), Some(1_002));
+        // One under the bound: no longer served, ended after the hold.
+        assert!(
+            step(&mut reg, 180, Some(BOUND - 1)).is_empty(),
+            "FSYNC-HEALTH fsync_ended_within_hold"
+        );
+        assert!(
+            current(&reg, ConditionKind::StoreIoSlow).is_none(),
+            "FSYNC-HEALTH fsync_below_bound_raised"
+        );
+        assert!(
+            step(&mut reg, 225, None).is_empty(),
+            "FSYNC-HEALTH fsync_ended_within_hold"
+        );
+        let ended = step(&mut reg, 240, Some(BOUND - 1));
+        assert!(
+            matches!(
+                ended.as_slice(),
+                [Transition::Ended {
+                    kind: ConditionKind::StoreIoSlow,
+                    unobserved: false,
+                    ..
+                }]
+            ),
+            "FSYNC-HEALTH fsync_not_ended_after_hold: {ended:?}"
+        );
+        // A probe that stops returning (30 s is its timeout).
+        let started = step(&mut reg, 300, Some(30_000));
+        assert!(matches!(started.as_slice(), [Transition::Started { .. }]));
+        assert!(step(&mut reg, 300 + OBSERVATION_GAP_MS / 1000, None).is_empty());
+        let stale = step(&mut reg, 301 + OBSERVATION_GAP_MS / 1000, None);
+        assert!(
+            matches!(
+                stale.as_slice(),
+                [Transition::Ended {
+                    unobserved: true,
+                    ..
+                }]
+            ),
+            "FSYNC-HEALTH stale_fsync_kept: {stale:?}"
+        );
+    }
+
+    /// Reads and fsync slow together are one notice naming both, with the
+    /// drive's check; slow reads beside a quick fsync keep their own.
+    #[test]
+    fn slow_reads_and_fsync_are_one_store_condition() {
+        let mut reg = HealthRegistry::default();
+        reg.observe_store_io(Some(slow_io()), T0);
+        reg.observe_store_fsync(1_002, 100, T0);
+        reg.evaluate(T0, &no_cadence);
+        let c = current(&reg, ConditionKind::StoreIoSlow).unwrap();
+        assert_eq!(
+            notice_text(&c),
+            "Store reads and fsync slow (this node's disk): canary p99 412ms of 58 reads in \
+             60s, disk read 25ms/op, write 3.1ms/op, 4 KiB write and fsync 1002ms (bound 100ms).",
+            "FSYNC-HEALTH fsync_notice_missing"
+        );
+        assert_eq!(c.action, ConditionAction::CheckStoreFsync as i32);
+        reg.observe_store_fsync(4, 100, T0 + 15_000);
+        reg.evaluate(T0 + 15_000, &no_cadence);
+        let c = current(&reg, ConditionKind::StoreIoSlow).unwrap();
+        assert_eq!(c.store_fsync_ms, None);
+        assert_eq!(c.action, ConditionAction::CheckDiskAndLoad as i32);
+        assert!(notice_text(&c).starts_with("Store reads slow (this node's disk): "));
     }
 
     /// A master store that stopped writing is this node's error.

@@ -217,7 +217,9 @@ enum ConditionKind {
   // 24 hour value. Served to this node only.
   CONDITION_KIND_REWARD_DROP = 8;
   // The master store's reads or the disk under it stay slow
-  // (`StoreIoHealth.verdict`).
+  // (`StoreIoHealth.verdict`), or the store's disk took at least
+  // `HealthCondition.threshold` ms to write and fsync 4 KiB
+  // (`HealthCondition.store_fsync_ms`).
   CONDITION_KIND_STORE_IO_SLOW = 9;
   // The master store stopped writing (`master_store_write_failed`).
   CONDITION_KIND_MASTER_STORE_WRITE_FAILED = 10;
@@ -355,6 +357,8 @@ enum ConditionAction {
   CONDITION_ACTION_WAIT_FOR_NEXT_EPOCH = 22;
   // None: shield once GLOBAL reaches the admission frame.
   CONDITION_ACTION_WAIT_FOR_SHIELD_ADMISSION = 23;
+  // The store's drive: its fsync latency and what else writes to it.
+  CONDITION_ACTION_CHECK_STORE_FSYNC = 24;
 }
 
 // One shard or allocation a condition affects.
@@ -406,6 +410,10 @@ message HealthCondition {
   GlobalProgress global = 14;
   // For the expected waits: what ends it.
   ExpectedWait wait = 15;
+  // For `..._STORE_IO_SLOW`: the store's latest 4 KiB write and fsync, in
+  // ms, when at or past its bound; unset otherwise. `threshold` holds the
+  // bound, in ms, once the probe has run.
+  optional uint64 store_fsync_ms = 16;
 }
 
 // An expected wait as this node judged it (`HealthCondition.wait`).

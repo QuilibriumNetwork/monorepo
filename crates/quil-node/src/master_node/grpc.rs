@@ -3596,6 +3596,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                         .map(|(filter, low)| quil_rpc::health_conditions::SeatShare { filter, low })
                         .collect();
                     let store_io = quil_forest::store_io::latest().map(|report| report.to_proto());
+                    let fsync = super::store_latency::latest_fsync();
                     let write_failed =
                         quil_forest::storage_health::store_latched(quil_forest::StoreRole::Master);
                     let reachability = reachability();
@@ -3611,6 +3612,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                         }
                         health.observe_seats(seats, now);
                         health.observe_store_io(store_io, now);
+                        if let Some(f) = fsync {
+                            health.observe_store_fsync(f.fsync_ms, f.bound_ms, f.unix_ms);
+                        }
                         health.observe_master_store(write_failed, now);
                         health.observe_reachability(&reachability, now);
                         health.evaluate(now, &|filter: &[u8]| cadence.snapshot(filter, now / 1000))

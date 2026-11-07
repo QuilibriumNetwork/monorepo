@@ -5,12 +5,13 @@
 //! Each minute it samples a small fsync on the store's disk, the kernel's
 //! pressure stall figures and how long the node's store writes took; one info
 //! line carries them, and a warn line, at most every
-//! [`WARN_EVERY`], only when one is past its bound.
+//! [`WARN_EVERY`], only when one is past its bound. The latest fsync also
+//! feeds the node's store health condition ([`latest_fsync`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use quil_forest::WriteTimesSample;
 use tracing::{info, warn};
@@ -109,6 +110,37 @@ impl FsyncProbe {
     }
 }
 
+/// The latest probe that ran, for the node's health conditions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct FsyncReading {
+    pub fsync_ms: u64,
+    /// The bound from which it warns.
+    pub bound_ms: u64,
+    /// When it returned.
+    pub unix_ms: u64,
+}
+
+static LATEST_FSYNC: Mutex<Option<FsyncReading>> = Mutex::new(None);
+
+/// The latest probe that ran; `None` before one returns.
+pub(super) fn latest_fsync() -> Option<FsyncReading> {
+    *LATEST_FSYNC.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn publish_fsync(fsync_ms: Option<u64>) {
+    let Some(fsync_ms) = fsync_ms else {
+        return;
+    };
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    *LATEST_FSYNC.lock().unwrap_or_else(PoisonError::into_inner) = Some(FsyncReading {
+        fsync_ms,
+        bound_ms: FSYNC_BOUND_MS,
+        unix_ms,
+    });
+}
+
 fn fsync_once(path: &Path) -> Option<Duration> {
     use std::io::Write;
     let started = Instant::now();
@@ -202,6 +234,7 @@ pub(super) struct StoreLatency {
 
 impl StoreLatency {
     pub(super) fn observe(&mut self, sample: Sample) {
+        publish_fsync(sample.fsync_ms);
         let reading = sample.reading();
         self.observe_at(sample, reading, Instant::now());
     }
@@ -439,6 +472,28 @@ mod tests {
         assert_eq!(latency.observe_at(sample, None, at(240)), Logged::Nothing);
         assert_eq!(latency.observe_at(sample, past, at(300)), Logged::Nothing);
         assert_eq!(latency.observe_at(sample, past, at(660)), Logged::Warned);
+    }
+
+    /// Each probe that ran is published with its bound for the node's
+    /// health conditions; one that could not run keeps the last.
+    #[test]
+    fn a_probe_is_published_with_its_bound() {
+        assert_eq!(latest_fsync(), None);
+        let probe = |fsync_ms| Sample {
+            fsync_ms,
+            ..Default::default()
+        };
+        let mut latency = StoreLatency::default();
+        latency.observe(probe(Some(1_002)));
+        let published = latest_fsync().expect("FSYNC-HEALTH fsync_unpublished");
+        assert_eq!(
+            (published.fsync_ms, published.bound_ms),
+            (1_002, FSYNC_BOUND_MS),
+            "FSYNC-HEALTH fsync_unpublished"
+        );
+        assert!(published.unix_ms > 0);
+        latency.observe(probe(None));
+        assert_eq!(latest_fsync(), Some(published));
     }
 
     /// The probe measures a real fsync, leaves no file behind, and says so
