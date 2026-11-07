@@ -20,6 +20,7 @@ pub enum KeyType {
     Secp256k1 = 2,
     ECDSA = 3,
     Ed448 = 4,
+    Falcon = 5,
 }
 
 impl Default for KeyType {
@@ -36,6 +37,7 @@ impl From<i32> for KeyType {
             2 => KeyType::Secp256k1,
             3 => KeyType::ECDSA,
             4 => KeyType::Ed448,
+            5 => KeyType::Falcon,
             _ => Self::default(),
         }
     }
@@ -49,6 +51,7 @@ impl<'a> From<&'a str> for KeyType {
             "Secp256k1" => KeyType::Secp256k1,
             "ECDSA" => KeyType::ECDSA,
             "Ed448" => KeyType::Ed448,
+            "Falcon" => KeyType::Falcon,
             _ => Self::default(),
         }
     }

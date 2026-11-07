@@ -267,7 +267,9 @@ where
         ]
         .concat();
 
-        let zeta = self.zero_share.compute::<C>(&data.counterparties, &zero_sid);
+        let zeta = self
+            .zero_share
+            .compute::<C>(&data.counterparties, &zero_sid);
 
         // "Unique" because it is only one message referring to all counter parties.
         let unique_keep = UniqueKeep1to2 {

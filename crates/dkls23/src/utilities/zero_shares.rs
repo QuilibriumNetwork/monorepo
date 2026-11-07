@@ -199,7 +199,8 @@ mod tests {
             let mut counterparties = executing_parties.clone();
             counterparties.retain(|index| *index != party);
             //Compute the share (there is a -1 because indexes for parties start at 1).
-            let share = zero_shares[(party as usize) - 1].compute::<k256::Secp256k1>(&counterparties, &session_id);
+            let share = zero_shares[(party as usize) - 1]
+                .compute::<k256::Secp256k1>(&counterparties, &session_id);
             shares.push(share);
         }
 

@@ -1,0 +1,223 @@
+//! `qclient node …` — node management.
+//!
+//! The `manage` TUI, the `prover` subgroup (status/lifecycle) and the
+//! install/update/service/config/log subcommands (OS plumbing).
+
+use clap::Subcommand;
+
+use crate::context::GlobalArgs;
+
+pub mod archive;
+pub mod diagnostics;
+pub mod diagnostics_dial;
+pub mod diagnostics_grants;
+pub mod diagnostics_logs;
+pub mod doctor;
+pub mod lifecycle;
+pub mod log;
+pub mod nodeconfig;
+pub mod prover;
+pub mod service;
+
+#[derive(Debug, Subcommand)]
+pub enum NodeCommand {
+    /// Interactive node management TUI; `node prover manage` opens the same.
+    Manage(prover::ManageArgs),
+    /// Prover management.
+    Prover {
+        #[command(subcommand)]
+        command: prover::ProverCommand,
+    },
+    /// Node config management.
+    Config {
+        #[command(subcommand)]
+        command: nodeconfig::ConfigCommand,
+    },
+    /// Archive peers the node reads from.
+    Archive {
+        #[command(subcommand)]
+        command: archive::ArchiveCommand,
+    },
+    /// Opt-in diagnostics from other nodes: their health reports and their
+    /// redacted logs, as their operators allow.
+    Diagnostics {
+        #[command(subcommand)]
+        command: diagnostics::DiagnosticsCommand,
+    },
+    /// Check whether peers can dial this node, and say what to change if
+    /// they cannot.
+    ///
+    /// Asks this node over its local RPC for its p2p listeners, AutoNAT's
+    /// view of it (status, confirmed external addresses, failing probes)
+    /// and the addresses its PeerInfo announces, and gives one verdict per
+    /// address family (IPv4, and IPv6 when the node has an IPv6 address)
+    /// and transport (TCP, QUIC): reachable when an AutoNAT server dialed
+    /// the node back on it; not reachable when servers on distinct IPs
+    /// could not, when AutoNAT holds the node private without a confirmed
+    /// address, or when the host's address is behind carrier-grade NAT;
+    /// unknown otherwise. For a family that is not reachable it advises by
+    /// the host's address: forward the ports on the router (private),
+    /// get a public IP address or a VPS (carrier-grade NAT), or open the
+    /// ports, with ufw, nftables and firewalld commands (public). It only
+    /// reads: it never enables UPnP and never changes a firewall.
+    ///
+    /// Exit status: 0 reachable, 1 not reachable, 2 unknown (also when the
+    /// node cannot be asked).
+    Doctor(doctor::DoctorArgs),
+    /// Node log management.
+    Log {
+        #[command(subcommand)]
+        command: log::LogCommand,
+    },
+    /// Print node info (runs the node binary's `--node-info`).
+    ///
+    /// The node binary is `quilibrium-node` on PATH, as `qclient node link`
+    /// sets it up; else the release file beside this qclient, named like it
+    /// (`qclient-2.1.0.25-linux-amd64` runs `node-2.1.0.25-linux-amd64`);
+    /// else the one `node-<version>-<os>-<arch>` file in the current
+    /// directory. Run it from the node directory when the node runs from
+    /// there.
+    Info {
+        /// Config name (defaults to the resolved default config).
+        config: Option<String>,
+    },
+    /// Manage the node system service (start/stop/status/install/…).
+    ///
+    /// The service runs with the environment of quilibrium.env in the
+    /// install root. systemd reads the file at each start; launchd (macOS)
+    /// reads none, so install and update write its KEY=VALUE lines into
+    /// the plist: after editing the file on macOS, run update, then reload
+    /// the service (disable, then enable).
+    Service {
+        /// One of: start, stop, restart, status, enable, disable, reload,
+        /// install, update, uninstall.
+        action: String,
+    },
+    /// Remove old logs and/or old node binary versions.
+    Clean {
+        /// Remove both old logs and old node versions.
+        #[arg(long)]
+        all: bool,
+        /// Remove old logs.
+        #[arg(long)]
+        logs: bool,
+        /// Remove old node binary versions (keeps the current one).
+        #[arg(long)]
+        node: bool,
+    },
+    /// Download, verify, and install the node binary (+ system service).
+    ///
+    /// Installs to /var/quilibrium/bin/node/<version> on Linux and
+    /// /opt/quilibrium/bin/node/<version> on macOS (/var/quilibrium while
+    /// an earlier install there exists and /opt/quilibrium does not), and
+    /// links /usr/local/bin/quilibrium-node to it. On macOS the service
+    /// writes node.log and node.err beside the node's own logs, in
+    /// ~/.quilibrium/configs/default/.log (/var/log/quilibrium with the
+    /// /var/quilibrium root). Configs stay in ~/.quilibrium/configs.
+    Install {
+        version: Option<String>,
+        /// Install a version older than the linked one.
+        #[arg(long)]
+        allow_downgrade: bool,
+    },
+    /// Install a newer node version (optionally restarting the service).
+    Update {
+        version: Option<String>,
+        #[arg(short = 'r', long)]
+        restart: bool,
+        /// Install a version older than the linked one.
+        #[arg(long)]
+        allow_downgrade: bool,
+    },
+    /// Symlink /usr/local/bin/quilibrium-node to an installed version.
+    Link { version: Option<String> },
+    /// Stop the service and remove node binaries (configs preserved).
+    Uninstall,
+    /// Manage a cron job to auto-update the node (enable|disable|status).
+    AutoUpdate { action: String },
+}
+
+pub async fn run(global: GlobalArgs, cmd: &NodeCommand) -> anyhow::Result<()> {
+    match cmd {
+        NodeCommand::Manage(args) => prover::manage_command(global, args).await,
+        NodeCommand::Prover { command } => prover::run(global, command).await,
+        NodeCommand::Config { command } => nodeconfig::run(global, command),
+        NodeCommand::Doctor(args) => doctor::run(global, args).await,
+        NodeCommand::Log { command } => log::run(global, command),
+        NodeCommand::Archive { command } => archive::run(global, command).await,
+        NodeCommand::Diagnostics { command } => diagnostics::run(global, command).await,
+        NodeCommand::Info { config } => info(global, config.as_deref()),
+        NodeCommand::Service { action } => service::run(action),
+        NodeCommand::Clean { all, logs, node } => clean(&global, *all, *logs, *node),
+        NodeCommand::Install {
+            version,
+            allow_downgrade,
+        } => lifecycle::install(version.as_deref(), *allow_downgrade).await,
+        NodeCommand::Update {
+            version,
+            restart,
+            allow_downgrade,
+        } => lifecycle::update(version.as_deref(), *restart, *allow_downgrade).await,
+        NodeCommand::Link { version } => lifecycle::link(version.as_deref()),
+        NodeCommand::Uninstall => lifecycle::uninstall(),
+        NodeCommand::AutoUpdate { action } => lifecycle::auto_update(action),
+    }
+}
+
+/// `qclient node clean` — remove old logs / old node versions.
+fn clean(global: &GlobalArgs, all: bool, logs: bool, node: bool) -> anyhow::Result<()> {
+    if !all && !logs && !node {
+        anyhow::bail!("specify --all, --logs, and/or --node");
+    }
+    if all || logs {
+        // Without a resolvable node config there are no log files to find.
+        if let Err(e) = log::clean(global) {
+            eprintln!("skipping logs: {e}");
+        }
+    }
+    if all || node {
+        let data = crate::system::node_data_path();
+        // Keep the version the current symlink points into.
+        let current = std::fs::read_link(crate::system::default_node_symlink_path()).ok();
+        let mut removed = 0;
+        if data.exists() {
+            for entry in std::fs::read_dir(&data)? {
+                let path = entry?.path();
+                let is_current = current
+                    .as_ref()
+                    .map(|c| c.starts_with(&path) || c == &path)
+                    .unwrap_or(false);
+                if !is_current {
+                    if std::fs::remove_dir_all(&path).is_ok() {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+        println!("Removed {removed} old version(s) from {}", data.display());
+    }
+    Ok(())
+}
+
+/// `qclient node info [config]` — shell out to the node binary's
+/// `--node-info` (port of `client/cmd/node/info.go`).
+fn info(global: GlobalArgs, config: Option<&str>) -> anyhow::Result<()> {
+    let network = global.network.as_deref().filter(|s| !s.is_empty());
+    let dir = match config {
+        Some(name) if name != "default" => crate::system::node_config_home_dir()?.join(name),
+        _ => crate::nodeconfig::default_node_config_dir(network)?,
+    };
+    let node = crate::system::node_binary()?;
+    let output = std::process::Command::new(&node)
+        .arg("--node-info")
+        .arg("--config")
+        .arg(&dir)
+        .output()
+        .map_err(|e| anyhow::anyhow!("run {}: {e}", node.display()))?;
+    std::io::Write::write_all(&mut std::io::stdout(), &output.stdout)?;
+    if !output.status.success() {
+        std::io::Write::write_all(&mut std::io::stderr(), &output.stderr)?;
+        anyhow::bail!("node --node-info exited with {}", output.status);
+    }
+    Ok(())
+}

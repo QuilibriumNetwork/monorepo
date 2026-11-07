@@ -8,12 +8,12 @@
 //! - [`request_to_payload`] -- serialize a `MessageRequest` into canonical bytes.
 //!
 //! NOT ported (service-dependent; needs the HypergraphIntrinsic
-//! + HypergraphCrdt bridge from task #64):
+//! + HypergraphCrdt bridge):
 //!
 //! - `ValidateMessage`, `ProcessMessage`, `handleBundle`,
-//!   `processIndividualMessage`, `handleDeploy`, `tryGetIntrinsic`
+//! `processIndividualMessage`, `handleDeploy`, `tryGetIntrinsic`
 //! - `Prove`, `Lock`, `Unlock` — Lock can compose on top of
-//!   `HypergraphLockState` once wiring lands.
+//! `HypergraphLockState` once wiring lands.
 
 use num_bigint::BigInt;
 use quil_types::error::{QuilError, Result};
@@ -23,8 +23,7 @@ use quil_types::proto::node::Capability;
 
 use crate::capabilities as caps;
 use crate::hypergraph_intrinsic::{
-    conversions::split_vertex_add_proof_chunks,
-    vertex_ops::vertex_add_cost_from_proof_count,
+    conversions::split_vertex_add_proof_chunks, vertex_ops::vertex_add_cost_from_proof_count,
 };
 
 // =====================================================================
@@ -115,11 +114,11 @@ pub fn peek_top_level_kind(input: &[u8]) -> Result<MessageKindTopLevel> {
 ///
 /// ```go
 /// isHypergraphOp := op.GetHypergraphDeploy() != nil ||
-///     op.GetHypergraphUpdate() != nil ||
-///     op.GetVertexAdd() != nil ||
-///     op.GetVertexRemove() != nil ||
-///     op.GetHyperedgeAdd() != nil ||
-///     op.GetHyperedgeRemove() != nil
+/// op.GetHypergraphUpdate() != nil ||
+/// op.GetVertexAdd() != nil ||
+/// op.GetVertexRemove() != nil ||
+/// op.GetHyperedgeAdd() != nil ||
+/// op.GetHyperedgeRemove() != nil
 /// ```
 pub fn request_is_hypergraph_op(request: &MessageRequest) -> bool {
     matches!(
@@ -141,19 +140,19 @@ pub fn request_is_hypergraph_op(request: &MessageRequest) -> bool {
 /// engine's rules.
 ///
 /// - **HypergraphDeploy**: `len(rdf_schema) + len(read) + len(write) + len(owner)`
-///   (concatenated byte count across the three keys + schema).
+/// (concatenated byte count across the three keys + schema).
 /// - **HypergraphUpdate**: same shape.
 /// - **VertexAdd**: delegates to the per-op helper via the packed
-///   proof-chunk count (55 bytes per proof).
+/// proof-chunk count (55 bytes per proof).
 /// - **VertexRemove**: constant 64.
 /// - **HyperedgeAdd**: cost = atom count under the extrinsic tree.
-///   We can't decode that without the lazy tree — callers pass a
-///   `hyperedge_atom_count_hint` when they know it, else cost defaults
-///   to zero.
+/// We can't decode that without the lazy tree — callers pass a
+/// `hyperedge_atom_count_hint` when they know it, else cost defaults
+/// to zero.
 /// - **HyperedgeRemove**: constant 64.
 /// - Any other request variant (including `None`, prover ops, token
-///   ops, compute ops): `0`, matching Go's final
-///   `return big.NewInt(0), nil`.
+/// ops, compute ops): `0`, matching Go's final
+/// `return big.NewInt(0), nil`.
 pub fn get_cost_from_request(
     request: &MessageRequest,
     hyperedge_atom_count_hint: u64,
@@ -165,7 +164,10 @@ pub fn get_cost_from_request(
     match req {
         MessageRequestInner::HypergraphDeploy(d) => {
             let size = d.rdf_schema.len()
-                + d.config.as_ref().map(|c| c.read_public_key.len()).unwrap_or(0)
+                + d.config
+                    .as_ref()
+                    .map(|c| c.read_public_key.len())
+                    .unwrap_or(0)
                 + d.config
                     .as_ref()
                     .map(|c| c.write_public_key.len())
@@ -179,7 +181,10 @@ pub fn get_cost_from_request(
 
         MessageRequestInner::HypergraphUpdate(u) => {
             let size = u.rdf_schema.len()
-                + u.config.as_ref().map(|c| c.read_public_key.len()).unwrap_or(0)
+                + u.config
+                    .as_ref()
+                    .map(|c| c.read_public_key.len())
+                    .unwrap_or(0)
                 + u.config
                     .as_ref()
                     .map(|c| c.write_public_key.len())
@@ -200,17 +205,15 @@ pub fn get_cost_from_request(
             Ok(vertex_add_cost_from_proof_count(chunks.len()))
         }
 
-        MessageRequestInner::VertexRemove(_) => {
-            Ok(BigInt::from(crate::hypergraph_intrinsic::VERTEX_REMOVE_COST))
-        }
-
-        MessageRequestInner::HyperedgeAdd(_) => Ok(BigInt::from(
-            hyperedge_atom_count_hint,
+        MessageRequestInner::VertexRemove(_) => Ok(BigInt::from(
+            crate::hypergraph_intrinsic::VERTEX_REMOVE_COST,
         )),
 
-        MessageRequestInner::HyperedgeRemove(_) => {
-            Ok(BigInt::from(crate::hypergraph_intrinsic::HYPEREDGE_REMOVE_COST))
-        }
+        MessageRequestInner::HyperedgeAdd(_) => Ok(BigInt::from(hyperedge_atom_count_hint)),
+
+        MessageRequestInner::HyperedgeRemove(_) => Ok(BigInt::from(
+            crate::hypergraph_intrinsic::HYPEREDGE_REMOVE_COST,
+        )),
 
         // Non-hypergraph ops (prover admin, token ops, compute ops,
         // shard ops) are zero-cost under the hypergraph engine — the
@@ -232,8 +235,7 @@ pub fn get_cost_from_request(
 /// `"unsupported message type"` fall-through.
 pub fn request_to_payload(request: &MessageRequest) -> Result<Vec<u8>> {
     use crate::hypergraph_intrinsic::types::{
-        HyperedgeAdd, HyperedgeRemove, HypergraphDeploy, HypergraphUpdate, VertexAdd,
-        VertexRemove,
+        HyperedgeAdd, HyperedgeRemove, HypergraphDeploy, HypergraphUpdate, VertexAdd, VertexRemove,
     };
 
     let Some(req) = &request.request else {
@@ -250,12 +252,8 @@ pub fn request_to_payload(request: &MessageRequest) -> Result<Vec<u8>> {
             HypergraphUpdate::from_proto(u)?.to_canonical_bytes()
         }
         MessageRequestInner::VertexAdd(v) => VertexAdd::from_proto(v).to_canonical_bytes(),
-        MessageRequestInner::VertexRemove(v) => {
-            VertexRemove::from_proto(v).to_canonical_bytes()
-        }
-        MessageRequestInner::HyperedgeAdd(h) => {
-            HyperedgeAdd::from_proto(h).to_canonical_bytes()
-        }
+        MessageRequestInner::VertexRemove(v) => VertexRemove::from_proto(v).to_canonical_bytes(),
+        MessageRequestInner::HyperedgeAdd(h) => HyperedgeAdd::from_proto(h).to_canonical_bytes(),
         MessageRequestInner::HyperedgeRemove(h) => {
             HyperedgeRemove::from_proto(h).to_canonical_bytes()
         }
@@ -286,8 +284,7 @@ const _: () = {
 pub fn is_hypergraph_type_prefix(tp: u32) -> bool {
     use crate::hypergraph_intrinsic::canonical::{
         TYPE_HYPEREDGE_ADD, TYPE_HYPEREDGE_REMOVE, TYPE_HYPERGRAPH_CONFIGURATION,
-        TYPE_HYPERGRAPH_DEPLOYMENT, TYPE_HYPERGRAPH_UPDATE, TYPE_VERTEX_ADD,
-        TYPE_VERTEX_REMOVE,
+        TYPE_HYPERGRAPH_DEPLOYMENT, TYPE_HYPERGRAPH_UPDATE, TYPE_VERTEX_ADD, TYPE_VERTEX_REMOVE,
     };
     matches!(
         tp,
@@ -349,13 +346,11 @@ mod tests {
                         owner_public_key: vec![0u8; owner_len],
                     }),
                     rdf_schema: vec![0u8; schema_len],
-                    public_key_signature_bls48581: Some(
-                        keys_pb::Bls48581AggregateSignature {
-                            signature: vec![0u8; 74],
-                            public_key: None,
-                            bitmask: vec![],
-                        },
-                    ),
+                    public_key_signature_bls48581: Some(keys_pb::Bls48581AggregateSignature {
+                        signature: vec![0u8; 74],
+                        public_key: None,
+                        bitmask: vec![],
+                    }),
                 },
             )),
         }
@@ -363,8 +358,7 @@ mod tests {
 
     fn make_request_vertex_add(proof_count: usize) -> MessageRequest {
         use crate::hypergraph_intrinsic::conversions::pack_vertex_add_proof_chunks;
-        let proofs: Vec<Vec<u8>> =
-            (0..proof_count).map(|_| vec![0xAAu8; 16]).collect();
+        let proofs: Vec<Vec<u8>> = (0..proof_count).map(|_| vec![0xAAu8; 16]).collect();
         let data = pack_vertex_add_proof_chunks(&proofs).unwrap();
         MessageRequest {
             timestamp: 0,
@@ -380,13 +374,11 @@ mod tests {
     fn make_request_vertex_remove() -> MessageRequest {
         MessageRequest {
             timestamp: 0,
-            request: Some(MessageRequestInner::VertexRemove(
-                hg_pb::VertexRemove {
-                    domain: vec![0u8; 32],
-                    data_address: vec![0u8; 32],
-                    signature: vec![0u8; 114],
-                },
-            )),
+            request: Some(MessageRequestInner::VertexRemove(hg_pb::VertexRemove {
+                domain: vec![0u8; 32],
+                data_address: vec![0u8; 32],
+                signature: vec![0u8; 114],
+            })),
         }
     }
 
@@ -425,14 +417,11 @@ mod tests {
     fn make_request_token_tx() -> MessageRequest {
         MessageRequest {
             timestamp: 0,
-            request: Some(MessageRequestInner::Transaction(token_pb::Transaction {
-                domain: vec![0u8; 32],
-                inputs: vec![],
-                outputs: vec![],
-                fees: vec![],
-                range_proof: vec![],
-                ..Default::default()
-            })),
+            request: Some(MessageRequestInner::TokenOperation(
+                token_pb::TokenOperation {
+                    canonical_bytes: Vec::new(),
+                },
+            )),
         }
     }
 
@@ -551,10 +540,7 @@ mod tests {
     fn cost_for_hypergraph_deploy_sums_schema_and_keys() {
         let req = make_request_hypergraph_deploy(57, 57, 585, 100);
         // 100 + 57 + 57 + 585 = 799
-        assert_eq!(
-            get_cost_from_request(&req, 0).unwrap(),
-            BigInt::from(799)
-        );
+        assert_eq!(get_cost_from_request(&req, 0).unwrap(), BigInt::from(799));
     }
 
     #[test]
@@ -600,10 +586,7 @@ mod tests {
     #[test]
     fn cost_for_hyperedge_remove_is_64() {
         let req = make_request_hyperedge_remove();
-        assert_eq!(
-            get_cost_from_request(&req, 0).unwrap(),
-            BigInt::from(64)
-        );
+        assert_eq!(get_cost_from_request(&req, 0).unwrap(), BigInt::from(64));
     }
 
     #[test]

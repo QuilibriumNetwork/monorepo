@@ -8,10 +8,10 @@
 //!
 //! - [`count_bits`] — population count (number of set bits)
 //! - [`has_overlapping_bits`] — detect whether two bitmasks share any
-//!   set bit positions (fast equivocation check)
+//! set bit positions (fast equivocation check)
 //! - [`bit_is_set`] / [`set_bit`] — individual bit access
 //! - [`intersect`] / [`union`] — set operations on equal-length
-//!   bitmasks
+//! bitmasks
 //!
 //! All functions treat missing trailing bytes as zero — e.g. a
 //! length-4 bitmask is equivalent to a length-8 bitmask padded with
@@ -55,7 +55,9 @@ pub fn has_overlapping_bits(a: &[u8], b: &[u8]) -> bool {
 pub fn bit_is_set(bitmask: &[u8], index: usize) -> bool {
     let byte_idx = index / 8;
     let bit_idx = index % 8;
-    bitmask.get(byte_idx).is_some_and(|b| (b >> bit_idx) & 1 == 1)
+    bitmask
+        .get(byte_idx)
+        .is_some_and(|b| (b >> bit_idx) & 1 == 1)
 }
 
 /// Set bit `index` in `bitmask`. Grows the bitmask if `index` would

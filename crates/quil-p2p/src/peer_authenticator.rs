@@ -80,12 +80,12 @@ pub enum AllowedPeerPolicy {
 /// This mirrors the core fields from `PeerAuthenticator` in Go:
 ///
 /// - **authenticated_peers** corresponds to the auth cache maps
-///   (`anyProverCache`, `globalProverCache`, `shardProverCache`) but unified
-///   into a single map keyed by `PeerId`.
+/// (`anyProverCache`, `globalProverCache`, `shardProverCache`) but unified
+/// into a single map keyed by `PeerId`.
 /// - **auth_challenges** holds pending random challenges for peers that have
-///   not yet completed authentication.
+/// not yet completed authentication.
 /// - **service_policies** / **method_policies** mirror the Go struct's
-///   `servicePolicies` and `methodPolicies` for per-RPC authorization.
+/// `servicePolicies` and `methodPolicies` for per-RPC authorization.
 pub struct PeerAuthenticator {
     /// Peers that have completed authentication.
     authenticated_peers: HashMap<PeerId, AuthState>,
@@ -276,18 +276,14 @@ impl PeerAuthenticator {
     pub fn authorize(&self, peer: &PeerId, policy: AllowedPeerPolicy) -> bool {
         match policy {
             AllowedPeerPolicy::AnyPeer => true,
-            AllowedPeerPolicy::OnlySelfPeer => {
-                self.self_peer_id.as_ref() == Some(peer)
-            }
+            AllowedPeerPolicy::OnlySelfPeer => self.self_peer_id.as_ref() == Some(peer),
             AllowedPeerPolicy::AnyProverPeer
             | AllowedPeerPolicy::OnlyGlobalProverPeer
             | AllowedPeerPolicy::OnlyShardProverPeer => {
                 // Placeholder: full prover-registry check will replace this.
                 self.is_authenticated(peer)
             }
-            AllowedPeerPolicy::OnlyWhitelistedPeers => {
-                self.whitelisted_peers.contains_key(peer)
-            }
+            AllowedPeerPolicy::OnlyWhitelistedPeers => self.whitelisted_peers.contains_key(peer),
         }
     }
 
@@ -518,9 +514,7 @@ mod tests {
         auth.authenticate(&peer, vec![0; 57]);
 
         auth.update_reputation(&peer, -10.0);
-        assert!(
-            (auth.get_reputation(&peer) - (DEFAULT_REPUTATION - 10.0)).abs() < f64::EPSILON
-        );
+        assert!((auth.get_reputation(&peer) - (DEFAULT_REPUTATION - 10.0)).abs() < f64::EPSILON);
     }
 
     #[test]

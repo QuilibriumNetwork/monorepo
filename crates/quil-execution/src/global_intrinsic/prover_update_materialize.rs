@@ -41,10 +41,10 @@ pub fn prover_update_domain() -> Result<[u8; 32]> {
 /// 2. `PublicKeySignatureBLS48581.Address` must be 32 bytes.
 /// 3. `DelegateAddress` must be 32 bytes.
 /// 4. The prover vertex must exist at `(GLOBAL_INTRINSIC_ADDRESS,
-///    Address)` under `vertex_adds`.
+/// Address)` under `vertex_adds`.
 /// 5. `poseidon(prover.PublicKey) == Address` (address binds to pubkey).
 /// 6. BLS48-581 G1 signature verifies over `DelegateAddress` with
-///    domain `PROVER_UPDATE`.
+/// domain `PROVER_UPDATE`.
 pub fn validate_prover_update(
     op: &ProverUpdate,
     state: &HypergraphState,
@@ -110,12 +110,17 @@ pub fn validate_prover_update(
         ));
     }
 
-    // BLS signature over DelegateAddress with PROVER_UPDATE domain.
+    // BLS signature over DelegateAddress (and the signed frame the update
+    // carries from the prover operation replay guard epoch; its freshness is
+    // checked against the including frame by `verify::verify_prover_update`)
+    // with PROVER_UPDATE domain.
     let domain_bytes = prover_update_domain()?;
+    let message =
+        super::prover_verify::prover_update_signing_message(&op.delegate_address, op.frame_number);
     let valid = key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &pubkey,
-        &op.delegate_address,
+        &message,
         &sig.signature,
         &domain_bytes,
     )?;
@@ -133,9 +138,9 @@ pub fn validate_prover_update(
 ///
 /// Steps:
 /// 1. Decode prover address from the addressed signature; compute the
-///    reward address `poseidon(QUIL_TOKEN || proverAddress)`.
+/// reward address `poseidon(QUIL_TOKEN || proverAddress)`.
 /// 2. Load the prover vertex; confirm `poseidon(PublicKey) ==
-///    proverAddress` (defense-in-depth).
+/// proverAddress` (defense-in-depth).
 /// 3. Load (or create) the reward vertex.
 /// 4. Write the new `DelegateAddress` field on the reward vertex.
 /// 5. Persist the updated reward vertex back to the hypergraph state.
@@ -166,9 +171,11 @@ pub fn materialize_prover_update(
     let prover_address = &sig.address;
 
     // Load prover vertex to cross-check the address binding.
-    let prover_data = state.get(domain, prover_address, &va_disc)?.ok_or_else(|| {
-        QuilError::InvalidArgument("prover update materialize: prover not found".into())
-    })?;
+    let prover_data = state
+        .get(domain, prover_address, &va_disc)?
+        .ok_or_else(|| {
+            QuilError::InvalidArgument("prover update materialize: prover not found".into())
+        })?;
     if prover_data.is_empty() {
         return Err(QuilError::InvalidArgument(
             "prover update materialize: prover has no data".into(),
@@ -223,27 +230,63 @@ mod tests {
 
     struct AcceptAll;
     impl KeyManager for AcceptAll {
-        fn validate_signature(&self, _: KeyType, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<bool> {
+        fn validate_signature(
+            &self,
+            _: KeyType,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<bool> {
             Ok(true)
         }
     }
 
     struct RejectAll;
     impl KeyManager for RejectAll {
-        fn validate_signature(&self, _: KeyType, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<bool> {
+        fn validate_signature(
+            &self,
+            _: KeyType,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<bool> {
             Ok(false)
         }
     }
 
     struct StubProver;
     impl InclusionProver for StubProver {
-        fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
-        fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
-        fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
-        fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> Result<Box<dyn Multiproof>> {
+        fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> {
+            Ok(vec![0u8; 64])
+        }
+        fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> {
+            Ok(vec![])
+        }
+        fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> {
+            Ok(true)
+        }
+        fn prove_multiple(
+            &self,
+            _: &[&[u8]],
+            _: &[&[u8]],
+            _: &[u64],
+            _: u64,
+        ) -> Result<Box<dyn Multiproof>> {
             Err(QuilError::Internal("batch not supported".into()))
         }
-        fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+        fn verify_multiple(
+            &self,
+            _: &[&[u8]],
+            _: &[&[u8]],
+            _: &[u64],
+            _: u64,
+            _: &[u8],
+            _: &[u8],
+        ) -> bool {
+            true
+        }
     }
 
     fn make_state() -> HypergraphState {
@@ -265,13 +308,15 @@ mod tests {
         let tree = make_prover_tree(pubkey);
         let blob = vertex_tree_to_blob(&tree);
         let va_disc = vertex_adds_discriminator().unwrap();
-        state.set(
-            &GLOBAL_INTRINSIC_ADDRESS[..],
-            &prover_addr,
-            &va_disc,
-            1,
-            blob,
-        ).unwrap();
+        state
+            .set(
+                &GLOBAL_INTRINSIC_ADDRESS[..],
+                &prover_addr,
+                &va_disc,
+                1,
+                blob,
+            )
+            .unwrap();
         prover_addr
     }
 
@@ -282,13 +327,17 @@ mod tests {
                 signature: vec![0xBBu8; 74],
                 address: addr.to_vec(),
             }),
+            frame_number: 0,
         }
     }
 
     #[test]
     fn domain_is_deterministic_and_32_bytes() {
         assert_eq!(prover_update_domain().unwrap().len(), 32);
-        assert_eq!(prover_update_domain().unwrap(), prover_update_domain().unwrap());
+        assert_eq!(
+            prover_update_domain().unwrap(),
+            prover_update_domain().unwrap()
+        );
     }
 
     #[test]
@@ -306,6 +355,7 @@ mod tests {
         let op = ProverUpdate {
             delegate_address: vec![0xCCu8; 32],
             public_key_signature_bls48581: None,
+            frame_number: 0,
         };
         assert!(validate_prover_update(&op, &state, &AcceptAll).is_err());
     }
@@ -319,6 +369,7 @@ mod tests {
                 signature: vec![0xBBu8; 74],
                 address: vec![0xAAu8; 31], // wrong
             }),
+            frame_number: 0,
         };
         assert!(validate_prover_update(&op, &state, &AcceptAll).is_err());
     }

@@ -101,7 +101,7 @@ impl<'a> PartyAwaitingPosition<'a> {
         for (G_i, H_i) in bp_share.G(self.n).zip(bp_share.H(self.n)) {
             // If v_i = 0, we add a_L[i] * G[i] + a_R[i] * H[i] = - H[i]
             // If v_i = 1, we add a_L[i] * G[i] + a_R[i] * H[i] =   G[i]
-            let v_i = Choice::from(((self.v.as_bytes()[i/8] >> i % 8) & 1) as u8);
+            let v_i = Choice::from(((self.v.to_bytes()[i / 8] >> i % 8) & 1) as u8);
             let mut point = -H_i;
             point.conditional_assign(&G_i, v_i);
             A = A + point;
@@ -193,7 +193,7 @@ impl<'a> PartyAwaitingBitChallenge<'a> {
         let mut exp_y = offset_y; // start at y^j
         let mut exp_2 = Scalar::one(); // start at 2^0 = 1
         for i in 0..n {
-            let a_L_i = Scalar::from(((self.v.to_bytes()[i/8] >> i % 8) & 1) as u64);
+            let a_L_i = Scalar::from(((self.v.to_bytes()[i / 8] >> i % 8) & 1) as u64);
             let a_R_i = a_L_i - Scalar::one();
 
             l_poly.0[i] = a_L_i - vc.z;

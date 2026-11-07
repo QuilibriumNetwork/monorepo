@@ -1,7 +1,7 @@
 use num_bigint::BigInt;
-use rayon::prelude::*;
 use quil_types::crypto::InclusionProver;
 use quil_types::error::{QuilError, Result};
+use rayon::prelude::*;
 
 use crate::nibble::{get_next_nibble, get_nibbles_until_diverge};
 use crate::node::{BranchNode, LeafNode, VectorCommitmentNode};
@@ -30,18 +30,32 @@ impl VectorCommitmentTree {
         Ok(())
     }
 
-    /// Commit the entire tree, computing all commitments. Branches are
-    /// processed in parallel via rayon.
+    /// Commit the entire tree. Small trees are serial; large trees use a bounded
+    /// budget of coarse subtrees rather than scheduling at every node.
     pub fn commit(&mut self, prover: &(dyn InclusionProver + Sync)) -> Vec<u8> {
         match &mut self.root {
             None => vec![0u8; 64],
-            Some(node) => commit_node(node, prover, true).to_vec(),
+            Some(node) => commit_node(node, prover, true, prover.commit_parallel_budget()).to_vec(),
         }
     }
 
     /// Get a value by key.
     pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
+        self.get_leaf(key).map(|leaf| leaf.value.as_slice())
+    }
+
+    /// Get the leaf stored at `key`, so a caller authenticating a value can
+    /// check that the leaf's commitment binds it
+    /// ([`LeafNode::value_is_bound`]).
+    pub fn get_leaf(&self, key: &[u8]) -> Option<&LeafNode> {
         get_recursive(self.root.as_ref(), key, 0)
+    }
+
+    /// Whether any leaf carries a value its commitment does not bind.
+    pub fn has_unbound_values(&self) -> bool {
+        self.root
+            .as_ref()
+            .is_some_and(VectorCommitmentNode::has_unbound_value)
     }
 
     /// Delete a key from the tree.
@@ -85,7 +99,8 @@ impl VectorCommitmentTree {
         if let Some(root) = self.root.as_ref() {
             root.collect_leaves(&mut leaves);
         }
-        leaves.into_iter()
+        leaves
+            .into_iter()
             .map(|l| (l.key.clone(), l.value.clone()))
             .collect()
     }
@@ -109,17 +124,24 @@ impl VectorCommitmentTree {
         }
 
         // Build path indices
-        let path_indices: Vec<Vec<u64>> = paths.iter()
+        let path_indices: Vec<Vec<u64>> = paths
+            .iter()
             .map(|p| p.iter().map(|&i| i as u64).collect())
             .collect();
-        let indices: Vec<u64> = paths.iter()
+        let indices: Vec<u64> = paths
+            .iter()
             .map(|p| *p.last().unwrap_or(&0) as u64)
             .collect();
 
         // Generate multiproof via KZG
-        let commit_refs: Vec<&[u8]> = commits[..commits.len() - 1].iter().map(|c| c.as_slice()).collect();
+        let commit_refs: Vec<&[u8]> = commits[..commits.len() - 1]
+            .iter()
+            .map(|c| c.as_slice())
+            .collect();
         let poly_refs: Vec<&[u8]> = polys.iter().map(|p| p.as_slice()).collect();
-        let multiproof = prover.prove_multiple(&commit_refs, &poly_refs, &indices, 64).ok()?;
+        let multiproof = prover
+            .prove_multiple(&commit_refs, &poly_refs, &indices, 64)
+            .ok()?;
 
         Some(TraversalProof {
             multiproof,
@@ -299,21 +321,34 @@ fn commit_node<'a>(
     node: &'a mut VectorCommitmentNode,
     prover: &(dyn InclusionProver + Sync),
     recalculate: bool,
+    parallel_budget: usize,
 ) -> &'a [u8] {
     match node {
         VectorCommitmentNode::Leaf(leaf) => leaf.commit(recalculate),
         VectorCommitmentNode::Branch(branch) => {
-            // Walk all 64 child slots in parallel. Each child commit is
-            // independent: leaves do SHA-512, branches recurse.
-            // KZG branch commit happens once all children are settled.
-            branch
-                .children
-                .par_iter_mut()
-                .for_each(|child_opt| {
-                    if let Some(child) = child_opt {
-                        commit_node(child, prover, recalculate);
-                    }
-                });
+            // Per-vertex metadata trees are often tiny and use SHA branch
+            // commitments. Split only substantial work, ignoring empty slots.
+            // Divide a fixed budget among children: binary/sparse trees can
+            // expose a few coarse levels without unbounded nested fanout.
+            if parallel_budget > 1
+                && branch.leaf_count >= prover.commit_parallel_threshold()
+                && branch.child_count() >= 2
+                && rayon::current_num_threads() > 1
+            {
+                let children: Vec<_> = branch.children.iter_mut().flatten().collect();
+                let min_chunk = children.len().div_ceil(parallel_budget);
+                let child_budget = (parallel_budget / children.len()).max(1);
+                children
+                    .into_par_iter()
+                    .with_min_len(min_chunk)
+                    .for_each(|child| {
+                        commit_node(child, prover, recalculate, child_budget);
+                    });
+            } else {
+                for child in branch.children.iter_mut().flatten() {
+                    commit_node(child, prover, recalculate, 1);
+                }
+            }
 
             // Aggregate `size` from children. `leaf_count` and
             // `longest_branch` are maintained at insert/delete time.
@@ -394,11 +429,15 @@ fn prove_recursive(
     }
 }
 
-fn get_recursive<'a>(node: Option<&'a VectorCommitmentNode>, key: &[u8], depth: usize) -> Option<&'a [u8]> {
+fn get_recursive<'a>(
+    node: Option<&'a VectorCommitmentNode>,
+    key: &[u8],
+    depth: usize,
+) -> Option<&'a LeafNode> {
     match node? {
         VectorCommitmentNode::Leaf(leaf) => {
             if leaf.key == key {
-                Some(&leaf.value)
+                Some(leaf)
             } else {
                 None
             }
@@ -461,8 +500,7 @@ fn insert_recursive(
                 Ok(VectorCommitmentNode::Leaf(leaf))
             } else {
                 // Split: create branch with both leaves
-                let (common, diverge_depth) =
-                    get_nibbles_until_diverge(&existing.key, key, depth);
+                let (common, diverge_depth) = get_nibbles_until_diverge(&existing.key, key, depth);
 
                 let mut branch = BranchNode::new(common);
 
@@ -593,9 +631,9 @@ fn insert_recursive(
 /// `found` is true iff a leaf with the exact key was removed somewhere in
 /// the sub-tree. `replacement_node` is what the caller should put in place
 /// of `node`:
-///   - `None` if the sub-tree is now empty
-///   - `Some(leaf)` if a branch collapsed down to its single remaining leaf
-///   - `Some(branch)` with refreshed metadata otherwise
+/// - `None` if the sub-tree is now empty
+/// - `Some(leaf)` if a branch collapsed down to its single remaining leaf
+/// - `Some(branch)` with refreshed metadata otherwise
 ///
 /// Mirrors Go's `Delete` recursion at `types/tries/lazy_proof_tree.go:2056`
 /// and `mergeBranchWithChild` at line 2242, minus the
@@ -710,12 +748,12 @@ fn delete_recursive(
 /// branch-split.
 ///
 /// - If the child is a leaf, the branch disappears entirely; the leaf
-///   takes its place. Insert would never have created the parent branch
-///   in the first place if only one leaf existed under it.
+/// takes its place. Insert would never have created the parent branch
+/// in the first place if only one leaf existed under it.
 /// - If the child is a branch, fold the parent's prefix + the child-slot
-///   nibble + the child's prefix into a single new prefix, and let the
-///   merged branch take the parent's place. Counters carry over from the
-///   child unchanged: it's the same set of leaves at the same depths.
+/// nibble + the child's prefix into a single new prefix, and let the
+/// merged branch take the parent's place. Counters carry over from the
+/// child unchanged: it's the same set of leaves at the same depths.
 fn merge_branch_with_child(
     branch: BranchNode,
     child_index: usize,
@@ -811,7 +849,70 @@ mod delete_tests {
     }
 
     fn ins(tree: &mut VectorCommitmentTree, k: &[u8], v: &[u8]) {
-        tree.insert(k, v, &[], &BigInt::from(v.len() as u64)).unwrap();
+        tree.insert(k, v, &[], &BigInt::from(v.len() as u64))
+            .unwrap();
+    }
+
+    #[test]
+    fn bounded_commit_matches_serial_before_and_after_mutations() {
+        fn serial(node: &mut VectorCommitmentNode, prover: &dyn InclusionProver) {
+            match node {
+                VectorCommitmentNode::Leaf(leaf) => {
+                    leaf.commit(true);
+                }
+                VectorCommitmentNode::Branch(branch) => {
+                    for child in branch.children.iter_mut().flatten() {
+                        serial(child, prover);
+                    }
+                    branch.size = branch
+                        .children
+                        .iter()
+                        .flatten()
+                        .map(|child| child.size())
+                        .sum();
+                    branch.commit(prover, true);
+                }
+            }
+        }
+        use sha2::{Digest, Sha256};
+        for threads in [1, 4, 16] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            for count in [0, 1, 8, 255, 256, 512] {
+                let mut tree = VectorCommitmentTree::new();
+                let keys: Vec<_> = (0..count)
+                    .map(|i| Sha256::digest((i as u64).to_le_bytes()).to_vec())
+                    .collect();
+                for key in &keys {
+                    tree.insert(key, &[42; 32], &[], &BigInt::from(1)).unwrap();
+                }
+                for phase in 0..3 {
+                    if phase == 1 && !keys.is_empty() {
+                        tree.insert(&keys[0], b"updated", b"hash target", &BigInt::from(9))
+                            .unwrap();
+                    }
+                    if phase == 2 && !keys.is_empty() {
+                        tree.delete(&keys[0]).unwrap();
+                    }
+                    let mut reference = VectorCommitmentTree {
+                        root: tree.root.clone(),
+                    };
+                    if let Some(root) = reference.root.as_mut() {
+                        serial(root, &crate::ShaInclusionProver);
+                    }
+                    pool.install(|| {
+                        tree.commit(&crate::ShaInclusionProver);
+                    });
+                    assert_eq!(
+                        crate::serialize_tree(tree.root.as_ref()).unwrap(),
+                        crate::serialize_tree(reference.root.as_ref()).unwrap(),
+                        "threads={threads}, count={count}, phase={phase}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -879,7 +980,10 @@ mod delete_tests {
                 assert_eq!(leaf.key, b"bravo");
                 assert_eq!(leaf.value, b"b");
             }
-            other => panic!("expected leaf root after collapse, got {:?}", other.is_some()),
+            other => panic!(
+                "expected leaf root after collapse, got {:?}",
+                other.is_some()
+            ),
         }
     }
 

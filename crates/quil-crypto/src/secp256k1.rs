@@ -2,7 +2,7 @@
 //! per Quilibrium's KeyType enum:
 //!
 //! - `Secp256k1Sha256`: ECDSA-secp256k1 with SHA-256 pre-hash (the
-//!   standard Bitcoin-style ECDSA).
+//! standard Bitcoin-style ECDSA).
 //! - `Secp256k1Sha3`: same curve, but pre-hash with SHA3-256.
 //!
 //! Both produce 64-byte fixed-length raw signatures (r || s, big
@@ -33,7 +33,12 @@ pub struct Secp256k1Signer {
 impl Secp256k1Signer {
     /// Construct a SHA-256-prehash secp256k1 signer.
     pub fn sha256(private_key: &[u8], public_key: &[u8]) -> Result<Self> {
-        Self::new(private_key, public_key, Hash::Sha256, KeyType::Secp256k1Sha256)
+        Self::new(
+            private_key,
+            public_key,
+            Hash::Sha256,
+            KeyType::Secp256k1Sha256,
+        )
     }
 
     /// Construct a SHA3-256-prehash secp256k1 signer.
@@ -41,12 +46,7 @@ impl Secp256k1Signer {
         Self::new(private_key, public_key, Hash::Sha3, KeyType::Secp256k1Sha3)
     }
 
-    fn new(
-        private_key: &[u8],
-        public_key: &[u8],
-        hash: Hash,
-        key_type: KeyType,
-    ) -> Result<Self> {
+    fn new(private_key: &[u8], public_key: &[u8], hash: Hash, key_type: KeyType) -> Result<Self> {
         if private_key.len() != 32 {
             return Err(QuilError::Crypto(format!(
                 "Secp256k1: invalid private key length {}",
@@ -81,7 +81,11 @@ impl Secp256k1Signer {
         sk_bytes.copy_from_slice(private_key);
         let sk = SigningKey::from_bytes(&sk_bytes.into())
             .map_err(|e| QuilError::Crypto(format!("Secp256k1: invalid private key: {}", e)))?;
-        Ok(sk.verifying_key().to_encoded_point(true).as_bytes().to_vec())
+        Ok(sk
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec())
     }
 
     fn prehash(&self, domain: &[u8], message: &[u8]) -> [u8; 32] {
@@ -145,13 +149,7 @@ impl Signer for Secp256k1Signer {
 /// Verify a secp256k1 ECDSA signature with the given pre-hash variant.
 /// `pubkey` may be 33 (compressed) or 65 (uncompressed) bytes;
 /// `signature` must be 64 bytes (r || s).
-fn verify(
-    pubkey: &[u8],
-    message: &[u8],
-    domain: &[u8],
-    signature: &[u8],
-    use_sha3: bool,
-) -> bool {
+fn verify(pubkey: &[u8], message: &[u8], domain: &[u8], signature: &[u8], use_sha3: bool) -> bool {
     if signature.len() != 64 {
         return false;
     }

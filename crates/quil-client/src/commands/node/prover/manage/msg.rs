@@ -1,0 +1,90 @@
+//! Async messages delivered into the TUI event loop (the bubbletea
+//! `tea.Msg` equivalents produced by the async action commands).
+
+use quil_types::proto::node::{GetShardInfoResponse, NodeInfoResponse, WorkerInfoResponse};
+
+use super::model::FilterOutcome;
+
+pub enum Msg {
+    /// The shield confirmation's reads and quotes, or why there is none.
+    ShieldPreview(Result<super::shield::Preview, String>),
+    /// A running shield's report.
+    Shield(super::shield::Progress),
+    /// A finished legacy read of the Coins tab, and its duration.
+    LegacyRefresh {
+        answer: super::coins::LegacyAnswer,
+        took: std::time::Duration,
+        /// The saved mint authorizations, read with it.
+        mints: Vec<super::mint::Saved>,
+    },
+    /// A legacy read under way: the pages read and the coins listed so far.
+    LegacyProgress {
+        pages: usize,
+        coins: usize,
+    },
+    /// The mint confirmation's reads and quote, or why there is none.
+    MintPreview(Result<super::mint::Preview, String>),
+    /// A running mint's or claim's report.
+    Mint(super::mint::Progress),
+    /// The shielded coins and pending transfers read, or why the read
+    /// failed.
+    Shielded(Result<super::transfer::Read, super::transfer::ReadFailure>),
+    /// A transfer action's confirmation, or why there is none.
+    TransferPreview(Result<super::transfer::Preview, String>),
+    /// A running transfer action's report.
+    Transfer(super::transfer::Progress),
+    RewardRefresh(Result<Option<(u128, u64)>, String>),
+    /// The node's health report: its conditions, none from a node that
+    /// predates them, or why it is unavailable.
+    HealthRefresh(super::model::HealthAnswer),
+    ShardLoading,
+    ShardRefresh(Result<GetShardInfoResponse, String>),
+    /// `dataRefreshMsg` — result of a full RPC data fetch.
+    DataRefresh {
+        node_info: Option<NodeInfoResponse>,
+        shard_info: Option<GetShardInfoResponse>,
+        worker_info: Option<WorkerInfoResponse>,
+        err: Option<String>,
+    },
+    /// `actionResultMsg` — RequestJoin RPC ack (Join only).
+    ActionResult {
+        action: String,
+        filter: String,
+        filters_raw: Vec<Vec<u8>>,
+        err: Option<String>,
+    },
+    /// `actionBroadcastMsg` — a signed lifecycle op was broadcast.
+    ActionBroadcast {
+        action: String,
+        filters_raw: Vec<Vec<u8>>,
+        send_frame: u64,
+        original_status: u32,
+        err: Option<String>,
+    },
+    /// A leave, pause or resume waits for the next epoch to sign.
+    SigningWait {
+        action: String,
+        frames_left: u64,
+    },
+    /// `toggleManualMsg` — SetManuallyManaged result for one worker.
+    ToggleManual {
+        core_id: u32,
+        new_state: bool,
+        err: Option<String>,
+    },
+    /// `markManualMsg` — batch SetManuallyManaged result.
+    MarkManual {
+        worker_ids: Vec<u32>,
+        failed_ids: Vec<u32>,
+        err: Option<String>,
+    },
+    /// `awaitCheckMsg` — timer fired; poll allocation status.
+    AwaitCheck,
+    /// `awaitResultMsg` — result of one allocation-status poll.
+    AwaitResult {
+        action: String,
+        frame: u64,
+        err: Option<String>,
+        per_filter: Vec<FilterOutcome>,
+    },
+}

@@ -25,10 +25,9 @@ fn ed448_sign_verify_over_canonical_bundle_matches_send_handler() {
         timestamp: 1_700_000_000_000,
     };
 
-    let payload = quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(
-        &bundle_pb,
-    )
-    .expect("canonicalize");
+    let payload =
+        quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(&bundle_pb)
+            .expect("canonicalize");
 
     // Reproducible seed — we don't care about secrecy, just that
     // sign and verify use the same key.
@@ -36,10 +35,8 @@ fn ed448_sign_verify_over_canonical_bundle_matches_send_handler() {
     for (i, b) in seed.iter_mut().enumerate() {
         *b = (i as u8).wrapping_mul(31).wrapping_add(7);
     }
-    let pk_bytes =
-        quil_crypto::Ed448Signer::derive_public(&seed).expect("derive pubkey");
-    let signer = quil_crypto::Ed448Signer::from_bytes(&seed, &pk_bytes)
-        .expect("Ed448 signer");
+    let pk_bytes = quil_crypto::Ed448Signer::derive_public(&seed).expect("derive pubkey");
+    let signer = quil_crypto::Ed448Signer::from_bytes(&seed, &pk_bytes).expect("Ed448 signer");
 
     let domain = vec![0xFFu8; 32];
     let mut context = Vec::with_capacity(19 + 32);
@@ -53,8 +50,7 @@ fn ed448_sign_verify_over_canonical_bundle_matches_send_handler() {
             .expect("Ed448 sign")
     };
 
-    let pk = ed448_rust::PublicKey::try_from(pk_bytes.as_slice())
-        .expect("decode pubkey");
+    let pk = ed448_rust::PublicKey::try_from(pk_bytes.as_slice()).expect("decode pubkey");
     // Go's Ed448Key.SignWithDomain signs `concat(domain, message)` with
     // empty context (pure Ed448, not Ed448ctx). Our Ed448Signer mirrors
     // that. Verify the same way — concatenate, then verify with None.
@@ -135,8 +131,7 @@ fn ed448_simple_round_trip() {
     let mut seed = [0u8; 57];
     seed[0] = 0xAA;
     let pk_bytes = quil_crypto::Ed448Signer::derive_public(&seed).unwrap();
-    let signer =
-        quil_crypto::Ed448Signer::from_bytes(&seed, &pk_bytes).unwrap();
+    let signer = quil_crypto::Ed448Signer::from_bytes(&seed, &pk_bytes).unwrap();
     let sig = {
         use quil_types::crypto::Signer;
         signer.sign_with_domain(payload, context).unwrap()
@@ -165,17 +160,14 @@ fn ed448_verify_rejects_when_payload_byte_is_flipped() {
         }],
         timestamp: 0,
     };
-    let mut payload = quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(
-        &bundle_pb,
-    )
-    .expect("canonicalize");
+    let mut payload =
+        quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(&bundle_pb)
+            .expect("canonicalize");
 
     let mut seed = [0u8; 57];
     seed[0] = 0xAA;
-    let pk_bytes =
-        quil_crypto::Ed448Signer::derive_public(&seed).expect("derive pubkey");
-    let signer = quil_crypto::Ed448Signer::from_bytes(&seed, &pk_bytes)
-        .expect("Ed448 signer");
+    let pk_bytes = quil_crypto::Ed448Signer::derive_public(&seed).expect("derive pubkey");
+    let signer = quil_crypto::Ed448Signer::from_bytes(&seed, &pk_bytes).expect("Ed448 signer");
     let context = b"NODE_AUTHENTICATION".to_vec();
     let signature = {
         use quil_types::crypto::Signer;
@@ -203,10 +195,8 @@ fn ed448_verify_rejects_when_context_differs() {
     let payload = b"some payload";
     let mut seed = [0u8; 57];
     seed[0] = 0xAA;
-    let pk_bytes =
-        quil_crypto::Ed448Signer::derive_public(&seed).expect("derive pubkey");
-    let signer = quil_crypto::Ed448Signer::from_bytes(&seed, &pk_bytes)
-        .expect("Ed448 signer");
+    let pk_bytes = quil_crypto::Ed448Signer::derive_public(&seed).expect("derive pubkey");
+    let signer = quil_crypto::Ed448Signer::from_bytes(&seed, &pk_bytes).expect("Ed448 signer");
     let signature = {
         use quil_types::crypto::Signer;
         signer.sign_with_domain(payload, b"context-A").unwrap()

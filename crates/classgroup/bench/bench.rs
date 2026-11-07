@@ -15,9 +15,9 @@
 #[macro_use]
 extern crate criterion;
 
+use classgroup::gmp::mpz::Mpz;
 use classgroup::{gmp_classgroup::GmpClassGroup, ClassGroup};
 use criterion::Criterion;
-use classgroup::gmp::mpz::Mpz;
 use std::str::FromStr;
 
 fn bench_square(c: &mut Criterion) {

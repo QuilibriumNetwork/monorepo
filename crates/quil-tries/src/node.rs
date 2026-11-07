@@ -30,8 +30,8 @@ pub struct BranchNode {
     /// 64 children. Semantics depend on [`Self::fully_loaded`]:
     /// - `fully_loaded = true`: `None` means the slot is genuinely empty.
     /// - `fully_loaded = false`: `None` means "not yet loaded from store"
-    ///   — the lazy walker calls `get_node_by_path(full_prefix + [i])`
-    ///   to fetch on demand. `Some(...)` always means resident.
+    /// — the lazy walker calls `get_node_by_path(full_prefix + [i])`
+    /// to fetch on demand. `Some(...)` always means resident.
     pub children: [Option<Box<VectorCommitmentNode>>; BRANCH_NODES],
     /// KZG or SHA-512 commitment.
     pub commitment: Vec<u8>,
@@ -68,6 +68,13 @@ impl LeafNode {
             h.update(&self.value);
         }
         self.commitment = h.finalize().to_vec();
+    }
+
+    /// Whether this leaf's commitment binds its `value`. A leaf carrying a
+    /// `hash_target` commits that target instead, so its `value` is not
+    /// authenticated by any commitment over the tree.
+    pub fn value_is_bound(&self) -> bool {
+        self.hash_target.is_empty()
     }
 
     /// Commit this leaf, recomputing if needed.
@@ -133,11 +140,7 @@ impl BranchNode {
         data
     }
 
-    pub fn commit(
-        &mut self,
-        prover: &dyn InclusionProver,
-        recalculate: bool,
-    ) -> &[u8] {
+    pub fn commit(&mut self, prover: &dyn InclusionProver, recalculate: bool) -> &[u8] {
         if !recalculate && !self.commitment.is_empty() {
             return &self.commitment;
         }
@@ -230,6 +233,19 @@ impl VectorCommitmentNode {
                 }
                 None
             }
+        }
+    }
+
+    /// Whether any leaf in this sub-tree carries a value its commitment does
+    /// not bind (see [`LeafNode::value_is_bound`]).
+    pub fn has_unbound_value(&self) -> bool {
+        match self {
+            VectorCommitmentNode::Leaf(leaf) => !leaf.value_is_bound(),
+            VectorCommitmentNode::Branch(branch) => branch
+                .children
+                .iter()
+                .flatten()
+                .any(|child| child.has_unbound_value()),
         }
     }
 
@@ -504,10 +520,8 @@ mod tests {
     fn branch_clone_preserves_children_count() {
         let mut original = BranchNode::new(vec![1, 2]);
         let leaf = leaf_with(b"k", b"v");
-        original.children[10] =
-            Some(Box::new(VectorCommitmentNode::Leaf(leaf.clone())));
-        original.children[20] =
-            Some(Box::new(VectorCommitmentNode::Leaf(leaf)));
+        original.children[10] = Some(Box::new(VectorCommitmentNode::Leaf(leaf.clone())));
+        original.children[20] = Some(Box::new(VectorCommitmentNode::Leaf(leaf)));
 
         let cloned = original.clone();
         assert_eq!(cloned.prefix, original.prefix);

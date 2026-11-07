@@ -11,7 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use std::{env, fs::File, io::Write, path::PathBuf, u16};
+use std::{env, fs::File, io::Write, path::PathBuf};
 
 /// The number of odd primes less than 65536.
 const PRIMES_LEN: usize = 6541;
@@ -104,7 +104,7 @@ fn generate(f: &mut dyn Write) {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    
+
     uniffi::generate_scaffolding("src/lib.udl").expect("uniffi generation failed");
 
     let manifest_path = env::var("OUT_DIR").expect("cargo should have set this");

@@ -217,8 +217,9 @@ impl Info {
             return false;
         }
         match self.typ {
-            Type::Undefined | Type::Bool | Type::Int | Type::Uint
-            | Type::Float | Type::String => self.bits == o.bits,
+            Type::Undefined | Type::Bool | Type::Int | Type::Uint | Type::Float | Type::String => {
+                self.bits == o.bits
+            }
             Type::Struct => {
                 if self.fields.len() != o.fields.len() || self.bits != o.bits {
                     return false;
@@ -250,12 +251,11 @@ impl Info {
             return false;
         }
         match self.typ {
-            Type::Undefined | Type::Bool | Type::Int | Type::Uint
-            | Type::Float | Type::String => !self.concrete() || self.bits == o.bits,
+            Type::Undefined | Type::Bool | Type::Int | Type::Uint | Type::Float | Type::String => {
+                !self.concrete() || self.bits == o.bits
+            }
             Type::Struct => {
-                if self.fields.len() != o.fields.len()
-                    || (self.concrete() && self.bits != o.bits)
-                {
+                if self.fields.len() != o.fields.len() || (self.concrete() && self.bits != o.bits) {
                     return false;
                 }
                 self.fields
@@ -264,9 +264,7 @@ impl Info {
                     .all(|(a, b)| a.type_info.specializable(&b.type_info))
             }
             Type::Array => {
-                if self.concrete()
-                    && (self.array_size != o.array_size || self.bits != o.bits)
-                {
+                if self.concrete() && (self.array_size != o.array_size || self.bits != o.bits) {
                     return false;
                 }
                 match (&self.element_type, &o.element_type) {
@@ -328,11 +326,7 @@ impl Info {
                         return true;
                     }
                     Type::Ptr => {
-                        if !o
-                            .element_type
-                            .as_ref()
-                            .map_or(false, |e| e.typ.is_array())
-                        {
+                        if !o.element_type.as_ref().map_or(false, |e| e.typ.is_array()) {
                             return false;
                         }
                         self.typ = Type::Ptr;
@@ -350,11 +344,7 @@ impl Info {
                     }
                     Type::Array => { /* continue below */ }
                     Type::Ptr => {
-                        if !o
-                            .element_type
-                            .as_ref()
-                            .map_or(false, |e| e.typ.is_array())
-                        {
+                        if !o.element_type.as_ref().map_or(false, |e| e.typ.is_array()) {
                             return false;
                         }
                         self.typ = Type::Ptr;
@@ -380,8 +370,7 @@ impl Info {
         match self.typ {
             Type::Struct => false,
             Type::Array | Type::Slice => {
-                if let (Some(ref mut el), Some(ref oel)) =
-                    (&mut self.element_type, &o.element_type)
+                if let (Some(ref mut el), Some(ref oel)) = (&mut self.element_type, &o.element_type)
                 {
                     if !el.concrete() && !el.instantiate(oel) {
                         return false;
@@ -398,9 +387,7 @@ impl Info {
                 true
             }
             Type::Ptr => {
-                if let (Some(ref el), Some(ref oel)) =
-                    (&self.element_type, &o.element_type)
-                {
+                if let (Some(ref el), Some(ref oel)) = (&self.element_type, &o.element_type) {
                     if el.typ != oel.typ {
                         return false;
                     }

@@ -302,7 +302,10 @@ mod tests {
             vec![(5, leaf_with_commitment(vec![0x22; 64]))],
         );
         let levels = compare_trees_at_height(Some(&left), Some(&right));
-        assert!(levels.len() >= 2, "expected at least 2 levels (root + child)");
+        assert!(
+            levels.len() >= 2,
+            "expected at least 2 levels (root + child)"
+        );
         // Root row records the root divergence.
         assert!(levels[0][0].differs);
         // Depth 1 row records the child-5 divergence with path [5].
@@ -323,10 +326,7 @@ mod tests {
         );
         let right = branch_with_children(
             vec![0xBB; 64],
-            vec![
-                (3, common_leaf),
-                (7, leaf_with_commitment(vec![0x55; 64])),
-            ],
+            vec![(3, common_leaf), (7, leaf_with_commitment(vec![0x55; 64]))],
         );
         let levels = compare_trees_at_height(Some(&left), Some(&right));
         let depth_one = &levels[1];

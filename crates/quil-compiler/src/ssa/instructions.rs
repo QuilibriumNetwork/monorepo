@@ -31,8 +31,8 @@ pub enum Opcode {
     Bor,
     Bxor,
     Bclear,
-    Bts,    // bit test
-    Btc,    // bit test and clear
+    Bts, // bit test
+    Btc, // bit test and clear
     // Shift
     Lshift,
     Rshift,
@@ -55,8 +55,8 @@ pub enum Opcode {
     GC,
     // Circuit-specific
     Circ,
-    Amov,  // array move
-    Smov,  // struct move
+    Amov, // array move
+    Smov, // struct move
 }
 
 impl fmt::Display for Opcode {

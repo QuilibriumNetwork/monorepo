@@ -10,8 +10,10 @@ For system preparation follow the official [Quilibrium Guide](https://docs.quili
 
 ### Generating Config
 The configuration directory `.config` is located at the root of the repository.
+Config generation runs the node-only image, so build it first:
 
 ```bash
+task build:node:source
 task config:gen
 ```
 This will generate `config.yml` and `keys.yml` in the `.config/` folder.
@@ -21,7 +23,7 @@ This will generate `config.yml` and `keys.yml` in the `.config/` folder.
 You have two primary ways to use Docker with Quilibrium:
 
 ### Option A: Build Binary via Docker (for Native Run)
-If you prefer to run the node natively but don't want to set up the full Go build environment, you can use Docker to compile the binary for your specific platform.
+If you prefer to run the node natively but don't want to set up the full Rust build environment, you can use Docker to compile the binary for your specific platform.
 
 1. **Build and Export Binary**:
    Run the task corresponding to your OS/Architecture:

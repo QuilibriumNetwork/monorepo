@@ -19,10 +19,10 @@ pub struct Ed448Signer {
 
 impl Ed448Signer {
     /// Accepts both encodings of the private key:
-    ///   * 57 bytes — raw seed.
-    ///   * 114 bytes — circl/Go layout: `seed(57) || pubkey(57)`. The
-    ///     trailing pubkey is dropped; the seed is what `ed448-rust`
-    ///     consumes.
+    /// * 57 bytes — raw seed.
+    /// * 114 bytes — circl/Go layout: `seed(57) || pubkey(57)`. The
+    /// trailing pubkey is dropped; the seed is what `ed448-rust`
+    /// consumes.
     /// `public_key` must be 57 bytes.
     pub fn from_bytes(private_key: &[u8], public_key: &[u8]) -> Result<Self> {
         let seed = normalize_ed448_seed(private_key)?;

@@ -60,6 +60,18 @@ async fn main() -> anyhow::Result<()> {
     let key_bytes = hex::decode(&config.p2p.peer_priv_key)?;
     anyhow::ensure!(key_bytes.len() >= 57, "need Ed448 key");
     let ed448_seed: [u8; 57] = key_bytes[..57].try_into().unwrap();
+    // :8340 network identity = the node's Falcon q-prover-key (from keystore);
+    // the Ed448 seed above stays as the seniority/identity key.
+    let falcon_signing_key = {
+        use quil_keys::KeyManager as _;
+        let fkm = quil_keys::FileKeyManager::new(
+            std::path::PathBuf::from(&config.key.key_store_file.path),
+            &config.key.key_store_file.encryption_key,
+            "default-proving-key".to_string(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )?;
+        fkm.get_private_key(quil_types::crypto::KeyType::Falcon512)?
+    };
     let ed448_pubkey = quil_p2p::ed448_identity::derive_public_key(&ed448_seed);
     let ed448_peer_id = quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&ed448_pubkey);
     info!(
@@ -69,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // BLS prover key
-    let bls_ctor = quil_crypto::Bls48581KeyConstructor;
+    let bls_ctor = quil_crypto::FalconKeyConstructor;
     let (bls_signer_box, bls_pubkey) = quil_types::crypto::BlsConstructor::new_key(&bls_ctor)?;
     // Wrap in Arc for sharing across tasks
     let bls_signer: Arc<dyn quil_types::crypto::Signer> = Arc::from(bls_signer_box);
@@ -89,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
     let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
 
     // P2P
-    let p2p_node = quil_p2p::node::P2PNode::new_with_options(&config.p2p, false)?;
+    let p2p_node = quil_p2p::node::P2PNode::new_with_options(&config.p2p, false, None)?;
     let listen_addr = if config.p2p.listen_multiaddr.is_empty() {
         "/ip4/0.0.0.0/udp/8336/quic-v1".to_string()
     } else {
@@ -103,8 +115,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Must subscribe before publishing — BlossomSub rejects publish to
     // unsubscribed bitmasks.
-    p2p_handle.subscribe(vec![0x00]).await;             // GLOBAL_CONSENSUS
-    p2p_handle.subscribe(vec![0x00, 0x00]).await;       // GLOBAL_FRAME
+    p2p_handle.subscribe(vec![0x00]).await; // GLOBAL_CONSENSUS
+    p2p_handle.subscribe(vec![0x00, 0x00]).await; // GLOBAL_FRAME
     p2p_handle.subscribe(vec![0x00, 0x00, 0x00]).await; // GLOBAL_PROVER
     p2p_handle.subscribe(vec![0x00, 0x00, 0x00, 0x00]).await; // GLOBAL_PEER_INFO
     info!("subscribed to all global bitmasks");
@@ -112,7 +124,10 @@ async fn main() -> anyhow::Result<()> {
     let token = CancellationToken::new();
     {
         let t = token.clone();
-        tokio::spawn(async move { tokio::signal::ctrl_c().await.ok(); t.cancel(); });
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            t.cancel();
+        });
     }
 
     let head_frame = Arc::new(AtomicU64::new(0));
@@ -151,21 +166,66 @@ async fn main() -> anyhow::Result<()> {
                     version: vec![2, 1, 0],
                     patch_number: vec![23],
                     capabilities: vec![
-                        quil_p2p::CanonicalCapability { protocol_identifier: 0x00020001, additional_metadata: vec![] }, // GLOBAL
-                        quil_p2p::CanonicalCapability { protocol_identifier: 0x00040001, additional_metadata: vec![] }, // TOKEN
-                        quil_p2p::CanonicalCapability { protocol_identifier: 0x00010001, additional_metadata: vec![] }, // COMPUTE
-                        quil_p2p::CanonicalCapability { protocol_identifier: 0x00030001, additional_metadata: vec![] }, // HYPERGRAPH
-                        quil_p2p::CanonicalCapability { protocol_identifier: 0x0101, additional_metadata: vec![] },     // DOUBLE_RATCHET
-                        quil_p2p::CanonicalCapability { protocol_identifier: 0x0201, additional_metadata: vec![] },     // TRIPLE_RATCHET
-                        quil_p2p::CanonicalCapability { protocol_identifier: 0x0301, additional_metadata: vec![] },     // ONION_ROUTING
-                        quil_p2p::CanonicalCapability { protocol_identifier: 0x00010101, additional_metadata: vec![] }, // KZG_VERIFY
-                        quil_p2p::CanonicalCapability { protocol_identifier: 0x00010201, additional_metadata: vec![] }, // BULLETPROOF_RANGE
-                        quil_p2p::CanonicalCapability { protocol_identifier: 0x00010301, additional_metadata: vec![] }, // BULLETPROOF_SUM
-                        quil_p2p::CanonicalCapability { protocol_identifier: 0x00010401, additional_metadata: vec![] }, // SECP256K1_ECDSA
-                        quil_p2p::CanonicalCapability { protocol_identifier: 0x00010501, additional_metadata: vec![] }, // ED25519_EDDSA
-                        quil_p2p::CanonicalCapability { protocol_identifier: 0x00010601, additional_metadata: vec![] }, // ED448_EDDSA
-                        quil_p2p::CanonicalCapability { protocol_identifier: 0x00010701, additional_metadata: vec![] }, // DECAF448_SCHNORR
-                        quil_p2p::CanonicalCapability { protocol_identifier: 0x00010801, additional_metadata: vec![] }, // SECP256R1_ECDSA
+                        quil_p2p::CanonicalCapability {
+                            protocol_identifier: 0x00020001,
+                            additional_metadata: vec![],
+                        }, // GLOBAL
+                        quil_p2p::CanonicalCapability {
+                            protocol_identifier: 0x00040001,
+                            additional_metadata: vec![],
+                        }, // TOKEN
+                        quil_p2p::CanonicalCapability {
+                            protocol_identifier: 0x00010001,
+                            additional_metadata: vec![],
+                        }, // COMPUTE
+                        quil_p2p::CanonicalCapability {
+                            protocol_identifier: 0x00030001,
+                            additional_metadata: vec![],
+                        }, // HYPERGRAPH
+                        quil_p2p::CanonicalCapability {
+                            protocol_identifier: 0x0101,
+                            additional_metadata: vec![],
+                        }, // DOUBLE_RATCHET
+                        quil_p2p::CanonicalCapability {
+                            protocol_identifier: 0x0201,
+                            additional_metadata: vec![],
+                        }, // TRIPLE_RATCHET
+                        quil_p2p::CanonicalCapability {
+                            protocol_identifier: 0x0301,
+                            additional_metadata: vec![],
+                        }, // ONION_ROUTING
+                        quil_p2p::CanonicalCapability {
+                            protocol_identifier: 0x00010101,
+                            additional_metadata: vec![],
+                        }, // KZG_VERIFY
+                        quil_p2p::CanonicalCapability {
+                            protocol_identifier: 0x00010201,
+                            additional_metadata: vec![],
+                        }, // BULLETPROOF_RANGE
+                        quil_p2p::CanonicalCapability {
+                            protocol_identifier: 0x00010301,
+                            additional_metadata: vec![],
+                        }, // BULLETPROOF_SUM
+                        quil_p2p::CanonicalCapability {
+                            protocol_identifier: 0x00010401,
+                            additional_metadata: vec![],
+                        }, // SECP256K1_ECDSA
+                        quil_p2p::CanonicalCapability {
+                            protocol_identifier: 0x00010501,
+                            additional_metadata: vec![],
+                        }, // ED25519_EDDSA
+                        quil_p2p::CanonicalCapability {
+                            protocol_identifier: 0x00010601,
+                            additional_metadata: vec![],
+                        }, // ED448_EDDSA
+                        quil_p2p::CanonicalCapability {
+                            protocol_identifier: 0x00010701,
+                            additional_metadata: vec![],
+                        }, // DECAF448_SCHNORR
+                        quil_p2p::CanonicalCapability {
+                            protocol_identifier: 0x00010801,
+                            additional_metadata: vec![],
+                        }, // SECP256R1_ECDSA
                     ],
                     public_key: Vec::new(),
                     signature: Vec::new(),
@@ -175,7 +235,12 @@ async fn main() -> anyhow::Result<()> {
                 let pv = ed448_rust::PrivateKey::from(s);
                 let m = quil_p2p::encode_canonical_peer_info(&pi, &pk, &[]);
                 if let Ok(sig) = pv.sign(&m, None) {
-                    let _ = h.publish(bm.clone(), quil_p2p::encode_canonical_peer_info(&pi, &pk, &sig)).await;
+                    let _ = h
+                        .publish(
+                            bm.clone(),
+                            quil_p2p::encode_canonical_peer_info(&pi, &pk, &sig),
+                        )
+                        .await;
                     info!("published signed PeerInfo");
                 }
 
@@ -242,11 +307,19 @@ async fn main() -> anyhow::Result<()> {
 
     // Wait for archives
     loop {
-        if token.is_cancelled() { return Ok(()); }
+        if token.is_cancelled() {
+            return Ok(());
+        }
         tokio::time::sleep(Duration::from_secs(5)).await;
         let n = archive_addrs.lock().await.len();
-        if n > 0 && head_frame.load(Ordering::Relaxed) > 0 { break; }
-        info!(archives = n, head = head_frame.load(Ordering::Relaxed), "waiting for archives...");
+        if n > 0 && head_frame.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+        info!(
+            archives = n,
+            head = head_frame.load(Ordering::Relaxed),
+            "waiting for archives..."
+        );
     }
     info!("archives found, starting main loop");
 
@@ -255,7 +328,9 @@ async fn main() -> anyhow::Result<()> {
     let mut last_sync: u64 = 0;
 
     loop {
-        if token.is_cancelled() { break; }
+        if token.is_cancelled() {
+            break;
+        }
         let p = *phase.lock().await;
         let hf = head_frame.load(Ordering::Relaxed);
 
@@ -264,7 +339,9 @@ async fn main() -> anyhow::Result<()> {
                 info!(elapsed = ?start.elapsed(), head = hf, "SYNCING");
                 let addr = archive_addrs.lock().await.first().cloned();
                 if let Some(addr) = addr {
-                    if let Ok(mut c) = quil_rpc::ArchiveClient::connect_mtls(&addr, &ed448_seed).await {
+                    if let Ok(mut c) =
+                        quil_rpc::ArchiveClient::connect_mtls(&addr, &falcon_signing_key).await
+                    {
                         if let Ok(f) = c.get_global_frame(0).await {
                             let fn_ = f.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
                             head_frame.store(fn_, Ordering::Relaxed);
@@ -279,25 +356,20 @@ async fn main() -> anyhow::Result<()> {
             Phase::FindingShards => {
                 info!(elapsed = ?start.elapsed(), "FINDING_SHARDS");
 
-                // Fresh sync prover tree — must be current data to pick correct filters
-                let addr = archive_addrs.lock().await.first().cloned();
-                if let Some(addr) = addr {
-                    let s = hg_store.clone();
-                    let _ = quil_rpc::ensure_prover_tree_fresh(
-                        &addr, &ed448_seed,
-                        quil_types::proto::application::HypergraphPhaseSet::VertexAdds,
-                        s,
-                        &[], // test binary: no expected_root pin
-                    ).await;
-                }
+                // (Prover-tree sync removed: the forest Merkle-diff sync applies
+                // into a live CRDT, which this diagnostic binary doesn't build.
+                // The legacy KZG ensure_prover_tree_* path was retired.)
 
                 let reg = Arc::new(quil_execution::SharedProverRegistry::new());
                 {
                     let r = reg.clone();
                     let h = hg_store.clone();
-                    tokio::task::spawn_blocking(move || r.refresh_from_store(&h)).await?;
+                    tokio::task::spawn_blocking(move || r.refresh_from_store(h.as_ref())).await??;
                 }
-                info!(provers = reg.read(|r| r.distinct_provers()), "registry loaded");
+                info!(
+                    provers = reg.read(|r| r.distinct_provers()),
+                    "registry loaded"
+                );
 
                 // 0 frame_number is OK here — the diagnostic
                 // binary doesn't care about expiry filtering of
@@ -305,23 +377,38 @@ async fn main() -> anyhow::Result<()> {
                 // reports.
                 let sums: Vec<quil_types::consensus::ProverShardSummary> =
                     reg.read(|r| r.get_prover_shard_summaries(0));
-                let mut cands: Vec<(u32, Vec<u8>)> = sums.iter().map(|s| {
-                    let a = s.status_counts.get(&quil_types::consensus::ProverStatus::Active).copied().unwrap_or(0);
-                    (a, s.filter.clone())
-                }).collect();
+                let mut cands: Vec<(u32, Vec<u8>)> = sums
+                    .iter()
+                    .map(|s| {
+                        let a = s
+                            .status_counts
+                            .get(&quil_types::consensus::ProverStatus::Active)
+                            .copied()
+                            .unwrap_or(0);
+                        (a, s.filter.clone())
+                    })
+                    .collect();
                 cands.sort_by_key(|(c, _)| *c);
 
-                let zeros: Vec<Vec<u8>> = cands.iter()
+                let zeros: Vec<Vec<u8>> = cands
+                    .iter()
                     .filter(|(c, _)| *c == 0)
                     .map(|(_, f)| f.clone())
                     .collect();
                 targets = if zeros.is_empty() {
                     // No empty shards — pick the least-populated one
-                    cands.into_iter().take(1).map(|(_c, f): (u32, Vec<u8>)| f).collect()
+                    cands
+                        .into_iter()
+                        .take(1)
+                        .map(|(_c, f): (u32, Vec<u8>)| f)
+                        .collect()
                 } else {
                     zeros
                 };
-                info!(targets = targets.len(), "selected ALL shards with no active provers");
+                info!(
+                    targets = targets.len(),
+                    "selected ALL shards with no active provers"
+                );
 
                 if targets.is_empty() {
                     tokio::time::sleep(Duration::from_secs(30)).await;
@@ -341,31 +428,54 @@ async fn main() -> anyhow::Result<()> {
                 // join's FrameNumber is rejected if >10 frames stale.
                 let addr = archive_addrs.lock().await.first().cloned();
                 let (output, fn_, diff) = if let Some(a) = addr {
-                    match quil_rpc::ArchiveClient::connect_mtls(&a, &ed448_seed).await {
+                    match quil_rpc::ArchiveClient::connect_mtls(&a, &falcon_signing_key).await {
                         Ok(mut c) => match c.get_global_frame(0).await {
                             Ok(f) => {
                                 let h = f.header.as_ref().unwrap();
-                                info!(frame = h.frame_number, "using fresh frame from archive for VDF challenge");
+                                info!(
+                                    frame = h.frame_number,
+                                    "using fresh frame from archive for VDF challenge"
+                                );
                                 (h.output.clone(), h.frame_number, h.difficulty)
                             }
-                            Err(e) => { warn!(%e, "archive get_global_frame failed, falling back to local");
+                            Err(e) => {
+                                warn!(%e, "archive get_global_frame failed, falling back to local");
                                 match clock_store.get_latest_global_frame() {
-                                    Ok(f) => { let h = f.header.as_ref().unwrap(); (h.output.clone(), h.frame_number, h.difficulty) }
-                                    Err(_) => { *phase.lock().await = Phase::Syncing; continue; }
+                                    Ok(f) => {
+                                        let h = f.header.as_ref().unwrap();
+                                        (h.output.clone(), h.frame_number, h.difficulty)
+                                    }
+                                    Err(_) => {
+                                        *phase.lock().await = Phase::Syncing;
+                                        continue;
+                                    }
                                 }
                             }
                         },
-                        Err(e) => { warn!(%e, "archive connect failed, falling back to local");
+                        Err(e) => {
+                            warn!(%e, "archive connect failed, falling back to local");
                             match clock_store.get_latest_global_frame() {
-                                Ok(f) => { let h = f.header.as_ref().unwrap(); (h.output.clone(), h.frame_number, h.difficulty) }
-                                Err(_) => { *phase.lock().await = Phase::Syncing; continue; }
+                                Ok(f) => {
+                                    let h = f.header.as_ref().unwrap();
+                                    (h.output.clone(), h.frame_number, h.difficulty)
+                                }
+                                Err(_) => {
+                                    *phase.lock().await = Phase::Syncing;
+                                    continue;
+                                }
                             }
                         }
                     }
                 } else {
                     match clock_store.get_latest_global_frame() {
-                        Ok(f) => { let h = f.header.as_ref().unwrap(); (h.output.clone(), h.frame_number, h.difficulty) }
-                        Err(_) => { *phase.lock().await = Phase::Syncing; continue; }
+                        Ok(f) => {
+                            let h = f.header.as_ref().unwrap();
+                            (h.output.clone(), h.frame_number, h.difficulty)
+                        }
+                        Err(_) => {
+                            *phase.lock().await = Phase::Syncing;
+                            continue;
+                        }
                     }
                 };
 
@@ -374,13 +484,17 @@ async fn main() -> anyhow::Result<()> {
                     use sha3::{Digest, Sha3_256};
                     Sha3_256::digest(&output).into()
                 };
-                let ids: Vec<Vec<u8>> = targets.iter().enumerate().map(|(i, f)| {
-                    let mut id = Vec::new();
-                    id.extend_from_slice(&prover_address);
-                    id.extend_from_slice(f);
-                    id.extend_from_slice(&(i as u32).to_be_bytes());
-                    id
-                }).collect();
+                let ids: Vec<Vec<u8>> = targets
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        let mut id = Vec::new();
+                        id.extend_from_slice(&prover_address);
+                        id.extend_from_slice(f);
+                        id.extend_from_slice(&(i as u32).to_be_bytes());
+                        id
+                    })
+                    .collect();
                 info!(
                     difficulty = diff,
                     filters = targets.len(),
@@ -409,7 +523,12 @@ async fn main() -> anyhow::Result<()> {
                 for handle in handles {
                     match handle.await {
                         Ok((i, Ok(proof))) => {
-                            info!(filter = i + 1, total = num_filters, len = proof.len(), "filter proof done");
+                            info!(
+                                filter = i + 1,
+                                total = num_filters,
+                                len = proof.len(),
+                                "filter proof done"
+                            );
                             results[i] = Some(proof);
                         }
                         Ok((i, Err(e))) => {
@@ -457,59 +576,98 @@ async fn main() -> anyhow::Result<()> {
                         elapsed = ?t0.elapsed(),
                         "all proofs done!"
                     );
-                    match build_join(&targets, fn_, &bls_pubkey, bls_signer.as_ref(), &prover_address, &proof) {
+                    match build_join(
+                        &targets,
+                        fn_,
+                        &bls_pubkey,
+                        bls_signer.as_ref(),
+                        &prover_address,
+                        &proof,
+                    ) {
                         Ok(join) => {
                             // Wrap in MessageBundle (not MessageRequest!)
                             // Go's handleProverMessage expects MessageBundleType (0x0312)
-                            let req = quil_execution::message_envelope::CanonicalMessageRequest::wrap(join);
+                            let req =
+                                quil_execution::message_envelope::CanonicalMessageRequest::wrap(
+                                    join,
+                                );
                             match req {
                                 Ok(r) => {
                                     let now_ms = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
-                                        .as_millis() as i64;
-                                    let bundle = quil_execution::message_envelope::CanonicalMessageBundle {
-                                        requests: vec![Some(r)],
-                                        timestamp: now_ms,
-                                    };
+                                        .as_millis()
+                                        as i64;
+                                    let bundle =
+                                        quil_execution::message_envelope::CanonicalMessageBundle {
+                                            requests: vec![Some(r)],
+                                            timestamp: now_ms,
+                                        };
                                     match bundle.to_canonical_bytes() {
                                         Ok(bytes) => {
                                             join_frame.store(fn_, Ordering::Relaxed);
-                                            info!(bundle_len = bytes.len(), "submitting ProverJoin via gRPC to archives");
+                                            info!(
+                                                bundle_len = bytes.len(),
+                                                "submitting ProverJoin via gRPC to archives"
+                                            );
                                             // Submit via gRPC to all known archives (like Go does)
                                             let addrs = archive_addrs.lock().await.clone();
                                             let mut submitted = false;
                                             for addr in &addrs {
                                                 let stream_addr = addr.replace(":8336", ":8340");
                                                 match quil_rpc::ArchiveClient::connect_mtls(
-                                                    &stream_addr, &ed448_seed,
-                                                ).await {
+                                                    &stream_addr,
+                                                    &falcon_signing_key,
+                                                )
+                                                .await
+                                                {
                                                     Ok(mut client) => {
-                                                        match client.submit_global_message(bytes.clone()).await {
+                                                        match client
+                                                            .submit_global_message(bytes.clone())
+                                                            .await
+                                                        {
                                                             Ok(()) => {
                                                                 info!(%stream_addr, "ProverJoin submitted to archive via gRPC!");
                                                                 submitted = true;
                                                             }
-                                                            Err(e) => warn!(%stream_addr, %e, "gRPC submit failed"),
+                                                            Err(e) => {
+                                                                warn!(%stream_addr, %e, "gRPC submit failed")
+                                                            }
                                                         }
                                                     }
-                                                    Err(e) => warn!(%stream_addr, %e, "archive connect failed"),
+                                                    Err(e) => {
+                                                        warn!(%stream_addr, %e, "archive connect failed")
+                                                    }
                                                 }
                                             }
                                             // Also publish via BlossomSub as fallback
-                                            if let Err(e) = p2p_handle.publish(vec![0u8; 3], bytes).await {
+                                            if let Err(e) =
+                                                p2p_handle.publish(vec![0u8; 3], bytes).await
+                                            {
                                                 warn!(error = %e, "ProverJoin BlossomSub publish failed");
                                             }
-                                            info!(submitted_grpc = submitted, "ProverJoin published via BlossomSub too");
+                                            info!(
+                                                submitted_grpc = submitted,
+                                                "ProverJoin published via BlossomSub too"
+                                            );
                                             *phase.lock().await = Phase::WaitingForJoinReceipt;
                                         }
-                                        Err(e) => { error!(%e, "bundle encode failed"); *phase.lock().await = Phase::Failed; }
+                                        Err(e) => {
+                                            error!(%e, "bundle encode failed");
+                                            *phase.lock().await = Phase::Failed;
+                                        }
                                     }
                                 }
-                                Err(e) => { error!(%e, "wrap in request failed"); *phase.lock().await = Phase::Failed; }
+                                Err(e) => {
+                                    error!(%e, "wrap in request failed");
+                                    *phase.lock().await = Phase::Failed;
+                                }
                             }
                         }
-                        Err(e) => { error!(%e, "build join failed"); *phase.lock().await = Phase::Failed; }
+                        Err(e) => {
+                            error!(%e, "build join failed");
+                            *phase.lock().await = Phase::Failed;
+                        }
                     }
                 } else {
                     error!("proof computation failed");
@@ -528,7 +686,9 @@ async fn main() -> anyhow::Result<()> {
                     let addr = archive_addrs.lock().await.first().cloned();
                     if let Some(addr) = addr {
                         // Update head frame
-                        if let Ok(mut c) = quil_rpc::ArchiveClient::connect_mtls(&addr, &ed448_seed).await {
+                        if let Ok(mut c) =
+                            quil_rpc::ArchiveClient::connect_mtls(&addr, &falcon_signing_key).await
+                        {
                             if let Ok(f) = c.get_global_frame(0).await {
                                 let new_hf = f.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
                                 head_frame.store(new_hf, Ordering::Relaxed);
@@ -536,23 +696,21 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
 
-                        // Incremental sync — compares commitments and only
-                        // fetches changed branches (seconds vs 9 minutes).
-                        let hs = hg_store.clone();
-                        let _ = quil_rpc::ensure_prover_tree_incremental(
-                            &addr, &ed448_seed,
-                            quil_types::proto::application::HypergraphPhaseSet::VertexAdds,
-                            hs.clone(),
-                            &[], // test binary: no expected_root pin
-                        ).await;
+                        // (Incremental prover-tree sync removed with the KZG
+                        // ensure_prover_tree_* retirement — see note above.)
 
                         let reg = Arc::new(quil_execution::SharedProverRegistry::new());
                         let hs2 = hg_store.clone();
                         let pa = prover_address;
                         let found = tokio::task::spawn_blocking(move || {
-                            reg.refresh_from_store(&hs2);
+                            if let Err(error) = reg.refresh_from_store(hs2.as_ref()) {
+                                warn!(%error, "prover registry refresh failed");
+                                return false;
+                            }
                             reg.read(|r| r.get_prover_info(&pa).is_some())
-                        }).await.unwrap_or(false);
+                        })
+                        .await
+                        .unwrap_or(false);
 
                         if found {
                             info!("=== JOIN CONFIRMED IN REGISTRY ===");
@@ -578,9 +736,14 @@ async fn main() -> anyhow::Result<()> {
                     last_sync = hf;
                     let addr = archive_addrs.lock().await.first().cloned();
                     if let Some(addr) = addr {
-                        if let Ok(mut c) = quil_rpc::ArchiveClient::connect_mtls(&addr, &ed448_seed).await {
+                        if let Ok(mut c) =
+                            quil_rpc::ArchiveClient::connect_mtls(&addr, &falcon_signing_key).await
+                        {
                             if let Ok(f) = c.get_global_frame(0).await {
-                                head_frame.store(f.header.as_ref().map(|h| h.frame_number).unwrap_or(0), Ordering::Relaxed);
+                                head_frame.store(
+                                    f.header.as_ref().map(|h| h.frame_number).unwrap_or(0),
+                                    Ordering::Relaxed,
+                                );
                             }
                         }
                     }
@@ -596,31 +759,46 @@ async fn main() -> anyhow::Result<()> {
                 info!(elapsed = ?start.elapsed(), "SUBMITTING_CONFIRM");
                 match build_confirm(&targets, hf, bls_signer.as_ref(), &prover_address) {
                     Ok(confirm) => {
-                        match quil_execution::message_envelope::CanonicalMessageRequest::wrap(confirm) {
+                        match quil_execution::message_envelope::CanonicalMessageRequest::wrap(
+                            confirm,
+                        ) {
                             Ok(r) => {
                                 let now_ms = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
-                                    .as_millis() as i64;
-                                let bundle = quil_execution::message_envelope::CanonicalMessageBundle {
-                                    requests: vec![Some(r)],
-                                    timestamp: now_ms,
-                                };
+                                    .as_millis()
+                                    as i64;
+                                let bundle =
+                                    quil_execution::message_envelope::CanonicalMessageBundle {
+                                        requests: vec![Some(r)],
+                                        timestamp: now_ms,
+                                    };
                                 match bundle.to_canonical_bytes() {
                                     Ok(bytes) => {
-                                        if let Err(e) = p2p_handle.publish(vec![0u8; 3], bytes).await {
+                                        if let Err(e) =
+                                            p2p_handle.publish(vec![0u8; 3], bytes).await
+                                        {
                                             warn!(error = %e, "ProverConfirm BlossomSub publish failed");
                                         }
                                         info!("ProverConfirm published as MessageBundle!");
                                         *phase.lock().await = Phase::Done;
                                     }
-                                    Err(e) => { error!(%e, "bundle confirm"); *phase.lock().await = Phase::Failed; }
+                                    Err(e) => {
+                                        error!(%e, "bundle confirm");
+                                        *phase.lock().await = Phase::Failed;
+                                    }
                                 }
                             }
-                            Err(e) => { error!(%e, "wrap confirm"); *phase.lock().await = Phase::Failed; }
+                            Err(e) => {
+                                error!(%e, "wrap confirm");
+                                *phase.lock().await = Phase::Failed;
+                            }
                         }
                     }
-                    Err(e) => { error!(%e, "build confirm"); *phase.lock().await = Phase::Failed; }
+                    Err(e) => {
+                        error!(%e, "build confirm");
+                        *phase.lock().await = Phase::Failed;
+                    }
                 }
             }
 
@@ -640,10 +818,16 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn build_join(
-    filters: &[Vec<u8>], frame: u64, pk: &[u8],
-    signer: &dyn quil_types::crypto::Signer, addr: &[u8; 32], proof: &[u8],
+    filters: &[Vec<u8>],
+    frame: u64,
+    pk: &[u8],
+    signer: &dyn quil_types::crypto::Signer,
+    addr: &[u8; 32],
+    proof: &[u8],
 ) -> quil_types::error::Result<Vec<u8>> {
-    use quil_execution::global_intrinsic::{prover_join::ProverJoin, sig_with_pop::SignatureWithPop};
+    use quil_execution::global_intrinsic::{
+        prover_join::ProverJoin, sig_with_pop::SignatureWithPop,
+    };
 
     // Go signs the FULL ProverJoin canonical bytes with signature=nil.
     // See global_prover_join.go:1074-1079:
@@ -681,19 +865,26 @@ fn build_join(
         delegate_address: addr.to_vec(),
         merge_targets: vec![],
         proof: proof.to_vec(),
-    }.to_canonical_bytes()
+    }
+    .to_canonical_bytes()
 }
 
 fn build_confirm(
-    filters: &[Vec<u8>], frame: u64,
-    signer: &dyn quil_types::crypto::Signer, addr: &[u8; 32],
+    filters: &[Vec<u8>],
+    frame: u64,
+    signer: &dyn quil_types::crypto::Signer,
+    addr: &[u8; 32],
 ) -> quil_types::error::Result<Vec<u8>> {
-    use quil_execution::global_intrinsic::{prover_ops::ProverConfirm, addressed_signature::AddressedSignature};
+    use quil_execution::global_intrinsic::{
+        addressed_signature::AddressedSignature, prover_ops::ProverConfirm,
+    };
 
     // Go signs filters_concat + frame_number (NOT the full canonical bytes).
     // See global_prover_confirm.go Prove/Verify.
     let mut msg = Vec::new();
-    for f in filters { msg.extend_from_slice(f); }
+    for f in filters {
+        msg.extend_from_slice(f);
+    }
     msg.extend_from_slice(&frame.to_be_bytes());
 
     let mut dp = quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS.to_vec();
@@ -704,15 +895,25 @@ fn build_confirm(
     ProverConfirm {
         filter: vec![],
         frame_number: frame,
-        public_key_signature_bls48581: Some(AddressedSignature { signature: sig, address: addr.to_vec() }),
+        public_key_signature_bls48581: Some(AddressedSignature {
+            signature: sig,
+            address: addr.to_vec(),
+        }),
         filters: filters.to_vec(),
-    }.to_canonical_bytes()
+        leaf_roots: Vec::new(),
+        release: None,
+    }
+    .to_canonical_bytes()
 }
 
 fn ma_to_hp(ma: &str) -> Option<String> {
     let p: Vec<&str> = ma.trim_start_matches('/').split('/').collect();
-    if p.len() < 4 || p[0] != "ip4" || p[2] != "tcp" { return None; }
+    if p.len() < 4 || p[0] != "ip4" || p[2] != "tcp" {
+        return None;
+    }
     let ip: std::net::Ipv4Addr = p[1].parse().ok()?;
-    if ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified() { return None; }
+    if ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified() {
+        return None;
+    }
     Some(format!("{}:{}", ip, p[3].parse::<u16>().ok()?))
 }

@@ -12,10 +12,7 @@
 //! `qkms-sdk` can drive DKG, signing, refresh, and resize protocols entirely
 //! in the browser or in Node.js.
 
-use dkls23_ffi::{
-    self as ffi,
-    EllipticCurve, PartyMessage,
-};
+use dkls23_ffi::{self as ffi, EllipticCurve, PartyMessage};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
@@ -175,8 +172,8 @@ fn parse_curve(s: &str) -> Result<EllipticCurve, String> {
 }
 
 fn parse_messages(messages_json: &str) -> Result<Vec<PartyMessage>, String> {
-    let parsed: Vec<PartyMessageJson> = serde_json::from_str(messages_json)
-        .map_err(|e| format!("invalid messages JSON: {}", e))?;
+    let parsed: Vec<PartyMessageJson> =
+        serde_json::from_str(messages_json).map_err(|e| format!("invalid messages JSON: {}", e))?;
     parsed.into_iter().map(PartyMessage::try_from).collect()
 }
 
@@ -220,13 +217,8 @@ pub fn js_dkls23_dkg_init(
         Err(e) => return err(format!("invalid session_id hex: {}", e)),
     };
 
-    let result = ffi::dkg_init_with_session_id(
-        party_id,
-        threshold,
-        total_parties,
-        &session_id,
-        curve,
-    );
+    let result =
+        ffi::dkg_init_with_session_id(party_id, threshold, total_parties, &session_id, curve);
 
     serde_json::to_string(&DkgInitResultJson {
         session_state: hex::encode(&result.session_state),

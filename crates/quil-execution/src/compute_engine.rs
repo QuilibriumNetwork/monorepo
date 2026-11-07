@@ -4,12 +4,12 @@
 //! Same structural split as `hypergraph_engine.rs` / `global_engine.rs`:
 //!
 //! - [`compute_engine_capabilities`] — 12 protocol IDs (compute v1,
-//!   ratchets, onion, KZG verify, bulletproof range/sum verify,
-//!   SECP256K1/ED25519/ED448/DECAF448/SECP256R1 signature verify).
+//! ratchets, onion, KZG verify, bulletproof range/sum verify,
+//! SECP256K1/ED25519/ED448/DECAF448/SECP256R1 signature verify).
 //! - [`request_is_compute_op`] — boolean predicate for bundle routing.
 //! - [`MessageKindCompute`] — the five compute operation types.
 //! - [`get_cost_from_request`] — per-type cost dispatch matching Go's
-//!   `ComputeExecutionEngine::GetCost` at line 306.
+//! `ComputeExecutionEngine::GetCost` at line 306.
 
 use num_bigint::BigInt;
 use quil_types::error::{QuilError, Result};
@@ -51,18 +51,54 @@ pub const SECP256R1_ECDSA_VERIFY: u32 = 0x00010801;
 /// `ComputeExecutionEngine::GetCapabilities` at line 77.
 pub fn compute_engine_capabilities() -> Vec<Capability> {
     vec![
-        Capability { protocol_identifier: COMPUTE_PROTOCOL_V1, additional_metadata: Vec::new() },
-        Capability { protocol_identifier: DOUBLE_RATCHET_PROTOCOL, additional_metadata: Vec::new() },
-        Capability { protocol_identifier: TRIPLE_RATCHET_PROTOCOL, additional_metadata: Vec::new() },
-        Capability { protocol_identifier: ONION_ROUTING_PROTOCOL, additional_metadata: Vec::new() },
-        Capability { protocol_identifier: KZG_VERIFY_BLS48581, additional_metadata: Vec::new() },
-        Capability { protocol_identifier: BULLETPROOF_RANGE_VERIFY_DECAF448, additional_metadata: Vec::new() },
-        Capability { protocol_identifier: BULLETPROOF_SUM_VERIFY_DECAF448, additional_metadata: Vec::new() },
-        Capability { protocol_identifier: SECP256K1_ECDSA_VERIFY, additional_metadata: Vec::new() },
-        Capability { protocol_identifier: ED25519_EDDSA_VERIFY, additional_metadata: Vec::new() },
-        Capability { protocol_identifier: ED448_EDDSA_VERIFY, additional_metadata: Vec::new() },
-        Capability { protocol_identifier: DECAF448_SCHNORR_VERIFY, additional_metadata: Vec::new() },
-        Capability { protocol_identifier: SECP256R1_ECDSA_VERIFY, additional_metadata: Vec::new() },
+        Capability {
+            protocol_identifier: COMPUTE_PROTOCOL_V1,
+            additional_metadata: Vec::new(),
+        },
+        Capability {
+            protocol_identifier: DOUBLE_RATCHET_PROTOCOL,
+            additional_metadata: Vec::new(),
+        },
+        Capability {
+            protocol_identifier: TRIPLE_RATCHET_PROTOCOL,
+            additional_metadata: Vec::new(),
+        },
+        Capability {
+            protocol_identifier: ONION_ROUTING_PROTOCOL,
+            additional_metadata: Vec::new(),
+        },
+        Capability {
+            protocol_identifier: KZG_VERIFY_BLS48581,
+            additional_metadata: Vec::new(),
+        },
+        Capability {
+            protocol_identifier: BULLETPROOF_RANGE_VERIFY_DECAF448,
+            additional_metadata: Vec::new(),
+        },
+        Capability {
+            protocol_identifier: BULLETPROOF_SUM_VERIFY_DECAF448,
+            additional_metadata: Vec::new(),
+        },
+        Capability {
+            protocol_identifier: SECP256K1_ECDSA_VERIFY,
+            additional_metadata: Vec::new(),
+        },
+        Capability {
+            protocol_identifier: ED25519_EDDSA_VERIFY,
+            additional_metadata: Vec::new(),
+        },
+        Capability {
+            protocol_identifier: ED448_EDDSA_VERIFY,
+            additional_metadata: Vec::new(),
+        },
+        Capability {
+            protocol_identifier: DECAF448_SCHNORR_VERIFY,
+            additional_metadata: Vec::new(),
+        },
+        Capability {
+            protocol_identifier: SECP256R1_ECDSA_VERIFY,
+            additional_metadata: Vec::new(),
+        },
     ]
 }
 
@@ -72,9 +108,8 @@ pub fn compute_engine_capabilities() -> Vec<Capability> {
 
 // Re-export from the canonical compute_intrinsic modules.
 pub use crate::compute_intrinsic::{
+    TYPE_CODE_DEPLOYMENT as TYPE_CODE_DEPLOY, TYPE_CODE_EXECUTE, TYPE_CODE_FINALIZE,
     TYPE_COMPUTE_DEPLOY, TYPE_COMPUTE_UPDATE,
-    TYPE_CODE_EXECUTE, TYPE_CODE_FINALIZE,
-    TYPE_CODE_DEPLOYMENT as TYPE_CODE_DEPLOY,
 };
 
 /// The five compute operation types.
@@ -158,9 +193,7 @@ pub fn request_is_compute_op(request: &MessageRequest) -> bool {
 }
 
 /// Map a `MessageRequest` oneof to compute kind, if applicable.
-pub fn compute_kind_for_request(
-    request: &MessageRequest,
-) -> Option<MessageKindCompute> {
+pub fn compute_kind_for_request(request: &MessageRequest) -> Option<MessageKindCompute> {
     match request.request.as_ref()? {
         MessageRequestInner::ComputeDeploy(_) => Some(MessageKindCompute::ComputeDeploy),
         MessageRequestInner::ComputeUpdate(_) => Some(MessageKindCompute::ComputeUpdate),
@@ -183,10 +216,7 @@ pub fn compute_kind_for_request(
 /// pattern as hypergraph). CodeDeploy/Execute/Finalize costs depend
 /// on the circuit compiler and verenc — callers that haven't wired
 /// those in yet can pass the `code_op_cost_hint` override.
-pub fn get_cost_from_request(
-    request: &MessageRequest,
-    code_op_cost_hint: i64,
-) -> Result<BigInt> {
+pub fn get_cost_from_request(request: &MessageRequest, code_op_cost_hint: i64) -> Result<BigInt> {
     let Some(req) = &request.request else {
         return Ok(BigInt::from(0));
     };
@@ -194,16 +224,34 @@ pub fn get_cost_from_request(
     match req {
         MessageRequestInner::ComputeDeploy(d) => {
             let size = d.rdf_schema.len()
-                + d.config.as_ref().map(|c| c.read_public_key.len()).unwrap_or(0)
-                + d.config.as_ref().map(|c| c.write_public_key.len()).unwrap_or(0)
-                + d.config.as_ref().map(|c| c.owner_public_key.len()).unwrap_or(0);
+                + d.config
+                    .as_ref()
+                    .map(|c| c.read_public_key.len())
+                    .unwrap_or(0)
+                + d.config
+                    .as_ref()
+                    .map(|c| c.write_public_key.len())
+                    .unwrap_or(0)
+                + d.config
+                    .as_ref()
+                    .map(|c| c.owner_public_key.len())
+                    .unwrap_or(0);
             Ok(BigInt::from(size as i64))
         }
         MessageRequestInner::ComputeUpdate(u) => {
             let size = u.rdf_schema.len()
-                + u.config.as_ref().map(|c| c.read_public_key.len()).unwrap_or(0)
-                + u.config.as_ref().map(|c| c.write_public_key.len()).unwrap_or(0)
-                + u.config.as_ref().map(|c| c.owner_public_key.len()).unwrap_or(0);
+                + u.config
+                    .as_ref()
+                    .map(|c| c.read_public_key.len())
+                    .unwrap_or(0)
+                + u.config
+                    .as_ref()
+                    .map(|c| c.write_public_key.len())
+                    .unwrap_or(0)
+                + u.config
+                    .as_ref()
+                    .map(|c| c.owner_public_key.len())
+                    .unwrap_or(0);
             Ok(BigInt::from(size as i64))
         }
         MessageRequestInner::CodeDeploy(_)
@@ -264,11 +312,9 @@ mod tests {
     fn make_code_execute() -> MessageRequest {
         MessageRequest {
             timestamp: 0,
-            request: Some(MessageRequestInner::CodeExecute(
-                compute_pb::CodeExecute {
-                    ..Default::default()
-                },
-            )),
+            request: Some(MessageRequestInner::CodeExecute(compute_pb::CodeExecute {
+                ..Default::default()
+            })),
         }
     }
 
@@ -383,7 +429,10 @@ mod tests {
 
     #[test]
     fn is_compute_op_false_for_none_request() {
-        let req = MessageRequest { timestamp: 0, request: None };
+        let req = MessageRequest {
+            timestamp: 0,
+            request: None,
+        };
         assert!(!request_is_compute_op(&req));
     }
 
@@ -408,7 +457,10 @@ mod tests {
 
     #[test]
     fn cost_for_non_compute_op_is_zero() {
-        let req = MessageRequest { timestamp: 0, request: None };
+        let req = MessageRequest {
+            timestamp: 0,
+            request: None,
+        };
         assert_eq!(get_cost_from_request(&req, 0).unwrap(), BigInt::from(0));
     }
 
@@ -436,7 +488,10 @@ mod tests {
 
     #[test]
     fn compute_kind_for_request_returns_none_for_non_compute() {
-        let req = MessageRequest { timestamp: 0, request: None };
+        let req = MessageRequest {
+            timestamp: 0,
+            request: None,
+        };
         assert!(compute_kind_for_request(&req).is_none());
     }
 }

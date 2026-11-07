@@ -6,7 +6,7 @@
 //! processing, then commits them atomically to the CRDT when the
 //! frame is finalized.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use num_bigint::BigInt;
 use quil_crypto::poseidon::hash_bytes_to_32;
@@ -15,31 +15,64 @@ use quil_types::crypto::InclusionProver;
 use quil_types::error::{QuilError, Result};
 use quil_types::execution::{StateChange, StateChangeEvent};
 
-use quil_hypergraph::HypergraphCrdt;
 use quil_hypergraph::addressing::Location;
+use quil_hypergraph::HypergraphCrdt;
 
 // =====================================================================
 // Discriminator constants
 // =====================================================================
 
+/// A PQ-safe content digest of a vector-commitment tree: `SHA-512` over its flat
+/// `(field_key, value)` leaves. Replaces the KZG/BLS48-581 `commit()` for the
+/// vestigial metadata `hash_target` and the compute-deploy domain — hashes tree
+/// CONTENT, not a curve commitment. Deterministic ⇒ consensus-safe.
+pub(crate) fn tree_content_digest(tree: &VectorCommitmentTree) -> Vec<u8> {
+    use sha2::{Digest, Sha512};
+    let mut h = Sha512::new();
+    for (k, v) in tree.leaves() {
+        h.update((k.len() as u32).to_be_bytes());
+        h.update(&k);
+        h.update((v.len() as u32).to_be_bytes());
+        h.update(&v);
+    }
+    h.finalize().to_vec()
+}
+
 /// `poseidon("vertex:adds")` — 32 bytes.
 pub fn vertex_adds_discriminator() -> Result<[u8; 32]> {
-    hash_bytes_to_32(b"vertex:adds")
+    static VALUE: OnceLock<[u8; 32]> = OnceLock::new();
+    cached_discriminator(&VALUE, b"vertex:adds")
 }
 
 /// `poseidon("vertex:removes")` — 32 bytes.
 pub fn vertex_removes_discriminator() -> Result<[u8; 32]> {
-    hash_bytes_to_32(b"vertex:removes")
+    static VALUE: OnceLock<[u8; 32]> = OnceLock::new();
+    cached_discriminator(&VALUE, b"vertex:removes")
 }
 
 /// `poseidon("hyperedge:adds")` — 32 bytes.
 pub fn hyperedge_adds_discriminator() -> Result<[u8; 32]> {
-    hash_bytes_to_32(b"hyperedge:adds")
+    static VALUE: OnceLock<[u8; 32]> = OnceLock::new();
+    cached_discriminator(&VALUE, b"hyperedge:adds")
 }
 
 /// `poseidon("hyperedge:removes")` — 32 bytes.
 pub fn hyperedge_removes_discriminator() -> Result<[u8; 32]> {
-    hash_bytes_to_32(b"hyperedge:removes")
+    static VALUE: OnceLock<[u8; 32]> = OnceLock::new();
+    cached_discriminator(&VALUE, b"hyperedge:removes")
+}
+
+// These protocol labels never vary by application or network. Rehashing them
+// on every state read made a bounded block-summary recovery spend seconds in
+// Poseidon even when every block was absent. Cache only successful results;
+// initialization errors remain retryable with their original error type.
+fn cached_discriminator(cache: &OnceLock<[u8; 32]>, label: &[u8]) -> Result<[u8; 32]> {
+    if let Some(value) = cache.get() {
+        return Ok(*value);
+    }
+    let value = hash_bytes_to_32(label)?;
+    let _ = cache.set(value);
+    Ok(value)
 }
 
 /// The special metadata address within each hypergraph domain.
@@ -59,14 +92,17 @@ pub fn seal_metadata_state_at_index(
     metadata: &mut VectorCommitmentTree,
     sub_data: &mut VectorCommitmentTree,
     index: u8,
-    prover: &(dyn InclusionProver + Sync),
+    _prover: &(dyn InclusionProver + Sync),
 ) -> Result<()> {
     if index > 63 {
         return Err(QuilError::InvalidArgument(
             "seal metadata state at index: index out of range".into(),
         ));
     }
-    let sub_commit = sub_data.commit(prover);
+    // hash_target = SHA-512 content digest (retired from the KZG commit; it is a
+    // vestigial go-tree leaf annotation, not a forest L3 leaf, so this only
+    // changes stored-blob bytes, never a state root).
+    let sub_commit = tree_content_digest(sub_data);
     let sub_bytes = serialize_go_tree(sub_data.root.as_ref())
         .map_err(|e| QuilError::Internal(format!("seal metadata: serialize: {e}")))?;
     let sub_size = sub_data
@@ -84,19 +120,17 @@ pub fn seal_metadata_state_at_index(
 // HypergraphState
 // =====================================================================
 
-/// One entry in the undo log built during `commit()`. Each successfully-
-/// Changeset accumulator. The execution engine creates one per frame,
-/// appends state changes during `process_message`, and commits them
-/// via `commit()` at the end of the frame.
-///
-/// (Earlier revisions kept an `undo_log` + `revert_changes` API
-/// mirroring Go's `TrackChange`/`RevertChanges`. Nothing in the
-/// workspace ever wired the revert path, and the per-node lazy tree
-/// doesn't implement `delete` — so the undo machinery has been
-/// dropped along with its sole consumer.)
+enum ExecutionChange {
+    State(StateChange),
+    Record(quil_types::store::RecordMutation),
+}
+
+/// Message changeset with savepoints for state and ancillary records. `commit`
+/// publishes the complete changeset to CRDT staging; the frame commit makes it
+/// durable. Callers clear this buffer after successful staging with `abort`.
 pub struct HypergraphState {
     crdt: Arc<HypergraphCrdt>,
-    changeset: Mutex<Vec<StateChange>>,
+    changeset: Mutex<Vec<ExecutionChange>>,
 }
 
 impl HypergraphState {
@@ -115,6 +149,24 @@ impl HypergraphState {
         &self.crdt
     }
 
+    /// Require coverage of every address in a domain before staging an
+    /// operation whose writes must all survive the commit coverage filter.
+    /// The last 6-bit path group straddles the domain/data boundary.
+    /// This checks configured coverage only, not synchronization completeness
+    /// or ownership of the domain's canonical execution venue.
+    pub fn require_full_domain_coverage(&self, domain: &[u8; 32]) -> Result<()> {
+        let prefix = self.crdt.get_covered_prefix();
+        let path = quil_tries::get_full_path(domain);
+        if prefix.len() > domain.len() * 8 / quil_tries::BRANCH_BITS
+            || path[..prefix.len()] != prefix
+        {
+            return Err(QuilError::ExecutionUnavailable(
+                "operation requires complete domain coverage".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Get a value from the CRDT. Checks the pending changeset first
     /// (reverse order for most recent), then falls back to the CRDT.
     ///
@@ -129,6 +181,9 @@ impl HypergraphState {
         // Check changeset (most recent first)
         let changeset = self.changeset.lock().unwrap();
         for change in changeset.iter().rev() {
+            let ExecutionChange::State(change) = change else {
+                continue;
+            };
             if change.domain == domain
                 && change.address == address
                 && change.discriminator == discriminator
@@ -144,12 +199,12 @@ impl HypergraphState {
 
         if discriminator == va_disc.as_slice() {
             let loc = location_from_domain_address(domain, address)?;
-            return Ok(self.crdt.get_vertex_data(&loc));
+            return self.crdt.get_vertex_data_checked(&loc);
         }
 
         if discriminator == ha_disc.as_slice() {
             let loc = location_from_domain_address(domain, address)?;
-            return Ok(self.crdt.get_hyperedge_data(&loc));
+            return self.crdt.get_hyperedge_data_checked(&loc);
         }
 
         Err(QuilError::InvalidArgument(
@@ -158,6 +213,12 @@ impl HypergraphState {
     }
 
     /// Set (create or update) a state entry. Appends to the changeset.
+    ///
+    /// The change is labelled `Update` whether or not the entry exists: every
+    /// reader of the changeset (`commit`, `pending_vertex_adds`) treats
+    /// `Create` and `Update` alike, so telling them apart cost a store read
+    /// (two, with the tombstone) per write and decided nothing. GLOBAL
+    /// execution writes three vertices per participant of every shard header.
     pub fn set(
         &self,
         domain: &[u8],
@@ -166,35 +227,25 @@ impl HypergraphState {
         _frame_number: u64,
         value: Vec<u8>,
     ) -> Result<()> {
-        let loc = location_from_domain_address(domain, address)?;
+        location_from_domain_address(domain, address)?;
         let va_disc = vertex_adds_discriminator()?;
         let ha_disc = hyperedge_adds_discriminator()?;
-
-        let event = if discriminator == va_disc.as_slice() {
-            if self.crdt.lookup_vertex(&loc) {
-                StateChangeEvent::Update
-            } else {
-                StateChangeEvent::Create
-            }
-        } else if discriminator == ha_disc.as_slice() {
-            if self.crdt.lookup_hyperedge(&loc) {
-                StateChangeEvent::Update
-            } else {
-                StateChangeEvent::Create
-            }
-        } else {
+        if discriminator != va_disc.as_slice() && discriminator != ha_disc.as_slice() {
             return Err(QuilError::InvalidArgument(
                 "HypergraphState::set: invalid discriminator".into(),
             ));
-        };
+        }
 
-        self.changeset.lock().unwrap().push(StateChange {
-            domain: domain.to_vec(),
-            address: address.to_vec(),
-            discriminator: discriminator.to_vec(),
-            state_change: event,
-            value,
-        });
+        self.changeset
+            .lock()
+            .unwrap()
+            .push(ExecutionChange::State(StateChange {
+                domain: domain.to_vec(),
+                address: address.to_vec(),
+                discriminator: discriminator.to_vec(),
+                state_change: StateChangeEvent::Update,
+                value,
+            }));
 
         Ok(())
     }
@@ -202,15 +253,15 @@ impl HypergraphState {
     /// Initialize a deployed intrinsic's metadata vertex — the Rust port
     /// of Go `HypergraphState.Init` (hypergraph_state.go:531-630). Builds
     /// the `publicStateInformation` tree:
-    ///   - `[0<<2]`  consensus metadata sub-tree (sealed; empty for all
-    ///              current intrinsics)
-    ///   - `[1<<2]`  sumcheck info sub-tree (sealed; empty)
-    ///   - `[2<<2]`  RDF schema, raw string bytes
-    ///   - `[(i+3)<<2]` each `additional_data[i]` with `i+3 >= 16`
-    ///              (sealed). `additional_data[13]` → key `[0x40]` is the
-    ///              intrinsic's configuration tree. Indices `i+3 < 16` are
-    ///              reserved and MUST be `None`.
-    ///   - `0xff*32` the `intrinsic_type` (base domain), raw
+    ///   - `[0<<2]` consensus metadata sub-tree (sealed; empty for all
+    /// current intrinsics)
+    ///   - `[1<<2]` sumcheck info sub-tree (sealed; empty)
+    ///   - `[2<<2]` RDF schema, raw string bytes
+    /// - `[(i+3)<<2]` each `additional_data[i]` with `i+3 >= 16`
+    /// (sealed). `additional_data[13]` → key `[0x40]` is the
+    /// intrinsic's configuration tree. Indices `i+3 < 16` are
+    /// reserved and MUST be `None`.
+    /// - `0xff*32` the `intrinsic_type` (base domain), raw
     /// then writes it as a vertex at `(domain, HYPERGRAPH_METADATA_ADDRESS)`
     /// in the vertex-adds set. `domain` must be 32 bytes. The metadata
     /// vertex is committed before serialization so the stored blob carries
@@ -276,9 +327,9 @@ impl HypergraphState {
             )
             .map_err(|e| QuilError::Internal(format!("init metadata: type-domain insert: {e}")))?;
 
-        // Commit so the serialized blob carries node commitments, then
-        // write the metadata vertex.
-        let _ = public.commit(prover);
+        // Node commitments in the serialized blob are no longer KZG-computed
+        // (retired — they are forest-irrelevant; the flattened leaf values, not
+        // node commitments, form the state root). Serialize as-is.
         let public_blob = serialize_go_tree(public.root.as_ref())
             .map_err(|e| QuilError::Internal(format!("init metadata: serialize: {e}")))?;
         let va_disc = vertex_adds_discriminator()?;
@@ -300,17 +351,20 @@ impl HypergraphState {
         discriminator: &[u8],
         _frame_number: u64,
     ) -> Result<()> {
-        self.changeset.lock().unwrap().push(StateChange {
-            domain: domain.to_vec(),
-            address: address.to_vec(),
-            discriminator: discriminator.to_vec(),
-            state_change: StateChangeEvent::Delete,
-            value: Vec::new(),
-        });
+        self.changeset
+            .lock()
+            .unwrap()
+            .push(ExecutionChange::State(StateChange {
+                domain: domain.to_vec(),
+                address: address.to_vec(),
+                discriminator: discriminator.to_vec(),
+                state_change: StateChangeEvent::Delete,
+                value: Vec::new(),
+            }));
         Ok(())
     }
 
-    /// Commit the accumulated changeset to the CRDT. Walks each change
+    /// Atomically stage the accumulated changeset in the CRDT. Walks each change
     /// and applies it:
     /// - Create/Update on vertex_adds → `crdt.add_vertex`
     /// - Delete on vertex_removes → `crdt.remove_vertex`
@@ -334,8 +388,16 @@ impl HypergraphState {
 
         let prefix = self.crdt.get_covered_prefix();
 
-        let changeset = self.changeset.lock().unwrap().clone();
-        for change in &changeset {
+        let changeset = self.changeset.lock().unwrap();
+        let mut mutations = Vec::new();
+        for change in changeset.iter() {
+            let change = match change {
+                ExecutionChange::State(change) => change,
+                ExecutionChange::Record(record) => {
+                    mutations.push(quil_hypergraph::Mutation::Record(record));
+                    continue;
+                }
+            };
             let loc = location_from_domain_address(&change.domain, &change.address)?;
 
             // covered_prefix gate — drop changes whose nibble path
@@ -350,26 +412,64 @@ impl HypergraphState {
 
             if change.discriminator == va_disc.as_slice() {
                 match change.state_change {
-                    StateChangeEvent::Create | StateChangeEvent::Update | StateChangeEvent::Initialize => {
-                        self.crdt.add_vertex(&loc, &change.value)?;
+                    StateChangeEvent::Create
+                    | StateChangeEvent::Update
+                    | StateChangeEvent::Initialize => {
+                        mutations.push(quil_hypergraph::Mutation::AddVertex(loc, &change.value));
                     }
                     StateChangeEvent::Delete => {}
                 }
             } else if change.discriminator == vr_disc.as_slice() {
-                self.crdt.remove_vertex(&loc)?;
+                mutations.push(quil_hypergraph::Mutation::RemoveVertex(loc));
             } else if change.discriminator == ha_disc.as_slice() {
                 match change.state_change {
-                    StateChangeEvent::Create | StateChangeEvent::Update | StateChangeEvent::Initialize => {
-                        self.crdt.add_hyperedge(&loc, &change.value)?;
+                    StateChangeEvent::Create
+                    | StateChangeEvent::Update
+                    | StateChangeEvent::Initialize => {
+                        mutations.push(quil_hypergraph::Mutation::AddHyperedge(loc, &change.value));
                     }
                     StateChangeEvent::Delete => {}
                 }
             } else if change.discriminator == hr_disc.as_slice() {
-                self.crdt.remove_hyperedge(&loc)?;
+                mutations.push(quil_hypergraph::Mutation::RemoveHyperedge(loc));
             }
         }
 
-        Ok(())
+        self.crdt.apply_mutations(&mutations)
+    }
+
+    /// Ancillary writes share the message savepoint and the durable frame batch.
+    pub(crate) fn stage_records(
+        &self,
+        records: impl IntoIterator<Item = quil_types::store::RecordMutation>,
+    ) {
+        self.changeset
+            .lock()
+            .unwrap()
+            .extend(records.into_iter().map(ExecutionChange::Record));
+    }
+
+    pub(crate) fn pending_records(&self) -> std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+        let changeset = self.changeset.lock().unwrap();
+        let mut records = self.crdt.staged_records();
+        for change in changeset.iter() {
+            if let ExecutionChange::Record(record) = change {
+                records.insert(record.key.clone(), record.value.clone());
+            }
+        }
+        records
+    }
+
+    pub(crate) fn get_record(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let changeset = self.changeset.lock().unwrap();
+        for change in changeset.iter().rev() {
+            if let ExecutionChange::Record(record) = change {
+                if record.key == key {
+                    return Ok(record.value.clone());
+                }
+            }
+        }
+        self.crdt.read_execution_record(key)
     }
 
     /// Abort — discard all pending changes.
@@ -396,6 +496,34 @@ impl HypergraphState {
     /// Number of pending changes.
     pub fn changeset_len(&self) -> usize {
         self.changeset.lock().unwrap().len()
+    }
+
+    /// Snapshot staged vertex-adds writes for a domain in application order.
+    /// Derived state (such as the coin accumulator) must include these writes
+    /// before commit so it can be rolled back together with its source entries.
+    pub(crate) fn pending_vertex_adds(&self, domain: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let disc = vertex_adds_discriminator()?;
+        Ok(self
+            .changeset
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|change| match change {
+                ExecutionChange::State(change) => Some(change),
+                _ => None,
+            })
+            .filter(|change| {
+                change.domain == domain
+                    && change.discriminator == disc
+                    && matches!(
+                        change.state_change,
+                        StateChangeEvent::Create
+                            | StateChangeEvent::Update
+                            | StateChangeEvent::Initialize
+                    )
+            })
+            .map(|change| (change.address.clone(), change.value.clone()))
+            .collect())
     }
 }
 
@@ -444,44 +572,167 @@ impl InMemoryHypergraphStore {
 
 struct NoopTxn;
 impl quil_types::store::Transaction for NoopTxn {
-    fn get(&self, _: &[u8]) -> Result<Option<Vec<u8>>> { Ok(None) }
-    fn set(&self, _: &[u8], _: &[u8]) -> Result<()> { Ok(()) }
-    fn commit(self: Box<Self>) -> Result<()> { Ok(()) }
-    fn delete(&self, _: &[u8]) -> Result<()> { Ok(()) }
-    fn abort(self: Box<Self>) -> Result<()> { Ok(()) }
-    fn new_iter(&self, _: &[u8], _: &[u8]) -> Result<Box<dyn quil_types::store::Iterator>> { Err(QuilError::Internal("iterator not supported on in-memory state".into())) }
-    fn delete_range(&self, _: &[u8], _: &[u8]) -> Result<()> { Ok(()) }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn get(&self, _: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    fn set(&self, _: &[u8], _: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn commit(self: Box<Self>) -> Result<()> {
+        Ok(())
+    }
+    fn delete(&self, _: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn abort(self: Box<Self>) -> Result<()> {
+        Ok(())
+    }
+    fn new_iter(&self, _: &[u8], _: &[u8]) -> Result<Box<dyn quil_types::store::Iterator>> {
+        Err(QuilError::Internal(
+            "iterator not supported on in-memory state".into(),
+        ))
+    }
+    fn delete_range(&self, _: &[u8], _: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl quil_types::store::HypergraphStore for InMemoryHypergraphStore {
-    fn new_transaction(&self, _: bool) -> Result<Box<dyn quil_types::store::Transaction>> { Ok(Box::new(NoopTxn)) }
-    fn get_node_by_key(&self, s: &str, p: &str, sk: &quil_types::store::ShardKey, k: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.nodes.lock().unwrap().get(&Self::key(s, p, sk, k)).cloned())
+    fn new_transaction(&self, _: bool) -> Result<Box<dyn quil_types::store::Transaction>> {
+        Ok(Box::new(NoopTxn))
     }
-    fn get_node_by_path(&self, _: &str, _: &str, _: &quil_types::store::ShardKey, _: &[i32]) -> Result<Option<Vec<u8>>> { Ok(None) }
-    fn insert_node(&self, _: &dyn quil_types::store::Transaction, s: &str, p: &str, sk: &quil_types::store::ShardKey, k: &[u8], _: &[i32], d: &[u8]) -> Result<()> {
-        self.nodes.lock().unwrap().insert(Self::key(s, p, sk, k), d.to_vec());
+    fn get_node_by_key(
+        &self,
+        s: &str,
+        p: &str,
+        sk: &quil_types::store::ShardKey,
+        k: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .nodes
+            .lock()
+            .unwrap()
+            .get(&Self::key(s, p, sk, k))
+            .cloned())
+    }
+    fn get_node_by_path(
+        &self,
+        _: &str,
+        _: &str,
+        _: &quil_types::store::ShardKey,
+        _: &[i32],
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    fn insert_node(
+        &self,
+        _: &dyn quil_types::store::Transaction,
+        s: &str,
+        p: &str,
+        sk: &quil_types::store::ShardKey,
+        k: &[u8],
+        _: &[i32],
+        d: &[u8],
+    ) -> Result<()> {
+        self.nodes
+            .lock()
+            .unwrap()
+            .insert(Self::key(s, p, sk, k), d.to_vec());
         if k != [0xFFu8; 32] {
-            self.per_vertex.lock().unwrap().insert((Self::scope(s, p, sk), k.to_vec()), d.to_vec());
+            self.per_vertex
+                .lock()
+                .unwrap()
+                .insert((Self::scope(s, p, sk), k.to_vec()), d.to_vec());
         }
         Ok(())
     }
-    fn save_root(&self, _: &dyn quil_types::store::Transaction, _: &str, _: &str, _: &quil_types::store::ShardKey, _: &[u8]) -> Result<()> { Ok(()) }
-    fn delete_node(&self, _: &dyn quil_types::store::Transaction, _: &str, _: &str, _: &quil_types::store::ShardKey, _: &[u8], _: &[i32]) -> Result<()> { Ok(()) }
-    fn set_covered_prefix(&self, _: &[i32]) -> Result<()> { Ok(()) }
-    fn set_shard_commit(&self, _: &dyn quil_types::store::Transaction, _: u64, _: &str, _: &str, _: &[u8], _: &[u8]) -> Result<()> { Ok(()) }
-    fn get_shard_commit(&self, _: u64, _: &str, _: &str, _: &[u8]) -> Result<Vec<u8>> { Ok(vec![]) }
-    fn get_root_commits(&self, _: u64) -> Result<std::collections::HashMap<quil_types::store::ShardKey, Vec<Vec<u8>>>> { Ok(std::collections::HashMap::new()) }
-    fn load_vertex_underlying_raw(&self, s: &str, p: &str, sk: &quil_types::store::ShardKey, k: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.nodes.lock().unwrap().get(&Self::key(s, p, sk, k)).cloned())
-    }
-    fn save_vertex_underlying(&self, _txn: &dyn quil_types::store::Transaction, s: &str, p: &str, sk: &quil_types::store::ShardKey, k: &[u8], d: &[u8]) -> Result<()> {
-        self.nodes.lock().unwrap().insert(Self::key(s, p, sk, k), d.to_vec());
-        self.per_vertex.lock().unwrap().insert((Self::scope(s, p, sk), k.to_vec()), d.to_vec());
+    fn save_root(
+        &self,
+        _: &dyn quil_types::store::Transaction,
+        _: &str,
+        _: &str,
+        _: &quil_types::store::ShardKey,
+        _: &[u8],
+    ) -> Result<()> {
         Ok(())
     }
-    fn for_each_vertex_underlying(&self, s: &str, p: &str, sk: &quil_types::store::ShardKey, callback: &mut dyn FnMut(Vec<u8>, Vec<u8>)) -> Result<usize> {
+    fn delete_node(
+        &self,
+        _: &dyn quil_types::store::Transaction,
+        _: &str,
+        _: &str,
+        _: &quil_types::store::ShardKey,
+        _: &[u8],
+        _: &[i32],
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn set_covered_prefix(&self, _: &[i32]) -> Result<()> {
+        Ok(())
+    }
+    fn set_shard_commit(
+        &self,
+        _: &dyn quil_types::store::Transaction,
+        _: u64,
+        _: &str,
+        _: &str,
+        _: &[u8],
+        _: &[u8],
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn get_shard_commit(&self, _: u64, _: &str, _: &str, _: &[u8]) -> Result<Vec<u8>> {
+        Ok(vec![])
+    }
+    fn get_root_commits(
+        &self,
+        _: u64,
+    ) -> Result<std::collections::HashMap<quil_types::store::ShardKey, Vec<Vec<u8>>>> {
+        Ok(std::collections::HashMap::new())
+    }
+    fn load_vertex_underlying_raw(
+        &self,
+        s: &str,
+        p: &str,
+        sk: &quil_types::store::ShardKey,
+        k: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .nodes
+            .lock()
+            .unwrap()
+            .get(&Self::key(s, p, sk, k))
+            .cloned())
+    }
+    fn save_vertex_underlying(
+        &self,
+        _txn: &dyn quil_types::store::Transaction,
+        s: &str,
+        p: &str,
+        sk: &quil_types::store::ShardKey,
+        k: &[u8],
+        d: &[u8],
+    ) -> Result<()> {
+        self.nodes
+            .lock()
+            .unwrap()
+            .insert(Self::key(s, p, sk, k), d.to_vec());
+        self.per_vertex
+            .lock()
+            .unwrap()
+            .insert((Self::scope(s, p, sk), k.to_vec()), d.to_vec());
+        Ok(())
+    }
+    fn for_each_vertex_underlying(
+        &self,
+        s: &str,
+        p: &str,
+        sk: &quil_types::store::ShardKey,
+        callback: &mut dyn FnMut(Vec<u8>, Vec<u8>),
+    ) -> Result<usize> {
         let scope = Self::scope(s, p, sk);
         let mut count = 0usize;
         for ((sc, vk), v) in self.per_vertex.lock().unwrap().iter() {
@@ -492,14 +743,66 @@ impl quil_types::store::HypergraphStore for InMemoryHypergraphStore {
         }
         Ok(count)
     }
-    fn apply_snapshot(&self, _: &str) -> Result<()> { Ok(()) }
-    fn set_alt_shard_commit(&self, _: &dyn quil_types::store::Transaction, _: u64, _: &[u8], _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<()> { Ok(()) }
-    fn get_latest_alt_shard_commit(&self, _: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> { Ok((vec![], vec![], vec![], vec![])) }
-    fn range_alt_shard_addresses(&self) -> Result<Vec<Vec<u8>>> { Ok(vec![]) }
-    fn reap_old_changesets(&self, _: &dyn quil_types::store::Transaction, _: u64) -> Result<()> { Ok(()) }
-    fn track_change(&self, _: &dyn quil_types::store::Transaction, _: &[u8], _: Option<&[u8]>, _: u64, _: &str, _: &str, _: &quil_types::store::ShardKey) -> Result<()> { Ok(()) }
-    fn get_changes(&self, _: u64, _: u64, _: &str, _: &str, _: &quil_types::store::ShardKey) -> Result<Vec<quil_types::store::ChangeRecord>> { Ok(vec![]) }
-    fn untrack_change(&self, _: &dyn quil_types::store::Transaction, _: &[u8], _: u64, _: &str, _: &str, _: &quil_types::store::ShardKey) -> Result<()> { Ok(()) }
+    fn apply_snapshot(&self, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn set_alt_shard_commit(
+        &self,
+        _: &dyn quil_types::store::Transaction,
+        _: u64,
+        _: &[u8],
+        _: &[u8],
+        _: &[u8],
+        _: &[u8],
+        _: &[u8],
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn get_latest_alt_shard_commit(
+        &self,
+        _: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+        Ok((vec![], vec![], vec![], vec![]))
+    }
+    fn range_alt_shard_addresses(&self) -> Result<Vec<Vec<u8>>> {
+        Ok(vec![])
+    }
+    fn reap_old_changesets(&self, _: &dyn quil_types::store::Transaction, _: u64) -> Result<()> {
+        Ok(())
+    }
+    fn track_change(
+        &self,
+        _: &dyn quil_types::store::Transaction,
+        _: &[u8],
+        _: Option<&[u8]>,
+        _: u64,
+        _: &str,
+        _: &str,
+        _: &quil_types::store::ShardKey,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn get_changes(
+        &self,
+        _: u64,
+        _: u64,
+        _: &str,
+        _: &str,
+        _: &quil_types::store::ShardKey,
+    ) -> Result<Vec<quil_types::store::ChangeRecord>> {
+        Ok(vec![])
+    }
+    fn untrack_change(
+        &self,
+        _: &dyn quil_types::store::Transaction,
+        _: &[u8],
+        _: u64,
+        _: &str,
+        _: &str,
+        _: &quil_types::store::ShardKey,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 // =====================================================================
@@ -509,8 +812,8 @@ impl quil_types::store::HypergraphStore for InMemoryHypergraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quil_types::crypto::NoopInclusionProver;
     use quil_hypergraph::testing::MemStore;
+    use quil_types::crypto::NoopInclusionProver;
 
     fn stub_state() -> HypergraphState {
         let crdt = Arc::new(HypergraphCrdt::new(
@@ -520,8 +823,12 @@ mod tests {
         HypergraphState::new(crdt)
     }
 
-    fn domain() -> Vec<u8> { vec![0xAAu8; 32] }
-    fn addr() -> Vec<u8> { vec![0xBBu8; 32] }
+    fn domain() -> Vec<u8> {
+        vec![0xAAu8; 32]
+    }
+    fn addr() -> Vec<u8> {
+        vec![0xBBu8; 32]
+    }
 
     // -----------------------------------------------------------------
     // Discriminators
@@ -555,7 +862,8 @@ mod tests {
     fn set_and_get_from_changeset() {
         let s = stub_state();
         let disc = vertex_adds_discriminator().unwrap();
-        s.set(&domain(), &addr(), &disc, 1, b"data".to_vec()).unwrap();
+        s.set(&domain(), &addr(), &disc, 1, b"data".to_vec())
+            .unwrap();
         let val = s.get(&domain(), &addr(), &disc).unwrap();
         assert_eq!(val, Some(b"data".to_vec()));
     }
@@ -564,9 +872,227 @@ mod tests {
     fn get_returns_most_recent_change() {
         let s = stub_state();
         let disc = vertex_adds_discriminator().unwrap();
-        s.set(&domain(), &addr(), &disc, 1, b"old".to_vec()).unwrap();
-        s.set(&domain(), &addr(), &disc, 2, b"new".to_vec()).unwrap();
-        assert_eq!(s.get(&domain(), &addr(), &disc).unwrap(), Some(b"new".to_vec()));
+        s.set(&domain(), &addr(), &disc, 1, b"old".to_vec())
+            .unwrap();
+        s.set(&domain(), &addr(), &disc, 2, b"new".to_vec())
+            .unwrap();
+        assert_eq!(
+            s.get(&domain(), &addr(), &disc).unwrap(),
+            Some(b"new".to_vec())
+        );
+    }
+
+    #[test]
+    fn database_read_errors_stop_reads_but_writes_stage_without_reading() {
+        let store = Arc::new(MemStore::new());
+        let state = HypergraphState::new(Arc::new(HypergraphCrdt::new(
+            store.clone(),
+            Arc::new(NoopInclusionProver),
+        )));
+        let va = vertex_adds_discriminator().unwrap();
+        let ha = hyperedge_adds_discriminator().unwrap();
+        for disc in [va, ha] {
+            for phase in ["adds", "removes"] {
+                store.fail_vertex_reads(Some(phase));
+                assert!(state.get(&domain(), &addr(), &disc).is_err());
+                // A write reads nothing, so it stages the same change whether
+                // or not the store can be read.
+                state
+                    .set(&domain(), &addr(), &disc, 1, b"data".to_vec())
+                    .unwrap();
+                assert_eq!(state.changeset_len(), 1);
+                assert_eq!(
+                    state.get(&domain(), &addr(), &disc).unwrap(),
+                    Some(b"data".to_vec())
+                );
+                // Staging reads the entry's adds (a vertex) or tombstone (a
+                // hyperedge): a store that cannot serve it stops the commit,
+                // and the changeset stays for a retry.
+                if (disc == va && phase == "adds") || (disc == ha && phase == "removes") {
+                    assert!(state.commit().unwrap_err().is_execution_unavailable());
+                    assert_eq!(state.changeset_len(), 1);
+                }
+                state.abort();
+            }
+            store.fail_vertex_reads(None);
+            assert_eq!(state.get(&domain(), &addr(), &disc).unwrap(), None);
+            state
+                .set(&domain(), &addr(), &disc, 1, b"pending".to_vec())
+                .unwrap();
+            store.fail_vertex_reads(Some("adds"));
+            assert_eq!(
+                state.get(&domain(), &addr(), &disc).unwrap(),
+                Some(b"pending".to_vec())
+            );
+            state.abort();
+            assert!(state.get(&domain(), &addr(), &disc).is_err());
+            store.fail_vertex_reads(None);
+        }
+    }
+
+    /// Stage `value` as `set` did while it read the store to label the change:
+    /// `Create` for an absent entry, `Update` for a present one.
+    fn stage_labelled(
+        state: &HypergraphState,
+        address: &[u8],
+        disc: &[u8],
+        value: &[u8],
+    ) -> StateChangeEvent {
+        let loc = location_from_domain_address(&domain(), address).unwrap();
+        let present = if disc == vertex_adds_discriminator().unwrap().as_slice() {
+            state.crdt.get_vertex_data_checked(&loc).unwrap().is_some()
+        } else {
+            state
+                .crdt
+                .get_hyperedge_data_checked(&loc)
+                .unwrap()
+                .is_some()
+        };
+        let event = if present {
+            StateChangeEvent::Update
+        } else {
+            StateChangeEvent::Create
+        };
+        state
+            .changeset
+            .lock()
+            .unwrap()
+            .push(ExecutionChange::State(StateChange {
+                domain: domain(),
+                address: address.to_vec(),
+                discriminator: disc.to_vec(),
+                state_change: event,
+                value: value.to_vec(),
+            }));
+        event
+    }
+
+    #[test]
+    fn set_commits_what_the_create_and_update_labels_committed() {
+        // The same writes go to two stores: through `set`, and labelled as
+        // `set` labelled them when it read the store. The first frame creates
+        // every entry, the second updates them.
+        let va = vertex_adds_discriminator().unwrap();
+        let ha = hyperedge_adds_discriminator().unwrap();
+        let (unread, labelled) = (stub_state(), stub_state());
+        let addresses = [addr(), vec![0xBCu8; 32]];
+        for (frame, value, label) in [
+            (1u64, b"created".as_slice(), StateChangeEvent::Create),
+            (2, b"updated".as_slice(), StateChangeEvent::Update),
+        ] {
+            for disc in [va, ha] {
+                for address in &addresses {
+                    unread
+                        .set(&domain(), address, &disc, frame, value.to_vec())
+                        .unwrap();
+                    assert_eq!(stage_labelled(&labelled, address, &disc, value), label);
+                }
+            }
+            assert_eq!(
+                unread.pending_vertex_adds(&domain()).unwrap(),
+                labelled.pending_vertex_adds(&domain()).unwrap(),
+            );
+            assert_eq!(
+                unread.pending_vertex_adds(&domain()).unwrap().len(),
+                addresses.len()
+            );
+            let mut roots = Vec::new();
+            for state in [&unread, &labelled] {
+                state.commit().unwrap();
+                state.abort();
+                roots.push(state.crdt.commit(frame).unwrap());
+                for address in &addresses {
+                    let loc = location_from_domain_address(&domain(), address).unwrap();
+                    assert_eq!(
+                        state.crdt.get_vertex_data_checked(&loc).unwrap().as_deref(),
+                        Some(value)
+                    );
+                    assert_eq!(
+                        state
+                            .crdt
+                            .get_hyperedge_data_checked(&loc)
+                            .unwrap()
+                            .as_deref(),
+                        Some(value)
+                    );
+                }
+            }
+            assert_eq!(roots[0], roots[1], "frame {frame}");
+        }
+    }
+
+    #[test]
+    fn commit_failure_keeps_the_entire_changeset_out_of_crdt() {
+        let store = Arc::new(MemStore::new());
+        let crdt = Arc::new(HypergraphCrdt::new(
+            store.clone(),
+            Arc::new(NoopInclusionProver),
+        ));
+        let state = HypergraphState::new(crdt.clone());
+        let first = Location {
+            app_address: [7; 32],
+            data_address: [8; 32],
+        };
+        let second = Location {
+            app_address: [7; 32],
+            data_address: [9; 32],
+        };
+        // Earlier accepted staging must survive a later batch failure.
+        crdt.add_vertex(&first, b"earlier-accepted").unwrap();
+        let va = vertex_adds_discriminator().unwrap();
+        let ha = hyperedge_adds_discriminator().unwrap();
+        state.stage_records([quil_types::store::RecordMutation {
+            key: b"test/atomic-record".to_vec(),
+            value: Some(vec![42]),
+        }]);
+        state
+            .set(
+                &first.app_address,
+                &first.data_address,
+                &va,
+                1,
+                b"replacement".to_vec(),
+            )
+            .unwrap();
+        state
+            .set(
+                &second.app_address,
+                &second.data_address,
+                &ha,
+                1,
+                b"new-edge".to_vec(),
+            )
+            .unwrap();
+        // Vertex preparation succeeds, then the hyperedge tombstone read fails.
+        store.fail_vertex_reads(Some("removes"));
+        assert!(state.commit().unwrap_err().is_execution_unavailable());
+        assert_eq!(state.changeset_len(), 3);
+        assert!(
+            crdt.staged_records().is_empty(),
+            "metadata cannot escape failed state staging"
+        );
+        store.fail_vertex_reads(None);
+        assert_eq!(
+            crdt.get_vertex_data_checked(&first).unwrap(),
+            Some(b"earlier-accepted".to_vec())
+        );
+        assert_eq!(crdt.get_hyperedge_data_checked(&second).unwrap(), None);
+        // Retry exactly the same changeset, without restaging it.
+        state.commit().unwrap();
+        assert_eq!(
+            crdt.read_execution_record(b"test/atomic-record").unwrap(),
+            Some(vec![42])
+        );
+        crdt.commit(1).unwrap();
+        let reopened = HypergraphCrdt::new(store, Arc::new(NoopInclusionProver));
+        assert_eq!(
+            reopened.get_vertex_data_checked(&first).unwrap(),
+            Some(b"replacement".to_vec())
+        );
+        assert_eq!(
+            reopened.get_hyperedge_data_checked(&second).unwrap(),
+            Some(b"new-edge".to_vec())
+        );
     }
 
     #[test]
@@ -588,7 +1114,8 @@ mod tests {
     fn abort_clears_changeset() {
         let s = stub_state();
         let disc = vertex_adds_discriminator().unwrap();
-        s.set(&domain(), &addr(), &disc, 1, b"data".to_vec()).unwrap();
+        s.set(&domain(), &addr(), &disc, 1, b"data".to_vec())
+            .unwrap();
         assert_eq!(s.changeset_len(), 1);
         s.abort();
         assert_eq!(s.changeset_len(), 0);
@@ -598,9 +1125,13 @@ mod tests {
     fn commit_applies_vertex_add_to_crdt() {
         let s = stub_state();
         let disc = vertex_adds_discriminator().unwrap();
-        s.set(&domain(), &addr(), &disc, 1, b"vertex-data".to_vec()).unwrap();
+        s.set(&domain(), &addr(), &disc, 1, b"vertex-data".to_vec())
+            .unwrap();
         s.commit().unwrap();
-        let loc = Location { app_address: [0xAAu8; 32], data_address: [0xBBu8; 32] };
+        let loc = Location {
+            app_address: [0xAAu8; 32],
+            data_address: [0xBBu8; 32],
+        };
         assert!(s.crdt.lookup_vertex(&loc));
     }
 
@@ -610,9 +1141,13 @@ mod tests {
         let va_disc = vertex_adds_discriminator().unwrap();
         let vr_disc = vertex_removes_discriminator().unwrap();
         // First add
-        s.set(&domain(), &addr(), &va_disc, 1, b"data".to_vec()).unwrap();
+        s.set(&domain(), &addr(), &va_disc, 1, b"data".to_vec())
+            .unwrap();
         s.commit().unwrap();
-        let loc = Location { app_address: [0xAAu8; 32], data_address: [0xBBu8; 32] };
+        let loc = Location {
+            app_address: [0xAAu8; 32],
+            data_address: [0xBBu8; 32],
+        };
         assert!(s.crdt.lookup_vertex(&loc));
         // Then remove
         s.delete(&domain(), &addr(), &vr_disc, 2).unwrap();
@@ -624,9 +1159,13 @@ mod tests {
     fn commit_applies_hyperedge_add() {
         let s = stub_state();
         let disc = hyperedge_adds_discriminator().unwrap();
-        s.set(&domain(), &addr(), &disc, 1, b"edge".to_vec()).unwrap();
+        s.set(&domain(), &addr(), &disc, 1, b"edge".to_vec())
+            .unwrap();
         s.commit().unwrap();
-        let loc = Location { app_address: [0xAAu8; 32], data_address: [0xBBu8; 32] };
+        let loc = Location {
+            app_address: [0xAAu8; 32],
+            data_address: [0xBBu8; 32],
+        };
         assert!(s.crdt.lookup_hyperedge(&loc));
     }
 
@@ -650,12 +1189,19 @@ mod tests {
         s.crdt.set_covered_prefix(&[0, 0, 0, 0]).unwrap();
 
         let disc = vertex_adds_discriminator().unwrap();
-        s.set(&domain(), &addr(), &disc, 1, b"data".to_vec()).unwrap();
+        s.set(&domain(), &addr(), &disc, 1, b"data".to_vec())
+            .unwrap();
         // commit must NOT error and must NOT add the vertex (out of prefix).
         s.commit().unwrap();
 
-        let loc = Location { app_address: [0xAAu8; 32], data_address: [0xBBu8; 32] };
-        assert!(!s.crdt.lookup_vertex(&loc), "out-of-prefix vertex was wrongly added");
+        let loc = Location {
+            app_address: [0xAAu8; 32],
+            data_address: [0xBBu8; 32],
+        };
+        assert!(
+            !s.crdt.lookup_vertex(&loc),
+            "out-of-prefix vertex was wrongly added"
+        );
 
         // Now switch to a matching prefix. First nibble of 0xAA is 42 (0b101010).
         s.crdt.set_covered_prefix(&[42]).unwrap();
@@ -664,8 +1210,33 @@ mod tests {
         // explicit).
         let s2 = stub_state();
         s2.crdt.set_covered_prefix(&[42]).unwrap();
-        s2.set(&domain(), &addr(), &disc, 1, b"data".to_vec()).unwrap();
+        s2.set(&domain(), &addr(), &disc, 1, b"data".to_vec())
+            .unwrap();
         s2.commit().unwrap();
-        assert!(s2.crdt.lookup_vertex(&loc), "in-prefix vertex should be added");
+        assert!(
+            s2.crdt.lookup_vertex(&loc),
+            "in-prefix vertex should be added"
+        );
+    }
+
+    #[test]
+    fn full_domain_coverage_excludes_subtree_and_other_domain_prefixes() {
+        let s = stub_state();
+        let domain = [0xAA; 32];
+        let path = quil_tries::get_full_path(&domain);
+        let complete_groups = domain.len() * 8 / quil_tries::BRANCH_BITS;
+        for length in 0..=complete_groups {
+            s.crdt.set_covered_prefix(&path[..length]).unwrap();
+            s.require_full_domain_coverage(&domain).unwrap();
+        }
+        s.crdt
+            .set_covered_prefix(&path[..complete_groups + 1])
+            .unwrap();
+        assert!(s.require_full_domain_coverage(&domain).is_err());
+        s.crdt.set_covered_prefix(&[0]).unwrap();
+        assert!(s.require_full_domain_coverage(&domain).is_err());
+        s.crdt.set_covered_prefix(&[]).unwrap();
+        s.require_full_domain_coverage(&crate::domains::GLOBAL)
+            .unwrap();
     }
 }
