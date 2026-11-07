@@ -10,6 +10,7 @@ pub mod config;
 pub mod context;
 pub mod keys;
 pub mod nodeconfig;
+pub mod public_file_key;
 pub mod release;
 pub mod retry;
 pub mod rpc;
