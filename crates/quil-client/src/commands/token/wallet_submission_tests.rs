@@ -1533,6 +1533,7 @@ async fn a_paced_batch_is_kept_for_its_wait_with_its_route() {
         paths: vec![vec![false], vec![true]],
         announce: Some(true),
         submissions: Vec::new(),
+        health: Err("not read by this test".into()),
         proved: Some((10, 2)),
         started: std::time::Instant::now(),
         record: &mut record,

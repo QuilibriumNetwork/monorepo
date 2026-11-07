@@ -2768,36 +2768,24 @@ mod paced_shield_tests {
     use super::super::model::Model;
     use super::super::update::{self, Cmd};
     use super::*;
-    use crate::commands::token::shield_pacing::{self, ShieldEvent as Paced, ShieldIo};
+    use crate::commands::token::shield_pacing::{
+        self, node_with_stall, GlobalRead, ShieldEvent as Paced, ShieldIo,
+    };
     use crate::commands::token::{ShieldEvent, ShieldReport};
     use crossterm::event::{KeyCode, KeyEvent};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     const START: u64 = 1_000_000;
 
-    /// GLOBAL at one frame per 10 s that stands still on `[from, to)`.
-    fn frames_with_stall(from: u64, to: u64) -> impl Fn(u64) -> u64 {
-        move |t| {
-            1_000
-                + if t < from {
-                    t / 10
-                } else if t < to {
-                    from / 10
-                } else {
-                    from / 10 + (t - to) / 10
-                }
-        }
-    }
-
-    fn healthy() -> impl Fn(u64) -> u64 {
-        frames_with_stall(u64::MAX - 1, u64::MAX)
+    fn healthy() -> impl Fn(u64) -> GlobalRead {
+        node_with_stall(u64::MAX - 1, u64::MAX)
     }
 
     /// A run on the manager's model: proving takes 150 s, a batch reads
     /// included `inclusion` s after its submission.
     struct Fake {
         now: u64,
-        frames: Box<dyn Fn(u64) -> u64>,
+        node: Box<dyn Fn(u64) -> GlobalRead>,
         inclusion: u64,
         /// A batch whose shard has no active prover from this time on.
         gone: Option<(usize, u64)>,
@@ -2813,7 +2801,7 @@ mod paced_shield_tests {
     }
 
     impl Fake {
-        fn new(batches: usize, frames: impl Fn(u64) -> u64 + 'static, inclusion: u64) -> Self {
+        fn new(batches: usize, node: impl Fn(u64) -> GlobalRead + 'static, inclusion: u64) -> Self {
             let mut model = Model::new();
             super::super::coins::open(&mut model);
             model.coins.shield.dialog = Some(shield::Dialog::Confirm(shield::Preview {
@@ -2824,7 +2812,7 @@ mod paced_shield_tests {
             assert!(matches!(cmds.as_slice(), [Cmd::ShieldRun(_)]));
             Self {
                 now: START,
-                frames: Box::new(frames),
+                node: Box::new(node),
                 inclusion,
                 gone: None,
                 submits: Vec::new(),
@@ -2902,8 +2890,8 @@ mod paced_shield_tests {
         async fn sleep(&mut self, secs: u64) {
             self.now += secs;
         }
-        async fn head(&mut self) -> anyhow::Result<u64> {
-            Ok((self.frames)(self.now))
+        async fn global(&mut self) -> anyhow::Result<GlobalRead> {
+            Ok((self.node)(self.now))
         }
         fn coins(&self, _index: usize) -> usize {
             96
@@ -3083,12 +3071,13 @@ mod paced_shield_tests {
         assert!(io.gaps().iter().all(|gap| *gap >= 300), "{:?}", io.gaps());
     }
 
-    /// While GLOBAL stands still the proved batch is held, the notice says
-    /// so as a warning, and it submits only after 10 min of healthy GLOBAL.
+    /// While the node reports GLOBAL's head unchanged the proved batch is
+    /// held, the notice says so as a warning with the node's text, and it
+    /// submits only after 10 min of healthy GLOBAL.
     #[tokio::test]
     async fn manager_shield_pauses_while_global_is_degraded() {
         let (from, to) = (START + 20, START + 2_000);
-        let mut io = Fake::new(1, frames_with_stall(from, to), 30);
+        let mut io = Fake::new(1, node_with_stall(from, to), 30);
         io.run(1).await.unwrap();
         let sent = io.submits[0].1;
         assert!(sent >= to + shield_pacing::RECOVERY_SECS, "{sent}");
@@ -3096,7 +3085,7 @@ mod paced_shield_tests {
         assert!(
             paused.iter().any(|t| t
                 .starts_with("Shield batch 1/1: proved and held; paused since ")
-                && t.contains(": GLOBAL advanced only ")
+                && t.contains(": Global head unchanged >120s; it submits after")
                 && t.ends_with("; it submits after 10 min of healthy GLOBAL.")),
             "{paused:#?}"
         );
