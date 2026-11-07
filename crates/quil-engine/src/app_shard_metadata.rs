@@ -586,8 +586,14 @@ pub fn storage_snapshot_grace() -> u64 {
 /// Ask for the snapshot of each of a seat's `filters` (its shard, then the
 /// shards a change creates from it) that `member` has not encoded for
 /// `epoch` and whose `snapshots` sources are known, to encode in the
-/// background in the seat's lane (`crate::storage_jobs`). A renewal asks for
-/// every seat's before it waits on any, so they encode side by side.
+/// background, each in the lane of `member`'s seat on that shard
+/// (`crate::storage_jobs`). A renewal asks for every seat's before it waits
+/// on any, so they encode side by side. A shard a change creates has a lane
+/// of its own: in its parent seat's lane the children of a split encoded
+/// one after another, and one starting too late for the grace by its
+/// estimate was given up, leaving its shard no sealed member (2026-11-03:
+/// the second child of a split of a 32 million node leaf, estimated at
+/// 2,410 s, would start about 1,840 s into a 3,200 s grace).
 pub fn request_storage_snapshots(
     crdt: &std::sync::Arc<HypergraphCrdt>,
     replica_store: &quil_store::replica_store::ReplicaStore,
@@ -599,9 +605,6 @@ pub fn request_storage_snapshots(
         Vec<quil_execution::global_intrinsic::storage_snapshot::Source>,
     )],
 ) -> quil_types::error::Result<()> {
-    let Some(seat) = filters.first() else {
-        return Ok(());
-    };
     // Past the renewal's grace a seat renews without the snapshot.
     if !quil_types::consensus::hash_storage_proofs_at(epoch)
         || crate::storage_snapshot::grace_passed(member, epoch)
@@ -620,7 +623,7 @@ pub fn request_storage_snapshots(
                 crdt.clone(),
                 replica_store.clone(),
                 member.to_vec(),
-                seat,
+                filter,
                 filter.clone(),
                 epoch,
                 sources.clone(),

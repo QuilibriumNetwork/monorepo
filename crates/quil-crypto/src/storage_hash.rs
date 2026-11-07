@@ -16,7 +16,7 @@
 use std::sync::OnceLock;
 
 use p3_field::integers::QuotientMap;
-use p3_field::{PrimeCharacteristicRing, PrimeField32};
+use p3_field::{Field, PackedValue, PrimeCharacteristicRing, PrimeField32};
 use p3_koala_bear::{default_koalabear_poseidon2_24, KoalaBear, Poseidon2KoalaBear};
 use p3_symmetric::Permutation;
 
@@ -73,6 +73,94 @@ pub fn compress(left: &Digest, right: &Digest, domain: Domain) -> Digest {
     state[RATE] = felt(domain as u32);
     permute(&mut state);
     first_digest(&state)
+}
+
+/// Independent hashes packed across the CPU's SIMD lanes. Each lane is
+/// exactly the scalar hash; packing changes neither domains nor transcripts.
+pub type Packed = <F as Field>::Packing;
+pub type PackedDigest = [Packed; DIGEST_ELEMS];
+
+pub fn packing_width() -> usize {
+    Packed::WIDTH
+}
+
+pub(crate) fn compress_packed(
+    left: &PackedDigest,
+    right: &PackedDigest,
+    domain: Domain,
+) -> PackedDigest {
+    let mut state = [Packed::ZERO; WIDTH];
+    state[..DIGEST_ELEMS].copy_from_slice(left);
+    state[DIGEST_ELEMS..RATE].copy_from_slice(right);
+    state[RATE] = Packed::from(felt(domain as u32));
+    permutation().permute_mut(&mut state);
+    state[..DIGEST_ELEMS].try_into().expect("8 packed elements")
+}
+
+/// Compress equally sized arrays without allocating or changing lane order.
+/// Incomplete SIMD groups use the scalar hash.
+pub fn compress_many(left: &[Digest], right: &[Digest], out: &mut [Digest], domain: Domain) {
+    assert_eq!(left.len(), right.len());
+    assert_eq!(left.len(), out.len());
+    let width = packing_width();
+    let packed_end = out.len() / width * width;
+    for at in (0..packed_end).step_by(width) {
+        let l = std::array::from_fn(|j| Packed::from_fn(|i| left[at + i][j]));
+        let r = std::array::from_fn(|j| Packed::from_fn(|i| right[at + i][j]));
+        let result = compress_packed(&l, &r, domain);
+        for i in 0..width {
+            out[at + i] = std::array::from_fn(|j| result[j].as_slice()[i]);
+        }
+    }
+    for i in packed_end..out.len() {
+        out[i] = compress(&left[i], &right[i], domain);
+    }
+}
+
+/// Packed equivalent of `Absorber`, including partial and empty blocks.
+pub(crate) struct PackedAbsorber {
+    state: [Packed; WIDTH],
+    position: usize,
+    remaining: usize,
+    permuted: bool,
+}
+
+impl PackedAbsorber {
+    pub(crate) fn new(domain: Domain, length: usize) -> Self {
+        let mut state = [Packed::ZERO; WIDTH];
+        state[RATE] = Packed::from(felt(domain as u32));
+        state[RATE + 1] = Packed::from(felt(length as u32));
+        Self {
+            state,
+            position: 0,
+            remaining: length,
+            permuted: false,
+        }
+    }
+
+    pub(crate) fn absorb_digest(&mut self, digest: &PackedDigest) {
+        for &value in digest {
+            debug_assert!(self.remaining > 0);
+            self.state[self.position] += value;
+            self.position += 1;
+            self.remaining -= 1;
+            if self.position == RATE {
+                permutation().permute_mut(&mut self.state);
+                self.position = 0;
+                self.permuted = true;
+            }
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> PackedDigest {
+        debug_assert_eq!(self.remaining, 0);
+        if self.position > 0 || !self.permuted {
+            permutation().permute_mut(&mut self.state);
+        }
+        self.state[..DIGEST_ELEMS]
+            .try_into()
+            .expect("8 packed elements")
+    }
 }
 
 fn first_digest(state: &[F; WIDTH]) -> Digest {
@@ -230,6 +318,30 @@ pub fn key_digest(key: &[u8]) -> Digest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_compression_matches_scalar_for_full_groups_and_tails() {
+        for domain in [
+            Domain::Node,
+            Domain::Empty,
+            Domain::Root,
+            Domain::Label,
+            Domain::Column,
+            Domain::Openings,
+        ] {
+            for n in 0..3 * packing_width() + 2 {
+                let left: Vec<Digest> = (0..n)
+                    .map(|i| std::array::from_fn(|j| felt((i * 8 + j) as u32)))
+                    .collect();
+                let right: Vec<Digest> = left.iter().rev().copied().collect();
+                let mut output = vec![ZERO; n];
+                compress_many(&left, &right, &mut output, domain);
+                for i in 0..n {
+                    assert_eq!(output[i], compress(&left[i], &right[i], domain));
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_node_packs_thirty_bytes_reversibly() {

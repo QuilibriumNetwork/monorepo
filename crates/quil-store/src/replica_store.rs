@@ -59,6 +59,10 @@ const HASH_LEAF: u8 = 0x05;
 /// length-prefixed leaf id and chunk index, so opening a node reads one chunk
 /// instead of the whole replica.
 const HASH_NODES: u8 = 0x06;
+/// Optional snapshot-data cap for sparse seal preparation.
+const DATA_CAP: u8 = 0x07;
+/// Latest immutable snapshot fingerprint and its epoch, by logical leaf.
+const SNAPSHOT_REUSE: u8 = 0x08;
 
 /// Nodes per stored chunk: one subtree below the cap, all a member reads of a
 /// replica to open one node of it (`MerkleCap::subtree`).
@@ -170,6 +174,8 @@ pub struct HashLeaf {
     pub cap: MerkleCap,
     pub registration_root: Vec<u8>,
     chunk_nodes: u64,
+    /// Immutable chunks retained for an epoch alias; aliases always point directly to the base.
+    source_epoch: Option<u64>,
 }
 
 impl HashLeaf {
@@ -188,7 +194,16 @@ impl HashLeaf {
     fn decode(value: &[u8]) -> Result<Self> {
         let corrupt = || QuilError::Store("a stored replica's leaf record does not decode".into());
         let (&version, rest) = value.split_first().ok_or_else(corrupt)?;
-        if version != HASH_LEAF_VERSION || rest.len() < 12 {
+        if ![HASH_LEAF_VERSION, 2].contains(&version) || rest.len() < 12 {
+            return Err(corrupt());
+        }
+        let (source_epoch, rest) = if version == 2 {
+            let epoch = u64::from_be_bytes(rest.get(..8).ok_or_else(corrupt)?.try_into().unwrap());
+            (Some(epoch), &rest[8..])
+        } else {
+            (None, rest)
+        };
+        if rest.len() < 12 {
             return Err(corrupt());
         }
         let n = u64::from_be_bytes(rest[..8].try_into().expect("8 bytes"));
@@ -206,6 +221,7 @@ impl HashLeaf {
             cap,
             registration_root: registration_root.to_vec(),
             chunk_nodes,
+            source_epoch,
         })
     }
 
@@ -596,12 +612,21 @@ impl ReplicaStore {
         cap: &[u8],
         registration_root: &[u8],
     ) -> Result<()> {
+        if self
+            .referenced_sources(0)?
+            .contains(&(epoch, leaf_id.to_vec()))
+        {
+            return Err(QuilError::Store(
+                "cannot replace a referenced immutable replica".into(),
+            ));
+        }
         if replica.len() % NODE_BYTES != 0 {
             return Err(QuilError::InvalidArgument(
                 "a replica is a whole number of nodes".into(),
             ));
         }
         forget_leaves(|e, id| e == epoch && id == leaf_id);
+        self.db.delete(&meta_key(DATA_CAP, epoch, leaf_id))?;
         self.db.delete(&leaf_key(epoch, leaf_id))?;
         self.db.delete_range(
             &chunk_key(epoch, leaf_id, 0),
@@ -621,6 +646,122 @@ impl ReplicaStore {
             &leaf_key(epoch, leaf_id),
             &HashLeaf::encode(n, cap, registration_root),
         )
+    }
+
+    /// Reuse the same immutable nodes in a later epoch. The source's data cap
+    /// and complete registration are retained; no chunk is copied. Eviction
+    /// pins exactly the base ranges still referenced by a live epoch.
+    pub fn alias_hash(&self, epoch: u64, leaf_id: &[u8], from: u64) -> Result<bool> {
+        if from >= epoch {
+            return Ok(false);
+        }
+        let _writing = hash_writes().lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(value) = self.db.get(&leaf_key(from, leaf_id))? else {
+            return Ok(false);
+        };
+        let leaf = HashLeaf::decode(&value)?;
+        let Some(cap) = self.db.get(&meta_key(DATA_CAP, from, leaf_id))? else {
+            return Ok(false);
+        };
+        let data = MerkleCap::from_bytes(&cap)
+            .ok_or_else(|| QuilError::Store("invalid source data cap".into()))?;
+        let registered =
+            quil_crypto::storage_proof::parse_registration_root(&leaf.registration_root)
+                .ok_or_else(|| QuilError::Store("invalid source registration".into()))?;
+        if data.n != leaf.n
+            || data.commitment(quil_crypto::storage_proof::Tree::Data) != registered.comm_d
+        {
+            return Err(QuilError::Store(
+                "source data cap differs from registration".into(),
+            ));
+        }
+        if leaf.source_epoch.is_some_and(|base| base >= from) {
+            return Err(QuilError::Store("forward snapshot reference".into()));
+        }
+        let base = leaf.source_epoch.unwrap_or(from);
+        let mut alias = vec![2];
+        alias.extend_from_slice(&base.to_be_bytes());
+        alias.extend_from_slice(&value[if value[0] == 2 { 9 } else { 1 }..]);
+        let txn = self.db.new_batch(false)?;
+        txn.set(&leaf_key(epoch, leaf_id), &alias)?;
+        txn.set(&meta_key(DATA_CAP, epoch, leaf_id), &cap)?;
+        txn.commit()?;
+        forget_leaves(|e, id| e == epoch && id == leaf_id);
+        Ok(true)
+    }
+
+    fn referenced_sources(&self, from: u64) -> Result<std::collections::BTreeSet<(u64, Vec<u8>)>> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut iter = self.db.new_iter(
+            &meta_key(HASH_LEAF, from, &[]),
+            &meta_key(HASH_LEAF + 1, 0, &[]),
+        )?;
+        let mut ok = iter.first();
+        while ok {
+            let key = iter.key();
+            if key.len() < 11 {
+                return Err(QuilError::Store("invalid leaf key".into()));
+            }
+            let epoch = u64::from_be_bytes(key[3..11].try_into().unwrap());
+            // Legacy metadata may contain an evictable incomplete cache; it
+            // cannot pin chunks. Only v2 records carry references.
+            if iter.value().first() != Some(&2) {
+                ok = iter.next();
+                continue;
+            }
+            let leaf = HashLeaf::decode(iter.value())?;
+            if let Some(base) = leaf.source_epoch {
+                if base >= epoch {
+                    return Err(QuilError::Store("invalid replica reference".into()));
+                }
+                out.insert((base, key[11..].to_vec()));
+            }
+            ok = iter.next();
+        }
+        iter.close()?;
+        Ok(out)
+    }
+
+    pub fn snapshot_match(&self, leaf_id: &[u8], fingerprint: &[u8; 32]) -> Result<Option<u64>> {
+        Ok(self
+            .db
+            .get(&meta_key(SNAPSHOT_REUSE, 0, leaf_id))?
+            .filter(|bytes| bytes.len() == 40 && bytes[..32] == fingerprint[..])
+            .map(|bytes| u64::from_be_bytes(bytes[32..].try_into().unwrap())))
+    }
+
+    pub fn note_snapshot(&self, epoch: u64, leaf_id: &[u8], fingerprint: &[u8; 32]) -> Result<()> {
+        let mut bytes = fingerprint.to_vec();
+        bytes.extend_from_slice(&epoch.to_be_bytes());
+        self.db.set(&meta_key(SNAPSHOT_REUSE, 0, leaf_id), &bytes)
+    }
+
+    /// Cache metadata only after the replica was committed; always bind it
+    /// back to that registration when reading it.
+    pub fn put_data_cap(&self, epoch: u64, leaf_id: &[u8], cap: &MerkleCap) -> Result<()> {
+        use quil_crypto::storage_proof::{parse_registration_root, Tree};
+        let _writing = hash_writes().lock().unwrap_or_else(PoisonError::into_inner);
+        let leaf = self
+            .db
+            .get(&leaf_key(epoch, leaf_id))?
+            .and_then(|bytes| HashLeaf::decode(&bytes).ok())
+            .ok_or_else(|| QuilError::Store("no chunked replica for data cap".into()))?;
+        let registered = parse_registration_root(&leaf.registration_root)
+            .ok_or_else(|| QuilError::Store("invalid replica registration".into()))?;
+        if cap.n != leaf.n || cap.commitment(Tree::Data) != registered.comm_d {
+            return Err(QuilError::Store(
+                "data cap differs from replica registration".into(),
+            ));
+        }
+        self.db
+            .set(&meta_key(DATA_CAP, epoch, leaf_id), &cap.to_bytes())
+    }
+
+    pub fn get_data_cap(&self, epoch: u64, leaf_id: &[u8]) -> Result<Option<MerkleCap>> {
+        let Some(bytes) = self.db.get(&meta_key(DATA_CAP, epoch, leaf_id))? else {
+            return Ok(None);
+        };
+        Ok(MerkleCap::from_bytes(&bytes))
     }
 
     /// A hash-proof epoch's leaf as [`Self::put_hash`] stored it, nodes and
@@ -842,6 +983,10 @@ impl ReplicaStore {
         leaf: &HashLeaf,
         nodes: std::ops::Range<u64>,
     ) -> Result<Vec<u8>> {
+        if leaf.source_epoch.is_some_and(|base| base >= epoch) {
+            return Err(QuilError::Store("forward replica alias".into()));
+        }
+        let epoch = leaf.source_epoch.unwrap_or(epoch);
         let missing = || {
             QuilError::Store(format!(
                 "nodes {}..{} of a stored replica of {} nodes are missing",
@@ -950,6 +1095,24 @@ impl ReplicaStore {
         self.db.get(&meta_key(SNAPSHOT_SOURCES, epoch, filter))
     }
 
+    /// The shards [`Self::put_snapshot_sources`] recorded sources of for
+    /// `epoch`: those whose registrations for it were encoded here.
+    pub fn snapshot_source_filters(&self, epoch: u64) -> Result<Vec<Vec<u8>>> {
+        let lower = meta_key(SNAPSHOT_SOURCES, epoch, &[]);
+        let upper = meta_key(SNAPSHOT_SOURCES, epoch.saturating_add(1), &[]);
+        let mut iter = self.db.new_iter(&lower, &upper)?;
+        let mut filters = Vec::new();
+        let mut ok = iter.first();
+        while ok {
+            if let Some(filter) = iter.key().get(lower.len()..) {
+                filters.push(filter.to_vec());
+            }
+            ok = iter.next();
+        }
+        iter.close()?;
+        Ok(filters)
+    }
+
     /// Record the node count of each leaf of shard `filter`'s partition for
     /// `epoch`, in the partition's order.
     pub fn put_leaf_nodes(&self, epoch: u64, filter: &[u8], nodes: &[u64]) -> Result<()> {
@@ -976,11 +1139,17 @@ impl ReplicaStore {
     pub fn delete(&self, epoch: u64, leaf_id: &[u8]) -> Result<()> {
         let _writing = hash_writes().lock().unwrap_or_else(PoisonError::into_inner);
         forget_leaves(|e, id| e == epoch && id == leaf_id);
+        self.db.delete(&meta_key(DATA_CAP, epoch, leaf_id))?;
         self.db.delete(&leaf_key(epoch, leaf_id))?;
-        self.db.delete_range(
-            &chunk_key(epoch, leaf_id, 0),
-            &chunk_key(epoch, leaf_id, u32::MAX),
-        )?;
+        if !self
+            .referenced_sources(0)?
+            .contains(&(epoch, leaf_id.to_vec()))
+        {
+            self.db.delete_range(
+                &chunk_key(epoch, leaf_id, 0),
+                &chunk_key(epoch, leaf_id, u32::MAX),
+            )?;
+        }
         self.db.delete(&replica_key(epoch, leaf_id))
     }
 
@@ -1015,6 +1184,8 @@ impl ReplicaStore {
     }
 
     fn evict(&self, keep_from: u64, store: &str) -> Result<()> {
+        let _writing = hash_writes().lock().unwrap_or_else(PoisonError::into_inner);
+        let pinned = self.referenced_sources(keep_from)?;
         let mut lo = Vec::with_capacity(9);
         lo.push(STORAGE_REPLICA);
         lo.extend_from_slice(&0u64.to_be_bytes());
@@ -1025,15 +1196,26 @@ impl ReplicaStore {
         self.db.delete_range(&lo, &hi)?;
         self.reclaim_in_background(lo, hi, "evicted");
         forget_leaves(|epoch, _| epoch < keep_from);
-        for kind in [
-            PARTITION,
-            SNAPSHOT_SOURCES,
-            LEAF_NODES,
-            HASH_LEAF,
-            HASH_NODES,
-        ] {
+        for kind in [PARTITION, SNAPSHOT_SOURCES, LEAF_NODES, HASH_LEAF, DATA_CAP] {
             self.db
                 .delete_range(&meta_key(kind, 0, &[]), &meta_key(kind, keep_from, &[]))?;
+        }
+        let mut at = meta_key(HASH_NODES, 0, &[]);
+        let until = meta_key(HASH_NODES, keep_from, &[]);
+        let mut protected: Vec<_> = pinned
+            .into_iter()
+            .filter(|(epoch, _)| *epoch < keep_from)
+            .map(|(epoch, id)| (chunk_key(epoch, &id, 0), chunk_key(epoch, &id, u32::MAX)))
+            .collect();
+        protected.sort();
+        for (lo, hi) in protected {
+            if at < lo {
+                self.db.delete_range(&at, &lo)?;
+            }
+            at = at.max(hi);
+        }
+        if at < until {
+            self.db.delete_range(&at, &until)?;
         }
         self.compact_evicted_in_background(keep_from, store);
         Ok(())
@@ -1104,6 +1286,76 @@ mod tests {
     fn store() -> ReplicaStore {
         let rocks = crate::RocksDb::open_in_memory().unwrap();
         ReplicaStore::new(Arc::new(rocks))
+    }
+
+    #[test]
+    fn aliases_survive_base_eviction_restart_and_flattened_chains() {
+        let s = store();
+        let (nodes, cap) = hash_leaf(3 * CHUNK_NODES as usize + 7, 19);
+        let data_cap = MerkleCap::from_bytes(&cap).unwrap();
+        let root = quil_crypto::storage_proof::registration_root(
+            &data_cap.commitment(quil_crypto::storage_proof::Tree::Data),
+            &[0; 32],
+            &data_cap.commitment(quil_crypto::storage_proof::Tree::Replica),
+        );
+        s.put_hash(3, b"leaf", &nodes, &cap, &root).unwrap();
+        s.put_data_cap(3, b"leaf", &data_cap).unwrap();
+        assert!(s.alias_hash(4, b"leaf", 3).unwrap());
+        assert!(s.alias_hash(5, b"leaf", 4).unwrap());
+        assert!(!s.alias_hash(5, b"leaf", 5).unwrap());
+        assert!(!s.alias_hash(5, b"absent", 3).unwrap());
+        assert!(s.db.get(&chunk_key(5, b"leaf", 0)).unwrap().is_none());
+        assert!(
+            s.put_hash(3, b"leaf", &nodes, &cap, &[0; 96]).is_err(),
+            "live alias protects base from overwrite"
+        );
+        s.evict_below_epoch(5).unwrap();
+        assert!(s.get_hash_leaf(3, b"leaf").unwrap().is_none());
+        let reopened = ReplicaStore::new(s.db.clone());
+        assert_eq!(
+            reopened.get_hash(5, b"leaf").unwrap().unwrap().replica[..],
+            nodes[..]
+        );
+        assert_eq!(reopened.get_data_cap(5, b"leaf").unwrap(), Some(data_cap));
+        assert!(reopened.alias_hash(6, b"leaf", 5).unwrap());
+        reopened.delete(5, b"leaf").unwrap();
+        assert_eq!(
+            reopened.get_hash(6, b"leaf").unwrap().unwrap().replica[..],
+            nodes[..]
+        );
+        reopened.evict_below_epoch(7).unwrap();
+        assert!(
+            reopened
+                .db
+                .get(&chunk_key(3, b"leaf", 0))
+                .unwrap()
+                .is_none(),
+            "last reference gone reclaims base"
+        );
+    }
+
+    #[test]
+    fn deleting_base_metadata_keeps_live_alias_chunks() {
+        let s = store();
+        let (nodes, cap) = hash_leaf(33, 6);
+        let data_cap = MerkleCap::from_bytes(&cap).unwrap();
+        let root = quil_crypto::storage_proof::registration_root(
+            &data_cap.commitment(quil_crypto::storage_proof::Tree::Data),
+            &[0; 32],
+            &data_cap.commitment(quil_crypto::storage_proof::Tree::Replica),
+        );
+        s.put_hash(3, b"leaf", &nodes, &cap, &root).unwrap();
+        s.put_data_cap(3, b"leaf", &MerkleCap::from_bytes(&cap).unwrap())
+            .unwrap();
+        s.note_snapshot(3, b"leaf", &[8; 32]).unwrap();
+        assert_eq!(s.snapshot_match(b"leaf", &[8; 32]).unwrap(), Some(3));
+        assert_eq!(s.snapshot_match(b"leaf", &[9; 32]).unwrap(), None);
+        assert!(s.alias_hash(4, b"leaf", 3).unwrap());
+        s.delete(3, b"leaf").unwrap();
+        assert_eq!(
+            s.get_hash(4, b"leaf").unwrap().unwrap().replica[..],
+            nodes[..]
+        );
     }
 
     #[test]
@@ -1451,9 +1703,21 @@ mod tests {
             "beside, not over, the replica"
         );
         assert_eq!(s.get_partition(6, b"filter").unwrap(), None);
+        s.put_snapshot_sources(5, b"child", b"sources").unwrap();
+        s.put_snapshot_sources(6, b"later", b"sources").unwrap();
+        assert_eq!(
+            s.snapshot_source_filters(5).unwrap(),
+            vec![b"child".to_vec(), b"filter".to_vec()],
+            "the epoch's shards, not another epoch's"
+        );
         s.evict_below_epoch(6).unwrap();
         assert_eq!(s.get_partition(5, b"filter").unwrap(), None);
         assert_eq!(s.get_snapshot_sources(5, b"filter").unwrap(), None);
+        assert!(s.snapshot_source_filters(5).unwrap().is_empty());
+        assert_eq!(
+            s.snapshot_source_filters(6).unwrap(),
+            vec![b"later".to_vec()]
+        );
         assert_eq!(s.get_leaf_nodes(5, b"filter").unwrap(), None);
     }
 

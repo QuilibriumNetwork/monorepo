@@ -56,14 +56,15 @@
 //! 30 million nodes than one of 15 (3 an epoch), where without the cap such
 //! nodes registered 11 to 49 (2026-11-03). Sized by 16 GiB a leaf, three
 //! times what one holds, a 16-thread node of 31 GiB kept two and gave up 8
-//! of its 10 seats of such leaves in an epoch (2026-11-06). While a
-//! renewal's leaf is labelled now ([`Reservation::labelling_now`]), only
-//! [`ahead_beside_due`] go on beside it; the others pause, keeping their
-//! memory and layers, and go on once it ends
-//! ([`Reservation::wait_while_paused`]): beside three or four leaves
-//! labelled ahead, a 16-thread node's renewal leaf ran at under 70% of its
-//! estimated pace and missed its grace, where three leaves at a time ran at
-//! 85 to 94% (2026-11-01).
+//! of its 10 seats of such leaves in an epoch (2026-11-06). Persistent
+//! sectors, for epochs where persistent storage holds, run ahead on every
+//! slot the memory admits, beside those leaves. While a renewal's leaf is
+//! labelled now ([`Reservation::labelling_now`]), only [`ahead_beside_due`]
+//! go on beside it; the others pause, keeping their memory and layers, and go
+//! on once it ends ([`Reservation::wait_while_paused`]): beside three or four
+//! leaves labelled ahead, a 16-thread node's renewal leaf ran at under 70% of
+//! its estimated pace and missed its grace, where three leaves at a time ran
+//! at 85 to 94% (2026-11-01).
 //!
 //! A node's processes on one host (a master and its standalone workers)
 //! admit their jobs together ([`install_host_ledger`],
@@ -92,6 +93,9 @@ use tracing::{info, warn};
 
 use crate::storage_ledger::HostLedger;
 
+#[cfg(any(target_os = "macos", test))]
+mod macos_memory;
+
 /// The lane of the node's epoch proofs (`storage_epoch_batch`).
 pub const EPOCH_PROOF_LANE: &[u8] = b"epoch proofs";
 
@@ -104,7 +108,9 @@ pub const MEMORY_SHARE_PERCENT: u64 = 75;
 /// takes a core and about 152 bytes a node, 4.9 GB for a leaf of 32 million
 /// nodes. One asking beyond them waits in its order and starts once one of
 /// them ends: labelled, given back to more urgent work, or given up at its
-/// epoch's snapshot frame (`crate::storage_labels`).
+/// epoch's snapshot frame (`crate::storage_labels`). Work ahead for an epoch
+/// where persistent storage holds is not counted against them and may take
+/// every slot ([`ahead_in_parallel`]).
 pub const AHEAD_JOBS: usize = 2;
 
 /// CPUs of the node per leaf labelled ahead ([`ahead_jobs_for`]): a quarter
@@ -277,7 +283,35 @@ impl Jobs {
         job: impl FnOnce() -> Result<()> + Send + 'static,
     ) {
         let shown = hex::encode(lane);
+        let stable = quil_types::consensus::stable_replica_key_epoch_thread_override();
+        let persistent = quil_types::consensus::persistent_storage_epoch_thread_override();
+        let profile = quil_types::consensus::storage_seal_profile_thread_override();
+        let minimum = quil_types::consensus::min_sector_nodes_thread_override();
         let job: Job = Box::new(move || {
+            struct Overrides(
+                Option<u64>,
+                Option<u64>,
+                Option<quil_types::consensus::StorageSealProfile>,
+                Option<u64>,
+            );
+            impl Drop for Overrides {
+                fn drop(&mut self) {
+                    quil_types::consensus::set_stable_replica_key_epoch_for_thread(self.0);
+                    quil_types::consensus::set_persistent_storage_epoch_for_thread(self.1);
+                    quil_types::consensus::set_storage_seal_profile_for_thread(self.2);
+                    quil_types::consensus::set_min_sector_nodes_for_thread(self.3);
+                }
+            }
+            let _restore = Overrides(
+                quil_types::consensus::stable_replica_key_epoch_thread_override(),
+                quil_types::consensus::persistent_storage_epoch_thread_override(),
+                quil_types::consensus::storage_seal_profile_thread_override(),
+                quil_types::consensus::min_sector_nodes_thread_override(),
+            );
+            quil_types::consensus::set_stable_replica_key_epoch_for_thread(stable);
+            quil_types::consensus::set_persistent_storage_epoch_for_thread(persistent);
+            quil_types::consensus::set_storage_seal_profile_for_thread(profile);
+            quil_types::consensus::set_min_sector_nodes_for_thread(minimum);
             let started = Instant::now();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
                 .unwrap_or_else(|_| Err(QuilError::Internal("the job panicked".into())));
@@ -437,12 +471,25 @@ pub fn reserve_until(bytes: u64, expired: &dyn Fn() -> bool) -> Option<Reservati
 /// more urgent work waits for it ([`Reservation::yield_requested`]), so a
 /// renewal's snapshot never waits for it for long. `None` once `expired`
 /// says the work is of no use any more while it waits ([`reserve_until`]).
+/// Work for an `epoch` where persistent storage holds may run on every slot;
+/// other work counts against [`AHEAD_JOBS`] ([`ahead_in_parallel`]).
 pub fn reserve_ahead(
     bytes: u64,
     order: AheadOrder,
+    epoch: u64,
     expired: &dyn Fn() -> bool,
 ) -> Option<Reservation> {
-    admission().reserve_ordered(bytes, Urgency::Ahead, Some(order), true, expired)
+    let parallel = ahead_in_parallel(epoch);
+    admission().reserve_ahead_in(bytes, Some(order), true, parallel, expired)
+}
+
+/// Whether work ahead for `epoch` may run on every slot the memory admits
+/// rather than within [`AHEAD_JOBS`]: only where persistent storage holds
+/// (`quil_types::consensus::persistent_storage_at`), whose sectors are
+/// certified side by side. Before it, labelling ahead keeps the cap the
+/// legacy leaves were measured with.
+pub fn ahead_in_parallel(epoch: u64) -> bool {
+    quil_types::consensus::persistent_storage_at(epoch)
 }
 
 /// [`reserve_ahead`] for work that holds its memory briefly and is never
@@ -631,12 +678,18 @@ pub fn for_each_parallel<T: Sync, R: Send>(
         Mutex::new((0..items.len()).map(|_| None).collect());
     // A test's stable replica key epoch, for the work's threads too.
     let stable_key = quil_types::consensus::stable_replica_key_epoch_thread_override();
+    let persistent = quil_types::consensus::persistent_storage_epoch_thread_override();
+    let profile = quil_types::consensus::storage_seal_profile_thread_override();
+    let minimum = quil_types::consensus::min_sector_nodes_thread_override();
     std::thread::scope(|scope| {
         for slot in 0..job_slots().min(items.len()) {
             std::thread::Builder::new()
                 .name(format!("stor-leaf-{slot}"))
                 .spawn_scoped(scope, || {
                     quil_types::consensus::set_stable_replica_key_epoch_for_thread(stable_key);
+                    quil_types::consensus::set_persistent_storage_epoch_for_thread(persistent);
+                    quil_types::consensus::set_storage_seal_profile_for_thread(profile);
+                    quil_types::consensus::set_min_sector_nodes_for_thread(minimum);
                     on_process_cpus();
                     loop {
                         let index = next.fetch_add(1, Ordering::Relaxed);
@@ -723,24 +776,31 @@ pub(crate) fn pausing_count() -> usize {
     admission().state().pausing
 }
 
-/// Bytes of memory available to the node now: the host's, or less within
-/// its container's limit, page cache counted available as the host counts
-/// it. `None` when the host does not say.
+/// Bytes available for additional work. macOS uses a pressure-aware process
+/// budget; other hosts use available RAM, bounded by their container's limit.
+/// `None` means the platform could not be queried, rather than zero headroom.
 fn available_memory() -> Option<u64> {
     #[cfg(test)]
     if let Some(bytes) = Some(TEST_AVAILABLE.load(Ordering::SeqCst)).filter(|&b| b > 0) {
         return Some(bytes);
     }
-    let mut system = sysinfo::System::new();
-    system.refresh_memory();
-    let host = system.available_memory();
-    if host == 0 {
-        return None;
+    #[cfg(target_os = "macos")]
+    {
+        macos_memory::available()
     }
-    let container = system
-        .cgroup_limits()
-        .map(|limits| limits.total_memory.saturating_sub(limits.rss));
-    Some(container.map_or(host, |container| container.min(host)))
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut system = sysinfo::System::new();
+        system.refresh_memory();
+        let host = system.available_memory();
+        if host == 0 {
+            return None;
+        }
+        let container = system
+            .cgroup_limits()
+            .map(|limits| limits.total_memory.saturating_sub(limits.rss));
+        Some(container.map_or(host, |container| container.min(host)))
+    }
 }
 
 /// Bytes that must be available for `bytes` of work ahead to fit with no
@@ -908,6 +968,8 @@ pub struct Admission {
     slots: usize,
     /// [`ahead_jobs_for`]; more in tests of the memory alone.
     ahead_jobs: usize,
+    /// Work ahead in parallel ([`ahead_in_parallel`]) at once: the slots.
+    parallel_ahead_jobs: usize,
     /// [`ahead_beside_due`].
     ahead_beside_due: usize,
     available: Box<dyn Fn() -> Option<u64> + Send + Sync>,
@@ -1007,6 +1069,9 @@ struct Waiting {
     place: (u8, u64, u64, u64, u64),
     /// Whether, granted, it gives its memory back when asked.
     yields: bool,
+    /// Whether it is work ahead in parallel ([`ahead_in_parallel`]), not
+    /// counted against [`AHEAD_JOBS`].
+    parallel: bool,
 }
 
 impl Waiting {
@@ -1027,6 +1092,8 @@ struct Yielding {
     millionths: u32,
     /// Whether it was asked to give its memory back.
     asked: bool,
+    /// Whether it is work ahead in parallel ([`ahead_in_parallel`]).
+    parallel: bool,
 }
 
 /// How a waiting reservation was passed by later ones that fit while it did
@@ -1079,6 +1146,7 @@ impl Admission {
             changed: Condvar::new(),
             slots: slots.max(1),
             ahead_jobs: AHEAD_JOBS,
+            parallel_ahead_jobs: slots.max(1),
             ahead_beside_due: AHEAD_JOBS_BESIDE_DUE,
             available,
             window: LOOK_WINDOW,
@@ -1268,7 +1336,8 @@ impl Admission {
     }
 
     /// [`Self::reserve_until`], work ahead waiting in `order` (the order
-    /// asked if none) and giving its memory back when asked if it `yields`.
+    /// asked if none) and giving its memory back when asked if it `yields`;
+    /// counted against [`AHEAD_JOBS`].
     pub fn reserve_ordered(
         &'static self,
         bytes: u64,
@@ -1277,6 +1346,32 @@ impl Admission {
         yields: bool,
         expired: &dyn Fn() -> bool,
     ) -> Option<Reservation> {
+        self.reserve_classed(bytes, urgency, order, yields, false, expired)
+    }
+
+    /// [`Self::reserve_ordered`] for work ahead, in parallel
+    /// ([`ahead_in_parallel`]) or not.
+    pub fn reserve_ahead_in(
+        &'static self,
+        bytes: u64,
+        order: Option<AheadOrder>,
+        yields: bool,
+        parallel: bool,
+        expired: &dyn Fn() -> bool,
+    ) -> Option<Reservation> {
+        self.reserve_classed(bytes, Urgency::Ahead, order, yields, parallel, expired)
+    }
+
+    fn reserve_classed(
+        &'static self,
+        bytes: u64,
+        urgency: Urgency,
+        order: Option<AheadOrder>,
+        yields: bool,
+        parallel: bool,
+        expired: &dyn Fn() -> bool,
+    ) -> Option<Reservation> {
+        let parallel = parallel && urgency == Urgency::Ahead;
         let mut state = self.state();
         let ticket = state.next_ticket;
         state.next_ticket += 1;
@@ -1313,6 +1408,7 @@ impl Admission {
                 bytes,
                 place,
                 yields: yields && urgency == Urgency::Ahead,
+                parallel,
             },
         );
         state.stale = true;
@@ -1321,13 +1417,17 @@ impl Admission {
         while !self.take_grant(&mut state, ticket) {
             if !waited {
                 waited = true;
-                let (labelling, cap) = (state.yielding.len(), self.ahead_cap(&state));
+                let (labelling, cap) = (
+                    self.ahead_holding(&state, parallel),
+                    self.ahead_cap(&state, parallel),
+                );
                 let look = state.last_look;
-                if yields && urgency == Urgency::Ahead && labelling >= cap {
+                if yields && urgency == Urgency::Ahead && self.ahead_full(&state, parallel) {
                     info!(
                         bytes,
                         labelling_ahead = labelling,
                         cap,
+                        parallel,
                         labelling_now = state.labelling_now,
                         "storage job ahead waits for a labelling slot: only cap leaves are \
                          labelled ahead at once, fewer while a renewal's leaf is labelled now, \
@@ -1471,7 +1571,7 @@ impl Admission {
                 index += 1;
                 continue;
             }
-            if waiting.yields && state.yielding.len() >= self.ahead_cap(state) {
+            if waiting.yields && self.ahead_full(state, waiting.parallel) {
                 index += 1;
                 continue;
             }
@@ -1493,6 +1593,7 @@ impl Admission {
                             bytes: waiting.bytes,
                             millionths: 0,
                             asked: false,
+                            parallel: waiting.parallel,
                         },
                     );
                 }
@@ -1643,29 +1744,40 @@ impl Admission {
                 std::cmp::Reverse(ticket),
             )
         });
-        let wanted: Vec<(u64, bool)> = state
+        let wanted: Vec<(u64, bool, bool)> = state
             .waiting
             .iter()
             .take_while(|waiting| waiting.rank() == head)
-            .map(|waiting| (waiting.bytes, waiting.yields))
+            .map(|waiting| (waiting.bytes, waiting.yields, waiting.parallel))
             .collect();
         let share = self.share(state);
         let (holders, reserved, slots) = (state.holders, state.reserved, self.slots);
-        let (labelling, cap) = (state.yielding.len(), self.ahead_cap(state));
+        let (labelling, cap) = (state.yielding.len(), self.ahead_cap(state, true));
+        let capped = self.ahead_holding(state, false);
+        let capped_cap = self.ahead_cap(state, false);
         // Whether the first `count` wanted fit once `freed` bytes of `jobs`
-        // holders are given back. Labelling ahead wanted beyond its cap
-        // also needs places given back: each holder that yields gives one.
-        let fit = |jobs: usize, freed: u64, count: usize| {
+        // holders, `capped_jobs` of them counted against [`AHEAD_JOBS`],
+        // are given back. Labelling ahead wanted beyond its cap also needs
+        // places given back: each holder of its class that yields gives one.
+        let fit = |jobs: usize, capped_jobs: usize, freed: u64, count: usize| {
             let labelling_wanted = wanted[..count]
                 .iter()
-                .filter(|&&(_, yields)| yields)
+                .filter(|&&(_, yields, _)| yields)
                 .count();
             if labelling_wanted > 0 && labelling.saturating_sub(jobs) + labelling_wanted > cap {
                 return false;
             }
+            let capped_wanted = wanted[..count]
+                .iter()
+                .filter(|&&(_, yields, parallel)| yields && !parallel)
+                .count();
+            if capped_wanted > 0 && capped.saturating_sub(capped_jobs) + capped_wanted > capped_cap
+            {
+                return false;
+            }
             let wanted = wanted[..count]
                 .iter()
-                .fold(0u128, |sum, &(b, _)| sum + u128::from(b));
+                .fold(0u128, |sum, &(b, _, _)| sum + u128::from(b));
             let holders = holders.saturating_sub(jobs);
             let reserved = u128::from(reserved.saturating_sub(freed));
             if holders == 0 {
@@ -1680,19 +1792,24 @@ impl Admission {
                 && share.is_some_and(|share| reserved + wanted <= u128::from(share))
         };
         let all = candidates.iter().map(|(_, yielding)| yielding.bytes).sum();
+        let all_capped = candidates
+            .iter()
+            .filter(|(_, yielding)| !yielding.parallel)
+            .count();
         let Some(count) = (1..=wanted.len())
             .rev()
-            .find(|&count| fit(candidates.len(), all, count))
+            .find(|&count| fit(candidates.len(), all_capped, all, count))
         else {
             return;
         };
-        let (mut jobs, mut freed) = (0, 0u64);
+        let (mut jobs, mut capped_jobs, mut freed) = (0, 0, 0u64);
         let mut newly: Vec<u64> = Vec::new();
         for &(ticket, yielding) in &candidates {
-            if fit(jobs, freed, count) {
+            if fit(jobs, capped_jobs, freed, count) {
                 break;
             }
             jobs += 1;
+            capped_jobs += usize::from(!yielding.parallel);
             freed = freed.saturating_add(yielding.bytes);
             if !yielding.asked {
                 newly.push(ticket);
@@ -1715,7 +1832,7 @@ impl Admission {
             waiting = count,
             waiting_bytes = wanted[..count]
                 .iter()
-                .fold(0u64, |sum, &(b, _)| sum.saturating_add(b)),
+                .fold(0u64, |sum, &(b, _, _)| sum.saturating_add(b)),
             due = head == 0,
             reserved,
             share,
@@ -1725,17 +1842,47 @@ impl Admission {
         );
     }
 
-    /// How many leaves labelled ahead may hold memory at once
-    /// ([`ahead_jobs_for`]): [`ahead_beside_due`] while a leaf is labelled
-    /// now ([`Reservation::labelling_now`]).
-    fn ahead_cap(&self, state: &State) -> usize {
-        let cap = if state.labelling_now > 0 {
-            self.ahead_jobs.min(self.ahead_beside_due)
+    /// How many leaves labelled ahead may hold memory at once: in parallel
+    /// ([`ahead_in_parallel`]) every slot, counting all work ahead; else
+    /// [`ahead_jobs_for`], counting only work ahead not in parallel
+    /// ([`Self::ahead_holding`]). [`ahead_beside_due`] while a leaf is
+    /// labelled now ([`Reservation::labelling_now`]). Less the leaves the
+    /// host's other processes label ahead ([`State::others`]), of either
+    /// class: their records do not tell them apart.
+    fn ahead_cap(&self, state: &State, parallel: bool) -> usize {
+        let cap = if parallel {
+            self.parallel_ahead_jobs
         } else {
-            self.ahead_jobs
+            self.ahead_jobs.min(self.parallel_ahead_jobs)
+        };
+        let cap = if state.labelling_now > 0 {
+            cap.min(self.ahead_beside_due)
+        } else {
+            cap
         };
         let others = usize::try_from(state.others.ahead).unwrap_or(usize::MAX);
         cap.saturating_sub(others)
+    }
+
+    /// Work ahead holding memory that counts against [`Self::ahead_cap`]
+    /// of work ahead in parallel or not: all of it, or what is not.
+    fn ahead_holding(&self, state: &State, parallel: bool) -> usize {
+        if parallel {
+            state.yielding.len()
+        } else {
+            state
+                .yielding
+                .values()
+                .filter(|yielding| !yielding.parallel)
+                .count()
+        }
+    }
+
+    /// Whether labelling ahead, in parallel or not, waits for a place: as
+    /// much work ahead holds memory as may in all, or of its own class.
+    fn ahead_full(&self, state: &State, parallel: bool) -> bool {
+        state.yielding.len() >= self.ahead_cap(state, true)
+            || self.ahead_holding(state, parallel) >= self.ahead_cap(state, parallel)
     }
 
     /// Whether the labelling ahead holding `ticket` pauses
@@ -2829,6 +2976,112 @@ mod tests {
         }
     }
 
+    /// Before persistent storage holds, a host of many slots and ample
+    /// memory still labels [`AHEAD_JOBS`] leaves ahead at once, by default
+    /// ([`Admission::new`]): the cap the legacy leaves were measured with.
+    #[test]
+    fn before_persistent_storage_two_leaves_are_labelled_ahead_on_any_host() {
+        let admission = Box::leak(Box::new(Admission::new(9, Box::new(|| Some(128 * GIB)))));
+        let first = reserve_now(admission, GIB, ahead(false, 1, 0));
+        let _second = reserve_now(admission, GIB, ahead(false, 1, 1));
+        let third = hold_yielding(admission, GIB, ahead(false, 1, 2));
+        assert!(
+            third.granted.recv_timeout(NOT_YET).is_err(),
+            "a third leaf waits though seven slots and the memory are free"
+        );
+        assert_eq!(admission.state().holders, 2);
+        drop(first);
+        assert!(
+            third.granted.recv_timeout(SOON).is_ok(),
+            "it starts once one ends"
+        );
+        drop(third.release);
+    }
+
+    /// Where persistent storage holds, sectors labelled ahead run on every
+    /// slot the memory admits, and one beyond them starts once one ends.
+    #[test]
+    fn persistent_sectors_are_labelled_ahead_on_every_slot() {
+        let admission = Box::leak(Box::new(Admission::new(9, Box::new(|| Some(128 * GIB)))));
+        let mut held: Vec<Held> = (0..9)
+            .map(|leaf| hold_parallel(admission, GIB, ahead(false, 1, leaf)))
+            .collect();
+        for sector in &held {
+            assert!(granted(sector), "each sector starts on its own slot");
+        }
+        assert_eq!(admission.state().holders, 9);
+        let tenth = hold_parallel(admission, GIB, ahead(false, 1, 9));
+        assert!(
+            still_waiting(&tenth),
+            "a tenth sector waits: every slot is held"
+        );
+        drop(held.pop());
+        assert!(granted(&tenth), "the tenth sector starts once one ends");
+        drop((held, tenth.release));
+    }
+
+    /// Sectors labelled ahead in parallel do not count against the legacy
+    /// leaves' [`AHEAD_JOBS`], and those leaves stay capped beside them.
+    #[test]
+    fn legacy_leaves_keep_their_cap_beside_parallel_sectors() {
+        let admission = Box::leak(Box::new(Admission::new(9, Box::new(|| Some(128 * GIB)))));
+        let sectors: Vec<Held> = (0..3)
+            .map(|leaf| hold_parallel(admission, GIB, ahead(false, 1, leaf)))
+            .collect();
+        for sector in &sectors {
+            assert!(granted(sector), "each sector starts on its own slot");
+        }
+        let leaves = [
+            hold_yielding(admission, GIB, ahead(false, 2, 0)),
+            hold_yielding(admission, GIB, ahead(false, 2, 1)),
+        ];
+        for leaf in &leaves {
+            assert!(
+                leaf.granted.recv_timeout(SOON).is_ok(),
+                "two legacy leaves start beside three sectors"
+            );
+        }
+        let third = hold_yielding(admission, GIB, ahead(false, 2, 2));
+        assert!(
+            third.granted.recv_timeout(NOT_YET).is_err(),
+            "a third legacy leaf waits beside the sectors"
+        );
+        let sector = hold_parallel(admission, GIB, ahead(false, 3, 0));
+        assert!(
+            granted(&sector),
+            "a sector after it in order does not wait for it"
+        );
+    }
+
+    /// Work ahead runs in parallel only for an epoch where persistent
+    /// storage holds; a disabled or future activation keeps the legacy cap.
+    #[test]
+    fn work_ahead_runs_in_parallel_only_once_persistent_storage_holds() {
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(u64::MAX));
+        assert!(!ahead_in_parallel(1500));
+        assert!(!ahead_in_parallel(u64::MAX - 1));
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(1500));
+        assert!(!ahead_in_parallel(1499));
+        assert!(ahead_in_parallel(1500));
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
+    }
+
+    /// Work ahead in parallel in `order` holding `bytes` on a thread of its
+    /// own ([`hold`]): `granted` hears when it is, and dropping `release`
+    /// gives it back.
+    fn hold_parallel(admission: &'static Admission, bytes: u64, order: AheadOrder) -> Held {
+        let (granted_tx, granted) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _reservation = admission
+                .reserve_ahead_in(bytes, Some(order), true, true, &|| false)
+                .expect("a reservation that never expires");
+            granted_tx.send(()).unwrap();
+            let _ = released.recv();
+        });
+        Held { granted, release }
+    }
+
     /// At most [`AHEAD_JOBS`] leaves are labelled ahead at once whatever the
     /// memory and slots let, and one asking beyond them starts once one of
     /// them ends; reading a leaf ahead and work due now do not wait for them
@@ -2897,7 +3150,7 @@ mod tests {
         let memory: u64 = 32_729_092 * 1024;
         let each = crate::storage_labels::label_ahead_bytes(AHEAD_JOB_NODES);
         let now = crate::storage_snapshot::encoding_bytes(AHEAD_JOB_NODES);
-        assert_eq!(each, 5_424_000_470, "ahead misjudged: the reservation");
+        assert_eq!(each, 5_428_614_204, "ahead misjudged: the reservation");
         assert_eq!(now, 8_020_283_296, "ahead misjudged: a leaf labelled now");
         assert!(
             u128::from(memory) * 75 / 100 >= u128::from(now) + 3 * u128::from(each),
@@ -3528,6 +3781,79 @@ mod tests {
         drop(ahead.release);
     }
 
+    /// Regression for the 64 GiB Mac whose sysinfo estimate saturated to zero
+    /// despite normal kernel pressure, silently serializing nine cold sectors.
+    #[test]
+    fn macos_normal_pressure_admits_nine_cold_sectors() {
+        let snapshot = macos_memory::Snapshot {
+            total: 64 * GIB,
+            wired: 7 * GIB,
+            footprint: 3 * GIB,
+            pressure: 1,
+        };
+        let admission = Box::leak(Box::new(Admission::new(
+            9,
+            Box::new(move || Some(snapshot.headroom())),
+        )));
+        let cold_bytes = quil_crypto::storage_proof::labelling_peak_bytes(
+            1 << 24,
+            &quil_crypto::sdr::SdrParams::default(),
+        ) + (400 << 20);
+        let held: Vec<_> = (0..9)
+            .map(|leaf| {
+                let held = hold_parallel(admission, cold_bytes, ahead(false, 1, leaf));
+                assert!(
+                    granted(&held),
+                    "every cold sector fits alongside the others"
+                );
+                held
+            })
+            .collect();
+        assert_eq!(admission.state().holders, 9);
+        let extra = hold_parallel(admission, cold_bytes, ahead(false, 1, 9));
+        assert!(still_waiting(&extra), "the CPU slot limit still applies");
+        drop(held);
+        assert!(granted(&extra));
+    }
+
+    #[test]
+    fn macos_pressure_stops_admission_and_normal_pressure_resumes_it() {
+        let pressure = Arc::new(std::sync::atomic::AtomicU32::new(1));
+        let probe = pressure.clone();
+        let mut admission = Admission::new(
+            9,
+            Box::new(move || {
+                Some(
+                    macos_memory::Snapshot {
+                        total: 64 * GIB,
+                        wired: 7 * GIB,
+                        footprint: 3 * GIB,
+                        pressure: probe.load(Ordering::SeqCst),
+                    }
+                    .headroom(),
+                )
+            }),
+        );
+        admission.window = Duration::ZERO;
+        let admission = Box::leak(Box::new(admission));
+        // Pressure with no holders must be known zero, not unknown memory:
+        // unknown memory deliberately admits one ahead job as a fallback.
+        pressure.store(2, Ordering::SeqCst);
+        let ahead = hold_with(admission, GIB, Urgency::Ahead);
+        assert!(still_waiting(&ahead));
+        let due = hold(admission, GIB);
+        assert!(
+            granted(&due),
+            "urgent work retains its one-job escape hatch"
+        );
+        assert!(still_waiting(&ahead), "no extra work starts under pressure");
+        pressure.store(1, Ordering::SeqCst);
+        admission.changed.notify_all();
+        assert!(granted(&ahead), "normal pressure resumes parallel work");
+        drop(due);
+        drop(ahead);
+    }
+
     #[test]
     fn no_more_jobs_hold_memory_than_there_are_slots() {
         let (admission, _) = admission(2, 1 << 50);
@@ -3876,5 +4202,25 @@ mod tests {
                 "the leaves ran on threads named {names:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod profile_context_tests {
+    use super::*;
+    use quil_types::consensus::*;
+    #[test]
+    fn parallel_jobs_receive_profile_and_sector_floor() {
+        let old_profile = storage_seal_profile_thread_override();
+        let old_minimum = min_sector_nodes_thread_override();
+        set_storage_seal_profile_for_thread(Some(StorageSealProfile::Three));
+        set_min_sector_nodes_for_thread(Some(64));
+        let values = for_each_parallel(&[0u8, 1], |_| {
+            Ok((storage_seal_profile(1500), min_sector_nodes()))
+        })
+        .unwrap();
+        set_storage_seal_profile_for_thread(old_profile);
+        set_min_sector_nodes_for_thread(old_minimum);
+        assert_eq!(values, vec![(StorageSealProfile::Three, 64); 2]);
     }
 }

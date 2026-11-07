@@ -1,0 +1,134 @@
+Blank mainnet node: production storage readiness
+================================================
+
+Use an optimized quil-node built from this branch, on the CPU/RAM limits and
+filesystem intended for production. No existing snapshot, configuration,
+keystore, account, or mainnet registration is needed. The command exits before
+normal node startup. It never submits capacity certificates or joins mainnet.
+
+Example: qualify a planned allocation of 16 seats using the 16 largest reported
+live shards (replace 16 with the intended allocation):
+
+  ./quil-node --benchmark-storage /mnt/ssd/storage-readiness \
+    --benchmark-storage-seats 16
+
+For an exact intended allocation, use full hex shard filters instead:
+
+  ./quil-node --benchmark-storage /mnt/ssd/storage-readiness \
+    --benchmark-storage-filter HEX_FILTER_1,HEX_FILTER_2
+
+The scratch directory must be absent or empty. Use the actual production data
+disk. Downloads and intermediate files remain there for inspection; nothing is
+automatically deleted. A full allocation can require substantial disk space and
+hours of work. Do not point this command at an existing node directory.
+
+What is fetched and measured
+---------------------------
+
+The public explorer at https://explorer-api.quilibrium.com supplies live shard
+selection/sizing and a freshness cross-check. Its sizes are not used as a
+substitute for canonical state. Identity-pinned archive RPC supplies a fresh
+GLOBAL checkpoint, checked against the genesis/successor finalization committee
+and the production VDF/header verifier. Each storage snapshot record must have
+a valid membership proof under that checkpoint's prover root. The actual shard
+subtrees and vertex blobs are downloaded at all four recorded snapshot roots.
+Missing, stale, pruned, or unverifiable inputs produce INCOMPLETE.
+
+This is an exact checkpoint snapshot, not a claim to reproduce a continually
+changing head. By default the test uses the snapshot epoch after the GLOBAL
+head's epoch. An explicit --benchmark-storage-epoch E selects another retained
+snapshot; the checkpoint itself must still be fresh.
+
+Selected shards download concurrently, up to the node CPU-job allowance.
+Every selected shard runs through the production sector labeller, capacity
+certificate prover/verifier, encoder, sparse snapshot binding, fresh seal
+prover/verifier, streaming frame openings, and full settlement prover/verifier.
+All allocations and sectors run concurrently through shared CPU, RAM and disk
+admission, leaving one CPU slot for the master. Barriers separate cold setup,
+registration, frame openings and settlement so the measured wall times include
+contention across the entire allocation. Two repeat rounds force full input
+reads and fresh output databases. The full 720-frame settlement workload is the default. There is no synthetic-data
+fallback, small-sector extrapolation, or silent truncation of an allocation.
+
+The current settlement path retains a seat's replicas and builds large STARK
+traces. A conservative estimate from the actual AIR dimensions rejects a run
+that cannot fit its memory budget before spending hours on cold certification.
+The benchmark disk cutoff is 99.9% used (0.1% free, about 2 GB on a 2 TB
+filesystem), shared by its monitor and isolated label store. This does not
+change production node label limits. Underlying database write guards retain
+their 2 GiB hard minimum. The report records the benchmark free-space floor.
+
+Measured peak process RSS, filesystem minimum free space, proof bytes, and
+per-phase times are also recorded. The estimator is a hardware qualification
+guard, not a change to admission or consensus rules.
+
+Results and interpretation
+--------------------------
+
+Progress is written to stderr; JSON is printed to stdout and atomically saved
+to WORKDIR/report.json. --benchmark-storage-report PATH selects another report
+location (its parent must exist). The v2 artifact includes allocation-wide phase wall times, per-shard work times,
+checkpoint header,
+snapshot membership proofs, exact roots, build/platform, resource budgets,
+timings, and the assumptions used for the verdict.
+
+Exit 0: go_for_checkpoint. All intended shards completed the full repeated
+workload in a release build within the resource and timing budgets.
+Exit 2: no_go. Measured work or a resource/preflight requirement exceeded budget,
+or a production storage operation failed after measurement began.
+Exit 3: incomplete. Required authenticated input or full qualification evidence
+was unavailable. Invalid arguments/startup errors use the normal CLI error exit.
+
+The assessment uses the slowest full-allocation wall time for each recurring
+phase across the repeat rounds. Individual shard work times remain in the
+report for diagnostics and are not summed as elapsed parallel time. Default
+timing headroom is 2x. Cold download/setup plus first registration must fit the
+current 32-epoch capacity warmup; registration must fit production snapshot grace; settlement
+must fit its production window; combined recurring storage work must fit an
+epoch. Deadlines use the protocol's nominal 10-second frame time. Four frames
+per sector are reserved for GLOBAL inclusion; this latency is an assumption,
+not measured mainnet message inclusion. Proof sizes also face GLOBAL limits.
+
+GO is evidence for storage work at this checkpoint and allocation. It does not
+measure real GLOBAL inclusion, contention from other nodes, future shard growth,
+or normal concurrent foreground work. Default headroom and a 2 GiB RAM reserve
+allow space for other work but cannot guarantee that work fits. OS page cache
+is not globally cleared; warm cache effects are disclosed in the artifact.
+Run under the same CPU affinity/container memory limits planned for production.
+
+Useful controls
+---------------
+
+  --benchmark-storage-headroom 2
+  --benchmark-storage-reserve-memory-gib 2
+  --benchmark-storage-timeout-secs SECONDS
+  --benchmark-storage-archive HOST:8340=PINNED_PEER_ID   (repeat for failover)
+
+Default archives are the genesis archive endpoints with pinned identities.
+Private RPC access is not needed if those endpoints serve the exact retained
+snapshot and GLOBAL membership-proof RPC. Failure is INCOMPLETE, never guessed.
+
+--benchmark-storage-frames 2 and --benchmark-storage-allow-debug are useful for
+exercising the harness. Reduced frame workloads or debug builds always yield
+INCOMPLETE, even when their measured phases pass. Repeat count must be 2..5.
+The future persistent-storage activation epoch remains unset by this test.
+
+Developer validation
+--------------------
+
+Run the existing scripts/test-persistent-storage.py regression runner to include
+the engine's readiness arithmetic and small real-snapshot two-round lifecycle.
+The lifecycle uses two frame openings to keep the regression bounded; it is not
+a production qualification. Node-specific argument, authenticated record, and
+bounded HTTP response tests run with:
+
+  cargo test -p quil-node --bin quil-node storage_readiness::tests::
+
+Opt-in, read-only live metadata smoke check (no shard download or sealing):
+
+  cargo test -p quil-node --bin quil-node \
+    storage_readiness::tests::live_mainnet_checkpoint_and_snapshot_record_are_authenticated \
+    -- --exact --ignored --nocapture
+
+A stale or unreachable mainnet fails this deployment check; it is intentionally
+excluded from the deterministic regression suite.

@@ -36,7 +36,14 @@ const MAX_SHARD_FILTER_LEN: u32 = 64;
 /// A leaf prefix is a nibble path; a 1 GiB leaf at 6-bit branching is at most a
 /// few levels deep, but bound generously.
 const MAX_PREFIX_LEN: u32 = 256;
-const MAX_LEAF_ROOT_LEN: u32 = 128;
+const LEGACY_MAX_LEAF_ROOT_LEN: u32 = 128;
+fn max_leaf_root_len() -> u32 {
+    if quil_types::consensus::persistent_storage_epoch() == u64::MAX {
+        LEGACY_MAX_LEAF_ROOT_LEN
+    } else {
+        quil_crypto::persistent_storage::ROOT_BYTES as u32
+    }
+}
 /// The most leaf-root groups (shards) one confirm registers; a confirm with
 /// more does not decode, so a sender splits its seats across confirms.
 pub const MAX_CONFIRM_LEAF_ROOT_GROUPS: usize = MAX_PREFIX_LEN as usize;
@@ -131,7 +138,7 @@ impl LeafRootRegistration {
         let epoch = read_u64(data, &mut c)?;
 
         let lrl = read_u32(data, &mut c)?;
-        if lrl > MAX_LEAF_ROOT_LEN {
+        if lrl > max_leaf_root_len() {
             return Err(QuilError::InvalidArgument(format!(
                 "LeafRootRegistration: invalid leaf_root length {}",
                 lrl
@@ -251,11 +258,12 @@ pub fn check_confirm_leaf_roots(groups: &[ConfirmLeafRoots]) -> Result<()> {
         } else if let Some(entry) = group
             .entries
             .iter()
-            .find(|e| e.leaf_root.len() > MAX_LEAF_ROOT_LEN as usize)
+            .find(|e| e.leaf_root.len() > max_leaf_root_len() as usize)
         {
             format!(
-                "a leaf root of {} bytes (at most {MAX_LEAF_ROOT_LEN})",
-                entry.leaf_root.len()
+                "a leaf root of {} bytes (at most {})",
+                entry.leaf_root.len(),
+                max_leaf_root_len()
             )
         } else {
             continue;
@@ -309,7 +317,7 @@ pub fn read_confirm_leaf_roots(data: &[u8], cursor: &mut usize) -> Result<Vec<Co
                 prefix.push(read_u32(data, cursor)?);
             }
             let lrl = read_u32(data, cursor)?;
-            if lrl > MAX_LEAF_ROOT_LEN {
+            if lrl > max_leaf_root_len() {
                 return Err(QuilError::InvalidArgument(
                     "ConfirmLeafRoots: leaf_root too long".into(),
                 ));
@@ -379,14 +387,27 @@ pub fn init_pre_registration_frame(network: u8) -> Option<u64> {
     })
 }
 
-/// Shards that a split or merge recorded to apply at `epoch` creates from any
-/// of `confirmed`: every child of a split whose parent is confirmed, and the
-/// target of a merge one of whose sources is confirmed. A member confirming
-/// its shard in the epoch before the change registers leaves for these too,
-/// so it holds a registration for the shard it is on when the change
-/// applies; otherwise it proves nothing for that epoch. A split assigns each
-/// member its child when it applies, so every child is named. Sorted, without
-/// the confirmed filters themselves.
+/// Whether a recorded split or merge may apply at `epoch`, so the shards it
+/// creates are registered for it and read their data from its sources: at
+/// its effective epoch and, from the sealed storage epoch, at every later
+/// epoch it is still pending in. A committee handoff keeps a due change
+/// pending until its sources seal or are fenced, and from that epoch a
+/// member counts on a shard only with a seat sealed there: a change applying
+/// late must find its members registered and sealed for the epoch it
+/// applies in, or the shards it creates never produce.
+pub fn applies_at(change: &quil_types::store::PendingShardChange, epoch: u64) -> bool {
+    change.effective_epoch == epoch
+        || (change.effective_epoch < epoch && quil_types::consensus::sealed_storage_required(epoch))
+}
+
+/// Shards that a split or merge recorded to apply at `epoch` ([`applies_at`])
+/// creates from any of `confirmed`: every child of a split whose parent is
+/// confirmed, and the target of a merge one of whose sources is confirmed. A
+/// member confirming its shard in the epoch before the change registers
+/// leaves for these too, so it holds a registration for the shard it is on
+/// when the change applies; otherwise it proves nothing for that epoch. A
+/// split assigns each member its child when it applies, so every child is
+/// named. Sorted, without the confirmed filters themselves.
 pub fn pre_registration_targets(
     changes: &[quil_types::store::PendingShardChange],
     confirmed: &[Vec<u8>],
@@ -395,7 +416,7 @@ pub fn pre_registration_targets(
     use quil_types::store::ShardChangeKind;
     let mut targets: Vec<Vec<u8>> = changes
         .iter()
-        .filter(|change| change.effective_epoch == epoch)
+        .filter(|change| applies_at(change, epoch))
         .flat_map(|change| match change.kind {
             ShardChangeKind::Split if confirmed.contains(&change.parent) => change.children.clone(),
             ShardChangeKind::Merge if change.children.iter().any(|c| confirmed.contains(c)) => {
@@ -468,6 +489,57 @@ mod tests {
         );
     }
 
+    /// From the sealed storage epoch a change a committee handoff keeps
+    /// pending past its effective epoch still names the shards it creates,
+    /// at every epoch until it applies; before that epoch only its effective
+    /// epoch does.
+    #[test]
+    fn a_change_still_pending_names_its_shards_from_the_sealed_storage_epoch() {
+        use quil_types::consensus::set_sealed_storage_epoch_for_thread;
+        use quil_types::store::{PendingShardChange, ShardChangeKind};
+        let changes = vec![
+            PendingShardChange {
+                kind: ShardChangeKind::Split,
+                parent: vec![1],
+                children: vec![vec![10], vec![11]],
+                effective_epoch: 8,
+                proposed_frame: 0,
+            },
+            PendingShardChange {
+                kind: ShardChangeKind::Merge,
+                parent: vec![2],
+                children: vec![vec![20], vec![21]],
+                effective_epoch: 8,
+                proposed_frame: 0,
+            },
+        ];
+        set_sealed_storage_epoch_for_thread(Some(9));
+        assert_eq!(
+            pre_registration_targets(&changes, &[vec![1]], 10),
+            vec![vec![10], vec![11]],
+            "a split still pending two epochs after its effective epoch"
+        );
+        assert_eq!(
+            pre_registration_targets(&changes, &[vec![20]], 9),
+            vec![vec![2]],
+            "a merge still pending"
+        );
+        assert!(
+            pre_registration_targets(&changes, &[vec![1]], 7).is_empty(),
+            "not before its effective epoch"
+        );
+        set_sealed_storage_epoch_for_thread(Some(11));
+        assert!(
+            pre_registration_targets(&changes, &[vec![1]], 10).is_empty(),
+            "before the sealed storage epoch, only at its effective epoch"
+        );
+        assert_eq!(
+            pre_registration_targets(&changes, &[vec![1]], 8),
+            vec![vec![10], vec![11]]
+        );
+        set_sealed_storage_epoch_for_thread(None);
+    }
+
     /// `check_confirm_leaf_roots` admits exactly the groups a confirm
     /// decodes: senders leave out a seat by it, so they must not drift apart.
     #[test]
@@ -486,38 +558,52 @@ mod tests {
             append_confirm_leaf_roots(&mut bytes, groups);
             read_confirm_leaf_roots(&bytes, &mut 0).is_ok()
         };
-        let max = MAX_PREFIX_LEN as usize;
-        let at_limits = vec![group(64, vec![entry(max, 128); max])];
-        let cases = [
-            (at_limits, true),
-            (
-                vec![group(32, Vec::new()); MAX_CONFIRM_LEAF_ROOT_GROUPS],
-                true,
-            ),
-            (
-                vec![group(32, Vec::new()); MAX_CONFIRM_LEAF_ROOT_GROUPS + 1],
-                false,
-            ),
-            (vec![group(65, Vec::new())], false),
-            (vec![group(32, vec![entry(1, 1); max + 1])], false),
-            (vec![group(32, vec![entry(max + 1, 1)])], false),
-            (vec![group(32, vec![entry(1, 129)])], false),
-        ];
-        for (index, (groups, fits)) in cases.iter().enumerate() {
-            assert_eq!(
-                check_confirm_leaf_roots(groups).is_ok(),
-                *fits,
-                "case {index}"
+        // Exercise both the historical limit and the configured persistent
+        // format, whose future-epoch registrations must decode during warmup.
+        for (activation, root_limit) in [
+            (Some(u64::MAX), 128),
+            (None, quil_crypto::persistent_storage::ROOT_BYTES),
+        ] {
+            quil_types::consensus::set_persistent_storage_epoch_for_thread(activation);
+            assert_eq!(max_leaf_root_len() as usize, root_limit);
+            let max = MAX_PREFIX_LEN as usize;
+            let at_limits = vec![group(64, vec![entry(max, root_limit); max])];
+            let cases = [
+                (at_limits, true),
+                (
+                    vec![group(32, Vec::new()); MAX_CONFIRM_LEAF_ROOT_GROUPS],
+                    true,
+                ),
+                (
+                    vec![group(32, Vec::new()); MAX_CONFIRM_LEAF_ROOT_GROUPS + 1],
+                    false,
+                ),
+                (vec![group(65, Vec::new())], false),
+                (vec![group(32, vec![entry(1, 1); max + 1])], false),
+                (vec![group(32, vec![entry(max + 1, 1)])], false),
+                (vec![group(32, vec![entry(1, root_limit + 1)])], false),
+            ];
+            for (index, (groups, fits)) in cases.iter().enumerate() {
+                assert_eq!(
+                    check_confirm_leaf_roots(groups).is_ok(),
+                    *fits,
+                    "case {index}"
+                );
+                assert_eq!(decodes(groups), *fits, "case {index}");
+            }
+            let error = check_confirm_leaf_roots(&[group(1, vec![entry(1, root_limit + 1)])])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!(
+                    "leaf-root group 04: a leaf root of {} bytes (at most {})",
+                    root_limit + 1,
+                    root_limit
+                )),
+                "{error}"
             );
-            assert_eq!(decodes(groups), *fits, "case {index}");
         }
-        let error = check_confirm_leaf_roots(&[group(1, vec![entry(1, 129)])])
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("leaf-root group 04: a leaf root of 129 bytes (at most 128)"),
-            "{error}"
-        );
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
     }
 
     fn sample(sig: bool) -> LeafRootRegistration {

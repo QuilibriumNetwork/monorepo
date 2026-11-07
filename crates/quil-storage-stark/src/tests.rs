@@ -571,3 +571,72 @@ fn opening_costs() {
         proof.len() / 1024
     );
 }
+
+#[test]
+fn stable_replica_keys_do_not_allow_epoch_stark_replay_after_1429() {
+    let legacy = Fixture::at(b"stable-key-leaf", 1428, 4096, 3);
+    let first = Fixture::at(b"stable-key-leaf", 1429, 4096, 3);
+    let next = Fixture::at(b"stable-key-leaf", 1430, 4096, 3);
+    assert_ne!(legacy.encoded.replica, first.encoded.replica);
+    assert_eq!(first.encoded.replica, next.encoded.replica);
+    let params = SdrParams::default();
+    let count = 8;
+    let statement = first.statement(b"beacon");
+    let plain = first.seal(&statement, count);
+    let proof = seal::prove(&statement, &params, count, &plain).unwrap();
+    seal::verify(&statement, &params, count, &proof).unwrap();
+    let later = next.statement(b"beacon");
+    assert!(seal::verify(&later, &params, count, &proof).is_err());
+    let plain = next.seal(&later, count);
+    let proof = seal::prove(&later, &params, count, &plain).unwrap();
+    seal::verify(&later, &params, count, &proof).unwrap();
+    assert!(seal::verify(&statement, &params, count, &proof).is_err());
+}
+
+#[test]
+fn experimental_profiles_verify_and_reject_cross_profile_proofs() {
+    for layers in [2, 3] {
+        let params = SdrParams {
+            layers,
+            ..Default::default()
+        };
+        let mut fixture = Fixture::new(60);
+        fixture.encoded = encode_leaf(
+            &data(60, 3),
+            &sdr::replica_key(&fixture.member, &fixture.leaf, fixture.epoch),
+            &params,
+        );
+        let statement = fixture.statement(b"profile-beacon");
+        let plain = prove_seal(&fixture.encoded.replica, &statement, &params, 64).unwrap();
+        let proof = seal::prove(&statement, &params, 64, &plain).unwrap();
+        seal::verify(&statement, &params, 64, &proof).unwrap();
+        for other in [2, 3, 11].into_iter().filter(|other| *other != layers) {
+            let wrong = SdrParams {
+                layers: other,
+                ..Default::default()
+            };
+            assert!(seal::verify(&statement, &wrong, 64, &proof).is_err());
+        }
+        let mut malformed = plain.clone();
+        malformed.openings[0].column.labels.pop();
+        assert!(seal::prove(&statement, &params, 64, &malformed).is_err());
+        let epoch = EpochStatement {
+            seals: vec![statement],
+            count: 64,
+            held: vec![],
+            frames: vec![],
+            queries: 0,
+        };
+        let outcome = std::panic::catch_unwind(|| {
+            seal::prove_with(&epoch, &params, &[&plain], &[], &mut |table, trace| {
+                if table == 3 {
+                    let width = trace.width;
+                    trace.values[(layers - 1) * width + seal::col::LABEL] += Val::ONE;
+                }
+            })
+        });
+        if let Ok(Ok(forged)) = outcome {
+            assert!(seal::verify_epoch(&epoch, &params, &forged).is_err());
+        }
+    }
+}

@@ -5,6 +5,7 @@
 //! hash-based throughout, so post-quantum up to generic attacks.
 
 pub mod config;
+pub mod persistent;
 mod poseidon;
 pub mod seal;
 

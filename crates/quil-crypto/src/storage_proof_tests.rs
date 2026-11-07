@@ -1008,27 +1008,201 @@ fn labelling_stops_when_told_and_is_unchanged_otherwise() {
         label_leaf_until(n, key, &params(), &mut |_, _| {}, &|| false),
         Some(whole)
     );
-    // Stopped within the second layer: one layer handed on, then none.
-    let looks = Cell::new(0usize);
-    let checks_per_layer = (n as usize).div_ceil(STOP_CHECK_NODES);
+    // Worker polling is timed: stop immediately after the first callback.
+    let done = Cell::new(false);
+    let stopped_looks = Cell::new(0usize);
     let mut layers = Vec::new();
     let stopped = label_leaf_until(
         n,
         key,
         &params(),
-        &mut |index, _| layers.push(index),
+        &mut |index, _| {
+            layers.push(index);
+            done.set(true);
+        },
         &|| {
-            looks.set(looks.get() + 1);
-            looks.get() > checks_per_layer + 1
+            if done.get() {
+                stopped_looks.set(stopped_looks.get() + 1);
+                true
+            } else {
+                false
+            }
         },
     );
     assert_eq!(stopped, None);
     assert_eq!(layers, vec![0], "no layer after the stop");
     assert_eq!(
-        looks.get(),
-        checks_per_layer + 2,
-        "it stops at the first look that says so"
+        stopped_looks.get(),
+        1,
+        "stops at the first affirmative look"
     );
+}
+
+#[test]
+fn streaming_caps_match_full_trees_including_partial_subtrees() {
+    for n in [1, 2, 3, 7, 1024, 1025, 3000] {
+        let bytes = nodes(n, 3);
+        let digests = hash::digests_from_bytes(&bytes).unwrap();
+        let full = MerkleTree::from_digests(digests.clone());
+        for height in [0, 3, CAP_HEIGHT, 20] {
+            let cap = MerkleCap::from_digests(&digests, height);
+            assert_eq!(cap, full.cap(height), "n={n} height={height}");
+            for i in [0, n / 2, n - 1] {
+                assert_eq!(cap.path(&bytes, i as u64), Some(full.path(i as u64)));
+            }
+        }
+    }
+}
+
+#[test]
+fn concurrent_labels_match_the_scalar_reference_on_every_layer() {
+    let barrier = std::sync::Barrier::new(4);
+    std::thread::scope(|scope| {
+        for (id, n) in [17usize, 18, 19, 17].into_iter().enumerate() {
+            let barrier = &barrier;
+            scope.spawn(move || {
+                let key = [id as u8 + 1; 32];
+                let expected = all_layers(n, &key);
+                let thread = std::thread::current().id();
+                let mut layers = Vec::new();
+                barrier.wait();
+                let (last, columns) = label_leaf(n as u64, &key, &params(), &mut |_, layer| {
+                    assert_eq!(thread, std::thread::current().id());
+                    layers.push(layer.to_vec());
+                });
+                assert_eq!(layers, expected);
+                assert_eq!(last, *expected.last().unwrap());
+                for v in 0..n {
+                    let column: Vec<Node> =
+                        expected.iter().map(|l| hash::to_bytes(&l[v])).collect();
+                    assert_eq!(hash::to_bytes(&columns[v]), column_digest(&column).unwrap());
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn cancelling_one_batched_leaf_does_not_cancel_its_peers() {
+    let barrier = std::sync::Barrier::new(4);
+    std::thread::scope(|scope| {
+        for id in 0..4 {
+            let barrier = &barrier;
+            scope.spawn(move || {
+                let stopped = std::cell::Cell::new(false);
+                barrier.wait();
+                let result = label_leaf_until(
+                    73,
+                    &[id; 32],
+                    &params(),
+                    &mut |_, _| {
+                        if id == 0 {
+                            stopped.set(true);
+                        }
+                    },
+                    &|| stopped.get(),
+                );
+                assert_eq!(result.is_none(), id == 0);
+                if let Some((last, _)) = result {
+                    assert_eq!(last, *all_layers(73, &[id; 32]).last().unwrap());
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn sparse_seals_equal_dense_seals_and_reject_stale_cache_roots() {
+    struct Sparse {
+        kept: Kept,
+        encoded: EncodedLeaf,
+        data: Vec<u8>,
+        column: Vec<u8>,
+        cap: MerkleCap,
+    }
+    impl LabelSource for Sparse {
+        fn label(&self, layer: usize, v: u64) -> Option<Node> {
+            self.kept.label(layer, v)
+        }
+        fn columns(&self) -> Option<Vec<Digest>> {
+            panic!("sparse seals must not load full columns")
+        }
+        fn last_layer(&self) -> Option<Vec<Digest>> {
+            panic!("sparse seals must not load a full label layer")
+        }
+        fn cap(&self, tree: Tree) -> Option<MerkleCap> {
+            Some(match tree {
+                Tree::Data => self.encoded.data_cap.clone(),
+                Tree::Column => self.cap.clone(),
+                Tree::Replica => self.encoded.replica_cap.clone(),
+            })
+        }
+        fn nodes(&self, tree: Tree, range: std::ops::Range<u64>) -> Option<Vec<u8>> {
+            assert!(range.end - range.start <= 1 << CAP_HEIGHT);
+            let bytes = match tree {
+                Tree::Data => &self.data,
+                Tree::Column => &self.column,
+                Tree::Replica => &self.encoded.replica,
+            };
+            Some(bytes[range.start as usize * NODE_BYTES..range.end as usize * NODE_BYTES].to_vec())
+        }
+    }
+    let m = member(3);
+    let raw = data(1025 * 30, 9);
+    let key = sdr::replica_key(&m, LEAF, EPOCH);
+    let (kept, comm_c) = Kept::label(1025, &key);
+    let encoded = encode_with_labels(&raw, 1025, kept.layers.last().unwrap(), comm_c).unwrap();
+    let stmt = statement(&m, &encoded, b"beacon");
+    let dense = prove_seal_with_labels(&encoded.replica, &stmt, &params(), 8, &kept).unwrap();
+    let source = Sparse {
+        cap: MerkleCap::from_digests(&kept.columns, CAP_HEIGHT),
+        column: hash::digests_to_bytes(&kept.columns),
+        data: data_nodes(&raw),
+        kept,
+        encoded,
+    };
+    let sparse = prove_seal_with_labels(&[], &stmt, &params(), 8, &source).unwrap();
+    assert_eq!(sparse, dense);
+    verify_seal(&stmt, &sparse, &params(), 8).unwrap();
+    let wrong = SealStatement {
+        epoch: EPOCH + 1,
+        ..stmt
+    };
+    assert!(prove_seal_with_labels(&[], &wrong, &params(), 8, &source).is_err());
+    let wrong = SealStatement {
+        registered: Registered {
+            comm_d: [0; NODE_BYTES],
+            ..stmt.registered
+        },
+        ..stmt
+    };
+    assert!(prove_seal_with_labels(&[], &wrong, &params(), 8, &source).is_err());
+}
+
+#[test]
+fn stable_keys_start_at_1393_and_still_bind_the_identity_and_leaf() {
+    quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(1393));
+    assert_ne!(
+        sdr::replica_key(b"a", b"leaf", 1391),
+        sdr::replica_key(b"a", b"leaf", 1392)
+    );
+    assert_ne!(
+        sdr::replica_key(b"a", b"leaf", 1392),
+        sdr::replica_key(b"a", b"leaf", 1393)
+    );
+    assert_eq!(
+        sdr::replica_key(b"a", b"leaf", 1393),
+        sdr::replica_key(b"a", b"leaf", 1394)
+    );
+    assert_ne!(
+        sdr::replica_key(b"a", b"leaf", 1393),
+        sdr::replica_key(b"b", b"leaf", 1393)
+    );
+    assert_ne!(
+        sdr::replica_key(b"a", b"leaf", 1393),
+        sdr::replica_key(b"a", b"other", 1393)
+    );
+    quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
 }
 
 /// Labelling resumed from the whole layers a stopped attempt handed on
@@ -1047,19 +1221,18 @@ fn labelling_resumed_from_kept_layers_is_the_leaf_labelled_at_once() {
     let comm_c =
         |columns: Vec<hash::Digest>| MerkleTree::from_digests(columns).commitment(Tree::Column);
     let expected = comm_c(columns.clone());
-    // Stopped within the fourth layer: three whole layers handed on.
-    let looks = Cell::new(0usize);
-    let checks_per_layer = (n as usize).div_ceil(STOP_CHECK_NODES);
+    // Stop after three complete callbacks, independent of worker timing.
+    let done = Cell::new(0usize);
     let mut kept = Vec::new();
     let stopped = label_leaf_until(
         n,
         key,
         &params(),
-        &mut |_, layer| kept.push(layer.to_vec()),
-        &|| {
-            looks.set(looks.get() + 1);
-            looks.get() > 3 * checks_per_layer + 1
+        &mut |index, layer| {
+            kept.push(layer.to_vec());
+            done.set(index + 1);
         },
+        &|| done.get() >= 3,
     );
     assert!(stopped.is_none());
     assert_eq!(kept.len(), 3);
@@ -1107,4 +1280,48 @@ fn labelling_resumed_from_kept_layers_is_the_leaf_labelled_at_once() {
         &|| false,
     );
     assert!(unreadable.is_none());
+}
+
+#[test]
+fn cached_subtree_paths_match_full_trees_including_short_tails() {
+    for n in [1, 2, 3, 5, 31, 32, 33, 1000, 1025] {
+        let nodes = nodes(n, 9);
+        let tree = MerkleTree::from_nodes(&nodes).unwrap();
+        for height in [0, 1, 3, 10] {
+            let cap = tree.cap(height);
+            for index in [0, n / 2, n - 1] {
+                let range = cap.subtree(index as u64).unwrap();
+                let subtree = MerkleTree::from_nodes(
+                    &nodes[range.start as usize * 32..range.end as usize * 32],
+                )
+                .unwrap();
+                assert_eq!(
+                    cap.path_from_subtree(&subtree, index as u64),
+                    Some(tree.path(index as u64)),
+                    "n={n},height={height},index={index}"
+                );
+                let mut corrupt =
+                    nodes[range.start as usize * 32..range.end as usize * 32].to_vec();
+                corrupt[0] ^= 1;
+                let corrupt = MerkleTree::from_nodes(&corrupt).unwrap();
+                assert!(cap.path_from_subtree(&corrupt, index as u64).is_none());
+            }
+            assert!(cap.path_from_subtree(&tree, n as u64).is_none());
+        }
+    }
+}
+
+#[test]
+fn logarithmic_zero_commitment_matches_dense_padding() {
+    assert!(zero_commitment(Tree::Data, 0).is_none());
+    for n in [1, 2, 3, 5, 8, 31, 33, 1025] {
+        let tree = MerkleTree::from_nodes(&vec![0; n * 32]).unwrap();
+        for kind in [Tree::Data, Tree::Replica, Tree::Column] {
+            assert_eq!(
+                zero_commitment(kind, n as u64),
+                Some(tree.commitment(kind)),
+                "n={n}"
+            );
+        }
+    }
 }
