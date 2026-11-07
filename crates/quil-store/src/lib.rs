@@ -19,8 +19,8 @@ mod token;
 mod worker;
 
 pub use clock::{
-    CandidatePrune, GlobalFrameCacheStats, PrunedShard, RocksClockStore, StagedFrameCleanup,
-    UnservedFramePrune,
+    CandidatePrune, GlobalFrameCacheStats, KeptShard, PrunedShard, RocksClockStore,
+    StagedFrameCleanup, UnservedFramePrune,
 };
 pub use clock_overlay::OverlayClockStore;
 pub use dispatch::{InboxUsage, RocksInboxStore, INBOX_MESSAGE_KEY_LEN};

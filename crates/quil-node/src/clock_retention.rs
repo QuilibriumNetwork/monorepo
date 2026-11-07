@@ -285,13 +285,49 @@ struct UnservedPass {
     pause: Duration,
 }
 
-/// What one [`prune_unserved`] pass did.
+/// What one [`prune_unserved`] pass did, each shard counted once: in
+/// `pruned` when any of its frames went, else under the reason the last step
+/// that reached it kept it for.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct UnservedTotals {
+    /// Shards with a latest-frame index the pass examined.
     shards: u64,
+    /// Shards whose old frames were deleted.
+    pruned: u64,
     frames: u64,
     bytes: u64,
     compacted: u64,
+    /// Kept whole: a worker or engine of this node serves them.
+    served: u64,
+    /// Kept whole: the latest frame is within the idle bound.
+    recent: u64,
+    /// Kept whole: the index or the latest frame does not decode.
+    unreadable: u64,
+    /// Unserved and idle with only the latest frame left: pruned before.
+    latest_only: u64,
+}
+
+impl UnservedTotals {
+    fn count(
+        &mut self,
+        pruned: &HashMap<Vec<u8>, (u64, u64)>,
+        kept: &HashMap<Vec<u8>, quil_store::KeptShard>,
+    ) {
+        use quil_store::KeptShard;
+        self.pruned = pruned.len() as u64;
+        for (filter, why) in kept {
+            if pruned.contains_key(filter) {
+                continue;
+            }
+            match why {
+                KeptShard::Served => self.served += 1,
+                KeptShard::Recent => self.recent += 1,
+                KeptShard::Unreadable => self.unreadable += 1,
+                KeptShard::LatestOnly => self.latest_only += 1,
+            }
+        }
+        self.shards = self.pruned + self.served + self.recent + self.unreadable + self.latest_only;
+    }
 }
 
 fn now_ms() -> i64 {
@@ -302,7 +338,8 @@ fn now_ms() -> i64 {
 
 /// One bounded pass from `resume`, which it leaves where the next pass goes
 /// on. The served set is read again for every step; when it cannot be read
-/// the pass stops.
+/// the pass stops. Every pass that reads it ends with one summary line: what
+/// went and why each other shard from `resume` on stayed.
 fn prune_unserved(
     store: &quil_store::RocksClockStore,
     served: &(dyn Fn() -> Option<HashSet<Vec<u8>>> + Send + Sync),
@@ -314,12 +351,14 @@ fn prune_unserved(
     let idle_before_ms = now_ms().saturating_sub(pass.idle.as_millis() as i64);
     let mut totals = UnservedTotals::default();
     let mut shards: HashMap<Vec<u8>, (u64, u64)> = HashMap::new();
-    let (mut examined, mut announced, mut overran) = (0u64, false, false);
+    let mut kept: HashMap<Vec<u8>, quil_store::KeptShard> = HashMap::new();
+    let (mut examined, mut announced, mut overran, mut listed) = (0u64, false, false, false);
     loop {
         let Some(set) = served() else {
             info!(store = %label, "unserved shard frame pass skipped: the served shards cannot be listed");
             break;
         };
+        listed = true;
         let is_served = |filter: &[u8]| set.contains(filter);
         let step = pass
             .step
@@ -337,6 +376,7 @@ fn prune_unserved(
                 true,
             ) {
                 Ok(dry) if dry.pruned.is_empty() && dry.next.is_none() => {
+                    kept.extend(dry.kept);
                     *resume = None;
                     break;
                 }
@@ -364,6 +404,7 @@ fn prune_unserved(
             }
         };
         examined += step.examined.max(1);
+        kept.extend(step.kept);
         for shard in &step.pruned {
             let entry = shards.entry(shard.filter.clone()).or_default();
             entry.0 = entry.0.max(shard.below);
@@ -382,18 +423,21 @@ fn prune_unserved(
         }
         std::thread::sleep(pass.pause);
     }
-    totals.shards = shards.len() as u64;
+    totals.count(&shards, &kept);
     for (filter, (below, bytes)) in &shards {
         if *bytes >= quil_store::RocksClockStore::SHARD_FRAME_RECLAIM_BYTES {
             store.compact_pruned_shard_frames(filter, *below);
             totals.compacted += 1;
         }
     }
-    if announced {
-        info!(store = %label, shards = totals.shards, frames = totals.frames,
-            mib = totals.bytes >> 20, compacted = totals.compacted,
-            done = resume.is_none(), secs = started.elapsed().as_secs(),
-            "pruned frames of shards this node no longer serves");
+    if listed {
+        info!(store = %label, shards = totals.shards, pruned = totals.pruned,
+            frames = totals.frames, bytes = totals.bytes, compacted = totals.compacted,
+            kept_served = totals.served, kept_recent = totals.recent,
+            kept_unreadable = totals.unreadable, kept_latest_only = totals.latest_only,
+            idle_secs = pass.idle.as_secs(), done = resume.is_none(),
+            millis = started.elapsed().as_millis() as u64,
+            "unserved shard frame pass finished");
     }
     totals
 }
@@ -570,8 +614,83 @@ mod unserved_tests {
             12,
             "a recently left shard keeps every frame"
         );
-        assert_eq!((totals.shards, totals.frames, totals.compacted), (1, 11, 0));
+        assert_eq!((totals.pruned, totals.frames, totals.compacted), (1, 11, 0));
         assert_eq!(resume, None);
+    }
+
+    /// A pass's summary counts each shard once, whatever number of steps
+    /// reached it: pruned, or kept as served, recent or already pruned; a
+    /// pass with nothing to delete still counts every shard it kept.
+    #[test]
+    fn a_pass_summary_counts_each_shard_once_by_why_it_stayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, s) = open(dir.path());
+        let (left, served, recent, done) =
+            (vec![1u8; 35], vec![2u8; 35], vec![3u8; 35], vec![4u8; 35]);
+        serve(&s, &left, 12, 3 * DAY);
+        serve(&s, &served, 12, 3 * DAY);
+        serve(&s, &recent, 12, DAY);
+        serve(&s, &done, 1, 3 * DAY);
+        let set: HashSet<Vec<u8>> = [served.clone()].into();
+        let listed = move || Some(set.clone());
+        let mut resume = None;
+
+        // Steps of 4 frame keys: the first shard takes several steps.
+        let first = prune_unserved(&s, &listed, &pass(1_000), &mut resume, "test");
+        let counts = |t: &UnservedTotals| {
+            (
+                t.shards,
+                t.pruned,
+                t.served,
+                t.recent,
+                t.unreadable,
+                t.latest_only,
+            )
+        };
+        assert_eq!(
+            counts(&first),
+            (4, 1, 1, 1, 0, 1),
+            "first_pass_counts: (shards, pruned, served, recent, unreadable, latest only)"
+        );
+        assert_eq!((first.frames, first.bytes > 0), (11, true));
+
+        let second = prune_unserved(&s, &listed, &pass(1_000), &mut resume, "test");
+        assert_eq!(
+            counts(&second),
+            (4, 0, 1, 1, 0, 2),
+            "idle_pass_counts: a pass with nothing to delete counts what it kept"
+        );
+        assert_eq!((second.frames, second.bytes), (0, 0));
+        assert_eq!(resume, None);
+    }
+
+    /// A shard taken up after a step of the pass deleted some of its frames
+    /// counts as pruned, not as served.
+    #[test]
+    fn a_shard_taken_up_mid_pass_counts_as_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, s) = open(dir.path());
+        let left = vec![1u8; 35];
+        serve(&s, &left, 12, 3 * DAY);
+        let calls = std::sync::atomic::AtomicU64::new(0);
+        // Listed once per step: the third step finds the shard served.
+        let listed = || {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(if call < 2 {
+                HashSet::new()
+            } else {
+                HashSet::from([left.clone()])
+            })
+        };
+        let mut resume = None;
+
+        let totals = prune_unserved(&s, &listed, &pass(1_000), &mut resume, "test");
+        assert_eq!(frames(&s, &left, 12), 4, "two steps deleted 8 frames");
+        assert_eq!(
+            (totals.shards, totals.pruned, totals.served, totals.frames),
+            (1, 1, 0, 8),
+            "taken_up_counts: (shards, pruned, served, frames)"
+        );
     }
 
     /// Without the served shards, a pass deletes nothing.
@@ -734,8 +853,8 @@ mod unserved_tests {
                 .unwrap();
             if next.is_none() {
                 dry.0 = step.shards;
-                dry.1 = step.served;
-                dry.2 = step.recent;
+                dry.1 = step.kept(quil_store::KeptShard::Served);
+                dry.2 = step.kept(quil_store::KeptShard::Recent);
             }
             dry.3 += step.frames();
             dry.4 += step.bytes();

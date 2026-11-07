@@ -22,18 +22,29 @@ pub struct PrunedShard {
     pub bytes: u64,
 }
 
+/// Why a call of [`RocksClockStore::prune_unserved_shard_frames`] deleted
+/// no frame of a shard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeptShard {
+    /// The caller serves it.
+    Served,
+    /// Its latest frame is within the idle bound.
+    Recent,
+    /// The index or the latest frame does not decode, or the index moved
+    /// while the shard was scanned.
+    Unreadable,
+    /// Unserved and idle, but no frame below its latest is left.
+    LatestOnly,
+}
+
 /// One call of [`RocksClockStore::prune_unserved_shard_frames`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UnservedFramePrune {
     /// Shards with a latest-frame index examined.
     pub shards: u64,
-    /// Kept whole: the caller serves them.
-    pub served: u64,
-    /// Kept whole: the latest frame is within the idle bound.
-    pub recent: u64,
-    /// Kept whole: the index or the latest frame does not decode, or the
-    /// index moved while the shard was scanned.
-    pub unreadable: u64,
+    /// Shards examined whose frames all stay, and why. A shard the call
+    /// stopped in before reaching any of its frames is in neither list.
+    pub kept: Vec<(Vec<u8>, KeptShard)>,
     /// Frame keys examined.
     pub examined: u64,
     /// Shards whose old frames were deleted (or, in a dry run, deletable).
@@ -49,6 +60,11 @@ impl UnservedFramePrune {
 
     pub fn bytes(&self) -> u64 {
         self.pruned.iter().map(|p| p.bytes).sum()
+    }
+
+    /// Shards kept for `why`.
+    pub fn kept(&self, why: KeptShard) -> u64 {
+        self.kept.iter().filter(|(_, kept)| *kept == why).count() as u64
     }
 }
 
@@ -142,20 +158,20 @@ impl RocksClockStore {
             };
             result.shards += 1;
             if served(&filter) {
-                result.served += 1;
+                result.kept.push((filter, KeptShard::Served));
                 continue;
             }
             let Some(head) = head else {
-                result.unreadable += 1;
+                result.kept.push((filter, KeptShard::Unreadable));
                 continue;
             };
             match self.latest_frame_timestamp(&filter, head)? {
                 None => {
-                    result.unreadable += 1;
+                    result.kept.push((filter, KeptShard::Unreadable));
                     continue;
                 }
                 Some(timestamp) if timestamp >= idle_before_ms => {
-                    result.recent += 1;
+                    result.kept.push((filter, KeptShard::Recent));
                     continue;
                 }
                 Some(_) => {}
@@ -167,9 +183,9 @@ impl RocksClockStore {
                 // The shard may have been taken up while it was scanned.
                 let index = encoding::clock_shard_latest_index(&filter);
                 if self.read_u64_index_checked(&index)? != Some(head) {
-                    result.unreadable += 1;
+                    result.kept.push((filter.clone(), KeptShard::Unreadable));
                 } else if served(&filter) {
-                    result.served += 1;
+                    result.kept.push((filter.clone(), KeptShard::Served));
                 } else {
                     if !dry_run {
                         let mut batch =
@@ -188,6 +204,8 @@ impl RocksClockStore {
                         bytes: scan.bytes,
                     });
                 }
+            } else if scan.stopped.is_none() {
+                result.kept.push((filter.clone(), KeptShard::LatestOnly));
             }
             if scan.stopped.is_some() {
                 result.next = scan.stopped;
@@ -408,8 +426,24 @@ mod tests {
             .get_staged_shard_clock_frame(&left, 41, &[0x41; 32], false)
             .is_ok());
         assert_eq!(pass.frames(), 39);
-        assert_eq!((pass.shards, pass.served, pass.recent), (4, 2, 1));
+        assert_eq!(
+            (
+                pass.shards,
+                pass.kept(KeptShard::Served),
+                pass.kept(KeptShard::Recent)
+            ),
+            (4, 2, 1)
+        );
         assert_eq!(pass.next, None);
+        let again = s
+            .prune_unserved_shard_frames(&is_served, BOUND, None, usize::MAX, false)
+            .unwrap();
+        assert!(again.pruned.is_empty());
+        assert_eq!(
+            again.kept(KeptShard::LatestOnly),
+            1,
+            "a pruned shard is kept with only its latest frame"
+        );
     }
 
     /// A call examines at most its budget of frame keys, a longer filter's
@@ -503,7 +537,7 @@ mod tests {
             10,
             "a shard taken up during its scan keeps its frames"
         );
-        assert_eq!(pass.served, 1);
+        assert_eq!(pass.kept(KeptShard::Served), 1);
     }
 
     /// Compacting a pruned shard's range drops its table files.
