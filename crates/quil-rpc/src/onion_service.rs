@@ -224,6 +224,12 @@ impl Transport for OnionTransport {
             Some(sa) => sa,
             None => return false,
         };
+        // The stream is filed under `peer_id`, so the dial must reach that
+        // peer: a node answering at its advertised address as another is
+        // refused.
+        let Ok(expected) = quil_p2p::PeerId::from_bytes(peer_id) else {
+            return false;
+        };
 
         // `http://` scheme: tonic refuses `https://` unless its own TLS is set;
         // we install our own PQNoise connector on :8340 instead.
@@ -237,7 +243,7 @@ impl Transport for OnionTransport {
                 Err(_) => return false,
             };
         let channel = match endpoint
-            .connect_with_connector(QuilPqNoiseConnector::new(seed))
+            .connect_with_connector(QuilPqNoiseConnector::new(seed).with_expected_peer(expected))
             .await
         {
             Ok(ch) => ch,
@@ -285,6 +291,43 @@ impl Transport for OnionTransport {
         });
         true
     }
+}
+
+/// A loopback onion service answering every dial as the holder of
+/// `signing_key`, until the test's runtime ends: its stream multiaddr.
+#[cfg(test)]
+pub(crate) async fn onion_server_as(signing_key: Vec<u8>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let (tx, key) = (tx.clone(), signing_key.clone());
+            tokio::spawn(async move {
+                if let Ok(stream) = crate::pqnoise_channel::pq_server_handshake(tcp, &key).await {
+                    let _ = tx.send(Ok::<_, std::io::Error>(stream));
+                }
+            });
+        }
+    });
+    let service = OnionTransport::new(b"server".to_vec(), Arc::new(|_: &[u8]| Some(Vec::new())));
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(
+                quil_types::proto::global::onion_service_server::OnionServiceServer::new(service),
+            )
+            .serve_with_incoming(tokio_stream::wrappers::UnboundedReceiverStream::new(rx)),
+    );
+    format!("/ip4/127.0.0.1/tcp/{port}")
+}
+
+/// The peer `signing_key` identifies.
+#[cfg(test)]
+pub(crate) fn peer_of(signing_key: &[u8]) -> quil_p2p::PeerId {
+    quil_p2p::Keypair::falcon_from_bytes(signing_key)
+        .unwrap()
+        .public()
+        .to_peer_id()
 }
 
 type ConnectStreamOut =
@@ -481,6 +524,44 @@ mod tests {
 
         drop(in_tx);
         let _ = pump.await;
+    }
+
+    /// An onion link to a routing peer is opened only when the node at its
+    /// advertised address answers as that peer: one answering with another
+    /// identity is refused and no stream is filed under the peer, so cells
+    /// meant for it never go to that node.
+    #[tokio::test]
+    async fn an_onion_link_is_opened_only_to_the_peer_it_is_for() {
+        let hop_key = quil_p2p::generate_falcon_signing_key();
+        let hop = peer_of(&hop_key).to_bytes();
+        for (answering, linked) in [
+            (quil_p2p::generate_falcon_signing_key(), false),
+            (hop_key.clone(), true),
+        ] {
+            let addr = onion_server_as(answering).await;
+            let dialer_key = quil_p2p::generate_falcon_signing_key();
+            let dialer = OnionTransport::new_with_dialer(
+                peer_of(&dialer_key).to_bytes(),
+                routing_lookup_allowing(vec![addr]),
+                dialer_key,
+            );
+            let connected = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                dialer.ensure_connected(&hop),
+            )
+            .await
+            .expect("the dial ends");
+            let filed = dialer.inner.client_streams.read().contains_key(&hop);
+            if !linked && (connected || filed) {
+                panic!(
+                    "VULNERABLE: an unpinned onion dial filed a node answering with a \
+                     different peer's identity as the routing peer"
+                );
+            }
+            if linked && (!connected || !filed) {
+                panic!("the routing peer was refused at its own address");
+            }
+        }
     }
 
     #[test]

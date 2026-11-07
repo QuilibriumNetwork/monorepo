@@ -1477,13 +1477,15 @@ pub(crate) async fn start(
         let gap_ingest = gap_ingest.clone();
         let key = mtls_seed.map(|_| falcon_signing_key.clone());
         let gap_peers = peer_info_cache.clone();
+        let gap_registry: Arc<dyn quil_types::consensus::ProverRegistry> = prover_registry.clone();
         let gap_network = config.p2p.network;
         let no_member_notice: Arc<peer_info_file::HourlyNotice> = Default::default();
-        // One connection per endpoint, shared by every fetch: a frame each
-        // second used to open a new connection to every endpoint it asked.
-        let clients: Arc<
-            parking_lot::Mutex<std::collections::HashMap<String, quil_rpc::ArchiveClient>>,
-        > = Default::default();
+        // One connection per endpoint and the peer it must reach (none for
+        // an archive, which the pool pins), shared by every fetch: a frame
+        // each second used to open a new connection to every endpoint it
+        // asked.
+        type GapEndpoint = peer_info_file::GapEndpoint;
+        let clients: Arc<peer_info_file::GapClients> = Default::default();
         detached_spawner.detach("archive-shard-gap-fetch", async move {
             use futures::StreamExt;
             // Fetches at once, across shards. Four, each of one frame asked for
@@ -1512,18 +1514,32 @@ pub(crate) async fn start(
                 // archives that restarted together (the usual way a gap opens)
                 // missed the same frame. A live run sat on such a gap for the
                 // whole session while every member of the shard had the frame.
-                let (mut endpoints, peer_info_records) = {
+                // Members are the registered provers serving the shard: any
+                // key can sign a PeerInfo claiming it. Until the registry has
+                // loaded after a restart, every record's claim is taken,
+                // bounded, as the members are whom such a restart needs.
+                let (members, peer_info_records, registry_loaded) = {
                     let peers = gap_peers.read();
-                    (peer_info_file::shard_member_endpoints(&peers, &filter, gap_network), peers.len())
+                    let loaded = gap_registry.initial_load_complete();
+                    let members = if loaded {
+                        peer_info_file::registered_member_endpoints(&peers, &filter, gap_network, &*gap_registry)
+                    } else {
+                        peer_info_file::shard_member_endpoints(&peers, &filter, gap_network)
+                    };
+                    (members, peers.len(), loaded)
                 };
-                if endpoints.is_empty() && no_member_notice.due(&filter) {
-                    tracing::info!(filter = %hex::encode(&filter), frame = frame_number, peer_info_records,
-                        "app-shard gap fetch knows no member endpoint for this shard, so it asks archives only; \
+                if members.is_empty() && no_member_notice.due(&filter) {
+                    tracing::info!(filter = %hex::encode(&filter), frame = frame_number, peer_info_records, registry_loaded,
+                        "app-shard gap fetch knows no endpoint of a registered member of this shard, so it asks archives only; \
                          it ends when a member's PeerInfo arrives (repeated hourly while it lasts)");
                 }
+                let mut members: Vec<GapEndpoint> = members
+                    .into_iter()
+                    .map(|member| (member.addr, Some(member.peer)))
+                    .collect();
                 async move {
                     let Some(key) = key.as_ref() else { return };
-                    // Every one of the shard's members, then every archive: an
+                    // Every one of the shard's members and every archive: an
                     // archive that executed the GLOBAL frames rewarding this
                     // frame holds it. The archive used to be appended after
                     // the members and cut off at six endpoints, so on a shard
@@ -1536,38 +1552,34 @@ pub(crate) async fn start(
                     // are asked in an order that moves with each request and
                     // frame, a few at a time; each endpoint gets its own
                     // deadline, so unreachable members cannot use up the attempt.
+                    // Archives follow the first few members, before the rest,
+                    // so members that hold the dial for their whole deadline
+                    // delay an archive's answer by one deadline at most.
                     // Missing/failed requests are retried by the ingest timer.
                     const ARCHIVES: usize = 8;
                     const CONCURRENT: usize = 4;
                     const PER_ENDPOINT: std::time::Duration = std::time::Duration::from_secs(4);
-                    if !endpoints.is_empty() {
+                    if !members.is_empty() {
                         let turn = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                             .map_or(0, |elapsed| elapsed.as_secs() / 5) as usize;
-                        let len = endpoints.len();
-                        endpoints.rotate_left(turn.wrapping_add(frame_number as usize) % len);
+                        let len = members.len();
+                        members.rotate_left(turn.wrapping_add(frame_number as usize) % len);
                     }
                     // A failed or timed-out endpoint's connection is dropped
-                    // and opened again on its next request.
-                    let fetch_from = |addr: String, number: u64| {
+                    // and opened again on its next request. A member's dial
+                    // must reach the peer whose record named the endpoint.
+                    let fetch_from = |addr: String, peer: Option<quil_p2p::PeerId>, number: u64| {
                         let filter = filter.clone();
                         let clients = clients.clone();
                         async move {
+                            let endpoint: GapEndpoint = (addr, peer);
                             let fetch = async {
-                                let cached = clients.lock().get(&addr).cloned();
-                                let mut client = match cached {
-                                    Some(client) => client,
-                                    None => {
-                                        let client = quil_rpc::ArchiveClient::connect_mtls(&addr, key).await
-                                            .map_err(|e| e.to_string())?;
-                                        clients.lock().insert(addr.clone(), client.clone());
-                                        client
-                                    }
-                                };
+                                let mut client = peer_info_file::gap_fetch_client(&clients, &endpoint, key).await?;
                                 client.get_app_shard_frame(filter, number).await.map_err(|e| e.to_string())
                             };
                             let fetched = tokio::time::timeout(PER_ENDPOINT, fetch).await;
                             if !matches!(fetched, Ok(Ok(_))) {
-                                clients.lock().remove(&addr);
+                                clients.lock().remove(&endpoint);
                             }
                             fetched
                         }
@@ -1579,11 +1591,15 @@ pub(crate) async fn start(
                             archives.rotate_left(index);
                         }
                     }
+                    let later_members = members.split_off(CONCURRENT.min(members.len()));
+                    let mut endpoints = members;
                     for addr in archives.into_iter().take(ARCHIVES) {
-                        if !endpoints.contains(&addr) {
-                            endpoints.push(addr);
+                        let archive: GapEndpoint = (addr, None);
+                        if !endpoints.contains(&archive) {
+                            endpoints.push(archive);
                         }
                     }
+                    endpoints.extend(later_members);
                     // A frame that fails verification (a copy without its
                     // storage attestation, or one this archive stored from a
                     // session that later ended below it) does not end the
@@ -1604,12 +1620,13 @@ pub(crate) async fn start(
                         .and_then(|(_, verifier)| verifier.stored_above_cursor(&filter, number));
                     type Attempt = Result<Result<Option<quil_types::proto::global::AppShardFrame>, String>,
                         tokio::time::error::Elapsed>;
-                    let stored = local(frame_number).map(|frame| (LOCAL.to_string(), Attempt::Ok(Ok(Some(frame)))));
-                    let mut attempts = futures::stream::iter(stored).chain(futures::stream::iter(endpoints.iter().cloned().map(|addr| {
-                        let attempt = fetch_from(addr.clone(), frame_number);
-                        async move { (addr, attempt.await) }
+                    let stored = local(frame_number)
+                        .map(|frame| (LOCAL.to_string(), None::<quil_p2p::PeerId>, Attempt::Ok(Ok(Some(frame)))));
+                    let mut attempts = futures::stream::iter(stored).chain(futures::stream::iter(endpoints.iter().cloned().map(|(addr, peer)| {
+                        let attempt = fetch_from(addr.clone(), peer, frame_number);
+                        async move { (addr, peer, attempt.await) }
                     })).buffer_unordered(CONCURRENT));
-                    while let Some((source, attempt)) = attempts.next().await {
+                    while let Some((source, source_peer, attempt)) = attempts.next().await {
                         let frame = match attempt {
                             Ok(Ok(Some(frame))) if frame.header.as_ref().is_some_and(|h|
                                 h.address == filter && h.frame_number == frame_number) => frame,
@@ -1633,21 +1650,22 @@ pub(crate) async fn start(
                         let frames = match validator.as_ref() {
                             Some(validator) if anchored => {
                                 let fetch = |number: u64| {
-                                    let order: Vec<String> = std::iter::once(source.clone())
-                                        .chain(endpoints.iter().filter(|addr| **addr != source).cloned())
-                                        .collect();
+                                    let asked: GapEndpoint = (source.clone(), source_peer);
+                                    let order: Vec<GapEndpoint> = endpoints.iter().filter(|endpoint| **endpoint != asked)
+                                        .cloned().collect();
+                                    let order: Vec<GapEndpoint> = std::iter::once(asked).chain(order).collect();
                                     let filter = filter.clone();
                                     let fetch_from = &fetch_from;
                                     let local = &local;
                                     async move {
-                                        for addr in order {
+                                        for (addr, peer) in order {
                                             if addr == LOCAL {
                                                 if let Some(frame) = local(number) {
                                                     return Some(frame);
                                                 }
                                                 continue;
                                             }
-                                            if let Ok(Ok(Some(frame))) = fetch_from(addr, number).await {
+                                            if let Ok(Ok(Some(frame))) = fetch_from(addr, peer, number).await {
                                                 if frame.header.as_ref().is_some_and(|h| h.address == filter && h.frame_number == number) {
                                                     return Some(frame);
                                                 }

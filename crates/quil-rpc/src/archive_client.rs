@@ -332,6 +332,19 @@ impl ArchiveClient {
         Self::connect_pq(addr, connector).await
     }
 
+    /// [`Self::connect_mtls`] to a node that must answer as `peer`: a dial
+    /// to an endpoint taken from a peer's signed record, so that the
+    /// record cannot name another node's address and have it answer for it.
+    pub async fn connect_peer(
+        addr: &str,
+        falcon_signing_key: &[u8],
+        peer: quil_p2p::PeerId,
+    ) -> Result<Self, ArchiveClientError> {
+        let connector =
+            QuilPqNoiseConnector::new(falcon_signing_key.to_vec()).with_expected_peer(peer);
+        Self::connect_pq(addr, connector).await
+    }
+
     /// Connect only to this worker's own master, which holds the same Falcon
     /// identity. Historical canonical frames and the archive directory rely
     /// on this pin; possession of an unrelated peer key is insufficient.
@@ -339,12 +352,8 @@ impl ArchiveClient {
         addr: &str,
         falcon_signing_key: &[u8],
     ) -> Result<Self, ArchiveClientError> {
-        let peer = quil_p2p::Keypair::falcon_from_bytes(falcon_signing_key)
-            .map_err(|error| ArchiveClientError::TlsInit(format!("master identity: {error}")))?
-            .public()
-            .to_peer_id();
         let connector =
-            QuilPqNoiseConnector::new(falcon_signing_key.to_vec()).with_expected_peer(peer);
+            QuilPqNoiseConnector::to_own_master(falcon_signing_key.to_vec()).map_err(|e| *e)?;
         Self::connect_pq(addr, connector).await
     }
 
@@ -1358,6 +1367,21 @@ impl QuilPqNoiseConnector {
         self
     }
 
+    /// A connector to this node's own master, which holds the same Falcon
+    /// identity: a node answering at the master's address as another is
+    /// refused.
+    pub fn to_own_master(falcon_signing_key: Vec<u8>) -> Result<Self, Box<ArchiveClientError>> {
+        let peer = quil_p2p::Keypair::falcon_from_bytes(&falcon_signing_key)
+            .map_err(|error| {
+                Box::new(ArchiveClientError::TlsInit(format!(
+                    "master identity: {error}"
+                )))
+            })?
+            .public()
+            .to_peer_id();
+        Ok(Self::new(falcon_signing_key).with_expected_peer(peer))
+    }
+
     /// Fail with [`OwnEndpoint`] when the server is `peer`.
     pub fn refusing_peer(mut self, peer: quil_p2p::PeerId) -> Self {
         self.refused_peer = Some(peer);
@@ -1734,6 +1758,43 @@ mod pinned_archive_tests {
 #[cfg(test)]
 mod pinned_master_tests {
     use super::*;
+
+    /// A worker's connector to its master expects the node's own identity: a
+    /// node at the master's address holding another key is refused.
+    #[tokio::test]
+    async fn a_connector_to_the_own_master_refuses_another_identity() {
+        for same_key in [true, false] {
+            let client_key = quil_p2p::generate_falcon_signing_key();
+            let server_key = if same_key {
+                client_key.clone()
+            } else {
+                quil_p2p::generate_falcon_signing_key()
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                crate::pqnoise_channel::pq_server_handshake(tcp, &server_key)
+                    .await
+                    .unwrap()
+            });
+            let mut connector = QuilPqNoiseConnector::to_own_master(client_key).unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                connector.call(format!("http://{address}").parse().unwrap()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), same_key, "same key: {same_key}");
+            if let Err(error) = result {
+                assert!(
+                    error.to_string().contains("identity does not match"),
+                    "{error}"
+                );
+            }
+            let _ = server.await;
+        }
+    }
 
     #[tokio::test]
     async fn master_pin_accepts_own_key_and_rejects_a_legitimate_unrelated_peer() {
