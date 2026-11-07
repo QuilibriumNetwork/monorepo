@@ -61,7 +61,15 @@ fn pipeline_with_busy_patience(
 }
 
 fn certified_deploy(rig: &Rig) -> GlobalFrame {
-    let mut frame = rig.deploy();
+    certified(rig, rig.deploy())
+}
+
+/// [`certified_deploy`] with the deploy paid (a paying rig only).
+fn certified_paid_deploy(rig: &Rig) -> GlobalFrame {
+    certified(rig, rig.paid_deploy())
+}
+
+fn certified(rig: &Rig, mut frame: GlobalFrame) -> GlobalFrame {
     frame.header.as_mut().unwrap().prover = vec![0x42; 32];
     certify(&mut frame, &rig.signer, 0);
     frame
@@ -116,8 +124,8 @@ fn a_frame_waits_for_its_sequenced_ingest_before_executing() {
 
 #[test]
 fn queued_finalization_publishes_atomically_before_any_announcement() {
-    let rig = Rig::new();
-    let input = certified_deploy(&rig);
+    let rig = Rig::paying();
+    let input = certified_paid_deploy(&rig);
     let (pipeline, seen) = pipeline(&rig, prover(&input), 8);
     assert!(pipeline.offer(input.clone()));
     let FinalizationStep::Published { frame, result } = pipeline.step(1) else {
@@ -512,8 +520,8 @@ fn atomic_finalizer_keeps_the_legacy_order_beyond_the_admission_window() {
 // uncertified ancestor stops GLOBAL publishing.
 #[test]
 fn a_certified_descendant_publishes_its_notarized_ancestor() {
-    let rig = Rig::new();
-    let ancestor = rig.deploy();
+    let rig = Rig::paying();
+    let ancestor = rig.paid_deploy();
     let noop = crate::cw_global_seams::NoopTxn;
     rig.clock
         .put_global_clock_frame_candidate(&ancestor, &noop)

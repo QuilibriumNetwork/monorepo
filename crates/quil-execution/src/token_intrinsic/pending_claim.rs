@@ -71,9 +71,10 @@ pub(crate) fn check_authorization(
         // Expiry does not revoke the recipient's right to claim.
         ClaimBranch::Recipient => &policy.recipient,
         ClaimBranch::Refund => {
-            let frame = finalized_global_frame.ok_or_else(|| {
-                QuilError::ExecutionUnavailable("refund requires consensus global anchor".into())
-            })?;
+            // A frame naming no anchor is a property of the certified frame, so
+            // every replica refuses alike instead of failing the frame on each retry.
+            let frame = finalized_global_frame
+                .ok_or_else(|| invalid("refund requires the frame's global anchor"))?;
             policy
                 .key_for_branch(ClaimBranch::Refund, frame)
                 .ok_or_else(|| invalid("refund before global deadline"))?
@@ -921,7 +922,7 @@ mod tests {
         sign(&mut claim, &refunder);
         assert!(matches!(
             check(&claim, None),
-            Err(QuilError::ExecutionUnavailable(_))
+            Err(QuilError::InvalidArgument(_))
         ));
         assert!(matches!(
             check(&claim, Some(99)),

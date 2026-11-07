@@ -412,10 +412,39 @@ impl ExecutionEngineManager {
         Ok(self)
     }
 
-    /// Set the network this node prices state growth for. Every node of a
-    /// network must use the same value (it is the network's own selector).
+    /// Set the network this node prices state growth for, which is also the
+    /// network whose first citable global frame bounds the settlement claims
+    /// the compute and hypergraph engines admit, and the token engine admits
+    /// without a token policy. Every node of a network must use the same value
+    /// (it is the network's own selector).
     pub fn with_pricing_network(mut self, network: u8) -> Self {
         self.pricing_network = network;
+        let engines = self
+            .engines
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(feature = "native-proof")]
+        if let Some(token) = engines
+            .get_mut("token")
+            .and_then(|engine| engine.as_any_mut())
+            .and_then(|engine| engine.downcast_mut::<TokenExecutionEngine>())
+        {
+            token.set_network(network);
+        }
+        if let Some(compute) = engines
+            .get_mut("compute")
+            .and_then(|engine| engine.as_any_mut())
+            .and_then(|engine| engine.downcast_mut::<ComputeExecutionEngine>())
+        {
+            compute.set_network(network);
+        }
+        if let Some(hypergraph) = engines
+            .get_mut("hypergraph")
+            .and_then(|engine| engine.as_any_mut())
+            .and_then(|engine| engine.downcast_mut::<HypergraphExecutionEngine>())
+        {
+            hypergraph.set_network(network);
+        }
         self
     }
 
@@ -2112,6 +2141,92 @@ impl ExecutionEngineManager {
                 }
                 _ => 0,
             })
+        }
+    }
+
+    /// GLOBAL frames whose prover roots the reward citations of a request or
+    /// bundle to `address` name (mint claims, settlement claims and coin
+    /// deliveries that decode), limited to the ones execution reads: from the
+    /// network's first citable frame to `anchor`, the executing frame's GLOBAL
+    /// anchor. Ascending, each once. A shard worker fetches those it lacks
+    /// before executing the frame; execution still decides every operation,
+    /// so a citation missed here only goes unfetched.
+    pub fn message_cited_global_frames(
+        &self,
+        address: &[u8],
+        message: &[u8],
+        anchor: u64,
+    ) -> Vec<u64> {
+        #[cfg(not(feature = "confidential-tokens"))]
+        {
+            let _ = (address, message, anchor);
+            Vec::new()
+        }
+        #[cfg(feature = "confidential-tokens")]
+        {
+            use crate::message_envelope::{
+                CanonicalMessageBundle, CanonicalMessageRequest, TYPE_MESSAGE_BUNDLE,
+                TYPE_MESSAGE_REQUEST,
+            };
+            use crate::token_intrinsic::{constants, settlement_claim};
+            let Some(application) = address.get(..32).and_then(|a| <[u8; 32]>::try_from(a).ok())
+            else {
+                return Vec::new();
+            };
+            let requests: Vec<CanonicalMessageRequest> = match message
+                .get(..4)
+                .map(|prefix| u32::from_be_bytes(prefix.try_into().unwrap()))
+            {
+                Some(TYPE_MESSAGE_REQUEST) => {
+                    CanonicalMessageRequest::from_canonical_bytes(message)
+                        .map(|request| vec![request])
+                        .unwrap_or_default()
+                }
+                Some(TYPE_MESSAGE_BUNDLE) => CanonicalMessageBundle::from_canonical_bytes(message)
+                    .map(|bundle| bundle.requests.into_iter().flatten().collect())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            let network = crate::token_intrinsic::state::network_identifier(self.pricing_network());
+            let first =
+                crate::token_intrinsic::mint_authorization::first_citable_global_frame(&network);
+            let mut cited = std::collections::BTreeSet::new();
+            for request in &requests {
+                let bytes = request.inner_bytes.as_slice();
+                let frame = match request.inner_type_prefix {
+                    // Execution refuses a mint claim of any other application
+                    // before reading its citation (`mint_claim::verify_from_clock`).
+                    constants::TYPE_LATTICE_MINT_CLAIM
+                        if application == crate::domains::QUIL_TOKEN =>
+                    {
+                        quil_lattice_ct::confidential::mint_claim::MintClaim::decode(
+                            bytes,
+                            &network,
+                            &application,
+                        )
+                        .ok()
+                        .map(|claim| claim.cited_global_frame)
+                    }
+                    settlement_claim::TYPE_SETTLEMENT_CLAIM => {
+                        settlement_claim::SettlementClaim::decode(bytes)
+                            .ok()
+                            .map(|claim| claim.cited_global_frame)
+                    }
+                    #[cfg(feature = "native-proof")]
+                    constants::TYPE_COIN_DELIVERY => {
+                        crate::token_intrinsic::delivery::CoinDelivery::decode(
+                            bytes,
+                            &network,
+                            &application,
+                        )
+                        .ok()
+                        .map(|delivery| delivery.cited_global_frame)
+                    }
+                    _ => None,
+                };
+                cited.extend(frame.filter(|frame| (first..=anchor).contains(frame)));
+            }
+            cited.into_iter().collect()
         }
     }
 
@@ -4328,9 +4443,11 @@ mod tests {
         let bundle_bytes = bundle.to_canonical_bytes().unwrap();
 
         // Route it at the token base domain (as the global frame materializer
-        // does for a deploy).
+        // does for a deploy), at a zero price: what this test checks is
+        // routing, and at a nonzero price every node refuses a deploy that
+        // carries no settlement claim (engines' settlement parity tests).
         let token_base = crate::token_intrinsic::constants::token_base_domain();
-        m.process_message(0, &BigInt::from(1), &token_base, &bundle_bytes)
+        m.process_message(0, &BigInt::from(0), &token_base, &bundle_bytes)
             .unwrap();
         m.commit_frame(0).unwrap();
 

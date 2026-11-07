@@ -2584,7 +2584,8 @@ mod tests {
             .map(|bit| if *bit { '1' } else { '0' })
             .collect();
 
-        // GLOBAL's record of the delivery, certified at global frame 9.
+        // GLOBAL's record of the delivery, certified at a mainnet global frame.
+        let certified = super::super::constants::MAINNET_FIRST_CITABLE_GLOBAL_FRAME + 9;
         let record = global_commit::delivery_address(&application, block, 0).unwrap();
         let fields = [
             (
@@ -2628,7 +2629,7 @@ mod tests {
         let delivery = CoinDelivery {
             network,
             application,
-            cited_global_frame: 9,
+            cited_global_frame: certified,
             global_root: root,
             block,
             seq: 0,
@@ -2659,7 +2660,7 @@ mod tests {
             let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
             clock.seed_frame(GlobalFrame {
                 header: Some(GlobalFrameHeader {
-                    frame_number: 9,
+                    frame_number: certified,
                     prover_tree_commitment: root.to_vec(),
                     ..Default::default()
                 }),
@@ -2694,7 +2695,7 @@ mod tests {
                     .process_message_with_context(
                         FrameExecutionContext {
                             frame_number: 10,
-                            finalized_global_frame: Some(9),
+                            finalized_global_frame: Some(certified),
                             venue: Some(Venue::Application),
                             shard: ShardPath::from_bits(&shard),
                         },

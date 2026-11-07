@@ -333,6 +333,9 @@ pub fn message_cost(message: &[u8]) -> Result<u64> {
 pub struct PaymentContext<'a> {
     pub state: Option<&'a HypergraphState>,
     pub clock: Option<&'a dyn quil_types::store::ClockStore>,
+    /// The executing node's network (`network_identifier`): a claim may not
+    /// cite a global frame before the network's first citable frame.
+    pub network: &'a [u8; 32],
     /// Newest global frame whose root a claim may cite, `None` when the venue
     /// has no finalized global anchor.
     pub global_bound: Option<u64>,
@@ -459,16 +462,21 @@ pub fn admit_bundle(
         )
     })?;
 
-    let bound = payment.global_bound.ok_or_else(|| {
-        QuilError::ExecutionUnavailable(
-            "settlement claim requires a finalized global anchor".into(),
-        )
-    })?;
+    // A frame naming no anchor is a property of the certified frame, so every
+    // replica refuses alike instead of failing the frame on each retry.
+    let bound = payment
+        .global_bound
+        .ok_or_else(|| invalid("requires the frame's global anchor"))?;
     let clock = payment.clock.ok_or_else(|| {
         QuilError::ExecutionUnavailable("settlement claim requires the global clock store".into())
     })?;
-    let root =
-        super::mint_authorization::clock_reward_root(clock, claim.cited_global_frame, bound)?;
+    let root = super::mint_authorization::cited_reward_root(
+        clock,
+        payment.network,
+        "settlement claim",
+        claim.cited_global_frame,
+        bound,
+    )?;
     if root != claim.global_root {
         return Err(invalid("global root mismatch"));
     }
@@ -800,6 +808,7 @@ mod tests {
                 &PaymentContext {
                     state: None,
                     clock: None,
+                    network: &[1; 32],
                     global_bound: Some(10),
                     frame_number: 11,
                     multiplier,
@@ -823,6 +832,7 @@ mod tests {
             &PaymentContext {
                 state: None,
                 clock: None,
+                network: &[1; 32],
                 global_bound: Some(10),
                 frame_number: 11,
                 multiplier: &BigInt::from(0),
@@ -857,6 +867,7 @@ mod tests {
                 &PaymentContext {
                     state: None,
                     clock: None,
+                    network: &[1; 32],
                     global_bound: Some(10),
                     frame_number: 11,
                     multiplier: &BigInt::from(2),
@@ -940,6 +951,7 @@ mod tests {
                 &PaymentContext {
                     state: None,
                     clock: None,
+                    network: &[1; 32],
                     global_bound: Some(10),
                     frame_number: 11,
                     multiplier: &BigInt::from(2),
@@ -963,6 +975,7 @@ mod tests {
             &PaymentContext {
                 state: None,
                 clock: None,
+                network: &[1; 32],
                 global_bound: Some(10),
                 frame_number: 11,
                 multiplier: &BigInt::from(2),

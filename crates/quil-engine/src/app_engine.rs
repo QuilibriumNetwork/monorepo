@@ -49,6 +49,22 @@ const MAX_APP_MESSAGES_PER_RANK: usize = 100;
 /// Consecutive `commit_frame` failures on a received frame before it's
 /// dropped and repaired via a shard sync instead of retried-from-zero.
 const MAX_MATERIALIZE_RETRIES: u32 = 3;
+/// Longest one materialization waits for the GLOBAL frames its reward
+/// citations name ([`AppConsensusEngine::fetch_cited_global_frames`]); one
+/// fetch from the master is bounded at 12 s.
+const CITED_FRAME_FETCH_BUDGET: Duration = Duration::from_secs(30);
+/// What a frame fails with, for retry and before any bundle executes, while
+/// GLOBAL frames its reward citations name are not held here.
+pub(crate) const CITED_FRAMES_UNFETCHED: &str =
+    "GLOBAL frames this frame's reward citations name are not held yet";
+/// Why cited GLOBAL frames were not fetched on a worker with no master source.
+const NO_CITED_FRAME_SOURCE: &str = "this worker has no master source for GLOBAL frames";
+/// How often a frame still waiting for the GLOBAL frames its reward citations
+/// name logs the wait again.
+const CITED_WAIT_REPEAT: Duration = Duration::from_secs(10 * 60);
+/// The executions that wait for cited GLOBAL frames, named in their lines.
+const CITED_CANONICAL: &str = "canonical";
+const CITED_PRIVATE_PARENT: &str = "private parent";
 
 // =====================================================================
 // Inbound messages to the app engine
@@ -4319,6 +4335,10 @@ impl AppConsensusEngine {
         if let Some(pending) = self.defer_for_proof_verification(&exec, &requests, frame_number) {
             return Err(pending);
         }
+        // Every GLOBAL frame the reward citations name is held before any
+        // bundle executes, or the frame waits for retry with nothing executed.
+        self.fetch_cited_global_frames(&exec, &requests, frame_number, global_frame_number)
+            .await?;
         let collector = self.message_collector.clone();
         // Price from the network size certified by global consensus on the
         // anchored global frame — identical on every member — never from this
@@ -4411,6 +4431,94 @@ impl AppConsensusEngine {
             collector.mark_finalized(&taken);
             (processed, skipped)
         })
+    }
+
+    /// Fetch from this node's own master the GLOBAL frames this frame's
+    /// reward citations name (mint claims, settlement claims, deliveries)
+    /// that this worker does not hold, before execution reads them. A worker
+    /// holds GLOBAL frames only from its start, so a citation of older
+    /// history found nothing here and failed the frame on every retry. The
+    /// fetched frame is the canonical one (the master authenticates it), so
+    /// the result equals a holder's. A frame still missing after
+    /// [`CITED_FRAME_FETCH_BUDGET`] fails this frame for retry
+    /// ([`CITED_FRAMES_UNFETCHED`]) before any bundle executes: never a
+    /// refusal of the operation, since another replica may hold the frame
+    /// and accept it, and never a partial execution, whose staged writes a
+    /// retry would build on.
+    async fn fetch_cited_global_frames(
+        &self,
+        exec: &quil_execution::ExecutionEngineManager,
+        requests: &[quil_types::proto::global::MessageBundle],
+        frame_number: u64,
+        global_frame_number: u64,
+    ) -> Result<()> {
+        let store = self.global_anchor_store.as_ref();
+        let frames = cited_frames_not_held(
+            exec,
+            store,
+            &self.app_address,
+            requests,
+            global_frame_number,
+        );
+        let (Some(&first), Some(&last)) = (frames.first(), frames.last()) else {
+            end_cited_wait(self.core_id, &self.filter, frame_number, CITED_CANONICAL);
+            return Ok(());
+        };
+        let waiting = cited_wait_known(&self.filter, frame_number);
+        let started = std::time::Instant::now();
+        let outcome = match self.global_anchor_source.as_ref() {
+            Some(source) => {
+                if !waiting {
+                    info!(
+                        core_id = self.core_id,
+                        filter = %hex::encode(&self.filter),
+                        frame = frame_number,
+                        anchor = global_frame_number,
+                        cited = frames.len(),
+                        first,
+                        last,
+                        "fetching the GLOBAL frames this frame's reward citations name from \
+                         this node's master before executing it"
+                    );
+                }
+                crate::global_anchor::fetch_cited_frames(
+                    store,
+                    source,
+                    &frames,
+                    CITED_FRAME_FETCH_BUDGET,
+                )
+                .await
+            }
+            None => crate::global_anchor::CitedFetch::unfetchable(&frames, NO_CITED_FRAME_SOURCE),
+        };
+        let millis = started.elapsed().as_millis() as u64;
+        let Some((missing, reason)) = outcome.missing.first() else {
+            if !end_cited_wait(self.core_id, &self.filter, frame_number, CITED_CANONICAL) {
+                info!(
+                    core_id = self.core_id,
+                    filter = %hex::encode(&self.filter),
+                    frame = frame_number,
+                    fetched = outcome.held.len(),
+                    millis,
+                    "fetched the GLOBAL frames this frame's reward citations name"
+                );
+            }
+            return Ok(());
+        };
+        note_cited_wait(
+            self.core_id,
+            &self.filter,
+            frame_number,
+            global_frame_number,
+            &outcome,
+            millis,
+            CITED_CANONICAL,
+        );
+        Err(QuilError::ExecutionUnavailable(format!(
+            "{CITED_FRAMES_UNFETCHED}: frame {frame_number} cites {} not held, first \
+             {missing} ({reason})",
+            outcome.missing.len()
+        )))
     }
 
     /// Recompute a received frame's `requests_root` on the blocking
@@ -10482,7 +10590,11 @@ impl AppConsensusEngine {
                         .filter(|_| !continues_legacy)
                         .map(|s| (s.base_frame, s.genesis)),
                 )
-                .for_core(self.core_id),
+                .for_core(self.core_id)
+                .with_cited_frame_source(
+                    self.global_anchor_source.clone(),
+                    tokio::runtime::Handle::try_current().ok(),
+                ),
             )),
             _ => None,
         };
@@ -13872,6 +13984,219 @@ const PROOF_DEFERRAL_OVERRUN: std::time::Duration = std::time::Duration::from_se
 /// (its submission left the queue uncached) before it verifies inline.
 const MAX_DEFERRAL_RESTARTS: u32 = 2;
 
+/// The GLOBAL frames the reward citations of `requests` name, from the
+/// network's first citable frame to `anchor` (the frame's GLOBAL anchor), that
+/// `store` does not hold, ascending: what execution would read and not find.
+/// A frame the store cannot read counts as not held.
+fn cited_frames_not_held(
+    exec: &quil_execution::ExecutionEngineManager,
+    store: &dyn ClockStore,
+    app_address: &[u8],
+    requests: &[quil_types::proto::global::MessageBundle],
+    anchor: u64,
+) -> Vec<u64> {
+    if anchor == 0 {
+        return Vec::new();
+    }
+    let address = &app_address[..app_address.len().min(32)];
+    let mut cited = std::collections::BTreeSet::new();
+    for bundle in requests {
+        if let Ok(bytes) = crate::consensus_wire::app_bundle_to_canonical_bytes(bundle) {
+            cited.extend(exec.message_cited_global_frames(address, &bytes, anchor));
+        }
+    }
+    cited
+        .into_iter()
+        .filter(|&number| store.get_global_clock_frame(number).is_err())
+        .collect()
+}
+
+/// Frames whose execution waits for GLOBAL frames their reward citations
+/// name, by filter and frame. Their log lines are the wait's start, a repeat
+/// every [`CITED_WAIT_REPEAT`] with the time waited, and its end.
+#[derive(Debug, Default)]
+struct CitedFrameWaits {
+    waits: HashMap<(Vec<u8>, u64), CitedWait>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CitedWait {
+    since: std::time::Instant,
+    /// The last check that found cited frames missing.
+    last: std::time::Instant,
+    /// When the wait was last logged.
+    logged: std::time::Instant,
+    checks: u64,
+}
+
+/// What one check that found cited frames missing logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CitedWaitNote {
+    Start,
+    Repeat { waited: Duration, checks: u64 },
+    Quiet,
+}
+
+impl CitedFrameWaits {
+    /// A check of `frame` found cited frames missing at `now`.
+    fn missing(&mut self, filter: &[u8], frame: u64, now: std::time::Instant) -> CitedWaitNote {
+        // A wait no check found for a repeat interval ended unseen (its frame
+        // went to a shard sync, or its parent was not extended): forget it.
+        self.waits
+            .retain(|_, wait| now.saturating_duration_since(wait.last) < CITED_WAIT_REPEAT);
+        let key = (filter.to_vec(), frame);
+        let Some(wait) = self.waits.get_mut(&key) else {
+            self.waits.insert(
+                key,
+                CitedWait {
+                    since: now,
+                    last: now,
+                    logged: now,
+                    checks: 1,
+                },
+            );
+            return CitedWaitNote::Start;
+        };
+        wait.last = now;
+        wait.checks += 1;
+        if now.saturating_duration_since(wait.logged) < CITED_WAIT_REPEAT {
+            return CitedWaitNote::Quiet;
+        }
+        wait.logged = now;
+        CitedWaitNote::Repeat {
+            waited: now.saturating_duration_since(wait.since),
+            checks: wait.checks,
+        }
+    }
+
+    fn known(&self, filter: &[u8], frame: u64) -> bool {
+        self.waits.contains_key(&(filter.to_vec(), frame))
+    }
+
+    /// `frame` holds every frame it cites now: its wait, if any, ends.
+    fn over(
+        &mut self,
+        filter: &[u8],
+        frame: u64,
+        now: std::time::Instant,
+    ) -> Option<(Duration, u64)> {
+        self.waits
+            .remove(&(filter.to_vec(), frame))
+            .map(|wait| (now.saturating_duration_since(wait.since), wait.checks))
+    }
+}
+
+static CITED_FRAME_WAITS: std::sync::LazyLock<std::sync::Mutex<CitedFrameWaits>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn cited_wait_known(filter: &[u8], frame: u64) -> bool {
+    CITED_FRAME_WAITS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .known(filter, frame)
+}
+
+/// End `frame`'s wait for the GLOBAL frames it cites, logging the wait if
+/// there was one; whether there was.
+fn end_cited_wait(core_id: u32, filter: &[u8], frame: u64, path: &'static str) -> bool {
+    let ended = CITED_FRAME_WAITS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .over(filter, frame, std::time::Instant::now());
+    let Some((waited, checks)) = ended else {
+        return false;
+    };
+    info!(
+        core_id,
+        filter = %hex::encode(filter),
+        frame,
+        path,
+        waited_secs = waited.as_secs(),
+        checks,
+        "the GLOBAL frames this frame's reward citations name are held now; the frame executes"
+    );
+    true
+}
+
+/// Log a check of `frame` that left GLOBAL frames its reward citations name
+/// missing: at the wait's start, then every [`CITED_WAIT_REPEAT`].
+fn note_cited_wait(
+    core_id: u32,
+    filter: &[u8],
+    frame: u64,
+    anchor: u64,
+    outcome: &crate::global_anchor::CitedFetch,
+    millis: u64,
+    path: &'static str,
+) {
+    let Some((first_missing, reason)) = outcome.missing.first() else {
+        return;
+    };
+    let note = CITED_FRAME_WAITS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .missing(filter, frame, std::time::Instant::now());
+    match note {
+        CitedWaitNote::Quiet => {}
+        CitedWaitNote::Start => warn!(
+            core_id,
+            filter = %hex::encode(filter),
+            frame,
+            anchor,
+            path,
+            fetched = outcome.held.len(),
+            missing_frames = outcome.missing.len(),
+            first_missing = *first_missing,
+            reason = %reason,
+            millis,
+            scope = "this node: it lacks GLOBAL frames other replicas may hold",
+            action = "none if it clears: the frame is retried and the frames fetched so far are \
+                      kept; this repeats every 10 min while it waits; if it does, check that \
+                      this node's master reaches an archive",
+            "GLOBAL frames this frame's reward citations name are not fetched yet; the frame \
+             waits for them with nothing executed"
+        ),
+        CitedWaitNote::Repeat { waited, checks } => warn!(
+            core_id,
+            filter = %hex::encode(filter),
+            frame,
+            anchor,
+            path,
+            missing_frames = outcome.missing.len(),
+            first_missing = *first_missing,
+            reason = %reason,
+            waited_secs = waited.as_secs(),
+            checks,
+            scope = "this node: it lacks GLOBAL frames other replicas may hold",
+            action = "check that this node's master reaches an archive",
+            "GLOBAL frames this frame's reward citations name are still not fetched; the frame \
+             keeps waiting"
+        ),
+    }
+}
+
+/// Digests of the bundles execution reached in this test process
+/// ([`materialize_app_shard_requests`]): what a test shows ran or not.
+#[cfg(test)]
+static EXECUTED_BUNDLES: std::sync::Mutex<Vec<[u8; 32]>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn note_bundle_executed(bundle: &[u8]) {
+    EXECUTED_BUNDLES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(crate::admission_verify::digest(bundle));
+}
+
+/// Whether execution reached `bundle` (canonical bytes) in this process.
+#[cfg(test)]
+fn bundle_executed(bundle: &[u8]) -> bool {
+    EXECUTED_BUNDLES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&crate::admission_verify::digest(bundle))
+}
+
 /// Frames whose materialization waits for background proof verification.
 static PROOF_DEFERRALS: std::sync::LazyLock<std::sync::Mutex<ProofDeferrals>> =
     std::sync::LazyLock::new(Default::default);
@@ -14878,6 +15203,46 @@ pub(crate) struct MaterializeSteps {
     pub(crate) commit_thread: crate::replay_split::ThreadStep,
 }
 
+/// Discards what a frame's execution attempt staged unless the attempt
+/// committed: the frame then runs again from the committed state and records
+/// what a single run records. Left staged, a retry refused the bundles the
+/// failed attempt executed (their spent and consumption markers were staged),
+/// then committed their writes without their fees, settlements and spends.
+struct DiscardUnlessCommitted {
+    crdt: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    frame_number: u64,
+}
+
+impl DiscardUnlessCommitted {
+    fn committed(mut self) {
+        self.crdt = None;
+    }
+}
+
+impl Drop for DiscardUnlessCommitted {
+    fn drop(&mut self) {
+        let Some(crdt) = self.crdt.take() else {
+            return;
+        };
+        match crdt.discard_staged_mutations() {
+            Ok(true) => info!(
+                frame = self.frame_number,
+                "app-shard materialize: discarded the failed attempt's staged writes; the frame \
+                 runs again from the committed state"
+            ),
+            Ok(false) => {}
+            Err(error) => warn!(
+                frame = self.frame_number,
+                error = %error,
+                scope = "this node's worker",
+                action = "restart the node if this repeats: a retry over these writes records \
+                          another outcome than the shard's other members",
+                "app-shard materialize: could not discard the failed attempt's staged writes"
+            ),
+        }
+    }
+}
+
 pub(crate) fn materialize_app_shard_requests(
     execution_manager: &quil_execution::ExecutionEngineManager,
     requests: &[quil_types::proto::global::MessageBundle],
@@ -14899,6 +15264,10 @@ pub(crate) fn materialize_app_shard_requests(
     // application is refused identically everywhere rather than as an
     // infrastructure fault that would fail the frame and retry forever.
     let shard = shard_path_of_filter(app_address);
+    let staged = DiscardUnlessCommitted {
+        crdt: Some(execution_manager.crdt()),
+        frame_number,
+    };
 
     // Verify every confidential token proof of the frame concurrently before
     // the sequential state loop below; the loop then finds verdicts cached.
@@ -15034,6 +15403,8 @@ pub(crate) fn materialize_app_shard_requests(
         };
         drop(pricing);
 
+        #[cfg(test)]
+        note_bundle_executed(&bundle_bytes);
         let process = StepTimer::start(&mut steps.process, probe::Section::AppFrameProcess);
         let outcome = execution_manager.process_message_with_context(
             quil_types::execution::FrameExecutionContext {
@@ -15113,6 +15484,7 @@ pub(crate) fn materialize_app_shard_requests(
     )?;
     drop(commit);
     steps.commit_thread = committing.end();
+    staged.committed();
     Ok(MaterializedAppFrame {
         processed,
         skipped,
@@ -28813,3 +29185,11 @@ mod relay_tests;
 #[cfg(test)]
 #[path = "app_engine_shield_hold_tests.rs"]
 mod shield_hold_tests;
+
+#[cfg(test)]
+#[path = "app_engine_cited_frame_fetch_tests.rs"]
+mod cited_frame_fetch_tests;
+
+#[cfg(test)]
+#[path = "app_engine_retry_discard_tests.rs"]
+mod retry_discard_tests;

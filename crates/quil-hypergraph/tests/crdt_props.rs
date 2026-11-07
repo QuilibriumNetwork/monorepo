@@ -1545,3 +1545,55 @@ fn ordered_batch_matches_sequential_mutations() {
         Some(b"live-edge".to_vec())
     );
 }
+
+/// A discarded attempt leaves the CRDT as its last commit left it: nothing
+/// staged, the committed data and shard sizes (a bucket the attempt created
+/// is gone), and a later commit publishes none of the discarded writes. After
+/// a commit, a discard restores the sizes of that commit, not older ones.
+#[test]
+fn discarding_staged_mutations_restores_the_committed_state_and_sizes() {
+    use num_bigint::BigInt;
+    let c = fresh_crdt();
+    let at = |app: u8, tag: u8| {
+        let mut data_address = [0u8; 32];
+        data_address[31] = tag;
+        Location {
+            app_address: [app; 32],
+            data_address,
+        }
+    };
+    c.add_vertex(&at(0x22, 1), b"aaaa").unwrap();
+    c.commit(1).unwrap();
+    assert!(!c.has_staged_mutations());
+    assert!(!c.discard_staged_mutations().unwrap(), "nothing was staged");
+    let committed = (c.total_size(), c.get_vertex_data(&at(0x22, 1)));
+    assert_eq!(committed, (BigInt::from(4), Some(b"aaaa".to_vec())));
+
+    // A failed attempt staged an overwrite, a new vertex, a removal and a
+    // write to an application without a size bucket yet.
+    c.add_vertex(&at(0x22, 1), b"bbbbbbbb").unwrap();
+    c.add_vertex(&at(0x22, 2), b"cc").unwrap();
+    c.remove_vertex(&at(0x22, 1)).unwrap();
+    c.add_vertex(&at(0x33, 1), b"fffff").unwrap();
+    assert!(c.has_staged_mutations());
+    assert_ne!(c.total_size(), committed.0);
+    assert!(c.discard_staged_mutations().unwrap());
+    assert!(!c.has_staged_mutations());
+    assert_eq!((c.total_size(), c.get_vertex_data(&at(0x22, 1))), committed);
+    assert_eq!(c.get_vertex_data(&at(0x22, 2)), None);
+    assert_eq!(c.get_vertex_data(&at(0x33, 1)), None);
+
+    // The retry's commit publishes only what the retry staged.
+    c.add_vertex(&at(0x22, 3), b"ddd").unwrap();
+    c.commit(2).unwrap();
+    assert_eq!(c.total_size(), BigInt::from(7));
+    assert_eq!(c.get_vertex_data(&at(0x22, 1)), Some(b"aaaa".to_vec()));
+    assert_eq!(c.get_vertex_data(&at(0x22, 2)), None);
+    assert_eq!(c.get_vertex_data(&at(0x33, 1)), None);
+    assert_eq!(c.get_vertex_data(&at(0x22, 3)), Some(b"ddd".to_vec()));
+
+    c.add_vertex(&at(0x22, 4), b"e").unwrap();
+    assert_eq!(c.total_size(), BigInt::from(8));
+    assert!(c.discard_staged_mutations().unwrap());
+    assert_eq!(c.total_size(), BigInt::from(7));
+}

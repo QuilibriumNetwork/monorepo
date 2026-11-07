@@ -130,7 +130,27 @@ pub struct AppParentExecutor {
     /// The worker this executor serves, for its log lines: they run outside
     /// the worker's span.
     core_id: u32,
+    /// This node's own master, which serves the GLOBAL frames a chain's
+    /// reward citations name when this member lacks them, and the runtime
+    /// that fetches them in the background ([`Self::with_cited_frame_source`]).
+    cited_source: Option<(
+        crate::global_anchor::GlobalAnchorSource,
+        tokio::runtime::Handle,
+    )>,
+    cited_fetch: Arc<std::sync::Mutex<CitedParentFetch>>,
 }
+
+/// The background fetch of the GLOBAL frames a selected parent's chain cites.
+#[derive(Debug, Default)]
+struct CitedParentFetch {
+    running: bool,
+    /// After a fetch that left frames missing, the next waits until then.
+    not_before: Option<std::time::Instant>,
+}
+
+/// The least time between two background fetches of cited GLOBAL frames for
+/// private execution, as between canonical retries of a frame.
+const CITED_PARENT_FETCH_RETRY: Duration = Duration::from_secs(10);
 
 impl AppParentExecutor {
     #[allow(clippy::too_many_arguments)]
@@ -168,12 +188,27 @@ impl AppParentExecutor {
             verdicts: std::sync::Mutex::new(std::collections::VecDeque::new()),
             tip_hint: std::sync::Mutex::new(None),
             core_id: 0,
+            cited_source: None,
+            cited_fetch: Arc::new(std::sync::Mutex::new(CitedParentFetch::default())),
         }
     }
 
     /// Name the worker in this executor's lines ([`Self::core_id`]).
     pub(super) fn for_core(mut self, core_id: u32) -> Self {
         self.core_id = core_id;
+        self
+    }
+
+    /// Fetch the GLOBAL frames a selected parent's chain cites and this
+    /// member lacks from `source` (this node's own master), on `runtime`.
+    /// Without one, such a chain is refused until canonical execution has
+    /// fetched them.
+    pub(super) fn with_cited_frame_source(
+        mut self,
+        source: Option<crate::global_anchor::GlobalAnchorSource>,
+        runtime: Option<tokio::runtime::Handle>,
+    ) -> Self {
+        self.cited_source = source.zip(runtime);
         self
     }
 
@@ -378,6 +413,9 @@ impl AppParentExecutor {
                 "selected parent fails proposal validation: {reason} ({detail})"
             )));
         }
+        // Every GLOBAL frame the chain's reward citations name is held before
+        // any of it executes, as for canonical execution.
+        self.hold_cited_frames(&chain)?;
         let frame = chain
             .last()
             .expect("a chain holds the selected parent")
@@ -511,6 +549,136 @@ impl AppParentExecutor {
         });
         *prepared = Some(result.clone());
         Ok(result)
+    }
+
+    /// Whether this member holds every GLOBAL frame the reward citations of
+    /// `chain` name. If not, they are fetched from its master in the
+    /// background, at most one fetch at a time and
+    /// [`CITED_PARENT_FETCH_RETRY`] after one that left frames missing, and the
+    /// chain is refused until they are here: executed without them, it would
+    /// fail part-way on every member lacking them, and a parent that can only
+    /// finalize through a child would never execute anywhere.
+    fn hold_cited_frames(&self, chain: &[AppShardFrame]) -> Result<()> {
+        let parent = chain
+            .last()
+            .and_then(|frame| frame.header.as_ref())
+            .ok_or_else(|| unavailable("selected parent has no header"))?;
+        let (number, anchor) = (parent.frame_number, parent.global_frame_number);
+        let mut unheld = std::collections::BTreeSet::new();
+        for frame in chain {
+            let Some(header) = frame.header.as_ref() else {
+                continue;
+            };
+            unheld.extend(cited_frames_not_held(
+                self.exec.as_ref(),
+                self.global_anchor_store.as_ref(),
+                &self.app_address,
+                &frame.requests,
+                header.global_frame_number,
+            ));
+        }
+        let frames: Vec<u64> = unheld.into_iter().collect();
+        let (Some(&first), Some(&last)) = (frames.first(), frames.last()) else {
+            end_cited_wait(self.core_id, &self.filter, number, CITED_PRIVATE_PARENT);
+            return Ok(());
+        };
+        match self.cited_source.clone() {
+            Some((source, runtime)) => {
+                self.fetch_cited_frames(source, runtime, number, anchor, &frames)
+            }
+            None => note_cited_wait(
+                self.core_id,
+                &self.filter,
+                number,
+                anchor,
+                &crate::global_anchor::CitedFetch::unfetchable(&frames, NO_CITED_FRAME_SOURCE),
+                0,
+                CITED_PRIVATE_PARENT,
+            ),
+        }
+        Err(unavailable(format!(
+            "{CITED_FRAMES_UNFETCHED}: the selected parent's chain cites {} not held, {first} to \
+             {last}",
+            frames.len()
+        )))
+    }
+
+    /// Fetch `frames` for selected parent `number` in the background, unless
+    /// a fetch runs or one left frames missing less than
+    /// [`CITED_PARENT_FETCH_RETRY`] ago.
+    fn fetch_cited_frames(
+        &self,
+        source: crate::global_anchor::GlobalAnchorSource,
+        runtime: tokio::runtime::Handle,
+        number: u64,
+        anchor: u64,
+        frames: &[u64],
+    ) {
+        {
+            let mut fetch = self.cited_fetch.lock().unwrap_or_else(|e| e.into_inner());
+            let now = std::time::Instant::now();
+            if fetch.running || fetch.not_before.is_some_and(|at| now < at) {
+                return;
+            }
+            fetch.running = true;
+            fetch.not_before = None;
+        }
+        if !cited_wait_known(&self.filter, number) {
+            info!(
+                core_id = self.core_id,
+                filter = %hex::encode(&self.filter),
+                frame = number,
+                anchor,
+                cited = frames.len(),
+                first = frames[0],
+                last = frames[frames.len() - 1],
+                "fetching the GLOBAL frames a selected parent's reward citations name from this \
+                 node's master before executing it privately"
+            );
+        }
+        let store = self.global_anchor_store.clone();
+        let state = self.cited_fetch.clone();
+        let filter = self.filter.clone();
+        let core_id = self.core_id;
+        let frames = frames.to_vec();
+        runtime.spawn(quil_types::thread_probe::probed(
+            quil_types::thread_probe::Section::GlobalAnchorRecovery,
+            async move {
+                let started = std::time::Instant::now();
+                let outcome = crate::global_anchor::fetch_cited_frames(
+                    store.as_ref(),
+                    &source,
+                    &frames,
+                    CITED_FRAME_FETCH_BUDGET,
+                )
+                .await;
+                let millis = started.elapsed().as_millis() as u64;
+                if outcome.missing.is_empty() {
+                    info!(
+                        core_id,
+                        filter = %hex::encode(&filter),
+                        frame = number,
+                        fetched = outcome.held.len(),
+                        millis,
+                        "fetched the GLOBAL frames a selected parent's reward citations name"
+                    );
+                } else {
+                    note_cited_wait(
+                        core_id,
+                        &filter,
+                        number,
+                        anchor,
+                        &outcome,
+                        millis,
+                        CITED_PRIVATE_PARENT,
+                    );
+                }
+                let mut fetch = state.lock().unwrap_or_else(|e| e.into_inner());
+                fetch.running = false;
+                fetch.not_before = (!outcome.missing.is_empty())
+                    .then(|| std::time::Instant::now() + CITED_PARENT_FETCH_RETRY);
+            },
+        ));
     }
 
     /// A re-seal's checkpoint view names a seal, not necessarily its data

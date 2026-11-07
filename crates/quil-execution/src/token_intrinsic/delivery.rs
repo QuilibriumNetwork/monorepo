@@ -251,8 +251,13 @@ pub fn verify_and_apply(
     let anchor = context
         .finalized_global_frame
         .ok_or_else(|| invalid("delivery requires the frame's global anchor"))?;
-    let root =
-        super::mint_authorization::clock_reward_root(clock, delivery.cited_global_frame, anchor)?;
+    let root = super::mint_authorization::cited_reward_root(
+        clock,
+        network,
+        "coin delivery",
+        delivery.cited_global_frame,
+        anchor,
+    )?;
     if root != delivery.global_root {
         return Err(invalid("cited global root mismatch"));
     }

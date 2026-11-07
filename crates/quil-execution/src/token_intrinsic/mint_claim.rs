@@ -30,15 +30,23 @@ pub fn verify_from_clock(
     bytes: &[u8],
     max_outputs: usize,
 ) -> Result<VerifiedMintClaim> {
-    let bound = context.finalized_global_frame.ok_or_else(|| {
-        QuilError::ExecutionUnavailable("mint claim requires consensus global anchor".into())
-    })?;
+    // A frame naming no anchor is a property of the certified frame, so every
+    // replica refuses alike instead of failing the frame on each retry.
+    let bound = context
+        .finalized_global_frame
+        .ok_or_else(|| invalid("requires the frame's global anchor"))?;
     let claim = MintClaim::decode(bytes, network, application)
         .map_err(|_| invalid("invalid encoding or context"))?;
     if application != &domains::QUIL_TOKEN || claim.outputs.len() > max_outputs {
         return Err(invalid("unsupported application or dimensions"));
     }
-    let root = super::mint::clock_reward_root(clock, claim.cited_global_frame, bound)?;
+    let root = super::mint::cited_reward_root(
+        clock,
+        network,
+        "mint claim",
+        claim.cited_global_frame,
+        bound,
+    )?;
     if root != claim.global_root {
         return Err(invalid("global root mismatch"));
     }

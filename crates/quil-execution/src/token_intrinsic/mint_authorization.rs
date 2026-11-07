@@ -411,7 +411,7 @@ mod tests {
                     finalized_global_frame: None,
                     ..context
                 }),
-                Err(QuilError::ExecutionUnavailable(_))
+                Err(QuilError::InvalidArgument(_))
             ));
             assert!(matches!(
                 verify(FrameExecutionContext {
@@ -764,4 +764,168 @@ pub(crate) fn clock_reward_root(
         .as_slice()
         .try_into()
         .map_err(|_| unavailable("global reward root is not 32 bytes".into()))
+}
+
+/// First GLOBAL frame whose prover root an operation executed on `network`
+/// (the executing node's `network_identifier`) may cite:
+/// [`MAINNET_FIRST_CITABLE_GLOBAL_FRAME`] on mainnet, frame 0 elsewhere.
+///
+/// [`MAINNET_FIRST_CITABLE_GLOBAL_FRAME`]: super::constants::MAINNET_FIRST_CITABLE_GLOBAL_FRAME
+pub(crate) fn first_citable_global_frame(network: &[u8; 32]) -> u64 {
+    if *network == super::state::network_identifier(crate::pricing::MAINNET_NETWORK) {
+        super::constants::MAINNET_FIRST_CITABLE_GLOBAL_FRAME
+    } else {
+        0
+    }
+}
+
+/// [`clock_reward_root`] for an operation (`citer`, named in the log)
+/// executed on `network`. A cited frame before the network's first citable
+/// frame is refused deterministically, before any clock read: no node holds a
+/// forest root for it, so the read would fail on every node and the frame
+/// carrying the operation could never finish anywhere.
+pub(crate) fn cited_reward_root(
+    clock: &dyn quil_types::store::ClockStore,
+    network: &[u8; 32],
+    citer: &'static str,
+    cited_frame: u64,
+    finalized_global_frame: u64,
+) -> quil_types::error::Result<[u8; 32]> {
+    let first = first_citable_global_frame(network);
+    if cited_frame < first {
+        note_uncitable(citer, cited_frame, first, finalized_global_frame);
+        return Err(quil_types::error::QuilError::InvalidArgument(format!(
+            "{citer}: global reward frame {cited_frame} precedes the network's first citable \
+             frame {first}"
+        )));
+    }
+    clock_reward_root(clock, cited_frame, finalized_global_frame)
+}
+
+/// When the last refusal warning was logged, and the refusals quieted since.
+static UNCITABLE_WARNED: std::sync::Mutex<Option<(std::time::Instant, u64)>> =
+    std::sync::Mutex::new(None);
+
+/// At most one refusal warning per interval, so a flood of such operations
+/// cannot flood the log; the next warning counts the quieted ones.
+const UNCITABLE_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Whether a refusal at `now` is due a warning, with the refusals quieted
+/// since the last one; otherwise this refusal is counted as quieted.
+fn uncitable_warning_due(
+    last: &mut Option<(std::time::Instant, u64)>,
+    now: std::time::Instant,
+) -> Option<u64> {
+    match *last {
+        Some((at, quieted)) if now.duration_since(at) < UNCITABLE_WARN_INTERVAL => {
+            *last = Some((at, quieted + 1));
+            None
+        }
+        previous => {
+            *last = Some((now, 0));
+            Some(previous.map_or(0, |(_, quieted)| quieted))
+        }
+    }
+}
+
+fn note_uncitable(citer: &str, cited_frame: u64, first_citable_frame: u64, anchor: u64) {
+    let due = match UNCITABLE_WARNED.lock() {
+        Ok(mut last) => uncitable_warning_due(&mut last, std::time::Instant::now()),
+        Err(_) => None,
+    };
+    let Some(quieted) = due else {
+        return;
+    };
+    tracing::warn!(
+        citer,
+        cited_frame,
+        first_citable_frame,
+        anchor,
+        refusals_since_last_warning = quieted,
+        scope = "network: a submitted operation cites a GLOBAL frame no node holds a forest \
+            root for; not this node",
+        action = "none here: this build refuses the operation and the frame carrying it \
+            completes; a node on an older build stays stopped at that frame until it upgrades; \
+            report it to the maintainers with the cited frame if it repeats",
+        "refused an operation citing a GLOBAL frame before the network's first citable frame",
+    );
+}
+
+#[cfg(test)]
+mod first_citable_frame_tests {
+    use super::*;
+    use quil_types::error::QuilError;
+    use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+    use std::time::{Duration, Instant};
+
+    fn network(selector: u8) -> [u8; 32] {
+        super::super::state::network_identifier(selector)
+    }
+
+    #[test]
+    fn only_mainnet_bounds_citations_from_below() {
+        assert_eq!(
+            first_citable_global_frame(&network(crate::pricing::MAINNET_NETWORK)),
+            669_976
+        );
+        for other in [network(1), network(7), network(255), [1; 32]] {
+            assert_eq!(first_citable_global_frame(&other), 0);
+        }
+    }
+
+    /// The frame before the bound is refused even where it is held, so the
+    /// refusal precedes the clock read; the bound itself and every frame on a
+    /// test network still resolve.
+    #[test]
+    fn a_citation_before_the_first_citable_frame_is_refused_before_the_read() {
+        let first = super::super::constants::MAINNET_FIRST_CITABLE_GLOBAL_FRAME;
+        let clock = quil_store::testing::InMemoryClockStore::new();
+        for (number, root) in [(first - 1, [1u8; 32]), (first, [2u8; 32])] {
+            clock.seed_frame(GlobalFrame {
+                header: Some(GlobalFrameHeader {
+                    frame_number: number,
+                    prover_tree_commitment: root.to_vec(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        let mainnet = network(crate::pricing::MAINNET_NETWORK);
+        let anchor = first + 10;
+        assert!(matches!(
+            cited_reward_root(&clock, &mainnet, "test", first - 1, anchor),
+            Err(QuilError::InvalidArgument(reason)) if reason.contains("first citable frame")
+        ));
+        assert!(matches!(
+            cited_reward_root(&clock, &mainnet, "test", 0, anchor),
+            Err(QuilError::InvalidArgument(_))
+        ));
+        assert_eq!(
+            cited_reward_root(&clock, &mainnet, "test", first, anchor).unwrap(),
+            [2; 32]
+        );
+        assert_eq!(
+            cited_reward_root(&clock, &network(1), "test", first - 1, anchor).unwrap(),
+            [1; 32]
+        );
+        assert!(matches!(
+            cited_reward_root(&clock, &network(1), "test", 5, anchor),
+            Err(QuilError::ExecutionUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn refusal_warnings_are_bounded_and_count_the_quieted() {
+        let start = Instant::now();
+        let mut last = None;
+        assert_eq!(uncitable_warning_due(&mut last, start), Some(0));
+        for second in 1..=3 {
+            let now = start + Duration::from_secs(second);
+            assert_eq!(uncitable_warning_due(&mut last, now), None);
+        }
+        let next = start + UNCITABLE_WARN_INTERVAL;
+        assert_eq!(uncitable_warning_due(&mut last, next), Some(3));
+        let soon = next + Duration::from_secs(1);
+        assert_eq!(uncitable_warning_due(&mut last, soon), None);
+    }
 }

@@ -143,6 +143,24 @@ impl Rig {
         let fixture = Fixture::new(Some(signer.public_key()));
         Self::over(signer, fixture)
     }
+    /// A rig whose genesis prover tree holds the settlement record that
+    /// [`Self::paid_deploy`] claims.
+    fn paying() -> Self {
+        let signer = Arc::new(quil_crypto::FalconSigner::generate());
+        let paid = PaidDeploy::new(&Self::token_deploy());
+        let fixture = Fixture::seeded(Some(signer.public_key()), |crdt| paid.seed(crdt));
+        Self::over(signer, fixture)
+    }
+    /// An independent durable executor in a paying rig's genesis state.
+    fn expected(&self) -> Fixture {
+        let paid = PaidDeploy::new(&Self::token_deploy());
+        let fixture = Fixture::seeded(Some(self.signer.public_key()), |crdt| paid.seed(crdt));
+        save(
+            fixture.clock.as_ref(),
+            &state_frame(&fixture.source, 0, 0, digest_from_identity([0; 32])),
+        );
+        fixture
+    }
     fn over(signer: Arc<quil_crypto::FalconSigner>, fixture: Fixture) -> Self {
         let source = Arc::new(fixture.source);
         let genesis_frame = state_frame(&source, 0, 0, digest_from_identity([0; 32]));
@@ -220,17 +238,22 @@ impl Rig {
         seam.note_frame(id(parent), parent.header.as_ref().unwrap().frame_number);
         seam
     }
-    fn deploy(&self) -> GlobalFrame {
+    fn token_deploy() -> quil_execution::token_intrinsic::TokenDeploy {
         let config = quil_execution::token_intrinsic::config::TokenConfiguration {
             behavior: quil_execution::token_intrinsic::constants::DIVISIBLE as u32,
             name: b"selected-parent token".to_vec(),
             owner_public_key: vec![1; 32],
             ..Default::default()
         };
-        let deploy = quil_execution::token_intrinsic::TokenDeploy {
+        quil_execution::token_intrinsic::TokenDeploy {
             config: config.to_canonical_bytes().unwrap(),
             rdf_schema: Vec::new(),
-        };
+        }
+    }
+    /// Frame 1 carrying an unpaid deploy, which every node refuses at a
+    /// nonzero price: a frame body that changes no application state.
+    fn deploy(&self) -> GlobalFrame {
+        let deploy = Self::token_deploy();
         let mut frame = state_frame(&self.source, 1, 41, self.genesis);
         frame
             .requests
@@ -251,6 +274,23 @@ impl Rig {
         body_root(&mut frame);
         frame
     }
+    /// Frame 1 carrying the deploy paid by a settlement claim (a paying
+    /// rig only): the deploy executes and changes application state.
+    fn paid_deploy(&self) -> GlobalFrame {
+        let genesis = self.clock.get_global_clock_frame(0).unwrap();
+        let root: [u8; 32] = genesis
+            .header
+            .unwrap()
+            .prover_tree_commitment
+            .try_into()
+            .unwrap();
+        let mut frame = state_frame(&self.source, 1, 41, self.genesis);
+        frame
+            .requests
+            .push(PaidDeploy::new(&Self::token_deploy()).bundle(&self.source.hypergraph, root));
+        body_root(&mut frame);
+        frame
+    }
 }
 
 #[test]
@@ -261,10 +301,10 @@ fn selected_parent_proposal_and_vote_use_executed_state_without_publishing_it() 
             .with_test_writer()
             .finish(),
     );
-    let rig = Rig::new();
-    let parent = rig.deploy();
+    let rig = Rig::paying();
+    let parent = rig.paid_deploy();
     rig.put(&parent);
-    let expected = Fixture::new(Some(rig.signer.public_key()));
+    let expected = rig.expected();
     let outcome = expected.source.materialize(&parent).unwrap();
     assert_eq!(outcome.processed, 1);
     let context = rig.context(&parent);

@@ -5,10 +5,6 @@ use quil_types::store::{ClockStore, KvDb};
 
 #[test]
 fn publication_recovers_complete_deployment_frame_and_execution_receipt() {
-    let fixture = Fixture::new(None);
-    let path = fixture.db.inner().path().to_path_buf();
-    let sequence = fixture.db.inner().latest_sequence_number();
-    let mut branch = fixture.source.capture_execution_branch(limits()).unwrap();
     let config = quil_execution::token_intrinsic::config::TokenConfiguration {
         behavior: quil_execution::token_intrinsic::constants::DIVISIBLE as u32,
         name: b"atomic publication token".to_vec(),
@@ -20,18 +16,13 @@ fn publication_recovers_complete_deployment_frame_and_execution_receipt() {
         config: config.to_canonical_bytes().unwrap(),
         rdf_schema: vec![],
     };
+    let paid = PaidDeploy::new(&deploy);
+    let (fixture, genesis) = Fixture::paying(None, &paid);
+    let path = fixture.db.inner().path().to_path_buf();
+    let sequence = fixture.db.inner().latest_sequence_number();
+    let mut branch = fixture.source.capture_execution_branch(limits()).unwrap();
     let mut input = frame(1, branch.prover_root().unwrap());
-    input.requests[0]
-        .requests
-        .push(quil_types::proto::global::MessageRequest {
-            timestamp: 0,
-            request: Some(
-                quil_types::proto::global::message_request::Request::TokenDeploy(
-                    quil_execution::token_intrinsic::conversions::token_deploy_to_proto(&deploy)
-                        .unwrap(),
-                ),
-            ),
-        });
+    input.requests[0] = paid.bundle(&fixture.source.hypergraph, genesis);
     let result = branch.materialize(&input).unwrap();
     assert_eq!(result.processed, 1);
     assert_eq!(result.skipped, 0);
