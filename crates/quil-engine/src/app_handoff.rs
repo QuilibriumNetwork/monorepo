@@ -178,31 +178,51 @@ pub fn worker_retention(
     filter: &[u8],
     member: &[u8],
 ) -> Option<bool> {
-    let check = || -> Result<bool> {
-        let view = CommittedView::capture(global)?;
-        let Some(session) = handoff::head(&view, filter)? else {
+    worker_retention_in(&CommittedView::capture(global), filter, member)
+}
+
+/// [`worker_retention`] in a view captured once for many workers
+/// (`CommittedView::capture`): a reconcile pass asks for each of its
+/// workers and reads them all from one snapshot.
+pub fn worker_retention_in(
+    view: &Result<CommittedView>,
+    filter: &[u8],
+    member: &[u8],
+) -> Option<bool> {
+    let check = |view: &CommittedView| -> Result<bool> {
+        let Some(session) = handoff::head(view, filter)? else {
             return Ok(false);
         };
         if !session.members.iter().any(|key| key == member) {
             return Ok(false);
         }
-        Ok(match handoff::status(&view, &session.id()?)? {
+        Ok(match handoff::status(view, &session.id()?)? {
             Status::Active => true,
-            Status::Sealing(_) => !schedule::seal_submitted(&view, &session)?,
+            Status::Sealing(_) => !schedule::seal_submitted(view, &session)?,
             Status::Closed(_) => false,
         })
     };
-    match check() {
-        Ok(retain) => Some(retain),
-        Err(error) if handoff::global_sync_in_progress(&error) => None,
+    match view {
+        Ok(view) => match check(view) {
+            Ok(retain) => Some(retain),
+            Err(error) => retention_unknown(&error, filter),
+        },
+        Err(error) => retention_unknown(error, filter),
+    }
+}
+
+/// What [`worker_retention`] answers when the committed view cannot be read.
+fn retention_unknown(error: &QuilError, filter: &[u8]) -> Option<bool> {
+    match error {
+        error if handoff::global_sync_in_progress(error) => None,
         // No authenticated GLOBAL state yet: this node cannot be running a
         // session host (startup needs the same snapshot), so nothing is closing.
-        Err(QuilError::ExecutionUnavailable(_)) => Some(false),
+        QuilError::ExecutionUnavailable(_) => Some(false),
         // A store or decoding failure says nothing about the session: do not
         // release a possibly closing member on it.
         // Once a minute at most: the reconcile asks every frame, and the
         // recovery gate on each recovery request.
-        Err(error) => {
+        error => {
             static LAST_WARN_SECS: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let now = std::time::SystemTime::now()
