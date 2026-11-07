@@ -24,7 +24,7 @@ const EXPIRABLE: u32 = 1 << 4;
 const TENDERABLE: u32 = 1 << 5;
 
 /// The keys a deploy takes.
-const DEPLOY_KEYS: [&str; 11] = [
+const DEPLOY_KEYS: [&str; 12] = [
     "name",
     "symbol",
     "behavior",
@@ -36,9 +36,11 @@ const DEPLOY_KEYS: [&str; 11] = [
     "entitlementroot",
     "units",
     "supply",
+    "additionalreference",
 ];
 
-pub async fn run(dc: &DeployCtx, args: &[String]) -> anyhow::Result<()> {
+/// The configuration the `key=value` args describe, without its owner key.
+pub(super) fn deploy_config(dc: &DeployCtx, args: &[String]) -> anyhow::Result<TokenConfiguration> {
     check_key_args(args, &DEPLOY_KEYS)?;
     let mut config: HashMap<String, String> = HashMap::new();
     for arg in args {
@@ -138,7 +140,14 @@ pub async fn run(dc: &DeployCtx, args: &[String]) -> anyhow::Result<()> {
         cfg.supply =
             parse_bigint_be(v).map_err(|_| anyhow::anyhow!("invalid supply value: {v}"))?;
     }
+    if let Some(reference) = additional_reference(dc, args)? {
+        cfg.additional_reference = vec![reference];
+    }
+    Ok(cfg)
+}
 
+pub async fn run(dc: &DeployCtx, args: &[String]) -> anyhow::Result<()> {
+    let mut cfg = deploy_config(dc, args)?;
     let keys = dc.deploy_keys()?;
     cfg.owner_public_key = keys.owner;
 
@@ -168,7 +177,41 @@ pub async fn run(dc: &DeployCtx, args: &[String]) -> anyhow::Result<()> {
     if !cfg.symbol.is_empty() {
         println!("  Symbol: {}", cfg.symbol);
     }
+    for reference in &cfg.additional_reference {
+        println!("  Additional reference: {}", hex::encode(reference));
+    }
     Ok(())
+}
+
+/// The `additionalreference=<address>` arg: the 64-byte address (hex or
+/// alias) of the data the token points at, such as a file `deploy file`
+/// stored. The node stores several references as one concatenated field and
+/// reads them back as one value, so a token takes exactly one.
+pub(super) fn additional_reference(
+    dc: &DeployCtx,
+    args: &[String],
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let values: Vec<&str> = args
+        .iter()
+        .filter_map(|arg| arg.split_once('='))
+        .filter(|(key, _)| key.eq_ignore_ascii_case("additionalreference"))
+        .map(|(_, value)| value)
+        .collect();
+    let value = match values.as_slice() {
+        [] => return Ok(None),
+        [value] => *value,
+        _ => anyhow::bail!(
+            "additionalreference is given {} times; a token takes one reference",
+            values.len()
+        ),
+    };
+    anyhow::ensure!(
+        !value.contains(','),
+        "additionalreference takes one 64-byte address, not a list: {value}"
+    );
+    dc.resolve_address(value, 64)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("additional reference {value}: {e}"))
 }
 
 /// Parse a base-10 big integer to big-endian bytes (`big.Int.Bytes()`).

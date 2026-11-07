@@ -77,13 +77,14 @@ pub(crate) fn build_token_update(
 }
 
 /// The keys an update sets.
-const UPDATE_KEYS: [&str; 6] = [
+const UPDATE_KEYS: [&str; 7] = [
     "name",
     "symbol",
     "behavior",
     "mintstrategy",
     "units",
     "supply",
+    "additionalreference",
 ];
 
 /// The strategy `mintstrategy=proof` sets, as `deploy token` does: a custom
@@ -122,7 +123,7 @@ pub async fn run(dc: &DeployCtx, domain_arg: &str, args: &[String]) -> anyhow::R
 
     let mut client = dc.connect().await?;
     let current = read_config(&mut client, &domain).await?;
-    let cfg = updated_config(&current, args)?;
+    let cfg = update_config(dc, &current, args)?;
 
     println!("Domain: {}", hex::encode(&domain));
     let changes = changed_fields(&current, &cfg);
@@ -197,6 +198,21 @@ fn config_from_metadata_vertex(blob: &[u8]) -> anyhow::Result<TokenConfiguration
     let mut cfg = token_config_to_proto(&canonical).map_err(|e| anyhow::anyhow!("{e}"))?;
     // The node stores the references as one field; an empty one is none.
     cfg.additional_reference.retain(|r| !r.is_empty());
+    Ok(cfg)
+}
+
+/// The configuration an update submits, as `updated_config` builds it, with
+/// the `additionalreference` arg (hex or an alias) replacing the token's
+/// additional reference; without the arg the token keeps its reference.
+pub(super) fn update_config(
+    dc: &DeployCtx,
+    current: &TokenConfiguration,
+    args: &[String],
+) -> anyhow::Result<TokenConfiguration> {
+    let mut cfg = updated_config(current, args)?;
+    if let Some(reference) = super::token::additional_reference(dc, args)? {
+        cfg.additional_reference = vec![reference];
+    }
     Ok(cfg)
 }
 
