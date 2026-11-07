@@ -13,7 +13,7 @@ use quil_types::proto::token::{
     ProofBasisType, TokenConfiguration, TokenDeploy, TokenMintBehavior, TokenMintStrategy,
 };
 
-use super::DeployCtx;
+use super::{check_key_args, DeployCtx};
 
 // Behavior bit flags (token_intrinsic/constants.rs).
 const MINTABLE: u32 = 1 << 0;
@@ -23,7 +23,23 @@ const ACCEPTABLE: u32 = 1 << 3;
 const EXPIRABLE: u32 = 1 << 4;
 const TENDERABLE: u32 = 1 << 5;
 
+/// The keys a deploy takes.
+const DEPLOY_KEYS: [&str; 11] = [
+    "name",
+    "symbol",
+    "behavior",
+    "mintstrategy",
+    "authoritykey",
+    "canburn",
+    "paymentaddress",
+    "price",
+    "entitlementroot",
+    "units",
+    "supply",
+];
+
 pub async fn run(dc: &DeployCtx, args: &[String]) -> anyhow::Result<()> {
+    check_key_args(args, &DEPLOY_KEYS)?;
     let mut config: HashMap<String, String> = HashMap::new();
     for arg in args {
         if let Some((k, v)) = arg.split_once('=') {

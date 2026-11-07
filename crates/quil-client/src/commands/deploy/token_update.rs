@@ -33,7 +33,7 @@ use quil_types::proto::token::{
     TokenUpdate,
 };
 
-use super::DeployCtx;
+use super::{check_key_args, DeployCtx};
 
 /// Build a signed `TokenUpdate` for `domain`. The signed message is the
 /// canonical `TokenUpdate` with the signature field cleared (the node re-encodes
@@ -76,6 +76,27 @@ pub(crate) fn build_token_update(
     })
 }
 
+/// The keys an update sets.
+const UPDATE_KEYS: [&str; 6] = [
+    "name",
+    "symbol",
+    "behavior",
+    "mintstrategy",
+    "units",
+    "supply",
+];
+
+/// The strategy `mintstrategy=proof` sets, as `deploy token` does: a custom
+/// token mints by proof against the Merkle root of entitlements in its
+/// configuration. The node refuses its mints by proof of meaningful work.
+pub(super) fn proof_mint_strategy() -> TokenMintStrategy {
+    TokenMintStrategy {
+        mint_behavior: TokenMintBehavior::MintWithProof as i32,
+        proof_basis: ProofBasisType::MerkleEntitlementWithSignature as i32,
+        ..Default::default()
+    }
+}
+
 const MINTABLE: u32 = 1 << 0;
 const BURNABLE: u32 = 1 << 1;
 const DIVISIBLE: u32 = 1 << 2;
@@ -96,6 +117,7 @@ pub async fn run(dc: &DeployCtx, domain_arg: &str, args: &[String]) -> anyhow::R
     if domain_arg.is_empty() {
         anyhow::bail!("--domain <token address> is required for update");
     }
+    check_key_args(args, &UPDATE_KEYS)?;
     let domain = dc.resolve_address(domain_arg, 32)?;
 
     let mut client = dc.connect().await?;
@@ -215,10 +237,7 @@ pub(crate) fn updated_config(
     if let Some(v) = config.get("mintstrategy") {
         let mut strat = TokenMintStrategy::default();
         match v.to_lowercase().as_str() {
-            "proof" => {
-                strat.mint_behavior = TokenMintBehavior::MintWithProof as i32;
-                strat.proof_basis = ProofBasisType::ProofOfMeaningfulWork as i32;
-            }
+            "proof" => strat = proof_mint_strategy(),
             "authority" => strat.mint_behavior = TokenMintBehavior::MintWithAuthority as i32,
             "signature" => strat.mint_behavior = TokenMintBehavior::MintWithSignature as i32,
             "payment" => strat.mint_behavior = TokenMintBehavior::MintWithPayment as i32,
