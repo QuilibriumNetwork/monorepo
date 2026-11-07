@@ -156,6 +156,95 @@ where
     Ok(answers.into_iter().flatten().collect())
 }
 
+/// Bounds of one leaf listing ([`quil_forest::BatchTreeReader::leaves_under`]).
+/// A listing is checked against its subtree's root only once complete, so an
+/// archive could otherwise keep listing into memory without end. Past a
+/// bound the subtree is walked node by node instead, each node checked as it
+/// arrives, and its large children are listed in turn: an honest subtree
+/// past a bound costs at most the bound downloaded twice, not a stalled
+/// sync.
+#[derive(Clone, Copy, Debug)]
+struct ListingBounds {
+    leaves: usize,
+    /// Keys and values.
+    bytes: usize,
+    deadline: Duration,
+}
+
+const LISTING_BOUNDS: ListingBounds = ListingBounds {
+    leaves: 1 << 22,
+    bytes: 1 << 30,
+    deadline: Duration::from_secs(30 * 60),
+};
+
+/// A page of a leaf listing, and whether more leaves follow it.
+type LeafPage = (Vec<([u8; 32], Vec<u8>)>, bool);
+
+/// What [`list_leaves`] got.
+enum Listing {
+    Complete(Vec<(KeyHash, OwnedValue)>),
+    /// Stopped past its [`ListingBounds`], holding this many leaves and bytes.
+    Bounded {
+        leaves: usize,
+        bytes: usize,
+    },
+}
+
+/// Every leaf in `[first, last]`, page by page from `fetch(after)`, each
+/// page's size reported to `on_page`. Each page must continue past the last
+/// in strictly ascending key order within the range: a listing that does
+/// not advance, or leaves its range, would never end. Its content is
+/// checked by the caller.
+async fn list_leaves<F, Fut>(
+    bounds: ListingBounds,
+    first: [u8; 32],
+    last: [u8; 32],
+    mut fetch: F,
+    mut on_page: impl FnMut(usize),
+) -> std::result::Result<Listing, ArchiveClientError>
+where
+    F: FnMut(Option<[u8; 32]>) -> Fut,
+    Fut: Future<Output = std::result::Result<LeafPage, ArchiveClientError>>,
+{
+    let started = std::time::Instant::now();
+    let mut leaves: Vec<(KeyHash, OwnedValue)> = Vec::new();
+    let mut bytes = 0usize;
+    let mut after: Option<[u8; 32]> = None;
+    loop {
+        let (page, more) = fetch(after).await?;
+        let mut previous = after;
+        let in_order = page.iter().all(|(key, _)| {
+            let in_range = first <= *key && *key <= last;
+            let advances = previous.is_none_or(|before| before < *key);
+            previous = Some(*key);
+            in_range && advances
+        });
+        if !in_order || (more && page.is_empty()) {
+            return Err(ArchiveClientError::MissingField(
+                "forest leaf listing did not advance in key order within its range",
+            ));
+        }
+        on_page(page.len());
+        after = previous;
+        bytes = page.iter().fold(bytes, |total, (_, value)| {
+            total.saturating_add(32 + value.len())
+        });
+        leaves.extend(page.into_iter().map(|(key, value)| (KeyHash(key), value)));
+        if !more {
+            return Ok(Listing::Complete(leaves));
+        }
+        if leaves.len() > bounds.leaves
+            || bytes > bounds.bytes
+            || started.elapsed() >= bounds.deadline
+        {
+            return Ok(Listing::Bounded {
+                leaves: leaves.len(),
+                bytes,
+            });
+        }
+    }
+}
+
 /// A walk logs its progress only once it is long: past this many reads or
 /// [`WALK_LOG_AFTER`]. The GLOBAL prover tree's routine walks (about 10k
 /// reads in seconds) stay quiet.
@@ -326,17 +415,17 @@ impl RemoteTreeReader {
             .await
     }
 
-    /// Every leaf in `[first, last]` at `version`, page by page.
+    /// Every leaf in `[first, last]` at `version`, page by page; `None` once
+    /// the listing passes its [`ListingBounds`].
     async fn listed(
         &self,
         version: u64,
         first: [u8; 32],
         last: [u8; 32],
-    ) -> std::result::Result<Vec<(KeyHash, OwnedValue)>, ArchiveClientError> {
-        let mut leaves: Vec<(KeyHash, OwnedValue)> = Vec::new();
-        let mut after: Option<[u8; 32]> = None;
-        loop {
-            let (page, more) = retry_forest_read(|| {
+    ) -> std::result::Result<Option<Vec<(KeyHash, OwnedValue)>>, ArchiveClientError> {
+        let started = std::time::Instant::now();
+        let fetch = |after: Option<[u8; 32]>| {
+            retry_forest_read(move || {
                 let (mut client, shard_id) = (self.client.clone(), self.shard_id.clone());
                 async move {
                     client
@@ -344,23 +433,22 @@ impl RemoteTreeReader {
                         .await
                 }
             })
-            .await?;
-            // Each page must continue past the last: a listing that does not
-            // advance would never end. Its content is checked by the caller.
-            if page
-                .first()
-                .is_some_and(|(key, _)| after.is_some_and(|after| *key <= after))
-                || (more && page.is_empty())
-            {
-                return Err(ArchiveClientError::MissingField(
-                    "forest leaf listing did not advance",
-                ));
-            }
-            self.counted(page.len());
-            after = page.last().map(|(key, _)| *key).or(after);
-            leaves.extend(page.into_iter().map(|(key, value)| (KeyHash(key), value)));
-            if !more {
-                return Ok(leaves);
+        };
+        let on_page = |count| self.counted(count);
+        let listed = list_leaves(LISTING_BOUNDS, first, last, fetch, on_page).await?;
+        match listed {
+            Listing::Complete(leaves) => Ok(Some(leaves)),
+            Listing::Bounded { leaves, bytes } => {
+                tracing::info!(
+                    shard = %hex::encode(&self.label),
+                    phase = self.phase,
+                    leaves,
+                    bytes,
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "forest leaf listing passed its bounds (a very large subtree, or an archive \
+                     listing without end); walking the subtree node by node instead",
+                );
+                Ok(None)
             }
         }
     }
@@ -434,7 +522,7 @@ impl quil_forest::BatchTreeReader for RemoteTreeReader {
         }
         let (first, last) = quil_forest::key_range_under(bit_path);
         match self.handle.block_on(self.listed(version, first, last)) {
-            Ok(leaves) => Ok(Some(leaves)),
+            Ok(leaves) => Ok(leaves),
             Err(e) if e.is_unimplemented() => {
                 self.listing
                     .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -593,6 +681,93 @@ mod tests {
         );
     }
 
+    fn key(n: u64) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        key[24..].copy_from_slice(&n.to_be_bytes());
+        key
+    }
+
+    type PageFuture = futures::future::Ready<std::result::Result<LeafPage, ArchiveClientError>>;
+
+    /// A listing answering `pages` in turn, the last without more to follow.
+    fn pages(pages: Vec<Vec<u64>>) -> impl FnMut(Option<[u8; 32]>) -> PageFuture {
+        let mut pages = pages.into_iter();
+        move |_after: Option<[u8; 32]>| {
+            let page = pages.next().unwrap_or_default();
+            let more = !pages.as_slice().is_empty();
+            let leaves: Vec<([u8; 32], Vec<u8>)> =
+                page.into_iter().map(|n| (key(n), vec![1; 100])).collect();
+            futures::future::ready(Ok((leaves, more)))
+        }
+    }
+
+    /// A listing that keeps listing past the last key asked for.
+    fn endless(per_page: u64) -> impl FnMut(Option<[u8; 32]>) -> PageFuture {
+        move |after: Option<[u8; 32]>| {
+            let next = after.map_or(0, |after| {
+                u64::from_be_bytes(after[24..].try_into().unwrap()) + 1
+            });
+            let leaves: Vec<([u8; 32], Vec<u8>)> = (next..next + per_page)
+                .map(|n| (key(n), vec![1; 100]))
+                .collect();
+            futures::future::ready(Ok((leaves, true)))
+        }
+    }
+
+    /// Pages must ascend strictly, past the last page, within the range
+    /// asked for; an empty page must end the listing.
+    #[tokio::test]
+    async fn listing_pages_must_ascend_within_their_range() {
+        let (first, last) = (key(10), key(100));
+        let listed = list_leaves(
+            LISTING_BOUNDS,
+            first,
+            last,
+            pages(vec![vec![10, 11], vec![12, 100], vec![]]),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(matches!(listed, Listing::Complete(leaves) if leaves.len() == 4));
+        for refused in [
+            vec![vec![12, 11]],
+            vec![vec![9, 11]],
+            vec![vec![11, 101]],
+            vec![vec![10, 12], vec![12, 13]],
+            vec![vec![10], vec![], vec![11]],
+        ] {
+            let listed = list_leaves(LISTING_BOUNDS, first, last, pages(refused.clone()), |_| {});
+            assert!(listed.await.is_err(), "{refused:?}");
+        }
+    }
+
+    /// A listing past its leaf, byte or time bound stops, so the subtree is
+    /// walked instead.
+    #[tokio::test]
+    async fn a_listing_past_its_bounds_stops() {
+        let (first, last) = (key(0), [0xff; 32]);
+        let mut fetched = 0;
+        let bounds = ListingBounds {
+            leaves: 1_000,
+            ..LISTING_BOUNDS
+        };
+        let listed = list_leaves(bounds, first, last, endless(100), |_| fetched += 1).await;
+        assert!(matches!(listed, Ok(Listing::Bounded { leaves: 1_100, .. })));
+        assert_eq!(fetched, 11);
+        let bounds = ListingBounds {
+            bytes: 10_000,
+            ..LISTING_BOUNDS
+        };
+        let listed = list_leaves(bounds, first, last, endless(100), |_| {}).await;
+        assert!(matches!(listed, Ok(Listing::Bounded { bytes: 13_200, .. })));
+        let bounds = ListingBounds {
+            deadline: Duration::ZERO,
+            ..LISTING_BOUNDS
+        };
+        let listed = list_leaves(bounds, first, last, endless(100), |_| {}).await;
+        assert!(matches!(listed, Ok(Listing::Bounded { leaves: 100, .. })));
+    }
+
     /// An archive that stays busy is given up on after a while, so the sync
     /// can move to another archive.
     #[tokio::test]
@@ -603,5 +778,117 @@ mod tests {
             })
             .await;
         assert!(result.unwrap_err().is_busy());
+    }
+
+    /// An archive whose listing pages step back within the range asked for
+    /// kept the listing going for as long as it answered, every page held in
+    /// memory before any check.
+    #[test]
+    fn reproduces_endless_forest_leaf_listing() {
+        use quil_types::proto::global::{
+            ForestLeaf, GetForestLeavesRequest, GetForestLeavesResponse,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tonic::codegen::http;
+
+        /// Lists two leaves, the second below the first, with more to follow.
+        struct SteppingBack(Arc<AtomicUsize>);
+
+        impl tonic::server::UnaryService<GetForestLeavesRequest> for SteppingBack {
+            type Response = GetForestLeavesResponse;
+            type Future = futures::future::Ready<
+                std::result::Result<tonic::Response<GetForestLeavesResponse>, tonic::Status>,
+            >;
+
+            fn call(&mut self, _: tonic::Request<GetForestLeavesRequest>) -> Self::Future {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let leaf = |byte: u8| ForestLeaf {
+                    key_hash: vec![byte; 32],
+                    value: vec![byte; 8],
+                };
+                futures::future::ready(Ok(tonic::Response::new(GetForestLeavesResponse {
+                    leaves: vec![leaf(0x20), leaf(0x10)],
+                    more: true,
+                })))
+            }
+        }
+
+        /// An archive's GlobalService answering every call as a listing.
+        #[derive(Clone)]
+        struct Archive(Arc<AtomicUsize>);
+
+        impl tonic::server::NamedService for Archive {
+            const NAME: &'static str = "quilibrium.node.global.pb.GlobalService";
+        }
+
+        impl tonic::codegen::Service<http::Request<tonic::body::BoxBody>> for Archive {
+            type Response = http::Response<tonic::body::BoxBody>;
+            type Error = std::convert::Infallible;
+            type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+
+            fn poll_ready(
+                &mut self,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, request: http::Request<tonic::body::BoxBody>) -> Self::Future {
+                let listing = SteppingBack(self.0.clone());
+                Box::pin(async move {
+                    let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::default());
+                    Ok(grpc.unary(listing, request).await)
+                })
+            }
+        }
+
+        struct Incoming(tokio::net::TcpListener);
+
+        impl futures::Stream for Incoming {
+            type Item = std::io::Result<tokio::net::TcpStream>;
+
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                self.0
+                    .poll_accept(cx)
+                    .map(|result| Some(result.map(|(stream, _)| stream)))
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let pages = Arc::new(AtomicUsize::new(0));
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        runtime.spawn(
+            tonic::transport::Server::builder()
+                .add_service(Archive(pages.clone()))
+                .serve_with_incoming(Incoming(listener)),
+        );
+        let client = runtime
+            .block_on(ArchiveClient::connect_plaintext(&address))
+            .unwrap();
+        let reader = RemoteTreeReader::new(client, runtime.handle().clone(), vec![1; 32], 0);
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let listed = quil_forest::BatchTreeReader::leaves_under(&reader, 1, &[false]);
+            let _ = done.send(listed.map(|leaves| leaves.map(|leaves| leaves.len())));
+        });
+        let outcome = outcome.recv_timeout(Duration::from_secs(5));
+        let served = pages.load(Ordering::SeqCst);
+        runtime.shutdown_background();
+        assert!(
+            matches!(outcome, Ok(Err(_)) | Ok(Ok(None))),
+            "listing pages stepping back within their range were still followed after 5 s: \
+             {served} pages of two leaves listed ({outcome:?})"
+        );
     }
 }

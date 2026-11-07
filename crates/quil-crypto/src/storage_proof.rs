@@ -303,6 +303,61 @@ pub fn verify_path(
     hash::to_bytes(&bind(tree, n, &acc)) == *commitment
 }
 
+/// The node at `index` on level `height` of a tree of `n` leaves whose
+/// leaves under it are all zero nodes: what a path holds there, the empty
+/// subtree past the level's end ([`MerkleTree::path`]).
+fn zero_padding_node(n: u64, height: usize, index: u64) -> Digest {
+    static FULL: std::sync::OnceLock<Vec<Digest>> = std::sync::OnceLock::new();
+    let full = FULL.get_or_init(|| {
+        let mut levels = Vec::with_capacity(65);
+        levels.push(hash::ZERO);
+        for height in 0..64 {
+            let below = levels[height];
+            levels.push(hash::compress(&below, &below, Domain::Node));
+        }
+        levels
+    });
+    if index >= n.div_ceil(1u64 << height) {
+        return empty_subtree(height);
+    }
+    if (index + 1) << height <= n {
+        return full[height];
+    }
+    // The one node of the level holding the tree's last leaf.
+    hash::compress(
+        &zero_padding_node(n, height - 1, 2 * index),
+        &zero_padding_node(n, height - 1, 2 * index + 1),
+        Domain::Node,
+    )
+}
+
+/// Whether `value` and `path` open leaf `first` of the data tree committed
+/// as `commitment`, with `n` leaves, and show it and every leaf after it a
+/// zero node: a registration's padding past its leaf's data. Every leaf
+/// after `first` lies under a right sibling on its path, so each must be
+/// the root of zero nodes it stands for.
+pub fn verify_zero_padding(
+    n: u64,
+    commitment: &Node,
+    first: u64,
+    value: &Node,
+    path: &[Node],
+) -> bool {
+    if *value != hash::to_bytes(&hash::ZERO)
+        || !verify_path(Tree::Data, n, commitment, first, value, path)
+    {
+        return false;
+    }
+    let mut i = first;
+    for (height, sibling) in path.iter().enumerate() {
+        if i & 1 == 0 && *sibling != hash::to_bytes(&zero_padding_node(n, height, i + 1)) {
+            return false;
+        }
+        i >>= 1;
+    }
+    true
+}
+
 /// The upper levels of a tree: with the leaves themselves they give any path,
 /// recomputing only the subtree of `2^height` leaves below the cap.
 #[derive(Clone, Debug, PartialEq, Eq)]

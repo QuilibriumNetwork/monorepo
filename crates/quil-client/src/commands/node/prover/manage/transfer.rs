@@ -43,7 +43,56 @@ pub struct Read {
     /// Unspent confidential coins and their total; `None` while the
     /// application holds no confidential coin at all.
     pub coins: Option<(usize, u128)>,
+    /// Coins the read left out of the count and total.
+    pub skipped: Skipped,
     pub escrows: Vec<Escrow>,
+    /// Why the pending transfers could not be read; the coins still were.
+    pub escrows_failed: Option<ReadFailure>,
+}
+
+/// Why a read of the coins or the pending transfers failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadFailure {
+    /// The node released the scan's snapshot `minutes` after the scan
+    /// started, before it read every record: a read again stops the same
+    /// way.
+    Outlived { minutes: u64 },
+    /// Any other failure, in its own words: a read again may pass.
+    Failed(String),
+}
+
+impl ReadFailure {
+    /// The notice of `what` (the coins or the pending transfers) whose
+    /// read failed so; it offers ‹E› only where a read again may pass.
+    fn notice(&self, what: &str) -> String {
+        match self {
+            Self::Outlived { minutes } => format!(
+                "{what}: the network is too large for this node to scan within its \
+                 {minutes}-min snapshot."
+            ),
+            Self::Failed(error) => format!("{what}: read failed ({error}); ‹E› reads them again."),
+        }
+    }
+}
+
+/// Coins a read of the shielded side left out, by kind; anyone can send
+/// such a coin to this wallet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Skipped {
+    /// Their memo opens for this wallet but does not match the coin: never
+    /// counted or spent.
+    pub mismatched: usize,
+    /// They share a spend image with a counted coin: only one coin per
+    /// image can be spent.
+    pub duplicates: usize,
+    /// Coins past the read's limit, the smallest: not counted.
+    pub limited: usize,
+    /// Pending transfers past the read's limit, the last ranked (those this
+    /// wallet can act on first, then the largest): not listed.
+    pub escrows: usize,
+    /// Pending transfers whose memo opens for this wallet but does not
+    /// match: they can be neither accepted nor refunded.
+    pub escrows_mismatched: usize,
 }
 
 /// What an action does, with its exact inputs.
@@ -159,7 +208,7 @@ pub struct Run {
 #[derive(Debug, Default)]
 pub struct Transfers {
     /// The last read: what it found and when, or why it failed.
-    pub read: Option<Result<(Read, SystemTime), String>>,
+    pub read: Option<Result<(Read, SystemTime), ReadFailure>>,
     pub reading: Option<Instant>,
     /// The Transfers row under the cursor.
     pub cursor: usize,
@@ -288,7 +337,7 @@ pub fn request_read(m: &mut Model) -> Vec<Cmd> {
 
 /// A finished read. A failed one leaves no figures: the row and the panel
 /// say it failed rather than show older ones as current.
-pub fn apply_read(m: &mut Model, read: Result<Read, String>) {
+pub fn apply_read(m: &mut Model, read: Result<Read, ReadFailure>) {
     let transfers = &mut m.coins.transfer;
     transfers.reading = None;
     transfers.read = Some(read.map(|read| (read, SystemTime::now())));
@@ -613,9 +662,93 @@ pub fn notices(m: &Model) -> Vec<Notice> {
             NoticeSeverity::Warning,
             false,
             false,
-            format!("Shielded coins: read failed ({error}); ‹E› reads them again."),
+            error.notice("Shielded coins"),
         ),
         Some(Ok((read, _))) => {
+            // Coins the read left out, of all it found unspent for this
+            // wallet; the balance cells show the counted ones.
+            let skipped = read.skipped;
+            let found = read.coins.map_or(0, |(count, _)| count)
+                + skipped.mismatched
+                + skipped.duplicates
+                + skipped.limited;
+            if skipped.mismatched > 0 {
+                push(
+                    "transfers-skipped-mismatched",
+                    NoticeSeverity::Warning,
+                    false,
+                    false,
+                    format!(
+                        "Shielded coins: {} of {found} received left out: their memo does not \
+                         match the coin, so they are never counted or spent.",
+                        skipped.mismatched
+                    ),
+                );
+            }
+            if skipped.duplicates > 0 {
+                push(
+                    "transfers-skipped-duplicates",
+                    NoticeSeverity::Warning,
+                    false,
+                    false,
+                    format!(
+                        "Shielded coins: {} of {found} received left out: each shares a spend \
+                         image with a counted coin, and only one per image can be spent.",
+                        skipped.duplicates
+                    ),
+                );
+            }
+            if skipped.limited > 0 {
+                push(
+                    "transfers-skipped-limited",
+                    NoticeSeverity::Warning,
+                    false,
+                    false,
+                    format!(
+                        "Shielded coins: {} of {found} received left out past the read's limit; \
+                         ‹J› merges coins, bringing more into the count, and `qclient token \
+                         coins --max-coins <n>` lists them all.",
+                        skipped.limited
+                    ),
+                );
+            }
+            if skipped.escrows > 0 {
+                push(
+                    "transfers-skipped-escrows",
+                    NoticeSeverity::Warning,
+                    false,
+                    false,
+                    format!(
+                        "Pending transfers: {} of {} left out past the read's limit; those you \
+                         can act on, then the largest, are listed, and `qclient token escrows \
+                         --max-escrows <n>` lists them all.",
+                        skipped.escrows,
+                        read.escrows.len() + skipped.escrows
+                    ),
+                );
+            }
+            if skipped.escrows_mismatched > 0 {
+                push(
+                    "transfers-skipped-escrows-mismatched",
+                    NoticeSeverity::Warning,
+                    false,
+                    false,
+                    format!(
+                        "Pending transfers: {} naming this node left out: their memo does not \
+                         match the transfer, so they can be neither accepted nor refunded.",
+                        skipped.escrows_mismatched
+                    ),
+                );
+            }
+            if let Some(error) = &read.escrows_failed {
+                push(
+                    "transfers-escrows-read-failed",
+                    NoticeSeverity::Warning,
+                    false,
+                    false,
+                    error.notice("Pending transfers"),
+                );
+            }
             // The transfers, their amounts and refund frames are the
             // Transfers panel's: these notices name the condition and key.
             let rows = &read.escrows;
@@ -764,6 +897,141 @@ mod transfer_tests {
         assert!(matches!(&m.coins.transfer.dialog, Some(Dialog::Form(f)) if f.error.is_some()));
     }
 
+    /// A read the node's snapshot hour stopped stops the same way when read
+    /// again: its notice names that in one row and offers no ‹E›, for the
+    /// coins and for the pending transfers.
+    #[test]
+    fn a_read_its_snapshot_hour_stopped_offers_no_read_again() {
+        let mut m = Model::new();
+        let outlived = ReadFailure::Outlived { minutes: 60 };
+        let text = |m: &Model, key: &str| {
+            notices(m)
+                .into_iter()
+                .find(|notice| notice.key == key)
+                .map(|notice| notice.text)
+        };
+        apply_read(&mut m, Err(outlived.clone()));
+        assert_eq!(
+            text(&m, "transfers-read-failed").as_deref(),
+            Some(
+                "Shielded coins: the network is too large for this node to scan within its \
+                 60-min snapshot."
+            ),
+            "the coins' notice offers a read that stops the same way"
+        );
+        let read = Read {
+            coins: Some((1, 5)),
+            skipped: Skipped::default(),
+            escrows: Vec::new(),
+            escrows_failed: Some(outlived),
+        };
+        apply_read(&mut m, Ok(read));
+        assert_eq!(
+            text(&m, "transfers-escrows-read-failed").as_deref(),
+            Some(
+                "Pending transfers: the network is too large for this node to scan within its \
+                 60-min snapshot."
+            ),
+            "the pending transfers' notice offers a read that stops the same way"
+        );
+    }
+
+    /// A read that left coins or pending transfers out says so, one notice
+    /// per kind naming what to do, counting coins against every coin it
+    /// found unspent for this wallet; a read that left none out says
+    /// nothing. A failed read of the pending transfers keeps the coins and
+    /// says so.
+    #[test]
+    fn a_shielded_read_names_the_coins_it_left_out() {
+        let mut m = Model::new();
+        let read = |skipped, escrows_failed| Read {
+            coins: Some((3, 35)),
+            skipped,
+            escrows: vec![Escrow {
+                address: [1; 32],
+                amount: 5,
+                outgoing: false,
+                refund_after: 100,
+            }],
+            escrows_failed,
+        };
+        let shown = |m: &Model| {
+            notices(m)
+                .into_iter()
+                .filter(|notice| {
+                    notice.key.starts_with("transfers-skipped")
+                        || notice.key == "transfers-escrows-read-failed"
+                })
+                .map(|notice| (notice.severity, notice.text))
+                .collect::<Vec<_>>()
+        };
+        apply_read(&mut m, Ok(read(Skipped::default(), None)));
+        assert!(shown(&m).is_empty());
+        let cap = ReadFailure::Failed("escrow scan reached its --max-pages cap".into());
+        apply_read(&mut m, Ok(read(Skipped::default(), Some(cap))));
+        assert_eq!(
+            shown(&m),
+            [(
+                NoticeSeverity::Warning,
+                "Pending transfers: read failed (escrow scan reached its --max-pages cap); ‹E› \
+                 reads them again."
+                    .to_string()
+            )],
+            "skipped coins: a failed read of the pending transfers keeps the coins"
+        );
+        apply_read(
+            &mut m,
+            Ok(read(
+                Skipped {
+                    mismatched: 2,
+                    duplicates: 1,
+                    limited: 1,
+                    escrows: 2,
+                    escrows_mismatched: 1,
+                },
+                None,
+            )),
+        );
+        assert_eq!(
+            shown(&m),
+            [
+                (
+                    NoticeSeverity::Warning,
+                    "Shielded coins: 2 of 7 received left out: their memo does not match the \
+                     coin, so they are never counted or spent."
+                        .to_string()
+                ),
+                (
+                    NoticeSeverity::Warning,
+                    "Shielded coins: 1 of 7 received left out: each shares a spend image with a \
+                     counted coin, and only one per image can be spent."
+                        .to_string()
+                ),
+                (
+                    NoticeSeverity::Warning,
+                    "Shielded coins: 1 of 7 received left out past the read's limit; ‹J› merges \
+                     coins, bringing more into the count, and `qclient token coins --max-coins \
+                     <n>` lists them all."
+                        .to_string()
+                ),
+                (
+                    NoticeSeverity::Warning,
+                    "Pending transfers: 2 of 3 left out past the read's limit; those you can act \
+                     on, then the largest, are listed, and `qclient token escrows --max-escrows \
+                     <n>` lists them all."
+                        .to_string()
+                ),
+                (
+                    NoticeSeverity::Warning,
+                    "Pending transfers: 1 naming this node left out: their memo does not match \
+                     the transfer, so they can be neither accepted nor refunded."
+                        .to_string()
+                ),
+            ],
+            "skipped coins: the manager shows each kind the read left out"
+        );
+    }
+
     #[test]
     fn accept_and_refund_act_on_the_selected_escrow_only_when_they_can() {
         let mut m = Model::new();
@@ -771,6 +1039,8 @@ mod transfer_tests {
         assert!(request(&mut m, 'A').is_empty());
         let read = |escrows| Read {
             coins: Some((2, 300)),
+            skipped: Default::default(),
+            escrows_failed: None,
             escrows,
         };
         apply_read(
@@ -830,7 +1100,7 @@ mod transfer_tests {
             }
         }
         // A failed read leaves no rows.
-        apply_read(&mut m, Err("unavailable".into()));
+        apply_read(&mut m, Err(ReadFailure::Failed("unavailable".into())));
         assert!(escrows(&m).is_empty() && m.coins.transfer.cursor == 0);
         assert!(request(&mut m, 'R').is_empty());
     }

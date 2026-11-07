@@ -333,7 +333,7 @@ const UNIFIED_PHASES: [(&str, &str, quil_forest::Phase); 4] = [
 /// finalized then made every member abstain, and the shard wedged. The master
 /// warms its own CRDT at boot with its committed apps.
 /// The gossip topics a registered shard engine subscribes.
-fn shard_topics(filter: &[u8]) -> [Vec<u8>; 4] {
+pub(super) fn shard_topics(filter: &[u8]) -> [Vec<u8>; 4] {
     [
         quil_engine::bitmasks::shard_frame_bitmask(filter),
         quil_engine::bitmasks::shard_consensus_bitmask(filter),

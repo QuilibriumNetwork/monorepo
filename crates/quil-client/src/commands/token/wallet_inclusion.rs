@@ -44,7 +44,8 @@ const SUGGESTED_WAIT_SECS: u64 = 600;
 pub(crate) struct Follow {
     /// `--wait`: zero prints the identifiers and returns.
     pub(crate) wait: std::time::Duration,
-    /// Page budget of a coin scan for the operation's coins.
+    /// Page cap of a coin scan for the operation's coins: `--max-pages`, else
+    /// none.
     pub(crate) max_pages: usize,
 }
 
@@ -324,6 +325,9 @@ impl RecipientWallet {
                     }
                 }
                 pages += 1;
+                if let Some(line) = scan.progress("coins") {
+                    say_err!("{line}");
+                }
             }
             say_err!(
                 "coin scan: {pages} pages in {:.1} s{}",
@@ -343,8 +347,8 @@ impl RecipientWallet {
 
     /// Whether this wallet can open `output`: the coin is its own.
     pub(super) fn owns(&self, output: &Output) -> bool {
-        quil_lattice_ct::confidential::memo::open_output(
-            &self.context,
+        quil_lattice_ct::confidential::memo::open_output_with_keys(
+            self.opening_keys(),
             &self.kem_secret,
             &self.recipient,
             output,

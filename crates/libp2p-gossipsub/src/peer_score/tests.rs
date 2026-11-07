@@ -1025,3 +1025,44 @@ fn committee_ip_exemption_preserves_invalid_message_and_other_penalties() {
         "departed members regain the IP penalty"
     );
 }
+
+/// A peer that leaves with no recorded state is forgotten with its IPs, and
+/// an IP no peer uses any more is dropped (upstream #6710). Before, each
+/// left an empty set behind, one for every distinct IP ever connected, and
+/// the peer was kept for `retain_score`.
+#[test]
+fn departed_blank_peers_leave_no_score_state() {
+    let mut peer_score = PeerScore::new(PeerScoreParams::default(), PeerScoreThresholds::default());
+    for i in 0..1000u32 {
+        let peer = PeerId::random();
+        let ip = IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i));
+        peer_score.add_peer(peer);
+        peer_score.add_ip(&peer, ip);
+        // The behaviour removes the closed connection's IP first; a peer
+        // removed with its IPs still recorded is covered too.
+        if i % 2 == 0 {
+            peer_score.remove_ip(&peer, &ip);
+        }
+        peer_score.remove_peer(&peer);
+    }
+    assert_eq!(
+        peer_score.peer_ips.len(),
+        0,
+        "IP sets were kept for peers that left"
+    );
+    assert_eq!(
+        peer_score.peer_stats.len(),
+        0,
+        "blank peers that left were retained"
+    );
+
+    // A penalised peer is still retained with its IP.
+    let peer = PeerId::random();
+    let ip = IpAddr::from(std::net::Ipv4Addr::new(192, 0, 2, 1));
+    peer_score.add_peer(peer);
+    peer_score.add_ip(&peer, ip);
+    peer_score.add_penalty(&peer, 1);
+    peer_score.remove_peer(&peer);
+    assert!(peer_score.peer_stats.contains_key(&peer));
+    assert!(peer_score.peer_ips[&ip].contains(&peer));
+}

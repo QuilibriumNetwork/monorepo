@@ -55,7 +55,7 @@ pub(crate) struct OwnDecisions {
 }
 
 /// The refusal reason of a parent that is not readable yet.
-const PARENT_UNAVAILABLE: &str = "parent unavailable";
+pub(crate) const PARENT_UNAVAILABLE: &str = "parent unavailable";
 
 /// What an operator does about a stall this member causes by refusing.
 const THIS_NODE_ACTION: &str = "own_refused says why: 'not at the parent frame' and 'anchored GLOBAL frame missing' \

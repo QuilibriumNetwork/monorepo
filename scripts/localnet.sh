@@ -186,11 +186,12 @@ fi
 # removed — a shard splits on prover-count (SPLIT_MAX_PROVERS) AND divisibility.
 # To force a localnet split, lower SPLIT_MAX_PROVERS below the covered count.
 
-# DEV: unified-app-tree cutover frame. Localnet starts at frame 0, so mainnet's
-# 695500 is never reached; set a LOW frame to exercise the state-commitment
-# switch — split apps fold into their single app tree + the commitment forks
-# (JMT root vs the legacy hash_pair rollup). Every node MUST use the SAME value
-# (deterministic or fork). Only honored when set; mainnet never sets it.
+# DEV: unified-app-tree cutover frame. Localnet starts at frame 0, so the
+# mainnet default (699500) is never reached and a localnet keeps the legacy
+# commitment unless this is set. Set a LOW frame (e.g. 30) to run the unified
+# tree mainnet runs — split apps fold into their single app tree + the commitment
+# forks (JMT root vs the legacy hash_pair rollup). Every node MUST use the SAME
+# value (deterministic or fork). Only honored when set; mainnet never sets it.
 if [[ -n "${UNIFIED_TREE_CUTOVER_FRAME:-}" ]]; then
   export QUIL_UNIFIED_TREE_CUTOVER_FRAME="$UNIFIED_TREE_CUTOVER_FRAME"
 fi
@@ -346,17 +347,15 @@ write_regular_config() {
   p2p=$(node_p2p "$idx"); strm=$(node_strm "$idx")
   grpc=$(node_grpc "$idx")
   if [[ -n "$bootstrap" ]]; then boot_block=$'\n    - "'"$bootstrap"'"'; fi
-  # The archive pool is seeded ONLY from engine.archiveEndpoints (or mainnet's
-  # hardcoded genesis IPs) — nothing populates it from PeerInfo gossip, despite
-  # the comment in master_node/mod.rs saying so. Leaving it empty on a regular
-  # makes every archive-pool consumer resolve an EMPTY endpoint and silently
-  # no-op: the app-shard catch-up sync, a new split child's inherited-subtree
-  # bootstrap, and delivery source-frame fetches all fail, so shards stall
-  # after a split with `addr:""` in the syncer log.
+  # Seed the archive pool with EVERY archive's stream endpoint. The pool also
+  # learns archives from their PeerInfo gossip, but only once the mesh
+  # converges; until then an empty pool makes every archive-pool consumer
+  # resolve an EMPTY endpoint and no-op (app-shard catch-up sync, a split
+  # child's subtree bootstrap, delivery source-frame fetches).
   local archive_endpoints_yaml=""
-  local ep
-  for ep in ${ARCH_ENDPOINTS[@]+"${ARCH_ENDPOINTS[@]}"}; do
-    archive_endpoints_yaml+=$'\n    - "'"$ep"'"'
+  local a
+  for (( a=0; a<ARCHIVES; a++ )); do
+    archive_endpoints_yaml+=$'\n    - "/ip4/127.0.0.1/tcp/'"$(node_strm "$a")"'"'
   done
   [[ -z "$archive_endpoints_yaml" ]] && archive_endpoints_yaml=" []"
   # Cluster mode: one stream multiaddr per worker process.

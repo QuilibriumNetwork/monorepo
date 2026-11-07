@@ -18,16 +18,24 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use std::{collections::HashMap, convert::Infallible, fmt, io, pin::Pin, time::Duration};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    convert::Infallible,
+    fmt, io,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use asynchronous_codec::{Decoder, Encoder, Framed};
 use byteorder::{BigEndian, ByteOrder};
 use bytes::{Buf, BytesMut};
 use futures::prelude::*;
 use libp2p_core::{InboundUpgrade, OutboundUpgrade, UpgradeInfo};
-use libp2p_identity::{PeerId, PublicKey};
+use libp2p_identity::{KeyType, PeerId, PublicKey};
 use libp2p_swarm::StreamProtocol;
 use quick_protobuf::{BytesReader, MessageRead, MessageWrite, Writer};
+use sha2::{Digest, Sha256};
 use web_time::Instant;
 
 use crate::{
@@ -119,6 +127,120 @@ pub(crate) fn signature_payload(
     buf
 }
 
+/// QUILIBRIUM: the key types (protobuf `KeyType` values) a message signature
+/// may use: Ed25519 (1) and Falcon (5). Nodes sign gossip with their Falcon
+/// network identity; Ed25519 is cheap to verify and used by tests and tools.
+/// No node publishes with another type, and some cost far more to verify
+/// (Ed448 is reference big-integer code), so an entry carrying one is dropped
+/// before anything of it is decoded or hashed
+/// ([`ValidationError::RefusedKeyType`]). It is not counted as an invalid
+/// signature: releases before this check verify such entries and forward
+/// them, and penalising those relays would cut them off the mesh.
+const SIGNATURE_KEY_TYPES: [u64; 2] = [1, 5];
+
+/// QUILIBRIUM: the outcome of a message's signature check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignatureCheck {
+    Valid,
+    Invalid,
+    /// Signed with a key of a type not in [`SIGNATURE_KEY_TYPES`].
+    RefusedKeyType,
+}
+
+/// QUILIBRIUM: the type of a protobuf-encoded public key, read without
+/// decoding the key: the last `Type` field (1), as the decoder reads it.
+fn encoded_key_type(encoded: &[u8]) -> Option<u64> {
+    let mut key = WireReader::new(encoded);
+    let mut key_type = None;
+    while !key.is_empty() {
+        let tag = key.varint32().ok()?;
+        if tag == 8 {
+            key_type = Some(key.varint().ok()?);
+        } else {
+            key.skip(tag).ok()?;
+        }
+    }
+    key_type
+}
+
+/// QUILIBRIUM: decodes a message's signing key when its type is one of
+/// [`SIGNATURE_KEY_TYPES`], checked before and after decoding.
+fn decode_signing_key(encoded: &[u8]) -> Option<PublicKey> {
+    if !encoded_key_type(encoded).is_some_and(|key_type| SIGNATURE_KEY_TYPES.contains(&key_type)) {
+        return None;
+    }
+    let key = PublicKey::try_decode_protobuf(encoded).ok()?;
+    matches!(key.key_type(), KeyType::Ed25519 | KeyType::Falcon).then_some(key)
+}
+
+/// QUILIBRIUM: how many verified entries [`VerifiedSignatures`] remembers. The
+/// copies of a message reach a node from its mesh peers within seconds, so a
+/// few seconds of traffic is enough; at 32 bytes a digest this is under 1 MiB.
+const MAX_VERIFIED_SIGNATURES: usize = 16_384;
+
+/// QUILIBRIUM: digests of the published entries whose signatures verified,
+/// shared by the inbound streams of one behaviour. An entry identical to one
+/// already verified (the same signed fields, signature and key) skips the
+/// check. Every mesh peer forwards a copy of each message, and the duplicate
+/// check runs in the behaviour, after the codec, so each copy (or a replay of
+/// any message seen on the network) otherwise cost a verification of its own.
+#[derive(Debug, Default)]
+pub(crate) struct VerifiedSignatures {
+    entries: Mutex<VerifiedSet>,
+}
+
+/// QUILIBRIUM: the digests of [`VerifiedSignatures`], oldest first.
+#[derive(Debug, Default)]
+struct VerifiedSet {
+    digests: HashSet<[u8; 32]>,
+    order: VecDeque<[u8; 32]>,
+}
+
+impl VerifiedSignatures {
+    fn contains(&self, digest: &[u8; 32]) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .digests
+            .contains(digest)
+    }
+
+    fn insert(&self, digest: [u8; 32]) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !entries.digests.insert(digest) {
+            return;
+        }
+        entries.order.push_back(digest);
+        if entries.order.len() > MAX_VERIFIED_SIGNATURES {
+            if let Some(oldest) = entries.order.pop_front() {
+                entries.digests.remove(&oldest);
+            }
+        }
+    }
+}
+
+/// QUILIBRIUM: the key of an entry in [`VerifiedSignatures`]: its signed
+/// bytes, signature and key, each length-prefixed.
+fn verified_digest(signed: &[u8], signature: &[u8], key: Option<&[u8]>) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for part in [Some(signed), Some(signature), key] {
+        match part {
+            Some(part) => {
+                hasher.update([1u8]);
+                hasher.update((part.len() as u64).to_be_bytes());
+                hasher.update(part);
+            }
+            None => hasher.update([0u8]),
+        }
+    }
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&hasher.finalize());
+    digest
+}
+
 pub(crate) const GOSSIPSUB_1_2_0_PROTOCOL: ProtocolId = ProtocolId {
     protocol: StreamProtocol::new("/meshsub/1.2.0"),
     kind: PeerKind::Gossipsubv1_2,
@@ -148,6 +270,8 @@ pub struct ProtocolConfig {
     pub(crate) default_max_transmit_size: usize,
     /// The max transmit sizes for a topic.
     pub(crate) max_transmit_sizes: HashMap<TopicHash, usize>,
+    /// QUILIBRIUM: entries whose signatures verified, shared by every stream.
+    pub(crate) verified_signatures: Arc<VerifiedSignatures>,
 }
 
 impl Default for ProtocolConfig {
@@ -161,6 +285,7 @@ impl Default for ProtocolConfig {
             ],
             default_max_transmit_size: 65536,
             max_transmit_sizes: HashMap::new(),
+            verified_signatures: Arc::default(),
         }
     }
 }
@@ -215,7 +340,8 @@ where
                     self.default_max_transmit_size,
                     self.validation_mode,
                     self.max_transmit_sizes,
-                ),
+                )
+                .with_verified_signatures(self.verified_signatures),
             ),
             protocol_id.kind,
         )))
@@ -238,7 +364,8 @@ where
                     self.default_max_transmit_size,
                     self.validation_mode,
                     self.max_transmit_sizes,
-                ),
+                )
+                .with_verified_signatures(self.verified_signatures),
             ),
             protocol_id.kind,
         )))
@@ -259,6 +386,8 @@ pub struct GossipsubCodec {
     max_transmit_sizes: HashMap<TopicHash, usize>,
     /// QUILIBRIUM: failed signature checks this stream has caused.
     invalid_signatures: InvalidSignatureBudget,
+    /// QUILIBRIUM: entries whose signatures verified (see [`VerifiedSignatures`]).
+    verified_signatures: Arc<VerifiedSignatures>,
 }
 
 impl GossipsubCodec {
@@ -274,7 +403,14 @@ impl GossipsubCodec {
             max_length,
             max_transmit_sizes,
             invalid_signatures: InvalidSignatureBudget::default(),
+            verified_signatures: Arc::default(),
         }
+    }
+
+    /// QUILIBRIUM: shares `verified` with the other streams of a behaviour.
+    pub(crate) fn with_verified_signatures(mut self, verified: Arc<VerifiedSignatures>) -> Self {
+        self.verified_signatures = verified;
+        self
     }
 
     /// Get the max transmit size for a given topic if it exists.
@@ -285,41 +421,33 @@ impl GossipsubCodec {
     /// Verifies a gossipsub message. This returns either a success or failure. All errors
     /// are logged, which prevents error handling in the codec and handler. We simply drop invalid
     /// messages and log warnings, rather than propagating errors through the codec.
-    fn verify_signature(message: &proto::Message) -> bool {
+    fn verify_signature(message: &proto::Message, verified: &VerifiedSignatures) -> SignatureCheck {
         let Some(from) = message.from.as_ref() else {
             tracing::debug!("Signature verification failed: No source id given");
-            return false;
+            return SignatureCheck::Invalid;
         };
 
         let Ok(source) = PeerId::from_bytes(from) else {
             tracing::debug!("Signature verification failed: Invalid Peer Id");
-            return false;
+            return SignatureCheck::Invalid;
         };
 
         let Some(signature) = message.signature.as_ref() else {
             tracing::debug!("Signature verification failed: No signature provided");
-            return false;
+            return SignatureCheck::Invalid;
         };
 
-        // If there is a key value in the protobuf, use that key otherwise the key must be
-        // obtained from the inlined source peer_id.
-        let public_key = match message.key.as_deref().map(PublicKey::try_decode_protobuf) {
-            Some(Ok(key)) => key,
-            _ => match PublicKey::try_decode_protobuf(&source.to_bytes()[2..]) {
-                Ok(v) => v,
-                Err(_) => {
-                    tracing::debug!("Signature verification failed: No valid public key supplied");
-                    return false;
-                }
-            },
-        };
-
-        // The key must match the peer_id
-        if source != public_key.to_peer_id() {
-            tracing::debug!(
-                "Signature verification failed: Public key doesn't match source peer id"
-            );
-            return false;
+        // QUILIBRIUM: the type of the key the check would use, read first: the
+        // entry's key if it has a type, else the one inlined in the source.
+        let inline_key = source.to_bytes();
+        let key_type = message
+            .key
+            .as_deref()
+            .and_then(encoded_key_type)
+            .or_else(|| encoded_key_type(&inline_key[2..]));
+        if !key_type.is_some_and(|key_type| SIGNATURE_KEY_TYPES.contains(&key_type)) {
+            tracing::debug!(?key_type, "Signature not checked: refused key type");
+            return SignatureCheck::RefusedKeyType;
         }
 
         // Construct the signature bytes
@@ -329,7 +457,39 @@ impl GossipsubCodec {
             message.seqno.as_deref(),
             &message.topic,
         );
-        public_key.verify(&signature_bytes, signature)
+        // QUILIBRIUM: a copy of an entry that verified is not verified again.
+        let digest = verified_digest(&signature_bytes, signature, message.key.as_deref());
+        if verified.contains(&digest) {
+            return SignatureCheck::Valid;
+        }
+
+        // If there is a key value in the protobuf, use that key otherwise the key must be
+        // obtained from the inlined source peer_id.
+        // QUILIBRIUM: only keys of the types in `SIGNATURE_KEY_TYPES` are decoded.
+        let public_key = match message.key.as_deref().and_then(decode_signing_key) {
+            Some(key) => key,
+            None => match decode_signing_key(&inline_key[2..]) {
+                Some(key) => key,
+                None => {
+                    tracing::debug!("Signature verification failed: No valid public key supplied");
+                    return SignatureCheck::Invalid;
+                }
+            },
+        };
+
+        // The key must match the peer_id
+        if source != public_key.to_peer_id() {
+            tracing::debug!(
+                "Signature verification failed: Public key doesn't match source peer id"
+            );
+            return SignatureCheck::Invalid;
+        }
+
+        if !public_key.verify(&signature_bytes, signature) {
+            return SignatureCheck::Invalid;
+        }
+        verified.insert(digest);
+        SignatureCheck::Valid
     }
 }
 
@@ -480,7 +640,38 @@ impl Decoder for GossipsubCodec {
             }
 
             // verify message signatures if required
-            if verify_signature && !GossipsubCodec::verify_signature(&message) {
+            let signature_check = if verify_signature {
+                GossipsubCodec::verify_signature(&message, &self.verified_signatures)
+            } else {
+                SignatureCheck::Valid
+            };
+            // QUILIBRIUM: an entry signed with a refused key type is reported
+            // without counting against the stream's budget.
+            if signature_check == SignatureCheck::RefusedKeyType {
+                let source = message
+                    .from
+                    .as_deref()
+                    .and_then(|from| PeerId::from_bytes(from).ok());
+                // Source and sequence number are kept: the behaviour computes
+                // the message id to release the promises of the message.
+                let sequence_number = message
+                    .seqno
+                    .as_deref()
+                    .filter(|seqno| seqno.len() == 8)
+                    .map(BigEndian::read_u64);
+                let message = RawMessage {
+                    source,
+                    data: message.data.unwrap_or_default(),
+                    sequence_number,
+                    topic: TopicHash::from_raw(message.topic),
+                    signature: None, // don't inform the application
+                    key: None,
+                    validated: false,
+                };
+                invalid_messages.push((message, ValidationError::RefusedKeyType));
+                continue;
+            }
+            if signature_check == SignatureCheck::Invalid {
                 // QUILIBRIUM: debug, as every entry of an RPC can fail; the
                 // budget logs once when it closes the stream.
                 tracing::debug!("Invalid signature for received message");
@@ -1389,6 +1580,39 @@ mod tests {
         assert_eq!(protocol_config.protocol_ids[1].protocol, "/floodsub/1.0.0");
     }
 
+    /// Gossip entries signed with an Ed448 key are verified like any other,
+    /// with big-integer reference code that costs far more than the Falcon
+    /// keys nodes sign with; validly signed ones cost that check every time.
+    #[test]
+    fn reproduces_ed448_signed_gossip_verified() {
+        let mut gs: Behaviour = Behaviour::new(
+            MessageAuthenticity::Signed(Keypair::generate_ed448()),
+            Config::default(),
+        )
+        .unwrap();
+        let message = gs
+            .build_raw_message(TopicHash::from_raw("test"), vec![1, 2, 3])
+            .unwrap();
+        let rpc = Rpc {
+            messages: vec![message],
+            subscriptions: vec![],
+            control_msgs: vec![],
+        };
+        let mut codec =
+            GossipsubCodec::new(u32::MAX as usize, ValidationMode::Strict, HashMap::new());
+        let mut buf = BytesMut::new();
+        codec.encode(rpc.into_protobuf(), &mut buf).unwrap();
+        let accepted = match codec.decode(&mut buf) {
+            Ok(Some(HandlerEvent::Message { rpc, .. })) => rpc.messages.len(),
+            Ok(_) => panic!("must decode an RPC"),
+            Err(_) => 0,
+        };
+        assert_eq!(
+            accepted, 0,
+            "an Ed448-signed gossip entry was verified and accepted"
+        );
+    }
+
     /// One RPC whose entries all carry invalid signatures must not cost one
     /// signature verification per entry: the key and signature of each entry
     /// are the sender's choice, and verification runs before any dedup.
@@ -1480,5 +1704,126 @@ mod tests {
                 bytes / frame_len,
             );
         }
+    }
+
+    /// Signed messages from one Falcon key, the network identity's type.
+    fn falcon_signed_messages(count: u8) -> Vec<RawMessage> {
+        let mut gs: Behaviour = Behaviour::new(
+            MessageAuthenticity::Signed(Keypair::generate_falcon()),
+            Config::default(),
+        )
+        .unwrap();
+        let topic = TopicHash::from_raw("test");
+        (0..count)
+            .map(|i| gs.build_raw_message(topic.clone(), vec![i]).unwrap())
+            .collect()
+    }
+
+    /// QUILIBRIUM: entries signed with the Falcon network identity verify.
+    #[test]
+    fn falcon_signed_entries_are_accepted() {
+        let mut codec =
+            GossipsubCodec::new(u32::MAX as usize, ValidationMode::Strict, HashMap::new());
+        let event = decode_rpc(&mut codec, falcon_signed_messages(2)).unwrap();
+        assert_eq!(counts(event), (2, 0));
+    }
+
+    /// QUILIBRIUM: a copy of a verified entry is accepted from the shared
+    /// cache, on any stream of the behaviour, but the cache is keyed by the
+    /// key the entry carries: a copy whose key was swapped is checked again
+    /// and fails.
+    #[test]
+    fn verified_entries_are_shared_and_keyed_by_their_key() {
+        let verified = Arc::new(VerifiedSignatures::default());
+        let codec = || {
+            GossipsubCodec::new(u32::MAX as usize, ValidationMode::Strict, HashMap::new())
+                .with_verified_signatures(verified.clone())
+        };
+        let message = falcon_signed_messages(1).remove(0);
+        let event = decode_rpc(&mut codec(), vec![message.clone()]).unwrap();
+        assert_eq!(counts(event), (1, 0));
+        let proto = proto::Message::from(message.clone());
+        let signed = signature_payload(
+            proto.from.as_deref(),
+            proto.data.as_deref(),
+            proto.seqno.as_deref(),
+            &proto.topic,
+        );
+        let digest = verified_digest(
+            &signed,
+            proto.signature.as_deref().unwrap(),
+            proto.key.as_deref(),
+        );
+        assert!(verified.contains(&digest), "the verified entry is cached");
+        let event = decode_rpc(&mut codec(), vec![message.clone()]).unwrap();
+        assert_eq!(counts(event), (1, 0));
+
+        let mut swapped = message;
+        swapped.key = Some(Keypair::generate_falcon().public().encode_protobuf());
+        let event = decode_rpc(&mut codec(), vec![swapped]).unwrap();
+        assert_eq!(counts(event), (0, 1));
+    }
+
+    /// QUILIBRIUM: entries signed with a refused key type (Ed448 here) are
+    /// reported as such, not as invalid signatures, so they do not spend the
+    /// stream's budget, and are not verified.
+    #[test]
+    fn refused_key_types_are_reported_without_spending_the_budget() {
+        let mut gs: Behaviour = Behaviour::new(
+            MessageAuthenticity::Signed(Keypair::generate_ed448()),
+            Config::default(),
+        )
+        .unwrap();
+        let topic = TopicHash::from_raw("test");
+        let budget = MAX_INVALID_SIGNATURES_PER_WINDOW as u8;
+        let messages = (0..budget + 4)
+            .map(|i| gs.build_raw_message(topic.clone(), vec![i]).unwrap())
+            .collect();
+        let mut codec =
+            GossipsubCodec::new(u32::MAX as usize, ValidationMode::Strict, HashMap::new());
+        match decode_rpc(&mut codec, messages).unwrap() {
+            Some(HandlerEvent::Message {
+                rpc,
+                invalid_messages,
+            }) => {
+                assert!(rpc.messages.is_empty());
+                assert_eq!(invalid_messages.len(), budget as usize + 4);
+                assert!(invalid_messages
+                    .iter()
+                    .all(|(_, error)| *error == ValidationError::RefusedKeyType));
+            }
+            _ => panic!("must decode an RPC"),
+        }
+        assert!(!codec.invalid_signatures.exhausted);
+        let event = decode_rpc(&mut codec, falcon_signed_messages(1)).unwrap();
+        assert_eq!(counts(event), (1, 0));
+    }
+
+    /// QUILIBRIUM: the cache keeps the newest `MAX_VERIFIED_SIGNATURES`.
+    #[test]
+    fn verified_signatures_are_bounded() {
+        let verified = VerifiedSignatures::default();
+        let digest = |i: usize| verified_digest(&i.to_be_bytes(), &[], None);
+        for i in 0..=MAX_VERIFIED_SIGNATURES {
+            verified.insert(digest(i));
+        }
+        assert!(!verified.contains(&digest(0)));
+        assert!(verified.contains(&digest(1)));
+        assert!(verified.contains(&digest(MAX_VERIFIED_SIGNATURES)));
+    }
+
+    /// QUILIBRIUM: a key type is read as the decoder reads it, so a repeated
+    /// `Type` field cannot pass the check under one type and decode as another.
+    #[test]
+    fn encoded_key_type_reads_the_last_type_field() {
+        let falcon = Keypair::generate_falcon().public().encode_protobuf();
+        assert_eq!(encoded_key_type(&falcon), Some(5));
+        let mut retyped = vec![0x08, 0x05];
+        retyped.extend_from_slice(&falcon);
+        retyped.extend_from_slice(&[0x08, 0x04]);
+        assert_eq!(encoded_key_type(&retyped), Some(4));
+        assert!(decode_signing_key(&retyped).is_none());
+        assert!(decode_signing_key(&falcon).is_some());
+        assert_eq!(encoded_key_type(&[0x80]), None);
     }
 }

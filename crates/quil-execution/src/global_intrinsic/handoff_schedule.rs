@@ -1132,12 +1132,84 @@ fn fence_absent_session(
     decision: &super::exclusion::Decision,
 ) -> Result<bool> {
     let filter = &decision.filter;
+    let fenced = match fence_early(state, frame, filter, &decision.session, &decision.committee)? {
+        EarlyFence::Fenced(fenced) => fenced,
+        EarlyFence::Reserved(session) => {
+            tracing::info!(frame, filter = hex::encode(filter), generation = session.generation,
+                "committee presence: stalled session's shard is reserved by a pending split or merge; no early fence");
+            return Ok(false);
+        }
+        EarlyFence::NotApplicable => return Ok(false),
+    };
+    for (member, next) in decision.excluded.iter().zip(&decision.strikes) {
+        super::exclusion::set_exclusion(state, frame, filter, member, next)?;
+    }
+    tracing::warn!(
+        frame,
+        filter = hex::encode(filter),
+        generation = fenced.session.generation,
+        members = fenced.session.members.len(),
+        fenced_at = fenced.checkpoint.frame,
+        request = hex::encode(fenced.request),
+        requested_at = fenced.requested_at,
+        committee = decision.committee.len(),
+        committee_quorum = super::exclusion::quorum(decision.committee.len()),
+        excluded = decision.excluded.len(),
+        provers = ?decision.describe_strikes(),
+        "committee presence: stalled session fenced early at its executed tip; its successor seats its present \
+         members and excludes its absent ones",
+    );
+    tracing::info!(
+        frame,
+        request = hex::encode(fenced.request),
+        "committee handoff: successors authorized from fenced sources"
+    );
+    Ok(true)
+}
+
+/// What [`fence_early`] did.
+pub(super) enum EarlyFence {
+    /// The session was fenced and its successor authorized.
+    Fenced(Box<EarlyFenced>),
+    /// The shard is reserved by a pending split or merge: nothing written.
+    Reserved(Session),
+    /// The session is no longer the head, has ended, was succeeded, or is
+    /// closing for a split or merge: nothing written.
+    NotApplicable,
+}
+
+/// A session [`fence_early`] fenced.
+pub(super) struct EarlyFenced {
+    /// The fenced session.
+    pub session: Session,
+    /// Its fence: its executed tip, or its base.
+    pub checkpoint: quil_cw_consensus::handoff::Checkpoint,
+    /// The membership request its successor was authorized from.
+    pub request: [u8; 32],
+    /// The GLOBAL frame that request was made at.
+    pub requested_at: u64,
+}
+
+/// Fence `filter`'s head session `session_id` early at its executed tip and
+/// authorize its membership successor with `committee`, for a caller that
+/// then records why ([`fence_absent`], `silence::fence`). An active session
+/// is first asked to close for that committee; a closing one's request
+/// committee is replaced by it. The fence's GLOBAL frame is recorded
+/// ([`fence_frame`]). A refused committee is an `InvalidArgument` error, so
+/// the caller can undo the whole decision.
+pub(super) fn fence_early(
+    state: &HypergraphState,
+    frame: u64,
+    filter: &[u8],
+    session_id: &[u8; 32],
+    committee: &[Vec<u8>],
+) -> Result<EarlyFence> {
     let Some(session) = head(state, filter)? else {
-        return Ok(false);
+        return Ok(EarlyFence::NotApplicable);
     };
     let id = session.id()?;
-    if id != decision.session {
-        return Ok(false);
+    if id != *session_id {
+        return Ok(EarlyFence::NotApplicable);
     }
     let request_id = match status(state, &id)? {
         Status::Sealing(request_id) => request_id,
@@ -1146,37 +1218,34 @@ fn fence_absent_session(
             // activated would fail its activation forever once the shard
             // has another session: leave it to that change.
             if reserved(state, filter)? {
-                tracing::info!(frame, filter = hex::encode(filter), generation = session.generation,
-                    "committee presence: stalled session's shard is reserved by a pending split or merge; no early fence");
-                return Ok(false);
+                return Ok(EarlyFence::Reserved(session));
             }
             let targets = vec![DesiredCommittee {
-                filter: filter.clone(),
-                members: decision.committee.clone(),
+                filter: filter.to_vec(),
+                members: committee.to_vec(),
             }];
-            let request = schedule(state, frame, vec![filter.clone()], targets.clone())?;
+            let request = schedule(state, frame, vec![filter.to_vec()], targets.clone())?;
             let request_id = request.id()?;
             reserve(state, frame, &targets, &request_id)?;
             request_id
         }
-        Status::Closed(_) => return Ok(false),
+        Status::Closed(_) => return Ok(EarlyFence::NotApplicable),
     };
     let key = seal_key(&request_id, &id);
     if read(state, b"seal", &key)?.is_some() || read(state, b"fence", &key)?.is_some() {
-        return Ok(false);
+        return Ok(EarlyFence::NotApplicable);
     }
     let pending = request(state, &request_id)?
         .ok_or_else(|| QuilError::Store("closing session's request is absent".into()))?;
     if !membership_request(&pending, filter) {
-        return Ok(false);
+        return Ok(EarlyFence::NotApplicable);
     }
     let target = &pending.targets[0];
-    let members =
-        (decision.committee != target.committee.members).then(|| decision.committee.clone());
+    let members = (committee != target.committee.members.as_slice()).then(|| committee.to_vec());
     if let Some(members) = &members {
         Session {
             chain_id: session.chain_id,
-            filter: filter.clone(),
+            filter: filter.to_vec(),
             generation: target.generation,
             genesis: [0; 32],
             base_frame: 0,
@@ -1190,30 +1259,12 @@ fn fence_absent_session(
     if !activate_with(state, frame, &pending, members)? {
         return Err(invalid("the early fence authorized no successor"));
     }
-    for (member, next) in decision.excluded.iter().zip(&decision.strikes) {
-        super::exclusion::set_exclusion(state, frame, filter, member, next)?;
-    }
-    tracing::warn!(
-        frame,
-        filter = hex::encode(filter),
-        generation = session.generation,
-        members = session.members.len(),
-        fenced_at = checkpoint.frame,
-        request = hex::encode(request_id),
-        requested_at = pending.frame,
-        committee = decision.committee.len(),
-        committee_quorum = super::exclusion::quorum(decision.committee.len()),
-        excluded = decision.excluded.len(),
-        provers = ?decision.describe_strikes(),
-        "committee presence: stalled session fenced early at its executed tip; its successor seats its present \
-         members and excludes its absent ones",
-    );
-    tracing::info!(
-        frame,
-        request = hex::encode(request_id),
-        "committee handoff: successors authorized from fenced sources"
-    );
-    Ok(true)
+    Ok(EarlyFence::Fenced(Box::new(EarlyFenced {
+        session,
+        checkpoint,
+        request: request_id,
+        requested_at: pending.frame,
+    })))
 }
 
 /// The committee a fence's membership successor takes: its shard's eligible
@@ -1281,11 +1332,19 @@ pub fn reconcile_membership(
     let mut created = 0;
     for filter in filters {
         // From the presence exclusion frame, less the members excluded for
-        // absence (`exclusion::seated`).
+        // absence (`exclusion::seated`); from the silent fence's first
+        // frame, less the silent members not seen signing since their fence
+        // (`silence::seated`).
         let members =
             super::exclusion::seated(state, frame, filter, desired_members(scan, filter, frame))?;
+        let members = super::silence::seated(state, frame, filter, members, scan)?;
         if members.is_empty() {
             continue;
+        }
+        // An excluded member seen signing again is seated from here on:
+        // its exclusion closes, logged once, at the epoch's first pass.
+        if first_pass_of_epoch(frame) {
+            super::silence::end_returned(state, frame, filter, &members, scan)?;
         }
         let Some(current) = head(state, filter)? else {
             // Legacy history continues through generation zero (`legacy::migrate`),

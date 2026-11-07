@@ -22,6 +22,7 @@ use super::{
 };
 use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
 use quil_lattice_ct::confidential::{
+    coin_tree::is_burned_owner,
     relation::membership::IDENTITY_BYTES,
     transfer::{parameter_context, Output, MEMO_BYTES},
     AmountCommitment, COMMITMENT_BYTES,
@@ -251,8 +252,13 @@ pub fn verify_and_apply(
     let anchor = context
         .finalized_global_frame
         .ok_or_else(|| invalid("delivery requires the frame's global anchor"))?;
-    let root =
-        super::mint_authorization::clock_reward_root(clock, delivery.cited_global_frame, anchor)?;
+    let root = super::mint_authorization::cited_reward_root(
+        clock,
+        network,
+        "coin delivery",
+        delivery.cited_global_frame,
+        anchor,
+    )?;
     if root != delivery.global_root {
         return Err(invalid("cited global root mismatch"));
     }
@@ -300,6 +306,9 @@ pub fn verify_and_apply(
                 if shard_store { shard.as_slice() } else { &[] },
                 limits,
             )?;
+            if is_burned_owner(&output.owner) {
+                note_burned(context.frame_number, application, &shard, &delivery);
+            }
             Ok(address)
         }
         Delivered::Escrow(blob) => {
@@ -335,6 +344,33 @@ pub fn verify_and_apply(
             Ok(address)
         }
     }
+}
+
+/// A delivered coin GLOBAL committed with an owner that is not a canonical
+/// identity: placed and burned (`coin_tree::committed_leaf`), so the block's
+/// later coins still land. One line per such delivery, bounded by the
+/// frame's deliveries ([`MAX_DELIVERIES_PER_FRAME`]); each is an output its
+/// sender paid a fee for.
+fn note_burned(frame: u64, application: &[u8; 32], shard: &[bool], delivery: &CoinDelivery) {
+    let path: String = shard
+        .iter()
+        .map(|&bit| if bit { '1' } else { '0' })
+        .collect();
+    tracing::warn!(
+        frame,
+        application = %hex::encode(application),
+        shard = %path,
+        block = delivery.block,
+        seq = delivery.seq,
+        source_frame = delivery.source_frame,
+        tx = %hex::encode(&delivery.tx_id[..8]),
+        reason = "owner is not a canonical identity",
+        scope = "the network",
+        action = "nothing on this node: GLOBAL committed an output no fold can take; every \
+                  replica burns it (its position holds the empty leaf) and the block's later \
+                  coins land; report this line, with its tx prefix, to the maintainers",
+        "coin delivery burned"
+    );
 }
 
 /// Write a committed output at its committed position `(block, seq)` and

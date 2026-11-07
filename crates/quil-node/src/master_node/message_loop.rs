@@ -21,6 +21,13 @@ const OTHER_BUILD_LINES_PER_STATUS: u32 = 32;
 /// as many as the network task queues for the lane.
 const LOOP_QUEUE: usize = 4096;
 
+/// Authors whose router drops one status interval attributes; the status line
+/// names the top eight of them.
+const MAX_DROP_SOURCES: usize = 1024;
+
+/// Verified GLOBAL_ALERTs remembered so their copies are not shown again.
+const MAX_ALERTS_SEEN: usize = 64;
+
 pub(crate) struct MessageLoopArgs {
     /// Standalone workers, when this node runs them: direct shard consensus
     /// messages for their shards are handed to them.
@@ -164,6 +171,59 @@ pub(crate) fn gap_fetched_frame_message(
         from: Vec::new(),
         direct: false,
     }
+}
+
+/// The stream endpoints a verified archive's PeerInfo names, each pinned to
+/// the archive that signed it before the pool dials it, so that whoever
+/// answers there must be that archive. An endpoint pinned to another
+/// archive is left out (its pin stays), as is every endpoint of a record
+/// whose peer id does not parse.
+pub(crate) fn archive_record_endpoints(
+    info: &quil_p2p::CanonicalPeerInfo,
+    network: u8,
+) -> Vec<String> {
+    let Ok(peer) = quil_p2p::PeerId::from_bytes(&info.peer_id) else {
+        return Vec::new();
+    };
+    let mut endpoints = Vec::new();
+    for reach in &info.reachability {
+        for ma in &reach.stream_multiaddrs {
+            let Some(addr) =
+                crate::util::multiaddr::multiaddr_to_host_port_with_network(ma, network)
+            else {
+                continue;
+            };
+            if let Err(held) = quil_rpc::archive_client::pin_archive_peer(&addr, peer) {
+                warn!(
+                    peer = %peer,
+                    endpoint = %addr,
+                    pinned_to = %held,
+                    scope = "peer",
+                    "archive record names an endpoint pinned to another archive: not dialed"
+                );
+                continue;
+            }
+            if !endpoints.contains(&addr) {
+                endpoints.push(addr);
+            }
+        }
+    }
+    endpoints
+}
+
+/// Add a verified archive record's stream endpoints to `pool`, each pinned
+/// to that archive first ([`archive_record_endpoints`]); returns the first.
+pub(crate) async fn add_archive_record_endpoints(
+    pool: &quil_rpc::ArchiveEndpointPool,
+    info: &quil_p2p::CanonicalPeerInfo,
+    network: u8,
+) -> Option<String> {
+    let endpoints = archive_record_endpoints(info, network);
+    let first = endpoints.first().cloned();
+    for addr in endpoints {
+        pool.add(addr).await;
+    }
+    first
 }
 
 fn shard_sender_key(
@@ -407,13 +467,20 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         // validators emit; size <= ~20 keys in practice.
         let mut router_drops_by_reason: std::collections::HashMap<&'static str, u64> =
             std::collections::HashMap::new();
-        // Per-SOURCE aggregation (propagation peer -> dropped-message count).
-        // Distinguishes a targeted flood (drops concentrated on one/few peers →
-        // blacklist candidate) from systemic backlog aging (drops spread across
-        // every mesh peer → this node is overloaded, not attacked). Keyed by the
-        // authenticated `from` peer, so it is bounded by the live connection set.
+        // Per-SOURCE aggregation (signed author -> dropped-message count) since
+        // the last status line. Distinguishes a targeted flood (drops
+        // concentrated on one/few authors → blacklist candidate) from systemic
+        // backlog aging (drops spread across many → this node is overloaded,
+        // not attacked). Authors are free to mint, so at most
+        // `MAX_DROP_SOURCES` are tracked per status interval; drops of further
+        // authors are counted in `router_drops_untracked_sources`.
         let mut router_drops_by_source: std::collections::HashMap<Vec<u8>, u64> =
             std::collections::HashMap::new();
+        let mut router_drops_untracked_sources: u64 = 0;
+        // Digests of the GLOBAL_ALERTs already verified and shown: a copy is
+        // neither verified nor shown again (the signature covers no time, so
+        // an alert can be re-broadcast at will).
+        let mut alerts_seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         let mut status_timer = tokio::time::interval(std::time::Duration::from_secs(30));
         status_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut global_execution = super::global_execution::GlobalExecution::default();
@@ -663,6 +730,16 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                             "GLOBAL_PEER_INFO validation changed: when strict, peers forwarding invalid PeerInfo, KeyRegistry or alerts are penalised and KeyRegistry records with an unsigned timestamp are refused"
                         );
                     }
+                    // Strict shard gossip follows it too.
+                    let strict_shard_gossip = quil_types::consensus::strict_shard_gossip_active(latest_frame);
+                    if quil_p2p::set_strict_shard_gossip(strict_shard_gossip) != strict_shard_gossip {
+                        info!(
+                            frame = latest_frame,
+                            epoch = quil_types::consensus::strict_shard_gossip_epoch(),
+                            strict = strict_shard_gossip,
+                            "shard gossip validation changed: when strict, peers forwarding a message no leader can propose on a shard's dispatch or submission topic are penalised and shard CW message ids name their author"
+                        );
+                    }
                     {
                         let _write = probe::section(ProbeSection::StatusPeerInfoCache);
                         peer_info_bounds.expire(&mut pic_for_recv.write(), super::peer_info_file::unix_millis());
@@ -765,8 +842,12 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 .join(",")
                         },
                         config = %config_brief,
+                        drop_sources_untracked = router_drops_untracked_sources,
                         "node status"
                     );
+                    // Drop sources are reported per status interval.
+                    router_drops_by_source.clear();
+                    router_drops_untracked_sources = 0;
                     // Resolver traffic of the shards this process runs.
                     quil_engine::resolver_traffic::ResolverTraffic::process().log();
                     // Forest reads this node served to syncing peers (since
@@ -1020,12 +1101,16 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 if let Some(reason) = route_outcome.reject_reason() {
                                     *router_drops_by_reason.entry(reason).or_insert(0) += 1;
                                 }
-                                // Attribute the drop to the peer that forwarded
-                                // it (bounded by the live connection set).
+                                // Attribute the drop to its signed author, up to
+                                // `MAX_DROP_SOURCES` authors per status interval.
                                 if !received.from.is_empty() {
-                                    *router_drops_by_source
-                                        .entry(received.from.clone())
-                                        .or_insert(0) += 1;
+                                    if let Some(count) = router_drops_by_source.get_mut(&received.from) {
+                                        *count += 1;
+                                    } else if router_drops_by_source.len() < MAX_DROP_SOURCES {
+                                        router_drops_by_source.insert(received.from.clone(), 1);
+                                    } else {
+                                        router_drops_untracked_sources += 1;
+                                    }
                                 }
                                 // Categorize for operator visibility.
                                 let topic = match received.bitmask.as_slice() {
@@ -1226,17 +1311,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             // "am I behind?" without an RPC head-fetch.
                                             gossip_freshness_for_recv
                                                 .note_network_head(info.last_global_head_frame);
-                                            let mut first_addr: Option<String> = None;
-                                            for reach in &info.reachability {
-                                                for ma in &reach.stream_multiaddrs {
-                                                    if let Some(addr) = crate::util::multiaddr::multiaddr_to_host_port_with_network(ma, network_for_recv) {
-                                                        if first_addr.is_none() {
-                                                            first_addr = Some(addr.clone());
-                                                        }
-                                                        pool_for_recv.add(addr).await;
-                                                    }
-                                                }
-                                            }
+                                            let first_addr = add_archive_record_endpoints(&pool_for_recv, &info, network_for_recv).await;
                                             info!(
                                                 peer = bs58::encode(&info.peer_id).into_string(),
                                                 head_frame = info.last_global_head_frame,
@@ -1932,8 +2007,11 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 // with domain `"GLOBAL_ALERT" || message`.
                                 // Canonical format:
                                 //   [u32 type=0x0911][u32 msg_len][msg][u32 sig_len][sig]
+                                let alert_id = quil_p2p::node::message_id(&received.data);
                                 if alert_pubkey_for_recv.is_empty() || alert_pubkey_for_recv.len() != 57 {
                                     debug!("GLOBAL_ALERT received but no valid alertKey configured — dropping");
+                                } else if alerts_seen.contains(&alert_id) {
+                                    debug!("GLOBAL ALERT already shown — dropping the copy");
                                 } else if received.data.len() >= 12 {
                                     let d = &received.data;
                                     let mut c = 4usize; // skip type prefix
@@ -1944,7 +2022,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         c += msg_len;
                                         let sig_len = u32::from_be_bytes(d[c..c+4].try_into().unwrap_or([0;4])) as usize;
                                         c += 4;
-                                        if sig_len == 114 && c + sig_len <= d.len() {
+                                        // The signature covers no trailing bytes, so
+                                        // an alert carrying any is refused.
+                                        if sig_len == 114 && c + sig_len == d.len() {
                                             let sig = &d[c..c+sig_len];
                                             let mut signed = Vec::with_capacity(b"GLOBAL_ALERT".len() + msg_len);
                                             signed.extend_from_slice(b"GLOBAL_ALERT");
@@ -1953,9 +2033,16 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 let msg_str = String::from_utf8_lossy(msg);
                                                 warn!(message = %msg_str, "GLOBAL ALERT (verified)");
                                                 coverage_for_recv.emit_alert(&msg_str);
+                                                // Bounded: genuine alerts are rare.
+                                                if alerts_seen.len() >= MAX_ALERTS_SEEN {
+                                                    alerts_seen.clear();
+                                                }
+                                                alerts_seen.insert(alert_id);
                                             } else {
                                                 debug!("GLOBAL ALERT rejected — signature invalid");
                                             }
+                                        } else if sig_len == 114 && c + sig_len < d.len() {
+                                            debug!(trailing = d.len() - c - sig_len, "GLOBAL ALERT rejected — trailing bytes");
                                         } else {
                                             debug!(sig_len, "GLOBAL ALERT rejected — bad signature length");
                                         }
@@ -2196,5 +2283,79 @@ mod tests {
         assert!(super::super::archive_ingest_queue::may_carry_shard_frame(
             &fetched.bitmask
         ));
+    }
+
+    /// R112-D-2: an endpoint a verified archive's PeerInfo names is pinned
+    /// to that archive before the pool dials it, so whoever answers there
+    /// must be that archive. Another archive's record naming the same
+    /// endpoint neither re-pins nor adds it.
+    #[test]
+    fn r112_d2_a_gossiped_archive_endpoint_is_pinned_to_its_record() {
+        use quil_rpc::archive_client::pinned_archive_peer;
+        let peer = || {
+            quil_p2p::Keypair::falcon_from_bytes(&quil_p2p::generate_falcon_signing_key())
+                .unwrap()
+                .public()
+                .to_peer_id()
+        };
+        let (a, b) = (peer(), peer());
+        let record = |peer: quil_p2p::PeerId, addrs: &[&str]| quil_p2p::CanonicalPeerInfo {
+            peer_id: peer.to_bytes(),
+            reachability: vec![quil_p2p::CanonicalReachability {
+                stream_multiaddrs: addrs.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let shared = "203.0.113.7:8340";
+        assert_eq!(
+            archive_record_endpoints(&record(a, &["/ip4/203.0.113.7/tcp/8340"]), 0),
+            vec![shared.to_string()]
+        );
+        assert_eq!(
+            pinned_archive_peer(shared),
+            Some(a),
+            "R112-D-2: a gossiped archive endpoint is dialed unpinned"
+        );
+        let other = archive_record_endpoints(
+            &record(
+                b,
+                &["/ip4/203.0.113.7/tcp/8340", "/ip4/203.0.113.8/tcp/8340"],
+            ),
+            0,
+        );
+        assert_eq!(
+            (other, pinned_archive_peer(shared)),
+            (vec!["203.0.113.8:8340".to_string()], Some(a)),
+            "R112-D-2: another archive's record took over an endpoint pinned to the first"
+        );
+        assert_eq!(pinned_archive_peer("203.0.113.8:8340"), Some(b));
+    }
+
+    /// R112-D-2: what the gossip handler adds to the archive pool is pinned
+    /// to the archive whose record named it.
+    #[tokio::test]
+    async fn r112_d2_the_gossip_handler_adds_archive_endpoints_pinned() {
+        let peer = quil_p2p::Keypair::falcon_from_bytes(&quil_p2p::generate_falcon_signing_key())
+            .unwrap()
+            .public()
+            .to_peer_id();
+        let info = quil_p2p::CanonicalPeerInfo {
+            peer_id: peer.to_bytes(),
+            reachability: vec![quil_p2p::CanonicalReachability {
+                stream_multiaddrs: vec!["/ip4/203.0.113.21/tcp/8340".to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let pool = quil_rpc::ArchiveEndpointPool::new(std::time::Duration::ZERO);
+        let first = add_archive_record_endpoints(&pool, &info, 0).await;
+        assert_eq!(first.as_deref(), Some("203.0.113.21:8340"));
+        assert_eq!(pool.get_all().await, vec!["203.0.113.21:8340".to_string()]);
+        assert_eq!(
+            quil_rpc::archive_client::pinned_archive_peer("203.0.113.21:8340"),
+            Some(peer),
+            "R112-D-2: the gossip handler added an archive endpoint unpinned"
+        );
     }
 }

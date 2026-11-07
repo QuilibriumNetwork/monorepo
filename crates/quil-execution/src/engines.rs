@@ -586,6 +586,11 @@ pub struct TokenExecutionEngine {
     #[cfg(feature = "native-proof")]
     token_worker:
         Option<quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier>,
+    /// Network selector whose first citable global frame bounds the
+    /// settlement claims this engine admits without a token policy (mainnet
+    /// unless [`Self::set_network`] names another).
+    #[cfg(feature = "native-proof")]
+    network: u8,
     inclusion_prover: Arc<dyn InclusionProver>,
     state: Option<Arc<crate::hypergraph_state::HypergraphState>>,
     key_manager: Arc<dyn quil_types::crypto::KeyManager>,
@@ -644,6 +649,24 @@ impl TokenExecutionEngine {
         self.token_policy = Some(policy);
         self.token_worker = Some(worker);
         Ok(())
+    }
+
+    /// The network selector this engine executes for; every node of a
+    /// network sets the same one.
+    #[cfg(feature = "native-proof")]
+    pub fn set_network(&mut self, network: u8) {
+        self.network = network;
+    }
+
+    /// The network whose first citable global frame bounds the settlement
+    /// claims this engine admits: the token policy's, else the one set by
+    /// [`Self::set_network`] (a node without the token proof suite).
+    #[cfg(feature = "native-proof")]
+    fn citation_network(&self) -> [u8; 32] {
+        self.token_policy.map_or_else(
+            || crate::token_intrinsic::state::network_identifier(self.network),
+            |policy| policy.network,
+        )
     }
 
     /// Confidential operations inside canonical bundles: `(address, inner bytes,
@@ -836,6 +859,8 @@ impl TokenExecutionEngine {
             token_execution: std::sync::Mutex::new(()),
             #[cfg(feature = "native-proof")]
             token_worker: None,
+            #[cfg(feature = "native-proof")]
+            network: crate::pricing::MAINNET_NETWORK,
             inclusion_prover,
             state: None,
             key_manager,
@@ -864,6 +889,8 @@ impl TokenExecutionEngine {
             token_execution: std::sync::Mutex::new(()),
             #[cfg(feature = "native-proof")]
             token_worker: None,
+            #[cfg(feature = "native-proof")]
+            network: crate::pricing::MAINNET_NETWORK,
             inclusion_prover,
             state: Some(state),
             key_manager,
@@ -1428,11 +1455,16 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                 // price must open with a settlement claim covering that growth
                 // (paid to the executing shard's provers); the claim may also
                 // carry a paid mint's price to the token's payment address.
+                // Every engine that writes state admits it, with or without
+                // the token proof suite: one that skipped the claim applied
+                // a priced deploy or update the others refused, and left the
+                // claim's record unconsumed.
                 #[cfg(feature = "native-proof")]
-                if self.token_policy.is_some()
+                if self.state.is_some()
                     && _address.len() >= 32
                     && _address[..32] != crate::domains::QUIL_TOKEN
                 {
+                    let network = self.citation_network();
                     let growth = bundle
                         .requests
                         .iter()
@@ -1444,6 +1476,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                         &crate::token_intrinsic::settlement_claim::PaymentContext {
                             state: self.state.as_deref(),
                             clock: Some(self.clock_store.as_ref()),
+                            network: &network,
                             global_bound: settlement_global_bound(
                                 effective_mode(self.mode, context),
                                 context,
@@ -1482,13 +1515,23 @@ impl ShardExecutionEngine for TokenExecutionEngine {
             }
             TYPE_MESSAGE_REQUEST => {
                 let req = CanonicalMessageRequest::from_canonical_bytes(message)?;
-                // A lone custom-token request cannot carry a claim, so it is
-                // admitted only when it grows no state or the price is zero.
+                // A claim funds the bundle it opens, so a lone custom-token
+                // request carrying one is refused by every replica alike. Any
+                // other is admitted only when it grows no state or the price
+                // is zero, with or without the token proof suite, as a bundle is.
                 #[cfg(feature = "native-proof")]
-                if self.token_policy.is_some()
+                if self.state.is_some()
                     && _address.len() >= 32
                     && _address[..32] != crate::domains::QUIL_TOKEN
                 {
+                    if req.inner_type_prefix
+                        == crate::token_intrinsic::settlement_claim::TYPE_SETTLEMENT_CLAIM
+                    {
+                        return Err(QuilError::InvalidArgument(
+                            "token: a settlement claim must open a bundle".into(),
+                        ));
+                    }
+                    let network = self.citation_network();
                     let growth = token_consumer_cost(&req)?;
                     let single = CanonicalMessageBundle {
                         requests: vec![Some(req.clone())],
@@ -1498,6 +1541,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                         &crate::token_intrinsic::settlement_claim::PaymentContext {
                             state: None,
                             clock: None,
+                            network: &network,
                             global_bound: None,
                             frame_number: _frame_number,
                             multiplier: _fee_multiplier,
@@ -1956,6 +2000,9 @@ pub struct ComputeExecutionEngine {
     circuit_compiler: Arc<dyn quil_types::execution::CircuitCompiler>,
     /// Canonical global frames, for settlement claims funding compute writes.
     global_clock: Option<Arc<dyn quil_types::store::ClockStore>>,
+    /// Network selector whose first citable global frame bounds those claims
+    /// (mainnet unless [`Self::set_network`] names another).
+    network: u8,
 }
 
 impl TokenExecutionEngine {
@@ -2003,6 +2050,7 @@ impl ComputeExecutionEngine {
             key_manager,
             circuit_compiler,
             global_clock: None,
+            network: crate::pricing::MAINNET_NETWORK,
         }
     }
 
@@ -2021,6 +2069,7 @@ impl ComputeExecutionEngine {
             key_manager,
             circuit_compiler,
             global_clock: None,
+            network: crate::pricing::MAINNET_NETWORK,
         }
     }
 }
@@ -2059,6 +2108,12 @@ impl ComputeExecutionEngine {
     /// Store holding canonical global frames (settlement claim citations).
     pub fn set_global_clock_store(&mut self, store: Arc<dyn quil_types::store::ClockStore>) {
         self.global_clock = Some(store);
+    }
+
+    /// The network selector this engine executes for; every node of a
+    /// network sets the same one.
+    pub fn set_network(&mut self, network: u8) {
+        self.network = network;
     }
 }
 
@@ -2110,6 +2165,7 @@ impl ShardExecutionEngine for ComputeExecutionEngine {
                 &crate::token_intrinsic::settlement_claim::PaymentContext {
                     state: self.state.as_deref(),
                     clock: self.global_clock.as_deref(),
+                    network: &crate::token_intrinsic::state::network_identifier(self.network),
                     global_bound: settlement_global_bound(
                         effective_mode(self.mode, context),
                         context,
@@ -2488,12 +2544,21 @@ pub struct HypergraphExecutionEngine {
     key_manager: Option<Arc<dyn quil_types::crypto::KeyManager>>,
     /// Canonical global frames, for settlement claims funding writes.
     global_clock: Option<Arc<dyn quil_types::store::ClockStore>>,
+    /// Network selector whose first citable global frame bounds those claims
+    /// (mainnet unless [`Self::set_network`] names another).
+    network: u8,
 }
 
 impl HypergraphExecutionEngine {
     /// Store holding canonical global frames (settlement claim citations).
     pub fn set_global_clock_store(&mut self, store: Arc<dyn quil_types::store::ClockStore>) {
         self.global_clock = Some(store);
+    }
+
+    /// The network selector this engine executes for; every node of a
+    /// network sets the same one.
+    pub fn set_network(&mut self, network: u8) {
+        self.network = network;
     }
 
     pub fn new(
@@ -2507,6 +2572,7 @@ impl HypergraphExecutionEngine {
             config_resolver,
             key_manager: None,
             global_clock: None,
+            network: crate::pricing::MAINNET_NETWORK,
         }
     }
 
@@ -2523,6 +2589,7 @@ impl HypergraphExecutionEngine {
             config_resolver,
             key_manager: None,
             global_clock: None,
+            network: crate::pricing::MAINNET_NETWORK,
         }
     }
 
@@ -3019,6 +3086,7 @@ impl ShardExecutionEngine for HypergraphExecutionEngine {
                 &crate::token_intrinsic::settlement_claim::PaymentContext {
                     state: self.state.as_deref(),
                     clock: self.global_clock.as_deref(),
+                    network: &crate::token_intrinsic::state::network_identifier(self.network),
                     global_bound: settlement_global_bound(
                         effective_mode(self.mode, context),
                         context,
@@ -4100,6 +4168,8 @@ mod tests {
         );
         let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
         engine.set_global_clock_store(clock.clone());
+        // A test network: its claims may cite frames from 0, like this frame 9.
+        engine.set_network(1);
 
         // The consumer write: a signed vertex add, bound by the payer's context.
         let kp = quil_crypto::sntrup761::Sntrup761KeyPair::generate();
@@ -4564,3 +4634,7 @@ mod tests {
     // TYPE_TRANSACTION arm for the full attack chain.
     // =================================================================
 }
+
+#[cfg(all(test, feature = "native-proof"))]
+#[path = "token_settlement_parity_tests.rs"]
+mod token_settlement_parity_tests;

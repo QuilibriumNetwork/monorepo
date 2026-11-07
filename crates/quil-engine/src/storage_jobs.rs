@@ -48,19 +48,23 @@
 //! (2026-11-01).
 //!
 //! At most [`ahead_jobs_for`] leaves are labelled ahead at once, whatever
-//! the memory lets at a moment: [`AHEAD_JOBS`] on a node of 32 GB, where four
-//! of about 4.5 GB each held 17.9 GB of its 20.5 GB (2026-11-01), and more
-//! with more cores and memory: at two, a node of 55 seats registers no more
-//! leaves of 30 million nodes than one of 15 (3 an epoch), where without the
-//! cap such nodes registered 11 to 49 (2026-11-03). Persistent sectors, for
-//! epochs where persistent storage holds, run ahead on every slot the memory
-//! admits, beside those leaves. While a renewal's leaf is labelled now
-//! ([`Reservation::labelling_now`]), only [`ahead_beside_due`] go on beside
-//! it; the others pause, keeping their memory and layers, and go on once it
-//! ends ([`Reservation::wait_while_paused`]): beside three or four leaves
-//! labelled ahead, a 16-thread node's renewal leaf ran at under 70% of its
-//! estimated pace and missed its grace, where three leaves at a time ran at
-//! 85 to 94% (2026-11-01).
+//! the memory lets at a moment: one per four of the node's CPUs, and as
+//! many of the largest leaves' reservations as the jobs' share of its memory
+//! holds beside one such leaf labelled now, never fewer than [`AHEAD_JOBS`]:
+//! four of about 4.5 GB each held 17.9 GB of a 32 GB node's 20.5 GB
+//! (2026-11-01), and at two, a node of 55 seats registers no more leaves of
+//! 30 million nodes than one of 15 (3 an epoch), where without the cap such
+//! nodes registered 11 to 49 (2026-11-03). Sized by 16 GiB a leaf, three
+//! times what one holds, a 16-thread node of 31 GiB kept two and gave up 8
+//! of its 10 seats of such leaves in an epoch (2026-11-06). Persistent
+//! sectors, for epochs where persistent storage holds, run ahead on every
+//! slot the memory admits, beside those leaves. While a renewal's leaf is
+//! labelled now ([`Reservation::labelling_now`]), only [`ahead_beside_due`]
+//! go on beside it; the others pause, keeping their memory and layers, and go
+//! on once it ends ([`Reservation::wait_while_paused`]): beside three or four
+//! leaves labelled ahead, a 16-thread node's renewal leaf ran at under 70% of
+//! its estimated pace and missed its grace, where three leaves at a time ran
+//! at 85 to 94% (2026-11-01).
 //!
 //! A node's processes on one host (a master and its standalone workers)
 //! admit their jobs together ([`install_host_ledger`],
@@ -114,17 +118,24 @@ pub const AHEAD_JOBS: usize = 2;
 /// to its workers and to leaves labelled now.
 const AHEAD_JOB_CPUS: usize = 4;
 
-/// Bytes of the node's memory per leaf labelled ahead ([`ahead_jobs_for`]):
-/// about three times what a leaf of 32 million nodes holds, the rest left to
-/// the node and to work due now. A 32 GB node holds no more than
-/// [`AHEAD_JOBS`].
-const AHEAD_JOB_MEMORY: u64 = 16 << 30;
+/// Nodes of the leaf [`ahead_jobs_for`] sizes a node's memory by: the
+/// largest leaves mainnet nodes label ahead, measured at 32,339,852 nodes
+/// (2026-11-01; 13 of a 15-seat node's 18 leaves on 2026-11-06).
+const AHEAD_JOB_NODES: u64 = 32_339_852;
 
 /// The leaves a node of `cpus` CPUs and `memory` bytes labels ahead at once:
-/// never fewer than [`AHEAD_JOBS`]. The memory available at a moment still
-/// bounds them (`Admission::fits`).
+/// one per [`AHEAD_JOB_CPUS`] CPUs, and as many leaves of
+/// [`AHEAD_JOB_NODES`] as the jobs' share of the memory
+/// ([`MEMORY_SHARE_PERCENT`]) holds at the bytes labelling one ahead
+/// reserves (`crate::storage_labels::label_ahead_bytes`, 5.4 GB) beside one
+/// labelled now (`crate::storage_snapshot::encoding_bytes`, 8.0 GB); never
+/// fewer than [`AHEAD_JOBS`]. The memory available at a moment still bounds
+/// them (`Admission::fits`).
 pub fn ahead_jobs_for(cpus: usize, memory: u64) -> usize {
-    let by_memory = usize::try_from(memory / AHEAD_JOB_MEMORY).unwrap_or(usize::MAX);
+    let share = u128::from(memory) * u128::from(MEMORY_SHARE_PERCENT) / 100;
+    let now = u128::from(crate::storage_snapshot::encoding_bytes(AHEAD_JOB_NODES));
+    let each = u128::from(crate::storage_labels::label_ahead_bytes(AHEAD_JOB_NODES)).max(1);
+    let by_memory = usize::try_from(share.saturating_sub(now) / each).unwrap_or(usize::MAX);
     (cpus / AHEAD_JOB_CPUS).min(by_memory).max(AHEAD_JOBS)
 }
 
@@ -3103,27 +3114,49 @@ mod tests {
         drop((first, third.release, read.release, due.release));
     }
 
-    /// The cap on labelling ahead follows the node: two on a 16-thread node
-    /// of 32 GB, as measured there (2026-11-01), and on any smaller; more
-    /// only with both more cores and more memory.
+    /// The cap on labelling ahead follows the node: one leaf per four CPUs,
+    /// and as many of the largest leaves as the jobs' share of its memory
+    /// holds at what labelling one ahead reserves, beside one labelled now;
+    /// never fewer than two.
     #[test]
     fn a_larger_node_labels_more_leaves_ahead_at_once() {
         const GB: u64 = 1_000_000_000;
         for (cpus, memory, jobs, beside) in [
             (4, 8 * GB, 2, 1),
             (8, 32 * GB, 2, 1),
+            (16, 16 * GB, 2, 1),
             (16, 32 * GB, 2, 1),
+            (16, 32 * GIB, 3, 1),
             (16, 1024 * GB, 4, 2),
             (2, 1024 * GB, 2, 1),
-            (24, 62 * GIB, 3, 1),
-            (32, 64 * GB, 3, 1),
-            (64, 256 * GB, 14, 7),
-            (256, 1024 * GB, 59, 29),
+            (24, 62 * GIB, 6, 3),
+            (32, 64 * GB, 7, 3),
+            (64, 256 * GB, 16, 8),
+            (256, 1024 * GB, 64, 32),
         ] {
             let got = ahead_jobs_for(cpus, memory);
-            assert_eq!(got, jobs, "{cpus} CPUs, {memory} bytes");
+            assert_eq!(got, jobs, "ahead misjudged: {cpus} CPUs, {memory} bytes");
             assert_eq!(ahead_beside_due(got), beside, "beside {got} leaves");
         }
+    }
+
+    /// A 16-thread node of 31 GiB, sharing about 25 GB, labels three of its
+    /// largest leaves ahead at once: 5.4 GB each beside 8.0 GB for one
+    /// labelled now. Sized by 16 GiB a leaf it labelled two, and gave up 8
+    /// of its 10 seats of such leaves in an epoch (2026-11-06, epoch 1420).
+    #[test]
+    fn the_memory_term_counts_what_labelling_a_leaf_ahead_reserves() {
+        // The node's MemTotal: 32,729,092 kB.
+        let memory: u64 = 32_729_092 * 1024;
+        let each = crate::storage_labels::label_ahead_bytes(AHEAD_JOB_NODES);
+        let now = crate::storage_snapshot::encoding_bytes(AHEAD_JOB_NODES);
+        assert_eq!(each, 5_428_614_204, "ahead misjudged: the reservation");
+        assert_eq!(now, 8_020_283_296, "ahead misjudged: a leaf labelled now");
+        assert!(
+            u128::from(memory) * 75 / 100 >= u128::from(now) + 3 * u128::from(each),
+            "ahead misjudged: three fit beside one labelled now"
+        );
+        assert_eq!(ahead_jobs_for(16, memory), 3, "ahead misjudged: the cap");
     }
 
     /// A node sized for four leaves labels four ahead and starts no fifth;

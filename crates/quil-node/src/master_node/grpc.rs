@@ -511,13 +511,14 @@ fn node_service_bind(configured: String, allow_remote: bool) -> NodeServiceBind 
 const SUBMIT_REFUSAL_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The message collector's refusal reasons, as the summary names them.
-const SUBMIT_REFUSAL_NAMES: [&str; 6] = [
+const SUBMIT_REFUSAL_NAMES: [&str; 7] = [
     "prover_only",
     "unknown_shard",
     "rank_full",
     "invalid_shard_frame",
     "awaiting_execution",
     "no_proposer",
+    "invalid_alt_shard_update",
 ];
 
 fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usize {
@@ -529,6 +530,7 @@ fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usiz
         Refusal::InvalidShardFrame => 3,
         Refusal::AwaitingExecution => 4,
         Refusal::NoProposer => 5,
+        Refusal::InvalidAltShardUpdate => 6,
     }
 }
 
@@ -536,7 +538,7 @@ fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usiz
 /// first is logged at once, the rest at most once per
 /// [`SUBMIT_REFUSAL_REPORT_INTERVAL`], with the next refusal after it.
 struct SubmitRefusals {
-    counts: [u64; 6],
+    counts: [u64; 7],
     latest_peer: String,
     latest_reason: &'static str,
     logged_at: Option<std::time::Instant>,
@@ -544,7 +546,7 @@ struct SubmitRefusals {
 
 #[derive(Debug, PartialEq, Eq)]
 struct SubmitRefusalSummary {
-    counts: [u64; 6],
+    counts: [u64; 7],
     latest_peer: String,
     latest_reason: &'static str,
     since_previous: Option<std::time::Duration>,
@@ -553,7 +555,7 @@ struct SubmitRefusalSummary {
 impl SubmitRefusals {
     const fn new() -> Self {
         Self {
-            counts: [0; 6],
+            counts: [0; 7],
             latest_peer: String::new(),
             latest_reason: "",
             logged_at: None,
@@ -2576,12 +2578,16 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         })
         .flatten()
     {
-        let reader = Arc::new(crate::master_node::remote_reads::PeerCoinReader::new(
+        // Covering nodes are the registered provers serving the shards.
+        let registry: Arc<dyn quil_types::consensus::ProverRegistry> = prover_registry.clone();
+        let reader = crate::master_node::remote_reads::PeerCoinReader::new(
             peer_info_cache.clone(),
             archive_pool.clone(),
             falcon,
             network,
-        ));
+        )
+        .with_prover_registry(registry);
+        let reader = Arc::new(reader);
         tracing::info!(
             "state reads for uncovered applications will be forwarded to covering nodes"
         );
@@ -3474,24 +3480,90 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
     }
     node_rpc_builder = node_rpc_builder
         .with_certificate_share_provider(Arc::new(super::seat_certificates::snapshot));
+    // The node's health conditions, served in its health report: fed by
+    // every shard info served (peer-reported and committed heads), the
+    // frame-observation sampler (committed heads) and the worker view, and
+    // judged every 15 s by each shard's cadence.
+    let health = Arc::new(std::sync::Mutex::new(
+        quil_rpc::health_conditions::HealthRegistry::default(),
+    ));
+    {
+        let health = health.clone();
+        node_rpc_builder = node_rpc_builder.with_shard_info_observer(Arc::new(
+            move |response: &quil_types::proto::node::GetShardInfoResponse| {
+                observe_served_shards(&health, response, quil_engine::worker_execution::now_ms());
+            },
+        ));
+    }
+    {
+        let (health, cadence, view, registry, head) = (
+            health.clone(),
+            cadence.clone(),
+            workers_view.clone(),
+            prover_registry.clone(),
+            current_frame.clone(),
+        );
+        // The expected waits' inputs: the GLOBAL head this node serves and
+        // its committed GLOBAL state.
+        let global = (last_global_head_frame.clone(), crdt.clone());
+        sup.spawn("health-conditions", move |token| async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! { _ = token.cancelled() => break, _ = interval.tick() => {} }
+                let global = global.clone();
+                let (health, cadence, view, registry, head) = (
+                    health.clone(),
+                    cadence.clone(),
+                    view.clone(),
+                    registry.clone(),
+                    head.clone(),
+                );
+                tokio::task::spawn_blocking(move || {
+                    let now = quil_engine::worker_execution::now_ms();
+                    let workers =
+                        health_workers(&view, registry.as_ref(), &prover_address, head.effective());
+                    let observed = health_global(&global.0, &global.1);
+                    let transitions = {
+                        let cadence = cadence.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut health = health.lock().unwrap_or_else(|e| e.into_inner());
+                        health.observe_global(observed, now);
+                        health.observe_workers(workers, now);
+                        health.evaluate(now, &|filter: &[u8]| cadence.snapshot(filter, now / 1000))
+                    };
+                    for transition in &transitions {
+                        quil_rpc::health_conditions::log_transition(transition);
+                    }
+                })
+                .await?;
+            }
+            Ok(())
+        });
+    }
     {
         let state = cadence.clone();
         let registry = prover_registry.clone();
         let wm = worker_manager.clone();
         let committed = crdt.clone();
         let head = current_frame.clone();
+        let health = health.clone();
+        let read_failures = Arc::new(std::sync::Mutex::new(
+            super::frame_observations::ReadFailures::default(),
+        ));
         sup.spawn("frame-observation-sampler", move |token| async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut ticks = 0;
             loop {
                 tokio::select! { _ = token.cancelled() => break, _ = interval.tick() => {} }
-                let (state, registry, wm, committed, head) = (
+                let (state, registry, wm, committed, head, health, read_failures) = (
                     state.clone(),
                     registry.clone(),
                     wm.clone(),
                     committed.clone(),
                     head.clone(),
+                    health.clone(),
+                    read_failures.clone(),
                 );
                 let path = frame_observations_path.clone();
                 let scope = cadence_scope.clone();
@@ -3518,7 +3590,31 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                         filters.extend(cache.filters());
                     }
                     let filters: Vec<_> = filters.into_iter().collect();
-                    let heads = committed_global_app_heads(&committed, &filters).ok();
+                    let started = std::time::Instant::now();
+                    let read = committed_global_app_heads(&committed, &filters);
+                    let read_ms = started.elapsed().as_millis() as u64;
+                    let line = {
+                        let mut failures = read_failures.lock().unwrap_or_else(|e| e.into_inner());
+                        match &read {
+                            Ok(_) => failures.succeeded(now),
+                            Err(e) => failures.failed(now, &e.to_string(), read_ms),
+                        }
+                    };
+                    if let Some(line) = line {
+                        line.emit(filters.len());
+                    }
+                    let heads = read.ok();
+                    if let Some(heads) = heads.as_ref() {
+                        let observed: Vec<_> = filters
+                            .iter()
+                            .zip(heads)
+                            .filter_map(|(filter, head)| Some((filter.clone(), (*head)?)))
+                            .collect();
+                        health
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .observe_committed(&observed, quil_engine::worker_execution::now_ms());
+                    }
                     let mut cache = state.lock().unwrap_or_else(|e| e.into_inner());
                     cache.observe(&[], Some((head.effective(), 0)), now);
                     for (i, filter) in filters.iter().enumerate() {
@@ -4082,10 +4178,24 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
             let registry =
                 prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>;
             let capacity = worker_capacity.clone();
+            let health = health.clone();
             let source: quil_rpc::diagnostics_service::HealthSource = Arc::new(move || {
                 let mut inputs =
                     health_inputs(&view, &head, &crdt, registry.as_ref(), &prover_address);
                 inputs.worker_capacity = capacity.load(std::sync::atomic::Ordering::Relaxed);
+                // The expected waits are judged on the head served now: a
+                // client deciding when to sign reads them.
+                let observed = health_global(&head, &crdt);
+                let now = quil_engine::worker_execution::now_ms();
+                let (snapshot, transitions) = {
+                    let mut health = health.lock().unwrap_or_else(|e| e.into_inner());
+                    let transitions = health.refresh_waits(observed, now);
+                    (health.snapshot(), transitions)
+                };
+                for transition in &transitions {
+                    quil_rpc::health_conditions::log_transition(transition);
+                }
+                inputs.health = Some(snapshot);
                 inputs
             });
             let fingerprint = hex::decode(env!("QUIL_BUILD_FINGERPRINT"))
@@ -4435,14 +4545,17 @@ fn worker_entries(wm: &dyn quil_engine::worker::WorkerManager) -> Vec<quil_rpc::
         .all
         .into_iter()
         .map(|w| quil_rpc::WorkerEntry {
-            execution: quil_engine::worker_execution::with_store_state(
-                w.core_id,
-                quil_engine::worker_execution::with_renewal_state(
-                    &w.filter,
-                    execution
-                        .iter()
-                        .find(|(id, filter, _)| *id == w.core_id && *filter == w.filter)
-                        .map(|(_, _, s)| s.clone()),
+            execution: quil_engine::worker_execution::with_restart_readiness(
+                &w.filter,
+                quil_engine::worker_execution::with_store_state(
+                    w.core_id,
+                    quil_engine::worker_execution::with_renewal_state(
+                        &w.filter,
+                        execution
+                            .iter()
+                            .find(|(id, filter, _)| *id == w.core_id && *filter == w.filter)
+                            .map(|(_, _, s)| s.clone()),
+                    ),
                 ),
             ),
             core_id: w.core_id,
@@ -4515,7 +4628,119 @@ fn health_inputs(
         // The configured count is the worker manager's; the source sets it.
         worker_capacity: 0,
         store_io: quil_forest::store_io::latest().map(|report| report.to_proto()),
+        // The node's registry; the source sets it.
+        health: None,
     }
+}
+
+/// This node's GLOBAL position and settings as the health conditions'
+/// expected waits judge them: the head it serves, the epoch length, the
+/// frames admission takes legacy coin shields from, and whether a GLOBAL
+/// state sync has installed some of its chunks but not the last (committed
+/// GLOBAL state is unreadable until it does).
+fn health_global(
+    head: &std::sync::atomic::AtomicU64,
+    crdt: &quil_hypergraph::HypergraphCrdt,
+) -> quil_rpc::health_conditions::GlobalObservation {
+    #[cfg(feature = "confidential-tokens")]
+    let shields_from = Some((
+        quil_execution::token_intrinsic::legacy_migration::migrated_owner_frame(),
+        quil_execution::token_intrinsic::global_commit::batch_shield_frame(),
+    ));
+    #[cfg(not(feature = "confidential-tokens"))]
+    let shields_from = None;
+    let sync_installing = crdt.capture_committed_snapshot().and_then(|snapshot| {
+        quil_hypergraph::crdt::snapshot_sync_incomplete(
+            snapshot.as_ref(),
+            &quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS,
+        )
+    });
+    if let Err(error) = &sync_installing {
+        debug!(%error, "health conditions: GLOBAL sync state unreadable");
+    }
+    quil_rpc::health_conditions::GlobalObservation {
+        head_frame: head.load(std::sync::atomic::Ordering::Relaxed),
+        epoch_length: quil_types::consensus::epoch_length_frames(),
+        shields_from,
+        sync_installing: sync_installing.ok(),
+    }
+}
+
+/// Feed one served shard info to the health conditions: the head peers
+/// report for each shard and its head in committed GLOBAL state.
+fn observe_served_shards(
+    health: &std::sync::Mutex<quil_rpc::health_conditions::HealthRegistry>,
+    response: &quil_types::proto::node::GetShardInfoResponse,
+    now_ms: u64,
+) {
+    let peers: Vec<_> = response
+        .shards
+        .iter()
+        .map(|s| quil_rpc::health_conditions::PeerObservation {
+            filter: s.filter.clone(),
+            latest_frame: s.latest_frame,
+            materialized_frame: s.materialized_frame,
+            active_provers: s.active_provers,
+            generation: s.global_head.as_ref().map(|h| h.generation),
+        })
+        .collect();
+    let committed: Vec<_> = response
+        .shards
+        .iter()
+        .filter_map(|s| Some((s.filter.clone(), s.global_head?)))
+        .collect();
+    let mut health = health.lock().unwrap_or_else(|e| e.into_inner());
+    health.observe_peers(&peers, now_ms);
+    health.observe_committed(&committed, now_ms);
+}
+
+/// The worker view as the health conditions judge it: each allocated
+/// worker with its engine's report, earning while its allocation is active
+/// or leaving in this node's prover registry at `frame`.
+fn health_workers(
+    view: &std::sync::RwLock<Vec<quil_rpc::WorkerEntry>>,
+    registry: &dyn quil_types::consensus::ProverRegistry,
+    prover_address: &[u8],
+    frame: u64,
+) -> Vec<quil_rpc::health_conditions::WorkerObservation> {
+    use quil_types::consensus::EffectiveStatus;
+    let earning: std::collections::HashSet<Vec<u8>> = match registry.get_prover_info(prover_address)
+    {
+        Ok(Some(prover)) if frame > 0 => prover
+            .allocations
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a.effective_status(frame),
+                    EffectiveStatus::Active | EffectiveStatus::Leaving
+                )
+            })
+            .map(|a| a.confirmation_filter.clone())
+            .collect(),
+        Ok(_) => Default::default(),
+        Err(error) => {
+            debug!(%error, "health conditions without earning allocations: prover registry unavailable");
+            Default::default()
+        }
+    };
+    view.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|w| w.allocated && !w.filter.is_empty())
+        .map(|w| {
+            let e = w.execution.as_ref();
+            quil_rpc::health_conditions::WorkerObservation {
+                core_id: w.core_id,
+                filter: w.filter.clone(),
+                earning: earning.contains(&w.filter),
+                state: e.map(|e| e.state.clone()).unwrap_or_default(),
+                blocker: e.map(|e| e.blocker.clone()).unwrap_or_default(),
+                observed_unix_ms: e.map_or(0, |e| e.observed_unix_ms),
+                materialized_frame: e.and_then(|e| e.materialized_frame),
+                last_advance_unix_ms: e.map_or(0, |e| e.last_advance_unix_ms),
+            }
+        })
+        .collect()
 }
 
 /// Keep shard diagnostics on a single durable GLOBAL snapshot, never the
@@ -4668,6 +4893,44 @@ mod health_input_tests {
     use quil_types::crypto::Signer as _;
     use quil_types::proto::diagnostics::Phase;
 
+    /// The worker view carries each seat's restart readiness: a seat whose
+    /// committee has no spare voter reads as stopping its shard, and a worker
+    /// without a seat has none.
+    #[test]
+    fn the_worker_view_carries_each_seats_restart_readiness() {
+        let workers = quil_engine::test_support::TestWorkerManager::new();
+        let filter = vec![7; 32];
+        workers.add_with_filter(1, filter.clone());
+        workers.add_with_filter(2, Vec::new());
+        let now = quil_engine::worker_execution::now_ms();
+        let tight = quil_types::proto::node::WorkerExecution {
+            state: "serving".into(),
+            observed_unix_ms: now,
+            own_votes: Some(2),
+            committee_members: 28,
+            committee_quorum: 19,
+            committee_voters: 19,
+            committee_observed_unix_ms: now,
+            ..Default::default()
+        };
+        workers.set_execution(1, &filter, tight.clone());
+        workers.set_execution(2, &[], tight);
+        let entries = worker_entries(&workers);
+        let restart = |core: u32| {
+            entries
+                .iter()
+                .find(|w| w.core_id == core)
+                .and_then(|w| w.execution.as_ref())
+                .and_then(|e| e.restart.clone())
+        };
+        let seat = restart(1).expect("a seat has a verdict");
+        assert_eq!(
+            (seat.verdict.as_str(), seat.committee_margin),
+            ("stops_shard", Some(0))
+        );
+        assert_eq!(restart(2), None);
+    }
+
     /// The report reads the master's worker view as the refresh loop builds
     /// it, and each allocated shard's committed session head.
     #[test]
@@ -4805,6 +5068,123 @@ mod health_input_tests {
                 Some(1),
                 Some(2 * quil_types::consensus::epoch_length_frames())
             )
+        );
+    }
+
+    /// Served shard info feeds the health conditions: the head peers report
+    /// and the committed head of each shard.
+    #[test]
+    fn served_shard_info_feeds_the_health_conditions() {
+        use quil_types::proto::diagnostics::ConditionKind;
+        use quil_types::proto::node::{GetShardInfoResponse, GlobalAppFrameHead, ShardRewardInfo};
+        let health = std::sync::Mutex::new(quil_rpc::health_conditions::HealthRegistry::default());
+        let response = |global_frame| GetShardInfoResponse {
+            shards: vec![ShardRewardInfo {
+                filter: vec![1],
+                active_provers: 3,
+                latest_frame: 200,
+                global_head: Some(GlobalAppFrameHead {
+                    frame: 50,
+                    global_frame,
+                    generation: 1,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let t0 = 1_800_000_000_000;
+        observe_served_shards(&health, &response(10), t0);
+        observe_served_shards(&health, &response(10), t0 + 60_000);
+        let mut health = health.into_inner().unwrap();
+        health.evaluate(t0 + 60_000, &|_: &[u8]| None);
+        let kinds: Vec<i32> = health
+            .snapshot()
+            .conditions
+            .iter()
+            .map(|c| c.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ConditionKind::PeerAppFramesUnchanged as i32,
+                ConditionKind::GlobalAppFramesBehind as i32
+            ]
+        );
+    }
+
+    /// The expected waits read the head this node serves and its committed
+    /// GLOBAL state: a GLOBAL state sync that installed some of its chunks
+    /// but not the last reads as installing until the last one is in.
+    #[test]
+    fn the_expected_waits_read_the_served_head_and_a_global_sync() {
+        use quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS;
+        use quil_hypergraph::testing::{CrdtTreeReader, MemStore, StubProver};
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(StubProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::new(db.inner()));
+        let head = std::sync::atomic::AtomicU64::new(712);
+        let observed = health_global(&head, &crdt);
+        assert_eq!(
+            (
+                observed.head_frame,
+                observed.epoch_length,
+                observed.sync_installing
+            ),
+            (
+                712,
+                quil_types::consensus::epoch_length_frames(),
+                Some(false)
+            )
+        );
+
+        let archive = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(MemStore::new()),
+            Arc::new(StubProver),
+        ));
+        for byte in 1..=2u8 {
+            let location = quil_hypergraph::Location {
+                app_address: GLOBAL_INTRINSIC_ADDRESS,
+                data_address: [byte; 32],
+            };
+            archive.add_vertex(&location, &[byte; 48]).unwrap();
+        }
+        archive.commit(1).unwrap();
+        let (version, root) = archive
+            .serve_forest_head(&GLOBAL_INTRINSIC_ADDRESS, 0)
+            .unwrap();
+        let reader = CrdtTreeReader {
+            source: archive,
+            shard_id: GLOBAL_INTRINSIC_ADDRESS.to_vec(),
+            phase: 0,
+        };
+        let mut plan = crdt
+            .prepare_phase_sync(
+                &reader,
+                version,
+                &GLOBAL_INTRINSIC_ADDRESS,
+                0,
+                &[],
+                Some(quil_forest::SubtreeSyncAnchor::AppRoot(root)),
+            )
+            .unwrap();
+        assert_eq!(plan.remaining().len(), 2);
+        let byte = plan.remaining()[0].0[0];
+        crdt.apply_sync_chunk(&mut plan, &[vec![byte; 48]]).unwrap();
+        assert_eq!(
+            health_global(&head, &crdt).sync_installing,
+            Some(true),
+            "between a sync's chunks"
+        );
+        let byte = plan.remaining()[0].0[0];
+        crdt.apply_sync_chunk(&mut plan, &[vec![byte; 48]]).unwrap();
+        assert_eq!(crdt.finish_phase_sync(&plan).unwrap(), root);
+        assert_eq!(
+            health_global(&head, &crdt).sync_installing,
+            Some(false),
+            "the last chunk is in"
         );
     }
 }
@@ -5677,7 +6057,7 @@ mod rpc_bound_tests {
         assert_eq!(
             refusals.record(Refusal::InvalidShardFrame, "a".into(), start),
             Some(SubmitRefusalSummary {
-                counts: [0, 0, 0, 1, 0, 0],
+                counts: [0, 0, 0, 1, 0, 0, 0],
                 latest_peer: "a".into(),
                 latest_reason: Refusal::InvalidShardFrame.reason(),
                 since_previous: None,
@@ -5697,7 +6077,7 @@ mod rpc_bound_tests {
                 start + SUBMIT_REFUSAL_REPORT_INTERVAL
             ),
             Some(SubmitRefusalSummary {
-                counts: [0, 99, 1, 0, 0, 0],
+                counts: [0, 99, 1, 0, 0, 0, 0],
                 latest_peer: "b".into(),
                 latest_reason: Refusal::RankFull.reason(),
                 since_previous: Some(SUBMIT_REFUSAL_REPORT_INTERVAL),

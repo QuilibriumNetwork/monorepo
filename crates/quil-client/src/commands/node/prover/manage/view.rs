@@ -2,7 +2,7 @@
 //! and its panel/help/join-picker renderers, expressed with ratatui.
 
 use super::super::local_execution::{
-    advance_age, execution_label, recovery, recovery_summary, seal_summary, sealed,
+    advance_age, execution_label, recovery, recovery_summary, restart_summary, seal_summary, sealed,
 };
 
 use super::super::epoch::EffectiveStatus;
@@ -20,6 +20,7 @@ use super::super::format_quil_daily_round;
 use super::coins;
 use super::model::*;
 use super::util::{center_trunc, clamp_offset, filter_label, shared_filter_address};
+use quil_types::proto::diagnostics::ConditionSeverity;
 
 #[path = "coins_view.rs"]
 mod coins_view;
@@ -581,7 +582,6 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         &sorted_allocs,
         &sorted_avail,
     );
-    update_app_progress_warning(m);
     let alloc_heading = alloc_heading_lines(m, &sorted_allocs, chunks[1].width.saturating_sub(4));
     let alloc_border = Style::new().fg(if m.focus.is_alloc() { PRIMARY } else { DIM });
     let alloc_block = Block::default()
@@ -825,17 +825,12 @@ fn provers_notice_summary(m: &Model) -> Option<(usize, NoticeSeverity)> {
     if global_alarm_active(m) {
         found.push(NoticeSeverity::Error);
     }
-    if m.notice_minimum <= NoticeSeverity::Warning {
-        if rpc_status_is_fresh(m)
-            && m.reported_app_stall_counts(std::time::Instant::now())
-                .is_some()
-        {
-            found.push(NoticeSeverity::Warning);
-        }
-        if m.app_stall_time.is_some() {
-            found.push(NoticeSeverity::Warning);
-        }
-    }
+    found.extend(
+        node_condition_notices(m)
+            .into_iter()
+            .map(|(severity, _)| severity)
+            .filter(|severity| *severity >= m.notice_minimum),
+    );
     found.extend(
         condition_notices(m)
             .into_iter()
@@ -1332,6 +1327,48 @@ fn claimable_title(m: &Model) -> String {
     }
 }
 
+/// The Credited KPI: QUIL/day credited over the last 60m and 24h of this
+/// session's claimable reads, measured, so without `~`.
+fn credited_kpi(m: &Model) -> String {
+    let now = std::time::Instant::now();
+    let values = [false, true]
+        .map(|day| {
+            m.credited_daily(day, now)
+                .map_or_else(|| "-".into(), |v| fmt_forecast(&v))
+        })
+        .join("/");
+    if m.compact_actions {
+        format!("Credited [Q/d 60m/24h] {values}")
+    } else {
+        format!("Credited [Q/d 60m/24h]: {values}")
+    }
+}
+
+/// The cursor detail's note on the Reward windows that use the quorum share
+/// because the node has counted none of this seat's certificates in them.
+fn quorum_share_detail(m: &Model, filter: &[u8]) -> Option<String> {
+    let mut share = None;
+    let windows: Vec<_> = [(false, "60m"), (true, "24h")]
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| m.reward_mask() & (1 << i) != 0)
+        .filter_map(|(_, (day, label))| {
+            let s = m.reward_share(filter, day)?;
+            (!s.measured && s.paid < s.frames).then(|| {
+                share = Some(s);
+                label
+            })
+        })
+        .collect();
+    let s = share?;
+    Some(format!(
+        "Reward {}: quorum share {}/{}, no certificate counted yet",
+        windows.join("/"),
+        s.paid,
+        s.frames
+    ))
+}
+
 fn alloc_kpis(m: &Model, sorted: &[AllocationRow]) -> Vec<String> {
     let mut joining = BigInt::from(0);
     let mut paused = BigInt::from(0);
@@ -1394,6 +1431,7 @@ fn alloc_kpis(m: &Model, sorted: &[AllocationRow]) -> Vec<String> {
             },
         ),
         ("Reward", reward),
+        ("Credited", credited_kpi(m)),
         (
             "Allocation GLOBAL snapshot",
             global_snapshot_label(m, sorted.iter().map(|a| a.global_head.as_ref())),
@@ -1560,7 +1598,7 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
                     .and_then(|s| s.materialized_frame)
                     .map(|h| h.to_string())
                     .unwrap_or_else(|| "-".into());
-                if m.local_stalled_rows.contains(&a.filter_key) {
+                if m.local_app_stalled(&a.filter, a.worker_id) {
                     height + "!"
                 } else {
                     height
@@ -2024,7 +2062,7 @@ fn recovery_failed(a: &AllocationRow) -> bool {
 fn local_color(m: &Model, a: &AllocationRow) -> Color {
     let state = m.execution_state(a.execution.as_ref());
     if matches!(state, "running" | "serving")
-        && (local_warning(m, a) || m.local_stalled_rows.contains(&a.filter_key))
+        && (local_warning(m, a) || m.local_app_stalled(&a.filter, a.worker_id))
     {
         Color::Yellow
     } else {
@@ -2133,8 +2171,17 @@ fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
         };
         text += &format!(" | {label}: {}", execution.blocker);
     }
+    let mut restart_warns = false;
+    if let Some(r) = execution.restart.as_ref() {
+        let (summary, warns) = restart_summary(r);
+        restart_warns = warns;
+        text += &format!(" | {summary}");
+    }
     if let Some(coverage) = cadence_coverage(m, &a.filter) {
         text += &format!(" | {coverage}");
+    }
+    if let Some(share) = quorum_share_detail(m, &a.filter) {
+        text += &format!(" | {share}");
     }
     if let Some(r) = execution.recovery.as_ref() {
         text += &format!(
@@ -2161,6 +2208,8 @@ fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
     // A cached or stale observation is `cached` / `stale`, not `blocked`.
     let color = if matches!(state, "blocked" | "stopped") {
         ERROR
+    } else if restart_warns {
+        WARNING
     } else {
         HELP
     };
@@ -3199,15 +3248,6 @@ fn update_message_lifetime(m: &mut Model) {
     } else {
         m.global_alarm_time = None;
     }
-    if rpc_status_is_fresh(m)
-        && m.reported_app_stall_counts(std::time::Instant::now())
-            .is_some()
-    {
-        m.reported_app_stall_time
-            .get_or_insert_with(std::time::SystemTime::now);
-    } else {
-        m.reported_app_stall_time = None;
-    }
     let active: Vec<&'static str> = condition_notices(m)
         .into_iter()
         .map(|(key, ..)| key)
@@ -3365,63 +3405,6 @@ fn earning_allocations(m: &Model) -> Vec<&AllocationRow> {
         .collect()
 }
 
-/// Judge each staffed earning allocation with a fresh observation on its own:
-/// missing or old data is excluded rather than reported as a stall, and one
-/// advancing allocation does not hide another that stopped.
-fn update_app_progress_warning(m: &mut Model) {
-    let rows: Vec<(String, u64)> = if m.reachable {
-        earning_allocations(m)
-            .into_iter()
-            .filter_map(|a| {
-                let e = a.execution.as_ref()?;
-                (e.materialized_frame.is_some()
-                    && matches!(
-                        m.execution_state(Some(e)),
-                        "starting" | "running" | "serving" | "blocked" | "stopped"
-                    ))
-                .then(|| (a.filter_key.clone(), e.last_advance_unix_ms))
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    if rows.is_empty() {
-        m.app_progress_observed_since = None;
-        m.app_stall_time = None;
-        m.local_stalled_rows.clear();
-        m.local_stalled_count = 0;
-        m.local_app_rows = 0;
-        return;
-    }
-    let observed = *m
-        .app_progress_observed_since
-        .get_or_insert_with(std::time::Instant::now);
-    let now = std::time::SystemTime::now();
-    let now_ms = now
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    m.local_app_rows = rows.len();
-    let stalled: Vec<String> = rows
-        .into_iter()
-        .filter(|(_, last)| {
-            if *last == 0 {
-                observed.elapsed().as_secs() >= 60
-            } else {
-                now_ms.saturating_sub(*last) >= 60_000
-            }
-        })
-        .map(|(key, _)| key)
-        .collect();
-    m.local_stalled_count = stalled.len();
-    m.local_stalled_rows = stalled.into_iter().collect();
-    if m.local_stalled_count == 0 {
-        m.app_stall_time = None;
-    } else {
-        m.app_stall_time.get_or_insert(now);
-    }
-}
-
 /// Current active + leaving forecasts in the 60m and 24h windows when the
 /// 60m one is below half the 24h one. Only rows whose shard has 30 min of
 /// 60m and 2h of 24h coverage count; both windows price frames alike.
@@ -3467,27 +3450,18 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
     if !rpc_status_is_fresh(m) {
         return notices;
     }
-    if let Some((stalled, behind, known)) = m.committed_app_counts(std::time::Instant::now()) {
-        if stalled > 0 {
-            notices.push((
-                "global-app-unchanged",
-                NoticeSeverity::Warning,
-                format!(
-                    "{}: {stalled}/{known} tracked shards.",
-                    progress_stall_text("Global app frames", 60.max(m.refresh_seconds * 3))
-                ),
-            ));
-        }
-        if behind > 0 {
-            notices.push((
-                "global-app-behind",
-                NoticeSeverity::Warning,
-                format!(
-                    "Global app frames >{GLOBAL_APP_LAG_FRAMES} behind app heads: \
-                     {behind}/{known} tracked shards."
-                ),
-            ));
-        }
+    match &m.health {
+        HealthAnswer::NotReported => notices.push((
+            "health-not-reported",
+            NoticeSeverity::Warning,
+            "Health conditions not reported by this node version.".to_string(),
+        )),
+        HealthAnswer::Failed(reason) => notices.push((
+            "health-unavailable",
+            NoticeSeverity::Warning,
+            format!("Health report unavailable: {reason}."),
+        )),
+        HealthAnswer::Unread | HealthAnswer::Reported(_) => {}
     }
     if let Some((hour, day)) = reward_drop(m) {
         notices.push((
@@ -3679,6 +3653,31 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
     notices
 }
 
+/// The node's current health conditions as notice lines, each stamped
+/// with the time the node saw it start: the node judges them, this client
+/// only shows them.
+fn node_condition_notices(m: &Model) -> Vec<(NoticeSeverity, String)> {
+    m.health_conditions()
+        .iter()
+        .map(|c| {
+            let severity = match ConditionSeverity::try_from(c.severity) {
+                Ok(ConditionSeverity::Error) => NoticeSeverity::Error,
+                Ok(ConditionSeverity::Info) => NoticeSeverity::Info,
+                _ => NoticeSeverity::Warning,
+            };
+            let since = std::time::UNIX_EPOCH + std::time::Duration::from_millis(c.since_unix_ms);
+            (
+                severity,
+                format!(
+                    "{}{}",
+                    message_timestamp(Some(since)),
+                    quil_rpc::health_conditions::notice_text(c)
+                ),
+            )
+        })
+        .collect()
+}
+
 /// Shared progress-notice convention; tracker definitions belong in help.
 fn progress_stall_text(signal: &str, seconds: u64) -> String {
     format!("{signal} unchanged >{seconds}s")
@@ -3723,33 +3722,16 @@ fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'sta
             width,
         ));
     }
-    if m.notice_minimum <= NoticeSeverity::Warning {
-        if rpc_status_is_fresh(m) {
-            if let Some((stalled, known)) = m.reported_app_stall_counts(std::time::Instant::now()) {
-                lines.extend(wrap_message(
-                    Line::from(Span::styled(
-                        format!(
-                            "{}{}: {stalled}/{known} tracked shards.",
-                            message_timestamp(m.reported_app_stall_time),
-                            progress_stall_text("Peer app frames", 60.max(m.refresh_seconds * 3))
-                        ),
-                        Style::new().fg(Color::Yellow),
-                    )),
-                    width,
-                ));
-            }
-        }
-        if let Some(time) = m.app_stall_time {
+    for (severity, text) in node_condition_notices(m) {
+        if severity >= m.notice_minimum {
             lines.extend(wrap_message(
                 Line::from(Span::styled(
-                    format!(
-                        "{}{}: {}/{} allocations.",
-                        message_timestamp(Some(time)),
-                        progress_stall_text("Local app frames", 60),
-                        m.local_stalled_count,
-                        m.local_app_rows
-                    ),
-                    Style::new().fg(Color::Yellow),
+                    text,
+                    Style::new().fg(if severity == NoticeSeverity::Error {
+                        ERROR
+                    } else {
+                        WARNING
+                    }),
                 )),
                 width,
             ));
@@ -4609,11 +4591,12 @@ fn help_items() -> Vec<HelpItem> {
         item("`bound`, `idle`: worker rows (see the Status column)"),
         item("`unknown`: a raw allocation status this client cannot classify"),
         kv("Claimable", "Authenticated claimable QUIL at the cited frame; compact label `[Q]`"),
-        kv("Reward", "Forecast QUIL/day of the displayed staffed rows in the selected `60m`/`24h`/`T` order; compact label `[~Q/d …]`, which omits zero fields. Estimates, not measured earnings; unassigned rows are excluded:"),
+        kv("Reward", "Forecast QUIL/day of the displayed staffed rows in the selected `60m`/`24h`/`T` order; compact label `[~Q/d …]`, which omits zero fields. Estimates, not measured earnings (see Credited); unassigned rows are excluded:"),
         item("`now`: active + leaving estimates; compact names it only beside other fields"),
         item("`paused`: paused estimates, available upon resume"),
         item("`delta` (compact `Δ`): joining minus leaving; activation epochs may differ"),
         item("`-`: unavailable; `+` after a value: known subtotal with unknown rows"),
+        kv("Credited", "QUIL/day credited to this node's prover, measured, so without `~`: the rises of Claimable between this session's reads over its last `60m`/`24h`, per the time the reads span. A fall (a mint) adds nothing, so credits in the read interval holding a mint are missed. `-` until the reads span 30m (`60m`) or 2h (`24h`)"),
         kv("Snapshot", "GLOBAL frame the panel's GlobalHead values cite, in expanded headers; compact mode cites it in the GlobalHead column header (see Global citation)"),
         kv("Shown", "Allocations rows that pass the active column filters / all rows; shown only while filters hide rows"),
         kv("Selected", "Rows marked for a batch action in that panel (‹space›, or ‹a› for all)"),
@@ -4635,16 +4618,16 @@ fn help_items() -> Vec<HelpItem> {
         item("`yellow` (or `!` with colors off): halt risk by count; the shard holds data and at most 3 of its provers are active or activating, so losing one risks its quorum"),
         kv("Cert", "This node's share of its shard's certificates over the last 60m: of the shard frames GLOBAL included from committee sessions this node sits in, the percent whose certificate it signed, as the node counts them from the GLOBAL frames it receives. Only a frame's signers earn its reward, and a certificate carries the first votes to reach quorum, committee - floor((committee - 1) / 3) of them, so a member voting in time signs about 70%. Less means its votes arrive after the quorum, or its worker is blocked or behind its shard; the master log has each seat's hourly counts (`this seat's share of its shard's certificates`)"),
         item("`yellow` (or `!` with colors off): low; an hour counted with at least 30 frames, of which this node signed under half the in-time share (quorum / committee); the node warns (`this seat signed under half the shard certificates`)"),
-        item("`-`: no frame counted in the last 60m, or a node that predates the count"),
+        item("`-`: no frame counted in the last 60m, or a node that predates the count; the `60m` Reward estimate then uses the quorum share"),
         kv("Ring", "Committed rank; `~` marks a join forecast with one ring of competing admissions"),
         kv("Size [GB]", "Shard size in decimal gigabytes, one decimal; `<0.1` preserves small nonzero sizes"),
         kv("Shards", "Data shards the filter covers"),
         kv("LocalMat", "Local materialized height:"),
         item("`-`: unknown"),
         item("`0!`: no materialized frames, with colors off; colors show a `yellow` `0`"),
-        item("`yellow` (or `!` with colors off): unchanged for 60s; see Local app notice"),
+        item("`yellow` (or `!` with colors off): unchanged for its window; see Local app notice"),
         kv("PeerMat", "Peer-reported materialized height; compared with PeerHead"),
-        kv("PeerHead", "Peer-reported shard head; remote metadata, not the local cursor. `yellow` (or `!` with colors off) marks unchanged fresh reports for max(60s, 3 polls)"),
+        kv("PeerHead", "Peer-reported shard head; remote metadata, not the local cursor. `yellow` (or `!` with colors off) marks a shard the node reports unchanged; see Reported app heads"),
         kv("GlobalHead", "Committed app head@generation, independent of LocalMat and peer metadata; absent on older servers:"),
         item("`-`: unavailable"),
         item("`0@gN`: a known genesis head"),
@@ -4667,7 +4650,7 @@ fn help_items() -> Vec<HelpItem> {
         item("`lag`: behind its head"),
         item("`unmat`: nothing materialized"),
         item("`unknown`: no head"),
-        kv("Reward [~Q/d]", "Forecast QUIL/day to one decimal, in selected `60m`/`24h`/`T` order (`T` = theoretical 10s/frame; expanded: `theory`). `~` before `Q/d` marks estimates; `<0.1` is a trickle; current per-frame pricing/ring applied to observed cadence, not historical credited income"),
+        kv("Reward [~Q/d]", "Forecast QUIL/day to one decimal, in selected `60m`/`24h`/`T` order (`T` = theoretical, see Reward estimates; expanded: `theory`). `~` before `Q/d` marks estimates; `<0.1` is a trickle; current per-frame pricing/ring applied to observed cadence, not historical credited income"),
         kv("Worker", "Core the allocation is bound to; `-1` means none is bound"),
         kv("Status", "Effective protocol status of the row:"),
         item("`joining`, `active`, `paused`, `leaving`, `rejected`, `kicked`: protocol status"),
@@ -4687,16 +4670,18 @@ fn help_items() -> Vec<HelpItem> {
         kv("Interval [s]", "Node-observed mean seconds per committed app frame. ‹b› exposes `60m`/`24h` sub-items under Interval [s] in Columns and Global interval in Top header; these selections are independent. Sort/filter uses the first visible interval. Coverage needs 60s; gaps/downtime excluded; includes pauses/catch-up. `-` unavailable or no advances"),
         note("Thresholds read `in Nf` (frames from the received GLOBAL frame; `now` once reached) or `@f<frame>`; ‹e› switches. Expanded relative thresholds add a `~` time estimate from the measured GLOBAL interval; `~` marks estimates. Q/d is whole QUIL per day, GB is decimal gigabytes. Available Shards shows the same columns, minus the ones that only exist once a shard is allocated to you."),
         sec("Footers and notifications"),
-        kv("Details", "The cursor row's detail sits at the bottom of Allocations, Available Shards and Balances under a `├─ cursor ─┤` rule (a `cursor:` label when the panel leaves it one row), in dim italics, warning colors italic only, so it never reads as a row. It adds only what the row's cells lack, never its key or values: in Allocations the last advance as `<60s` / `>60s`, the reason or blocker, the coverage, recovery and seal; in Available Shards the frames PeerMat trails PeerHead by and the coverage. No ticking timers; a cursor move or a longer detail never resizes a panel. PeerHead is peer-reported metadata"),
+        kv("Details", "The cursor row's detail sits at the bottom of Allocations, Available Shards and Balances under a `├─ cursor ─┤` rule (a `cursor:` label when the panel leaves it one row), in dim italics, warning colors italic only, so it never reads as a row. It adds only what the row's cells lack, never its key or values: in Allocations the last advance as `<60s` / `>60s`, the reason or blocker, the restart cost, the coverage, the quorum share a Reward window uses while none of the seat's certificates is counted, recovery and seal; in Available Shards the frames PeerMat trails PeerHead by and the coverage. No ticking timers; a cursor move or a longer detail never resizes a panel. PeerHead is peer-reported metadata"),
+        kv("Restart cost", "What restarting the node now costs the seat, from data the node holds. `ok`; `costs this seat's storage share this epoch` when its running storage encode, delayed by the work a restart loses and the start-up (`adds N min`), would end past the renewal's grace frame (`N min to grace`); `stops this shard` when its committee has no spare voter (margin: voters in recent views minus quorum); `cost unknown; no GLOBAL frame seen yet`. Absent on older nodes"),
         kv("Recovery footer", "Compact shows phase and fixed age buckets; expand for archive, attempt, leaf and outcome details. `unobserved` means no timestamp; `<60s` / `>60s` are fixed age buckets. Detail wraps within the panel; enlarge it for omitted lines"),
         kv("Freshness", "Age of the worker state shown; poll delays do not age the received state, and startup restoration is not an advance:"),
         item("`stale`: node observation already >30s old at receipt"),
         item("`cached`: no worker result for >2 polls +30s; not proof of ongoing execution"),
-        kv("Local app notice", "`Local app frames unchanged >60s`: staffed earning allocations whose LocalMat has not advanced for 60s, of those with fresh observations; sync, close, handoff and activation waits are excluded. Their LocalMat cells are `yellow`, or marked `!` with colors off"),
-        kv("Reported app heads", "No peer-reported app frames advanced on the stated subset of tracked shards. Counts include allocated and unallocated shards. Affected PeerHead / PeerState cells are `yellow`, or marked `!` with colors off. Requires 3+ fresh snapshots over max(60s, 3 polls); missing/unstaffed rows are excluded. Does not prove a network halt"),
+        kv("Health conditions", "The node judges every condition below from its own observations, logs each when it starts, every 10 min while it lasts and when it ends, and serves them in its health report (`qclient node diagnostics health --self`); this manager reads that report each refresh and only shows it. A condition is shown only while the node's last evaluation found it: it ends after 60s clear, and one recurring sooner is shown again under its first start, so the log can hold a condition open while none is shown; its lasting and end lines count those clear spells (`clear_spells`, `unserved_secs`). A stall window is 60s, or 3 of the shard's node-measured mean frame intervals on a slower shard (the shorter of the fresh 60m and 24h means), so a healthy slow shard is not reported between frames; notices state the 60s base. Missing or old observations establish no condition. Expected waits are info and name the event that ends them: `GLOBAL state sync installing` (committed shard heads, and so the GlobalHead cells, show again once its last chunk is in), `Prover ops wait for the next epoch` (leave, pause and resume sign from the frame it names) and `Legacy coin shields admitted from GLOBAL frame …`; one past its expected time (10 min) is a warning. `Health conditions not reported by this node version`: the node predates them, so none are shown; update the node. `Health report unavailable`: this manager could not read the report from the node's peer listener"),
+        kv("Local app notice", "`Local app frames unchanged >60s`: earning allocations whose worker's LocalMat has not advanced for their window, of those with fresh observations; sync, close, handoff and activation waits are excluded. Their LocalMat cells are `yellow`, or marked `!` with colors off"),
+        kv("Reported app heads", "No peer-reported app frames advanced for their window on the stated subset of the shards the node tracks from served shard info; while no client reads shard info the node tracks none. Counts include allocated and unallocated shards. Affected PeerHead / PeerState cells are `yellow`, or marked `!` with colors off. Missing/unstaffed rows are excluded. Does not prove a network halt"),
         kv("Global notice", "After max(60s, 3 polls) without received-head advance; timestamp survives refresh changes. Clears on advance or stale RPC"),
-        kv("Global app notice", "Committed GLOBAL state: each tracked shard's GlobalHead against its app head, the higher of PeerHead and LocalMat. Counts include allocated and unallocated shards with provers, a GlobalHead and an app head. Affected GlobalHead cells are `yellow`, or marked `!` with colors off:"),
-        item("`Global app frames unchanged >Ns`: GlobalHead kept its frame over 3+ fresh snapshots spanning max(60s, 3 polls) while the GLOBAL snapshot and the app head both advanced"),
+        kv("Global app notice", "Committed GLOBAL state: each tracked shard's GlobalHead against its app head, the higher of PeerHead and LocalMat, sampled by the node every minute and on each served shard info. Counts include allocated and unallocated shards with provers, a GlobalHead and an app head. Affected GlobalHead cells are `yellow`, or marked `!` with colors off:"),
+        item("`Global app frames unchanged >60s`: GlobalHead kept its frame for its window while the GLOBAL snapshot and the app head both advanced"),
         item("`Global app frames >100 behind app heads`: GlobalHead trails the app head by more than 100 frames"),
         item("Either way GLOBAL has not applied the newer shard frames, so their shard state and rewards are not credited yet. On most tracked shards it is network-wide: GLOBAL frames are not carrying shard frames; report it with the GLOBAL frame and shard filters. On a few shards, check those shards' committees"),
         kv("Reward notice", "`Reward now 60m … vs 24h … Q/d`: the active + leaving forecast over the last 60m is below half its 24h value. Counts rows whose shard has 30 min of 60m and 2h of 24h coverage. Both windows apply the current per-frame reward, so the drop is in committed app frames, not in pricing; see Global app notice"),
@@ -4719,8 +4704,8 @@ fn help_items() -> Vec<HelpItem> {
         item("`red`: blocked/error"),
         sec("Measurements and forecasts"),
         kv("Frame windows", "Node samples once/minute; `60m`/`24h` windows survive updates. Downtime/missing reads excluded; selected row shows coverage. Generation changes cannot count inherited heights as produced frames"),
-        kv("Frame intervals", "GLOBAL measures received head; app measures committed GlobalHead. Node history survives updates, retains at most 24h, samples once/minute and withholds a sample over 90s old; coverage in RPC. A value stays through a late or failed refresh; once no answer has come for one refresh plus its RPC timeout, cells read `stale` (color, or `stale!`) and the `Shard intervals and forecasts stale` notice names the wait: it says the node's RPC is not answering, not that frames stopped. `-` means the node holds no sample. Forecasts use current per-frame reward and observed frame rate; 10s is theoretical, none proves earned credits"),
-        kv("Reward estimates", "`60m`/`24h` are observation windows, scaled by the quorum share: a frame pays only its certificate's signers, n−⌊(n−1)/3⌋ of the n active and leaving provers; `T` (`theory` in expanded mode) assumes 10s/frame, every frame paid. Forecasts in heading order; ‹b› exposes shared `60m`/`24h`/`T` sub-items under the Reward column and Allocations header Reward KPI. `~` before `Q/d` marks estimates. Observed zero progress estimates zero; actual credits separate; reward sort/filter uses the first visible window"),
+        kv("Frame intervals", "GLOBAL measures received head; app measures committed GlobalHead. Node history survives updates, retains at most 24h, samples once/minute and withholds a sample over 90s old; coverage in RPC. A value stays through a late or failed refresh; once no answer has come for one refresh plus its RPC timeout, cells read `stale` (color, or `stale!`) and the `Shard intervals and forecasts stale` notice names the wait: it says the node's RPC is not answering, not that frames stopped. `-` means the node holds no sample. Forecasts use current per-frame reward and observed frame rate; `T` is theoretical, none proves earned credits"),
+        kv("Reward estimates", "`60m`/`24h` are observation windows. GLOBAL credits each signer of a frame's certificate the same per-signer reward, so each is scaled by this node's certificate share of the window (Cert shows the 60m one); while the node has counted none, and on shards where it holds no seat, by the quorum share n−⌊(n−1)/3⌋ of the n active and leaving provers, which the cursor detail names. `T` (`theory` in expanded mode) assumes one frame of the shard per GLOBAL frame at the node's measured GLOBAL interval (24h, else 60m; the 10s target until one is measured), every frame signed: the most a seat can be credited. Forecasts in heading order; ‹b› exposes shared `60m`/`24h`/`T` sub-items under the Reward column and Allocations header Reward KPI. `~` before `Q/d` marks estimates. Observed zero progress estimates zero; Credited measures actual credits; reward sort/filter uses the first visible window"),
         kv("Global citation", "Compact Global heading / expanded Snapshot cite the GLOBAL frame behind GlobalHead cells. Compact `@-Nf` / `@+Nf` offsets refer to the top Global head; equal-frame citations are omitted. Claimable uses its authenticated balance frame. Expanded shows absolute frames"),
         sec("Display"),
         kv("‹n›", "Toggle compact / expanded display (n: names; default compact): identity, KPIs, action/reason names, threshold estimates, units and recovery/seal detail; default actions remain named"),
@@ -4803,7 +4788,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("Balances", "One row per kind; the cursor row's detail follows the table:"),
         item("`reward`: the claimable reward balance the GLOBAL reward witness shows at the `As of` frame, read with each Provers refresh"),
         item("`legacy`: Coins `U/T` counts the U unshielded of the T listed legacy coins, `0` once none is unshielded; Amount is the unshielded total. Read in the background when the manager starts, every 10 min while the tab is open and on ‹r›; `As of` is the read's UTC time, a spinner beside it marks a read in progress. The detail gives the shielded count and the read's pages and duration; the Shield plan beside it gives the `qclient token shield-all` plan and when shields open"),
-        item("`shielded`: this wallet's unspent confidential coins (Coins) and their total (Amount), read on ‹E› with the pending transfers: full scans of the coins and escrows, matched on this machine (about a minute, never on a timer). Their spent and consumed checks read this node's GLOBAL state; no coin or escrow is looked up anywhere else. `As of` is the read's UTC time"),
+        item("`shielded`: this wallet's unspent confidential coins (Coins) and their total (Amount), read on ‹E› with the pending transfers: full scans of the coins and escrows, matched on this machine (longer on a larger network, at most an hour; never on a timer). Their spent and consumed checks read this node's GLOBAL state; no coin or escrow is looked up anywhere else. `As of` is the read's UTC time"),
         kv("State", "What the row needs:"),
         item("`◆ claimable` / `◆ unshielded`: waiting for your action; `blue`, and the `◆` marker keeps the meaning with colors off"),
         item("`unshielded` without `◆`: shields are not open yet, an expected wait; the notice gives the frame"),
@@ -5842,95 +5827,26 @@ mod tests {
         }
     }
 
+    /// The node's conditions show as notices stamped with the node's start
+    /// time, at their level, and flag only the cells they list; an old
+    /// report shows nothing, and a node that predates conditions or a
+    /// failed read says so instead of being judged here.
     #[test]
-    fn reported_app_notice_has_independent_scope_timestamp_and_freshness() {
-        use quil_types::proto::node::ShardRewardInfo;
-        use std::time::{Duration, Instant};
-        let now = Instant::now();
-        let mut m = Model::new();
-        m.last_fetch_success = Some(now);
-        let shards = quil_types::proto::node::GetShardInfoResponse {
-            shards: vec![ShardRewardInfo {
-                filter: vec![1],
-                active_provers: 1,
-                latest_frame: 10,
-                ..Default::default()
-            }],
-            ..Default::default()
+    fn node_conditions_drive_the_notices_and_cells() {
+        use quil_types::proto::diagnostics::{
+            AffectedShard, ConditionKind, HealthCondition, HealthConditions,
         };
-        for ago in [60, 30, 0] {
-            m.observe_reported_app_heads(&shards, now - Duration::from_secs(ago));
-        }
-        update_message_lifetime(&mut m);
-        let timestamp = m
-            .reported_app_stall_time
-            .expect("known shard stalls independently of local allocations");
-        let text = message_lines(&m, Line::default(), 300)
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(text.contains(&format!(
-            "{}Peer app frames unchanged >60s: 1/1 tracked shards.",
-            message_timestamp(Some(timestamp))
-        )));
-        assert!(
-            text.chars().count() <= 80,
-            "keep routine notices short; explain tracking in help"
-        );
-        assert!(!text.contains("Local app frames unchanged"));
-        for interval in [30, 60, 5, 15] {
-            m.refresh_seconds = interval;
-            update_message_lifetime(&mut m);
-            assert_eq!(m.reported_app_stall_time, Some(timestamp));
-        }
-        let mut allocation = row("01", 1, 1, 9, "", "");
-        allocation.filter = vec![1];
-        allocation.latest_frame = 10;
-        let mut available = shard("01", 1, 1);
-        available.filter = vec![1];
-        available.latest_frame = 10;
-        assert_eq!(alloc_cell(&m, &allocation, 7, 0), "10!");
-        assert_eq!(avail_cell(&m, &available, 9, 0), "stalled!");
-        m.color_coding = true;
-        assert!(!alloc_display_cell(&m, &allocation, 7, 0).contains('!'));
-        assert!(!avail_display_cell(&m, &available, 9, 0).contains('!'));
-        let lines =
-            render_alloc_panel(&mut m, &[allocation.clone()], Rect::new(0, 0, 300, 3), None);
-        assert!(lines
-            .iter()
-            .flat_map(|line| &line.spans)
-            .any(|span| span.content.trim() == "10" && span.style.fg == Some(WARNING)));
-        m.color_coding = false;
-        assert!(alloc_display_cell(&m, &allocation, 7, 0).contains('!'));
-        assert!(avail_display_cell(&m, &available, 9, 0).contains('!'));
-        m.notice_minimum = NoticeSeverity::Error;
-        assert!(!message_lines(&m, Line::default(), 300)
-            .iter()
-            .any(|l| l.to_string().contains("Peer app frames unchanged")));
-        m.shard_error = Some("fetch failed".into());
-        update_message_lifetime(&mut m);
-        assert!(m.reported_app_stall_time.is_none());
-        assert_eq!(alloc_cell(&m, &allocation, 7, 0), "10");
-        assert_ne!(avail_cell(&m, &available, 9, 0), "stalled!");
-    }
-
-    #[test]
-    fn app_stall_warning_counts_each_allocation_and_clears_on_progress_or_missing_data() {
         use quil_types::proto::node::WorkerExecution;
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
         let mut m = Model::new();
-        m.frame_number = 2160;
-        m.epoch_length = 720;
-        m.reachable = true;
         m.color_coding = false;
+        m.last_fetch_success = Some(Instant::now());
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
         let mut worker = row("aa", 1, 1, 7, "", "");
-        worker.status = 2;
-        worker.epoch = 3;
+        worker.filter = vec![0xaa];
         worker.execution = Some(WorkerExecution {
             state: "serving".into(),
             materialized_frame: Some(744),
@@ -5939,14 +5855,33 @@ mod tests {
             ..Default::default()
         });
         let mut other = worker.clone();
+        other.filter = vec![0xbb];
         other.filter_key = "bb".into();
         other.filter_hex = "bb".into();
         other.worker_id = 8;
         m.allocations = vec![worker, other];
-        update_app_progress_warning(&mut m);
-        let timestamp = m.app_stall_time.expect("known stalled workers warn");
-        update_app_progress_warning(&mut m);
-        assert_eq!(m.app_stall_time, Some(timestamp));
+        let since = now - 90_000;
+        let reported = HealthAnswer::Reported(HealthConditions {
+            conditions: vec![HealthCondition {
+                kind: ConditionKind::LocalAppFramesUnchanged as i32,
+                severity: ConditionSeverity::Warning as i32,
+                since_unix_ms: since,
+                affected: 1,
+                tracked: 2,
+                threshold: 60,
+                shards: vec![AffectedShard {
+                    filter: vec![0xaa],
+                    core_id: 7,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            sources: Vec::new(),
+        });
+        m.health = HealthAnswer::Reported(HealthConditions::default());
+        m.health_received = Some(Instant::now());
+        let quiet = provers_notice_summary(&m).map_or(0, |(n, _)| n);
+        m.health = reported;
         let notices = |m: &Model| {
             message_lines(m, Line::default(), 240)
                 .iter()
@@ -5955,205 +5890,37 @@ mod tests {
                 .join(" ")
         };
         m.notice_minimum = NoticeSeverity::Warning;
-        assert!(notices(&m).contains(&format!(
-            "{}Local app frames unchanged >60s: 2/2 allocations.",
-            message_timestamp(Some(timestamp))
-        )));
+        let stamp = message_timestamp(Some(UNIX_EPOCH + Duration::from_millis(since)));
+        assert!(
+            notices(&m).contains(&format!(
+                "{stamp}Local app frames unchanged >60s: 1/2 allocations."
+            )),
+            "{}",
+            notices(&m)
+        );
+        assert_eq!(provers_notice_summary(&m).map(|(n, _)| n), Some(quiet + 1));
         m.notice_minimum = NoticeSeverity::Error;
         assert!(!notices(&m).contains("Local app frames unchanged"));
         m.notice_minimum = NoticeSeverity::Warning;
-        // One advancing allocation no longer hides another that stopped.
-        m.allocations[1]
-            .execution
-            .as_mut()
-            .unwrap()
-            .last_advance_unix_ms = now;
-        update_app_progress_warning(&mut m);
-        assert_eq!(m.app_stall_time, Some(timestamp));
-        assert!(notices(&m).contains("Local app frames unchanged >60s: 1/2 allocations."));
         assert_eq!(alloc_display_cell(&m, &m.allocations[0], 6, 0), "744!");
         assert_eq!(alloc_display_cell(&m, &m.allocations[1], 6, 0), "744 ");
         assert_eq!(local_color(&m, &m.allocations[0]), Color::Yellow);
         assert_eq!(local_color(&m, &m.allocations[1]), SUCCESS);
-        // Missing data leaves the count rather than counting as a stall.
-        m.allocations[0].execution = None;
-        update_app_progress_warning(&mut m);
-        assert!(m.app_stall_time.is_none());
+        // An old report shows nothing.
+        m.health_received = Some(Instant::now() - Duration::from_secs(61));
         assert!(!notices(&m).contains("Local app frames unchanged"));
-        m.allocations[1].execution = None;
-        update_app_progress_warning(&mut m);
-        assert!(m.app_stall_time.is_none());
-        assert!(m.app_progress_observed_since.is_none());
-    }
-
-    #[test]
-    fn global_app_notice_reports_unchanged_and_trailing_committed_heads() {
-        use quil_types::proto::node::{GetShardInfoResponse, GlobalAppFrameHead, ShardRewardInfo};
-        use std::time::{Duration, Instant};
-        let now = Instant::now();
-        let mut m = Model::new();
-        m.last_fetch_success = Some(now);
-        let shard_info =
-            |filter: u8, provers: u32, latest: u64, head: Option<(u64, u64)>| ShardRewardInfo {
-                filter: vec![filter],
-                active_provers: provers,
-                latest_frame: latest,
-                global_head: head.map(|(frame, global_frame)| GlobalAppFrameHead {
-                    frame,
-                    global_frame,
-                    generation: 1,
-                }),
-                ..Default::default()
-            };
-        for step in 0..3u64 {
-            let snapshot = GetShardInfoResponse {
-                shards: vec![
-                    // GLOBAL and the shard advance; the committed head does not.
-                    shard_info(1, 4, 1000 + step * 6, Some((995, 500 + step * 3))),
-                    // The committed head advances but trails by more than the bound.
-                    shard_info(2, 4, 1300 + step, Some((1000 + step, 500 + step * 3))),
-                    // Healthy: the committed head follows the shard.
-                    shard_info(
-                        3,
-                        4,
-                        1000 + step * 6,
-                        Some((995 + step * 6, 500 + step * 3)),
-                    ),
-                    // GLOBAL did not advance: the Global head notice covers it.
-                    shard_info(4, 4, 1000 + step * 6, Some((995, 500))),
-                    // The shard produced nothing new for GLOBAL to commit.
-                    shard_info(5, 4, 1000, Some((995, 500 + step * 3))),
-                    // Unstaffed, or without a committed head: not tracked.
-                    shard_info(6, 0, 1000 + step * 6, Some((995, 500 + step * 3))),
-                    shard_info(7, 4, 1000 + step * 6, None),
-                ],
-                ..Default::default()
-            };
-            m.observe_committed_app_heads(&snapshot, now - Duration::from_secs(60 - step * 30));
-        }
-        assert_eq!(m.committed_app_counts(now), Some((1, 1, 5)));
+        assert_eq!(alloc_display_cell(&m, &m.allocations[0], 6, 0), "744 ");
+        // A node that predates conditions, or a failed read: nothing is
+        // judged here in their place.
+        m.health_received = Some(Instant::now());
+        m.health = HealthAnswer::NotReported;
         update_message_lifetime(&mut m);
-        let unchanged = m.notice_since["global-app-unchanged"];
-        let behind = m.notice_since["global-app-behind"];
-        let text = message_lines(&m, Line::default(), 300)
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        for notice in [
-            format!(
-                "{}Global app frames unchanged >60s: 1/5 tracked shards.",
-                message_timestamp(Some(unchanged))
-            ),
-            format!(
-                "{}Global app frames >100 behind app heads: 1/5 tracked shards.",
-                message_timestamp(Some(behind))
-            ),
-        ] {
-            assert!(text.contains(&notice), "{notice} missing from {text:?}");
-            assert!(notice.chars().count() <= 80, "routine notices fit one row");
-        }
-        let committed = |filter: u8, frame: u64| {
-            let mut s = shard("01", 1, 1);
-            s.filter = vec![filter];
-            s.global_head = Some(GlobalAppFrameHead {
-                frame,
-                global_frame: 506,
-                generation: 1,
-            });
-            s
-        };
-        let (stalled, trailing, healthy) =
-            (committed(1, 995), committed(2, 1002), committed(3, 1007));
-        assert_eq!(avail_cell(&m, &stalled, 8, 0), "995@g1!");
-        assert_eq!(avail_cell(&m, &trailing, 8, 0), "1002@g1!");
-        assert_eq!(avail_cell(&m, &healthy, 8, 0), "1007@g1");
-        let mut allocation = row("02", 1, 1, 7, "", "");
-        allocation.filter = vec![2];
-        allocation.global_head = trailing.global_head.clone();
-        assert_eq!(alloc_cell(&m, &allocation, 8, 0), "1002@g1!");
-        assert_eq!(alloc_display_cell(&m, &allocation, 8, 0), "1002@g1 ");
-        let lines = render_avail_panel(
-            &mut m,
-            &[healthy.clone(), stalled.clone()],
-            Rect::new(0, 0, 300, 4),
-            None,
-        );
-        let fg = |content: &str| {
-            lines
-                .iter()
-                .flat_map(|line| &line.spans)
-                .find(|span| span.content.trim() == content)
-                .and_then(|span| span.style.fg)
-        };
-        assert_eq!(fg("995@g1"), Some(WARNING));
-        assert_ne!(fg("1007@g1"), Some(WARNING));
-        m.color_coding = false;
-        assert_eq!(avail_display_cell(&m, &stalled, 8, 0), "995@g1!");
-        assert_eq!(avail_display_cell(&m, &healthy, 8, 0), "1007@g1 ");
-        m.notice_minimum = NoticeSeverity::Error;
-        assert!(!message_lines(&m, Line::default(), 300)
-            .iter()
-            .any(|l| l.to_string().contains("Global app frames")));
-        m.notice_minimum = NoticeSeverity::Warning;
-        // Stale status cannot keep a claim alive, nor can a failed shard fetch.
-        m.last_fetch_success = Some(now - Duration::from_secs(60));
-        assert!(!message_lines(&m, Line::default(), 300)
-            .iter()
-            .any(|l| l.to_string().contains("Global app frames")));
-        m.last_fetch_success = Some(now);
-        m.shard_error = Some("fetch failed".into());
+        assert!(notices(&m).contains("Health conditions not reported by this node version."));
+        assert!(!notices(&m).contains("unchanged"));
+        m.health = HealthAnswer::Failed("connect to this node's peer listener: refused".into());
         update_message_lifetime(&mut m);
-        assert!(m.committed_app_counts(now).is_none());
-        assert!(!m.committed_app_flagged(&[1]));
-        assert!(m.notice_since.is_empty());
-        assert_eq!(avail_cell(&m, &stalled, 8, 0), "995@g1");
-    }
-
-    #[test]
-    fn global_app_lag_needs_one_snapshot_and_uses_the_higher_local_or_peer_head() {
-        use quil_types::proto::node::{
-            GetShardInfoResponse, GlobalAppFrameHead, ShardRewardInfo, WorkerExecution,
-        };
-        let now = std::time::Instant::now();
-        let mut m = Model::new();
-        m.last_fetch_success = Some(now);
-        let mut allocation = row("09", 1, 1, 3, "", "");
-        allocation.filter = vec![9];
-        allocation.execution = Some(WorkerExecution {
-            materialized_frame: Some(1151),
-            ..Default::default()
-        });
-        m.allocations = vec![allocation];
-        let snapshot = |committed| GetShardInfoResponse {
-            shards: vec![ShardRewardInfo {
-                filter: vec![9],
-                active_provers: 4,
-                latest_frame: 1000,
-                global_head: Some(GlobalAppFrameHead {
-                    frame: committed,
-                    global_frame: 500,
-                    generation: 2,
-                }),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        m.observe_committed_app_heads(&snapshot(1051), now);
-        assert_eq!(
-            m.committed_app_counts(now),
-            None,
-            "the bound itself is not behind"
-        );
-        m.observe_committed_app_heads(&snapshot(1050), now);
-        assert_eq!(m.committed_app_counts(now), Some((0, 1, 1)));
-        assert!(m.committed_app_flagged(&[9]));
-        m.allocations.clear();
-        m.observe_committed_app_heads(&snapshot(1050), now);
-        assert_eq!(
-            m.committed_app_counts(now),
-            None,
-            "the peer head alone is within the bound"
-        );
+        assert!(notices(&m)
+            .contains("Health report unavailable: connect to this node's peer listener: refused."));
     }
 
     #[test]
@@ -6422,6 +6189,58 @@ mod tests {
     }
 
     #[test]
+    fn the_cursor_detail_names_what_a_restart_costs_the_seat() {
+        use quil_types::proto::node::{RestartReadiness, WorkerExecution};
+        let mut m = Model::new();
+        m.compact_actions = false;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let mut worker = row("01", 2, 1, 7, "", "");
+        worker.execution = Some(WorkerExecution {
+            state: "running".into(),
+            observed_unix_ms: now,
+            materialized_frame: Some(124),
+            last_advance_unix_ms: now - 22_000,
+            ..Default::default()
+        });
+        let detail = |worker: &AllocationRow, m: &Model| allocation_detail(m, worker);
+        assert!(!detail(&worker, &m).to_string().contains("Restart"));
+        let restart = |verdict: &str| RestartReadiness {
+            verdict: verdict.into(),
+            encoding: verdict == "costs_share",
+            labels_kept: true,
+            layers_done: 4,
+            layers: 11,
+            restart_cost_minutes: 20,
+            minutes_to_grace: 15,
+            committee_margin: (verdict == "stops_shard").then_some(0),
+        };
+        worker.execution.as_mut().unwrap().restart = Some(restart("ok"));
+        let line = detail(&worker, &m);
+        assert!(line.to_string().ends_with("Restart: ok"), "{line}");
+        assert_eq!(line.spans[0].style.fg, Some(HELP));
+        worker.execution.as_mut().unwrap().restart = Some(restart("costs_share"));
+        let line = detail(&worker, &m);
+        let text = line.to_string();
+        assert!(
+            text.contains("costs this seat's storage share this epoch")
+                && text.contains("layer 4/11")
+                && text.contains("adds 20 min, 15 min to grace"),
+            "{text}"
+        );
+        assert_eq!(line.spans[0].style.fg, Some(WARNING));
+        worker.execution.as_mut().unwrap().restart = Some(restart("stops_shard"));
+        let line = detail(&worker, &m);
+        assert!(
+            line.to_string().contains("Restart: stops this shard"),
+            "{line}"
+        );
+        assert_eq!(line.spans[0].style.fg, Some(WARNING));
+    }
+
+    #[test]
     fn worker_context_stays_in_allocation_panel_and_zero_frames_warns() {
         use quil_types::proto::node::WorkerExecution;
         let mut m = Model::new();
@@ -6686,20 +6505,10 @@ mod tests {
                 .to_string()
                 .contains(&format!("Reason: {reason}")));
             m.allocations = vec![allocation];
-            m.app_progress_observed_since =
-                Some(std::time::Instant::now() - std::time::Duration::from_secs(120));
-            update_app_progress_warning(&mut m);
-            assert!(m.app_stall_time.is_none());
-            assert!(m.app_progress_observed_since.is_none());
         }
         m.allocations[0].execution.as_mut().unwrap().state = "serving".into();
         assert_eq!(alloc_cell(&m, &m.allocations[0], 9, STATE_WIDTH), "serve");
         assert!(local_warning(&m, &m.allocations[0]));
-        update_app_progress_warning(&mut m);
-        assert!(
-            m.app_stall_time.is_some(),
-            "serving still has independent progress warnings"
-        );
     }
 
     #[test]
@@ -7500,7 +7309,8 @@ mod tests {
         m.node_app_cadence.insert(a.filter.clone(), c);
         m.node_global_cadence_received = Some(Instant::now());
         m.node_app_cadence_received = Some(Instant::now());
-        let theory = fmt_forecast(&(&a.estimated_reward * BigInt::from(8640)));
+        // One frame per GLOBAL frame at its measured 20s, held while stale.
+        let theory = fmt_forecast(&(&a.estimated_reward * BigInt::from(30 * 86_400 / 600)));
         let notices = |m: &Model| {
             message_lines(m, Line::default(), 300)
                 .iter()
@@ -8689,6 +8499,7 @@ mod tests {
             "Status",
             "Claimable",
             "Reward",
+            "Credited",
             "Snapshot",
             "Shown",
             "Selected",
@@ -8699,8 +8510,10 @@ mod tests {
         let topics = [
             "KPI separators",
             "Details",
+            "Restart cost",
             "Recovery footer",
             "Freshness",
+            "Health conditions",
             "Local app notice",
             "Reported app heads",
             "Global notice",
@@ -8841,6 +8654,7 @@ mod tests {
             "Status",
             "Claimable",
             "Reward",
+            "Credited",
             "Shown",
             "Selected",
             "Count",
@@ -10361,6 +10175,123 @@ mod cursor_rule_tests {
         assert_eq!(
             available_detail(&m, &shards[0]).to_string(),
             "Peer materialization trails its head by 5 frames."
+        );
+    }
+}
+
+#[cfg(test)]
+mod reward_share_tests {
+    use super::tests::row;
+    use super::*;
+    use quil_types::proto::node::{
+        CertificateShare, CertificateWindow, FrameCadence, FrameWindow, GetShardInfoResponse,
+        ShardRewardInfo, WorkerExecution,
+    };
+    use std::time::{Duration, Instant};
+
+    fn counted(frames: u64, signed_frames: u64) -> Option<CertificateWindow> {
+        Some(CertificateWindow {
+            window_seconds: 3600,
+            observed_seconds: 3600,
+            frames,
+            signed_frames,
+        })
+    }
+    /// A 22-member committee's shard (quorum 15) with both windows covered.
+    fn answer(share: Option<CertificateShare>) -> GetShardInfoResponse {
+        let window = Some(FrameWindow {
+            window_seconds: 3600,
+            observed_seconds: 600,
+            advanced_frames: 30,
+        });
+        GetShardInfoResponse {
+            shards: vec![ShardRewardInfo {
+                filter: vec![1],
+                active_provers: 22,
+                frame_cadence: Some(FrameCadence {
+                    last_observed_unix_seconds: 1,
+                    hour: window,
+                    day: window,
+                }),
+                certificate_share: share,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The detail names the windows still at the quorum share, and nothing
+    /// once both count the seat's own certificates.
+    #[test]
+    fn the_cursor_detail_names_the_quorum_share_a_reward_window_uses() {
+        let mut m = Model::new();
+        m.data_loaded = true;
+        m.reward_windows = 7;
+        let mut a = row("aa", 22, 1, 1, "", "");
+        a.filter = vec![1];
+        a.status = 2;
+        a.status_name = "active".into();
+        a.execution = Some(WorkerExecution {
+            state: "serving".into(),
+            ..Default::default()
+        });
+        let detail = |m: &Model| allocation_detail(m, &a).to_string();
+
+        m.observe_app_intervals(&answer(None), Instant::now());
+        assert!(
+            detail(&m).contains("Reward 60m/24h: quorum share 15/22, no certificate counted yet"),
+            "rewards: {}",
+            detail(&m)
+        );
+        let share = |hour, day| {
+            Some(CertificateShare {
+                hour,
+                day,
+                committee: 22,
+                quorum: 15,
+            })
+        };
+        m.observe_app_intervals(
+            &answer(share(counted(0, 0), counted(900, 810))),
+            Instant::now(),
+        );
+        assert!(
+            detail(&m).contains("Reward 60m: quorum share 15/22"),
+            "rewards: {}",
+            detail(&m)
+        );
+        m.observe_app_intervals(
+            &answer(share(counted(40, 38), counted(900, 810))),
+            Instant::now(),
+        );
+        assert!(
+            !detail(&m).contains("quorum share"),
+            "rewards: {}",
+            detail(&m)
+        );
+    }
+
+    /// Credited is the claimable balance's rises per day of the reads'
+    /// span: 0.5 Q, a mint's fall, 0.5 Q over 40m is 36 Q/d; the 24h value
+    /// waits for 2h of reads.
+    #[test]
+    fn credited_states_the_claimable_balance_rises_per_day() {
+        use super::super::{msg::Msg, update::apply_msg_at};
+        let mut m = Model::new();
+        m.data_loaded = true;
+        let quil = |tenths: u128| tenths * u128::from(crate::util::UNITS_PER_QUIL) / 10;
+        let start = Instant::now();
+        for (minutes, tenths) in [(0, 100), (10, 105), (20, 2), (40, 7)] {
+            apply_msg_at(
+                &mut m,
+                Msg::RewardRefresh(Ok(Some((quil(tenths), 1_000 + minutes)))),
+                start + Duration::from_secs(minutes * 60),
+            );
+        }
+        let title = alloc_title(&m, &[]).to_string();
+        assert!(
+            title.contains("Credited [Q/d 60m/24h] 36.0/-"),
+            "rewards: {title}"
         );
     }
 }

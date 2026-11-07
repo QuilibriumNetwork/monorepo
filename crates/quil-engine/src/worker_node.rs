@@ -1291,22 +1291,7 @@ impl WorkerOnlyNode {
         let Some(p2p) = self.worker_p2p.clone() else {
             return;
         };
-        let bitmasks = vec![
-            crate::bitmasks::shard_frame_bitmask(filter),
-            crate::bitmasks::shard_consensus_bitmask(filter),
-            crate::bitmasks::app_prover_bitmask(filter),
-            crate::bitmasks::shard_dispatch_bitmask(filter),
-            // App-shard CW consensus rides its own per-shard topic. The app
-            // engine ALWAYS starts commonware-simplex (`app_engine::run` →
-            // `start_consensus_cw`, ungated — Jolteon is gone), so this
-            // subscription must be unconditional too: without it the worker
-            // publishes CW out (`CwOut` → `shard_cw_bitmask`) to a topic it
-            // never joined ("not subscribed to bitmask") AND never receives
-            // peers' votes/certs/blocks → its simplex engine can't reach
-            // quorum. It was once gated on a config flag, a vestige of the
-            // removed legacy path; that gating was the bug.
-            crate::bitmasks::shard_cw_bitmask(filter),
-        ];
+        let bitmasks = shard_bitmasks(filter);
         for bm in &bitmasks {
             p2p.subscribe(bm.clone()).await;
         }
@@ -1661,6 +1646,26 @@ impl WorkerOnlyNode {
     pub fn stop(&self) {
         self.cancel.cancel();
     }
+}
+
+/// The per-shard bitmasks a worker-owned p2p subscribes for `filter`.
+pub fn shard_bitmasks(filter: &[u8]) -> Vec<Vec<u8>> {
+    vec![
+        crate::bitmasks::shard_frame_bitmask(filter),
+        crate::bitmasks::shard_consensus_bitmask(filter),
+        crate::bitmasks::app_prover_bitmask(filter),
+        crate::bitmasks::shard_dispatch_bitmask(filter),
+        // App-shard CW consensus rides its own per-shard topic. The app
+        // engine ALWAYS starts commonware-simplex (`app_engine::run` →
+        // `start_consensus_cw`, ungated — Jolteon is gone), so this
+        // subscription must be unconditional too: without it the worker
+        // publishes CW out (`CwOut` → `shard_cw_bitmask`) to a topic it
+        // never joined ("not subscribed to bitmask") AND never receives
+        // peers' votes/certs/blocks → its simplex engine can't reach
+        // quorum. It was once gated on a config flag, a vestige of the
+        // removed legacy path; that gating was the bug.
+        crate::bitmasks::shard_cw_bitmask(filter),
+    ]
 }
 
 /// Most peer keys a worker keeps. A mainnet node knew about 105 peers

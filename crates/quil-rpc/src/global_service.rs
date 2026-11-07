@@ -1199,15 +1199,27 @@ impl GlobalService for GlobalRpcServer {
             .archive_directory
             .as_ref()
             .ok_or_else(|| Status::unavailable("archive directory unavailable"))?;
-        let endpoints = pool
+        let endpoints: Vec<String> = pool
             .get_all()
             .await
             .into_iter()
             .filter(|entry| !entry.is_empty() && entry.len() <= 512)
             .take(32)
             .collect();
+        // Each endpoint's pin goes with it: pins are per process, and a
+        // worker dialing an endpoint must reach the archive this master
+        // pinned it to.
+        let peer_ids = endpoints
+            .iter()
+            .map(|endpoint| {
+                crate::archive_client::pinned_archive_peer(endpoint)
+                    .map(|peer| peer.to_bytes())
+                    .unwrap_or_default()
+            })
+            .collect();
         Ok(Response::new(global::GetArchiveEndpointsResponse {
             endpoints,
+            peer_ids,
         }))
     }
     async fn get_global_vertex_proof(
@@ -2312,6 +2324,61 @@ mod identity_gate_tests {
         assert_eq!(endpoints.len(), 32);
         assert_eq!(endpoints[0], "192.0.2.1:8340");
         assert_eq!(endpoints[31], "192.0.2.32:8340");
+    }
+
+    /// R112-D-2: the master's archive directory carries the peer each
+    /// endpoint is pinned to, and a worker reads it back; a directory from
+    /// a master that predates it reads as all unpinned, and a malformed one
+    /// is refused.
+    #[tokio::test]
+    async fn r112_d2_the_master_directory_carries_each_endpoint_pin() {
+        let me = quil_p2p::PeerId::random();
+        let archive =
+            quil_p2p::Keypair::falcon_from_bytes(&quil_p2p::generate_falcon_signing_key())
+                .unwrap()
+                .public()
+                .to_peer_id();
+        let (pinned, unpinned) = ("203.0.113.41:8340", "203.0.113.42:8340");
+        crate::archive_client::pin_archive_peer(pinned, archive).unwrap();
+        let pool = Arc::new(crate::ArchiveEndpointPool::new(std::time::Duration::ZERO));
+        pool.add(pinned.to_string()).await;
+        pool.add(unpinned.to_string()).await;
+        let server = GlobalRpcServer::new(Arc::new(NoopLookup))
+            .with_self_peer_id(me.to_bytes())
+            .with_archive_directory(pool);
+        let mut request = Request::new(global::GetArchiveEndpointsRequest {});
+        *request.extensions_mut() = auth_ext(me);
+        let response = server
+            .get_archive_endpoints(request)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            crate::archive_client::archive_directory(response.clone()).unwrap(),
+            vec![
+                (pinned.to_string(), Some(archive)),
+                (unpinned.to_string(), None)
+            ],
+            "R112-D-2: the master's archive directory does not carry its pins"
+        );
+        let old = global::GetArchiveEndpointsResponse {
+            endpoints: response.endpoints.clone(),
+            peer_ids: Vec::new(),
+        };
+        assert!(crate::archive_client::archive_directory(old)
+            .unwrap()
+            .iter()
+            .all(|(_, peer)| peer.is_none()));
+        let short = global::GetArchiveEndpointsResponse {
+            endpoints: response.endpoints.clone(),
+            peer_ids: vec![Vec::new()],
+        };
+        assert!(crate::archive_client::archive_directory(short).is_err());
+        let garbage = global::GetArchiveEndpointsResponse {
+            endpoints: vec![pinned.to_string()],
+            peer_ids: vec![vec![0xFF; 7]],
+        };
+        assert!(crate::archive_client::archive_directory(garbage).is_err());
     }
 
     #[test]

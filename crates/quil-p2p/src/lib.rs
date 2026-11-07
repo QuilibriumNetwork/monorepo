@@ -19,6 +19,7 @@ pub mod peer_info;
 pub mod pqnoise;
 pub mod pqnoise_transport;
 pub mod protocol;
+mod quic_close;
 pub mod signer_registry;
 pub mod tls_debug;
 
@@ -37,7 +38,7 @@ pub use gossip_traffic::{
 };
 pub use libp2p::identity::Keypair;
 pub use libp2p::PeerId;
-pub use node::{P2PHandle, P2PNode, ReceivedMessage};
+pub use node::{set_strict_shard_gossip, strict_shard_gossip, P2PHandle, P2PNode, ReceivedMessage};
 pub use peer_authenticator::{AllowedPeerPolicy, AuthState, PeerAuthenticator};
 pub use peer_info::{
     build_worker_reachability, classify_peer_info_message, decode_canonical_key_registry,
@@ -88,14 +89,6 @@ pub mod params {
     /// the gossip ad lost and (optionally) re-IWANTing from a
     /// different advertiser. Matches Go gossipsub's default.
     pub const IWANT_FOLLOWUP_TIME: Duration = Duration::from_secs(3);
-    /// Per-subnet (IPv4 /24 or IPv6 /48) cap on mesh peers per
-    /// bitmask. Eclipse-resistance: a Sybil attacker who controls a
-    /// single /24 cannot fill more than this many mesh slots,
-    /// limiting how much of the victim's view they can dominate.
-    /// `0` disables the check (legacy / test setups). 2 lets normal
-    /// clustering (a couple of legitimate co-located peers) through
-    /// without bias; 1 is the strictest setting.
-    pub const MESH_PEERS_PER_SUBNET: usize = 2;
     /// Hard cap on the total bytes of message payloads held in the
     /// IHAVE/IWANT message cache (`MessageCache`). The cache retains
     /// `HISTORY_LENGTH` (24) windows × `HEARTBEAT_INTERVAL` (700ms) ≈ 17s
@@ -127,10 +120,6 @@ pub struct BlossomsubParams {
     pub unsubscribe_backoff: std::time::Duration,
     pub iwant_followup_time: std::time::Duration,
     pub idont_want_message_threshold: usize,
-    /// Cap on mesh peers per IPv4 /24 (or IPv6 /48) per bitmask.
-    /// Eclipse-resistance: see [`params::MESH_PEERS_PER_SUBNET`].
-    /// `0` disables the check.
-    pub mesh_peers_per_subnet: usize,
     /// Hard byte cap on the IHAVE/IWANT message cache. See
     /// [`params::MCACHE_MAX_BYTES`]. Bounds memory under catch-up floods
     /// that window-count history alone cannot.
@@ -151,7 +140,6 @@ impl Default for BlossomsubParams {
             unsubscribe_backoff: params::UNSUBSCRIBE_BACKOFF,
             iwant_followup_time: params::IWANT_FOLLOWUP_TIME,
             idont_want_message_threshold: params::IDONT_WANT_MESSAGE_THRESHOLD,
-            mesh_peers_per_subnet: params::MESH_PEERS_PER_SUBNET,
             mcache_max_bytes: params::MCACHE_MAX_BYTES,
         }
     }
@@ -197,9 +185,6 @@ impl BlossomsubParams {
             } else {
                 d.idont_want_message_threshold
             },
-            // No P2PConfig field yet. Default protects against
-            // single-/24 eclipse on every node.
-            mesh_peers_per_subnet: d.mesh_peers_per_subnet,
             // No P2PConfig field yet: a 512 MiB ceiling, enforced by
             // the vendored gossipsub's message cache.
             mcache_max_bytes: d.mcache_max_bytes,

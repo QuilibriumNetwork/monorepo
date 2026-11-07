@@ -29,19 +29,23 @@ use quil_execution::hypergraph_intrinsic::{
     hyperedge_extrinsic_commit, verify_op_signature, AuthCheck, HypergraphConfigResolver,
     HypergraphUpdate as CanonicalHypergraphUpdate, OpForAuth,
 };
-use quil_execution::token_intrinsic::conversions::token_update_from_proto;
+use quil_execution::token_intrinsic::conversions::{
+    token_config_from_proto, token_update_from_proto,
+};
 use quil_keys::FileKeyManager;
 use quil_types::crypto::KeyType;
 use quil_types::proto::compute::{
     Application, ComputeConfiguration, ExecuteOperation, ExecutionContext,
 };
 use quil_types::proto::hypergraph::HypergraphConfiguration;
-use quil_types::proto::token::TokenConfiguration;
+use quil_types::proto::token::{
+    FeeBasis, FeeBasisType, TokenConfiguration, TokenMintBehavior, TokenMintStrategy,
+};
 
 use crate::commands::compute::build_code_execute;
 use crate::commands::deploy::compute_update::build_compute_update;
 use crate::commands::deploy::hypergraph_update::build_hypergraph_update;
-use crate::commands::deploy::token_update::build_token_update;
+use crate::commands::deploy::token_update::{build_token_update, updated_config};
 use crate::commands::hypergraph::put::build_hyperedge_add;
 use crate::commands::hypergraph::remove::{build_hyperedge_remove, build_vertex_remove};
 use crate::vertex_write::{build_vertex_add, own_read_key};
@@ -286,6 +290,93 @@ fn token_update_is_accepted() {
     let mut sep = DOMAIN.to_vec();
     sep.extend_from_slice(b"TOKEN_UPDATE");
     assert!(falcon_ok(&km, &owner, &msg, &sig, &sep));
+}
+
+/// A paid-mint token as the chain holds it, with every field set.
+fn deployed_paid_mint_token(owner: Vec<u8>) -> TokenConfiguration {
+    TokenConfiguration {
+        // Mintable, burnable, acceptable.
+        behavior: 0b1011,
+        mint_strategy: Some(TokenMintStrategy {
+            mint_behavior: TokenMintBehavior::MintWithPayment as i32,
+            payment_address: vec![0x5a; 32],
+            fee_basis: Some(FeeBasis {
+                r#type: FeeBasisType::PerUnit as i32,
+                baseline: vec![0x03, 0xe8],
+            }),
+            ..Default::default()
+        }),
+        units: vec![0x01],
+        supply: vec![0x27, 0x10],
+        name: "Example".into(),
+        symbol: "EXM".into(),
+        additional_reference: vec![vec![0x7c; 64]],
+        owner_public_key: owner,
+    }
+}
+
+/// An update that renames a token must leave every other field as the chain
+/// holds it: the node replaces the whole configuration with the update's.
+#[test]
+fn token_update_keeps_unchanged_config_fields() {
+    use quil_execution::token_intrinsic::metadata_schema::{
+        build_token_configuration_metadata_tree, decode_token_config_from_tree,
+    };
+    use quil_execution::token_intrinsic::TokenConfiguration as CanonicalTokenConfiguration;
+
+    let km = make_km();
+    let owner = prover_pubkey(&km);
+    let current = deployed_paid_mint_token(owner.clone());
+    let cfg = updated_config(&current, &["name=Renamed".to_string()]).unwrap();
+    let signed = build_token_update(&km, &DOMAIN, cfg).unwrap();
+
+    // The node's reading: the canonical update, signed by the current owner.
+    let sig = signed
+        .public_key_signature_bls48581
+        .as_ref()
+        .unwrap()
+        .signature
+        .clone();
+    let mut unsigned = signed.clone();
+    unsigned.public_key_signature_bls48581 = None;
+    let update = token_update_from_proto(&unsigned).unwrap();
+    let msg = update.to_canonical_bytes().unwrap();
+    let mut sep = DOMAIN.to_vec();
+    sep.extend_from_slice(b"TOKEN_UPDATE");
+    assert!(falcon_ok(&km, &owner, &msg, &sig, &sep));
+
+    // The configuration the node writes, read back as the node reads it.
+    let stored = |cfg: &CanonicalTokenConfiguration| {
+        let tree = build_token_configuration_metadata_tree(cfg).unwrap();
+        decode_token_config_from_tree(&tree).unwrap()
+    };
+    let got = stored(&CanonicalTokenConfiguration::from_canonical_bytes(&update.config).unwrap());
+    let mut renamed = current.clone();
+    renamed.name = "Renamed".into();
+    let want = stored(&token_config_from_proto(&renamed).unwrap());
+
+    assert_eq!(got.name, b"Renamed".to_vec(), "update lost the new name");
+    let unchanged = [
+        ("behavior", got.behavior == want.behavior),
+        ("mint strategy", got.mint_strategy == want.mint_strategy),
+        ("units", got.units == want.units),
+        ("supply", got.supply == want.supply),
+        ("symbol", got.symbol == want.symbol),
+        (
+            "additional reference",
+            got.additional_reference.concat() == want.additional_reference.concat(),
+        ),
+        ("owner key", got.owner_public_key == want.owner_public_key),
+    ];
+    let erased: Vec<&str> = unchanged
+        .iter()
+        .filter(|(_, same)| !same)
+        .map(|(field, _)| *field)
+        .collect();
+    assert!(
+        erased.is_empty(),
+        "update erased unchanged fields: {erased:?}"
+    );
 }
 
 #[test]

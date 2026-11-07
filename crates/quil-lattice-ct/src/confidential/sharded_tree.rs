@@ -18,7 +18,7 @@
 //! Occupancy is per shard rather than a dense prefix: within a shard, coins
 //! fill `0..count` of its range, and every index above that — and every shard
 //! with no coins — is the canonical zero node for its level.
-use super::coin_tree::{AuthPath, CoinRecord, TreeError};
+use super::coin_tree::{committed_leaf, AuthPath, CoinRecord, TreeError};
 use super::relation::membership::{MembershipKey, Node, MAX_DEPTH};
 use super::AmountCommitment;
 
@@ -92,8 +92,7 @@ pub fn subtree_root(
         if local >= (1u64 << shape.subtree_bits) {
             return Err(TreeError::Position);
         }
-        let owner = Node::from_identity_bytes(&coin.owner).map_err(|_| TreeError::Encoding)?;
-        leaves.push((local, key.leaf(&owner, &coin.commitment)));
+        leaves.push((local, committed_leaf(&key, &coin.owner, &coin.commitment)));
     }
     fold_level(&key, &zeros, leaves, usize::from(shape.subtree_bits))
 }
@@ -466,8 +465,10 @@ impl ShardedCoinTree {
             if shard >= shape.shards() {
                 return Err(TreeError::Position);
             }
-            let owner = Node::from_identity_bytes(&coin.owner).map_err(|_| TreeError::Encoding)?;
-            leaves.push((coin.position, key.leaf(&owner, &coin.commitment)));
+            leaves.push((
+                coin.position,
+                committed_leaf(&key, &coin.owner, &coin.commitment),
+            ));
             index.push((coin.address, coin.position));
         }
         leaves.sort_unstable_by_key(|(position, _)| *position);

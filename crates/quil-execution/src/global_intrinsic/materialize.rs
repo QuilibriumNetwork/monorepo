@@ -85,7 +85,7 @@ pub const UNIFIED_TREE_CUTOVER_FRAME: u64 = 699_500;
 /// The effective unified-tree cutover frame. Defaults to
 /// [`UNIFIED_TREE_CUTOVER_FRAME`] (mainnet); DEV/localnet ONLY may lower it via
 /// `QUIL_UNIFIED_TREE_CUTOVER_FRAME` so the transition is reachable in a short
-/// localnet run (which starts at frame 0 — mainnet's 698_000 is never reached
+/// localnet run (which starts at frame 0 — mainnet's 699_500 is never reached
 /// there). Env-gated exactly like `QUIL_SPLIT_MAX_PROVERS` / `QUIL_EPOCH_LENGTH_FRAMES`:
 /// mainnet never sets it, so mainnet is untouched. Read ONCE and cached, so every
 /// call site agrees and the per-network switch stays deterministic across nodes.

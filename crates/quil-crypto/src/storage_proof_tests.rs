@@ -913,6 +913,71 @@ fn a_changed_leaf_reuses_its_labels_and_an_epoch_keyed_seal_fails() {
     set_stable_replica_key_epoch_for_thread(None);
 }
 
+/// The padding bound (class guard): a zero tail opens at its first node for
+/// every leaf count and boundary, and a nonzero node anywhere from that
+/// node on, at either end or between, fails it, whatever node it opens and
+/// however the tail is opened; a nonzero node before it does not.
+#[test]
+fn only_a_tail_of_zero_nodes_opens_as_padding() {
+    let zero = hash::to_bytes(&hash::ZERO);
+    let mut counts: Vec<u64> = (2..=40).collect();
+    counts.extend([63, 64, 65, 127, 128, 129, 1000, 1024, 1025]);
+    for n in counts {
+        let data = nodes(n as usize, 7);
+        let mut firsts: Vec<u64> = (1..n.min(34)).collect();
+        firsts.extend([n / 2, n - 2, n - 1]);
+        firsts.retain(|&first| first > 0 && first < n);
+        firsts.dedup();
+        for first in firsts {
+            let mut padded = data.clone();
+            padded[first as usize * NODE_BYTES..].fill(0);
+            let tree = MerkleTree::from_nodes(&padded).unwrap();
+            let comm = tree.commitment(Tree::Data);
+            assert!(
+                verify_zero_padding(n, &comm, first, &zero, &tree.path(first)),
+                "a zero tail of {n} from {first}"
+            );
+            let nonzero = node_at(&data, 0);
+            assert!(
+                !verify_zero_padding(n, &comm, first, &nonzero, &tree.path(first)),
+                "a nonzero first node posed as zero"
+            );
+            let mut spots = vec![first, n - 1, first + (n - first) / 2];
+            if first + 1 < n {
+                spots.push(first + 1);
+            }
+            for spot in spots {
+                let mut cheat = padded.clone();
+                cheat[spot as usize * NODE_BYTES] = 1;
+                let tree = MerkleTree::from_nodes(&cheat).unwrap();
+                let comm = tree.commitment(Tree::Data);
+                for opened in [first, spot] {
+                    assert!(
+                        !verify_zero_padding(n, &comm, opened, &zero, &tree.path(opened)),
+                        "a nonzero node at {spot} of {n} passed as padding from {opened}"
+                    );
+                }
+                let own = node_at(&cheat, first);
+                assert!(
+                    !verify_zero_padding(n, &comm, first, &own, &tree.path(first)),
+                    "a nonzero tail of {n} opened as itself"
+                );
+            }
+            // Data before the padding is the data's own.
+            let mut before = padded.clone();
+            before[(first - 1) as usize * NODE_BYTES] = 1;
+            let tree = MerkleTree::from_nodes(&before).unwrap();
+            assert!(verify_zero_padding(
+                n,
+                &tree.commitment(Tree::Data),
+                first,
+                &zero,
+                &tree.path(first)
+            ));
+        }
+    }
+}
+
 /// A count labelled ahead stays registrable while the data changes by a few
 /// percent, and a registration never pads past an eighth and the floor.
 #[test]

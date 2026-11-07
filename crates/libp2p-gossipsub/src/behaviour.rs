@@ -43,8 +43,8 @@ use libp2p_identity::{Keypair, PeerId};
 use libp2p_swarm::{
     behaviour::{AddressChange, ConnectionClosed, ConnectionEstablished, FromSwarm},
     dial_opts::DialOpts,
-    ConnectionDenied, ConnectionId, NetworkBehaviour, NotifyHandler, THandler, THandlerInEvent,
-    THandlerOutEvent, ToSwarm,
+    CloseConnection, ConnectionDenied, ConnectionId, NetworkBehaviour, NotifyHandler, THandler,
+    THandlerInEvent, THandlerOutEvent, ToSwarm,
 };
 #[cfg(feature = "metrics")]
 use prometheus_client::registry::Registry;
@@ -349,6 +349,9 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
     /// Tracks the numbers of failed messages per peer-id.
     failed_messages: HashMap<PeerId, FailedMessages>,
 
+    /// QUILIBRIUM: since when each peer has failed messages at every heartbeat.
+    slow_since: HashMap<PeerId, Instant>,
+
     /// Tracks recently sent `IWANT` messages and checks if peers respond to them.
     gossip_promises: GossipPromises,
 
@@ -357,7 +360,15 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
 
     /// QUILIBRIUM: RPCs not queued because the peer was no longer connected.
     unsent_rpcs: UnsentRpcStats,
+
+    /// QUILIBRIUM: per peer, the messages it sent us in answer to an IWANT for the id an
+    /// older release computes (`Config::legacy_message_id`), since the last
+    /// [`Behaviour::take_legacy_id_answers`]; at most [`MAX_LEGACY_ID_PEERS`] peers.
+    legacy_id_answers: HashMap<PeerId, u64>,
 }
+
+/// QUILIBRIUM: the most peers [`Behaviour::take_legacy_id_answers`] holds between two calls.
+const MAX_LEGACY_ID_PEERS: usize = 1024;
 
 /// QUILIBRIUM: RPCs the behaviour did not queue because their peer was not in its connected
 /// peer list (a peer that disconnected after the RPC was addressed to it), counted since the
@@ -375,6 +386,17 @@ pub struct UnsentRpcStats {
 /// dropped RPC scores -1000, below any usual graylist threshold, until the penalty decays.
 /// No honest peer sends such an RPC.
 const REJECTED_RPC_PENALTY: usize = 10;
+
+/// QUILIBRIUM: how long a peer may have messages refused by its full queues, or
+/// dropped there unsent, at every heartbeat before its connections are closed.
+/// Nothing else frees what is queued for a peer that stops reading its stream.
+const SLOW_PEER_DISCONNECT_AFTER: Duration = Duration::from_secs(60);
+
+/// QUILIBRIUM: the most messages a peer's priority queue may hold before its
+/// connections are closed. The queue is unbounded, as control messages must not
+/// be refused, and holds at most `connection_handler_queue_len / 2` publishes;
+/// a peer that stops reading while it sends GRAFTs fills it with our PRUNEs.
+const MAX_PRIORITY_QUEUE_LEN: usize = 10_000;
 
 impl<D, F> Behaviour<D, F>
 where
@@ -490,9 +512,11 @@ where
             subscription_filter,
             data_transform,
             failed_messages: Default::default(),
+            slow_since: HashMap::new(),
             gossip_promises: Default::default(),
             rejected_rpcs: RejectedRpcStats::default(),
             unsent_rpcs: UnsentRpcStats::default(),
+            legacy_id_answers: HashMap::new(),
         })
     }
 
@@ -566,6 +590,13 @@ where
     /// [`UnsentRpcStats`]).
     pub fn unsent_rpc_stats(&self) -> UnsentRpcStats {
         self.unsent_rpcs
+    }
+
+    /// QUILIBRIUM: the peers that answered our IWANT for a message under the id an older
+    /// release computes (`Config::legacy_message_id`), with how many such answers each, since
+    /// the previous call. Such a peer runs a release from before the change of id.
+    pub fn take_legacy_id_answers(&mut self) -> HashMap<PeerId, u64> {
+        std::mem::take(&mut self.legacy_id_answers)
     }
 
     /// Returns the gossipsub score for a given peer, if one exists.
@@ -1476,29 +1507,27 @@ where
 
         let mut do_px = self.config.do_px();
 
-        let Some(connected_peer) = self.connected_peers.get_mut(peer_id) else {
+        // QUILIBRIUM: as upstream 0.49.5 (GHSA-g3g5-x568-qvqx), a GRAFT no longer records its
+        // topics as subscriptions of its sender: it is not one and is not filtered like one, so
+        // recording them let a peer grow its entry without limit. A GRAFT for a topic the peer
+        // has not subscribed to is dropped below.
+        let Some(connected_peer) = self.connected_peers.get(peer_id) else {
             tracing::error!(peer_id = %peer_id, "Peer non-existent when handling graft");
             return;
         };
         // Needs to be here to comply with the borrow checker.
         let is_outbound = connected_peer.outbound;
 
-        // For each topic, if a peer has grafted us, then we necessarily must be in their mesh
-        // and they must be subscribed to the topic. Ensure we have recorded the mapping.
-        for topic in &topics {
-            if connected_peer.topics.insert(topic.clone()) {
-                #[cfg(feature = "metrics")]
-                if let Some(m) = self.metrics.as_mut() {
-                    m.inc_topic_peers(topic);
-                }
-            }
-        }
-
         // we don't GRAFT to/from explicit peers; complain loudly if this happens
         if self.explicit_peers.contains(peer_id) {
             tracing::warn!(peer=%peer_id, "GRAFT: ignoring request from direct peer");
             // this is possibly a bug from non-reciprocal configuration; send a PRUNE for all topics
-            to_prune_topics = topics.into_iter().collect();
+            // QUILIBRIUM: only for topics the node joined. Each PRUNE stores a backoff for its
+            // topic, so the topics an explicit peer named were all kept for the prune backoff.
+            to_prune_topics = topics
+                .into_iter()
+                .filter(|topic| self.mesh.contains_key(topic))
+                .collect();
             // but don't PX
             do_px = false
         } else {
@@ -1576,6 +1605,18 @@ where
                         to_prune_topics.insert(topic_hash.clone());
                         // but we won't PX to them
                         do_px = false;
+                        continue;
+                    }
+
+                    // QUILIBRIUM: discard the GRAFT if the peer has not subscribed to the topic,
+                    // as upstream 0.49.5 does.
+                    if !connected_peer.topics.contains(&topic_hash) {
+                        do_px = false;
+                        tracing::debug!(
+                            peer=%peer_id,
+                            topic=%topic_hash,
+                            "GRAFT: dropping unsubscribed topic from peer"
+                        );
                         continue;
                     }
 
@@ -1705,6 +1746,19 @@ where
             .peer_score
             .below_threshold(peer_id, |ts| ts.accept_px_threshold);
         for (topic_hash, px, backoff) in prune_data {
+            // QUILIBRIUM: port of upstream #6707 (GHSA-vrx6-jcp8-vm7m). A PRUNE
+            // names topics of its sender's choosing, and the backoff it asks
+            // for was stored for each of them, whether or not the node joined
+            // it, for up to an hour.
+            if !self.mesh.contains_key(&topic_hash) {
+                tracing::debug!(
+                    peer=%peer_id,
+                    topic=%topic_hash,
+                    "PRUNE: Received prune for unknown topic from peer"
+                );
+                continue;
+            }
+
             if self.remove_peer_from_mesh(peer_id, &topic_hash, backoff, true) {
                 #[cfg(feature = "metrics")]
                 if let Some(m) = self.metrics.as_mut() {
@@ -1913,9 +1967,38 @@ where
         // Calculate the message id on the transformed data.
         let msg_id = self.config.message_id(&message);
 
+        // Check the validity of the message
+        // Peers get penalized if this message is invalid. We don't add it to the duplicate cache
+        // and instead continually penalize peers that repeatedly send this message.
+        if !self.message_is_valid(&msg_id, &mut raw_message, propagation_source) {
+            return;
+        }
+
+        // QUILIBRIUM: a peer that answers our IWANT for the id an older release computes, with
+        // a message whose id is now another, computes that older id: it runs such a release.
+        // Counted for the node's operator log (`take_legacy_id_answers`); the promise itself
+        // stays, as before. Checked before the duplicate check, as the answer usually comes
+        // after a mesh peer delivered the message.
+        if let Some(legacy_id) = self.config.legacy_message_id(&message) {
+            if legacy_id != msg_id
+                && self
+                    .gossip_promises
+                    .promised_by(&legacy_id, propagation_source)
+                && (self.legacy_id_answers.len() < MAX_LEGACY_ID_PEERS
+                    || self.legacy_id_answers.contains_key(propagation_source))
+            {
+                *self
+                    .legacy_id_answers
+                    .entry(*propagation_source)
+                    .or_insert(0) += 1;
+            }
+        }
+
         // Broadcast IDONTWANT messages
         // QUILIBRIUM: only for the first copy. A duplicate's IDONTWANT would
-        // repeat, to every mesh peer, the one the first copy already sent.
+        // repeat, to every mesh peer, the one the first copy already sent. And
+        // only once the copy passed `message_is_valid`, so that a refused copy
+        // does not suppress the ones that follow.
         if raw_protobuf_len > self.config.idontwant_message_size_threshold()
             && !self.duplicate_cache.contains(&msg_id)
         {
@@ -1939,13 +2022,6 @@ where
                     }),
                 );
             }
-        }
-
-        // Check the validity of the message
-        // Peers get penalized if this message is invalid. We don't add it to the duplicate cache
-        // and instead continually penalize peers that repeatedly send this message.
-        if !self.message_is_valid(&msg_id, &mut raw_message, propagation_source) {
-            return;
         }
 
         if !self.duplicate_cache.insert(msg_id.clone()) {
@@ -2681,6 +2757,11 @@ where
         self.mcache.shift();
 
         // Report expired messages
+        // QUILIBRIUM: and close the connections of a peer that has not read its
+        // stream for `SLOW_PEER_DISCONNECT_AFTER`, or whose priority queue grew
+        // past `MAX_PRIORITY_QUEUE_LEN`.
+        let now = Instant::now();
+        let mut slow_since = HashMap::with_capacity(self.failed_messages.len());
         for (peer_id, failed_messages) in self.failed_messages.drain() {
             tracing::debug!("Peer couldn't consume messages: {:?}", failed_messages);
             self.events
@@ -2688,8 +2769,33 @@ where
                     peer_id,
                     failed_messages,
                 }));
+            let since = self.slow_since.get(&peer_id).copied().unwrap_or(now);
+            slow_since.insert(peer_id, since);
         }
         self.failed_messages.shrink_to_fit();
+        self.slow_since = slow_since;
+        let stalled: Vec<PeerId> = self
+            .connected_peers
+            .iter()
+            .filter(|(peer_id, peer)| {
+                peer.sender.priority_len() > MAX_PRIORITY_QUEUE_LEN
+                    || self.slow_since.get(*peer_id).is_some_and(|since| {
+                        now.saturating_duration_since(*since) >= SLOW_PEER_DISCONNECT_AFTER
+                    })
+            })
+            .map(|(peer_id, _)| *peer_id)
+            .collect();
+        for peer_id in stalled {
+            tracing::warn!(
+                peer=%peer_id,
+                "Closing gossipsub connections of a peer that does not read its stream"
+            );
+            self.slow_since.remove(&peer_id);
+            self.events.push_back(ToSwarm::CloseConnection {
+                peer_id,
+                connection: CloseConnection::All,
+            });
+        }
 
         // Flush stale IDONTWANTs.
         for peer in self.connected_peers.values_mut() {
@@ -3514,6 +3620,21 @@ where
                 {
                     tracing::debug!(peer=%propagation_source, "RPC Dropped from greylisted peer");
                     return;
+                }
+
+                // QUILIBRIUM: a message signed with a refused key type is
+                // dropped without penalty (see `ValidationError::RefusedKeyType`),
+                // and the promises of its id are released, so its advertisers are
+                // not penalised for an IWANT answered with it either.
+                let (refused, invalid_messages): (Vec<_>, Vec<_>) = invalid_messages
+                    .into_iter()
+                    .partition(|(_, error)| *error == ValidationError::RefusedKeyType);
+                for (raw_message, _) in refused {
+                    if let Ok(message) = self.data_transform.inbound_transform(raw_message) {
+                        let msg_id = self.config.message_id(&message);
+                        self.gossip_promises
+                            .reject_message(&msg_id, &RejectReason::ValidationIgnored);
+                    }
                 }
 
                 // Handle any invalid messages from this peer

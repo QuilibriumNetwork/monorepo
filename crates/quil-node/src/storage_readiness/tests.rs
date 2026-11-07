@@ -192,7 +192,8 @@ async fn live_mainnet_checkpoint_and_snapshot_record_are_authenticated() {
     let verify = verifier().unwrap();
     let mut failures = Vec::new();
     for (endpoint, peer) in endpoints(&args).unwrap() {
-        quil_rpc::archive_client::pin_archive_peer(&endpoint, peer);
+        // A conflicting entry keeps the first pin: its dial fails.
+        let _ = quil_rpc::archive_client::pin_archive_peer(&endpoint, peer);
         let result = async {
             let mut client =
                 quil_rpc::ArchiveClient::connect_mtls(&endpoint, signer.private_key()).await?;
@@ -246,6 +247,7 @@ fn suite_selection_uses_scheduled_mainnet_default_and_rejects_unsupported_parame
         "/tmp/quil-default-profile",
         "--benchmark-storage-seats",
         "9",
+        "--benchmark-storage-allow-debug",
     ])
     .unwrap();
     assert_eq!(benchmark.storage_readiness.benchmark_storage_layers, 3);

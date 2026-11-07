@@ -5,6 +5,8 @@
 use super::super::local_execution::{execution_label, local_execution_state, state_at};
 use std::collections::{HashMap, HashSet};
 
+use quil_types::proto::diagnostics::{ConditionKind, HealthCondition, HealthConditions};
+
 use num_bigint::{BigInt, Sign};
 
 use quil_types::proto::node::{
@@ -88,7 +90,11 @@ pub const INTERVAL_WINDOW_NAMES: &[&str] = &["  60m window", "  24h window"];
 /// The Global KPI's fields, in printed order; picker names, and the expanded
 /// labels the KPI prints.
 pub const GLOBAL_FIELD_NAMES: &[&str] = &["  frame", "  epoch", "  next boundary"];
-pub const REWARD_ESTIMATE_NAMES: &[&str] = &["60m window", "24h window", "Theory (T): 10s/frame"];
+pub const REWARD_ESTIMATE_NAMES: &[&str] = &["60m window", "24h window", "Theory (T): GLOBAL rate"];
+
+/// Readings the Credited KPI needs before it states a rate, in seconds:
+/// half of its 60m window, and 2h of its 24h one.
+pub const CREDITED_MIN_SPAN_SECONDS: [u64; 2] = [1800, 7200];
 
 pub const TOP_KPI_NAMES: &[&str] = &[
     "Peer ID",
@@ -104,6 +110,7 @@ pub const ALLOC_KPI_NAMES: &[&str] = &[
     "Status",
     "Claimable",
     "Reward",
+    "Credited",
     "Allocation GLOBAL snapshot",
     "Shown allocations",
     "Selected allocations",
@@ -377,38 +384,18 @@ pub struct FilterOutcome {
     pub settled: bool,
 }
 
-/// Progress inferred only from newly returned peer-head snapshots.
-#[derive(Debug, Clone)]
-pub struct ReportedAppProgress {
-    pub frame: u64,
-    pub generation: Option<u64>,
-    pub last_change: std::time::Instant,
-    pub last_seen: std::time::Instant,
-    pub observations: u32,
-    pub stalled: bool,
-}
-
-/// A committed app head (GlobalHead) trailing the shard's app head by more
-/// than this many frames is reported as behind.
-pub const GLOBAL_APP_LAG_FRAMES: u64 = 100;
-
-/// Progress of GLOBAL's committed app head of one shard, inferred only from
-/// newly returned shard snapshots, against the shard's app head: the higher
-/// of the peer-reported head and this node's materialized frame.
-#[derive(Debug, Clone)]
-pub struct CommittedAppProgress {
-    pub frame: u64,
-    pub generation: u64,
-    /// The GLOBAL frame and app head when `frame` last changed.
-    pub global_frame: u64,
-    pub head: u64,
-    pub last_change: std::time::Instant,
-    pub last_seen: std::time::Instant,
-    pub observations: u32,
-    /// Unchanged while GLOBAL and the app head both advanced.
-    pub stalled: bool,
-    /// More than [`GLOBAL_APP_LAG_FRAMES`] behind the app head.
-    pub behind: bool,
+/// The node's answer to the node manager's health report request.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum HealthAnswer {
+    /// No answer yet.
+    #[default]
+    Unread,
+    /// The node's conditions.
+    Reported(HealthConditions),
+    /// The node answered without conditions: its version predates them.
+    NotReported,
+    /// No report: why.
+    Failed(String),
 }
 
 // ── Model ────────────────────────────────────────────────────────────────
@@ -456,6 +443,9 @@ pub struct Model {
     pub node_app_cadence: HashMap<Vec<u8>, quil_types::proto::node::FrameCadence>,
     /// Frame committee size by shard filter, scaling the observed estimates.
     pub node_app_committee: HashMap<Vec<u8>, u32>,
+    /// This node's seat's certificate share by shard filter, scaling the
+    /// observed estimates in place of the committee's quorum share.
+    pub node_app_cert_share: HashMap<Vec<u8>, CertificateShare>,
     /// When each cadence's RPC answer arrived; staleness counts from here.
     pub node_global_cadence_received: Option<std::time::Instant>,
     pub node_app_cadence_received: Option<std::time::Instant>,
@@ -478,6 +468,9 @@ pub struct Model {
 
     // Verified GLOBAL reward witness, refreshed independently of shard queries.
     pub claimable_reward: Option<(u128, u64)>,
+    /// This session's claimable balance readings, oldest first, kept for
+    /// 24h; runs of an unchanged balance keep their first and last reading.
+    pub claimable_readings: std::collections::VecDeque<(std::time::Instant, u128)>,
     /// Why the last reward read failed; cleared by a successful one.
     pub reward_error: Option<String>,
     pub reward_loaded: bool,
@@ -561,17 +554,11 @@ pub struct Model {
     pub notice_offset: usize,
     pub notice_lines: usize,
     pub notice_visible: usize,
-    pub app_progress_observed_since: Option<std::time::Instant>,
     pub global_alarm_time: Option<std::time::SystemTime>,
-    pub app_stall_time: Option<std::time::SystemTime>,
-    pub reported_app_progress: HashMap<Vec<u8>, ReportedAppProgress>,
-    pub reported_app_stall_time: Option<std::time::SystemTime>,
-    pub committed_app_progress: HashMap<Vec<u8>, CommittedAppProgress>,
-    /// Allocations (filter keys) whose local materialized frame is unchanged
-    /// for 60s, and the staffed earning allocations with fresh observations.
-    pub local_stalled_rows: HashSet<String>,
-    pub local_stalled_count: usize,
-    pub local_app_rows: usize,
+    /// The node's health conditions, as its last health report gave them.
+    pub health: HealthAnswer,
+    /// When the last health answer arrived.
+    pub health_received: Option<std::time::Instant>,
     /// When each current condition notice was first observed, by its key.
     pub notice_since: HashMap<&'static str, std::time::SystemTime>,
     pub status_msg: String,
@@ -886,7 +873,10 @@ impl Model {
     }
     pub fn daily_reward(&self, per_frame: &BigInt, filter: &[u8], index: usize) -> Option<BigInt> {
         if index == 2 {
-            return Some(per_frame * BigInt::from(8640));
+            return Some(super::super::theory_quil_daily(
+                per_frame,
+                self.node_global_cadence.as_ref(),
+            ));
         }
         if self.app_cadence_stale() {
             return None;
@@ -896,7 +886,62 @@ impl Model {
             self.node_app_cadence.get(filter)?,
             index == 1,
             self.node_app_committee.get(filter).copied().unwrap_or(0),
+            self.node_app_cert_share.get(filter),
         )
+    }
+    /// The share of frames the 60m (`day` false) or 24h estimate pays this
+    /// node's seat on a shard; `None` while that estimate reads `-`.
+    pub fn reward_share(&self, filter: &[u8], day: bool) -> Option<super::super::SigningShare> {
+        if self.app_cadence_stale() {
+            return None;
+        }
+        super::super::observed_window(self.node_app_cadence.get(filter)?, day)?;
+        Some(super::super::signing_share(
+            self.node_app_cert_share.get(filter),
+            day,
+            self.node_app_committee.get(filter).copied().unwrap_or(0),
+        ))
+    }
+    /// Record an authenticated claimable balance read at `now`.
+    pub fn record_claimable(&mut self, units: u128, now: std::time::Instant) {
+        let readings = &mut self.claimable_readings;
+        let run = readings.len() >= 2
+            && readings
+                .iter()
+                .rev()
+                .take(2)
+                .all(|&(_, previous)| previous == units);
+        if run {
+            readings.pop_back();
+        }
+        readings.push_back((now, units));
+        while readings
+            .front()
+            .is_some_and(|&(at, _)| now.saturating_duration_since(at).as_secs() > 86_400)
+        {
+            readings.pop_front();
+        }
+    }
+    /// Base units per day credited to this node's prover over the last 60m
+    /// (`day` false) or 24h of this session: the claimable balance's rises
+    /// between consecutive readings over the time they span. A fall, a mint
+    /// claiming the balance, adds nothing. `None` until the readings span
+    /// [`CREDITED_MIN_SPAN_SECONDS`].
+    pub fn credited_daily(&self, day: bool, now: std::time::Instant) -> Option<BigInt> {
+        let window = if day { 86_400 } else { 3_600 };
+        let mut readings = self
+            .claimable_readings
+            .iter()
+            .filter(|(at, _)| now.saturating_duration_since(*at).as_secs() <= window);
+        let &(first_at, mut previous) = readings.next()?;
+        let (mut last_at, mut credited) = (first_at, 0u128);
+        for &(at, units) in readings {
+            credited = credited.saturating_add(units.saturating_sub(previous));
+            (previous, last_at) = (units, at);
+        }
+        let span = last_at.saturating_duration_since(first_at).as_secs();
+        (span >= CREDITED_MIN_SPAN_SECONDS[usize::from(day)])
+            .then(|| BigInt::from(credited) * BigInt::from(86_400) / BigInt::from(span))
     }
     pub fn app_interval(&self, filter: &[u8]) -> Option<f64> {
         if self.app_cadence_stale() {
@@ -923,6 +968,7 @@ impl Model {
             .filter_map(|s| s.frame_cadence.clone().map(|c| (s.filter.clone(), c)))
             .collect();
         self.node_app_committee = committee_sizes(shards);
+        self.node_app_cert_share = certificate_shares(shards);
         self.seat_concentration = seat_concentration(shards);
     }
 
@@ -935,174 +981,46 @@ impl Model {
         }
     }
 
-    /// Record peer-head progress once per fresh shard RPC, never on cache reuse.
-    pub fn observe_reported_app_heads(
-        &mut self,
-        shards: &GetShardInfoResponse,
-        now: std::time::Instant,
-    ) {
-        let budget = std::time::Duration::from_secs(self.refresh_seconds * 2 + 30);
-        let window = std::time::Duration::from_secs(60.max(self.refresh_seconds * 3));
-        let mut known = HashSet::new();
-        for shard in &shards.shards {
-            // Empty/unknown peer metadata and unstaffed shards cannot establish a stall.
-            if shard.active_provers == 0
-                || (shard.latest_frame == 0 && shard.materialized_frame == 0)
-            {
-                continue;
-            }
-            if !known.insert(shard.filter.clone()) {
-                continue;
-            }
-            let generation = shard.global_head.as_ref().map(|h| h.generation);
-            let progress = self
-                .reported_app_progress
-                .entry(shard.filter.clone())
-                .or_insert(ReportedAppProgress {
-                    frame: shard.latest_frame,
-                    generation,
-                    last_change: now,
-                    last_seen: now,
-                    observations: 0,
-                    stalled: false,
-                });
-            if progress.frame != shard.latest_frame
-                || progress.generation != generation
-                || now.saturating_duration_since(progress.last_seen) > budget
-            {
-                *progress = ReportedAppProgress {
-                    frame: shard.latest_frame,
-                    generation,
-                    last_change: now,
-                    last_seen: now,
-                    observations: 0,
-                    stalled: false,
-                };
-            }
-            progress.last_seen = now;
-            progress.observations = progress.observations.saturating_add(1);
-            if progress.observations >= 3
-                && now.saturating_duration_since(progress.last_change) >= window
-            {
-                progress.stalled = true;
-            }
+    /// The node's current conditions, from a fresh health report; none from
+    /// an old or missing one.
+    pub fn health_conditions(&self) -> &[HealthCondition] {
+        let fresh = self
+            .health_received
+            .is_some_and(|t| t.elapsed().as_secs() <= self.refresh_seconds * 2 + 30);
+        match &self.health {
+            HealthAnswer::Reported(health) if fresh => health.conditions.as_slice(),
+            _ => &[],
         }
-        self.reported_app_progress
-            .retain(|filter, _| known.contains(filter));
     }
 
+    /// Whether the node's current `kind` condition lists `filter` (and,
+    /// for this node's workers, `core`).
+    pub fn condition_affects(&self, kind: ConditionKind, filter: &[u8], core: Option<u32>) -> bool {
+        self.health_conditions()
+            .iter()
+            .filter(|c| c.kind == kind as i32)
+            .flat_map(|c| &c.shards)
+            .any(|s| s.filter == filter && core.is_none_or(|core| s.core_id == core))
+    }
+
+    /// The node reports the shard's peer-reported head unchanged.
     pub fn reported_app_stalled(&self, filter: &[u8]) -> bool {
-        if self.shard_error.is_some() {
-            return false;
-        }
-        self.reported_app_progress.get(filter).is_some_and(|p| {
-            p.stalled && p.last_seen.elapsed().as_secs() <= self.refresh_seconds * 2 + 30
-        })
+        self.condition_affects(ConditionKind::PeerAppFramesUnchanged, filter, None)
     }
 
-    pub fn reported_app_stall_counts(&self, now: std::time::Instant) -> Option<(usize, usize)> {
-        if self.shard_error.is_some() {
-            return None;
-        }
-        let budget = std::time::Duration::from_secs(self.refresh_seconds * 2 + 30);
-        let known: Vec<_> = self
-            .reported_app_progress
-            .values()
-            .filter(|p| now.saturating_duration_since(p.last_seen) <= budget)
-            .collect();
-        let stalled = known.iter().filter(|p| p.stalled).count();
-        (stalled > 0).then_some((stalled, known.len()))
-    }
-
-    /// Record GLOBAL's committed app heads once per fresh shard RPC, never on
-    /// cache reuse. Unstaffed shards and shards without a committed head or
-    /// an app head cannot establish a stall or a lag.
-    pub fn observe_committed_app_heads(
-        &mut self,
-        shards: &GetShardInfoResponse,
-        now: std::time::Instant,
-    ) {
-        let budget = std::time::Duration::from_secs(self.refresh_seconds * 2 + 30);
-        let window = std::time::Duration::from_secs(60.max(self.refresh_seconds * 3));
-        let mut local: HashMap<Vec<u8>, u64> = HashMap::new();
-        for a in &self.allocations {
-            if let Some(frame) = a.execution.as_ref().and_then(|e| e.materialized_frame) {
-                let entry = local.entry(a.filter.clone()).or_default();
-                *entry = (*entry).max(frame);
-            }
-        }
-        let mut known = HashSet::new();
-        for shard in &shards.shards {
-            let Some(committed) = shard.global_head.as_ref() else {
-                continue;
-            };
-            let head = shard
-                .latest_frame
-                .max(local.get(&shard.filter).copied().unwrap_or(0));
-            if shard.active_provers == 0 || head == 0 || !known.insert(shard.filter.clone()) {
-                continue;
-            }
-            let fresh = CommittedAppProgress {
-                frame: committed.frame,
-                generation: committed.generation,
-                global_frame: committed.global_frame,
-                head,
-                last_change: now,
-                last_seen: now,
-                observations: 0,
-                stalled: false,
-                behind: false,
-            };
-            let progress = self
-                .committed_app_progress
-                .entry(shard.filter.clone())
-                .or_insert_with(|| fresh.clone());
-            if progress.frame != committed.frame
-                || progress.generation != committed.generation
-                || now.saturating_duration_since(progress.last_seen) > budget
-            {
-                *progress = fresh;
-            }
-            progress.last_seen = now;
-            progress.observations = progress.observations.saturating_add(1);
-            progress.behind = head.saturating_sub(committed.frame) > GLOBAL_APP_LAG_FRAMES;
-            if progress.observations >= 3
-                && now.saturating_duration_since(progress.last_change) >= window
-                && committed.global_frame > progress.global_frame
-                && head > progress.head
-            {
-                progress.stalled = true;
-            }
-        }
-        self.committed_app_progress
-            .retain(|filter, _| known.contains(filter));
-    }
-
-    /// The shard's GlobalHead is stalled or behind in a fresh snapshot.
+    /// The node reports the shard's committed head (GlobalHead) unchanged
+    /// or behind.
     pub fn committed_app_flagged(&self, filter: &[u8]) -> bool {
-        if self.shard_error.is_some() {
-            return false;
-        }
-        self.committed_app_progress.get(filter).is_some_and(|p| {
-            (p.stalled || p.behind)
-                && p.last_seen.elapsed().as_secs() <= self.refresh_seconds * 2 + 30
-        })
+        self.condition_affects(ConditionKind::GlobalAppFramesUnchanged, filter, None)
+            || self.condition_affects(ConditionKind::GlobalAppFramesBehind, filter, None)
     }
 
-    /// Stalled and behind shards, and the tracked shards with fresh snapshots.
-    pub fn committed_app_counts(&self, now: std::time::Instant) -> Option<(usize, usize, usize)> {
-        if self.shard_error.is_some() {
-            return None;
-        }
-        let budget = std::time::Duration::from_secs(self.refresh_seconds * 2 + 30);
-        let known: Vec<_> = self
-            .committed_app_progress
-            .values()
-            .filter(|p| now.saturating_duration_since(p.last_seen) <= budget)
-            .collect();
-        let stalled = known.iter().filter(|p| p.stalled).count();
-        let behind = known.iter().filter(|p| p.behind).count();
-        (stalled + behind > 0).then_some((stalled, behind, known.len()))
+    /// The node reports the local app frames of the allocation on `filter`
+    /// served by `worker_id` unchanged.
+    pub fn local_app_stalled(&self, filter: &[u8], worker_id: i64) -> bool {
+        u32::try_from(worker_id).is_ok_and(|core| {
+            self.condition_affects(ConditionKind::LocalAppFramesUnchanged, filter, Some(core))
+        })
     }
 
     // ── Data refresh ─────────────────────────────────────────────────────
@@ -1153,6 +1071,7 @@ impl Model {
                 .filter_map(|s| s.frame_cadence.clone().map(|c| (s.filter.clone(), c)))
                 .collect();
             self.node_app_committee = committee_sizes(shards);
+            self.node_app_cert_share = certificate_shares(shards);
             self.seat_concentration = seat_concentration(shards);
         }
         self.peer_id = node_info.peer_id.clone();
@@ -2226,6 +2145,15 @@ fn committee_sizes(shards: &GetShardInfoResponse) -> HashMap<Vec<u8>, u32> {
         .collect()
 }
 
+/// This node's seat's certificate share on each shard that reports one.
+fn certificate_shares(shards: &GetShardInfoResponse) -> HashMap<Vec<u8>, CertificateShare> {
+    shards
+        .shards
+        .iter()
+        .filter_map(|s| Some((s.filter.clone(), s.certificate_share?)))
+        .collect()
+}
+
 /// A seat's certificate share over the last 60m, in whole percent; `None`
 /// while the node reports none or counted no frame in the hour.
 pub fn cert_share_percent(share: Option<&CertificateShare>) -> Option<u64> {
@@ -2439,123 +2367,47 @@ fn timing(a: &ShardAllocationInfo) -> AllocationTiming<'_> {
 #[cfg(test)]
 mod tests {
 
-    #[test]
-    fn reported_heads_track_individual_shards_and_ignore_unknown_or_unstaffed_rows() {
-        use quil_types::proto::node::ShardRewardInfo;
-        use std::time::{Duration, Instant};
-        let start = Instant::now();
-        let mut m = Model::new();
-        let mut shards = GetShardInfoResponse {
-            shards: vec![
-                ShardRewardInfo {
-                    filter: vec![1],
-                    active_provers: 1,
-                    latest_frame: 10,
-                    ..Default::default()
-                },
-                ShardRewardInfo {
-                    filter: vec![2],
-                    active_provers: 1,
-                    latest_frame: 20,
-                    ..Default::default()
-                },
-                ShardRewardInfo {
-                    filter: vec![3],
-                    active_provers: 1,
-                    ..Default::default()
-                },
-                ShardRewardInfo {
-                    filter: vec![4],
-                    latest_frame: 30,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        for secs in [0, 30, 60] {
-            shards.shards[1].latest_frame += 1;
-            m.observe_reported_app_heads(&shards, start + Duration::from_secs(secs));
-        }
-        assert_eq!(m.reported_app_progress.len(), 2);
-        assert_eq!(
-            m.reported_app_stall_counts(start + Duration::from_secs(60)),
-            Some((1, 2))
-        );
-        // Row filtering and cache-backed local-status refreshes do not affect tracking.
-        m.allocations.clear();
-        m.available.clear();
-        m.process_refresh_data(Some(NodeInfoResponse::default()), None, None);
-        assert_eq!(m.reported_app_progress[&vec![1]].observations, 3);
-        m.refresh_seconds = 60;
-        m.observe_reported_app_heads(&shards, start + Duration::from_secs(61));
-        assert_eq!(
-            m.reported_app_stall_counts(start + Duration::from_secs(61)),
-            Some((1, 2))
-        );
-        shards.shards[0].latest_frame += 1;
-        m.observe_reported_app_heads(&shards, start + Duration::from_secs(62));
-        assert_eq!(
-            m.reported_app_stall_counts(start + Duration::from_secs(62)),
-            None
-        );
-    }
-
-    #[test]
-    fn reported_heads_require_fresh_confirmations_and_reset_on_missing_data_or_generation() {
-        use quil_types::proto::node::{GlobalAppFrameHead, ShardRewardInfo};
-        use std::time::{Duration, Instant};
-        let start = Instant::now();
-        let mut m = Model::new();
-        let mut shards = GetShardInfoResponse {
-            shards: vec![ShardRewardInfo {
-                filter: vec![1],
-                active_provers: 1,
-                latest_frame: 10,
-                global_head: Some(GlobalAppFrameHead {
-                    generation: 1,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        m.observe_reported_app_heads(&shards, start);
-        m.observe_reported_app_heads(&shards, start + Duration::from_secs(60));
-        assert_eq!(
-            m.reported_app_stall_counts(start + Duration::from_secs(60)),
-            None
-        );
-        m.observe_reported_app_heads(&shards, start + Duration::from_secs(61));
-        assert_eq!(
-            m.reported_app_stall_counts(start + Duration::from_secs(61)),
-            Some((1, 1))
-        );
-        m.shard_error = Some("fetch failed".into());
-        assert_eq!(
-            m.reported_app_stall_counts(start + Duration::from_secs(61)),
-            None
-        );
-        m.shard_error = None;
-        assert_eq!(
-            m.reported_app_stall_counts(start + Duration::from_secs(122)),
-            None
-        );
-        m.observe_reported_app_heads(&shards, start + Duration::from_secs(122));
-        assert_eq!(m.reported_app_progress[&vec![1]].observations, 1);
-        assert!(!m.reported_app_progress[&vec![1]].stalled);
-        shards.shards[0].global_head.as_mut().unwrap().generation = 2;
-        m.observe_reported_app_heads(&shards, start + Duration::from_secs(123));
-        assert_eq!(m.reported_app_progress[&vec![1]].observations, 1);
-        shards.shards[0].latest_frame = 9;
-        m.observe_reported_app_heads(&shards, start + Duration::from_secs(124));
-        assert_eq!(m.reported_app_progress[&vec![1]].observations, 1);
-        m.observe_reported_app_heads(
-            &GetShardInfoResponse::default(),
-            start + Duration::from_secs(125),
-        );
-        assert!(m.reported_app_progress.is_empty());
-    }
     use super::*;
+
+    /// Cells follow the node's conditions while its report is fresh: each
+    /// kind flags only the shards (and workers) it lists, and an old report
+    /// or one from a node that predates conditions flags nothing.
+    #[test]
+    fn cells_follow_the_node_conditions_while_the_report_is_fresh() {
+        use quil_types::proto::diagnostics::AffectedShard;
+        let shard = |filter: u8, core_id| AffectedShard {
+            filter: vec![filter],
+            core_id,
+            ..Default::default()
+        };
+        let condition = |kind: ConditionKind, shards| HealthCondition {
+            kind: kind as i32,
+            shards,
+            ..Default::default()
+        };
+        let mut m = Model::new();
+        m.health = HealthAnswer::Reported(HealthConditions {
+            conditions: vec![
+                condition(ConditionKind::PeerAppFramesUnchanged, vec![shard(1, 0)]),
+                condition(ConditionKind::GlobalAppFramesBehind, vec![shard(2, 0)]),
+                condition(ConditionKind::LocalAppFramesUnchanged, vec![shard(3, 7)]),
+            ],
+            sources: Vec::new(),
+        });
+        m.health_received = Some(std::time::Instant::now());
+        assert!(m.reported_app_stalled(&[1]));
+        assert!(!m.reported_app_stalled(&[2]));
+        assert!(m.committed_app_flagged(&[2]));
+        assert!(!m.committed_app_flagged(&[1]));
+        assert!(m.local_app_stalled(&[3], 7));
+        assert!(!m.local_app_stalled(&[3], 8), "another worker on it");
+        assert!(!m.local_app_stalled(&[3], -1), "no worker");
+        m.health_received = Some(std::time::Instant::now() - std::time::Duration::from_secs(61));
+        assert!(!m.reported_app_stalled(&[1]), "an old report");
+        m.health_received = Some(std::time::Instant::now());
+        m.health = HealthAnswer::NotReported;
+        assert!(m.health_conditions().is_empty());
+    }
 
     fn allocation(filter: Vec<u8>, epoch: u64) -> ShardAllocationInfo {
         ShardAllocationInfo {
@@ -3421,5 +3273,178 @@ mod frame_interval_tests {
         };
         m.observe_app_intervals(&shards, std::time::Instant::now());
         assert_eq!(m.app_interval(&[1]), None);
+    }
+}
+
+#[cfg(test)]
+mod reward_share_tests {
+    use super::*;
+    use quil_types::proto::node::{CertificateWindow, FrameCadence, FrameWindow, ShardRewardInfo};
+
+    /// 30 frames in 600s in both windows: 95_040_000 a day at 22_000 a
+    /// frame, every frame paid.
+    fn cadence() -> FrameCadence {
+        let window = Some(FrameWindow {
+            window_seconds: 3600,
+            observed_seconds: 600,
+            advanced_frames: 30,
+        });
+        FrameCadence {
+            last_observed_unix_seconds: 1,
+            hour: window,
+            day: window,
+        }
+    }
+    fn counted(frames: u64, signed_frames: u64) -> Option<CertificateWindow> {
+        Some(CertificateWindow {
+            window_seconds: 3600,
+            observed_seconds: 3600,
+            frames,
+            signed_frames,
+        })
+    }
+    /// A 22-member committee (quorum 15) whose seat signed `hour` and `day`.
+    fn model(hour: Option<CertificateWindow>, day: Option<CertificateWindow>) -> Model {
+        let mut m = Model::new();
+        let shards = GetShardInfoResponse {
+            shards: vec![ShardRewardInfo {
+                filter: vec![1],
+                active_provers: 22,
+                frame_cadence: Some(cadence()),
+                certificate_share: Some(CertificateShare {
+                    hour,
+                    day,
+                    committee: 22,
+                    quorum: 15,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        m.observe_app_intervals(&shards, std::time::Instant::now());
+        m
+    }
+
+    /// GLOBAL credits each signer of a frame's certificate the same
+    /// per-signer reward, so a seat earns the frames it signed.
+    #[test]
+    fn observed_rewards_pay_the_seats_own_certificate_share() {
+        let m = model(counted(40, 38), counted(900, 810));
+        let per_frame = BigInt::from(22_000);
+        assert_eq!(
+            m.daily_reward(&per_frame, &[1], 0),
+            Some(BigInt::from(95_040_000 / 40 * 38)),
+            "rewards: the 60m estimate pays the seat's 60m share, 38 of 40"
+        );
+        assert_eq!(
+            m.daily_reward(&per_frame, &[1], 1),
+            Some(BigInt::from(95_040_000 / 900 * 810)),
+            "rewards: the 24h estimate pays the seat's 24h share, 810 of 900"
+        );
+    }
+
+    /// A window in which the node counted no frame pays the quorum share,
+    /// 15 of 22; the other window keeps its own share.
+    #[test]
+    fn a_window_without_counted_certificates_pays_the_quorum_share() {
+        let m = model(counted(0, 0), counted(900, 810));
+        let per_frame = BigInt::from(22_000);
+        assert_eq!(
+            m.daily_reward(&per_frame, &[1], 0),
+            Some(BigInt::from(95_040_000 / 22 * 15)),
+            "rewards: no 60m frame counted, the 60m estimate pays the quorum share"
+        );
+        assert_eq!(
+            m.daily_reward(&per_frame, &[1], 1),
+            Some(BigInt::from(95_040_000 / 900 * 810)),
+            "rewards: the 24h estimate keeps the seat's 24h share"
+        );
+        let unreported = model(None, None);
+        assert_eq!(
+            unreported.daily_reward(&per_frame, &[1], 1),
+            Some(BigInt::from(95_040_000 / 22 * 15)),
+            "rewards: no share reported, the 24h estimate pays the quorum share"
+        );
+    }
+
+    /// `T`: one frame of the shard per GLOBAL frame at the measured GLOBAL
+    /// interval, the 24h window first, every frame paid; the 10s target
+    /// while none is measured.
+    #[test]
+    fn theory_pays_one_frame_per_measured_global_frame() {
+        let mut m = Model::new();
+        let per_frame = BigInt::from(1_000);
+        let window = |window_seconds, advanced_frames| {
+            Some(FrameWindow {
+                window_seconds,
+                observed_seconds: window_seconds,
+                advanced_frames,
+            })
+        };
+        m.node_global_cadence = Some(FrameCadence {
+            last_observed_unix_seconds: 1,
+            hour: window(3600, 353),
+            day: window(86_400, 8_470),
+        });
+        m.node_global_cadence_received = Some(std::time::Instant::now());
+        assert_eq!(
+            m.daily_reward(&per_frame, &[1], 2),
+            Some(BigInt::from(1_000 * 8_470)),
+            "rewards: T at the 24h GLOBAL rate, 8470 frames a day"
+        );
+        m.node_global_cadence.as_mut().unwrap().day = None;
+        assert_eq!(
+            m.daily_reward(&per_frame, &[1], 2),
+            Some(BigInt::from(1_000 * 353 * 24)),
+            "rewards: T at the 60m GLOBAL rate without a 24h one"
+        );
+        m.node_global_cadence = None;
+        assert_eq!(
+            m.daily_reward(&per_frame, &[1], 2),
+            Some(BigInt::from(1_000 * 8_640)),
+            "rewards: T at the 10s target while none is measured"
+        );
+    }
+
+    /// Credited reads only its window's reads; a run of an unchanged
+    /// balance keeps its first and last read, and reads age out after 24h.
+    #[test]
+    fn credited_reads_only_its_window() {
+        let mut m = Model::new();
+        let start = std::time::Instant::now();
+        let at = |minutes: u64| start + std::time::Duration::from_secs(minutes * 60);
+        for minute in 0..=5 {
+            m.record_claimable(1_000, at(minute));
+        }
+        assert_eq!(
+            m.claimable_readings.len(),
+            2,
+            "rewards: a run keeps its first and last read"
+        );
+        m.record_claimable(1_000, at(30));
+        m.record_claimable(4_600, at(90));
+        assert_eq!(
+            m.credited_daily(false, at(90)),
+            Some(BigInt::from(3_600 * 24)),
+            "rewards: the 60m window reads 30m..90m, 3_600 units in an hour"
+        );
+        assert_eq!(
+            m.credited_daily(true, at(90)),
+            None,
+            "rewards: the 24h window needs 2h of reads"
+        );
+        m.record_claimable(4_600, at(150));
+        assert_eq!(
+            m.credited_daily(true, at(150)),
+            Some(BigInt::from(3_600 * 86_400 / 9_000)),
+            "rewards: the 24h window reads 0..150m"
+        );
+        m.record_claimable(4_600, at(25 * 60));
+        assert!(
+            m.claimable_readings
+                .front()
+                .is_some_and(|&(first, _)| first >= at(60)),
+            "rewards: reads over 24h old age out"
+        );
     }
 }

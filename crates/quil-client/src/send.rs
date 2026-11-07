@@ -115,6 +115,96 @@ async fn deliver(
 /// Seconds a paid submission waits for its QUIL settlement to be certified.
 pub const PAID_SUBMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(900);
 
+/// The engine that executes `request` in an application, or `None` for a
+/// request no application engine executes.
+#[cfg(any(test, feature = "native-proof"))]
+fn request_engine(request: &MessageRequest) -> Option<&'static str> {
+    use quil_types::proto::global::message_request::Request;
+    match request.request.as_ref()? {
+        Request::TokenDeploy(_) | Request::TokenUpdate(_) | Request::TokenOperation(_) => {
+            Some("token")
+        }
+        Request::HypergraphDeploy(_)
+        | Request::HypergraphUpdate(_)
+        | Request::VertexAdd(_)
+        | Request::VertexRemove(_)
+        | Request::HyperedgeAdd(_)
+        | Request::HyperedgeRemove(_) => Some("hypergraph"),
+        Request::ComputeDeploy(_)
+        | Request::ComputeUpdate(_)
+        | Request::CodeDeploy(_)
+        | Request::CodeExecute(_)
+        | Request::CodeFinalize(_) => Some("compute"),
+        _ => None,
+    }
+}
+
+/// Refuse a write to an application whose engine does not execute it. That
+/// engine skips the operation, so its paid bundle succeeds, consumes the
+/// settlement and writes nothing (a vertex add sent to a token's domain).
+/// `route` is the application's type domain.
+#[cfg(any(test, feature = "native-proof"))]
+pub fn check_request_route(request: &MessageRequest, route: &[u8; 32]) -> anyhow::Result<()> {
+    let Some(wanted) = request_engine(request) else {
+        return Ok(());
+    };
+    let runs = quil_execution::manager::engine_for_route(route);
+    anyhow::ensure!(
+        runs == Some(wanted),
+        "this application runs the {} engine, which does not execute this {wanted} write \
+         (it would be charged and write nothing); address it to a {wanted} application",
+        runs.unwrap_or("no known")
+    );
+    Ok(())
+}
+
+/// An application's type domain from its metadata vertex (the vertex at
+/// `0xff*32`, key `0xff*32`), as the node routes it.
+#[cfg(any(test, feature = "native-proof"))]
+pub fn route_from_metadata(blob: &[u8]) -> anyhow::Result<[u8; 32]> {
+    let tree = quil_tries::VectorCommitmentTree {
+        root: quil_tries::deserialize_go_tree(blob)
+            .map_err(|e| anyhow::anyhow!("application metadata: {e}"))?,
+    };
+    let route = tree
+        .get(&[0xFF; 32])
+        .ok_or_else(|| anyhow::anyhow!("application metadata has no type domain"))?;
+    route
+        .get(..32)
+        .and_then(|route| route.try_into().ok())
+        .ok_or_else(|| anyhow::anyhow!("application type domain is shorter than 32 bytes"))
+}
+
+/// The type domain the node routes `application` by: a base domain routes as
+/// itself, a deployed application by its metadata vertex.
+#[cfg(feature = "native-proof")]
+async fn application_route(
+    client: &NodeServiceClient<Channel>,
+    application: &[u8; 32],
+) -> anyhow::Result<[u8; 32]> {
+    if quil_execution::manager::engine_for_route(application).is_some() {
+        return Ok(*application);
+    }
+    let mut address = application.to_vec();
+    address.extend_from_slice(&[0xFF; 32]);
+    let response = client
+        .clone()
+        .max_decoding_message_size(64 << 20)
+        .get_vertex_data(quil_types::proto::node::GetVertexDataRequest {
+            address,
+            full_data: true,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("application metadata: {e}"))?
+        .into_inner();
+    anyhow::ensure!(
+        !response.raw_data.is_empty(),
+        "application {} is not deployed",
+        hex::encode(application)
+    );
+    route_from_metadata(&response.raw_data)
+}
+
 /// Submit `request` executed under `execution_domain` in a bundle that opens
 /// with a settlement claim paying its QUIL fee: build the bundle, pay a QUIL
 /// settlement from this node's wallet bound to it, wait for certification, then
@@ -134,6 +224,12 @@ pub async fn send_paid_request(
         CanonicalMessageRequest,
     };
     use quil_types::proto::global::message_request::Request;
+    // Before paying: the settlement cannot be recovered once it funds a
+    // bundle the application's engine skips.
+    check_request_route(
+        &request,
+        &application_route(client, &execution_domain).await?,
+    )?;
     let timestamp = now_millis();
     let inner = proto_message_request_to_canonical_inner_bytes(&request)
         .map_err(|e| anyhow::anyhow!("canonical request: {e}"))?;
@@ -233,5 +329,76 @@ mod tests {
         let d = node_auth_domain(&[0xFFu8; 32]);
         assert_eq!(&d[..19], b"NODE_AUTHENTICATION");
         assert_eq!(&d[19..], &[0xFFu8; 32]);
+    }
+
+    /// A/B reproducer: a vertex add sent to a token's domain was skipped by
+    /// the token engine, so its paid bundle succeeded, consumed its
+    /// settlement and wrote nothing (mainnet). A write whose application's
+    /// engine does not execute it is refused before anything is paid.
+    #[test]
+    fn a_paid_write_is_refused_before_payment_where_its_engine_does_not_run() {
+        use quil_types::proto::global::message_request::Request;
+        const MSG: &str = "a write was let through to an engine that skips it";
+        let of = |request| MessageRequest {
+            request: Some(request),
+            timestamp: 0,
+        };
+        let token = quil_execution::token_intrinsic::constants::token_base_domain();
+        let hypergraph = quil_execution::hypergraph_intrinsic::hypergraph_base_domain();
+        let compute = quil_execution::domains::COMPUTE;
+        let vertex = of(Request::VertexAdd(Default::default()));
+        assert!(
+            check_request_route(&vertex, &token).is_err(),
+            "{MSG}: a vertex add to a token"
+        );
+        assert!(
+            check_request_route(&vertex, &quil_execution::domains::QUIL_TOKEN).is_err(),
+            "{MSG}: a vertex add to QUIL"
+        );
+        assert!(
+            check_request_route(&vertex, &compute).is_err(),
+            "{MSG}: a vertex add to a compute application"
+        );
+        assert!(
+            check_request_route(&vertex, &[7; 32]).is_err(),
+            "{MSG}: a vertex add to no known engine"
+        );
+        let update = of(Request::TokenUpdate(Default::default()));
+        assert!(
+            check_request_route(&update, &hypergraph).is_err(),
+            "{MSG}: a token update to a hypergraph"
+        );
+        let execute = of(Request::CodeExecute(Default::default()));
+        assert!(
+            check_request_route(&execute, &token).is_err(),
+            "{MSG}: a code execution to a token"
+        );
+        // Each runs where its engine does; a request no application engine
+        // executes is not checked.
+        check_request_route(&vertex, &hypergraph).unwrap();
+        check_request_route(&update, &token).unwrap();
+        check_request_route(&execute, &compute).unwrap();
+        check_request_route(&of(Request::Join(Default::default())), &token).unwrap();
+        check_request_route(&MessageRequest::default(), &token).unwrap();
+    }
+
+    /// The application's route is read as the node reads it.
+    #[test]
+    fn an_application_route_is_read_from_its_metadata_vertex() {
+        let blob = |value: &[u8]| {
+            let mut tree = quil_tries::VectorCommitmentTree::new();
+            tree.insert(
+                &[0xFF; 32],
+                value,
+                &[],
+                &num_bigint::BigInt::from(value.len()),
+            )
+            .unwrap();
+            quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap()
+        };
+        assert_eq!(route_from_metadata(&blob(&[5; 32])).unwrap(), [5; 32]);
+        assert!(route_from_metadata(&blob(&[5; 31])).is_err());
+        let empty = quil_tries::serialize_go_tree(None).unwrap();
+        assert!(route_from_metadata(&empty).is_err());
     }
 }

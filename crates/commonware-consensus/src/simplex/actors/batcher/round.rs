@@ -1,4 +1,9 @@
-use super::{repeats::Repeat, verifier::offload, Verifier};
+use super::{
+    race::{Outcome, Sample},
+    repeats::Repeat,
+    verifier::offload,
+    Verifier,
+};
 use crate::{
     simplex::{
         actors::span::ViewSpan,
@@ -19,6 +24,14 @@ use commonware_utils::{ordered::Quorum, N3f1};
 use rand_core::CryptoRng;
 use std::sync::Arc;
 use tracing::{info_span, Span};
+
+/// This member's own finalize vote in a view.
+#[derive(Clone, Copy)]
+struct OwnFinalize {
+    signer: Participant,
+    /// Finalize votes of others held when it was added.
+    held_before: u32,
+}
 
 /// Per-view state for vote accumulation and certificate tracking.
 pub struct Round<
@@ -47,6 +60,12 @@ pub struct Round<
     notarized: bool,
     nullified: bool,
     finalized: bool,
+
+    /// QUILIBRIUM: the quorum, and where this member's own finalize vote stood
+    /// when it was added (race.rs).
+    quorum: u32,
+    own_finalize: Option<OwnFinalize>,
+    race: Option<Sample>,
 
     /// Root span of the view, shared with the voter's round.
     ///
@@ -78,6 +97,10 @@ impl<
             notarized: false,
             nullified: false,
             finalized: false,
+
+            quorum,
+            own_finalize: None,
+            race: None,
 
             span: ViewSpan::new(),
         }
@@ -129,6 +152,22 @@ impl<
     /// Marks a finalization certificate as observed or constructed.
     pub const fn mark_finalized(&mut self) {
         self.finalized = true;
+    }
+
+    /// QUILIBRIUM: the reading of this member's finalize vote once the view's
+    /// certificate was assembled here (race.rs).
+    pub(super) const fn take_race(&mut self) -> Option<Sample> {
+        self.race.take()
+    }
+
+    /// QUILIBRIUM: the reading of this member's finalize vote when a peer's
+    /// certificate finishes the view (race.rs); call before marking it.
+    pub(super) fn peer_copy_race(&self) -> Option<Sample> {
+        if self.finalized {
+            return None;
+        }
+        self.own_finalize
+            .map(|own| Sample::new(own.held_before, self.quorum, Outcome::PeerCopy))
     }
 
     /// Adds a vote from the network to this round's verifier.
@@ -311,6 +350,11 @@ impl<
 
                 // Report activity
                 self.reporter.report(Activity::Finalize(finalize.clone()));
+
+                self.own_finalize = Some(OwnFinalize {
+                    signer: finalize.signer(),
+                    held_before: self.votes.len_finalizes(),
+                });
 
                 // Our own votes are already verified
                 assert!(
@@ -515,6 +559,10 @@ impl<
             return None;
         }
         let finalizes = self.verifier.take_verified_finalizes()?;
+        self.race = self.own_finalize.map(|own| {
+            let own_in = finalizes.iter().any(|f| f.signer() == own.signer);
+            Sample::new(own.held_before, self.quorum, Outcome::Assembled { own_in })
+        });
         let span = info_span!(
             "simplex.batcher.try_construct_finalization",
             epoch = self.round.epoch().traced(),

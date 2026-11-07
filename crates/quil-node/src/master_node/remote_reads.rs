@@ -16,6 +16,11 @@
 //! omits — answered by asking a covering node first (it has the data and is
 //! accountable for the shard) and by a peer refusing outright for an
 //! application it does not serve, rather than returning an empty page.
+//!
+//! A covering node is a registered prover serving the application's shards:
+//! any key can sign a PeerInfo claiming an application, so a claim counts
+//! only for the shards its signer holds an allocation on, and the dial must
+//! reach that signer.
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -119,6 +124,13 @@ fn bounded_reason(reason: &str) -> String {
     reason.chars().take(MAX_REASON_CHARS).collect()
 }
 
+/// Whether the shards' paths cover a whole application
+/// ([`super::grpc::shard_paths_cover_application`]).
+fn covers<'a, 'b: 'a>(shards: impl Iterator<Item = &'a (&'b [u8], Vec<bool>)>) -> bool {
+    let paths: Vec<Vec<bool>> = shards.map(|(_, path)| path.clone()).collect();
+    super::grpc::shard_paths_cover_application(&paths)
+}
+
 /// An error with its causes: tonic's transport error alone says only
 /// "transport error", not that the connection was refused or timed out.
 fn with_causes(error: &(dyn std::error::Error + 'static)) -> String {
@@ -171,10 +183,11 @@ impl Declines {
     }
 }
 
-/// Opens a connection to an endpoint for forwarded reads.
+/// Opens a connection to an endpoint for forwarded reads, which must answer
+/// as the endpoint's peer when it names one.
 type Dial<C> = Arc<
     dyn Fn(
-            String,
+            ReadEndpoint,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<C, ArchiveClientError>> + Send>,
         > + Send
@@ -233,8 +246,11 @@ fn connection_failed(error: &ArchiveClientError) -> bool {
 /// in the transport or times out, once unused for `idle` (a sweep runs while
 /// any is kept), and least recently used first beyond `capacity` endpoints.
 /// The lock guards only the map, never a dial or a call; clones of a client
-/// share its connection. A connection keeps the identity pinned for its
-/// endpoint at its dial, as a fresh dial per call did.
+/// share its connection. A connection is kept per [`ReadEndpoint`], the
+/// address and the peer that must answer there: one dialed as a covering
+/// prover never serves a read meant for another peer or for an archive at
+/// that address, and an archive's keeps the identity pinned for it at its
+/// dial, as a fresh dial per call did.
 struct ReadConnections<C> {
     dial: Dial<C>,
     idle: Duration,
@@ -244,7 +260,7 @@ struct ReadConnections<C> {
 }
 
 struct OpenConnections<C> {
-    by_endpoint: HashMap<String, KeptConnection<C>>,
+    by_endpoint: HashMap<ReadEndpoint, KeptConnection<C>>,
     next_id: u64,
     sweeping: bool,
 }
@@ -281,7 +297,7 @@ impl<C: Clone + Send + 'static> ReadConnections<C> {
     /// earlier call. A new one counts in `dials`.
     async fn connect(
         &self,
-        endpoint: &str,
+        endpoint: &ReadEndpoint,
         dials: &AtomicU64,
     ) -> Result<(C, u64, bool), ArchiveClientError> {
         {
@@ -293,7 +309,7 @@ impl<C: Clone + Send + 'static> ReadConnections<C> {
             }
         }
         dials.fetch_add(1, Ordering::Relaxed);
-        let client = (self.dial)(endpoint.to_string()).await?;
+        let client = (self.dial)(endpoint.clone()).await?;
         let mut open = self.open.lock();
         open.next_id += 1;
         let id = open.next_id;
@@ -308,7 +324,7 @@ impl<C: Clone + Send + 'static> ReadConnections<C> {
             }
         }
         open.by_endpoint.insert(
-            endpoint.to_string(),
+            endpoint.clone(),
             KeptConnection {
                 client: client.clone(),
                 id,
@@ -320,7 +336,7 @@ impl<C: Clone + Send + 'static> ReadConnections<C> {
     }
 
     /// Drop connection `id` to `endpoint`, unless another replaced it.
-    fn discard(&self, endpoint: &str, id: u64) {
+    fn discard(&self, endpoint: &ReadEndpoint, id: u64) {
         let mut open = self.open.lock();
         if open
             .by_endpoint
@@ -363,7 +379,7 @@ impl<C: Clone + Send + 'static> ReadConnections<C> {
     /// call made once more at once; any connection that failed is dropped.
     async fn call<T, F, Fut>(
         &self,
-        endpoint: &str,
+        endpoint: &ReadEndpoint,
         dials: &AtomicU64,
         mut call: F,
     ) -> Result<T, CallError>
@@ -532,17 +548,48 @@ type ScanKey = (ScanKind, [u8; 32], [u8; 32]);
 
 /// The endpoint serving a paged scan, and the scan's cost so far.
 struct PinnedScan {
-    endpoint: String,
+    endpoint: ReadEndpoint,
     used: Instant,
     stats: ScanStats,
 }
 
 type PeerInfoCache = Arc<parking_lot::RwLock<HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>>>;
 
+/// Where a forwarded read is sent: a covering prover's endpoint, which must
+/// answer as that prover, or an archive's (`peer` unset: the pool pins the
+/// archives whose identity it knows).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct ReadEndpoint {
+    addr: String,
+    peer: Option<quil_p2p::PeerId>,
+}
+
+impl ReadEndpoint {
+    fn archive(addr: String) -> Self {
+        Self { addr, peer: None }
+    }
+}
+
+impl std::fmt::Display for ReadEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.addr)
+    }
+}
+
+/// An archive's endpoint, for tests.
+#[cfg(test)]
+impl From<&str> for ReadEndpoint {
+    fn from(addr: &str) -> Self {
+        Self::archive(addr.into())
+    }
+}
+
 /// Reads an application's coins from whichever node holds it.
 pub struct PeerCoinReader {
     peer_info_cache: PeerInfoCache,
     archive_pool: Arc<quil_rpc::ArchiveEndpointPool>,
+    /// Decides which peers count as covering nodes ([`Self::covering_endpoints`]).
+    prover_registry: Option<Arc<dyn quil_types::consensus::ProverRegistry>>,
     /// Kept connections, dialed with the `:8340` mTLS identity.
     connections: ReadConnections<quil_rpc::ArchiveClient>,
     network: u8,
@@ -569,15 +616,25 @@ impl PeerCoinReader {
         network: u8,
     ) -> Self {
         let falcon_key: Arc<[u8]> = falcon_key.into();
-        let dial: Dial<quil_rpc::ArchiveClient> = Arc::new(move |endpoint: String| {
+        // A covering prover's endpoint must answer as that prover, so a
+        // record cannot name another node's address and have that node
+        // answer for it; an archive's is dialed as the pool pins it.
+        let dial: Dial<quil_rpc::ArchiveClient> = Arc::new(move |endpoint: ReadEndpoint| {
             let falcon_key = falcon_key.clone();
-            Box::pin(
-                async move { quil_rpc::ArchiveClient::connect_mtls(&endpoint, &falcon_key).await },
-            )
+            Box::pin(async move {
+                let addr = endpoint.addr.as_str();
+                match endpoint.peer {
+                    Some(peer) => {
+                        quil_rpc::ArchiveClient::connect_peer(addr, &falcon_key, peer).await
+                    }
+                    None => quil_rpc::ArchiveClient::connect_mtls(addr, &falcon_key).await,
+                }
+            })
         });
         Self {
             peer_info_cache,
             archive_pool,
+            prover_registry: None,
             connections: ReadConnections::new(dial, CONNECTION_IDLE, MAX_CONNECTIONS),
             network,
             served_by: parking_lot::Mutex::new(HashMap::new()),
@@ -586,6 +643,17 @@ impl PeerCoinReader {
             page_attempt: PAGE_ATTEMPT,
             declines_logged: parking_lot::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The registry that decides which peers count as covering nodes: the
+    /// registered provers serving the application's shards. Without one, or
+    /// until it has loaded, reads go to archives only.
+    pub fn with_prover_registry(
+        mut self,
+        registry: Arc<dyn quil_types::consensus::ProverRegistry>,
+    ) -> Self {
+        self.prover_registry = Some(registry);
+        self
     }
 
     #[cfg(test)]
@@ -606,14 +674,31 @@ impl PeerCoinReader {
         self
     }
 
-    /// Endpoints advertising a complete partition of `domain`. A child shard
-    /// alone cannot answer an application-wide scan. Group by endpoint within
-    /// each peer: cluster workers on different endpoints do not share stores.
-    fn covering_endpoints(&self, domain: &[u8; 32]) -> Vec<String> {
+    /// Endpoints of registered provers serving a complete partition of
+    /// `domain`, each to be dialed as its prover. A child shard alone cannot
+    /// answer an application-wide scan. Group by endpoint within each peer:
+    /// cluster workers on different endpoints do not share stores. A shard
+    /// counts only when the record's signer holds an allocation on it,
+    /// confirmed and not left: any key can sign a PeerInfo claiming an
+    /// application, and the endpoints sorting first used to be asked first.
+    fn covering_endpoints(&self, domain: &[u8; 32]) -> Vec<ReadEndpoint> {
+        let Some(registry) = self
+            .prover_registry
+            .as_deref()
+            .filter(|registry| registry.initial_load_complete())
+        else {
+            return Vec::new();
+        };
         let cache = self.peer_info_cache.read();
-        let mut endpoints = Vec::new();
+        // A record's claimed shards on one endpoint: filter and decoded path.
+        type ClaimedShards<'a> = Vec<(&'a [u8], Vec<bool>)>;
+        // Per record, the shards (filter and path) each endpoint names. A
+        // set of paths covers no less with more paths in it, so an endpoint
+        // whose every claimed shard does not cover is dropped here, before
+        // the registry is asked about it.
+        let mut claims = Vec::new();
         for info in cache.values() {
-            let mut paths_by_endpoint: HashMap<String, Vec<Vec<bool>>> = HashMap::new();
+            let mut by_endpoint: HashMap<String, ClaimedShards<'_>> = HashMap::new();
             for reach in &info.reachability {
                 // A shard partitions a 256-bit data address. Reject longer
                 // advertised paths before decoding or recursive coverage work.
@@ -628,19 +713,50 @@ impl PeerCoinReader {
                 for endpoint in reach.stream_multiaddrs.iter().filter_map(|ma| {
                     crate::util::multiaddr::archive_multiaddr_to_host_port(ma, self.network)
                 }) {
-                    paths_by_endpoint
+                    by_endpoint
                         .entry(endpoint)
                         .or_default()
-                        .push(path.clone());
+                        .push((reach.filter.as_slice(), path.clone()));
                 }
             }
-            endpoints.extend(
-                paths_by_endpoint
-                    .into_iter()
-                    .filter_map(|(endpoint, paths)| {
-                        super::grpc::shard_paths_cover_application(&paths).then_some(endpoint)
-                    }),
-            );
+            by_endpoint.retain(|_, shards| covers(shards.iter()));
+            if !by_endpoint.is_empty() {
+                claims.push((info, by_endpoint));
+            }
+        }
+        // Peer ID → the claimed shards its prover serves, asked once per shard.
+        let filters: HashSet<&[u8]> = claims
+            .iter()
+            .flat_map(|(_, by_endpoint)| by_endpoint.values().flatten())
+            .map(|(filter, _)| *filter)
+            .collect();
+        let mut served: HashMap<Vec<u8>, HashSet<&[u8]>> = HashMap::new();
+        for filter in filters {
+            for prover in registry.get_provers(filter).unwrap_or_default() {
+                if super::peer_info_file::serves(&prover, filter) {
+                    served
+                        .entry(quil_p2p::peer_id_from_falcon_pubkey(&prover.public_key))
+                        .or_default()
+                        .insert(filter);
+                }
+            }
+        }
+        let mut endpoints = Vec::new();
+        for (info, by_endpoint) in claims {
+            let Some(filters) = served.get(&info.peer_id) else {
+                continue;
+            };
+            let Ok(peer) = quil_p2p::PeerId::from_bytes(&info.peer_id) else {
+                continue;
+            };
+            for (addr, shards) in by_endpoint {
+                if covers(shards.iter().filter(|(filter, _)| filters.contains(filter))) {
+                    endpoints.push(ReadEndpoint {
+                        addr,
+                        peer: Some(peer),
+                    });
+                }
+            }
         }
         endpoints.sort();
         endpoints.dedup();
@@ -648,21 +764,32 @@ impl PeerCoinReader {
     }
 
     /// Bounded attempts in preference order, with room reserved for archives
-    /// even when every advertised covering peer is stale or unreachable.
-    async fn read_endpoints(&self, domain: &[u8; 32]) -> Vec<String> {
+    /// even when every advertised covering peer is stale or unreachable. An
+    /// archive already asked as a covering node (its address, answering as
+    /// the identity the pool pins for it) is not asked twice; one whose
+    /// address a covering record merely names still is.
+    async fn read_endpoints(&self, domain: &[u8; 32]) -> Vec<ReadEndpoint> {
         let mut endpoints: Vec<_> = self
             .covering_endpoints(domain)
             .into_iter()
             .take(MAX_ATTEMPTS)
             .collect();
-        let mut seen: HashSet<_> = endpoints.iter().cloned().collect();
+        let mut seen: HashSet<String> = endpoints
+            .iter()
+            .filter(|endpoint| {
+                let pinned = quil_rpc::archive_client::pinned_archive_peer(&endpoint.addr);
+                endpoint.peer.is_some() && endpoint.peer == pinned
+            })
+            .map(|endpoint| endpoint.addr.clone())
+            .collect();
         endpoints.extend(
             self.archive_pool
                 .get_all()
                 .await
                 .into_iter()
                 .filter(|endpoint| seen.insert(endpoint.clone()))
-                .take(MAX_ATTEMPTS),
+                .take(MAX_ATTEMPTS)
+                .map(ReadEndpoint::archive),
         );
         endpoints
     }
@@ -676,7 +803,12 @@ impl PeerCoinReader {
             .map(|pin| pin.stats.asked)
     }
 
-    fn pinned_endpoint(&self, kind: ScanKind, domain: [u8; 32], id: [u8; 32]) -> Option<String> {
+    fn pinned_endpoint(
+        &self,
+        kind: ScanKind,
+        domain: [u8; 32],
+        id: [u8; 32],
+    ) -> Option<ReadEndpoint> {
         let mut pins = self.served_by.lock();
         pins.retain(|_, pin| pin.used.elapsed() < SCAN_PIN_TTL);
         let pin = pins.get_mut(&(kind, domain, id))?;
@@ -691,7 +823,7 @@ impl PeerCoinReader {
         kind: ScanKind,
         domain: [u8; 32],
         id: [u8; 32],
-        endpoint: String,
+        endpoint: ReadEndpoint,
         page: &PageCost,
     ) -> Option<ScanStats> {
         let key = (kind, domain, id);
@@ -793,7 +925,7 @@ impl PeerCoinReader {
     #[allow(clippy::too_many_arguments)] // the wire request, its bounds and the dial count
     async fn page_from(
         &self,
-        endpoint: &str,
+        endpoint: &ReadEndpoint,
         domain: &[u8; 32],
         snapshot_id: Option<&[u8; 32]>,
         after: Option<&[u8; 32]>,
@@ -1062,7 +1194,7 @@ impl PeerCoinReader {
             } else {
                 "archive"
             };
-            log_scan_end("coin scan", &domain, &endpoint, served_by, &stats);
+            log_scan_end("coin scan", &domain, &endpoint.addr, served_by, &stats);
         }
         Ok(page)
     }
@@ -1120,7 +1252,7 @@ impl PeerCoinReader {
         max_coins: u32,
         dials: &AtomicU64,
         deadline: Instant,
-    ) -> Result<(CoinPageData, Option<String>), PageRefusal> {
+    ) -> Result<(CoinPageData, Option<ReadEndpoint>), PageRefusal> {
         let endpoints = match snapshot_id {
             Some(id) => vec![self
                 .pinned_endpoint(ScanKind::Coins, domain, id)
@@ -1162,7 +1294,7 @@ impl PeerCoinReader {
                     return Ok((page, Some(endpoint)));
                 }
                 Err(decline) => {
-                    self.log_decline(&endpoint, &domain, &decline.reason);
+                    self.log_decline(&endpoint.addr, &domain, &decline.reason);
                     declines.push(&decline.reason);
                     transfer |= decline.transfer;
                 }
@@ -1219,6 +1351,7 @@ impl PeerCoinReader {
             .await
             .into_iter()
             .take(MAX_ATTEMPTS)
+            .map(ReadEndpoint::archive)
         {
             let page = match self
                 .connections
@@ -1262,7 +1395,7 @@ impl PeerCoinReader {
                 })
             })();
             if let Some(page) = decoded {
-                return Some((page, endpoint));
+                return Some((page, endpoint.addr));
             }
         }
         None
@@ -1370,6 +1503,7 @@ mod tests {
         GetShardVertexResponse, ListLegacyCoinsRequest, ListLegacyCoinsResponse,
         ListShardCoinsRequest, ListShardCoinsResponse, ListShardEscrowsResponse, ShardCoin,
     };
+    use std::slice::from_ref;
     use tonic::{Request, Response, Status};
 
     fn page(has_more: bool) -> PageCost {
@@ -1536,9 +1670,11 @@ mod tests {
         let dials = Arc::new(AtomicU64::new(0));
         let dial: Dial<quil_rpc::ArchiveClient> = {
             let dials = dials.clone();
-            Arc::new(move |endpoint: String| {
+            Arc::new(move |endpoint: ReadEndpoint| {
                 dials.fetch_add(1, Ordering::SeqCst);
-                Box::pin(async move { quil_rpc::ArchiveClient::connect_plaintext(&endpoint).await })
+                Box::pin(
+                    async move { quil_rpc::ArchiveClient::connect_plaintext(&endpoint.addr).await },
+                )
             })
         };
         let reader = PeerCoinReader::new(
@@ -1590,7 +1726,7 @@ mod tests {
     /// Connections numbered by dial, for the pool alone.
     fn numbered_connections(idle: Duration, capacity: usize) -> ReadConnections<Arc<u64>> {
         let dialed = AtomicU64::new(0);
-        let dial: Dial<Arc<u64>> = Arc::new(move |_: String| {
+        let dial: Dial<Arc<u64>> = Arc::new(move |_: ReadEndpoint| {
             let n = dialed.fetch_add(1, Ordering::SeqCst) + 1;
             Box::pin(async move { Ok(Arc::new(n)) })
         });
@@ -1603,12 +1739,18 @@ mod tests {
         let connections = numbered_connections(idle, 2);
         let dials = AtomicU64::new(0);
         let number = |client: Arc<u64>| async move { Ok::<_, ArchiveClientError>(*client) };
-        assert_eq!(connections.call("a", &dials, number).await.ok(), Some(1));
-        assert_eq!(connections.call("a", &dials, number).await.ok(), Some(1));
+        assert_eq!(
+            connections.call(&"a".into(), &dials, number).await.ok(),
+            Some(1)
+        );
+        assert_eq!(
+            connections.call(&"a".into(), &dials, number).await.ok(),
+            Some(1)
+        );
         // The peer closed connection 1 while it was kept: the call goes
         // again at once on a new one.
         let served = connections
-            .call("a", &dials, |client: Arc<u64>| async move {
+            .call(&"a".into(), &dials, |client: Arc<u64>| async move {
                 match *client {
                     1 => Err(closed()),
                     n => Ok(n),
@@ -1618,31 +1760,47 @@ mod tests {
         assert_eq!(served.ok(), Some(2));
         // A refusal is the peer's answer, not a broken connection.
         let refused = connections
-            .call("a", &dials, |_| async {
+            .call(&"a".into(), &dials, |_| async {
                 Err::<u64, _>(ArchiveClientError::Rpc(Status::not_found("no such coin")))
             })
             .await;
         assert!(matches!(refused, Err(CallError::Call(_))));
-        assert_eq!(connections.call("a", &dials, number).await.ok(), Some(2));
+        assert_eq!(
+            connections.call(&"a".into(), &dials, number).await.ok(),
+            Some(2)
+        );
         assert_eq!(dials.load(Ordering::SeqCst), 2);
         // Unused past the idle bound, the connection is released without
         // another call...
-        let kept = Arc::downgrade(&connections.open.lock().by_endpoint["a"].client);
+        let kept =
+            Arc::downgrade(&connections.open.lock().by_endpoint[&ReadEndpoint::from("a")].client);
         tokio::time::sleep(idle * 3).await;
         assert!(connections.open.lock().by_endpoint.is_empty());
         assert!(kept.upgrade().is_none(), "the connection was dropped");
         // ...and the next call dials.
-        assert_eq!(connections.call("a", &dials, number).await.ok(), Some(3));
+        assert_eq!(
+            connections.call(&"a".into(), &dials, number).await.ok(),
+            Some(3)
+        );
         // At most `capacity` endpoints, least recently used dropped first.
-        assert_eq!(connections.call("b", &dials, number).await.ok(), Some(4));
-        assert_eq!(connections.call("a", &dials, number).await.ok(), Some(3));
-        assert_eq!(connections.call("c", &dials, number).await.ok(), Some(5));
+        assert_eq!(
+            connections.call(&"b".into(), &dials, number).await.ok(),
+            Some(4)
+        );
+        assert_eq!(
+            connections.call(&"a".into(), &dials, number).await.ok(),
+            Some(3)
+        );
+        assert_eq!(
+            connections.call(&"c".into(), &dials, number).await.ok(),
+            Some(5)
+        );
         let mut endpoints: Vec<_> = connections
             .open
             .lock()
             .by_endpoint
             .keys()
-            .cloned()
+            .map(|endpoint| endpoint.addr.clone())
             .collect();
         endpoints.sort();
         assert_eq!(endpoints, vec!["a", "c"]);
@@ -1783,123 +1941,204 @@ mod tests {
         }
     }
 
+    /// A registered prover's record naming `host` for each `claimed` shard,
+    /// and its registry entry, serving the `served` shards.
+    fn registered(
+        seed: u8,
+        claimed: &[Vec<u8>],
+        served: &[Vec<u8>],
+        host: &str,
+    ) -> (
+        quil_p2p::CanonicalPeerInfo,
+        quil_types::consensus::ProverInfo,
+    ) {
+        use crate::master_node::peer_info_file::test_prover;
+        use quil_types::consensus::ProverStatus;
+        let public_key = vec![seed; 897];
+        let info = quil_p2p::CanonicalPeerInfo {
+            peer_id: quil_p2p::peer_id_from_falcon_pubkey(&public_key),
+            public_key: public_key.clone(),
+            reachability: claimed
+                .iter()
+                .map(|filter| quil_p2p::CanonicalReachability {
+                    filter: filter.clone(),
+                    pubsub_multiaddrs: Vec::new(),
+                    stream_multiaddrs: vec![format!("/ip4/{host}/tcp/8340")],
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut prover = test_prover(&public_key, &[], ProverStatus::Active);
+        prover.allocations = served
+            .iter()
+            .flat_map(|filter| test_prover(&public_key, filter, ProverStatus::Active).allocations)
+            .collect();
+        (info, prover)
+    }
+
+    /// A reader over `records`, whose provers the registry holds.
+    fn reader_of(
+        records: Vec<(
+            quil_p2p::CanonicalPeerInfo,
+            quil_types::consensus::ProverInfo,
+        )>,
+        pool: Arc<quil_rpc::ArchiveEndpointPool>,
+    ) -> PeerCoinReader {
+        let (cache, provers): (HashMap<_, _>, Vec<_>) = records
+            .into_iter()
+            .map(|(info, prover)| ((info.peer_id.clone(), info), prover))
+            .unzip();
+        PeerCoinReader::new(
+            Arc::new(parking_lot::RwLock::new(cache)),
+            pool,
+            vec![0; 32],
+            1,
+        )
+        .with_prover_registry(Arc::new(
+            quil_engine::test_support::TestProverRegistry::with_provers(provers),
+        ))
+    }
+
+    fn no_archives() -> Arc<quil_rpc::ArchiveEndpointPool> {
+        Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO))
+    }
+
+    fn addrs(endpoints: Vec<ReadEndpoint>) -> Vec<String> {
+        endpoints
+            .into_iter()
+            .map(|endpoint| endpoint.addr)
+            .collect()
+    }
+
     /// A partial holder or a peer covering a different application cannot
     /// answer an application-wide wallet read.
     #[test]
     fn covering_peers_are_selected_by_advertised_filter() {
         let domain = [0xAB; 32];
-        let mut cache = HashMap::new();
-        cache.insert(
-            vec![1],
-            peer(domain.to_vec(), vec!["/ip4/10.0.0.1/tcp/8340".into()]),
-        );
-        cache.insert(
-            vec![2],
-            peer([0xCD; 32].to_vec(), vec!["/ip4/10.0.0.2/tcp/8340".into()]),
-        );
-        cache.insert(
-            vec![3],
-            peer(
-                quil_forest::encode_shard_bit_path(&domain, &[false]),
-                vec!["/ip4/10.0.0.3/tcp/8340".into()],
-            ),
-        );
-        let reader = PeerCoinReader::new(
-            Arc::new(parking_lot::RwLock::new(cache)),
-            Arc::new(quil_rpc::ArchiveEndpointPool::new(
-                std::time::Duration::ZERO,
-            )),
-            vec![0; 32],
-            1,
+        let root = domain.to_vec();
+        let other = [0xCD; 32].to_vec();
+        let half = quil_forest::encode_shard_bit_path(&domain, &[false]);
+        let reader = reader_of(
+            vec![
+                registered(1, from_ref(&root), from_ref(&root), "10.0.0.1"),
+                registered(2, from_ref(&other), from_ref(&other), "10.0.0.2"),
+                registered(3, from_ref(&half), from_ref(&half), "10.0.0.3"),
+            ],
+            no_archives(),
         );
         let endpoints = reader.covering_endpoints(&domain);
         assert_eq!(endpoints.len(), 1, "{endpoints:?}");
-        assert!(endpoints[0].contains("10.0.0.1"), "{endpoints:?}");
+        assert!(endpoints[0].addr.contains("10.0.0.1"), "{endpoints:?}");
+        // The dial must reach the prover whose record named the endpoint.
+        let (info, _) = registered(1, &[], &[], "");
+        assert_eq!(
+            endpoints[0].peer,
+            Some(quil_p2p::PeerId::from_bytes(&info.peer_id).unwrap())
+        );
         // An application nobody advertises has no covering candidate; the
         // caller then falls back to archives, and failing those, refuses.
         assert!(reader.covering_endpoints(&[0xEE; 32]).is_empty());
     }
 
+    /// Only a registered prover serving the shards it claims covers them:
+    /// not an unregistered key, nor a prover only joining them or serving
+    /// another; and without a registry, no peer covers anything.
     #[test]
-    fn covering_partition_must_share_an_endpoint_and_peer() {
+    fn covering_peers_must_serve_the_claimed_shards() {
+        use crate::master_node::peer_info_file::test_prover;
+        use quil_types::consensus::ProverStatus;
         let domain = [0xAB; 32];
-        let reach = |path: &[bool], host: &str| {
-            peer(
-                quil_forest::encode_shard_bit_path(&domain, path),
-                vec![format!("/ip4/{host}/tcp/8340")],
-            )
-            .reachability
-            .remove(0)
-        };
-        let mut complete = quil_p2p::CanonicalPeerInfo::default();
-        complete.reachability = vec![
-            reach(&[false, false], "10.0.0.1"),
-            reach(&[false, true], "10.0.0.1"),
-            reach(&[true], "10.0.0.1"),
+        let root = domain.to_vec();
+        let (joining, _) = registered(4, from_ref(&root), &[], "10.0.0.4");
+        let joining_prover = test_prover(&[4; 897], &root, ProverStatus::Joining);
+        let records = vec![
+            registered(1, from_ref(&root), from_ref(&root), "10.0.0.1"),
+            registered(2, from_ref(&root), &[[0xCD; 32].to_vec()], "10.0.0.2"),
+            (joining, joining_prover),
         ];
-        let mut separate_workers = quil_p2p::CanonicalPeerInfo::default();
-        separate_workers.reachability =
-            vec![reach(&[false], "10.0.0.2"), reach(&[true], "10.0.0.3")];
-        let cache = HashMap::from([
-            (vec![1], complete),
-            (vec![2], separate_workers),
-            // Even if different peers advertise the same endpoint, neither
-            // individually claims it can answer a complete scan.
-            (
-                vec![3],
-                peer(
-                    quil_forest::encode_shard_bit_path(&domain, &[false]),
-                    vec!["/ip4/10.0.0.4/tcp/8340".into()],
-                ),
-            ),
-            (
-                vec![4],
-                peer(
-                    quil_forest::encode_shard_bit_path(&domain, &[true]),
-                    vec!["/ip4/10.0.0.4/tcp/8340".into()],
-                ),
-            ),
-            // Malformed suffixes must not count as a root advertisement.
-            (
-                vec![5],
-                peer(
-                    [domain.to_vec(), vec![0x01, 0x02]].concat(),
-                    vec!["/ip4/10.0.0.5/tcp/8340".into()],
-                ),
-            ),
-            (
-                vec![6],
-                peer(
-                    quil_forest::encode_shard_bit_path(&domain, &vec![false; 65535]),
-                    vec!["/ip4/10.0.0.6/tcp/8340".into()],
-                ),
-            ),
-        ]);
+        let mut cache: HashMap<_, _> = records
+            .iter()
+            .map(|(info, _)| (info.peer_id.clone(), info.clone()))
+            .collect();
+        // Unregistered, and sorting first.
+        cache.insert(
+            vec![9],
+            peer(root.clone(), vec!["/ip4/10.0.0.0/tcp/8340".into()]),
+        );
+        let provers = records.into_iter().map(|(_, prover)| prover).collect();
         let reader = PeerCoinReader::new(
             Arc::new(parking_lot::RwLock::new(cache)),
-            Arc::new(quil_rpc::ArchiveEndpointPool::new(
-                std::time::Duration::ZERO,
-            )),
+            no_archives(),
             vec![0; 32],
             1,
         );
-        assert_eq!(reader.covering_endpoints(&domain), vec!["10.0.0.1:8340"]);
+        assert!(reader.covering_endpoints(&domain).is_empty());
+        let reader = reader.with_prover_registry(Arc::new(
+            quil_engine::test_support::TestProverRegistry::with_provers(provers),
+        ));
+        assert_eq!(
+            addrs(reader.covering_endpoints(&domain)),
+            vec!["10.0.0.1:8340"]
+        );
+    }
+
+    #[test]
+    fn covering_partition_must_share_an_endpoint_and_peer() {
+        let domain = [0xAB; 32];
+        let shard = |path: &[bool]| quil_forest::encode_shard_bit_path(&domain, path);
+        let complete = [
+            shard(&[false, false]),
+            shard(&[false, true]),
+            shard(&[true]),
+        ];
+        let halves = [shard(&[false]), shard(&[true])];
+        let mut separate_workers = registered(2, &halves, &halves, "10.0.0.2");
+        separate_workers.0.reachability[1].stream_multiaddrs =
+            vec!["/ip4/10.0.0.3/tcp/8340".into()];
+        let long = quil_forest::encode_shard_bit_path(&domain, &vec![false; 65535]);
+        let reader = reader_of(
+            vec![
+                registered(1, &complete, &complete, "10.0.0.1"),
+                separate_workers,
+                // Even if different peers advertise the same endpoint, neither
+                // individually claims it can answer a complete scan.
+                registered(3, &[shard(&[false])], &[shard(&[false])], "10.0.0.4"),
+                registered(4, &[shard(&[true])], &[shard(&[true])], "10.0.0.4"),
+                // Malformed suffixes must not count as a root advertisement.
+                registered(
+                    5,
+                    &[[domain.to_vec(), vec![0x01, 0x02]].concat()],
+                    &[[domain.to_vec(), vec![0x01, 0x02]].concat()],
+                    "10.0.0.5",
+                ),
+                registered(6, from_ref(&long), from_ref(&long), "10.0.0.6"),
+                // A complete partition claimed, two of its shards served.
+                registered(7, &complete, &complete[..2], "10.0.0.7"),
+            ],
+            no_archives(),
+        );
+        assert_eq!(
+            addrs(reader.covering_endpoints(&domain)),
+            vec!["10.0.0.1:8340"]
+        );
     }
 
     #[tokio::test]
     async fn covering_peer_failures_leave_a_separate_archive_budget() {
         let domain = [0xAB; 32];
-        let cache = (1..=4)
-            .map(|i| {
-                (
-                    vec![i],
-                    peer(domain.to_vec(), vec![format!("/ip4/10.0.0.{i}/tcp/8340")]),
-                )
-            })
+        let root = domain.to_vec();
+        let records: Vec<_> = (1..=4)
+            .map(|i| registered(i, from_ref(&root), from_ref(&root), &format!("10.0.0.{i}")))
             .collect();
-        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(
-            std::time::Duration::ZERO,
-        ));
+        let peer_of = |seed: u8| {
+            let (info, _) = registered(seed, &[], &[], "");
+            quil_p2p::PeerId::from_bytes(&info.peer_id).unwrap()
+        };
+        // The archive at the first covering endpoint is that prover: it is
+        // asked once. The one at the second is pinned to no one, so a
+        // record naming its address does not take its place.
+        quil_rpc::archive_client::pin_archive_peer("10.0.0.1:8340", peer_of(1)).unwrap();
+        let pool = no_archives();
         // A duplicate must not use an archive attempt, regardless of where
         // it appears in the pool. Distinct archives still get all three.
         for endpoint in [
@@ -1912,32 +2151,97 @@ mod tests {
         ] {
             pool.add(endpoint.into()).await;
         }
-        let reader = PeerCoinReader::new(
-            Arc::new(parking_lot::RwLock::new(cache)),
-            pool,
-            vec![0; 32],
-            1,
-        );
+        let reader = reader_of(records, pool);
         let endpoints = reader.read_endpoints(&domain).await;
         assert_eq!(
-            endpoints,
+            addrs(endpoints.clone()),
             vec![
                 "10.0.0.1:8340",
                 "10.0.0.2:8340",
                 "10.0.0.3:8340",
                 "10.0.1.1:8340",
+                "10.0.0.2:8340",
                 "10.0.1.2:8340",
-                "10.0.1.3:8340",
+            ]
+        );
+        assert_eq!(
+            endpoints.iter().map(|e| e.peer).collect::<Vec<_>>(),
+            vec![
+                Some(peer_of(1)),
+                Some(peer_of(2)),
+                Some(peer_of(3)),
+                None,
+                None,
+                None,
             ]
         );
         // Model three declining peers: an archive must still be attempted.
-        let successful = endpoints
-            .iter()
-            .find(|endpoint| endpoint.starts_with("10.0.1."));
-        assert_eq!(successful.map(String::as_str), Some("10.0.1.1:8340"));
+        let successful = endpoints.iter().find(|endpoint| endpoint.peer.is_none());
         assert_eq!(
-            reader.read_endpoints(&[0xEE; 32]).await,
+            successful.map(|endpoint| endpoint.addr.as_str()),
+            Some("10.0.1.1:8340")
+        );
+        assert_eq!(
+            addrs(reader.read_endpoints(&[0xEE; 32]).await),
             vec!["10.0.0.1:8340", "10.0.1.1:8340", "10.0.0.2:8340"]
+        );
+    }
+
+    /// A covering prover's endpoint is dialed only as that prover: a node
+    /// there answering with another identity is refused before any read is
+    /// sent, so a record cannot name another node's address and have that
+    /// node answer for the prover. A connection kept for the prover is not
+    /// handed to a read meant for another peer at that address.
+    #[tokio::test]
+    async fn a_covering_endpoint_is_dialed_only_as_its_prover() {
+        use crate::master_node::peer_info_file::{another_peer, pqnoise_listener};
+        let (addr, prover) = pqnoise_listener().await;
+        let reader = PeerCoinReader::new(
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            no_archives(),
+            quil_p2p::generate_falcon_signing_key(),
+            1,
+        );
+        let impostor = ReadEndpoint {
+            addr: addr.clone(),
+            peer: Some(another_peer()),
+        };
+        let dials = AtomicU64::new(0);
+        let endpoint = ReadEndpoint {
+            addr,
+            peer: Some(prover),
+        };
+        // The impostor is refused before the prover's connection is kept,
+        // and again after it.
+        for (expected, accepted) in [(&impostor, false), (&endpoint, true), (&impostor, false)] {
+            let connected = tokio::time::timeout(
+                Duration::from_secs(10),
+                reader.connections.connect(expected, &dials),
+            )
+            .await
+            .expect("the dial ends");
+            match connected {
+                Ok(_) if accepted => {}
+                Ok(_) => panic!("a node answering as another peer stood in for the prover"),
+                Err(error) if accepted => {
+                    panic!("the prover was refused: {}", with_causes(&error))
+                }
+                Err(error) => {
+                    let error = with_causes(&error);
+                    assert!(error.contains("identity does not match"), "{error}");
+                }
+            }
+        }
+        assert!(reader
+            .connections
+            .open
+            .lock()
+            .by_endpoint
+            .contains_key(&endpoint));
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            3,
+            "the impostor was dialed again"
         );
     }
 
@@ -2073,16 +2377,12 @@ mod tests {
         reader.remember_scan(ScanKind::Coins, domain, id, "coins".into(), &page(true));
         reader.remember_scan(ScanKind::Escrows, domain, id, "escrows".into(), &page(true));
         assert_eq!(
-            reader
-                .pinned_endpoint(ScanKind::Coins, domain, id)
-                .as_deref(),
-            Some("coins")
+            reader.pinned_endpoint(ScanKind::Coins, domain, id),
+            Some(ReadEndpoint::from("coins"))
         );
         assert_eq!(
-            reader
-                .pinned_endpoint(ScanKind::Escrows, domain, id)
-                .as_deref(),
-            Some("escrows")
+            reader.pinned_endpoint(ScanKind::Escrows, domain, id),
+            Some(ReadEndpoint::from("escrows"))
         );
         assert!(reader
             .pinned_endpoint(ScanKind::Coins, [3; 32], id)
@@ -2151,8 +2451,10 @@ mod tests {
     async fn plaintext_reader(endpoint: &str, budget: Duration) -> PeerCoinReader {
         let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO));
         pool.add(endpoint.to_string()).await;
-        let dial: Dial<quil_rpc::ArchiveClient> = Arc::new(|endpoint: String| {
-            Box::pin(async move { quil_rpc::ArchiveClient::connect_plaintext(&endpoint).await })
+        let dial: Dial<quil_rpc::ArchiveClient> = Arc::new(|endpoint: ReadEndpoint| {
+            Box::pin(
+                async move { quil_rpc::ArchiveClient::connect_plaintext(&endpoint.addr).await },
+            )
         });
         PeerCoinReader::new(
             Arc::new(parking_lot::RwLock::new(HashMap::new())),
@@ -2343,10 +2645,13 @@ mod tests {
         connections.stale_failure = Duration::from_millis(20);
         let dials = AtomicU64::new(0);
         let number = |client: Arc<u64>| async move { Ok::<_, ArchiveClientError>(*client) };
-        assert_eq!(connections.call("a", &dials, number).await.ok(), Some(1));
+        assert_eq!(
+            connections.call(&"a".into(), &dials, number).await.ok(),
+            Some(1)
+        );
         let calls = AtomicU64::new(0);
         let late = connections
-            .call("a", &dials, |_: Arc<u64>| {
+            .call(&"a".into(), &dials, |_: Arc<u64>| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 async {
                     tokio::time::sleep(Duration::from_millis(40)).await;
@@ -2357,9 +2662,48 @@ mod tests {
         assert!(matches!(late, Err(CallError::Call(_))));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
-            connections.call("a", &dials, number).await.ok(),
+            connections.call(&"a".into(), &dials, number).await.ok(),
             Some(2),
             "the failed connection is gone"
+        );
+    }
+
+    /// Unregistered records claiming an application, sorting before every
+    /// archive, were the first three peers a wallet read asked.
+    #[tokio::test]
+    async fn reproduces_unregistered_covering_peers_asked_for_wallet_reads() {
+        let domain = [0xAB; 32];
+        let cache = (1..=3)
+            .map(|i| {
+                (
+                    vec![i],
+                    peer(domain.to_vec(), vec![format!("/ip4/10.0.0.{i}/tcp/8340")]),
+                )
+            })
+            .collect();
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(
+            std::time::Duration::ZERO,
+        ));
+        pool.add("10.0.1.1:8340".into()).await;
+        let reader = PeerCoinReader::new(
+            Arc::new(parking_lot::RwLock::new(cache)),
+            pool,
+            vec![0; 32],
+            1,
+        );
+        let asked: Vec<String> = reader
+            .read_endpoints(&domain)
+            .await
+            .iter()
+            .map(|endpoint| endpoint.to_string())
+            .collect();
+        let unregistered: Vec<&String> = asked
+            .iter()
+            .filter(|endpoint| endpoint.starts_with("10.0.0."))
+            .collect();
+        assert!(
+            unregistered.is_empty(),
+            "unregistered peers asked for a wallet read: {unregistered:?} (in order {asked:?})"
         );
     }
 }

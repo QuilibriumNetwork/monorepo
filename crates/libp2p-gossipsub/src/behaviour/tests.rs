@@ -599,6 +599,7 @@ fn test_join() {
                 peer_id,
                 Receiver {
                     priority_queue_len: c.priority_queue_len,
+                    queued_bytes: c.queued_bytes,
                     priority: c.priority,
                     non_priority: c.non_priority,
                 },
@@ -1176,6 +1177,7 @@ fn test_handle_iwant_msg_cached_shifted() {
                 peer_id,
                 Receiver {
                     priority_queue_len: c.priority_queue_len,
+                    queued_bytes: c.queued_bytes,
                     priority: c.priority,
                     non_priority: c.non_priority,
                 },
@@ -1481,6 +1483,7 @@ fn count_control_msgs(
             peer_id,
             Receiver {
                 priority_queue_len: c.priority_queue_len,
+                queued_bytes: c.queued_bytes,
                 priority: c.priority,
                 non_priority: c.non_priority,
             },
@@ -1506,6 +1509,7 @@ fn flush_events<D: DataTransform, F: TopicSubscriptionFilter>(
             peer_id,
             Receiver {
                 priority_queue_len: c.priority_queue_len,
+                queued_bytes: c.queued_bytes,
                 priority: c.priority,
                 non_priority: c.non_priority,
             },
@@ -4498,7 +4502,7 @@ fn test_opportunistic_grafting() {
     let (mut gs, peers, _receivers, topics) = inject_nodes1()
         .peer_no(5)
         .topics(vec!["test".into()])
-        .to_subscribe(false)
+        .to_subscribe(true)
         .gs_config(config)
         .explicit(0)
         .outbound(0)
@@ -4807,7 +4811,7 @@ fn test_limit_number_of_message_ids_inside_ihave() {
     let (mut gs, peers, mut receivers, topics) = inject_nodes1()
         .peer_no(config.mesh_n_high())
         .topics(vec!["test".into()])
-        .to_subscribe(false)
+        .to_subscribe(true)
         .gs_config(config)
         .create_network();
 
@@ -5457,6 +5461,105 @@ fn sends_idontwant_for_the_first_copy_only() {
     gs.handle_received_message(message, &peers[3]);
     let (duplicates, _) = count_control_msgs(receivers, is_idontwant);
     assert_eq!(duplicates, 0, "a duplicate must not send IDONTWANT again");
+}
+
+/// QUILIBRIUM: a peer whose messages have failed at every heartbeat for
+/// `SLOW_PEER_DISCONNECT_AFTER` has its connections closed; a peer whose
+/// messages failed in one heartbeat only does not.
+#[test]
+fn stalled_peer_connections_are_closed() {
+    let (mut gs, peers, _receivers, _topic_hashes) = inject_nodes1()
+        .peer_no(2)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .create_network();
+    let failed = || FailedMessages {
+        publish: 0,
+        forward: 1,
+        priority: 0,
+        non_priority: 1,
+        timeout: 0,
+    };
+    let long_ago = Instant::now()
+        .checked_sub(SLOW_PEER_DISCONNECT_AFTER + Duration::from_secs(1))
+        .unwrap();
+    gs.slow_since.insert(peers[0], long_ago);
+    gs.failed_messages.insert(peers[0], failed());
+    gs.failed_messages.insert(peers[1], failed());
+    gs.events.clear();
+
+    gs.heartbeat();
+
+    let closed: Vec<PeerId> = gs
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            ToSwarm::CloseConnection { peer_id, .. } => Some(*peer_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closed, vec![peers[0]]);
+    assert!(gs.slow_since.contains_key(&peers[1]));
+    assert!(!gs.slow_since.contains_key(&peers[0]));
+}
+
+/// QUILIBRIUM: a message signed with a refused key type costs its forwarder
+/// nothing, unlike an invalid signature, and releases the promises of its id.
+#[test]
+fn refused_key_types_are_dropped_without_penalty() {
+    let (mut gs, peers, _receivers, topic_hashes) = inject_nodes1()
+        .peer_no(2)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .scoring(Some((
+            PeerScoreParams::default(),
+            PeerScoreThresholds::default(),
+        )))
+        .create_network();
+    // The id the behaviour computes for the refused message (by default its
+    // source and sequence number).
+    let author = PeerId::random();
+    let message = || RawMessage {
+        source: Some(author),
+        data: vec![5; 8],
+        sequence_number: Some(7),
+        topic: topic_hashes[0].clone(),
+        signature: None,
+        key: None,
+        validated: false,
+    };
+    let msg_id = gs.config.message_id(&Message {
+        source: Some(author),
+        data: vec![5; 8],
+        sequence_number: Some(7),
+        topic: topic_hashes[0].clone(),
+    });
+    gs.gossip_promises.add_promise(
+        peers[1],
+        std::slice::from_ref(&msg_id),
+        Instant::now() + Duration::from_secs(60),
+    );
+    let deliver = |gs: &mut Behaviour, peer: PeerId, error: ValidationError| {
+        gs.on_connection_handler_event(
+            peer,
+            ConnectionId::new_unchecked(0),
+            HandlerEvent::Message {
+                rpc: Rpc {
+                    messages: vec![],
+                    subscriptions: vec![],
+                    control_msgs: vec![],
+                },
+                invalid_messages: vec![(message(), error)],
+            },
+        );
+    };
+
+    deliver(&mut gs, peers[0], ValidationError::InvalidSignature);
+    deliver(&mut gs, peers[1], ValidationError::RefusedKeyType);
+
+    assert!(gs.peer_score(&peers[0]).unwrap() < 0.0);
+    assert_eq!(gs.peer_score(&peers[1]), Some(0.0));
+    assert!(gs.gossip_promises.peers_for_message(&msg_id).is_empty());
 }
 
 /// QUILIBRIUM: IDONTWANT goes on the priority queue, ahead of queued forwards.
@@ -7061,4 +7164,243 @@ fn rpc_for_a_disconnected_peer_is_counted_not_queued() {
     let receiver = receivers.remove(&peers[1]).unwrap();
     let queued = receiver.priority.get_ref().len() + receiver.non_priority.get_ref().len();
     assert!(queued > 0, "the connected peer's RPC was not queued");
+}
+
+/// A copy of a large message that the behaviour refuses (here: its author is
+/// blacklisted) must not make the node tell its mesh it already has the
+/// message, or the genuine copies that follow are withheld from it.
+#[test]
+fn reproduces_idontwant_for_a_refused_copy() {
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(5)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(Config::default())
+        .explicit(1)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let author = PeerId::random();
+    gs.blacklist_peer(&author);
+    let message = RawMessage {
+        source: Some(author),
+        data: vec![12u8; 1024],
+        sequence_number: Some(0),
+        topic: topic_hashes[0].clone(),
+        signature: None,
+        key: None,
+        validated: true,
+    };
+
+    gs.handle_received_message(message, &peers[1]);
+
+    let (idontwants, _) =
+        count_control_msgs(receivers, |_, rpc| matches!(rpc, RpcOut::IDontWant(_)));
+    assert_eq!(
+        idontwants, 0,
+        "a refused copy sent {idontwants} IDONTWANTs for its message id"
+    );
+}
+
+/// A GRAFT is not a subscription and is not filtered like one, so the topics
+/// it names that the node does not serve must not be recorded for the peer.
+#[test]
+fn reproduces_graft_topics_recorded_without_subscription() {
+    let (mut gs, peers, _receivers, _topic_hashes) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .create_network();
+    let before = gs.connected_peers[&peers[0]].topics.len();
+    let grafted: Vec<TopicHash> = (0..1000)
+        .map(|i| TopicHash::from_raw(format!("unsubscribed-{i}")))
+        .collect();
+
+    gs.handle_graft(&peers[0], grafted);
+
+    let recorded = gs.connected_peers[&peers[0]].topics.len() - before;
+    assert_eq!(
+        recorded, 0,
+        "a GRAFT recorded {recorded} topics the node is not subscribed to for its sender"
+    );
+}
+
+/// A PRUNE names topics of its sender's choosing and asks for a backoff of
+/// up to an hour on each. Only a topic the node has joined may keep one
+/// (upstream GHSA-vrx6-jcp8-vm7m); the others were stored for the whole
+/// backoff, without limit.
+#[test]
+fn reproduces_prune_backoff_for_unjoined_topics() {
+    let (mut gs, peers, _receivers, topic_hashes) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .create_network();
+    let pruned: Vec<TopicHash> = (0..1000)
+        .map(|i| TopicHash::from_raw(format!("unjoined-{i}")))
+        .collect();
+
+    gs.handle_prune(
+        &peers[0],
+        pruned
+            .iter()
+            .map(|topic| (topic.clone(), Vec::new(), Some(3600)))
+            .collect(),
+    );
+
+    let stored = pruned
+        .iter()
+        .filter(|topic| gs.backoffs.get_backoff_time(topic, &peers[0]).is_some())
+        .count();
+    assert_eq!(
+        stored, 0,
+        "a PRUNE stored backoffs for {stored} topics the node has not joined"
+    );
+    gs.handle_prune(
+        &peers[0],
+        vec![(topic_hashes[0].clone(), Vec::new(), Some(60))],
+    );
+    assert!(
+        gs.backoffs
+            .get_backoff_time(&topic_hashes[0], &peers[0])
+            .is_some(),
+        "a PRUNE for a joined topic keeps its backoff"
+    );
+}
+
+/// An explicit peer's GRAFT is answered with a PRUNE, which stores a backoff
+/// for its topic: only for the topics the node joined.
+#[test]
+fn explicit_peer_grafts_back_off_only_joined_topics() {
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .explicit(1)
+        .create_network();
+    let mut grafted: Vec<TopicHash> = (0..1000)
+        .map(|i| TopicHash::from_raw(format!("unjoined-{i}")))
+        .collect();
+    grafted.push(topic_hashes[0].clone());
+
+    gs.handle_graft(&peers[0], grafted.clone());
+
+    let stored = grafted
+        .iter()
+        .filter(|topic| gs.backoffs.get_backoff_time(topic, &peers[0]).is_some())
+        .count();
+    assert_eq!(
+        stored, 1,
+        "an explicit peer's GRAFT left {stored} backoffs, for 1 joined topic"
+    );
+    let (prunes, _) = count_control_msgs(receivers, |peer_id, m| {
+        peer_id == &peers[0] && matches!(m, RpcOut::Prune(_))
+    });
+    assert_eq!(prunes, 1, "only the joined topic is pruned");
+}
+
+/// A GRAFT for a topic the node serves but its sender never subscribed to is
+/// dropped, as upstream 0.49.5 drops it (GHSA-g3g5-x568-qvqx): no mesh link,
+/// no recorded subscription, no PRUNE. After the subscription it is taken.
+#[test]
+fn grafts_for_topics_the_peer_did_not_subscribe_to_are_dropped() {
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(false)
+        .create_network();
+
+    gs.handle_graft(&peers[0], topic_hashes.clone());
+
+    assert!(
+        !gs.mesh[&topic_hashes[0]].contains(&peers[0]),
+        "a GRAFT without a subscription added its sender to the mesh"
+    );
+    assert!(
+        !gs.connected_peers[&peers[0]]
+            .topics
+            .contains(&topic_hashes[0]),
+        "a GRAFT was recorded as a subscription"
+    );
+    let (prunes, _) = count_control_msgs(receivers, |peer_id, m| {
+        peer_id == &peers[0] && matches!(m, RpcOut::Prune(_))
+    });
+    assert_eq!(prunes, 0, "a dropped GRAFT is not answered");
+
+    gs.handle_received_subscriptions(
+        &[Subscription {
+            action: SubscriptionAction::Subscribe,
+            topic_hash: topic_hashes[0].clone(),
+        }],
+        &peers[0],
+    );
+    gs.mesh.get_mut(&topic_hashes[0]).unwrap().remove(&peers[0]);
+    gs.handle_graft(&peers[0], topic_hashes.clone());
+    assert!(
+        gs.mesh[&topic_hashes[0]].contains(&peers[0]),
+        "a GRAFT after the subscription is taken"
+    );
+}
+
+/// QUILIBRIUM: a peer that answers our IWANT for the id an older release computes
+/// (`Config::legacy_message_id`) is counted, also when the answer is a duplicate. A copy from a
+/// peer we asked nothing, and an answer under the current id, are not.
+#[test]
+fn iwant_answers_under_a_legacy_id_are_counted() {
+    // Data starting with 0: no legacy id; 2: the legacy id is the current one; else it differs.
+    let current = |data: &[u8]| MessageId::new(&[b"current-".as_slice(), data].concat());
+    let config = ConfigBuilder::default()
+        .message_id_fn(move |message| current(&message.data))
+        .legacy_message_id_fn(move |message| match message.data.first() {
+            Some(0) => None,
+            Some(2) => Some(current(&message.data)),
+            _ => Some(MessageId::new(&message.data)),
+        })
+        .build()
+        .unwrap();
+    let (mut gs, peers, _receivers, topic_hashes) = inject_nodes1()
+        .peer_no(5)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(config)
+        .create_network();
+    let message = |data: Vec<u8>| RawMessage {
+        source: Some(PeerId::random()),
+        data,
+        sequence_number: Some(0),
+        topic: topic_hashes[0].clone(),
+        signature: None,
+        key: None,
+        validated: true,
+    };
+    let topic = topic_hashes[0].clone();
+    let (legacy, mesh_first) = (vec![1u8, 1], vec![1u8, 2]);
+    let (same, none) = (vec![2u8, 3], vec![0u8, 4]);
+
+    // peers[0] answers an IWANT for its legacy id.
+    gs.handle_ihave(
+        &peers[0],
+        vec![(topic.clone(), vec![MessageId::new(&legacy)])],
+    );
+    gs.handle_received_message(message(legacy), &peers[0]);
+    // peers[1] was asked; peers[2] delivers first, then peers[1] answers with a duplicate.
+    gs.handle_ihave(
+        &peers[1],
+        vec![(topic.clone(), vec![MessageId::new(&mesh_first)])],
+    );
+    gs.handle_received_message(message(mesh_first.clone()), &peers[2]);
+    gs.handle_received_message(message(mesh_first), &peers[1]);
+    // peers[3] answers under the current id; peers[4] sends a message with no legacy id.
+    gs.handle_ihave(&peers[3], vec![(topic, vec![current(&same)])]);
+    gs.handle_received_message(message(same), &peers[3]);
+    gs.handle_received_message(message(none), &peers[4]);
+
+    assert_eq!(
+        gs.take_legacy_id_answers(),
+        HashMap::from([(peers[0], 1), (peers[1], 1)]),
+        "legacy-id answers counted for the wrong peers"
+    );
+    assert!(
+        gs.take_legacy_id_answers().is_empty(),
+        "taking resets the counts"
+    );
 }

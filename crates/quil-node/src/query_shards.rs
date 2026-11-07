@@ -61,6 +61,33 @@ pub async fn run_query_prover_root(
     Ok(())
 }
 
+/// The archives a shard query asks: `archive_arg`, else the configured
+/// endpoints, else on mainnet the genesis archives' static endpoints. An
+/// endpoint whose peer is known (a genesis archive's, a configured one
+/// naming `/p2p/`) is pinned to it in this process, so the dial must reach
+/// that archive.
+fn query_endpoints(archive_arg: &str, configured: &[String], network: u8) -> Vec<String> {
+    if !archive_arg.is_empty() {
+        vec![archive_arg.to_string()]
+    } else if !configured.is_empty() {
+        configured
+            .iter()
+            .filter_map(|ma| {
+                let endpoint = crate::util::multiaddr::archive_multiaddr_to_host_port(ma, network)?;
+                if let Some(peer) = crate::util::multiaddr::archive_multiaddr_peer(ma) {
+                    // A conflicting entry keeps the first pin: its dial fails.
+                    let _ = quil_rpc::archive_client::pin_archive_peer(&endpoint, peer);
+                }
+                Some(endpoint)
+            })
+            .collect()
+    } else if network == 0 {
+        crate::master_node::pin_genesis_archive_endpoints()
+    } else {
+        Vec::new()
+    }
+}
+
 /// The error of a tool whose keystore holds a prover key it cannot use as
 /// the Falcon network identity.
 pub(crate) fn falcon_key_unavailable(keys_path: &Path, e: impl std::fmt::Display) -> anyhow::Error {
@@ -125,23 +152,7 @@ pub async fn run_query_shards(
         .get_private_key(quil_types::crypto::KeyType::Falcon512)
         .map_err(|e| crate::query_shards::falcon_key_unavailable(&keys_path, e))?;
 
-    let endpoints: Vec<String> = if !archive_arg.is_empty() {
-        vec![archive_arg.to_string()]
-    } else if !config.engine.archive_endpoints.is_empty() {
-        config
-            .engine
-            .archive_endpoints
-            .iter()
-            .filter_map(|ma| crate::util::multiaddr::archive_multiaddr_to_host_port(ma, network))
-            .collect()
-    } else if network == 0 {
-        quil_engine::genesis::genesis_archive_static_ips()
-            .into_iter()
-            .map(|(_pid, ip)| format!("{ip}:8340"))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let endpoints = query_endpoints(archive_arg, &config.engine.archive_endpoints, network);
     if endpoints.is_empty() {
         anyhow::bail!("no archive endpoint — pass `ip:8340`, or set engine.archiveEndpoints, or use network 0");
     }
@@ -293,4 +304,26 @@ pub async fn run_query_shards(
         anyhow::bail!("no reachable archive answered GetAppShards");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod r112_d2_tests {
+    use super::query_endpoints;
+
+    /// R112-D-2: a shard query of the genesis archives dials each static
+    /// endpoint pinned to its archive.
+    #[test]
+    fn r112_d2_a_shard_query_pins_the_genesis_archive_endpoints() {
+        let endpoints = query_endpoints("", &[], 0);
+        assert!(!endpoints.is_empty());
+        for (peer_id, ip) in quil_engine::genesis::genesis_archive_static_ips() {
+            let endpoint = format!("{ip}:8340");
+            assert!(endpoints.contains(&endpoint));
+            assert_eq!(
+                quil_rpc::archive_client::pinned_archive_peer(&endpoint),
+                Some(peer_id.parse::<quil_p2p::PeerId>().unwrap()),
+                "R112-D-2: a shard query dials the genesis archive endpoint {endpoint} unpinned"
+            );
+        }
+    }
 }

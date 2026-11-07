@@ -887,29 +887,68 @@ pub async fn fetch_shielded(token: Option<(GlobalArgs, u128)>) -> Msg {
             shielded_read(&TokenCtx::for_manager(global, max_fee)?).await
         })
         .await
-        .map_err(|e| format!("{e:#}"))
+        .map_err(|e| read_failure(&e))
     };
     #[cfg(not(feature = "confidential-tokens"))]
     let result = {
         let _ = token;
-        Err("this qclient build has no confidential tokens".into())
+        let failed = "this qclient build has no confidential tokens".to_string();
+        Err(super::transfer::ReadFailure::Failed(failed))
     };
     Msg::Shielded(result)
+}
+
+/// A failed read as the manager's notices tell it. A scan stopped by the
+/// node's snapshot age stops the same way when read again; another names
+/// where it stopped and why, and the notice adds what to do.
+#[cfg(feature = "confidential-tokens")]
+fn read_failure(error: &anyhow::Error) -> super::transfer::ReadFailure {
+    use super::transfer::ReadFailure;
+    match error.downcast_ref::<crate::commands::token::ScanStopped>() {
+        Some(stopped) => match stopped.outlived() {
+            Some(minutes) => ReadFailure::Outlived { minutes },
+            None => ReadFailure::Failed(stopped.cause()),
+        },
+        None => ReadFailure::Failed(format!("{error:#}")),
+    }
 }
 
 #[cfg(feature = "confidential-tokens")]
 async fn shielded_read(
     tc: &crate::commands::token::TokenCtx,
 ) -> anyhow::Result<super::transfer::Read> {
-    use crate::commands::token::{
-        confidential_balance, list_escrows, SCAN_MAX_COINS, SCAN_MAX_PAGES,
-    };
+    use crate::commands::token::{SCAN_MAX_COINS, SCAN_PAGES_UNCAPPED};
+    shielded_read_within(tc, SCAN_PAGES_UNCAPPED, SCAN_MAX_COINS).await
+}
+
+/// [`shielded_read`] within a page cap and a limit on the coins and on the
+/// pending transfers it keeps. The coins are read first and kept when the
+/// pending transfers' read fails, which the read then carries.
+#[cfg(feature = "confidential-tokens")]
+async fn shielded_read_within(
+    tc: &crate::commands::token::TokenCtx,
+    max_pages: usize,
+    max_kept: usize,
+) -> anyhow::Result<super::transfer::Read> {
+    use crate::commands::token::{confidential_balance, list_escrows};
     own_node_only(tc)?;
-    let coins = confidential_balance(tc, SCAN_MAX_PAGES, SCAN_MAX_COINS).await?;
+    let (coins, skipped) = confidential_balance(tc, max_pages, max_kept).await?;
     let application = hex::encode(quil_execution::domains::QUIL_TOKEN);
-    let escrows = list_escrows(tc, &application, SCAN_MAX_PAGES, SCAN_MAX_COINS).await?;
+    let (escrows, escrows_skipped, escrows_failed) =
+        match list_escrows(tc, &application, max_pages, max_kept).await {
+            Ok((escrows, skipped)) => (escrows, skipped, None),
+            Err(error) => (Vec::new(), Default::default(), Some(read_failure(&error))),
+        };
     Ok(super::transfer::Read {
         coins,
+        skipped: super::transfer::Skipped {
+            mismatched: skipped.mismatched,
+            duplicates: skipped.duplicates,
+            limited: skipped.limited,
+            escrows: escrows_skipped.limited,
+            escrows_mismatched: escrows_skipped.mismatched,
+        },
+        escrows_failed,
         escrows: escrows
             .into_iter()
             .map(|escrow| super::transfer::Escrow {
@@ -1088,14 +1127,14 @@ async fn transfer_action(
     use super::transfer::Kind;
     use crate::commands::token::{
         run_claim, run_merge, run_pending_create, run_transfer, Follow, SCAN_MAX_COINS,
-        SCAN_MAX_PAGES,
+        SCAN_PAGES_UNCAPPED,
     };
     // The manager prints each submission's identifiers into its notice and
     // leaves the wait to the operator (`token inclusion`, named in the notice).
     const NO_WAIT: std::time::Duration = std::time::Duration::ZERO;
     let no_follow = || Follow {
         wait: NO_WAIT,
-        max_pages: SCAN_MAX_PAGES,
+        max_pages: SCAN_PAGES_UNCAPPED,
     };
     own_node_only(tc)?;
     let app = quil_token();
@@ -1109,7 +1148,7 @@ async fn transfer_action(
                 recipient,
                 *amount,
                 None,
-                SCAN_MAX_PAGES,
+                SCAN_PAGES_UNCAPPED,
                 SCAN_MAX_COINS,
                 NO_WAIT,
             )
@@ -1127,7 +1166,7 @@ async fn transfer_action(
                 *amount,
                 preview.fee,
                 *refund_after,
-                SCAN_MAX_PAGES,
+                SCAN_PAGES_UNCAPPED,
                 SCAN_MAX_COINS,
                 NO_WAIT,
             )
@@ -1161,7 +1200,7 @@ async fn transfer_action(
                 &app,
                 &["all".to_string()],
                 preview.fee,
-                SCAN_MAX_PAGES,
+                SCAN_PAGES_UNCAPPED,
                 SCAN_MAX_COINS,
                 NO_WAIT,
             )
@@ -1276,6 +1315,26 @@ pub async fn fetch_data(mut client: Client) -> Msg {
         worker_info,
         err: None,
     }
+}
+
+// ── Health report ────────────────────────────────────────────────────────
+
+/// The node's health conditions, or why there are none. A node without the
+/// diagnostics service, or whose report has no conditions, predates them:
+/// the node manager judges none in its place.
+pub async fn fetch_health(
+    source: Result<crate::commands::node::diagnostics::HealthSource, String>,
+) -> Msg {
+    use super::model::HealthAnswer;
+    let answer = match source {
+        Err(reason) => HealthAnswer::Failed(reason),
+        Ok(source) => match source.read().await {
+            Ok(Some(health)) => HealthAnswer::Reported(health),
+            Ok(None) => HealthAnswer::NotReported,
+            Err(reason) => HealthAnswer::Failed(reason),
+        },
+    };
+    Msg::HealthRefresh(answer)
 }
 
 /// Keep the shard query bounded, report failure explicitly, and allow node
@@ -1400,6 +1459,7 @@ fn build_request(
 pub async fn do_lifecycle(
     mut client: Client,
     km: Arc<FileKeyManager>,
+    waits: super::super::EpochWaits,
     action: String,
     filters: Vec<Vec<u8>>,
     original_status: u32,
@@ -1414,11 +1474,13 @@ pub async fn do_lifecycle(
     let _ = label; // label mirrors Go's status string; unused in the Rust flow.
 
     // Every node refuses one of these landing in a later epoch than it was
-    // signed in, so it signs clear of the epoch's end. A confirm or reject is
-    // valid only in this epoch and goes at once.
+    // signed in, so it signs once this node no longer holds prover ops for
+    // the next epoch. A confirm or reject is valid only in this epoch and
+    // goes at once.
     if matches!(action.as_str(), "Leave" | "Pause" | "Resume") {
         if let Err(e) = super::super::frame_clear_of_epoch_end(
             &mut client,
+            &waits,
             super::super::EPOCH_END_WAIT_CAP,
             super::super::EPOCH_END_POLL,
             |frames_left| {
@@ -2497,6 +2559,7 @@ mod epoch_end_tests {
         let length = quil_types::consensus::epoch_length_frames();
         let mut server = quil_rpc::NodeRpcServer::default();
         server.last_global_head_frame = Arc::new(AtomicU64::new(length - 1));
+        let head = server.last_global_head_frame.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let multiaddr = format!(
             "/ip4/127.0.0.1/tcp/{}",
@@ -2522,12 +2585,14 @@ mod epoch_end_tests {
         .await
         .unwrap();
         let (progress, mut notices) = tokio::sync::mpsc::unbounded_channel();
+        let waits = super::super::super::tests::node_waits(head.clone());
         let run = |action: &str| {
             tokio::time::timeout(
                 Duration::from_secs(1),
                 do_lifecycle(
                     client.clone(),
                     km.clone(),
+                    waits.clone(),
                     action.to_string(),
                     vec![vec![0xAA; 32]],
                     2,
@@ -3397,5 +3462,173 @@ mod transfer_action_tests {
             assert_eq!(records[0]["amount"], "50");
             assert_eq!(records[1]["outcome"], "failed");
         }
+    }
+    /// A token context for a wallet whose node listens on `listener`, its
+    /// keys in `directory`.
+    fn left_out_ctx(
+        directory: &std::path::Path,
+        listener: &tokio::net::TcpListener,
+    ) -> crate::commands::token::TokenCtx {
+        let km = Arc::new(
+            FileKeyManager::new(
+                directory.join("keys.yml"),
+                &hex::encode([9; 32]),
+                "q-prover-key".into(),
+                Box::new(quil_crypto::FalconKeyConstructor),
+            )
+            .unwrap(),
+        );
+        km.create_agreement_key("q-onion-key", 9).unwrap();
+        km.create_falcon_key("q-prover-key").unwrap();
+        let opts = crate::rpc::ConnectOpts {
+            listen_grpc_multiaddr: format!(
+                "/ip4/127.0.0.1/tcp/{}",
+                listener.local_addr().unwrap().port()
+            ),
+            ..Default::default()
+        };
+        crate::commands::token::TokenCtx {
+            node_config: quil_config::Config::default(),
+            config_dir: directory.to_path_buf(),
+            key_manager: km.clone(),
+            connect_opts: opts.clone(),
+            submit_opts: opts,
+            submit_key_manager: km,
+            submit_config_dir: directory.to_path_buf(),
+            submit_identity: Default::default(),
+            peer_id_bytes: Vec::new(),
+            read_flags: Vec::new(),
+            max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
+        }
+    }
+
+    /// The manager's read of the shielded side goes on past what its scans
+    /// leave out and carries their counts: a coin whose memo does not
+    /// match, a second coin of a spend image, a pending transfer whose memo
+    /// does not match, and pending transfers past its limit, of which it
+    /// lists the largest.
+    #[tokio::test]
+    async fn the_shielded_read_carries_what_its_scans_left_out() {
+        let directory = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tc = left_out_ctx(directory.path(), &listener);
+        let (stop, serving) = crate::commands::token::serve_left_out(&tc, listener);
+        let (notes, _lines) = tokio::sync::mpsc::unbounded_channel();
+        let read = crate::commands::token::output::capture(notes, shielded_read_within(&tc, 4, 2))
+            .await
+            .expect("skipped coins: the read goes on past what its scans leave out");
+        assert_eq!(read.coins, Some((2, 26)));
+        assert_eq!(
+            read.skipped,
+            super::super::transfer::Skipped {
+                mismatched: 1,
+                duplicates: 1,
+                limited: 1,
+                escrows: 1,
+                escrows_mismatched: 1,
+            },
+            "skipped coins: the read carries what its scans left out"
+        );
+        assert_eq!(read.escrows_failed, None);
+        let mut amounts: Vec<u128> = read.escrows.iter().map(|escrow| escrow.amount).collect();
+        amounts.sort();
+        assert_eq!(amounts, [9, 11]);
+        assert!(read.escrows.iter().all(|escrow| !escrow.outgoing));
+        stop.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
+    /// The manager's read, with its own bounds, reads past the 2,048 pages
+    /// that once ended it: other users' coins and escrows fill a scan's
+    /// pages, and anyone can add them for fees.
+    #[tokio::test]
+    async fn the_managers_read_reaches_past_the_old_page_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tc = left_out_ctx(directory.path(), &listener);
+        // Pages of eight reads, past 2,048 pages.
+        let (stop, serving) =
+            crate::commands::token::serve_left_out_with(&tc, listener, (2_048 + 8) * 8, false);
+        let (notes, _lines) = tokio::sync::mpsc::unbounded_channel();
+        let read = crate::commands::token::output::capture(notes, shielded_read(&tc))
+            .await
+            .expect("skipped coins: the manager's read goes past the old page budget");
+        assert_eq!(read.coins, Some((3, 29)));
+        assert_eq!(
+            read.skipped,
+            super::super::transfer::Skipped {
+                mismatched: 1,
+                duplicates: 1,
+                limited: 0,
+                escrows: 0,
+                escrows_mismatched: 1,
+            }
+        );
+        let mut amounts: Vec<u128> = read.escrows.iter().map(|escrow| escrow.amount).collect();
+        amounts.sort();
+        assert_eq!(amounts, [7, 9, 11]);
+        stop.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
+    /// The node releases a scan's snapshot an hour after the scan starts.
+    /// The manager's read that the hour stopped, of the coins or of the
+    /// pending transfers, fails as such, so that its notice offers no read
+    /// again; the coins are kept when only the pending transfers' scan
+    /// stopped.
+    #[tokio::test]
+    async fn a_read_its_snapshot_hour_stopped_fails_as_such() {
+        use super::super::transfer::ReadFailure;
+        use crate::commands::token::{output::capture, scans_begin_ago, serve_left_out_expiring};
+        let age = quil_hypergraph::snapshot::SCAN_MAX_AGE;
+        let minutes = age.as_secs() / 60;
+        for escrows in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let tc = left_out_ctx(directory.path(), &listener);
+            let (stop, serving) = serve_left_out_expiring(&tc, listener, escrows);
+            scans_begin_ago(age);
+            let (notes, _lines) = tokio::sync::mpsc::unbounded_channel();
+            let read = capture(notes, shielded_read(&tc)).await;
+            scans_begin_ago(std::time::Duration::ZERO);
+            let failure = match read {
+                Ok(read) => {
+                    assert_eq!(read.coins, Some((3, 29)));
+                    read.escrows_failed
+                }
+                Err(error) => Some(read_failure(&error)),
+            };
+            assert_eq!(
+                failure,
+                Some(ReadFailure::Outlived { minutes }),
+                "the read offers to read again (the escrow scan stopped: {escrows})"
+            );
+            stop.send(()).unwrap();
+            serving.await.unwrap();
+        }
+    }
+
+    /// The manager reads the coins, then the pending transfers. When the
+    /// pending transfers' read fails, the read keeps the coins and carries
+    /// the failure, which its notice shows.
+    #[tokio::test]
+    async fn the_managers_read_keeps_its_coins_when_the_escrow_read_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tc = left_out_ctx(directory.path(), &listener);
+        let (stop, serving) = crate::commands::token::serve_left_out_with(&tc, listener, 0, true);
+        let (notes, _lines) = tokio::sync::mpsc::unbounded_channel();
+        let read = crate::commands::token::output::capture(notes, shielded_read_within(&tc, 4, 2))
+            .await
+            .expect("skipped coins: a failed escrow read keeps the coins");
+        assert_eq!(read.coins, Some((2, 26)));
+        assert!(read.escrows.is_empty());
+        let failed = match read.escrows_failed {
+            Some(super::super::transfer::ReadFailure::Failed(failed)) => failed,
+            other => panic!("the escrow read failed as {other:?}"),
+        };
+        assert!(failed.contains("invalid escrow blob"), "{failed}");
+        stop.send(()).unwrap();
+        serving.await.unwrap();
     }
 }

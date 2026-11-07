@@ -916,6 +916,25 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         early_fence_frame = %if early_fence_from == u64::MAX { "never".to_string() } else { early_fence_from.to_string() },
         "committee handoff fences of unsealed closing sessions two epochs after their request"
     );
+    let fee_vote_bound_from = quil_engine::fees::init_fee_vote_bound_frame(args.network);
+    info!(
+        fee_vote_bound_frame = %if fee_vote_bound_from == u64::MAX { "never".to_string() } else { fee_vote_bound_from.to_string() },
+        "app shard frames refused when their fee vote is outside the bounds every leader computes"
+    );
+    let signed_frame_from = quil_types::consensus::init_signed_frame_activation_frame(args.network);
+    info!(
+        signed_frame_activation_frame = %if signed_frame_from == u64::MAX { "never".to_string() } else { signed_frame_from.to_string() },
+        "included app frames recording their signers' last signed frame and sessions' tip-advance frames"
+    );
+    let silent =
+        quil_execution::global_intrinsic::handoff::silence::init_silent_fence(args.network);
+    info!(
+        silent_fence_frame = %if silent.frame == u64::MAX || signed_frame_from == u64::MAX { "never".to_string() } else { silent.frame.to_string() },
+        window_frames = silent.window,
+        evidence_shards = silent.evidence,
+        "committee sessions stalled by provers silent on every shard fenced early without them \
+         (not before one epoch after the signed-frame activation frame)"
+    );
     let leaver_currency_from =
         quil_execution::prover_registry::init_leaver_currency_frame(args.network);
     info!(
@@ -958,6 +977,12 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     info!(
         committed_credit_frame = %if committed_credit_from == u64::MAX { "never".to_string() } else { committed_credit_from.to_string() },
         "settlement records and mint-claim fees credited only with committed spends"
+    );
+    let canonical_owners_from =
+        quil_execution::token_intrinsic::global_commit::init_canonical_owner_frame(args.network);
+    info!(
+        canonical_owner_frame = %if canonical_owners_from == u64::MAX { "never".to_string() } else { canonical_owners_from.to_string() },
+        "confidential operations refused for an owner that is not a canonical identity"
     );
     if let Some(frame) =
         quil_execution::global_intrinsic::leaf_root_registration::init_pre_registration_frame(
@@ -1506,10 +1531,20 @@ fn exit_node(result: &anyhow::Result<ExitCode>) -> ! {
     quil_engine::storage_jobs::exit_now(code)
 }
 
+/// Stack size of each shared rayon pool thread. A thread waiting in a
+/// join runs unrelated stolen jobs nested on its own stack, so the depth
+/// needed grows with nesting on a large pool and outgrew rayon's 2 MiB
+/// default during storage encoding. Reserved address space only (about
+/// 16 MiB per thread); pages become resident only when touched.
+const RAYON_STACK_SIZE: usize = 16 * 1024 * 1024;
+
 /// The shared rayon pool the node's parallel work runs on, at rayon's
-/// default size, its threads named `rayon-<index>`.
+/// default size, its threads named `rayon-<index>` with
+/// [`RAYON_STACK_SIZE`] stacks.
 fn rayon_pool() -> rayon::ThreadPoolBuilder {
-    rayon::ThreadPoolBuilder::new().thread_name(|index| format!("rayon-{index}"))
+    rayon::ThreadPoolBuilder::new()
+        .thread_name(|index| format!("rayon-{index}"))
+        .stack_size(RAYON_STACK_SIZE)
 }
 
 /// Tonic's cluster channels can be the first TLS users in either process.
@@ -1530,6 +1565,44 @@ mod startup_tests {
         let pool = super::rayon_pool().num_threads(1).build().unwrap();
         let name = pool.install(|| std::thread::current().name().map(str::to_owned));
         assert_eq!(name.as_deref(), Some("rayon-0"));
+    }
+
+    /// A pool thread runs a job needing ~6 MiB of stack, three times
+    /// rayon's 2 MiB default, as nested stolen jobs can on a large pool.
+    #[test]
+    fn rayon_pool_threads_have_deep_stacks() {
+        const CHILD: &str = "QUIL_TEST_RAYON_DEEP_STACK";
+        if std::env::var_os(CHILD).is_none() {
+            // A stack overflow aborts the process, so the job runs in a child.
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "startup_tests::rayon_pool_threads_have_deep_stacks",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("RUST_MIN_STACK")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "a pool thread could not run a ~6 MiB deep job ({}):\n{}\n{}",
+                result.status,
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let pool = super::rayon_pool().num_threads(1).build().unwrap();
+        assert_eq!(pool.install(|| deep_stack(96)), 97);
+    }
+
+    /// Recurses through `depth + 1` frames of 64 KiB each; returns the count.
+    #[inline(never)]
+    fn deep_stack(depth: usize) -> u32 {
+        let frame = std::hint::black_box([1u8; 64 * 1024]);
+        let below = depth.checked_sub(1).map_or(0, deep_stack);
+        below + u32::from(std::hint::black_box(&frame)[depth])
     }
 
     #[test]

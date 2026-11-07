@@ -420,6 +420,68 @@ fn projected_snapshot_frame(frame_number: u64, remaining: std::time::Duration) -
     frame_number.saturating_add(u64::try_from(frames).unwrap_or(u64::MAX))
 }
 
+/// What restarting now costs the pending seats, summed for one log line: the
+/// worst verdict, how many seats it costs or stops, and the encode's least
+/// advanced layers and longest restart cost.
+struct RestartSummary {
+    worst: crate::restart_readiness::Verdict,
+    costs_share: usize,
+    stops_shard: usize,
+    labels_kept: bool,
+    layers_done: u32,
+    layers: u32,
+    cost_minutes: u32,
+    minutes_to_grace: u32,
+    encoding: bool,
+}
+
+impl Default for RestartSummary {
+    fn default() -> Self {
+        Self {
+            worst: crate::restart_readiness::Verdict::Ok,
+            costs_share: 0,
+            stops_shard: 0,
+            labels_kept: true,
+            layers_done: 0,
+            layers: 0,
+            cost_minutes: 0,
+            minutes_to_grace: 0,
+            encoding: false,
+        }
+    }
+}
+
+impl RestartSummary {
+    fn add(
+        &mut self,
+        (seat, verdict): (
+            quil_types::proto::node::RestartReadiness,
+            crate::restart_readiness::Verdict,
+        ),
+    ) {
+        use crate::restart_readiness::Verdict;
+        self.worst = self.worst.max(verdict);
+        self.costs_share += usize::from(verdict == Verdict::CostsShare);
+        self.stops_shard += usize::from(verdict == Verdict::StopsShard);
+        self.cost_minutes = self.cost_minutes.max(seat.restart_cost_minutes);
+        if seat.encoding {
+            self.labels_kept &= seat.labels_kept;
+            self.layers_done = if self.encoding {
+                self.layers_done.min(seat.layers_done)
+            } else {
+                seat.layers_done
+            };
+            self.layers = self.layers.max(seat.layers);
+            self.minutes_to_grace = if self.encoding {
+                self.minutes_to_grace.min(seat.minutes_to_grace)
+            } else {
+                seat.minutes_to_grace
+            };
+            self.encoding = true;
+        }
+    }
+}
+
 /// Report the seats a confirm leaves out because their storage snapshot is
 /// not encoded yet: one line when the pending seats change, and again every
 /// [`PENDING_SNAPSHOT_REPORT`] while they stay, with the seats ready and the
@@ -450,10 +512,16 @@ fn report_pending_snapshots(frame_number: u64, prepared: &PreparedConfirm) {
     filters.sort();
     let mut encoding = 0usize;
     let mut late: Vec<(Vec<u8>, u64, bool)> = Vec::new();
+    // What restarting now costs the pending seats (`crate::restart_readiness`).
+    let mut restart = RestartSummary::default();
     for seat in &pending {
         let shards: Vec<Vec<u8>> = std::iter::once(seat.filter.clone())
             .chain(seat.targets.iter().cloned())
             .collect();
+        restart.add(crate::restart_readiness::shards_readiness(
+            &shards,
+            crate::restart_readiness::noted_margin(&seat.filter),
+        ));
         let Some(progress) = crate::storage_snapshot::snapshot_progress(&shards, epoch) else {
             continue;
         };
@@ -482,7 +550,12 @@ fn report_pending_snapshots(frame_number: u64, prepared: &PreparedConfirm) {
                 .join(",");
             info!(frame = frame_number, epoch, ready = prepared.filters.len(), pending = filters.len(),
                 encoding, not_started = filters.len() - encoding, grace_frame,
-                frames_to_grace = grace_frame.saturating_sub(frame_number), pending_filters = %listed,
+                frames_to_grace = grace_frame.saturating_sub(frame_number),
+                labels_kept = restart.labels_kept, layers_done = restart.layers_done,
+                layers = restart.layers, restart_cost_minutes = restart.cost_minutes,
+                minutes_to_grace = restart.minutes_to_grace, restart_costs_share = restart.costs_share,
+                restart_stops_shard = restart.stops_shard, restart = restart.worst.text(),
+                pending_filters = %listed,
                 more_pending = filters.len().saturating_sub(LISTED), scope = "local",
                 "confirmation submits the seats whose storage snapshot is encoded and retries the pending \
                  ones each cycle: an expected wait while their snapshots encode; a seat still pending at the \
@@ -4628,5 +4701,45 @@ mod tests {
             "3 of 11 layers left: {checked:?} of {three:?}"
         );
         leaf.end(LeafOutcome::Completed);
+    }
+
+    /// The pipeline line's restart summary takes the worst verdict, counts the
+    /// seats it costs or stops, and keeps the least advanced encode.
+    #[test]
+    fn the_restart_summary_takes_the_worst_seat() {
+        use crate::restart_readiness::Verdict;
+        use quil_types::proto::node::RestartReadiness;
+        let seat = |verdict: Verdict, encoding: bool, done: u32, cost: u32, grace: u32| {
+            (
+                RestartReadiness {
+                    verdict: verdict.name().into(),
+                    encoding,
+                    labels_kept: done > 2,
+                    layers_done: done,
+                    layers: 11,
+                    restart_cost_minutes: cost,
+                    minutes_to_grace: grace,
+                    committee_margin: None,
+                },
+                verdict,
+            )
+        };
+        let mut summary = super::RestartSummary::default();
+        summary.add(seat(Verdict::Ok, false, 0, 0, 0));
+        assert_eq!(summary.worst, Verdict::Ok);
+        summary.add(seat(Verdict::CostsShare, true, 6, 20, 30));
+        summary.add(seat(Verdict::StopsShard, true, 3, 12, 50));
+        summary.add(seat(Verdict::CostsShare, true, 1, 35, 40));
+        assert_eq!(summary.worst, Verdict::StopsShard);
+        assert_eq!((summary.costs_share, summary.stops_shard), (2, 1));
+        assert_eq!(
+            (
+                summary.layers_done,
+                summary.cost_minutes,
+                summary.minutes_to_grace
+            ),
+            (1, 35, 30)
+        );
+        assert!(!summary.labels_kept, "one seat's labels are not kept");
     }
 }

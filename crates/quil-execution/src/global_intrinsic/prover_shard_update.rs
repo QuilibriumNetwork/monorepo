@@ -2665,6 +2665,35 @@ mod tests {
         assert_eq!(blob.unwrap(), activity_blobs(77, 78, last_active_only).1);
     }
 
+    /// The production path records `LastSignedFrameNumber` from the
+    /// scheduled signed-frame activation frame, and not below it.
+    #[test]
+    fn update_allocation_activity_records_last_signed_from_the_scheduled_frame() {
+        let filter = vec![0xABu8; 32];
+        let last_signed = |frame: u64| {
+            let state = make_state();
+            let p = fake_prover(1, 1, 0, &filter);
+            seed_alloc_blob(&state, &p, &filter);
+            update_allocation_activity(&state, frame, &p, &filter).unwrap();
+            let alloc_addr = allocation_address(&p.public_key, &filter).unwrap();
+            let va_disc = vertex_adds_discriminator().unwrap();
+            let blob = state
+                .get(&GLOBAL_INTRINSIC_ADDRESS[..], &alloc_addr, &va_disc)
+                .unwrap()
+                .unwrap();
+            read_field(
+                &rebuild_vertex_tree_from_blob(&blob),
+                "allocation:ProverAllocation",
+                "LastSignedFrameNumber",
+            )
+        };
+        quil_types::consensus::set_signed_frame_activation_frame_for_thread(Some(80));
+        assert_eq!(last_signed(79), None, "below the scheduled frame");
+        assert_eq!(last_signed(80), Some(80u64.to_be_bytes().to_vec()));
+        quil_types::consensus::set_signed_frame_activation_frame_for_thread(None);
+        assert_eq!(last_signed(80), None, "below the mainnet frame by default");
+    }
+
     #[test]
     fn update_allocation_activity_sets_last_signed_from_signed_frame_activation() {
         // At and after the activation, one vertex write records both fields.

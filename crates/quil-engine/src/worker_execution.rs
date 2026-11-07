@@ -114,6 +114,23 @@ pub fn with_renewal_state(
     Some(execution)
 }
 
+/// A worker's report as the worker view shows it, with what restarting the
+/// node now costs the worker's seat ([`crate::restart_readiness`]). A worker
+/// without a seat has none.
+pub fn with_restart_readiness(
+    filter: &[u8],
+    execution: Option<WorkerExecution>,
+) -> Option<WorkerExecution> {
+    let mut execution = execution?;
+    if !filter.is_empty() {
+        execution.restart = Some(crate::restart_readiness::seat_readiness(
+            filter,
+            crate::restart_readiness::margin_of(&execution, now_ms()),
+        ));
+    }
+    Some(execution)
+}
+
 /// Whether worker `core_id`'s own store has stopped writing: latched after
 /// a failed write or below the free-space floor, or held stopped while the
 /// node reopens it. Its shard cannot be prepared and it hosts no new seat.
@@ -464,6 +481,21 @@ impl SharedWorkerExecution {
         s.last_peer_vote_unix_ms = votes.last_peer_vote_unix_ms;
         s.host_started_unix_ms = votes.host_started_unix_ms;
         s.silent_ms = votes.silent_ms;
+    }
+
+    /// The running committee session as consensus last saw it
+    /// (`WorkerExecution.committee_members` and its companions); all zero
+    /// clears it when no session host runs.
+    pub(crate) fn committee(&self, members: usize, quorum: usize, voters: usize) {
+        let mut s = self.record.lock().unwrap();
+        let to_u32 = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        if members == 0 && s.committee_members == 0 {
+            return;
+        }
+        s.committee_members = to_u32(members);
+        s.committee_quorum = to_u32(quorum);
+        s.committee_voters = to_u32(voters);
+        s.committee_observed_unix_ms = if members == 0 { 0 } else { now_ms() };
     }
 
     /// The engine this record belongs to started now
@@ -1528,6 +1560,68 @@ mod renewal_state_tests {
             "state unavailable"
         );
         assert_eq!(with_renewal_state(&held, None), None);
+    }
+}
+
+#[cfg(test)]
+mod restart_readiness_tests {
+    use super::*;
+
+    /// A worker records its committee's members, quorum and voters, and
+    /// clears them when no session host runs.
+    #[test]
+    fn a_worker_records_and_clears_its_committee_reading() {
+        let shared = SharedWorkerExecution::default();
+        shared.committee(28, 19, 22);
+        let seen = shared.snapshot();
+        assert_eq!(
+            (
+                seen.committee_members,
+                seen.committee_quorum,
+                seen.committee_voters
+            ),
+            (28, 19, 22)
+        );
+        assert!(seen.committee_observed_unix_ms > 0);
+        shared.committee(0, 0, 0);
+        let seen = shared.snapshot();
+        assert_eq!(
+            (seen.committee_members, seen.committee_observed_unix_ms),
+            (0, 0)
+        );
+    }
+
+    /// The worker view gives a seat's worker its restart readiness, with the
+    /// committee margin the worker reports, and a worker without a seat none.
+    #[test]
+    fn the_worker_view_adds_restart_readiness_for_a_seat_only() {
+        let report = Some(WorkerExecution {
+            state: "serving".into(),
+            own_votes: Some(4),
+            committee_members: 28,
+            committee_quorum: 19,
+            committee_voters: 19,
+            committee_observed_unix_ms: now_ms(),
+            ..Default::default()
+        });
+        let view = with_restart_readiness(&[0xe1; 32], report.clone()).unwrap();
+        let restart = view.restart.expect("a seat has a verdict");
+        assert_eq!(restart.verdict, "stops_shard");
+        assert_eq!(restart.committee_margin, Some(0));
+        let roomy = WorkerExecution {
+            committee_voters: 22,
+            ..report.clone().unwrap()
+        };
+        let restart = with_restart_readiness(&[0xe1; 32], Some(roomy))
+            .unwrap()
+            .restart
+            .unwrap();
+        assert_eq!(
+            (restart.verdict.as_str(), restart.committee_margin),
+            ("ok", Some(3))
+        );
+        assert_eq!(with_restart_readiness(&[], report).unwrap().restart, None);
+        assert_eq!(with_restart_readiness(&[0xe1; 32], None), None);
     }
 }
 

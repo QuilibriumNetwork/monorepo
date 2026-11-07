@@ -111,6 +111,10 @@ pub enum ValidationError {
     TransformFailed,
     /// Message size was too large for topic
     MessageSizeTooLargeForTopic,
+    /// QUILIBRIUM: the message is signed with a key of a type this node does
+    /// not verify. Dropped without penalty: releases that verify such keys
+    /// forward these messages.
+    RefusedKeyType,
 }
 
 impl std::fmt::Display for ValidationError {

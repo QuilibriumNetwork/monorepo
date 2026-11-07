@@ -298,6 +298,7 @@ impl FrameReader<'_> {
 
 /// A peer past its handshake, writing its own 1-RTT packets to the node.
 struct RawPeer {
+    peer_id: PeerId,
     socket: UdpSocket,
     server: SocketAddr,
     dcid: Vec<u8>,
@@ -399,6 +400,7 @@ impl RawPeer {
             .clone()
             .expect("handshake gave keys");
         Self {
+            peer_id: keypair.public().to_peer_id(),
             socket,
             server,
             dcid: dcid.expect("a server packet with a long header"),
@@ -952,6 +954,111 @@ async fn the_gap_bound_closes_only_that_connection_and_the_node_recovers() {
         returning.close
     );
     assert!(bystander.settled(Duration::from_secs(10)).await);
+}
+
+/// What the node logs at warn level and above, as formatted text.
+#[derive(Clone, Default)]
+struct Warnings(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Warnings {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Warnings {
+    /// Captures this test process's warnings from quil-p2p.
+    fn capture() -> Self {
+        let warnings = Self::default();
+        let writer = warnings.clone();
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("quil_p2p=warn"))
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .try_init()
+            .expect("no other subscriber in this test process");
+        warnings
+    }
+
+    fn lines_with(&self, text: &str) -> Vec<String> {
+        String::from_utf8_lossy(&self.0.lock().unwrap())
+            .lines()
+            .filter(|l| l.contains(text))
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+/// The value of `name=` in a formatted log line.
+fn field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let at = line.find(&format!(" {name}="))? + name.len() + 2;
+    line[at..].split_whitespace().next()
+}
+
+/// A connection the node closes on a transport error gets one warning that
+/// names the peer, the close reason and how long the connection lived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_closed_on_a_transport_error_is_named_to_the_operator() {
+    const FIRST: &str = "a QUIC connection closed on a transport error";
+    let warnings = Warnings::capture();
+    let node = start_node().await;
+    let mut peer = RawPeer::connect(node.addr).await;
+    let lived = Duration::from_secs(2);
+    let connected = Instant::now();
+    while connected.elapsed() < lived {
+        assert!(
+            peer.settled(Duration::from_secs(10)).await,
+            "the connection stopped answering before the test closed it: {:?}",
+            peer.close
+        );
+        peer.recv_for(Duration::from_millis(200)).await;
+    }
+    peer.send_frames(gapped_chunks(0, 3000)).await;
+    let close = peer.close_reason(Duration::from_secs(10)).await;
+    assert!(
+        close
+            .as_deref()
+            .is_some_and(|c| c.contains("too many gaps")),
+        "the gap bound did not close the connection: {close:?}"
+    );
+    // The swarm hears of the close shortly after the peer does.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while warnings.lines_with(FIRST).is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let lines = warnings.lines_with(FIRST);
+    let all = warnings.lines_with("");
+    let [line] = lines.as_slice() else {
+        panic!(
+            "no warning was logged, or more than one, for a QUIC connection the node closed on \
+             a transport error: {} lines; every warning: {all:#?}",
+            lines.len()
+        );
+    };
+    let peer_id = peer.peer_id.to_string();
+    assert_eq!(
+        field(line, "peer"),
+        Some(peer_id.as_str()),
+        "the warning omits the peer id {peer_id}: {line}"
+    );
+    assert!(
+        line.split(" reason=")
+            .nth(1)
+            .is_some_and(|r| r.contains("too many gaps in stream buffer")),
+        "the warning drops the close reason: {line}"
+    );
+    let age: u64 = field(line, "connection_age_secs")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("the warning has no connection_age_secs: {line}"));
+    assert!(
+        age + 1 >= lived.as_secs(),
+        "the connection age {age} s in the warning is below the {lived:?} the connection lived: {line}"
+    );
 }
 
 type ReadResult = Result<Vec<u8>, String>;

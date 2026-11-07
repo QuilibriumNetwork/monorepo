@@ -54,7 +54,13 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
                     None
                 } else {
                     shard.frame_cadence.as_ref().and_then(|c| {
-                        super::observed_quil_daily(&reward, c, *day, super::committee_size(shard))
+                        super::observed_quil_daily(
+                            &reward,
+                            c,
+                            *day,
+                            super::committee_size(shard),
+                            shard.certificate_share.as_ref(),
+                        )
                     })
                 };
                 if let Some(v) = value {

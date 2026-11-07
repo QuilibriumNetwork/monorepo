@@ -11,6 +11,7 @@ use num_bigint::{BigInt, Sign};
 use tonic::transport::Channel;
 
 use quil_config::Config;
+use quil_types::proto::diagnostics::{ConditionKind, ExpectedWait, HealthConditions};
 use quil_types::proto::node::node_service_client::NodeServiceClient;
 use quil_types::proto::node::GetWorkerInfoRequest;
 
@@ -101,6 +102,10 @@ pub struct ProverCtx {
     /// sig + `q-peer-key` Ed448 outer auth). Lazily needed only by the
     /// write ops.
     pub key_manager: std::sync::Arc<quil_keys::FileKeyManager>,
+    /// The node's answer on the epoch's end, fixed by a test that serves no
+    /// health report.
+    #[cfg(test)]
+    pub(crate) epoch_waits: Option<EpochWaits>,
 }
 
 impl ProverCtx {
@@ -134,6 +139,8 @@ impl ProverCtx {
             config_dir: dir,
             connect_opts,
             key_manager,
+            #[cfg(test)]
+            epoch_waits: None,
         })
     }
 
@@ -141,15 +148,30 @@ impl ProverCtx {
         crate::rpc::connect_node_service(&self.connect_opts).await
     }
 
+    /// Where this node says whether the epoch ends too soon to sign: its
+    /// health conditions, read on its peer listener as the node itself.
+    pub(crate) fn epoch_waits(&self) -> EpochWaits {
+        #[cfg(test)]
+        if let Some(waits) = &self.epoch_waits {
+            return waits.clone();
+        }
+        EpochWaits::Node(super::diagnostics::HealthSource::for_node(
+            &self.node_config,
+            &self.key_manager,
+        ))
+    }
+
     /// The frame to sign a pause, resume, leave or update with: the global
-    /// head, once it is clear of the epoch's end. Every node refuses such an op
-    /// landing in a later epoch than it was signed in, with nothing reported
-    /// here, and it can sign in the next epoch just as well. Says so if it waits.
+    /// head, once this node no longer holds prover ops for the next epoch.
+    /// Every node refuses such an op landing in a later epoch than it was
+    /// signed in, with nothing reported here, and it can sign in the next
+    /// epoch just as well. Says so if it waits.
     pub async fn last_global_head_frame(
         &self,
         client: &mut NodeServiceClient<Channel>,
     ) -> anyhow::Result<u64> {
-        frame_clear_of_epoch_end(client, EPOCH_END_WAIT_CAP, EPOCH_END_POLL, |left| {
+        let waits = self.epoch_waits();
+        frame_clear_of_epoch_end(client, &waits, EPOCH_END_WAIT_CAP, EPOCH_END_POLL, |left| {
             println!(
                 "The epoch ends in {left} frames, and an op signed now may land after it, where \
                  every node refuses it: waiting for the next epoch to sign."
@@ -159,32 +181,31 @@ impl ProverCtx {
     }
 
     /// The frame to sign a confirm or reject with: the global head at once, as
-    /// each is valid only in this epoch. Warns when it may land too late.
+    /// each is valid only in this epoch. Warns when this node holds prover
+    /// ops for the next epoch, as it may then land too late.
     pub async fn frame_in_this_epoch(
         &self,
         client: &mut NodeServiceClient<Channel>,
         op: &str,
     ) -> anyhow::Result<u64> {
-        let (head, epoch_length) = head_and_epoch_length(client).await?;
-        if let Some(left) = frames_left_if_close(head, epoch_length) {
-            println!(
-                "The epoch ends in {left} frames and this {op} is valid only in it: if it lands \
+        match self.epoch_waits().wait().await {
+            Ok(Some(wait)) => println!(
+                "The epoch ends in {} frames and this {op} is valid only in it: if it lands \
+                 later every node refuses it. Check with `qclient node prover status`.",
+                frames_left(&wait)
+            ),
+            Ok(None) => {}
+            Err(error) => println!(
+                "Cannot tell whether this {op} lands within the epoch: {error:#}. If it lands \
                  later every node refuses it. Check with `qclient node prover status`."
-            );
+            ),
         }
-        Ok(head)
+        self.head_frame(client).await
     }
 
     /// The global head as it stands (`GetNodeInfo.last_global_head_frame`).
     pub async fn head_frame(&self, client: &mut NodeServiceClient<Channel>) -> anyhow::Result<u64> {
-        let info = client
-            .get_node_info(tonic::Request::new(
-                quil_types::proto::node::GetNodeInfoRequest::default(),
-            ))
-            .await
-            .map_err(|e| anyhow::anyhow!("get node info: {e}"))?
-            .into_inner();
-        Ok(info.last_global_head_frame)
+        head_frame(client).await
     }
 
     /// Send a global-domain prover message (outer Ed448 `q-peer-key`
@@ -199,40 +220,79 @@ impl ProverCtx {
     }
 }
 
-/// Frames an op takes to land at most: every node refuses one older.
-const EPOCH_END_MARGIN_FRAMES: u64 =
-    quil_execution::global_intrinsic::verify::PROVER_OP_FRESHNESS_WINDOW;
-/// How long to wait for the next epoch: ten mainnet frames many times over, so
+/// How long to wait for the next epoch: the node's expected time for it, so
 /// reaching it means GLOBAL is not advancing, or this node is not following it.
-pub(crate) const EPOCH_END_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(600);
+pub(crate) const EPOCH_END_WAIT_CAP: std::time::Duration =
+    std::time::Duration::from_millis(quil_rpc::health_conditions::EPOCH_WAIT_EXPECTED_MS);
 pub(crate) const EPOCH_END_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The frames left in the epoch, if an op signed at `head` may not land in it.
-/// At most half of an epoch, so a short devnet epoch keeps a time to sign.
-fn frames_left_if_close(head: u64, epoch_length: u64) -> Option<u64> {
-    let length = epoch::epoch_len(epoch_length);
-    let left = length - head % length;
-    (left <= EPOCH_END_MARGIN_FRAMES.min(length / 2)).then_some(left)
+/// Where a prover op learns whether to wait for the next epoch: this node's
+/// health conditions, which judge the epoch's end on the head it serves.
+#[derive(Clone)]
+pub(crate) enum EpochWaits {
+    Node(Result<super::diagnostics::HealthSource, String>),
+    /// A fixed answer: the node's report, or why it could not be read.
+    #[cfg(test)]
+    Fixed(std::sync::Arc<dyn Fn() -> Result<Option<HealthConditions>, String> + Send + Sync>),
 }
 
-async fn head_and_epoch_length(
-    client: &mut NodeServiceClient<Channel>,
-) -> anyhow::Result<(u64, u64)> {
-    let info = client
-        .get_node_info(tonic::Request::new(
-            quil_types::proto::node::GetNodeInfoRequest::default(),
-        ))
-        .await
-        .map_err(|e| anyhow::anyhow!("get node info: {e}"))?
-        .into_inner();
-    Ok((info.last_global_head_frame, info.epoch_length_frames))
+impl EpochWaits {
+    /// The node's wait for the next epoch, if it holds prover ops; an
+    /// error when it cannot say.
+    pub(crate) async fn wait(&self) -> anyhow::Result<Option<ExpectedWait>> {
+        let report = match self {
+            Self::Node(Ok(source)) => source.read().await,
+            Self::Node(Err(reason)) => Err(reason.clone()),
+            #[cfg(test)]
+            Self::Fixed(read) => read(),
+        };
+        let health = report.map_err(|e| {
+            anyhow::anyhow!(
+                "cannot read this node's health report, which says whether the epoch ends too \
+                 soon to sign: {e}"
+            )
+        })?;
+        epoch_wait_of(health.as_ref())
+    }
 }
 
-/// The global head once it is clear of the epoch's end. `on_wait` hears the
-/// frames left, once, if this waits; past `cap` nothing has been signed and the
-/// error says why.
+/// The wait for the next epoch in a node's health conditions; an error
+/// when they do not judge it: the node predates them, or knows no GLOBAL
+/// head yet.
+fn epoch_wait_of(health: Option<&HealthConditions>) -> anyhow::Result<Option<ExpectedWait>> {
+    let kind = ConditionKind::ProverOpsWaitForEpoch as i32;
+    let Some(health) = health else {
+        anyhow::bail!(
+            "this node predates its health conditions, which say whether the epoch ends too \
+             soon to sign; update the node"
+        );
+    };
+    if let Some(c) = health.conditions.iter().find(|c| c.kind == kind) {
+        return Ok(Some(c.wait.unwrap_or_default()));
+    }
+    anyhow::ensure!(
+        health
+            .sources
+            .iter()
+            .any(|s| s.kind == kind && s.observed_unix_ms != 0),
+        "this node does not judge the epoch's end: it knows no GLOBAL head yet, or predates \
+         that judgement (update it)"
+    );
+    Ok(None)
+}
+
+/// The frames left in the epoch while the node holds prover ops.
+fn frames_left(wait: &ExpectedWait) -> u64 {
+    wait.until_frame.saturating_sub(wait.head_frame).max(1)
+}
+
+/// The global head once this node no longer holds prover ops for the next
+/// epoch. `on_wait` hears the frames left, once, if this waits; past `cap`,
+/// or when the node cannot say, nothing has been signed and the error says
+/// why.
 pub(crate) async fn frame_clear_of_epoch_end(
     client: &mut NodeServiceClient<Channel>,
+    waits: &EpochWaits,
     cap: std::time::Duration,
     poll: std::time::Duration,
     mut on_wait: impl FnMut(u64),
@@ -240,23 +300,39 @@ pub(crate) async fn frame_clear_of_epoch_end(
     let started = std::time::Instant::now();
     let mut told = false;
     loop {
-        let (head, epoch_length) = head_and_epoch_length(client).await?;
-        let Some(left) = frames_left_if_close(head, epoch_length) else {
-            return Ok(head);
+        let wait = waits
+            .wait()
+            .await
+            .map_err(|e| anyhow::anyhow!("not sent: {e:#}"))?;
+        let Some(wait) = wait else {
+            return head_frame(client).await;
         };
         if !told {
-            on_wait(left);
+            on_wait(frames_left(&wait));
             told = true;
         }
         if started.elapsed() >= cap {
             anyhow::bail!(
-                "not sent: waited {}s for the next epoch and the global head stays at frame \
-                 {head}; check that this node follows GLOBAL",
-                cap.as_secs()
+                "not sent: waited {}s for the next epoch and the global head stays at frame {}; \
+                 check that this node follows GLOBAL",
+                cap.as_secs(),
+                wait.head_frame
             );
         }
         tokio::time::sleep(poll).await;
     }
+}
+
+/// The global head as the node serves it (`GetNodeInfo.last_global_head_frame`).
+async fn head_frame(client: &mut NodeServiceClient<Channel>) -> anyhow::Result<u64> {
+    let info = client
+        .get_node_info(tonic::Request::new(
+            quil_types::proto::node::GetNodeInfoRequest::default(),
+        ))
+        .await
+        .map_err(|e| anyhow::anyhow!("get node info: {e}"))?
+        .into_inner();
+    Ok(info.last_global_head_frame)
 }
 
 pub async fn run(global: GlobalArgs, cmd: &ProverCommand) -> anyhow::Result<()> {
@@ -412,24 +488,79 @@ pub(crate) fn observed_window(
     (w.observed_seconds >= 60 && w.observed_seconds <= w.window_seconds).then_some(w)
 }
 
-/// Observed QUIL/day of a seat on a shard whose frames credit
-/// [`quorum_signers`] of its `committee` members: the expected share of
-/// frames that pay this seat. A committee of 0 or 1 pays every frame.
+/// The share of a shard's frames that pay a seat: `paid` of `frames`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SigningShare {
+    pub paid: u64,
+    pub frames: u64,
+    /// The seat's own certificate share, as the node counted it; else the
+    /// share a member voting in time signs, quorum of committee.
+    pub measured: bool,
+}
+
+/// [`SigningShare`] of a seat in the 60m or 24h window. GLOBAL credits each
+/// signer of a frame's certificate the same per-signer reward, so a seat
+/// earns the frames it signs: its own share once the node counted a frame
+/// in the window, else [`quorum_signers`] of `committee`. A committee of 0
+/// or 1 pays every frame.
+pub(crate) fn signing_share(
+    share: Option<&quil_types::proto::node::CertificateShare>,
+    day: bool,
+    committee: u32,
+) -> SigningShare {
+    let own = share.and_then(|s| if day { s.day.as_ref() } else { s.hour.as_ref() });
+    if let Some(w) = own.filter(|w| w.frames > 0) {
+        return SigningShare {
+            paid: w.signed_frames.min(w.frames),
+            frames: w.frames,
+            measured: true,
+        };
+    }
+    let n = committee.max(1);
+    SigningShare {
+        paid: u64::from(quorum_signers(n)),
+        frames: u64::from(n),
+        measured: false,
+    }
+}
+
+/// Observed QUIL/day of a seat on a shard: the shard's observed frame rate
+/// times the [`signing_share`] of its frames that pay the seat.
 pub(crate) fn observed_quil_daily(
     per_frame: &BigInt,
     cadence: &quil_types::proto::node::FrameCadence,
     day: bool,
     committee: u32,
+    share: Option<&quil_types::proto::node::CertificateShare>,
 ) -> Option<BigInt> {
     let w = observed_window(cadence, day)?;
-    let n = committee.max(1);
+    let s = signing_share(share, day, committee);
     Some(
-        per_frame
-            * BigInt::from(w.advanced_frames)
-            * BigInt::from(86400)
-            * BigInt::from(quorum_signers(n))
-            / (BigInt::from(w.observed_seconds) * BigInt::from(n)),
+        per_frame * BigInt::from(w.advanced_frames) * BigInt::from(86400) * BigInt::from(s.paid)
+            / (BigInt::from(w.observed_seconds) * BigInt::from(s.frames)),
     )
+}
+
+/// QUIL/day of a seat that signs every frame of a shard producing one frame
+/// per GLOBAL frame, the most GLOBAL credits a shard: at the measured GLOBAL
+/// interval (its 24h window, else its 60m one), or the 10s target while
+/// none is measured.
+pub(crate) fn theory_quil_daily(
+    per_frame: &BigInt,
+    global: Option<&quil_types::proto::node::FrameCadence>,
+) -> BigInt {
+    let measured = global.and_then(|c| {
+        [true, false]
+            .into_iter()
+            .find_map(|day| observed_window(c, day).filter(|w| w.advanced_frames > 0))
+    });
+    match measured {
+        Some(w) => {
+            per_frame * BigInt::from(w.advanced_frames) * BigInt::from(86400)
+                / BigInt::from(w.observed_seconds)
+        }
+        None => per_frame * BigInt::from(FRAMES_PER_DAY),
+    }
 }
 
 #[cfg(test)]
@@ -439,19 +570,32 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// Only the last frames of an epoch, where an op may land in the next one:
-    /// the freshness window on a mainnet epoch, half of a short devnet one.
-    #[test]
-    fn only_the_end_of_an_epoch_is_too_close_to_sign() {
-        assert_eq!(frames_left_if_close(720 - 11, 720), None);
-        assert_eq!(frames_left_if_close(720 - 10, 720), Some(10));
-        assert_eq!(frames_left_if_close(719, 720), Some(1));
-        assert_eq!(frames_left_if_close(720, 720), None);
-        assert_eq!(frames_left_if_close(89, 30), Some(1));
-        assert_eq!(frames_left_if_close(79, 30), None);
-        assert_eq!(frames_left_if_close(80, 30), Some(10));
-        assert_eq!(frames_left_if_close(4, 10), None);
-        assert_eq!(frames_left_if_close(5, 10), Some(5));
+    /// The node's answer on `head`: its health registry judges the epoch's
+    /// end as it serves a report.
+    pub(crate) fn node_waits(head: Arc<AtomicU64>) -> EpochWaits {
+        EpochWaits::Fixed(Arc::new(move || {
+            let mut registry = quil_rpc::health_conditions::HealthRegistry::default();
+            registry.refresh_waits(
+                quil_rpc::health_conditions::GlobalObservation {
+                    head_frame: head.load(Ordering::SeqCst),
+                    epoch_length: quil_types::consensus::epoch_length_frames(),
+                    ..Default::default()
+                },
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+            );
+            Ok(Some(registry.snapshot()))
+        }))
+    }
+
+    /// A node that judged the epoch's end and holds no prover ops (its head
+    /// at an epoch's first frame): what a command test serving no health
+    /// report signs with.
+    pub(crate) fn no_epoch_wait() -> Option<EpochWaits> {
+        let length = quil_types::consensus::epoch_length_frames();
+        Some(node_waits(Arc::new(AtomicU64::new(length))))
     }
 
     /// A client on a node whose global head is `head`.
@@ -496,11 +640,13 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
             advance.store(length + 3, Ordering::SeqCst);
         });
+        let waits = node_waits(head.clone());
         let mut told = Vec::new();
         let frame = tokio::time::timeout(
             Duration::from_secs(20),
             frame_clear_of_epoch_end(
                 &mut client,
+                &waits,
                 Duration::from_secs(15),
                 Duration::from_millis(50),
                 |left| told.push(left),
@@ -515,6 +661,7 @@ mod tests {
         told.clear();
         let frame = frame_clear_of_epoch_end(
             &mut client,
+            &waits,
             Duration::from_secs(15),
             Duration::from_millis(50),
             |left| told.push(left),
@@ -532,10 +679,12 @@ mod tests {
         let length = quil_types::consensus::epoch_length_frames();
         let head = Arc::new(AtomicU64::new(length - 1));
         let mut client = client_at(head.clone()).await;
+        let waits = node_waits(head.clone());
         let error = tokio::time::timeout(
             Duration::from_secs(20),
             frame_clear_of_epoch_end(
                 &mut client,
+                &waits,
                 Duration::from_millis(200),
                 Duration::from_millis(50),
                 |_| {},
@@ -550,6 +699,7 @@ mod tests {
         head.store(length, Ordering::SeqCst);
         let frame = frame_clear_of_epoch_end(
             &mut client,
+            &waits,
             Duration::from_millis(200),
             Duration::from_millis(50),
             |_| {},
@@ -557,6 +707,62 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(frame, length);
+    }
+
+    /// Nothing is signed when the node cannot say whether the epoch ends
+    /// too soon: its report unreadable, predating its conditions, or not
+    /// judging the epoch's end (no GLOBAL head yet); each says why.
+    #[tokio::test]
+    async fn an_op_is_not_signed_without_the_nodes_answer() {
+        let length = quil_types::consensus::epoch_length_frames();
+        let mut client = client_at(Arc::new(AtomicU64::new(length / 2))).await;
+        let fixed = |answer: Result<Option<HealthConditions>, String>| {
+            EpochWaits::Fixed(Arc::new(move || answer.clone()))
+        };
+        let unjudged = HealthConditions {
+            sources: vec![quil_types::proto::diagnostics::ConditionSource {
+                kind: ConditionKind::ProverOpsWaitForEpoch as i32,
+                observed_unix_ms: 0,
+                tracked: 0,
+            }],
+            ..Default::default()
+        };
+        for (waits, why) in [
+            (
+                fixed(Err("connect to this node's peer listener: refused".into())),
+                "cannot read this node's health report",
+            ),
+            (fixed(Ok(None)), "this node predates its health conditions"),
+            (fixed(Ok(Some(unjudged))), "it knows no GLOBAL head yet"),
+            (
+                fixed(Ok(Some(HealthConditions::default()))),
+                "does not judge the epoch's end",
+            ),
+        ] {
+            let error = frame_clear_of_epoch_end(
+                &mut client,
+                &waits,
+                Duration::from_millis(200),
+                Duration::from_millis(50),
+                |_| panic!("no wait to tell"),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.starts_with("not sent: "), "{error}");
+            assert!(error.contains(why), "{why} in {error}");
+        }
+        // The node judged it and holds nothing: signed at once.
+        let frame = frame_clear_of_epoch_end(
+            &mut client,
+            &node_waits(Arc::new(AtomicU64::new(length / 2))),
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+            |_| panic!("no wait to tell"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(frame, length / 2);
     }
 
     #[test]
