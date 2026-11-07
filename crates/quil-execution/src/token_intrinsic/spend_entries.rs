@@ -241,6 +241,20 @@ pub fn check_owners(
     refuse_noncanonical(&operation_owners(network, application, tp, bytes)?)
 }
 
+/// Whether operation `bytes` (type `tp`) names an owner that is not a
+/// canonical identity, the refusal of [`check_owners`], read from its bytes
+/// alone; false when they do not decode (execution refuses those for their
+/// encoding, not their owners) and for a type that names no owner.
+pub fn names_noncanonical_owner(
+    network: &[u8; 32],
+    application: &[u8; 32],
+    tp: u32,
+    bytes: &[u8],
+) -> bool {
+    operation_owners(network, application, tp, bytes)
+        .is_ok_and(|owners| owners.iter().any(is_burned_owner))
+}
+
 /// Refuse an operation creating a coin whose owner is not a canonical
 /// identity: exactly the coins a globally executed application's fold took
 /// and failed on, so that venue keeps refusing them (at every frame, with no
@@ -702,6 +716,8 @@ mod tests {
                 "case {case}"
             );
             check_owners(&network, application, *tp, &bytes).unwrap();
+            let named = |bytes: &[u8]| names_noncanonical_owner(&network, application, *tp, bytes);
+            assert!(!named(&bytes) && !named(&bytes[1..]), "case {case}");
             let relayed = is_relayed(*tp) || application != &quil;
             if relayed {
                 check_coin_owners(&network, application, *tp, &bytes).unwrap();
@@ -711,6 +727,11 @@ mod tests {
                 owners[slot] = [0xff; IDENTITY_BYTES];
                 let bytes = encode(case, &owners);
                 let refused = check_owners(&network, application, *tp, &bytes).unwrap_err();
+                assert!(
+                    names_noncanonical_owner(&network, application, *tp, &bytes),
+                    "READ-AHEAD GAP: case {case} slot {slot}: check_owners refuses an owner the \
+                     read-ahead misses"
+                );
                 assert!(
                     refused.to_string().contains("not a canonical identity"),
                     "case {case} slot {slot}: {refused}"

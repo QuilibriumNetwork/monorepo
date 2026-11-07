@@ -1098,9 +1098,22 @@ impl ExecutionEngineManager {
         };
         use crate::token_intrinsic::{
             commit_verify, custom_mint,
-            global_commit::Standing,
+            global_commit::{self, Standing},
             shield::{self, SourceStanding},
+            spend_entries,
         };
+        // Execution refuses an operation naming an owner that is not a
+        // canonical identity before its proof once that check is active
+        // (`dispatch_for_commit`). The check reads the bytes alone and its
+        // gate opens once, so it is judged at the latest GLOBAL frame this
+        // process saw; near the gate frame that can refuse a few frames
+        // early, which drops only operations no honest wallet makes.
+        let view = quil_types::consensus::frame_time_head();
+        if global_commit::canonical_owners_active(Some(view))
+            && spend_entries::names_noncanonical_owner(network, application, tp, bytes)
+        {
+            return Some(Standing::Lasting("an owner is not a canonical identity"));
+        }
         if tp == TYPE_LATTICE_PENDING_CLAIM {
             let claim = quil_lattice_ct::confidential::pending_claim::PendingClaim::decode(
                 bytes,

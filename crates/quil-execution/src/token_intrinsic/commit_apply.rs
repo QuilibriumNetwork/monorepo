@@ -34,6 +34,11 @@ pub fn refused_before_proof(
     tp: u32,
     bytes: &[u8],
 ) -> Option<QuilError> {
+    // `commit_and_place` refuses a coin whose owner is not canonical first,
+    // at every frame, from the bytes alone.
+    if let Err(error) = spend_entries::check_coin_owners(network, application, tp, bytes) {
+        return Some(error);
+    }
     let entry = spend_entries::commit_entry(state, network, application, tp, bytes, frame).ok()?;
     global_commit::refusal(
         state,
@@ -712,6 +717,22 @@ mod tests {
             .get(&APPLICATION, &placed[0], &disc)
             .unwrap()
             .is_some());
+    }
+
+    /// The global venue refuses a coin whose owner is not canonical before
+    /// its proof, with the error its commit refuses it with: the pre-proof
+    /// read runs the commit's owner check first. An honest coin stands.
+    #[test]
+    fn a_noncanonical_coin_owner_is_refused_before_the_proof() {
+        let state = state();
+        let claim = mint_claim(9, vec![noncanonical_output(1)]);
+        let ahead = refused_before_proof(&state, 10, &NETWORK, &APPLICATION, CLAIM, &claim)
+            .expect("READ-AHEAD GAP: the commit refuses this coin's owner, the pre-proof read not");
+        let commit = commit_and_place(&state, 10, &NETWORK, &APPLICATION, CLAIM, &claim, limits())
+            .expect_err("the commit refuses it");
+        assert_eq!(ahead.to_string(), commit.to_string());
+        let honest = mint_claim(8, vec![output(6, 100)]);
+        assert!(refused_before_proof(&state, 10, &NETWORK, &APPLICATION, CLAIM, &honest).is_none());
     }
 
     /// Recovery: a delivery GLOBAL already committed with a non-canonical

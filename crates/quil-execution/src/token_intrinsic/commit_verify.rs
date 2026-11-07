@@ -427,6 +427,36 @@ mod tests {
         );
     }
 
+    /// The owner check `dispatch_for_commit` makes before the proof, once
+    /// canonical owners are required, is read ahead by `execution_standing`
+    /// through the same predicate, under the same gate.
+    #[test]
+    fn the_owner_check_made_before_the_proof_is_read_ahead() {
+        let dispatch = include_str!("dispatch.rs");
+        let start = dispatch
+            .find("fn dispatch_for_commit(")
+            .expect("dispatch_for_commit");
+        let end = start
+            + dispatch[start..]
+                .find("verify_for_commit(")
+                .expect("its proof");
+        let before_proof = &dispatch[start..end];
+        let manager = include_str!("../manager.rs");
+        let start = manager
+            .find("fn execution_standing(")
+            .expect("execution_standing");
+        let end = start + manager[start..].find("fn proof_refused(").expect("its end");
+        let standing = &manager[start..end];
+        if before_proof.contains("check_owners(") {
+            assert!(
+                standing.contains("spend_entries::names_noncanonical_owner(")
+                    && standing.contains("canonical_owners_active("),
+                "READ-AHEAD GAP: dispatch_for_commit refuses a non-canonical owner before the \
+                 proof; execution_standing does not read it ahead"
+            );
+        }
+    }
+
     /// A claim's authority signature is judged ahead of the proof at any
     /// frame: one its branch's authority signed stands, before its refund
     /// deadline too (the executing frame judges that), and one signed by
